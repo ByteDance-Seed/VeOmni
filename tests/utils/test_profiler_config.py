@@ -1318,7 +1318,7 @@ def test_base_trainer_preserves_declared_callback_order_for_profile_resume(monke
 
             def on_train_begin(state, _name=self.name):
                 events.append((_name, state.global_step))
-                if _name == "checkpointer":
+                if _name == "global_state":
                     state.global_step = 4
 
             callback.on_train_begin = on_train_begin
@@ -1329,9 +1329,8 @@ def test_base_trainer_preserves_declared_callback_order_for_profile_resume(monke
         ("TqdmCallback", "tqdm"),
         ("WandbTraceCallback", "wandb"),
         ("ProfileTraceCallback", "profile"),
-        ("CheckpointerCallback", "checkpointer"),
-        ("HuggingfaceCkptCallback", "hf"),
-        ("HFLoraCkptCallback", "hf_lora"),
+        ("CheckpointCallback", "checkpoint"),
+        ("GlobalStateCallback", "global_state"),
         ("EvaluateCallback", "evaluate"),
         ("MoERouterMonitorCallback", "moe"),
         ("ChannelLossCallback", "channel"),
@@ -1342,15 +1341,13 @@ def test_base_trainer_preserves_declared_callback_order_for_profile_resume(monke
     trainer.args = SimpleNamespace(model=SimpleNamespace(lora_config=None))
     trainer._init_callbacks()
 
-    assert trainer._callbacks.index(trainer.profile_callback) > trainer._callbacks.index(
-        trainer.checkpointer_callback
-    )
+    assert trainer._callbacks.index(trainer.profile_callback) > trainer._callbacks.index(trainer.global_state_callback)
     assert trainer._callbacks[-1] is trainer.profile_callback
 
     trainer.on_train_begin()
 
     names = [name for name, _ in events]
-    assert names.index("profile") > names.index("checkpointer")
+    assert names.index("profile") > names.index("global_state")
     assert events[names.index("profile")][1] == 4
 
 

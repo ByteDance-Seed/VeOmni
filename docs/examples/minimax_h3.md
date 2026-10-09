@@ -13,7 +13,7 @@ This guide walks through **training** and **inference** for MiniMax H3 FL2VA (fi
 2. [Data Format](#2-data-format)
 3. [Training (Two Stages, Step by Step)](#3-training-two-stages-step-by-step)
 4. [Training Config Notes](#4-training-config-notes)
-5. [Inference](#5-inference-step-by-step)
+5. [Inference](#5-inference)
 6. [Inference Config Notes](#6-inference-config-notes)
 
 ---
@@ -45,7 +45,7 @@ dataset/my_data/
 
 The following 4 columns are **required**, with fixed column names:
 
-```csv
+```text
 video,prompt,input_audio,frame_rate
 video.mp4,"A girl is very happy, she is speaking in english.",video.mp4,24
 ```
@@ -65,8 +65,6 @@ video.mp4,"A girl is very happy, she is speaking in english.",video.mp4,24
 | Resolution | **480x832** (height x width) | Must be divisible by the VAE downsampling factor |
 | Frame rate | 24 | `fps: 24` in the config; audio latent length is computed as `num_frames/24*40` |
 | Audio | 32kHz stereo | Audio is resampled to 32kHz automatically; videos without audio fail during training |
-
----
 
 ## 3. Training (Two Stages, Step by Step)
 
@@ -124,7 +122,7 @@ model:
 data:
   train_path: dataset/minimax-h3-demo/minimax_h3/MiniMax-H3-FL2VA/metadata.csv
   data_transform: minimax_h3_online         # Stage 1 encodes raw video online
-  datasets_type: minimax_h3_online
+  datasets_type: mapping
   dataloader:
     num_workers: 0                          # Stage 1 is encode-heavy; use 0 workers to avoid memory contention
     drop_last: false
@@ -140,7 +138,7 @@ data:
 
 **Important**:
 
-- `train_path` must point to the **metadata.csv file**, not a directory, otherwise you get `png files are not supported`
+- `train_path` must point to the **metadata.csv file** (or a directory that contains it). Directories are scanned for `parquet` / `json` / `csv` / `arrow` files only, so leftover images or `veomni_cli.yaml` are ignored.
 - When changing data, `fps/min_frames/max_frames/height/width` must match the actual video parameters; the frame count must satisfy `(N-5) % 17 == 0`
 - `offline_embedding_save_dir` must match Stage 2's `data.train_path`
 
@@ -154,34 +152,33 @@ model:
     skip_encoder_load: true                 # must be true: do not load VAE/TextEncoder
     video_max_frames: 120
     video_max_resolution: 832
-
-data:
-  train_path: output/minimax_h3_fl2va_embedding    # output dir of Stage 1
-  data_transform: dit_offline
-  datasets_type: minimax_h3_offline
-  shuffle: false
-  mm_configs:
-    repeat: 100                             # dataset repeat count (must be > 1 for small datasets)
-
-train:
-  training_task: offline_training
-  global_batch_size: 8
-  micro_batch_size: 1
-  init_device: meta
-  max_steps: 30
-  gradient_checkpointing:
-    enable: true                            # turning this off OOMs when memory is tight
   optimizer:
     type: adamw
     lr: 1.0e-5
     max_grad_norm: 1.0e9
   accelerator:
+    init_device: meta
+    gradient_checkpointing:
+      enable: true                            # turning this off OOMs when memory is tight
     fsdp_config:
       fsdp_mode: fsdp2
       mixed_precision:
         enable: true
         param_dtype: bfloat16
         reduce_dtype: float32
+
+data:
+  train_path: output/minimax_h3_fl2va_embedding    # output dir of Stage 1
+  data_transform: dit_offline
+  datasets_type: iterable
+  shuffle: false
+  dataset_repeat: true
+
+train:
+  training_task: offline_training
+  global_batch_size: 8
+  micro_batch_size: 1
+  max_steps: 30
   checkpoint:
     output_dir: output/minimax_h3_fl2va_offline
     save_steps: 10
@@ -189,6 +186,129 @@ train:
 ```
 
 ---
+
+## Packed Offline Training
+
+With `train.micro_batch_size > 1`, H3 packs samples inside its ordinary forward.
+Both **FL2VA** and **visual Ref2VA** (image/video references, without reference
+audio) use `process_condition(**batch) → model(**batch)` and return sample-mean
+scalar losses. There is no Trainer packing switch or alternate output protocol.
+The recipe defaults to one sample. This does not batch inference requests,
+enable dynamic batching, load new encoders, or implement an RL objective.
+
+Use the offline recipe with the updated packed metadata:
+
+```shell
+bash train.sh tasks/train_dit.py configs/dit/minimax_h3_fl2va_offline.yaml \
+  --train.micro_batch_size 2 \
+  --train.global_batch_size 16
+```
+
+Keep `train.dyn_bsz=false`, `data.dataloader.drop_last=true`, and FSDP2
+`mixed_precision.cast_forward_inputs=false`. Timesteps stay FP32 and positions
+stay FP32/FP64; blanket BF16 input casting is rejected rather than silently
+changing their precision. Samples in one microbatch may differ in task
+(FL2VA/visual Ref2VA, with or without keyframes), target video/audio geometry,
+prompt length, reference count and reference geometry; `DiTDataCollator` fills
+keys a sample lacks with `None`, and multi-sample outputs return per-sample
+prediction lists. Multi-sample packing rejects Ulysses SP and block/checkpoint
+offload inside modeling. Single-device/FSDP2 with SP/CP/TP/PP sizes one is the validation target;
+LoRA, compilation and additional parallel/offload combinations are not validated.
+
+FL2VA and Ref2VA layouts now contain exactly `[text | cond | audio | video]`, with
+`seq_len=used` and `cu_seqlens=[0, used]`. There is no 64-row tail to crop during
+batch packing. Regenerate old cached `packed` metadata with the current builders
+before multi-sample training; latent tensors and embeddings need not be re-encoded.
+Legacy padded metadata is rejected for multi-sample packing. Any divisibility
+padding for single-sample Ulysses remains local to `MiniMaxH3DiT.forward`.
+Uncovered SP attention rows are zero-initialized so discarded outputs cannot
+introduce nonfinite parameter gradients.
+
+Samples encoded without an audio track keep the silent placeholder latent, so the
+layout is unchanged, but carry `has_audio=False` (also saved in offline
+embeddings). Their `mse_audio` is zero-weighted, and a packed microbatch takes
+the plain sample mean, so after the trainer's division by the accumulation steps
+every sample keeps weight `1/G`, as with `micro_batch_size=1`. Normalizing by the
+global audio-sample count is not implemented. Caches written without `has_audio`
+keep supervising audio as before.
+
+### Visual Ref2VA prepared data
+
+Use matching Ref2VA model weights and **precomputed** Ref2VA prompt/condition
+embeddings. The existing FL2VA embedding recipe does not become a Ref2VA encoder.
+A decoded offline sample has the usual `input_latents`, `audio_input_latents`,
+`prompt_embeds` and `use_gradient_checkpointing`, plus:
+
+```python
+from veomni.models.diffusers.minimax_h3.minimax_h3_core.packed_sequence import build_packed_ref2va
+
+# Illustrative geometry; match it to the actual encoded tensors.
+ref_blocks = [
+    {"kind": "image", "latent_t": 1, "latent_h": 16, "latent_w": 24},
+    {"kind": "video", "latent_t": 6, "latent_h": 16, "latent_w": 24},
+]
+packed = build_packed_ref2va(
+    text_len=prompt_embeds.shape[0],
+    latent_t=video_latents.shape[2],
+    latent_h=video_latents.shape[3],
+    latent_w=video_latents.shape[4],
+    audio_t=audio_latents.shape[-1],
+    audio_channel=audio_latents.shape[0],
+    ref_blocks=ref_blocks,
+    text_token_tags=text_token_tags,
+)
+```
+
+Store this `packed` dictionary and `ref_visual_anchor` of shape
+`[packed["cond_rows"], 96]` in the existing offline-record format. Anchor rows must
+be concatenated in reference-block order and already use the same conditioning
+noise augmentation as `model.condition_model_cfg.imgvid_cond_noise_aug`, matching
+the native inference reference encoder. Preserve the Ref2VA presentation's text
+versus vision token tags. Do not substitute target-video keyframes or FL2VA prompt
+embeddings for Ref2VA references. Reference audio is rejected explicitly.
+
+Each sample samples its own timestep/noise through the existing condition path
+before packing. The transformer then executes once over compact rows with
+independent main-DiT and text-refiner cumulative boundaries. Its RoPE coordinates
+stay sample-local; timestep tables are remapped, not assumed shared. Reference
+rows are cropped separately for each output. Video/audio signs, unpatchification,
+scheduler weights and sample-mean losses retain their single-sample meanings.
+For multi-sample inputs, the small text token refiner runs separately for each sample. Its BF16 output
+projections can round differently when their GEMM row count changes; the deep
+pretrained DiT amplifies those differences. Keeping the refiner sample-local
+preserves its serial arithmetic without disabling packing in the main DiT.
+This is not a promise of bitwise equality for every packed operator or shape.
+
+AdaLN timestep gathers retain the upstream dtype and backward reduction on both
+paths. This feature does not introduce an FP32 gather correction into the shared
+H3 implementation. Low-precision repeated-index reductions can vary even between
+serial repeats, so packed-gradient comparisons must also measure that baseline
+variability; a separate accumulation-precision fix must not silently change the
+single-sample path. Sample-local refiner execution is restricted to cross-sample
+packing; ordinary single-sample attention dispatch is preserved.
+
+### Attention and validation
+
+- `eager` / `sdpa`: explicit per-segment PyTorch SDPA reference path; main-DiT
+  projections and MLPs still operate on compact cross-sample rows.
+- `flash_attention_2` / `flash_attention_3` in `model.ops_implementation` resolve
+  to VeOmni's local FA2/FA3 backends, and `flash_attention_2_hub` /
+  `flash_attention_3_hub` to the Hugging Face Hub kernels
+  (`kernels-community/flash-attn2` / `flash-attn3`, version 1). Each main-DiT
+  layer uses one non-causal varlen call; refiner layers retain one call per
+  sample. The kernel is loaded on the first multi-sample forward and needs
+  BF16/FP16; unavailable kernels are not silently replaced with SDPA.
+
+`tests/models/test_minimax_h3_packing.py` uses a native tiny model on CPU to
+check packed-versus-serial outputs, losses and gradients (including mixed target
+geometry and checkpoint recomputation), sample isolation, Ref2VA variable
+references, forward-local SP padding and fail-closed inputs. SP collectives are
+mocked there, so it does not establish distributed SP parity. The FA2/FA3 call
+site is checked for all four backends with a kernel stub that asserts the
+varlen layout; kernel correctness itself is covered by
+`tests/ops/test_flash_attn_varlen_padding.py`.
+No end-to-end speedup or convergence is claimed. Benchmark against an equivalent,
+tuned non-packed baseline before claiming a performance improvement.
 
 ## 5. Inference
 
@@ -259,5 +379,3 @@ video, audio = pipe(
 **Important**:
 
 - `num_frames` must satisfy `(N-5) % 17 == 0`, otherwise the Video VAE raises an error
-
----

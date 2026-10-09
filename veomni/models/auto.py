@@ -50,6 +50,30 @@ logger = logging.get_logger(__name__)
 CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
 
 
+def check_model_build_prerequisites(config: PretrainedConfig) -> None:
+    """Let a model config refuse a run it cannot serve, before any weight is read.
+
+    A hook rather than a body: any config class may define
+    ``validate_build_prerequisites`` and this calls it. Nothing here knows which
+    models do, which is the point -- the alternative is a list of model names in the
+    generic builder, and a list is a thing the next model has to be remembered into.
+
+    What a config cannot see on its own is the rest of the run, so the convention is
+    that the hook reads whatever singletons it needs (the installed
+    ``OpsImplementationConfig``, the parallel state) and takes no arguments. Kept as a
+    plain ``getattr`` for the same reason: a config that has nothing to refuse should
+    not have to say so.
+
+    ``DeepseekV4Config.validate_build_prerequisites`` is the only implementation
+    today. It refuses a Lightning Indexer KL objective configured without the TileLang
+    indexer and attention it is defined in terms of -- a disagreement between a model
+    field and two kernel selections, which no single dataclass can see.
+    """
+    validate = getattr(config, "validate_build_prerequisites", None)
+    if callable(validate):
+        validate()
+
+
 def check_context_parallel_supported(config: PretrainedConfig) -> None:
     """Raise unless this model type implements context parallelism.
 
@@ -66,6 +90,9 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
 
     if not get_parallel_state().cp_enabled:
         return
+
+    if is_torch_npu_available():
+        raise NotImplementedError("Context parallelism is GPU-only in this release; set cp_size=1 on Ascend/NPU runs.")
 
     model_type = getattr(config, "model_type", None)
     if model_type in CONTEXT_PARALLEL_MODEL_TYPES:
@@ -148,6 +175,30 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
     return bool(bound)
 
 
+def bind_ops_to_modeling(model_cls: Optional[type]) -> bool:
+    """Resolve ``model_cls``'s OpSlots against the ops config now in force.
+
+    Every load path needs this same step and none of them holds the modeling
+    *module* that :func:`_bind_veomni_ops` wants — they hold the model class.
+    Keeping the lookup here means the callers (this file's
+    :func:`build_foundation_model` and ``OmniModel._load_modules``) stay one
+    line each, and slot binding has a single site to delete once every op
+    resolves at call time.
+
+    Callers are responsible for installing the intended config first; this
+    reads whatever ``apply_ops_config`` last put in place.
+    """
+    from ..ops.config.singleton import get_ops_config
+
+    if model_cls is None:
+        return False
+    modeling_module = sys.modules.get(model_cls.__module__)
+    ops_config = get_ops_config()
+    if modeling_module is None or ops_config is None:
+        return False
+    return _bind_veomni_ops(modeling_module, ops_config)
+
+
 def _validate_attention_parallelism(attn_implementation: Optional[str]) -> None:
     if attn_implementation not in ("magi_attention", "veomni_magi_attention_with_sp"):
         return
@@ -172,14 +223,18 @@ def build_foundation_model(
             "eager",
             "sdpa",
             "flash_attention_2",
+            "flash_attention_2_hub",
             "flash_attention_3",
+            "flash_attention_3_hub",
             "flash_attention_4",
             "flex_attention",
             "magi_attention",
             "veomni_flex_attention_with_sp",
             "veomni_magi_attention_with_sp",
             "veomni_flash_attention_2_with_sp",
+            "veomni_flash_attention_2_hub_with_sp",
             "veomni_flash_attention_3_with_sp",
+            "veomni_flash_attention_3_hub_with_sp",
             "veomni_flash_attention_4_with_sp",
             "native-sparse",
         ]
@@ -208,7 +263,9 @@ def build_foundation_model(
     from ..ops.config.singleton import get_ops_config
 
     if ops_implementation is not None:
-        attn_implementation = ops_implementation.attn_implementation
+        attn_implementation = OpsImplementationConfig.normalize_hub_attention_backend(
+            ops_implementation.attn_implementation
+        )
         _validate_attention_parallelism(attn_implementation)
         apply_ops_config(ops_implementation)
     else:
@@ -228,6 +285,7 @@ def build_foundation_model(
         # variant the user selected.
         if attn_implementation is None:
             attn_implementation = installed.attn_implementation
+        attn_implementation = OpsImplementationConfig.normalize_hub_attention_backend(attn_implementation)
         _validate_attention_parallelism(attn_implementation)
 
     if config_kwargs is None:
@@ -239,6 +297,7 @@ def build_foundation_model(
         config = build_config(config_path, **config_kwargs)
 
     check_context_parallel_supported(config)
+    check_model_build_prerequisites(config)
 
     if encoder_data_balance:
         if config.model_type == "qwen3_vl_moe":
@@ -275,10 +334,8 @@ def build_foundation_model(
     # the timing uniform. Assumes ``loader.model_cls`` is final at this point —
     # i.e. no loader rewrites it between here and ``loader.load_model()`` below.
     model_cls = getattr(loader, "model_cls", None) if loader is not None else None
-    modeling_module = sys.modules.get(model_cls.__module__) if model_cls is not None else None
-    if modeling_module is not None:
-        if _bind_veomni_ops(modeling_module, get_ops_config()):
-            logger.info_rank0("OpSlot-based kernel dispatch active.")
+    if bind_ops_to_modeling(model_cls):
+        logger.info_rank0("OpSlot-based kernel dispatch active.")
 
     init_kwargs = {
         "config": config,
@@ -291,7 +348,9 @@ def build_foundation_model(
         "veomni_flex_attention_with_sp",
         "veomni_magi_attention_with_sp",
         "veomni_flash_attention_2_with_sp",
+        "veomni_flash_attention_2_hub_with_sp",
         "veomni_flash_attention_3_with_sp",
+        "veomni_flash_attention_3_hub_with_sp",
         "veomni_flash_attention_4_with_sp",
     ):
         logger.warning_rank0(

@@ -12,51 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""How DeepSeek-V4 context parallelism splits a sequence, and how the shards talk.
-
-Two halves of one mechanism, sharing the canonical fixture below so that the
-arithmetic and the collectives cannot drift apart: ``window_owner_counts``
-computing ``EXPECTED_OWNER_COUNTS`` is exactly why the gather of compressed rows
-has to handle uneven per-rank counts.
-
-The arithmetic half is pure host code and runs anywhere. The collectives half
-spawns ``CP_SIZE`` ranks and skips without that many devices.
-"""
+"""Window ownership arithmetic for DeepSeek-V4 context parallelism."""
 
 from __future__ import annotations
 
-import os
-import tempfile
-
 import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from veomni.distributed.context_parallel.sharding import (
+    empty_compressed_rows,
     local_window_range,
+    local_window_token_indices,
+    plan_compressor_shard,
     rebase_window_indices,
     window_owner_counts,
 )
-from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
 # Canonical fixture: cp_size=4, seq_len=64, L=16, R=4, samples [(0,38),(38,64)].
 # The window at 46 straddles the rank 2/3 boundary and the counts are unequal.
-CP_SIZE = 4
-LOCAL_LEN = 16
-SEQ_LEN = CP_SIZE * LOCAL_LEN
 WINDOW_STARTS = torch.tensor([0, 4, 8, 12, 16, 20, 24, 28, 32, 38, 42, 46, 50, 54, 58])
-EXPECTED_OWNER_COUNTS = [4, 4, 4, 3]
-DIM = 8
-
-
-# ------------------------------ window arithmetic ------------------------------
+LOCAL_LEN = 16
+CP_SIZE = 4
 
 
 def test_owner_counts_are_unequal_and_sum_to_every_window():
     counts = window_owner_counts(WINDOW_STARTS, LOCAL_LEN, CP_SIZE)
-    assert counts.tolist() == EXPECTED_OWNER_COUNTS
+    assert counts.tolist() == [4, 4, 4, 3]
     assert int(counts.sum()) == WINDOW_STARTS.numel()
 
 
@@ -64,6 +46,19 @@ def test_owner_counts_handle_no_windows():
     empty = torch.zeros(0, dtype=torch.long)
     counts = window_owner_counts(empty, LOCAL_LEN, CP_SIZE)
     assert counts.tolist() == [0, 0, 0, 0]
+
+
+# ``local_len <= 0`` is unreachable from production: every caller derives it from
+# a tensor's sequence dimension, and ``plan_compressor_shard`` refuses
+# ``rate > local_seq_len`` with ``rate >= 1`` before it reaches either function.
+# The guards are pinned rather than deleted because both functions are exported
+# from ``veomni.distributed.context_parallel`` and neither fails usefully without
+# them: this one raises ``ZeroDivisionError`` from inside ``torch.div``, and
+# ``local_window_range`` below does not fail at all.
+@pytest.mark.parametrize("local_len", [0, -4])
+def test_owner_counts_refuse_a_non_positive_local_length(local_len):
+    with pytest.raises(ValueError, match="local_len must be positive"):
+        window_owner_counts(WINDOW_STARTS, local_len, CP_SIZE)
 
 
 def test_local_ranges_tile_the_global_window_array():
@@ -82,6 +77,15 @@ def test_every_window_is_owned_by_the_rank_holding_its_first_token():
         owned = WINDOW_STARTS[begin:end]
         assert torch.all(owned >= rank * LOCAL_LEN)
         assert torch.all(owned < (rank + 1) * LOCAL_LEN)
+
+
+# The other half of the guard pair above. This one is the reason they are worth
+# keeping: without it a non-positive width answers ``(0, 0)``, an empty shard
+# that reads as a rank owning nothing rather than as an error.
+@pytest.mark.parametrize("local_len", [0, -4])
+def test_local_window_range_refuses_a_non_positive_local_length(local_len):
+    with pytest.raises(ValueError, match="local_len must be positive"):
+        local_window_range(WINDOW_STARTS, local_len, 0)
 
 
 def test_rebasing_maps_a_straddling_window_inside_the_haloed_shard():
@@ -106,89 +110,94 @@ def test_rebasing_maps_the_previous_window_into_the_left_halo():
     assert rebased.tolist() == [[0, 1, 2, 3]]
 
 
-# -------------------------------- collectives --------------------------------
-
-
-def _run(rank: int, world_size: int, init_file: str) -> None:
-    """CP collectives reproduce the single-rank tensors and carry gradients."""
-    device_type = get_device_type()
-    get_torch_device().set_device(rank)
-    dist.init_process_group(
-        backend=get_dist_comm_backend(),
-        init_method=f"file://{init_file}",
-        rank=rank,
-        world_size=world_size,
+def test_the_unpacked_plan_builds_the_window_starts_every_rank_agrees_on():
+    """Without packed metadata the starts are consecutive multiples of the rate."""
+    plan = plan_compressor_shard(
+        role="test",
+        rate=4,
+        local_seq_len=LOCAL_LEN,
+        cp_rank=2,
+        cp_size=CP_SIZE,
+        packed_compression_metadata=None,
+        device=torch.device("cpu"),
     )
+    assert plan.window_starts.tolist() == list(range(0, LOCAL_LEN * CP_SIZE, 4))
+    assert (plan.begin, plan.end) == (8, 12)
+    assert plan.counts.tolist() == [4, 4, 4, 4]
 
-    from veomni.distributed.context_parallel.dsa_cp import (
-        all_gather_compressed_rows,
-        all_gather_kv,
-        exchange_compressor_halos,
+
+def test_the_packed_plan_takes_its_windows_from_the_metadata():
+    """Packed starts are not multiples of the rate, so they must come from the caller."""
+    metadata = {4: {"window_starts": WINDOW_STARTS}}
+    plan = plan_compressor_shard(
+        role="test",
+        rate=4,
+        local_seq_len=LOCAL_LEN,
+        cp_rank=3,
+        cp_size=CP_SIZE,
+        packed_compression_metadata=metadata,
+        device=torch.device("cpu"),
     )
+    assert plan.window_starts is WINDOW_STARTS
+    assert (plan.begin, plan.end) == (12, 15)
+    assert plan.counts.tolist() == [4, 4, 4, 3]
 
-    group = dist.group.WORLD
-    torch.manual_seed(0)
-    full_kv = torch.randn(1, 1, SEQ_LEN, DIM, device=device_type)
-    dist.broadcast(full_kv, src=0)
-    local_kv = full_kv[:, :, rank * LOCAL_LEN : (rank + 1) * LOCAL_LEN].clone().requires_grad_(True)
 
-    gathered = all_gather_kv(local_kv, group)
-    torch.testing.assert_close(gathered, full_kv)
+def test_the_plan_refuses_a_shard_narrower_than_one_window_and_names_its_caller():
+    """One guard for three call sites, so the message has to say which one raised."""
+    with pytest.raises(ValueError, match="one compression window wide") as raised:
+        plan_compressor_shard(
+            role="DeepSeek V4 CSA compressor",
+            rate=8,
+            local_seq_len=4,
+            cp_rank=0,
+            cp_size=CP_SIZE,
+            packed_compression_metadata=None,
+            device=torch.device("cpu"),
+        )
+    assert "DeepSeek V4 CSA compressor" in str(raised.value), str(raised.value)
 
-    # Gradient reaches only this rank's slice, with the value the full-tensor
-    # backward would have produced there. Each rank backprops through only its
-    # OWN slice of the (identical, replicated) gathered tensor -- summing the
-    # WHOLE tensor on every rank would make every rank's contribution identical
-    # rather than distinct, and the all-reduce in `_Gather.backward` would then
-    # inflate the result by `world_size` instead of reproducing the single-rank
-    # baseline.
-    gathered[:, :, rank * LOCAL_LEN : (rank + 1) * LOCAL_LEN].sum().backward()
-    torch.testing.assert_close(local_kv.grad, torch.ones_like(local_kv))
 
-    # Uneven compressed rows -- the counts the arithmetic above pins -- land in
-    # global window order.
-    counts = torch.tensor(EXPECTED_OWNER_COUNTS, device=device_type)
-    offset = sum(EXPECTED_OWNER_COUNTS[:rank])
-    local_rows = (
-        torch.arange(offset, offset + EXPECTED_OWNER_COUNTS[rank], device=device_type, dtype=torch.float32)
-        .view(1, EXPECTED_OWNER_COUNTS[rank], 1)
-        .expand(1, EXPECTED_OWNER_COUNTS[rank], DIM)
-        .contiguous()
+def test_token_indices_put_a_straddling_window_inside_the_haloed_shard():
+    """Rank 2 owns the window at 46, whose last two tokens live on rank 3."""
+    rate = 4
+    plan = plan_compressor_shard(
+        role="test",
+        rate=rate,
+        local_seq_len=LOCAL_LEN,
+        cp_rank=2,
+        cp_size=CP_SIZE,
+        packed_compression_metadata={rate: {"window_starts": WINDOW_STARTS}},
+        device=torch.device("cpu"),
     )
-    total_rows = sum(EXPECTED_OWNER_COUNTS)
-    rows = all_gather_compressed_rows(local_rows, counts, group)
-    assert rows.shape == (1, total_rows, DIM)
-    torch.testing.assert_close(rows[0, :, 0], torch.arange(total_rows, device=device_type, dtype=torch.float32))
-
-    # Halos come from the neighbours, with zeros beyond the ends.
-    halo = 4
-    local_flat = full_kv[0, 0, rank * LOCAL_LEN : (rank + 1) * LOCAL_LEN].unsqueeze(0)
-    kv_ext, gate_ext = exchange_compressor_halos(local_flat, local_flat.clone(), halo, group)
-    assert kv_ext.shape == (1, halo + LOCAL_LEN + halo, DIM)
-    torch.testing.assert_close(kv_ext[:, halo : halo + LOCAL_LEN], local_flat)
-    if rank == 0:
-        torch.testing.assert_close(kv_ext[:, :halo], torch.zeros_like(kv_ext[:, :halo]))
-    else:
-        expected = full_kv[0, 0, rank * LOCAL_LEN - halo : rank * LOCAL_LEN].unsqueeze(0)
-        torch.testing.assert_close(kv_ext[:, :halo], expected)
-    if rank == world_size - 1:
-        torch.testing.assert_close(kv_ext[:, -halo:], torch.zeros_like(kv_ext[:, -halo:]))
-    else:
-        expected = full_kv[0, 0, (rank + 1) * LOCAL_LEN : (rank + 1) * LOCAL_LEN + halo].unsqueeze(0)
-        torch.testing.assert_close(kv_ext[:, -halo:], expected)
-    torch.testing.assert_close(gate_ext, kv_ext)
-
-    dist.destroy_process_group()
+    indices, first_window_position = local_window_token_indices(
+        plan, rate=rate, local_seq_len=LOCAL_LEN, cp_rank=2, device=torch.device("cpu")
+    )
+    # Rank 2 owns the windows at 32, 38, 42 and 46; the extended buffer is
+    # [4 halo | 16 local | 4 halo], so global token 32 sits at index 4.
+    assert indices.tolist() == [[4, 5, 6, 7], [10, 11, 12, 13], [14, 15, 16, 17], [18, 19, 20, 21]]
+    assert first_window_position == 32
+    assert int(indices.max()) < rate + LOCAL_LEN + rate
 
 
-@pytest.mark.skipif(get_torch_device().device_count() < CP_SIZE, reason="needs 4 devices")
-def test_cp_collectives():
-    # A bare ``tempfile.NamedTemporaryFile`` races with the ``file://`` init
-    # method: PyTorch's file store itself removes the file once every rank has
-    # rendezvoused, so the file's own ``__exit__`` unlink then raises
-    # ``FileNotFoundError``. Passing a path inside a ``TemporaryDirectory``
-    # (as `tests/parallel/ulysses/test_deepseek_v4_ulysses.py` does) avoids the
-    # double-delete: only the file disappears, not the directory.
-    with tempfile.TemporaryDirectory() as tmpdir:
-        init_file = os.path.join(tmpdir, "init")
-        mp.spawn(_run, args=(CP_SIZE, init_file), nprocs=CP_SIZE, join=True)
+def test_the_zero_window_result_keeps_both_inputs_in_the_autograd_graph():
+    """The hang-class property: a rank owning no window still reaches every backward.
+
+    ``new_zeros`` here would detach this rank from the graph, so it would skip
+    the backward all-reduce of the compressed-row all-gather and of both halo
+    all-gathers while its peers block in them. A result built from ``chunk_kv``
+    alone would do the same to the gate halo's. Both inputs receiving a gradient
+    is what says neither can happen.
+    """
+    chunk_kv = torch.randn(1, 3, 8, requires_grad=True)
+    chunk_gate = torch.randn(1, 3, 8, requires_grad=True)
+    empty = empty_compressed_rows(chunk_kv, chunk_gate, head_dim=4)
+
+    assert empty.shape == (1, 0, 4)
+    assert empty.requires_grad, "a detached empty result skips the collectives' backward"
+    # Reach the loss *through* the empty result, the way the row all-gather does
+    # on a rank that owns nothing: the rows are all its peers', and this rank's
+    # contribution to them is empty.
+    torch.cat([empty, torch.ones(1, 2, 4)], dim=1).sum().backward()
+    assert chunk_kv.grad is not None, "the kv halo's backward was never reached"
+    assert chunk_gate.grad is not None, "the gate halo's backward was never reached"

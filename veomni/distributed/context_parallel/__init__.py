@@ -15,14 +15,26 @@
 """Context parallelism for DeepSeek-V4 sparse attention."""
 
 from .dsa_cp import all_gather_compressed_rows, all_gather_kv, exchange_compressor_halos
-from .sharding import local_window_range, rebase_window_indices, window_owner_counts
+from .sharding import (
+    CompressorShardPlan,
+    empty_compressed_rows,
+    local_window_range,
+    local_window_token_indices,
+    plan_compressor_shard,
+    rebase_window_indices,
+    window_owner_counts,
+)
 
 
 __all__ = [
+    "CompressorShardPlan",
     "all_gather_compressed_rows",
     "all_gather_kv",
+    "empty_compressed_rows",
     "exchange_compressor_halos",
     "local_window_range",
+    "local_window_token_indices",
+    "plan_compressor_shard",
     "rebase_window_indices",
     "window_owner_counts",
 ]

@@ -20,7 +20,7 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from ...utils.device import get_device_id
+from ...utils.device import get_device_id, is_nccl_backend
 from .comm import (
     get_ulysses_sequence_parallel_group,
     get_ulysses_sequence_parallel_world_size,
@@ -200,7 +200,7 @@ class _Gather(torch.autograd.Function):
     full-sequence grad back to this rank's local segment.
 
     ``sum_grad`` selects the backward semantics:
-    - True (default): all-reduce the grad first. After a mid-model gather each
+    - True (default): sum the grad across ranks. After a mid-model gather each
       rank consumed a DIFFERENT segment of the full sequence downstream, so its
       grads only cover its own rows — summing reconstructs the full grad.
     - False: no all-reduce. Used at the model output, where the downstream loss
@@ -231,25 +231,64 @@ class _Gather(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor, None, None, None]:
-        if ctx.grad_scale:
-            grad_output = grad_output * ctx.seq_world_size
-
-        # A caller that reduces the gathered output with a bare ``.sum()`` (no
-        # elementwise op in between to materialise a real buffer) hands back a
-        # stride-0 broadcast view here, which NCCL's in-place all_reduce rejects
-        # with "Tensors must be contiguous". ``.contiguous()`` also protects
-        # against scribbling in place on a tensor autograd may still own.
-        grad_output = grad_output.contiguous()
-        if ctx.sum_grad:
-            dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.group)
-
-        return (
-            None,
-            grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank].contiguous(),
-            None,
-            None,
-            None,
-        )
+        if not ctx.sum_grad:
+            grad_input = grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank]
+            if ctx.grad_scale:
+                grad_input = grad_input * ctx.seq_world_size
+            grad_input = grad_input.contiguous()
+        elif (
+            is_nccl_backend(dist.get_backend(ctx.group))
+            and not grad_output.is_complex()
+            and all(size > 0 for size in ctx.dim_size_list)
+            and grad_output.numel() > 0
+        ):
+            # Reduce this rank's shard without modifying the shared input.
+            # Collective selection must not depend on rank-local strides/view bits.
+            dim = ctx.dim % grad_output.ndim
+            shape = list(grad_output.shape)
+            shape[dim] = ctx.dim_size_list[ctx.rank]
+            if len(set(ctx.dim_size_list)) == 1:
+                # Stacked rank-major input avoids the list API's internal flatten.
+                packed = grad_output.unflatten(dim, (ctx.seq_world_size, ctx.dim_size_list[0])).movedim(dim, 0)
+                owns_packed = ctx.grad_scale or packed.is_neg() or not packed.is_contiguous()
+                if ctx.grad_scale or packed.is_neg():
+                    packed = packed.clone(memory_format=torch.contiguous_format)
+                else:
+                    packed = packed.contiguous()
+                if ctx.grad_scale:
+                    # Scale before summing to preserve low-precision overflow semantics.
+                    packed.mul_(ctx.seq_world_size)
+                if owns_packed and (ctx.seq_world_size == 1 or all(size == 1 for size in shape[:dim])):
+                    # NCCL allows an in-place output at this rank's input offset.
+                    # Reuse owned packing when the old all-reduce shard also
+                    # retained full storage, avoiding another local allocation.
+                    grad_input = packed[ctx.rank]
+                else:
+                    grad_input = torch.empty(shape, dtype=grad_output.dtype, device=grad_output.device)
+                dist.reduce_scatter_tensor(grad_input, packed, group=ctx.group)
+            else:
+                # NCCL's uneven list path reduces each differently sized shard.
+                chunks = grad_output.split(ctx.dim_size_list, dim=dim)
+                chunks = [
+                    chunk.clone(memory_format=torch.contiguous_format)
+                    if ctx.grad_scale or chunk.is_neg()
+                    else chunk.contiguous()
+                    for chunk in chunks
+                ]
+                if ctx.grad_scale:
+                    for chunk in chunks:
+                        chunk.mul_(ctx.seq_world_size)
+                grad_input = torch.empty(shape, dtype=grad_output.dtype, device=grad_output.device)
+                dist.reduce_scatter(grad_input, chunks, group=ctx.group)
+        else:
+            # Preserve other backends and NCCL's complex/empty all-reduce path.
+            # Own this in-place buffer, reusing it for optional scaling as well.
+            grad_output = grad_output.clone(memory_format=torch.contiguous_format)
+            if ctx.grad_scale:
+                grad_output.mul_(ctx.seq_world_size)
+            dist.all_reduce(grad_output, group=ctx.group)
+            grad_input = grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank].contiguous()
+        return None, grad_input, None, None, None
 
 
 def gather_heads_scatter_seq(x: Tensor, head_dim: int, seq_dim: int, group: ProcessGroup = None) -> Tensor:

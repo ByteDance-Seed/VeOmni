@@ -115,6 +115,44 @@ def set_device(device: torch.types.Device) -> None:
     get_torch_device().set_device(device)
 
 
+def get_device_rng_state() -> Any:
+    """Snapshot the accelerator's default RNG state, or ``None`` if unsupported.
+
+    ``torch.get_rng_state()`` only covers the CPU generator, while diffusion
+    condition models draw noise and timesteps from the device default RNG. A
+    checkpoint that restores only the CPU state therefore resumes a different
+    device random stream than an uninterrupted run.
+
+    The accelerator namespaces differ (``torch.cuda`` / ``torch.npu`` /
+    ``torch.mlu``), and a namespace may not expose the accessor at all, so this
+    returns ``None`` rather than failing the checkpoint.
+    """
+    if get_device_type() == "cpu":
+        return torch.get_rng_state()
+
+    getter = getattr(get_torch_device(), "get_rng_state", None)
+    if getter is None:
+        logger.warning(f"Device RNG state is not available on {get_device_type()}; checkpoint will not restore it.")
+        return None
+    return getter()
+
+
+def set_device_rng_state(state: Any) -> None:
+    """Restore a snapshot produced by :func:`get_device_rng_state`."""
+    if state is None:
+        return
+
+    if get_device_type() == "cpu":
+        torch.set_rng_state(state)
+        return
+
+    setter = getattr(get_torch_device(), "set_rng_state", None)
+    if setter is None:
+        logger.warning(f"Device RNG state cannot be restored on {get_device_type()}; ignoring the snapshot.")
+        return
+    setter(state)
+
+
 def is_nccl_backend(backend: str | None = None) -> bool:
     """Check if the distributed communication backend is NCCL."""
     return (backend or get_dist_comm_backend()) == "nccl"
@@ -141,6 +179,45 @@ def get_gpu_compute_capability(device: torch.types.Device | int | None = None) -
 def is_sm90_or_above() -> bool:
     """Check if the current CUDA device has SM90+ capability."""
     return get_gpu_compute_capability() >= 90
+
+
+def create_stream(device: torch.device | None = None, priority: int = 0) -> Any:
+    """Create a device stream (CUDA/NPU-agnostic)."""
+    device_type = get_device_type()
+    device_api = get_torch_device()
+
+    # ``torch.cpu.Stream`` intentionally has a smaller constructor than the
+    # CUDA/NPU stream implementations.  Passing ``device`` or ``priority``
+    # through unconditionally makes CPU-only unit tests fail before they can
+    # exercise the device-agnostic caller.
+    if device_type == "cpu":
+        return device_api.Stream()
+
+    kwargs = {}
+    if device is not None:
+        kwargs["device"] = device
+    if priority:
+        kwargs["priority"] = priority
+    return device_api.Stream(**kwargs)
+
+
+def create_event(enable_timing: bool = False, blocking: bool = False) -> Any:
+    """Create a device event (CUDA/NPU-agnostic)."""
+    device_api = get_torch_device()
+    if get_device_type() == "cpu":
+        # ``torch.cpu.Event`` is a no-argument synchronization marker.
+        return device_api.Event()
+    return device_api.Event(enable_timing=enable_timing, blocking=blocking)
+
+
+def get_current_stream() -> Any:
+    """Get the current device stream."""
+    return get_torch_device().current_stream()
+
+
+def switch_to_specified_stream(stream: Any) -> Any:
+    """Context manager to switch to a specified device stream."""
+    return get_torch_device().stream(stream)
 
 
 def get_compute_units():

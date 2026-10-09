@@ -50,7 +50,7 @@ git clone https://github.com/ByteDance-Seed/VeOmni.git
 cd VeOmni
 
 pip install -e .[npu]
-pip install transformers==5.9.0
+pip install transformers==5.16.1
 pip install datasets==2.21.0
 ```
 

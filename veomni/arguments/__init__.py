@@ -15,6 +15,7 @@
 
 from .arguments_types import (
     AcceleratorConfig,
+    BaseModelArguments,
     CheckpointConfig,
     DataArguments,
     DataloaderConfig,
