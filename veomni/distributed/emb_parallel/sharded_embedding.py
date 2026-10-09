@@ -120,7 +120,7 @@ class ShardedEmbedding(nn.Embedding):
             raise RuntimeError(
                 f"{type(self).__name__} holds a split table but is not the emb module's own FSDP2 unit on the "
                 f"emb_fsdp mesh. List {type(self).__name__} (or a module class containing it) in the model's "
-                "_no_split_modules, and make its weight the emb plan's only (first) entry."
+                "_no_split_modules, and shard its weight under the emb plan."
             )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:

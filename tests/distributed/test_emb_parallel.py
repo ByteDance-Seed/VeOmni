@@ -526,8 +526,8 @@ def _wrong_mesh_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
         rows = _FSDP_VOCAB // 2
         embedding = ShardedEmbedding(_FSDP_VOCAB, _FSDP_HIDDEN)
         embedding.weight = nn.Parameter(_fsdp_weights()[0][emb_rank * rows : (emb_rank + 1) * rows].clone())
-        # Its own unit, but on the regular FSDP mesh: what a second planned table listed in
-        # _no_split_modules gets, since only the plan's first entry is wrapped on emb_fsdp.
+        # Its own unit, but on the regular FSDP mesh: what a split table gets when the
+        # parallelizer does not take it for an emb module.
         fully_shard(embedding, mesh=init_device_mesh("cpu", (world,)))
         raised = {}
         for name, call in (
