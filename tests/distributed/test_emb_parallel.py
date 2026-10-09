@@ -166,6 +166,35 @@ def test_ops_match_dense_on_the_selected_device():
     assert torch.allclose(VocabParallelLinear.apply(None, hidden, weight), F.linear(hidden, weight))
 
 
+def _bf16_autocast_linear(fn, hidden: torch.Tensor, weight: torch.Tensor, grad: torch.Tensor):
+    hidden = hidden.clone().requires_grad_(True)
+    weight = weight.clone().requires_grad_(True)
+    with torch.autocast(device_type=hidden.device.type, dtype=torch.bfloat16):
+        logits = fn(hidden, weight)
+    # Backward outside the autocast region, as the trainer runs it.
+    (logits.float() * grad).sum().backward()
+    return logits, hidden.grad, weight.grad
+
+
+def test_linear_matches_dense_under_autocast():
+    """FP32 hidden / weight under BF16 autocast: forward returns BF16, backward must still match ``F.linear``.
+
+    Autograd does not re-enter autocast for a custom Function's backward, so without replaying
+    it the grad matmuls would mix the BF16 ``grad_logits`` with the FP32 saved tensors.
+    """
+    device = _device()
+    generator = torch.Generator().manual_seed(0)
+    hidden, weight, grad = (
+        torch.randn(*shape, generator=generator).to(device) for shape in ((3, HIDDEN), (VOCAB, HIDDEN), (3, VOCAB))
+    )
+
+    sharded = _bf16_autocast_linear(lambda h, w: VocabParallelLinear.apply(None, h, w), hidden, weight, grad)
+    dense = _bf16_autocast_linear(F.linear, hidden, weight, grad)
+    for name, got, want in zip(("logits", "hidden_grad", "weight_grad"), sharded, dense):
+        assert got.dtype == want.dtype, name
+        torch.testing.assert_close(got, want, rtol=1e-2, atol=1e-2, msg=name)
+
+
 def test_embedding_rejects_out_of_range_ids_instead_of_returning_garbage(table):
     """A negative id must fail, not silently produce an uninitialized row.
 
@@ -237,6 +266,46 @@ def _parity_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
 
 def test_sharded_ops_match_dense_over_all_ranks(tmp_path):
     mp.spawn(_parity_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=_WORLD, join=True)
+
+    for rank in range(_WORLD):
+        result = json.loads((tmp_path / f"rank{rank}.json").read_text())
+        assert all(result.values()), (rank, result)
+
+
+def _autocast_linear_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", world_size=_WORLD, rank=rank)
+    try:
+        table = _mr_table().float()
+        rows = _MR_VOCAB // _WORLD
+        chunk = slice(rank * rows, (rank + 1) * rows)
+        hidden = [_mr_randn(r, 1, 3, _MR_HIDDEN).float() for r in range(_WORLD)]
+        grads = [_mr_randn(r, 3, 3, _MR_VOCAB).float() for r in range(_WORLD)]
+
+        logits, hidden_grad, shard_grad = _bf16_autocast_linear(
+            lambda h, w: VocabParallelLinear.apply(dist.group.WORLD, h, w), hidden[rank], table[chunk], grads[rank]
+        )
+        dense_grad = torch.zeros_like(table)
+        for r in range(_WORLD):
+            dense_logits, dense_hidden_grad, dense_grad_r = _bf16_autocast_linear(F.linear, hidden[r], table, grads[r])
+            dense_grad += dense_grad_r
+            if r == rank:
+                want_logits, want_hidden_grad = dense_logits, dense_hidden_grad
+
+        # The shard grad is reduce-scattered in the autocast dtype, the dense one summed in FP32.
+        result = {
+            "logits": logits.dtype == torch.bfloat16 and torch.allclose(logits, want_logits),
+            "hidden_grad": hidden_grad.dtype == torch.float32 and torch.allclose(hidden_grad, want_hidden_grad),
+            "weight_grad": shard_grad.dtype == torch.float32
+            and torch.allclose(shard_grad, dense_grad[chunk], rtol=1e-2, atol=1e-2),
+        }
+        with open(f"{out_dir}/rank{rank}.json", "w") as f:
+            json.dump(result, f)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_sharded_linear_matches_dense_under_autocast_over_all_ranks(tmp_path):
+    mp.spawn(_autocast_linear_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=_WORLD, join=True)
 
     for rank in range(_WORLD):
         result = json.loads((tmp_path / f"rank{rank}.json").read_text())
