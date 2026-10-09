@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
+from veomni.distributed.sequence_parallel.async_ulysses_dit import _AsyncA2A
+from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
+from veomni.distributed.sequence_parallel.ulysses import (
+    _all_to_all_single,
+    _Gather,
+)
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 from .core import attention_forward, gradient_checkpoint_forward
@@ -82,19 +90,27 @@ def _modulate_gate(x, gate, other, indices):
     return (x + gate.index_select(0, indices) * other).to(x.dtype)
 
 
-def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale):
-    out = torch.empty_like(q)
+class _PackedBounds(NamedTuple):
+    """Packed segment bounds as device ``int32`` tensor and host integers."""
+
+    device: torch.Tensor
+    host: tuple[int, ...]
+
+
+def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale, compatibility_mode=False):
+    # Zero uncovered SP rows so discarded outputs cannot poison parameter gradients.
+    out = torch.zeros_like(q)
     # Host-side segment bounds: the DiT / token-refiner entries convert the
     # cu_seqlens tensor once per forward and pass a tuple. Tensor fallback
     # keeps any external caller working (paying one sync).
-    bounds = tuple(cu_seqlens) if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
+    bounds = tuple(cu_seqlens.tolist()) if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
     for start, stop in zip(bounds[:-1], bounds[1:]):
         if stop == start:
             continue
         seg_q = q[start:stop].transpose(0, 1).unsqueeze(0)
         seg_k = k[start:stop].transpose(0, 1).unsqueeze(0)
         seg_v = v[start:stop].transpose(0, 1).unsqueeze(0)
-        seg_out = attention_forward(seg_q, seg_k, seg_v, scale=softmax_scale)
+        seg_out = attention_forward(seg_q, seg_k, seg_v, scale=softmax_scale, compatibility_mode=compatibility_mode)
         out[start:stop] = seg_out.squeeze(0).transpose(0, 1)
     return out
 
@@ -144,24 +160,88 @@ class MiniMaxH3Attention(nn.Module):
         self.head_dim = attention_head_dim
         inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
+        self.packed_sdpa = False
+        self.varlen_kernel = None
         self.qkv_proj = nn.Linear(hidden_size, inner_dim * 3, bias=False)
         self.q_norm = _norm(attention_head_dim, eps=qk_norm_eps)
         self.k_norm = _norm(attention_head_dim, eps=qk_norm_eps)
         self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
 
-    def forward(self, x, *, rope_cos, rope_sin, cu_seqlens, max_seqlen=None):
+    def forward(self, x, *, rope_cos, rope_sin, cu_seqlens, max_seqlen=None, use_ulysses=False):
+        sp_group = get_ulysses_sequence_parallel_group() if use_ulysses else None
         total = x.shape[0]
         qkv = self.qkv_proj(x)
         qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
-        q = qkv[:, :, 0, :]
-        k = qkv[:, :, 1, :]
-        v = qkv[:, :, 2, :]
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        if rope_cos is not None:
-            q = _apply_rope(q, rope_cos, rope_sin)
-            k = _apply_rope(k, rope_cos, rope_sin)
-        out = _sdpa_varlen_attention(q, k, v, cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale)
+        if sp_group is not None:
+            # Ulysses, pipelined per head-block: split heads into blocks of
+            # sp_world heads, launch each block's all-to-all asynchronously and
+            # compute the previous block while the next one is in flight (block
+            # i's exchange leaves one head per rank; the per-block inverse
+            # exchange concatenates the ranks back along the head dim, so the
+            # contiguous head order is restored for the local out_proj).
+            sp_world = dist.get_world_size(sp_group)
+            assert self.num_heads % sp_world == 0
+            nb = self.num_heads // sp_world
+            blocks = qkv.view(total, nb, sp_world, 3, self.head_dim).unbind(1)
+            w = _all_to_all_single(blocks[0], 1, 0, sp_group, async_op=True)
+            out_blocks = []
+            o_wait, o_prev = None, None
+            for i, b in enumerate(blocks):
+                if i + 1 < nb:  # launch block i+1: transfers while block i computes
+                    w_next = _all_to_all_single(blocks[i + 1], 1, 0, sp_group, async_op=True)
+                full = _AsyncA2A.apply(w, b, 1, 0, sp_group)  # [SEQ, 1, 3, d]: this rank's head of block i
+                q = self.q_norm(full[:, :, 0])
+                k = self.k_norm(full[:, :, 1])
+                if rope_cos is not None:
+                    q = _apply_rope(q, rope_cos, rope_sin)
+                    k = _apply_rope(k, rope_cos, rope_sin)
+                o = _sdpa_varlen_attention(
+                    q, k, full[:, :, 2], cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale
+                )
+                if o_wait is not None:  # block i-1's inverse exchange finished during this sdpa
+                    out_blocks.append(_AsyncA2A.apply(o_wait, o_prev, 0, 1, sp_group))
+                o_wait = _all_to_all_single(o, 0, 1, sp_group, async_op=True)
+                o_prev = o
+                w = w_next
+            out_blocks.append(_AsyncA2A.apply(o_wait, o_prev, 0, 1, sp_group))
+            out = torch.cat(out_blocks, dim=1)  # [unit, sp_world, d] per block -> [unit, num_heads, d]
+        else:
+            q = qkv[:, :, 0, :]
+            k = qkv[:, :, 1, :]
+            v = qkv[:, :, 2, :]
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+            if rope_cos is not None:
+                q = _apply_rope(q, rope_cos, rope_sin)
+                k = _apply_rope(k, rope_cos, rope_sin)
+            packed_attention = isinstance(cu_seqlens, _PackedBounds)
+            if packed_attention and not self.packed_sdpa and self.varlen_kernel is None:
+                raise RuntimeError("H3 packed FlashAttention kernel was not loaded before the packed forward.")
+            if not packed_attention or self.varlen_kernel is None:
+                out = _sdpa_varlen_attention(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens=cu_seqlens.host if packed_attention else cu_seqlens,
+                    softmax_scale=self.softmax_scale,
+                    compatibility_mode=packed_attention,
+                )
+            else:
+                if q.dtype not in (torch.float16, torch.bfloat16):
+                    raise ValueError("H3 FlashAttention varlen requires float16 or bfloat16 inputs.")
+                out = self.varlen_kernel(
+                    q.contiguous(),
+                    k.contiguous(),
+                    v.contiguous(),
+                    cu_seqlens_q=cu_seqlens.device,
+                    cu_seqlens_k=cu_seqlens.device,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    softmax_scale=self.softmax_scale,
+                    causal=False,
+                )
+                if isinstance(out, tuple):
+                    out = out[0]
         out = out.reshape(total, self.num_heads * self.head_dim)
         return self.out_proj(out)
 
@@ -236,7 +316,22 @@ class MiniMaxH3TokenRefiner(nn.Module):
         )
         self.final_norm = _norm(hidden_size, eps=final_norm_eps)
 
-    def forward(self, x, *, cu_seqlens, max_seqlen):
+    def forward(self, x, *, cu_seqlens, max_seqlen, sample_local=False):
+        if sample_local and isinstance(cu_seqlens, _PackedBounds) and len(cu_seqlens.host) > 2:
+            bounds = cu_seqlens.host
+            segments = [(i, start, stop) for i, (start, stop) in enumerate(zip(bounds, bounds[1:])) if stop > start]
+            if len(segments) > 1:
+                # Small BF16 refiner GEMMs can change rounding with the row count.
+                # Keep them sample-local: pretrained main-DiT blocks amplify those
+                # differences. The much larger main-DiT sequence stays packed.
+                outputs = []
+                for index, start, stop in segments:
+                    length = stop - start
+                    # Device bounds via slicing the packed tensor: no host-to-device copy per sample.
+                    device_cu = cu_seqlens.device[index : index + 2] - cu_seqlens.device[index]
+                    local_cu = _PackedBounds(device_cu, (0, length))
+                    outputs.append(self.forward(x[start:stop], cu_seqlens=local_cu, max_seqlen=length))
+                return torch.cat(outputs, dim=0)
         for block in self.blocks:
             x = block(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         return self.final_norm(x)
@@ -263,12 +358,19 @@ class MiniMaxH3DiTBlock(nn.Module):
             hidden_size, time_embed_dim, adaln_out_features, expand_ratio=6, modality_num=MINIMAX_H3_ADALN_MODALITY_NUM
         )
 
-    def forward(self, x, *, t_emb, combined_indices, rope_cos, rope_sin, cu_seqlens, max_seqlen):
+    def forward(self, x, *, t_emb, combined_indices, rope_cos, rope_sin, cu_seqlens, max_seqlen, use_ulysses=False):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
         residual = x
         h = self.norm1(x)
         h = _modulate_scale_shift(h, shift_msa, scale_msa, combined_indices)
-        h = self.attn(h, rope_cos=rope_cos, rope_sin=rope_sin, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        h = self.attn(
+            h,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            use_ulysses=use_ulysses,
+        )
         x = _modulate_gate(residual, gate_msa, h, combined_indices)
         residual = x
         h = self.norm2(x)
@@ -415,6 +517,7 @@ class MiniMaxH3DiT(nn.Module):
         text_pos,
         refiner_cu_seqlens,
         refiner_max_seqlen,
+        packed_batch,
         seq_len,
         device,
     ):
@@ -425,7 +528,12 @@ class MiniMaxH3DiT(nn.Module):
         audio_embed = self.audio_patch_proj(audio_rows)
         text_rows = text_embeddings_selected.to(device=device)
         text_embed = self.condition_proj(text_rows)
-        text_embed = self.token_refiner(text_embed, cu_seqlens=refiner_cu_seqlens, max_seqlen=refiner_max_seqlen)
+        text_embed = self.token_refiner(
+            text_embed,
+            cu_seqlens=refiner_cu_seqlens,
+            max_seqlen=refiner_max_seqlen,
+            sample_local=packed_batch,
+        )
 
         embeddings = torch.zeros((seq_len, self.hidden_size), device=device, dtype=dtype)
         embeddings[text_pos] = text_embed.to(dtype)[: text_pos.shape[0]]
@@ -455,6 +563,7 @@ class MiniMaxH3DiT(nn.Module):
         use_gradient_checkpointing_offload=False,
         update_audio_mask=None,
         skip_mask_out_condition=False,
+        packed_batch=False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inverse_indices = inverse_indices.view(-1).to(torch.long)
         token_tags = token_tags.view(-1).to(torch.long)
@@ -465,10 +574,24 @@ class MiniMaxH3DiT(nn.Module):
         text_pos = text_pos_info["position_ids"].view(-1).to(torch.long)
         infer_out_pos = img_pos_for_infer_output_info["position_ids"].view(-1).to(torch.long)
 
+        # Ulysses sequence parallel: pad the packed sequence so it splits evenly
+        # across the SP ranks, then each rank processes its own contiguous half.
+        # Attention exchanges the local seq for this rank's share of heads
+        # inside the module; the residual / MLP / AdaLN path and the output
+        # projections stay local.
+        sp_group = get_ulysses_sequence_parallel_group()
+        sp_world = dist.get_world_size(sp_group) if sp_group is not None else 1
+        sp_rank = dist.get_rank(sp_group) if sp_group is not None else 0
+        if packed_batch and (sp_world != 1 or self._block_offload_enabled or use_gradient_checkpointing_offload):
+            raise ValueError("H3 multi-sample packing does not support sequence parallelism or offload.")
+
         cu_seqlens = packed_seq_params["cu_seqlens_q"].to(torch.int32)
         max_seqlen = int(packed_seq_params["max_seqlen_q"])
         refiner_cu = refiner_packed_seq_params["cu_seqlens_q"].to(torch.int32)
         refiner_max = int(refiner_packed_seq_params["max_seqlen_q"])
+        # Host bounds come from packing/conditioning; reading the device tensor is only a fallback.
+        cu_host = packed_seq_params.get("cu_seqlens_host") or tuple(cu_seqlens.tolist())
+        refiner_host = refiner_packed_seq_params.get("cu_seqlens_host") or tuple(refiner_cu.tolist())
 
         if x.dim() != 3 or x.shape[0] != 1:
             raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
@@ -477,6 +600,15 @@ class MiniMaxH3DiT(nn.Module):
 
         if self._block_offload_enabled:
             self._stage_side_modules(device)
+
+        unit = (seq_len + sp_world - 1) // sp_world
+        padded_seq_len = unit * sp_world
+        pad = padded_seq_len - seq_len
+        if pad and sp_world > 1:
+            # Repeat the last (t, h, w) position for the pad rows; they sit
+            # outside every attention segment (cu_bounds stays at seq_len) and
+            # are dropped by the output index_select before the loss.
+            img_position_ids = torch.cat((img_position_ids, img_position_ids[:, -1:, :].expand(-1, pad, -1)), dim=1)
 
         rope_freqs = self.rope(img_position_ids).to(device)
 
@@ -488,11 +620,18 @@ class MiniMaxH3DiT(nn.Module):
             img_pos=img_pos.to(device),
             audio_pos=audio_pos.to(device),
             text_pos=text_pos.to(device),
-            refiner_cu_seqlens=tuple(refiner_cu.to(device).tolist()),
+            refiner_cu_seqlens=_PackedBounds(refiner_cu.to(device), refiner_host) if packed_batch else refiner_host,
             refiner_max_seqlen=refiner_max,
-            seq_len=seq_len,
+            packed_batch=packed_batch,
+            seq_len=padded_seq_len,
             device=device,
         )
+
+        if pad and sp_world > 1:
+            # AdaLN modulation indices / output gather positions for the pad
+            # rows: zeros are safe, pad rows are dropped by the index_select.
+            inverse_indices = torch.cat((inverse_indices, inverse_indices.new_zeros(pad)))
+            token_tags = torch.cat((token_tags, token_tags.new_zeros(pad)))
 
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
         inverse_indices = inverse_indices.to(device)
@@ -502,11 +641,18 @@ class MiniMaxH3DiT(nn.Module):
         rope_cos = torch.cos(rope_freqs).to(decoder_input.dtype).unsqueeze(1)
         rope_sin = torch.sin(rope_freqs).to(decoder_input.dtype).unsqueeze(1)
 
+        if sp_world > 1:
+            decoder_input = decoder_input.narrow(0, unit * sp_rank, unit)
+            combined_indices = combined_indices.narrow(0, unit * sp_rank, unit)
+            inverse_indices = inverse_indices.narrow(0, unit * sp_rank, unit)
+
         hidden = decoder_input
-        cu_seqlens = cu_seqlens.to(device)
-        # Single device→host sync per forward: segment bounds shared across
-        # every block instead of one tolist() per attention module.
-        cu_bounds = tuple(cu_seqlens.tolist())
+        # Host bounds were read once above and are shared by every block. Bounds stay
+        # at the ORIGINAL seq_len: the per-segment SDPA is non-causal, so an
+        # extended bound would leak pad keys into the last real rows. Pad rows
+        # fall outside every segment, have zero attention output, and are
+        # dropped by the index_select below.
+        cu_bounds = _PackedBounds(cu_seqlens.to(device), cu_host) if packed_batch else cu_host
         block_swap = self._block_swap if self._block_offload_enabled else 0
         for i, block in enumerate(self.blocks):
             if self._block_offload_enabled:
@@ -529,6 +675,7 @@ class MiniMaxH3DiT(nn.Module):
                 rope_sin=rope_sin,
                 cu_seqlens=cu_bounds,
                 max_seqlen=max_seqlen,
+                use_ulysses=sp_world > 1,
             )
 
         if self._block_offload_enabled:
@@ -536,6 +683,15 @@ class MiniMaxH3DiT(nn.Module):
                 b.to("cpu")
 
         video_logits, audio_logits = self.final_layer(hidden, t_emb=t_emb, inverse_indices=inverse_indices)
+
+        if sp_group is not None:
+            # Rebuild the full packed sequence so the output position
+            # index_select / update_mask below see the original layout. The
+            # backward splits without all-reduce (grad_scale=False,
+            # sum_grad=False): the downstream loss is replicated across the SP
+            # ranks, so a sum would multiply the gradient by the SP world size.
+            video_logits = _Gather.apply(sp_group, video_logits, 0, False, False)
+            audio_logits = _Gather.apply(sp_group, audio_logits, 0, False, False)
 
         video_logits = video_logits.index_select(0, infer_out_pos.to(device))
         audio_logits = audio_logits.index_select(0, audio_pos.to(device))

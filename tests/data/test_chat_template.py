@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from veomni.data.chat_template import (
     CHAT_TEMPLATE_REGISTRY,
@@ -9,6 +10,7 @@ from veomni.data.chat_template import (
     Qwen2VLChatTemplate,
     Qwen3VLChatTemplate,
     TokenizerTemplate,
+    add_mtp_labels,
     build_chat_template,
 )
 from veomni.utils.constants import IGNORE_INDEX, TYPE2INDEX
@@ -43,6 +45,30 @@ def test_tokenizer_template_masks_non_assistant_turns_and_truncates():
         "attention_mask": [1, 1, 1, 1],
         "labels": [IGNORE_INDEX, 3, 20, 21],
     }
+
+
+def test_add_mtp_labels_builds_each_depth_before_packing():
+    feature = {"labels": torch.tensor([10, 11, 12, 13, 14])}
+
+    add_mtp_labels(feature, num_depths=3)
+
+    expected = torch.tensor(
+        [
+            [12, 13, 14, IGNORE_INDEX, IGNORE_INDEX],
+            [13, 14, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX],
+            [14, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX],
+        ]
+    )
+    assert torch.equal(feature["mtp_labels"], expected)
+
+
+def test_tokenizer_template_does_not_emit_mtp_labels():
+    template = TokenizerTemplate(_PrefixStableTokenizer())
+    encoded = template.encode_messages(
+        [{"role": "user", "content": [10, 11]}, {"role": "assistant", "content": [20, 21]}],
+        max_seq_len=4,
+    )
+    assert "mtp_labels" not in encoded
 
 
 def test_gpt_oss_tokenizer_template_supports_terminal_token_rewrite():
@@ -270,6 +296,57 @@ def _video_metadata(total_num_frames, fps=2.0, frames_indices=None):
         fps=fps,
         frames_indices=list(range(total_num_frames)) if frames_indices is None else frames_indices,
     )
+
+
+def test_qwen2vl_template_does_not_emit_mtp_labels():
+    template = build_chat_template("qwen2vl", _Processor(_SpecialTokenTokenizer()))
+    encoded = template.encode_messages([("user", ("text", "hi")), ("assistant", ("text", "ok"))], {})
+    assert "mtp_labels" not in encoded
+
+
+@pytest.mark.parametrize("sample_fps,max_frames", [(2.0, 4), (2.0, None), (1.0, None)])
+def test_qwen_vl_transform_preserves_video_timestamps(sample_fps, max_frames):
+    import re
+
+    import torch
+    from transformers import Qwen3VLVideoProcessor
+
+    from veomni.data.data_transform import _process_sample_qwen_vl_base
+
+    # Five seconds at 30 FPS. Each frame's pixels identify its source index.
+    frames = torch.arange(150, dtype=torch.uint8)[:, None, None, None].expand(-1, 3, 32, 32).numpy()
+    processor = SimpleNamespace(
+        tokenizer=_SpecialTokenTokenizer(),
+        video_processor=Qwen3VLVideoProcessor(size={"shortest_edge": 32 * 32, "longest_edge": 32 * 32}),
+    )
+    template = build_chat_template("qwen3vl", processor)
+    sample = {
+        "source": "LLaVA-Video-178K",
+        "videos": [{"video": frames, "video_fps": 30.0}],
+        "conversations": [{"from": "human", "value": "<image>\nDescribe the video."}],
+    }
+
+    def position_ids(**kwargs):
+        return {"position_ids": torch.arange(kwargs["input_ids"].shape[-1]).view(1, 1, -1)}
+
+    result = _process_sample_qwen_vl_base(
+        sample, processor, template, position_ids, fps=sample_fps, max_frames=max_frames
+    )[0]
+    decoded = "".join(chr(i - 1000) for i in result["input_ids"].tolist() if i >= 1000)
+    timestamps = re.findall(r"<([\d.]+) seconds>", decoded)
+    # Recover the selected frames independently from processor pixel output.
+    # Constant-color patches preserve their source frame value through normalization.
+    pixels = result["pixel_values_videos"]
+    patch_size = processor.video_processor.patch_size
+    temporal = processor.video_processor.temporal_patch_size
+    selected = (pixels.reshape(-1, 3, temporal, patch_size, patch_size)[:, 0, :, 0, 0] * 0.5 + 0.5) * 255
+    selected = selected.round().reshape(-1).tolist()
+    # At 32x32 there are four spatial patches per time block; take one copy.
+    spatial_patches = int(result["video_grid_thw"][0, 1:].prod())
+    source_pairs = [selected[i : i + temporal] for i in range(0, len(selected), spatial_patches * temporal)]
+    expected = [f"{(pair[0] + pair[-1]) / (2 * 30):.1f}" for pair in source_pairs]
+    assert timestamps == expected
+    assert float(timestamps[-1]) > 4.0
 
 
 # Frame/token pairs read off the real Qwen3VLVideoProcessor (temporal_patch_size=2,

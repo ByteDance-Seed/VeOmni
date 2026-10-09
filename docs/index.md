@@ -30,10 +30,12 @@ usage/basic_modules.md
 usage/multimodal_data_processing.md
 usage/data_packing_and_dyn_bsz.md
 usage/long_context_dyn_bsz_cold_start.md
+usage/dit_microbatching.md
 usage/support_new_models/guide_and_checklist.md
 usage/support_new_models/qwen3_vl_example.md
 usage/support_new_models/qwen3_omni_moe_example.md
 usage/support_new_models/dit_model_guide.md
+usage/checkpoint.md
 usage/checkpoint_conversion.md
 usage/trainer.md
 usage/agent_workflow.md
@@ -52,8 +54,11 @@ hardware_support/precision_analysis.md
 hardware_support/profiling_analysis.md
 hardware_support/AscendDockerUsage/build_a2_docker.md
 hardware_support/AscendDockerUsage/build_a3_docker.md
+hardware_support/AscendDockerUsage/overview.md
+hardware_support/AscendDockerUsage/supported_tags.md
 hardware_support/FAQ.md
 hardware_support/rocm/README.md
+hardware_support/mlu/README.md
 ```
 
 ```{toctree}
@@ -66,6 +71,7 @@ examples/qwen3_moe.md
 examples/qwen3_vl.md
 examples/qwen3_omni_moe.md
 examples/qwen3_omni_offline_av.md
+examples/minimax_h3.md
 examples/wan2.1.md
 examples/wan2.1_I2V_1.3B.md
 examples/ltx-2.3.md
@@ -83,7 +89,16 @@ key_features/ep_fsdp2.md
 key_features/extra_parallel.md
 key_features/ulysses.md
 key_features/lora.md
+key_features/mtp.md
 
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: SeedOmni
+
+seed_omni/mixins/metric_meter.md
+seed_omni/mixins/offline_encoding.md
 ```
 
 ```{toctree}
@@ -94,8 +109,11 @@ design/kernel_selection.md
 design/fused_moe_kernels.md
 design/local_parallel_state.md
 design/patchgen.md
+design/qwen4_exp_ple_2d_parallelism.md
 design/unified_kernel_registry.md
 design/verl_topk_distill_integration.md
+design/deepseek_v4_context_parallel.md
+design/deepseek_v4_indexer_loss.md
 ```
 
 ```{toctree}

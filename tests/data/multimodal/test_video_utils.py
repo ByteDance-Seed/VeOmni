@@ -1,6 +1,8 @@
 import os
+import sys
 import time
 from io import BytesIO
+from types import ModuleType, SimpleNamespace
 
 import av
 import numpy as np
@@ -8,6 +10,7 @@ import PIL.Image
 import pytest
 import torch
 
+from veomni.data.multimodal import video_utils
 from veomni.data.multimodal.video_utils import (
     _apply_dynamic_video_max_pixels,
     calculate_frame_indices,
@@ -22,10 +25,12 @@ from veomni.utils.import_utils import is_ffmpeg_available
 
 
 # Make sure to place a sample.mp4 file in tests/data/assets
-VIDEO_PATH = os.path.join(os.environ["CI_SAMPLES_DIR"], "sample.mp4")
+VIDEO_PATH = os.path.join(os.environ.get("CI_SAMPLES_DIR", "tests/data/assets"), "sample.mp4")
 
-# Skip tests if the sample video file doesn't exist
-pytestmark = pytest.mark.skipif(not os.path.exists(VIDEO_PATH), reason=f"Test video not found at {VIDEO_PATH}")
+# Only tests that read the external sample require it; synthetic tests run independently.
+requires_sample_video = pytest.mark.skipif(
+    not os.path.exists(VIDEO_PATH), reason=f"Test video not found at {VIDEO_PATH}"
+)
 
 
 def assert_video_output_valid(video: torch.Tensor, audio: np.ndarray = None, **kwargs):
@@ -87,6 +92,7 @@ def assert_video_output_valid(video: torch.Tensor, audio: np.ndarray = None, **k
             )
 
 
+@requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 def test_fetch_videos_from_path():
     """
@@ -110,6 +116,7 @@ def test_fetch_videos_from_path():
     assert_video_output_valid(videos[0], audios[0], **kwargs)
 
 
+@requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 def test_fetch_videos_from_bytes():
     """
@@ -190,6 +197,7 @@ def test_fetch_videos_from_dict():
     assert_video_output_valid(videos[0], audios[0], **kwargs)
 
 
+@requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 def test_fetch_videos_without_audio():
     """
@@ -213,6 +221,7 @@ def test_fetch_videos_without_audio():
     assert_video_output_valid(videos[0], **kwargs)
 
 
+@requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 def test_fetch_videos_with_frame_constraints():
     """
@@ -244,6 +253,7 @@ def test_fetch_videos_with_frame_constraints():
     assert_video_output_valid(videos[0], audios[0], **kwargs)
 
 
+@requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 def test_fetch_videos_multiple_inputs():
     """
@@ -280,6 +290,7 @@ def test_fetch_videos_multiple_inputs():
         assert_video_output_valid(video, audio, **kwargs)
 
 
+@requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 def test_fetch_videos_from_bytes_list():
     """
@@ -319,6 +330,7 @@ def test_fetch_videos_from_bytes_list():
     assert_video_output_valid(videos[0], **kwargs)
 
 
+@requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 def test_fetch_videos_metadata():
     """
@@ -346,7 +358,10 @@ def test_fetch_videos_metadata():
     assert "fps" in video_meta[0], "Video metadata should contain 'fps'"
     assert "total_num_frames" in video_meta[0], "Video metadata should contain 'total_num_frames'"
     assert "frames_indices" in video_meta[0], "Video metadata should contain 'frames_indices'"
-    assert video_meta[0]["total_num_frames"] == videos[0].shape[0], "Metadata frame count should match tensor"
+    with av.open(VIDEO_PATH) as container:
+        stream = container.streams.video[0]
+        assert video_meta[0]["total_num_frames"] == stream.frames
+        assert video_meta[0]["fps"] == pytest.approx(float(stream.average_rate))
 
     # Check frames_indices
     frames_indices = video_meta[0]["frames_indices"]
@@ -376,6 +391,7 @@ def test_fetch_videos_metadata():
     )
 
 
+@requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 def test_smart_video_nframes_explicit_frames():
     """
@@ -392,10 +408,12 @@ def test_smart_video_nframes_explicit_frames():
     assert processed_video.shape[0] == target_frames, (
         f"Expected {target_frames} frames, got {processed_video.shape[0]}"
     )
-    assert processed_meta["total_num_frames"] == target_frames
+    assert processed_meta["total_num_frames"] == video.shape[0]
+    assert len(processed_meta["frames_indices"]) == target_frames
     assert "fps" in processed_meta, "Processed metadata should contain 'fps'"
 
 
+@requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 def test_smart_video_nframes_metadata():
     """
@@ -412,10 +430,12 @@ def test_smart_video_nframes_metadata():
     assert "total_num_frames" in processed_meta, "Metadata should contain 'total_num_frames'"
 
     # Check metadata accuracy
-    assert processed_meta["total_num_frames"] == processed_video.shape[0]
-    assert processed_meta["fps"] > 0, "FPS should be positive"
+    assert processed_meta["total_num_frames"] == video.shape[0]
+    assert len(processed_meta["frames_indices"]) == processed_video.shape[0]
+    assert processed_meta["fps"] == video_meta["fps"]
 
 
+@requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 def test_smart_audio_nframes_conditional_resample():
     """
@@ -441,6 +461,7 @@ def test_smart_audio_nframes_conditional_resample():
             assert len(processed_audio2) != len(audio), "Audio length should change after resampling"
 
 
+@requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 def test_smart_audio_nframes_metadata():
     """
@@ -469,6 +490,7 @@ def test_load_video_from_bytes_list_empty():
         load_video_from_bytes_list([], fps=2.0)
 
 
+@requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 def test_load_video_metadata_structure():
     """
@@ -482,7 +504,10 @@ def test_load_video_metadata_structure():
     assert "fps" in video_meta, "Video metadata should contain 'fps'"
     assert "total_num_frames" in video_meta, "Video metadata should contain 'total_num_frames'"
     assert "frames_indices" in video_meta, "Video metadata should contain 'frames_indices'"
-    assert video_meta["total_num_frames"] == video.shape[0], "Metadata frame count should match tensor"
+    with av.open(VIDEO_PATH) as container:
+        stream = container.streams.video[0]
+        assert video_meta["total_num_frames"] == stream.frames
+        assert video_meta["fps"] == pytest.approx(float(stream.average_rate))
 
     # Check frames_indices
     frames_indices = video_meta["frames_indices"]
@@ -500,6 +525,7 @@ def test_load_video_metadata_structure():
         assert "total_num_frames" in audio_meta, "Audio metadata should contain 'total_num_frames'"
 
 
+@requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 def test_frames_indices_for_qwen3vl():
     """
@@ -533,7 +559,8 @@ def test_frames_indices_for_qwen3vl():
     assert frames_indices is not None, "frames_indices should not be None"
     assert isinstance(frames_indices, torch.Tensor), "frames_indices should be a torch.Tensor"
     assert frames_indices.dtype == torch.long, f"frames_indices should be torch.long, got {frames_indices.dtype}"
-    assert len(frames_indices) == total_frames, "frames_indices length should match total_num_frames"
+    assert len(frames_indices) == videos[0].shape[0], "Each output frame must have a source index"
+    assert frames_indices.max() < total_frames, "Frame indices must refer to the source video"
 
     # Validate frames_indices values
     assert frames_indices.min() >= 0, "All frame indices should be >= 0"
@@ -661,6 +688,7 @@ class TestCalculateFrameIndicesRemainder:
         assert pad1 == pad2
 
 
+@requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 @pytest.mark.benchmark
 def test_benchmark_fetch_videos_from_path():
@@ -717,6 +745,7 @@ def test_benchmark_fetch_videos_from_path():
     print(f"{'=' * 60}")
 
 
+@requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 @pytest.mark.benchmark
 def test_benchmark_fetch_videos_different_resolutions():
@@ -770,6 +799,7 @@ def test_benchmark_fetch_videos_different_resolutions():
     print(f"{'=' * 95}")
 
 
+@requires_sample_video
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
 @pytest.mark.benchmark
 def test_benchmark_audio_processing():
@@ -914,3 +944,96 @@ class TestApplyDynamicVideoMaxPixels:
         result = _apply_dynamic_video_max_pixels(nframes=16, kwargs=kwargs)
         assert result["video_max_pixels"] < 602112
         assert result["video_max_pixels"] > 100352
+
+
+def _frames(count):
+    # Pixel values identify the original frame, independently of returned metadata.
+    return torch.arange(count, dtype=torch.uint8)[:, None, None, None].expand(-1, 3, 32, 32).clone()
+
+
+@pytest.mark.parametrize("max_frames, expected", [(None, [0, 17, 34, 51, 68, 85, 102, 119]), (4, [0, 40, 79, 119])])
+@pytest.mark.parametrize("container", ["video.mp4", b"video container"])
+def test_container_metadata_preserves_source_time(monkeypatch, max_frames, expected, container):
+    frames = _frames(120)
+
+    class Decoder:
+        def __init__(self, *args, **kwargs):
+            self.metadata = SimpleNamespace(average_fps=30.0, num_frames=120)
+
+        def get_frames_at(self, indices):
+            return SimpleNamespace(data=frames[indices])
+
+    decoders = ModuleType("torchcodec.decoders")
+    decoders.VideoDecoder = Decoder
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+    monkeypatch.setattr(video_utils, "is_ffmpeg_available", lambda: True)
+    kwargs = dict(fps=2.0, max_frames=max_frames, use_audio_in_video=False)
+    videos, metadata, audios, _ = video_utils.fetch_videos_metadata([container], **kwargs)
+    meta = metadata[0]
+    assert meta["fps"] == 30.0
+    assert meta["total_num_frames"] == 120
+    assert meta["frames_indices"].tolist() == expected
+    assert videos[0][:, 0, 0, 0].tolist() == expected
+    assert (meta["frames_indices"] / meta["fps"]).tolist() == pytest.approx(np.array(expected) / 30.0)
+    # Omni and DiT still receive the same two-value API and sampled frame data.
+    legacy_videos, legacy_audios = video_utils.fetch_videos([container], **kwargs)
+    assert torch.equal(legacy_videos[0], videos[0])
+    assert legacy_audios == audios == [None]
+
+
+@pytest.mark.parametrize("kind", ["array_dict", "bytes_dict", "pil_list", "bytes_list"])
+@pytest.mark.parametrize(
+    "sampling, expected", [({"max_frames": 4}, [0, 2, 3, 5]), ({"frames": 8}, [0, 1, 2, 3, 4, 5, 5, 5])]
+)
+def test_predecoded_timing_and_repeated_frame_padding(kind, sampling, expected):
+    frames = _frames(6)
+    images = [PIL.Image.fromarray(frame.permute(1, 2, 0).numpy()) for frame in frames]
+    encoded = []
+    for img in images:
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        encoded.append(buffer.getvalue())
+    video = {
+        "array_dict": {"video": frames.permute(0, 2, 3, 1).numpy(), "video_fps": 2.0},
+        "bytes_dict": {"frames": encoded, "video_fps": 2.0},
+        "pil_list": images,
+        "bytes_list": encoded,
+    }[kind]
+    videos, metadata, _, _ = video_utils.fetch_videos_metadata([video], fps=2.0, **sampling)
+    meta = metadata[0]
+    assert meta["fps"] == 2.0
+    assert meta["total_num_frames"] == 6
+    assert meta["frames_indices"].tolist() == expected
+    assert videos[0][:, 0, 0, 0].tolist() == expected
+
+
+def test_dict_source_fps_differs_from_target():
+    video = {"video": _frames(120).numpy(), "video_fps": 30.0}
+    videos, metadata, _, _ = video_utils.fetch_videos_metadata([video], fps=2.0, max_frames=4)
+    assert metadata[0]["fps"] == 30.0
+    assert metadata[0]["total_num_frames"] == 120
+    assert metadata[0]["frames_indices"].tolist() == [0, 40, 79, 119]
+    assert videos[0][:, 0, 0, 0].tolist() == [0, 40, 79, 119]
+
+
+def test_decoder_fallback_keeps_repeated_first_frame_time(monkeypatch):
+    class Decoder:
+        def __init__(self, *args, **kwargs):
+            self.metadata = SimpleNamespace(average_fps=30.0, num_frames=120)
+
+        def get_frames_at(self, indices):
+            if indices != [0]:
+                raise RuntimeError("End of stream")
+            return SimpleNamespace(data=_frames(1))
+
+    decoders = ModuleType("torchcodec.decoders")
+    decoders.VideoDecoder = Decoder
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+    monkeypatch.setattr(video_utils, "is_ffmpeg_available", lambda: True)
+    videos, metadata, _, _ = video_utils.fetch_videos_metadata(
+        ["video.mp4"], fps=2, min_frames=4, frame_factor=2, use_audio_in_video=False
+    )
+    assert metadata[0]["fps"] == 30.0
+    assert metadata[0]["total_num_frames"] == 120
+    assert metadata[0]["frames_indices"].tolist() == [0, 0, 0, 0]
+    assert videos[0].shape[0] == 4

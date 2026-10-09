@@ -48,9 +48,9 @@ def test_vlm_data_arguments_identify_multimodal_policy_scope():
 
 
 def test_base_trainer_forwards_buffer_policy_scope(monkeypatch):
+    import veomni.trainer.base as base_mod
     from veomni.arguments.arguments_types import DataloaderConfig
     from veomni.trainer.base import BaseTrainer
-    import veomni.trainer.base as base_mod
 
     captured_kwargs = {}
     monkeypatch.setattr(base_mod, "build_dataloader", lambda **kwargs: captured_kwargs.update(kwargs) or object())
@@ -291,7 +291,6 @@ def test_build_dataloader_native_override_resolves_before_external_dispatch():
     assert captured_kwargs["dyn_bsz_buffer_size"] == 24
 
 
-@pytest.mark.parametrize("missing_argument", ["max_seq_len", "micro_batch_size"])
 def test_build_dataloader_rejects_context_aware_when_dyn_bsz_disabled():
     with pytest.raises(ValueError, match="requires dyn_bsz=True"):
         build_dataloader(
@@ -320,9 +319,9 @@ def test_build_native_dataloader_rejects_context_aware_when_dyn_bsz_disabled():
 
 
 def test_dit_trainer_rejects_context_aware_after_setup_disables_dyn_bsz(monkeypatch):
+    import veomni.trainer.dit_trainer as dit_mod
     from veomni.arguments.arguments_types import DataloaderConfig
     from veomni.trainer.dit_trainer import DiTTrainer
-    import veomni.trainer.dit_trainer as dit_mod
 
     monkeypatch.setattr(
         dit_mod,
@@ -345,6 +344,7 @@ def test_dit_trainer_rejects_context_aware_after_setup_disables_dyn_bsz(monkeypa
                 dyn_bsz_buffer_size=200,
                 dyn_bsz_buffer_policy="context_aware",
                 data_modality="diffusion",
+                shuffle=False,
             ),
             train=types.SimpleNamespace(
                 micro_batch_size=1,
@@ -369,6 +369,7 @@ def test_dit_trainer_rejects_context_aware_after_setup_disables_dyn_bsz(monkeypa
         trainer._build_dataloader()
 
 
+@pytest.mark.parametrize("missing_argument", ["max_seq_len", "micro_batch_size"])
 def test_build_dataloader_context_aware_policy_reports_missing_arguments(missing_argument):
     arguments = {
         "dataloader_type": "native",

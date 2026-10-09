@@ -1,7 +1,20 @@
 import pytest
+import torch
 
 from veomni.models.loader import get_model_class, get_model_config, get_model_processor
 from veomni.utils.helper import get_cache_dir
+
+
+@pytest.mark.parametrize("toy_name", ["qwen3vl", "qwen3vlmoe", "qwen3_5", "qwen3_5_moe"])
+def test_generated_multimodal_children(monkeypatch, toy_name):
+    """AutoModel inside a generated parent must not bypass the patched towers."""
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    config = get_model_config(f"./tests/toy_config/{toy_name}_toy")
+    model_class = get_model_class(config)
+    with torch.device("meta"):
+        model = model_class._from_config(config, attn_implementation="eager")
+    for tower in (model.model.visual, model.model.language_model):
+        assert type(tower).__module__ == model_class.__module__
 
 
 local_test_cases = [

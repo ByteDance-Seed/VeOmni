@@ -41,6 +41,7 @@ from . import logging
 from .count_flops import VeomniFlopsCounter
 from .device import (
     IS_CUDA_AVAILABLE,
+    IS_MLU_AVAILABLE,
     IS_NPU_AVAILABLE,
     get_device_type,
     get_torch_device,
@@ -149,11 +150,55 @@ def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]
     micro_batch.pop("source_name", None)
     micro_batch.pop("cur_token_num", None)
     if isinstance(ds_idx, torch.Tensor):
-        # packed micro batch
+        # packed micro batch (e.g. PackingCollator)
         return ds_idx.tolist()
-    else:
-        # unpacked sample
-        return [ds_idx]
+    if isinstance(ds_idx, list):
+        # SeedOmniCollator gathers per-sample ds_idx into a list
+        return [int(idx) for idx in ds_idx]
+    # single-sample micro batch
+    return [int(ds_idx)]
+
+
+def compute_device_memory_metrics() -> Dict[str, Any]:
+    """Device + host memory metrics, reduced to the worst rank across all ranks.
+
+    Shared by :class:`EnvironMeter` (single model) and
+    :class:`veomni.utils.omni_helper.OmniEnvironMeter` (OmniModel) — these are
+    module-agnostic and depend only on the device, so both meters report them
+    identically. Used memory and usage take the max over ranks, available host
+    memory the min, so rank 0's log shows the host closest to running out.
+    """
+    allocated_memory = get_torch_device().max_memory_allocated()
+    reserved_memory = get_torch_device().max_memory_reserved()
+    num_alloc_retries = get_torch_device().memory_stats()["num_alloc_retries"]
+    cpu_memory_info = psutil.virtual_memory()
+    # One max-reduce: the min of available memory is the max of its negation.
+    (
+        allocated_memory,
+        reserved_memory,
+        num_alloc_retries,
+        cpu_used_memory,
+        cpu_memory_usage,
+        neg_cpu_available_memory,
+    ) = all_reduce(
+        (
+            allocated_memory,
+            reserved_memory,
+            num_alloc_retries,
+            cpu_memory_info.used,
+            cpu_memory_info.percent,
+            -cpu_memory_info.available,
+        ),
+        op="max",
+    )
+    return {
+        "max_memory_allocated(GB)": allocated_memory / (1024**3),
+        "max_memory_reserved(GB)": reserved_memory / (1024**3),
+        "cpu_used_memory(GB)": cpu_used_memory / (1024**3),
+        "cpu_available_memory(GB)": -neg_cpu_available_memory / (1024**3),
+        "cpu_memory_usage(%)": cpu_memory_usage,
+        "num_alloc_retries": num_alloc_retries,
+    }
 
 
 class EnvironMeter:
@@ -290,17 +335,6 @@ class EnvironMeter:
         self.consume_tokens += batch_tokens
         self.consume_chunks += real_global_batch_size
 
-        # cuda memory
-        allocated_memory = get_torch_device().max_memory_allocated()
-        reserved_memory = get_torch_device().max_memory_reserved()
-        num_alloc_retries = get_torch_device().memory_stats()["num_alloc_retries"]
-        allocated_memory, reserved_memory, num_alloc_retries = all_reduce(
-            (allocated_memory, reserved_memory, num_alloc_retries), op="max"
-        )
-
-        # cpu memory
-        cpu_memory_info = psutil.virtual_memory()
-
         metrics = {
             "flops_achieved(T)": flops_achieved,
             "flops_promised(T)": flops_promised,
@@ -311,13 +345,8 @@ class EnvironMeter:
             "consume_tokens(M)": self.consume_tokens / 1e6,
             "consume_tokens(B)": self.consume_tokens / 1e9,
             "consumed_chunk_num": self.consume_chunks,
-            "max_memory_allocated(GB)": allocated_memory / (1024**3),
-            "max_memory_reserved(GB)": reserved_memory / (1024**3),
-            "cpu_used_memory(GB)": cpu_memory_info.used / (1024**3),
-            "cpu_available_memory(GB)": cpu_memory_info.available / (1024**3),
-            "cpu_memory_usage(%)": cpu_memory_info.percent,
-            "num_alloc_retries": num_alloc_retries,
         }
+        metrics.update(compute_device_memory_metrics())
 
         if self.enable_multisource:
             metrics.update(self.multisource_tracker.step(self.batch_ds_idx, self.batch_seqlens))
@@ -448,6 +477,10 @@ def enable_high_precision_for_bf16():
         torch.npu.matmul.allow_tf32 = False
         torch.npu.matmul.allow_bf16_reduced_precision_reduction = False
 
+    if IS_MLU_AVAILABLE:
+        torch.backends.mlu.matmul.allow_tf32 = False
+        torch.backends.mlu.matmul.allow_bf16_reduced_precision_reduction = False
+
 
 def enable_full_determinism(seed: int):
     """
@@ -478,6 +511,10 @@ def enable_full_determinism(seed: int):
     if IS_NPU_AVAILABLE:
         torch.npu.manual_seed(seed)
         torch.npu.manual_seed_all(seed)
+
+    if IS_MLU_AVAILABLE:
+        torch.mlu.manual_seed(seed)
+        torch.mlu.manual_seed_all(seed)
 
 
 def set_seed(seed: int, full_determinism: bool = False) -> None:
@@ -558,7 +595,7 @@ def empty_cache() -> None:
     """
     gc.collect()
 
-    if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
+    if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE or IS_MLU_AVAILABLE:
         from veomni.utils.device import empty_cache
 
         empty_cache()
@@ -700,7 +737,7 @@ def create_profiler(
     global_rank: int,
 ):
     """
-    Creates a profiler to record the CPU and CUDA activities. Default export to trace.json.
+    Creates a profiler to record the CPU and CUDA / MLU activities. Default export to trace.json.
     Profile steps in [start_step, end_step).
 
     When is_npu_available = True, the profiler will be created as torch_npu.profiler.
@@ -734,7 +771,7 @@ def create_profiler(
             nonlocal npu_trace_handler
             npu_trace_handler(p)
             trace_file = p.prof_if.prof_path
-        elif IS_CUDA_AVAILABLE:
+        elif IS_CUDA_AVAILABLE or IS_MLU_AVAILABLE:
             p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
@@ -773,6 +810,10 @@ def create_profiler(
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
             data_simplification=False,
         )
+    elif IS_MLU_AVAILABLE:
+        profiler_module = torch.profiler
+        activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.MLU]
+        experimental_config = None
     else:
         profiler_module = torch.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.CUDA]
