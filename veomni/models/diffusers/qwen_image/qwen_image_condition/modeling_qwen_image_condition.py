@@ -483,7 +483,14 @@ class QwenImageConditionModel(PreTrainedModel):
         if self.config.training_recipe == "diffsynth":
             packed_conditions["loss_weights"] = []
 
-        for sample_params, sample_context, sample_context_mask, sample_img_shapes, sample_edit_latents, sample_edit_img_shapes in zip(
+        for (
+            sample_params,
+            sample_context,
+            sample_context_mask,
+            sample_img_shapes,
+            sample_edit_latents,
+            sample_edit_img_shapes,
+        ) in zip(
             latents_list,
             encoder_hidden_states_list,
             encoder_hidden_states_mask_list,

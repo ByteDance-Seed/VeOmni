@@ -175,7 +175,9 @@ class WanTransformer3DConditionModel(PreTrainedModel):
                 torch.rand((), device=self.generator.device, generator=self.generator) < self.config.cfg_negative_prob
             )
             if use_negative_context:
-                sample_context = self.negative_prompt_embeds.to(device=sample_latents.device, dtype=sample_context.dtype)
+                sample_context = self.negative_prompt_embeds.to(
+                    device=sample_latents.device, dtype=sample_context.dtype
+                )
             else:
                 sample_context = sample_context.to(sample_latents.device)
 

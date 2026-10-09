@@ -56,6 +56,7 @@ def wan_eager_attention_forward(
 
 # Patch diffusers GELU to use torch_npu.fast_gelu on NPU.
 if IS_NPU_AVAILABLE and torch_npu is not None:
+
     def _gelu_npu(self, gate: torch.Tensor) -> torch.Tensor:
         if gate.device.type == "npu":
             return torch_npu.fast_gelu(gate)
@@ -182,6 +183,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
 
         try:
             import torch_npu
+
             _is_npu = True
         except ImportError:
             _is_npu = False
@@ -200,6 +202,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
         use_sp = get_parallel_state().sp_enabled and not is_cross_attention
 
         if rotary_emb is not None:
+
             def apply_rotary_emb(
                 hidden_states: torch.Tensor,
                 freqs_cos: torch.Tensor,
@@ -226,6 +229,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
 
             try:
                 import torch_npu
+
                 _is_npu = True
             except ImportError:
                 _is_npu = False
@@ -316,8 +320,10 @@ def _wan_block_ckpt_wrapper(block):
     diffusers' ``WanTransformerBlock.forward()`` does not accept; this wrapper
     absorbs and ignores it.
     """
+
     def custom_forward(*args, early_stop=None, **kwargs):
         return block(*args, **kwargs)
+
     return custom_forward
 
 
@@ -333,8 +339,8 @@ def WanTransformer3DModel_forward(
 ):
     batch_size, num_channels, num_frames, height, width = hidden_states.shape
 
-        # in_channels=36: [noise(16), image_latent(16), mask(4)] -> 36 channels
-        # in_channels=48: [noise(16), image_latent(16), mask(16)] -> 48 channels
+    # in_channels=36: [noise(16), image_latent(16), mask(4)] -> 36 channels
+    # in_channels=48: [noise(16), image_latent(16), mask(16)] -> 48 channels
     is_i2v_36ch = self.config.in_channels == 36 and num_channels == 16
     is_i2v_48ch = self.config.in_channels == 48 and num_channels == 16
 
@@ -395,6 +401,7 @@ def WanTransformer3DModel_forward(
     hidden_states = self.patch_embedding(hidden_states)
     try:
         import torch_npu
+
         B, C = hidden_states.shape[:2]
         S = hidden_states.shape[2:].numel()
         hidden_states = torch_npu.npu_confusion_transpose(hidden_states, [0, 2, 1], [B, C, S], transpose_first=False)
@@ -566,7 +573,7 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
             # WanTransformer3DModel_forward so that this wrapper stays decoupled
             # from the model's internal channel layout.
             is_i2v = self.config.in_channels in (36, 48) and hs.shape[1] == 16
-            img_lat_source = "from_caller_or_none"
+
             if is_i2v:
                 if img_lat is None:
                     # Use the first frame of norm_latents as the image condition.
@@ -580,7 +587,6 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
                             "norm_latents is required for I2V training when image_latents is not provided"
                         )
                     img_lat = norm_lat[:, :, 0:1, :, :]  # [B, 16, 1, H, W]
-
 
                 if msk is None:
                     B, _C, T, H, W = hs.shape
@@ -650,4 +656,5 @@ def apply_veomni_wan_transformer_patch() -> None:
     logger.info_rank0("Applied VeOmni SP patch to WanTransformer3DModel.forward.")
 
     from veomni.models.transformers.wan.device_patch import apply_veomni_wan_device_patch
+
     apply_veomni_wan_device_patch()
