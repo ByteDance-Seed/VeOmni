@@ -1404,17 +1404,6 @@ class OpsImplementationConfig:
             "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'eager' uses PyTorch."
         },
     )
-    mhc_pre_implementation: Literal["eager", "npu", "tilelang"] | None = field(
-        default=None,
-        metadata={
-            "help": "Optional MHC pre/Sinkhorn override. None inherits mhc_implementation; use 'eager' "
-            "with mhc_post_implementation='npu' because the NPU pre implementation is not supported yet."
-        },
-    )
-    mhc_post_implementation: Literal["eager", "npu", "tilelang"] | None = field(
-        default=None,
-        metadata={"help": "Optional MHC residual post-mix override. None inherits mhc_implementation."},
-    )
     qat_implementation: Literal["none", "fp8_blockwise"] = field(
         default="none",
         metadata={

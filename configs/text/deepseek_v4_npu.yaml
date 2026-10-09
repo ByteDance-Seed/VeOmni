@@ -38,8 +38,6 @@ model:
     dsa_indexer_implementation: npu
     dsa_attention_implementation: npu
     mhc_implementation: npu
-    mhc_pre_implementation: eager
-    mhc_post_implementation: npu
   optimizer:
     type: adamw
     lr: 3.0e-4
