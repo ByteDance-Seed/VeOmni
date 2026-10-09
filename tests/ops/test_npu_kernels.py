@@ -477,6 +477,27 @@ class TestNPULightningIndexer:
         assert compressed_len % compress_rate == 0  # The old implementation incorrectly passed zero.
         assert seen_residuals == [[expected_residual], [expected_residual]]
 
+class TestNPUSparseFlashMLA:
+    @staticmethod
+    def _inputs(index_topk):
+        q = torch.zeros((1, 1, 1, 8), dtype=torch.bfloat16, device=DEVICE)
+        ori_kv = torch.zeros((1, 1, 1, 8), dtype=torch.bfloat16, device=DEVICE)
+        cmp_kv = torch.zeros((1, 1, 1, 8), dtype=torch.bfloat16, device=DEVICE)
+        indices = torch.zeros((1, 1, index_topk), dtype=torch.int32, device=DEVICE)
+        return q, ori_kv, cmp_kv, indices
+
+    def test_rejects_sparse_indices_for_non_csa_compression_ratio(self):
+        from veomni.ops.kernels.deepseek_v4.npu_sparse_flash_mla import npu_sparse_flash_mla
+
+        with pytest.raises(ValueError, match=r"supported only when cmp_ratio=4; got cmp_ratio=128"):
+            npu_sparse_flash_mla(*self._inputs(16), cmp_ratio=128)
+
+    def test_rejects_sparse_index_width_above_operator_limit(self):
+        from veomni.ops.kernels.deepseek_v4.npu_sparse_flash_mla import npu_sparse_flash_mla
+
+        with pytest.raises(ValueError, match=r"index_topk=1025 exceeds sfmla K limit \(1024\)"):
+            npu_sparse_flash_mla(*self._inputs(1025), cmp_ratio=4)
+
 # ---------------------------------------------------------------------------
 # Kernel registry NPU registrations sanity checks
 # ---------------------------------------------------------------------------

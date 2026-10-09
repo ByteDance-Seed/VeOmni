@@ -230,11 +230,18 @@ def npu_sparse_flash_mla(
 
     has_cmp = cmp_kv is not None
 
+    if cmp_sparse_indices is not None and cmp_ratio != 4:
+        raise ValueError(
+            "cmp_sparse_indices are supported only when cmp_ratio=4; "
+            f"got cmp_ratio={cmp_ratio}"
+        )
+
     # SCFA: [B,S,k] -> [B,S,1,K], K in {512, 1024}, pad invalid slots with -1.
     if has_cmp and cmp_ratio == 4 and cmp_sparse_indices is not None:
         k = cmp_sparse_indices.shape[-1]
+        if k > 1024:
+            raise ValueError(f"index_topk={k} exceeds sfmla K limit (1024)")
         K = 512 if k <= 512 else 1024
-        assert k <= 1024, f"index_topk={k} exceeds sfmla K limit (1024)"
         idx = cmp_sparse_indices.to(torch.int32)
         if k < K:
             idx = torch.cat([idx, idx.new_full((B, S, K - k), -1)], dim=-1)
