@@ -12,20 +12,12 @@
 FROM rocm/primus:v26.4
 
 ARG MAX_JOBS=16
-ENV DEBIAN_FRONTEND=noninteractive \
-    MAX_JOBS=${MAX_JOBS}
+ENV MAX_JOBS=${MAX_JOBS}
 
 # MIOPEN_DEBUG_FORCE_IMMED_MODE_FALLBACK: skip MIOpen conv3d exhaustive tuning
 #   (otherwise the Wan VAE conv3d autotunes for minutes on the first call).
-# FLA_TILELANG=0: force fla GatedDeltaNet onto the Triton path; the tilelang
-#   ROCm backend in this stack has a HIP codegen bug.
 ENV MIOPEN_DEBUG_FORCE_IMMED_MODE_FALLBACK=1 \
-    FLA_TILELANG=0 \
     TOKENIZERS_PARALLELISM=false
-
-RUN apt-get update -y \
-    && apt-get install -y --no-install-recommends ffmpeg git \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.16 /uv /uvx /bin/
 ENV UV_NO_CACHE=1
@@ -54,14 +46,14 @@ ENV ROCM_HOME=$ROCM_PATH \
     HIP_LIB_PATH=$ROCM_PATH/lib \
     HIP_DEVICE_LIB_PATH=$ROCM_PATH/lib/llvm/amdgcn/bitcode \
     PATH=/app/.venv/bin:$ROCM_PATH/bin:$ROCM_PATH/llvm/bin:/opt/openmpi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    LD_LIBRARY_PATH=/opt/openmpi/lib:$ROCM_PATH/lib:$ROCM_PATH/lib64:$ROCM_PATH/llvm/lib:$ROCM_PATH/lib/host-math/lib:$ROCM_PATH/lib/rocm_sysdeps/lib \
-    LIBRARY_PATH=$ROCM_PATH/lib:$ROCM_PATH/lib64 \
+    LD_LIBRARY_PATH=/opt/openmpi/lib:$ROCM_PATH/lib:$ROCM_PATH/llvm/lib:$ROCM_PATH/lib/host-math/lib:$ROCM_PATH/lib/rocm_sysdeps/lib \
+    LIBRARY_PATH=$ROCM_PATH/lib \
     CPATH=$ROCM_PATH/include \
     PKG_CONFIG_PATH=$ROCM_PATH/lib/pkgconfig
 RUN rocm-sdk init
 
-# flash-attn, aiter and causal-conv1d are not in uv.lock, so an exact `uv sync`
-# removes them; re-sync with `uv sync --active --inexact --frozen --extra rocm`.
+# flash-attn and aiter are not in uv.lock, so an exact `uv sync` removes them;
+# re-sync with `uv sync --active --inexact --frozen --extra rocm`.
 # The base image sets CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=2 for TransformerEngine
 # only after building its flash-attn, so that build used CK's default of 3.
 # aiter's runtime JIT keeps the base value, as it does in rocm/primus:v26.4.
@@ -83,22 +75,7 @@ RUN git clone https://github.com/ROCm/aiter.git /tmp/aiter \
     && uv pip install . \
     && cd / && rm -rf /tmp/aiter
 
-# GatedDeltaNet conv (qwen3_5). The PyPI sdist ships without its csrc/ sources.
-ARG CAUSAL_CONV1D_COMMIT=e940ead2fd962c56854455017541384909ca669f
-RUN git clone https://github.com/Dao-AILab/causal-conv1d.git /tmp/causal-conv1d \
-    && cd /tmp/causal-conv1d \
-    && git checkout ${CAUSAL_CONV1D_COMMIT} \
-    && CAUSAL_CONV1D_FORCE_BUILD=TRUE uv pip install --no-build-isolation . \
-    && cd / && rm -rf /tmp/causal-conv1d
-
 # aiter's setup.py tries to reinstall triton with whatever pip is on PATH; fail
 # the build if that or any other step left the locked packages inconsistent
 # (torch pins its triton exactly).
 RUN uv pip check
-
-# aiter JIT-compiles kernels on first use for the GPU it finds at runtime.
-ENV GPU_ARCHS=native
-
-# torch_shm_manager ships without the executable bit in the ROCm wheel, which
-# crashes DataLoader workers (SIGSEGV) during trainer save/load.
-RUN find /app/.venv -type f -name torch_shm_manager -exec chmod +x {} +

@@ -230,8 +230,8 @@ Core files:
     - MagiAttention itself is the optional `--extra magi` extra (`uv sync --extra gpu --extra magi`).
       The SM90 CUTLASS overlay is then installed by `scripts/kernel/install_magi_sm90.sh`.
       Reinstall the overlay after a later exact `uv sync` before running MagiAttention on SM90.
-    - The ROCm image (`docker/rocm/Dockerfile.ROCm7.14`) builds flash-attn, aiter and
-      causal-conv1d from source outside `uv.lock`. Re-sync its venv with
+    - The ROCm image (`docker/rocm/Dockerfile.ROCm7.14`) builds flash-attn and aiter
+      from source outside `uv.lock`. Re-sync its venv with
       `uv sync --active --inexact --frozen --extra rocm`, never an exact sync.
 
 28. **In-place collective reductions in backward must own their gradient buffer**
