@@ -1,0 +1,143 @@
+# docker hub: https://hub.docker.com/r/ascendai/cann/tags?name=9.1.0-910b-ubuntu22.04-py3.12
+# cann image source: https://github.com/Ascend/cann-container-image/tree/main/cann/9.1.0-910b-ubuntu22.04-py3.12
+# git repo: https://gitcode.com/Ascend/pytorch
+FROM swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-910b-ubuntu22.04-py3.12
+
+# Define environments
+ENV MAX_JOBS=16
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_ROOT_USER_ACTION=ignore
+
+# Define installation arguments
+ARG APT_SOURCE=http://archive.ubuntu.com/ubuntu/
+ARG PIP_INDEX=https://pypi.org/simple
+
+# ubuntu 22.04 line-format /etc/apt/sources.list (not the deb822 format used
+# by 24.04+). Only override on non-default APT_SOURCE. Wider regex matches any
+# `…/ubuntu[/]` URL so CANN bases preconfigured with Huawei Cloud / Aliyun
+# mirrors get rewritten too — anchoring on archive.ubuntu.com would silently
+# no-op there.
+RUN if [ "${APT_SOURCE}" != "http://archive.ubuntu.com/ubuntu/" ]; then \
+    cp /etc/apt/sources.list /etc/apt/sources.list.bak && \
+    sed -E -i "s#https?://[^[:space:]]+/ubuntu/?#${APT_SOURCE}#g" /etc/apt/sources.list; \
+    fi
+
+# Change pip source (only when --build-arg PIP_INDEX=... is overridden)
+RUN if [ "${PIP_INDEX}" != "https://pypi.org/simple" ]; then \
+        pip config set global.index-url "${PIP_INDEX}" && \
+        pip config set global.extra-index-url "${PIP_INDEX}"; \
+    fi && \
+    pip config set global.no-cache-dir "true" && \
+    python -m pip install --upgrade pip
+
+# Ubuntu 22.04 base does not preinstall tzdata, unlike the CUDA base.
+RUN apt-get update -y && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y tzdata && \
+    echo "Setting timezone to CST (China Standard Time)..." && \
+    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    echo "Asia/Shanghai" > /etc/timezone && \
+    dpkg-reconfigure -f noninteractive tzdata
+
+# gcc/g++/cmake/build-essential — compile sdists with no NPU/aarch64 wheel.
+# libnuma-dev — required by the Ascend runtime.
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        gcc g++ cmake libnuma-dev sudo wget git curl jq vim build-essential ssh ca-certificates ffmpeg gawk \
+    && apt-get clean
+
+# Add tiger user, remove default user if uid=1000 is occupied
+RUN userdel -r $(id -un 1000) 2>/dev/null || true && \
+    groupadd --non-unique -g 1000 tiger && \
+    useradd -g 1000 -u 1000 -d /home/tiger -m tiger && \
+    mkdir -p /home/tiger/.service/ && \
+    mkdir -p /home/tiger/.local/share/code-server/User/ && \
+    chown -R tiger:tiger /home/tiger && \
+    mkdir -p /opt/tiger && \
+    chown tiger:tiger /opt/tiger && \
+    mkdir -p /app && \
+    chown tiger:tiger /app && \
+    mkdir -p /opt/log/tiger && \
+    chown -R tiger:tiger /opt/log && \
+    mkdir -p /var/log/tiger && \
+    chown tiger:tiger /var/log/tiger
+
+# enable VFS (Virtual File System) used by UCX for tiger user
+RUN mkdir -p /run/user/1000 && chown tiger:tiger /run/user/1000
+
+# Enable sudo for tiger user
+RUN mkdir -p /etc/sudoers.d && \
+    echo "tiger ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/tiger && \
+    chmod 0440 /etc/sudoers.d/tiger
+
+# Add tiger python install permission
+RUN groupadd python-users && \
+    usermod -aG python-users root && \
+    usermod -aG python-users tiger && \
+    chown -R root:python-users /usr/local/python3.12.13/lib/python3.12/site-packages/ && \
+    chmod -R g+w /usr/local/python3.12.13/lib/python3.12/site-packages/ && \
+    chmod g+s /usr/local/python3.12.13/lib/python3.12/site-packages/
+
+USER tiger
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:0.11.16 /uv /uvx /bin/
+ENV PATH="/bin/:$PATH"
+ENV UV_CACHE_DIR=/home/tiger/.cache/uv
+
+# uv sync
+WORKDIR /app
+COPY --chown=tiger:tiger . ./
+RUN uv sync --system-certs --python 3.12 --locked --extra npu
+
+# fla_npu needs a torch_npu post matched to torch: its scripts/check_npu_env.py maps
+# torch 2.10.0 -> torch_npu 2.10.0.post2. VeOmni's npu extra pins plain torch-npu
+# 2.10.0 (< post2), so bump to .post2 here. torch stays at main's 2.10.0 — no downgrade,
+# no divergence from VeOmni main. pybind11 is needed by the fla_npu torch-binding build.
+RUN uv pip install torch-npu==2.10.0.post2 pybind11
+
+# Install triton-ascend (a GDN kernel dep not in the lockfile), after uv sync so the
+# lockfile prune does not remove it. Both community triton and triton-ascend ship a
+# triton/_C/libtriton.so; triton-ascend's has the ascend backend, community triton's is
+# vanilla. Whoever writes that shared path LAST wins. `uv pip install triton triton-ascend`
+# is a single parallel transaction that does NOT guarantee order — on CI vanilla triton
+# won and clobbered the patch, so `from triton._C.libtriton import ascend` failed. So
+# install in TWO steps: triton first, then triton-ascend, so its patched .so lands last.
+# (pip on the aarch64 files installs sequentially in dependency order, so it doesn't hit
+# this; uv needs the split.) The trailing import verifies the patch stuck.
+# Use Huawei Cloud's package index: osinfra returns wrong-name metadata for transitive
+# package lookups, which uv correctly rejects during dependency resolution.
+RUN (uv pip uninstall triton triton-ascend || true) && \
+    uv pip install triton==3.2.0 && \
+    uv pip install triton-ascend==3.2.1 \
+    --index=https://mirrors.huaweicloud.com/ascend/repos/pypi && \
+    echo "Verifying triton-ascend patched libtriton.so ..." && \
+    /app/.venv/bin/python -c "from triton._C.libtriton import ascend"
+
+# Build & install fla_npu (AscendC fused GDN ops exposed as torch.ops.npu.*).
+# Kept as ONE RUN so the CANN env sourced from set_env.sh persists across the
+# compile steps (every Dockerfile RUN is otherwise a fresh shell). Must come after
+# triton-ascend: fla_npu's operator build depends on it. Its build scripts do NOT
+# honor the activated venv — they install into the base image's system python — so
+# the torch binding wheel is re-installed into /app/.venv explicitly with --no-deps
+# (without --no-deps, uv would pull a CUDA torch and clobber the +cpu / triton stack).
+# The .run installs the AscendC operators (opp) into the CANN vendor dir
+# ($ASCEND_OPP_PATH/vendors), which is root-owned while this RUN executes as tiger —
+# so chown it to tiger (tiger has passwordless sudo) before the .run. Keeping the ops
+# in the standard CANN opp path means they are found at runtime with no extra env var,
+# and they survive a bind-mount over /app.
+# NOTE: base image ships CANN 9.1.0 while fla-npu's README recommends 8.5.2 — verified
+# working here; set_env.sh path and the .run's --quiet flag likewise confirmed.
+RUN git clone https://github.com/flashserve/flash-linear-attention-npu /tmp/fla-npu && \
+    cd /tmp/fla-npu && git checkout c2e3d83f && \
+    source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    . /app/.venv/bin/activate && \
+    python scripts/check_npu_env.py --build-only && \
+    bash build.sh --soc=ascend910b --pkg --vendor_name=fla_npu && \
+    sudo mkdir -p "$ASCEND_OPP_PATH/vendors" && \
+    sudo chown -R tiger:tiger "$ASCEND_OPP_PATH/vendors" && \
+    bash build_out/*.run --quiet && \
+    cd torch_custom/fla_npu && bash build.sh && \
+    uv pip install --no-deps dist/*.whl && \
+    cd / && rm -rf /tmp/fla-npu
+
+USER root

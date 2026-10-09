@@ -31,7 +31,7 @@ import torch
 from veomni.patchgen.patch_spec import PatchConfig
 
 from .deepseek_v3_gpu_patch_gen_config import (
-    PatchedDeepseekV3NaiveMoe,
+    PatchedDeepseekV3Experts,
     deepseek_v3_forcausallm_forward_patched,
     deepseek_v3_get_parallel_plan_patched,
     deepseek_v3_moe_forward_patched,
@@ -104,8 +104,8 @@ def apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1)
 # checkpoint interchangeability between GPU and NPU runs.
 # ================================================================
 config.replace_class(
-    "DeepseekV3NaiveMoe",
-    replacement=PatchedDeepseekV3NaiveMoe,
+    "DeepseekV3Experts",
+    replacement=PatchedDeepseekV3Experts,
     description="Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path",
 )
 

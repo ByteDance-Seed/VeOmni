@@ -12,6 +12,7 @@ from transformers import AutoConfig, AutoProcessor
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 
 from veomni.checkpoint.dcp_checkpointer import _get_sharding_plan, _process_shard
+from veomni.checkpoint.layout import weights_dir
 from veomni.utils import helper
 
 
@@ -84,7 +85,8 @@ def save_lora_adapter_weights(
     else:
         logger.warning(
             "No --adapter-config-path provided. ``adapter_model.safetensors`` was written, but you must drop "
-            "``adapter_config.json`` (from the matching training run's ``output_dir/global_step_*/``) next to it "
+            "``adapter_config.json`` (from the matching training run's "
+            "``output_dir/checkpoints/global_step_*/lora_ckpt/``) next to it "
             "before the adapter can be loaded by peft / diffusers."
         )
 
@@ -204,7 +206,16 @@ def main():
         description="Merge DCP checkpoint to HuggingFace format (streaming optimized)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--load-dir", type=str, required=True, help="Directory containing DCP checkpoint")
+    parser.add_argument(
+        "--load-dir",
+        type=str,
+        required=True,
+        help=(
+            "A checkpoint step directory (checkpoints/global_step_N) or a DCP directory. "
+            "Given a step directory, the weights are read from its model/ckpt subdirectory; "
+            "the optimizer state sitting beside them is never read."
+        ),
+    )
     parser.add_argument(
         "--save-dir",
         type=str,
@@ -239,14 +250,21 @@ def main():
         default=None,
         help=(
             "Path to the matching adapter_config.json produced during LoRA training "
-            "(usually under <output_dir>/global_step_*/adapter_config.json). Only used in 'lora' mode; "
+            "(usually under <output_dir>/checkpoints/global_step_*/lora_ckpt/adapter_config.json). "
+            "Only used in 'lora' mode; "
             "copied next to adapter_model.safetensors so the adapter is loadable as-is."
         ),
     )
     args = parser.parse_args()
 
-    load_dir = args.load_dir
-    save_dir = os.path.join(load_dir, "hf_ckpt") if args.save_dir is None else args.save_dir
+    # A step directory is not itself a DCP directory: it holds model/ckpt and
+    # model/optimizer. Resolve to the weights, but keep the export next to the
+    # rest of the step rather than burying it under model/.
+    save_root = args.load_dir
+    load_dir = weights_dir(args.load_dir)
+    if not os.path.exists(os.path.join(load_dir, ".metadata")):
+        load_dir = args.load_dir
+    save_dir = os.path.join(save_root, "hf_ckpt") if args.save_dir is None else args.save_dir
     model_assets_dir = args.model_assets_dir
     shard_size = args.shard_size
 

@@ -1,9 +1,11 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 
 from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+from veomni.utils.device import MOE_TRITON_DEVICE_TYPES
 
 
 def _deepseek_v4_experts_reference(
@@ -34,14 +36,19 @@ def _deepseek_v4_experts_reference(
     return output
 
 
-def test_deepseek_v4_test_overrides_keep_eager_attention_and_expected_moe():
-    from tests.tools.training_utils import resolve_ops_overrides
-    from veomni.utils.import_utils import is_torch_npu_available
+@pytest.mark.parametrize(
+    ("device_type", "expected_moe"),
+    [
+        (MOE_TRITON_DEVICE_TYPES[0], "fused_triton"),
+        ("npu", "fused_npu"),
+    ],
+)
+def test_deepseek_v4_test_overrides_follow_active_device(monkeypatch, device_type, expected_moe):
+    from tests.tools import training_utils
 
-    overrides = resolve_ops_overrides("deepseek_v4")
+    monkeypatch.setattr(training_utils, "get_device_type", lambda: device_type)
+    overrides = training_utils.resolve_ops_overrides("deepseek_v4")
 
-    is_npu = is_torch_npu_available()
-    expected_moe = "eager" if is_npu else "fused_triton"
     assert "--model.ops_implementation.attn_implementation=eager" in overrides
     assert f"--model.ops_implementation.moe_implementation={expected_moe}" in overrides
 
@@ -252,6 +259,7 @@ def test_deepseek_v4_fused_moe_receives_merged_weights_and_swiglu_limit(monkeypa
         fc2_weight,
         fc1_1_2_weight=None,
         swiglu_limit=None,
+        assume_distinct_experts=False,
     ):
         captured.update(
             num_experts=num_experts,
@@ -263,6 +271,7 @@ def test_deepseek_v4_fused_moe_receives_merged_weights_and_swiglu_limit(monkeypa
             fc2_weight=fc2_weight,
             fc1_1_2_weight=fc1_1_2_weight,
             swiglu_limit=swiglu_limit,
+            assume_distinct_experts=assume_distinct_experts,
         )
         return _deepseek_v4_experts_reference(
             num_experts=num_experts,
@@ -294,8 +303,51 @@ def test_deepseek_v4_fused_moe_receives_merged_weights_and_swiglu_limit(monkeypa
     assert captured["fc2_weight"] is experts.down_proj
     assert captured["fc1_1_2_weight"] is experts.gate_up_proj
     assert captured["swiglu_limit"] == config.swiglu_limit
+    # A bare ``DeepseekV4Experts`` keeps the conservative default; only
+    # ``DeepseekV4SparseMoeBlock`` opts the learned top-k layers into ``T``.
+    assert captured["assume_distinct_experts"] is False
     assert captured["routing_weights"].dtype == hidden_states.dtype
     torch.testing.assert_close(captured["routing_weights"], top_k_weights.to(hidden_states.dtype), rtol=0, atol=0)
     torch.testing.assert_close(captured["fc1_1_2_weight"][:, : config.intermediate_size], gate, rtol=0, atol=0)
     torch.testing.assert_close(captured["fc1_1_2_weight"][:, config.intermediate_size :], up, rtol=0, atol=0)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def _sparse_moe_block_config(mlp_layer_types):
+    return SimpleNamespace(
+        mlp_layer_types=mlp_layer_types,
+        num_experts_per_tok=2,
+        num_local_experts=4,
+        hidden_size=5,
+        intermediate_size=7,
+        swiglu_limit=6.5,
+        hidden_act="silu",
+        mlp_bias=False,
+        scoring_func="sigmoid",
+        routed_scaling_factor=1.0,
+        vocab_size=16,
+    )
+
+
+def test_deepseek_v4_sparse_moe_block_opts_topk_layers_into_tight_max_m_bound():
+    # Learned top-k routing (``torch.topk``) guarantees distinct experts per
+    # token, so the block must opt its experts into the tight ``max_M = T``
+    # grouped-GEMM bound (``assume_distinct_experts=True``).
+    config = _sparse_moe_block_config(["moe", "hash_moe"])
+    block = dsv4.DeepseekV4SparseMoeBlock(config, layer_idx=0)
+
+    assert block.is_hash is False
+    assert isinstance(block.gate, dsv4.DeepseekV4TopKRouter)
+    assert block.experts.assume_distinct_experts is True
+
+
+def test_deepseek_v4_sparse_moe_block_keeps_hash_layers_conservative():
+    # Hash routing reads a frozen ``tid2eid`` table that may repeat an expert
+    # within a token's slots, so the tight ``T`` bound is unsafe — the block
+    # must leave the conservative ``T * top_k`` default in place.
+    config = _sparse_moe_block_config(["moe", "hash_moe"])
+    block = dsv4.DeepseekV4SparseMoeBlock(config, layer_idx=1)
+
+    assert block.is_hash is True
+    assert isinstance(block.gate, dsv4.DeepseekV4HashRouter)
+    assert block.experts.assume_distinct_experts is False

@@ -15,7 +15,7 @@ r"""Trainer-driven EP=2 tests for fused MoE-LoRA on Qwen3-MoE.
 
 Two complementary tests, both driving the merged ``MoeLoraTrainer``
 subprocess (the same one ``test_moe_lora_trainer.py`` uses for
-save/load/resume) end-to-end with ``--train.accelerator.ep_size=2``:
+save/load/resume) end-to-end with ``--model.accelerator.ep_size=2``:
 
 1. ``test_ep2_trainer_integration[mode]`` -- asserts that the EP=2 path
    engages the right plumbing (plan-bridges fire, slicing log emits the
@@ -203,7 +203,7 @@ def _parse_ep_slices(stdout: str) -> tuple[set, dict[str, tuple[int, int, int]]]
 
 
 def _load_adapter(adapter_dir: str) -> dict[str, torch.Tensor]:
-    """Load the consolidated ``adapter_model.safetensors`` written by HFLoraCkptCallback.
+    """Load the consolidated ``adapter_model.safetensors`` written by CheckpointCallback.
 
     ``save_lora_adapter_with_dcp`` consolidates on rank 0 with
     ``safe_serialization=True``, so the adapter is always safetensors
@@ -227,7 +227,7 @@ def _make_seeder_yaml(base_yaml: str, dest: str, *, max_steps: int, dcp_save_ste
         will load. Validates EP=2 -> full-shape gather path
         (``save_lora_adapter_with_dcp`` -> DCP consolidation).
       * **DCP shards** at step ``dcp_save_steps`` (and
-        ``max_steps`` -- ``CheckpointerCallback`` always saves the
+        ``max_steps`` -- ``CheckpointCallback`` always saves the
         final step). The intermediate one is the resume target for
         the DCP round-trip subprocess.
 
@@ -301,8 +301,8 @@ def _make_dcp_resume_yaml(base_yaml: str, dcp_path: str, dest: str, *, max_steps
 
     The DCP resumer continues from the seeder's intermediate DCP
     checkpoint (``<seeder>/checkpoints/global_step_<dcp_save_steps>``)
-    and runs to ``max_steps`` -- ``CheckpointerCallback._load_checkpoint``
-    bumps ``global_step`` to the resumed value and the trainer
+    and runs to ``max_steps`` -- ``CheckpointCallback`` / ``GlobalStateCallback``
+    restore weights and the step counter and the trainer
     continues the remaining ``max_steps - dcp_save_steps`` steps. We
     then compare the resumer's per-step trajectory against the
     seeder's tail-end log to verify DCP saved+loaded the full
@@ -418,7 +418,7 @@ def test_ep2_trainer_integration(tmp_path, toy_base_dir, mode):
     _torchrun_capture(
         yaml_path,
         ep1_dir,
-        extra_overrides=base_overrides + ["--train.accelerator.ep_size=1"],
+        extra_overrides=base_overrides + ["--model.accelerator.ep_size=1"],
         nproc=nproc,
     )
     ep1_adapter = _load_adapter(_writer_adapter_path(ep1_dir, save_step=4))
@@ -428,7 +428,7 @@ def test_ep2_trainer_integration(tmp_path, toy_base_dir, mode):
     ep2_stdout = _torchrun_capture(
         yaml_path,
         ep2_dir,
-        extra_overrides=base_overrides + ["--train.accelerator.ep_size=2"],
+        extra_overrides=base_overrides + ["--model.accelerator.ep_size=2"],
         nproc=nproc,
     )
 
@@ -500,7 +500,7 @@ def test_ep2_trainer_integration(tmp_path, toy_base_dir, mode):
 # Test 2: EP=2 save + (cross-EP adapter resume parity) + (EP=2 DCP
 # round-trip parity). All four subprocesses driven by the same
 # trainer entry point used in test_moe_lora_trainer.py; only the
-# yamls + ``--train.accelerator.ep_size`` differ.
+# yamls + ``--model.accelerator.ep_size`` differ.
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -554,16 +554,16 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
        Real EP=2 trainer -- LoRA tensors are EP-sliced
        ``[E_local, r, H]`` per ``_extend_plan_for_moe_lora_independent``
        (or replicated for Shared mode), forward/backward go through
-       the fused EP-aware kernel, and the two save callbacks fire:
+       the fused EP-aware kernel, and ``CheckpointCallback`` fires:
 
-         * ``HFLoraCkptCallback`` at step ``_ALIGN_MAX_STEPS`` calls
+         * at step ``_ALIGN_MAX_STEPS`` it calls
            ``save_lora_adapter_with_dcp`` which uses DCP to gather
            the EP shards back into the full ``[E, r, H]`` tensor on
            rank 0 before writing ``adapter_model.safetensors``.
-         * ``CheckpointerCallback`` at steps
-           ``_DCP_SAVE_STEP`` (intermediate) and
-           ``_ALIGN_MAX_STEPS`` writes sharded DCP shards
-           (model + optimizer + RNG + dataloader cursor).
+         * at steps ``_DCP_SAVE_STEP`` (intermediate) and
+           ``_ALIGN_MAX_STEPS`` it writes sharded DCP shards
+           (model + optimizer). ``GlobalStateCallback`` writes the
+           job cursor (RNG + dataloader) beside them.
 
        Per-step ``log_dict.json`` records DP-averaged loss + global
        grad_norm for the full ``_ALIGN_MAX_STEPS`` trajectory.
@@ -578,7 +578,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
        ``_ALIGN_MAX_STEPS`` steps from a freshly-zeroed optimizer.
 
     3. **Adapter resumer (EP=2)**. Same as (2) but with
-       ``--train.accelerator.ep_size=2``. The adapter-load path
+       ``--model.accelerator.ep_size=2``. The adapter-load path
        EP-slices the LoRA on read (Independent) or leaves it
        replicated (Shared). Runs ``_ALIGN_MAX_STEPS`` steps from a
        freshly-zeroed optimizer.
@@ -586,8 +586,8 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     4. **DCP resumer (EP=2)**. Loads the seeder's intermediate DCP
        shard at step ``_DCP_SAVE_STEP`` via
        ``train.checkpoint.load_path`` ->
-       ``CheckpointerCallback._load_checkpoint`` (which restores
-       model + optimizer + RNG + dataloader cursor and bumps
+       ``BaseTrainer.load`` / ``GlobalStateCallback.load_global_state``
+       (which restore model + optimizer + RNG + dataloader cursor and bump
        ``global_step``). Continues to ``_ALIGN_MAX_STEPS`` -- so it
        takes ``_ALIGN_MAX_STEPS - _DCP_SAVE_STEP`` more optimizer
        steps that should retrace the seeder's tail-end trajectory
@@ -665,7 +665,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     _torchrun_capture(
         seeder_yaml,
         seeder_dir,
-        extra_overrides=base_overrides + ["--train.accelerator.ep_size=2"],
+        extra_overrides=base_overrides + ["--model.accelerator.ep_size=2"],
         nproc=nproc,
     )
     seeder_adapter = _writer_adapter_path(seeder_dir, save_step=_ALIGN_MAX_STEPS)
@@ -700,7 +700,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     _torchrun_capture(
         adapter_yaml,
         ep1_adapter_dir,
-        extra_overrides=base_overrides + ["--train.accelerator.ep_size=1"],
+        extra_overrides=base_overrides + ["--model.accelerator.ep_size=1"],
         nproc=nproc,
     )
 
@@ -709,7 +709,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     _torchrun_capture(
         adapter_yaml,
         ep2_adapter_dir,
-        extra_overrides=base_overrides + ["--train.accelerator.ep_size=2"],
+        extra_overrides=base_overrides + ["--model.accelerator.ep_size=2"],
         nproc=nproc,
     )
 
@@ -718,7 +718,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     _torchrun_capture(
         dcp_yaml,
         ep2_dcp_dir,
-        extra_overrides=base_overrides + ["--train.accelerator.ep_size=2"],
+        extra_overrides=base_overrides + ["--model.accelerator.ep_size=2"],
         nproc=nproc,
     )
 

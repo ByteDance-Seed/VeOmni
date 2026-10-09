@@ -37,10 +37,17 @@ def select_hidden_state_block_value(device_name: str) -> int:
     return _DEFAULT_HIDDEN_STATE_BLOCK_VALUE
 
 
-@cache
-def get_hidden_state_block_value(device_index: int) -> int:
-    """Return the GDR hidden-state value tile for one explicit NPU."""
+def get_hidden_state_block_value(device_index: int | None) -> int:
+    """Resolve the current NPU before caching its hardware-specific launch tile."""
+    import torch_npu
 
+    if device_index is None:
+        device_index = torch_npu.npu.current_device()
+    return _get_hidden_state_block_value(device_index)
+
+
+@cache
+def _get_hidden_state_block_value(device_index: int) -> int:
     import torch_npu
 
     return select_hidden_state_block_value(torch_npu.npu.get_device_name(device_index))

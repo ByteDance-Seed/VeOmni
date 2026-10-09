@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Sets up a .<agent_name>/ directory with symlinks to shared .agents/ resources.
 # Usage: bash .agents/setup_agent.sh <agent_name>
-# Example: bash .agents/setup_agent.sh gemini
+# The name is whatever dotfile directory your agent expects, minus the leading
+# dot -- e.g. passing "foo" creates .foo/ pointing at .agents/.
 set -euo pipefail
 
-AGENT_NAME="${1:?Usage: bash .agents/setup_agent.sh <agent_name> (e.g., gemini, codex)}"
+AGENT_NAME="${1:?Usage: bash .agents/setup_agent.sh <agent_name>}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET_DIR="${REPO_ROOT}/.${AGENT_NAME}"
 

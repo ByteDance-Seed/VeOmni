@@ -57,6 +57,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=int, default=0, help="Visible NPU index used by the gate.")
     parser.add_argument("--atol", type=float, default=_STRICT_ATOL)
     parser.add_argument("--rtol", type=float, default=_STRICT_RTOL)
+    parser.add_argument(
+        "--require-strict",
+        action="store_true",
+        help="Fail before hardware initialization if this is only a diagnostic profile.",
+    )
     return parser.parse_args()
 
 
@@ -412,6 +417,8 @@ def main() -> None:
         and args.tokens >= _STRICT_MIN_TOKENS
         and args.reference_tokens >= _STRICT_MIN_REFERENCE_TOKENS
     )
+    if args.require_strict and not strict_profile:
+        raise ValueError("--require-strict requires the strict production profile and default tolerances")
     triton_arch = os.getenv("TRITON_ASCEND_ARCH")
     if triton_arch != _EXPECTED_TRITON_ARCH:
         raise RuntimeError(

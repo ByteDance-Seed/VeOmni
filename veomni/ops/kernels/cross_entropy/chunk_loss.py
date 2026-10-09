@@ -98,11 +98,9 @@ def chunk_loss_function(
     **kwargs,
 ) -> torch.Tensor:
     sp_enabled = get_parallel_state().sp_enabled
-    # Snapshot the pre-shift labels for the SP denominator — the non-SP branch
-    # below rewrites `labels` in place with the shifted view.
-    sp_reduction_labels = labels
-
-    if not sp_enabled:
+    if shift_labels is not None:
+        labels = shift_labels
+    elif not sp_enabled:
         labels = labels[..., 1:].contiguous()
         hidden_states = hidden_states[..., :-1, :].contiguous()
 
@@ -119,7 +117,6 @@ def chunk_loss_function(
             vocab_size,
             num_items_in_batch,
             ignore_index,
-            shift_labels,
             hidden_states=hidden_states,
             weights=weights,
             **kwargs,
@@ -127,9 +124,10 @@ def chunk_loss_function(
         return loss, logits
 
     chunk_labels = torch.split(labels, chunk_size, dim=1)
+    num_items_in_batch = (labels != ignore_index).sum()
 
     loss_kwargs_chunks = [
-        {"labels": chunk_labels[i], "ignore_index": ignore_index, "num_items_in_batch": (labels != ignore_index).sum()}
+        {"labels": chunk_labels[i], "ignore_index": ignore_index, "num_items_in_batch": num_items_in_batch}
         for i in range(len(chunk_labels))
     ]
 
@@ -138,6 +136,6 @@ def chunk_loss_function(
     # Match ``ForCausalLMLoss`` SP behavior so chunk_loss can back both
     # ForCausalLM and ForConditionalGeneration heads when SP is enabled.
     if sp_enabled:
-        num_valid_tokens = (sp_reduction_labels != ignore_index).sum()
+        num_valid_tokens = (labels != ignore_index).sum()
         chunk_loss = reduce_sequence_parallel_loss(chunk_loss, num_valid_tokens)
     return chunk_loss, None
