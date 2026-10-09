@@ -25,14 +25,18 @@ from datasets import Dataset
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
+from veomni.data.multimodal.dit import (
+    data_transform as _data_transform_register,  # noqa: F401  (import side effect: registers dit_offline / dit_online / minimax_h3_online transforms)
+)
+
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import build_data_transform, build_dataloader
 from ..data.data_collator import DataCollator
-from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..models import build_foundation_model
 from ..models.auto import build_config
 from ..models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from ..models.model_runtime import VeOmniModelRuntime
 from ..ops import apply_ops_config
 from ..utils import helper
 from ..utils.device import (
@@ -110,10 +114,11 @@ class DiTDataCollator(DataCollator):
     def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
         batch = defaultdict(list)
 
-        # batching features
+        # Fill keys missing from a sample with None so every column stays aligned with its samples.
+        keys = dict.fromkeys(key for feature in features for key in feature)
         for feature in features:
-            for key in feature.keys():
-                batch[key].append(feature[key])
+            for key in keys:
+                batch[key].append(feature.get(key))
 
         return batch
 
@@ -145,6 +150,17 @@ class DiTDataArguments(DataArguments):
         default=True,
         metadata={"help": "Whether or not to shuffle the dataset."},
     )
+    data_transform: Optional[str] = field(
+        default="dit_online",
+        metadata={
+            "help": "Override the DATA_TRANSFORM_REGISTRY transform name. "
+            "When None, DiTTrainer picks dit_offline/dit_online by training_task."
+        },
+    )
+    log_sample: bool = field(
+        default=True,
+        metadata={"help": "Whether to print the first micro batch example to the log."},
+    )
 
 
 @dataclass
@@ -165,6 +181,129 @@ class VeOmniDiTArguments(VeOmniArguments):
     train: DiTTrainingArguments = field(default_factory=DiTTrainingArguments)
 
 
+class DiTModelRuntime(VeOmniModelRuntime):
+    """A DiT and the frozen condition model that feeds it.
+
+    ``offline_embedding`` runs the condition model only, so the parallelize and
+    optimizer steps are overridden to no-ops rather than the build sequence
+    itself, which would then have to be kept in step with the base by hand.
+    """
+
+    condition_model: PreTrainedModel = None
+
+    def _build_model(self):
+        logger.info_rank0("Build model")
+        args: DiTModelArguments = self.args
+        # Apply ops config eagerly so the condition model (built below via
+        # ``model_class._from_config``, not ``build_foundation_model``) sees a
+        # populated ops singleton / LOSS_MAPPING. ``build_foundation_model``
+        # below will re-apply the same config — that call is idempotent.
+        apply_ops_config(args.ops_implementation)
+        dit_config = build_config(args.config_path, **args.model_config)
+        self.model_config = dit_config
+        logger.info_rank0(f"Detected DiT model type: {dit_config.model_type}.")
+        self._build_condition_model(dit_config.condition_model_type)
+        if self.train_args.training_task != "offline_embedding":
+            logger.info_rank0(f"Task: {self.train_args.training_task}, prepare dit model.")
+            self.model = build_foundation_model(
+                config_path=args.config_path,
+                weights_path=args.model_path,
+                torch_dtype="float32" if args.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
+                init_device=args.accelerator.init_device,
+                ops_implementation=args.ops_implementation,
+                config_kwargs=args.model_config,
+            )
+            self.model_config = getattr(self.model, "config", None)
+        else:
+            self.model = None
+            logger.info_rank0(f"Task: {self.train_args.training_task}, dit model is not prepared.")
+
+    def _build_condition_model(self, condition_model_type: str) -> None:
+        args: DiTModelArguments = self.args
+        config_class = MODEL_CONFIG_REGISTRY[condition_model_type]()
+        condition_cfg = config_class.from_pretrained(
+            args.condition_model_path,
+            seed=self.train_args.seed,  # seed for randn noise and scheduler
+            **args.condition_model_cfg,
+        )
+        model_class = MODELING_REGISTRY[condition_model_type]()
+        if self.train_args.training_task == "offline_training":
+            self.condition_model = model_class._from_config(condition_cfg, meta_init=True)
+            logger.info_rank0("Condition model loaded with empty weights.")
+        else:
+            self.condition_model = model_class._from_config(condition_cfg)
+            self.condition_model.to(get_device_type())
+            logger.info_rank0("Condition model loaded.")
+
+    def _freeze_model_module(self):
+        self.condition_model.requires_grad_(False)
+
+        if self.train_args.training_task != "offline_embedding":
+            super()._freeze_model_module()
+
+    def extra_state(self) -> dict[str, Any]:
+        """Model-bound state: the condition model's noise/timestep generator."""
+        rng_state_dict = getattr(self.condition_model, "rng_state_dict", None)
+        if (
+            self.condition_model is not None
+            and rng_state_dict is None
+            and getattr(self.condition_model, "generator", None) is not None
+        ):
+            logger.warning_rank0(
+                "Condition model owns a ``generator`` but exposes no ``rng_state_dict``; "
+                "its noise/timestep stream will not be restored across a resume."
+            )
+        return {} if rng_state_dict is None else {"condition_model_rng_state": rng_state_dict()}
+
+    def load_extra_state(self, extra_state: dict[str, Any]) -> None:
+        condition_model_rng_state = extra_state.get("condition_model_rng_state")
+        if condition_model_rng_state is None:
+            return
+        loader = getattr(self.condition_model, "load_rng_state_dict", None)
+        if loader is None:
+            logger.warning_rank0(
+                "Checkpoint carries condition-model RNG state but the model cannot restore it; "
+                "the resumed run may replay its initial noise stream."
+            )
+        else:
+            loader(condition_model_rng_state)
+
+    def _build_parallelized_model(self) -> None:
+        """``offline_embedding`` builds no DiT, so there is nothing to wrap."""
+        if self.train_args.training_task != "offline_embedding":
+            super()._build_parallelized_model()
+
+    def _build_model_assets(self) -> None:
+        """A DiT reads latents, not text — there is no preprocessor to load.
+
+        That leaves the config, and only a run that trains the DiT has one worth
+        exporting: ``offline_embedding`` builds no DiT at all, it writes cached
+        condition embeddings, which need no model sidecars.
+        """
+        self.model_assets = [self.model_config] if self.train_args.training_task != "offline_embedding" else []
+
+    def _build_optimizer(self, param_groups=None) -> None:
+        """``offline_embedding`` trains nothing, so there is nothing to optimize."""
+        if self.train_args.training_task != "offline_embedding":
+            super()._build_optimizer(param_groups=param_groups)
+
+    def load(self) -> None:
+        if self.train_args.training_task != "offline_embedding":
+            super().load()
+
+    def save_dcp(self, state) -> None:
+        if self.train_args.training_task != "offline_embedding":
+            super().save_dcp(state)
+
+    def save_hf_or_lora(self, state, stage: str = "step_end") -> None:
+        if self.train_args.training_task != "offline_embedding":
+            super().save_hf_or_lora(state, stage=stage)
+
+    def save_model_assets(self) -> None:
+        if self.train_args.training_task != "offline_embedding":
+            super().save_model_assets()
+
+
 class DiTTrainer:
     """
     DiT Trainer merging BaseTrainer infrastructure with DiT-specific model setup.
@@ -172,14 +311,11 @@ class DiTTrainer:
     and training loop; overrides model building and forward pass.
     """
 
-    condition_model: PreTrainedModel
     training_task: Literal["offline_training", "online_training", "offline_embedding"]
     offline_embedding_save_dir: str = None
     offline_embedding_saver: OfflineEmbeddingSaver = None
 
     def __init__(self, args: VeOmniDiTArguments):
-        if getattr(getattr(args.train, "chunk_mbs_config", None), "enable", False):
-            raise ValueError("train.chunk_mbs_config is not supported by DiTTrainer.")
         if args.train.channel_loss.enable:
             raise ValueError(
                 "train.channel_loss is only supported by causal-LM trainers; DiTTrainer uses diffusion objectives."
@@ -191,47 +327,40 @@ class DiTTrainer:
         # ``base._setup`` registers ParallelState; DiT then recomputes
         # dataloader_batch_size from ``dp_size``.
         self._setup()
+        # Builds the condition model and, unless this is an embedding-only run,
+        # the DiT itself along with its optimizer.
+        self.base.model = self._build_model_runtime()
+        self.base.LOG_SAMPLE = args.data.log_sample
 
-        # All build steps read the current ParallelState via ``get_parallel_state()``
-        # (meta-init, FSDP2/EP wrap + weight load, optimizer, SP data pipeline), so
-        # scope the whole build under this trainer's own state. No-op for the
-        # single-model case; keeps each module building over its own mesh once
-        # multiple modules build separately.
-        with use_parallel_state("base"):
-            # rewrite _build_model, build condition model & dit model
-            self._build_model()
-
-            # rewrite _freeze_model_module, freeze condition model
-            self._freeze_model_module()
-
-            # rewrite _build_model_assets to support processor of condition model
-            self._build_model_assets()
-
+        with use_parallel_state(self.base.model.parallel_state):
             # rewrite _build_data_transform, build data transform for offline or online dit data
             self._build_data_transform()
-
             # rewrite _build_dataset, init offline_embedding_saver after build_dataset
             self._build_dataset()
-
             # Do not use maincollator in dit training
             # self.base._build_collate_fn()
-
             # rewrite _build_dataloader, build dataloader only on sp_rank_0 to save memory
             self._build_dataloader()
 
-            if self.training_task != "offline_embedding":
-                self.base._build_parallelized_model()
-                self.base._build_optimizer()
-                self.base._build_lr_scheduler()
-                self.base._build_training_context()
+        if self.training_task != "offline_embedding":
+            self.base._build_lr_scheduler()
+            self.base._build_training_context(self.base.model)
 
-            self.base._init_callbacks()
+        self.base._init_callbacks()
+
+    @property
+    def condition_model(self) -> PreTrainedModel:
+        return self.base.model.condition_model
+
+    def _build_model_runtime(self) -> DiTModelRuntime:
+        """Build (and own) this job's DiT. Override to swap in another runtime."""
+        return DiTModelRuntime(self.base.args.model, "base", train=self.base.args.train)
 
     def _setup(self):
-        self.base._setup()  # registers ParallelState("base") before seed
         args: VeOmniDiTArguments = self.base.args
+        # registers ParallelState("base") before seed
+        self.base.device = self.base._setup(args)
         args.train.dyn_bsz = False
-        args.train.micro_batch_size = 1
         # dataloader_batch_size was computed in __post_init__ when dyn_bsz was still True
         # (default), so it was set to 1. Recompute now that dyn_bsz=False.
         args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
@@ -246,11 +375,10 @@ class DiTTrainer:
             args.data.shuffle = False
             args.train.checkpoint.save_epochs = 0
             args.train.checkpoint.save_hf_weights = False
-            # No gradient accumulation needed; process one sample per step to
-            # avoid broadcast_object_list serialising all micro-batches at once
-            # which can OOM CPU memory with large video data.
-            args.train.global_batch_size = get_parallel_state().dp_size
-            args.train.dataloader_batch_size = 1
+            # Keep one microbatch per step to limit video broadcast memory; embedding needs no accumulation.
+            args.train.global_batch_size = args.train.micro_batch_size * get_parallel_state().dp_size
+            args.train.dataloader_batch_size = args.train.micro_batch_size
+            args.train.gradient_accumulation_steps = 1
             logger.info_rank0(
                 f"Task offline_embedding. Drop last: {args.data.drop_last}, shuffle: {args.data.shuffle}"
             )
@@ -258,75 +386,14 @@ class DiTTrainer:
 
         self.training_task = args.train.training_task
 
-    def _build_model(self):
-        logger.info_rank0("Build model")
-        args: VeOmniDiTArguments = self.base.args
-        # Apply ops config eagerly so the condition model (built below via
-        # ``model_class._from_config``, not ``build_foundation_model``) sees a
-        # populated ops singleton / LOSS_MAPPING. ``build_foundation_model``
-        # below will re-apply the same config — that call is idempotent.
-        apply_ops_config(args.model.ops_implementation)
-        model_config = args.model.model_config
-        dit_config = build_config(args.model.config_path, **model_config)
-        self.base.model_config = dit_config
-        logger.info_rank0(f"Detected DiT model type: {dit_config.model_type}.")
-        self._build_condition_model(
-            condition_model_type=dit_config.condition_model_type,
-        )
-        if self.training_task == "offline_training" or self.training_task == "online_training":
-            logger.info_rank0(f"Task: {self.training_task}, prepare dit model.")
-            self.base.model = build_foundation_model(
-                config_path=args.model.config_path,
-                weights_path=args.model.model_path,
-                torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-                init_device=args.train.init_device,
-                ops_implementation=args.model.ops_implementation,
-                config_kwargs=model_config,
-            )
-            self.base.model_config = getattr(self.base.model, "config", None)
-        else:
-            self.base.model = None
-            logger.info_rank0(f"Task: {self.training_task}, dit model is not prepared.")
-
-    def _build_condition_model(
-        self,
-        condition_model_type: str,
-    ) -> PreTrainedModel:
-        args: VeOmniDiTArguments = self.base.args
-        config_class = MODEL_CONFIG_REGISTRY[condition_model_type]()
-        condition_cfg = config_class.from_pretrained(
-            args.model.condition_model_path,
-            seed=args.train.seed,  # seed for randn noise and scheduler
-            **args.model.condition_model_cfg,
-        )
-        model_class = MODELING_REGISTRY[condition_model_type]()
-        if self.training_task == "offline_training":
-            self.condition_model = model_class._from_config(condition_cfg, meta_init=True)
-            logger.info_rank0("Condition model loaded with empty weights.")
-        else:
-            self.condition_model = model_class._from_config(condition_cfg)
-            self.condition_model.to(get_device_type())
-            logger.info_rank0("Condition model loaded.")
-
-    def _freeze_model_module(self):
-        self.condition_model.requires_grad_(False)
-
-        if self.training_task == "offline_training" or self.training_task == "online_training":
-            self.base._freeze_model_module()
-
-    def _build_model_assets(self):
-        if self.training_task == "offline_training" or self.training_task == "online_training":
-            self.base.model_assets = [self.base.model.config]
-        else:
-            self.base.model_assets = []
-
     def _build_data_transform(self):
         args: VeOmniDiTArguments = self.base.args
+        logger.info(f"args.data.data_transform: {args.data.data_transform}, training_task: {self.training_task}")
         if self.training_task == "offline_training":
             self.base.data_transform = build_data_transform("dit_offline")
         else:
             self.base.data_transform = build_data_transform(
-                "dit_online",
+                args.data.data_transform,
                 **args.data.mm_configs,
             )
 
@@ -353,7 +420,8 @@ class DiTTrainer:
                     math.ceil(self.base.train_dataset.data_len / args.train.global_batch_size)
                     * args.train.global_batch_size
                 )
-                self.base.train_dataset.data_len = padded_len
+                # Keep the source length intact for MappingDataset's repeated-index mapping.
+                self.base.train_dataset = torch.utils.data.Subset(self.base.train_dataset, range(padded_len))
                 args._train_steps = padded_len // dp_size // args.train.dataloader_batch_size
                 self.base.train_steps = args.train_steps
             else:
@@ -396,7 +464,10 @@ class DiTTrainer:
                 drop_last=args.data.dataloader.drop_last,
                 pin_memory=args.data.dataloader.pin_memory,
                 prefetch_factor=args.data.dataloader.prefetch_factor,
+                persistent_workers=args.data.dataloader.persistent_workers,
+                in_order=args.data.dataloader.in_order,
                 seed=args.train.seed,
+                shuffle=args.data.shuffle,
                 collate_fn=DiTDataCollator(),
                 save_steps=args.train.checkpoint.save_steps,
             )
@@ -418,8 +489,8 @@ class DiTTrainer:
     def on_step_begin(self, micro_batches=None):
         self.base.on_step_begin(micro_batches=micro_batches)
 
-    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
+        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics)
 
     def preforward(self, micro_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass."""
@@ -472,7 +543,7 @@ class DiTTrainer:
         with torch.no_grad():
             micro_batch = self.condition_model.process_condition(**micro_batch)
 
-        with use_parallel_state("base"), self.base.model_fwd_context:
+        with use_parallel_state(self.base.model.parallel_state), self.base.model_fwd_context:
             outputs = self.base.model(**micro_batch)
 
         loss: torch.Tensor
@@ -480,18 +551,17 @@ class DiTTrainer:
         # DiT postforward does not read ambient ParallelState.
         loss, loss_dict = self.postforward(outputs, micro_batch)
 
-        with use_parallel_state("base"), self.base.model_bwd_context:
+        with use_parallel_state(self.base.model.parallel_state), self.base.model_bwd_context:
             loss.backward()
 
         del micro_batch
         return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        args = self.base.args
         self.base.state.global_step += 1
 
         # SP broadcast of micro_batches
-        with use_parallel_state("base"):
+        with use_parallel_state(self.base.model.parallel_state):
             if get_parallel_state().sp_enabled:
                 if get_parallel_state().sp_rank == 0:
                     micro_batches = next(data_iterator)
@@ -508,9 +578,10 @@ class DiTTrainer:
             else:
                 micro_batches = next(data_iterator)
 
+        self.base._reset_async_activation_offload_if_enabled(self.base.model)
         self.on_step_begin(micro_batches=micro_batches)
 
-        synchronize()
+        self.base.sync_before_train_step()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(float)
@@ -521,6 +592,7 @@ class DiTTrainer:
         for micro_step, micro_batch in enumerate(micro_batches):
             if self.training_task != "offline_embedding":
                 self.base.model_reshard(micro_step, num_micro_batches)
+                self.base._configure_hsdp_allreduce(micro_step, num_micro_batches)
 
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
@@ -533,11 +605,10 @@ class DiTTrainer:
                     total_loss_dict[k] += v.item()
 
         if self.training_task != "offline_embedding":
-            with use_parallel_state("base"):
-                grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
-            self.base.optimizer.step()
-            self.base.lr_scheduler.step()
-            self.base.optimizer.zero_grad()
+            grad_norm = self.base.model.clip_grad_norm()
+            self.base.model.optimizer.step()
+            self.base.model.lr_scheduler.step()
+            self.base.model.optimizer.zero_grad()
 
         self.on_step_end(loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
 

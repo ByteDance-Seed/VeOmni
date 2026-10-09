@@ -1,33 +1,40 @@
 # Agent Workflow Guide
 
-VeOmni provides a skill-based workflow system that helps AI coding agents work on the project effectively. Skills follow the [Agent Skills](https://agentskills.io) open standard and work with any compatible agent (Cursor, Claude Code, Codex, Junie, Goose, etc.).
+VeOmni provides a skill-based workflow system that helps AI coding agents work on the project effectively. Skills follow the [Agent Skills](https://agentskills.io) open standard, so they work with any agent that implements it — no VeOmni-specific plugin required.
 
 ## Overview
 
 The workflow consists of three layers:
 
-```
+```text
 AGENTS.md                      <- Entry point: principles, skill dispatch, commit flow
 .agents/skills/                <- Skills: step-by-step workflows for common tasks
 .agents/knowledge/             <- Knowledge: constraints, architecture, dependency info
-.cursor/rules/                 <- IDE rules: Cursor-specific coding conventions
+.cursor/rules/                 <- IDE rules: coding conventions, for editors that read them
 ```
 
-When an agent opens the project, it reads `AGENTS.md` (or its symlink `CLAUDE.md`) to understand:
+When an agent opens the project, it reads `AGENTS.md` to understand:
 - **What constraints to follow** before making any change
 - **Which skill to use** for the task at hand
-- **How to commit** (mandatory code review gate)
+- **How to verify commits and review pull requests**
+
+Some agents look for an entry point under a different filename. `CLAUDE.md` is a
+symlink to `AGENTS.md` for that reason — there is one source of truth, and
+adding another alias is just another symlink.
 
 ## Quick Start
 
 ### For AI Agent Users
 
-If you are using Cursor or another AI coding tool on this project, the workflow activates automatically:
+How much of this is automatic depends on the agent. Reading `AGENTS.md` on
+session start and auto-discovering skills from their `description` are both
+capabilities the agent has to implement; where it does not, everything below
+still works by invoking `/skill-name` explicitly.
 
 1. The agent reads `AGENTS.md` on session start.
 2. For each task, the agent selects the appropriate skill from the dispatch table (or auto-discovers it via the `description` frontmatter).
 3. The agent reads the skill's `SKILL.md` and follows its step-by-step instructions.
-4. Before committing, the agent runs the `/veomni-review` skill (a subagent code review).
+4. Before opening a pull request and before pushing a substantive update to an open one, the agent runs `/veomni-review` over the branch diff, following its applicability rules.
 
 **You don't need to do anything special** — just describe your task in natural language. You can also invoke a specific skill with `/skill-name` in chat (e.g., `/veomni-debug`).
 
@@ -40,7 +47,7 @@ If you are using Cursor or another AI coding tool on this project, the workflow 
 | "Add a fused RoPE kernel" | `/veomni-new-op` |
 | "Refactor the data collator" | `/veomni-develop` |
 | "Update torch to 2.10" | `/veomni-uv-update` |
-| "Port Qwen3 to transformers v5 patchgen" | `/veomni-migrate-transformers-v5` |
+| "Write the patchgen config for Qwen3" | `/veomni-patchgen-model` |
 | "Analyze this Chrome trace" | `/veomni-profile` |
 | "Submit the current branch as a PR" | `/create-pr` |
 
@@ -50,20 +57,20 @@ If you are using Cursor or another AI coding tool on this project, the workflow 
 
 Each skill is a folder containing a `SKILL.md` file with YAML frontmatter (`name` and `description`):
 
-```
+```text
 .agents/skills/
 ├── veomni-develop/SKILL.md    # Feature development and refactoring
 ├── veomni-debug/SKILL.md      # Bug fix and debugging (quick path + full protocol)
-├── veomni-review/SKILL.md     # Pre-commit code review (mandatory)
+├── veomni-review/SKILL.md     # Pre-PR code review (mandatory)
 ├── veomni-new-model/SKILL.md  # Add a new model to VeOmni
-├── veomni-migrate-transformers-v5/SKILL.md  # Migrate model patches to transformers v5
+├── veomni-patchgen-model/SKILL.md  # Author a model's patchgen-generated modeling
 ├── veomni-new-op/SKILL.md     # Add a new kernel/operator
 ├── veomni-uv-update/SKILL.md  # Dependency management with uv
 ├── veomni-profile/SKILL.md    # Performance profiling and optimization
 └── create-pr/SKILL.md         # Create or update a pull request
 ```
 
-The `description` field in frontmatter tells the agent when to apply the skill. Agents that support auto-discovery (Cursor, Claude Code) will offer the relevant skill automatically based on the task description.
+The `description` field in frontmatter tells the agent when to apply the skill. Agents that support auto-discovery will offer the relevant skill automatically based on the task description.
 
 ### `.agents/knowledge/`
 
@@ -71,14 +78,17 @@ Domain knowledge that agents should read before making changes:
 
 | File | Content |
 |------|---------|
-| `constraints.md` | 22 hard constraints — violating any one causes bugs or crashes |
+| `constraints.md` | Hard constraints whose violation causes bugs or crashes |
 | `architecture.md` | Module map, trainer hierarchy, data flow, model loading flow, test mapping |
+| `cpu_only_env.md` | What can be verified on a machine with no GPU/NPU |
 | `multimodal_metadata.md` | Canonical multimodal metadata keys and ownership boundaries |
+| `testing.md` | How CI selects tests; whether a change needs one and where it goes |
 | `uv.md` | Dependency management architecture (uv, extras, lockfile, torch sources) |
 
 ### `.cursor/rules/`
 
-Cursor IDE rules (auto-applied when editing matching files):
+Editor rules, auto-applied when editing matching files by editors that read this
+directory:
 
 - `no-section-divider-comments.mdc` — no decorative `# ----` banners in Python
 - `skills-reusable-only.mdc` — enforce Agent Skills standard format in `.agents/skills/`
@@ -107,19 +117,24 @@ See the [Agent Skills specification](https://agentskills.io/specification) for t
 2. Reference it from the Context Loading section in `AGENTS.md`.
 3. If the knowledge contains hard rules, add them to `constraints.md`.
 
-## Commit Flow
+## Commit and review flow
 
-The agent workflow enforces a structured commit flow:
+Run `/veomni-review` over the whole branch diff before opening a pull request
+and again before pushing a substantive update to an open one. Follow the
+skill's applicability rules, including self-checks for documentation-only changes:
 
-```
-Code Change -> /veomni-review (subagent) -> Verdict
-                                             |
-                                     safe -> commit
-                              needs-attention -> fix, then commit
-                                     risky -> report to user, wait
+```text
+each commit    -> make quality + your own verification
+
+before opening or substantively updating a PR
+               -> /veomni-review -> Verdict
+                                                |
+                                        safe -> open or update the PR
+                                 needs-attention -> fix, then open or update the PR
+                                        risky -> report to user, wait
 ```
 
 Additional gates:
-- `make quality` must pass (ruff check + format)
-- Commit messages must not mention AI/Claude
+- `make quality` must pass (ruff check + format) on every commit
+- Commit messages describe the change, not the tool that produced it — no assistant or agent names, no `Co-Authored-By` trailers
 - PR title must follow `[{modules}] {type}: {description}` format

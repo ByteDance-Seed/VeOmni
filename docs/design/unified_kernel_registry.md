@@ -282,6 +282,7 @@ class OpsImplementationConfig:
     dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = "eager"
     dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "tilelang"] = "eager"
     mhc_implementation: Literal["eager", "tilelang"] = "eager"
+    qat_implementation: Literal["none", "fp8_blockwise"] = "none"
 ```
 
 **Shipped today** (what is actually on `OpsImplementationConfig` as of this
@@ -291,17 +292,18 @@ PR — see `veomni/arguments/arguments_types.py`):
 |-------|------------------|-------|
 | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | VeOmni rewrites FA2/3/4 to SP-aware variants under `MODELING_BACKEND=veomni` |
 | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
-| `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
+| `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | |
 | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | |
 | `moe_implementation` | `eager`, `fused_triton`, `fused_quack`, `fused_npu` | Single field. On NPU, a value still equal to the GPU default `fused_triton` is normalized to `fused_npu`; incompatible non-default overrides raise. |
 | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | |
 | `load_balancing_loss_implementation` | `eager`, `triton` | `triton` is CUDA-only; current NPU config normalization maps the default-valued `triton` selection to `eager` before binding. |
 | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | Qwen3.5 GatedDeltaNet `self.norm`; default `fla` |
 | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | Qwen3.5 GatedDeltaNet pre-mixer; `eager` has no `cu_seqlens` path |
-| `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla`, `npu` | Qwen3.5 linear attention; `flash_qla` is Hopper SM90-only, while `npu` uses the vendored MindSpeed-MM kernel |
+| `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla`, `npu`, `npu_ascendc` | Qwen3.5 linear attention; `flash_qla` is Hopper SM90-only. `npu` uses the vendored MindSpeed-MM Triton kernel; `npu_ascendc` is the AscendC fused `torch.ops.npu.*` path (requires a manual `fla_npu` install) |
 | `dsa_indexer_implementation` | `eager`, `cudnn`, `tilelang` | GLM-DSA supports `cudnn`; DeepSeek V4 supports `tilelang`. Optimized implementations require compatible NVIDIA hardware. |
 | `dsa_attention_implementation` | `eager`, `flashmla_cudnn`, `tilelang` | GLM-DSA supports `flashmla_cudnn`; DeepSeek V4 supports `tilelang`. Optimized implementations require compatible NVIDIA hardware. |
 | `mhc_implementation` | `eager`, `tilelang` | DeepSeek V4 manifold-constrained Hyper-Connection pre/post/head kernels provided by the `tile-kernels` package. The three `OpSlot("mhc", variant)` instances share this selection and require NVIDIA SM90+ for `tilelang`. |
+| `qat_implementation` | `none`, `fp8_blockwise` | DeepSeek V4 fake-quantization recipe, not a kernel backend: it has no `OpSlot`, and the patched modeling helpers read it through an `OpsConfigSlot` to decide whether to route a tensor through `veomni/ops/qat/`. `fp8_blockwise` needs the TileLang quantizers, so `_validate_implementations` rejects it below NVIDIA CUDA SM90. |
 
 No preset field was shipped. Configure each `OpsImplementationConfig` field
 explicitly; unknown fields such as `preset` are invalid.
@@ -788,7 +790,7 @@ model.forward()                                    # (5) runtime
 | `VEOMNI_USE_LIGER_KERNEL=1` env var | Per-op `*_implementation: liger_kernel` fields | Removed; configure fields explicitly |
 | `gpu_patch.py` monkey-patching | patchgen + registry/`OpSlot` dispatch | Removed from current model paths |
 | `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + `apply_ops_config()` | Replaced by the unified config install point |
-| `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | All MoE models (qwen3_moe, qwen3_5_moe, qwen3_vl_moe, qwen3_omni_moe, deepseek_v3, deepseek_v4) now bind through OpSlot guards; the function is kept only as the binding helper invoked from `_bind_veomni_ops` to set the global `_fused_moe_forward` pointer. DeepSeek-V4 separately exposes TileLang DSA indexer/attention config slots and three registry-backed TileKernels mHC slots. Its MoE keeps a direct `fused_moe_forward(...)` call under the experts guard so it can pass its merged `gate_up_proj` layout and `swiglu_limit` clamp explicitly; clamp-aware V4 fused MoE is currently provided by the GPU backends and defaults to `fused_triton` on GPU, while `fused_npu` raises until the NPU kernel implements `swiglu_limit`. |
+| `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | All MoE models (qwen3_moe, qwen3_5_moe, qwen3_vl_moe, qwen3_omni_moe, deepseek_v3, deepseek_v4) now bind through OpSlot guards; the function is kept only as the binding helper invoked from `_bind_veomni_ops` to set the global `_fused_moe_forward` pointer. DeepSeek-V4 separately exposes TileLang DSA indexer/attention config slots and three registry-backed TileKernels mHC slots. Its MoE keeps a direct `fused_moe_forward(...)` call under the experts guard so it can pass its merged `gate_up_proj` layout and `swiglu_limit` clamp explicitly; clamp-aware V4 fused MoE is provided by `fused_triton`, `fused_quack`, and Ascend `fused_npu` (via a forward/backward Triton activation kernel with the original eager activation as the missing-package fallback). |
 | `moe_implementation: fused` | `moe_implementation: fused_triton`, `fused_quack`, or `fused_npu` | The legacy `"fused"` alias remains deprecated: it resolves to `fused_quack` on GPU and `fused_npu` on NPU with a warning. The default-valued `fused_triton` selection is also normalized to `fused_npu` on NPU for compatibility; explicit backend names are recommended. |
 
 ---

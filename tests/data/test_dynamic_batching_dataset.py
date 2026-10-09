@@ -1,6 +1,6 @@
 """Tests for DynamicBatchingSizeDataset functionality.
 
-This module tests the ``DynamicBatchingSizeDataset`` class using ``ShardedIterableDataset``.
+This module tests ``DynamicBatchingSizeDataset`` with iterable and map-style datasets.
 It validates that ``DynamicBatchingSizeDataset`` can properly:
 
 1. Batch samples based on token count (``micro_batch_seq_length``).
@@ -23,8 +23,8 @@ The test suite includes:
 
     End-to-end distributed tests (require ``torchrun`` with 2 processes):
         - ``test_dynamic_batching_dataset_distributed`` – parametrised over
-          ``shuffle × save_by_idx × multi_sample_per_iteration`` (5 combinations), verifying that resumed
-          batches are byte-for-byte identical to the original run.
+          dataset type, shuffle, save_by_idx, and multi-sample transforms, verifying
+          that resumed batches are byte-for-byte identical to the original run.
 """
 
 import argparse
@@ -46,11 +46,11 @@ import torch
 from tools import resolve_ops_overrides
 from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
-from transformers import PretrainedConfig
 from utils import (
-    FakeModel,
+    FakeModelRuntime,
     ShardedIterableDataset,
-    StepAwareResumeCheckpointerCallback,
+    ShardedMappingDataset,
+    StepAwareResumeGlobalStateCallback,
     compare_global_batch,
     compare_items,
     compare_metrics,
@@ -74,7 +74,6 @@ from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks import Callback, EnvironMeterCallback, TrainerState
 from veomni.utils import helper
 from veomni.utils.constants import IGNORE_INDEX
-from veomni.utils.device import get_device_type
 
 
 logger = helper.create_logger(__name__)
@@ -532,22 +531,26 @@ def test_save_load_state_dict(save_by_idx):
 
 
 @pytest.mark.parametrize(
-    "shuffle,save_by_idx,multi_sample_per_iteration",
+    "dataset_type,shuffle,save_by_idx,multi_sample_per_iteration",
     [
-        (False, False, False),
-        (False, True, False),
-        (True, False, False),
-        (True, True, False),
-        (True, True, True),
+        ("iterable", False, False, False),
+        ("iterable", False, True, False),
+        ("iterable", True, False, False),
+        ("iterable", True, True, False),
+        ("iterable", True, True, True),
+        ("mapping", True, True, False),
+        ("mapping", True, True, True),
+        ("mapping", True, False, False),
     ],
 )
-def test_dynamic_batching_dataset_distributed(shuffle, save_by_idx, multi_sample_per_iteration):
+def test_dynamic_batching_dataset_distributed(dataset_type, shuffle, save_by_idx, multi_sample_per_iteration):
     """Test DynamicBatchingSizeDataset in distributed setting.
 
     Runs _main_distributed_test() by torchrun with or without data shuffling
     and with or without save_by_idx for checkpoint buffer saving.
 
     Args:
+        dataset_type: Whether the upstream is iterable or map-style.
         shuffle: Whether to enable data shuffling.
         save_by_idx: Whether to save buffer by index for checkpointing.
         multi_sample_per_iteration: Whether one dataset iteration emits two samples.
@@ -556,6 +559,7 @@ def test_dynamic_batching_dataset_distributed(shuffle, save_by_idx, multi_sample
         subprocess.CalledProcessError: If the distributed test fails.
     """
     command = build_command(
+        dataset_type=dataset_type,
         shuffle=shuffle,
         save_by_idx=save_by_idx,
         multi_sample_per_iteration=multi_sample_per_iteration,
@@ -565,13 +569,14 @@ def test_dynamic_batching_dataset_distributed(shuffle, save_by_idx, multi_sample
     assert result.returncode == 0
 
 
-def build_command(shuffle=True, save_by_idx=True, multi_sample_per_iteration=False):
+def build_command(dataset_type="iterable", shuffle=True, save_by_idx=True, multi_sample_per_iteration=False):
     """Build torchrun command for distributed testing.
 
     Constructs a command to launch the test script with torchrun for
     distributed execution with 2 processes.
 
     Args:
+        dataset_type: Whether to build an iterable or map-style upstream dataset.
         shuffle: Whether to enable data shuffling.
         save_by_idx: Whether to save buffer by index for checkpointing.
         multi_sample_per_iteration: Whether one dataset iteration emits two samples.
@@ -597,11 +602,12 @@ def build_command(shuffle=True, save_by_idx=True, multi_sample_per_iteration=Fal
         "--train.micro_batch_size=2",
         f"--shuffle={str(shuffle).lower()}",
         "--train.global_batch_size=16",
-        "--train.accelerator.fsdp_config.fsdp_mode=ddp",
+        "--model.accelerator.fsdp_config.fsdp_mode=ddp",
         "--train.checkpoint.manager=dcp",
         "--train.checkpoint.output_dir=.tests/cache",
         "--train.dyn_bsz=true",
         "--train.dyn_bsz_runtime=worker",
+        f"--dataset_type={dataset_type}",
         f"--save_by_idx={str(save_by_idx).lower()}",
         f"--multi_sample_per_iteration={str(multi_sample_per_iteration).lower()}",
         "--train.seed=42",
@@ -623,27 +629,23 @@ class TrainerTest(BaseTrainer):
     def __init__(
         self,
         args: VeOmniArguments,
+        dataset_type: str,
         shuffle: bool,
         save_by_idx: bool,
         multi_sample_per_iteration: bool,
     ):
+        self.dataset_type = dataset_type
         self.shuffle = shuffle
         self.save_by_idx = save_by_idx
         self.multi_sample_per_iteration = multi_sample_per_iteration
         super().__init__(args)
 
-    def _setup(self):
-        self.device, _ = setup_test_distributed(self.args)
+    def _setup(self, args):
+        device, _ = setup_test_distributed(args)
+        return device
 
-    def _freeze_model_module(self):
-        pass
-
-    def _build_model(self):
-        self.model = FakeModel().to(get_device_type())
-        self.model_config = PretrainedConfig()
-
-    def _build_model_assets(self):
-        self.model_assets = [self.model_config]
+    def _build_model_runtime(self):
+        return FakeModelRuntime(self.args.model, train=self.args.train)
 
     def _build_data_transform(self):
         pass
@@ -651,12 +653,18 @@ class TrainerTest(BaseTrainer):
     def _build_dataset(self):
         args = self.args
         transform = multi_sample_transform if self.multi_sample_per_iteration else single_sample_transform
-        self.train_dataset = ShardedIterableDataset(
-            size=DATASET_SIZE,
-            shuffle=self.shuffle,
-            seed=args.train.seed,
-            transform=transform,
-        )
+        if self.dataset_type == "mapping":
+            self.train_dataset = ShardedMappingDataset(
+                size=DATASET_SIZE, transform=transform, sample_length_range=(6, 7)
+            )
+        else:
+            self.train_dataset = ShardedIterableDataset(
+                size=DATASET_SIZE,
+                shuffle=self.shuffle,
+                seed=args.train.seed,
+                transform=transform,
+                sample_length_range=(6, 7),
+            )
         effective_dataset_size = DATASET_SIZE * (2 if self.multi_sample_per_iteration else 1)
         args.compute_train_steps(effective_dataset_size)
         args.train.num_train_epochs = 2
@@ -688,49 +696,43 @@ class TrainerTest(BaseTrainer):
             **dataloader_kwargs,
         )
 
-    def _build_parallelized_model(self):
-        self.model.train()
-
-    def _build_optimizer(self):
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.args.train.optimizer.lr)
-
     def _build_lr_scheduler(self):
-        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lambda _: 1.0)
+        self.model.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.model.optimizer, lambda _: 1.0)
 
-    def _build_training_context(self):
+    def _build_training_context(self, model=None):
         self.model_fwd_context = nullcontext()
         self.model_bwd_context = nullcontext()
 
     def _init_callbacks(self):
         self.environ_meter_callback = EnvironMeterCallback(self)
-        self.checkpointer_callback = StepAwareResumeCheckpointerCallback(self)
+        self.global_state_callback = StepAwareResumeGlobalStateCallback(self)
         self.check_callback = CheckCallback(self)
         self.state = TrainerState()
 
     def on_train_begin(self):
         self.environ_meter_callback.on_train_begin(self.state)
-        self.checkpointer_callback.on_train_begin(self.state)
+        self.global_state_callback.on_train_begin(self.state)
         self.check_callback.on_train_begin(self.state)
 
     def on_train_end(self):
         self.environ_meter_callback.on_train_end(self.state)
-        self.checkpointer_callback.on_train_end(self.state)
+        self.global_state_callback.on_train_end(self.state)
         self.check_callback.on_train_end(self.state)
 
     def on_epoch_begin(self):
         self.state.curr_step = self.start_step - 1
         self.environ_meter_callback.on_epoch_begin(self.state)
-        self.checkpointer_callback.on_epoch_begin(self.state)
+        self.global_state_callback.on_epoch_begin(self.state)
         self.check_callback.on_epoch_begin(self.state)
 
     def on_epoch_end(self):
         self.environ_meter_callback.on_epoch_end(self.state)
-        self.checkpointer_callback.on_epoch_end(self.state)
+        self.global_state_callback.on_epoch_end(self.state)
         self.check_callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.checkpointer_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.global_state_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.check_callback.on_step_begin(self.state, micro_batches=micro_batches)
 
     def on_step_end(self, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs) -> None:
@@ -740,7 +742,7 @@ class TrainerTest(BaseTrainer):
             # Skip metrics on CPU (torch.cpu has no attribute 'get_device_name')
             logger.warning(f"[rank{self.args.train.global_rank}] Skipping metrics: {e}")
             self.step_env_metrics = {}
-        self.checkpointer_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.global_state_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.check_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
@@ -814,6 +816,7 @@ def _main_distributed_test():
         patch("veomni.utils.device.empty_cache", mock_empty_cache),
     ):
         _parser = argparse.ArgumentParser()
+        _parser.add_argument("--dataset_type", choices=["iterable", "mapping"], default="iterable")
         _parser.add_argument("--shuffle", type=lambda x: x.lower() == "true", default=True)
         _parser.add_argument("--save_by_idx", type=lambda x: x.lower() == "true", default=True)
         _parser.add_argument("--multi_sample_per_iteration", type=lambda x: x.lower() == "true", default=False)
@@ -823,6 +826,7 @@ def _main_distributed_test():
         args = parse_args(VeOmniArguments)
         trainer = TrainerTest(
             args,
+            dataset_type=test_args.dataset_type,
             shuffle=test_args.shuffle,
             save_by_idx=test_args.save_by_idx,
             multi_sample_per_iteration=test_args.multi_sample_per_iteration,

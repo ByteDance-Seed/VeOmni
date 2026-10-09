@@ -129,7 +129,7 @@ data:
 The Gemma path is used by the preprocessing command; the shipped offline
 training configs consume the precomputed embeddings and do not reload Gemma.
 
-## Start training
+## Start training on GPU/NPU
 
 ### Audio-Video LoRA (default)
 

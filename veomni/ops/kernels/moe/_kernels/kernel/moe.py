@@ -17,7 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ......utils.device import get_torch_device
+from ......utils.device import get_torch_device, is_moe_kernel_supported
 from .triton_utils.memory import (
     load_with_pred_1d,
     store_with_pred_1d,
@@ -56,7 +56,7 @@ def expert_histogram(input: torch.Tensor, num_bins: int) -> torch.Tensor:
     probably should go for some other histogram method.
     """
 
-    assert input.is_cuda
+    assert is_moe_kernel_supported(input.device)
     assert input.dtype == torch.int32 or input.dtype == torch.int64
     assert input.numel() < (1 << 31) - 1, "Too many elements."
     flattened = input.flatten().contiguous()
@@ -127,7 +127,7 @@ def _moe_gather_kernel(
 
 
 def moe_gather(x: torch.Tensor, index: torch.Tensor, out_dtype=None):
-    assert x.is_cuda and index.is_cuda
+    assert is_moe_kernel_supported(x.device) and is_moe_kernel_supported(index.device)
     M, topk = index.shape
     assert x.shape[0] == M * topk
     N = x.shape[1]
@@ -210,7 +210,11 @@ def _moe_add_gather_kernel(
 
 
 def moe_add_gather(x: torch.Tensor, y: torch.Tensor, index: torch.Tensor, out_dtype=None):
-    assert x.is_cuda and y.is_cuda and index.is_cuda
+    assert (
+        is_moe_kernel_supported(x.device)
+        and is_moe_kernel_supported(y.device)
+        and is_moe_kernel_supported(index.device)
+    )
     assert x.shape == y.shape
     assert x.dtype == y.dtype
     M, topk = index.shape
@@ -300,7 +304,7 @@ def _moe_scatter_kernel(
 
 
 def moe_scatter(x: torch.Tensor, index: torch.Tensor, out_dtype=None):
-    assert x.is_cuda and index.is_cuda
+    assert is_moe_kernel_supported(x.device) and is_moe_kernel_supported(index.device)
     assert x.shape[0] == index.shape[0]
 
     assert x.device == index.device, f"x.device = {x.device}, index.device = {index.device}"

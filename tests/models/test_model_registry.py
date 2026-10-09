@@ -1,12 +1,25 @@
 import pytest
+import torch
 
 from veomni.models.loader import get_model_class, get_model_config, get_model_processor
 from veomni.utils.helper import get_cache_dir
 
 
+@pytest.mark.parametrize("toy_name", ["qwen3vl", "qwen3vlmoe", "qwen3_5", "qwen3_5_moe"])
+def test_generated_multimodal_children(monkeypatch, toy_name):
+    """AutoModel inside a generated parent must not bypass the patched towers."""
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    config = get_model_config(f"./tests/toy_config/{toy_name}_toy")
+    model_class = get_model_class(config)
+    with torch.device("meta"):
+        model = model_class._from_config(config, attn_implementation="eager")
+    for tower in (model.model.visual, model.model.language_model):
+        assert type(tower).__module__ == model_class.__module__
+
+
 local_test_cases = [
     pytest.param("./tests/toy_config/qwen2vl_toy", True, False, ["config", "model", "processor"], ["model"]),
-    pytest.param("./tests/toy_config/janus_siglip_toy", False, True, [], ["config", "model", "processor"]),
+    pytest.param("./tests/toy_config/movqgan_toy", False, True, [], ["config", "model", "processor"]),
     pytest.param("./tests/toy_config/gpt_oss_toy", True, False, ["config", "model"], ["model"]),
 ]
 
@@ -49,9 +62,6 @@ def test_local_model_registry(monkeypatch, config_path, is_hf_model, load_proces
 
 remote_test_cases = [
     pytest.param("Qwen/Qwen2-VL-2B-Instruct", ["config", "model", "processor"], ["model"]),
-    pytest.param(
-        "deepseek-community/Janus-Pro-1B", ["config", "model", "processor"], ["config", "model", "processor"]
-    ),
 ]
 
 
@@ -82,7 +92,3 @@ def test_remote_model_registry(monkeypatch, config_path, hf_registered, veomni_r
         "veomni." if "processor" in veomni_registered else "transformers."
     )
     veomni_processor.save_pretrained(save_path)
-
-
-if __name__ == "__main__":
-    test_remote_model_registry("deepseek-community/Janus-Pro-1B")

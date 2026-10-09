@@ -229,15 +229,32 @@ def test_validate_accepts_ddp_style_module_wrapper():
 
 
 _REPO_ROOT = Path(moe_router_replay.__file__).resolve().parents[2]
-_GENERATED_FILES = [
-    _REPO_ROOT / "veomni/models/transformers/qwen3_moe/generated/patched_modeling_qwen3_moe_gpu.py",
-    _REPO_ROOT / "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_gpu.py",
-    _REPO_ROOT / "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_npu.py",
-]
+
+# path -> number of router forwards that must call the hook.
+#
+# The count is asserted exactly, not as a lower bound, because a *missing*
+# call site is silent rather than fatal downstream. Replay consumers match
+# recorded routing to routers by fire order, while rollout backends index
+# their recorded tensor by absolute decoder-layer index (vLLM sizes its
+# capture buffer to ``num_hidden_layers`` and writes at
+# ``extract_layer_index(layer_name)``). Those two agree only when every
+# decoder layer contributes exactly one hook call, so a family whose layers
+# use more than one router class must wire all of them: DeepSeek-V4's first
+# three layers are hash-routed (``mlp_layer_types``) and leaving that class
+# unhooked shifts every learned router's target by three layers, which just
+# degrades the trained policy instead of raising.
+_GENERATED_FILES = {
+    _REPO_ROOT / "veomni/models/transformers/qwen3_moe/generated/patched_modeling_qwen3_moe_gpu.py": 1,
+    _REPO_ROOT / "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_gpu.py": 1,
+    _REPO_ROOT / "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_npu.py": 1,
+    # TopKRouter + HashRouter.
+    _REPO_ROOT / "veomni/models/transformers/deepseek_v4/generated/patched_modeling_deepseek_v4_gpu.py": 2,
+    _REPO_ROOT / "veomni/models/transformers/deepseek_v4/generated/patched_modeling_deepseek_v4_npu.py": 2,
+}
 
 
-@pytest.mark.parametrize("path", _GENERATED_FILES, ids=lambda p: p.name)
-def test_generated_file_wires_maybe_replay_indices(path: Path):
+@pytest.mark.parametrize(("path", "expected_calls"), _GENERATED_FILES.items(), ids=lambda p: getattr(p, "name", p))
+def test_generated_file_wires_maybe_replay_indices(path: Path, expected_calls: int):
     assert path.is_file(), f"generated file missing: {path} — run `make patchgen`"
     src = path.read_text()
     # Import must be present. The patch site imports `maybe_replay_indices`
@@ -247,7 +264,11 @@ def test_generated_file_wires_maybe_replay_indices(path: Path):
         r"from\s+veomni\.utils\.moe_router_replay\s+import\s+[^\n]*\bmaybe_replay_indices\b",
         src,
     ), f"{path.name} dropped the maybe_replay_indices import — patchgen state likely stale"
-    # Call site must be present (match arbitrary whitespace/newlines after the name).
-    assert re.search(r"\bmaybe_replay_indices\s*\(", src), (
-        f"{path.name} imports maybe_replay_indices but never calls it — patchgen regressed"
+    # Call sites must be present (match arbitrary whitespace/newlines after the name).
+    num_calls = len(re.findall(r"\bmaybe_replay_indices\s*\(", src))
+    assert num_calls == expected_calls, (
+        f"{path.name} calls maybe_replay_indices {num_calls} time(s), expected "
+        f"{expected_calls} — one per router class in this family. Fewer means some "
+        "layers route natively while their slot is still consumed, shifting every "
+        "later layer's replayed experts; more means a slot is claimed twice."
     )
