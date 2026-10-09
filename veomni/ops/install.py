@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Install process-wide integrations required by VeOmni operations."""
 
@@ -26,7 +26,6 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ..utils import logging
 from ..utils.env import get_env
-from ..utils.import_utils import is_transformers_version_greater_or_equal_to
 from .kernels.attention.mask.flash import flash_attention_mask_builder
 from .kernels.attention.mask.flex import flex_attention_mask_builder
 from .kernels.attention.mask.magi import magi_attention_mask_builder
@@ -179,11 +178,9 @@ def patch_transformers_hub_kernel_loader_for_veomni() -> None:
         if attn_implementation in VEOMNI_FLASH_ATTN_IMPL_MAPPING or attn_implementation in _HUB_FLASH_REPOS:
             return _load_veomni_local_flash_kernel(attn_implementation)
 
-        if is_transformers_version_greater_or_equal_to("5.3.0"):
-            return _original_load_and_register_attn_kernel(
-                attn_implementation, attention_wrapper, allow_all_kernels=allow_all_kernels
-            )
-        return _original_load_and_register_attn_kernel(attn_implementation, attention_wrapper)
+        return _original_load_and_register_attn_kernel(
+            attn_implementation, attention_wrapper, allow_all_kernels=allow_all_kernels
+        )
 
     hub_kernels.load_and_register_attn_kernel = _veomni_load_and_register_attn_kernel
     _veomni_hub_kernel_loader_patch_applied = True

@@ -22,8 +22,8 @@ from tests.ops.tol import (
     MOE_EP_PRE_SM90_GRAD_FC1_RTOL,
     MOE_EP_PRE_SM90_GRAD_FC2_ATOL,
     MOE_EP_PRE_SM90_GRAD_FC2_RTOL,
-    MOE_EP_PRE_SM90_GRAD_HIDDEN_ATOL,
-    MOE_EP_PRE_SM90_GRAD_HIDDEN_RTOL,
+    MOE_EP_PRE_SM90_GRAD_ROUTING_ATOL,
+    MOE_EP_PRE_SM90_GRAD_ROUTING_RTOL,
     MOE_EP_SM90_ATOL,
     MOE_EP_SM90_GRAD_FC1_ATOL,
     MOE_EP_SM90_GRAD_FC1_RTOL,
@@ -109,25 +109,26 @@ def _ep_atol() -> float:
 
 
 def _ep_gradient_tolerances(swiglu_limit):
+    if swiglu_limit is not None:
+        hidden_tol = (MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL, MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL)
+    else:
+        hidden_tol = (MOE_FUSED_GRAD_HIDDEN_ATOL, MOE_FUSED_GRAD_HIDDEN_RTOL)
     if is_sm90_or_above():
         fc1_tol = (MOE_EP_SM90_GRAD_FC1_ATOL, MOE_EP_SM90_GRAD_FC1_RTOL)
         fc2_tol = (MOE_EP_SM90_GRAD_FC2_ATOL, MOE_EP_SM90_GRAD_FC2_RTOL)
-        if swiglu_limit is not None:
-            hidden_tol = (MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL, MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL)
-        else:
-            hidden_tol = (MOE_FUSED_GRAD_HIDDEN_ATOL, MOE_FUSED_GRAD_HIDDEN_RTOL)
+        routing_tol = hidden_tol
     else:
         fc1_tol = (MOE_EP_PRE_SM90_GRAD_FC1_ATOL, MOE_EP_PRE_SM90_GRAD_FC1_RTOL)
         fc2_tol = (MOE_EP_PRE_SM90_GRAD_FC2_ATOL, MOE_EP_PRE_SM90_GRAD_FC2_RTOL)
-        hidden_tol = (MOE_EP_PRE_SM90_GRAD_HIDDEN_ATOL, MOE_EP_PRE_SM90_GRAD_HIDDEN_RTOL)
-    return hidden_tol, fc1_tol, fc2_tol
+        routing_tol = (MOE_EP_PRE_SM90_GRAD_ROUTING_ATOL, MOE_EP_PRE_SM90_GRAD_ROUTING_RTOL)
+    return hidden_tol, routing_tol, fc1_tol, fc2_tol
 
 
-def _assert_ep_reference_grads(pairs, hidden_tol, fc1_tol, fc2_tol):
+def _assert_ep_reference_grads(pairs, hidden_tol, routing_tol, fc1_tol, fc2_tol):
     """Require useful reference signal, then compare with recorded error."""
     budgets = {
         "hidden gradient": hidden_tol,
-        "routing gradient": hidden_tol,
+        "routing gradient": routing_tol,
         "fc1 gradient": fc1_tol,
         "fc1_1 gradient": fc1_tol,
         "fc1_2 gradient": fc1_tol,
@@ -149,13 +150,14 @@ def test_ep_weight_grad_budgets_are_platform_specific():
     assert MOE_EP_SM90_GRAD_FC2_RTOL == 0
     assert MOE_EP_PRE_SM90_GRAD_FC1_RTOL == 0
     assert MOE_EP_PRE_SM90_GRAD_FC2_RTOL == 0
-    hidden_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(None)
+    hidden_tol, routing_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(None)
     assert fc1_tol[1] == 0
     assert fc2_tol[1] == 0
+    assert hidden_tol[0] == MOE_FUSED_GRAD_HIDDEN_ATOL
     if is_sm90_or_above():
-        assert hidden_tol[0] == MOE_FUSED_GRAD_HIDDEN_ATOL
+        assert routing_tol == hidden_tol
     else:
-        assert hidden_tol[0] == MOE_EP_PRE_SM90_GRAD_HIDDEN_ATOL
+        assert routing_tol[0] == MOE_EP_PRE_SM90_GRAD_ROUTING_ATOL
 
 
 @pytest.mark.parametrize("swiglu_limit", [None, 7.0, 10.0])
@@ -389,7 +391,7 @@ def test_ep_vs_non_ep(
     ep_raw2 = EPGroupGemm.apply(pt_ep, cumsum, fc1_1_ep, fc1_2_ep, fc2_ep, swiglu_limit)
     out_ep2 = _gather_tokens_autograd(ep_raw2, routing_ep, scatter_index)
     out_ep2.backward(grad_output)
-    hidden_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(swiglu_limit)
+    hidden_tol, routing_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(swiglu_limit)
     _assert_ep_reference_grads(
         (
             ("hidden gradient", hs_ep.grad, hs_eager.grad),
@@ -399,6 +401,7 @@ def test_ep_vs_non_ep(
             ("fc1_2 gradient", fc1_2_ep.grad, fc1_2_eager.grad),
         ),
         hidden_tol,
+        routing_tol,
         fc1_tol,
         fc2_tol,
     )
@@ -483,7 +486,7 @@ def test_ep_merged_vs_non_ep(
     ep_raw2 = EPMergedFc1GroupGemm.apply(pt_ep, cumsum, fc1_merged_ep, fc2_ep, swiglu_limit)
     out_ep2 = _gather_tokens_autograd(ep_raw2, routing_ep, scatter_index)
     out_ep2.backward(grad_output)
-    hidden_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(swiglu_limit)
+    hidden_tol, routing_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(swiglu_limit)
     _assert_ep_reference_grads(
         (
             ("hidden gradient", hs_ep.grad, hs_eager.grad),
@@ -492,6 +495,7 @@ def test_ep_merged_vs_non_ep(
             ("fc1 gradient", fc1_merged_ep.grad, torch.cat([fc1_1_eager.grad, fc1_2_eager.grad], dim=1)),
         ),
         hidden_tol,
+        routing_tol,
         fc1_tol,
         fc2_tol,
     )

@@ -197,6 +197,7 @@ jobs:
         # `uv sync --frozen --extra gpu --group dev` step is sufficient — no extra sync needed here.
         # Coverage:
         #   - lora_trainer_saveload: dense Qwen3 + linear LoRA save/load smoke test
+        #   - qwen3_5_moe_lora: CPU Qwen3.5-MoE (incl. MTP) fused-expert LoRA target mapping
         #   - veomni_lora_moe_native: CPU MoE-LoRA injection/save-load + init_lora_parameter
         #     preserve/partial/fresh reset contract (catches to_empty clobber regressions)
         #   - moe_lora_eager: wrapper layout + autograd parity (Mode 1 + Mode 2, all v5 MoE configs)
@@ -209,6 +210,7 @@ jobs:
         # Order: cheap unit tests first to fail fast, trainer/ep2 last (multi-subprocess, ~5-10 min each).
         run: |
           uv run --frozen pytest -s -x tests/lora/test_target_mapping.py
+          uv run --frozen pytest -s -x tests/lora/test_qwen3_5_moe_lora.py
           uv run --frozen pytest -s -x tests/lora/test_veomni_lora_moe_native.py
           uv run --frozen pytest -s -x tests/lora/test_lora_trainer_saveload.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_eager.py

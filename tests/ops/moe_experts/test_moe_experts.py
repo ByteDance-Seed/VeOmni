@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """MoE experts eager vs fused / HF references, and fused impls vs eager."""
 
@@ -37,8 +37,8 @@ from tests.ops.tol import (
     MOE_FUSED_GRAD_FC2_RTOL,
     MOE_FUSED_GRAD_HIDDEN_ATOL,
     MOE_FUSED_GRAD_HIDDEN_RTOL,
-    MOE_FUSED_PRODUCTION_PRE_SM90_GRAD_HIDDEN_ATOL,
-    MOE_FUSED_PRODUCTION_PRE_SM90_GRAD_HIDDEN_RTOL,
+    MOE_FUSED_PRODUCTION_PRE_SM90_GRAD_ROUTING_ATOL,
+    MOE_FUSED_PRODUCTION_PRE_SM90_GRAD_ROUTING_RTOL,
     MOE_FUSED_RTOL,
     MOE_FUSED_SWIGLU_ATOL,
     MOE_FUSED_SWIGLU_GRAD_FC1_ATOL,
@@ -475,8 +475,8 @@ def _run_fused_three_way(
     device: torch.device | None = None,
     data_scale: float = 0.1,
     require_active_clamp: bool = False,
-    grad_hidden_atol: float | None = None,
-    grad_hidden_rtol: float | None = None,
+    grad_routing_atol: float | None = None,
+    grad_routing_rtol: float | None = None,
 ):
     """Compare one fused implementation's split and merged layouts with eager."""
     torch.manual_seed(seed)
@@ -544,14 +544,12 @@ def _run_fused_three_way(
         hidden_atol, hidden_rtol = MOE_FUSED_GRAD_HIDDEN_ATOL, MOE_FUSED_GRAD_HIDDEN_RTOL
         fc1_atol, fc1_rtol = MOE_FUSED_GRAD_FC1_ATOL, MOE_FUSED_GRAD_FC1_RTOL
         fc2_atol, fc2_rtol = MOE_FUSED_GRAD_FC2_ATOL, MOE_FUSED_GRAD_FC2_RTOL
-    if grad_hidden_atol is not None:
-        hidden_atol = grad_hidden_atol
-    if grad_hidden_rtol is not None:
-        hidden_rtol = grad_hidden_rtol
+    routing_atol = hidden_atol if grad_routing_atol is None else grad_routing_atol
+    routing_rtol = hidden_rtol if grad_routing_rtol is None else grad_routing_rtol
     reference_checks = (
         ("output", out_e, fwd_atol, fwd_rtol),
         ("hidden gradient", hidden_e.grad, hidden_atol, hidden_rtol),
-        ("routing gradient", routing_e.grad, hidden_atol, hidden_rtol),
+        ("routing gradient", routing_e.grad, routing_atol, routing_rtol),
         ("fc1_1 gradient", fc1_1_e.grad, fc1_atol, fc1_rtol),
         ("fc1_2 gradient", fc1_2_e.grad, fc1_atol, fc1_rtol),
         ("fc2 gradient", fc2_e.grad, fc2_atol, fc2_rtol),
@@ -563,7 +561,7 @@ def _run_fused_three_way(
         "hidden gradient", hidden_m.grad.float(), hidden_e.grad.float(), atol=hidden_atol, rtol=hidden_rtol
     )
     assert_close_with_error(
-        "routing gradient", routing_m.grad.float(), routing_e.grad.float(), atol=hidden_atol, rtol=hidden_rtol
+        "routing gradient", routing_m.grad.float(), routing_e.grad.float(), atol=routing_atol, rtol=routing_rtol
     )
     assert_close_with_error("fc2 gradient", fc2_m.grad.float(), fc2_e.grad.float(), atol=fc2_atol, rtol=fc2_rtol)
     assert_close_with_error(
@@ -761,8 +759,8 @@ def test_triton_split_and_merged_match_eager_swiglu_limit(swiglu_limit: float):
 def test_triton_split_and_merged_match_eager_production(shape: tuple[int, int, int, int, int], seed: int):
     kwargs = {}
     if not is_sm90_or_above():
-        kwargs["grad_hidden_atol"] = MOE_FUSED_PRODUCTION_PRE_SM90_GRAD_HIDDEN_ATOL
-        kwargs["grad_hidden_rtol"] = MOE_FUSED_PRODUCTION_PRE_SM90_GRAD_HIDDEN_RTOL
+        kwargs["grad_routing_atol"] = MOE_FUSED_PRODUCTION_PRE_SM90_GRAD_ROUTING_ATOL
+        kwargs["grad_routing_rtol"] = MOE_FUSED_PRODUCTION_PRE_SM90_GRAD_ROUTING_RTOL
     _run_fused_three_way("fused_triton", shape=shape, seed=seed, **kwargs)
 
 

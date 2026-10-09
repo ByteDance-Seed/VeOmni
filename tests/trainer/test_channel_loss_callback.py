@@ -210,14 +210,17 @@ def test_channel_loss_wrapper_forwards_original_call_unchanged():
 def test_channel_loss_extracts_fused_inputs_from_models_loss_partial():
     from veomni.models.loss_utils import ForCausalLMLoss
 
+    ce_calls = []
+
     def fake_ce(hidden_states, labels, weights, **kwargs):
+        ce_calls.append((hidden_states, weights))
         del labels, kwargs
         return hidden_states.sum() * 0 + weights.sum() * 0
 
     class DummyModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.loss_function = partial(ForCausalLMLoss, kernel=fake_ce)
+            self.loss_function = partial(ForCausalLMLoss, op=fake_ce)
 
     model = DummyModel()
     computer = ChannelLossComputer()
@@ -238,6 +241,8 @@ def test_channel_loss_extracts_fused_inputs_from_models_loss_partial():
                 weights=weights,
             )
 
+        assert len(ce_calls) == 1
+        assert ce_calls[0][1] is weights
         assert computer._result
         assert computer._result[0]["source_id"] == 0
         assert computer._result[0]["token_count"].item() == 2

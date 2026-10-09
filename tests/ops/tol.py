@@ -80,12 +80,13 @@ MOE_FUSED_SWIGLU_ATOL = 2e-2
 MOE_FUSED_SWIGLU_RTOL = 2e-2
 MOE_FUSED_GRAD_HIDDEN_ATOL = 5e-2
 MOE_FUSED_GRAD_HIDDEN_RTOL = 5e-2
-# Production-shape fused vs eager hidden/routing grads. SM90 (H20) routing
+# Production-shape fused vs eager routing grads only. SM90 (H20) routing
 # matches eager (max_abs=0). L20 CI failed allclose atol=rtol=5e-2 on
 # routing_m vs routing_e for (512, 128, 2048, 768, 8); dumped abs diffs
 # reached ~0.125. 2e-1 is ~1.5x that with room for the unprinted tail.
-MOE_FUSED_PRODUCTION_PRE_SM90_GRAD_HIDDEN_ATOL = 2e-1
-MOE_FUSED_PRODUCTION_PRE_SM90_GRAD_HIDDEN_RTOL = 2e-1
+# Hidden-state grads keep MOE_FUSED_GRAD_HIDDEN_*.
+MOE_FUSED_PRODUCTION_PRE_SM90_GRAD_ROUTING_ATOL = 2e-1
+MOE_FUSED_PRODUCTION_PRE_SM90_GRAD_ROUTING_RTOL = 2e-1
 MOE_FUSED_GRAD_FC1_ATOL = 3e-2
 MOE_FUSED_GRAD_FC1_RTOL = 3e-2
 MOE_FUSED_GRAD_FC2_ATOL = 1e-2
@@ -113,12 +114,13 @@ MOE_EP_PRE_SM90_GRAD_FC1_ATOL = 1.8e-2
 MOE_EP_PRE_SM90_GRAD_FC1_RTOL = 0.0
 MOE_EP_PRE_SM90_GRAD_FC2_ATOL = 1.2e-2
 MOE_EP_PRE_SM90_GRAD_FC2_RTOL = 0.0
-# EP hidden/routing grads vs eager. github/main compared fc1/fc2 only.
+# EP routing grads vs eager. github/main compared fc1/fc2 only.
 # L20 CI failed test_ep_vs_non_ep[256-8-1024-512-2-0-None] routing at the
 # generic fused hidden budget (5e-2): max_abs=0.078125 max_rel=0.81893.
-# 1.2e-1 is ~1.5x that measurement. SM90 keeps the fused 5e-2 scale.
-MOE_EP_PRE_SM90_GRAD_HIDDEN_ATOL = 1.2e-1
-MOE_EP_PRE_SM90_GRAD_HIDDEN_RTOL = 1.2e-1
+# 1.2e-1 is ~1.5x that measurement. SM90 routing and every hidden-state
+# grad keep the fused hidden budget.
+MOE_EP_PRE_SM90_GRAD_ROUTING_ATOL = 1.2e-1
+MOE_EP_PRE_SM90_GRAD_ROUTING_RTOL = 1.2e-1
 
 GDN_FUSED_ATOL = 2e-2
 GDN_FUSED_RTOL = 2e-2

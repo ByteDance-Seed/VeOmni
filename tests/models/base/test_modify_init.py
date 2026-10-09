@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """``modify_init`` extras stay at the function-body indent."""
 
@@ -53,6 +53,29 @@ def test_modify_init_appends_at_function_body_indent_not_trailing_if():
     assert handle_lines
     assert handle_lines[0].startswith("    self.veomni_attn")
     assert not handle_lines[0].startswith("        self.veomni_attn")
+
+
+def test_modify_init_keeps_upstream_init_decorators_once():
+    source = textwrap.dedent(
+        """
+        class Foo:
+            @deprecate_kwarg("device", version="5.18")
+            def __init__(self, device=None):
+                self.device = device
+        """
+    ).lstrip()
+    config = PatchConfig(source_module="mod", target_file="out.py")
+    config.modify_init("Foo", description="Bind handle")(_bind_handle)
+    generator = ModelingCodeGenerator(config)
+    generator.source_code = source
+    generator.source_lines = source.splitlines()
+    generator.source_ast = ast.parse(source)
+    generated = generator._generate_class_source(generator.source_ast.body[0], {})
+    assert generated.count('@deprecate_kwarg("device", version="5.18")') == 1
+    lines = generated.splitlines()
+    decorator_idx = next(i for i, line in enumerate(lines) if "@deprecate_kwarg" in line)
+    assert lines[decorator_idx - 1].strip() == "# [modified __init__] Bind handle"
+    assert lines[decorator_idx + 1].strip().startswith("def __init__")
 
 
 def test_exclude_from_output_strips_decorators_that_name_the_dropped_helper():

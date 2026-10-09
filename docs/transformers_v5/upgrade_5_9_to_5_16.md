@@ -181,7 +181,7 @@ existing MoE checkpoint layout conversions remain in the checkpoint layer.
 Upstream removed the `qk_head_dim != v_head_dim` value padding from each MLA
 model's `forward` and moved it into HF's `integrations/flash_attention.py`
 wrapper. VeOmni registers its own `veomni_flash_attention_*` implementations that
-replace that wrapper, so `veomni/ops/kernels/attention/flash.py` now carries the
+replace that wrapper, so `veomni/ops/kernels/attention/standard/flash.py` now carries the
 pad-and-crop itself; without it DeepSeek-V3/V4 training fails with
 `RuntimeError: v must have shape (total_k, num_heads_k, head_size)`. The padding
 is applied after the Ulysses all-to-all so the padded columns are not
@@ -213,7 +213,7 @@ VeOmni also registers `veomni_flash_attention_*` names, and those swallow
 `indices` into `**kwargs` — which would run *dense* attention with the DSA
 selection silently discarded. Two places now reject that: the patched GPU
 attention forward raises for any implementation that is not eager/sdpa/flash-mla,
-and `veomni/ops/kernels/attention/flash.py` refuses a non-`None` `indices`
+and `veomni/ops/kernels/attention/standard/flash.py` refuses a non-`None` `indices`
 outright. The second one is what covers the glm_moe_dsa **NPU** build, whose
 config does not patch the attention forward at all, and any future DSA family.
 

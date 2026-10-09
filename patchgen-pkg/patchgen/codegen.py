@@ -1180,12 +1180,9 @@ class ModelingCodeGenerator:
         )
         if init_node is None:
             raise CodegenError(f"modify_init({class_node.name!r}) requires an upstream __init__")
+        # Start at ``def``: the method splice keeps the upstream decorator lines.
         original = textwrap.dedent(
-            extract_source_segment(
-                self.source_lines,
-                get_node_start_line(init_node),
-                get_node_end_line(init_node, self.source_lines),
-            )
+            "\n".join(self.source_lines[init_node.lineno - 1 : get_node_end_line(init_node, self.source_lines)])
         )
         extras = extra_init_statements(patch)
         indent = function_body_indent(original)

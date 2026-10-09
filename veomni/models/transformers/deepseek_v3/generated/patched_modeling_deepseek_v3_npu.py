@@ -120,7 +120,6 @@ class DeepseekV3RMSNorm(nn.Module):
 class DeepseekV3RotaryEmbedding(nn.Module):
     # [modified __init__] Capture rotary freq impl at construct time
     @deprecate_kwarg("device", version="5.18")
-    @deprecate_kwarg("device", version="5.18")
     def __init__(self, config: DeepseekV3Config, device=None):
         super().__init__()
         self.max_seq_len_cached = config.max_position_embeddings

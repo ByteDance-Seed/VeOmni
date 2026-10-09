@@ -508,7 +508,7 @@ PLE 2D layout: rows=8 (ple), columns=8 (ple_fsdp), local=[V/8, E/8]
 | `veomni/distributed/parallel_plan.py` | Persistent complementary-shard metadata; construct/track 2D PLE DTensors. |
 | `veomni/distributed/parallel_state.py` | Accessor for the flattened `ple_fsdp × ple` group and stable mesh-coordinate mapping. |
 | `veomni/distributed/torch_parallelize.py` | Skip PLE `fully_shard`, propagate `ignored_params`, and exclude PLE from prefetch. |
-| `veomni/models/module_utils.py` | Placement-aware 2D safetensor streaming and already-local DTensor dispatch. |
+| `veomni/models/checkpoint/weights.py` | Placement-aware 2D safetensor streaming and already-local DTensor dispatch. |
 | `veomni/checkpoint/dcp_checkpointer.py` | Preserve persistent 2D DTensors instead of applying FSDP drop/restore. |
 | `veomni/optim/optimizer.py` | Classify persistent PLE DTensors into the `ple` optimizer bucket. |
 | `veomni/distributed/fsdp2/clip_grad_norm.py` | Verify two-axis norm reduction for persistent PLE shards. |

@@ -150,7 +150,7 @@ and `triton-ascend` on a mutually compatible release set.
 `npu_ascendc` is a second NPU backend for `chunk_gated_delta_rule` that delegates the heavy GDN
 compute to the external [`fla_npu`](https://github.com/flashserve/flash-linear-attention-npu)
 package (registered as `torch.ops.npu.*` fused ops); only the Triton glue stays vendored under
-`_ascend/triton_core`. It coexists with `npu` (pure vendored Triton), which remains the fallback.
+`veomni/ops/kernels/gated_delta_rule/vendor/triton_core`. It coexists with `npu` (pure vendored Triton), which remains the fallback.
 Set only `chunk_gated_delta_rule` to `npu_ascendc`; keep `rms_norm_gated` / `causal_conv1d` on `npu`:
 
 ```yaml
