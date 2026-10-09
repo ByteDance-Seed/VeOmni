@@ -2987,3 +2987,69 @@ def test_capture_forward_failure_discards_observations_without_collectives(monke
     assert not computer._capture_errors
     assert not computer._observer_devices
     assert computer._capture_sp_descriptor is None
+
+
+@pytest.mark.parametrize("fail_observer", [False, True])
+def test_chunk_observer_with_offload_hooks_preserves_loss_and_gradients(monkeypatch, fail_observer):
+    from torch.autograd.graph import saved_tensors_hooks
+
+    import veomni.ops.kernels.cross_entropy.chunk_loss as chunk_module
+    from veomni.utils.loss_observer import capture_chunk_loss_per_token
+
+    monkeypatch.setattr(chunk_module, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+    torch.manual_seed(319)
+    hidden = torch.randn(2, 11, 64, requires_grad=True)
+    weight = torch.randn(19, 64, requires_grad=True)
+    labels = torch.randint(0, 19, (2, 11))
+    labels[:, 2:6] = -100
+    ref_hidden = hidden.detach().clone().requires_grad_()
+    ref_weight = weight.detach().clone().requires_grad_()
+    reference, _ = chunk_module.chunk_loss_function(ref_hidden, ref_weight, labels, chunk_size=3, vocab_size=19)
+    (reference * 0.37).backward()
+    expected_tokens = (
+        torch.nn.functional.cross_entropy(
+            torch.nn.functional.linear(hidden[:, :-1], weight).reshape(-1, 19),
+            labels[:, 1:].reshape(-1),
+            reduction="none",
+        )
+        .reshape(2, 10)
+        .detach()
+    )
+
+    original_ce = torch.nn.functional.cross_entropy
+    original_linear = torch.nn.functional.linear
+    projections, packed, unpacked, observed, errors = [], [], [], [], []
+
+    def ce(*args, **kwargs):
+        if fail_observer and kwargs.get("reduction") == "none":
+            raise RuntimeError("observer-only failure")
+        return original_ce(*args, **kwargs)
+
+    def linear(*args, **kwargs):
+        projections.append(1)
+        return original_linear(*args, **kwargs)
+
+    def pack(tensor):
+        packed.append(tensor.shape)
+        return tensor.detach().cpu().clone()
+
+    def unpack(tensor):
+        unpacked.append(tensor.shape)
+        return tensor
+
+    monkeypatch.setattr(torch.nn.functional, "cross_entropy", ce)
+    monkeypatch.setattr(torch.nn.functional, "linear", linear)
+    with capture_chunk_loss_per_token(observed.append, errors.append), saved_tensors_hooks(pack, unpack):
+        actual, _ = chunk_module.chunk_loss_function(hidden, weight, labels, chunk_size=3, vocab_size=19)
+        (actual * 0.37).backward()
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    torch.testing.assert_close(hidden.grad, ref_hidden.grad, rtol=0, atol=0)
+    torch.testing.assert_close(weight.grad, ref_weight.grad, rtol=0, atol=0)
+    assert len(projections) == 4  # observer reuses the main projection
+    assert packed == unpacked == [hidden[:, :-1].shape, weight.shape]
+    if fail_observer:
+        assert not observed
+        assert len(errors) == 1 and "observer-only failure" in errors[0]
+    else:
+        assert not errors and len(observed) == 1
+        torch.testing.assert_close(observed[0], expected_tokens)
