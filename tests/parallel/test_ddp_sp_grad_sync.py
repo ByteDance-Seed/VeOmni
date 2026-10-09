@@ -79,7 +79,7 @@ def _token_loss(outputs: torch.Tensor) -> torch.Tensor:
 
 
 def main() -> None:
-    from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
+    from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm, veomni_compute_grad_norm
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, get_parallel_state
     from veomni.distributed.sequence_parallel.loss import reduce_sequence_parallel_loss
     from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -171,6 +171,17 @@ def main() -> None:
         _token_loss(reference(micro_batch)).backward()
     reference_grads = [param.grad.detach().clone() for param in reference.parameters()]
     reference_norm = torch.nn.utils.clip_grad_norm_(reference.parameters(), MAX_GRAD_NORM)
+
+    # Measuring first averages the grads over ``dp_sp`` once already; the clip below
+    # averages again, which must leave the already-synced grads where they are.
+    unclipped_norm = veomni_compute_grad_norm(model)
+    torch.testing.assert_close(
+        unclipped_norm,
+        reference_norm.item(),
+        rtol=1e-4,
+        atol=1e-6,
+        msg=lambda message: f"[rank {rank}] unclipped grad norm differs from the sp=1 reference: {message}",
+    )
 
     grad_norm = veomni_clip_grad_norm(model, MAX_GRAD_NORM)
 

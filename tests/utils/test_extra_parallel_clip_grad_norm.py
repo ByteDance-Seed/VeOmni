@@ -14,7 +14,7 @@ from packaging.version import Version
 from torch.distributed._tensor import DTensor, Shard
 
 from veomni.arguments import ModelArguments, TrainingArguments, parse_args
-from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
+from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm, veomni_compute_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -263,6 +263,15 @@ def main():
             + 64 * 16
             + (64 * 16 * 32) * (1 / ps.extra_parallel_sizes["ep"] ** 2)
         )
+        unclipped_grad_norm = veomni_compute_grad_norm(model)
+        torch.testing.assert_close(unclipped_grad_norm, expected=expected_total_grad_norm, atol=1e-6, rtol=1e-6)
+        check_model_param_grad_one_by_one(
+            expected_grad=expected,
+            ep_expected_grad=ep_expected,
+            emb_expected_grad=emb_expected,
+            msg="After measuring the unclipped norm",
+        )
+
         total_grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
 
         # check whether total grad norm meets our expectation

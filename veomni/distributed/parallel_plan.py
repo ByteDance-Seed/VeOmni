@@ -157,6 +157,8 @@ class ParallelPlan:
                             para_name=para, para_fsdp_mesh=para_fsdp_mesh, placement=Replicate(), fqn=fqn
                         )
 
+        self.post_shard(model)
+
         for fqn, param in model.named_parameters():
             assert hasattr(param, "spec_info"), f"Internal Error: {fqn=} with {param=} is omitted"
 
@@ -177,6 +179,16 @@ class ParallelPlan:
 
         model._fqn2spec_info = fqn2spec_info
         return fqn2spec_info
+
+    def post_shard(self, model: nn.Module) -> None:
+        """Hook run after sharding, before the completeness check.
+
+        No-op by default. Sharding rebinds each matched parameter to a fresh object,
+        which breaks any tie that reaches outside the matched FQN. A model that shares
+        parameters across submodules restores those ties here: doing it after ``apply``
+        returns is too late, because the check below would already have tripped over
+        the orphaned copy, which never got a ``spec_info``.
+        """
 
     def _get_persistent_fsdp_shard_dim(self, para_name: str, parameter_fqn: str) -> Optional[int]:
         """Return the persistent complementary shard dim for ``parameter_fqn``."""

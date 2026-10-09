@@ -65,3 +65,44 @@ class ReduceLoss(torch.autograd.Function):
 
 def reduce_sequence_parallel_loss(loss: torch.Tensor, num_valid_tokens: torch.Tensor, group=None) -> torch.Tensor:
     return ReduceLoss.apply(loss, num_valid_tokens, group)
+
+
+class SumOverShards(torch.autograd.Function):
+    """Report the whole group's sum; leave each rank differentiating only its own part.
+
+    For a quantity that is a sum over tokens -- a loss sum, or a per-expert
+    statistic -- the shards already add up to the unsharded value, so no
+    reweighting is needed, only the addition.
+
+    The gradient is the part that is not free. FSDP shards over ``dp_shard_sp``
+    and *averages* over it, so ``sp_size`` ranks each holding one shard's
+    derivative would deliver ``1/sp_size`` of the total. Scaling here cancels
+    that, which is the same factor ``reduce_sequence_parallel_loss`` applies to a
+    token-mean loss.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, group, sp_size: int) -> torch.Tensor:
+        ctx.sp_size = sp_size
+        total = tensor.detach().clone()
+        dist.all_reduce(total, op=dist.ReduceOp.SUM, group=group)
+        return total
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output * ctx.sp_size, None, None
+
+
+def sum_over_ulysses_shards(tensor: torch.Tensor) -> torch.Tensor:
+    """``SumOverShards`` over the Ulysses group; the identity when Ulysses is off.
+
+    Reads the ``ulysses`` mesh dimension, not ``sp``: ``sp`` is a flattened
+    dimension that only resolves on the thread that flattened it, so it fails in
+    a backward replayed by gradient checkpointing.
+    """
+    from ..parallel_state import get_parallel_state
+
+    state = get_parallel_state()
+    if not state.ulysses_enabled:
+        return tensor
+    return SumOverShards.apply(tensor, state.ulysses_group, state.ulysses_size)
