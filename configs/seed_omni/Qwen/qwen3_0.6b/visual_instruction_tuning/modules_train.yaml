@@ -15,5 +15,3 @@ qwen3_text_encoder:
     enable_image: true
 qwen3_llm:
   model_path: qwen3_llm
-  model_config:
-    freeze: true
