@@ -248,8 +248,10 @@ def flash_attention_forward(
     if getattr(cp_state, "cp_enabled", False) and not skip_ulysses:
         if cp_state.cp_layout != "zigzag":
             raise NotImplementedError("USP flash attention requires cp_layout='zigzag'.")
-        if not is_causal or attention_mask is not None:
-            raise NotImplementedError("USP requires causal attention without an explicit attention mask.")
+        # Causal attention runs the zig-zag ring (text); bidirectional attention runs the
+        # ViT ring, which assumes the per-vit-seq layout of ``ring_attention.layout.vit_usp_slice``.
+        if attention_mask is not None:
+            raise NotImplementedError("USP does not support an explicit attention mask.")
         if dropout or sliding_window is not None or softcap not in (None, 0.0) or kwargs.get("s_aux") is not None:
             raise NotImplementedError(
                 "USP does not support attention dropout, sliding windows, softcap, or attention sinks."
@@ -357,6 +359,7 @@ def flash_attention_forward(
             value,
             group=cp_state.cp_group,
             cp_size=cp_state.cp_size,
+            ulysses_size=cp_state.ulysses_size,
             device_type=cp_state.device_type,
             cu_seqlens=kwargs.get("cu_seq_lens_q"),
             attention_mask=attention_mask,

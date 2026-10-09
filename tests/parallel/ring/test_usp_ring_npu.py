@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ascend numerical tests for NPU zig-zag Ring Attention and USP routing."""
+"""Ascend numerical tests for NPU zig-zag / bidirectional (ViT) Ring Attention and USP routing."""
 
 import pytest
 import torch
@@ -24,10 +24,16 @@ from torch.testing._internal.common_utils import run_tests
 from veomni.distributed import parallel_state as PS
 from veomni.distributed.sequence_parallel.ring_attention.layout import (
     local_cu_seqlens,
+    vit_cp_cu_seqlens,
+    vit_usp_slice,
     zigzag_reorder,
     zigzag_reorder_packed,
 )
 from veomni.distributed.sequence_parallel.ring_attention.npu import (
+    _npu_fa_backward,
+    _npu_fa_forward,
+    ring_npu_flash_attn_varlen_func,
+    update_npu_out_and_softmax_stats,
     zigzag_ring_npu_flash_attn_func,
     zigzag_ring_npu_flash_attn_varlen_func,
 )
@@ -41,15 +47,18 @@ _ATOL = 8e-2
 _RTOL = 6e-2
 
 
-def _dense_reference(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
+def _dense_reference(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float, causal: bool = True
+) -> torch.Tensor:
     dtype = q.dtype
     q = q.float().transpose(1, 2)
     k = k.float().transpose(1, 2)
     v = v.float().transpose(1, 2)
     scores = torch.matmul(q, k.transpose(-1, -2)) * scale
-    seq = scores.shape[-1]
-    mask = torch.triu(torch.ones((seq, seq), dtype=torch.bool, device=scores.device), diagonal=1)
-    scores = scores.masked_fill(mask, float("-inf"))
+    if causal:
+        seq = scores.shape[-1]
+        mask = torch.triu(torch.ones((seq, seq), dtype=torch.bool, device=scores.device), diagonal=1)
+        scores = scores.masked_fill(mask, float("-inf"))
     return torch.matmul(torch.softmax(scores, dim=-1), v).transpose(1, 2).to(dtype).contiguous()
 
 
@@ -59,6 +68,7 @@ def _varlen_reference(
     v: torch.Tensor,
     cu_seqlens: torch.Tensor,
     scale: float,
+    causal: bool = True,
 ) -> torch.Tensor:
     outputs = []
     cu = [int(value) for value in cu_seqlens.tolist()]
@@ -69,6 +79,7 @@ def _varlen_reference(
                 k[start:end].unsqueeze(0),
                 v[start:end].unsqueeze(0),
                 scale,
+                causal,
             ).squeeze(0)
         )
     return torch.cat(outputs, dim=0)
@@ -174,6 +185,115 @@ class NPUZigzagRingTest(MultiProcessTestCase):
         torch.testing.assert_close(v_local.grad, self._shard_varlen(v_ref.grad, cu), atol=_ATOL, rtol=_RTOL)
 
 
+# ── zero-length segments in npu_fusion_attention (bidirectional ViT ring) ─────
+# The bidirectional ring pairs per-rank vit shards; a shard is empty on some rank
+# when a vit seq has fewer merger units than cp ranks, so the TND offsets contain
+# repeated endpoints (including a leading 0). These single-card probes pin the
+# torch_npu behaviour the ring relies on.
+@pytest.mark.parametrize("head_dim", [72, 128])
+def test_npu_fusion_attention_zero_length_segments(head_dim):
+    device = get_device_type()
+    heads, scale = 4, head_dim**-0.5
+    # seg0: empty Q, 4 K rows | seg1: 8 Q rows, empty K | seg2: 4 Q rows, 8 K rows
+    cu_q, cu_k = [0, 0, 8, 12], [0, 4, 4, 12]
+    q = torch.randn(12, heads, head_dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    dout = torch.randn_like(q)
+    kwargs = dict(input_layout="TND", softmax_scale=scale, dropout_p=0.0, causal=False, softmax_layout="TND")
+
+    out, smax, ssum, rng = _npu_fa_forward(q, k, v, actual_seq_qlen=cu_q, actual_seq_kvlen=cu_k, **kwargs)
+    assert torch.isfinite(out).all()
+    assert (ssum[0:8] == 0).all(), "rows without keys must report softmax_sum == 0"
+    assert not torch.isposinf(smax[0:8]).any(), "rows without keys must not report softmax_max == +inf"
+    scores = torch.einsum("qnd,knd->nqk", q[8:12].float(), k[4:12].float()) * scale
+    expected = torch.einsum("nqk,knd->qnd", torch.softmax(scores, -1), v[4:12].float()).to(out.dtype)
+    torch.testing.assert_close(out[8:12], expected, atol=_ATOL, rtol=_RTOL)
+
+    # Merging an empty-key block must leave previously accumulated rows unchanged.
+    prev_out, prev_max, prev_sum = update_npu_out_and_softmax_stats(
+        None, None, None, *_npu_fa_forward(q, k, v, actual_seq_qlen=[0, 12], actual_seq_kvlen=[0, 12], **kwargs)[:3]
+    )
+    merged_out, _, _ = update_npu_out_and_softmax_stats(prev_out.clone(), prev_max, prev_sum, out, smax, ssum)
+    assert torch.isfinite(merged_out).all()
+    torch.testing.assert_close(merged_out[0:8], prev_out[0:8])
+
+    smax_rows, ssum_rows = smax[..., 0], ssum[..., 0]
+    dq, dk, dv = _npu_fa_backward(
+        dout, q, k, v, out, smax_rows, ssum_rows, rng_state=rng, actual_seq_qlen=cu_q, actual_seq_kvlen=cu_k, **kwargs
+    )
+    for grad in (dq, dk, dv):
+        assert torch.isfinite(grad).all()
+    assert (dq[0:8] == 0).all(), "queries without keys must get zero dq"
+    assert (dk[0:4] == 0).all() and (dv[0:4] == 0).all(), "keys without queries must get zero dk/dv"
+
+
+# ── bidirectional (ViT) packed ring ───────────────────────────────────────────
+class _NPUBidirectionalRingTest(MultiProcessTestCase):
+    def setUp(self):
+        super().setUp()
+        self._spawn_processes()
+
+    def _run_case(self):
+        store = dist.FileStore(self.file_name, self.world_size)
+        get_torch_device().set_device(self.rank)
+        dist.init_process_group(get_dist_comm_backend(), store=store, rank=self.rank, world_size=self.world_size)
+        group = dist.distributed_c10d._get_default_group()
+        device = get_device_type()
+        heads, dim = 4, 72  # Qwen3-VL ViT head_dim
+        # Two vit seqs have fewer merger units than ranks -> empty shards mid-cu.
+        vit_seqlens = [4, 360, 8, 124]
+        total = sum(vit_seqlens)
+        scale = dim**-0.5
+        global_cu = torch.tensor([0, *torch.tensor(vit_seqlens).cumsum(0).tolist()])
+
+        q = torch.randn(total, heads, dim, device=device, dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        grad = torch.randn_like(q)
+        for tensor in (q, k, v, grad):
+            dist.broadcast(tensor, 0)
+
+        q_ref, k_ref, v_ref = (t.clone().requires_grad_(True) for t in (q, k, v))
+        out_ref = _varlen_reference(q_ref, k_ref, v_ref, global_cu, scale, causal=False)
+        out_ref.backward(grad)
+
+        def shard(t, pad_value=0):
+            return vit_usp_slice(t, vit_seqlens, 0, self.world_size, self.rank, 1, 0, pad_value=pad_value)
+
+        cu_per_rank = [vit_cp_cu_seqlens(global_cu, self.world_size, c, 1) for c in range(self.world_size)]
+        q_local, k_local, v_local = (shard(t).requires_grad_(True) for t in (q, k, v))
+        out = ring_npu_flash_attn_varlen_func(q_local, k_local, v_local, cu_per_rank, softmax_scale=scale, group=group)
+        out.backward(shard(grad))
+
+        rows = shard(torch.arange(total, device=device), pad_value=-1)
+        real = rows >= 0
+        torch.testing.assert_close(out[real], out_ref.detach()[rows[real]], atol=_ATOL, rtol=_RTOL)
+        torch.testing.assert_close(q_local.grad[real], q_ref.grad[rows[real]], atol=_ATOL, rtol=_RTOL)
+        torch.testing.assert_close(k_local.grad[real], k_ref.grad[rows[real]], atol=_ATOL, rtol=_RTOL)
+        torch.testing.assert_close(v_local.grad[real], v_ref.grad[rows[real]], atol=_ATOL, rtol=_RTOL)
+
+
+class NPUBidirectionalRingWorld2Test(_NPUBidirectionalRingTest):
+    @property
+    def world_size(self):
+        return 2
+
+    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
+    def test_bidirectional_ring_matches_full_attention(self):
+        self._run_case()
+
+
+class NPUBidirectionalRingWorld4Test(_NPUBidirectionalRingTest):
+    @property
+    def world_size(self):
+        return 4
+
+    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    def test_bidirectional_ring_matches_full_attention(self):
+        self._run_case()
+
+
 class _AttentionModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -274,6 +394,58 @@ class NPUUSPAttentionTest(MultiProcessTestCase):
         )
         expected = self._usp_slice(reference, mesh, cu if packed else None)
         torch.testing.assert_close(out, expected, atol=_ATOL, rtol=_RTOL)
+
+    def _run_bidirectional_attention_case(self):
+        from veomni.ops.kernels.attention import flash_attention_forward
+
+        mesh = self._init()
+        device = get_device_type()
+        cp_rank, ulysses_rank = mesh.get_local_rank("cp"), mesh.get_local_rank("ulysses")
+        heads, dim = 4, 72
+        vit_seqlens = [4, 360, 8, 124]
+        total = sum(vit_seqlens)
+        scale = dim**-0.5
+        # ViT on NPU keeps cu_seqlens on the host (Patch.5 of the Qwen3-VL ViT forward).
+        global_cu = torch.tensor([0, *torch.tensor(vit_seqlens).cumsum(0).tolist()], dtype=torch.int32)
+        q = torch.randn(1, heads, total, dim, device=device, dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        for tensor in (q, k, v):
+            dist.broadcast(tensor, 0)
+
+        def shard(full, dim_, pad_value=0):
+            return vit_usp_slice(
+                full, vit_seqlens, dim_, self.cp_size, cp_rank, self.ulysses_size, ulysses_rank, pad_value=pad_value
+            )
+
+        reference = _varlen_reference(
+            q.transpose(1, 2).squeeze(0),
+            k.transpose(1, 2).squeeze(0),
+            v.transpose(1, 2).squeeze(0),
+            global_cu,
+            scale,
+            causal=False,
+        )
+        module = _AttentionModule().to(device)
+        module.is_causal = False
+        out, _ = flash_attention_forward(
+            module,
+            shard(q, 2),
+            shard(k, 2),
+            shard(v, 2),
+            attention_mask=None,
+            scaling=scale,
+            cu_seq_lens_q=global_cu,
+            cu_seq_lens_k=global_cu,
+            is_causal=False,
+        )
+        rows = shard(torch.arange(total, device=device), 0, pad_value=-1)
+        real = rows >= 0
+        torch.testing.assert_close(out.squeeze(0)[real], reference[rows[real]], atol=_ATOL, rtol=_RTOL)
+
+    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    def test_unified_attention_bidirectional_routes_to_npu_vit_ring(self):
+        self._run_bidirectional_attention_case()
 
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_unified_attention_dense_routes_to_npu_ring(self):

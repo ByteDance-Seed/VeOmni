@@ -35,7 +35,7 @@ the ``cp`` group on the resulting shard (see
 
 import inspect
 import os
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor
@@ -112,6 +112,7 @@ __all__ = [
     "update_out_and_lse",
     "forward",
     "packed_forward",
+    "bidirectional_packed_forward",
 ]
 
 
@@ -949,4 +950,24 @@ def packed_forward(
         softmax_scale=softmax_scale,
         causal=causal,
         group=group,
+    )
+
+
+def bidirectional_packed_forward(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_per_rank: Sequence[Sequence[int]],
+    softmax_scale: Optional[float] = None,
+    group: Optional[ProcessGroup] = None,
+    dropout_p: float = 0.0,
+) -> Tensor:
+    """Bidirectional (ViT) Ring Attention is not implemented for CUDA yet.
+
+    Per-rank vit shards can be empty, and FlashAttention returns ``lse=+inf`` for query rows with no
+    key in a varlen segment, which the online-softmax merge would turn into a silent wrong result.
+    """
+    raise NotImplementedError(
+        "bidirectional (ViT) ring attention is only implemented for NPU; the FlashAttention backend "
+        "needs special handling for zero-length key/value segments"
     )
