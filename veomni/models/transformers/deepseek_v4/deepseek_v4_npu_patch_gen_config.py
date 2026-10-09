@@ -18,7 +18,7 @@ Regen command:
 patchgen veomni.models.transformers.deepseek_v4.deepseek_v4_npu_patch_gen_config -o veomni/models/transformers/deepseek_v4/generated --diff
 
 NPU reuses every GPU structural and numerics patch verbatim (RMSNorm/RoPE/SwiGLU
-dispatch, mHC dispatch, packed attention, indexer, model forward, fused-MoE
+dispatch, mHC dispatch, packed attention, model forward, fused-MoE
 experts, fused-CE ForCausalLM.forward, parallel plan) by import rather than
 duplication, mirroring the ``deepseek_v3`` GPU/NPU pair. This is safe rather
 than merely convenient:
@@ -28,14 +28,14 @@ than merely convenient:
   is bound to a non-eager implementation; Liger requires CUDA, so these fall
   straight through to the shared eager arithmetic on NPU without any change
   needed here.
-- ``DeepseekV4Indexer.forward`` / ``eager_attention_forward`` gate their
+- ``eager_attention_forward`` gates its
   TileLang fast paths behind ``.is_cuda`` (and SM90 checks inside
   ``veomni.ops.kernels.deepseek_v4``). The module-level import of
   ``sparse_attn_tilelang`` / ``v4_lighting_indexer`` is lazy-safe on NPU:
   ``veomni/ops/kernels/deepseek_v4/__init__.py`` only imports TileLang inside
   the wrapper *bodies*, guarded by ``_require_tilelang_sm90()``, which is
-  never reached because the ``.is_cuda`` condition short-circuits first. Both
-  functions fall straight through to the eager PyTorch computation on NPU.
+  never reached because the ``.is_cuda`` condition short-circuits first. It
+  falls straight through to the eager PyTorch computation on NPU.
 - The mHC pre/post/head patches are OpSlot-guarded
   (``veomni_mhc_{pre,post,head}``); ``mhc_implementation`` defaults to
   ``"eager"`` (see ``OpsImplementationConfig.mhc_implementation`` —
@@ -61,6 +61,8 @@ for why they are scoped to this file rather than shared):
 2. ``DeepseekV4HCACompressor`` / ``DeepseekV4CSACompressor`` ``forward`` —
    anchor gradient participation for packed micro-batches with zero
    compression windows.
+3. ``DeepseekV4Indexer.forward`` — dispatch the CANN Lightning Indexer under
+   the NPU-only execution contract while retaining eager/TileLang compatibility paths.
 
 Intentionally NOT patched (same rationale as the GPU config, restated here so
 NPU readers don't have to cross-reference):
@@ -109,7 +111,6 @@ from .deepseek_v4_gpu_patch_gen_config import (
     deepseek_v4_hash_router_forward_patched,
     deepseek_v4_hyper_connection_forward_patched,
     deepseek_v4_hyper_head_forward_patched,
-    deepseek_v4_indexer_forward_patched,
     deepseek_v4_mlp_forward_patched,
     deepseek_v4_model_forward_patched,
     deepseek_v4_rms_norm_forward_patched,
@@ -123,6 +124,349 @@ from .deepseek_v4_gpu_patch_gen_config import (
     veomni_qat_fake_quant_kv,
     veomni_qat_linear,
 )
+
+
+def deepseek_v4_indexer_forward_npu_patched(
+    self,
+    hidden_states: torch.Tensor,
+    q_residual: torch.Tensor,
+    position_ids: torch.Tensor,
+    past_key_values: Cache | None,
+    layer_idx: int,
+    packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
+    packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
+    build_indexer_loss: bool = False,
+) -> torch.LongTensor | tuple[torch.LongTensor, torch.Tensor]:
+    if (packed_sequence_slices is None) != (packed_compression_metadata is None):
+        raise ValueError("Packed sequence slices and compression metadata must be provided together")
+
+    # --- Patch.2 ---
+    # The indexer trains on its own KL alone (DeepSeek-V3.2 §2.1: "we detach the
+    # indexer input from the computational graph for separate optimization"). Until
+    # the scores started coming back out of here the graph was severed only by
+    # accident, because this forward returned integer indices, which carry no
+    # gradient; from here on this detach is the only thing keeping the auxiliary
+    # objective from reaching the language-modelling one.
+    #
+    # ``build_indexer_loss`` arrives from ``DeepseekV4Attention.forward``, which owns
+    # the model config and evaluated ``_builds_indexer_kl`` once for this layer. This
+    # module keeps only scalars off the config it was constructed with, and deriving
+    # the answer a second time here is what would let the detach, the return arity and
+    # the compressor's unpacking disagree inside a single call.
+    if build_indexer_loss:
+        hidden_states = hidden_states.detach()
+        q_residual = q_residual.detach()
+    # --- Patch.2 ---
+
+    batch, seq_len, _ = hidden_states.shape
+    cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
+    kv = self.kv_proj(hidden_states)
+    gate = self.gate_proj(hidden_states)
+
+    # --- Patch.2 ---
+    # Under context parallelism the queries arrive already sharded, but a top-k
+    # value names a slot in the enclosing CSA compressor's compressed KV, which is
+    # replicated. So the compressed *keys* have to stay global, and the indexer
+    # runs the same own-your-windows-then-all-gather compression its compressor
+    # does -- it cannot reuse that result, because it summarises the same windows
+    # through its own projections at ``index_head_dim``. Only the query axis is
+    # local, and ``query_offset`` is what keeps a local query row addressing its
+    # absolute position.
+    parallel_state = get_parallel_state()
+    cp_enabled = parallel_state.cp_enabled and cache_layer is None
+    query_offset = 0
+    if cp_enabled:
+        cp_group = parallel_state.cp_group
+        cp_rank = parallel_state.cp_rank
+        local_seq_len = seq_len
+        rate = self.compress_rate
+        query_offset = cp_rank * local_seq_len
+        shard = plan_compressor_shard(
+            role="DeepSeek V4 Lightning Indexer",
+            rate=rate,
+            local_seq_len=local_seq_len,
+            cp_rank=cp_rank,
+            cp_size=parallel_state.cp_size,
+            packed_compression_metadata=packed_compression_metadata,
+            device=kv.device,
+        )
+        # Every guard is above this line, so no rank enters a collective while its
+        # peers are still deciding whether to raise.
+        kv, gate = exchange_compressor_halos(kv, gate, rate, cp_group)
+
+    # The caller hands over the *global* packed metadata alongside a local shard,
+    # exactly as the attention forward hands it to the compressors: only the module
+    # holding the hidden states knows they are one shard, so only it can shard the
+    # metadata. Both the compression below and the per-query ranges further down
+    # read the sharded copy.
+    rate_metadata = None
+    if cache_layer is None and packed_compression_metadata is not None:
+        rate_metadata = packed_compression_metadata[self.compress_rate]
+        if cp_enabled:
+            rate_metadata = shard_packed_compression_metadata(
+                rate_metadata,
+                window_begin=shard.begin,
+                window_end=shard.end,
+                local_seq_len=local_seq_len,
+                cp_rank=cp_rank,
+                halo=rate,
+            )
+    # --- Patch.2 ---
+
+    prior_kv = prior_gate = None
+    if rate_metadata is not None:
+        compressed = compress_packed_windows(
+            kv,
+            gate,
+            self.position_bias,
+            self.head_dim,
+            self.compress_rate,
+            self.kv_norm,
+            self.rotary_emb,
+            self.rope_layer_type,
+            position_ids,
+            rate_metadata,
+            overlap=True,
+            apply_rope=apply_rotary_pos_emb,
+        )
+        chunk_kv = chunk_gate = None
+        first_window_position = 0
+    elif cp_enabled:
+        # This rank's own windows, out of the haloed buffer in window order.
+        # Mirrors the CSA compressor, which windows the same tokens at the model
+        # head dim.
+        window_indices, first_window_position = local_window_token_indices(
+            shard, rate=rate, local_seq_len=local_seq_len, cp_rank=cp_rank, device=kv.device
+        )
+        flat_indices = window_indices.reshape(-1)
+        chunk_kv, chunk_gate = kv[:, flat_indices], gate[:, flat_indices]
+        if first_window_position >= rate:
+            # The window before the first owned one, read out of the left halo. It
+            # fills the very slots the decode path fills from the cache. Global
+            # window 0 has no predecessor, so rank 0 leaves that slot at zero-kv /
+            # -inf-gate and never reads the halo's zeros.
+            previous_indices = window_indices[0] - rate
+            prior_kv = kv[:, previous_indices, : self.head_dim]
+            prior_gate = gate[:, previous_indices, : self.head_dim] + self.position_bias[:, : self.head_dim].to(
+                gate.dtype
+            )
+    elif cache_layer is None:
+        usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
+        chunk_kv, chunk_gate, first_window_position = kv[:, :usable], gate[:, :usable], 0
+    else:
+        chunk_kv, chunk_gate, first_window_position = cache_layer.store_compression_weights("indexer", kv, gate)
+
+    if chunk_kv is None:
+        pass  # The packed branch above already produced ``compressed``.
+    elif chunk_kv.shape[1] > 0:
+        n_windows = chunk_kv.shape[1] // self.compress_rate
+        ratio = self.compress_rate
+        chunk_kv = chunk_kv.view(batch, n_windows, ratio, -1)
+        chunk_gate = chunk_gate.view(batch, n_windows, ratio, -1) + self.position_bias.to(chunk_gate.dtype)
+
+        new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, self.head_dim))
+        new_gate = chunk_gate.new_full((batch, n_windows, 2 * ratio, self.head_dim), float("-inf"))
+        new_kv[:, :, ratio:] = chunk_kv[..., self.head_dim :]
+        new_gate[:, :, ratio:] = chunk_gate[..., self.head_dim :]
+        if n_windows > 1:
+            new_kv[:, 1:, :ratio] = chunk_kv[:, :-1, :, : self.head_dim]
+            new_gate[:, 1:, :ratio] = chunk_gate[:, :-1, :, : self.head_dim]
+        if cache_layer is not None:
+            prior_kv, prior_gate = cache_layer.update_overlap_state("indexer", chunk_kv, chunk_gate, self.head_dim)
+        if prior_kv is not None:
+            new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
+            new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
+
+        # See the HCA compressor above: `sum` needs an explicit `dtype` under autocast.
+        compressed = self.kv_norm(
+            (new_kv * new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype))
+            .sum(dim=2, dtype=torch.float32)
+            .to(new_kv.dtype)
+        )
+        positions = torch.arange(n_windows, device=compressed.device)
+        positions = positions * self.compress_rate + first_window_position
+        positions = positions.unsqueeze(0).expand(batch, -1)
+        cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
+        compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+    else:
+        compressed = empty_compressed_rows(chunk_kv, chunk_gate, self.head_dim)
+
+    if cp_enabled:
+        compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
+    # Covers the packed, windowed and empty branches above, all of which leave
+    # `compressed` in the form the indexer's K cache holds.
+    compressed = veomni_qat_fake_quant_act(compressed)
+    compressed_kv = compressed if cache_layer is None else cache_layer.update_compressor_states("indexer", compressed)
+
+    cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
+    q = veomni_qat_linear(self.q_b_proj, q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
+    q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
+    # Both sides of the index logits are rounded, so Q is quantized like K --
+    # in contrast to the main attention, whose Q stays BF16.
+    q = veomni_qat_fake_quant_act(q)
+    # `weights_proj` stays unquantized: it produces one score per head, so its
+    # [index_n_heads, hidden_size] weight has too few rows to tile at 128 in the
+    # first place, and inference keeps it BF16.
+    weights = self.scorer.weights_proj(hidden_states).float() * (
+        self.scorer.weights_scaling * self.scorer.softmax_scale
+    )
+    compressed_len = compressed_kv.shape[1]
+    top_k = min(self.index_topk, compressed_len)
+
+    # --- Patch.1 ---
+    indexer_implementation = veomni_dsa_indexer_implementation.value
+    if indexer_implementation not in {"eager", "npu", "tilelang"}:
+        raise ValueError(
+            "DeepSeek-V4 does not support "
+            f"dsa_indexer_implementation={indexer_implementation!r}; expected 'eager', 'npu' or 'tilelang'"
+        )
+    # A local query row ``i`` is global row ``query_offset + i``; off the context
+    # parallel path ``query_offset`` is zero and this is the arange it always was.
+    canonical_positions = (
+        (torch.arange(seq_len, device=position_ids.device) + query_offset).unsqueeze(0).expand_as(position_ids)
+    )
+    packed_ranges = None if rate_metadata is None else packed_compressed_causal_ranges(rate_metadata)
+    single_full_sequence = packed_sequence_slices is None or (
+        len(packed_sequence_slices) == 1
+        and packed_sequence_slices[0][0] == 0
+        and packed_sequence_slices[0][1] == seq_len
+    )
+    use_npu = (
+        indexer_implementation == "npu"
+        and hidden_states.device.type == "npu"
+        and cache_layer is None
+        and not cp_enabled
+        and not parallel_state.ulysses_enabled
+        and single_full_sequence
+        and compressed_len > 0
+        and torch.equal(position_ids, canonical_positions)
+    )
+    if indexer_implementation == "npu" and not use_npu and compressed_len > 0:
+        raise ValueError(
+            "dsa_indexer_implementation='npu' was requested outside the fused Lightning Indexer "
+            "contract (training/prefill, one full sequence with canonical positions, no SP/CP)"
+        )
+    if use_npu:
+        from veomni.ops.kernels.deepseek_v4.npu_lightning_indexer import npu_lightning_indexer
+
+        top_k_indices, _ = npu_lightning_indexer(q, compressed_kv, weights, top_k, compress_rate=self.compress_rate)
+        return top_k_indices.to(torch.long)
+    # Operand dtypes are the kernel's contract and are enforced by
+    # ``v4_lighting_indexer`` itself, which reports the offending dtype. Only
+    # structural conditions belong here.
+    use_tilelang = (
+        indexer_implementation == "tilelang"
+        and hidden_states.is_cuda
+        and self.num_heads <= 64
+        and self.num_heads % 8 == 0
+        and self.head_dim >= 32
+        and self.head_dim == 1 << (self.head_dim - 1).bit_length()
+        and cache_layer is None
+        and compressed_len > 0
+        and (packed_ranges is not None or torch.equal(position_ids, canonical_positions))
+    )
+    if indexer_implementation == "tilelang" and not use_tilelang:
+        # Names ``dsa_indexer_loss`` when that is what selected the implementation:
+        # the objective requires ``tilelang``, so a user who enabled it and then lands
+        # here would otherwise get an error about a flag they never chose.
+        chosen_by = " (required by dsa_indexer_loss)" if build_indexer_loss else ""
+        raise ValueError(
+            f"dsa_indexer_implementation='tilelang'{chosen_by} was requested but the TileLang indexer "
+            f"does not support this call: is_cuda={hidden_states.is_cuda}, num_heads={self.num_heads}, "
+            f"head_dim={self.head_dim}, decode={cache_layer is not None}, "
+            f"compressed_len={compressed_len}, packed={packed_ranges is not None}"
+        )
+    if use_tilelang:
+        query = q.transpose(0, 1).contiguous()
+        query_weights = weights.transpose(0, 1).contiguous()
+        query_range_starts = None if packed_ranges is None else packed_ranges[0]
+        query_range_ends = None if packed_ranges is None else packed_ranges[1]
+        # Either sequence-parallel mode has to spell out each query's visible
+        # compressed interval, because the kernel's default derives it from the
+        # query's *row*, which is no longer its position.
+        if cp_enabled and query_range_starts is None:
+            query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
+            query_positions = torch.arange(seq_len, device=q.device, dtype=torch.int32) + query_offset
+            query_range_ends = (query_positions + 1) // self.compress_rate
+        # Ulysses partitions the full-sequence queries here and stitches the
+        # selection back together below; CP received them already partitioned and
+        # wants the result per shard, so both halves fall away together. One flag
+        # for both, so a slice can never happen without its matching all-gather.
+        ulysses_query_partition = parallel_state.ulysses_enabled and not cp_enabled
+        if ulysses_query_partition:
+            if query_range_starts is None and query_range_ends is None:
+                query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
+                query_positions = torch.arange(seq_len, device=q.device, dtype=torch.int32)
+                query_range_ends = (query_positions + 1) // self.compress_rate
+            if seq_len % parallel_state.ulysses_size != 0:
+                raise ValueError(
+                    f"DeepSeek-V4 indexer sequence length ({seq_len}) must be divisible by "
+                    f"Ulysses size ({parallel_state.ulysses_size})"
+                )
+            local_seq_len = seq_len // parallel_state.ulysses_size
+            query_start = parallel_state.ulysses_rank * local_seq_len
+            query_end = query_start + local_seq_len
+            query = query[query_start:query_end]
+            query_weights = query_weights[query_start:query_end]
+            if query_range_starts is not None and query_range_ends is not None:
+                query_range_starts = query_range_starts[query_start:query_end]
+                query_range_ends = query_range_ends[query_start:query_end]
+
+        index_score, top_k_indices = v4_lighting_indexer(
+            query,
+            compressed_kv.transpose(0, 1).contiguous(),
+            query_weights,
+            self.compress_rate,
+            top_k,
+            cu_seqlen_ks=query_range_starts,
+            cu_seqlen_ke=query_range_ends,
+        )
+        if ulysses_query_partition:
+            top_k_indices = gather_outputs(
+                top_k_indices,
+                gather_dim=1,
+                group=parallel_state.ulysses_group,
+            )
+        # --- Patch.2 ---
+        # ``index_score`` needs no all-gather to match: the two branches are mutually
+        # exclusive, because ``_indexer_loss_enabled`` refuses ``ulysses_size > 1``
+        # outright (a head shard would make the teacher's head sum partial), so a
+        # partitioned score can never be the one being returned.
+        if build_indexer_loss:
+            return top_k_indices.to(torch.long), index_score
+        # --- Patch.2 ---
+        return top_k_indices.to(torch.long)
+    # --- Patch.1 ---
+
+    # No refusal for the loss here, deliberately: reaching this line under
+    # ``dsa_indexer_loss`` would discard the scores the KL trains against, but it
+    # cannot happen. ``_indexer_loss_enabled`` admits the objective only when
+    # ``dsa_indexer_implementation`` is ``tilelang``, and the refusal above already
+    # rejects that value whenever ``use_tilelang`` came out false -- for every
+    # caller, not just this one, and before the module does any work. A second
+    # refusal here would be unreachable by construction, and an unreachable ``raise``
+    # that no test can exercise is worse than none: it reads as the protection while
+    # the one doing the work sits elsewhere.
+    scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))
+    scores = F.relu(scores) * self.scorer.softmax_scale
+    eager_weights = self.scorer.weights_proj(hidden_states).float() * self.scorer.weights_scaling
+    index_scores = (scores * eager_weights.unsqueeze(-1)).sum(dim=2)
+    if compressed_len > 0:
+        entry_indices = torch.arange(compressed_len, device=index_scores.device)
+        if packed_ranges is None:
+            causal_starts = torch.zeros_like(position_ids)
+            causal_ends = (position_ids + 1) // self.compress_rate
+        else:
+            causal_starts, causal_ends = (value.unsqueeze(0) for value in packed_ranges)
+        future_mask = (entry_indices.view(1, 1, -1) < causal_starts.unsqueeze(-1)) | (
+            entry_indices.view(1, 1, -1) >= causal_ends.unsqueeze(-1)
+        )
+        index_scores = index_scores.masked_fill(future_mask, float("-inf"))
+        top_k_indices = index_scores.topk(top_k, dim=-1).indices
+        invalid = (top_k_indices < causal_starts.unsqueeze(-1)) | (top_k_indices >= causal_ends.unsqueeze(-1))
+        return torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
+    return index_scores.topk(top_k, dim=-1).indices
+
 
 
 config = PatchConfig(
@@ -319,8 +663,8 @@ config.override_method(
 
 config.override_method(
     "DeepseekV4Indexer.forward",
-    replacement=deepseek_v4_indexer_forward_patched,
-    description="Optional TileLang Lightning Indexer dispatch (no-ops to eager on NPU)",
+    replacement=deepseek_v4_indexer_forward_npu_patched,
+    description="NPU Lightning Indexer dispatch with eager/TileLang compatibility paths",
 )
 
 config.override_method(

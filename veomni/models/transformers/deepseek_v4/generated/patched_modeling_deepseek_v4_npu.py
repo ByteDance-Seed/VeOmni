@@ -28,7 +28,7 @@
 #    - method_override: DeepseekV4DecoderLayer.forward
 #      Dispatch DeepSeek V4 mHC residual post-mixing through an OpSlot
 #    - method_override: DeepseekV4Indexer.forward
-#      Optional TileLang Lightning Indexer dispatch (no-ops to eager on NPU)
+#      NPU Lightning Indexer dispatch with eager/TileLang compatibility paths
 #    - method_override: DeepseekV4Attention.forward
 #      Packed compressor path + Ulysses SP for DeepSeek-V4 eager/TileLang attention
 #    - function_replacement: eager_attention_forward
@@ -991,22 +991,6 @@ class DeepseekV4Indexer(nn.Module):
         self.scorer = DeepseekV4IndexerScorer(config)
         self.position_bias._veomni_fsdp_shard_dim = 1
 
-    # ================================================================
-    # Patch: DeepseekV4Indexer.forward
-    # 1. Dispatch CUDA prefill/training index scoring to the TileLang Lightning
-    #    Indexer when ``dsa_indexer_implementation=tilelang``. Cache/decode and unusual
-    #    position layouts fall outside what that kernel accepts, and having been asked
-    #    for it explicitly this refuses rather than demoting to the eager scorer.
-    # 2. Context parallelism: compress this shard's own windows and all-gather the
-    #    compressed rows, so the keys stay global while the queries stay local, and
-    #    drop the Ulysses query partitioning, which has nothing left to do.
-    # 3. Under ``dsa_indexer_loss``, hand the per-slot index scores back next to the
-    #    selection so the auxiliary KL has a student to train, and detach the inputs so
-    #    that KL cannot reach the main model. The eager scorer discards those scores and
-    #    so cannot serve the objective, but needs no refusal of its own here: the gate
-    #    admits the objective only under ``tilelang``, and the dispatch refusal in (1)
-    #    then covers every call that TileLang cannot take.
-    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,

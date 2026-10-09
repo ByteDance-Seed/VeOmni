@@ -1249,10 +1249,10 @@ class DeepseekV4Indexer(nn.Module):
 
         # --- Patch.1 ---
         indexer_implementation = veomni_dsa_indexer_implementation.value
-        if indexer_implementation not in {"eager", "npu", "tilelang"}:
+        if indexer_implementation not in {"eager", "tilelang"}:
             raise ValueError(
-                "DeepSeek-V4 does not support "
-                f"dsa_indexer_implementation={indexer_implementation!r}; expected 'eager', 'npu' or 'tilelang'"
+                "DeepSeek-V4 GPU does not support "
+                f"dsa_indexer_implementation={indexer_implementation!r}; expected 'eager' or 'tilelang'"
             )
         # A local query row ``i`` is global row ``query_offset + i``; off the context
         # parallel path ``query_offset`` is zero and this is the arange it always was.
@@ -1260,33 +1260,6 @@ class DeepseekV4Indexer(nn.Module):
             (torch.arange(seq_len, device=position_ids.device) + query_offset).unsqueeze(0).expand_as(position_ids)
         )
         packed_ranges = None if rate_metadata is None else packed_compressed_causal_ranges(rate_metadata)
-        single_full_sequence = packed_sequence_slices is None or (
-            len(packed_sequence_slices) == 1
-            and packed_sequence_slices[0][0] == 0
-            and packed_sequence_slices[0][1] == seq_len
-        )
-        use_npu = (
-            indexer_implementation == "npu"
-            and hidden_states.device.type == "npu"
-            and cache_layer is None
-            and not cp_enabled
-            and not parallel_state.ulysses_enabled
-            and single_full_sequence
-            and compressed_len > 0
-            and torch.equal(position_ids, canonical_positions)
-        )
-        if indexer_implementation == "npu" and not use_npu and compressed_len > 0:
-            raise ValueError(
-                "dsa_indexer_implementation='npu' was requested outside the fused Lightning Indexer "
-                "contract (training/prefill, one full sequence with canonical positions, no SP/CP)"
-            )
-        if use_npu:
-            from veomni.ops.kernels.deepseek_v4.npu_lightning_indexer import npu_lightning_indexer
-
-            top_k_indices, _ = npu_lightning_indexer(
-                q, compressed_kv, weights, top_k, compress_rate=self.compress_rate
-            )
-            return top_k_indices.to(torch.long)
         # Operand dtypes are the kernel's contract and are enforced by
         # ``v4_lighting_indexer`` itself, which reports the offending dtype. Only
         # structural conditions belong here.
