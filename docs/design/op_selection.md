@@ -53,6 +53,10 @@ The general per-op fields are typed as plain `str` (not `Literal`), so
 third-party backends can call `register_op(...)` without modifying
 `OpsImplementationConfig`.
 
+Renamed values such as `veomni_*_with_sp` and `moe_implementation: fused` still
+parse with a deprecation warning; see the deprecated-values table in
+[Arguments](../usage/arguments.md#deprecated-values).
+
 ---
 
 ## Lifecycle Overview
@@ -263,6 +267,10 @@ model:
 | `npu` | Registered `torch_npu.npu_rms_norm` row | `torch_npu` |
 | `triton` | Registered model-specific Triton row (for example DeepSeek-V3 batch-invariant RMSNorm) | `triton` |
 | `eager` | Registered PyTorch reference row | — |
+
+Qwen3.5-family `(1 + weight)` RMSNorms use the `offset` variant, which was
+named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
+`variant="offset"`.
 
 #### `rotary_pos_emb_implementation`
 

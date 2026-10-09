@@ -60,8 +60,7 @@ def test_deepseek_v3_eager_matches_hf():
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
-    # MLA + MoE expert-loop ULP (~1e-7); not bitwise vs Hugging Face.
-    assert_eager_matches_hf(hf, ours, input_ids=input_ids)
+    assert_eager_matches_hf(hf, ours, input_ids=input_ids, logits_equal=True)
 
 
 def test_deepseek_v3_experts_cast_router_scores_to_hidden_dtype():

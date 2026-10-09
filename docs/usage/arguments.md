@@ -238,6 +238,23 @@ NPU validation runs at two times:
 | mhc_implementation | `Literal["eager", "tilelang"]` | `"eager"` | DeepSeek V4 manifold-constrained Hyper-Connection implementation. `tilelang` enables the forward/backward path provided by the `tile-kernels` package and requires an SM90+ CUDA GPU. |
 | qat_implementation | `Literal["none", "fp8_blockwise"]` | `"none"` | DeepSeek V4 quantization-aware training recipe. Unlike the other fields this selects a quantization recipe rather than an op-registry implementation. `fp8_blockwise` fake-quantizes what FP8 inference rounds — linear operands (128x128 weight tiles, 1x128 activation blocks), the NoPE channels of every stored KV entry (1x64), both sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path (FP4 `1x32` groups when the checkpoint's `expert_dtype` is `fp4`, otherwise FP8 tiles) — and requires an SM90+ CUDA GPU. See `veomni/ops/qat/`. |
 
+#### Deprecated values
+
+Values renamed by the move to instance-local `VeomniOp` handles still parse.
+`OpsImplementationConfig` resolves them to the current name and logs a
+deprecation warning. Set the new name explicitly; the old values will be removed
+in a future release.
+
+| Field | Deprecated value | Resolves to |
+|---|---|---|
+| `attn_implementation` | `veomni_<name>_with_sp` (FA2/FA3/FA4, their Hub forms, Flex, Magi) | `veomni_<name>`; Ulysses is applied inside the adapter |
+| `moe_implementation` | `fused` | `fused_quack` on GPU, `fused_npu` on Ascend NPU, `fused_mlu` (with Apex) or `fused_triton` on MLU |
+| `moe_implementation` | `fused_mlu_triton` | `fused_triton`, the same group-gemm kernel |
+
+`rms_norm_implementation: qwen3_5` is rejected at parse time. `qwen3_5` was the
+Qwen3.5 RMSNorm variant name, now `offset`, and never an implementation. Other
+unknown values fail at model build with the registered implementations listed.
+
 #### The Lightning Indexer KL objective (`dsa_indexer_loss`)
 
 Set under **`model.model_config`**, not under `model.ops_implementation`. The

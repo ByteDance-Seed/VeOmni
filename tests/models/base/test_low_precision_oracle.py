@@ -19,7 +19,11 @@ restores the model-level coverage those tests do not replace:
 
 - An independent Hugging Face model in BF16 with FA2 or SDPA.
 - ``build_foundation_model(weights_path=...)`` through safetensors for dense,
-  merged-MoE, VL, and Omni checkpoints. A single Linear roundtrip is not enough.
+  merged-MoE, DSA, VL, and Omni checkpoints. A single Linear roundtrip is not
+  enough.
+
+Cases are bitwise by default. A case that is not bitwise names the measured
+source of drift next to its budget.
 """
 
 from __future__ import annotations
@@ -39,11 +43,22 @@ from transformers import PretrainedConfig
 
 from tests.models.compare import qwen_image_inputs
 from tests.models.tiny_configs import (
+    tiny_deepseek_v3_config,
     tiny_glm_moe_dsa_config,
+    tiny_gpt_oss_config,
     tiny_qwen2_5_omni_thinker_config,
+    tiny_qwen2_5_vl_config,
+    tiny_qwen2_config,
+    tiny_qwen2_vl_config,
+    tiny_qwen3_5_config,
+    tiny_qwen3_5_moe_config,
+    tiny_qwen3_5_moe_text_config,
+    tiny_qwen3_5_text_config,
     tiny_qwen3_config,
     tiny_qwen3_moe_config,
+    tiny_qwen3_omni_moe_thinker_config,
     tiny_qwen3_vl_config,
+    tiny_qwen3_vl_moe_config,
 )
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.models import build_foundation_model
@@ -63,10 +78,10 @@ os.environ.setdefault("MASTER_ADDR", "localhost")
 os.environ.setdefault("MASTER_PORT", "12357")
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-# Tiny BF16 FA2/SDPA vs Hugging Face. Dense full-attention is bitwise.
-# MoE/DSA/vision accumulate BF16 ULP through expert loops or vision scatter.
-_BF16_ATOL = 5e-2
-_BF16_RTOL = 5e-2
+# Kinds: "causal_lm" (text ids), "qwen3_5_text" (text ids + cu_seq_lens_q),
+# "vlm_full" / "omni_thinker" (packed images), "qwen3_5_vlm_full" (images +
+# VeOmni-only empty cu_seq_lens_q).
+_TEXT_KINDS = ("causal_lm", "qwen3_5_text")
 
 
 @dataclass(frozen=True)
@@ -77,125 +92,239 @@ class Case:
     config_factory: Callable[[], PretrainedConfig]
     hf_cls_factory: Callable[[], type]
     attn_implementation: str = "flash_attention_2"
-    logits_equal: bool = False
-    atol: float = _BF16_ATOL
-    rtol: float = _BF16_RTOL
+    logits_equal: bool = True
+    atol: float = 0.0
+    rtol: float = 0.0
+    grads_equal: bool = True
+    grad_atol: float = 0.0
+    dtype: torch.dtype = torch.bfloat16
     config_overrides: dict = field(default_factory=dict)
 
 
-def _hf_qwen3():
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+def _hf(module: str, name: str) -> Callable[[], type]:
+    def factory() -> type:
+        return getattr(importlib.import_module(f"transformers.models.{module}"), name)
 
-    return Qwen3ForCausalLM
-
-
-def _hf_qwen3_moe():
-    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
-
-    return Qwen3MoeForCausalLM
+    return factory
 
 
-def _hf_glm():
-    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCausalLM
-
-    return GlmMoeDsaForCausalLM
-
-
-def _hf_qwen3_vl():
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
-
-    return Qwen3VLForConditionalGeneration
+def _qwen3_5_full_attention(factory: Callable[..., PretrainedConfig]) -> Callable[[], PretrainedConfig]:
+    # GatedDeltaNet binds different fla / causal_conv1d kernels in HF and VeOmni.
+    return lambda: factory(layer_types=["full_attention", "full_attention"])
 
 
-def _hf_qwen2_5_omni_thinker():
-    from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniThinkerForConditionalGeneration
+def _qwen3_vl_moe_loader_config() -> PretrainedConfig:
+    config = tiny_qwen3_vl_moe_config()
+    # A square (E, 2I, H) gate_up is ambiguous between the HF and v5 layouts.
+    config.text_config.moe_intermediate_size = 16
+    return config
 
-    return Qwen2_5OmniThinkerForConditionalGeneration
 
+_EAGER_EXPERTS = {"_experts_implementation": "eager"}
+
+# VeOmni's tensorized ``fast_pos_embed_interpolate`` patches (Qwen3-VL and
+# Qwen3.5) cast the bilinear weights to BF16 before the four-way sum. Hugging
+# Face 5.16.1 keeps them in FP32 (``get_vision_interpolation_indices_and_weights``).
+# Measured max abs on H20 is 4.9e-3 at |logits| <= 0.71, about one BF16 ULP.
+# Qwen3-Omni keeps the HF method and is bitwise.
+_QWEN3_VL_POS_EMBED = {"logits_equal": False, "atol": 1e-2}
+
+# ``veomni_sdpa`` pins EFFICIENT_ATTENTION for masked calls. HF's default
+# dispatch picks cuDNN attention on H20. Forward is bitwise, but backward
+# differs by up to 3.9e-3 (embed_tokens) on H20.
+_SDPA_MASKED_BACKWARD = {"grads_equal": False, "grad_atol": 1e-2}
 
 _ORACLE_CASES = [
-    Case(
-        "qwen3-fa2",
-        "Qwen3ForCausalLM",
-        "causal_lm",
-        tiny_qwen3_config,
-        _hf_qwen3,
-        logits_equal=True,
-    ),
+    Case("qwen2-fa2", "Qwen2ForCausalLM", "causal_lm", tiny_qwen2_config, _hf("qwen2", "Qwen2ForCausalLM")),
+    Case("qwen3-fa2", "Qwen3ForCausalLM", "causal_lm", tiny_qwen3_config, _hf("qwen3", "Qwen3ForCausalLM")),
     Case(
         "qwen3_moe-fa2",
         "Qwen3MoeForCausalLM",
         "causal_lm",
         tiny_qwen3_moe_config,
-        _hf_qwen3_moe,
-        # Expert loops accumulate BF16 ULP; not the dense FA2 bitwise path.
-        atol=5e-2,
-        rtol=5e-2,
-        config_overrides={"_experts_implementation": "eager"},
+        _hf("qwen3_moe", "Qwen3MoeForCausalLM"),
+        config_overrides=_EAGER_EXPERTS,
     ),
     Case(
         "glm_moe_dsa-sdpa",
         "GlmMoeDsaForCausalLM",
         "causal_lm",
         tiny_glm_moe_dsa_config,
-        _hf_glm,
+        _hf("glm_moe_dsa", "GlmMoeDsaForCausalLM"),
         attn_implementation="sdpa",
-        # DSA + SDPA in BF16 is not the dense FA2 bitwise path; ~0.16 max abs.
-        atol=0.2,
-        rtol=0.2,
-        config_overrides={"_experts_implementation": "eager"},
+        config_overrides=_EAGER_EXPERTS,
+        **_SDPA_MASKED_BACKWARD,
+    ),
+    Case(
+        "qwen3_5-text-fa2",
+        "Qwen3_5ForCausalLM",
+        "qwen3_5_text",
+        _qwen3_5_full_attention(tiny_qwen3_5_text_config),
+        _hf("qwen3_5", "Qwen3_5ForCausalLM"),
+    ),
+    Case(
+        "qwen3_5_moe-text-sdpa",
+        "Qwen3_5MoeForCausalLM",
+        "qwen3_5_text",
+        _qwen3_5_full_attention(tiny_qwen3_5_moe_text_config),
+        _hf("qwen3_5_moe", "Qwen3_5MoeForCausalLM"),
+        attn_implementation="sdpa",
+        **_SDPA_MASKED_BACKWARD,
+    ),
+    Case(
+        "qwen2_vl-fa2",
+        "Qwen2VLForConditionalGeneration",
+        "vlm_full",
+        tiny_qwen2_vl_config,
+        _hf("qwen2_vl", "Qwen2VLForConditionalGeneration"),
+    ),
+    Case(
+        "qwen2_5_vl-fa2",
+        "Qwen2_5_VLForConditionalGeneration",
+        "vlm_full",
+        tiny_qwen2_5_vl_config,
+        _hf("qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"),
     ),
     Case(
         "qwen3_vl-fa2",
         "Qwen3VLForConditionalGeneration",
         "vlm_full",
         tiny_qwen3_vl_config,
-        _hf_qwen3_vl,
-        # Vision scatter mixes BF16 reductions; keep the measured family budget.
-        atol=5e-2,
-        rtol=5e-2,
+        _hf("qwen3_vl", "Qwen3VLForConditionalGeneration"),
+        **_QWEN3_VL_POS_EMBED,
+    ),
+    Case(
+        "qwen3_vl_moe-fa2",
+        "Qwen3VLMoeForConditionalGeneration",
+        "vlm_full",
+        tiny_qwen3_vl_moe_config,
+        _hf("qwen3_vl_moe", "Qwen3VLMoeForConditionalGeneration"),
+        config_overrides=_EAGER_EXPERTS,
+        **_QWEN3_VL_POS_EMBED,
+    ),
+    Case(
+        "qwen3_5_vl-sdpa",
+        "Qwen3_5ForConditionalGeneration",
+        "qwen3_5_vlm_full",
+        _qwen3_5_full_attention(tiny_qwen3_5_config),
+        _hf("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+        attn_implementation="sdpa",
+        **_QWEN3_VL_POS_EMBED,
+    ),
+    Case(
+        "qwen3_5_moe_vl-sdpa",
+        "Qwen3_5MoeForConditionalGeneration",
+        "qwen3_5_vlm_full",
+        _qwen3_5_full_attention(tiny_qwen3_5_moe_config),
+        _hf("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+        attn_implementation="sdpa",
+        **_QWEN3_VL_POS_EMBED,
     ),
     Case(
         "qwen2_5_omni-fa2",
         "Qwen2_5OmniThinkerForConditionalGeneration",
         "omni_thinker",
         tiny_qwen2_5_omni_thinker_config,
-        _hf_qwen2_5_omni_thinker,
-        # Thinker + expert/vision mix; same measured family budget as Qwen3-VL.
-        atol=5e-2,
-        rtol=5e-2,
+        _hf("qwen2_5_omni", "Qwen2_5OmniThinkerForConditionalGeneration"),
+    ),
+    Case(
+        "qwen3_omni_moe-fa2",
+        "Qwen3OmniMoeThinkerForConditionalGeneration",
+        "omni_thinker",
+        tiny_qwen3_omni_moe_thinker_config,
+        _hf("qwen3_omni_moe", "Qwen3OmniMoeThinkerForConditionalGeneration"),
+        config_overrides=_EAGER_EXPERTS,
     ),
 ]
 
+_FP32_EAGER = {"attn_implementation": "eager", "dtype": torch.float32}
+
 _LOADER_CASES = [
-    Case("qwen3-fa2-loader", "Qwen3ForCausalLM", "causal_lm", tiny_qwen3_config, _hf_qwen3, logits_equal=True),
+    Case(
+        "qwen3_moe-eager-loader",
+        "Qwen3MoeForCausalLM",
+        "causal_lm",
+        tiny_qwen3_moe_config,
+        _hf("qwen3_moe", "Qwen3MoeForCausalLM"),
+        config_overrides=_EAGER_EXPERTS,
+        **_FP32_EAGER,
+    ),
+    Case(
+        "deepseek_v3-eager-loader",
+        "DeepseekV3ForCausalLM",
+        "causal_lm",
+        tiny_deepseek_v3_config,
+        _hf("deepseek_v3", "DeepseekV3ForCausalLM"),
+        config_overrides=_EAGER_EXPERTS,
+        **_FP32_EAGER,
+    ),
+    Case(
+        "gpt_oss-eager-loader",
+        "GptOssForCausalLM",
+        "causal_lm",
+        tiny_gpt_oss_config,
+        _hf("gpt_oss", "GptOssForCausalLM"),
+        config_overrides=_EAGER_EXPERTS,
+        **_FP32_EAGER,
+    ),
+    Case(
+        "glm_moe_dsa-eager-loader",
+        "GlmMoeDsaForCausalLM",
+        "causal_lm",
+        tiny_glm_moe_dsa_config,
+        _hf("glm_moe_dsa", "GlmMoeDsaForCausalLM"),
+        config_overrides=_EAGER_EXPERTS,
+        **_FP32_EAGER,
+    ),
+    Case("qwen3-fa2-loader", "Qwen3ForCausalLM", "causal_lm", tiny_qwen3_config, _hf("qwen3", "Qwen3ForCausalLM")),
     Case(
         "qwen3_moe-fa2-loader",
         "Qwen3MoeForCausalLM",
         "causal_lm",
         tiny_qwen3_moe_config,
-        _hf_qwen3_moe,
-        atol=5e-2,
-        rtol=5e-2,
-        config_overrides={"_experts_implementation": "eager"},
+        _hf("qwen3_moe", "Qwen3MoeForCausalLM"),
+        config_overrides=_EAGER_EXPERTS,
+    ),
+    Case(
+        "glm_moe_dsa-sdpa-loader",
+        "GlmMoeDsaForCausalLM",
+        "causal_lm",
+        tiny_glm_moe_dsa_config,
+        _hf("glm_moe_dsa", "GlmMoeDsaForCausalLM"),
+        attn_implementation="sdpa",
+        config_overrides=_EAGER_EXPERTS,
     ),
     Case(
         "qwen3_vl-fa2-loader",
         "Qwen3VLForConditionalGeneration",
         "vlm_full",
         tiny_qwen3_vl_config,
-        _hf_qwen3_vl,
-        atol=5e-2,
-        rtol=5e-2,
+        _hf("qwen3_vl", "Qwen3VLForConditionalGeneration"),
+        **_QWEN3_VL_POS_EMBED,
+    ),
+    Case(
+        "qwen3_vl_moe-fa2-loader",
+        "Qwen3VLMoeForConditionalGeneration",
+        "vlm_full",
+        _qwen3_vl_moe_loader_config,
+        _hf("qwen3_vl_moe", "Qwen3VLMoeForConditionalGeneration"),
+        config_overrides=_EAGER_EXPERTS,
+        **_QWEN3_VL_POS_EMBED,
     ),
     Case(
         "qwen2_5_omni-fa2-loader",
         "Qwen2_5OmniThinkerForConditionalGeneration",
         "omni_thinker",
         tiny_qwen2_5_omni_thinker_config,
-        _hf_qwen2_5_omni_thinker,
-        atol=5e-2,
-        rtol=5e-2,
+        _hf("qwen2_5_omni", "Qwen2_5OmniThinkerForConditionalGeneration"),
+    ),
+    Case(
+        "qwen3_omni_moe-fa2-loader",
+        "Qwen3OmniMoeThinkerForConditionalGeneration",
+        "omni_thinker",
+        tiny_qwen3_omni_moe_thinker_config,
+        _hf("qwen3_omni_moe", "Qwen3OmniMoeThinkerForConditionalGeneration"),
+        config_overrides=_EAGER_EXPERTS,
     ),
 ]
 
@@ -263,11 +392,21 @@ def _make_config(case: Case) -> PretrainedConfig:
     return config
 
 
-def _make_inputs(case: Case, config, device, dtype) -> tuple[torch.Tensor, dict]:
+def _make_inputs(case: Case, config, device, dtype) -> tuple[torch.Tensor, dict, dict]:
+    """Return ``(input_ids, shared_kwargs, veomni_only_kwargs)``.
+
+    VeOmni's Qwen3.5 decoder requires ``cu_seq_lens_q``. A single text row
+    passes ``[0, seq_len]`` to both sides. Padded image batches pass an empty
+    tensor to VeOmni only, since HF FA2 would treat it as packed varlen.
+    """
     vocab = min(getattr(config, "vocab_size", 128), getattr(getattr(config, "text_config", None), "vocab_size", 128))
-    if case.kind == "causal_lm":
-        input_ids = torch.randint(3, vocab, (1, 16), device=device)
-        return input_ids, {}
+    if case.kind in _TEXT_KINDS:
+        seq_len = 16
+        input_ids = torch.randint(3, vocab, (1, seq_len), device=device)
+        shared = {}
+        if case.kind == "qwen3_5_text":
+            shared["cu_seq_lens_q"] = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+        return input_ids, shared, {}
     input_ids = torch.randint(3, 100, (2, 20), device=device)
     image = qwen_image_inputs(config, input_ids)
     ids = image.pop("input_ids").to(device)
@@ -280,7 +419,10 @@ def _make_inputs(case: Case, config, device, dtype) -> tuple[torch.Tensor, dict]
             fwd[key] = value.to(device)
         else:
             fwd[key] = value
-    return ids, fwd
+    veomni_only = {}
+    if case.kind == "qwen3_5_vlm_full":
+        veomni_only["cu_seq_lens_q"] = torch.empty(0, dtype=torch.int32, device=device)
+    return ids, fwd, veomni_only
 
 
 def _ops_config(case: Case):
@@ -300,7 +442,7 @@ def _build_veomni_model(case: Case, config, hf_state_dict):
     model = build_foundation_model(
         config_path=config,
         weights_path=None,
-        torch_dtype="bfloat16",
+        torch_dtype=str(case.dtype).removeprefix("torch."),
         attn_implementation=case.attn_implementation,
         init_device=get_device_type(),
         ops_implementation=_ops_config(case),
@@ -331,7 +473,7 @@ def _build_veomni_model_from_disk(case: Case, config, hf_state_dict, hf_buffers,
         config_path=weights_dir,
         weights_path=weights_dir,
         config_kwargs=dict(case.config_overrides),
-        torch_dtype="bfloat16",
+        torch_dtype=str(case.dtype).removeprefix("torch."),
         attn_implementation=case.attn_implementation,
         init_device=get_device_type(),
         ops_implementation=_ops_config(case),
@@ -379,13 +521,15 @@ def _hf_logits(case: Case, config, input_ids, fwd_kwargs, dtype):
 def test_bf16_fa2_sdpa_logits_match_independent_hf(case: Case):
     _skip_if_unavailable(case)
     device = get_device_type()
-    dtype = torch.bfloat16
+    dtype = case.dtype
     config = _make_config(case)
-    input_ids, fwd_kwargs = _make_inputs(case, config, device, dtype)
+    input_ids, fwd_kwargs, ve_kwargs = _make_inputs(case, config, device, dtype)
     logits_hf, state_dict, _buffers = _hf_logits(case, config, input_ids, fwd_kwargs, dtype)
     model_ve = _build_veomni_model(case, config, state_dict)
     with torch.no_grad():
-        logits_ve = model_ve(input_ids=input_ids.clone(), use_cache=False, **fwd_kwargs).logits.detach().clone()
+        logits_ve = (
+            model_ve(input_ids=input_ids.clone(), use_cache=False, **fwd_kwargs, **ve_kwargs).logits.detach().clone()
+        )
     del model_ve, state_dict
     _release()
     _assert_logits(case, logits_hf, logits_ve)
@@ -395,15 +539,19 @@ def test_bf16_fa2_sdpa_logits_match_independent_hf(case: Case):
 def test_weights_path_loader_logits_match_independent_hf(case: Case):
     _skip_if_unavailable(case)
     device = get_device_type()
-    dtype = torch.bfloat16
+    dtype = case.dtype
     config = _make_config(case)
-    input_ids, fwd_kwargs = _make_inputs(case, config, device, dtype)
+    input_ids, fwd_kwargs, ve_kwargs = _make_inputs(case, config, device, dtype)
     logits_hf, state_dict, buffers = _hf_logits(case, config, input_ids, fwd_kwargs, dtype)
     tmp_dir = tempfile.mkdtemp(prefix="veomni_loader_oracle_")
     try:
         model_ve = _build_veomni_model_from_disk(case, config, state_dict, buffers, tmp_dir)
         with torch.no_grad():
-            logits_ve = model_ve(input_ids=input_ids.clone(), use_cache=False, **fwd_kwargs).logits.detach().clone()
+            logits_ve = (
+                model_ve(input_ids=input_ids.clone(), use_cache=False, **fwd_kwargs, **ve_kwargs)
+                .logits.detach()
+                .clone()
+            )
         del model_ve
         _release()
     finally:
@@ -413,7 +561,7 @@ def test_weights_path_loader_logits_match_independent_hf(case: Case):
     _assert_logits(case, logits_hf, logits_ve)
 
 
-_BACKWARD_CASES = [case for case in _ORACLE_CASES if case.kind == "causal_lm"]
+_BACKWARD_CASES = [case for case in _ORACLE_CASES if case.kind in _TEXT_KINDS]
 
 
 def test_low_precision_oracle_scoped_flags_survive_a_frozen_cudnn_context():
@@ -447,9 +595,9 @@ def test_low_precision_oracle_scoped_flags_survive_a_frozen_cudnn_context():
 def test_bf16_causal_lm_backward_matches_independent_hf(case: Case):
     _skip_if_unavailable(case)
     device = get_device_type()
-    dtype = torch.bfloat16
+    dtype = case.dtype
     config = _make_config(case)
-    input_ids, fwd_kwargs = _make_inputs(case, config, device, dtype)
+    input_ids, fwd_kwargs, ve_kwargs = _make_inputs(case, config, device, dtype)
     labels = input_ids.clone()
     model_hf = _build_hf_model(case, config, dtype).train()
     state_dict = copy.deepcopy(model_hf.state_dict())
@@ -461,16 +609,24 @@ def test_bf16_causal_lm_backward_matches_independent_hf(case: Case):
     del model_hf
     _release()
     model_ve = _build_veomni_model(case, config, state_dict).train()
-    loss_ve = model_ve(input_ids=input_ids.clone(), labels=labels.clone(), use_cache=False, **fwd_kwargs).loss
+    loss_ve = model_ve(
+        input_ids=input_ids.clone(), labels=labels.clone(), use_cache=False, **fwd_kwargs, **ve_kwargs
+    ).loss
     loss_ve.backward()
-    torch.testing.assert_close(loss_ve.float(), loss_hf.float(), atol=case.atol, rtol=case.rtol)
-    shared = [
-        (name, grad, model_ve.get_parameter(name).grad)
-        for name, grad in hf_grads.items()
-        if name in dict(model_ve.named_parameters())
-    ]
-    assert shared, f"[{case.case_id}] no shared parameter gradients"
-    name, hf_grad, ve_grad = next(item for item in shared if item[2] is not None)
-    torch.testing.assert_close(ve_grad.float(), hf_grad.float(), atol=case.atol, rtol=case.rtol, msg=name)
+    assert torch.equal(loss_ve, loss_hf), f"[{case.case_id}] loss {loss_ve.item()} != {loss_hf.item()}"
+    ve_grads = {name: param.grad for name, param in model_ve.named_parameters() if param.grad is not None}
+    assert hf_grads.keys() == ve_grads.keys(), (
+        f"[{case.case_id}] gradient sets differ: "
+        f"hf_only={sorted(hf_grads.keys() - ve_grads.keys())} ve_only={sorted(ve_grads.keys() - hf_grads.keys())}"
+    )
+    for name, hf_grad in hf_grads.items():
+        ve_grad = ve_grads[name]
+        if case.grads_equal:
+            assert torch.equal(ve_grad, hf_grad), (
+                f"[{case.case_id}] {name} grad not bitwise equal: "
+                f"max_abs_diff={float((ve_grad.float() - hf_grad.float()).abs().max().item()):.3e}"
+            )
+        else:
+            torch.testing.assert_close(ve_grad.float(), hf_grad.float(), atol=case.grad_atol, rtol=0, msg=name)
     del model_ve, state_dict
     _release()

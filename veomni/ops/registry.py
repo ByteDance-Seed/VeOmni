@@ -223,7 +223,10 @@ class OpRegistry:
                     f"Op {op!r} variant={variant!r} impl={impl!r} "
                     f"is not registered for device {device!r} (have {sorted(devices)})"
                 )
-            raise KeyError(f"Unknown op {op!r} variant={variant!r} impl={impl!r}")
+            raise KeyError(
+                f"Unknown op {op!r} variant={variant!r} impl={impl!r} "
+                f"(registered impls: {self.list_registered(op, variant)})"
+            )
         if entry.requirement is not None:
             try:
                 entry.requirement.check()

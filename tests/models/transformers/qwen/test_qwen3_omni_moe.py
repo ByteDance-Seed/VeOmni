@@ -185,12 +185,12 @@ def test_qwen3_omni_moe_eager_matches_hf_text_only():
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, 100, (2, 8))
-    # Merged-expert loop ULP (~1e-7); not bitwise vs Hugging Face.
     assert_eager_matches_hf(
         hf,
         ours,
         input_ids=input_ids,
         ours_fwd_kwargs=_mask_kwargs(input_ids),
+        logits_equal=True,
     )
 
 
@@ -217,6 +217,7 @@ def test_qwen3_omni_moe_eager_matches_hf_image_and_text():
         labels=labels,
         fwd_kwargs=image,
         ours_fwd_kwargs=ours_masks,
+        logits_equal=True,
     )
 
 

@@ -121,8 +121,7 @@ def _qwen3_moe_hf_experts(
 
     Installed class: ``transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts``.
 
-    HF scales routing after ``down_proj``. Our eager scales the SwiGLU
-    intermediate before ``fc2``. Those match when ``down_proj`` has no bias.
+    HF scales routing after ``down_proj``, the same order as our eager row.
     """
     config = Qwen3MoeConfig(
         hidden_size=hidden.shape[-1],
@@ -163,20 +162,19 @@ def test_standard_eager_matches_hf_qwen3_moe_experts():
         gu_e,
         num_experts=num_experts,
     )
-    # Moving routing across bias-free fc2 is equivalent in real arithmetic.
-    # Floating-point operation order still changes rounding, especially in BF16.
-    assert torch.allclose(out_e, out_h, atol=1e-5, rtol=1e-5)
+    assert torch.equal(out_e, out_h)
 
     go = torch.randn_like(out_e)
     out_h.backward(go)
     out_e.backward(go)
-    assert torch.allclose(hidden_e.grad, hidden_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-    assert torch.allclose(routing_e.grad, routing_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-    assert torch.allclose(gu_e.grad, experts_h.gate_up_proj.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-    assert torch.allclose(fc2_e.grad, experts_h.down_proj.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.equal(hidden_e.grad, hidden_h.grad)
+    assert torch.equal(routing_e.grad, routing_h.grad)
+    assert torch.equal(gu_e.grad, experts_h.gate_up_proj.grad)
+    assert torch.equal(fc2_e.grad, experts_h.down_proj.grad)
 
 
 def test_eager_matches_fused_reference():
+    """Fused rows scale routing before ``fc2``; eager after. Equal up to rounding."""
     torch.manual_seed(0)
     num_tokens, num_experts, hidden_dim, ffn_dim, top_k = 8, 4, 16, 8, 2
     hidden = torch.randn(num_tokens, hidden_dim)
@@ -207,7 +205,7 @@ def test_eager_matches_fused_reference():
         _empty(hidden.device),
         num_experts=num_experts,
     )
-    assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    assert torch.allclose(out_e, out_h, atol=1e-5, rtol=1e-5)
 
     go = torch.randn_like(out_e)
     out_h.backward(go)
@@ -222,8 +220,8 @@ def test_eager_matches_fused_reference():
 def test_eager_keeps_compute_dtype_when_routing_is_fp32():
     """DSV3-style router scores are fp32 while FSDP2 compute is bf16.
 
-    Scaling the SwiGLU intermediate by those scores must not promote ``y``
-    back to float32, or batch-invariant ``F.linear`` rejects the down-proj.
+    Routing scales the ``fc2`` output, so batch-invariant ``F.linear`` still
+    sees compute-dtype operands, and the result returns in compute dtype.
     """
     require_nvidia_cuda()
     from veomni.ops.batch_invariant import set_batch_invariant_mode
@@ -478,7 +476,12 @@ def _run_fused_three_way(
     grad_routing_atol: float | None = None,
     grad_routing_rtol: float | None = None,
 ):
-    """Compare one fused implementation's split and merged layouts with eager."""
+    """Compare one fused implementation's split and merged layouts with eager math.
+
+    The reference is ``standard_fused_reference``: eager math in the fused
+    rows' routing order. The production eager row uses Hugging Face order,
+    which drifts from it by BF16 rounding at production shapes.
+    """
     torch.manual_seed(seed)
     if device is None:
         device = torch.device("cuda")
@@ -493,7 +496,6 @@ def _run_fused_three_way(
     fc2 = data_scale * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
     empty = _empty(device, dtype)
     fused = resolve_op("moe_experts", "standard", impl).wrapper
-    eager = resolve_op("moe_experts", "standard", "eager").wrapper
     kwargs = {"num_experts": num_experts, "swiglu_limit": swiglu_limit}
 
     if require_active_clamp:
@@ -508,7 +510,7 @@ def _run_fused_three_way(
     hidden_e, routing_e, fc1_1_e, fc1_2_e, fc2_e = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
     out_s = fused(hidden_s, routing_s, selected, fc1_1_s, fc1_2_s, fc2_s, empty, **kwargs)
     out_m = fused(hidden_m, routing_m, selected, empty, empty, fc2_m, fc1_12_m, **kwargs)
-    out_e = eager(hidden_e, routing_e, selected, fc1_1_e, fc1_2_e, fc2_e, empty, **kwargs)
+    out_e = standard_fused_reference(hidden_e, routing_e, selected, fc1_1_e, fc1_2_e, fc2_e, **kwargs)
     torch.testing.assert_close(out_s, out_m, rtol=0, atol=0)
 
     go = torch.randn_like(out_s)

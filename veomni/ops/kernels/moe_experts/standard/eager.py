@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""standard MoE experts eager math (fused operator order)."""
+"""standard MoE experts eager math (Hugging Face operator order)."""
 
 from __future__ import annotations
 
@@ -36,9 +36,11 @@ def wrapper(
 ) -> Tensor:
     """Routed expert MLP. Empty ``fc1_*`` means that layout is unused.
 
-    Routing weights scale the SwiGLU intermediate, then ``fc2``. Regular
-    autograd, no custom backward. ``assume_distinct_experts`` only tightens
-    the Triton grouped-GEMM launch bound, so it is unused here.
+    Matches Hugging Face's expert loop bitwise: ``fc2`` first, then the
+    routing weights in their own dtype. Fused rows scale the intermediate
+    before ``fc2`` instead, so they agree with this row only to rounding.
+    Regular autograd, no custom backward. ``assume_distinct_experts`` only
+    tightens the Triton grouped-GEMM launch bound, so it is unused here.
     """
     del assume_distinct_experts
     has_split = fc1_1_weight.numel() > 0
@@ -64,11 +66,7 @@ def wrapper(
         if swiglu_limit is not None:
             gate = gate.clamp(max=swiglu_limit)
             up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-        y = F.silu(gate) * up
-        # Fused order: scale the intermediate, then fc2. Router scores stay
-        # float32 even under FSDP2 bf16 compute; keep the scale on ``y.dtype``
-        # so batch-invariant ``F.linear`` sees matching activation/weight dtypes.
-        y = y * routing_weights[token_idx, top_k_pos, None].to(dtype=y.dtype)
-        y = F.linear(y, fc2_weight[idx])
+        y = F.linear(F.silu(gate) * up, fc2_weight[idx])
+        y = y * routing_weights[token_idx, top_k_pos, None]
         output = output.index_add(0, token_idx, y.to(output.dtype))
     return output

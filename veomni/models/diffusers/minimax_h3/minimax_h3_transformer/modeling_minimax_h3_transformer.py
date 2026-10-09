@@ -45,22 +45,13 @@ _PACKED_FLASH_BACKENDS = (
 )
 
 
-def _packed_attn_name(attn_implementation: str | None) -> str | None:
-    if attn_implementation is None:
-        return None
-    if attn_implementation.endswith("_with_sp"):
-        return attn_implementation[: -len("_with_sp")]
-    return attn_implementation
-
-
 def _veomni_attn_impl(attn_implementation: str | None) -> str | None:
-    name = _packed_attn_name(attn_implementation)
-    if name in (None, "eager", "sdpa", "veomni_sdpa"):
+    if attn_implementation in (None, "eager", "sdpa", "veomni_sdpa"):
         return None
-    if name.startswith("flash_attention_"):
-        return f"veomni_{name}"
-    if name.startswith("veomni_flash_attention_"):
-        return name
+    if attn_implementation.startswith("flash_attention_"):
+        return f"veomni_{attn_implementation}"
+    if attn_implementation.startswith("veomni_flash_attention_"):
+        return attn_implementation
     return None
 
 
@@ -104,7 +95,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         cannot construct ``veomni_flash_attention_4``, so a flash name is
         validated and bound on the first forward.
         """
-        self._packed_attn_implementation = _packed_attn_name(attn_implementation)
+        self._packed_attn_implementation = attn_implementation
 
     def _load_packed_attention_kernel(self):
         implementation = self._packed_attn_implementation

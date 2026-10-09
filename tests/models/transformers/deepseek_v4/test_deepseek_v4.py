@@ -232,8 +232,7 @@ def test_deepseek_v4_eager_matches_hf(seq_len):
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, seq_len))
-    # DSA + mHC ULP (~2e-7); not bitwise vs Hugging Face.
-    assert_eager_matches_hf(hf, ours, input_ids=input_ids)
+    assert_eager_matches_hf(hf, ours, input_ids=input_ids, logits_equal=True)
 
     if seq_len >= config.compress_rates["heavily_compressed_attention"]:
         # Every attention layer must train its compressor, not just match an unused branch.

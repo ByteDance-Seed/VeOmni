@@ -301,7 +301,7 @@ def test_accumulated_microbatches_weight_each_sample_like_single_sample():
 
 def test_unsupported_backend_fails_only_on_packed_forward():
     model = tiny_model()
-    model._configure_packed_attention("veomni_flash_attention_4_with_sp")  # what __init__ runs; must not raise
+    model._configure_packed_attention("veomni_flash_attention_4")  # what __init__ runs; must not raise
     samples = prepare(condition_model(), [raw_sample(3), raw_sample(5)])
     serial(model, samples)
     with pytest.raises(ValueError, match="Unsupported H3 packing backend"):

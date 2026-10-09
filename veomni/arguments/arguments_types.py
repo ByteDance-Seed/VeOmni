@@ -1233,6 +1233,32 @@ _MLU_DEFAULT_FALLBACK: Dict[str, str] = {
     "cross_entropy_loss_implementation": "eager",
 }
 
+# Values renamed by the OpSlot -> VeomniOp migration. They still parse, resolve to
+# the new name with a warning, and are listed in docs/usage/arguments.md.
+_DEPRECATED_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, str]] = {
+    "attn_implementation": {
+        f"{name}_with_sp": name
+        for name in (
+            "veomni_flash_attention_2",
+            "veomni_flash_attention_2_hub",
+            "veomni_flash_attention_3",
+            "veomni_flash_attention_3_hub",
+            "veomni_flash_attention_4",
+            "veomni_flex_attention",
+            "veomni_magi_attention",
+        )
+    },
+    "moe_implementation": {"fused_mlu_triton": "fused_triton"},
+}
+
+# Values that were never implementation names and have no implementation equivalent.
+_REJECTED_IMPLEMENTATION_VALUES: Dict[str, Dict[str, str]] = {
+    "rms_norm_implementation": {
+        "qwen3_5": "'qwen3_5' was the Qwen3.5 RMSNorm variant name (now 'offset'), not an implementation; "
+        "use one of 'liger_kernel', 'npu', 'triton', or 'eager'.",
+    },
+}
+
 
 @dataclass
 class OpsImplementationConfig:
@@ -1452,6 +1478,7 @@ class OpsImplementationConfig:
         }.get(implementation, implementation)
 
     def __post_init__(self):
+        self._apply_deprecated_aliases()
         self.attn_implementation = self.normalize_hub_attention_backend(self.attn_implementation)
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
@@ -1471,6 +1498,38 @@ class OpsImplementationConfig:
         self._apply_npu_default_fallback()
         self._apply_mlu_default_fallback()
         self._validate_implementations()
+
+    def _apply_deprecated_aliases(self) -> None:
+        """Resolve renamed implementation values and reject values that were never implementations."""
+        for field_name, messages in _REJECTED_IMPLEMENTATION_VALUES.items():
+            value = getattr(self, field_name)
+            if value in messages:
+                raise ValueError(f"{field_name}={value!r}: {messages[value]}")
+
+        for field_name, aliases in _DEPRECATED_IMPLEMENTATION_ALIASES.items():
+            value = getattr(self, field_name)
+            if value in aliases:
+                self._warn_deprecated(field_name, value, aliases[value])
+                setattr(self, field_name, aliases[value])
+
+        if self.moe_implementation == "fused":
+            from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available, is_torch_npu_available
+
+            if is_torch_npu_available():
+                resolved = "fused_npu"
+            elif is_torch_mlu_available():
+                resolved = "fused_mlu" if is_apex_mlu_available() else "fused_triton"
+            else:
+                resolved = "fused_quack"
+            self._warn_deprecated("moe_implementation", "fused", resolved)
+            self.moe_implementation = resolved
+
+    @staticmethod
+    def _warn_deprecated(field_name: str, old: str, new: str) -> None:
+        logger.warning_rank0(
+            f"{field_name}={old!r} is deprecated and resolves to {new!r} on this host. "
+            f"Set {field_name}={new!r} explicitly; the old value will be removed in a future release."
+        )
 
     def _apply_npu_default_fallback(self):
         """Auto-resolve GPU-only defaults to NPU-compatible alternatives.
