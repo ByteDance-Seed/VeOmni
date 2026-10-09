@@ -239,7 +239,7 @@ def test_native_data_to_optimizer_and_checkpoint(snapshot, tmp_path, capsys, dty
         model_fwd_context=nullcontext(),
         model_bwd_context=nullcontext(),
     )
-    trainer.condition_model = condition
+    trainer.base.model.condition_model = condition
     trainer.training_task = "online_training"
     losses = []
     micro_batches = next(iter(loader))
