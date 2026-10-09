@@ -91,6 +91,7 @@ from veomni.distributed.sequence_parallel import (
     reduce_sequence_parallel_loss,
 )
 from veomni.models.transformers.deepseek_v4.packed_utils import (
+    CompressedCandidates,
     build_packed_compression_metadata,
     build_packed_sparse_attention_indices,
     build_sparse_attention_indices,
@@ -1396,7 +1397,7 @@ class DeepseekV4CSACompressor(nn.Module):
         # call sites below stay on their bare-tensor return and this file needs no
         # ``_split_indexer_output``.
         build_indexer_loss: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, CompressedCandidates]:
         if (packed_sequence_slices is None) != (packed_compression_metadata is None):
             raise ValueError("Packed sequence slices and compression metadata must be provided together")
         if build_indexer_loss:
@@ -1461,7 +1462,7 @@ class DeepseekV4CSACompressor(nn.Module):
             else:
                 block_bias = None
             result = (compressed_kv, block_bias)
-            return (*result, top_k_indices) if return_topk_indices else result
+            return (*result, CompressedCandidates(topk_indices=top_k_indices)) if return_topk_indices else result
 
         if cache_layer is None:
             usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
@@ -1514,7 +1515,7 @@ class DeepseekV4CSACompressor(nn.Module):
         else:
             block_bias = None
         result = (compressed_kv, block_bias)
-        return (*result, top_k_indices) if return_topk_indices else result
+        return (*result, CompressedCandidates(topk_indices=top_k_indices)) if return_topk_indices else result
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
