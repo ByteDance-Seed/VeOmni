@@ -69,6 +69,7 @@ from veomni.ops.config import (
     resolve_qat_impl,
 )
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.ops.qat import (
     fp4_fake_quant_weight,
     fp8_fake_quant_act,
@@ -105,6 +106,7 @@ config.add_import("typing", names=["Optional"])
 
 config.add_import("functools", names=["partial"])
 config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.ops.config",
     names=[
@@ -1832,7 +1834,7 @@ def deepseek_v4_mlp_init_patched(self, config):
 
 @config.override_method(
     "DeepseekV4MLP.forward",
-    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
     if self.qat_implementation == "fp8_blockwise":
@@ -1841,7 +1843,7 @@ def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
             min=-self.limit, max=self.limit
         )
         return veomni_qat_linear(self.down_proj, self.act_fn(gate) * up, qat_implementation=self.qat_implementation)
-    if self.config.hidden_act in {"silu", "swish"}:
+    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,
@@ -1852,9 +1854,9 @@ def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
             self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
             swiglu_limit=self.limit,
         )
-    gate = self.gate_proj(x).clamp(max=self.limit)
-    up = self.up_proj(x).clamp(min=-self.limit, max=self.limit)
-    return self.down_proj(self.act_fn(gate) * up)
+    gate = self.gate_proj(x).float().clamp(max=self.limit)
+    up = self.up_proj(x).float().clamp(min=-self.limit, max=self.limit)
+    return self.down_proj((self.act_fn(gate) * up).to(x.dtype))
 
 
 @config.override_method(

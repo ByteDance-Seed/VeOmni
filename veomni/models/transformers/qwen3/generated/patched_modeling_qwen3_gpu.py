@@ -16,7 +16,7 @@
 #    - method_override: Qwen3MLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: Qwen3MLP.forward
-#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - method_override: Qwen3Attention.__init__
 #      Construct local rope and attention VeomniOps
 #    - method_override: Qwen3Attention.forward
@@ -68,6 +68,7 @@ from transformers.utils.output_capturing import capture_outputs
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -111,7 +112,7 @@ class Qwen3MLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"}:
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,

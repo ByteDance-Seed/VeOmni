@@ -18,7 +18,7 @@
 #    - method_override: Qwen3VLTextMLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: Qwen3VLTextMLP.forward
-#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - method_override: Qwen3VLVisionAttention.forward
 #      Use precomputed max_seqlen passed from outer forward to avoid per-layer CPU-GPU sync
 #    - method_override: Qwen3VLVisionBlock.forward
@@ -104,6 +104,7 @@ from veomni.models.loss_utils import ForCausalLMLoss
 # Additional imports for patches
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.model_outputs import (  # noqa: F401  surfaced for forward log_probs path
@@ -816,7 +817,7 @@ class Qwen3VLTextMLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"}:
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,

@@ -16,7 +16,7 @@
 #    - method_override: GlmMoeDsaMLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: GlmMoeDsaMLP.forward
-#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - init_modification: GlmMoeDsaIndexer
 #      Bind instance-local interleave rope VeomniOp
 #    - method_override: GlmMoeDsaIndexer.forward
@@ -62,6 +62,7 @@ from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, create_standard_causal_mask, translate_fused_dsa_mask
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -506,7 +507,7 @@ class GlmMoeDsaMLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"}:
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,

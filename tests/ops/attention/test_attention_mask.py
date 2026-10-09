@@ -135,7 +135,9 @@ def test_flash_like_hf_names_share_the_flash_mask_builder():
 
     for name in (
         "veomni_flash_attention_2",
+        "veomni_flash_attention_2_hub",
         "veomni_flash_attention_3",
+        "veomni_flash_attention_3_hub",
         "veomni_flash_attention_4",
         "veomni_sage_attention",
     ):
@@ -197,6 +199,21 @@ def test_flex_ulysses_2d_mask_length_aligns(monkeypatch):
     full_2d = torch.ones(1, 8, dtype=torch.bool)
     flex = flex_attention_mask_builder(1, 4, 4, attention_mask=full_2d, device="cpu")
     assert tuple(flex.shape[-2:]) == (8, 8)
+
+
+@pytest.mark.parametrize(("impl", "module"), (("veomni_flex_attention", flex_mask), ("veomni_sdpa", sdpa_mask)))
+def test_hf_create_causal_mask_with_ulysses_uses_global_lengths(monkeypatch, impl, module):
+    """HF takes ``kv_length`` from the unsliced 2D mask, while Q stays the local shard."""
+    _patch_mask_ulysses(monkeypatch, module, apply=True)
+    config = PreTrainedConfig()
+    config._attn_implementation = impl
+    local_embeds = torch.randn(1, 4, 16)
+    full_2d = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 0]], dtype=torch.bool)
+
+    mask = create_causal_mask(config, local_embeds, full_2d, None, torch.arange(4).unsqueeze(0))
+
+    visible = flex_visible(mask, 8, 8) if impl == "veomni_flex_attention" else mask[0, 0]
+    torch.testing.assert_close(visible, torch.ones(8, 8, dtype=torch.bool).tril() & full_2d)
 
 
 @pytest.mark.parametrize(

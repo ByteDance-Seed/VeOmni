@@ -16,7 +16,7 @@
 #    - method_override: SeedOssMLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: SeedOssMLP.forward
-#      Call swiglu_mlp for silu/swish, otherwise self.act_fn, then residual dropout
+#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules, then residual dropout
 #    - method_override: SeedOssForCausalLM.__init__
 #      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: SeedOssForCausalLM.forward
@@ -58,6 +58,7 @@ from transformers.utils.output_capturing import capture_outputs
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -102,7 +103,7 @@ class SeedOssMLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"}:
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
             down_proj = self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,

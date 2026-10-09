@@ -53,6 +53,7 @@ from veomni.distributed.sequence_parallel import (
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import Qwen2_5_VLCausalLMOutputWithLogProbs
@@ -90,6 +91,7 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "Qwen2_5_VLCausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.ops.config",
     names=["resolve_op_impl"],
@@ -145,10 +147,10 @@ def qwen2_5_vl_vision_mlp_init_patched(self, config, bias: bool = False):
 
 @config.override_method(
     "Qwen2_5_VLMLP.forward",
-    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 def qwen2_5_vl_vision_mlp_forward_patched(self, hidden_state):
-    if self.config.hidden_act in {"silu", "swish"}:
+    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
         return self.veomni_swiglu_mlp(
             hidden_state,
             self.gate_proj.weight,
@@ -179,10 +181,10 @@ def qwen2_5_vl_text_mlp_init_patched(self, config):
 
 @config.override_method(
     "Qwen2MLP.forward",
-    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 def qwen2_5_vl_text_mlp_forward_patched(self, x):
-    if self.config.hidden_act in {"silu", "swish"}:
+    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,

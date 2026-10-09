@@ -57,6 +57,20 @@ def effective_sequence_lengths(
     return q_length * scale, kv_length * scale
 
 
+def ulysses_mask_lengths(q_length: int, kv_length: int, mask_length: int | None) -> tuple[int, int]:
+    """Return the gathered Q/K lengths for a mask built before Ulysses gathers.
+
+    Q is always the local shard. HF ``create_*_mask`` without a cache takes
+    ``kv_length`` from the 2D mask, which the collator does not SP-slice, so a
+    ``kv_length`` that equals both the mask length and the gathered Q length is
+    already global. Any other ``kv_length`` is local.
+    """
+    full_q_length, full_kv_length = effective_sequence_lengths(q_length, kv_length)
+    if kv_length == mask_length == full_q_length:
+        return full_q_length, kv_length
+    return full_q_length, full_kv_length
+
+
 def prepare_ulysses_qkv(
     query: torch.Tensor,
     key: torch.Tensor,

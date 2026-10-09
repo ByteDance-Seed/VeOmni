@@ -24,7 +24,7 @@
 #    - method_override: DeepseekV3MLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: DeepseekV3MLP.forward
-#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - class_replacement: DeepseekV3Experts
 #      Always call moe_experts VeomniOp on v5 gate_up_proj weights
 #    - method_override: DeepseekV3TopkRouter.forward
@@ -74,6 +74,7 @@ from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 from veomni.utils.moe_monitor import record_router_indices
 
@@ -202,7 +203,7 @@ class DeepseekV3MLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"}:
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,

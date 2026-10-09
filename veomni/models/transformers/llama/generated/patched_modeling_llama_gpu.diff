@@ -1,6 +1,6 @@
 --- a/transformers/models/llama/modeling_llama.py
 +++ b/patched_modeling_llama_gpu.py
-@@ -1,70 +1,94 @@
+@@ -1,70 +1,95 @@
 -# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 +# ==============================================================================
 +#  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
@@ -28,7 +28,7 @@
 +#    - method_override: LlamaMLP.__init__
 +#      Construct a local swiglu_mlp VeomniOp
 +#    - method_override: LlamaMLP.forward
-+#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
++#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 +#    - method_override: LlamaForCausalLM.__init__
 +#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 +#    - method_override: LlamaForCausalLM.forward
@@ -100,6 +100,7 @@
 +from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 +from veomni.ops import VeomniOp
 +from veomni.ops.config import resolve_op_impl
++from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -134,7 +135,7 @@
 
      def extra_repr(self):
          return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-@@ -127,42 +151,15 @@
+@@ -127,42 +152,15 @@
          return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -182,7 +183,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -170,10 +167,20 @@
+@@ -170,10 +168,20 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -191,7 +192,7 @@
      def forward(self, x):
 -        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 -        return down_proj
-+        if self.config.hidden_act in {"silu", "swish"}:
++        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
 +            return self.veomni_swiglu_mlp(
 +                x,
 +                self.gate_proj.weight,
@@ -205,7 +206,7 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -213,10 +220,16 @@
+@@ -213,10 +221,16 @@
      return attn_output, attn_weights
 
 
@@ -223,7 +224,7 @@
      def __init__(self, config: LlamaConfig, layer_idx: int):
          super().__init__()
          self.config = config
-@@ -239,6 +252,9 @@
+@@ -239,6 +253,9 @@
          self.o_proj = nn.Linear(
              config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
          )
@@ -233,7 +234,7 @@
 
      def forward(
          self,
-@@ -256,16 +272,12 @@
+@@ -256,16 +273,12 @@
          value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -252,7 +253,7 @@
              self,
              query_states,
              key_states,
-@@ -417,6 +429,12 @@
+@@ -417,6 +430,12 @@
          )
 
 
@@ -265,7 +266,7 @@
  @auto_docstring
  class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -429,8 +447,9 @@
+@@ -429,8 +448,9 @@
          self.model = LlamaModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -277,7 +278,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -444,55 +463,110 @@
+@@ -444,55 +464,110 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,

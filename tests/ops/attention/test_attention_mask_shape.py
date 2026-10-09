@@ -28,6 +28,7 @@ from transformers.masking_utils import (
 )
 
 from tests.ops.attention.attention_cases import flex_visible, materialize_magi_mask
+from veomni.ops.install import _VEOMNI_HF_PATCHES
 from veomni.ops.kernels.attention import ulysses as ulysses_mask
 from veomni.ops.kernels.attention.mask import flex as flex_mask
 from veomni.ops.kernels.attention.mask import magi as magi_mask
@@ -84,6 +85,30 @@ def test_shape_masks_treat_veomni_prefix_as_the_stock_name():
         flex_visible(causal_mask(4, 4, impl="flex_attention", device="cpu"), 4, 4),
         flex_visible(causal_mask(4, 4, impl="veomni_flex_attention", device="cpu"), 4, 4),
     )
+
+
+_SHAPE_APIS_REJECTED_BY_BACKEND = {
+    ("veomni_magi_attention", "sliding_window_mask"),
+    ("veomni_sage_attention", "packed_causal_mask"),
+    ("veomni_sage_attention", "sliding_window_mask"),
+}
+
+
+@pytest.mark.parametrize("impl", [name for name, _, _ in _VEOMNI_HF_PATCHES])
+def test_shape_masks_dispatch_every_registered_veomni_name(impl):
+    """Every registered ``veomni_*`` name reaches a backend branch in each shape API."""
+    calls = (
+        (causal_mask, {}),
+        (sliding_window_mask, {"sliding_window": 4}),
+        (packed_causal_mask, {"cu_seqlens": torch.tensor([0, 3, 8], dtype=torch.int32)}),
+    )
+    for api, kwargs in calls:
+        if (impl, api.__name__) in _SHAPE_APIS_REJECTED_BY_BACKEND:
+            with pytest.raises(ValueError) as error:
+                api(8, 8, impl=impl, device="cpu", **kwargs)
+            assert "unsupported attention impl" not in str(error.value)
+        else:
+            api(8, 8, impl=impl, device="cpu", **kwargs)
 
 
 def test_eager_causal_is_additive_like_hf():

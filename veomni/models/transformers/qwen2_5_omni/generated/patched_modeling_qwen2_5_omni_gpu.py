@@ -16,11 +16,11 @@
 #    - method_override: Qwen2_5OmniMLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: Qwen2_5OmniMLP.forward
-#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - method_override: Qwen2MLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: Qwen2MLP.forward
-#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - method_override: Qwen2_5OmniPreTrainedModelForConditionalGeneration.get_rope_index
 #      Per-video use_audio_in_video via audio_seqlens + None attention_mask tolerance
 #    - method_override: Qwen2_5OmniPreTrainedModel._init_weights
@@ -141,6 +141,7 @@ from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
 
@@ -1449,7 +1450,7 @@ class Qwen2_5OmniMLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, hidden_state):
-        if self.config.hidden_act in {"silu", "swish"}:
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 hidden_state,
                 self.gate_proj.weight,
@@ -2008,7 +2009,7 @@ class Qwen2MLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, hidden_state):
-        if self.config.hidden_act in {"silu", "swish"}:
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 hidden_state,
                 self.gate_proj.weight,

@@ -108,7 +108,7 @@ config.override_method(
 config.override_method(
     "GlmMoeDsaMLP.forward",
     replacement=glm_moe_dsa_mlp_forward_patched,
-    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 config.modify_init(
     "GlmMoeDsaIndexer",

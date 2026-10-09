@@ -188,7 +188,7 @@ config.override_method(
     "Qwen3VLMoeTextMLP.forward",
     replacement=qwen3_vl_text_mlp_forward_patched,
     name_map=_NAME_MAP,
-    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 config.modify_init(
     "Qwen3VLMoeVisionAttention",

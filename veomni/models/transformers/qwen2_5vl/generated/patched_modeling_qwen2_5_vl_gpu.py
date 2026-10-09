@@ -16,11 +16,11 @@
 #    - method_override: Qwen2_5_VLMLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: Qwen2_5_VLMLP.forward
-#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - method_override: Qwen2MLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: Qwen2MLP.forward
-#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - init_modification: Qwen2_5_VLVisionAttention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen2_5_VLVisionAttention.forward
@@ -106,6 +106,7 @@ from veomni.distributed.sequence_parallel import (
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import (
     Qwen2_5_VLCausalLMOutputWithLogProbs,
@@ -342,7 +343,7 @@ class Qwen2_5_VLMLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, hidden_state):
-        if self.config.hidden_act in {"silu", "swish"}:
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 hidden_state,
                 self.gate_proj.weight,
@@ -1010,7 +1011,7 @@ class Qwen2MLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"}:
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,

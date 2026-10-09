@@ -52,6 +52,7 @@ from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
@@ -106,10 +107,10 @@ def qwen4_exp_text_mlp_init_patched(self, config, intermediate_size=None):
 
 @config.override_method(
     "Qwen4ExpTextMLP.forward",
-    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 def qwen4_exp_text_mlp_forward_patched(self, x):
-    if self.config.hidden_act in {"silu", "swish"}:
+    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,
@@ -133,6 +134,7 @@ config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_I
 config.add_import("veomni.utils.model_outputs", names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin"])
 config.add_import("veomni.utils.seqlen_pos_transform_utils", names=["culen2pos", "pos2culen"])
 config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.ops.config",
     names=["resolve_op_impl"],

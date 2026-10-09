@@ -30,7 +30,7 @@ from transformers.masking_utils import (
     sliding_window_overlay,
 )
 
-from ..ulysses import effective_sequence_lengths, should_apply_ulysses
+from ..ulysses import should_apply_ulysses, ulysses_mask_lengths
 from .packed import packed_mask_function
 
 
@@ -98,10 +98,10 @@ def flex_attention_mask_builder(
         if attention_mask is not None and attention_mask.ndim != 2:
             raise ValueError("FlexAttention with Ulysses requires a full-sequence 2D attention mask.")
 
-        full_q_length, full_kv_length = effective_sequence_lengths(
+        full_q_length, full_kv_length = ulysses_mask_lengths(
             q_length,
             kv_length,
-            skip_ulysses=skip_ulysses,
+            None if attention_mask is None else attention_mask.shape[-1],
         )
         if attention_mask is not None and attention_mask.shape[-1] != full_kv_length:
             raise ValueError(

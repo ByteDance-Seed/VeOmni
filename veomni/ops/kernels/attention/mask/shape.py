@@ -37,7 +37,15 @@ from .sdpa import _dense_attention_mask_builder, sdpa_attention_mask_builder
 # full on every SM: the public dispatcher takes ``is_causal`` and no dense
 # ``attention_mask``. That is a Sage API fact, not a Wan leftover.
 # SDPA accepts dense masks but has no packed/varlen API.
-_FLASH = frozenset({"flash_attention_2", "flash_attention_3", "flash_attention_4"})
+_FLASH = frozenset(
+    {
+        "flash_attention_2",
+        "flash_attention_2_hub",
+        "flash_attention_3",
+        "flash_attention_3_hub",
+        "flash_attention_4",
+    }
+)
 _SAGE = frozenset({"sage_attention"})
 _FLASH_LIKE_CAUSAL = _FLASH | _SAGE
 _SDPA = frozenset({"sdpa"})

@@ -23,7 +23,6 @@ from .core import (
     gradient_checkpoint_forward,
     is_flash_attn_impl,
     minimax_attention,
-    packed_block_diag_mask,
 )
 
 
@@ -174,44 +173,75 @@ class MiniMaxH3Attention(nn.Module):
         max_seqlen: int | None,
         valid_seqlen: int,
     ) -> torch.Tensor:
-        """One packed attention call. FA uses varlen kwargs; SDPA uses a block-diag mask."""
+        """One FlashAttention varlen call over the packed multi-sample sequence."""
         total = q.shape[0]
         query = q[:valid_seqlen].unsqueeze(0).transpose(1, 2)
         key = k[:valid_seqlen].unsqueeze(0).transpose(1, 2)
         value = v[:valid_seqlen].unsqueeze(0).transpose(1, 2)
         max_seqlen = valid_seqlen if max_seqlen is None else max_seqlen
-        if isinstance(cu_seqlens, _PackedBounds):
-            cu_seqlens = cu_seqlens.device
-        elif not isinstance(cu_seqlens, torch.Tensor):
+        if not isinstance(cu_seqlens, torch.Tensor):
             cu_seqlens = torch.tensor(cu_seqlens, device=query.device, dtype=torch.int32)
         cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32)
-        if is_flash_attn_impl(self.config._attn_implementation):
-            packed = minimax_attention(
-                self,
-                query,
-                key,
-                value,
-                scaling=self.softmax_scale,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
-                max_length_q=max_seqlen,
-                max_length_k=max_seqlen,
-            )
-        else:
-            packed = minimax_attention(
-                self,
-                query,
-                key,
-                value,
-                attention_mask=packed_block_diag_mask(cu_seqlens, valid_seqlen, query.device),
-                scaling=self.softmax_scale,
-            )
+        packed = minimax_attention(
+            self,
+            query,
+            key,
+            value,
+            scaling=self.softmax_scale,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+        )
         packed = packed.squeeze(0).transpose(0, 1)
         if packed.shape[0] == total:
             return packed
-        out = q.new_empty(total, q.shape[1], q.shape[2])
+        # Zero uncovered SP rows so discarded outputs cannot poison parameter gradients.
+        out = q.new_zeros(total, q.shape[1], q.shape[2])
         out[:valid_seqlen] = packed
         return out
+
+    def _segment_attention(self, q, k, v, *, cu_seqlens, compatibility_mode=False):
+        """Attend inside each segment: the bound flash handle per segment, otherwise SDPA."""
+        if not is_flash_attn_impl(self.config._attn_implementation):
+            return _sdpa_varlen_attention(
+                q,
+                k,
+                v,
+                cu_seqlens=cu_seqlens,
+                softmax_scale=self.softmax_scale,
+                compatibility_mode=compatibility_mode,
+            )
+        bounds = tuple(cu_seqlens.tolist()) if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
+        # Zero uncovered SP rows so discarded outputs cannot poison parameter gradients.
+        out = torch.zeros_like(q)
+        for start, stop in zip(bounds[:-1], bounds[1:]):
+            if stop == start:
+                continue
+            segment = minimax_attention(
+                self,
+                q[start:stop].transpose(0, 1).unsqueeze(0),
+                k[start:stop].transpose(0, 1).unsqueeze(0),
+                v[start:stop].transpose(0, 1).unsqueeze(0),
+                scaling=self.softmax_scale,
+            )
+            out[start:stop] = segment.squeeze(0).transpose(0, 1)
+        return out
+
+    def _attention(self, q, k, v, *, cu_seqlens, max_seqlen, valid_seqlen):
+        """Varlen flash for packed multi-sample bounds, per-segment attention otherwise."""
+        packed_attention = isinstance(cu_seqlens, _PackedBounds)
+        if packed_attention and is_flash_attn_impl(self.config._attn_implementation):
+            return self._run_packed_attention(
+                q, k, v, cu_seqlens=cu_seqlens.device, max_seqlen=max_seqlen, valid_seqlen=valid_seqlen
+            )
+        return self._segment_attention(
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens.host if packed_attention else cu_seqlens,
+            compatibility_mode=packed_attention,
+        )
 
     def forward(self, x, *, rope_cos, rope_sin, cu_seqlens, max_seqlen=None, valid_seqlen=None, use_ulysses=False):
         if valid_seqlen is None:
@@ -247,7 +277,7 @@ class MiniMaxH3Attention(nn.Module):
                 k = self.k_norm(full[:, :, 1])
                 if rope_cos is not None:
                     q, k = self.veomni_rope(q, k, rope_cos, rope_sin)
-                o = self._run_packed_attention(
+                o = self._attention(
                     q,
                     k,
                     full[:, :, 2],
@@ -270,20 +300,7 @@ class MiniMaxH3Attention(nn.Module):
             k = self.k_norm(k)
             if rope_cos is not None:
                 q, k = self.veomni_rope(q, k, rope_cos, rope_sin)
-            packed_attention = isinstance(cu_seqlens, _PackedBounds)
-            if packed_attention and is_flash_attn_impl(self.config._attn_implementation):
-                out = self._run_packed_attention(
-                    q, k, v, cu_seqlens=cu_seqlens.device, max_seqlen=max_seqlen, valid_seqlen=valid_seqlen
-                )
-            else:
-                out = _sdpa_varlen_attention(
-                    q,
-                    k,
-                    v,
-                    cu_seqlens=cu_seqlens.host if packed_attention else cu_seqlens,
-                    softmax_scale=self.softmax_scale,
-                    compatibility_mode=packed_attention,
-                )
+            out = self._attention(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, valid_seqlen=valid_seqlen)
         out = out.reshape(total, self.num_heads * self.head_dim)
         return self.out_proj(out)
 

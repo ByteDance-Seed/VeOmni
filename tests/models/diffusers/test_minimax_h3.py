@@ -276,6 +276,52 @@ def test_minimax_h3_flash2_bind_defers_until_packed_bounds():
     assert captured["cu_seq_lens_k"].tolist() == [0, 2, 6]
 
 
+def _sdpa_backed_flash_handle(calls: list):
+    """Stand-in for a flash handle: records each call and computes it with unmasked SDPA."""
+
+    def record(_module, query, key, value, attention_mask=None, **kwargs):
+        calls.append({"length": query.shape[-2], "attention_mask": attention_mask, **kwargs})
+        out = F.scaled_dot_product_attention(query, key, value, scale=kwargs["scaling"])
+        return out.transpose(1, 2), None
+
+    return record
+
+
+def test_minimax_h3_flash_single_sample_runs_handle_per_segment():
+    """Single-sample and Ulysses attention call the flash handle per segment, with no mask or varlen metadata."""
+    torch.manual_seed(0)
+    attn = _tiny_attention()
+    hidden = torch.randn(6, 16)
+    kwargs = dict(rope_cos=None, rope_sin=None, cu_seqlens=(0, 2, 6), max_seqlen=4, valid_seqlen=6)
+    reference = attn(hidden, **kwargs)
+
+    calls: list = []
+    attn.veomni_attn = _sdpa_backed_flash_handle(calls)
+    attn.config._attn_implementation = "veomni_flash_attention_2"
+    out = attn(hidden, **kwargs)
+
+    assert [call["length"] for call in calls] == [2, 4]
+    assert all(call["attention_mask"] is None and "cu_seq_lens_q" not in call for call in calls)
+    torch.testing.assert_close(out, reference, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+
+def test_minimax_h3_packed_flash_zeroes_uncovered_rows():
+    """Rows past ``valid_seqlen`` (Ulysses padding) must be zero, not uninitialized memory."""
+    attn = _tiny_attention()
+    attn.veomni_attn = _sdpa_backed_flash_handle([])
+    attn.config._attn_implementation = "veomni_flash_attention_2"
+    q, k, v = torch.randn(3, 6, 2, 8).unbind(0)
+    previous = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)  # Fills uninitialized float memory with NaN.
+    try:
+        out = attn._run_packed_attention(
+            q, k, v, cu_seqlens=torch.tensor([0, 4], dtype=torch.int32), max_seqlen=4, valid_seqlen=4
+        )
+    finally:
+        torch.use_deterministic_algorithms(previous)
+    assert torch.equal(out[4:], torch.zeros_like(out[4:]))
+
+
 def test_minimax_h3_video_vae_attention_uses_partial_rope():
     from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_video_vae import Attention
 

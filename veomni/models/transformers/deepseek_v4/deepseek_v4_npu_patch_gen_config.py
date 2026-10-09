@@ -128,7 +128,7 @@ config.override_method(
 config.override_method(
     "DeepseekV4MLP.forward",
     replacement=deepseek_v4_mlp_forward_patched,
-    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 config.override_method(
     "DeepseekV4TopKRouter.forward",

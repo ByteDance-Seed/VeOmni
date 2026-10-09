@@ -516,7 +516,8 @@ def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(mon
     assert len(calls) == 4 and calls[2] == calls[3] and len(calls[2]) == 3
 
 
-def test_flash_backend_defers_packed_kernel_until_multisample_forward(monkeypatch):
+@pytest.mark.parametrize("multisample", [False, True])
+def test_flash_backend_defers_kernel_until_first_forward(monkeypatch, multisample):
     from veomni.models.diffusers.minimax_h3.minimax_h3_transformer import (
         modeling_minimax_h3_transformer as h3_modeling,
     )
@@ -532,12 +533,11 @@ def test_flash_backend_defers_packed_kernel_until_multisample_forward(monkeypatc
     config = tiny_model().config
     config._attn_implementation = "veomni_flash_attention_2"
     model = MiniMaxH3DiTModel(config)
+    assert loads == []
     samples = prepare(condition_model(), [raw_sample(3), raw_sample(7)])
 
-    serial(model, samples[:1])
-    assert loads == []
     with pytest.raises(ImportError, match="flash_attn unavailable"):
-        model(**batch(samples))
+        model(**batch(samples)) if multisample else serial(model, samples[:1])
     assert loads == ["veomni_flash_attention_2"]
 
 

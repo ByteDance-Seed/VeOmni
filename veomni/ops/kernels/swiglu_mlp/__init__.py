@@ -19,6 +19,8 @@ clamp. Variant ``geglu`` is ``down(gelu_pytorch_tanh(gate(x)) * up(x))``.
 Empty biases are unused.
 """
 
+from torch import nn
+
 from ...platform import GpuKernelRequirement
 from ...registry import register_op
 from .geglu import eager as geglu_eager
@@ -28,6 +30,15 @@ from .standard import liger_kernel as standard_liger
 
 
 _GPU = GpuKernelRequirement()
+
+
+def has_plain_linear_projections(mlp: nn.Module) -> bool:
+    """Whether ``swiglu_mlp`` may read ``mlp``'s projection weights directly.
+
+    A wrapped projection such as ``LoraLinear`` has no ``weight`` and must run
+    its own forward, so the MLP has to call the projection modules instead.
+    """
+    return all(isinstance(getattr(mlp, name), nn.Linear) for name in ("gate_proj", "up_proj", "down_proj"))
 
 
 register_op(

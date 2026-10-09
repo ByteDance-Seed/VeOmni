@@ -58,7 +58,7 @@
 #    - method_override: DeepseekV4MLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: DeepseekV4MLP.forward
-#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - method_override: DeepseekV4TopKRouter.forward
 #      Match the official DeepSeek-V4 FP32 router projection
 #    - method_override: DeepseekV4HashRouter.forward
@@ -137,6 +137,7 @@ from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl, resolve_qat_impl
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.ops.qat import (
     fp4_fake_quant_weight,
     fp8_fake_quant_act,
@@ -1823,7 +1824,7 @@ class DeepseekV4MLP(nn.Module):
             return veomni_qat_linear(
                 self.down_proj, self.act_fn(gate) * up, qat_implementation=self.qat_implementation
             )
-        if self.config.hidden_act in {"silu", "swish"}:
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,
@@ -1834,9 +1835,9 @@ class DeepseekV4MLP(nn.Module):
                 self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
                 swiglu_limit=self.limit,
             )
-        gate = self.gate_proj(x).clamp(max=self.limit)
-        up = self.up_proj(x).clamp(min=-self.limit, max=self.limit)
-        return self.down_proj(self.act_fn(gate) * up)
+        gate = self.gate_proj(x).float().clamp(max=self.limit)
+        up = self.up_proj(x).float().clamp(min=-self.limit, max=self.limit)
+        return self.down_proj((self.act_fn(gate) * up).to(x.dtype))
 
 
 # ======================================================================

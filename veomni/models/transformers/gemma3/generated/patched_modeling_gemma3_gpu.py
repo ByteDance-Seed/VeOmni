@@ -22,7 +22,7 @@
 #    - init_modification: Gemma3MLP
 #      Bind instance-local geglu swiglu_mlp VeomniOp
 #    - method_override: Gemma3MLP.forward
-#      Call geglu swiglu_mlp for gelu_pytorch_tanh, otherwise self.act_fn
+#      Call geglu swiglu_mlp for gelu_pytorch_tanh on plain nn.Linear projections, otherwise the projection modules
 #    - init_modification: Gemma3Attention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Gemma3Attention.forward
@@ -78,6 +78,7 @@ from transformers.utils.output_capturing import capture_outputs
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.ops.mask import packed_causal_mask, sliding_window_mask
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
@@ -163,7 +164,9 @@ class Gemma3MLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "geglu", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        if self.config.hidden_activation in {"gelu_pytorch_tanh", "gelu_python_tanh"}:
+        if self.config.hidden_activation in {"gelu_pytorch_tanh", "gelu_python_tanh"} and has_plain_linear_projections(
+            self
+        ):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,

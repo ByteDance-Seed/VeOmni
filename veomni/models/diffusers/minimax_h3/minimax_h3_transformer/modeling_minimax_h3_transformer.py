@@ -100,9 +100,9 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         self._configure_packed_attention(config._attn_implementation)
 
     def _configure_packed_attention(self, attn_implementation):
-        """Record the packed backend. Do not bind it yet: FA4/NPU/pre-SM90
-        cannot construct ``veomni_flash_attention_4``, and github/main only
-        validates the name on packed forward.
+        """Record the attention backend. Do not bind it yet: FA4/NPU/pre-SM90
+        cannot construct ``veomni_flash_attention_4``, so a flash name is
+        validated and bound on the first forward.
         """
         self._packed_attn_implementation = _packed_attn_name(attn_implementation)
 
@@ -214,6 +214,8 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         scheduler_video = kwargs.pop("scheduler_video", None)
         scheduler_audio = kwargs.pop("scheduler_audio", None)
 
+        if self._packed_attn_implementation in _PACKED_FLASH_BACKENDS:
+            self._load_packed_attention_kernel()
         # Run DiT — skip_mask_out_condition=True, update_mask=None
         video_tokens, audio_tokens = self.dit(
             x=x,
