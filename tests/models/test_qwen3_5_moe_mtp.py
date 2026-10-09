@@ -428,9 +428,9 @@ def test_qwen3_5_moe_reuses_checkpoint_index_mapping():
     assert not any("experts.0." in key for key in converted)
 
 
-def test_qwen3_5_moe_conditional_generation_builds_mtp(monkeypatch):
+def _build_conditional_generation(monkeypatch, mtp_loss_weight):
     config = AutoConfig.from_pretrained(TOY_CONFIG)
-    config.text_config.mtp_loss_weight = 0.3
+    config.text_config.mtp_loss_weight = mtp_loss_weight
     monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
     for slot_name in (
         "veomni_rms_norm",
@@ -444,7 +444,29 @@ def test_qwen3_5_moe_conditional_generation_builds_mtp(monkeypatch):
         getattr(modeling, slot_name).bind("eager")
 
     with torch.device("meta"):
-        model = modeling.Qwen3_5MoeForConditionalGeneration(config)
+        return modeling.Qwen3_5MoeForConditionalGeneration(config)
+
+
+def test_qwen3_5_moe_conditional_generation_builds_mtp(monkeypatch):
+    model = _build_conditional_generation(monkeypatch, mtp_loss_weight=0.3)
 
     assert isinstance(model.mtp, modeling.Qwen3_5MoeMTP)
     assert any(name.startswith("mtp.") for name, _ in model.named_parameters())
+
+
+@pytest.mark.parametrize("mtp_loss_weight", [None, 0.3])
+def test_qwen3_5_moe_parallel_plan_wraps_every_ep_sliced_owner_on_the_ep_mesh(monkeypatch, mtp_loss_weight):
+    """An EP-sliced weight whose owner is not an ep_fsdp unit is re-sharded over the regular FSDP mesh."""
+    model = _build_conditional_generation(monkeypatch, mtp_loss_weight)
+    plan = get_parallel_plan()
+
+    sliced_owners = {
+        name.rsplit(".", 1)[0]
+        for name, _ in model.named_parameters()
+        if any(check_fqn_match(pattern, name) for pattern in plan.extra_parallel_plan["ep"])
+    }
+    ep_owners = set(plan.get_extra_parallel_fsdp_no_shard_info(model, "ep"))
+
+    assert sliced_owners
+    assert ep_owners == sliced_owners
+    assert any(owner.startswith("mtp.") for owner in ep_owners) == (mtp_loss_weight is not None)
