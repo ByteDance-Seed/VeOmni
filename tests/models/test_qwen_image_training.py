@@ -225,6 +225,7 @@ def test_native_data_to_optimizer_and_checkpoint(snapshot, tmp_path, capsys, dty
     )
     condition = condition_model(snapshot)
     model = transformer(dtype).train()
+    model.parallel_state = parallel_state.get_parallel_state_by_name("base")
     model.gradient_checkpointing_enable()
     optimizer = build_optimizer(model, lr=1e-3)
     scheduler = build_lr_scheduler(optimizer, train_steps=1, lr=1e-3)
