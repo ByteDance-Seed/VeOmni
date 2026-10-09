@@ -105,6 +105,7 @@ seed_omni/mixins/offline_encoding.md
 :maxdepth: 1
 :caption: Design
 
+design/qwen4_frozen_prefix.md
 design/kernel_selection.md
 design/fused_moe_kernels.md
 design/local_parallel_state.md
