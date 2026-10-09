@@ -122,8 +122,8 @@ version = "0.1"
 [[manifest.dependency-metadata]]
 name = "rocm"
 version = "7.14.0"
-requires-dist = ["rocm-sdk-core==7.14.0", "rocm-sdk-libraries==7.14.0 ; extra == 'libraries'", "rocm-sdk-devel==7.14.0 ; extra == 'devel'"]
-provides-extras = ["libraries", "devel"]
+requires-dist = ["rocm-sdk-core==7.14.0", "rocm-sdk-libraries==7.14.0 ; extra == 'libraries'"]
+provides-extras = ["libraries"]
 
 [[package]]
 name = "accelerate"

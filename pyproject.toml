@@ -132,7 +132,7 @@ rocm = [
   "torchcodec==0.14.0",
   "liger-kernel",
   # 0.4.1's Triton causal_conv1d is not bit-exact across channel slices on ROCm,
-  # which GatedDeltaNet under Ulysses relies on (test_qwen3_5_gated_deltanet_ulysses).
+  # which test_qwen3_5_gated_deltanet_ulysses asserts.
   "flash-linear-attention==0.5.1",
   "av>=14.3.0,<15.0; python_version == '3.11'",
   "av>=14.0.0,<14.3; python_version == '3.12'",
@@ -380,17 +380,16 @@ explicit = true
 
 # The `rocm` meta-package ships only as an sdist whose setup.py probes the
 # build machine's GPU to choose its dependencies. Static metadata keeps the lock
-# independent of the machine that runs `uv lock`; only the extras torch and the
-# `rocm` extra rely on are declared.
+# independent of the machine that runs `uv lock`; only the `libraries` extra
+# that torch requires is declared.
 [[tool.uv.dependency-metadata]]
 name = "rocm"
 version = "7.14.0"
 requires-dist = [
   "rocm-sdk-core==7.14.0",
   "rocm-sdk-libraries==7.14.0; extra == 'libraries'",
-  "rocm-sdk-devel==7.14.0; extra == 'devel'",
 ]
-provides-extras = ["libraries", "devel"]
+provides-extras = ["libraries"]
 
 # The Magi packages below intentionally use empty static runtime metadata.
 # Their companion extensions declare no runtime requirements upstream, while
