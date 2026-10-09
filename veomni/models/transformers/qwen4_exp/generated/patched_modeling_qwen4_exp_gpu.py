@@ -286,23 +286,15 @@ def qwen4_exp_gdn_pad_value_heads(states, num_key_heads):
 
 
 def qwen4_exp_gather_cp_kv(states: torch.Tensor, parallel_state) -> torch.Tensor:
-    """Restore canonical tokens after U head exchange and CP KV all-gather.
+    """Gather CP-local KV into canonical CP-major, Ulysses-inner token order.
 
-    Input is [B,H,U*L,D]. CP gathering produces [CP,U,L] token blocks;
-    the collator and flattened SP mesh use [U,CP,L]. Queries stay CP-local.
-    gather_outputs sums KV gradients from the disjoint CP query partitions.
+    Input is [B,H,U*L,D] after Ulysses head exchange. The current SP mesh is
+    [CP,U], so CP gathering already concatenates canonical [CP,U,L] blocks.
+    Queries stay CP-local; gather_outputs sums gradients from all CP queries.
     """
-    cp_size = parallel_state.cp_size
-    ulysses_size = parallel_state.ulysses_size
-    if states.shape[2] % ulysses_size:
+    if states.shape[2] % parallel_state.ulysses_size:
         raise ValueError("Qwen4-Exp CP KV length must divide into equal Ulysses shards.")
-    batch, heads, length, dim = states.shape
-    gathered = gather_outputs(states, gather_dim=2, group=parallel_state.cp_group)
-    return (
-        gathered.reshape(batch, heads, cp_size, ulysses_size, length // ulysses_size, dim)
-        .transpose(2, 3)
-        .reshape(batch, heads, cp_size * length, dim)
-    )
+    return gather_outputs(states, gather_dim=2, group=parallel_state.cp_group)
 
 
 # ================================================================

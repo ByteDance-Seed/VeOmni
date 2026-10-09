@@ -284,7 +284,9 @@ class GlobalStateCallback(Callback):
         if self.trainer.train_dataloader is not None and global_state.get("train_dataloader") is not None:
             self.trainer.train_dataloader.load_state_dict(global_state["train_dataloader"])
 
-        self.trainer.environ_meter.load_state_dict(global_state["environ_meter"])
+        # OmniTrainer checkpoints written before it had a meter store None here.
+        if global_state.get("environ_meter") is not None:
+            self.trainer.environ_meter.load_state_dict(global_state["environ_meter"])
         rng_state = global_state.get("torch_rng_state")
         if rng_state is not None:
             torch.set_rng_state(rng_state)

@@ -35,7 +35,7 @@ VeOmni supports two training workflows:
 
 | Workflow | `training_task` | Description |
 |---|---|---|
-| **Offline** (recommended) | `offline_training` | Pre-embed videos once; re-use embeddings across epochs. Saves GPU memory during training. |
+| **Offline** (recommended) | `offline_training` | Pre-embed videos once; reuse embeddings across epochs. Saves GPU memory during training. |
 | **Online** | `online_training` | Embed videos on-the-fly each step. Requires the VAE + text encoder to stay on GPU throughout training. |
 
 ### 3.1 Download the Tom and Jerry dataset
