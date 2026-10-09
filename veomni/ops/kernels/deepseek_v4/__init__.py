@@ -62,9 +62,6 @@ def sparse_attn_triton(
     topk_idxs: torch.Tensor,
     sm_scale: float | None = None,
 ) -> torch.Tensor:
-    # The kernels are tuned and validated on ROCm only. Within ROCm there is no
-    # arch gate: they lower through ``tl.dot`` to MFMA, so any MFMA-capable arch
-    # runs them. They currently ship in Primus, imported lazily by ``impl``.
     _require_triton_rocm()
     from .triton_sparse_mla import sparse_attn_triton as impl
 

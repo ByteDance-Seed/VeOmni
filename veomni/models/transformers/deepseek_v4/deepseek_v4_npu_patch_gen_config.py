@@ -137,10 +137,7 @@ config.add_import("veomni.ops", names=["fused_moe_forward"])
 # ``_indexer_loss_enabled``), and the TileLang sparse attention declines any
 # non-CUDA tensor, so the branches reusing it are dead on NPU and refuse on the
 # first attention call. The import exists only so patchgen can emit a module that
-# type-checks. ``sparse_attn_triton`` is here for the same reason: the shared
-# ``eager_attention_forward`` names it, but reaching it needs
-# ``dsa_attention_implementation='triton'``, which that function accepts only for
-# CUDA/ROCm tensors.
+# type-checks. ``sparse_attn_triton`` is imported for the same reason.
 config.add_import(
     "veomni.ops.kernels.deepseek_v4",
     names=["sparse_attn_tilelang", "sparse_attn_triton", "sparse_mqa_target_fwd", "v4_lighting_indexer"],

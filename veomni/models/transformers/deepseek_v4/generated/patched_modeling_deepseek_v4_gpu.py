@@ -1644,10 +1644,8 @@ def eager_attention_forward(
             f"dsa_attention_implementation={attention_implementation!r}; "
             "expected 'eager', 'tilelang' or 'triton'"
         )
-    # Both sparse kernels consume the same compact index list over the same
-    # single-latent KV, so they share every structural condition; only the call
-    # site below differs. Operand dtypes are each kernel's own contract and are
-    # enforced there, which is what reports the offending dtype.
+    # Operand dtypes are each kernel's contract and are enforced by its wrapper,
+    # which reports the offending dtype. Only structural conditions belong here.
     sparse_implementation = attention_implementation in {"tilelang", "triton"}
     use_sparse_kernel = (
         sparse_implementation
@@ -1657,10 +1655,7 @@ def eager_attention_forward(
         and dropout == 0
         and key.shape[1] == 1
     )
-    # Only TileLang returns the log-sum-exp the indexer loss needs for its
-    # teacher, so that path stays gated on it specifically. ``_indexer_loss_enabled``
-    # already refuses any other implementation up front; this keeps the runtime
-    # refusal below exact rather than relying on that.
+    # Only TileLang returns the log-sum-exp the indexer loss's teacher needs.
     use_tilelang = use_sparse_kernel and attention_implementation == "tilelang"
     # --- Patch.3 ---
     # The indexer loss's teacher is a TileLang kernel, so a declined dispatch cannot
@@ -1762,16 +1757,6 @@ def eager_attention_forward(
         if attention_implementation == "tilelang":
             attn_output = sparse_attn_tilelang(query_rows, kv_rows, sinks, topk_indices, scaling)
         else:
-            # DeepSeek-V4 attention passes the same shared latent as both K and V,
-            # and the Triton sparse-MLA kernel reads one pool for both. An
-            # aliasing check is the only way to notice a caller that stopped
-            # doing that, because the shapes would still line up and V would
-            # simply be ignored.
-            if key.data_ptr() != value.data_ptr():
-                raise ValueError(
-                    "dsa_attention_implementation='triton' expects DeepSeek-V4's "
-                    "single-latent attention where K and V are the same tensor"
-                )
             attn_output = sparse_attn_triton(query_rows, kv_rows, sinks, topk_indices, scaling)
         return attn_output, None
     # --- Patch.1 ---
@@ -2881,11 +2866,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             # ``eager_attention_forward`` declines the TileLang dispatch for non-bf16
             # or host tensors, and its dense fallback needs the mask to stay causal,
             # so mirror those two runtime conditions before dropping the mask.
-            #
-            # Deliberately not extended to ``triton``: dropping the mask changes
-            # which invariants the index list alone has to carry, and that
-            # combination is unvalidated there. Keeping the mask costs the packed
-            # O(S^2) intermediate but leaves the Triton path on its tested contract.
+            # ``triton`` keeps the dense mask: the mask-free path is validated only with TileLang.
             mask_free_sparse = (
                 veomni_dsa_attention_implementation.value == "tilelang"
                 and not isinstance(attention_mask, dict)

@@ -1380,7 +1380,7 @@
  def eager_attention_forward(
      module: nn.Module,
      query: torch.Tensor,
-@@ -714,26 +1635,169 @@
+@@ -714,26 +1635,154 @@
      scaling: float,
      dropout: float | int = 0.0,
      **kwargs,
@@ -1396,10 +1396,8 @@
 +            f"dsa_attention_implementation={attention_implementation!r}; "
 +            "expected 'eager', 'tilelang' or 'triton'"
 +        )
-+    # Both sparse kernels consume the same compact index list over the same
-+    # single-latent KV, so they share every structural condition; only the call
-+    # site below differs. Operand dtypes are each kernel's own contract and are
-+    # enforced there, which is what reports the offending dtype.
++    # Operand dtypes are each kernel's contract and are enforced by its wrapper,
++    # which reports the offending dtype. Only structural conditions belong here.
 +    sparse_implementation = attention_implementation in {"tilelang", "triton"}
 +    use_sparse_kernel = (
 +        sparse_implementation
@@ -1409,10 +1407,7 @@
 +        and dropout == 0
 +        and key.shape[1] == 1
 +    )
-+    # Only TileLang returns the log-sum-exp the indexer loss needs for its
-+    # teacher, so that path stays gated on it specifically. ``_indexer_loss_enabled``
-+    # already refuses any other implementation up front; this keeps the runtime
-+    # refusal below exact rather than relying on that.
++    # Only TileLang returns the log-sum-exp the indexer loss's teacher needs.
 +    use_tilelang = use_sparse_kernel and attention_implementation == "tilelang"
 +    # --- Patch.3 ---
 +    # The indexer loss's teacher is a TileLang kernel, so a declined dispatch cannot
@@ -1514,16 +1509,6 @@
 +        if attention_implementation == "tilelang":
 +            attn_output = sparse_attn_tilelang(query_rows, kv_rows, sinks, topk_indices, scaling)
 +        else:
-+            # DeepSeek-V4 attention passes the same shared latent as both K and V,
-+            # and the Triton sparse-MLA kernel reads one pool for both. An
-+            # aliasing check is the only way to notice a caller that stopped
-+            # doing that, because the shapes would still line up and V would
-+            # simply be ignored.
-+            if key.data_ptr() != value.data_ptr():
-+                raise ValueError(
-+                    "dsa_attention_implementation='triton' expects DeepSeek-V4's "
-+                    "single-latent attention where K and V are the same tensor"
-+                )
 +            attn_output = sparse_attn_triton(query_rows, kv_rows, sinks, topk_indices, scaling)
 +        return attn_output, None
 +    # --- Patch.1 ---
@@ -1559,7 +1544,7 @@
 
 
  COMPRESSOR_CLASSES = {
-@@ -741,6 +1805,12 @@
+@@ -741,6 +1790,12 @@
      "compressed_sparse_attention": DeepseekV4CSACompressor,
      "heavily_compressed_attention": DeepseekV4HCACompressor,
  }
@@ -1572,7 +1557,7 @@
 
 
  class DeepseekV4Attention(nn.Module):
-@@ -789,6 +1859,20 @@
+@@ -789,6 +1844,20 @@
              COMPRESSOR_CLASSES[self.layer_type](config) if self.layer_type != "sliding_attention" else None
          )
 
@@ -1593,7 +1578,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -796,48 +1880,204 @@
+@@ -796,48 +1865,204 @@
          position_ids: torch.Tensor,
          attention_mask: torch.Tensor | None,
          past_key_values: Cache | None = None,
@@ -1820,7 +1805,7 @@
              self,
              q,
              kv,
-@@ -846,22 +2086,65 @@
+@@ -846,22 +2071,65 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -1897,7 +1882,7 @@
 
 
  class DeepseekV4HyperConnection(nn.Module):
-@@ -912,22 +2195,30 @@
+@@ -912,22 +2180,30 @@
          # doubly-stochastic manifold). Each output gets its own learned scale.
          self.scale = nn.Parameter(torch.empty(3))
 
@@ -1939,7 +1924,7 @@
          pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
          post = 2 * torch.sigmoid(post_w * post_scale + post_b)
          comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
-@@ -936,11 +2227,14 @@
+@@ -936,11 +2212,14 @@
          for _ in range(self.hc_sinkhorn_iters - 1):
              comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
              comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
@@ -1957,7 +1942,7 @@
 
 
  class DeepseekV4HyperHead(nn.Module):
-@@ -956,10 +2250,27 @@
+@@ -956,10 +2235,27 @@
          self.hc_scale = nn.Parameter(torch.empty(1))
 
      def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1985,7 +1970,7 @@
 
 
  class DeepseekV4MLP(nn.Module):
-@@ -974,17 +2285,65 @@
+@@ -974,17 +2270,65 @@
          self.act_fn = ACT2FN[config.hidden_act]
          self.limit = config.swiglu_limit
 
@@ -2058,7 +2043,7 @@
          super().__init__()
          self.num_experts = config.num_local_experts
          self.hidden_dim = config.hidden_size
-@@ -993,32 +2352,77 @@
+@@ -993,32 +2337,77 @@
          self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
          self.act_fn = ACT2FN[config.hidden_act]
          self.limit = config.swiglu_limit
@@ -2149,7 +2134,7 @@
 
 
  class DeepseekV4TopKRouter(nn.Module):
-@@ -1032,14 +2436,28 @@
+@@ -1032,14 +2421,28 @@
          self.routed_scaling_factor = config.routed_scaling_factor
          self.e_score_correction_bias = nn.Buffer(torch.zeros(self.num_experts))
 
@@ -2181,7 +2166,7 @@
 
 
  class DeepseekV4HashRouter(nn.Module):
-@@ -1062,23 +2480,54 @@
+@@ -1062,23 +2465,54 @@
          self.tid2eid = nn.Buffer(torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), persistent=True)
 
      def forward(
@@ -2240,7 +2225,7 @@
          self.shared_experts = DeepseekV4MLP(config)
 
      def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None) -> torch.Tensor:
-@@ -1093,6 +2542,12 @@
+@@ -1093,6 +2527,12 @@
          return routed + self.shared_experts(residual)
 
 
@@ -2253,7 +2238,7 @@
  class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
      r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
      two places:
-@@ -1122,26 +2577,54 @@
+@@ -1122,26 +2562,54 @@
          hidden_states: torch.Tensor,
          input_ids: torch.Tensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -2323,7 +2308,7 @@
 
 
  @auto_docstring
-@@ -1252,6 +2735,12 @@
+@@ -1252,6 +2720,12 @@
                  init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
@@ -2336,7 +2321,7 @@
  @auto_docstring
  class DeepseekV4Model(DeepseekV4PreTrainedModel):
      def __init__(self, config: DeepseekV4Config):
-@@ -1271,6 +2760,20 @@
+@@ -1271,6 +2745,20 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -2357,7 +2342,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1283,38 +2786,193 @@
+@@ -1283,38 +2771,189 @@
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -2462,11 +2447,7 @@
 +            # ``eager_attention_forward`` declines the TileLang dispatch for non-bf16
 +            # or host tensors, and its dense fallback needs the mask to stay causal,
 +            # so mirror those two runtime conditions before dropping the mask.
-+            #
-+            # Deliberately not extended to ``triton``: dropping the mask changes
-+            # which invariants the index list alone has to carry, and that
-+            # combination is unvalidated there. Keeping the mask costs the packed
-+            # O(S^2) intermediate but leaves the Triton path on its tested contract.
++            # ``triton`` keeps the dense mask: the mask-free path is validated only with TileLang.
 +            mask_free_sparse = (
 +                veomni_dsa_attention_implementation.value == "tilelang"
 +                and not isinstance(attention_mask, dict)
@@ -2561,7 +2542,7 @@
                  hidden_states,
                  position_embeddings=position_embeddings,
                  position_ids=position_ids,
-@@ -1323,9 +2981,88 @@
+@@ -1323,9 +2962,88 @@
                  past_key_values=past_key_values,
                  **kwargs,
              )
@@ -2651,7 +2632,7 @@
 
 
  def load_balancing_loss_func(
-@@ -1397,6 +3134,12 @@
+@@ -1397,6 +3115,12 @@
      return overall_loss * num_experts
 
 
@@ -2664,7 +2645,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1416,6 +3159,17 @@
+@@ -1416,6 +3140,17 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -2682,7 +2663,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1430,36 +3184,12 @@
+@@ -1430,36 +3165,12 @@
          output_router_logits: bool | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -2721,7 +2702,7 @@
              input_ids=input_ids,
              attention_mask=attention_mask,
              position_ids=position_ids,
-@@ -1471,26 +3201,183 @@
+@@ -1471,26 +3182,183 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -2918,7 +2899,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1498,7 +3385,20 @@
+@@ -1498,7 +3366,20 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

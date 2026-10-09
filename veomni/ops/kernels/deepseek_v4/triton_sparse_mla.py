@@ -14,24 +14,11 @@
 #
 # Adapted from AMD-AGI/Primus (v4_sparse_mla_adapter.py, MIT License); modified for VeOmni.
 
-"""DeepSeek-V4 sparse MQA on AMD via Triton sparse-MLA kernels.
+"""DeepSeek-V4 sparse MQA on AMD GPUs via Primus' Triton sparse-MLA kernels.
 
-The ROCm counterpart to ``tilelang_sparse_mla``: same compact index-list
-contract, same per-head learnable sink, but MFMA Triton kernels that run on any
-MFMA-capable arch instead of requiring NVIDIA SM90+. The kernels currently ship
-in Primus and are imported lazily, so importing VeOmni never needs that tree.
-
-The kernels take one flat latent pool and a token-major index list, which is a
-different layout from the ``[B, S, ...]`` tensors DeepSeek-V4 attention holds.
-This module owns that translation:
-
-* ``d_qk = kv_lora_rank + rope_rank`` is the kernel's contract, with a nonzero
-  rope rank. DeepSeek-V4 carries no separate rope block here, so ``ROPE_PAD``
-  zero channels are appended; the kernels skip them and the backward slices
-  them back off.
-* the index list is rebased from per-sample to pool-global rows. Anything
-  outside ``[0, kv_len)`` becomes ``-1``, as TileLang treats it.
-* ``topk`` is padded to ``TOPK_ALIGN`` with ``-1``.
+Same interface as ``tilelang_sparse_mla.sparse_attn_tilelang``. The kernels take
+one flat KV pool and a token-major index list, so this module appends a zero
+rope block, rebases per-sample indices onto the pool and pads ``topk``.
 """
 
 from __future__ import annotations
@@ -43,33 +30,17 @@ import torch
 from ....utils.device import get_torch_device
 
 
-# The kernels require ``d_qk > kv_lora_rank`` but skip the rope block in the
-# single-latent form, so its contents never matter. 64 matches Primus' adapter.
+# The kernels need a nonzero rope block (``d_qk > kv_lora_rank``) but never read it.
 ROPE_PAD = 64
-# Primus' own adapter pads topk to a multiple of 64 so that backends with 64-wide
-# dKV tiles stay valid. Padded slots are ``-1`` and select nothing; matching it
-# keeps this path on the operand layout Primus validates.
+# Primus' adapter pads topk to a multiple of 64 for backends with 64-wide dKV tiles.
 TOPK_ALIGN = 64
-# The Triton backward stages its LDS operand tiles across pipeline stages, which
-# needs 160 KiB at the default schedule -- fine on CDNA4, over budget on the
-# 64 KiB of CDNA3. These knobs are the backend's own; see ``_apply_lds_budget``.
+# The default backward schedule needs 160 KiB of LDS; these select the small-LDS one.
 _LDS_BUDGET_KNOBS = {"PRIMUS_DSA_BWD_NUM_STAGES": "1", "PRIMUS_DSA_DKV_SAFE": "1"}
 _SMALL_LDS_BYTES = 64 * 1024
 
 
 def _apply_lds_budget(device: torch.device) -> None:
-    """Pick the small-LDS backward schedule when the device needs it.
-
-    Measured on MI308X (gfx942, 64 KiB LDS) at S=4096 / H=64 / topk=640, the
-    default schedule asks for 163840 B and ``PRIMUS_DSA_DKV_SAFE`` alone still
-    asks for 73728 B; both raise ``triton.OutOfResources``. Disabling the
-    pipeline staging is what brings it under budget (27.59 ms), and adding the
-    narrow dKV tile is a further 12% (24.18 ms).
-
-    ``setdefault`` rather than assignment: an explicitly exported value wins.
-    Only devices that need it are touched, leaving the faster default schedule
-    in place on larger LDS.
-    """
+    """Select the small-LDS backward schedule on 64 KiB-LDS devices; exported values win."""
     properties = get_torch_device().get_device_properties(device)
     if getattr(properties, "shared_memory_per_block", 0) > _SMALL_LDS_BYTES:
         return
@@ -102,8 +73,7 @@ def _to_pool_indices(topk_indices: torch.Tensor, kv_len: int) -> torch.Tensor:
     """Rebase ``[B, S, K]`` per-sample indices onto one ``B * kv_len`` pool."""
     batch = topk_indices.shape[0]
     offsets = torch.arange(batch, device=topk_indices.device, dtype=topk_indices.dtype).view(batch, 1, 1) * kv_len
-    # The kernel only bounds-checks the whole pool, so a row past this sample's
-    # ``kv_len`` would read the next sample's keys instead of being masked.
+    # The kernel only bounds-checks the whole pool: an index past ``kv_len`` would read the next sample.
     valid = (topk_indices >= 0) & (topk_indices < kv_len)
     global_indices = torch.where(valid, topk_indices + offsets, torch.full_like(topk_indices, -1))
     global_indices = global_indices.reshape(-1, global_indices.shape[-1]).to(torch.int32)
@@ -152,7 +122,6 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
             kv_lora_rank=head_dim,
             scale=ctx.sm_scale,
         )
-        # Drop the zero rope block the operands were padded with.
         dq = dq[..., :head_dim].reshape(batch, seq_len, num_heads, head_dim)
         dkv = dkv[:, 0, :head_dim].reshape(batch, kv_len, head_dim)
         return dq, dkv, d_attn_sink, None, None
@@ -179,15 +148,6 @@ def sparse_attn_triton(q, kv, attn_sink, topk_idxs, sm_scale=None):
         raise ValueError(f"DeepSeek V4 Triton sparse attention requires bfloat16 q/kv, got q={q.dtype}, kv={kv.dtype}")
     if attn_sink.dtype is not torch.float32:
         raise ValueError(f"DeepSeek V4 Triton sparse attention requires a float32 sink, got {attn_sink.dtype}")
-    if q.shape[-1] != kv.shape[-1]:
-        raise ValueError(
-            f"DeepSeek V4 Triton sparse attention requires matching head dims, got q={q.shape[-1]}, kv={kv.shape[-1]}"
-        )
-    if attn_sink.shape != (q.shape[-2],):
-        raise ValueError(
-            "DeepSeek V4 Triton sparse attention requires one sink value per query head, got "
-            f"shape={tuple(attn_sink.shape)}"
-        )
     if sm_scale is None:
         sm_scale = q.shape[-1] ** -0.5
     return DeepSeekV4SparseAttention.apply(
