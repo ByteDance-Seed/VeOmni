@@ -247,7 +247,7 @@ def test_minimax_h3_flash2_bind_defers_until_packed_bounds():
     ops.attn_implementation = "flash_attention_2"
     with ops_config_scope(ops):
         attn = MiniMaxH3Attention(hidden_size=16, num_attention_heads=2, attention_head_dim=8, qk_norm_eps=1e-5)
-    assert attn.veomni_attn.impl == "sdpa"
+    assert attn.veomni_attn.impl == "veomni_sdpa"
     assert attn.veomni_rope.op == "rope"
     assert attn.veomni_rope.variant == "partial"
 

@@ -14,6 +14,7 @@
 
 """SDPA backend and SP-aware adapter implementation."""
 
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -22,7 +23,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers.integrations.sdpa_attention import sdpa_attention_forward as hf_sdpa_attention_forward
 
 from .....distributed.parallel_state import get_parallel_state
-from ..helper import reject_sdpa_packed_metadata
+from ..helper import strip_sdpa_packed_metadata
 from ..ulysses import (
     prepare_ulysses_qkv,
     restore_ulysses_output,
@@ -30,8 +31,9 @@ from ..ulysses import (
 )
 
 
-# Flash / cuDNN drop dense masks. This kernel exists for mask + Ulysses, so pin
-# memory-efficient first. MATH stays as the CPU / unsupported-shape fallback.
+# Flash / cuDNN drop dense masks, so masked calls pin memory-efficient first.
+# MATH stays as the CPU / unsupported-shape fallback. Unmasked calls keep
+# PyTorch's default backend selection.
 _SDPA_MASK_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
 
@@ -92,19 +94,20 @@ def sdpa_attention_forward(
 
     ``sliding_window`` is shared-signature metadata and is not forwarded. This
     row supports windowed visibility only when it is already encoded in
-    ``attention_mask``. Packed/varlen metadata is rejected because the SDPA
-    API has no cumulative-length arguments. ``softcap`` changes logits rather
-    than visibility, so a mask cannot encode it; this row rejects explicit
-    softcapping rather than silently changing attention semantics.
+    ``attention_mask``. The SDPA API has no cumulative-length arguments, so
+    packed/varlen metadata is dropped when it describes one segment per row
+    or a dense mask isolates the segments; otherwise it raises. ``softcap``
+    changes logits rather than visibility, so a mask cannot encode it; this
+    row rejects explicit softcapping rather than silently changing attention
+    semantics.
 
-    Uses memory-efficient SDPA so a dense bool / additive mask stays valid.
-    Flash is not tried. Use ``veomni_flash_attention_*`` when the pattern can
-    stay in attention kwargs.
+    Calls with a dense bool / additive mask use memory-efficient SDPA so the
+    mask stays valid. Unmasked calls keep PyTorch's default backend selection.
 
     ``skip_ulysses`` opts a call out when it already gathered or its tokens
     are not on the SP mesh.
     """
-    reject_sdpa_packed_metadata(kwargs)
+    kwargs = strip_sdpa_packed_metadata(kwargs, batch_size=query.shape[0], dense_mask=attention_mask)
     del sliding_window
 
     if softcap is not None:
@@ -146,7 +149,7 @@ def sdpa_attention_forward(
             local_query_head_count=query.shape[1],
             group=parallel_state.ulysses_group,
         )
-    with sdpa_kernel(_SDPA_MASK_BACKENDS):
+    with sdpa_kernel(_SDPA_MASK_BACKENDS) if attention_mask is not None else nullcontext():
         output, lse = hf_sdpa_attention_forward(
             backend_module,
             query,

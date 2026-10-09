@@ -17,33 +17,40 @@
 import torch
 
 
-def reject_sdpa_packed_metadata(kwargs: dict) -> None:
-    """Reject non-null packed/varlen arguments absent from the SDPA API.
+_SDPA_CU_SEQLENS_KEYS = ("cu_seqlens", "cu_seqlens_q", "cu_seqlens_k", "cu_seq_lens_q", "cu_seq_lens_k")
+_SDPA_PACKED_METADATA_KEYS = (*_SDPA_CU_SEQLENS_KEYS, "max_length_q", "max_length_k", "max_seqlen_q", "max_seqlen_k")
 
-    Dense attention masks remain supported. Do not inspect their contents or
-    infer packing from position IDs used by ordinary attention calls.
+
+def strip_sdpa_packed_metadata(
+    kwargs: dict,
+    *,
+    batch_size: int,
+    dense_mask: torch.Tensor | None,
+) -> dict:
+    """Drop packed/varlen arguments absent from the SDPA API.
+
+    The collator always emits this metadata. It is dropped when it describes
+    at most one segment per batch row, or when ``dense_mask`` is a 3-D/4-D
+    mask, which the caller built to isolate the segments. Several segments in
+    a row without such a mask would attend across samples, so that raises.
+    Dense mask contents are not inspected.
     """
-    unsupported = tuple(
+    packed = [name for name in _SDPA_PACKED_METADATA_KEYS if kwargs.get(name) is not None]
+    if not packed:
+        return kwargs
+    multi_segment = [
         name
-        for name in (
-            "cu_seqlens",
-            "cu_seqlens_q",
-            "cu_seqlens_k",
-            "cu_seq_lens_q",
-            "cu_seq_lens_k",
-            "max_length_q",
-            "max_length_k",
-            "max_seqlen_q",
-            "max_seqlen_k",
-        )
-        if kwargs.get(name) is not None
-    )
-    if unsupported:
+        for name in _SDPA_CU_SEQLENS_KEYS
+        if torch.is_tensor(kwargs.get(name)) and kwargs[name].numel() - 1 > batch_size
+    ]
+    if multi_segment and (dense_mask is None or dense_mask.ndim < 3):
         raise ValueError(
-            "SDPA does not support packed/varlen attention metadata: "
-            + ", ".join(unsupported)
-            + ". Use a packed-capable attention implementation."
+            "SDPA received packed metadata with several segments per row ("
+            + ", ".join(multi_segment)
+            + ") but no dense attention mask that isolates them. Build one with "
+            "packed_causal_mask or use a packed-capable attention implementation."
         )
+    return {key: value for key, value in kwargs.items() if key not in packed}
 
 
 def require_all(condition: torch.Tensor, message: str) -> None:

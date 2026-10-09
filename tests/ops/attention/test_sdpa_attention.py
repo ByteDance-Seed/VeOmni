@@ -40,7 +40,7 @@ from veomni.ops import VeomniOp
 from veomni.ops.kernels.attention import ulysses as ulysses_backend
 from veomni.ops.kernels.attention.mask import sdpa as sdpa_mask
 from veomni.ops.kernels.attention.standard import sdpa as sdpa_backend
-from veomni.ops.mask import causal_mask, sliding_window_mask
+from veomni.ops.mask import causal_mask, packed_causal_mask, sliding_window_mask
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
@@ -65,25 +65,22 @@ def test_sdpa_attention_forward_square_causal_layout(impl, metadata):
     assert torch.isfinite(output).all()
 
 
-_PACKED_METADATA_KEYS = (
-    "cu_seqlens",
-    "cu_seqlens_q",
-    "cu_seqlens_k",
-    "cu_seq_lens_q",
-    "cu_seq_lens_k",
-    "max_length_q",
-    "max_length_k",
-    "max_seqlen_q",
-    "max_seqlen_k",
-)
+_CU_SEQLENS_KEYS = ("cu_seqlens", "cu_seqlens_q", "cu_seqlens_k", "cu_seq_lens_q", "cu_seq_lens_k")
+_MAX_LENGTH_KEYS = ("max_length_q", "max_length_k", "max_seqlen_q", "max_seqlen_k")
+
+
+def _sdpa_forward(entrypoint):
+    if entrypoint == "adapter":
+        return sdpa_backend.sdpa_attention_forward
+    return VeomniOp("attention", "standard", entrypoint)
 
 
 @pytest.mark.parametrize(
     "entrypoint",
     ("sdpa", "veomni_sdpa", "adapter", "mask", "causal_mask", "sliding_window_mask"),
 )
-def test_sdpa_rejects_packed_metadata_before_backend_or_collectives(monkeypatch, entrypoint):
-    """Every SDPA entry rejects explicit packing, including standalone aliases."""
+def test_sdpa_rejects_unisolated_packing_before_backend_or_collectives(monkeypatch, entrypoint):
+    """Several segments per row without a dense mask would attend across samples."""
 
     def unexpected_call(*args, **kwargs):
         pytest.fail("packed metadata reached SDPA or parallel-state handling")
@@ -91,9 +88,11 @@ def test_sdpa_rejects_packed_metadata_before_backend_or_collectives(monkeypatch,
     monkeypatch.setattr(sdpa_backend, "get_parallel_state", unexpected_call)
     monkeypatch.setattr(sdpa_mask, "should_apply_ulysses", unexpected_call)
     monkeypatch.setattr(F, "scaled_dot_product_attention", unexpected_call)
-    for name in _PACKED_METADATA_KEYS:
-        metadata = {name: 0 if name.startswith("max_") else torch.tensor([0, 2, 4])}
-        with pytest.raises(ValueError, match=f"SDPA does not support packed/varlen attention metadata: {name}"):
+    for name in _CU_SEQLENS_KEYS:
+        if entrypoint == "sliding_window_mask" and name == "cu_seqlens":
+            continue
+        metadata = {name: torch.tensor([0, 2, 4]), "max_length_q": 2}
+        with pytest.raises(ValueError, match=f"several segments per row \\({name}\\)"):
             if entrypoint == "mask":
                 sdpa_mask.sdpa_attention_mask_builder(1, 4, 4, device="cpu", **metadata)
             elif entrypoint == "causal_mask":
@@ -102,12 +101,66 @@ def test_sdpa_rejects_packed_metadata_before_backend_or_collectives(monkeypatch,
                 sliding_window_mask(4, 4, impl="sdpa", device="cpu", sliding_window=2, **metadata)
             else:
                 query = torch.ones(1, 2, 4, 8)
-                forward = (
-                    sdpa_backend.sdpa_attention_forward
-                    if entrypoint == "adapter"
-                    else VeomniOp("attention", "standard", entrypoint)
-                )
-                forward(_FakeAttentionModule(), query, query, query, None, **metadata)
+                padding = torch.ones(1, 4, dtype=torch.bool)
+                _sdpa_forward(entrypoint)(_FakeAttentionModule(), query, query, query, padding, **metadata)
+
+
+@pytest.mark.parametrize("entrypoint", ("sdpa", "veomni_sdpa", "adapter"))
+def test_sdpa_drops_single_segment_metadata(entrypoint):
+    """Collator metadata for one sample per row matches the plain causal call."""
+    query = torch.randn(2, 2, 4, 8)
+    forward = _sdpa_forward(entrypoint)
+    expected, _ = forward(_FakeAttentionModule(), query, query, query, None)
+    single = torch.tensor([0, 4, 8])
+    metadata = dict.fromkeys(_CU_SEQLENS_KEYS, single) | dict.fromkeys(_MAX_LENGTH_KEYS, 4)
+    output, _ = forward(_FakeAttentionModule(), query, query, query, None, **metadata)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+    built = sdpa_mask.sdpa_attention_mask_builder(2, 4, 4, device="cpu", **metadata)
+    reference = sdpa_mask.sdpa_attention_mask_builder(2, 4, 4, device="cpu")
+    assert (built is None) == (reference is None)
+    if built is not None:
+        torch.testing.assert_close(built, reference)
+
+
+@pytest.mark.parametrize("entrypoint", ("sdpa", "veomni_sdpa", "adapter"))
+def test_sdpa_accepts_packing_isolated_by_dense_mask(entrypoint):
+    cu_seqlens = torch.tensor([0, 2, 4])
+    mask = packed_causal_mask(4, 4, impl="sdpa", device="cpu", cu_seqlens=cu_seqlens)
+    query = torch.randn(1, 2, 4, 8)
+    forward = _sdpa_forward(entrypoint)
+    expected, _ = forward(_FakeAttentionModule(), query, query, query, mask)
+    output, _ = forward(
+        _FakeAttentionModule(),
+        query,
+        query,
+        query,
+        mask,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+        max_length_q=2,
+        max_length_k=2,
+    )
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    # The first token of the second segment only sees itself.
+    torch.testing.assert_close(output[0, 2], query[0, :, 2], rtol=ATTN_RTOL, atol=ATTN_ATOL)
+
+
+def test_veomni_sdpa_pins_mask_backends_only_with_mask(monkeypatch):
+    pinned = []
+    real_sdpa_kernel = sdpa_backend.sdpa_kernel
+
+    def recording_sdpa_kernel(backends):
+        pinned.append(backends)
+        return real_sdpa_kernel(backends)
+
+    monkeypatch.setattr(sdpa_backend, "sdpa_kernel", recording_sdpa_kernel)
+    query = torch.randn(1, 2, 4, 8)
+    sdpa_backend.sdpa_attention_forward(_FakeAttentionModule(), query, query, query, None)
+    assert pinned == []
+    mask = torch.ones(1, 1, 4, 4, dtype=torch.bool).tril()
+    sdpa_backend.sdpa_attention_forward(_FakeAttentionModule(), query, query, query, mask)
+    assert pinned == [sdpa_backend._SDPA_MASK_BACKENDS]
 
 
 def test_sdpa_attention_rejects_zero_dimensions():

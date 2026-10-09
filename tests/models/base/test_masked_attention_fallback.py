@@ -42,12 +42,12 @@ def _qwen_image_processor():
         pytest.param(_qwen_image_processor, id="qwen_image"),
     ),
 )
-def test_masked_attention_falls_back_to_sdpa(available_nvidia_ops, build):
+def test_masked_attention_falls_back_to_veomni_sdpa(available_nvidia_ops, build):
     ops = eager_ops_config()
     ops.attn_implementation = "flash_attention_2"
     with ops_config_scope(ops):
         module = build()
 
     assert module.veomni_attn.impl == "flash_attention_2"
-    assert module.veomni_attn_masked.impl == "sdpa"
+    assert module.veomni_attn_masked.impl == "veomni_sdpa"
     assert module.veomni_attn_masked is not module.veomni_attn

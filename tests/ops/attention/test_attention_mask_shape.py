@@ -154,20 +154,17 @@ def test_eager_packed_with_long_padding_mask_is_additive():
     torch.testing.assert_close(blocked, torch.full_like(blocked, torch.finfo(torch.float32).min))
 
 
-def test_sdpa_packed_shape_is_unsupported():
-    """SDPA rejects the packed API before looking at cached vs square lengths."""
-    with pytest.raises(ValueError, match="SDPA does not support packed_causal_mask"):
-        packed_causal_mask(
-            2,
-            4,
-            impl="sdpa",
-            device="cpu",
-            cu_seqlens=torch.tensor([0, 2]),
-            cu_seq_lens_k=torch.tensor([0, 4]),
-        )
+@pytest.mark.parametrize("impl", ("sdpa", "veomni_sdpa"))
+def test_sdpa_packed_shape_isolates_segments(impl):
+    shaped = packed_causal_mask(4, 4, impl=impl, device="cpu", cu_seqlens=torch.tensor([0, 2, 4]))
+    keep = torch.zeros(4, 4, dtype=torch.bool)
+    keep[:2, :2] = torch.tril(torch.ones(2, 2, dtype=torch.bool))
+    keep[2:, 2:] = torch.tril(torch.ones(2, 2, dtype=torch.bool))
+    assert shaped.dtype == torch.bool
+    torch.testing.assert_close(shaped[0, 0], keep)
 
 
-@pytest.mark.parametrize("impl", ("eager", "flex_attention", "magi_attention"))
+@pytest.mark.parametrize("impl", ("eager", "sdpa", "flex_attention", "magi_attention"))
 def test_packed_cached_uses_independent_query_and_key_segments(impl):
     """Cross-length packed masks align each query with its paired key segment."""
     expected = torch.tensor(
@@ -188,6 +185,8 @@ def test_packed_cached_uses_independent_query_and_key_segments(impl):
         )
         if impl == "eager":
             visible = shaped[0, 0] == 0
+        elif impl == "sdpa":
+            visible = shaped[0, 0]
         elif impl == "flex_attention":
             visible = flex_visible(shaped, 3, 6)
         else:

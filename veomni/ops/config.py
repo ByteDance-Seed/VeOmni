@@ -40,16 +40,20 @@ def get_ops_config() -> Any:
     return _ops_config
 
 
-def resolve_op_impl(field: str, *, npu_as: str | None = None) -> str:
+def resolve_op_impl(field: str, *, npu_as: str | None = None, eager_as: str | None = None) -> str:
     """Return the impl name on the installed ops config, or ``eager``.
 
-    ``npu_as`` remaps the ``npu`` CE name to ``chunk_loss``. Missing config
-    is eager so unit tests can construct a module without ``set_ops_config``.
+    ``npu_as`` remaps the ``npu`` CE name to ``chunk_loss``. ``eager_as``
+    remaps ``eager`` for modeling without a local ``eager_attention_forward``,
+    which the ``attention/standard/eager`` row requires. Missing config is
+    eager so unit tests can construct a module without ``set_ops_config``.
     """
     cfg = get_ops_config()
     impl = "eager" if cfg is None else getattr(cfg, field, "eager")
     if npu_as is not None and impl == "npu":
         return npu_as
+    if eager_as is not None and impl == "eager":
+        return eager_as
     return impl
 
 

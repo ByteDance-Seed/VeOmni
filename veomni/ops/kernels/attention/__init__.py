@@ -36,7 +36,7 @@ from ...platform import (
     NvidiaGpuPlatform,
 )
 from ...registry import register_op
-from .helper import reject_sdpa_packed_metadata
+from .helper import strip_sdpa_packed_metadata
 
 
 def _module_eager_forward(module: torch.nn.Module) -> Callable | None:
@@ -70,7 +70,7 @@ def lookup(impl: str) -> Callable:
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Dispatch one attention call through the selected Transformers interface."""
         if impl == "sdpa":
-            reject_sdpa_packed_metadata(kwargs)
+            kwargs = strip_sdpa_packed_metadata(kwargs, batch_size=query.shape[0], dense_mask=attention_mask)
 
         eager_default = _module_eager_forward(module)
         forward = ALL_ATTENTION_FUNCTIONS.get_interface(impl, eager_default)

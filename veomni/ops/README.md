@@ -168,7 +168,8 @@ hidden_states = self.veomni_rms_norm(hidden_states, self.weight, eps=self.varian
 `VeomniOp` resolves its row at construction, is interned by the public
 triple, and always calls the row's wrapper. `models.build_foundation_model`
 installs the `OpsImplementationConfig` object in `ops/config.py` before
-constructing the model.
+constructing the model. Changing the installed config later does not
+retarget handles that already exist.
 
 The registry wrapper is the canonical tensor contract for an op variant;
 it is not a collection of model-specific adapters. Transformations that vary
@@ -191,13 +192,16 @@ into the outer custom-autograd state.
 ## Process-wide integrations
 
 The `sdpa` and `veomni_sdpa` attention rows accept ordinary dense attention
-masks but do not expose a packed/varlen API. `packed_causal_mask` rejects these
-implementations, and their attention calls and the VeOmni SDPA mask builder
-reject non-null cumulative-length or varlen maximum-length metadata. Packing
-must use a packed-capable implementation. This follows the public
+masks but do not expose a packed/varlen API, following the public
 [`torch.nn.functional.scaled_dot_product_attention` signature](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html),
-which has `attn_mask` but no `cu_seqlens` arguments. Opaque dense masks are not
-inspected to infer whether they encode sequence boundaries.
+which has `attn_mask` but no `cu_seqlens` arguments. `packed_causal_mask`
+composes the segments into a dense block-diagonal mask for these
+implementations. Their attention calls and the VeOmni SDPA mask builder drop
+cumulative-length and varlen maximum-length metadata when it describes at most
+one segment per batch row, or when the call carries a 3-D/4-D dense mask.
+Several segments per row without such a mask raise, because SDPA would attend
+across samples. Opaque dense masks are not inspected to infer whether they
+encode sequence boundaries.
 
 The VeOmni SDPA mask builder only honors causal mask-elision hints for the
 canonical causal predicate with equal Q/K lengths and offsets. Bidirectional
@@ -221,7 +225,6 @@ selected through `VeomniOp`.
 - Per-family math and hardware behavior: `tests/ops/<family>/`
 - Model-facing integration and helpers: `tests/models/`
 - User-facing selection and lifecycle: `docs/design/op_selection.md`
-- Breaking change map from OpSlot: `docs/design/opslot_to_veomniop.md`
 
 When adding a row, test its numerical contract, registration, hardware
 requirement, and optional-package requirements. When adding model-specific

@@ -110,11 +110,14 @@ def test_gemma3_eager_matches_hf_softcap():
         )
 
 
-def test_gemma3_packed_eager_matches_independent_samples():
+@pytest.mark.parametrize("impl", ("eager", "sdpa", "veomni_sdpa"))
+def test_gemma3_packed_dense_matches_independent_samples(impl):
     """Packed ``cu_seq_lens_q`` uses ``packed_causal_mask`` / ``sliding_window_mask``."""
     torch.manual_seed(123)
     config = _tiny_config()
-    ours = _build_ours(config).eval()
+    ops = eager_ops_config()
+    ops.attn_implementation = impl
+    ours = _build_ours(config, ops).eval()
     first_input_ids = torch.tensor([[5, 6, 7]])
     second_input_ids = torch.tensor([[8, 9, 10, 11, 12]])
     packed_input_ids = torch.cat((first_input_ids, second_input_ids), dim=1)

@@ -182,8 +182,6 @@ def test_qwen_image_joint_keep_mask_keeps_padding_and_dropped_text():
 
 
 def test_qwen_image_processor_uses_primary_handle_without_mask(monkeypatch):
-    from torch import nn
-
     from veomni.models.diffusers.qwen_image.qwen_image_transformer import modeling_qwen_image_transformer as modeling
 
     monkeypatch.setattr(
@@ -209,9 +207,42 @@ def test_qwen_image_processor_uses_primary_handle_without_mask(monkeypatch):
     processor.veomni_attn = primary
     processor.veomni_attn_masked = masked
 
-    heads, dim_head = 2, 4
+    attn = _tiny_attn(heads=2, dim_head=4)
+    hidden = torch.randn(1, 4, 8)
+    encoder = torch.randn(1, 3, 8)
+
+    processor(attn, hidden, encoder, attention_mask=None)
+    assert used["handle"] == "primary"
+    assert used["mask"] is None
+
+    processor(attn, hidden, encoder, attention_mask=torch.ones(1, 7, dtype=torch.bool))
+    assert used["handle"] == "masked"
+    assert used["mask"] is not None
+
+
+def test_qwen_image_eager_config_runs_unmasked_attention(monkeypatch):
+    from veomni.models.diffusers.qwen_image.qwen_image_transformer import modeling_qwen_image_transformer as modeling
+
+    monkeypatch.setattr(
+        modeling,
+        "get_parallel_state",
+        lambda: SimpleNamespace(sp_enabled=False, ulysses_group=None),
+    )
+    with ops_config_scope(eager_ops_config()):
+        processor = modeling.QwenImageSPAttnProcessor()
+    assert processor.veomni_attn.impl == "veomni_sdpa"
+    assert processor.veomni_attn_masked is processor.veomni_attn
+
+    img_out, txt_out = processor(_tiny_attn(heads=2, dim_head=4), torch.randn(1, 4, 8), torch.randn(1, 3, 8))
+    assert img_out.shape == (1, 4, 8)
+    assert txt_out.shape == (1, 3, 8)
+
+
+def _tiny_attn(*, heads: int, dim_head: int) -> SimpleNamespace:
+    from torch import nn
+
     inner = heads * dim_head
-    attn = SimpleNamespace(
+    return SimpleNamespace(
         heads=heads,
         to_q=nn.Linear(inner, inner, bias=False),
         to_k=nn.Linear(inner, inner, bias=False),
@@ -227,13 +258,3 @@ def test_qwen_image_processor_uses_primary_handle_without_mask(monkeypatch):
         norm_added_k=None,
         layer_idx=0,
     )
-    hidden = torch.randn(1, 4, inner)
-    encoder = torch.randn(1, 3, inner)
-
-    processor(attn, hidden, encoder, attention_mask=None)
-    assert used["handle"] == "primary"
-    assert used["mask"] is None
-
-    processor(attn, hidden, encoder, attention_mask=torch.ones(1, 7, dtype=torch.bool))
-    assert used["handle"] == "masked"
-    assert used["mask"] is not None

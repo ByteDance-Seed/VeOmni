@@ -28,7 +28,7 @@ from transformers.masking_utils import (
     sliding_window_overlay,
 )
 
-from ..helper import reject_sdpa_packed_metadata
+from ..helper import strip_sdpa_packed_metadata
 from ..ulysses import effective_sequence_lengths, should_apply_ulysses
 from .packed import packed_mask_function
 
@@ -46,13 +46,14 @@ def sdpa_attention_mask_builder(
 ) -> Tensor | None:
     """HF-signature SDPA mask for ``sdpa`` / ``veomni_sdpa``.
 
-    Packed/varlen metadata is rejected, matching the SDPA attention API.
-    Dense masks and sliding-window/custom visibility remain supported.
-    Skip hints apply only to the matching canonical predicate. Causal skip
-    additionally requires equal Q/K lengths and offsets; composed predicates
-    always produce an explicit mask, even if skip hints are enabled.
+    Single-segment packed/varlen metadata is dropped. Several segments per
+    row raise; build them with ``packed_causal_mask``. Dense masks and
+    sliding-window/custom visibility remain supported. Skip hints apply only
+    to the matching canonical predicate. Causal skip additionally requires
+    equal Q/K lengths and offsets; composed predicates always produce an
+    explicit mask, even if skip hints are enabled.
     """
-    reject_sdpa_packed_metadata(kwargs)
+    kwargs = strip_sdpa_packed_metadata(kwargs, batch_size=batch_size, dense_mask=None)
     return _dense_attention_mask_builder(
         batch_size,
         q_length,
@@ -82,8 +83,9 @@ def _dense_attention_mask_builder(
     Expand Ulysses-local lengths only when the adapter would gather Q/K/V
     itself: ``ulysses_size > 1`` and not ``skip_ulysses``. Then call Transformers'
     ``sdpa`` builder. Cached decode (``q_length != kv_length``) cannot use
-    SDPA ``is_causal`` skip. Eager shape masks may additionally compose packed
-    boundaries; the public SDPA builder rejects that metadata before this call.
+    SDPA ``is_causal`` skip. Packed shape masks may additionally compose packed
+    boundaries; the public SDPA builder drops single-segment metadata and
+    rejects several segments before this call.
     Optional ``sliding_window`` composes onto ``mask_function``. Canonical
     causal/bidirectional masks need no explicit metadata under Ulysses;
     custom predicates do.

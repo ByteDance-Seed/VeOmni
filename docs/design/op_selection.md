@@ -147,6 +147,12 @@ builders on Transformers' `ALL_ATTENTION_FUNCTIONS` /
 `__init__` (or `modify_init`) and stores `self.veomni_attn`. `forward` calls
 that handle. The registered row looks up the same Transformers interface.
 
+`eager` resolves the modeling file's own `eager_attention_forward`, as in
+Transformers. Flux, Qwen-Image, LTX-2.3, and MiniMax-H3 define none, so
+they read the field with `resolve_op_impl("attn_implementation",
+eager_as="veomni_sdpa")`. Their masked fallback for a mask-less backend is
+also `veomni_sdpa`.
+
 FlexAttention requires a model-provided native `BlockMask`; VeOmni does not
 construct model-specific visibility. With Ulysses enabled, the mask must be
 head-broadcast (`BlockMask.shape[1] == 1`) because rank-local head indices are
@@ -651,6 +657,5 @@ model:
 
 ## Related
 
-- Breaking change map from OpSlot / `kernel_registry`: [`opslot_to_veomniop.md`](opslot_to_veomniop.md)
 - Fused MoE scatter/gather and backward launch bounds: [`fused_moe_ops.md`](fused_moe_ops.md)
 - Package layout and registration: `veomni/ops/README.md`

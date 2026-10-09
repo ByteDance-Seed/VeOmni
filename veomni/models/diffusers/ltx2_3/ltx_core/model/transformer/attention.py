@@ -54,7 +54,7 @@ class VeomniLTXAttention:
     def __init__(self, impl: str) -> None:
         self.veomni_attn = VeomniOp("attention", "standard", impl)
         self.veomni_attn_masked = (
-            self.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "sdpa")
+            self.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "veomni_sdpa")
         )
         self.is_causal = False
         self.layer_idx = None
@@ -94,18 +94,18 @@ class VeomniLTXAttention:
 
 def _impl_from_attention_function(fn: "AttentionFunction") -> str:
     if fn is AttentionFunction.AUTOMATIC:
-        return resolve_op_impl("attn_implementation")
+        return resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
     if fn is AttentionFunction.FLASH_ATTENTION_3:
         return "flash_attention_3"
     if fn is AttentionFunction.FLASH_ATTENTION_4:
         return "flash_attention_4"
-    return "sdpa"
+    return "veomni_sdpa"
 
 
 def _impl_from_masked_function(fn: "MaskedAttentionFunction") -> str:
     if fn is MaskedAttentionFunction.AUTOMATIC:
-        return resolve_op_impl("attn_implementation")
-    return "sdpa"
+        return resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
+    return "veomni_sdpa"
 
 
 class AttentionFunction(Enum):
@@ -122,8 +122,9 @@ class AttentionFunction(Enum):
     def to_callable(self) -> AttentionCallable:
         """Resolve to a VeOmni attention adapter at module construction time.
 
-        ``AUTOMATIC`` reads ``resolve_op_impl("attn_implementation")``. SDPA pin
-        names and xformers collapse to ``sdpa``. Flash-3/4 keep those impl names.
+        ``AUTOMATIC`` reads ``resolve_op_impl("attn_implementation")`` and maps
+        ``eager`` to ``veomni_sdpa``. SDPA pin names and xformers collapse to
+        ``veomni_sdpa``. Flash-3/4 keep those impl names.
         """
         return VeomniLTXAttention(_impl_from_attention_function(self))
 
@@ -131,7 +132,7 @@ class AttentionFunction(Enum):
 class MaskedAttentionFunction(Enum):
     """Backends usable on the masked path. FA names stay off this enum because
     those kernels cannot take a dense mask. ``to_callable`` still returns the
-    shared adapter; a non-SDPA unmasked impl falls back to ``sdpa`` when a mask
+    shared adapter; a non-SDPA unmasked impl falls back to ``veomni_sdpa`` when a mask
     is present.
     """
 

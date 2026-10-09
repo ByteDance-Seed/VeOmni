@@ -124,10 +124,10 @@ class QwenImageSPAttnProcessor:
     """
 
     def __init__(self):
-        impl = resolve_op_impl("attn_implementation")
+        impl = resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
         self.veomni_attn = VeomniOp("attention", "standard", impl)
         self.veomni_attn_masked = (
-            self.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "sdpa")
+            self.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "veomni_sdpa")
         )
         self.config = SimpleNamespace(_attn_implementation=impl)
 

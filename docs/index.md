@@ -97,7 +97,6 @@ key_features/mtp.md
 :caption: Design
 
 design/op_selection.md
-design/opslot_to_veomniop.md
 design/fused_moe_ops.md
 design/local_parallel_state.md
 design/patchgen.md

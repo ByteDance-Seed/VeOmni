@@ -157,9 +157,9 @@ class MiniMaxH3Attention(nn.Module):
         self.k_norm = VeomniRMSNorm(attention_head_dim, eps=qk_norm_eps)
         self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
         # Packed FA is bound later. FA3/FA4 cannot be constructed on NPU or pre-SM90.
-        impl = resolve_op_impl("attn_implementation")
+        impl = resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
         if is_flash_attn_impl(impl):
-            impl = "sdpa"
+            impl = "veomni_sdpa"
         bind_minimax_attention(self, is_causal=False, impl=impl)
         # 3-axis rope is shorter than head_dim (96 vs 128 in production). q/k are [S, H, D].
         self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))

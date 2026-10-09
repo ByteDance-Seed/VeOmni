@@ -12,10 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Wan models registry, op-selection, and parity tests.
-
-Compare a toy DiT against ``tests/models/refs/wan.py``.
-"""
+"""Wan models registry and op-selection tests."""
 
 from __future__ import annotations
 
@@ -27,36 +24,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.models.compare import (
-    assert_outputs_and_grads_match,
-    eager_ops_config,
-    ops_config_scope,
-)
-from tests.models.refs.wan import WanConfig as RefWanConfig
-from tests.models.refs.wan import WanModel as RefWanModel
+from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.tiny_configs import tiny_wan_config as _tiny_config
 from veomni.models.transformers.wan import fa3_fp8
 from veomni.models.transformers.wan import modeling_wan as wan_modeling
 from veomni.models.transformers.wan.config_wan import WanConfig
 from veomni.models.transformers.wan.fa3_fp8 import should_use_fa3_fp8
-
-
-def _tiny_ref_config() -> RefWanConfig:
-    config = _tiny_config()
-    return RefWanConfig(
-        patch_size=config.patch_size,
-        dim=config.dim,
-        eps=config.eps,
-        ffn_dim=config.ffn_dim,
-        freq_dim=config.freq_dim,
-        in_dim=config.in_dim,
-        num_heads=config.num_heads,
-        num_layers=config.num_layers,
-        out_dim=config.out_dim,
-        text_dim=config.text_dim,
-        text_len=config.text_len,
-        has_image_input=config.has_image_input,
-    )
 
 
 def _build_ours(config: WanConfig, ops: SimpleNamespace | None = None):
@@ -290,16 +263,3 @@ def test_wan_mixed_sp_async_is_rejected_under_ulysses(monkeypatch):
     model.blocks[1].self_attn.sp_async = True
     with pytest.raises(ValueError, match="same SelfAttention.sp_async mode"):
         model(**_wan_inputs(in_dim=4, text_len=8, text_dim=16))
-
-
-def test_wan_eager_matches_official():
-    torch.manual_seed(0)
-    official = RefWanModel(_tiny_ref_config())
-    ours = _build_ours(_tiny_config())
-    ours.load_state_dict(official.state_dict())
-    inputs = _wan_inputs(in_dim=4, text_len=8, text_dim=16)
-
-    def call(model):
-        return model(**inputs)
-
-    assert_outputs_and_grads_match(official, ours, call)

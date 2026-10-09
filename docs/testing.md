@@ -20,8 +20,7 @@ tests/
 │   ├── transformers/               # Transformer-family parity and contracts
 │   │   ├── deepseek_v4/            # DeepSeek-V4-specific model coverage
 │   │   └── qwen/                   # Qwen-family model coverage
-│   ├── diffusers/                  # Diffuser-family parity and contracts
-│   └── refs/                       # Vendored comparison helpers
+│   └── diffusers/                  # Diffuser-family parity and contracts
 │
 ├── ops/                            # Registry and tensor-op correctness
 │   ├── base/test_op_entry.py                # Registration, resolution, and generated autograd

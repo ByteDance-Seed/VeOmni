@@ -269,19 +269,28 @@ def test_ltx_automatic_to_callable_reads_ops_config():
     assert masked.veomni_attn_masked is masked.veomni_attn
 
 
-def test_ltx_sdpa_flash_to_callable_collapses_to_sdpa():
+def test_ltx_sdpa_flash_to_callable_collapses_to_veomni_sdpa():
     adapter = AttentionFunction.SDPA_FLASH.to_callable()
     assert isinstance(adapter, VeomniLTXAttention)
-    assert adapter.veomni_attn.impl == "sdpa"
+    assert adapter.veomni_attn.impl == "veomni_sdpa"
     assert adapter.veomni_attn_masked is adapter.veomni_attn
 
 
-def test_ltx_non_sdpa_masked_falls_back_to_sdpa():
+def test_ltx_non_sdpa_masked_falls_back_to_veomni_sdpa():
     assert AttentionFunction.FLASH_ATTENTION_3.value == "flash_attention_3"
-    adapter = VeomniLTXAttention("eager")
-    assert adapter.veomni_attn.impl == "eager"
-    assert adapter.veomni_attn_masked.impl == "sdpa"
+    adapter = VeomniLTXAttention("flex_attention")
+    assert adapter.veomni_attn.impl == "flex_attention"
+    assert adapter.veomni_attn_masked.impl == "veomni_sdpa"
     assert adapter.veomni_attn_masked is not adapter.veomni_attn
+
+
+def test_ltx_automatic_eager_selects_veomni_sdpa():
+    with ops_config_scope(eager_ops_config()):
+        adapter = AttentionFunction.AUTOMATIC.to_callable()
+        masked = MaskedAttentionFunction.AUTOMATIC.to_callable()
+    assert adapter.veomni_attn.impl == "veomni_sdpa"
+    assert adapter.veomni_attn_masked is adapter.veomni_attn
+    assert masked.veomni_attn.impl == "veomni_sdpa"
 
 
 def test_ltx_adapter_expands_mask_and_skips_ulysses():

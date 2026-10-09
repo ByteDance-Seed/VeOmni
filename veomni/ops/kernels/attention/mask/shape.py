@@ -91,13 +91,19 @@ def _sdpa_or_eager_mask(
     sliding_window: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
 ):
-    """Build an SDPA boolean mask or convert it to eager additive form."""
+    """Build an SDPA boolean mask or convert it to eager additive form.
+
+    ``cu_seqlens`` composes packed isolation into the dense mask for both
+    backends; the public SDPA builder only accepts single-segment metadata.
+    """
     dtype = extra.pop("dtype", torch.float32)
     if sliding_window is not None:
         extra["sliding_window"] = sliding_window
     if cu_seqlens is not None:
         extra["cu_seqlens"] = cu_seqlens
-    builder = _dense_attention_mask_builder if backend in _EAGER else sdpa_attention_mask_builder
+    builder = (
+        _dense_attention_mask_builder if backend in _EAGER or cu_seqlens is not None else sdpa_attention_mask_builder
+    )
     mask = builder(
         batch_size,
         q_len,
@@ -258,17 +264,15 @@ def packed_causal_mask(
     """Packed causal mask from ``cu_seqlens``.
 
     Flash returns only optional 2D padding metadata; packed lengths stay in
-    kernel kwargs. Eager / Flex builders receive ``skip_ulysses``. Magi validates
-    ``cu_seqlens`` against the effective post-Ulysses sequence lengths. SDPA
-    rejects this API because it has no packed/varlen arguments.
+    kernel kwargs. SDPA / Eager / Flex builders receive ``skip_ulysses``; SDPA
+    and Eager compose the segments into a dense mask. Magi validates
+    ``cu_seqlens`` against the effective post-Ulysses sequence lengths.
     """
     backend = impl.removeprefix("veomni_")
     extra = _compose_or_and(kwargs)
     extra["skip_ulysses"] = skip_ulysses
     if backend in _SAGE:
         raise ValueError("veomni_sage_attention does not support packed_causal_mask")
-    if backend in _SDPA:
-        raise ValueError("SDPA does not support packed_causal_mask; use a packed-capable attention implementation.")
     if backend in _FLASH:
         _require_canonical_causal(backend, extra["mask_function"])
         return flash_attention_mask_builder(
@@ -278,7 +282,7 @@ def packed_causal_mask(
             q_offset=kv_len - q_len,
             **extra,
         )
-    if backend in _EAGER:
+    if backend in _SDPA or backend in _EAGER:
         return _sdpa_or_eager_mask(
             backend,
             batch_size,

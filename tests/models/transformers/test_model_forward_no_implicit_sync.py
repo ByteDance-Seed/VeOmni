@@ -320,13 +320,7 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
 # allowlisted), it would be misleading to add these to ``_ALLOWED_SYNCS``;
 # the skip keeps the case visible in pytest output as a reminder. The
 # skip reason should name the offending functions and the follow-up.
-_PENDING_FIX_CASES: dict[str, str] = {
-    "qwen3_5_vl-sdpa": (
-        "qwen3_5 language forward requires cu_seq_lens_q, but veomni_sdpa rejects "
-        "packed/varlen kwargs after the SDPA packed-input guard. The case stays "
-        "SDPA because FA2 NaNs on the toy config."
-    ),
-}
+_PENDING_FIX_CASES: dict[str, str] = {}
 
 
 # Cases that have been wired to consume ``multimodal_metadata`` via the
