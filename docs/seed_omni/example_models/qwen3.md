@@ -271,9 +271,14 @@ default → plain text-only Qwen3):
   tokenizer (`convert_tokens_to_ids`), since the user can't know them but the
   module can. (With `enable_image: false` the embedding is fully trainable.)
 
-The grad mask uses **global** row indices, so the module is loaded **`ddp`**
-(replicated, not FSDP-sharded) and with **`weight_decay: 0`** (otherwise AdamW's
-decoupled decay would erode the frozen rows). Both are set in `train/modules_train.yaml`.
+The mask is attached from a forward pre-hook on `embed_tokens`, after FSDP2 has
+unsharded it, to the rows the lookup reads, sliced to this rank's vocab rows when
+an `emb` plan splits the table. The tied `embed_tokens.project` reads that same
+parameter, so its gradient is masked too, provided `encode` runs before the first
+`decode` (it always does in this graph). It therefore holds under `ddp`, `fsdp2`
+and `emb` alike. Keep **`weight_decay: 0`** for this module (set in
+`visual_instruction_tuning/modules_train.yaml`): AdamW's decoupled decay would
+otherwise erode the frozen rows.
 
 > The special-token rows load verbatim from Qwen3-0.6B (an untrained reserved
 > stub). They start training from there; if you want a better starting point,

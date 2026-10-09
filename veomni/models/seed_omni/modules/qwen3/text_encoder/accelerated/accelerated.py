@@ -9,6 +9,9 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from veomni.distributed.emb_parallel import ShardedEmbedding
+from veomni.distributed.parallel_state import get_parallel_state
+
 from .....mixins.training_module_mixin import post_forward, pre_forward
 from .....utils.conversation import ConversationItem
 from ....base.text_encoder.accelerated import (
@@ -28,7 +31,7 @@ class TrainingMixin(BaseTrainingMixin):
     device: torch.device
     dtype: torch.dtype
     _tokenizer: Any
-    embed_tokens: torch.nn.Embedding
+    embed_tokens: ShardedEmbedding
     _trainable_row_mask: Optional[torch.Tensor]
 
     def __init__(self, *args, **kwargs) -> None:
@@ -65,17 +68,28 @@ class TrainingMixin(BaseTrainingMixin):
         # The user can't know the vision special-token ids, but the module can:
         # resolve them from its own tokenizer so only those rows stay trainable.
         ids = [int(self._tokenizer.convert_tokens_to_ids(tok)) for tok in self._VISION_SPECIAL_TOKENS]
-        weight = self.embed_tokens.weight
-        weight.requires_grad_(True)
-        keep = torch.zeros(weight.shape[0], dtype=torch.bool)
+        keep = torch.zeros(self.embed_tokens.num_embeddings, dtype=torch.bool)
         keep[ids] = True
         self._trainable_row_mask = keep
+        self.embed_tokens.weight.requires_grad_(True)
+        # The weight parameter is replaced by parallelization (FSDP2 shards it, the
+        # emb plan splits its rows), so a hook on it now would be lost. FSDP2's own
+        # pre-forward hook is prepended, so on the first lookup this one sees the
+        # rows the lookup reads. The tied ``project`` does not run module hooks; it
+        # is masked because it reads that same unsharded parameter, which is why
+        # ``encode`` must run before the first ``decode``.
+        self.embed_tokens.register_forward_pre_hook(self._mask_frozen_embedding_rows)
 
-        def _mask_grad(grad: torch.Tensor) -> torch.Tensor:
-            mask = self._trainable_row_mask.to(device=grad.device)
-            return grad * mask.unsqueeze(1).to(grad.dtype)
-
-        weight.register_hook(_mask_grad)
+    def _mask_frozen_embedding_rows(self, embed_tokens: torch.nn.Module, args: tuple) -> None:
+        weight = embed_tokens.weight
+        if not weight.requires_grad or getattr(weight, "_frozen_rows_masked", False):
+            return
+        rows = weight.shape[0]
+        start = 0 if rows == embed_tokens.num_embeddings else get_parallel_state().extra_parallel_rank("emb") * rows
+        mask = self._trainable_row_mask[start : start + rows].to(device=weight.device, dtype=weight.dtype)
+        weight.register_hook(lambda grad: grad * mask.unsqueeze(1))
+        # FSDP2 keeps one unsharded parameter across steps, so hook it once.
+        weight._frozen_rows_masked = True
 
 
 class VeOmniMixin(TrainingMixin, BaseVeOmniMixin):
