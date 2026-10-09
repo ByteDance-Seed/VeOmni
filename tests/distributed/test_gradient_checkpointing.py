@@ -1,6 +1,7 @@
 import gc
 import types
 import weakref
+from contextlib import nullcontext
 from functools import partial
 
 import pytest
@@ -70,6 +71,81 @@ def test_build_parallelize_model_forwards_checkpoint_early_stop(monkeypatch, ear
 
 def test_gradient_checkpointing_config_enables_early_stop_by_default():
     assert GradientCheckpointingConfig().early_stop is True
+
+
+def _parallelize(monkeypatch, model, **kwargs):
+    """``build_parallelize_model`` with the parallel machinery stubbed out."""
+    import veomni.distributed.torch_parallelize as torch_parallelize
+
+    monkeypatch.setattr(
+        torch_parallelize,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(fsdp_enabled=True, tp_enabled=False, dp_mode="fsdp2"),
+    )
+    monkeypatch.setattr(torch_parallelize, "parallelize_model_fsdp2", lambda model, **kwargs: model)
+    return build_parallelize_model(model, mixed_precision=MixedPrecisionConfig(enable=False), **kwargs)
+
+
+def test_the_enable_carries_the_policys_recompute_context(monkeypatch):
+    """The entry points the policy binds get the context from ``plan_block``; the ones it
+    does not bind keep HF's function, so the enable has to be given the same context."""
+    log = []
+    policy = recompute_utils.RecomputePolicy(recompute_context=lambda: _RecordingContext("run", log))
+    model = _CheckpointingModel()
+
+    _parallelize(monkeypatch, model, recompute_policy=policy)
+
+    context_fn = model.gradient_checkpointing_kwargs["context_fn"]
+    assert context_fn is not noop_context_fn
+
+    forward_ctx, recompute_ctx = context_fn()
+    with forward_ctx:
+        assert log == []  # the forward half is not scoped
+    with recompute_ctx:
+        assert log == ["enter run"]
+    assert log == ["enter run", "exit run"]
+
+
+def test_the_enable_keeps_torchs_default_without_a_run_context(monkeypatch):
+    model = _CheckpointingModel()
+
+    _parallelize(monkeypatch, model, recompute_policy=recompute_utils.RecomputePolicy(recompute_layers=5))
+
+    assert model.gradient_checkpointing_kwargs["context_fn"] is noop_context_fn
+
+
+def test_an_explicit_recompute_context_fn_still_wins(monkeypatch):
+    """A caller that passes its own context is not overridden by the policy's."""
+    log = []
+
+    def explicit():
+        return nullcontext(), _RecordingContext("explicit", log)
+
+    policy = recompute_utils.RecomputePolicy(recompute_context=lambda: _RecordingContext("policy", log))
+    model = _CheckpointingModel()
+
+    _parallelize(monkeypatch, model, recompute_policy=policy, recompute_context_fn=explicit)
+
+    assert model.gradient_checkpointing_kwargs["context_fn"] is explicit
+
+
+def test_the_enable_drops_the_run_context_when_reentrant(monkeypatch):
+    """Reentrant checkpointing refuses every other ``context_fn``, so neither the run's
+    context nor an explicit one may be handed to torch with ``use_reentrant=True``."""
+    policy = recompute_utils.RecomputePolicy(recompute_context=lambda: _RecordingContext("run", []))
+    model = _CheckpointingModel()
+    explicit_model = _CheckpointingModel()
+
+    _parallelize(monkeypatch, model, recompute_policy=policy, enable_reentrant=True)
+    _parallelize(
+        monkeypatch,
+        explicit_model,
+        enable_reentrant=True,
+        recompute_context_fn=lambda: (nullcontext(), _RecordingContext("explicit", [])),
+    )
+
+    assert model.gradient_checkpointing_kwargs["context_fn"] is noop_context_fn
+    assert explicit_model.gradient_checkpointing_kwargs["context_fn"] is noop_context_fn
 
 
 def test_reentrant_checkpoint_releases_recomputed_input_grad():
@@ -511,6 +587,187 @@ def test_out_of_range_index_raises_even_with_optimizations():
         recompute_utils.plan_block(recompute_utils.RecomputePolicy(), BLOCK_TOTAL, BLOCK_TOTAL)
 
 
+class _RecordingContext:
+    """A context manager that appends its own entry and exit to a shared log."""
+
+    def __init__(self, name, log):
+        self.name = name
+        self.log = log
+
+    def __enter__(self):
+        self.log.append(f"enter {self.name}")
+        return self
+
+    def __exit__(self, *exc_info):
+        self.log.append(f"exit {self.name}")
+        return False
+
+
+class _HFToyModel(nn.Module):
+    """An HF-style model whose enable writes an entry point onto every flagged module.
+
+    This mirrors ``PreTrainedModel._set_gradient_checkpointing``, which walks
+    ``self.modules()`` and assigns ``_gradient_checkpointing_func`` on each module
+    carrying the flag — including the blocks the policy just replaced.
+    """
+
+    _no_split_modules = ["_ToyLayer"]
+
+    def __init__(self, depth=4):
+        super().__init__()
+        self.layers = nn.ModuleList(_ToyLayer() for _ in range(depth))
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        func = partial(torch.utils.checkpoint.checkpoint, **(gradient_checkpointing_kwargs or {}))
+        for module in self.modules():
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = True
+                module._gradient_checkpointing_func = func
+
+
+def test_sac_recomputes_inside_the_runs_context():
+    """The run's context wraps SAC's selective context, so the model's scoping is in place first.
+
+    torch calls ``context_fn`` before the forward and enters the halves itself, so nothing
+    may be entered until it does: an eagerly entered pair would scope the forward, and
+    SAC's dispatch mode would be live while the forward runs.
+    """
+    log = []
+    policy = recompute_utils.RecomputePolicy(
+        recompute_layers=-1,
+        selective_recompute_layers=2,
+        context_fn=lambda: (nullcontext(), _RecordingContext("sac", log)),
+        recompute_context=lambda: _RecordingContext("run", log),
+    )
+
+    plan = recompute_utils.plan_block(policy, 0, BLOCK_TOTAL)
+    assert plan.decision is recompute_utils.Decision.SAC
+
+    forward_ctx, recompute_ctx = plan.checkpoint_kwargs["context_fn"]()
+    assert log == []
+
+    with forward_ctx:
+        assert log == []
+    with recompute_ctx:
+        assert log == ["enter run", "enter sac"]
+
+    assert log == ["enter run", "enter sac", "exit sac", "exit run"]
+
+
+def _attention_block(value):
+    query = value.unsqueeze(0).unsqueeze(0)
+    return torch.nn.functional.scaled_dot_product_attention(query, query, query).squeeze().sin()
+
+
+def test_sac_with_a_run_context_survives_a_real_checkpoint():
+    """The composition driven through torch's own ``checkpoint``.
+
+    SAC's selective context must be entered when torch enters it: kept live across the
+    forward, torch's cached dispatch mode is asked for the attention op's saved output
+    during the backward and it was never stored ("not found in storage"). The run
+    context is the observable half here — it must be entered for the recompute only.
+    """
+    log = []
+    policy = recompute_utils.RecomputePolicy(
+        recompute_layers=-1,
+        selective_recompute_layers=1,
+        context_fn=recompute_utils._build_context_fn(None),
+        recompute_context=lambda: _RecordingContext("run", log),
+    )
+    plan = recompute_utils.plan_block(policy, 0, BLOCK_TOTAL)
+    assert plan.decision is recompute_utils.Decision.SAC
+
+    value = torch.randn(8, 8, requires_grad=True)
+    output = torch.utils.checkpoint.checkpoint(_attention_block, value, **plan.checkpoint_kwargs)
+    output.sum().backward()
+
+    assert value.grad is not None
+    assert log == ["enter run", "exit run"]
+
+
+def test_a_full_block_recomputes_inside_the_runs_context():
+    """Without SAC the run's context still reaches every recomputed block, and only those."""
+    log = []
+    policy = recompute_utils.build_policy(
+        enabled=True,
+        enable_reentrant=False,
+        early_stop=True,
+        recompute_layers=5,
+        save_ops=[],
+        recompute_context=lambda: _RecordingContext("run", log),
+    )
+    assert policy.context_fn is None  # nothing selective here
+
+    plan = recompute_utils.plan_block(policy, BLOCK_TOTAL - 1, BLOCK_TOTAL)
+    assert plan.decision is recompute_utils.Decision.FULL
+    assert recompute_utils.plan_block(policy, 0, BLOCK_TOTAL).decision is recompute_utils.Decision.DIRECT
+
+    forward_ctx, recompute_ctx = plan.checkpoint_kwargs["context_fn"]()
+    with forward_ctx:
+        assert log == []  # the forward half runs unscoped
+    with recompute_ctx:
+        assert log == ["enter run"]
+    assert log == ["enter run", "exit run"]
+
+
+def test_only_a_recompute_context_does_not_become_sac():
+    """``context_fn`` is the SAC signal; a run context on its own must not make blocks selective."""
+    policy = recompute_utils.RecomputePolicy(
+        recompute_layers=-1,
+        selective_recompute_layers=2,
+        recompute_context=lambda: nullcontext(),
+    )
+
+    decisions = _plan_decisions(policy)
+    assert recompute_utils.Decision.SAC not in decisions
+    assert decisions == _expected_decisions(-1, 0)
+
+
+def test_reentrant_checkpointing_drops_the_runs_context():
+    """torch rejects ``context_fn`` on the reentrant path, so the context goes with SAC."""
+    policy = recompute_utils.RecomputePolicy(
+        recompute_layers=-1,
+        selective_recompute_layers=10,
+        context_fn=noop_context_fn,
+        recompute_context=lambda: nullcontext(),
+        use_reentrant=True,
+    )
+
+    assert recompute_utils.plan_block(policy, 0, BLOCK_TOTAL).checkpoint_kwargs == {"use_reentrant": True}
+
+
+def test_enabling_checkpointing_again_erases_the_applied_policy(monkeypatch):
+    """Why the omni setup enables first and applies second: a later enable rewrites every block.
+
+    The policy lives in the per-block entry points, so the second
+    ``gradient_checkpointing_enable`` puts the plain function back and both the
+    filter and SAC are gone. SeedOmni therefore folds its ``ParallelState`` into
+    the policy instead of arming checkpointing twice.
+    """
+    recorder = _Recorder()
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", recorder)
+    model = _HFToyModel(depth=4)
+    policy = recompute_utils.RecomputePolicy(
+        recompute_layers=1, selective_recompute_layers=1, context_fn=noop_context_fn
+    )
+
+    model.gradient_checkpointing_enable({"use_reentrant": False})
+    recompute_utils.apply_recompute_policy(model, policy)
+
+    for layer in model.layers:
+        layer._gradient_checkpointing_func(partial(layer, x=torch.zeros(1)))
+    assert len(recorder.calls) == 1  # only the last block: the policy is in force
+    assert recorder.calls[0]["context_fn"] is noop_context_fn  # and it is the SAC one
+
+    recorder.calls.clear()
+    model.gradient_checkpointing_enable({"use_reentrant": False})
+
+    for layer in model.layers:
+        layer._gradient_checkpointing_func(partial(layer, x=torch.zeros(1)))
+    assert len(recorder.calls) == 4  # every block checkpoints again
+    assert all("context_fn" not in call for call in recorder.calls)  # with SAC erased
+
+
 def test_layer_entry_point_gets_per_layer_decisions(monkeypatch):
     recorder = _Recorder()
     monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", recorder)
@@ -830,7 +1087,7 @@ def test_build_policy_is_inactive_by_default():
 
 
 # ---------------------------------------------------------------------------
-# Bindings: lifetime, idempotence, and what installing must leave alone
+# Bindings: lifetime, idempotence, and what applying must leave alone
 # ---------------------------------------------------------------------------
 
 
@@ -864,7 +1121,7 @@ def test_bindings_do_not_keep_models_alive():
     assert len(recompute_utils._block_bindings) == 0
 
 
-def test_install_is_idempotent_and_reinstallable():
+def test_apply_is_idempotent_and_reapplicable():
     model = _ToyModel(depth=3)
 
     recompute_utils.apply_recompute_policy(model, recompute_utils.RecomputePolicy(recompute_layers=1))
@@ -885,7 +1142,7 @@ def test_install_is_idempotent_and_reinstallable():
     ] * 3
 
 
-def test_install_leaves_gradient_checkpointing_kwargs_alone(monkeypatch):
+def test_apply_leaves_gradient_checkpointing_kwargs_alone(monkeypatch):
     model = _ToyModel(depth=2)
     model.gradient_checkpointing_kwargs = {"use_reentrant": False, "context_fn": noop_context_fn, "early_stop": True}
     expected = dict(model.gradient_checkpointing_kwargs)
