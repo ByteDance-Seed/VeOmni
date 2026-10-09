@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
+from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_layers import (
     GenericForQuestionAnswering,
@@ -86,6 +87,7 @@ def rotate_half(x):
 # Reason: Use LigerKernel rotary embedding
 # Source: veomni.models.transformers.seed_oss.seed_oss_gpu_patch_gen_config
 # ======================================================================
+@use_kernel_forward_from_hub("rotary_pos_emb")
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,

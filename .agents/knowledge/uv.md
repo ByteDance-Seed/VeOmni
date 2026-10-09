@@ -109,6 +109,7 @@ forced into a specific 5.x patch.
 |---|---|---|
 | `flash-attn` (FA2) | cp311 wheel (v0.0.3) + cp312 wheel (v0.0.5), Luosuu cu130/torch2.11/sm80-100 | x86_64 only; omitted on aarch64 |
 | `flash-attn-3` (Hopper) | cp310-abi3 Luosuu wheel on x86_64; cp39-abi3 PyTorch cu130 wheel on aarch64 | abi3 covers supported Python versions; aarch64 requires glibc 2.34+ |
+| `kernels` | PyPI `0.16.0` | Optional `flash_attention_{2,3}_hub` runtimes load pinned version 1 of `kernels-community/flash-attn{2,3}`; local FA2/FA3 remain the defaults. Its Sigstore verification stack adds crypto/TUF dependencies and resolves Pydantic 2.13.x in the Linux GPU environment. |
 | `flash-mla` | cp311/cp312 Luosuu cu130/torch2.11/sm90a+sm100f wheels | architecture-specific x86_64/aarch64 wheels |
 | `flash-attn-4` (cute) | PyPI `4.0.0b16` | pure-Python wheel |
 | `flash-qla` | PyPI `0.1.2` | pure-Python wheel that publishes usable metadata (it declares only `apache-tvm-ffi`), so no source build and no `dependency-metadata` override |
