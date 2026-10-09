@@ -470,3 +470,7 @@ def test_qwen3_5_moe_parallel_plan_wraps_every_ep_sliced_owner_on_the_ep_mesh(mo
     assert sliced_owners
     assert ep_owners == sliced_owners
     assert any(owner.startswith("mtp.") for owner in ep_owners) == (mtp_loss_weight is not None)
+    # The parallelizer only gives an ep owner its own ep_fsdp unit under a wrap target.
+    wrap_targets = [name for name, module in model.named_modules() if type(module).__name__ in model._no_split_modules]
+    for owner in ep_owners:
+        assert any(owner.startswith(target + ".") for target in wrap_targets), owner
