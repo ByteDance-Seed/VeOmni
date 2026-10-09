@@ -124,6 +124,8 @@ jobs:
         #       tests/parallel/ulysses/test_ulysses_async.py still works
         run: |
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_qwen4_exp_ulysses.py
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_qwen4_exp_cp_gloo.py tests/models/test_qwen4_cp_build_gate.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_slice_input_tensor.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_wan_ulysses_padding.py
@@ -140,6 +142,7 @@ jobs:
           uv run --frozen pytest -s -x tests/models/test_generated_modeling_imports.py
           uv run --frozen pytest -s -x tests/models/test_transformers_upgrade_compat.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
+          uv run --frozen pytest -s -x tests/models/test_qwen4_exp_qsa_topk.py
           uv run --frozen pytest -s -x tests/models/test_qwen3_5_moe_mtp.py
           uv run --frozen pytest -s -x tests/models/test_vlm_trainer.py
           uv run --frozen pytest -s -x tests/trainer/test_aux_metrics.py

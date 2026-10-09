@@ -56,6 +56,7 @@ class ParallelPlan:
         self,
         extra_parallel_plan: Dict[str, Dict[str, Shard]],
         extra_parallel_persistent_modules: Optional[Dict[str, Dict[str, int]]] = None,
+        sequence_parallel_persistent_names: Optional[set[str]] = None,
     ):
         self.extra_parallel_plan = extra_parallel_plan
         # ``{para_name: {module_fqn_pattern: complementary_shard_dim}}``.
@@ -63,6 +64,19 @@ class ParallelPlan:
         # API: only parameters already selected by ``extra_parallel_plan`` may
         # opt into the persistent complementary shard.
         self.extra_parallel_persistent_modules = extra_parallel_persistent_modules or {}
+        # Persistent ExtraParallel parameters are rejected under sequence
+        # parallelism by default. A model may opt in a named parallel dimension
+        # only after its runtime lookup, gradient scaling, optimizer, and
+        # checkpoint semantics have been validated with sequence-sharded input.
+        self.sequence_parallel_persistent_names = frozenset(sequence_parallel_persistent_names or ())
+        unknown_sp_persistent_names = self.sequence_parallel_persistent_names.difference(
+            self.extra_parallel_persistent_modules
+        )
+        if unknown_sp_persistent_names:
+            raise ValueError(
+                "sequence_parallel_persistent_names must refer to persistent ExtraParallel dimensions; "
+                f"got unknown names {sorted(unknown_sp_persistent_names)}."
+            )
         self.extra_parallel_fsdp_no_shard_module = {
             para_name: {".".join(list(plan.keys())[0].split(".")[:-1])}
             for para_name, plan in self.extra_parallel_plan.items()
