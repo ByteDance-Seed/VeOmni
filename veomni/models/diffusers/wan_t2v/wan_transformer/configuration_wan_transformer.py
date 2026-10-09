@@ -70,11 +70,7 @@ class WanTransformer3DModelConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
     def to_diffuser_dict(self):
-        return {
-            key: getattr(self, key)
-            for key in WAN_INIT_SIGNATURE.parameters.keys()
-            if key != "self"
-        }
+        return {key: getattr(self, key) for key in WAN_INIT_SIGNATURE.parameters.keys() if key != "self"}
 
     def to_dict(self):
         return_dict = super().to_dict()

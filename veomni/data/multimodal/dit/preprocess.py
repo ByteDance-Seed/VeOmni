@@ -76,9 +76,7 @@ def qwen_image_edit_preprocess(conversations, **kwargs):
     if target_image is None:
         raise ValueError("Qwen-Image-Edit data requires one of: target_image, image, image_bytes, image_path.")
     if edit_images is None:
-        raise ValueError(
-            "Qwen-Image-Edit data requires one of: edit_image(s), source_image(s), src_image(s)."
-        )
+        raise ValueError("Qwen-Image-Edit data requires one of: edit_image(s), source_image(s), src_image(s).")
     if not isinstance(prompt, str):
         raise ValueError("Qwen-Image-Edit requires a text prompt.")
     if not isinstance(target_image, (str, bytes)):

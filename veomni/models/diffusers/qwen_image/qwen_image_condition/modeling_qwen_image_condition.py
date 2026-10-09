@@ -6,7 +6,7 @@ import torch
 from diffusers import AutoencoderKLQwenImage, FlowMatchEulerDiscreteScheduler
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from torchvision.transforms import InterpolationMode, functional
-from transformers import PreTrainedModel, Qwen2Tokenizer, Qwen2VLProcessor, Qwen2_5_VLForConditionalGeneration
+from transformers import PreTrainedModel, Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwen2VLProcessor
 
 from .....distributed.parallel_state import get_parallel_state
 from .....utils import logging
@@ -314,14 +314,10 @@ class QwenImageConditionModel(PreTrainedModel):
         outputs_list = kwargs.get("outputs") or []
         edit_images_per_sample = None
         if self.config.enable_edit:
-            edit_images_per_sample = [
-                sample_outputs.get("edit_images", []) for sample_outputs in outputs_list
-            ]
+            edit_images_per_sample = [sample_outputs.get("edit_images", []) for sample_outputs in outputs_list]
             if len(edit_images_per_sample) != len(prompts):
                 raise ValueError("Qwen-Image edit training requires one source-image list per sample.")
-            prompt_embeds, prompt_embeds_mask = self._get_qwen_edit_prompt_embeds(
-                prompts, edit_images_per_sample
-            )
+            prompt_embeds, prompt_embeds_mask = self._get_qwen_edit_prompt_embeds(prompts, edit_images_per_sample)
         else:
             prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompt=prompts)
 

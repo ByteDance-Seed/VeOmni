@@ -462,9 +462,7 @@ def test_edit_condition_and_zero_cond_t(snapshot):
     target_images = [Image.new("RGB", (16, 16), color="red")]
     source_images = [Image.new("RGB", (16, 16), color="blue")]
     outputs = [{"edit_images": source_images}]
-    encoded = condition.get_condition(
-        inputs=["make it red"], images=[target_images], outputs=outputs
-    )
+    encoded = condition.get_condition(inputs=["make it red"], images=[target_images], outputs=outputs)
     assert "edit_latents" in encoded and "edit_img_shapes" in encoded
     packed = condition.process_condition(**encoded)
     # hidden_states includes target + source tokens; training_target only target.

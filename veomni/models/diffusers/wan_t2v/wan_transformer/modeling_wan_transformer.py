@@ -397,9 +397,7 @@ def WanTransformer3DModel_forward(
         import torch_npu
         B, C = hidden_states.shape[:2]
         S = hidden_states.shape[2:].numel()
-        hidden_states = torch_npu.npu_confusion_transpose(
-            hidden_states, [0, 2, 1], [B, C, S], transpose_first=False
-        )
+        hidden_states = torch_npu.npu_confusion_transpose(hidden_states, [0, 2, 1], [B, C, S], transpose_first=False)
     except (ImportError, ModuleNotFoundError):
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
@@ -582,7 +580,7 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
                             "norm_latents is required for I2V training when image_latents is not provided"
                         )
                     img_lat = norm_lat[:, :, 0:1, :, :]  # [B, 16, 1, H, W]
-                    img_lat_source = "from_norm_latents"
+
 
                 if msk is None:
                     B, _C, T, H, W = hs.shape

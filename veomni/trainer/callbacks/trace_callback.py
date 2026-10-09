@@ -27,6 +27,8 @@ logger = get_logger(__name__)
 
 
 if TYPE_CHECKING:
+    import torch
+
     from ..base import BaseTrainer, VeOmniArguments
 
 

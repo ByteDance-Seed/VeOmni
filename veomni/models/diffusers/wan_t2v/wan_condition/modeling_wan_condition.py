@@ -98,12 +98,12 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         latents_mean = torch.tensor(
             self.vae.config.latents_mean,
             device=latents.device,
-            dtype=latents.dtype
+            dtype=latents.dtype,
         ).view(1, self.vae.config.z_dim, 1, 1, 1)
         latents_std = torch.tensor(
             self.vae.config.latents_std,
             device=latents.device,
-            dtype=latents.dtype
+            dtype=latents.dtype,
         ).view(1, self.vae.config.z_dim, 1, 1, 1)
         return (latents - latents_mean) / latents_std
 
