@@ -316,8 +316,8 @@ class TestNPURotaryPosEmb:
 class TestNPURmsNormGated:
     """Tests for the ``rms_norm_gated`` NPU kernel (NPUFusedRMSNormGated)."""
 
-    @pytest.mark.parametrize("batch,seq,hidden,ffn_dim", [(2, 16, 128, 256), (1, 8, 64, 128)])
-    def test_matches_eager_bf16(self, batch, seq, hidden, ffn_dim):
+    @pytest.mark.parametrize("batch,seq,hidden", [(2, 16, 128), (1, 8, 64)])
+    def test_matches_eager_bf16(self, batch, seq, hidden):
         slot = OpSlot("rms_norm_gated", "standard")
         slot.bind("npu")
         # The bound kernel is the NPUFusedRMSNormGated class; instantiate it.
@@ -326,7 +326,7 @@ class TestNPURmsNormGated:
         fused_module = fused_cls(hidden_size=hidden, eps=1e-6).to(device=DEVICE, dtype=torch.bfloat16)
 
         hidden_states = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
-        gate = torch.randn(batch, seq, ffn_dim, device=DEVICE, dtype=torch.bfloat16)
+        gate = torch.randn_like(hidden_states)
 
         out_fused = fused_module(hidden_states, gate=gate)
         out_eager = _eager_rms_norm_gated(hidden_states, fused_module.weight, fused_module.variance_epsilon, gate)

@@ -1,4 +1,4 @@
-"""CPU contract checks for the NPU wrapper; native parity is a worker gate."""
+"""CPU contract checks and native Ascend forward/backward parity."""
 
 import importlib.util
 import sys
@@ -58,3 +58,42 @@ def test_zero_gate_is_half_normalized_and_silu_unchanged():
         cls(128, activation="relu")
     with pytest.raises(ValueError, match="gate"):
         cls(128, activation="sigmoid")(x)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("activation", ["sigmoid", "silu"])
+@pytest.mark.parametrize("autocast_enabled", [False, True])
+def test_native_npu_reference_and_gradients(dtype, activation, autocast_enabled):
+    # Load the real wrapper without the CPU tests' torch_npu substitution.
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("Native Ascend device is required")
+    path = Path(__file__).parents[2] / "veomni/ops/kernels/gated_delta_rule/npu_rms_norm_gated.py"
+    spec = importlib.util.spec_from_file_location("_native_gated_norm_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    torch.manual_seed(73)
+    norm = module.NPUFusedRMSNormGated(128, device="npu", dtype=dtype, activation=activation)
+    with torch.no_grad():
+        norm.weight.copy_(torch.linspace(0.25, 1.75, 128).to(device="npu", dtype=dtype))
+    x = torch.randn(2, 7, 128, device="npu", dtype=dtype).requires_grad_()
+    z = torch.linspace(-20, 20, x.numel()).reshape(x.shape).to(device="npu", dtype=dtype).requires_grad_()
+    rx, rz, rw = (tensor.detach().clone().requires_grad_() for tensor in (x, z, norm.weight))
+    # An independent torch reference preserves the architecture's cast boundary.
+    with torch.autocast("npu", enabled=False):
+        normalized = rx.float() * torch.rsqrt(rx.float().square().mean(-1, keepdim=True) + norm.variance_epsilon)
+        if activation == "sigmoid":
+            expected = (rw * normalized.to(dtype) * rz.float().sigmoid()).to(dtype)
+        else:
+            expected = F.silu(rz) * (normalized * rw.float()).to(dtype)
+    with torch.autocast("npu", dtype=torch.bfloat16, enabled=autocast_enabled):
+        actual = norm(x, z)
+    assert actual.dtype == dtype
+    dy = torch.randn_like(actual)
+    got = torch.autograd.grad(actual, (x, z, norm.weight), dy)
+    ref = torch.autograd.grad(expected, (rx, rz, rw), dy)
+    # Fused CANN reductions need tolerance; BF16 roundoff is not bitwise FP32.
+    rtol, atol = (3e-2, 2e-2) if dtype == torch.bfloat16 else (3e-5, 3e-5)
+    for a, b in zip((actual, *got), (expected, *ref), strict=True):
+        assert torch.isfinite(a).all()
+        torch.testing.assert_close(a, b, atol=atol, rtol=rtol)
