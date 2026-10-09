@@ -17,7 +17,9 @@
 Consolidates the pure-CPU (no GPU / no distributed) USP data tests:
   * zig-zag block ordering, dense + varlen reorder/undo round-trips;
   * ``SequenceParallelCollator`` USP varlen (packed) per-document slicing,
-    reassembly, cu_seqlens derivation, and alignment error handling.
+    reassembly, cu_seqlens derivation, and alignment error handling;
+  * ``SequenceParallelCollator`` ViT patch-stream slicing for bidirectional ring
+    attention and the text-side layout the model reuses for visual placeholders.
 """
 
 # ── zig-zag reorder helpers ───────────────────────────────────────────────────
@@ -31,6 +33,8 @@ import veomni.distributed.sequence_parallel.ring_attention.npu as ring_attention
 from veomni.data.data_collator import MainCollator, PackingCollator, SequenceParallelCollator
 from veomni.distributed.sequence_parallel.ring_attention.layout import (
     local_cu_seqlens,
+    usp_zigzag_slice,
+    vit_usp_slice,
     zigzag_block_order,
     zigzag_reorder,
     zigzag_reorder_packed,
@@ -407,3 +411,81 @@ def test_contiguous_cp_keeps_original_token_order(monkeypatch):
     tokens = torch.arange(16)
     assert torch.equal(collator.sp_slice("input_ids", tokens), tokens[:8])
     assert PackingCollator().cp_size == 1
+
+
+# ── ViT patch streams under cp > 1 ─────────────────────────────────────────────
+def _vision_features():
+    # doc 1: 10 tokens with 6 image placeholders (grid [1,4,6] -> 24 patch rows);
+    # doc 2: 6 tokens with 1 image placeholder (grid [1,2,2] -> 4 patch rows).
+    features = []
+    for length, (start, n_image), grid in ((10, (2, 6), [1, 4, 6]), (6, (3, 1), [1, 2, 2])):
+        image_mask = torch.zeros(length, dtype=torch.bool)
+        image_mask[start : start + n_image] = True
+        rows = grid[0] * grid[1] * grid[2]
+        features.append(
+            {
+                "input_ids": torch.arange(1, length + 1) + 100 * len(features),
+                "labels": torch.arange(1, length + 1),
+                "attention_mask": torch.ones(length, dtype=torch.long),
+                "position_ids": torch.arange(length),
+                "image_mask": image_mask,
+                "pixel_values": torch.arange(rows, dtype=torch.float32).unsqueeze(-1).repeat(1, 3)
+                + 1000 * len(features),
+                "image_grid_thw": torch.tensor([grid]),
+            }
+        )
+    return features
+
+
+@pytest.mark.parametrize(("cp", "uly"), [(2, 1), (2, 2), (4, 1)])
+def test_cp_collator_slices_vit_pixels_per_vit_seq(monkeypatch, cp, uly):
+    full_pixels = torch.cat([feature["pixel_values"] for feature in _vision_features()])
+    vit_seqlens = [24, 4]
+    hook_calls = []
+    for c in range(cp):
+        for u in range(uly):
+            state = _FakeState(cp_size=cp, ulysses_size=uly, cp_rank=c, ulysses_rank=u)
+            monkeypatch.setattr(dc, "get_parallel_state", lambda state=state: state)
+            collator = MainCollator(metadata_collate_func=lambda batch, sp_pad: hook_calls.append(dict(sp_pad)))
+            batch = collator(_vision_features())
+
+            expected = vit_usp_slice(full_pixels, vit_seqlens, 0, cp, c, uly, u)
+            assert torch.equal(batch["pixel_values"], expected)
+            assert batch["image_grid_thw"].tolist() == [[1, 4, 6], [1, 2, 2]]
+            # Placeholder masks stay full (the model slices them with the text layout).
+            assert batch["image_mask"].shape[-1] == batch["attention_mask"].shape[-1]
+    assert all(call["pixel_values"] == 0 for call in hook_calls)
+
+
+@pytest.mark.parametrize(("cp", "uly"), [(2, 1), (2, 2)])
+@pytest.mark.parametrize("single_doc", [False, True])
+def test_model_side_zigzag_with_cu_seq_lens_matches_collator(monkeypatch, cp, uly, single_doc):
+    """The model slices image_mask with ``usp_zigzag_slice(.., cu_seq_lens_q)``; it must match input_ids."""
+    features = _vision_features()[:1] if single_doc else _vision_features()
+    for c in range(cp):
+        for u in range(uly):
+            state = _FakeState(cp_size=cp, ulysses_size=uly, cp_rank=c, ulysses_rank=u)
+            monkeypatch.setattr(dc, "get_parallel_state", lambda state=state: state)
+            batch = MainCollator()([dict(feature) for feature in features])
+
+            full_ids = torch.cat([feature["input_ids"] for feature in features])
+            # Rebuild the padded full sequence: per-doc cp alignment + SP tail, all padded with 0.
+            doc_cu = batch["cu_seq_lens_q"].tolist()
+            padded = torch.zeros(1, batch["image_mask"].shape[-1], dtype=full_ids.dtype)
+            offset = 0
+            for feature in features:
+                n = feature["input_ids"].numel()
+                padded[0, offset : offset + n] = feature["input_ids"]
+                offset += n + (-n) % (2 * cp)
+            got = usp_zigzag_slice(padded, doc_cu, -1, cp, c, uly, u)
+            assert torch.equal(got, batch["input_ids"])
+
+
+def test_cp_collator_requires_grid_for_vit_pixels(monkeypatch):
+    state = _FakeState(cp_size=2, ulysses_size=1, cp_rank=0, ulysses_rank=0)
+    monkeypatch.setattr(dc, "get_parallel_state", lambda: state)
+    features = _vision_features()
+    for feature in features:
+        feature.pop("image_grid_thw")
+    with pytest.raises(ValueError, match="requires 'image_grid_thw'"):
+        MainCollator()(features)

@@ -150,6 +150,17 @@ DEFAULT_DATA_COLLATE_INFO: Dict[str, DataCollateInfo] = {
 }
 
 
+# Under USP context parallelism (cp_size > 1) the ViT patch streams are not
+# zig-zag sliced like text: every vit seq (one image, or one video temporal step)
+# is split into per-rank shards for bidirectional ring attention (see
+# ``ring_attention.layout.vit_usp_slice``). First version: the vit seq rule
+# (``[h * w] * t`` from the grid) follows Qwen3-VL and is hardcoded here.
+_CP_VIT_GRID_KEYS: Dict[str, str] = {
+    "pixel_values": "image_grid_thw",
+    "pixel_values_videos": "video_grid_thw",
+}
+
+
 @dataclass
 class DataCollator(ABC):
     """
@@ -420,17 +431,41 @@ class SequenceParallelCollator(DataCollator):
         attention stays balanced per document. Otherwise the whole sequence is
         treated as one document (dense zig-zag).
         """
-        from ..distributed.sequence_parallel.ring_attention.layout import zigzag_reorder, zigzag_reorder_packed
+        from ..distributed.sequence_parallel.ring_attention.layout import usp_zigzag_slice
 
-        cu = self._cp_cu_seqlens
-        if cu is not None and cu.numel() > 2:
-            reordered = zigzag_reorder_packed(feature, cu, dim=dim, cp_size=self.cp_size)
-        else:
-            reordered = zigzag_reorder(feature, dim=dim, cp_size=self.cp_size)
-        cp_chunk = reordered.size(dim) // self.cp_size
-        cp_region = reordered.narrow(dim, self.cp_rank * cp_chunk, cp_chunk)
-        uly_chunk = cp_region.size(dim) // self.ulysses_size
-        return cp_region.narrow(dim, self.ulysses_rank * uly_chunk, uly_chunk).contiguous()
+        return usp_zigzag_slice(
+            feature,
+            self._cp_cu_seqlens,
+            dim=dim,
+            cp_size=self.cp_size,
+            cp_rank=self.cp_rank,
+            ulysses_size=self.ulysses_size,
+            ulysses_rank=self.ulysses_rank,
+        )
+
+    def _cp_slice_vit_pixels(self, key: str, batch: Dict[str, Any]) -> torch.Tensor:
+        """Slice a packed ViT patch stream for bidirectional ring attention (cp_size > 1).
+
+        Every vit seq is split into per-rank shards on merger-unit granularity and each rank's
+        cp local seq is tail-padded with zero patches (see ``ring_attention.layout.vit_usp_slice``).
+        """
+        from ..distributed.sequence_parallel.ring_attention.layout import vit_usp_slice
+
+        grid_key = _CP_VIT_GRID_KEYS[key]
+        grid = batch.get(grid_key)
+        if grid is None:
+            raise ValueError(f"context-parallel (cp_size>1) slicing of {key!r} requires {grid_key!r} in the batch")
+        grid_list = grid.tolist() if torch.is_tensor(grid) else grid
+        vit_seqlens = [h * w for t, h, w in grid_list for _ in range(t)]
+        return vit_usp_slice(
+            batch[key],
+            vit_seqlens,
+            dim=self.collate_infos[key].pack_dim,
+            cp_size=self.cp_size,
+            cp_rank=self.cp_rank,
+            ulysses_size=self.ulysses_size,
+            ulysses_rank=self.ulysses_rank,
+        )
 
     def _compute_cp_cu_seqlens(
         self,
@@ -555,6 +590,10 @@ class SequenceParallelCollator(DataCollator):
         for key in batch.keys():
             collate_info: DataCollateInfo = self.collate_infos.get(key, None)
             if collate_info is None:
+                continue
+            if self.cp_size > 1 and key in _CP_VIT_GRID_KEYS:
+                # ViT patch streams: per-vit-seq shards + tail pad instead of sp pad / zig-zag.
+                batch[key] = self._cp_slice_vit_pixels(key, batch)
                 continue
             pack_dim = collate_info.pack_dim
             sp_slice = collate_info.sp_slice
