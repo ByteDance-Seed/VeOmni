@@ -191,6 +191,7 @@ jobs:
           uv run --frozen pytest -v -s -x tests/distributed/test_async_offload_unit.py
           uv run --frozen pytest -v -s -x tests/distributed/test_dummy_forward.py
           uv run --frozen pytest -v -s -x tests/distributed/test_emb_parallel.py
+          uv run --frozen pytest -v -s -x tests/distributed/test_parallel_plan.py
       - name: Run data tests
         run: |
           uv run --frozen pytest -v -s -x tests/data
