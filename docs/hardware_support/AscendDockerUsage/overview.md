@@ -123,6 +123,18 @@ RUN apt update -y && \
 
 ---
 
+## Security Risks
+
+When running containers with these images, be aware of the following security risks:
+
+- Running as the `root` user: Containers run as the `root` user by default, which can introduce security risks. In production environments, it is recommended to create a non-privileged user to run the application.
+
+- Lack of CPU and memory resource limits: Not setting resource limits may cause a container to consume excessive system resources and affect host performance. It is recommended to use the `--cpus` and `--memory` parameters to limit resource usage.
+
+- Device use with `rwm` permissions: The NPU device is assigned read, write, and `mknod` permissions. Although these are required for functionality, the scope of permissions should be carefully evaluated in security-sensitive environments.
+
+---
+
 ## License
 
 The CANN and MindSeries software included in these images is subject to their own licenses; see the [Ascend CANN community license information](https://www.hiascend.com/software/cann/community). The VeOmni framework's license is in its [GitHub repository](https://github.com/ByteDance-Seed/VeOmni).
