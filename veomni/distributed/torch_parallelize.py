@@ -1022,9 +1022,20 @@ def build_parallelize_model(
         if use_reentrant:
             torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
 
+        # The entry points the policy does not bind keep whatever HF is given here,
+        # so the run's own recompute context has to be in it — otherwise a module
+        # whose blocks are not selected would recompute outside its scoping.
+        recompute_context_fn = kwargs.pop("recompute_context_fn", None)
+        if recompute_context_fn is None and recompute_policy is not None:
+            recompute_context_fn = recompute_utils.recompute_context_fn(recompute_policy.recompute_context)
+        if use_reentrant:
+            # ``checkpoint`` rejects any other ``context_fn`` when reentrant, and
+            # reentrant recomputation never enters one anyway.
+            recompute_context_fn = None
+
         gradient_checkpointing_kwargs = {
             "use_reentrant": use_reentrant,
-            "context_fn": kwargs.pop("recompute_context_fn", noop_context_fn),
+            "context_fn": recompute_context_fn or noop_context_fn,
         }
         if not use_reentrant:
             gradient_checkpointing_kwargs["early_stop"] = checkpoint_early_stop

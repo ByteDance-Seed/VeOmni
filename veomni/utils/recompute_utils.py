@@ -30,7 +30,7 @@ The framework owns the strategy, models stay unchanged:
   models: the same execution rule as above, for a model that owns a bare
   ``torch.utils.checkpoint`` call and finds the block itself. No in-tree model
   needs it — a block loop calls ``self._gradient_checkpointing_func``, which the
-  install step replaces.
+  apply step replaces.
 
 The public configuration spells the two layer counts the decision layer works
 with: ``recompute_layers`` picks the recompute range from the last block
@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import functools
 import importlib
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import Any, Callable, Sequence
@@ -345,12 +346,19 @@ class RecomputePolicy:
     decide the full-recompute range, which every model that arms checkpointing at
     all does honour. With ``enabled=False`` an HF-style model never arms it, so
     the plan is then computed and logged but nothing runs it.
+
+    ``recompute_context`` is the run's own context for the recompute half of every
+    checkpointed block — SAC and full alike. A model that needs its parallelism
+    current during recompute (SeedOmni re-enters a module's ``ParallelState``)
+    passes it here rather than arming checkpointing a second time, which would
+    overwrite the per-block decisions this policy just applied.
     """
 
     # ``plan_block`` clamps both counts against the model depth.
     recompute_layers: int = -1  # -1 = every layer, N = the last N, 0 = none
     selective_recompute_layers: int = 0  # 0 = SAC off, N = the first N of the recomputed layers
-    context_fn: Callable[[], tuple[Any, Any]] | None = None
+    context_fn: Callable[[], tuple[Any, Any]] | None = None  # SAC's selective context, when available
+    recompute_context: Callable[[], AbstractContextManager] | None = None
     early_stop: bool = True
     use_reentrant: bool = False
 
@@ -368,6 +376,7 @@ def build_policy(
     recompute_layers: int = -1,
     selective_recompute_layers: int = 0,
     save_ops: Sequence[str] | None = None,
+    recompute_context: Callable[[], AbstractContextManager] | None = None,
     offload_active: bool = False,
     compile_enabled: bool = False,
 ) -> RecomputePolicy:
@@ -381,6 +390,10 @@ def build_policy(
     ``context_fn`` is dropped, so those layers fall back to full recomputation with
     a warning. A ``save_ops`` entry that is neither a known group nor a real operator
     is still passed through, and surfaces later as an unresolved-operator warning.
+
+    ``recompute_context`` is the caller's own context for the recompute half of every
+    block (see :class:`RecomputePolicy`); it is carried through untouched and only
+    the decision layer composes it.
 
     This entry point is also called directly, so it clamps an out-of-range count
     with a warning; the config dataclass rejects the same values earlier.
@@ -400,10 +413,14 @@ def build_policy(
             "selective_recompute_layers is set but recompute_layers=0 recomputes no block at all, so SAC never applies"
         )
 
-    if recompute_layers != -1 or sac_layers > 0:
-        window = "every block" if recompute_layers == -1 else f"the last {recompute_layers} block(s)"
+    if recompute_layers == 0:
         logger.info_rank0(
-            f"gradient_checkpointing: {window} recompute ({sac_layers} of them through SAC, counted "
+            "gradient_checkpointing: no block recomputes; checkpointing is on but every block keeps its activations"
+        )
+    elif recompute_layers != -1 or sac_layers > 0:
+        counted = "every block" if recompute_layers == -1 else f"the last {recompute_layers} block(s)"
+        logger.info_rank0(
+            f"gradient_checkpointing: {counted} recompute ({sac_layers} of them through SAC, counted "
             "from the front); any block before that recomputes nothing"
         )
     extra_op_names = expand_save_ops(save_ops)
@@ -435,10 +452,17 @@ def build_policy(
     if context_fn is not None and compile_enabled:
         logger.warning_once("torch.compile is enabled; SAC with torch.compile is unverified")
 
+    if recompute_context is not None and enable_reentrant:
+        logger.warning_once(
+            "the run's recompute context is ignored: reentrant checkpointing takes no context_fn, "
+            "so recomputation runs outside it"
+        )
+
     return RecomputePolicy(
         recompute_layers=recompute_layers,
         selective_recompute_layers=selective_recompute_layers,
         context_fn=context_fn,
+        recompute_context=recompute_context,
         early_stop=early_stop,
         use_reentrant=enable_reentrant,
     )
@@ -470,15 +494,67 @@ class BlockPlan:
     checkpoint_kwargs: dict[str, Any]
 
 
+def _with_recompute_context(context_fn, recompute_context):
+    """Fold the run's recompute context into a checkpoint ``context_fn``.
+
+    ``context_fn`` returns ``(forward_ctx, recompute_ctx)``; ``recompute_context``
+    wraps the recompute half, with SAC's selective context (when there is one)
+    inside it, so the model's own scoping is in place before any recomputed op runs.
+    Returns ``context_fn`` unchanged when there is nothing to fold in.
+
+    torch calls ``context_fn`` once, before the forward, and enters the two halves
+    itself — so the pair is built lazily here: entering them any earlier would leave
+    SAC's dispatch mode live during the forward, and would scope the model's own
+    context over the forward instead of over the recomputation.
+    """
+    if recompute_context is None:
+        return context_fn
+    if context_fn is None:
+        return lambda: (nullcontext(), recompute_context())
+
+    def composed():
+        forward_ctx, recompute_ctx = context_fn()
+
+        @contextmanager
+        def recompute_cm():
+            with recompute_context(), recompute_ctx:
+                yield
+
+        return forward_ctx, recompute_cm()
+
+    return composed
+
+
+def recompute_context_fn(recompute_context: Callable[[], AbstractContextManager] | None):
+    """The ``context_fn`` of a checkpoint entry point set up outside the policy.
+
+    HF's enable writes one function onto every flagged module, and the policy
+    replaces the entry points it binds — so what the others keep must already carry
+    the run's recompute context, or only the bound blocks would re-enter the model's
+    own scoping. ``None`` when the run has no context of its own, leaving the caller
+    to pass torch's ``noop_context_fn``.
+    """
+    if recompute_context is None:
+        return None
+    return _with_recompute_context(None, recompute_context)
+
+
 def _full_recompute_kwargs(policy: RecomputePolicy) -> dict[str, Any]:
     """Checkpoint options of a block that recomputes everything.
 
     torch rejects ``context_fn`` and ignores ``early_stop`` on the reentrant path,
-    so the two cases differ by more than the flag.
+    so the two cases differ by more than the flag; a policy carrying its own
+    recompute context loses it there too, which is what reentrant checkpointing
+    costs. A runtime whose recomputation *needs* that context never builds such a
+    policy — it rejects ``enable_reentrant`` instead.
     """
     if policy.use_reentrant:
         return {"use_reentrant": True}
-    return {"use_reentrant": False, "early_stop": policy.early_stop}
+    kwargs = {"use_reentrant": False, "early_stop": policy.early_stop}
+    context_fn = recompute_context_fn(policy.recompute_context)
+    if context_fn is not None:
+        kwargs["context_fn"] = context_fn
+    return kwargs
 
 
 def _clamp_recompute_n(count: int, total: int) -> int:
@@ -525,7 +601,11 @@ def plan_block(policy: RecomputePolicy, index: int, total: int) -> BlockPlan:
     if not policy.use_reentrant and policy.context_fn is not None and index - recompute_start < sac_n:
         return BlockPlan(
             Decision.SAC,
-            {"use_reentrant": False, "context_fn": policy.context_fn, "early_stop": policy.early_stop},
+            {
+                "use_reentrant": False,
+                "context_fn": _with_recompute_context(policy.context_fn, policy.recompute_context),
+                "early_stop": policy.early_stop,
+            },
         )
     return BlockPlan(Decision.FULL, _full_recompute_kwargs(policy))
 
