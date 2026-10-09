@@ -418,12 +418,20 @@ class ChannelLossComputer:
             self._reset_capture_state()
             self._capture_sp_descriptor = _resolve_cached_sp_capture_descriptor(self.parallel_state)
         token = _ACTIVE_CHANNEL_LOSS_COMPUTER.set(self)
+        forward_completed = False
         try:
             yield
+            forward_completed = True
         finally:
             _ACTIVE_CHANNEL_LOSS_COMPUTER.reset(token)
             if not nested:
-                self._finalize_capture()
+                if forward_completed:
+                    self._finalize_capture()
+                else:
+                    # The training forward failed; do not add observer collectives
+                    # during exception unwinding or mask the original failure.
+                    self._reset_capture_state()
+                    self._capture_sp_descriptor = None
 
     def _reset_capture_state(self) -> None:
         self._pending_observations = []
