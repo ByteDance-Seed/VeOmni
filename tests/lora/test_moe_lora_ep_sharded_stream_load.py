@@ -100,19 +100,18 @@ _SEED_STEPS = 2
 # ──────────────────────────────────────────────────────────────────────
 #
 # ``ep_sharded_stream_load`` streams each rank's dim-0 expert slice
-# straight from the checkpoint. That is only possible when the on-disk
-# expert layout *is* the model's fused layout
-# (``...experts.gate_up_proj`` / ``down_proj`` with shape ``[E, ...]``).
-# The shared ``toy_base_dir`` fixture in ``test_moe_lora_trainer`` writes
-# the standard HF **per-expert** layout (``...experts.<e>.gate_proj.weight``),
-# which needs the ``Qwen3MoeCheckpointTensorConverter`` per-expert->fused
-# fusion at load time -- a transform the stream loader explicitly refuses
-# (``NotImplementedError``; covered by the non-PEFT bail case in
-# ``tests/utils/test_moe_ep_sharded_load_matrix.py``).
+# straight from the checkpoint when the on-disk expert layout *is* the
+# model's fused layout (``...experts.gate_up_proj`` / ``down_proj`` with
+# shape ``[E, ...]``). The shared ``toy_base_dir`` fixture in
+# ``test_moe_lora_trainer`` writes the standard HF **per-expert** layout
+# (``...experts.<e>.gate_proj.weight``), which instead goes through the
+# ``Qwen3MoeCheckpointTensorConverter`` per-rank expert stacking (covered
+# by ``tests/utils/test_moe_ep_sharded_load_matrix.py`` and
+# ``tests/utils/test_ep_sharded_expert_stream_load.py``).
 #
-# So this test builds its *own* base by dumping the fused
+# This test builds its *own* base by dumping the fused
 # ``model.state_dict()`` directly (no ``save_pretrained`` re-split),
-# giving a converter-free, streamable checkpoint.
+# so it exercises the converter-free dim-0 slice path under PEFT.
 
 
 def _build_and_save_fused_toy_base(dest_dir: str) -> None:

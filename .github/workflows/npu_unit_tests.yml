@@ -183,6 +183,7 @@ jobs:
         # it runs on NPU via hccl).
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_moe_ep_sharded_load_matrix.py
+          uv run --frozen pytest -v -s -x tests/utils/test_ep_sharded_expert_stream_load.py
       - name: Run checkpoint tests
         run: |
           uv run --frozen pytest -v -s -x tests/checkpoints/
