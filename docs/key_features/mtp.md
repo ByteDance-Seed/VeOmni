@@ -259,7 +259,8 @@ in its patch config:
    plan key for the `ep_fsdp` mesh, but the parallelizer pairs those modules only
    under a wrap target. MTP experts outside a wrap target are still EP-sliced, but
    FSDP2 shards them again over the regular mesh, so each rank gathers a mix of
-   other ranks' experts without any error.
+   other ranks' experts without any error (see
+   [Plan owners](./extra_parallel.md#plan-owners)).
 
 Note `config.modify_init()` looks like the natural fit for step 3 but is a **dead API**: `PatchType.INIT_MODIFICATION` has no implementation in patchgen's codegen, so
 the patch is silently dropped. Use `override_method("<Class>.__init__")`.
