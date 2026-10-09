@@ -116,6 +116,7 @@ def rotate_half(x):
 # Reason: Use NPU fused rotary embedding
 # Source: veomni.models.transformers.seed_oss.seed_oss_npu_patch_gen_config
 # ======================================================================
+@use_kernel_forward_from_hub("rotary_pos_emb")
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,

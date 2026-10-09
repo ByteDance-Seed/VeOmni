@@ -64,5 +64,6 @@ it itself. The trainer adds no packing switch, alternate sample/output protocol,
 or model-capability envelope.
 
 This is fixed-sample batching, independent of the token-budget scheduling used
-by dynamic batching. MiniMax H3 packing is a separate model implementation; this
-trainer change alone does not lift H3's single-sample condition-processing check.
+by dynamic batching. A larger microbatch does not imply packing for every model.
+MiniMax H3 implements model-owned packing; see
+[its usage guide](../examples/minimax_h3.md) for supported configurations.
