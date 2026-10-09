@@ -124,6 +124,7 @@ jobs:
         #       tests/parallel/ulysses/test_ulysses_async.py still works
         run: |
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_qwen4_exp_ulysses.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_slice_input_tensor.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_wan_ulysses_padding.py

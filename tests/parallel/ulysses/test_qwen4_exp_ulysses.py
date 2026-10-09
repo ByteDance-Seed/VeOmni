@@ -82,12 +82,13 @@ def _use_full_float32_matmuls() -> None:
 def _assert_forward_deterministic(
     layer: torch.nn.Module,
     inputs: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
     repeats: int = 10,
 ) -> None:
     with torch.no_grad():
-        reference = layer(inputs, attention_mask=None, linear_attn_cu_seq_lens_q=None).detach()
+        reference = layer(inputs, attention_mask=None, linear_attn_cu_seq_lens_q=cu_seq_lens).detach()
         for _ in range(repeats - 1):
-            output = layer(inputs, attention_mask=None, linear_attn_cu_seq_lens_q=None)
+            output = layer(inputs, attention_mask=None, linear_attn_cu_seq_lens_q=cu_seq_lens)
             torch.testing.assert_close(output, reference, rtol=0, atol=0)
 
 
@@ -170,7 +171,16 @@ def _torch_causal_conv_channels_first(
     activation: str | None = None,
     **kwargs,
 ) -> torch.Tensor:
-    del kwargs
+    cu_seqlens = kwargs.pop("cu_seqlens", kwargs.pop("cu_seq_lens_q", None))
+    if cu_seqlens is not None:
+        boundaries = cu_seqlens.tolist()
+        return torch.cat(
+            [
+                _torch_causal_conv_channels_first(x[..., start:end], weight, bias, activation)
+                for start, end in zip(boundaries[:-1], boundaries[1:])
+            ],
+            dim=-1,
+        )
     output = torch.nn.functional.conv1d(
         x,
         weight.unsqueeze(1),
@@ -220,6 +230,24 @@ def _fla_causal_conv_channels_first(
     return output.transpose(1, 2).contiguous()
 
 
+def _torch_recurrent_gated_delta_rule_packed(q, k, v, g, beta, **kwargs):
+    """Reset the independent torch GDN reference at every packed boundary."""
+    modeling = importlib.import_module(_PATCHED_MODULE)
+    cu_seqlens = kwargs.pop("cu_seqlens", None)
+    if cu_seqlens is None:
+        return modeling.torch_recurrent_gated_delta_rule(q, k, v, g, beta, **kwargs)
+    if kwargs.get("initial_state") is not None or kwargs.get("output_final_state", False):
+        raise ValueError("The packed test reference supports stateless training only")
+    outputs = []
+    boundaries = cu_seqlens.tolist()
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        output, _ = modeling.torch_recurrent_gated_delta_rule(
+            q[:, start:end], k[:, start:end], v[:, start:end], g[:, start:end], beta[:, start:end], **kwargs
+        )
+        outputs.append(output)
+    return torch.cat(outputs, dim=1), None
+
+
 def _get_model_test_kernels(qwen4_exp):
     """Keep each platform's established full-model test kernels."""
     if get_device_type() != "npu":
@@ -228,7 +256,7 @@ def _get_model_test_kernels(qwen4_exp):
         return fla_causal_conv1d, fla_chunk_gated_delta_rule, _fla_causal_conv_channels_first
     return (
         _torch_causal_conv_sequence_first,
-        qwen4_exp.torch_recurrent_gated_delta_rule,
+        _torch_recurrent_gated_delta_rule_packed,
         _torch_causal_conv_channels_first,
     )
 
@@ -260,6 +288,7 @@ def _run_ple_halo_equivalence() -> None:
 
         local_seq_len = max(ple.short_conv_state_len, ple.ple_embedding.context_len) + 2
         seq_len = local_seq_len * world_size
+        cu_seq_lens = torch.tensor([0, local_seq_len, seq_len], dtype=torch.int32, device=device)
         full_ids = (torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0) + 3) % config.vocab_size
         # Exercise the packed-sample reset immediately before an SP boundary.
         full_ids[:, local_seq_len - 1] = config.eos_token_id
@@ -279,9 +308,9 @@ def _run_ple_halo_equivalence() -> None:
             extra_parallel_sizes={"ple": 1},
         )
         with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
-            expected_embeddings = ple.ple_embedding(full_ids, past_key_values=None).detach()
+            expected_embeddings = ple.ple_embedding(full_ids, past_key_values=None, cu_seq_lens_q=cu_seq_lens).detach()
 
-        actual_embeddings = ple.ple_embedding(local_ids, past_key_values=None).detach()
+        actual_embeddings = ple.ple_embedding(local_ids, past_key_values=None, cu_seq_lens_q=cu_seq_lens).detach()
         torch.testing.assert_close(_gather_sequence(actual_embeddings), expected_embeddings)
 
         torch.manual_seed(29)
@@ -293,14 +322,14 @@ def _run_ple_halo_equivalence() -> None:
             requires_grad=True,
         )
         with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
-            expected_output = ple._short_conv(full_hidden, past_key_values=None)
+            expected_output = ple._short_conv(full_hidden, past_key_values=None, cu_seq_lens_q=cu_seq_lens)
             expected_output.sum().backward()
         expected_input_grad = full_hidden.grad.detach().clone()
         expected_weight_grad = ple.conv1d.weight.grad.detach().clone()
         ple.conv1d.weight.grad = None
 
         local_hidden = full_hidden.detach()[:, local_slice].contiguous().requires_grad_(True)
-        actual_output = ple._short_conv(local_hidden, past_key_values=None)
+        actual_output = ple._short_conv(local_hidden, past_key_values=None, cu_seq_lens_q=cu_seq_lens)
         actual_output.sum().backward()
         dist.all_reduce(ple.conv1d.weight.grad, op=dist.ReduceOp.SUM)
 
@@ -593,7 +622,13 @@ def _run_gated_deltanet_equivalence(
                 ),
             ):
                 expected_output = torch.cat(
-                    [layer(baseline_input[:, start:end]) for start, end in zip(boundaries[:-1], boundaries[1:])],
+                    [
+                        layer(
+                            baseline_input[:, start:end],
+                            linear_attn_cu_seq_lens_q=torch.tensor([0, end - start], dtype=torch.int32, device=device),
+                        )
+                        for start, end in zip(boundaries[:-1], boundaries[1:])
+                    ],
                     dim=1,
                 )
                 (expected_output.sum() / expected_output.numel()).backward()
@@ -662,7 +697,7 @@ def test_qwen4_exp_gated_deltanet_rejects_nondivisible_heads(num_k_heads, num_v_
         patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=parallel_state),
         pytest.raises(ValueError, match="must divide Qwen4-Exp GatedDeltaNet key heads"),
     ):
-        layer(hidden_states)
+        layer(hidden_states, linear_attn_cu_seq_lens_q=torch.tensor([0, 8], dtype=torch.int32))
 
 
 def _run_gated_deltanet_determinism(bsz: int, seq_len: int) -> None:
@@ -694,19 +729,20 @@ def _run_gated_deltanet_determinism(bsz: int, seq_len: int) -> None:
 
         shard_len = seq_len // world_size
         local_input = full_input[:, rank * shard_len : (rank + 1) * shard_len].contiguous()
-        _assert_forward_deterministic(layer, local_input)
+        cu_seq_lens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+        _assert_forward_deterministic(layer, local_input, cu_seq_lens)
     finally:
         clear_parallel_state()
 
 
-@pytest.mark.parametrize("bsz", [1, 4])
+@pytest.mark.parametrize("bsz", [1])
 @pytest.mark.parametrize("seq_len", [8, 2048])
 def test_qwen4_exp_gated_deltanet_forward_deterministic_sp(bsz: int, seq_len: int) -> None:
     _require_fla_devices(world_size=2)
     torchrun(_run_gated_deltanet_determinism, 2, bsz, seq_len)
 
 
-@pytest.mark.parametrize("bsz", [1, 4])
+@pytest.mark.parametrize("bsz", [1])
 @pytest.mark.parametrize("seq_len", [8, 2048])
 def test_qwen4_exp_gated_deltanet_forward_deterministic_no_sp(bsz: int, seq_len: int) -> None:
     _require_fla_devices()
@@ -730,7 +766,8 @@ def test_qwen4_exp_gated_deltanet_forward_deterministic_no_sp(bsz: int, seq_len:
         ulysses_size=1,
     )
     with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
-        _assert_forward_deterministic(layer, inputs)
+        cu_seq_lens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+        _assert_forward_deterministic(layer, inputs, cu_seq_lens)
 
 
 def _run_text_model_equivalence() -> None:

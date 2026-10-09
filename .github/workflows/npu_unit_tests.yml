@@ -149,6 +149,7 @@ jobs:
       - name: Run parallel tests
         run: |
           uv run --frozen pytest -v -s -x tests/parallel/ulysses/test_ulysses.py
+          uv run --frozen pytest -v -s -x tests/parallel/ulysses/test_qwen4_exp_ulysses.py
           uv run --frozen pytest -v -s -x tests/parallel/ulysses/test_all_gather.py
           uv run --frozen pytest -v -s -x tests/parallel/ulysses/test_slice_input_tensor.py
           uv run --frozen pytest -v -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
