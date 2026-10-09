@@ -23,16 +23,18 @@ declared module, composes their models into one ``OmniModel`` and cascades the
 
 import os
 from contextlib import nullcontext
+from functools import partial
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import FSDPModule
+from torch.utils.checkpoint import noop_context_fn
 
 from .....distributed.clip_grad_norm import veomni_omni_module_clip_grad_norm
 from .....distributed.parallel_state import use_parallel_state
-from .....utils import logging
+from .....utils import logging, recompute_utils
 from .....utils.checkpoint_utils import should_skip_hf_weight_load
 from .....utils.device import get_device_type
 from ....model_runtime import VeOmniModelRuntime
@@ -148,7 +150,8 @@ class ModuleRuntime(VeOmniModelRuntime):
                 self._freeze_model_module()
                 self._build_parallelized_model()
                 if not self.wrap_omni_model:
-                    self._scope_recompute_to_parallel_state()
+                    # Parallel-state scoping for recompute rides in the policy; the
+                    # apply step inside ``_build_parallelized_model`` is the last writer.
                     self._build_optimizer()
                     self.build_checkpoint()
 
@@ -361,15 +364,58 @@ class ModuleRuntime(VeOmniModelRuntime):
         """Training steps that need the wrapped parameters, once the composed OmniModel is wrapped.
 
         Under ``fsdp_scope='model'`` :meth:`__init__` stops after building this
-        module on meta; the optimizer, the checkpoint manager and the recompute
-        scope all bind to the DTensor parameters ``fully_shard`` creates, so
+        module on meta; the recompute apply step, the optimizer and the checkpoint
+        manager all need the DTensor parameters ``fully_shard`` creates, so
         :class:`OmniModelRuntime` calls this after its wrap. Inference needs
         none of them.
         """
         with self._scoped():
-            self._scope_recompute_to_parallel_state()
+            self._apply_recompute_policy()
             self._build_optimizer()
             self.build_checkpoint()
+
+    def _apply_recompute_policy(self) -> None:
+        """Arm checkpointing and apply this module's recompute policy.
+
+        The composed wrap runs ``build_parallelize_model`` with
+        ``enable_gradient_checkpointing=False`` (each module arms its own), so this
+        is where ``fsdp_scope='model'`` gets both: HF's entry point first, then the
+        per-block decisions, never the other way round — a later
+        ``gradient_checkpointing_enable`` writes over every block's function.
+
+        The enable carries this module's recompute context, so the entry points the
+        policy does not bind (an inactive policy, or a model whose blocks were not
+        found) still recompute inside the module's ``ParallelState``; the policy
+        composes the same context onto the blocks it does bind.
+        """
+        gc = self.args.accelerator.gradient_checkpointing
+        if not gc.enable:
+            return
+        model = unwrap_module_chain(self.model)
+        policy = self._build_recompute_policy()
+
+        gradient_checkpointing_kwargs = {
+            "use_reentrant": gc.enable_reentrant,
+            "context_fn": recompute_utils.recompute_context_fn(policy.recompute_context) or noop_context_fn,
+            "early_stop": gc.early_stop,
+        }
+
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+        # ``basic_modules`` is what ranks the block stacks, the same list the
+        # ``fsdp_scope='module'`` path hands to the wrap; without it the two scopes
+        # could bind different stacks for one configuration.
+        recompute_utils.apply_recompute_policy(model, policy, basic_modules=list(self.args.basic_modules or []))
+
+    def _recompute_context(self):
+        """Run the recompute half of every checkpointed block under this module's ParallelState.
+
+        The forward is already wrapped in :meth:`OmniModelRuntime.module_context`, but
+        the recompute (in backward) escapes it: reads of the free
+        ``get_parallel_state()`` (EP groups, vocab-parallel ``emb`` group, …) must
+        resolve to this module's mesh there too. Both the enable and every block the
+        policy binds carry this, so SAC and the module's scoping survive together.
+        """
+        return partial(use_parallel_state, self.module_name)
 
     def _scoped(self):
         """Context manager making this module's ParallelState current.
@@ -385,35 +431,6 @@ class ModuleRuntime(VeOmniModelRuntime):
         if self.is_eager:
             return nullcontext()
         return use_parallel_state(self.module_name)
-
-    def _scope_recompute_to_parallel_state(self) -> None:
-        """Make gradient-checkpoint recompute re-enter this module's ParallelState.
-
-        torch ``checkpoint``'s ``context_fn`` returns ``(forward_ctx, recompute_ctx)``;
-        the forward is already wrapped in :meth:`OmniModelRuntime.module_context`, but the
-        recompute (in backward) escapes it. Setting ``recompute_ctx`` to
-        :func:`use_parallel_state` keeps reads of the free ``get_parallel_state()``
-        (EP groups, vocab-parallel ``emb`` group, …) resolving to this module's mesh
-        during recompute. ``use_reentrant=True`` does not honour ``context_fn`` — but
-        the omni path runs non-reentrant (``accelerator.gradient_checkpointing.enable_reentrant``
-        defaults to ``False``).
-        """
-        name = self.module_name
-        gc = self.args.accelerator.gradient_checkpointing
-
-        def _recompute_context_fn():
-            return nullcontext(), use_parallel_state(name)
-
-        # DDP wraps the model (``.module``) and does not expose
-        # ``gradient_checkpointing_enable``; FSDP2 wraps in place. Unwrap so the
-        # call reaches the raw HF model regardless of dp_mode.
-        if gc.enable:
-            unwrap_module_chain(self.model).gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={
-                    "use_reentrant": gc.enable_reentrant,
-                    "context_fn": _recompute_context_fn,
-                }
-            )
 
     @property
     def has_trainable_parameters(self) -> bool:

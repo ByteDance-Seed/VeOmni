@@ -55,6 +55,9 @@ model:
     ulysses_size: 1
     gradient_checkpointing:
       enable: true
+      # recompute_layers: 15  # 开启重计算的层数, 从最后一层往前数: -1 = 全部层(默认), 0 = 不重算, 超过总层数取总层数
+      # selective_recompute_layers: 10  # 其中走选择重计算(SAC)的层数, 从重算区间前段数: 0 = 不开(默认), 超过重算区间长度取整个区间
+      # save_ops: ["attn"]  # SAC 下不做重计算的算子, 默认 attn (SDPA 类 op MUST_SAVE, 其余重算); [] 等价 attn
     fsdp_config:
       fsdp_mode: fsdp2
       mixed_precision:
@@ -77,7 +80,7 @@ data:
   text_keys: text
   dataloader:
     type: native
-    num_workers: 8
+    num_workers: 4
     drop_last: true
 
 # -----------------------------------------------------------------------------
@@ -86,14 +89,25 @@ data:
 train:
   training_task: offline_training
 
-  global_batch_size: 16
+  global_batch_size: 8
   micro_batch_size: 1
   dyn_bsz: false
 
   seed: 42
 
   num_train_epochs: 1
-  max_steps: 20
+  max_steps: 25
+
+  profile:
+      enable: false
+      start_step: 5
+      end_step: 7
+      trace_dir: "./profiling/trace"
+      record_shapes: true
+      profile_memory: true
+      with_stack: false
+      with_modules: false
+      rank0_only: true
 
   checkpoint:
     output_dir: output/minimax_h3_fl2va_offline

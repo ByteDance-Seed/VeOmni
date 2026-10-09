@@ -30,7 +30,7 @@ from torch.utils.checkpoint import noop_context_fn
 from ..arguments import MixedPrecisionConfig
 from ..arguments.arguments_types import validate_low_precision_reduce_scatter_comm
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
-from ..utils import logging
+from ..utils import logging, recompute_utils
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
 from .fsdp2.reduce_scatter import (
@@ -980,6 +980,7 @@ def build_parallelize_model(
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
+    recompute_policy: Optional[recompute_utils.RecomputePolicy] = None,
     muon_expert_zero_comm: bool = False,
     low_precision_reduce_scatter_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
@@ -996,6 +997,8 @@ def build_parallelize_model(
             module's path; the composed wrap passes one path per child.
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
+        recompute_policy: Per-block recomputation strategy, bound after HF has
+            enabled gradient checkpointing and before FSDP2 shards the blocks.
     """
     parallel_state = get_parallel_state()
     if low_precision_reduce_scatter_comm is not False:
@@ -1019,9 +1022,20 @@ def build_parallelize_model(
         if use_reentrant:
             torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
 
+        # The entry points the policy does not bind keep whatever HF is given here,
+        # so the run's own recompute context has to be in it — otherwise a module
+        # whose blocks are not selected would recompute outside its scoping.
+        recompute_context_fn = kwargs.pop("recompute_context_fn", None)
+        if recompute_context_fn is None and recompute_policy is not None:
+            recompute_context_fn = recompute_utils.recompute_context_fn(recompute_policy.recompute_context)
+        if use_reentrant:
+            # ``checkpoint`` rejects any other ``context_fn`` when reentrant, and
+            # reentrant recomputation never enters one anyway.
+            recompute_context_fn = None
+
         gradient_checkpointing_kwargs = {
             "use_reentrant": use_reentrant,
-            "context_fn": kwargs.pop("recompute_context_fn", noop_context_fn),
+            "context_fn": recompute_context_fn or noop_context_fn,
         }
         if not use_reentrant:
             gradient_checkpointing_kwargs["early_stop"] = checkpoint_early_stop
@@ -1029,6 +1043,13 @@ def build_parallelize_model(
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
         )
+
+    # Layer selection and SAC are bound per block, after HF has set its own
+    # function on every checkpointing layer and before FSDP shards them. Runs
+    # outside the branch above: models whose block loops drive checkpointing
+    # themselves (MiniMax-H3) still need their blocks bound.
+    if recompute_policy is not None:
+        recompute_utils.apply_recompute_policy(model, recompute_policy, basic_modules=basic_modules)
 
     if parallel_state.tp_enabled:
         logger.info_rank0("Apply tensor parallel to the model.")
