@@ -168,20 +168,27 @@ def _distributed_worker(rank, world, rendezvous, checkpoint_dir):
     dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world)
     mesh = init_device_mesh("cpu", (world,))
     try:
-        # Uneven row shards cut straight through interleaved Q/gate blocks.
-        # Column sharding exercises the other FSDP matrix axis. Expert-axis
-        # sharding must keep expert-local orthogonalization communication-free.
-        for shape, axis in [((12, 9), 0), ((12, 9), 1), ((4, 8, 9), 0), ((4, 8, 9), 1)]:
+        aligned_2d = [("muon", 0, 3), ("adamw", 3, 6), ("muon", 6, 9), ("adamw", 9, 12)]
+        crossing_2d = [("adamw", 0, 4), ("muon", 4, 8), ("adamw", 8, 12)]
+        aligned_3d = [("muon", 0, 4), ("muon", 4, 8)]
+        crossing_3d = [("muon", 0, 3), ("muon", 3, 8)]
+        # Keep aligned blocks, column shards, and whole-expert ownership covered.
+        # The added row-axis cases cross a logical Muon matrix: row 6 cuts
+        # [4, 8) in 2D; row 4 cuts [3, 8) independently within each expert.
+        cases = [
+            ((12, 9), 0, aligned_2d),
+            ((12, 9), 1, aligned_2d),
+            ((4, 8, 9), 0, aligned_3d),
+            ((4, 8, 9), 1, aligned_3d),
+            ((12, 9), 0, crossing_2d),
+            ((4, 8, 9), 1, crossing_3d),
+        ]
+        for case_id, (shape, axis, plan) in enumerate(cases):
             torch.manual_seed(123)
             full = torch.randn(shape).bfloat16()
             model = torch.nn.Module()
             model.register_parameter("weight", torch.nn.Parameter(distribute_tensor(full, mesh, [Shard(axis)])))
             p = model.weight
-            plan = (
-                [("muon", 0, 3), ("adamw", 3, 6), ("muon", 6, 9), ("adamw", 9, 12)]
-                if len(shape) == 2
-                else [("muon", 0, 4), ("muon", 4, 8)]
-            )
             reference_p = torch.nn.Parameter(full.clone())
             opt, reference = make_optimizer(p, plan), make_optimizer(reference_p, plan)
             for step in range(3):
@@ -194,7 +201,7 @@ def _distributed_worker(rank, world, rendezvous, checkpoint_dir):
                     wanted = distribute_tensor(reference.state[reference_p][key], mesh, [Shard(axis)]).to_local()
                     torch.testing.assert_close(opt.state[p][key].to_local(), wanted, atol=1e-7, rtol=1e-6)
                 if step == 1:
-                    path = str(Path(checkpoint_dir) / f"ndim{len(shape)}-axis{axis}")
+                    path = str(Path(checkpoint_dir) / f"case{case_id}-ndim{len(shape)}-axis{axis}")
                     msd, osd = get_state_dict(model, opt)
                     dcp.save({"model": msd, "optimizer": osd}, checkpoint_id=path)
                     fresh_p = torch.nn.Parameter(distribute_tensor(torch.zeros_like(full), mesh, [Shard(axis)]))

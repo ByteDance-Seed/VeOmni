@@ -1,6 +1,6 @@
 # Qwen3.8 mixed Muon/AdamW candidate
 
-`train.optimizer.type: qwen38_muon` is an opt-in correctness-first optimizer
+`model.optimizer.type: qwen38_muon` is an opt-in correctness-first optimizer
 for the Qwen4-Exp implementation of Qwen3.8. It leaves model forward/backward,
 Ulysses/CP, expert routing, and global gradient clipping unchanged. The generic
 `muon` optimizer and existing AdamW recipes retain their existing behavior.
