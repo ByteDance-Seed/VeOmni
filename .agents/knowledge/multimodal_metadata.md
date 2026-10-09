@@ -192,6 +192,13 @@ mirrors how text-side `cu_seq_lens` picks up SP-pad via the `position_ids == 0`
 zero-tail convention. The embeddings for those positions are discarded after the
 per-rank slice in Model.forward.
 
+Under USP context parallelism (`cp_size > 1`) `SequenceParallelCollator` slices
+`pixel_values*` itself with the per-vit-seq ViT ring layout and passes
+`sp_pad = 0`, so `vit_*_cu_seqlens` hold the **global offsets of the real vit seqs
+only** (no pad tail). The ViT forward passes them to attention unchanged, and
+bidirectional ring attention derives every cp rank's local offsets (including
+each rank's tail pad segment) from them.
+
 ## Backwards compatibility
 
 Every consumer site **must** keep a runtime fallback for when `multimodal_metadata`

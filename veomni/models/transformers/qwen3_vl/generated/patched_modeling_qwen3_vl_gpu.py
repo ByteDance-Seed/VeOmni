@@ -95,6 +95,7 @@ from veomni.distributed.sequence_parallel.async_ulysses import (
     async_ulysses_output_projection,
     async_ulysses_qkv_projection,
 )
+from veomni.distributed.sequence_parallel.ring_attention.layout import usp_zigzag_slice, vit_usp_slice
 
 # ── OpSlot declarations ──────────────────────────────────────────────────
 # Bound at model-build time by _bind_veomni_ops() in auto.py.
@@ -205,8 +206,10 @@ def _qwen3_vl_async_ulysses_attention_forward(
     # full-seq QKV, so gather them back across the SP group. In v5,
     # `apply_interleaved_mrope` collapses the leading 3-axis from mrope, so the
     # incoming shape here is (bs, seq_len, head_dim) and the seq dim is 1.
-    cos = gather_outputs(cos, gather_dim=1, group=get_parallel_state().sp_group)
-    sin = gather_outputs(sin, gather_dim=1, group=get_parallel_state().sp_group)
+    # The fused all-to-all runs over the ulysses group, so gather cos/sin over the
+    # same group (under USP cp>1 the sp group also spans cp ranks).
+    cos = gather_outputs(cos, gather_dim=1, group=get_parallel_state().ulysses_group)
+    sin = gather_outputs(sin, gather_dim=1, group=get_parallel_state().ulysses_group)
 
     query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
 
@@ -261,6 +264,92 @@ def get_position_id(main_func, self, **kwargs):
         )
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
+
+
+def _vit_seqlens_from_grid(grid_thw_list):
+    """ViT varlen attention units: one per image, one per video temporal step."""
+    return [h * w for t, h, w in grid_thw_list for _ in range(t)]
+
+
+def _vit_cp_slice(tensor, grid_thw_list):
+    """This rank's rows of a full ViT patch-axis tensor under USP cp>1 (same layout as the collator)."""
+    ps = get_parallel_state()
+    return vit_usp_slice(
+        tensor,
+        _vit_seqlens_from_grid(grid_thw_list),  # noqa: F821 defined via add_helper
+        0,
+        ps.cp_size,
+        ps.cp_rank,
+        ps.ulysses_size,
+        ps.ulysses_rank,
+    )
+
+
+def _vit_gathered_token_index(vit_seqlens, cp_size, ulysses_size, merger_unit=4):
+    """Map every real vit token (natural order) to its row in the gathered ViT merger output.
+
+    The merger output is gathered over the ulysses group first and then the cp group, so its rows
+    follow the ``vit_usp_slice`` layout in (cp_rank, ulysses_rank) order. Slicing the global patch
+    row ids with the same layout recovers which patch every gathered row came from; padding rows
+    are -1 and are never referenced.
+    """
+    rows = torch.arange(sum(vit_seqlens))
+    gathered_rows = torch.cat(
+        [
+            vit_usp_slice(rows, vit_seqlens, 0, cp_size, cp_rank, ulysses_size, ulysses_rank, pad_value=-1)
+            for cp_rank in range(cp_size)
+            for ulysses_rank in range(ulysses_size)
+        ]
+    )
+    first_rows = gathered_rows[::merger_unit]
+    valid = first_rows >= 0
+    index = torch.empty(sum(vit_seqlens) // merger_unit, dtype=torch.long)
+    index[first_rows[valid] // merger_unit] = torch.nonzero(valid).squeeze(1)
+    return index
+
+
+def _gather_vit_tokens(tensor):
+    """All-gather per-rank ViT merger outputs: ulysses group first, then cp group."""
+    ps = get_parallel_state()
+    if ps.ulysses_enabled:
+        tensor = gather_outputs(tensor, gather_dim=0, group=ps.ulysses_group)
+    return gather_outputs(tensor, gather_dim=0, group=ps.cp_group)
+
+
+def _usp_merge_visual_embeds(inputs_embeds, vit_embeds, deepstack_embeds, full_mask, grid_thw_list, doc_cu_seqlens):
+    """Scatter ViT tokens into the zig-zag sliced LLM tokens under USP cp>1.
+
+    ``inputs_embeds`` keep this rank's zig-zag shard; ``full_mask`` is the full placeholder mask
+    from the collator. The mask and the per-placeholder vit token ordinal are sliced with the text
+    layout, and the gathered ViT output is indexed so each rank takes exactly the tokens of its
+    local placeholders, in local order. Returns ``(inputs_embeds, deepstack_embeds, local_mask)``.
+    """
+    ps = get_parallel_state()
+    slice_kwargs = dict(
+        cp_size=ps.cp_size,
+        cp_rank=ps.cp_rank,
+        ulysses_size=ps.ulysses_size,
+        ulysses_rank=ps.ulysses_rank if ps.ulysses_enabled else 0,
+    )
+    full_mask = full_mask.to(inputs_embeds.device, non_blocking=True)
+    ordinal = full_mask.long().cumsum(-1) - 1
+    local_mask = usp_zigzag_slice(full_mask, doc_cu_seqlens, -1, **slice_kwargs)
+    local_ordinal = usp_zigzag_slice(ordinal, doc_cu_seqlens, -1, **slice_kwargs)[local_mask]
+
+    token_index = _vit_gathered_token_index(  # noqa: F821 defined via add_helper
+        _vit_seqlens_from_grid(grid_thw_list),  # noqa: F821 defined via add_helper
+        ps.cp_size,
+        ps.ulysses_size,
+    )
+    index = token_index.to(inputs_embeds.device, non_blocking=True)[local_ordinal]
+    vit_embeds = _gather_vit_tokens(vit_embeds)[index]  # noqa: F821 defined via add_helper
+    vit_embeds = vit_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+    inputs_embeds = inputs_embeds.masked_scatter(local_mask.unsqueeze(-1).expand_as(inputs_embeds), vit_embeds)
+    deepstack_embeds = [
+        _gather_vit_tokens(embed)[index]  # noqa: F821 defined via add_helper
+        for embed in deepstack_embeds
+    ]
+    return inputs_embeds, deepstack_embeds, local_mask
 
 
 def collate_multimodal_metadata(batch, sp_pad):
@@ -1135,6 +1224,10 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
     # 5. on NPU, move cu_seqlens to CPU — NPU FA2 varlen path requires it
     # 6. return BaseModelOutputWithDeepstackFeatures (v5 contract: the v4
     #    path returned `(merged, deepstack_list)` as a bare tuple)
+    # 7. USP cp>1: pos_embeds / cos / sin take this rank's rows with the same
+    #    per-vit-seq layout the collator used for pixel_values (vit_usp_slice);
+    #    cu_seqlens stay the GLOBAL offsets of the real vit seqs (no sp-pad
+    #    tail) — bidirectional ring attention derives per-rank offsets from them
     # ================================================================
     @merge_with_config_defaults
     @capture_outputs
@@ -1164,8 +1257,12 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
 
+        # --- Patch.7 ---
+        if get_parallel_state().cp_enabled:
+            pos_embeds = _vit_cp_slice(pos_embeds, grid_thw_list)  # noqa: F821 defined via add_helper
+        # --- Patch.7 ---
         # --- Patch.1 ---
-        if get_parallel_state().sp_enabled:
+        elif get_parallel_state().sp_enabled:
             pos_embeds = sp_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=4)
         # --- Patch.1 ---
 
@@ -1211,7 +1308,15 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         position_embeddings = (emb.cos(), emb.sin())
 
         sp_pad_seq_len = 0
-        if get_parallel_state().sp_enabled:
+        if get_parallel_state().cp_enabled:
+            # --- Patch.7 ---
+            cos, sin = position_embeddings
+            position_embeddings = (
+                _vit_cp_slice(cos, grid_thw_list),  # noqa: F821 defined via add_helper
+                _vit_cp_slice(sin, grid_thw_list),  # noqa: F821 defined via add_helper
+            )
+            # --- Patch.7 ---
+        elif get_parallel_state().sp_enabled:
             # --- Patch.1 ---
             cos, sin = position_embeddings
             cos = sp_pad_and_slice(cos, dim=0, pad_value=0, pad_scale=4)
@@ -1289,6 +1394,8 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
     #    at the same dim-0 size for the `hidden_states + pos_embeds` add. Shapes
     #    are derived from the vision config (patch_size / temporal_patch_size /
     #    in_channels / spatial_merge_size) so model variants don't break.
+    # 5. USP cp>1: slice the dummy patches with the per-vit-seq layout
+    #    (vit_usp_slice) the collator uses for real pixel_values
     # ================================================================
     def dummy_forward(self):
         # --- Patch.1 ---
@@ -1326,7 +1433,11 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         # data path produces. Otherwise hidden_states keeps the full size while
         # pos_embeds gets sp_pad_and_slice'd inside forward, and
         # `hidden_states + pos_embeds` mismatches at dim 0 by sp_size.
-        if get_parallel_state().sp_enabled:
+        # --- Patch.5 ---
+        if get_parallel_state().cp_enabled:
+            pixel_values = _vit_cp_slice(pixel_values, [[t, h, w]])  # noqa: F821 defined via add_helper
+        # --- Patch.5 ---
+        elif get_parallel_state().sp_enabled:
             pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=4)
         # --- Patch.3 ---
 
@@ -1790,6 +1901,10 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
     #    graph via fake_embeds * 0, and threads a fake deepstack tensor
     #    down into `_deepstack_process` so those params participate too
     # 5. honor precomputed 3D position_ids: (bs, 3, L) -> (3, bs, L)
+    # 7. USP cp>1: keep inputs_embeds zig-zag sliced; gather the ViT outputs
+    #    (ulysses then cp) and index the tokens of this rank's placeholders
+    #    (_usp_merge_visual_embeds), which also yields the local masks and
+    #    deepstack embeds — no full-sequence gather / slice-back
     # ================================================================
     @auto_docstring
     @can_return_tuple
@@ -1821,6 +1936,13 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
+        # --- Patch.7 ---
+        # USP context parallel (cp>1): text stays zig-zag sliced; visual tokens are
+        # gathered and indexed per rank instead of gathering the full sequence.
+        usp_cp = get_parallel_state().cp_enabled
+        has_visual = pixel_values is not None or pixel_values_videos is not None
+        # --- Patch.7 ---
+
         # --- Patch.2 ---
         image_mask = kwargs.pop("image_mask", None)
         video_mask = kwargs.pop("video_mask", None)
@@ -1828,6 +1950,13 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         # language model. Derived from input_ids below when not supplied.
         mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
         if video_mask is None and image_mask is None:
+            # --- Patch.7 ---
+            if usp_cp and has_visual:
+                raise RuntimeError(
+                    "Qwen3VLModel.forward: context parallel (cp_size>1) requires the full image_mask / "
+                    "video_mask from the VeOmni data pipeline."
+                )
+            # --- Patch.7 ---
             if get_parallel_state().sp_enabled:
                 input_ids_list = [torch.zeros_like(input_ids) for _ in range(get_parallel_state().sp_size)]
                 dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
@@ -1867,8 +1996,18 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 flash_attn_kwargs[key] = kwargs.pop(key)
         # --- Patch.3 ---
 
+        # --- Patch.7 ---
+        # Document offsets of the full (padded) text sequence: the placeholder masks
+        # are zig-zag sliced with the same layout the collator used for input_ids.
+        doc_cu_seqlens = None
+        if usp_cp and has_visual:
+            if "cu_seq_lens_q" not in flash_attn_kwargs:
+                raise RuntimeError("Qwen3VLModel.forward: context parallel (cp_size>1) requires cu_seq_lens_q.")
+            doc_cu_seqlens = flash_attn_kwargs["cu_seq_lens_q"].tolist()
+        # --- Patch.7 ---
+
         # --- Patch.1 ---
-        if get_parallel_state().sp_enabled:
+        if get_parallel_state().sp_enabled and not usp_cp:
             inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
 
@@ -1881,43 +2020,58 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             image_embeds = image_outputs.pooler_output
             deepstack_image_embeds = image_outputs.deepstack_features
 
-            # --- Patch.1 ---
-            if get_parallel_state().sp_enabled:
-                image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
-                deepstack_image_embeds = [
-                    gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
-                    for embed in deepstack_image_embeds
-                ]
-            # --- Patch.1 ---
+            if usp_cp:
+                # --- Patch.7 ---
+                image_grid_thw_list = image_vit_kwargs["vit_metadata"]["grid_thw_list"]
+                if image_grid_thw_list is None:
+                    image_grid_thw_list = image_grid_thw.tolist()
+                inputs_embeds, deepstack_image_embeds, image_mask = _usp_merge_visual_embeds(  # noqa: F821 defined via add_helper
+                    inputs_embeds,
+                    image_embeds,
+                    deepstack_image_embeds,
+                    image_mask,
+                    image_grid_thw_list,
+                    doc_cu_seqlens,
+                )
+                # --- Patch.7 ---
+            else:
+                # --- Patch.1 ---
+                if get_parallel_state().sp_enabled:
+                    image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
+                    deepstack_image_embeds = [
+                        gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
+                        for embed in deepstack_image_embeds
+                    ]
+                # --- Patch.1 ---
 
-            embeds_image_mask = (
-                image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
-            )
-            # `masked_scatter` consumes exactly `image_mask.sum()` elements from `image_embeds`, taking
-            # the leading rows in order — image-placeholder positions in `input_ids` are laid out in the
-            # same order as their vision tokens, and the data collator pads the vision sequence only at
-            # the *end*. So any padded vision rows are trailing and unused; no `image_embeds[:n]` slice
-            # is needed, which also removes the `image_mask.sum().item()` host-device sync. Same
-            # argument for the per-layer deepstack embeds (they follow the same row order, sliced into
-            # the same `image_mask`).
-            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
+                embeds_image_mask = (
+                    image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+                )
+                # `masked_scatter` consumes exactly `image_mask.sum()` elements from `image_embeds`, taking
+                # the leading rows in order — image-placeholder positions in `input_ids` are laid out in the
+                # same order as their vision tokens, and the data collator pads the vision sequence only at
+                # the *end*. So any padded vision rows are trailing and unused; no `image_embeds[:n]` slice
+                # is needed, which also removes the `image_mask.sum().item()` host-device sync. Same
+                # argument for the per-layer deepstack embeds (they follow the same row order, sliced into
+                # the same `image_mask`).
+                image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 
-            # --- Patch.1 ---
-            if get_parallel_state().sp_enabled:
-                seq_len = image_mask.shape[1]
-                seq_per_rank = seq_len // get_parallel_state().sp_size
-                rank_start = get_parallel_state().sp_rank * seq_per_rank
-                rank_end = rank_start + seq_per_rank
+                # --- Patch.1 ---
+                if get_parallel_state().sp_enabled:
+                    seq_len = image_mask.shape[1]
+                    seq_per_rank = seq_len // get_parallel_state().sp_size
+                    rank_start = get_parallel_state().sp_rank * seq_per_rank
+                    rank_end = rank_start + seq_per_rank
 
-                deepstack_offset = image_mask[:, :rank_start].sum().item()
-                image_mask = image_mask[:, rank_start:rank_end]
-                deepstack_len = image_mask.sum().item()
+                    deepstack_offset = image_mask[:, :rank_start].sum().item()
+                    image_mask = image_mask[:, rank_start:rank_end]
+                    deepstack_len = image_mask.sum().item()
 
-                deepstack_image_embeds = [
-                    embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_image_embeds
-                ]
-            # --- Patch.1 ---
+                    deepstack_image_embeds = [
+                        embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_image_embeds
+                    ]
+                # --- Patch.1 ---
 
         elif get_parallel_state().fsdp_enabled:
             # --- Patch.4 ---
@@ -1935,39 +2089,54 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             video_embeds = video_outputs.pooler_output
             deepstack_video_embeds = video_outputs.deepstack_features
 
-            # --- Patch.1 ---
-            if get_parallel_state().sp_enabled:
-                video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
-                deepstack_video_embeds = [
-                    gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
-                    for embed in deepstack_video_embeds
-                ]
-            # --- Patch.1 ---
+            if usp_cp:
+                # --- Patch.7 ---
+                video_grid_thw_list = video_vit_kwargs["vit_metadata"]["grid_thw_list"]
+                if video_grid_thw_list is None:
+                    video_grid_thw_list = video_grid_thw.tolist()
+                inputs_embeds, deepstack_video_embeds, video_mask = _usp_merge_visual_embeds(  # noqa: F821 defined via add_helper
+                    inputs_embeds,
+                    video_embeds,
+                    deepstack_video_embeds,
+                    video_mask,
+                    video_grid_thw_list,
+                    doc_cu_seqlens,
+                )
+                # --- Patch.7 ---
+            else:
+                # --- Patch.1 ---
+                if get_parallel_state().sp_enabled:
+                    video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
+                    deepstack_video_embeds = [
+                        gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
+                        for embed in deepstack_video_embeds
+                    ]
+                # --- Patch.1 ---
 
-            embeds_video_mask = (
-                video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
-            )
-            # As with `image_embeds` above: `masked_scatter` uses exactly `video_mask.sum()` leading
-            # rows, any collator-padded vision rows are trailing and unused — no `video_embeds[:n]`
-            # slice (and no `video_mask.sum().item()` host-device sync) needed.
-            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
+                embeds_video_mask = (
+                    video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+                )
+                # As with `image_embeds` above: `masked_scatter` uses exactly `video_mask.sum()` leading
+                # rows, any collator-padded vision rows are trailing and unused — no `video_embeds[:n]`
+                # slice (and no `video_mask.sum().item()` host-device sync) needed.
+                video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 
-            # --- Patch.1 ---
-            if get_parallel_state().sp_enabled:
-                seq_len = video_mask.shape[1]
-                seq_per_rank = seq_len // get_parallel_state().sp_size
-                rank_start = get_parallel_state().sp_rank * seq_per_rank
-                rank_end = rank_start + seq_per_rank
+                # --- Patch.1 ---
+                if get_parallel_state().sp_enabled:
+                    seq_len = video_mask.shape[1]
+                    seq_per_rank = seq_len // get_parallel_state().sp_size
+                    rank_start = get_parallel_state().sp_rank * seq_per_rank
+                    rank_end = rank_start + seq_per_rank
 
-                deepstack_offset = video_mask[:, :rank_start].sum().item()
-                video_mask = video_mask[:, rank_start:rank_end]
-                deepstack_len = video_mask.sum().item()
+                    deepstack_offset = video_mask[:, :rank_start].sum().item()
+                    video_mask = video_mask[:, rank_start:rank_end]
+                    deepstack_len = video_mask.sum().item()
 
-                deepstack_video_embeds = [
-                    embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_video_embeds
-                ]
-            # --- Patch.1 ---
+                    deepstack_video_embeds = [
+                        embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_video_embeds
+                    ]
+                # --- Patch.1 ---
 
         elif get_parallel_state().fsdp_enabled:
             # --- Patch.4 ---
@@ -1979,7 +2148,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             # --- Patch.4 ---
 
         # --- Patch.1 ---
-        if get_parallel_state().sp_enabled:
+        if get_parallel_state().sp_enabled and not usp_cp:
             inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
 
@@ -1992,7 +2161,10 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             image_mask_joint = image_mask[visual_pos_masks]
             video_mask_joint = video_mask[visual_pos_masks]
             for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds):
-                embed_joint = img_embed.new_zeros(visual_pos_masks.sum(), img_embed.shape[-1]).to(img_embed.device)
+                # Sum of the shapes instead of visual_pos_masks.sum(): same value, no host-device sync.
+                embed_joint = img_embed.new_zeros(img_embed.shape[0] + vid_embed.shape[0], img_embed.shape[-1]).to(
+                    img_embed.device
+                )
                 embed_joint[image_mask_joint, :] = img_embed
                 embed_joint[video_mask_joint, :] = vid_embed
                 deepstack_visual_embeds.append(embed_joint)

@@ -49,6 +49,11 @@ logger = logging.get_logger(__name__)
 # being silently wrong.
 CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
 
+# VLMs whose USP (zigzag) support also covers the vision encoder: their ViT runs the
+# bidirectional ViT ring (``ring_attention.bidirectional_ring_attention``) and the
+# collator slices ``pixel_values*`` with the Qwen3-VL per-vit-seq rule.
+USP_VISION_MODEL_TYPES = frozenset({"qwen3_vl", "qwen3_vl_moe"})
+
 
 def check_model_build_prerequisites(config: PretrainedConfig) -> None:
     """Let a model config refuse a run it cannot serve, before any weight is read.
@@ -95,10 +100,14 @@ def check_context_parallel_supported(config: PretrainedConfig, attn_implementati
     if getattr(state, "cp_layout", "contiguous") == "zigzag":
         implementation = attn_implementation or getattr(config, "_attn_implementation", None)
         supported_backends = {"veomni_flash_attention_2_with_sp", "veomni_flash_attention_4_with_sp"}
-        if config.model_type != "qwen3" or implementation not in supported_backends:
+        if config.model_type not in {"qwen3", *USP_VISION_MODEL_TYPES} or implementation not in supported_backends:
             raise NotImplementedError(
-                "USP zigzag CP currently supports Qwen3 with VeOmni FlashAttention 2 or 4 only. "
-                "Use contiguous CP for DeepSeek V4 or cp_size=1 for other models/backends."
+                "USP zigzag CP currently supports Qwen3 / Qwen3-VL / Qwen3-VL-MoE with VeOmni FlashAttention 2 or 4 "
+                "only. Use contiguous CP for DeepSeek V4 or cp_size=1 for other models/backends."
+            )
+        if config.model_type in USP_VISION_MODEL_TYPES and not is_torch_npu_available():
+            raise NotImplementedError(
+                "USP for Qwen3-VL runs the bidirectional ViT ring, which is Ascend NPU only for now."
             )
         if is_torch_npu_available() and implementation != "veomni_flash_attention_2_with_sp":
             raise NotImplementedError("Ascend USP uses the VeOmni FlashAttention 2 adapter with torch_npu.")

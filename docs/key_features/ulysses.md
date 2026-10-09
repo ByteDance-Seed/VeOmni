@@ -451,6 +451,14 @@ VeOmni uses **zig-zag** block placement for the ring so causal attention stays
 load-balanced: the sequence is split into `2·cp_size` blocks and cp-rank `r`
 owns blocks `r` and `2·cp_size-1-r`.
 
+Vision encoders (bidirectional attention) use a different ring layout: every
+ViT varlen sequence (one image, or one video temporal step) is split into
+`cp_size` shards on spatial-merge granularity (`merger_unit = 4` patch rows), so
+images may be split unevenly and no image needs padding. Each ring step pairs
+the local queries with the key/value shards of the source rank using that
+rank's own `cu_seqlens`. `ring_attention(...)` dispatches on `causal`: causal →
+zig-zag ring (text), bidirectional → ViT ring.
+
 ### Quick Start
 
 ```shell
@@ -470,11 +478,29 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
 | 128K    | `ulysses=8`, `cp=2..4`       | Ring extends past the head ceiling. |
 | 256K+   | `ulysses=8` (intra-node), `cp=N` (inter-node) | Ring scales horizontally. |
 
+Qwen3-VL (dense / MoE) on Ascend:
+
+```shell
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense_usp.yaml \
+    --model.model_path YOUR_MODEL_PATH \
+    --data.train_path YOUR_DATA_PATH
+```
+
 ### Constraints
 
-- **Ring path is causal-only**: `cp_size > 1` does not support explicit
-  attention masks (only causal). Packed (varlen) sequences ARE supported —
-  each document is zig-zag split independently across the `cp` group.
+- **No explicit attention masks**: `cp_size > 1` supports causal attention
+  (zig-zag ring) and, for vision encoders, bidirectional varlen attention (ViT
+  ring). Packed (varlen) sequences ARE supported — each document is zig-zag
+  split independently across the `cp` group.
+- **Vision encoders under `cp_size > 1`** (first version):
+  - Only **Qwen3-VL / Qwen3-VL-MoE**, only on **Ascend NPU**. The CUDA ViT ring
+    raises `NotImplementedError`: FlashAttention returns `lse=+inf` for query
+    rows whose key segment is empty, which needs special handling.
+  - Every bidirectional attention under `cp_size > 1` is treated with the ViT
+    layout, and `SequenceParallelCollator` slices `pixel_values` /
+    `pixel_values_videos` with the Qwen3-VL rule (`[h·w] × t` vit seqs from
+    `*_grid_thw`). Other VLMs are not supported with `cp_size > 1` yet.
+  - ViT head count must be divisible by `ulysses_size`.
 - **Packed divisibility**: under `cp_size > 1`, `PackingCollator` automatically
   pads every packed document to a multiple of `2 · cp_size` before concatenation.
   The inserted tokens use ignored labels (`-100`) and continuing position IDs,
@@ -521,7 +547,13 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
   (`zigzag_reorder` / `zigzag_undo` for fixed-shape inputs, `zigzag_reorder_packed` /
   `local_cu_seqlens` for packed) and `SequenceParallelCollator._usp_slice`.
 - Attention integration: the ring branch in
-  `veomni/ops/kernels/attention/flash.py` runs after the Ulysses all-to-all.
+  `veomni/ops/kernels/attention/flash.py` runs after the Ulysses all-to-all;
+  `ring_attention(...)` dispatches on `causal` to `zigzag_ring_attention` (text)
+  or `bidirectional_ring_attention` (ViT).
+- ViT ring: `layout.vit_usp_slice` (per-vit-seq shards + tail pad) and
+  `layout.vit_cp_cu_seqlens` (each cp rank's local offsets from the global ones);
+  NPU kernel `npu.ring_npu_flash_attn_varlen_func`. Qwen3-VL scatters the
+  gathered ViT tokens into the zig-zag sliced text in `_usp_merge_visual_embeds`.
 - Mesh: `init_parallel_state_from_config()` builds `[ulysses, cp]` and flattens `sp`.
 
 ### USP integration with model-specific CP
@@ -529,7 +561,8 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
 Set `model.accelerator.cp_layout: zigzag` for USP. The default `contiguous`
 layout preserves DeepSeek V4's model-specific CP and does not allow combining
 CP with Ulysses. This release enables USP for Qwen3 causal text training with
-VeOmni FlashAttention 2 or 4 on CUDA, or the FlashAttention 2 adapter on Ascend. RL/DPO, multimodal packing, sliding-window attention,
+VeOmni FlashAttention 2 or 4 on CUDA, or the FlashAttention 2 adapter on Ascend,
+and for Qwen3-VL / Qwen3-VL-MoE (ViT ring, see above). RL/DPO, other multimodal models, sliding-window attention,
 softcap, attention sinks, and nonzero attention dropout are unsupported and
 rejected. Other models require a separate compatibility check before enabling USP.
 
