@@ -510,7 +510,8 @@ This side channel does not change the returned training loss or gradients.
 Observer-only CE failures are recorded before the shared capture preflight;
 they do not trigger another detached CE attempt. Non-strict mode skips invalid
 observations, while strict mode reports failures at the globally synchronized
-step end. Errors in the main training loss still propagate normally.
+step end. Errors in the main training forward or loss still propagate normally. A failed
+forward discards pending observations without entering observer collectives.
 The default `chunk_loss` backend reuses the main loss projection, but the detached
 per-token CE still needs a chunk-sized full-vocabulary workspace. Other fused-loss
 backends may recompute the LM-head projection on sampled steps, so the default

@@ -3015,3 +3015,29 @@ def test_chunk_observer_failure_preserves_main_loss_and_gradients(monkeypatch, s
     if strict:
         assert computer.strict_observation_errors
         assert "injected detached observer failure" in computer.strict_observation_errors[0][1]
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_capture_forward_failure_discards_observations_without_collectives(monkeypatch, nested, error_type):
+    _install_test_parallel_state(monkeypatch)
+    computer = ChannelLossComputer()
+    monkeypatch.setattr(channel_loss_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        channel_loss_module.dist, "all_gather_object", lambda *a, **kw: pytest.fail("collective on failed forward")
+    )
+    monkeypatch.setattr(computer, "_finalize_capture", lambda: pytest.fail("finalized failed forward"))
+    error = error_type("injected training forward failure")
+    with pytest.raises(error_type) as captured:
+        with computer.capture():
+            computer._pending_observations = [{"partial": torch.ones(1)}]
+            if nested:
+                with computer.capture():
+                    raise error
+            raise error
+    assert captured.value is error
+    assert not computer.capture_active
+    assert not computer._pending_observations
+    assert not computer._capture_errors
+    assert not computer._observer_devices
+    assert computer._capture_sp_descriptor is None
