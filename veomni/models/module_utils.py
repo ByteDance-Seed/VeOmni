@@ -23,7 +23,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Literal, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Literal, Optional, Sequence, Set, Tuple, Union
 
 import torch
 
@@ -658,7 +658,9 @@ def load_model_weights_ep_sharded(
       * per-expert -> fused stacking (e.g. an HF per-expert MoE checkpoint), opted
         into via ``fused_expert_target`` + ``for_expert_range``: each rank reads only
         the per-expert tensors in its ``Shard(0)`` expert range and stacks them into
-        its local ``[E/ep, ...]`` slice; other ranks' experts are never read.
+        its local ``[E/ep, ...]`` slice; other ranks' experts are never read. Every
+        rank raises ``RuntimeError`` if the checkpoint does not hold per-expert keys
+        for exactly experts ``0..E-1`` of a built fused target.
 
     PEFT is supported. Base-checkpoint keys are remapped to their PEFT
     ``base_layer`` FQNs (:func:`build_lora_key_overrides`) and streamed exactly
@@ -724,19 +726,19 @@ def load_model_weights_ep_sharded(
     parallel_state = get_parallel_state()
     key_to_file, file_to_path = _resolve_safetensors_shards(weights_path, **kwargs)
 
-    def _local_expert_range(fused_name: str) -> Tuple[int, int]:
-        """``(start, num_local)`` of the experts this rank holds in fused parameter ``fused_name``."""
+    def _local_expert_range(fused_name: str) -> Tuple[int, int, int]:
+        """``(start, num_local, num_experts)`` of fused parameter ``fused_name`` on this rank."""
         target0 = param_shapes[fused_name][0]
         shard_group = parallel_plan._get_shard_parameter_groupname(fused_name)
         if shard_group is None:
-            return 0, target0
+            return 0, target0, target0
         spec_info = getattr(model, "_fqn2spec_info", {}).get(fused_name)
         if spec_info is not None and spec_info.persistent_fsdp_shard_dim is not None:
             raise NotImplementedError(
                 f"ep_sharded_stream_load: converter target '{fused_name}' is a persistent ExtraParallel parameter."
             )
-        _, para_rank, _ = _ep_dim0_slice_meta(parallel_state, shard_group, target0)
-        return para_rank * target0, target0
+        _, para_rank, expected_full0 = _ep_dim0_slice_meta(parallel_state, shard_group, target0)
+        return para_rank * target0, target0, expected_full0
 
     # Up-front scan of the *raw checkpoint keys* for a converter's non-dim0-zero-pad
     # transforms. It must run over raw keys rather than in the per-destination main loop:
@@ -757,6 +759,10 @@ def load_model_weights_ep_sharded(
     unbuilt_expert_keys = set()
     if converter is not None:
         expert_ranges: Dict[Tuple[int, int], str] = {}
+        # Expert indices present per fused target. A rank whose whole range is absent
+        # never buffers anything, so its converter's ``finalize`` cannot flag the gap.
+        expert_ids: Dict[str, Set[int]] = {}
+        num_experts_by_target: Dict[str, int] = {}
         for raw_name in key_to_file:
             bare_name = _convert_weight_key(raw_name, model)
             if checkpoint_converter_should_skip_without_loading(converter, bare_name):
@@ -778,7 +784,22 @@ def load_model_weights_ep_sharded(
             if fused_name not in param_shapes:
                 unbuilt_expert_keys.add(raw_name)
                 continue
-            expert_ranges.setdefault(_local_expert_range(fused_name), fused_name)
+            if fused_name not in num_experts_by_target:
+                start, num_local, num_experts_by_target[fused_name] = _local_expert_range(fused_name)
+                expert_ranges.setdefault((start, num_local), fused_name)
+            expert_ids.setdefault(fused_name, set()).add(target[1])
+        for fused_name, ids in expert_ids.items():
+            expected = set(range(num_experts_by_target[fused_name]))
+            problems = []
+            if expected - ids:
+                problems.append(f"missing per-expert keys for experts {sorted(expected - ids)}")
+            if ids - expected:
+                problems.append(f"unexpected experts {sorted(ids - expected)}")
+            if problems:
+                raise RuntimeError(
+                    f"ep_sharded_stream_load: incomplete checkpoint detected for '{fused_name}' "
+                    f"({len(expected)} experts): " + "; ".join(problems) + "."
+                )
         if len(expert_ranges) > 1:
             raise NotImplementedError(
                 f"ep_sharded_stream_load: per-expert checkpoint keys map to fused experts with different "

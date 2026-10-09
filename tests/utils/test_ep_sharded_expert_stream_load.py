@@ -205,6 +205,32 @@ def test_a_fusion_converter_without_expert_streaming_still_bails(monkeypatch, tm
         _load_as_rank(monkeypatch, tmp_path, 0, _meta_model(_WholeSetOnlyConverter))
 
 
+@pytest.mark.parametrize("ep_rank", range(EP_SIZE))
+def test_a_checkpoint_missing_one_ranks_whole_expert_range_raises_on_every_rank(monkeypatch, tmp_path, ep_rank):
+    """Rank 1 would buffer nothing for experts 2-3, so its ``finalize`` alone cannot
+    flag the gap; the whole-tensor loader rejects this checkpoint, and so must this one."""
+    state = _write_checkpoint(tmp_path)
+    for expert in range(NUM_EXPERTS // EP_SIZE, NUM_EXPERTS):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            del state[PER_EXPERT.format(expert=expert, proj=proj)]
+    save_file(state, str(tmp_path / "model.safetensors"))
+
+    with pytest.raises(
+        RuntimeError, match=r"incomplete checkpoint detected .*missing per-expert keys for experts \[2, 3\]"
+    ):
+        _load_as_rank(monkeypatch, tmp_path, ep_rank, _meta_model())
+
+
+def test_a_checkpoint_with_more_experts_than_the_model_raises(monkeypatch, tmp_path):
+    state = _write_checkpoint(tmp_path)
+    for proj, shape in (("gate_proj", (INTERMEDIATE, HIDDEN)), ("up_proj", (INTERMEDIATE, HIDDEN))):
+        state[PER_EXPERT.format(expert=NUM_EXPERTS, proj=proj)] = torch.zeros(*shape)
+    save_file(state, str(tmp_path / "model.safetensors"))
+
+    with pytest.raises(RuntimeError, match=rf"\({NUM_EXPERTS} experts\): unexpected experts \[{NUM_EXPERTS}\]\.$"):
+        _load_as_rank(monkeypatch, tmp_path, 0, _meta_model())
+
+
 def test_per_expert_keys_of_an_unbuilt_module_are_skipped_unread(monkeypatch, tmp_path):
     """With MTP off the model has no ``mtp`` experts; the checkpoint's per-expert MTP
     keys are unexpected, as on the whole-tensor loader, and never read."""
