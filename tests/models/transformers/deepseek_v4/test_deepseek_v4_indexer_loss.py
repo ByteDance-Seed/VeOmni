@@ -48,13 +48,18 @@ def _kernels_config_installed(**overrides):
         set_ops_config(previous)
 
 
-def _module_with_config(**overrides):
+def _module_with_config(*, indexer: str = "eager", attention: str = "eager", **overrides):
     config = DeepseekV4Config(
         num_hidden_layers=2,
         layer_types=["compressed_sparse_attention"] * 2,
         **overrides,
     )
-    return SimpleNamespace(config=config, layer_type="compressed_sparse_attention")
+    return SimpleNamespace(
+        config=config,
+        layer_type="compressed_sparse_attention",
+        veomni_dsa_attention=SimpleNamespace(impl=attention),
+        compressor=SimpleNamespace(indexer=SimpleNamespace(veomni_dsa_indexer=SimpleNamespace(impl=indexer))),
+    )
 
 
 def _sequence_parallel_state(monkeypatch: pytest.MonkeyPatch, **sizes) -> ParallelState:
@@ -169,9 +174,8 @@ def test_indexer_loss_enabled_refuses_eager_indexer(monkeypatch: pytest.MonkeyPa
         "veomni.models.transformers.deepseek_v4.indexer_loss.get_parallel_state",
         lambda: ParallelState(dp_size=1, ulysses_size=1),
     )
-    with _kernels_config_installed(dsa_attention_implementation="tilelang"):
-        with pytest.raises(ValueError, match="dsa_indexer_implementation"):
-            _indexer_loss_enabled(_module_with_config(dsa_indexer_loss=True))
+    with pytest.raises(ValueError, match="dsa_indexer_implementation"):
+        _indexer_loss_enabled(_module_with_config(attention="tilelang", dsa_indexer_loss=True))
 
 
 def test_indexer_loss_enabled_refuses_eager_attention(monkeypatch: pytest.MonkeyPatch):
@@ -179,9 +183,8 @@ def test_indexer_loss_enabled_refuses_eager_attention(monkeypatch: pytest.Monkey
         "veomni.models.transformers.deepseek_v4.indexer_loss.get_parallel_state",
         lambda: ParallelState(dp_size=1, ulysses_size=1),
     )
-    with _kernels_config_installed(dsa_indexer_implementation="tilelang"):
-        with pytest.raises(ValueError, match="dsa_attention_implementation"):
-            _indexer_loss_enabled(_module_with_config(dsa_indexer_loss=True))
+    with pytest.raises(ValueError, match="dsa_attention_implementation"):
+        _indexer_loss_enabled(_module_with_config(indexer="tilelang", dsa_indexer_loss=True))
 
 
 @pytest.mark.parametrize(
@@ -199,9 +202,8 @@ def test_indexer_loss_enabled_refuses_sequence_parallel(
         "veomni.models.transformers.deepseek_v4.indexer_loss.get_parallel_state",
         lambda: _sequence_parallel_state(monkeypatch, **sizes),
     )
-    with _kernels_config_installed(dsa_indexer_implementation="tilelang", dsa_attention_implementation="tilelang"):
-        with pytest.raises(ValueError, match=expected):
-            _indexer_loss_enabled(_module_with_config(dsa_indexer_loss=True))
+    with pytest.raises(ValueError, match=expected):
+        _indexer_loss_enabled(_module_with_config(indexer="tilelang", attention="tilelang", dsa_indexer_loss=True))
 
 
 def test_a_config_without_the_fields_reads_as_off():
@@ -219,19 +221,19 @@ def test_indexer_loss_enabled_on_the_supported_configuration(monkeypatch: pytest
         "veomni.models.transformers.deepseek_v4.indexer_loss.get_parallel_state",
         lambda: state,
     )
-    with _kernels_config_installed(dsa_indexer_implementation="tilelang", dsa_attention_implementation="tilelang"):
-        assert _indexer_loss_enabled(_module_with_config(dsa_indexer_loss=True)) is True
+    assert _indexer_loss_enabled(_module_with_config(indexer="tilelang", attention="tilelang", dsa_indexer_loss=True))
 
 
 @pytest.mark.parametrize("coef", [0.0, -0.0, 0, -1.0])
 def test_a_non_positive_coefficient_switches_the_objective_off(coef):
-    with _kernels_config_installed(dsa_indexer_implementation="tilelang", dsa_attention_implementation="tilelang"):
-        assert _indexer_loss_enabled(_module_with_config(dsa_indexer_loss=True, dsa_indexer_loss_coef=coef)) is False
+    module = _module_with_config(
+        indexer="tilelang", attention="tilelang", dsa_indexer_loss=True, dsa_indexer_loss_coef=coef
+    )
+    assert _indexer_loss_enabled(module) is False
 
 
 def test_a_coefficient_of_zero_does_not_refuse_an_unsupported_configuration():
-    with _kernels_config_installed():
-        assert _indexer_loss_enabled(_module_with_config(dsa_indexer_loss=True, dsa_indexer_loss_coef=0.0)) is False
+    assert _indexer_loss_enabled(_module_with_config(dsa_indexer_loss=True, dsa_indexer_loss_coef=0.0)) is False
 
 
 @pytest.mark.parametrize("coef", [1e-8, 0.5, 1.0])
@@ -240,8 +242,10 @@ def test_a_positive_coefficient_leaves_the_objective_on(monkeypatch: pytest.Monk
         "veomni.models.transformers.deepseek_v4.indexer_loss.get_parallel_state",
         lambda: ParallelState(dp_size=1, ulysses_size=1, device_type="cpu"),
     )
-    with _kernels_config_installed(dsa_indexer_implementation="tilelang", dsa_attention_implementation="tilelang"):
-        assert _indexer_loss_enabled(_module_with_config(dsa_indexer_loss=True, dsa_indexer_loss_coef=coef)) is True
+    module = _module_with_config(
+        indexer="tilelang", attention="tilelang", dsa_indexer_loss=True, dsa_indexer_loss_coef=coef
+    )
+    assert _indexer_loss_enabled(module) is True
 
 
 def test_builds_indexer_kl_only_on_csa_layers(monkeypatch: pytest.MonkeyPatch):
@@ -249,11 +253,34 @@ def test_builds_indexer_kl_only_on_csa_layers(monkeypatch: pytest.MonkeyPatch):
         "veomni.models.transformers.deepseek_v4.indexer_loss.get_parallel_state",
         lambda: ParallelState(dp_size=1, ulysses_size=1),
     )
-    with _kernels_config_installed(dsa_indexer_implementation="tilelang", dsa_attention_implementation="tilelang"):
-        csa = _module_with_config(dsa_indexer_loss=True)
-        hca = SimpleNamespace(config=csa.config, layer_type="heavily_compressed_attention")
-        assert _builds_indexer_kl(csa) is True
-        assert _builds_indexer_kl(hca) is False
+    csa = _module_with_config(indexer="tilelang", attention="tilelang", dsa_indexer_loss=True)
+    hca = SimpleNamespace(
+        config=csa.config,
+        layer_type="heavily_compressed_attention",
+        veomni_dsa_attention=csa.veomni_dsa_attention,
+    )
+    assert _builds_indexer_kl(csa) is True
+    assert _builds_indexer_kl(hca) is False
+
+
+@pytest.mark.parametrize(
+    ("global_impl", "bound_impl", "enabled"),
+    [("tilelang", "eager", False), ("eager", "tilelang", True)],
+)
+def test_indexer_loss_reads_the_bound_handles_not_the_global_config(
+    monkeypatch: pytest.MonkeyPatch, global_impl: str, bound_impl: str, enabled: bool
+):
+    monkeypatch.setattr(
+        "veomni.models.transformers.deepseek_v4.indexer_loss.get_parallel_state",
+        lambda: ParallelState(dp_size=1, ulysses_size=1),
+    )
+    module = _module_with_config(indexer=bound_impl, attention=bound_impl, dsa_indexer_loss=True)
+    with _kernels_config_installed(dsa_indexer_implementation=global_impl, dsa_attention_implementation=global_impl):
+        if enabled:
+            assert _indexer_loss_enabled(module) is True
+        else:
+            with pytest.raises(ValueError, match="dsa_indexer_implementation"):
+                _indexer_loss_enabled(module)
 
 
 def test_the_npu_backend_refuses_the_objective_rather_than_dropping_it():

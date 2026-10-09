@@ -21,7 +21,6 @@ from veomni.models.transformers.glm_moe_dsa.glm_moe_dsa_gpu_patch_gen_config imp
     glm_moe_dsa_attention_init_patched,
     glm_moe_dsa_forcausallm_forward_patched,
     glm_moe_dsa_forcausallm_init_patched,
-    glm_moe_dsa_get_parallel_plan_patched,
     glm_moe_dsa_mlp_forward_patched,
     glm_moe_dsa_mlp_init_patched,
     glm_moe_dsa_rmsnorm_forward_patched,
@@ -140,9 +139,4 @@ config.override_method(
     "GlmMoeDsaForCausalLM.forward",
     replacement=glm_moe_dsa_forcausallm_forward_patched,
     description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
-)
-config.override_method(
-    "GlmMoeDsaForCausalLM.get_parallel_plan",
-    replacement=glm_moe_dsa_get_parallel_plan_patched,
-    description="Register GLM-MoE-DSA expert parallel plan for v5 generated modeling",
 )

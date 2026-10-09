@@ -394,6 +394,34 @@ class TestDeepseekV4ConverterConvert:
         assert restored.name == target
         assert torch.equal(restored.tensor, weight)
 
+    @pytest.mark.parametrize(
+        ("expert_dtype", "scale_dtype"),
+        [("fp8", torch.float32), ("fp4", torch.float8_e8m0fnu)],
+    )
+    def test_fp8_export_rounds_scales_like_qat(self, monkeypatch, expert_dtype, scale_dtype):
+        from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
+        from veomni.models.transformers.deepseek_v4 import export_quant
+
+        origin = "layers.0.attn.wq_a.weight"
+        weight = torch.randn(4, 8, dtype=torch.bfloat16)
+        calls: list[tuple[str | None, torch.dtype]] = []
+
+        def fake_fp8_weight_quant(x, block_size, scale_fmt, scale_dtype):
+            calls.append((scale_fmt, scale_dtype))
+            return x, torch.ones(1, dtype=scale_dtype)
+
+        model = SimpleNamespace(
+            config=SimpleNamespace(expert_dtype=expert_dtype),
+            _veomni_fqn_to_index_mapping={origin: 1, "layers.0.attn.wq_a.scale": 1},
+        )
+        monkeypatch.setattr(module, "export_weights", lambda model: iter([(origin, weight)]))
+        monkeypatch.setattr(export_quant, "fp8_weight_quant", fake_fp8_weight_quant)
+
+        exported = dict(DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS).export_weights(model))
+
+        assert set(exported) == {origin, "layers.0.attn.wq_a.scale"}
+        assert calls == [("ue8m0", scale_dtype)]
+
     def test_dequantizes_block_scaled_fp8_weight(self):
         weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))
         scale = torch.tensor([[1.0, 2.0], [4.0, 8.0]])

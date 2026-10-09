@@ -417,8 +417,9 @@ raise during config validation or op binding.
 
 Patched experts modules construct `VeomniOp("moe_experts", variant, resolve_op_impl("moe_implementation"))`
 in `__init__` and always call that handle. `eager` is a registered row, not a
-separate `ModuleList` fork. LoRA experts reuse the same `moe_implementation`
-field and map it onto `moe_experts_lora` rows.
+separate `ModuleList` fork. LoRA experts follow the wrapped module's
+`veomni_moe.impl` and fall back to `eager` when that `moe_experts_lora` row is
+unavailable on the device.
 
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
 SM90+ `tilelang` indexer and attention implementations. Its MoE path

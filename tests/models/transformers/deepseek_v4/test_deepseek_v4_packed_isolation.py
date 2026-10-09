@@ -326,9 +326,8 @@ def test_deepseek_v4_packed_model_forward_skips_dense_mask(monkeypatch):
 
     position_ids = torch.cat([torch.arange(length) for length in segment_lengths]).unsqueeze(0).to(device)
     cu_seq_lens = torch.tensor([0, segment_lengths[0], total_len], dtype=torch.int32, device=device)
-    tilelang_ops = eager_ops_config()
-    tilelang_ops.dsa_attention_implementation = "tilelang"
-    with ops_config_scope(tilelang_ops), torch.no_grad():
+    # The bound handles decide; an eager global config must not bring the mask back.
+    with ops_config_scope(eager_ops_config()), torch.no_grad():
         model(
             input_ids=torch.randint(0, config.vocab_size, (1, total_len), device=device),
             position_ids=position_ids,
@@ -349,6 +348,41 @@ def test_deepseek_v4_packed_model_forward_skips_dense_mask(monkeypatch):
         causal = sliding <= queries[:, None]
         assert (within_sample | ~is_sliding).all(), "sliding candidate crossed a packed boundary"
         assert (causal | ~is_sliding).all(), "sliding candidate is not causal"
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="mask-free sparse dispatch requires bf16 CUDA tensors")
+def test_deepseek_v4_packed_forward_keeps_mask_for_eager_bound_attention(monkeypatch):
+    """A TileLang global config must not drop the mask that eager-bound attention needs."""
+    device = torch.device(get_device_type())
+    config = _toy_config()
+    segment_lengths = (24, 40)
+    total_len = sum(segment_lengths)
+    with ops_config_scope(eager_ops_config()):
+        model = modeling.DeepseekV4Model(config).to(device=device, dtype=torch.bfloat16).eval()
+
+    built: list[bool] = []
+    create_mask = modeling.create_sliding_window_causal_mask
+
+    def record_dense_mask(*args, **kwargs):
+        built.append(True)
+        return create_mask(*args, **kwargs)
+
+    monkeypatch.setattr(modeling, "create_sliding_window_causal_mask", record_dense_mask)
+
+    position_ids = torch.cat([torch.arange(length) for length in segment_lengths]).unsqueeze(0).to(device)
+    cu_seq_lens = torch.tensor([0, segment_lengths[0], total_len], dtype=torch.int32, device=device)
+    tilelang_ops = eager_ops_config()
+    tilelang_ops.dsa_attention_implementation = "tilelang"
+    with ops_config_scope(tilelang_ops), torch.no_grad():
+        model(
+            input_ids=torch.randint(0, config.vocab_size, (1, total_len), device=device),
+            position_ids=position_ids,
+            use_cache=False,
+            cu_seq_lens_q=cu_seq_lens,
+            cu_seq_lens_k=cu_seq_lens,
+        )
+
+    assert built, "eager-bound attention needs the dense causal mask"
 
 
 def test_deepseek_v4_packed_causal_mask_blocks_previous_samples():

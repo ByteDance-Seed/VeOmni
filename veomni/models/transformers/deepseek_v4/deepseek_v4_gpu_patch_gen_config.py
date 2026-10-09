@@ -1578,7 +1578,7 @@ def deepseek_v4_model_forward_patched(
         # or host tensors, and its dense fallback needs the mask to stay causal,
         # so mirror those two runtime conditions before dropping the mask.
         mask_free_sparse = (
-            resolve_op_impl("dsa_attention_implementation") == "tilelang"
+            all(layer.self_attn.veomni_dsa_attention.impl == "tilelang" for layer in self.layers)
             and not isinstance(attention_mask, dict)
             and inputs_embeds.dtype == torch.bfloat16
             and inputs_embeds.is_cuda

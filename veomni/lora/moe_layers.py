@@ -116,8 +116,8 @@ EP-aware rank-0 broadcast / per-rank load paths slice the disk-side
 
 Both wrappers always call ``VeomniOp("moe_experts_lora", variant, impl)``.
 ``variant`` is the wrapper class (``shared`` / ``independent``). ``impl``
-comes from the ops config's ``moe_implementation`` (``fused_triton`` / ``fused_npu``;
-everything else remaps to ``eager``).
+follows the wrapped experts' ``veomni_moe`` handle when that LoRA row is
+available on this device, and falls back to ``eager`` otherwise.
 
 PEFT-format save/load compatibility (PEFT-aligned FQN layout)
 -------------------------------------------------------------
@@ -146,7 +146,9 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
+from transformers.activations import SiLUActivation
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
@@ -158,23 +160,26 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
-_FUSED_MOE_LORA_IMPLS = frozenset({"fused_triton", "fused_npu"})
+
+def _moe_lora_op(base_layer: nn.Module, variant: str):
+    """Bind ``moe_experts_lora`` to the wrapped experts' impl, or ``eager`` when no LoRA row is available."""
+    from veomni.ops import OP_REGISTRY, VeomniOp
+
+    base_op = getattr(base_layer, "veomni_moe", None)
+    impl = "eager" if base_op is None else base_op.impl
+    if impl not in OP_REGISTRY.list_available("moe_experts_lora", variant):
+        impl = "eager"
+    return VeomniOp("moe_experts_lora", variant, impl)
 
 
-def _resolve_moe_lora_impl() -> str:
-    """Map the ops config's ``moe_implementation`` onto a registered LoRA impl."""
-    from veomni.ops.config import get_ops_config
-
-    cfg = get_ops_config()
-    impl = "eager" if cfg is None else getattr(cfg, "moe_implementation", "eager")
-    return impl if impl in _FUSED_MOE_LORA_IMPLS else "eager"
-
-
-def _moe_lora_op(variant: str):
-    """Intern the ``moe_experts_lora`` handle for ``variant`` and the active impl."""
-    from veomni.ops import VeomniOp
-
-    return VeomniOp("moe_experts_lora", variant, _resolve_moe_lora_impl())
+def _validate_silu_act_fn(base_layer: nn.Module) -> None:
+    """Raise unless ``base_layer.act_fn`` is SiLU; every ``moe_experts_lora`` impl hard-codes SwiGLU."""
+    act_fn = base_layer.act_fn
+    if act_fn is F.silu or isinstance(act_fn, (nn.SiLU, SiLUActivation)):
+        return
+    raise ValueError(
+        f"VeOmni MoE-LoRA only supports SiLU experts; {type(base_layer).__name__} uses {type(act_fn).__name__}."
+    )
 
 
 # Module FQNs of PEFT-wrapped models gain a ``base_model.model.`` prefix.
@@ -411,6 +416,7 @@ class LoraSharedExperts(nn.Module):
         # into self below so a downstream caller seeing the drained
         # base_layer would get a confusing error.
         _validate_fused_layout(base_layer)
+        _validate_silu_act_fn(base_layer)
 
         self.r = r
         self.lora_alpha = lora_alpha
@@ -488,7 +494,7 @@ class LoraSharedExperts(nn.Module):
         # sync inside the autograd.Function. Kept in lock-step with
         # ``lora_scaling``.
         self._lora_scale_value: float = float(scaling)
-        self.veomni_moe_lora = _moe_lora_op("shared")
+        self.veomni_moe_lora = _moe_lora_op(base_layer, "shared")
 
         # Freeze base, then unfreeze lora_*. ``_is_lora_param_name``
         # detects the canonical ``lora_A`` / ``lora_B`` segments in the
@@ -791,6 +797,7 @@ class LoraIndependentExperts(nn.Module):
         # Validate before stealing — see LoraSharedExperts.__init__ for the
         # rationale on this ordering.
         _validate_fused_layout(base_layer)
+        _validate_silu_act_fn(base_layer)
 
         self.r = r
         self.lora_alpha = lora_alpha
@@ -851,7 +858,7 @@ class LoraIndependentExperts(nn.Module):
         # the scale as a plain float to avoid a host/device sync inside the
         # autograd.Function. Kept in lock-step with ``lora_scaling``.
         self._lora_scale_value: float = float(scaling)
-        self.veomni_moe_lora = _moe_lora_op("independent")
+        self.veomni_moe_lora = _moe_lora_op(base_layer, "independent")
 
         # Freeze base, then unfreeze lora_*. ``_is_lora_param_name`` looks
         # at canonical ``lora_A`` / ``lora_B`` segments so it works under

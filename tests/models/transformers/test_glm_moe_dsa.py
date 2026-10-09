@@ -102,21 +102,15 @@ def test_glm_moe_dsa_base_model_eager_matches_hf():
     )
 
 
-def test_glm_moe_dsa_registry_installs_checkpoint_hooks_and_ep_plan():
+def test_glm_moe_dsa_registry_installs_checkpoint_hooks_without_ep_plan():
     from veomni.models import get_model_class
 
     for architecture in ("GlmMoeDsaForCausalLM", "GlmMoeDsaModel"):
         model_cls = get_model_class(_tiny_config(architecture))
         assert callable(model_cls._create_checkpoint_tensor_converter)
         assert callable(model_cls._convert_fqn_to_index_mapping)
-
-    causal_cls = get_model_class(_tiny_config())
-    ep_plan = causal_cls.get_parallel_plan(None).extra_parallel_plan["ep"]
-    assert set(ep_plan) == {
-        "model.layers.*.mlp.experts.gate_up_proj",
-        "model.layers.*.mlp.experts.down_proj",
-    }
-    assert all(placement.dim == 0 for placement in ep_plan.values())
+        # GLM experts are HF's per-expert loop over global ids, so EP must stay unavailable.
+        assert not hasattr(model_cls, "get_parallel_plan")
 
 
 def test_glm_moe_dsa_chunked_prefill_and_independent_decode_matches_hf():

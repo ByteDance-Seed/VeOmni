@@ -251,7 +251,7 @@ def test_layout_validate_and_wrap(toy_dir: str, mode: str):
 
 @pytest.mark.parametrize("mode", _MODE_CASES)
 def test_wrapper_selects_op_impl(mode: str):
-    """Wrapper constructs ``moe_experts_lora`` from the ops config's ``moe_implementation``."""
+    """Wrapper constructs ``moe_experts_lora`` from the experts' ``moe_experts`` handle."""
     from veomni.ops.config import get_ops_config, set_ops_config
 
     model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
@@ -292,6 +292,58 @@ def test_wrapper_selects_op_impl(mode: str):
         assert wrapper_f.veomni_moe_lora.impl == "fused_triton"
     finally:
         set_ops_config(saved_cfg)
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_wrapper_follows_experts_handle_not_global_config(mode: str):
+    """A global config installed after model build must not change the wrapped experts' impl."""
+    from veomni.ops.config import get_ops_config, set_ops_config
+
+    model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
+    patterns = lora_cfg["target_parameters"]
+    sample_fqn, experts = find_first_matching_module(model, experts_module_globs(patterns))
+    assert experts.veomni_moe.impl == "eager"
+    saved_cfg = get_ops_config()
+    try:
+        set_ops_config(fused_triton_moe_ops())
+        _apply(
+            mode,
+            model,
+            target_parameter_patterns=patterns,
+            r=lora_cfg["rank"],
+            lora_alpha=lora_cfg["alpha"],
+            freeze_base_model=True,
+        )
+    finally:
+        set_ops_config(saved_cfg)
+    assert model.get_submodule(sample_fqn).veomni_moe_lora.impl == "eager"
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+@pytest.mark.parametrize("base_impl", ["fused_triton", "fused_quack"])
+def test_wrapper_uses_eager_when_lora_row_is_unavailable(monkeypatch, mode: str, base_impl: str):
+    from types import SimpleNamespace
+
+    from veomni.lora.moe_layers import _moe_lora_op
+    from veomni.ops import OP_REGISTRY
+
+    monkeypatch.setattr(OP_REGISTRY, "list_available", lambda op, variant: ["eager"])
+    base_layer = SimpleNamespace(veomni_moe=SimpleNamespace(impl=base_impl))
+
+    assert _moe_lora_op(base_layer, mode).impl == "eager"
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_wrapper_rejects_non_silu_experts(mode: str):
+    from transformers.activations import GELUActivation
+
+    model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
+    _, experts = find_first_matching_module(model, experts_module_globs(lora_cfg["target_parameters"]))
+    experts.act_fn = GELUActivation()
+
+    with pytest.raises(ValueError, match="only supports SiLU"):
+        _wrapper_cls(mode)(experts, r=lora_cfg["rank"], lora_alpha=lora_cfg["alpha"])
+    assert "gate_up_proj" in experts._parameters
 
 
 @pytest.mark.parametrize("mode", _MODE_CASES)

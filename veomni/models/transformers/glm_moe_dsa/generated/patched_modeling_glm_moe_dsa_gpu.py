@@ -29,8 +29,6 @@
 #      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: GlmMoeDsaForCausalLM.forward
 #      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
-#    - method_override: GlmMoeDsaForCausalLM.get_parallel_plan
-#      Register GLM-MoE-DSA expert parallel plan for v5 generated modeling
 #
 # ==============================================================================
 
@@ -793,7 +791,7 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] GlmMoeDsaForCausalLM
-# Methods patched: __init__, forward, get_parallel_plan
+# Methods patched: __init__, forward
 # ======================================================================
 
 
@@ -871,11 +869,6 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
-    def get_parallel_plan(self):
-        from ..parallel_plan import get_parallel_plan as _get_parallel_plan
-
-        return _get_parallel_plan()
 
 
 __all__ = [

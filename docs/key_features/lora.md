@@ -386,7 +386,7 @@ too — they are orthogonal to the MoE-LoRA on the routed experts.
 
 ### 5.3 MoE-LoRA forward backends
 
-Each MoE-LoRA wrapper dispatches based on `model.ops_implementation.moe_implementation`:
+Each MoE-LoRA wrapper follows the `moe_implementation` its wrapped experts module was built with:
 
 | `moe_implementation` | non-EP | EP | Notes |
 |---|---|---|---|
@@ -397,8 +397,10 @@ Each MoE-LoRA wrapper dispatches based on `model.ops_implementation.moe_implemen
 The fused GPU path lives in `veomni/ops/kernels/moe_experts_lora/` and reuses the same
 `group_gemm_same_nk` / `group_gemm_same_mn` primitives as the non-LoRA MoE forward, so it
 inherits the same EP `all-to-all` dispatch pipeline. Each wrapper constructs
-`VeomniOp("moe_experts_lora", variant, impl)` from
-`model.ops_implementation.moe_implementation`.
+`VeomniOp("moe_experts_lora", variant, impl)` from the wrapped experts'
+`veomni_moe.impl`. Any other impl (for example `fused_quack`, or `fused_triton`
+on MLU) has no available LoRA row and uses `eager`. MoE-LoRA requires SiLU
+experts and rejects other activations at wrap time.
 
 ### 5.4 Expert Parallelism (EP)
 
