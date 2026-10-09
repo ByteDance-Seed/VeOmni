@@ -321,19 +321,15 @@ class VeOmniModelRuntime:
         if not self.args.chat_template:
             return
 
-        from ..data.chat_template import CHAT_TEMPLATE_REGISTRY, MultimodalChatTemplate, build_chat_template
-
-        # Text templates read the tokenizer's encode / special tokens directly, so a checkpoint
-        # that also ships a processor must still hand them the tokenizer.
-        template_cls = CHAT_TEMPLATE_REGISTRY[self.args.chat_template]
-        is_multimodal = isinstance(template_cls, type) and issubclass(template_cls, MultimodalChatTemplate)
-        preprocessor = self.processor if is_multimodal else self.tokenizer
+        preprocessor = self.processor or self.tokenizer
         if preprocessor is None:
             logger.warning_once(
                 f"{type(self).__name__}: chat template {self.args.chat_template!r} was requested but no "
-                f"{'processor' if is_multimodal else 'tokenizer'} loaded to build it from; leaving it unset."
+                "preprocessor loaded to build it from; leaving it unset."
             )
             return
+
+        from ..data.chat_template import build_chat_template
 
         self.chat_template = build_chat_template(self.args.chat_template, preprocessor)
 
