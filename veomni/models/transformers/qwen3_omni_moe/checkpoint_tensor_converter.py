@@ -36,8 +36,10 @@ through untouched — the fused shape already equals the modeling layout, so
 dispatch copies them into place.
 
 The talker tower (`talker.model.layers.{i}.mlp.experts.*`) uses the same
-per-expert convention; the regex matches both tower prefixes so standalone
-talker tensors (if ever loaded through this converter) are handled uniformly.
+per-expert convention and the regex matches it too, but VeOmni builds the
+model with `has_talker=False` and sizes this converter from the thinker
+config. Talker keys therefore end up unexpected: `ep_sharded_stream_load`
+skips them unread, while the whole-tensor loaders stack and then drop them.
 """
 
 from typing import Dict
@@ -50,7 +52,7 @@ from ..._moe_per_expert_converter import PerExpertFusedCheckpointTensorConverter
 
 
 class Qwen3OmniMoeCheckpointTensorConverter(PerExpertFusedCheckpointTensorConverter):
-    """Per-expert -> fused converter for Qwen3-Omni-MoE thinker (and talker) experts."""
+    """Per-expert -> fused converter for Qwen3-Omni-MoE thinker experts."""
 
     model_name = "Qwen3OmniMoe"
 

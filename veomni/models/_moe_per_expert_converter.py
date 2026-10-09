@@ -24,7 +24,9 @@ directly and never runs that recipe, so this converter reproduces it::
       {prefix}.experts.{j}.down_proj.weight [H, I]  ->  {prefix}.experts.down_proj    [E, H, I]
 
 Fused keys (e.g. a VeOmni ``save_original_format=False`` export) do not match
-the pattern and pass through to dispatch untouched.
+the pattern and pass through to dispatch untouched. FP8 expert tensors raise:
+their ``weight_scale_inv`` companions are not applied here, so a cast would
+silently load wrong weights.
 
 The converter also implements the optional ``fused_expert_target`` /
 ``for_expert_range`` capabilities, so ``ep_sharded_stream_load`` streams these
@@ -86,6 +88,11 @@ class PerExpertFusedCheckpointTensorConverter:
         if not match:
             return None
 
+        if tensor.dtype.is_floating_point and tensor.element_size() == 1:
+            raise ValueError(
+                f"{name} is {tensor.dtype}: the {self.model_name} checkpoint converter does not dequantize "
+                "block-scaled FP8 experts. Load a BF16 checkpoint (dequantize the FP8 release first)."
+            )
         prefix, expert_id_str, proj_name = match.groups()
         expert_id = int(expert_id_str) - self.expert_offset
         if not 0 <= expert_id < self.num_experts:

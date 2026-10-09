@@ -378,6 +378,12 @@ class TestPerExpertConverterExpertRange:
         with pytest.raises(ValueError, match="outside this converter's 4 experts"):
             converter_cls(num_experts=4).for_expert_range(3, 2)
 
+    def test_fp8_experts_raise_instead_of_loading_unscaled(self, converter_cls):
+        converter = converter_cls(num_experts=4)
+        fp8 = torch.zeros(1, 2).to(torch.float8_e4m3fn)
+        with pytest.raises(ValueError, match="does not dequantize"):
+            converter.convert("model.layers.0.mlp.experts.0.down_proj.weight", fp8)
+
     def test_incomplete_checkpoint_error_names_the_model(self, converter_cls):
         converter = converter_cls(num_experts=4)
         converter.convert("model.layers.0.mlp.experts.0.down_proj.weight", torch.zeros(1, 2))

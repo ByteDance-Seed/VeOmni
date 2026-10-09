@@ -64,12 +64,13 @@ Two authoritative sources:
 **Pick the template by the verified HF layout, not by model family:**
 
 - **HF ships per-expert split keys** (`*.mlp.experts.{j}.{gate|up|down}_proj.weight`)
-  → template = `veomni/models/transformers/qwen3_moe/checkpoint_tensor_converter.py`.
+  → template = `veomni/models/_moe_per_expert_converter.py`.
   The regex only matches *HF-side* keys, so a v5-saved fused-key checkpoint
   passes through the converter untouched — no round-trip hazard.
   With exactly these key names, do not copy the stacking logic: subclass
-  `PerExpertFusedCheckpointTensorConverter` (`veomni/models/_moe_per_expert_converter.py`)
-  as qwen3_moe / qwen3_omni_moe / deepseek_v3 do. That also gives
+  `PerExpertFusedCheckpointTensorConverter` as
+  `veomni/models/transformers/qwen3_moe/checkpoint_tensor_converter.py`
+  (also qwen3_omni_moe / deepseek_v3) does. That also gives
   `ep_sharded_stream_load` support. A converter for other names (e.g. DeepSeek-V4's
   `w1/w2/w3`) must implement `fused_expert_target` + `for_expert_range` itself,
   or the streaming loader refuses the checkpoint.

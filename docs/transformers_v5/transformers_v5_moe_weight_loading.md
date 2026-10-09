@@ -114,7 +114,9 @@ HF per-expert:                             VeOmni fused:
   experts.{j}.down_proj.weight [H, I]   ->   experts.down_proj    [E, H, I]
 ```
 
-This eliminates the need for offline `moe_merge.py` preprocessing.
+This eliminates the need for offline `moe_merge.py` preprocessing. The converter
+does not dequantize: an FP8 per-expert checkpoint, such as the official
+DeepSeek-V3 release, raises `ValueError` and must be converted to BF16 first.
 
 With `model.ep_sharded_stream_load=true`, the converter also streams per rank.
 It reports each per-expert key's fused target and expert index
