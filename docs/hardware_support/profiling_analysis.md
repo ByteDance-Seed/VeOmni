@@ -73,7 +73,7 @@ In `offline` mode, VeOmni can spawn a detached postprocess sidecar after raw fin
 | Config / integration | Effect |
 |-----|--------|
 | `npu_postprocess: true` (default) | Analyse the finalized raw capture in a detached sidecar; copy it when `trace_dir` is `hdfs://` |
-| `npu_upload: true` (default) in a Merlin job | Upload through the platform file uploader or `merlin-cli`, associating the asset with the current Trial when available |
+| `npu_upload: true` (default) | Upload through an explicit or platform file uploader without requiring a JobRun; `merlin-cli` fallback and automatic Trial association require a JobRun context |
 | `VEOMNI_UPLOAD_CMD=...` | Optional explicit user uploader; the command is parsed as argv and runs on `trace_view.json.gz` (`{trace}` placeholder supported) |
 
 VeOmni waits for an automatically spawned sidecar for up to `npu_sidecar_wait_timeout` seconds when training ends. A timeout is non-fatal and leaves the raw local capture in place; for very large captures, use the manual postprocess command below while the pod remains alive.
