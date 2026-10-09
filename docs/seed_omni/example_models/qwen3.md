@@ -309,7 +309,7 @@ suffix:
 | File | Role |
 |------|------|
 | `visual_instruction_tuning/base.yaml` | Launcher (model paths, accelerator, data, train, infer). |
-| `visual_instruction_tuning/modules_train.yaml` | All overrides: `qwen3vl_vision` merger retarget (`out_hidden_size`) + `disable_deepstack` + `freeze`; `qwen3_text_encoder` image mode + special-token freeze (`ddp` + `weight_decay: 0`); `qwen3_llm` freeze. Add `--accelerator.ulysses_size N` for uniform Ulysses SP — no separate SP config (see [§7.5](#75-train-on-sharegpt4v)). |
+| `visual_instruction_tuning/modules_train.yaml` | All overrides: `qwen3vl_vision` merger retarget (`out_hidden_size`) + `disable_deepstack` + `freeze`; `qwen3_text_encoder` image mode + special-token freeze (`weight_decay: 0`); `qwen3_llm` freeze. Add `--accelerator.ulysses_size N` for uniform Ulysses SP — no separate SP config (see [§7.5](#75-train-on-sharegpt4v)). |
 | `visual_instruction_tuning/graph_train.yaml` | `{qwen3vl_vision, qwen3_text_encoder.encode} → qwen3_llm → qwen3_text_encoder.decode → end`. |
 | `visual_instruction_tuning/data.yaml` | ShareGPT4V captions (image + text). |
 | `visual_instruction_tuning/graph_infer.yaml` | I2T generation FSM. |
