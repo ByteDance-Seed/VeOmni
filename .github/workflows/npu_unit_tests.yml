@@ -190,12 +190,14 @@ jobs:
         run: |
           uv run --frozen pytest -v -s -x tests/distributed/test_async_offload_unit.py
           uv run --frozen pytest -v -s -x tests/distributed/test_dummy_forward.py
+          uv run --frozen pytest -v -s -x tests/distributed/test_emb_parallel.py
       - name: Run data tests
         run: |
           uv run --frozen pytest -v -s -x tests/data
       - name: Run ops tests
         run: |
           uv run --frozen pytest -v -s -x tests/ops/test_comp.py
+          uv run --frozen pytest -v -s -x tests/ops/test_chunk_loss.py tests/ops/test_chunk_loss_saved_tensor_hooks.py tests/ops/test_chunk_loss_saved_hooks.py
           uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
           uv run --frozen pytest -v -s -x tests/ops/test_npu_kernels.py
       - name: Run utils tests
