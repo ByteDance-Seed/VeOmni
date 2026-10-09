@@ -532,7 +532,7 @@ class GenerationGraph:
         if self._initial in self._states and self._initial != done_name:
             lines.append(f"    fsm_start ==> state_{self._initial}")
 
-        # ── State transitions (thick ==> arrows with quoted condition labels) ─
+        # State transitions: thick ``==>`` arrows with quoted condition labels.
         for name in drawn:
             for trans in self._states[name].transitions:
                 if trans.next_state == done_name:

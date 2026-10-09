@@ -87,10 +87,19 @@ key_features/model_loader.md
 key_features/preprocessor_registry.md
 key_features/ep_fsdp2.md
 key_features/extra_parallel.md
+key_features/sharded_embedding.md
 key_features/ulysses.md
 key_features/lora.md
 key_features/mtp.md
 
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: SeedOmni
+
+seed_omni/mixins/metric_meter.md
+seed_omni/mixins/offline_encoding.md
 ```
 
 ```{toctree}
