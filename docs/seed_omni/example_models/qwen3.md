@@ -26,7 +26,7 @@ per-purpose module/graph files. Both training and inference take the **same**
 | `qwen3_0.6b/train/modules_train.yaml` | Per-module training overrides. Add `--accelerator.ulysses_size N` to run it under uniform Ulysses SP — no separate SP config (see [§3.1](#31-sequence-parallelism-ulysses)). |
 | `qwen3_0.6b/train/graph_train.yaml` | Training DAG (`qwen3_text_encoder → qwen3_llm → qwen3_text_encoder.decode`). |
 | `qwen3_0.6b/train/data.yaml` | Weighted multisource data list (Tulu-3 SFT mixture). |
-| `qwen3_0.6b/train/graph_infer.yaml` | Text chat generation graph (mapped under `infer.infer_graph.infer_text`). |
+| `qwen3_0.6b/train/graph_infer.yaml` | Text chat generation graph (mapped under `model.model_config.infer_graph.infer_text`). |
 
 ---
 
@@ -149,16 +149,16 @@ bash train.sh tasks/omni/train_omni.py \
 ## 5. Inference
 
 `tasks/omni/infer_omni.py` runs the `infer_text` generation graph (the default
-and only `infer.infer_type` for Qwen3). Point `--infer.model_path` at a
-**split-checkpoint root** holding `qwen3_text_encoder/` and `qwen3_llm/`, or omit
-it to fall back to `model.model_path`. The step-1 converter output already has
-this layout, so you can infer directly:
+and only `model.model_config.infer_type` for Qwen3). `--model.model_path` is a
+**split-checkpoint root** holding `qwen3_text_encoder/` and `qwen3_llm/`;
+`base.yaml` already points it at the step-1 converter output, so you can infer
+directly:
 
 ```bash
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
-  --infer.infer_type infer_text \
-  --infer.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-v2 \
+  --model.model_config.infer_type infer_text \
+  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-v2 \
   --infer.prompt "What is 2+2?" \
   --infer.output_dir qwen3_out \
   --infer.generation_kwargs.max_new_tokens 1024
@@ -175,7 +175,7 @@ mkdir -p "$ASM"
 for m in qwen3_text_encoder qwen3_llm; do
   ln -sfn "$(realpath "$STEP/hf_ckpt/$m")" "$ASM/$m"
 done
-# then: --infer.model_path "$ASM"
+# then: --model.model_path "$ASM"
 ```
 
 ---
@@ -355,32 +355,34 @@ Use the trained-checkpoint command below for real outputs.
 ```bash
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml \
-  --infer.infer_type understanding \
-  --infer.image /path/to/image.jpg \
+  --model.model_config.infer_type understanding \
+  --infer.images /path/to/image.jpg \
   --infer.prompt "What is in this image?" \
   --infer.output_dir qwen3_vit_out
 ```
 
 To infer from a **trained** checkpoint (per-module weights live under
-`<step>/hf_ckpt/<module>/`), point `--infer.model_path` at the checkpoint step
+`<step>/hf_ckpt/<module>/`), point `--model.model_path` at the checkpoint step
 dir and override each module's `model_path` **relative to that root** — do NOT
-repeat the `--infer.model_path` prefix. Per-module override paths are joined
-under `--infer.model_path` unless they are absolute (start with `/`); passing a
+repeat the `--model.model_path` prefix. Per-module override paths are joined
+under `--model.model_path` unless they are absolute (start with `/`); passing a
 cwd-relative full path double-joins it and fails with a cryptic
-`HFValidationError: Repo id must be in the form ...`.
+`HFValidationError: Repo id must be in the form ...`. `qwen3_llm` is frozen, so
+the checkpoint has no copy of it: point that module back at the base root with an
+absolute path.
 
 ```bash
 STEP=outputs/qwen3_0.6b_visual_instruction_tuning/checkpoints/global_step_2000
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml \
-  --infer.infer_type understanding \
-  --infer.model_path "$STEP" \
-  --infer.image /path/to/image.jpg \
+  --model.model_config.infer_type understanding \
+  --model.model_path "$STEP" \
+  --infer.images /path/to/image.jpg \
   --infer.prompt "What is in this image?" \
   --infer.output_dir qwen3_vit_out \
-  --infer.modules.qwen3vl_vision.model.model_path hf_ckpt/qwen3vl_vision \
-  --infer.modules.qwen3_text_encoder.model.model_path hf_ckpt/qwen3_text_encoder \
-  --infer.modules.qwen3_llm.model.model_path hf_ckpt/qwen3_llm
+  --model.model_config.modules.qwen3vl_vision.model_path hf_ckpt/qwen3vl_vision \
+  --model.model_config.modules.qwen3_text_encoder.model_path hf_ckpt/qwen3_text_encoder \
+  --model.model_config.modules.qwen3_llm.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-v2/qwen3_llm
 ```
 
 > **Scope**: this is a deliberately minimal setup (frozen ViT blocks + frozen LLM

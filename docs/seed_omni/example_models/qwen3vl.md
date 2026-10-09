@@ -40,7 +40,7 @@ Config dir: `configs/seed_omni/Qwen/qwen3vl_2b/`
 | `train/modules_train.yaml` | Per-module training overrides (`qwen3vl_vision` / `qwen3vl_text_encoder` / `qwen3vl_llm`). Add `--accelerator.ulysses_size N` for uniform Ulysses SP — no separate SP config (see [§3.1](#31-sequence-parallelism-ulysses)). |
 | `train/graph_train.yaml` | Training DAG — flat edge list (`{qwen3vl_vision, qwen3vl_text_encoder.encode} → qwen3vl_llm → qwen3vl_text_encoder.decode → end`). |
 | `data.yaml` | Weighted multisource data list (ShareGPT4V images + LLaVA-Video). |
-| `infer/graph_infer.yaml` | Image/video-understanding (I2T / VQA) generation graph (`infer.infer_type: vision_understanding`). |
+| `infer/graph_infer.yaml` | Image/video-understanding (I2T / VQA) generation graph (`model.model_config.infer_type: vision_understanding`). |
 
 ---
 
@@ -176,7 +176,7 @@ python tasks/omni/infer_omni.py \
   configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml \
   --model.model_config.infer_type vision_understanding \
   --infer.prompt "What is in this image?" \
-  --infer.image /path/to/image.jpg \
+  --infer.images /path/to/image.jpg \
   --infer.output_dir qwen3vl_out \
   --infer.generation_kwargs.max_new_tokens 1024
 ```

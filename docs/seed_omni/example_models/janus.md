@@ -25,9 +25,9 @@ drives the inferencer.
 | `packed/base.yaml` | Packed-training launcher (`packed/modules_train.yaml` + packed graph). |
 | `train/base_model_fsdp.yaml` | Conversation DAG with `fsdp_scope: model` (one FSDP tree over OmniModel). |
 | `../data.yaml` | Weighted multisource data list (ImageNet + ShareGPT4V). |
-| `infer/modules_infer_fsdp.yaml` | Per-module **inference** overrides — distributed: `janus_text_encoder` vocab-parallel `emb` + `janus_llama` `ddp`, vision modules eager (base.yaml's default `infer.modules`). |
+| `infer/modules_infer_fsdp.yaml` | Per-module **inference** overrides — distributed: `janus_text_encoder` vocab-parallel `emb` + `janus_llama` `ddp`, vision modules eager. Select it with `--model.model_config.modules`. |
 | `infer/modules_infer_eager.yaml` | Per-module **inference** overrides — every module `eager` (single-process replica). |
-| `infer/graph_infer_und.yaml` / `infer/graph_infer_gen.yaml` / `infer/graph_infer_interleave.yaml` | Per-scenario generation graphs (mapped under `infer.infer_graph`). |
+| `infer/graph_infer_und.yaml` / `infer/graph_infer_gen.yaml` / `infer/graph_infer_interleave.yaml` | Per-scenario generation graphs (mapped under `model.model_config.infer_graph`). |
 
 ---
 
@@ -198,31 +198,21 @@ Two public launches are documented in
   module builds `OmniModelRuntime` + `accelerated/accelerated.py`).
 
 `tasks/omni/infer_omni.py` runs a generation graph selected by
-`--infer.infer_type` (a key into the `infer.infer_graph` map in `base.yaml`;
-defaults to `infer_interleave`). Point `--infer.model_path` at a
+`--model.model_config.infer_type` (a key into the `model.model_config.infer_graph`
+map in `base.yaml`; defaults to `infer_interleave`). `--model.model_path` is a
 **split-checkpoint root** that holds one subfolder per module (`janus_siglip/`,
 `janus_vqvae/`, `janus_text_encoder/`, `janus_llama/`), each with its own
-`config.json` + weights — or omit it to fall back to `model.model_path`. The
-step-1 converter output already has this layout, so you can infer directly with
-the converted base model.
+`config.json` + weights; `base.yaml` already points it at the step-1 converter
+output, so you can infer directly with the converted base model.
 
 Each module opts into FSDP / extra-parallel via its inference module YAML's
 `accelerator` block; `OmniInferencer` auto-detects whether any module needs a
 distributed run. Two ready-made inference module files ship with the config:
 
-| `infer.modules` file | Layout | Launch |
-|----------------------|--------|--------|
-| `infer/modules_infer_fsdp.yaml` (base.yaml default) | `janus_text_encoder` → distributed **vocab-parallel `emb`** (`fsdp2` + `emb`), `janus_llama` → `ddp`, vision modules eager | **torchrun** (`bash train.sh …`) |
+| `--model.model_config.modules` file | Layout | Launch |
+|-------------------------------------|--------|--------|
+| `infer/modules_infer_fsdp.yaml` | `janus_text_encoder` → distributed **vocab-parallel `emb`** (`fsdp2` + `emb`), `janus_llama` → `ddp`, vision modules eager | **torchrun** (`bash train.sh …`) |
 | `infer/modules_infer_eager.yaml` | every module `eager` — plain per-rank replica | single-process (`python …`) |
-
-Four launcher scripts at the repo root wrap the two paths for both scenarios:
-
-| Script | Modules | Launcher |
-|--------|---------|----------|
-| `infer_fsdp_i2t.sh` / `infer_fsdp_t2i.sh` | base default (`infer/modules_infer_fsdp.yaml`) | `bash train.sh` (torchrun) |
-| `infer_eager_i2t.sh` / `infer_eager_t2i.sh` | `--infer.modules …/infer/modules_infer_eager.yaml` | `python` (single process) |
-
-The commands below mirror those scripts.
 
 ### 5.1 Inferring from a trained checkpoint
 
@@ -239,71 +229,71 @@ for m in janus_siglip janus_vqvae janus_text_encoder janus_llama; do
 done
 ```
 
-Then pass `--infer.model_path "$ASM"` to any of the commands below. (Verified:
+Then pass `--model.model_path "$ASM"` to any of the commands below. (Verified:
 the `global_step_20` checkpoint loads all four modules and runs both the I2T and
 T2I graphs end-to-end.)
 
 **Image understanding (I2T / VQA)** — `infer/graph_infer_und.yaml`.
 
-Distributed (`infer_fsdp_i2t.sh`) — base default `infer/modules_infer_fsdp.yaml`, torchrun:
+Distributed — `infer/modules_infer_fsdp.yaml`, torchrun:
 
 ```bash
 bash train.sh tasks/omni/infer_omni.py \
   configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
-  --infer.infer_type infer_und \
-  --infer.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \
-  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2 \
+  --model.model_config.infer_type infer_und \
+  --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \
+  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2 \
   --infer.prompt "What do you see in this image?" \
-  --infer.image /path/to/image.png \
+  --infer.images /path/to/image.png \
   --infer.output_dir janus_out \
   --infer.generation_kwargs.max_new_tokens 1024
 ```
 
-Single-process (`infer_eager_i2t.sh`) — swap `infer.modules` to the all-eager
-file so every module loads as a plain replica (no torchrun):
+Single-process — the all-eager modules file, so every module loads as a plain
+replica (no torchrun):
 
 ```bash
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
-  --infer.infer_type infer_und \
-  --infer.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
-  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2 \
+  --model.model_config.infer_type infer_und \
+  --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
+  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2 \
   --infer.prompt "What do you see in this image?" \
-  --infer.image /path/to/image.png \
+  --infer.images /path/to/image.png \
   --infer.output_dir janus_out \
   --infer.generation_kwargs.max_new_tokens 1024
 ```
 
 **Text-to-image (T2I)** — `infer/graph_infer_gen.yaml` (`guidance_scale` enables CFG).
 
-Distributed (`infer_fsdp_t2i.sh`) — base default `infer/modules_infer_fsdp.yaml`, torchrun:
+Distributed — `infer/modules_infer_fsdp.yaml`, torchrun:
 
 ```bash
 bash train.sh tasks/omni/infer_omni.py \
   configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
-  --infer.infer_type infer_gen \
-  --infer.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \
-  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2 \
+  --model.model_config.infer_type infer_gen \
+  --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \
+  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2 \
   --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
   --infer.output_dir janus_out \
   --infer.generation_kwargs.max_new_tokens 2048 \
   --infer.generation_kwargs.guidance_scale 5.0
 ```
 
-Single-process (`infer_eager_t2i.sh`) — swap `infer.modules` to the all-eager
-file so every module loads as a plain replica (no torchrun):
+Single-process — the all-eager modules file, so every module loads as a plain
+replica (no torchrun):
 
 ```bash
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
-  --infer.infer_type infer_gen \
-  --infer.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
-  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2 \
+  --model.model_config.infer_type infer_gen \
+  --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
+  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2 \
   --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
   --infer.output_dir janus_out \
   --infer.generation_kwargs.max_new_tokens 2048 \
   --infer.generation_kwargs.guidance_scale 5.0
 ```
 
-**Interleaved** — `infer/graph_infer_interleave.yaml` (default `infer.infer_type`)
+**Interleaved** — `infer/graph_infer_interleave.yaml` (default `model.model_config.infer_type`)
 mixes text and image generation in one graph.

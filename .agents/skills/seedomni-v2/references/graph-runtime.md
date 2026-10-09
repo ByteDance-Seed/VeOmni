@@ -65,15 +65,16 @@ level:
 - Use module code to emit semantic signals such as `text_done` or
   `image_complete`; do not make the FSM inspect raw token IDs.
 
-One authoring file declares one scenario. `infer.infer_graph` maps every scenario
-name to its file, and `infer.infer_type` picks the active one:
+One authoring file declares one scenario. `model.model_config.infer_graph` maps every
+scenario name to its file, and `model.model_config.infer_type` picks the active one:
 
 ```yaml
-infer:
-  infer_graph:
-    infer_gen: configs/seed_omni/<Model>/<variant>/infer/graph_infer_gen.yaml
-    infer_und: configs/seed_omni/<Model>/<variant>/infer/graph_infer_und.yaml
-  infer_type: infer_gen
+model:
+  model_config:
+    infer_graph:
+      infer_gen: configs/seed_omni/<Model>/<variant>/infer/graph_infer_gen.yaml
+      infer_und: configs/seed_omni/<Model>/<variant>/infer/graph_infer_und.yaml
+    infer_type: infer_gen
 ```
 
 ## Generation Graphs In A Checkpoint

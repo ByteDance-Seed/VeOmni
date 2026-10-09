@@ -26,7 +26,7 @@ own copy of the dense-Qwen3 mixture at `train/data.yaml`.
 | `train/graph_train.yaml` | Training DAG. |
 | `infer/modules_infer_eager.yaml` | Inference overrides — all eager (single-process). |
 | `infer/modules_infer_fsdp.yaml` | Inference overrides — distributed FSDP2 + EP (mirrors train). |
-| `train/graph_infer.yaml` | Text chat generation graph (`infer.infer_graph.infer_text`). |
+| `train/graph_infer.yaml` | Text chat generation graph (`model.model_config.infer_graph.infer_text`). |
 | `train/data.yaml` | Weighted multisource data list — a local copy of the dense-Qwen3 mixture. |
 
 ---
@@ -49,7 +49,7 @@ Notes:
   (`experts.{j}.{gate,up,down}_proj`); both eager (HF `from_pretrained`) and the
   veomni FSDP loader fuse it to the v5 `experts.gate_up_proj` layout at load time
   (the omni `Qwen3MoeLlm` carries the per-expert→fused checkpoint converter).
-- `output_dir` becomes `model.model_path` (training) / `infer.model_path` (inference).
+- `output_dir` becomes `model.model_path`, for training and inference alike.
 
 ---
 
@@ -138,7 +138,8 @@ bash train.sh tasks/omni/train_omni.py \
 
 ## 5. Inference
 
-Two paths, selected by `infer.modules` (default = eager in `base.yaml`):
+Two paths, selected by the `--model.model_config.modules` file (with `base.yaml`'s
+own, inference loads every module eager):
 
 **Eager — single process**: every module loads via
 `from_pretrained(device_map='auto')` and the MoE runs the eager experts loop over
@@ -147,24 +148,24 @@ the full 128-expert weights. No torchrun / EP.
 ```bash
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Qwen/qwen3_30b_a3b/train/base.yaml \
-  --infer.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B-v2 \
-  --infer.infer_type infer_text \
+  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B-v2 \
+  --model.model_config.infer_type infer_text \
   --infer.prompt "Give me a short introduction to large language models." \
   --infer.output_dir qwen3moe_out \
   --infer.generation_kwargs.max_new_tokens 40
 ```
 
-**Distributed FSDP2 + EP** (mirrors train): override
-`infer.modules` to the fsdp file; `OmniInferencer` auto-detects the non-eager
+**Distributed FSDP2 + EP** (mirrors train): point
+`--model.model_config.modules` at the fsdp file; `OmniInferencer` auto-detects the non-eager
 modules, inits the process group, and runs each module's forward under its own
 `ParallelState` (fused MoE takes the EP all-to-all path). Needs ≥ ep GPUs.
 
 ```bash
 bash train.sh tasks/omni/infer_omni.py \
   configs/seed_omni/Qwen/qwen3_30b_a3b/train/base.yaml \
-  --infer.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B-v2 \
-  --infer.modules configs/seed_omni/Qwen/qwen3_30b_a3b/infer/modules_infer_fsdp.yaml \
-  --infer.infer_type infer_text \
+  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B-v2 \
+  --model.model_config.modules configs/seed_omni/Qwen/qwen3_30b_a3b/infer/modules_infer_fsdp.yaml \
+  --model.model_config.infer_type infer_text \
   --infer.prompt "Give me a short introduction to large language models." \
   --infer.output_dir qwen3moe_out \
   --infer.generation_kwargs.max_new_tokens 40
@@ -180,7 +181,7 @@ mkdir -p "$ASM"
 for m in qwen3_text_encoder qwen3_moe_llm; do
   ln -sfn "$(realpath "$STEP/hf_ckpt/$m")" "$ASM/$m"
 done
-# then: --infer.model_path "$ASM"
+# then: --model.model_path "$ASM"
 ```
 
 ---

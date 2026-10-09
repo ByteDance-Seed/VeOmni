@@ -466,7 +466,7 @@ python tasks/omni/infer_omni.py \
     --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
     --model.model_config.infer_type infer_und \
     --infer.prompt "Describe this image." \
-    --infer.image /path/to/image.jpg \
+    --infer.images /path/to/image.jpg \
     --infer.output_dir janus_out
 
 # any FSDP2 / DDP / ExtraParallel module: OmniModelRuntime + accelerated classes
@@ -489,7 +489,8 @@ matching transition. It stops at the `done` state or the
 the FSM — `OmniInferencer` calls `reset()` at request boundaries.
 
 The same node pool backs three different FSMs, selected by
-`infer.infer_type` (a key into the `infer.infer_graph` map, each pointing at one
+`model.model_config.infer_type` (a key into the `model.model_config.infer_graph`
+map, each pointing at one
 `infer/graph_infer*.yaml`):
 
 **Understanding — `infer/graph_infer_und.yaml` (I2T / VQA):**
@@ -598,8 +599,8 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
      packed tensors on the batch dict instead.
    - `infer/modules_infer_*.yaml` (optional) — per-module inference overrides.
    - `infer/graph_infer*.yaml` — one `generation_graph` (FSM) per scenario, mapped
-     under `infer.infer_graph`. `OmniConfig` loads **all** of them into
-     `generation_graphs` and `infer.infer_type` selects the active one, so an
+     under `model.model_config.infer_graph`. `OmniConfig` loads **all** of them into
+     `generation_graphs` and `model.model_config.infer_type` selects the active one, so an
      exported checkpoint keeps serving every scenario.
 
 5. **Honour the contracts:**

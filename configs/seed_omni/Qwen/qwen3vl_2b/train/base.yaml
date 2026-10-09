@@ -5,7 +5,7 @@
 #
 # Launch inference (image/video understanding):
 #   python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml \
-#     --infer.image /path/to/image.jpg \
+#     --infer.images /path/to/image.jpg \
 #     --infer.prompt "What is in this image?" \
 #     --infer.output_dir qwen3vl_out
 #

@@ -338,7 +338,7 @@ training unit is therefore declared once and applies per module in V2 and to the
 model in V1; `AcceleratorConfig.__post_init__` validates the mesh, `ModelArguments.__post_init__`
 the load policy, so a per-module override is checked on the same terms as the top-level default.
 
-**Generation scenarios**: `OmniConfig` holds *every* FSM from `infer.infer_graph` in
+**Generation scenarios**: `OmniConfig` holds *every* FSM from `model.model_config.infer_graph` in
 `generation_graphs` (`{infer_type: fsm}`), with `infer_type` naming the active one and
 the `generation_graph` property returning it. So a checkpoint exported for `infer_gen`
 can still run `infer_und` — set `config.infer_type` and rebuild the model. `OmniModel`

@@ -249,7 +249,7 @@ instead of encoding pixels.
 
 ## 4. Inference
 
-`tasks/omni/infer_omni.py` selects a generation graph with `--infer.infer_type`.
+`tasks/omni/infer_omni.py` selects a generation graph with `--model.model_config.infer_type`.
 Use `infer/modules_infer_eager.yaml` for a single-process run or
 `infer/modules_infer_fsdp.yaml` with `bash train.sh` for a torchrun/FSDP2 run.
 
@@ -258,10 +258,10 @@ Use `infer/modules_infer_eager.yaml` for a single-process run or
 ```bash
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
-  --infer.infer_type infer_und \
-  --infer.modules configs/seed_omni/Bagel/bagel_7b_mot/infer/modules_infer_eager.yaml \
-  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT-v2 \
-  --infer.image /path/to/image.jpg \
+  --model.model_config.infer_type infer_und \
+  --model.model_config.modules configs/seed_omni/Bagel/bagel_7b_mot/infer/modules_infer_eager.yaml \
+  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT-v2 \
+  --infer.images /path/to/image.jpg \
   --infer.prompt "Describe this image." \
   --infer.output_dir bagel_out
 ```
@@ -275,9 +275,9 @@ decode until `text_done`.
 ```bash
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
-  --infer.infer_type infer_gen \
-  --infer.modules configs/seed_omni/Bagel/bagel_7b_mot/infer/modules_infer_eager.yaml \
-  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT-v2 \
+  --model.model_config.infer_type infer_gen \
+  --model.model_config.modules configs/seed_omni/Bagel/bagel_7b_mot/infer/modules_infer_eager.yaml \
+  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT-v2 \
   --infer.prompt "A watercolor painting of a small cabin beside a lake." \
   --infer.output_dir bagel_out \
   --infer.generation_kwargs.num_timesteps 50 \
@@ -305,10 +305,10 @@ Each step moves the tail `output` row through `BAGEL_PHASE_KEY` values
 ```bash
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
-  --infer.infer_type infer_edit \
-  --infer.modules configs/seed_omni/Bagel/bagel_7b_mot/infer/modules_infer_eager.yaml \
-  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT-v2 \
-  --infer.image /path/to/source.jpg \
+  --model.model_config.infer_type infer_edit \
+  --model.model_config.modules configs/seed_omni/Bagel/bagel_7b_mot/infer/modules_infer_eager.yaml \
+  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT-v2 \
+  --infer.images /path/to/source.jpg \
   --infer.prompt "Make it look like a snowy evening." \
   --infer.output_dir bagel_out
 ```
