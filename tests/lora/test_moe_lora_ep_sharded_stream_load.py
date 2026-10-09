@@ -69,6 +69,7 @@ from .test_moe_lora_trainer import (
     _gpu_count_or_skip,
     _writer_adapter_path,
     _yaml_for_mode,
+    toy_base_dir,  # noqa: F401  (pytest fixture, per-expert HF layout)
 )
 
 
@@ -111,7 +112,9 @@ _SEED_STEPS = 2
 #
 # This test builds its *own* base by dumping the fused
 # ``model.state_dict()`` directly (no ``save_pretrained`` re-split),
-# so it exercises the converter-free dim-0 slice path under PEFT.
+# so it exercises the converter-free dim-0 slice path under PEFT. The
+# ``per_expert`` case loads ``toy_base_dir`` instead, so the converter's
+# per-rank expert stacking runs with experts under ``base_layer``.
 
 
 def _build_and_save_fused_toy_base(dest_dir: str) -> None:
@@ -221,8 +224,10 @@ def _make_adapter_resume_yaml(base_yaml: str, adapter_path: str, dest: str) -> s
     return dest
 
 
-@pytest.mark.parametrize("mode", ["independent", "shared"])
-def test_peft_ep_sharded_stream_load_matches_broadcast(tmp_path, fused_toy_base_dir, mode):
+@pytest.mark.parametrize(
+    "mode, base_layout", [("independent", "fused"), ("shared", "fused"), ("independent", "per_expert")]
+)
+def test_peft_ep_sharded_stream_load_matches_broadcast(tmp_path, request, mode, base_layout):
     """Streaming a LoRA-wrapped MoE checkpoint == broadcast loader, bit-exact.
 
     Three EP=2 subprocesses on the Qwen3-MoE toy:
@@ -243,11 +248,13 @@ def test_peft_ep_sharded_stream_load_matches_broadcast(tmp_path, fused_toy_base_
     difference is *how* each rank obtained its local slice. For
     ``independent`` the adapter's per-expert LoRA is EP-streamed; for
     ``shared`` the adapter LoRA is read whole while the base experts are
-    still EP-streamed.
+    still EP-streamed. With the ``per_expert`` base the stream resumer stacks
+    each rank's experts through the checkpoint converter.
     """
     nproc = _gpu_count_or_skip(min_count=2, max_count=2)
     yaml_path = _yaml_for_mode(mode)
-    base_overrides = _fused_model_path_overrides(fused_toy_base_dir) + [
+    base_dir = request.getfixturevalue("fused_toy_base_dir" if base_layout == "fused" else "toy_base_dir")
+    base_overrides = _fused_model_path_overrides(base_dir) + [
         _fused_ops_override(),
         "--model.accelerator.ep_size=2",
     ]
@@ -288,7 +295,7 @@ def test_peft_ep_sharded_stream_load_matches_broadcast(tmp_path, fused_toy_base_
     _compare_snapshots_bit_exact(
         actual_path=os.path.join(stream_dir, SNAPSHOT_PRE),
         ref_path=os.path.join(ref_dir, SNAPSHOT_PRE),
-        label=f"{mode}/ep_sharded_stream_vs_broadcast",
+        label=f"{mode}/{base_layout}/ep_sharded_stream_vs_broadcast",
     )
 
     for d in (ref_dir, stream_dir):
