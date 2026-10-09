@@ -29,6 +29,8 @@ In VeOmni, experts module is defined as tensors of [E, H, I] (Expert number, hid
 
 Extra parallelism is applied on dim-0 (expert number, vocab size), while FSDP2 is applied on dim-1 instead of default dim-0 for more flexible parallelism setup. Otherwise, if we also choose dim-0 for FSDP2, Expert Parallel or Embed Parallel x FSDP2 size needs to be exact expert number or vocab size.
 
+The lookup of a vocab-sharded embedding is described in [sharded_embedding.md](./sharded_embedding.md).
+
 ## Usage
 
 > File: tests/utils/test_extra_parallel_clip_grad_norm.py
