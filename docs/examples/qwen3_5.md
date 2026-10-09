@@ -326,7 +326,13 @@ raw runtime device name. VeOmni independently reads the raw
 GatedDeltaNet hidden-state recurrence in both forward and backward. Other
 Ascend devices retain the upstream 128-wide tile. This changes launch
 geometry only: value tiles are independent, so the training objective and
-gradient equations are unchanged.
+gradient equations are unchanged. Hardware detection stays in VeOmni glue;
+the vendored launch helpers accept an optional `BV=128` and do not import
+VeOmni hardware helpers.
+
+This gate and BV override cover only `chunk_gated_delta_rule_implementation:
+npu` (Triton). The `npu_ascendc` backend uses external fused operators with
+internal tiling; it is not validated or modified by this 910B4 fix.
 
 Run the live hardware gate before a long Qwen3.5 training job. `--tokens`
 is the sequence length seen by each GatedDeltaNet kernel after Ulysses

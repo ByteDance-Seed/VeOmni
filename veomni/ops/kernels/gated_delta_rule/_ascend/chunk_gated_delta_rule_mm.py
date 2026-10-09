@@ -5,6 +5,8 @@ from typing import Optional
 
 import torch
 
+from ..npu_hardware import get_hidden_state_block_value
+
 from .triton.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
 from .triton.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
 from .triton.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
@@ -58,6 +60,7 @@ def chunk_gated_delta_rule_fwd(
         output_final_state=output_final_state,
         chunk_size=chunk_size,
         cu_seqlens=cu_seqlens,
+        BV=get_hidden_state_block_value(k.device.index),
     )
     o = chunk_fwd_o(
         q=q,
@@ -103,6 +106,7 @@ def chunk_gated_delta_rule_bwd(
         output_final_state=False,
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
+        BV=get_hidden_state_block_value(k.device.index),
     )
     dv = chunk_bwd_dv_local(
         q=q,
@@ -125,6 +129,7 @@ def chunk_gated_delta_rule_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
+        BV=get_hidden_state_block_value(k.device.index),
     )
     dq, dk, dw, dg = chunk_bwd_dqkwg(
         q=q,
