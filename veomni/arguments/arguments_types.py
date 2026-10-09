@@ -85,9 +85,23 @@ class OptimizerConfig:
     norms use AdamW.
     """
 
-    type: Literal["adamw", "anyprecision_adamw", "muon"] = field(
+    type: Literal[
+        "adamw", "anyprecision_adamw", "muon", "master_fp32_adamw", "full_fp32_adamw", "cpu_offload_adamw"
+    ] = field(
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
+    )
+    cpu_offload_param_patterns: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Full parameter-name regexes selecting CPU master/m/v for cpu_offload_adamw."},
+    )
+    cpu_offload_resident_moment_dtype: Literal["float32", "bfloat16"] = field(
+        default="float32",
+        metadata={"help": "Moment storage precision for resident cpu_offload_adamw parameters; master stays FP32."},
+    )
+    cpu_offload_cpu_moment_dtype: Literal["float32", "bfloat16"] = field(
+        default="float32",
+        metadata={"help": "Moment storage precision for CPU-offloaded parameters; master stays FP32."},
     )
     lr: float = field(
         default=5e-5,
