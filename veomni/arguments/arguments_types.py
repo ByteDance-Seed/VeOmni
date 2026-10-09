@@ -115,7 +115,7 @@ class OptimizerConfig:
     )
     weight_decay: float = field(
         default=0,
-        metadata={"help": "L2 regularization strength."},
+        metadata={"help": "Weight decay. AdamW applies it decoupled, outside the gradient."},
     )
     no_decay_modules: List[str] = field(
         default_factory=list,

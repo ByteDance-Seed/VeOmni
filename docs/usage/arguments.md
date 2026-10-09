@@ -446,7 +446,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | lr_warmup_ratio | `float` | `0` | Ratio of learning rate warmup steps. |
 | lr_decay_style | `str` | `"constant"` | Learning rate scheduler (`"constant"`, `"linear"`, `"cosine"`). |
 | lr_decay_ratio | `float` | `1.0` | Ratio of learning rate decay steps. |
-| weight_decay | `float` | `0` | L2 regularization strength. |
+| weight_decay | `float` | `0` | Weight decay. AdamW applies it decoupled (`p *= 1 - lr * weight_decay` each step), outside the gradient. |
 | no_decay_modules | `List[str]` | `[]` | Modules excluded from weight decay (e.g. `RMSNorm`). |
 | no_decay_params | `List[str]` | `[]` | Parameters excluded from weight decay (e.g. `bias`). |
 | max_grad_norm | `float` | `1.0` | Gradient clipping norm. |

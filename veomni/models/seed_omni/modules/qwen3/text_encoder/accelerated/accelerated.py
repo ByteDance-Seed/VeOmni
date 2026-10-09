@@ -2,7 +2,8 @@
 
 FSM ``generate`` now lives natively on :class:`~.modeling.Qwen3TextEncoder`;
 this file only owns the SP-aware training pre/forward/post hooks plus the
-image-mode vision-token freeze (both genuinely accelerated-only).
+image-mode vision-token freeze and its row-wise weight decay (all genuinely
+accelerated-only).
 """
 
 from typing import Any, Dict, Optional

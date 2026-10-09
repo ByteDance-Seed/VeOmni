@@ -1,6 +1,6 @@
 # VeOmni config — visual instruction tuning of text-only Qwen3-0.6B into image
-# understanding using the Qwen3-VL ViT, training ONLY the ViT patch merger + the
-# vision special-token embedding rows (ViT blocks + LLM frozen).
+# understanding using the Qwen3-VL ViT, training the ViT patch merger, the vision
+# special-token embedding rows and the LLM (ViT blocks + other embedding rows frozen).
 #
 # No bespoke modeling/script and no combined checkpoint: ``model_path`` is the
 # converted Qwen3-0.6B root and the modules YAML points ``qwen3vl_vision`` at the
