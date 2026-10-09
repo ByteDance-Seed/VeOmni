@@ -27,14 +27,23 @@ _ACTIVE_CHUNK_LOSS_CONSUMER: ContextVar[Callable[[torch.Tensor], None] | None] =
 )
 
 
+_ACTIVE_CHUNK_LOSS_ERROR_CONSUMER: ContextVar[Callable[[str], None] | None] = ContextVar(
+    "veomni_active_chunk_loss_error_consumer", default=None
+)
+
+
 @contextmanager
-def capture_chunk_loss_per_token(consumer: Callable[[torch.Tensor], None]) -> Iterator[None]:
+def capture_chunk_loss_per_token(
+    consumer: Callable[[torch.Tensor], None], on_error: Callable[[str], None] | None = None
+) -> Iterator[None]:
     """Route the main chunk-loss kernel's detached per-token CE to ``consumer``."""
 
     token = _ACTIVE_CHUNK_LOSS_CONSUMER.set(consumer)
+    error_token = _ACTIVE_CHUNK_LOSS_ERROR_CONSUMER.set(on_error)
     try:
         yield
     finally:
+        _ACTIVE_CHUNK_LOSS_ERROR_CONSUMER.reset(error_token)
         _ACTIVE_CHUNK_LOSS_CONSUMER.reset(token)
 
 
@@ -42,3 +51,12 @@ def get_chunk_loss_consumer() -> Callable[[torch.Tensor], None] | None:
     """Return the consumer active for the current model-forward context."""
 
     return _ACTIVE_CHUNK_LOSS_CONSUMER.get()
+
+
+def report_chunk_loss_observer_error(error: Exception) -> bool:
+    """Defer observer failure without retaining exception traceback tensors."""
+    handler = _ACTIVE_CHUNK_LOSS_ERROR_CONSUMER.get()
+    if handler is None:
+        return False
+    handler(f"{type(error).__name__}: {error}")
+    return True

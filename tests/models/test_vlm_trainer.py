@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import pytest
 
 from veomni.models import build_foundation_model
@@ -7,11 +5,11 @@ from veomni.trainer.vlm_trainer import (
     VeOmniVLMArguments,
     VLMMDataArguments,
     VLMMModelArguments,
-    VLMTrainer,
+    VLMModelRuntime,
     _get_vlm_visual_module,
 )
 
-from ..tools.training_utils import make_eager_ops_config
+from ..tools.training_utils import make_eager_ops_config, unbuilt_runtime
 
 
 _FREEZE_VIT_VLM_CASES = [
@@ -21,16 +19,11 @@ _FREEZE_VIT_VLM_CASES = [
     pytest.param("./tests/toy_config/qwen25vl_toy/config.json", id="qwen2_5_vl"),
     pytest.param("./tests/toy_config/qwen3vl_toy/config.json", id="qwen3_vl"),
     pytest.param("./tests/toy_config/qwen3vlmoe_toy/config.json", id="qwen3_vl_moe"),
+    pytest.param("./tests/toy_config/qwen4_exp_toy/config.json", id="qwen4_exp"),
 ]
 
 
-@pytest.mark.parametrize(
-    "freeze_vit",
-    [
-        pytest.param(False, id="freeze_vit_disabled"),
-        pytest.param(True, id="freeze_vit_enabled"),
-    ],
-)
+@pytest.mark.parametrize("freeze_vit", [False, True])
 @pytest.mark.parametrize("config_path", _FREEZE_VIT_VLM_CASES)
 def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
     # This test only constructs the model on `meta` and verifies freeze
@@ -52,24 +45,14 @@ def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
     assert visual is not None
 
     args = VeOmniVLMArguments(
-        model=VLMMModelArguments(
-            config_path=config_path,
-            ops_implementation=make_eager_ops_config(),
-        ),
+        model=VLMMModelArguments(config_path=config_path, ops_implementation=ops_implementation),
         data=VLMMDataArguments(train_path="dummy"),
     )
     args.train.freeze_vit = freeze_vit
+    runtime = unbuilt_runtime(args.model, cls=VLMModelRuntime, train=args.train)
+    runtime.model = model
+    runtime.model_config = model.config
 
-    trainer = VLMTrainer.__new__(VLMTrainer)
-    trainer.base = SimpleNamespace(
-        args=args,
-        model=model,
-        model_config=model.config,
-    )
+    runtime._freeze_model_module()
 
-    trainer._freeze_model_module()
-
-    if freeze_vit:
-        assert all(not param.requires_grad for param in visual.parameters())
-    else:
-        assert all(param.requires_grad for param in visual.parameters())
+    assert all(param.requires_grad is not freeze_vit for param in visual.parameters())

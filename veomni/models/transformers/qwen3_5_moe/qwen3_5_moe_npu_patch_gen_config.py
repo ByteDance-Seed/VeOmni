@@ -35,15 +35,18 @@ Patches applied:
 4. Fused loss + aux_loss in ForConditionalGeneration.
 """
 
+import torch
+from transformers.cache_utils import Cache
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.processing_utils import Unpack
+
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
-    qwen3_5_text_model_update_linear_attn_mask,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
-    qwen3_5_vision_model_forward,
     qwen3_5_vision_model_rot_pos_emb,
 )
 from veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config import (
@@ -51,19 +54,27 @@ from veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config import (
     apply_rotary_pos_emb_vision,
     qwen3_5_gated_deltanet_forward_patched,
     qwen3_5_rmsnorm_forward_patched,
+    qwen3_5_text_model_forward_patched,
+    qwen3_5_vision_model_forward,
 )
 from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config import (
     PatchedQwen3_5MoeExperts,
     Qwen3_5MoeCausalLMOutputWithLogProbs,
+    Qwen3_5MoeMTP,
+    Qwen3_5MoeMTPContextOutput,
+    _mtp_loss_weight,
     _Qwen3_5MoeFakeForPosID,
     collate_multimodal_metadata,
+    compute_mtp_loss,
+    compute_mtp_router_aux_loss,
     get_position_id,
     mm_token_type_ids_from_input_ids,
-    qwen3_5_moe_decoder_layer_forward_patched,
+    qwen3_5_moe_causal_lm_get_parallel_plan_patched,
     qwen3_5_moe_forcausallm_forward_patched,
     qwen3_5_moe_forconditional_generation_forward_patched,
     qwen3_5_moe_forconditional_generation_get_metadata_collate_func,
     qwen3_5_moe_forconditional_generation_get_position_id_func,
+    qwen3_5_moe_forconditional_generation_init_patched,
     qwen3_5_moe_get_parallel_plan_patched,
     qwen3_5_moe_model_forward_patched,
     qwen3_5_moe_model_init_patched,
@@ -79,6 +90,7 @@ config = PatchConfig(
 )
 
 config.add_import("copy", names=["copy"])
+config.add_import("dataclasses", names=["dataclass"])
 config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
@@ -93,7 +105,7 @@ config.add_import(
 config.add_import(
     "veomni.distributed.sequence_parallel", names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"]
 )
-config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+config.add_import("veomni.utils.constants", names=["IGNORE_INDEX", "IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 # Surface ``MoeCausalLMOutputWithLogProbs`` so the patched text ``forward``
 # (re-used from the GPU config) can return per-token log-probs in the unified
 # MoE output dataclass.
@@ -108,21 +120,6 @@ config.drop_import_names(
     "causal_conv1d_update",
     "chunk_gated_delta_rule",
     "fused_recurrent_gated_delta_rule",
-)
-config.add_post_import_block(
-    """
-    # NPU has no fla/flash_qla backend registered today; selecting a non-eager
-    # linear-attention impl raises at OpSlot.bind() time. These None
-    # placeholders preserve the upstream HF top-level
-    # `is_fast_path_available = all((causal_conv1d_fn, ...))` (resolves to
-    # False — legacy warning) and let the `<fla_name> or <torch_fallback>`
-    # assignments in __init__ resolve to torch.
-    FusedRMSNormGated = None
-    causal_conv1d_fn = None
-    causal_conv1d_update = None
-    chunk_gated_delta_rule = None
-    fused_recurrent_gated_delta_rule = None
-    """
 )
 config.add_post_import_block(
     """
@@ -240,7 +237,7 @@ config.override_method(
 config.override_method(
     "Qwen3_5MoeVisionModel.forward",
     replacement=qwen3_5_vision_model_forward,
-    description="Optimized vision forward with Sequence Parallel (SP) support and padded cu_seqlens.",
+    description="Optimized vision forward with Sequence Parallel (SP) support and padded cu_seqlens. Keep cu_seqlens on CPU to avoid per-layer NPU→CPU sync.",
 )
 
 config.override_method(
@@ -262,6 +259,11 @@ config.override_method(
 
 
 config.add_helper_after("Qwen3_5MoeCausalLMOutputWithPast", Qwen3_5MoeCausalLMOutputWithLogProbs)
+config.add_helper_after("Qwen3_5MoeDecoderLayer", Qwen3_5MoeMTP)
+config.add_helper_after("Qwen3_5MoeModelOutputWithPast", Qwen3_5MoeMTPContextOutput)
+config.add_helper(_mtp_loss_weight)
+config.add_helper(compute_mtp_loss)
+config.add_helper(compute_mtp_router_aux_loss)
 
 
 config.override_method(
@@ -275,6 +277,12 @@ config.override_method(
     "Qwen3_5MoeForConditionalGeneration.get_metadata_collate_func",
     replacement=qwen3_5_moe_forconditional_generation_get_metadata_collate_func,
     description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
+)
+
+config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.__init__",
+    replacement=qwen3_5_moe_forconditional_generation_init_patched,
+    description="Build the MTP head when enabled",
 )
 
 
@@ -313,20 +321,92 @@ config.override_method(
     description="Support varlen flash linear attention and Ulysses SP in Qwen3_5MoeGatedDeltaNet.forward",
 )
 
-config.override_method(
-    "Qwen3_5MoeTextModel._update_linear_attn_mask",
-    replacement=qwen3_5_text_model_update_linear_attn_mask,
-    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
-)
+# NOTE: `Qwen3_5MoeTextModel._update_linear_attn_mask` was removed in
+# transformers 5.16 — see the note in qwen3_5_gpu_patch_gen_config.py.
 
 
-# ── DecoderLayer forward ────────────────────────────────────────────────────────
+# ── DecoderLayer forward (NPU: plumb precomputed varlen metadata to GDN) ───────
 
 
-config.override_method(
+@config.override_method(
     "Qwen3_5MoeDecoderLayer.forward",
-    replacement=qwen3_5_moe_decoder_layer_forward_patched,
-    description="Extract and pass cu_seq_lens_q for varlen linear attention in Qwen3_5MoeDecoderLayer.forward",
+    description="Extract and pass cu_seq_lens_q + precomputed varlen metadata for AscendC GDN kernels in Qwen3_5MoeDecoderLayer.forward",
+)
+def qwen3_5_moe_decoder_layer_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    cache_position: torch.LongTensor | None = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> torch.FloatTensor:
+    return_router_logits = kwargs.pop("return_router_logits", False)
+    residual = hidden_states
+
+    hidden_states = self.input_layernorm(hidden_states)
+
+    # Modification: read varlen metadata from kwargs and enforce it for linear-attention varlen kernels.
+    cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
+    assert cu_seq_lens_q is not None, (
+        "cu_seq_lens_q must be provided to support varlen Flash Linear Attention, varlen Conv1D,"
+        "and to remove the full Flash Attention CPU-GPU sync."
+    )
+    linear_attn_cu_seq_lens_q = kwargs.pop("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
+    linear_attn_cu_seqlens_list = kwargs.pop("cu_seqlens_list_q", None)
+    linear_attn_chunk_indices = kwargs.pop("chunk_indices_q", None)
+    linear_attn_chunk_indices_list = kwargs.pop("chunk_indices_list_q", None)
+
+    # Token Mixer
+    if self.block_type == "linear_attention":
+        # Modification: pass linear-attention cu_seqlens + precomputed metadata through to GatedDeltaNet.forward.
+        hidden_states = self.linear_attn(
+            hidden_states=hidden_states,
+            cache_params=past_key_values,
+            cache_position=cache_position,
+            attention_mask=attention_mask,
+            cu_seq_lens_q=linear_attn_cu_seq_lens_q,
+            cu_seqlens_list=linear_attn_cu_seqlens_list,
+            chunk_indices=linear_attn_chunk_indices,
+            chunk_indices_list=linear_attn_chunk_indices_list,
+        )
+    elif self.block_type == "full_attention":
+        # Self Attention
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+
+    hidden_states = residual + hidden_states
+
+    # Fully Connected
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    hidden_states = self.mlp(hidden_states)
+    # For the MoE layers, we need to unpack
+    router_logits = None
+    if isinstance(hidden_states, tuple):
+        hidden_states, router_logits = hidden_states
+    hidden_states = residual + hidden_states
+    if return_router_logits:
+        return hidden_states, router_logits
+    return hidden_states
+
+
+# ── TextModel forward (NPU: reuse dense + MoE output type) ─────────────────────
+
+
+config.override_method(
+    "Qwen3_5MoeTextModel.forward",
+    replacement=qwen3_5_text_model_forward_patched,
+    name_map={"Qwen3_5": "Qwen3_5Moe"},
+    description="Precompute varlen metadata (cu_seqlens_list, chunk_indices, chunk_indices_list) once for all AscendC GDN layers to avoid per-layer tolist overhead",
 )
 
 
@@ -358,3 +438,15 @@ config.override_method(
     replacement=qwen3_5_moe_get_parallel_plan_patched,
     description="Register Qwen3_5Moe expert parallel plan for v5 generated modeling",
 )
+
+
+config.override_method(
+    "Qwen3_5MoeForCausalLM.get_parallel_plan",
+    replacement=qwen3_5_moe_causal_lm_get_parallel_plan_patched,
+    description="Register Qwen3_5MoeForCausalLM expert parallel plan for v5 generated modeling",
+)
+config.add_import("veomni.utils", names=["logging"])
+config.add_post_import_block("""
+from veomni.utils import logging
+logger = logging.get_logger(__name__)
+""")

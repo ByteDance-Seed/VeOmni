@@ -43,6 +43,8 @@ def build_dit_dataloader(
     drop_last: bool = True,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
+    persistent_workers: bool = False,
+    in_order: bool = True,
     seed: int = 0,
     build_collate_fn: bool = True,
     collate_fn_kwargs: Optional[Dict[str, Any]] = None,
@@ -79,6 +81,12 @@ def build_dit_dataloader(
             seed=seed,
         )
 
+    if not in_order and num_workers > 0:
+        logger.warning_rank0(
+            "data.dataloader.in_order=False can improve throughput for uneven worker loads, "
+            "but StatefulDataLoader does not guarantee exact checkpoint/resume ordering in this mode."
+        )
+
     dataloader = DistributedDataloader(
         dataset,
         batch_size=dataloader_batch_size,
@@ -89,6 +97,8 @@ def build_dit_dataloader(
         pin_memory_device=get_device_type(),
         drop_last=drop_last,
         prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers and num_workers > 0,
+        in_order=in_order,
     )
 
     return dataloader

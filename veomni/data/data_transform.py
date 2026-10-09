@@ -30,6 +30,18 @@ if TYPE_CHECKING:
 DATA_TRANSFORM_REGISTRY = Registry("DataTransform")
 
 
+def _get_exact_token_id(tokenizer: "PreTrainedTokenizer", token: str, fallback_token: str | None = None) -> int:
+    candidates = (token,) if fallback_token is None else (token, fallback_token)
+    unk_token_id = getattr(tokenizer, "unk_token_id", None)
+    for candidate in candidates:
+        token_id = tokenizer.convert_tokens_to_ids(candidate)
+        if token_id is not None and token_id != unk_token_id:
+            return token_id
+
+    token_names = " or ".join(candidates)
+    raise ValueError(f"Cannot find token ({token_names}) in tokenizer vocab.")
+
+
 def build_data_transform(transform_name: str, **kwargs) -> Callable:
     return partial(DATA_TRANSFORM_REGISTRY[transform_name], **kwargs)
 
@@ -303,8 +315,13 @@ def _process_sample_qwen_vl_base(
 
     if "videos" in sample and sample["videos"]:
         videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], **kwargs)
+        # Fetch already sampled the frames. Preserve its source indices/FPS for timestamps.
         video_inputs = processor.video_processor(
-            videos=videos, video_metadata=metadata, return_tensors="pt", return_metadata=True
+            videos=videos,
+            video_metadata=metadata,
+            do_sample_frames=False,
+            return_tensors="pt",
+            return_metadata=True,
         )
         video_grid_thw = video_inputs["video_grid_thw"]
         video_metadata = video_inputs.pop("video_metadata", None)
@@ -374,6 +391,7 @@ def _process_sample_qwen_vl_base(
 @DATA_TRANSFORM_REGISTRY.register("qwen3_vl_moe")
 @DATA_TRANSFORM_REGISTRY.register("qwen3_5")
 @DATA_TRANSFORM_REGISTRY.register("qwen3_5_moe")
+@DATA_TRANSFORM_REGISTRY.register("qwen4_exp")
 def process_sample_qwen_vl(
     sample: Dict[str, Any],
     processor: "ProcessorMixin",
@@ -405,7 +423,7 @@ def process_sample_qwen_omni(
     from .multimodal import conv_preprocess
     from .multimodal.audio_utils import fetch_audios
     from .multimodal.image_utils import fetch_images
-    from .multimodal.video_utils import fetch_videos
+    from .multimodal.video_utils import fetch_videos_metadata
 
     QWEN_OMNI_SYSTEM_MESSAGE = (
         "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
@@ -414,16 +432,9 @@ def process_sample_qwen_omni(
 
     def get_omni_token_ids(processor: "ProcessorMixin") -> tuple[int, int, int]:
         tokenizer = getattr(processor, "tokenizer", processor)
-        vocab = tokenizer.get_vocab()
-        image_token_id = vocab.get("<|image_pad|>", vocab.get("<|IMAGE|>"))
-        video_token_id = vocab.get("<|video_pad|>", vocab.get("<|VIDEO|>"))
-        audio_token_id = vocab.get("<|audio_pad|>", vocab.get("<|AUDIO|>"))
-        if image_token_id is None:
-            raise ValueError("Cannot find image token (<|image_pad|> or <|IMAGE|>) in tokenizer vocab.")
-        if video_token_id is None:
-            raise ValueError("Cannot find video token (<|video_pad|> or <|VIDEO|>) in tokenizer vocab.")
-        if audio_token_id is None:
-            raise ValueError("Cannot find audio token (<|audio_pad|> or <|AUDIO|>) in tokenizer vocab.")
+        image_token_id = _get_exact_token_id(tokenizer, "<|image_pad|>", "<|IMAGE|>")
+        video_token_id = _get_exact_token_id(tokenizer, "<|video_pad|>", "<|VIDEO|>")
+        audio_token_id = _get_exact_token_id(tokenizer, "<|audio_pad|>", "<|AUDIO|>")
         return image_token_id, video_token_id, audio_token_id
 
     image_token_id, video_token_id, audio_token_id = get_omni_token_ids(processor)
@@ -463,9 +474,9 @@ def process_sample_qwen_omni(
 
     videos = sample.get("videos", [])
     if videos:
-        videos, video_audios = fetch_videos(videos, **kwargs)
+        videos, video_metadata, video_audios, _ = fetch_videos_metadata(videos, **kwargs)
     else:
-        videos, video_audios = [], []
+        videos, video_metadata, video_audios = [], [], []
 
     audios = sample.get("audios", [])
     if audios:
@@ -488,6 +499,8 @@ def process_sample_qwen_omni(
         audios=audios,
         images=images,
         videos=videos,
+        video_metadata=video_metadata,
+        do_sample_frames=False,
         return_tensors="pt",
         padding=True,
     )
@@ -536,11 +549,8 @@ def process_sample_qwen_omni(
 
     labels = torch.full_like(input_ids, fill_value=IGNORE_INDEX)
     tokenizer = getattr(processor, "tokenizer", processor)
-    vocab = tokenizer.get_vocab()
-    user_token_id = vocab.get("user")
-    assistant_token_id = vocab.get("assistant")
-    if user_token_id is None or assistant_token_id is None:
-        raise ValueError("Cannot find user/assistant tokens in tokenizer vocab.")
+    user_token_id = _get_exact_token_id(tokenizer, "user")
+    assistant_token_id = _get_exact_token_id(tokenizer, "assistant")
     user_start_index = torch.where(input_ids == user_token_id)[0].tolist()
     assistant_start_index = torch.where(input_ids == assistant_token_id)[0].tolist()
     user_start_index.append(len(input_ids) + 1)

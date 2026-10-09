@@ -43,4 +43,16 @@ git rebase origin/master
 git push -u origin dev_your_branch
 ```
 
-6. Create a merge request from your branch `dev_your_branch`
+6. Create a pull request from your branch `dev_your_branch`
+
+## Code review
+
+GitHub pull requests are reviewed automatically by [CodeRabbit](https://docs.coderabbit.ai) once the `coderabbitai` GitHub App is installed on the repository.
+
+- New PRs receive a walkthrough and inline comments within a few minutes.
+- Already-open PRs: comment `@coderabbitai full review`.
+- Review only new commits: `@coderabbitai review`.
+- Skip one PR: add `@coderabbitai ignore` to the description.
+- Command list: `@coderabbitai help`.
+
+Review behavior is configured in `.coderabbit.yaml`.

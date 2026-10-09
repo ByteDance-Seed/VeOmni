@@ -37,7 +37,7 @@ import torch.nn.functional as F
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import reduce_sequence_parallel_loss
-from ....utils.loss_observer import get_chunk_loss_consumer
+from ....utils.loss_observer import get_chunk_loss_consumer, report_chunk_loss_observer_error
 from .eager import eager_cross_entropy
 
 
@@ -74,22 +74,32 @@ class ChunkLoss(torch.autograd.Function):
             )(hidden_states_chunk, head_weight, None, **loss_kwargs_chunks[i])
 
             if observer is not None:
-                chunk_labels = loss_kwargs_chunks[i]["labels"]
-                with torch.no_grad():
-                    per_token_loss = F.cross_entropy(
-                        chunk_logits,
-                        chunk_labels.reshape(-1).to(chunk_logits.device),
-                        ignore_index=loss_kwargs_chunks[i]["ignore_index"],
-                        reduction="none",
-                    )
-                observed_loss_chunks.append(per_token_loss.reshape(chunk_labels.shape).detach())
+                try:
+                    chunk_labels = loss_kwargs_chunks[i]["labels"]
+                    with torch.no_grad():
+                        per_token_loss = F.cross_entropy(
+                            chunk_logits,
+                            chunk_labels.reshape(-1).to(chunk_logits.device),
+                            ignore_index=loss_kwargs_chunks[i]["ignore_index"],
+                            reduction="none",
+                        )
+                    observed_loss_chunks.append(per_token_loss.reshape(chunk_labels.shape).detach())
+                except Exception as error:
+                    observed_loss_chunks.clear()
+                    observer = None
+                    if not report_chunk_loss_observer_error(error):
+                        raise
 
             accumulated_loss.add_(chunk_loss)
             grad_inputs_chunk.copy_(chunk_grad_input)
             grad_weight.add_(chunk_grad_weight)
 
         if observer is not None and observed_loss_chunks:
-            observer(torch.cat(observed_loss_chunks, dim=-1))
+            try:
+                observer(torch.cat(observed_loss_chunks, dim=-1))
+            except Exception as error:
+                if not report_chunk_loss_observer_error(error):
+                    raise
 
         ctx.save_for_backward(grad_inputs, grad_weight)
         return accumulated_loss
@@ -115,11 +125,9 @@ def chunk_loss_function(
     **kwargs,
 ) -> torch.Tensor:
     sp_enabled = get_parallel_state().sp_enabled
-    # Snapshot the pre-shift labels for the SP denominator — the non-SP branch
-    # below rewrites `labels` in place with the shifted view.
-    sp_reduction_labels = labels
-
-    if not sp_enabled:
+    if shift_labels is not None:
+        labels = shift_labels
+    elif not sp_enabled:
         labels = labels[..., 1:].contiguous()
         hidden_states = hidden_states[..., :-1, :].contiguous()
 
@@ -136,7 +144,6 @@ def chunk_loss_function(
             vocab_size,
             num_items_in_batch,
             ignore_index,
-            shift_labels,
             hidden_states=hidden_states,
             weights=weights,
             **kwargs,
@@ -144,9 +151,10 @@ def chunk_loss_function(
         return loss, logits
 
     chunk_labels = torch.split(labels, chunk_size, dim=1)
+    num_items_in_batch = (labels != ignore_index).sum()
 
     loss_kwargs_chunks = [
-        {"labels": chunk_labels[i], "ignore_index": ignore_index, "num_items_in_batch": (labels != ignore_index).sum()}
+        {"labels": chunk_labels[i], "ignore_index": ignore_index, "num_items_in_batch": num_items_in_batch}
         for i in range(len(chunk_labels))
     ]
 
@@ -155,6 +163,6 @@ def chunk_loss_function(
     # Match ``ForCausalLMLoss`` SP behavior so chunk_loss can back both
     # ForCausalLM and ForConditionalGeneration heads when SP is enabled.
     if sp_enabled:
-        num_valid_tokens = (sp_reduction_labels != ignore_index).sum()
+        num_valid_tokens = (labels != ignore_index).sum()
         chunk_loss = reduce_sequence_parallel_loss(chunk_loss, num_valid_tokens)
     return chunk_loss, None
