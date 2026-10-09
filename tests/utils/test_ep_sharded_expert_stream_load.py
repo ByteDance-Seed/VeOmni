@@ -221,6 +221,31 @@ def test_a_checkpoint_missing_one_ranks_whole_expert_range_raises_on_every_rank(
         _load_as_rank(monkeypatch, tmp_path, ep_rank, _meta_model())
 
 
+@pytest.mark.parametrize("ep_rank", range(EP_SIZE))
+def test_an_expert_missing_one_fused_source_key_raises_on_every_rank(monkeypatch, tmp_path, ep_rank):
+    """Expert 3 keeps ``up_proj`` but loses ``gate_proj``: only rank 1's ``finalize``
+    would see the unpaired buffer, so the up-front scan must catch it for rank 0 too."""
+    state = _write_checkpoint(tmp_path)
+    del state[PER_EXPERT.format(expert=NUM_EXPERTS - 1, proj="gate_proj")]
+    save_file(state, str(tmp_path / "model.safetensors"))
+
+    with pytest.raises(RuntimeError, match=rf"experts \[{NUM_EXPERTS - 1}\] have fewer than 2 source keys"):
+        _load_as_rank(monkeypatch, tmp_path, ep_rank, _meta_model())
+
+
+@pytest.mark.parametrize("ep_rank", range(EP_SIZE))
+def test_a_fused_source_key_missing_for_every_expert_raises_on_every_rank(monkeypatch, tmp_path, ep_rank):
+    """Uniform per-expert counts pass the up-front scan; each rank then stacks the
+    surviving ``up_proj`` with no ``gate_proj`` to pair, and its ``finalize`` raises."""
+    state = _write_checkpoint(tmp_path)
+    for expert in range(NUM_EXPERTS):
+        del state[PER_EXPERT.format(expert=expert, proj="gate_proj")]
+    save_file(state, str(tmp_path / "model.safetensors"))
+
+    with pytest.raises(RuntimeError, match="missing gate/up pair"):
+        _load_as_rank(monkeypatch, tmp_path, ep_rank, _meta_model())
+
+
 def test_a_checkpoint_with_more_experts_than_the_model_raises(monkeypatch, tmp_path):
     state = _write_checkpoint(tmp_path)
     for proj, shape in (("gate_proj", (INTERMEDIATE, HIDDEN)), ("up_proj", (INTERMEDIATE, HIDDEN))):

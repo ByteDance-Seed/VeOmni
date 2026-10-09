@@ -23,7 +23,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Literal, Optional, Sequence, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Literal, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -659,8 +659,9 @@ def load_model_weights_ep_sharded(
         into via ``fused_expert_target`` + ``for_expert_range``: each rank reads only
         the per-expert tensors in its ``Shard(0)`` expert range and stacks them into
         its local ``[E/ep, ...]`` slice; other ranks' experts are never read. Every
-        rank raises ``RuntimeError`` if the checkpoint does not hold per-expert keys
-        for exactly experts ``0..E-1`` of a built fused target.
+        rank raises ``RuntimeError`` if a built fused target that has per-expert keys
+        does not have them for exactly experts ``0..E-1``, each with the same number
+        of source keys (e.g. both ``gate_proj`` and ``up_proj``).
 
     PEFT is supported. Base-checkpoint keys are remapped to their PEFT
     ``base_layer`` FQNs (:func:`build_lora_key_overrides`) and streamed exactly
@@ -759,9 +760,10 @@ def load_model_weights_ep_sharded(
     unbuilt_expert_keys = set()
     if converter is not None:
         expert_ranges: Dict[Tuple[int, int], str] = {}
-        # Expert indices present per fused target. A rank whose whole range is absent
-        # never buffers anything, so its converter's ``finalize`` cannot flag the gap.
-        expert_ids: Dict[str, Set[int]] = {}
+        # Source-key count per expert of each fused target. A converter's ``finalize`` only
+        # sees its own rank's range, so a gap there would fail one rank (or, for a wholly
+        # absent range, none); checking here makes every rank reject the checkpoint.
+        expert_key_counts: Dict[str, Dict[int, int]] = {}
         num_experts_by_target: Dict[str, int] = {}
         for raw_name in key_to_file:
             bare_name = _convert_weight_key(raw_name, model)
@@ -787,14 +789,21 @@ def load_model_weights_ep_sharded(
             if fused_name not in num_experts_by_target:
                 start, num_local, num_experts_by_target[fused_name] = _local_expert_range(fused_name)
                 expert_ranges.setdefault((start, num_local), fused_name)
-            expert_ids.setdefault(fused_name, set()).add(target[1])
-        for fused_name, ids in expert_ids.items():
+            counts = expert_key_counts.setdefault(fused_name, {})
+            counts[target[1]] = counts.get(target[1], 0) + 1
+        for fused_name, counts in expert_key_counts.items():
             expected = set(range(num_experts_by_target[fused_name]))
             problems = []
-            if expected - ids:
-                problems.append(f"missing per-expert keys for experts {sorted(expected - ids)}")
-            if ids - expected:
-                problems.append(f"unexpected experts {sorted(ids - expected)}")
+            if expected - counts.keys():
+                problems.append(f"missing per-expert keys for experts {sorted(expected - counts.keys())}")
+            if counts.keys() - expected:
+                problems.append(f"unexpected experts {sorted(counts.keys() - expected)}")
+            # Several source keys can fuse into one target (gate_proj + up_proj -> gate_up_proj);
+            # every expert must contribute as many as the most complete one.
+            full = max(counts.values())
+            short = sorted(e for e, n in counts.items() if n < full)
+            if short:
+                problems.append(f"experts {short} have fewer than {full} source keys")
             if problems:
                 raise RuntimeError(
                     f"ep_sharded_stream_load: incomplete checkpoint detected for '{fused_name}' "
