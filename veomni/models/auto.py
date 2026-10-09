@@ -48,9 +48,7 @@ logger = logging.get_logger(__name__)
 # 1/cp_size of the sequence, and the run trains to a plausible loss curve while
 # being silently wrong.
 NATIVE_CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
-HEADWISE_GDN_CONTEXT_PARALLEL_MODEL_TYPES = frozenset(
-    {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}
-)
+HEADWISE_GDN_CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"})
 
 
 def check_context_parallel_supported(config: PretrainedConfig) -> None:

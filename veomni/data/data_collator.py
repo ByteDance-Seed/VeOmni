@@ -354,9 +354,7 @@ class SequenceParallelCollator(DataCollator):
         self.gdn_context_parallel_implementation = getattr(
             parallel_state, "gdn_context_parallel_implementation", "disabled"
         )
-        self.headwise_cp_enabled = (
-            self.cp_size > 1 and self.gdn_context_parallel_implementation == "headwise_lossless"
-        )
+        self.headwise_cp_enabled = self.cp_size > 1 and self.gdn_context_parallel_implementation == "headwise_lossless"
         self.dp_rank = int(getattr(parallel_state, "dp_rank", 0))
         self._data_parity_trace_limit = _data_parity_trace_limit()
         self._data_parity_trace_index = 0

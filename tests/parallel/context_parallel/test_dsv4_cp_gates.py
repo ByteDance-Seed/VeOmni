@@ -52,9 +52,7 @@ def test_gate_is_inert_when_no_parallel_state_was_installed(monkeypatch):
     ("model_type", "implementation"),
     [("deepseek_v4", "disabled"), ("qwen3_5_moe", "headwise_lossless")],
 )
-def test_model_gate_accepts_only_the_matching_context_parallel_implementation(
-    monkeypatch, model_type, implementation
-):
+def test_model_gate_accepts_only_the_matching_context_parallel_implementation(monkeypatch, model_type, implementation):
     state = SimpleNamespace(
         cp_enabled=True,
         gdn_context_parallel_implementation=implementation,
