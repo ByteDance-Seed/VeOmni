@@ -168,8 +168,12 @@ jobs:
           uv run --frozen pytest -v -s -x tests/models/test_vlm_trainer.py
           uv run --frozen pytest -v -s -x tests/trainer/test_aux_metrics.py
           uv run --frozen pytest -v -s -x tests/trainer/test_dit_microbatch.py
+          uv run --frozen pytest -v -s -x tests/models/test_minimax_h3_packing.py
           uv run --frozen pytest -v -s -x tests/lora/test_vlm_lora.py
           uv run --frozen pytest -v -s -x tests/models/test_checkpoint_tensor_converter.py
+      - name: Run SeedOmni unit tests
+        run: |
+          uv run --frozen pytest -v -s -x tests/seed_omni
       - name: Run fsdp2/extra_parallel+fsdp2 (e.g. ep+fsdp2, mb+fsdp2, ep+emb+fsdp2) clip grad norm test
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
@@ -179,6 +183,9 @@ jobs:
         # it runs on NPU via hccl).
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_moe_ep_sharded_load_matrix.py
+      - name: Run Qwen4 training compatibility regressions
+        run: |
+          uv run --frozen pytest -v -s -x tests/optim/test_master_fp32_adamw.py tests/optim/test_cpu_offload_adamw.py
       - name: Run checkpoint tests
         run: |
           uv run --frozen pytest -v -s -x tests/checkpoints/
@@ -186,6 +193,7 @@ jobs:
         run: |
           uv run --frozen pytest -v -s -x tests/distributed/test_async_offload_unit.py
           uv run --frozen pytest -v -s -x tests/distributed/test_dummy_forward.py
+          uv run --frozen pytest -v -s -x tests/distributed/test_emb_parallel.py
       - name: Run data tests
         run: |
           uv run --frozen pytest -v -s -x tests/data
