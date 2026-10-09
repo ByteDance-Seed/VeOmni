@@ -53,7 +53,6 @@ data:
   datasets_type: iterable
   multisource_datasets_type: veomni_weighted_multisource
   train_sample: 1000000
-  chat_template: default
   dataloader:
     type: native
     num_workers: 4

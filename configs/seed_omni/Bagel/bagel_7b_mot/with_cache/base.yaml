@@ -52,7 +52,6 @@ data:
   train_path: outputs/bagel_vae_cached_dataset
   datasets_type: iterable
   train_sample: 1000000
-  chat_template: default
   dataloader:
     type: native
     num_workers: 4

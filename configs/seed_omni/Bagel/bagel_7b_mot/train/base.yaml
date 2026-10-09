@@ -55,7 +55,6 @@ data:
   multisource_datasets_type: veomni_weighted_multisource
   # Iterable has no __len__; train_steps = ceil(train_sample / global_batch_size).
   train_sample: 1000000
-  chat_template: default
   dataloader:
     type: native
     num_workers: 4
