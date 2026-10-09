@@ -15,13 +15,6 @@ def get_parallel_plan():
             "ep": ep_plan,
         }
     )
-    # ParallelPlan only wraps the first key's parent on the ep_fsdp mesh. The MTP experts are
-    # EP-sliced too, so left out they would be re-sharded over the regular FSDP mesh and gather
-    # other ranks' experts.
-    parallel_plan.extra_parallel_fsdp_no_shard_module["ep"] = {
-        "model.language_model.layers.*.mlp.experts",
-        "mtp.layers.*.mlp.experts",
-    }
     return parallel_plan
 
 

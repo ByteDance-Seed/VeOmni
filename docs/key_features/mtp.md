@@ -253,14 +253,13 @@ in its patch config:
 5. `forward` extended with an explicit `mtp_labels` parameter (never left in
    `**kwargs`, which would leak it into the attention and CE kernels) assigning
    the per-head dictionary to `output.loss`.
-6. For a MoE head, list the MTP experts in the `ep` plan **and** in
-   `extra_parallel_fsdp_no_shard_module["ep"]` (see
-   `veomni/models/transformers/qwen3_5_moe/parallel_plan.py`), and keep the MTP
-   layer class in `_no_split_modules`. `ParallelPlan` registers only the parent of
-   the plan's first key for the `ep_fsdp` mesh, and the parallelizer pairs those
-   modules only under a wrap target. MTP experts that miss either are still
-   EP-sliced, but FSDP2 shards them again over the regular mesh, so each rank
-   gathers a mix of other ranks' experts without any error.
+6. For a MoE head, list the MTP experts in the `ep` plan (see
+   `veomni/models/transformers/qwen3_5_moe/parallel_plan.py`) and keep the MTP
+   layer class in `_no_split_modules`. `ParallelPlan` registers the parent of every
+   plan key for the `ep_fsdp` mesh, but the parallelizer pairs those modules only
+   under a wrap target. MTP experts outside a wrap target are still EP-sliced, but
+   FSDP2 shards them again over the regular mesh, so each rank gathers a mix of
+   other ranks' experts without any error.
 
 Note `config.modify_init()` looks like the natural fit for step 3 but is a **dead API**: `PatchType.INIT_MODIFICATION` has no implementation in patchgen's codegen, so
 the patch is silently dropped. Use `override_method("<Class>.__init__")`.

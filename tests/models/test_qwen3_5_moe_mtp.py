@@ -4,9 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
 from transformers import AutoConfig
 
+from veomni.distributed.parallel_plan import get_runtime_parallel_plan
 from veomni.distributed.utils import check_fqn_match
+from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
 from veomni.models.checkpoint_tensor_loading import maybe_convert_checkpoint_tensor
 from veomni.models.transformers.qwen3_5_moe import (
     register_qwen3_5_moe_modeling,
@@ -428,7 +431,7 @@ def test_qwen3_5_moe_reuses_checkpoint_index_mapping():
     assert not any("experts.0." in key for key in converted)
 
 
-def _build_conditional_generation(monkeypatch, mtp_loss_weight):
+def _build_conditional_generation(monkeypatch, mtp_loss_weight, model_cls=None):
     config = AutoConfig.from_pretrained(TOY_CONFIG)
     config.text_config.mtp_loss_weight = mtp_loss_weight
     monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
@@ -444,7 +447,7 @@ def _build_conditional_generation(monkeypatch, mtp_loss_weight):
         getattr(modeling, slot_name).bind("eager")
 
     with torch.device("meta"):
-        return modeling.Qwen3_5MoeForConditionalGeneration(config)
+        return (model_cls or modeling.Qwen3_5MoeForConditionalGeneration)(config)
 
 
 def test_qwen3_5_moe_conditional_generation_builds_mtp(monkeypatch):
@@ -474,3 +477,24 @@ def test_qwen3_5_moe_parallel_plan_wraps_every_ep_sliced_owner_on_the_ep_mesh(mo
     wrap_targets = [name for name, module in model.named_modules() if type(module).__name__ in model._no_split_modules]
     for owner in ep_owners:
         assert any(owner.startswith(target + ".") for target in wrap_targets), owner
+
+
+def test_qwen3_5_moe_moe_lora_plan_rewrite_keeps_mtp_experts_ep_sliced(monkeypatch):
+    """The MoE-LoRA rewrite replaces only the trunk expert patterns; the MTP experts stay unwrapped."""
+    model = _build_conditional_generation(
+        monkeypatch, mtp_loss_weight=0.3, model_cls=register_qwen3_5_moe_modeling("Qwen3_5MoeForConditionalGeneration")
+    )
+    lora_config = yaml.safe_load(Path("configs/text/qwen3_5_moe_lora.yaml").read_text(encoding="utf-8"))
+    resolved = resolve_fused_moe_lora_targets(model, lora_config["model"]["lora_config"])
+    wrapped = VeOmniLoraModel(model, VeOmniLoraConfig.from_yaml(resolved))
+    ep_plan = get_runtime_parallel_plan(wrapped).extra_parallel_plan["ep"]
+
+    expert_weights = [
+        name
+        for name, _ in wrapped.named_parameters()
+        if ".mlp.experts." in name and ("gate_up_proj" in name or "down_proj" in name) and "lora_" not in name
+    ]
+    assert any(".mtp." in name for name in expert_weights)
+    assert any(".base_layer." in name for name in expert_weights)
+    for name in expert_weights:
+        assert any(check_fqn_match(pattern, name) for pattern in ep_plan), name
