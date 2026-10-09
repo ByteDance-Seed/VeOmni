@@ -30,9 +30,9 @@
 #    - method_override: DeepseekV4Indexer.forward
 #      NPU Lightning Indexer dispatch with eager/TileLang compatibility paths
 #    - method_override: DeepseekV4Attention.forward
-#      Packed compressor path + Ulysses SP for DeepSeek-V4 eager/TileLang attention
+#      Packed compressor path + NPU sparse attention metadata + Ulysses SP
 #    - function_replacement: eager_attention_forward
-#      Optional TileLang sparse MQA dispatch (no-ops to eager on NPU)
+#      NPU sparse FlashMLA dispatch with eager/TileLang compatibility paths
 #    - method_override: DeepseekV4Model.forward
 #      Packed boundaries, SP-aware full-sequence masks, stateless indexer dispatch
 #    - class_replacement: DeepseekV4Experts
@@ -1531,21 +1531,9 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 # ======================================================================
 # [PATCHED FUNCTION] eager_attention_forward
-# Reason: Optional TileLang sparse MQA dispatch (no-ops to eager on NPU)
-# Source: veomni.models.transformers.deepseek_v4.deepseek_v4_gpu_patch_gen_config
+# Reason: NPU sparse FlashMLA dispatch with eager/TileLang compatibility paths
+# Source: veomni.models.transformers.deepseek_v4.deepseek_v4_npu_patch_gen_config
 # ======================================================================
-# ================================================================
-# Patch: eager_attention_forward
-# 1. Dispatch DeepSeek-V4 attention to the TileLang sparse MQA kernel when
-#    ``dsa_attention_implementation=tilelang``. The existing additive mask is
-#    converted to a compact fixed-width index list, preserving sliding-window,
-#    compressor, causal, and invalid-index semantics.
-# 2. Preserve the upstream eager implementation as the default fallback.
-# 3. Return the indexer loss's teacher distribution as a third value when the
-#    caller sets ``indexer_target_width``. The return annotation states that
-#    arity, so a caller reads the contract off the signature rather than off a
-#    comment; ``indexer_target_width`` is the only thing that selects it.
-# ================================================================
 def eager_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -1793,20 +1781,6 @@ class DeepseekV4Attention(nn.Module):
             COMPRESSOR_CLASSES[self.layer_type](config) if self.layer_type != "sliding_attention" else None
         )
 
-    # ================================================================
-    # Patch: DeepseekV4Attention.forward
-    # 1. Pass the collator-provided packed sequence slices into compressors.
-    # 2. Ulysses SP: all-to-all Q heads, sequence all-gather for MQA KV and
-    #    compressor inputs (windows/indexers need the full sequence), then
-    #    scatter attention outputs back to the local sequence shard.
-    # 3. Context parallelism: shard the queries instead of the heads and
-    #    replicate the MQA KV, so both Ulysses all-to-alls disappear and the
-    #    sparse indices keep addressing global KV rows.
-    # 4. Under ``dsa_indexer_loss`` on a CSA layer, return the indexer KL and its
-    #    zero-information reference as third and fourth values. The return
-    #    annotation states that arity, so a caller reads the contract off the
-    #    signature rather than off a comment -- keep the two in step.
-    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
