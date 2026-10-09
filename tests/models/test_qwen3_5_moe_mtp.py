@@ -484,7 +484,8 @@ def test_qwen3_5_moe_moe_lora_plan_rewrite_keeps_mtp_experts_ep_sliced(monkeypat
     model = _build_conditional_generation(
         monkeypatch, mtp_loss_weight=0.3, model_cls=register_qwen3_5_moe_modeling("Qwen3_5MoeForConditionalGeneration")
     )
-    lora_config = yaml.safe_load(Path("configs/text/qwen3_5_moe_lora.yaml").read_text(encoding="utf-8"))
+    lora_config_path = Path(__file__).parents[2] / "configs" / "text" / "qwen3_5_moe_lora.yaml"
+    lora_config = yaml.safe_load(lora_config_path.read_text(encoding="utf-8"))
     resolved = resolve_fused_moe_lora_targets(model, lora_config["model"]["lora_config"])
     wrapped = VeOmniLoraModel(model, VeOmniLoraConfig.from_yaml(resolved))
     ep_plan = get_runtime_parallel_plan(wrapped).extra_parallel_plan["ep"]
