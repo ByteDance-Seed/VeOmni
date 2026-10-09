@@ -9,8 +9,6 @@ qwen3_text_encoder:
   accelerator:
     gradient_checkpointing:
       enable: false
-  optimizer:
-    weight_decay: 0.0 # AdamW's decoupled decay would move the frozen embedding rows
   model_config:
     enable_image: true
 qwen3_llm:

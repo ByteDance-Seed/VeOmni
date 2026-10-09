@@ -169,6 +169,7 @@ defaults; `generate` / FSM inference lives natively on `modeling.py` (see
 | `pre_forward(method, **kwargs)` | training | prep inputs (conversation list, or packed tensors for Janus `pack_*` nodes) |
 | `post_forward(method, **outputs)` | training | write results back (conversation list, or packed features / losses) |
 | `freeze_model()` | build | freeze a parameter subset |
+| `configure_optimizer(optimizer)` | build | adjust the module's param groups or register step hooks, before the lr-scheduler is built and a checkpoint is loaded |
 | `get_parallel_plan()` | build | per-module FSDP/SP plan |
 | `get_assets()` | save | processors / tokenizers to checkpoint |
 | `dummy_inputs(...)` | training | zero placeholders to keep FSDP aligned |

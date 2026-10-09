@@ -276,10 +276,16 @@ unsharded it, to the rows the lookup reads, sliced to this rank's vocab rows whe
 an `emb` plan splits the table. The tied `embed_tokens.project` reads that same
 parameter, so its gradient is masked too, provided `encode` runs before the first
 `decode` (it always does in this graph). It therefore holds under `ddp`, `fsdp2`
-and `emb` alike. Keep **`weight_decay: 0`** for this module (set in
-`visual_instruction_tuning/modules_train.yaml`): AdamW's decoupled decay
-(`p -= lr * wd * p`) does not go through the gradient, so it would still shrink
-the masked rows, and with them the tied output head.
+and `emb` alike.
+
+AdamW's decoupled weight decay (`p *= 1 - lr * wd`) does not go through the
+gradient, so the mask alone would still let it shrink the frozen rows, and with
+them the tied output head. The module's `configure_optimizer` therefore takes the
+table's weight decay over: it sets that param group's `weight_decay` to 0 and
+applies the module's configured value (the model-level `optimizer.weight_decay`
+unless the module overrides it) to the vision rows alone, from an optimizer step
+pre-hook, before the update as AdamW would. The frozen rows stay bit-identical,
+and the vision rows decay like any other trained parameter.
 
 > The special-token rows load verbatim from Qwen3-0.6B (an untrained reserved
 > stub). They start training from there; if you want a better starting point,
@@ -315,7 +321,7 @@ suffix:
 | File | Role |
 |------|------|
 | `visual_instruction_tuning/base.yaml` | Launcher (model paths, accelerator, data, train, infer). |
-| `visual_instruction_tuning/modules_train.yaml` | All overrides: `qwen3vl_vision` merger retarget (`out_hidden_size`) + `disable_deepstack` + `freeze`; `qwen3_text_encoder` image mode + special-token freeze (`weight_decay: 0`). Add `--accelerator.ulysses_size N` for uniform Ulysses SP — no separate SP config (see [§7.5](#75-train-on-sharegpt4v)). |
+| `visual_instruction_tuning/modules_train.yaml` | All overrides: `qwen3vl_vision` merger retarget (`out_hidden_size`) + `disable_deepstack` + `freeze`; `qwen3_text_encoder` image mode + special-token freeze. Add `--accelerator.ulysses_size N` for uniform Ulysses SP — no separate SP config (see [§7.5](#75-train-on-sharegpt4v)). |
 | `visual_instruction_tuning/graph_train.yaml` | `{qwen3vl_vision, qwen3_text_encoder.encode} → qwen3_llm → qwen3_text_encoder.decode → end`. |
 | `visual_instruction_tuning/data.yaml` | ShareGPT4V captions (image + text). |
 | `visual_instruction_tuning/graph_infer.yaml` | I2T generation FSM. |

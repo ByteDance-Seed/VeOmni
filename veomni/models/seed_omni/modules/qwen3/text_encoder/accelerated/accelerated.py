@@ -8,6 +8,8 @@ image-mode vision-token freeze (both genuinely accelerated-only).
 from typing import Any, Dict, Optional
 
 import torch
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from veomni.distributed.emb_parallel import ShardedEmbedding
 from veomni.distributed.parallel_state import get_parallel_state
@@ -80,16 +82,75 @@ class TrainingMixin(BaseTrainingMixin):
         # ``encode`` must run before the first ``decode``.
         self.embed_tokens.register_forward_pre_hook(self._mask_frozen_embedding_rows)
 
+    def _emb_row_offset(self, rows: int) -> int:
+        """First table row of a weight holding ``rows`` rows: this rank's ``emb`` slice, if split."""
+        if rows == self.embed_tokens.num_embeddings:
+            return 0
+        return get_parallel_state().extra_parallel_rank("emb") * rows
+
     def _mask_frozen_embedding_rows(self, embed_tokens: torch.nn.Module, args: tuple) -> None:
         weight = embed_tokens.weight
         if not weight.requires_grad or getattr(weight, "_frozen_rows_masked", False):
             return
         rows = weight.shape[0]
-        start = 0 if rows == embed_tokens.num_embeddings else get_parallel_state().extra_parallel_rank("emb") * rows
+        start = self._emb_row_offset(rows)
         mask = self._trainable_row_mask[start : start + rows].to(device=weight.device, dtype=weight.dtype)
         weight.register_hook(lambda grad: grad * mask.unsqueeze(1))
         # FSDP2 keeps one unsharded parameter across steps, so hook it once.
         weight._frozen_rows_masked = True
+
+    def configure_optimizer(self, optimizer: torch.optim.Optimizer) -> None:
+        """Apply the table's weight decay to the vision rows only.
+
+        AdamW decays a whole parameter outside the gradient, so the masked rows
+        would still shrink. Their group's ``weight_decay`` is taken over: set to 0
+        for AdamW, and applied to the trainable rows by a step pre-hook, the same
+        ``p *= 1 - lr * wd`` before the update that AdamW would do.
+        """
+        if self._trainable_row_mask is None:
+            return
+        weight = self.embed_tokens.weight
+        sub_optimizers = getattr(optimizer, "optimizers_dict", {None: optimizer}).values()
+        owner = next((o for o in sub_optimizers if _param_group_of(o, weight) is not None), None)
+        if owner is None:
+            return
+        group = _param_group_of(owner, weight)
+        self._row_weight_decay = group["weight_decay"]
+        if not self._row_weight_decay:
+            return
+        if len(group["params"]) > 1:
+            group["params"] = [p for p in group["params"] if p is not weight]
+            owner.add_param_group({**group, "params": [weight], "weight_decay": 0.0})
+        else:
+            group["weight_decay"] = 0.0
+
+        local_rows = weight.shape[0]
+        start = self._emb_row_offset(local_rows)
+        if isinstance(weight, DTensor):
+            local_shape, offset = compute_local_shape_and_global_offset(
+                weight.shape, weight.device_mesh, weight.placements
+            )
+            start += offset[0]
+            local_rows = local_shape[0]
+        rows = self._trainable_row_mask[start : start + local_rows].nonzero().flatten()
+        self._decayed_rows = rows.to(weight.device)
+        self._decayed_weight = weight
+        optimizer.register_step_pre_hook(self._decay_trainable_rows)
+
+    def _decay_trainable_rows(self, optimizer: torch.optim.Optimizer, args: tuple, kwargs: dict) -> None:
+        weight = self._decayed_weight
+        group = _param_group_of(optimizer, weight)
+        if group is None or weight.grad is None:
+            return
+        # Loading a checkpoint rebuilds the param groups with their saved weight decay.
+        group["weight_decay"] = 0.0
+        local = weight.to_local() if isinstance(weight, DTensor) else weight
+        with torch.no_grad():
+            local[self._decayed_rows] *= 1 - group["lr"] * self._row_weight_decay
+
+
+def _param_group_of(optimizer: torch.optim.Optimizer, param: torch.Tensor) -> Optional[Dict[str, Any]]:
+    return next((g for g in optimizer.param_groups if any(p is param for p in g["params"])), None)
 
 
 class VeOmniMixin(TrainingMixin, BaseVeOmniMixin):

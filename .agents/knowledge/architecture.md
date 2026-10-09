@@ -229,7 +229,7 @@ V2 reuses lower-level libraries (`distributed/`, `optim/`, `models/`, `data/`, `
 | `build_model_assets` | binds the preprocessor onto the model (`bind_module_assets`), because the graph calls the module; HF export reads it back off the live model |
 | `freeze_model` | heads the base's parameter table and VRAM reading with the module's name — N modules build in sequence, so an unattributed report says nothing about which one moved the number |
 | `build_parallelized_model` | a custom runtime subclass may own the wrap via `customized_build_parallelize_model` (e.g. EP-sharded CPU streaming). `fsdp_scope='model'` makes this a no-op so the composer can wrap `OmniModel` |
-| `build_optimizer` / `build_lr_scheduler` | no-op for a fully-frozen module; both scope to the module's own mesh |
+| `build_optimizer` / `build_lr_scheduler` | no-op for a fully-frozen module; both scope to the module's own mesh. `build_optimizer` then hands the optimizer to the module's `configure_optimizer(optimizer)`, if it defines one |
 | `build_checkpoint` | per-module `OmniModuleCheckpointManager` under `<save_path>/global_step_N/<module>/`, and **none at all** when frozen — which is why `load` / `save_dcp` / `save_hf_or_lora` tolerate a missing manager |
 | `clip_grad_norm` | returns *this* module's norm (`veomni_omni_module_clip_grad_norm`); the orchestrator combines them |
 | `skip_hf_weight_load` | a frozen module with persistent state has no DCP payload to restore, so it must veto the skip |

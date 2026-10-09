@@ -82,6 +82,23 @@ def _dense_masked_grad() -> torch.Tensor:
     return table.grad * keep.unsqueeze(1)
 
 
+_LR, _WD = 0.1, 0.5
+
+
+def _vision_rows() -> torch.Tensor:
+    keep = torch.zeros(_VOCAB, dtype=torch.bool)
+    keep[list(_VISION_IDS.values())] = True
+    return keep
+
+
+def _dense_adamw_step(table: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
+    """One AdamW step on a dense copy, decaying every row."""
+    param = nn.Parameter(table.clone())
+    param.grad = grad.clone()
+    torch.optim.AdamW([param], lr=_LR, weight_decay=_WD, foreach=False).step()
+    return param.detach()
+
+
 def _fsdp_rank_main(rank: int, rendezvous: str, out_dir: str, layout: str) -> None:
     """``emb``: emb=2 x emb_fsdp=2. ``dp``: emb off, the table a plain FSDP2 unit over all ranks."""
     from torch.distributed.device_mesh import init_device_mesh
@@ -124,9 +141,18 @@ def _fsdp_rank_main(rank: int, rendezvous: str, out_dir: str, layout: str) -> No
 
         grad = text_encoder.embed_tokens.weight.grad.full_tensor()
         expected = _dense_masked_grad()[chunk] / divisor
+
+        optimizer = torch.optim.AdamW(text_encoder.parameters(), lr=_LR, weight_decay=_WD, foreach=False)
+        text_encoder.configure_optimizer(optimizer)
+        optimizer.step()
+        stepped = text_encoder.embed_tokens.weight.detach().full_tensor()
+        vision = _vision_rows()[chunk]
+        reference = _dense_adamw_step(_table()[chunk], expected)
         result = {
             "grad_matches_dense_masked": torch.allclose(grad, expected, atol=1e-5),
             "frozen_rows_are_zero": bool((grad[expected.abs().sum(1) == 0] == 0).all()),
+            "frozen_rows_unchanged": torch.equal(stepped[~vision], _table()[chunk][~vision]),
+            "vision_rows_match_adamw": torch.allclose(stepped[vision], reference[vision], atol=1e-6),
         }
         with open(f"{out_dir}/rank{rank}.json", "w") as f:
             json.dump(result, f)
@@ -153,6 +179,50 @@ def test_qwen3_image_mode_masks_the_weight_that_replaced_the_frozen_one(monkeypa
         logits = _encode_then_project(text_encoder, ids)
         (logits * _upstream_grad(rank, *logits.shape)).sum().backward()
     torch.testing.assert_close(text_encoder.embed_tokens.weight.grad, _dense_masked_grad())
+
+
+def test_qwen3_image_mode_weight_decay_reaches_only_vision_rows(monkeypatch):
+    """The table shares a group with another parameter, and a resume reloads the group's decay."""
+    _install_state(None, monkeypatch)
+    text_encoder = _image_mode_text_encoder()
+    text_encoder.freeze_model()
+    text_encoder.embed_tokens.weight = nn.Parameter(_table())
+    other = nn.Parameter(torch.ones(2))
+    optimizer = torch.optim.AdamW([text_encoder.embed_tokens.weight, other], lr=_LR, weight_decay=_WD, foreach=False)
+    text_encoder.configure_optimizer(optimizer)
+    saved = optimizer.state_dict()
+    for group in saved["param_groups"]:
+        group["weight_decay"] = _WD
+    optimizer.load_state_dict(saved)
+
+    vision = _vision_rows()
+    for _ in range(2):
+        optimizer.zero_grad()
+        logits = _encode_then_project(text_encoder, _RANK_IDS[0])
+        (logits * _upstream_grad(0, *logits.shape)).sum().backward()
+        other.grad = torch.zeros_like(other)
+        optimizer.step()
+
+    weight = text_encoder.embed_tokens.weight.detach()
+    assert torch.equal(weight[~vision], _table()[~vision])
+    # Every vision row is either looked up or read by the tied head, so each one moved.
+    assert not torch.equal(weight[vision], _table()[vision])
+    torch.testing.assert_close(other.detach(), torch.full((2,), (1 - _LR * _WD) ** 2))
+
+
+def test_qwen3_image_mode_vision_rows_follow_adamw_with_weight_decay(monkeypatch):
+    _install_state(None, monkeypatch)
+    text_encoder = _image_mode_text_encoder()
+    text_encoder.freeze_model()
+    text_encoder.embed_tokens.weight = nn.Parameter(_table())
+    optimizer = torch.optim.AdamW(text_encoder.parameters(), lr=_LR, weight_decay=_WD, foreach=False)
+    text_encoder.configure_optimizer(optimizer)
+    logits = _encode_then_project(text_encoder, _RANK_IDS[1])
+    (logits * _upstream_grad(1, *logits.shape)).sum().backward()
+    reference = _dense_adamw_step(_table(), text_encoder.embed_tokens.weight.grad)
+    optimizer.step()
+    vision = _vision_rows()
+    torch.testing.assert_close(text_encoder.embed_tokens.weight.detach()[vision], reference[vision])
 
 
 def test_text_only_qwen3_trains_every_row(monkeypatch):
