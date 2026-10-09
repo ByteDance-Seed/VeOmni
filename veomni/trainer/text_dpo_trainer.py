@@ -327,7 +327,7 @@ class TextDPOTrainer:
     def forward_backward_step(
         self, micro_batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        channel_loss_callback = getattr(self.base, "channel_loss_callback", None)
+        channel_loss_callback = BaseTrainer._get_registered_channel_loss_callback(self.base)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.base.state, micro_batch)
             if channel_loss_callback is not None

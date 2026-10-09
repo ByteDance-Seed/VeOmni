@@ -1901,9 +1901,12 @@ def test_base_step_begin_skips_unregistered_channel_loss_callback():
     assert calls == ["registered"]
 
 
-def test_base_forward_backward_allows_missing_channel_loss_callback(monkeypatch):
+@pytest.mark.parametrize("callback", [None, object()], ids=["missing", "unregistered"])
+def test_base_forward_backward_allows_missing_channel_loss_callback(monkeypatch, callback):
     _install_test_parallel_state(monkeypatch)
     trainer = object.__new__(BaseTrainer)
+    trainer.channel_loss_callback = callback
+    trainer._callbacks = []
     trainer.state = TrainerState(global_step=1)
     trainer.device = torch.device("cpu")
     trainer.args = SimpleNamespace(
@@ -1948,6 +1951,7 @@ def test_base_forward_backward_strips_channel_metadata_after_preforward(monkeypa
     trainer.LOG_SAMPLE = False
     trainer.postforward = lambda outputs, micro_batch: (outputs.loss, {"loss": outputs.loss.detach()})
     trainer.channel_loss_callback = ChannelLossCallback(trainer)
+    trainer._callbacks = [trainer.channel_loss_callback]
     preforward_seen = {}
 
     def preforward(micro_batch):
@@ -2064,6 +2068,7 @@ def test_base_forward_backward_composes_channel_loss_and_chunk_mbs_contexts(monk
     trainer.LOG_SAMPLE = False
     trainer.postforward = lambda outputs, micro_batch: (outputs.loss, {"loss": outputs.loss.detach()})
     trainer.channel_loss_callback = ChannelLossCallback(trainer)
+    trainer._callbacks = [trainer.channel_loss_callback]
     original_compute_side_channel = trainer.channel_loss_callback.computer.compute_side_channel
 
     def record_observation(*args, **kwargs):
@@ -2123,6 +2128,7 @@ def test_dpo_forward_backward_scopes_channel_loss_to_policy_model(monkeypatch):
         model_bwd_context=nullcontext(),
     )
     base.channel_loss_callback = ChannelLossCallback(base)
+    base._callbacks = [base.channel_loss_callback]
     preforward_seen = {}
 
     def preforward(micro_batch):

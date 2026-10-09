@@ -675,15 +675,19 @@ class BaseTrainer(Stateful, ABC):
         for callback in self._callbacks:
             callback.on_epoch_end(self.state)
 
+    def _get_registered_channel_loss_callback(self):
+        callback = getattr(self, "channel_loss_callback", None)
+        if callback is not None and any(item is callback for item in getattr(self, "_callbacks", ())):
+            return callback
+        return None
+
     def on_step_begin(self, micro_batches=None, **kwargs):
         # Multi-source accounting consumes ``ds_idx`` / ``source_name`` from the
         # micro-batches. Channel loss must snapshot that metadata first, while
         # keeping its on_step_end position after the meter so its metrics are not
         # overwritten by the meter's per-step reset.
-        channel_loss_callback = getattr(self, "channel_loss_callback", None)
-        channel_loss_registered = channel_loss_callback is not None and any(
-            callback is channel_loss_callback for callback in self._callbacks
-        )
+        channel_loss_callback = self._get_registered_channel_loss_callback()
+        channel_loss_registered = channel_loss_callback is not None
         if channel_loss_registered:
             channel_loss_callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
         for callback in self._callbacks:
@@ -732,7 +736,7 @@ class BaseTrainer(Stateful, ABC):
     def forward_backward_step(
         self, micro_batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        channel_loss_callback = getattr(self, "channel_loss_callback", None)
+        channel_loss_callback = self._get_registered_channel_loss_callback()
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
             if channel_loss_callback is not None
