@@ -46,7 +46,7 @@ class AllToAllEmbedding(torch.autograd.Function):
     (all-to-all) to their owning rank, looked up locally on that rank's shard,
     then the embeddings are shipped back (all-to-all) and reassembled in input
     order. Backward routes the per-token grads back the same way and index-adds
-    them into the local shard, in fp32 over only the rows this step touched.
+    them into the local shard, in at least fp32 over only the rows this step touched.
 
     Every rank learns in the first exchange whether any rank holds an id outside
     ``[0, vocab)``, and all of them raise before dispatching ids. Bucketing by
@@ -169,12 +169,13 @@ class AllToAllEmbedding(torch.autograd.Function):
             ctx.embedding_table_shape, device=grad_output.device, dtype=ctx.embedding_table_dtype
         )
         if grad_recv_buf.numel() > 0:
-            # Accumulate in fp32 (frequent tokens sum many rows into one), but only
-            # over touched rows: a full-table fp32 buffer would triple the peak.
+            # Accumulate in at least fp32 (frequent tokens sum many rows into one), but
+            # only over touched rows: a full-table fp32 buffer would triple the peak.
             # ``unique`` costs one host sync; ``index_copy_`` needs long indices.
+            accum_dtype = torch.promote_types(ctx.embedding_table_dtype, torch.float32)
             rows, inverse = torch.unique(local_indices.long(), return_inverse=True)
-            row_grads = torch.zeros(rows.numel(), embedding_dim, device=grad_output.device, dtype=torch.float32)
-            row_grads.index_add_(0, inverse, grad_recv_buf.float())
+            row_grads = torch.zeros(rows.numel(), embedding_dim, device=grad_output.device, dtype=accum_dtype)
+            row_grads.index_add_(0, inverse, grad_recv_buf.to(accum_dtype))
             grad_embedding_table.index_copy_(0, rows, row_grads.to(ctx.embedding_table_dtype))
 
         # Gradients for (group, input_tensor, embedding_table)

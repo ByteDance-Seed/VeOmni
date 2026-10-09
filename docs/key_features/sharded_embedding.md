@@ -34,7 +34,7 @@ Each rank therefore stores `[V / emb, H / emb_fsdp]`. The parallelizer wraps the
 3. Each owner runs a local `F.embedding` on the ids it received, rebased to its own rows.
 4. All-to-all the vectors back and restore the original order and shape.
 
-Backward runs the same exchange in reverse. It sums the incoming row gradients in fp32 over the rows that were actually touched, then casts the sum to the table dtype. Called with a group of one rank (or no group), the op aliases its buffers instead of running collectives, and reduces exactly to `F.embedding`.
+Backward runs the same exchange in reverse. It sums the incoming row gradients in at least fp32 over the rows that were actually touched, then casts the sum to the table dtype. Called with a group of one rank (or no group), the op aliases its buffers instead of running collectives, and reduces exactly to `F.embedding`.
 
 ### Tied output head
 
