@@ -114,13 +114,12 @@ class ShardedEmbedding(nn.Embedding):
         return True
 
     def _check_own_fsdp_unit(self) -> None:
-        # Any unit not on the emb_fsdp mesh (a parent unit, or its own unit on the regular FSDP mesh)
-        # gathers plain, correctly shaped rows that mix different ranks' vocab slices.
-        if not isinstance(self, FSDPModule) or getattr(self, "_extra_parallel_name", None) != "emb":
+        if not isinstance(self, FSDPModule):
+            # Inside a parent unit the rows are plain and correctly shaped, but that unit sharded and
+            # gathered them over the whole FSDP mesh, mixing different ranks' vocab slices.
             raise RuntimeError(
-                f"{type(self).__name__} holds a split table but is not the emb module's own FSDP2 unit on the "
-                f"emb_fsdp mesh. List {type(self).__name__} (or a module class containing it) in the model's "
-                "_no_split_modules, and make its weight the emb plan's only (first) entry."
+                f"{type(self).__name__} holds a split table but is not its own FSDP2 unit; list "
+                f"{type(self).__name__} (or a module class containing it) in the model's _no_split_modules."
             )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
