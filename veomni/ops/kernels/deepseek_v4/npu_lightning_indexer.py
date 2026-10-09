@@ -1,7 +1,21 @@
 from functools import lru_cache
 
 import torch
-from cann_ops_transformer import ops
+
+
+def _ops():
+    try:
+        from cann_ops_transformer import ops
+    except ImportError as exc:
+        raise ImportError("cann_ops_transformer is required for the NPU Lightning Indexer.") from exc
+    return ops
+
+
+def _causal_compression_residual(original_key_len: int, compress_rate: int) -> int:
+    """Return the pre-compression key-length remainder required by CANN."""
+    if compress_rate == 0:
+        compress_rate = 1
+    return original_key_len % compress_rate
 
 
 @lru_cache(maxsize=8)
@@ -20,7 +34,7 @@ def get_npu_lightning_indexer_metadata(
 ):
     """Build the metadata tensor required by the sparse + cmp + mask_mode=3 path."""
     cmp_residual_k = torch.full((batch_size,), residual, dtype=torch.int32, device=device)
-    return ops.lightning_indexer_metadata(
+    return _ops().lightning_indexer_metadata(
         num_heads,
         1,
         head_dim,
@@ -61,7 +75,7 @@ def npu_lightning_indexer(
     top_k = min(top_k, S_K)
     if compress_rate == 0:
         compress_rate = 1
-    residual = S_K % compress_rate
+    residual = _causal_compression_residual(seq_len, compress_rate)
     cmp_residual_k = torch.full((batch,), residual, dtype=torch.int32, device=q.device)
 
     q_in = q.contiguous().to(torch.bfloat16)
@@ -80,7 +94,7 @@ def npu_lightning_indexer(
         cmp_ratio=compress_rate,
     )
 
-    sparse_indices, sparse_values = ops.lightning_indexer(
+    sparse_indices, sparse_values = _ops().lightning_indexer(
         q_in,
         k_in,
         weights,

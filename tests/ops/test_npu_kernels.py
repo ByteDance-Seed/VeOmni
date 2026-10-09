@@ -440,6 +440,43 @@ class TestHcclPremulSum:
             dist.reduce_scatter_tensor = orig_reduce_scatter_tensor
 
 
+class TestNPULightningIndexer:
+    @pytest.mark.parametrize(("seq_len", "expected_residual"), [(17, 1), (18, 2)])
+    def test_uses_original_key_length_for_causal_compression_residual(
+        self, monkeypatch, seq_len, expected_residual
+    ):
+        from veomni.ops.kernels.deepseek_v4 import npu_lightning_indexer as module
+
+        seen_residuals = []
+
+        class FakeOps:
+            @staticmethod
+            def lightning_indexer_metadata(*args, cmp_residual_k, **kwargs):
+                seen_residuals.append(cmp_residual_k.cpu().tolist())
+                return torch.empty(1, dtype=torch.int32, device=DEVICE)
+
+            @staticmethod
+            def lightning_indexer(q, k, w, top_k, *, cmp_residual_k, **kwargs):
+                seen_residuals.append(cmp_residual_k.cpu().tolist())
+                shape = (q.shape[0], q.shape[1], 1, top_k)
+                indices = torch.zeros(shape, dtype=torch.int32, device=q.device)
+                values = torch.zeros(shape, dtype=torch.float32, device=q.device)
+                return indices, values
+
+        monkeypatch.setattr(module, "_ops", lambda: FakeOps)
+        module.get_npu_lightning_indexer_metadata.cache_clear()
+
+        batch, num_heads, head_dim, compress_rate = 1, 32, 128, 4
+        compressed_len = seq_len // compress_rate
+        q = torch.zeros((batch, seq_len, num_heads, head_dim), dtype=torch.bfloat16, device=DEVICE)
+        compressed_kv = torch.zeros((batch, compressed_len, head_dim), dtype=torch.bfloat16, device=DEVICE)
+        weights = torch.zeros((batch, seq_len, num_heads), dtype=torch.float32, device=DEVICE)
+
+        module.npu_lightning_indexer(q, compressed_kv, weights, compressed_len, compress_rate=compress_rate)
+
+        assert compressed_len % compress_rate == 0  # The old implementation incorrectly passed zero.
+        assert seen_residuals == [[expected_residual], [expected_residual]]
+
 # ---------------------------------------------------------------------------
 # Kernel registry NPU registrations sanity checks
 # ---------------------------------------------------------------------------
