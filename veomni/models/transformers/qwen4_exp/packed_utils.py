@@ -19,6 +19,13 @@ from ....distributed.sequence_parallel import gather_outputs
 _MAX_SCORE_ELEMENTS = 16 * 1024 * 1024
 
 
+def _qsa_masked_fill_value(device_type: str) -> float:
+    # ReLU makes finite valid scores nonnegative, including exact zeros.
+    # CANN TopKV2 can fault on sparse rows masked with -inf. Keep a finite
+    # sentinel strictly below valid scores; top_valid still removes masked picks.
+    return -1.0 if device_type == "npu" else float("-inf")
+
+
 def _packed_segments(
     batch_size: int,
     seq_len: int,
@@ -176,7 +183,7 @@ def compact_qsa_select(
                 block_starts[None, None] + indexer.compress_ratio - 1
                 <= query_positions[None, query_start:query_end, None]
             )
-            scores = scores.masked_fill(~visible, float("-inf"))
+            scores = scores.masked_fill(~visible, _qsa_masked_fill_value(scores.device.type))
             top_blocks = scores.topk(top_count, dim=-1).indices
             top_valid = visible.gather(-1, top_blocks)
             selected_starts = block_starts[top_blocks]
