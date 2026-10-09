@@ -23,8 +23,6 @@ This keeps only the needed v5 patches:
 3. Register get_parallel_plan on Qwen3MoeForCausalLM.
 """
 
-from typing import Optional
-
 import torch
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -189,7 +187,7 @@ def apply_rotary_pos_emb_patched(
     k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    position_ids: Optional[torch.Tensor] = None,
+    position_ids: torch.Tensor | None = None,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Modification: OpSlot guard — use fused RoPE kernel when bound.

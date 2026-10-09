@@ -126,9 +126,9 @@ python -c "import transformers; print(transformers.__version__)"
 uv sync --locked --extra npu --group dev
 
 # Or install using pip
-pip install transformers==5.9.0
+pip install transformers==5.16.1
 ```
 
 **Version Recommendations**:
-- VeOmni pins Transformers `5.9.0` (see `pyproject.toml`). Other v5 minor
+- VeOmni pins Transformers `5.16.1` (see `pyproject.toml`). Other v5 minor
   versions may work but are not exercised in CI.

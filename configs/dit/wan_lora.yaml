@@ -8,9 +8,35 @@ model:
     # liger_kernel RoPE cannot drop in. Pin to eager explicitly until a
     # Wan-specific liger wrapper exists.
     rotary_pos_emb_implementation: eager
-  lora_target_modules: q,k,v,o,ffn.0,ffn.2
-  lora_rank: 32
-  lora_alpha: 32
+  lora_config:
+    rank: 32
+    alpha: 32
+    lora_modules:
+      - q
+      - k
+      - v
+      - o
+      - ffn.0
+      - ffn.2
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    ulysses_size: 4
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: false
+    offload_config:
+      enable_activation: false
 
 data:
   train_path: Wanmini480
@@ -22,32 +48,12 @@ data:
   data_type: diffusion
   max_seq_len: 8192
   text_keys: text
-  datasets_repeat: 10
   dyn_bsz_buffer_size: 200
 
 train:
-  accelerator:
-    ulysses_size: 4
-    fsdp_config:
-      fsdp_mode: fsdp2
-      mixed_precision:
-        enable: false
-    offload:
-      enable_activation: false
-  gradient_checkpointing:
-    enable: true
   global_batch_size: 8
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007
-  optimizer:
-    type: adamw
-    lr: 1.0e-4
-    lr_warmup_ratio: 0.007
-    lr_decay_style: constant
-    lr_decay_ratio: 1.0
-    weight_decay: 0.01
-    max_grad_norm: 1.0
-  init_device: meta
   enable_full_determinism: false
   empty_cache_steps: 500
   checkpoint:
@@ -61,8 +67,3 @@ train:
     enable: false
     project: Wan2.1-I2V-14B-480P
     name: lora_wan_i2v_14b
-  ops_to_save:
-    # - aten.addmm.default
-    - torch.ops.flash_attn._flash_attn_forward.default
-    - aten._scaled_dot_product_flash_attention.default
-    - torch.ops.flash_attn_3.fwd.default

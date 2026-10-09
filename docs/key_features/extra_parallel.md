@@ -2,20 +2,20 @@
 
 **Author**: Junncheng Wan
 
-> TL;DR: VeOmni now supports extra parallelism from v0.1.0; Simply try it out by setting `accelerator.fsdp_config.fsdp_mode` to `fsdp2`, `accelerator.extra_parallel_sizes` to a list of integers, `accelerator.extra_parallel_placement_innermost` to a list of bools, and `accelerator.extra_parallel_names` to a list of strings.
+> TL;DR: VeOmni now supports extra parallelism from v0.1.0; Simply try it out by setting `model.accelerator.fsdp_config.fsdp_mode` to `fsdp2`, `model.accelerator.extra_parallel_sizes` to a list of integers, `model.accelerator.extra_parallel_placement_innermost` to a list of bools, and `model.accelerator.extra_parallel_names` to a list of strings.
 
 
 ## Motivation
 
-As EP+FSDP2 is well supported in VeOmni, similar parallelism is also needed for other modules, like embedding layer. To support this kind of parallelism with similar communication ops, we extend EP+FSDP2 to extra parallelism+FSDP2:
+VeOmni supports EP+FSDP2, but other modules, such as embedding layers, also need similar parallelism. To reuse the same communication operations, VeOmni generalizes EP+FSDP2 into ExtraParallel+FSDP2:
 
-* Support any length of list of parallelism sizes for different parallism patterns in FSDP2 training.
+* Support a list of parallelism sizes of any length for different parallelism patterns in FSDP2 training.
 * Support checkpoint save and (resharding) load for different parallelism patterns.
 * Support prefetching to overlap communication and computation as described in [ep_fsdp2.md](./ep_fsdp2.md).
 
 ## Design Overview
 
-The overall design of extra parallelism is similar to EP+FSDP2, except that it is applied on different parallel modules. Before reading this document, please read [ep_fsdp2.md](./ep_fsdp2.md). The key requirement:
+The overall design of extra parallelism is similar to EP+FSDP2, except that it applies to different parallel modules. Before reading this document, read [ep_fsdp2.md](./ep_fsdp2.md). The key requirement is:
 
 * The sharded modules need to be sorted in reverse order from submodules to parent modules to avoid sharding twice, as `fully_shard` is applied from bottom to top.
 
@@ -35,9 +35,9 @@ Extra parallelism is applied on dim-0 (expert number, vocab size), while FSDP2 i
 
 When using train script (e.g. [tasks/train_vlm.py](../../tasks/train_vlm.py)), add the arguments:
 ```shell
---train.accelerator.extra_parallel_sizes size1 size2
---train.accelerator.extra_parallel_placement_innermost bool1 bool2
---train.accelerator.extra_parallel_names name1 name2
+--model.accelerator.extra_parallel_sizes size1 size2
+--model.accelerator.extra_parallel_placement_innermost bool1 bool2
+--model.accelerator.extra_parallel_names name1 name2
 ```
 
 In the parallel plan config (e.g. [qwen3_moe/parallel_plan.py](../../veomni/models/transformers/qwen3_moe/parallel_plan.py)), add

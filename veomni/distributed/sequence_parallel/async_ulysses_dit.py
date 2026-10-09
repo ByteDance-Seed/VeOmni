@@ -21,9 +21,19 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
+from .backward import (
+    layer_norm_backward,
+    linear_backward,
+    linear_input_backward,
+    linear_parameter_backward,
+)
 from .comm import get_ulysses_sequence_parallel_group
-from .ulysses import all_to_all_tensor
-from .utils import padding_tensor_for_seqeunce_parallel, unpadding_tensor_for_seqeunce_parallel
+from .op_wrappers import get_op_wrapper, pack_saved_state, unpack_saved_state
+from .ulysses import _all_to_all_single, all_to_all_tensor
+from .utils import (
+    padding_tensor_for_seqeunce_parallel,
+    unpadding_tensor_for_seqeunce_parallel,
+)
 
 
 fused_layer_norm_cuda = None
@@ -64,6 +74,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         head_dim: int,
         group: ProcessGroup,
     ):
+        global fused_layer_norm_cuda
         sp_group = get_ulysses_sequence_parallel_group() if group is None else group
 
         # q projection
@@ -74,15 +85,16 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
             if isinstance(normalized_shape, numbers.Integral):
                 normalized_shape = (normalized_shape,)
             normalized_shape = torch.Size(normalized_shape)
-            global fused_layer_norm_cuda
-            if fused_layer_norm_cuda is None:
-                fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
             norm_q_weight = norm_q_weight.contiguous()
             output_q, mean_q, invvar_q = None, None, None
             output_k, mean_k, invvar_k = None, None, None
             if norm_type == "rmsnorm":
-                output_q, invvar_q = fused_layer_norm_cuda.rms_forward_affine(q, normalized_shape, norm_q_weight, eps)
+                rms = get_op_wrapper("rms_norm")
+                output_q, saved_rms_q = rms.forward(q, norm_q_weight, eps)
+                ctx.rms = rms
             elif norm_type == "layernorm":
+                if fused_layer_norm_cuda is None:
+                    fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
                 output_q, mean_q, invvar_q = fused_layer_norm_cuda.forward_affine(
                     q, normalized_shape, norm_q_weight, norm_q_bias, eps
                 )
@@ -106,13 +118,13 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
             if isinstance(normalized_shape, numbers.Integral):
                 normalized_shape = (normalized_shape,)
             normalized_shape = torch.Size(normalized_shape)
-            if fused_layer_norm_cuda is None:
-                fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
             norm_k_weight = norm_k_weight.contiguous()
             output_k, mean_k, invvar_k = None, None, None
             if norm_type == "rmsnorm":
-                output_k, invvar_k = fused_layer_norm_cuda.rms_forward_affine(k, normalized_shape, norm_k_weight, eps)
+                output_k, saved_rms_k = ctx.rms.forward(k, norm_k_weight, eps)
             elif norm_type == "layernorm":
+                if fused_layer_norm_cuda is None:
+                    fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
                 output_k, mean_k, invvar_k = fused_layer_norm_cuda.forward_affine(
                     k, normalized_shape, norm_k_weight, norm_k_bias, eps
                 )
@@ -155,7 +167,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         ctx.norm_type = norm_type
         ctx.normalized_shape = normalized_shape
         ctx.eps = eps
-        ctx.save_for_backward(
+        saved = [
             hidden_states,
             q_weight,
             q_bias,
@@ -163,17 +175,26 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
             k_bias,
             v_weight,
             v_bias,
-            q,
-            norm_q_weight,
-            norm_q_bias,
-            mean_q,
-            invvar_q,
-            k,
-            norm_k_weight,
-            norm_k_bias,
-            mean_k,
-            invvar_k,
-        )
+        ]
+        if norm_type == "layernorm":
+            saved.extend(
+                [
+                    q,
+                    norm_q_weight,
+                    norm_q_bias,
+                    mean_q,
+                    invvar_q,
+                    k,
+                    norm_k_weight,
+                    norm_k_bias,
+                    mean_k,
+                    invvar_k,
+                ]
+            )
+        elif norm_type == "rmsnorm":
+            ctx.rms_q_ref = pack_saved_state(saved, saved_rms_q)
+            ctx.rms_k_ref = pack_saved_state(saved, saved_rms_k)
+        ctx.save_for_backward(*saved)
 
         return output_q, output_k, v
 
@@ -186,6 +207,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         norm_type = ctx.norm_type
         normalized_shape = ctx.normalized_shape
         eps = ctx.eps
+        saved_tensors = ctx.saved_tensors
         (
             hidden_states,
             q_weight,
@@ -194,17 +216,24 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
             k_bias,
             v_weight,
             v_bias,
-            q,
-            norm_q_weight,
-            norm_q_bias,
-            mean_q,
-            invvar_q,
-            k,
-            norm_k_weight,
-            norm_k_bias,
-            mean_k,
-            invvar_k,
-        ) = ctx.saved_tensors
+            *norm_saved,
+        ) = saved_tensors
+        if norm_type == "layernorm":
+            (
+                q,
+                norm_q_weight,
+                norm_q_bias,
+                mean_q,
+                invvar_q,
+                k,
+                norm_k_weight,
+                norm_k_bias,
+                mean_k,
+                invvar_k,
+            ) = norm_saved
+        elif norm_type == "rmsnorm":
+            saved_rms_q = unpack_saved_state(saved_tensors, ctx.rms_q_ref)
+            saved_rms_k = unpack_saved_state(saved_tensors, ctx.rms_k_ref)
 
         # initialize grads
         grad_hidden_states = None
@@ -246,10 +275,12 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         )
 
         # v projection grad
-        grad_v_input = grad_v @ v_weight
-        grad_v_weight = (grad_v.transpose(-1, -2) @ hidden_states).sum(0)
-        if v_bias is not None and ctx.needs_input_grad[8]:
-            grad_v_bias = grad_v.sum((0, 1))
+        grad_v_input, grad_v_weight, grad_v_bias = linear_backward(
+            grad_v,
+            hidden_states,
+            v_weight,
+            has_bias=v_bias is not None and ctx.needs_input_grad[8],
+        )
 
         # k grad communication collect
         grad_k = grad_k_res()
@@ -257,26 +288,17 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         # k normalization backward (if needed)
         if norm_type is not None:
             if norm_type == "rmsnorm":
-                grad_k, grad_norm_k_weight = fused_layer_norm_cuda.rms_backward_affine(
-                    grad_k,
-                    invvar_k,
-                    k,
-                    normalized_shape,
-                    norm_k_weight,
-                    eps,
-                    False,
-                )
+                grad_k, grad_norm_k_weight = ctx.rms.backward(grad_k, saved_rms_k)
             elif norm_type == "layernorm":
-                grad_k, grad_norm_k_weight, grad_norm_k_bias = fused_layer_norm_cuda.backward_affine(
+                grad_k, grad_norm_k_weight, grad_norm_k_bias = layer_norm_backward(
                     grad_k,
+                    k,
                     mean_k,
                     invvar_k,
-                    k,
-                    normalized_shape,
                     norm_k_weight,
                     norm_k_bias,
+                    normalized_shape,
                     eps,
-                    False,
                 )
             else:
                 raise NotImplementedError(f"{norm_type} is not supported in async-ulysses now!")
@@ -296,10 +318,12 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         )
 
         # k projection grad
-        grad_k_input = grad_k @ k_weight
-        grad_k_weight = (grad_k.transpose(-1, -2) @ hidden_states).sum(0)
-        if k_bias is not None and ctx.needs_input_grad[6]:
-            grad_k_bias = grad_k.sum((0, 1))
+        grad_k_input, grad_k_weight, grad_k_bias = linear_backward(
+            grad_k,
+            hidden_states,
+            k_weight,
+            has_bias=k_bias is not None and ctx.needs_input_grad[6],
+        )
 
         # q grad communication collect
         grad_q = grad_q_res()
@@ -307,26 +331,17 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         # qk normalization backward (if needed)
         if norm_type is not None:
             if norm_type == "rmsnorm":
-                grad_q, grad_norm_q_weight = fused_layer_norm_cuda.rms_backward_affine(
-                    grad_q,
-                    invvar_q,
-                    q,
-                    normalized_shape,
-                    norm_q_weight,
-                    eps,
-                    False,
-                )
+                grad_q, grad_norm_q_weight = ctx.rms.backward(grad_q, saved_rms_q)
             elif norm_type == "layernorm":
-                grad_q, grad_norm_q_weight, grad_norm_q_bias = fused_layer_norm_cuda.backward_affine(
+                grad_q, grad_norm_q_weight, grad_norm_q_bias = layer_norm_backward(
                     grad_q,
+                    q,
                     mean_q,
                     invvar_q,
-                    q,
-                    normalized_shape,
                     norm_q_weight,
                     norm_q_bias,
+                    normalized_shape,
                     eps,
-                    False,
                 )
             else:
                 raise NotImplementedError(f"{norm_type} is not supported in async-ulysses now!")
@@ -334,10 +349,12 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
             grad_norm_q_weight = None
 
         # q projection grad
-        grad_q_input = grad_q @ q_weight
-        grad_q_weight = (grad_q.transpose(-1, -2) @ hidden_states).sum(0)
-        if q_bias is not None and ctx.needs_input_grad[4]:
-            grad_q_bias = grad_q.sum((0, 1))
+        grad_q_input, grad_q_weight, grad_q_bias = linear_backward(
+            grad_q,
+            hidden_states,
+            q_weight,
+            has_bias=q_bias is not None and ctx.needs_input_grad[4],
+        )
 
         # grad
         grad_hidden_states = grad_q_input + grad_k_input + grad_v_input
@@ -419,16 +436,19 @@ class AsyncUlyssesOutputProjection(torch.autograd.Function):
         grad_proj_bias = None
 
         # output grad
-        grad_o = grad_output[0] @ (proj_weight)
+        grad_o = linear_input_backward(grad_output[0], hidden_states, proj_weight)
 
         # output grad communication launch
         grad_out_res = all_to_all_tensor(
             grad_o, scatter_dim=head_dimension, gather_dim=seq_dimension, group=sp_group, async_op=True
         )
 
-        grad_proj_weight = (grad_output[0].transpose(-1, -2) @ hidden_states).sum(0)
-        if proj_bias is not None and ctx.needs_input_grad[4]:
-            grad_proj_bias = grad_output[0].sum((0, 1))
+        grad_proj_weight, grad_proj_bias = linear_parameter_backward(
+            grad_output[0],
+            hidden_states,
+            proj_weight,
+            has_bias=proj_bias is not None and ctx.needs_input_grad[4],
+        )
 
         # output grad communication collect
         grad_o = grad_out_res()
@@ -507,3 +527,27 @@ def async_ulysses_output_projection(
         unpadded_dim_size,
         group,
     )
+
+
+class _AsyncA2A(torch.autograd.Function):
+    """Wait on an async all-to-all started by ``_all_to_all_single(async_op=True)``.
+
+    ``x`` only anchors the gradient graph: backward performs the inverse
+    exchange on the incoming gradient, matching the exchange that ``x`` went
+    through, so gradients reach the pre-exchange tensor.
+    """
+
+    @staticmethod
+    def forward(ctx, wait_fn, x, scatter_dim, gather_dim, group):
+        ctx.group, ctx.scatter_dim, ctx.gather_dim = group, scatter_dim, gather_dim
+        return wait_fn()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return (
+            None,
+            _all_to_all_single(grad_output, ctx.gather_dim, ctx.scatter_dim, ctx.group),
+            None,
+            None,
+            None,
+        )
