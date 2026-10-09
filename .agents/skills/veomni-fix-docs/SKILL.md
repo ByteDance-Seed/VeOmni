@@ -21,6 +21,7 @@ For each candidate link or image:
 
 - Resolve a relative path from the containing document, including `..`, URL decoding, and exact filename case. Do not resolve every link from the repository root. Check whether an absolute-site path is handled by the documentation renderer.
 - For a fragment, inspect the target heading or explicit HTML ID and the **intended renderer's** generated permalink. GitHub and Sphinx/MyST can produce different IDs, especially for Emoji, linked heading text, punctuation, and duplicate headings. Do not remove an icon or change a heading merely to make a guessed fragment match.
+- For a source-file link with a line anchor (`file.py#L142`), open the target line and confirm it is the symbol or statement the link text names. Line anchors drift silently when code above them changes; re-point a stale anchor to the current line rather than dropping it.
 - Check reference-style links against their definitions. Exclude literal code and commented examples unless the user asks to review examples.
 - Treat malformed URLs, suspicious duplicates, missing spaces after heading markers, and unmatched fences as review candidates. Verify context before editing. Do not guess a replacement URL or destination.
 - Check external links only if network access is available and authorized; otherwise mark them unverified. MyST labels/directives, generated targets, MDX/JSX routing, and site-specific URL rules need renderer-specific checks.

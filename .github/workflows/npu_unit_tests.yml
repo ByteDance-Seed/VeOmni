@@ -185,6 +185,7 @@ jobs:
           uv run --frozen pytest -v -s -x tests/distributed/test_reduce_loss.py
           uv run --frozen pytest -v -s -x tests/distributed/test_dummy_forward.py
           uv run --frozen pytest -v -s -x tests/distributed/test_hccl_premul_sum.py
+          uv run --frozen pytest -v -s -x tests/distributed/test_emb_parallel.py
       - name: Run data tests
         run: |
           uv run --frozen pytest -v -s -x tests/data

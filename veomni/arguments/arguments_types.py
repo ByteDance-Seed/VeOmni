@@ -543,9 +543,25 @@ class FSDPConfig:
         default="fsdp2",
         metadata={
             "help": (
-                "Data parallel mode. 'eager' is reserved for a future single-process "
-                "from_pretrained(device_map=...) inference path that skips every wrapper, "
-                "and currently raises."
+                "Data parallel mode. 'eager' skips every wrapper for the single-process "
+                "inference path an omni module takes via ModuleRuntime._init_eager_inference."
+            )
+        },
+    )
+    fsdp_scope: Literal["module", "model"] = field(
+        default="module",
+        metadata={
+            "help": (
+                "Where to apply the FSDP2/DDP wrap for a SeedOmni composed model. "
+                "'module' (default) wraps each omni module independently. 'model' wraps "
+                "the composed OmniModel once, so one FSDP tree spans every sub-module. "
+                "Wrap targets are each child's _no_split_modules scoped as "
+                "'{child}.{ClassName}'; leftover params unshard on OmniModel.forward. "
+                "Under 'model', per-module fsdp_mode / extra_parallel / init_device and "
+                "SP-CP-TP-PP overlays stay as written but no longer decide mesh, init or "
+                "wrap — the top-level accelerator does, and only its fsdp_scope counts. "
+                "Every module must defer to that one wrap, so a module on inference "
+                "fsdp_mode='eager' is rejected under 'model'."
             )
         },
     )
@@ -604,13 +620,8 @@ class FSDPConfig:
                 "switch to fsdp_mode='fsdp2' (with model.accelerator.init_device='meta'), "
                 "'ddp', or 'eager'."
             )
-        if self.fsdp_mode == "eager":
-            # Reserved rather than live: the parallelize path has no unwrapped branch,
-            # so accepting this silently would hand the model to DDP instead.
-            raise NotImplementedError(
-                "model.accelerator.fsdp_config.fsdp_mode='eager' is reserved for the "
-                "single-process inference path and is not wired up yet."
-            )
+        if self.fsdp_scope not in ("module", "model"):
+            raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
         validate_low_precision_reduce_scatter_comm(
             self.low_precision_reduce_scatter_comm, self.mixed_precision, fsdp_mode=self.fsdp_mode
         )

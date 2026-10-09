@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from torch.optim.optimizer import Optimizer
 
     from ..arguments import ModelArguments, TrainingArguments
+    from ..arguments.arguments_types import AcceleratorConfig
     from ..data.chat_template import ChatTemplate
     from ..trainer.callbacks import TrainerState
     from .checkpoint import ModelCheckpointManager
@@ -161,6 +162,17 @@ class VeOmniModelRuntime:
         """
         return self.model(*args, **kwargs)
 
+    @property
+    def mesh_accelerator(self) -> "AcceleratorConfig":
+        """The accelerator config that decides mesh, init device and wrap.
+
+        Its own by default. A composed runtime whose wrap happens one level up
+        overrides this so mesh and init follow the owner of the wrap rather than
+        the model's local overlay (see
+        :class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime`).
+        """
+        return self.args.accelerator
+
     def train(self, mode: bool = True):
         """Forward ``nn.Module.train()``. Job-wide knobs live on :attr:`train_args`."""
         model = self.model
@@ -173,12 +185,12 @@ class VeOmniModelRuntime:
 
         The process group itself is job-bound and must already be initialised by
         :meth:`BaseTrainer._setup`; this only derives the model's own
-        mesh from its accelerator config, which is why sibling models in one job
+        mesh from :attr:`mesh_accelerator`, which is why sibling models in one job
         can hold different ones.
         """
         from ..distributed.parallel_state import init_parallel_state_from_config
 
-        init_parallel_state_from_config(self.args.accelerator, self.model_name)
+        init_parallel_state_from_config(self.mesh_accelerator, self.model_name)
 
     @property
     def parallel_state(self):
@@ -321,22 +333,17 @@ class VeOmniModelRuntime:
 
         self.chat_template = build_chat_template(self.args.chat_template, preprocessor)
 
-    def _build_parallelized_model(self) -> None:
-        """FSDP2/DDP-wrap the model and load its weights.
+    def _apply_async_activation_offload(self) -> None:
+        """Patch this model's offload targets for async activation offload, if enabled.
 
-        The wrap preserves ``requires_grad`` (the shard inherits it) and the
-        loader writes weights in place, so a freeze applied in
-        :meth:`_freeze_model_module` survives and is not re-asserted here.
+        Must run BEFORE FSDP2 sharding. Uses per-instance __call__ patching so
+        that async_save_on_cpu is OUTER to the checkpoint boundary pushed by
+        GradientCheckpointingLayer, matching MindSpeed-MM's GC+async offload
+        behavior: hidden_states inputs are offloaded to CPU (via
+        _NoopSaveInputs), while intermediate activations are handled by GC
+        recomputation (via _checkpoint_hook).
         """
-        args = self.args
-
-        # Apply async activation offload BEFORE FSDP2 sharding.
-        # Uses per-instance __call__ patching so that async_save_on_cpu is
-        # OUTER to the checkpoint boundary pushed by GradientCheckpointingLayer,
-        # matching MindSpeed-MM's GC+async offload behavior: hidden_states
-        # inputs are offloaded to CPU (via _NoopSaveInputs), while intermediate
-        # activations are handled by GC recomputation (via _checkpoint_hook).
-        offload_config = args.accelerator.offload_config
+        offload_config = self.args.accelerator.offload_config
         if offload_config.enable_async_activation:
             from ..distributed.async_offload import apply_async_activation_offload
 
@@ -345,6 +352,24 @@ class VeOmniModelRuntime:
                 offload_config.activation_offload_modules,
                 host_cache_limit_bytes=int(offload_config.activation_offload_host_cache_limit_gb * 1024**3),
             )
+
+    def _build_parallelized_model(self) -> None:
+        """FSDP2/DDP-wrap the model and load its weights.
+
+        The wrap preserves ``requires_grad`` (the shard inherits it) and the
+        loader writes weights in place, so a freeze applied in
+        :meth:`_freeze_model_module` survives and is not re-asserted here.
+        """
+        args = self.args
+        if args.accelerator.fsdp_config.fsdp_mode == "eager":
+            # ``build_parallelize_model`` has no unwrapped branch, so an eager
+            # mode reaching it would be handed to DDP instead.
+            raise ValueError(
+                "model.accelerator.fsdp_config.fsdp_mode='eager' is only supported by SeedOmni "
+                "module inference (ModuleRuntime._init_eager_inference)."
+            )
+
+        self._apply_async_activation_offload()
 
         # Customized parallelize model.
         customized_parallelize_model_function = getattr(self.model, "build_parallelize_model", None)
@@ -469,9 +494,20 @@ class VeOmniModelRuntime:
             self.model = VeOmniLoraModel(self.model, cfg)
 
         if not _has_trainable_lora_parameters(self.model):
-            raise ValueError(
-                "LoRA configuration produced no trainable adapters. Select at least one Linear or MoE target."
-            )
+            self.on_lora_matched_nothing()
+
+    def on_lora_matched_nothing(self) -> None:
+        """React to a LoRA config that selected none of this model's parameters.
+
+        For a single-model job that is always a misconfiguration — the run would
+        train nothing — so it fails here rather than after the first
+        zero-gradient step. A runtime that is one model *among several* overrides
+        this, because there "no targets in this one" is how a config says which
+        model to adapt.
+        """
+        raise ValueError(
+            "LoRA configuration produced no trainable adapters. Select at least one Linear or MoE target."
+        )
 
     def _freeze_model_module(self) -> None:
         """Let the model freeze itself, apply LoRA, and report what is left trainable.

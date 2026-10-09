@@ -169,7 +169,9 @@ jobs:
           uv run --frozen pytest -s -x tests/distributed/test_reduce_loss.py
           uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
           uv run --frozen pytest -s -x tests/distributed/test_hccl_premul_sum.py
+          uv run --frozen pytest -s -x tests/distributed/test_emb_parallel.py
           uv run --frozen pytest -s -x tests/distributed/test_reduce_scatter_fp32_accumulation.py
+          uv run --frozen pytest -s -x tests/distributed/test_gradient_checkpointing.py
           uv run --frozen pytest -s -x tests/distributed/test_torch_compile.py
       - name: Run data tests
         run: |

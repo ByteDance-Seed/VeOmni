@@ -7,7 +7,7 @@ checkpoint compose/load/save.  It must import nothing from VeOmni's runtime
 (``accelerator`` / ``distributed`` / trainer), at module scope or inside a
 function, so this modeling can be lifted into another framework as-is and so
 HF ``from_pretrained`` / ``from_config`` keeps working for eager
-single-process inference. ``tests/seed_omni/test_graph.py`` asserts this.
+single-process inference. ``tests/seed_omni/model/test_graph.py`` asserts this.
 
 ``forward`` is the FSDP2 root entry: leftover params unshard on ``__call__``,
 then the training graph runs each child eagerly, which is correct for an
@@ -31,7 +31,7 @@ walk.  Stop when ``is_done()`` or ``max_new_tokens`` is reached.
 from __future__ import annotations
 
 import os
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 import torch.distributed as dist
 import torch.nn as nn
@@ -375,7 +375,7 @@ class OmniModel(PreTrainedModel):
         Rank-0 writes and returns; the other ranks return immediately and this
         does **not** barrier. The caller owns the barrier, because it is the one
         that knows what the other ranks go on to do —
-        :meth:`OmniTrainer.save_model_assets` barriers right after. Without one,
+        :meth:`OmniModelRuntime.save_model_assets` barriers right after. Without one,
         a rank can read a half-written directory.
 
         For the same reason ``save_module_weights=True`` is for an unsharded
@@ -457,6 +457,7 @@ class OmniModel(PreTrainedModel):
         self,
         batch: dict[str, Any],
         *args: Any,
+        node_runner: Callable[[PretrainedOmniModule, NodeDef, dict[str, Any]], None] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Run the training DAG; this is the FSDP2 root ``forward``.
@@ -466,8 +467,14 @@ class OmniModel(PreTrainedModel):
         units (decoder layers, ``Embedding``, …) unshard on their own
         ``__call__``; leftover params on this module unshard because training
         enters here.
+
+        ``node_runner`` replaces how one node runs; the graph walk, loss
+        collection and return value stay here. A runtime that wraps the modules
+        passes one to unwrap them and scope each node to its module's mesh;
+        without one each node runs as :meth:`_run_train_node`.
         """
         del args, kwargs
+        run_node = node_runner if node_runner is not None else self._run_train_node
         if self.training_graph is None:
             raise ValueError(
                 "OmniModel.forward: this model has no training graph. Pass `training_graphs` "
@@ -478,7 +485,7 @@ class OmniModel(PreTrainedModel):
         self._losses.clear()
 
         for node in self.training_graph.iter_nodes():
-            self._run_train_node(self.get_module(node.module), node, batch)
+            run_node(self.get_module(node.module), node, batch)
             loss = batch.pop(LOSS_KEY, None)
             if loss is not None:
                 self._losses[node.name] = loss
