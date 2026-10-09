@@ -32,6 +32,8 @@ if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
     from torch.distributed.device_mesh import DeviceMesh
 
+    from ..arguments import AcceleratorConfig
+
 
 logger = logging.get_logger(__name__)
 
@@ -72,14 +74,27 @@ class ParallelState:
     extra_parallel_names: Tuple[str] = ("ep",)
     extra_parallel_sizes: Dict[str, int] = field(default_factory=lambda: {"ep": 1})
     extra_parallel_fsdp_device_mesh: Dict[str, Optional["DeviceMesh"]] = field(default_factory=lambda: {"ep": None})
+    extra_parallel_flat_device_mesh: Dict[str, Optional["DeviceMesh"]] = field(default_factory=lambda: {"ep": None})
     async_enabled: Optional[bool] = False
 
     def __post_init__(self):
         if not self.include_sp_in_fsdp:
             raise NotImplementedError("Decoupled sequence parallel has not been implemented.")
 
-        if self.cp_size > 1:
-            raise NotImplementedError("Ring attention is not supported yet.")
+        # The product check below cannot catch a negative cp_size on its own: a
+        # caller passing dp_size=-1 alongside cp_size=-1 lands on a product of +1,
+        # so an invalid topology would be admitted with CP reported as disabled.
+        # TrainingArguments validates this too, but a ParallelState can be built
+        # directly, which is how a per-module state under use_parallel_state is made.
+        if self.cp_size < 1:
+            raise ValueError(f"cp_size must be a positive integer; got {self.cp_size}.")
+
+        if self.cp_size > 1 and self.ulysses_size > 1:
+            raise NotImplementedError(
+                "Context parallelism cannot be combined with Ulysses yet; "
+                f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
+                "Set ulysses_size=1 to use context parallelism."
+            )
 
         if self.pp_size * self.dp_size * self.cp_size * self.ulysses_size * self.tp_size != self.world_size:
             raise ValueError("The product of parallel sizes should be equal to the world size.")
@@ -100,7 +115,8 @@ class ParallelState:
         if self.sp_enabled and self.device_mesh is None:
             raise ValueError(
                 "A sequence-parallel ParallelState must be built with a device mesh "
-                "(use init_parallel_state); meshless sequence-parallel init is no longer supported."
+                "(use init_parallel_state_from_config); meshless sequence-parallel init "
+                "is no longer supported."
             )
 
     @property
@@ -327,6 +343,38 @@ class ParallelState:
         return self.extra_parallel_fsdp_device_mesh[para_name][para_name, f"{para_name}_fsdp"]
 
     @requires_mesh
+    def extra_parallel_flat_mesh(self, para_name) -> "DeviceMesh":
+        """Return the flattened ``para_fsdp x para`` mesh.
+
+        The flattened mesh is created eagerly during parallel-state
+        initialization so model forward paths never create process groups.
+        """
+        mesh = self.extra_parallel_flat_device_mesh[para_name]
+        if mesh is None:
+            raise ValueError(f"ExtraParallel {para_name!r} does not have a flattened mesh.")
+        return mesh
+
+    @requires_mesh
+    def extra_parallel_flat_group(self, para_name) -> "ProcessGroup":
+        return self.extra_parallel_flat_mesh(para_name).get_group()
+
+    @requires_mesh
+    def extra_parallel_2d_rank_table(self, para_name) -> Tuple[Tuple[int, ...], ...]:
+        """Map ``(para_fsdp_rank, para_rank)`` coordinates to flat-group ranks."""
+        mesh = self.extra_parallel_fsdp_device_mesh[para_name]
+        flat_mesh = self.extra_parallel_flat_mesh(para_name)
+        if mesh is None or mesh.ndim != 2:
+            raise ValueError(
+                f"ExtraParallel {para_name!r} requires a 2D mesh, got {None if mesh is None else mesh.ndim}D."
+            )
+
+        flat_global_ranks = [int(rank) for rank in flat_mesh.mesh.flatten().tolist()]
+        flat_rank_by_global_rank = {global_rank: flat_rank for flat_rank, global_rank in enumerate(flat_global_ranks)}
+        return tuple(
+            tuple(flat_rank_by_global_rank[int(global_rank)] for global_rank in row) for row in mesh.mesh.tolist()
+        )
+
+    @requires_mesh
     def extra_parallel_group(self, para_name) -> "ProcessGroup":
         if self.extra_parallel_enabled(para_name):
             return self.extra_parallel_mesh(para_name).get_group()
@@ -424,7 +472,7 @@ def clear_parallel_state() -> None:
     Drop the ambient state, topology cache, and named registry.
 
     Call after ``destroy_process_group()`` (or in test teardown) so a later
-    ``init_parallel_state`` with the same topology cannot reuse DeviceMesh /
+    ``_init_parallel_state`` with the same topology cannot reuse DeviceMesh /
     process groups from a destroyed distributed session.
     """
     global _PARALLEL_STATE
@@ -441,7 +489,7 @@ def get_parallel_state_by_name(name: str) -> "ParallelState":
     return _PARALLEL_STATE_REGISTRY[name]
 
 
-def init_parallel_state(
+def _init_parallel_state(
     dp_size: int = 1,
     dp_replicate_size: int = 1,
     dp_shard_size: int = 1,
@@ -456,19 +504,36 @@ def init_parallel_state(
     extra_parallel_placement_innermost: Tuple[bool] = (False,),
     extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
-    name: str = "base",
+    name: Optional[str] = "base",
 ) -> "ParallelState":
     """
     Initialize a parallel state, register it under ``name``, and set it as the
     global state when none is current yet.
 
-    If ``name`` is already registered, log a warning and return the existing
-    state without building, caching, or overwriting anything.
+    Private: every parallelism knob here also lives on
+    :class:`~veomni.arguments.AcceleratorConfig`, so a second mapping restated
+    at a call site is a second place to keep in sync. Production code goes
+    through :func:`init_parallel_state_from_config`. Tests call this
+    directly to build a topology no job config can express — a CPU mesh, or a
+    rank layout unrelated to ``WORLD_SIZE``.
+
+    If ``name`` is already registered, log at debug and return the existing
+    state without building, caching, or overwriting anything. Single-model
+    trainers hit this on every run: ``BaseTrainer._setup`` registers ``"base"``
+    and ``VeOmniModelRuntime.setup`` registers the same name from the same
+    accelerator. A warning there trains people to ignore warnings.
+
+    ``name=None`` claims no registry key, for a caller that holds the returned
+    state itself rather than looking it up later — it would otherwise have to
+    collide on ``"base"`` with the standalone trainers or invent a key nobody
+    reads. Only the registry is opted out of: the state is still topology-cached
+    and still becomes the ambient global if none is set, so a later named call
+    with the same topology hands back this same object.
     """
     global _PARALLEL_STATE
 
-    if name in _PARALLEL_STATE_REGISTRY:
-        logger.warning(
+    if name is not None and name in _PARALLEL_STATE_REGISTRY:
+        logger.debug(
             f"Parallel state {name!r} is already registered; returning the existing state without rebuilding."
         )
         return _PARALLEL_STATE_REGISTRY[name]
@@ -524,7 +589,8 @@ def init_parallel_state(
         # never clear the cache), so a same-topology hit may find the global cleared.
         if _PARALLEL_STATE is None:
             _PARALLEL_STATE = cached_state
-        _PARALLEL_STATE_REGISTRY[name] = cached_state
+        if name is not None:
+            _PARALLEL_STATE_REGISTRY[name] = cached_state
         return cached_state
 
     logger.info_rank0(
@@ -541,12 +607,15 @@ def init_parallel_state(
     device_mesh = None
 
     extra_parallel_fsdp_device_mesh = {f"{para_name}": None for para_name in extra_parallel_names}
+    extra_parallel_flat_device_mesh = {f"{para_name}": None for para_name in extra_parallel_names}
 
+    # With TP disabled, the last mesh dimension has stride-1 ranks. Keep
+    # Ulysses inside CP so its groups can stay within a node when CP spans nodes.
     mesh_shape = []
     mesh_dim_names = []
     for d, dim_name in zip(
-        [pp_size, dp_replicate_size, dp_shard_size, ulysses_size, cp_size, tp_size],
-        ["pp", "dp_replicate", "dp_shard", "ulysses", "cp", "tp"],
+        [pp_size, dp_replicate_size, dp_shard_size, cp_size, ulysses_size, tp_size],
+        ["pp", "dp_replicate", "dp_shard", "cp", "ulysses", "tp"],
     ):
         if d > 1 or dim_name in ["dp_shard"]:
             mesh_shape.append(d)
@@ -574,14 +643,14 @@ def init_parallel_state(
         dp_mesh_dim_names.append("dp_shard")
         dp_shard_sp_mesh_dim_names.append("dp_shard")
         dp_sp_mesh_dim_names.append("dp_shard")
-    if ulysses_size > 1:
-        dp_shard_sp_mesh_dim_names.append("ulysses")
-        sp_mesh_dim_names.append("ulysses")
-        dp_sp_mesh_dim_names.append("ulysses")
     if cp_size > 1:
         dp_shard_sp_mesh_dim_names.append("cp")
         sp_mesh_dim_names.append("cp")
         dp_sp_mesh_dim_names.append("cp")
+    if ulysses_size > 1:
+        dp_shard_sp_mesh_dim_names.append("ulysses")
+        sp_mesh_dim_names.append("ulysses")
+        dp_sp_mesh_dim_names.append("ulysses")
 
     if dp_mesh_dim_names != []:
         device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
@@ -620,11 +689,17 @@ def init_parallel_state(
             para_mesh_dim_names.append(f"{para_name}_fsdp")
             para_mesh_dim_names.append(para_name)
 
-            extra_parallel_fsdp_device_mesh[f"{para_name}"] = init_device_mesh(
+            para_mesh = init_device_mesh(
                 device_type=device_type,
                 mesh_shape=param_mesh_shape,
                 mesh_dim_names=para_mesh_dim_names,
             )
+            extra_parallel_fsdp_device_mesh[f"{para_name}"] = para_mesh
+            # Qwen4-Exp PLE routes sparse lookup requests across the complete
+            # 2D mesh. Keep this local-TP exception scoped to ``ple`` so normal
+            # EP jobs do not create an additional process group they never use.
+            if para_name == "ple":
+                extra_parallel_flat_device_mesh[f"{para_name}"] = para_mesh._flatten(mesh_dim_name=f"{para_name}_flat")
 
     logger.info_rank0(f"Device mesh: {device_mesh}")
     for para_name in extra_parallel_names:
@@ -645,6 +720,7 @@ def init_parallel_state(
         extra_parallel_names=extra_parallel_names,
         extra_parallel_sizes=dict(zip(extra_parallel_names, extra_parallel_sizes)),
         extra_parallel_fsdp_device_mesh=extra_parallel_fsdp_device_mesh,
+        extra_parallel_flat_device_mesh=extra_parallel_flat_device_mesh,
         async_enabled=async_enabled,
     )
 
@@ -652,8 +728,33 @@ def init_parallel_state(
         _PARALLEL_STATE = parallel_state
 
     _PARALLEL_STATE_CACHE[cache_key] = parallel_state
-    _PARALLEL_STATE_REGISTRY[name] = parallel_state
+    if name is not None:
+        _PARALLEL_STATE_REGISTRY[name] = parallel_state
     return parallel_state
+
+
+def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Optional[str]) -> "ParallelState":
+    """Build the mesh an :class:`AcceleratorConfig` describes and register it as ``name``.
+
+    Every parallelism knob already lives on the config, so a caller that has one
+    should not be restating the mapping. Both a job's own mesh and a single
+    model's come through here.
+    """
+    return _init_parallel_state(
+        dp_size=accelerator.dp_size,
+        dp_replicate_size=accelerator.dp_replicate_size,
+        dp_shard_size=accelerator.dp_shard_size,
+        tp_size=accelerator.tp_size,
+        pp_size=accelerator.pp_size,
+        cp_size=accelerator.cp_size,
+        ulysses_size=accelerator.ulysses_size,
+        extra_parallel_sizes=accelerator.extra_parallel_sizes,
+        extra_parallel_placement_innermost=accelerator.extra_parallel_placement_innermost,
+        extra_parallel_names=accelerator.extra_parallel_names,
+        dp_mode=accelerator.fsdp_config.fsdp_mode,
+        async_enabled=accelerator.enable_async,
+        name=name,
+    )
 
 
 def set_parallel_state(parallel_state: "ParallelState") -> Optional["ParallelState"]:
@@ -688,6 +789,19 @@ def use_parallel_state(parallel_state: Union[str, "ParallelState"]):
         yield
     finally:
         set_parallel_state(old)
+
+
+def is_parallel_state_initialized() -> bool:
+    """Whether a ``ParallelState`` has been installed as the global state.
+
+    ``get_parallel_state`` falls back to *constructing* a default single-process
+    state, and that default raises when the process is in fact part of a
+    multi-rank world, since ``dp_size=1`` then contradicts the real world size.
+    Callers that only want to ask *whether* a form of parallelism is on -- rather
+    than use it -- should check this first, so that an uninitialized process
+    answers "off" instead of raising.
+    """
+    return _PARALLEL_STATE is not None
 
 
 def get_parallel_state() -> "ParallelState":

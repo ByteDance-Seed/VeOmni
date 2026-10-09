@@ -9,6 +9,11 @@ permissions:
   contents: read
   id-token: write # Required for OIDC trusted publishing
 
+env:
+  # Keep in sync with RUFF_VERSION in .github/workflows/check_pr_lint.yml so a
+  # release cannot fail lint on formatting that PR CI accepted.
+  RUFF_VERSION: "0.13.2"
+
 jobs:
   # ── Pre-publish checks ─────────────────────────────────────────────
   lint:
@@ -19,7 +24,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      - run: pip install ruff==${{ env.RUFF_VERSION }}
       - name: Ruff check & format
         run: |
           ruff check tasks tests veomni docs

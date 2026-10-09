@@ -239,6 +239,7 @@ def chunk_gated_delta_rule(
         cu_seqlens: Optional[torch.LongTensor] = None,
         chunk_size: int = 64,
         head_first: bool = False,
+        **kwargs
 ):
     r"""
     Args:

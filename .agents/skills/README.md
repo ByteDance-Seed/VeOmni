@@ -1,6 +1,6 @@
 # VeOmni Agent Skills
 
-Reusable workflow definitions for AI coding agents working on VeOmni. Skills follow the [Agent Skills](https://agentskills.io) open standard and are auto-discovered by compatible agents (Cursor, Claude Code, Codex, Junie, etc.).
+Reusable workflow definitions for AI coding agents working on VeOmni. Skills follow the [Agent Skills](https://agentskills.io) open standard, so any agent that implements it auto-discovers them.
 
 ## Structure
 
@@ -12,10 +12,30 @@ Each skill is a folder containing a `SKILL.md` with YAML frontmatter:
 │   └── SKILL.md          # name + description frontmatter, then instructions
 ├── veomni-debug/
 │   └── SKILL.md
+├── veomni-patchgen-model/
+│   ├── SKILL.md          # the spine: applies to every model
+│   └── references/       # loaded on demand, per model category
+│       ├── model-examples.md
+│       ├── moe.md
+│       └── multimodal.md
 └── ...
 ```
 
 Agents use the `description` field to decide when a skill is relevant. Users can also invoke skills manually with `/skill-name` in chat.
+
+## Keeping a skill readable
+
+A skill is read in full every time it fires, so length is a real cost. When a
+skill grows past a few hundred lines, check whether the bulk of it is
+*conditional* — only relevant to some subset of the cases it covers. If so,
+move each conditional block into `references/` and leave a routing table near
+the top of `SKILL.md` saying which file to load when.
+
+`veomni-patchgen-model` is the worked example: it was 1055 lines, of which
+roughly a third only applied to MoE models and another third only to VLM/Omni
+models. A text-only dense model now reads the ~710-line spine and skips both.
+Keep the spine self-contained — a reference file adds to a phase, it never
+replaces one, so nobody has to reconstruct the procedure from fragments.
 
 ## Adding a Skill
 
@@ -30,14 +50,6 @@ See the [Agent Skills specification](https://agentskills.io/specification) for t
 
 ## Skill Index
 
-| Skill | Description |
-|-------|-------------|
-| `veomni-develop` | Feature development and refactoring — VeOmni-specific impact analysis and safety checklist |
-| `veomni-debug` | Bug fix and debugging — quick path for simple fixes, full protocol for complex issues |
-| `veomni-review` | Pre-commit code review via subagent (mandatory gate) |
-| `veomni-new-model` | Adding a new model to VeOmni (patchgen, parallel plan, registry) |
-| `veomni-migrate-transformers-v5` | Add or refresh a model's patchgen path under `veomni/models/transformers/<model>/generated/` (text + MoE + Omni). Use when porting upstream changes or adding a new model to the v5 patchgen flow. |
-| `veomni-new-op` | Adding a new optimized kernel/operator to veomni/ops/ |
-| `veomni-uv-update` | Dependency management with uv (version bumps, torch, lockfile) |
-| `create-pr` | Create a pull request — handles uncommitted changes, generates CI-compliant title and description |
-| `veomni-profile` | Performance profiling — analyze traces/snapshots or generate profiles and optimize |
+The dispatch table in [`AGENTS.md`](../../AGENTS.md) is the single index — it maps
+a task to the skill to use, and every agent already loads it. Each skill's own
+`description` frontmatter is the authoritative statement of when it applies.

@@ -67,13 +67,13 @@ If a turn carries audio that is **not** paired with any video (a voice query,
 a sound effect, narration over a silent clip, …), use the existing
 `sample["audios"]` field and an `<audio>` marker:
 
-```json
+```json5
 {
-  "videos": [{"frames": [...], "audio": "<wav-bytes>"}],
+  "videos": [{"frames": ["<frame-bytes>"], "audio": "<wav-bytes>"}],
   "audios": ["<voice_query.wav>"],
   "conversations": [
     {"from": "human", "value": "<video>\nDescribe this. Also listen: <audio>"},
-    {"from": "gpt",   "value": "..."}
+    {"from": "gpt", "value": "Description and transcript."}
   ]
 }
 ```
@@ -203,7 +203,7 @@ A self-contained smoke test ships at
 3. *(Optional, gated on `QWEN3_OMNI_MODEL_PATH`)* The full
    `process_sample_qwen_omni` pipeline produces an `input_ids` whose
    `<|video_pad|>` and `<|audio_pad|>` token runs are **interleaved** (the
-   standard Qwen3-Omni omni layout), and `video_grid_thw` matches the
+   standard Qwen3-Omni layout), and `video_grid_thw` matches the
    sampled frame count.
 
 Run:
