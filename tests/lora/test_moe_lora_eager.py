@@ -334,6 +334,41 @@ def test_wrapper_uses_eager_when_lora_row_is_unavailable(monkeypatch, mode: str,
 
 
 @pytest.mark.parametrize("mode", _MODE_CASES)
+def test_wrapper_constructs_on_mocked_mlu_with_default_ops_config(monkeypatch, mode: str):
+    """MLU keeps the default ``fused_triton`` MoE row, but has no ``fused_triton`` MoE-LoRA row."""
+    pytest.importorskip("triton")
+    from transformers import Qwen3MoeConfig
+
+    from veomni.arguments import OpsImplementationConfig
+    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import Qwen3MoeExperts
+    from veomni.ops import OP_REGISTRY, VeomniOp
+    from veomni.ops.config import get_ops_config, set_ops_config
+
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: True)
+    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "mlu")
+    monkeypatch.setattr("veomni.ops.platform.requirement.IS_MLU_AVAILABLE", True)
+    # Handles are interned by triple; keep CUDA-resolved rows out and MLU-resolved rows in this test.
+    monkeypatch.setattr(VeomniOp, "_intern", {})
+
+    ops = OpsImplementationConfig()
+    assert ops.moe_implementation == "fused_triton"
+    assert "fused_triton" not in OP_REGISTRY.list_available("moe_experts_lora", mode)
+    with pytest.raises(RuntimeError, match="not registered for device 'mlu'"):
+        VeomniOp("moe_experts_lora", mode, "fused_triton")
+
+    config = Qwen3MoeConfig(hidden_size=16, moe_intermediate_size=8, num_experts=4, hidden_act="silu")
+    saved_cfg = get_ops_config()
+    set_ops_config(ops)
+    try:
+        experts = Qwen3MoeExperts(config)
+        assert experts.veomni_moe.impl == "fused_triton"
+        wrapper = _wrapper_cls(mode)(experts, r=2, lora_alpha=4)
+    finally:
+        set_ops_config(saved_cfg)
+    assert wrapper.veomni_moe_lora.impl == "eager"
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
 def test_wrapper_rejects_non_silu_experts(mode: str):
     from transformers.activations import GELUActivation
 
