@@ -188,7 +188,7 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
     def __init__(self, config: TextEncoderConfig):
         super().__init__(config)
 
-        self.embed_tokens = ShardedEmbedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = ShardedEmbedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
         if config.tie_word_embeddings:
             self.lm_head = None
         else:
@@ -231,13 +231,10 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         input_ids = input_ids.unsqueeze(0) if input_ids.dim() == 1 else input_ids
-        embeds = self._embed_tokens(input_ids)
+        embeds = self.embed_tokens(input_ids)
         return {
             "inputs_embeds": embeds.squeeze(0) if embeds.size(0) == 1 else embeds,
         }
-
-    def _embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
 
     def decode(
         self,

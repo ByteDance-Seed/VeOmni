@@ -143,7 +143,7 @@ class JanusTextEncoder(TextEncoder):
                 break
             input_ids.extend([pad_id] * len(part.value))
 
-        uncond_inputs_embeds = self._embed_tokens(torch.tensor(input_ids, dtype=torch.long, device=self.device))
+        uncond_inputs_embeds = self.embed_tokens(torch.tensor(input_ids, dtype=torch.long, device=self.device))
         return uncond_inputs_embeds
 
 

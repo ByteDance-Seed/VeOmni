@@ -59,7 +59,7 @@ python scripts/seed_omni/convert_model.py \
 
 The `output_dir` becomes `model.model_path` in `base.yaml`.
 (Qwen3-VL-2B has `tie_word_embeddings=True`, so `qwen3vl_text_encoder` stores only
-`embed_tokens` and the decode head reuses that weight via `F.linear`.)
+`embed_tokens` and the decode head reuses that table via `embed_tokens.project`.)
 
 ---
 

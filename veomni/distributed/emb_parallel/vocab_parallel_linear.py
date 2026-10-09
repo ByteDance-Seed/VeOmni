@@ -63,10 +63,21 @@ class VocabParallelLinear(torch.autograd.Function):
         ctx.save_for_backward(hidden, weight)
         ctx.group = group
         ctx.emb_size = emb_size
+        # Backward runs outside the caller's autocast region; replay it so the grad matmuls
+        # see the same dtypes as forward (e.g. fp32 saved tensors with bf16 grad_logits).
+        # Keyed on the input's device rather than torch.amp.custom_bwd's fixed device_type.
+        ctx.device_type = hidden.device.type
+        ctx.autocast_enabled = torch.is_autocast_enabled(ctx.device_type)
+        ctx.autocast_dtype = torch.get_autocast_dtype(ctx.device_type)
         return logits
 
     @staticmethod
     def backward(ctx, grad_logits: torch.Tensor):
+        with torch.autocast(device_type=ctx.device_type, dtype=ctx.autocast_dtype, enabled=ctx.autocast_enabled):
+            return VocabParallelLinear._backward(ctx, grad_logits)
+
+    @staticmethod
+    def _backward(ctx, grad_logits: torch.Tensor):
         hidden, weight = ctx.saved_tensors
         group, emb_size = ctx.group, ctx.emb_size
         _, needs_hidden_grad, needs_weight_grad = ctx.needs_input_grad

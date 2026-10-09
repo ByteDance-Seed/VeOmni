@@ -152,8 +152,8 @@ SP has **no dedicated config** — it is the normal `train/modules_train.yaml` p
 size. On **4 GPUs** with `ulysses_size 4` this gives `dp=1`. The
 `janus_text_encoder` `emb=4` extra-parallel composes here: on the 4-GPU box the
 `dp_shard_sp` mesh dim (`dp_shard=1 × ulysses=4`) IS the SP group, so the `emb`
-group and the `ulysses` group coincide — harmless, because the vocab lookup is a
-sequence-preserving `AllToAllEmbedding` (each rank still gets embeds for exactly
+group and the `ulysses` group coincide — harmless, because the `ShardedEmbedding`
+lookup is a sequence-preserving all-to-all (each rank still gets embeds for exactly
 its own `1/sp` token shard):
 
 ```bash

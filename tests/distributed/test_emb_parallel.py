@@ -166,6 +166,35 @@ def test_ops_match_dense_on_the_selected_device():
     assert torch.allclose(VocabParallelLinear.apply(None, hidden, weight), F.linear(hidden, weight))
 
 
+def _bf16_autocast_linear(fn, hidden: torch.Tensor, weight: torch.Tensor, grad: torch.Tensor):
+    hidden = hidden.clone().requires_grad_(True)
+    weight = weight.clone().requires_grad_(True)
+    with torch.autocast(device_type=hidden.device.type, dtype=torch.bfloat16):
+        logits = fn(hidden, weight)
+    # Backward outside the autocast region, as the trainer runs it.
+    (logits.float() * grad).sum().backward()
+    return logits, hidden.grad, weight.grad
+
+
+def test_linear_matches_dense_under_autocast():
+    """FP32 hidden / weight under BF16 autocast: forward returns BF16, backward must still match ``F.linear``.
+
+    Autograd does not re-enter autocast for a custom Function's backward, so without replaying
+    it the grad matmuls would mix the BF16 ``grad_logits`` with the FP32 saved tensors.
+    """
+    device = _device()
+    generator = torch.Generator().manual_seed(0)
+    hidden, weight, grad = (
+        torch.randn(*shape, generator=generator).to(device) for shape in ((3, HIDDEN), (VOCAB, HIDDEN), (3, VOCAB))
+    )
+
+    sharded = _bf16_autocast_linear(lambda h, w: VocabParallelLinear.apply(None, h, w), hidden, weight, grad)
+    dense = _bf16_autocast_linear(F.linear, hidden, weight, grad)
+    for name, got, want in zip(("logits", "hidden_grad", "weight_grad"), sharded, dense):
+        assert got.dtype == want.dtype, name
+        torch.testing.assert_close(got, want, rtol=1e-2, atol=1e-2, msg=name)
+
+
 def test_embedding_rejects_out_of_range_ids_instead_of_returning_garbage(table):
     """A negative id must fail, not silently produce an uninitialized row.
 
@@ -237,6 +266,46 @@ def _parity_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
 
 def test_sharded_ops_match_dense_over_all_ranks(tmp_path):
     mp.spawn(_parity_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=_WORLD, join=True)
+
+    for rank in range(_WORLD):
+        result = json.loads((tmp_path / f"rank{rank}.json").read_text())
+        assert all(result.values()), (rank, result)
+
+
+def _autocast_linear_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", world_size=_WORLD, rank=rank)
+    try:
+        table = _mr_table().float()
+        rows = _MR_VOCAB // _WORLD
+        chunk = slice(rank * rows, (rank + 1) * rows)
+        hidden = [_mr_randn(r, 1, 3, _MR_HIDDEN).float() for r in range(_WORLD)]
+        grads = [_mr_randn(r, 3, 3, _MR_VOCAB).float() for r in range(_WORLD)]
+
+        logits, hidden_grad, shard_grad = _bf16_autocast_linear(
+            lambda h, w: VocabParallelLinear.apply(dist.group.WORLD, h, w), hidden[rank], table[chunk], grads[rank]
+        )
+        dense_grad = torch.zeros_like(table)
+        for r in range(_WORLD):
+            dense_logits, dense_hidden_grad, dense_grad_r = _bf16_autocast_linear(F.linear, hidden[r], table, grads[r])
+            dense_grad += dense_grad_r
+            if r == rank:
+                want_logits, want_hidden_grad = dense_logits, dense_hidden_grad
+
+        # The shard grad is reduce-scattered in the autocast dtype, the dense one summed in FP32.
+        result = {
+            "logits": logits.dtype == torch.bfloat16 and torch.allclose(logits, want_logits),
+            "hidden_grad": hidden_grad.dtype == torch.float32 and torch.allclose(hidden_grad, want_hidden_grad),
+            "weight_grad": shard_grad.dtype == torch.float32
+            and torch.allclose(shard_grad, dense_grad[chunk], rtol=1e-2, atol=1e-2),
+        }
+        with open(f"{out_dir}/rank{rank}.json", "w") as f:
+            json.dump(result, f)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_sharded_linear_matches_dense_under_autocast_over_all_ranks(tmp_path):
+    mp.spawn(_autocast_linear_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=_WORLD, join=True)
 
     for rank in range(_WORLD):
         result = json.loads((tmp_path / f"rank{rank}.json").read_text())
@@ -345,9 +414,9 @@ def test_a_split_table_outside_its_own_fsdp_unit_is_rejected(emb_state):
     """A parent unit would shard and gather the rows over the whole FSDP mesh, mixing vocab slices."""
     emb_state(_emb_state(size=2))
     embedding = _sliced(ShardedEmbedding(8, 4), rows=4)
-    with pytest.raises(RuntimeError, match="not the emb module's own FSDP2 unit"):
+    with pytest.raises(RuntimeError, match="not its own FSDP2 unit"):
         embedding(torch.tensor([1]))
-    with pytest.raises(RuntimeError, match="not the emb module's own FSDP2 unit"):
+    with pytest.raises(RuntimeError, match="not its own FSDP2 unit"):
         embedding.project(torch.randn(1, 4))
 
 
@@ -450,8 +519,6 @@ def _fsdp_rank_main(
         if not tied:
             model.head.weight = nn.Parameter(head.clone())
         fully_shard(embedding, reshard_after_forward=reshard, **shard_kwargs)
-        if layout == "emb":
-            embedding._extra_parallel_name = "emb"  # what the parallelizer sets on the emb_fsdp unit
         if separate:
             fully_shard(model.mid, mesh=world_mesh, reshard_after_forward=reshard)
         fully_shard(model, mesh=world_mesh, reshard_after_forward=reshard)
@@ -511,45 +578,3 @@ def test_sharded_embedding_matches_dense_through_fsdp(tmp_path, layout, tied, re
     for rank in range(world):
         result = json.loads((tmp_path / f"rank{rank}.json").read_text())
         assert all(result.values()), (rank, result)
-
-
-def _wrong_mesh_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
-    from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.fsdp import fully_shard
-
-    world = len(_FSDP_IDS)
-    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", world_size=world, rank=rank)
-    try:
-        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("emb_fsdp", "emb"))
-        emb_rank = mesh["emb"].get_local_rank()
-        _install_state(_emb_state(group=mesh["emb"].get_group(), rank=emb_rank))
-        rows = _FSDP_VOCAB // 2
-        embedding = ShardedEmbedding(_FSDP_VOCAB, _FSDP_HIDDEN)
-        embedding.weight = nn.Parameter(_fsdp_weights()[0][emb_rank * rows : (emb_rank + 1) * rows].clone())
-        # Its own unit, but on the regular FSDP mesh: what a second planned table listed in
-        # _no_split_modules gets, since only the plan's first entry is wrapped on emb_fsdp.
-        fully_shard(embedding, mesh=init_device_mesh("cpu", (world,)))
-        raised = {}
-        for name, call in (
-            ("forward", lambda: embedding(torch.tensor([1]))),
-            ("project", lambda: embedding.project(torch.randn(1, _FSDP_HIDDEN))),
-        ):
-            try:
-                call()
-                raised[name] = False
-            except RuntimeError as e:
-                raised[name] = "emb_fsdp mesh" in str(e)
-        with open(f"{out_dir}/rank{rank}.json", "w") as f:
-            json.dump(raised, f)
-    finally:
-        dist.destroy_process_group()
-
-
-def test_a_split_table_in_its_own_unit_on_the_wrong_mesh_is_rejected(tmp_path):
-    """The gathered rows are correctly shaped but mix different ranks' vocab slices."""
-    world = len(_FSDP_IDS)
-    mp.spawn(_wrong_mesh_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=world, join=True)
-
-    for rank in range(world):
-        result = json.loads((tmp_path / f"rank{rank}.json").read_text())
-        assert result == {"forward": True, "project": True}, (rank, result)

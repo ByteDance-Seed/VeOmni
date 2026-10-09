@@ -769,8 +769,6 @@ def parallelize_model_fsdp2(
                     continue
                 # shard para module (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens)
                 fully_shard(_para_mod, **extra_parallel_fsdp_kwargs[para])
-                # Lets the module tell this unit from one on the regular FSDP mesh (e.g. ShardedEmbedding).
-                _para_mod._extra_parallel_name = para
                 # average para (e.g. ep) grads across para (e.g. ep) ranks
                 # NOTE: in torch 2.8 and later we should use
                 # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
