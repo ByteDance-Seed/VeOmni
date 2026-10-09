@@ -31,3 +31,22 @@ def test_other_npu_models_remain_rejected(monkeypatch):
     monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True))
     with pytest.raises(NotImplementedError, match="GPU-only"):
         auto.check_context_parallel_supported(SimpleNamespace(model_type="deepseek_v4"))
+
+
+@pytest.mark.parametrize("npu", [False, True])
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_hybrid_opt_in_does_not_enable_other_models(monkeypatch, npu, cp_size):
+    monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(auto, "is_torch_npu_available", lambda: npu)
+    state = SimpleNamespace(cp_enabled=True, cp_size=cp_size, ulysses_size=8, allow_hybrid_cp=True)
+    monkeypatch.setattr(auto, "get_parallel_state", lambda: state)
+    with pytest.raises(NotImplementedError, match="only for Qwen4-Exp"):
+        auto.check_context_parallel_supported(SimpleNamespace(model_type="deepseek_v4"))
+
+
+def test_native_gpu_cp_without_ulysses_remains_supported(monkeypatch):
+    monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(auto, "is_torch_npu_available", lambda: False)
+    state = SimpleNamespace(cp_enabled=True, cp_size=2, ulysses_size=1, allow_hybrid_cp=False)
+    monkeypatch.setattr(auto, "get_parallel_state", lambda: state)
+    auto.check_context_parallel_supported(SimpleNamespace(model_type="deepseek_v4"))

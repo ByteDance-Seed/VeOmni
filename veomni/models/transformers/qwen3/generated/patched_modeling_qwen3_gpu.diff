@@ -150,11 +150,17 @@
          down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
          return down_proj
 
-@@ -144,25 +188,23 @@
+@@ -144,25 +188,24 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
--@use_kernel_forward_from_hub("rotary_pos_emb")
++# ======================================================================
++# [PATCHED FUNCTION] apply_rotary_pos_emb
++# Reason: OpSlot guard for Liger fused RoPE
++# Source: veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config
++# ======================================================================
++# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
+ @use_kernel_forward_from_hub("rotary_pos_emb")
 -def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 -    """Applies Rotary Position Embedding to the query and key tensors.
 -
@@ -173,12 +179,6 @@
 -    Returns:
 -        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
 -    """
-+# ======================================================================
-+# [PATCHED FUNCTION] apply_rotary_pos_emb
-+# Reason: OpSlot guard for Liger fused RoPE
-+# Source: veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config
-+# ======================================================================
-+# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
 +def apply_rotary_pos_emb(
 +    q: torch.Tensor,
 +    k: torch.Tensor,
@@ -193,7 +193,7 @@
      cos = cos.unsqueeze(unsqueeze_dim)
      sin = sin.unsqueeze(unsqueeze_dim)
      q_embed = (q * cos) + (rotate_half(q) * sin)
-@@ -427,6 +469,12 @@
+@@ -427,6 +470,12 @@
          )
 
 
@@ -206,7 +206,7 @@
  @auto_docstring
  class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -443,6 +491,7 @@
+@@ -443,6 +492,7 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -214,7 +214,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -454,61 +503,130 @@
+@@ -454,61 +504,130 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,

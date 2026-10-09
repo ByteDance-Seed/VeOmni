@@ -11,10 +11,10 @@ from torch.autograd.function import once_differentiable
 
 def _blocked_mask(indices, kv_length):
     # An extra column absorbs -1 padding without overwriting valid duplicates.
-    blocked = torch.ones((*indices.shape[:-1], kv_length + 1), dtype=torch.bool, device=indices.device)
+    blocked = torch.ones((*indices.shape[:-1], kv_length + 1), dtype=torch.int8, device=indices.device)
     slots = torch.where(indices >= 0, indices, kv_length).long()
-    blocked.scatter_(-1, slots, False)
-    return blocked[..., :kv_length].unsqueeze(1).contiguous()
+    blocked.scatter_(-1, slots, 0)
+    return blocked[..., :kv_length].unsqueeze(1).bool().contiguous()
 
 
 def _kv_ranges(indices, kv_length, chunk_size):
