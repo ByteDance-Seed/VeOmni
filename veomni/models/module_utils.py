@@ -726,8 +726,6 @@ def load_model_weights_ep_sharded(
 
     def _local_expert_range(fused_name: str) -> Tuple[int, int]:
         """``(start, num_local)`` of the experts this rank holds in fused parameter ``fused_name``."""
-        if fused_name not in param_shapes:
-            raise RuntimeError(f"ep_sharded_stream_load: converter target '{fused_name}' is not a model parameter.")
         target0 = param_shapes[fused_name][0]
         shard_group = parallel_plan._get_shard_parameter_groupname(fused_name)
         if shard_group is None:
@@ -754,6 +752,9 @@ def load_model_weights_ep_sharded(
     # so raise before materialising anything.
     expert_converter = None
     expert_range: Optional[Tuple[int, int]] = None
+    # Per-expert keys whose fused target the model does not build (e.g. a checkpoint's MTP
+    # experts when MTP is off): unexpected keys, skipped without reading.
+    unbuilt_expert_keys = set()
     if converter is not None:
         expert_ranges: Dict[Tuple[int, int], str] = {}
         for raw_name in key_to_file:
@@ -774,6 +775,9 @@ def load_model_weights_ep_sharded(
                     f"to use the whole-tensor loader (broadcast or every-rank-read)."
                 )
             fused_name = _apply_peft_override(target[0])
+            if fused_name not in param_shapes:
+                unbuilt_expert_keys.add(raw_name)
+                continue
             expert_ranges.setdefault(_local_expert_range(fused_name), fused_name)
         if len(expert_ranges) > 1:
             raise NotImplementedError(
@@ -807,6 +811,9 @@ def load_model_weights_ep_sharded(
                 if checkpoint_converter_should_skip_without_loading(converter, bare_name):
                     checkpoint_converter_record_skip_without_loading(converter, bare_name)
                     n_skipped += 1
+                    continue
+                if raw_name in unbuilt_expert_keys:
+                    logger.info_rank0(f"Unexpected key in state dict: {name}.")
                     continue
                 expert_target = (
                     checkpoint_converter_fused_expert_target(converter, bare_name)

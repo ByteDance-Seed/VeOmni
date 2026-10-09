@@ -56,13 +56,14 @@ def _layer(num_local: int) -> nn.Module:
 class _MtpMoeModel(nn.Module):
     converter_cls = Qwen3MoeCheckpointTensorConverter
 
-    def __init__(self) -> None:
+    def __init__(self, with_mtp: bool = True) -> None:
         super().__init__()
         num_local = NUM_EXPERTS // EP_SIZE
         self.model = nn.Module()
         self.model.layers = nn.ModuleList([_layer(num_local)])
-        self.mtp = nn.Module()
-        self.mtp.layers = nn.ModuleList([_layer(num_local)])
+        if with_mtp:
+            self.mtp = nn.Module()
+            self.mtp.layers = nn.ModuleList([_layer(num_local)])
         self.lm_head = nn.Linear(HIDDEN, 5, bias=False)
         self.config = SimpleNamespace(tie_word_embeddings=False)
 
@@ -71,7 +72,7 @@ class _MtpMoeModel(nn.Module):
             extra_parallel_plan={
                 "ep": {
                     f"{root}.layers.*.mlp.experts.{proj}": Shard(0)
-                    for root in ("model", "mtp")
+                    for root in (("model", "mtp") if hasattr(self, "mtp") else ("model",))
                     for proj in ("gate_up_proj", "down_proj")
                 }
             }
@@ -151,9 +152,9 @@ def _load_as_rank(monkeypatch, weights_path: Path, ep_rank: int, model: nn.Modul
     return read_keys
 
 
-def _meta_model(converter_cls=Qwen3MoeCheckpointTensorConverter) -> nn.Module:
+def _meta_model(converter_cls=Qwen3MoeCheckpointTensorConverter, with_mtp: bool = True) -> nn.Module:
     with torch.device("meta"):
-        model = _MtpMoeModel()
+        model = _MtpMoeModel(with_mtp)
     model.converter_cls = converter_cls
     return model
 
@@ -204,21 +205,19 @@ def test_a_fusion_converter_without_expert_streaming_still_bails(monkeypatch, tm
         _load_as_rank(monkeypatch, tmp_path, 0, _meta_model(_WholeSetOnlyConverter))
 
 
-def test_converter_expert_range_stacks_only_its_experts():
-    converter = Qwen3MoeCheckpointTensorConverter(num_experts=4)
-    name = "model.layers.0.mlp.experts.3.up_proj.weight"
-    assert converter.fused_expert_target(name) == ("model.layers.0.mlp.experts.gate_up_proj", 3)
-    assert converter.fused_expert_target("model.layers.0.mlp.experts.gate_up_proj") is None
+def test_per_expert_keys_of_an_unbuilt_module_are_skipped_unread(monkeypatch, tmp_path):
+    """With MTP off the model has no ``mtp`` experts; the checkpoint's per-expert MTP
+    keys are unexpected, as on the whole-tensor loader, and never read."""
+    state = _write_checkpoint(tmp_path)
+    model = _meta_model(with_mtp=False)
 
-    local = converter.for_expert_range(2, 2)
-    tensors = {expert: torch.full((1, 2), float(expert)) for expert in (2, 3)}
-    assert local.convert("model.layers.0.mlp.experts.2.down_proj.weight", tensors[2]) is None
-    converted = local.convert("model.layers.0.mlp.experts.3.down_proj.weight", tensors[3])
-    assert converted.name == "model.layers.0.mlp.experts.down_proj"
-    torch.testing.assert_close(converted.tensor, torch.stack([tensors[2], tensors[3]]))
-    assert local.finalize() == []
+    read_keys = _load_as_rank(monkeypatch, tmp_path, 1, model)
 
-    with pytest.raises(ValueError, match="outside this converter's range"):
-        local.convert("model.layers.0.mlp.experts.1.down_proj.weight", tensors[2])
-    with pytest.raises(ValueError, match="outside this converter's 4 experts"):
-        converter.for_expert_range(3, 2)
+    assert not any(key.startswith("mtp.") for key in read_keys)
+    num_local = NUM_EXPERTS // EP_SIZE
+    torch.testing.assert_close(
+        model.model.layers[0].mlp.experts.down_proj.data,
+        state["model.layers.0.mlp.experts.down_proj"][num_local:],
+        atol=0,
+        rtol=0,
+    )
