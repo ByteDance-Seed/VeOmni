@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from veomni.ops.dispatch import OpSlot
 from veomni.ops.kernel_registry import KERNEL_REGISTRY
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_gpu_compute_capability
 
 
 _REGISTRY_MODULE = "veomni.ops.kernel_registry"
@@ -30,6 +30,9 @@ DEVICE = get_device_type()
 _MHC_GPU_AVAILABLE = (
     IS_CUDA_AVAILABLE and get_gpu_compute_capability() >= 90 and importlib.util.find_spec("tile_kernels") is not None
 )
+_MHC_NPU_AVAILABLE = IS_NPU_AVAILABLE and importlib.util.find_spec("cann_ops_transformer") is not None
+
+
 
 
 def _eager_pre(x, fn, scale, base, norm_eps, hc_mult, sinkhorn_iters, hc_eps):
@@ -139,6 +142,42 @@ def test_tile_kernels_mhc_head_forward_backward_matches_eager():
     for actual, expected in zip(kernel_grads, eager_grads, strict=True):
         assert torch.isfinite(actual).all()
         assert _cosine(actual, expected) > 0.98
+
+
+@pytest.mark.skipif(not _MHC_NPU_AVAILABLE, reason="Ascend mHC requires NPU and cann_ops_transformer")
+def test_npu_mhc_pre_forward_backward_matches_eager():
+    from veomni.ops.kernels.mhc.npu import mhc_pre_npu
+
+    torch.manual_seed(29)
+    batch, seq_len, hc_mult, hidden = 1, 8, 4, 128
+    norm_eps, hc_eps, sinkhorn_iters = 1e-6, 1e-6, 20
+    mix = (2 + hc_mult) * hc_mult
+    x = torch.randn(batch, seq_len, hc_mult, hidden, device=DEVICE, dtype=torch.bfloat16)
+    fn = torch.randn(mix, hc_mult * hidden, device=DEVICE, dtype=torch.float32) * 0.01
+    scale = torch.randn(3, device=DEVICE, dtype=torch.float32) * 0.01
+    base = torch.randn(mix, device=DEVICE, dtype=torch.float32) * 0.01
+
+    kernel_inputs = tuple(_clone_with_grad(tensor) for tensor in (x, fn, scale, base))
+    eager_inputs = tuple(_clone_with_grad(tensor) for tensor in (x, fn, scale, base))
+
+    kernel_outputs = mhc_pre_npu(*kernel_inputs, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+    eager_outputs = _eager_pre(*eager_inputs, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+    for actual, expected in zip(kernel_outputs, eager_outputs, strict=True):
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=4e-2)
+
+    grads = tuple(torch.randn_like(output) for output in kernel_outputs)
+    kernel_loss = sum((output * grad).sum() for output, grad in zip(kernel_outputs, grads, strict=True))
+    eager_loss = sum((output * grad).sum() for output, grad in zip(eager_outputs, grads, strict=True))
+    kernel_grads = torch.autograd.grad(kernel_loss, kernel_inputs)
+    eager_grads = torch.autograd.grad(eager_loss, eager_inputs)
+    for actual, expected in zip(kernel_grads, eager_grads, strict=True):
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=3e-2, atol=8e-2)
+
+
+@pytest.mark.parametrize("variant", ["pre", "post", "head"])
+def test_npu_mhc_registry_entries(variant):
+    assert "npu" in KERNEL_REGISTRY.list_available("mhc", variant)
 
 
 @pytest.mark.parametrize("variant", ["pre", "post", "head"])
