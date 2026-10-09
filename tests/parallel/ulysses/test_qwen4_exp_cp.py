@@ -23,18 +23,22 @@ from veomni.distributed.parallel_state import _init_parallel_state as init_paral
 from veomni.distributed.parallel_state import clear_parallel_state
 
 
-# Import real MoE communication without the unrelated CUDA GEMM package init.
-# This CPU-only test never calls a MoE kernel.
-moe_package = types.ModuleType("veomni.distributed.moe")
-moe_package.__path__ = [str(Path(__file__).resolve().parents[3] / "veomni/distributed/moe")]
-sys.modules[moe_package.__name__] = moe_package
-model_code = importlib.import_module(
-    "veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_"
-    + os.environ.get("QWEN4_CP_TEST_MODULE", "gpu")
-)
+model_code: types.ModuleType
+MODULE: str
 
 
-MODULE = model_code.__name__
+def _load_generated_model():
+    # Only the standalone Gloo child installs this shim. Pytest collection of
+    # this script must leave package-level MoE exports and imports untouched.
+    moe_package = types.ModuleType("veomni.distributed.moe")
+    moe_package.__path__ = [str(Path(__file__).resolve().parents[3] / "veomni/distributed/moe")]
+    sys.modules[moe_package.__name__] = moe_package
+    return importlib.import_module(
+        "veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_"
+        + os.environ.get("QWEN4_CP_TEST_MODULE", "gpu")
+    )
+
+
 NO_SP = SimpleNamespace(
     sp_enabled=False,
     sp_size=1,
@@ -161,6 +165,9 @@ def check_independent_segments(module, hidden, ids, boundaries, label):
 
 
 def main():
+    global model_code, MODULE
+    model_code = _load_generated_model()
+    MODULE = model_code.__name__
     torch.set_num_threads(1)
     dist.init_process_group("gloo")
     world, rank = dist.get_world_size(), dist.get_rank()
