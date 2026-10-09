@@ -352,6 +352,7 @@ def mlu_group_gemm_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,  # intentionally unused; see the del below
+    activation: str = "silu",
 ):
     """Triton grouped-gemm fused MoE forward pass.
 
@@ -373,6 +374,8 @@ def mlu_group_gemm_fused_moe_forward(
     # ``fused_moe_forward`` dispatch and the OpSlot adapter can forward it to
     # any backend uniformly.
     del assume_distinct_experts
+    if activation not in ("silu", "swish"):
+        raise ValueError(f"MLU fused MoE only supports SiLU, got activation={activation!r}.")
 
     if get_parallel_state().ep_enabled:
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)

@@ -252,6 +252,7 @@ def npu_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,  # intentionally unused; see the del below
+    activation: str = "silu",
 ):
     # ``assume_distinct_experts`` only tightens the grouped-GEMM ``max_M``
     # launch bound in the Triton backend. The NPU group GEMM has no such launch
@@ -259,6 +260,8 @@ def npu_fused_moe_forward(
     # only so the unified ``fused_moe_forward`` dispatch and the OpSlot adapter
     # can forward it to any backend uniformly.
     del assume_distinct_experts
+    if activation not in ("silu", "swish"):
+        raise ValueError(f"NPU fused MoE only supports SiLU, got activation={activation!r}.")
 
     if get_parallel_state().ep_enabled:
         final_hidden_states = npu_ep_fused_moe_forward(

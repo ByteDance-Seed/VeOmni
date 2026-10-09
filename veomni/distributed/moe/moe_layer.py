@@ -26,6 +26,11 @@ from .moe_utils import generate_weights_idx, permute, sort_chunks_by_idxs, unper
 
 if not is_torch_npu_available():
     from ...ops.kernels.moe._kernels.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
+    from ...ops.kernels.moe._kernels.kernel.triton_utils.activation import (
+        apply_activation,
+        apply_activation_backward,
+        normalize_activation,
+    )
 
 
 def _apply_swiglu_clamp(fc1_1_output, fc1_2_output, swiglu_limit):
@@ -101,7 +106,14 @@ def token_pre_all2all(
     org_hidden_states_shape = hidden_states.shape
     routing_map = expert_mask.sum(dim=1)
 
-    local_permuted_hidden_states, local_input_permutation_mapping = permute(hidden_states, routing_map)
+    # ``expert_mask`` is [experts, top_k, tokens], so dim 1 is the routing width, not the
+    # expert count. Both directions of the permutation need it, and both need the routing
+    # to give every token exactly that many distinct experts -- the reduction groups by a
+    # fixed stride, so a router that dropped or repeated one would mis-pair entries with
+    # tokens instead of failing.
+    local_permuted_hidden_states, local_input_permutation_mapping = permute(
+        hidden_states, routing_map, expert_mask.shape[1]
+    )
 
     global_permuted_hidden_states = all_to_all(ep_group, local_permuted_hidden_states, output_splits, input_splits)
 
@@ -189,7 +201,7 @@ def dispatch_to_ep_class(
 def tokens_post_all2all(
     expert_outputs: torch.Tensor,
     routing_weights: torch.Tensor,
-    selected_experts: int,
+    selected_experts: torch.Tensor,
     num_experts: int,
     input_splits: torch.Tensor,
     output_splits: torch.Tensor,
@@ -219,6 +231,7 @@ def tokens_post_all2all(
         org_hidden_states_shape,
         local_input_permutation_mapping,
         routing_map,
+        selected_experts.shape[-1],
     )
 
     return unpermute_outputs
@@ -234,7 +247,9 @@ class EPGroupGemm(torch.autograd.Function):
         fc1_2_weight,
         fc2_weight,
         swiglu_limit=None,
+        activation="silu",
     ):
+        activation = normalize_activation(activation)
         # permute_tokens: [tokens, hidden_dim]
         # cumsum: [local_experts]
 
@@ -265,8 +280,8 @@ class EPGroupGemm(torch.autograd.Function):
             fc1_1_output, fc1_2_output, swiglu_limit
         )
 
-        # compute the actication of linear layer fc1-1
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        # compute the activation of linear layer fc1-1
+        fc1_1_activation = apply_activation(fc1_1_output, activation)
 
         # compute final result of linear layer fc1
         fc1_output = fc1_1_activation * fc1_2_output
@@ -283,6 +298,7 @@ class EPGroupGemm(torch.autograd.Function):
         )
 
         ctx.swiglu_limit = swiglu_limit
+        ctx.activation = activation
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
@@ -325,7 +341,7 @@ class EPGroupGemm(torch.autograd.Function):
         )
 
         # recompute
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        fc1_1_activation = apply_activation(fc1_1_output, ctx.activation)
         fc1_output = fc1_1_activation * fc1_2_output
 
         # wgrad fc2
@@ -371,7 +387,7 @@ class EPGroupGemm(torch.autograd.Function):
                 transpose_b=False,
             )
 
-        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+        grad_fc1_1_output = apply_activation_backward(grad_fc1_1_activation.contiguous(), fc1_1_output, ctx.activation)
         if swiglu_limit is not None:
             grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
 
@@ -408,6 +424,7 @@ class EPGroupGemm(torch.autograd.Function):
             grad_fc1_2_weight,  # fc1_2_weight
             grad_fc2_weight,  # fc2_weight
             None,  # swiglu_limit
+            None,  # activation
         )
 
 
@@ -425,7 +442,9 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         fc1_1_2_weight,
         fc2_weight,
         swiglu_limit=None,
+        activation="silu",
     ):
+        activation = normalize_activation(activation)
         # permute_tokens: [tokens, hidden_dim]
         # cumsum: [local_experts]
         assert fc1_1_2_weight.shape[1] % 2 == 0, (
@@ -453,7 +472,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         )
 
         # compute the activation of linear layer fc1-1
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        fc1_1_activation = apply_activation(fc1_1_output, activation)
 
         # compute final result of linear layer fc1
         fc1_result = fc1_1_activation * fc1_2_output
@@ -469,6 +488,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         )
 
         ctx.swiglu_limit = swiglu_limit
+        ctx.activation = activation
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
@@ -497,7 +517,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         swiglu_limit = ctx.swiglu_limit
 
         # recompute
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        fc1_1_activation = apply_activation(fc1_1_output, ctx.activation)
         fc1_result = fc1_1_activation * fc1_2_output
 
         # dgrad fc2
@@ -526,7 +546,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         # gate gradients
         grad_fc1_2_output = fc1_1_activation * grad_fc1_result
         grad_fc1_1_activation = grad_fc1_result * fc1_2_output
-        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+        grad_fc1_1_output = apply_activation_backward(grad_fc1_1_activation.contiguous(), fc1_1_output, ctx.activation)
 
         if swiglu_limit is not None:
             grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
@@ -564,4 +584,5 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             grad_fc1_1_2_weight,  # fc1_1_2_weight
             grad_fc2_weight,  # fc2_weight
             None,  # swiglu_limit
+            None,  # activation
         )

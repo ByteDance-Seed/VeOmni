@@ -416,10 +416,26 @@ path instead. VeOmni's product-based Ascend images install and verify
 `triton-ascend`; other environments can install a release compatible with their
 CANN and `torch_npu` stack to enable the fused activation.
 
+The expert activation follows the config's `hidden_activation` / `hidden_act`
+(searched in `text_config`, `thinker_config.text_config`, the thinker, then the
+top level). `fused_triton` supports SiLU and the GELU family
+(`gelu`, `gelu_new`, `gelu_pytorch_tanh`, `gelu_tanh`); `fused_quack`,
+`fused_npu` and MLU are SwiGLU only. `_bind_veomni_ops` calls
+`refuse_fused_moe_on_unsupported_activation` before binding any OpSlot, so a
+model whose activation the selected kernel cannot compute fails at build time
+instead of training with the wrong nonlinearity. A config that names no
+activation only logs a warning.
+
+EP token permutation is deterministic: `permute` / `unpermute` in
+`veomni/distributed/moe/moe_utils.py` sum the top-k copies of each token in a
+fixed order (stable argsort, fp32 accumulation) instead of relying on
+`index_add_` atomics.
+
 ### Key files
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
 - Dispatch: `veomni/ops/kernels/moe/__init__.py` — `apply_veomni_fused_moe_patch()`
+- Activation gate: `veomni/ops/kernels/moe/activation_gate.py`
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
 
 ---

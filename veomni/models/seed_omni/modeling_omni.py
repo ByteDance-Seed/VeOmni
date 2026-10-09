@@ -312,7 +312,7 @@ class OmniModel(PreTrainedModel):
             apply_ops_config(module_ops)
 
             # After the ops config above was installed.
-            bind_ops_to_modeling(mod_cls)
+            bind_ops_to_modeling(mod_cls, module_config)
             if load_weights:
                 modules[name] = mod_cls.from_pretrained(module_path, config=module_config, **module_kwargs)
             else:

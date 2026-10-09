@@ -657,6 +657,7 @@ def quack_gemm_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,  # intentionally unused; see the del below
+    activation: str = "silu",
 ):
     """Quack GEMM fused MoE forward pass.
 
@@ -677,6 +678,8 @@ def quack_gemm_fused_moe_forward(
     # OpSlot adapter can forward it to any backend uniformly. The ``del`` makes
     # the deliberate non-use explicit rather than an oversight.
     del assume_distinct_experts
+    if activation not in ("silu", "swish"):
+        raise ValueError(f"Quack fused MoE only supports SiLU, got activation={activation!r}.")
 
     if get_parallel_state().ep_enabled:
         if fc1_1_2_weight is not None:

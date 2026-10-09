@@ -21,11 +21,19 @@ from ....utils.import_utils import (
     is_torch_mlu_available,
     is_torch_npu_available,
 )
+from .activation_gate import moe_expert_activation, refuse_fused_moe_on_unsupported_activation
 
 
 logger = logging.get_logger(__name__)
 
 _fused_moe_forward = None
+
+__all__ = [
+    "fused_moe_forward",
+    "apply_veomni_fused_moe_patch",
+    "moe_expert_activation",
+    "refuse_fused_moe_on_unsupported_activation",
+]
 
 
 def fused_moe_forward(
@@ -39,6 +47,7 @@ def fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
+    activation: str = "silu",
 ):
     if _fused_moe_forward is None:
         raise NotImplementedError("No fused MoE kernel is available. Please check your environment.")
@@ -61,6 +70,7 @@ def fused_moe_forward(
         fc1_1_2_weight,
         swiglu_limit=swiglu_limit,
         assume_distinct_experts=assume_distinct_experts,
+        activation=activation,
     )
 
 
@@ -160,7 +170,7 @@ def _make_moe_experts_adapter(raw_forward):
     ``quack_gemm_fused_moe_forward``) instead take the flat tensor-level
     signature ``(num_experts, routing_weights, selected_experts,
     hidden_states, fc1_1_weight, fc1_2_weight, fc2_weight,
-    fc1_1_2_weight, swiglu_limit)``. This adapter pulls
+    fc1_1_2_weight, swiglu_limit, assume_distinct_experts, activation)``. This adapter pulls
     ``num_experts``/``gate_up_proj``/``down_proj`` off ``self`` and forwards
     everything else positionally so the OpSlot stays a drop-in replacement
     for the HF ``forward``.
@@ -176,6 +186,9 @@ def _make_moe_experts_adapter(raw_forward):
     the tight grouped-GEMM bound; anything that does not set it keeps the safe
     conservative bound, so an unaudited or future router cannot silently get an
     unsafe tight bound.
+
+    ``activation`` is read from ``self.hidden_activation`` when present (Gemma
+    family experts run GELU-tanh) and defaults to SiLU.
     """
 
     def adapter(self, hidden_states, top_k_index, top_k_weights):
@@ -190,6 +203,7 @@ def _make_moe_experts_adapter(raw_forward):
             fc1_1_2_weight=self.gate_up_proj,
             swiglu_limit=getattr(self, "limit", None),
             assume_distinct_experts=getattr(self, "assume_distinct_experts", False),
+            activation=getattr(self, "hidden_activation", "silu"),
         )
 
     return adapter

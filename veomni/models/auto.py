@@ -128,12 +128,21 @@ def build_config(config_path: str, **config_kwargs) -> "PretrainedConfig":
     return get_model_config(config_path, trust_remote_code=trust_remote_code, **config_kwargs)
 
 
-def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bool:
+def _bind_veomni_ops(
+    modeling_module,
+    ops_config: OpsImplementationConfig,
+    config: Optional["PretrainedConfig"] = None,
+) -> bool:
     """Bind every OpSlot in *modeling_module* from *ops_config*.
+
+    *config* is the model config. When a fused MoE kernel is selected it is
+    checked against the expert activations that kernel implements, before the
+    module-global pointer or any OpSlot is mutated.
 
     Returns ``True`` if at least one OpSlot was found (and bound).
     """
     bound: list[str] = []
+    slots: list[tuple[OpSlot, str]] = []
     moe_experts_kernel: Optional[str] = None
     for name in dir(modeling_module):
         obj = getattr(modeling_module, name, None)
@@ -158,6 +167,17 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
                 moe_experts_kernel = impl_name
         else:
             impl_name = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
+        slots.append((obj, impl_name))
+
+    # Refuse an unsupported expert activation *before* any OpSlot.bind: a raise
+    # after bind would leave ``use_non_eager_impl`` true on a module-global
+    # slot, and same-process follow-up construction would take the fused branch.
+    if moe_experts_kernel is not None:
+        from ..ops.kernels.moe import refuse_fused_moe_on_unsupported_activation
+
+        refuse_fused_moe_on_unsupported_activation(config, moe_experts_kernel)
+
+    for obj, impl_name in slots:
         obj.bind(impl_name)
         bound.append(f"{obj.op_name} ({impl_name})")
 
@@ -175,8 +195,11 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
     return bool(bound)
 
 
-def bind_ops_to_modeling(model_cls: Optional[type]) -> bool:
+def bind_ops_to_modeling(model_cls: Optional[type], config: Optional["PretrainedConfig"] = None) -> bool:
     """Resolve ``model_cls``'s OpSlots against the ops config now in force.
+
+    ``config`` is the model config, checked against the fused MoE kernel's
+    supported expert activations when one is selected.
 
     Every load path needs this same step and none of them holds the modeling
     *module* that :func:`_bind_veomni_ops` wants — they hold the model class.
@@ -196,7 +219,7 @@ def bind_ops_to_modeling(model_cls: Optional[type]) -> bool:
     ops_config = get_ops_config()
     if modeling_module is None or ops_config is None:
         return False
-    return _bind_veomni_ops(modeling_module, ops_config)
+    return _bind_veomni_ops(modeling_module, ops_config, config)
 
 
 def _validate_attention_parallelism(attn_implementation: Optional[str]) -> None:
@@ -334,7 +357,7 @@ def build_foundation_model(
     # the timing uniform. Assumes ``loader.model_cls`` is final at this point —
     # i.e. no loader rewrites it between here and ``loader.load_model()`` below.
     model_cls = getattr(loader, "model_cls", None) if loader is not None else None
-    if bind_ops_to_modeling(model_cls):
+    if bind_ops_to_modeling(model_cls, config):
         logger.info_rank0("OpSlot-based kernel dispatch active.")
 
     init_kwargs = {
