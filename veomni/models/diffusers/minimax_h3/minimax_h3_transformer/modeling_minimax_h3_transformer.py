@@ -20,7 +20,13 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from ..minimax_h3_core.batch_packing import pack_samples
-from ..minimax_h3_core.minimax_h3_dit import MiniMaxH3Attention, MiniMaxH3DiT, unpack_audio, unpatchify_video
+from ..minimax_h3_core.minimax_h3_dit import (
+    MiniMaxH3Attention,
+    MiniMaxH3DiT,
+    MiniMaxH3FP32Linear,
+    unpack_audio,
+    unpatchify_video,
+)
 from .configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
 
 
@@ -44,9 +50,21 @@ class MiniMaxH3DiTModel(PreTrainedModel):
     config_class = MiniMaxH3DiTModelConfig
     supports_gradient_checkpointing = True
     _supports_sdpa = True
-    _no_split_modules = ["MiniMaxH3DiTBlock"]
-
+    # MiniMaxH3DiT is listed so FSDP2 scans its root-level FP32 projections.
+    _no_split_modules = ["MiniMaxH3DiTBlock", "MiniMaxH3DiT"]
     _checkpoint_conversion_mapping = {"^": "dit."}
+
+    def get_ignore_modules_in_mixed_precision(self):
+        """Shard the official FP32 projections without FSDP parameter casting.
+
+        FSDP2 calls this hook, so it also rejects LoRA on those projections.
+        """
+        from .....lora.layers import LoraLinear
+
+        for module in self.dit.modules():
+            if isinstance(module, LoraLinear) and isinstance(module.base_layer, MiniMaxH3FP32Linear):
+                raise NotImplementedError("H3 does not support LoRA on its FP32 projections.")
+        return (MiniMaxH3FP32Linear,)
 
     def __init__(self, config: MiniMaxH3DiTModelConfig, **kwargs):
         super().__init__(config)

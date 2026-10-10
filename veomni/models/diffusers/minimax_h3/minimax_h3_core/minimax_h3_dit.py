@@ -136,19 +136,35 @@ class MiniMaxH3Rope(nn.Module):
         return torch.cat((half, half), dim=-1)
 
 
+def _cast_linear_input(module, args):
+    """Adapt activations after FSDP has materialized this projection's parameters."""
+    return (args[0].to(module.weight.dtype), *args[1:])
+
+
+class MiniMaxH3FP32Linear(nn.Linear):
+    """Keep checkpoint FP32 projections independent of the block/autocast dtype."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs, dtype=torch.float32)
+
+    def forward(self, x):
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            return super().forward(x.to(self.weight.dtype))
+
+
 class MiniMaxH3TimeEmbedder(nn.Module):
     def __init__(self, timestep_input_dim, time_embed_hidden_size, time_embed_dim):
         super().__init__()
         self.frequency_embedding_size = timestep_input_dim
-        self.proj_in = nn.Linear(timestep_input_dim, time_embed_hidden_size, bias=True)
-        self.proj_out = nn.Linear(time_embed_hidden_size, time_embed_dim, bias=True)
+        self.proj_in = MiniMaxH3FP32Linear(timestep_input_dim, time_embed_hidden_size, bias=True)
+        self.proj_out = MiniMaxH3FP32Linear(time_embed_hidden_size, time_embed_dim, bias=True)
 
-    def forward(self, t: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
         half = self.frequency_embedding_size // 2
         freqs = torch.exp(-math.log(10000.0) * torch.arange(half, dtype=torch.float32, device=t.device) / half)
         args = t.to(torch.float32)[:, None] * freqs[None]
         t_freq = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        hidden = self.proj_in(t_freq.to(dtype))
+        hidden = self.proj_in(t_freq)
         hidden = nn.functional.silu(hidden)
         return self.proj_out(hidden)
 
@@ -270,6 +286,7 @@ class MiniMaxH3AdalnProj(nn.Module):
         self.modality_num = modality_num
         self.hidden_size = hidden_size
         self.linear = nn.Linear(time_embed_dim, out_features, bias=True)
+        self.linear.register_forward_pre_hook(_cast_linear_input)
 
     def forward(self, t_emb):
         x = nn.functional.silu(t_emb)
@@ -397,8 +414,8 @@ class MiniMaxH3FinalLayer(nn.Module):
         self.adaln_proj = MiniMaxH3AdalnProj(
             hidden_size, time_embed_dim, final_adaln_out_features, expand_ratio=2, modality_num=1
         )
-        self.video_out = nn.Linear(hidden_size, video_patch_dim, bias=True)
-        self.audio_out = nn.Linear(hidden_size, audio_latents_dim, bias=True)
+        self.video_out = MiniMaxH3FP32Linear(hidden_size, video_patch_dim, bias=True)
+        self.audio_out = MiniMaxH3FP32Linear(hidden_size, audio_latents_dim, bias=True)
 
     def forward(self, x, *, t_emb, inverse_indices):
         shift, scale = self.adaln_proj(t_emb)
@@ -442,9 +459,10 @@ class MiniMaxH3DiT(nn.Module):
         self.num_channels_latents = latents_dim
         video_patch_dim = latents_dim * patch_size[0] * patch_size[1] * patch_size[2]
 
-        self.video_patch_proj = nn.Linear(video_patch_dim, hidden_size, bias=True)
-        self.audio_patch_proj = nn.Linear(audio_latents_dim, hidden_size, bias=True)
+        self.video_patch_proj = MiniMaxH3FP32Linear(video_patch_dim, hidden_size, bias=True)
+        self.audio_patch_proj = MiniMaxH3FP32Linear(audio_latents_dim, hidden_size, bias=True)
         self.condition_proj = nn.Linear(text_dim, hidden_size, bias=True)
+        self.condition_proj.register_forward_pre_hook(_cast_linear_input)
         self.time_embedder = MiniMaxH3TimeEmbedder(timestep_input_dim, time_embed_hidden_size, time_embed_dim)
         self.rope = MiniMaxH3Rope(rope_inv_freq_len)
         self.token_refiner = MiniMaxH3TokenRefiner(
@@ -521,10 +539,9 @@ class MiniMaxH3DiT(nn.Module):
         seq_len,
         device,
     ):
-        dtype = text_embeddings_selected.dtype
-        x_rows = x.view(-1, x.shape[-1]).index_select(0, img_pos).to(dtype)
+        x_rows = x.view(-1, x.shape[-1]).index_select(0, img_pos)
         video_embed = self.video_patch_proj(x_rows)
-        audio_rows = audio_x.view(-1, audio_x.shape[-1]).index_select(0, audio_pos).to(dtype)
+        audio_rows = audio_x.view(-1, audio_x.shape[-1]).index_select(0, audio_pos)
         audio_embed = self.audio_patch_proj(audio_rows)
         text_rows = text_embeddings_selected.to(device=device)
         text_embed = self.condition_proj(text_rows)
@@ -535,12 +552,13 @@ class MiniMaxH3DiT(nn.Module):
             sample_local=packed_batch,
         )
 
+        dtype = text_embed.dtype
         embeddings = torch.zeros((seq_len, self.hidden_size), device=device, dtype=dtype)
         embeddings[text_pos] = text_embed.to(dtype)[: text_pos.shape[0]]
         embeddings[img_pos] = video_embed.to(dtype)[: img_pos.shape[0]]
         embeddings[audio_pos] = audio_embed.to(dtype)[: audio_pos.shape[0]]
 
-        t_emb = self.time_embedder(unique_timesteps, dtype=dtype)
+        t_emb = self.time_embedder(unique_timesteps)
         return embeddings, t_emb
 
     def forward(
@@ -565,6 +583,8 @@ class MiniMaxH3DiT(nn.Module):
         skip_mask_out_condition=False,
         packed_batch=False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if any(t.is_floating_point() and t.element_size() < 4 for t in (unique_timesteps, img_position_ids)):
+            raise ValueError("H3 timesteps/positions were cast below FP32; set cast_forward_inputs=false.")
         inverse_indices = inverse_indices.view(-1).to(torch.long)
         token_tags = token_tags.view(-1).to(torch.long)
         text_selected = prompt_embeds
