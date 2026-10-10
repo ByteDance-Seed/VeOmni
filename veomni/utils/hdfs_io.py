@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import os
+import posixpath
 import shutil
+import subprocess
 from typing import IO, Any
 
 from .logging import get_logger
@@ -108,12 +110,10 @@ def copy(src: str, dst: str, **kwargs) -> bool:
 
 
 def _isdir(file_path: str) -> bool:
-    """hdfs mkdir"""
+    """hdfs isdir"""
     if file_path.startswith("hdfs"):
-        _run_cmd(_hdfs_cmd(f"-test -d {file_path}"))
-    else:
-        return os.path.isdir(file_path)
-    return True
+        return _run_cmd(_hdfs_cmd(f"-test -d {file_path}")) == 0
+    return os.path.isdir(file_path)
 
 
 def isdir(path: str, **kwargs) -> bool:
@@ -136,10 +136,18 @@ def isdir(path: str, **kwargs) -> bool:
 def _listdir(path: str, **kwargs) -> list:
     """hdfs listdir"""
     if path.startswith("hdfs"):
-        _run_cmd(_hdfs_cmd(f"-ls {path}"))
-    else:
-        return os.listdir(path)
-    return True
+        result = subprocess.run(_hdfs_cmd(f"-ls {path}"), shell=True, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise FileNotFoundError(f"hdfs ls {path} failed: {result.stderr.strip()}")
+        names = []
+        for line in result.stdout.splitlines():
+            # Entry lines are "<perms> <repl> <owner> <group> <size> <date> <time> <path>"; the
+            # "Found N items" header has no such columns.
+            fields = line.split(None, 7)
+            if len(fields) == 8:
+                names.append(posixpath.basename(fields[7].rstrip("/")))
+        return names
+    return os.listdir(path)
 
 
 def listdir(path: str, **kwargs) -> list:
