@@ -159,7 +159,10 @@ class OmniProcessor:
         pretrained_model_name_or_path: str | os.PathLike,
         **config_kwargs: Any,
     ) -> OmniProcessor:
-        """Load preprocessors from a split-checkpoint root (no module weights)."""
+        """Load preprocessors from a split-checkpoint root, or an HF checkpoint with a registered layout."""
+        from .utils.hf_layout import resolve_omni_checkpoint_root
+
+        pretrained_model_name_or_path = resolve_omni_checkpoint_root(pretrained_model_name_or_path)
         config = OmniConfig.from_pretrained(pretrained_model_name_or_path, **config_kwargs)
         root = getattr(config, "_name_or_path", None) or str(pretrained_model_name_or_path)
         return cls.from_config(config, checkpoint_root=root)

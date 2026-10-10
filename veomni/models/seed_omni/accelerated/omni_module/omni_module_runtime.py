@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from .....arguments.omni_arguments_types import OmniModuleRuntimeArguments, OmniTrainingArguments
     from .....trainer.callbacks import TrainerState
     from ...modules.module_configuration_base import OmniModuleConfig
+    from ...utils.hf_layout import HFSource
 
 
 logger = logging.get_logger(__name__)
@@ -115,6 +116,7 @@ class ModuleRuntime(VeOmniModelRuntime):
     args: "OmniModuleRuntimeArguments"
     train_args: Optional["OmniTrainingArguments"] = None
     training_graph_methods: frozenset[str] = frozenset()
+    hf_source: Optional["HFSource"] = None
     _has_trainable_parameters: Optional[bool] = None
 
     def __init__(
@@ -127,10 +129,12 @@ class ModuleRuntime(VeOmniModelRuntime):
         train_args: Optional["OmniTrainingArguments"] = None,
         training_graph_methods: frozenset[str] = frozenset(),
         for_inference: bool = False,
+        hf_source: Optional["HFSource"] = None,
     ):
         self.args = args
         self.model_name = module_name
         self.module_config = module_config
+        self.hf_source = hf_source
         self.train_args = train_args
         self.training_graph_methods = training_graph_methods
         self.optimizer = None
@@ -221,6 +225,16 @@ class ModuleRuntime(VeOmniModelRuntime):
         )
 
     @property
+    def weights_path(self) -> Optional[str]:
+        """The upstream HF checkpoint under an HF ``model_path``, else this module's split subfolder.
+
+        ``args.model_path`` stays the module's subfolder either way: under an HF
+        ``model_path`` it is the weight-free view's, where the config and assets
+        are read from.
+        """
+        return self.hf_source.path if self.hf_source is not None else self.args.model_path
+
+    @property
     def module_name(self) -> str:
         """This module's name — the same identity the base calls ``model_name``.
 
@@ -281,6 +295,26 @@ class ModuleRuntime(VeOmniModelRuntime):
                 load_kwargs["attn_implementation"] = ops.attn_implementation
         # Before construction: slots read inside ``__init__`` need the binding.
         bind_ops_to_modeling(cls)
+        if self.hf_source is not None:
+            from ...utils.hf_layout import load_module_from_hf_source
+
+            device = "cpu" if get_device_type() == "cpu" else f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"
+            logger.info_rank0(
+                f"ModuleRuntime '{self.module_name}': eager inference load "
+                f"(model_type={model_type}, cls={cls.__name__}, device={device}) from {self.hf_source.path}"
+            )
+            self.model = load_module_from_hf_source(
+                cls,
+                self.module_config,
+                self.hf_source,
+                self.module_name,
+                device=device,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=load_kwargs.get("attn_implementation"),
+            ).eval()
+            self.model_config = self.model.config
+            self._build_model_assets()
+            return
         if dist.is_initialized():
             device_map = {"": f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"}
         else:
@@ -303,21 +337,36 @@ class ModuleRuntime(VeOmniModelRuntime):
         """Meta-init this module's sub-model from ``module_config``.
 
         The config comes from the composed :class:`OmniConfig`, which already
-        applied this module's ``model_config`` overwrites; ``model_path`` is
-        read only for the weights.
+        applied this module's ``model_config`` overwrites; :attr:`weights_path`
+        is read only for the weights.
+
+        Under an HF ``model_path`` the module is built on meta first so the
+        :class:`~veomni.models.seed_omni.utils.hf_layout.HFSourceKeyConverter`
+        is in place before any weight is read — here for a non-meta
+        ``init_device``, otherwise by the parallelize step.
         """
         args = self.args
         logger.info_rank0(f"ModuleRuntime '{self.module_name}': build module model")
         from .....models import build_foundation_model
 
         acc = self.mesh_accelerator
+        init_device = "meta" if self.reads_offline_cache else acc.init_device
         self.model = build_foundation_model(
             config_path=self.module_config,
-            weights_path=args.model_path,
+            weights_path=args.model_path if self.hf_source is None else None,
             torch_dtype="float32" if acc.fsdp_config.mixed_precision.enable else "bfloat16",
-            init_device="meta" if self.reads_offline_cache else acc.init_device,
+            init_device=init_device if self.hf_source is None else "meta",
             ops_implementation=args.ops_implementation,
         )
+        if self.hf_source is not None:
+            from ....module_utils import load_model_weights
+            from ...utils.hf_layout import attach_hf_source_converter
+
+            attach_hf_source_converter(self.model, self.hf_source, self.module_name)
+            # Mirrors the loaders' ``empty_init``: off rank 0 a CPU init stays on meta.
+            off_rank0 = dist.is_initialized() and dist.get_rank() != 0
+            if init_device != "meta" and not (init_device == "cpu" and off_rank0):
+                load_model_weights(self.model, self.hf_source.path, init_device)
         self.model_config = self.model.config
 
     def _build_model_assets(self) -> None:
@@ -663,6 +712,7 @@ def build_omni_module_runtime(
     train_args: Optional["OmniTrainingArguments"] = None,
     training_graph_methods: frozenset[str] = frozenset(),
     for_inference: bool = False,
+    hf_source: Optional["HFSource"] = None,
 ) -> ModuleRuntime:
     """Build the :class:`ModuleRuntime` for one module of a composed model."""
     return ModuleRuntime(
@@ -673,6 +723,7 @@ def build_omni_module_runtime(
         train_args=train_args,
         training_graph_methods=training_graph_methods,
         for_inference=for_inference,
+        hf_source=hf_source,
     )
 
 

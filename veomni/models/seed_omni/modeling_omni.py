@@ -31,8 +31,9 @@ walk.  Stop when ``is_done()`` or ``max_new_tokens`` is reached.
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
+import torch
 import torch.distributed as dist
 import torch.nn as nn
 from transformers import PreTrainedModel
@@ -49,6 +50,10 @@ from .graphs.generation_graph import GenerationGraph
 from .graphs.training_graph import TrainingGraph
 from .modules import OMNI_MODEL_REGISTRY, PretrainedOmniModule
 from .modules.module_configuration_base import OmniModuleConfig
+
+
+if TYPE_CHECKING:
+    from .utils.hf_layout import HFSource
 
 
 logger = helper.create_logger(__name__)
@@ -221,7 +226,15 @@ class OmniModel(PreTrainedModel):
         ``model_config`` / ``processor_config``, and the top-level fields
         ``infer_type``, ``generation_kwargs``, ``training_graphs``,
         ``generation_graphs``, ``_module_entries``.
+
+        An upstream HF checkpoint whose ``model_type`` has a registered
+        :class:`~veomni.models.seed_omni.utils.hf_layout.OmniHFLayout` loads
+        directly: configs and assets from a weight-free split view of it,
+        weights from the checkpoint itself.
         """
+        from .utils.hf_layout import resolve_omni_checkpoint_root
+
+        pretrained_model_name_or_path = resolve_omni_checkpoint_root(pretrained_model_name_or_path)
         config = kwargs.pop("config", None)
         config_kwargs = {key: kwargs.pop(key) for key in list(kwargs) if key in _CONFIG_LOAD_KWARG_NAMES}
         config_overrides = {key: kwargs.pop(key) for key in list(kwargs) if key in _OMNI_CONFIG_OVERRIDE_KEYS}
@@ -312,7 +325,11 @@ class OmniModel(PreTrainedModel):
 
             # After the ops config above was installed.
             bind_ops_to_modeling(mod_cls)
-            if load_weights:
+            if load_weights and config._hf_source is not None:
+                modules[name] = cls._load_module_from_hf_source(
+                    mod_cls, name, module_config, module_path, config._hf_source, module_kwargs
+                )
+            elif load_weights:
                 modules[name] = mod_cls.from_pretrained(module_path, config=module_config, **module_kwargs)
             else:
                 modules[name] = mod_cls._from_config(module_config, **cls._init_only_load_kwargs(module_kwargs))
@@ -321,6 +338,58 @@ class OmniModel(PreTrainedModel):
         if base_ops is not None:
             apply_ops_config(base_ops)
         return modules
+
+    @staticmethod
+    def _load_module_from_hf_source(
+        mod_cls: type,
+        name: str,
+        module_config: OmniModuleConfig,
+        module_path: str,
+        source: HFSource,
+        load_kwargs: dict[str, Any],
+    ) -> PretrainedOmniModule:
+        """``from_pretrained`` for a module whose weights live in the upstream HF checkpoint.
+
+        Takes the same ``torch_dtype`` / ``device_map`` / ``attn_implementation``
+        options; ``torch_dtype="auto"`` is the checkpoint's dtype, and
+        ``device_map`` must name a single device (``"auto"`` picks the first
+        accelerator). Assets bind from the weight-free view's subfolder.
+        """
+        from ...utils.device import get_device_type
+        from .modules.module_processing_base import bind_module_assets
+        from .utils.hf_layout import load_module_from_hf_source
+
+        load_kwargs = dict(load_kwargs)
+        device_map = load_kwargs.pop("device_map", None)
+        torch_dtype = load_kwargs.pop("torch_dtype", None)
+        attn_implementation = load_kwargs.pop("attn_implementation", None)
+        if load_kwargs:
+            raise ValueError(f"Loading from a HuggingFace checkpoint does not take {sorted(load_kwargs)}.")
+        if isinstance(device_map, Mapping):
+            devices = set(device_map.values())
+            if len(devices) != 1:
+                raise ValueError(
+                    f"Loading from a HuggingFace checkpoint needs a single-device device_map, got {device_map}."
+                )
+            device_map = next(iter(devices))
+        if device_map in (None, "auto"):
+            device_map = "cpu" if get_device_type() == "cpu" else f"{get_device_type()}:0"
+        if torch_dtype == "auto":
+            hf_config = source.layout.read_hf_config(source.path)
+            torch_dtype = getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype", None)
+        if isinstance(torch_dtype, str):
+            torch_dtype = getattr(torch, torch_dtype)
+        module = load_module_from_hf_source(
+            mod_cls,
+            module_config,
+            source,
+            name,
+            device=device_map,
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+        )
+        bind_module_assets(module, checkpoint_path=module_path)
+        return module
 
     def _save_module_subdirectory(
         self,
