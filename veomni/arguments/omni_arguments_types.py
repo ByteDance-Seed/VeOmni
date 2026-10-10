@@ -94,6 +94,75 @@ def _try_load_omni_checkpoint_config(path: Optional[str]):
 DEFAULT_SCENARIO = "default"
 
 
+def _resolve_hf_checkpoint_view(model_runtime: OmniModelRuntimeArguments) -> str:
+    """Point ``model.model_path`` at a weight-free split view when it names an upstream HF checkpoint.
+
+    Everything downstream (module configs, assets, the collator's
+    preprocessors, inference) then reads the view like any split checkpoint,
+    while module weights still come from the HF checkpoint the view records.
+    """
+    from ..models.seed_omni.utils.hf_layout import read_hf_source, resolve_omni_checkpoint_root
+
+    model_path = model_runtime.model_path
+    view = resolve_omni_checkpoint_root(model_path)
+    if view != model_path:
+        source = read_hf_source(view)
+        logger.info_rank0(
+            f"OmniModel: `model.model_path` is a HuggingFace `{source.model_type}` checkpoint; "
+            f"loading its modules through the {source.model_type} HF layout (view: {view})."
+        )
+        model_runtime.model_path = view
+    return view
+
+
+def _check_hf_source_exportable(model_path: str) -> None:
+    """Fail at startup, not at the first HF save, when the source cannot be written back."""
+    from ..models.seed_omni.utils.hf_layout import read_hf_source, source_weight_files
+
+    source = read_hf_source(model_path)
+    if source is None:
+        return
+    try:
+        source_weight_files(source.path)
+    except FileNotFoundError as e:
+        raise ValueError(
+            f"`train.checkpoint.save_hf_weights` exports in the source layout, which needs safetensors weights: {e} "
+            "Convert the checkpoint to safetensors, or disable save_hf_weights."
+        ) from e
+
+
+def _validate_hf_view_modules(model_path: str, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
+    """Under an HF ``model_path`` every module is one the family layout cuts from that checkpoint."""
+    from ..models.seed_omni.utils.hf_layout import read_hf_source
+
+    source = read_hf_source(model_path)
+    if source is None:
+        return
+    layout_modules = set(source.layout.modules)
+    for name, module_args in modules.items():
+        if name not in layout_modules:
+            raise ValueError(
+                f"Module {name!r} is not part of the `{source.model_type}` HF layout "
+                f"(modules: {sorted(layout_modules)}); an HF `model.model_path` only loads the family's own modules. "
+                "Convert the checkpoint to compose other modules."
+            )
+        if os.path.normpath(str(module_args.model_path)) != os.path.normpath(os.path.join(model_path, name)):
+            raise ValueError(
+                f"Module {name!r} sets its own model_path ({module_args.model_path!r}), but `model.model_path` is a "
+                f"HuggingFace `{source.model_type}` checkpoint every module loads from. Drop the per-module "
+                "model_path, or convert the checkpoint to compose modules from several sources."
+            )
+    overrides = {
+        name: sorted(keys) for name, args in modules.items() if (keys := hf_module_model_config(args.model_config))
+    }
+    if overrides:
+        logger.warning_rank0(
+            f"Per-module model_config overrides {overrides} apply to this run, but an HF export of the "
+            f"`{source.model_type}` checkpoint keeps its source config.json; an override that changes the "
+            "architecture will not be reflected there."
+        )
+
+
 def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool = False) -> OmniModelRuntimeArguments:
     """Resolve ``args.model`` launcher fields into a fully populated :class:`OmniModelRuntimeArguments`.
 
@@ -107,7 +176,9 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
     # ``model_path`` is already local: ``BaseModelArguments.__post_init__`` localizes
     # it, so per-module subfolders join against a path that exists on disk and
     # ``_try_load_omni_checkpoint_config`` below can open its ``config.json``.
-    model_path = model_runtime.model_path
+    model_path = _resolve_hf_checkpoint_view(model_runtime)
+    if not for_inference and args.train.checkpoint.save_hf_weights:
+        _check_hf_source_exportable(model_path)
     omni_cfg = _try_load_omni_checkpoint_config(model_path)
 
     # The checkpoint's per-module fields are their own layer, kept separate from
@@ -170,6 +241,7 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         for_inference=for_inference,
         checkpoint_modules=ckpt_modules,
     )
+    _validate_hf_view_modules(model_path, modules)
     for module_args in modules.values():
         _validate_omni_accelerator(module_args.accelerator)
     _validate_composed_wrap(model_runtime.accelerator, modules)

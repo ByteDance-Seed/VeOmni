@@ -17,6 +17,16 @@ plus the family's default graphs. `convert_checkpoint` saves the result through
 self-contained subfolder per module (`config.json`, `model.safetensors`, and any
 processor or tokenizer files).
 
+When every module is a key-prefix slice of the upstream checkpoint, register an
+`OmniHFLayout` in `modules/<family>/hf_layout.py` under the upstream `model_type`
+instead (`modules/qwen3/hf_layout.py` is the reference). Per module it declares
+the `key_prefixes` map (source prefix → module prefix; the longest match wins),
+`build_config` (HF config → module config) and `build_assets` (tokenizer /
+processors); `tied_source_keys` names stored duplicates of tied weights. A
+layout gives both the offline convert and the
+[direct load and HF-layout export](training_and_inference.md#21-load-an-upstream-checkpoint-directly);
+the contract is in [Upstream Checkpoint Layout](hf_layout.md).
+
 ## 2. Write each module
 
 Under `veomni/models/seed_omni/modules/<family>/<sub>/`:

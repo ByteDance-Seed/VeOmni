@@ -1,7 +1,9 @@
 """Registry for monolithic HF checkpoint → SeedOmni split checkpoints.
 
 Each family registers a converter under its upstream HuggingFace
-``model_type``. The converter **returns** split modules and, when it has them,
+``model_type`` (or only an
+:class:`~veomni.models.seed_omni.utils.hf_layout.OmniHFLayout`, which then
+does the split). The converter **returns** split modules and, when it has them,
 graphs; :func:`convert_checkpoint` writes the split directory (CLI:
 ``scripts/seed_omni/convert_model.py``). Graphs are optional at convert time —
 train / generate load sidecars from the checkpoint (or accept an override) and
@@ -198,13 +200,20 @@ def _apply_graph_files(
 def _run_converter(model_path: str, **kwargs) -> dict[str, Any]:
     """Dispatch to the registered converter; returns kwargs for :func:`_save_converted_omni`.
 
+    A family with no converter of its own but a registered
+    :class:`~veomni.models.seed_omni.utils.hf_layout.OmniHFLayout` splits
+    through that layout, the same key map an HF ``model_path`` loads with.
+
     Lazy-imports ``modules`` to break the convert_registry ↔ family cycle:
     every family's ``convert_model`` (imported by ``modules/__init__``) imports
     this module.
     """
     from ..modules import read_hf_model_type
+    from .hf_layout import convert_with_hf_layout, has_hf_layout
 
     model_type = read_hf_model_type(model_path)
+    if model_type not in OMNI_CONVERT_REGISTRY.valid_keys() and has_hf_layout(model_type):
+        return convert_with_hf_layout(model_path, **kwargs)
     converter: ConvertFn = OMNI_CONVERT_REGISTRY[model_type]()
     return converter(model_path, **kwargs)
 

@@ -35,6 +35,7 @@ from transformers import PretrainedConfig
 
 if TYPE_CHECKING:
     from .modules.module_configuration_base import OmniModuleConfig
+    from .utils.hf_layout import HFSource
 
 
 DEFAULT_TRAINING_GRAPH_FILE = "training_graph.yaml"
@@ -222,6 +223,11 @@ class OmniConfig(PretrainedConfig):
         # copy here would be a second place to keep in sync. Dropped by
         # :meth:`to_dict`.
         self._module_configs: Dict[str, OmniModuleConfig] = {}
+        # The upstream HF checkpoint the module weights are read from, when this
+        # config was loaded off a weight-free view of one (see
+        # :mod:`~veomni.models.seed_omni.utils.hf_layout`). In-memory only, like
+        # :attr:`_module_configs`: a saved config describes its own files.
+        self._hf_source: Optional[HFSource] = None
 
         super().__init__(**kwargs)
 
@@ -379,6 +385,7 @@ class OmniConfig(PretrainedConfig):
             self._module_entries[name]["model_path"] = name
         output = super().to_dict()
         output.pop("_module_configs", None)
+        output.pop("_hf_source", None)
         return output
 
     @classmethod
@@ -394,7 +401,14 @@ class OmniConfig(PretrainedConfig):
         ``ops_implementation``, ``model_config``, ``processor_config``. The
         config that comes back is the resolved one, and handing it to
         ``OmniModel.from_pretrained(path, config=...)`` loads the same model.
+
+        An upstream HF checkpoint whose ``model_type`` has a registered
+        :class:`~veomni.models.seed_omni.utils.hf_layout.OmniHFLayout` loads
+        too, through a weight-free split view of it.
         """
+        from .utils.hf_layout import resolve_omni_checkpoint_root
+
+        pretrained_model_name_or_path = resolve_omni_checkpoint_root(pretrained_model_name_or_path)
         # Out before transformers sees them: it would turn each one into a
         # config attribute. Judged against this config's entries once it exists.
         omni_kwargs = pop_omni_kwargs(kwargs)
@@ -418,8 +432,10 @@ class OmniConfig(PretrainedConfig):
         sidecar).
         """
         from .modules.module_configuration_base import OmniModuleConfig
+        from .utils.hf_layout import read_hf_source
 
         root = str(checkpoint_root)
+        self._hf_source = read_hf_source(root)
         self._load_graphs_from_pretrained(root)
         for name in self.module_names:
             entry = self._module_entries[name]

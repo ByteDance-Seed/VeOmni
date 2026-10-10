@@ -193,6 +193,7 @@ def _defer_runtime(name: str, model, *, ulysses_size: int = 1):
     rt = MagicMock()
     rt._defer_parallelize = True
     rt.skip_hf_weight_load = False
+    rt.weights_path = f"/tmp/{name}"
     rt.model = model
     rt.args = SimpleNamespace(
         model_path=f"/tmp/{name}",

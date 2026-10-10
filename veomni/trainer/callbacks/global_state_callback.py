@@ -75,7 +75,7 @@ class GlobalStateCallback(Callback):
         args: "VeOmniArguments" = self.trainer.args
         # The same cadences ``CheckpointCallback`` runs on, read from the same
         # config. An HF export writes the step's DCP whether or not the DCP
-        # cadence reaches that step (``ModelCheckpointManager._prepare_export``),
+        # cadence reaches that step (``ModelCheckpointManager.prepare_export``),
         # so the cursor has to follow both: model state at a step with no cursor
         # beside it is a step nothing can resume from.
         ckpt = args.train.checkpoint

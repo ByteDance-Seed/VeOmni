@@ -86,7 +86,9 @@ modules). See [Arguments](../../usage/arguments.md).
 
 **Checkpoints.** Each trainable module saves its own DCP shards and its own HF
 weights under `hf_ckpt/<module>/`; see
-[Checkpointing](../../usage/checkpoint.md).
+[Checkpointing](../../usage/checkpoint.md). A run loaded from an upstream HF
+checkpoint instead exports one flat `hf_ckpt/` in that checkpoint's layout
+([Upstream Checkpoint Layout](../usage/hf_layout.md)).
 
 **One FSDP2 tree instead.** `--model.accelerator.fsdp_config.fsdp_scope model`
 wraps the composed `OmniModel` once instead of each module. The mesh, init device

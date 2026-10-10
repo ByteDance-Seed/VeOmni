@@ -379,3 +379,46 @@ def test_the_training_graph_must_call_the_offline_endpoint_of_its_task(training_
     else:
         with pytest.raises(ValueError, match=error):
             _reject_graph_that_mismatches_training_task(graph_methods, train_args)
+
+
+def _exporting_runtime(checkpoint):
+    return SimpleNamespace(model=MagicMock(name="model"), checkpoint=checkpoint, save_hf_or_lora=MagicMock())
+
+
+def test_an_hf_source_run_exports_trained_modules_as_one_source_layout_checkpoint(monkeypatch):
+    from veomni.models.seed_omni.accelerated.omni_model import omni_model_runtime
+    from veomni.models.seed_omni.utils.hf_layout import HFSource
+
+    full = _exporting_runtime(MagicMock(trainable_only=False))
+    full.checkpoint.step_dir.return_value = "/run/checkpoints/global_step_4"
+    lora = _exporting_runtime(MagicMock(trainable_only=True))
+    frozen = _exporting_runtime(None)
+    saved = MagicMock()
+    monkeypatch.setattr(omni_model_runtime, "save_hf_source_checkpoint", saved)
+    source = HFSource(path="/hf/Qwen3", model_type="qwen3")
+    runtime = OmniModelRuntime(
+        MagicMock(), module_runtimes={"full": full, "lora": lora, "frozen": frozen}, hf_source=source
+    )
+    state = SimpleNamespace(global_step=4)
+
+    runtime.save_hf_or_lora(state, stage="train_end")
+
+    lora.checkpoint.save_lora.assert_called_once_with(state, stage="train_end")
+    full.checkpoint.prepare_export.assert_called_once_with(state, "train_end")
+    full.checkpoint.save_hf_or_lora.assert_not_called()
+    saved.assert_called_once_with(
+        source, {"full": (full.model, full.checkpoint.parallel_state)}, "/run/checkpoints/global_step_4/hf_ckpt"
+    )
+    for module in (full, lora, frozen):
+        module.save_hf_or_lora.assert_not_called()
+
+
+def test_a_split_run_exports_every_module_on_its_own():
+    modules = {name: _exporting_runtime(MagicMock()) for name in ("a", "b")}
+    runtime = OmniModelRuntime(MagicMock(), module_runtimes=modules)
+    state = SimpleNamespace(global_step=2)
+
+    runtime.save_hf_or_lora(state, stage="step_end")
+
+    for module in modules.values():
+        module.save_hf_or_lora.assert_called_once_with(state, stage="step_end")

@@ -5,4 +5,4 @@ SeedOmni graph runtime.  Each sub-module lives under
 ``qwen3/<sub_module>/`` with short-named inner files.
 """
 
-from . import convert_model, llm, text_encoder  # noqa: F401
+from . import hf_layout, llm, text_encoder  # noqa: F401
