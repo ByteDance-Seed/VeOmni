@@ -34,7 +34,7 @@ ALIGN_GRAD_RTOL = 5e-2
 
 
 def bagel_cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[3] / "configs" / "seed_omni" / "Bagel" / "bagel_7b_mot"
+    return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Bagel" / "bagel_7b_mot"
 
 
 def config_cls(model_type: str):

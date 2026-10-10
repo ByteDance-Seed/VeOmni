@@ -8,7 +8,7 @@ import importlib.util
 import pytest
 import torch
 
-from tests.seed_omni.bagel.helpers import (
+from tests.seed_omni.modules.bagel.helpers import (
     ALIGN_ATOL,
     ALIGN_GRAD_ATOL,
     ALIGN_GRAD_RTOL,

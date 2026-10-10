@@ -21,10 +21,10 @@ the parent prefix disambiguates the per-model ``base.yaml`` launchers):
 Usage
 -----
   # Default: raw Mermaid (.mmd) → graphs/janus_1.3b_base/
-  python scripts/visualize_omni_graph.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml
+  python scripts/seed_omni/visualize_graph.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml
 
   # Browser-renderable HTML instead
-  python scripts/visualize_omni_graph.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml \\
+  python scripts/seed_omni/visualize_graph.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml \\
       --visualize.format html
 """
 
@@ -86,7 +86,7 @@ class VisualizeArguments:
 
 @dataclass
 class Arguments(OmniArguments):
-    """Root config for ``visualize_omni_graph`` — extends the omni launcher schema."""
+    """Root config for ``scripts/seed_omni/visualize_graph.py`` — extends the omni launcher schema."""
 
     visualize: VisualizeArguments = field(default_factory=VisualizeArguments)
 

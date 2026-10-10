@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import yaml
 
-from tests.seed_omni.bagel.helpers import bagel_cfg_dir, load_module_runtime_args, load_omni_config
+from tests.seed_omni.modules.bagel.helpers import bagel_cfg_dir, load_module_runtime_args, load_omni_config
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
 
 

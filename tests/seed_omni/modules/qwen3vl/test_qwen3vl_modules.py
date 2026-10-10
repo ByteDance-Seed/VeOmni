@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
-from tests.seed_omni.helpers import load_from_omni, save_as_omni
+from tests.seed_omni.modules.helpers import load_from_omni, save_as_omni
 from veomni.models.seed_omni.modules import (
     OMNI_ACCELERATED_MODEL_REGISTRY,
     OMNI_CONFIG_REGISTRY,

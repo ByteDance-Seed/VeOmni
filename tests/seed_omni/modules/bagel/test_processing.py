@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.seed_omni.bagel.helpers import (
+from tests.seed_omni.modules.bagel.helpers import (
     config_cls,
     model_cls,
     native_model_cls,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tests.seed_omni.bagel.helpers import (
+from tests.seed_omni.modules.bagel.helpers import (
     build_toy_conversation,
     config_cls,
     native_model_cls,

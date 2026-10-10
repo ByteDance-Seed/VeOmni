@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.seed_omni.bagel.helpers import config_cls, model_cls, tiny_bagel_qwen2_cfg
+from tests.seed_omni.modules.bagel.helpers import config_cls, model_cls, tiny_bagel_qwen2_cfg
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.modules.bagel.vae.processing import route_image_contexts
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem

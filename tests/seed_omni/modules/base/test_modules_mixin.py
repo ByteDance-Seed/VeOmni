@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.seed_omni.helpers import load_from_omni, save_as_omni
+from tests.seed_omni.modules.helpers import load_from_omni, save_as_omni
 from veomni.arguments.omni_arguments_types import (
     OmniArguments,
     OmniDataArguments,
@@ -329,7 +329,7 @@ def test_janus_text_encoder_emit_image_start_replaces_output_tail():
 
 
 def test_text_encoder_decode_returns_single_loss_key():
-    """V2 single-loss protocol: ``post_forward`` maps ``loss`` → ``_loss``."""
+    """Single-loss protocol: ``post_forward`` maps ``loss`` → ``_loss``."""
     TextEncoder = _accelerated_model_cls("text_encoder")
     TextEncoderConfig = _config_cls("text_encoder")
     te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16))
@@ -447,7 +447,7 @@ def test_text_encoder_tied_head_uses_explicit_eager_loss(monkeypatch):
 
 
 def test_text_encoder_decode_all_masked_span_scores_zero(monkeypatch):
-    """An unsupervised span scores 0.0, never NaN (constraint 7b clamped denominator).
+    """An unsupervised span scores 0.0, never NaN (constraint 7d clamped denominator).
 
     The fused kernels normalize by their own supervised-token count with no way to
     clamp it, so a span whose labels are all ``-100`` must NOT reach them.
@@ -708,7 +708,7 @@ def test_fsdp_no_split_modules_preserved():
 
 
 def _janus_cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "Janus" / "janus_1.3b"
+    return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Janus" / "janus_1.3b"
 
 
 def test_janus_train_yaml_loads_with_v2_module_names():
@@ -815,7 +815,7 @@ def test_init_resolves_relative_module_paths():
 
 
 def _qwen3_cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "Qwen" / "qwen3_0.6b"
+    return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Qwen" / "qwen3_0.6b"
 
 
 def test_qwen3_train_yaml_loads_with_v2_module_names():

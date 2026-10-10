@@ -30,7 +30,7 @@ from veomni.utils.constants import IGNORE_INDEX
 
 
 def _janus_cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "Janus" / "janus_1.3b"
+    return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Janus" / "janus_1.3b"
 
 
 class _FakeTokenizer:
@@ -379,7 +379,7 @@ def test_composed_wrap_uses_composer_accelerator_not_module_overlay(monkeypatch:
     monkeypatch.setattr("veomni.distributed.torch_parallelize.build_parallelize_model", _fake_build)
 
     module = _defer_runtime("a", torch.nn.Linear(2, 2))
-    module.args.accelerator.init_device = "cuda"
+    module.args.accelerator.init_device = "cpu"
     module.args.optimizer.type = "adamw"
     omni = OmniModelRuntime.__new__(OmniModelRuntime)
     omni.model = MagicMock()

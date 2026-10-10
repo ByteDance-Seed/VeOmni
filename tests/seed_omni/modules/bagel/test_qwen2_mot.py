@@ -7,7 +7,7 @@ import torch
 from safetensors import safe_open
 from transformers.utils import SAFE_WEIGHTS_NAME
 
-from tests.seed_omni.bagel.helpers import config_cls, tiny_bagel_qwen2_cfg
+from tests.seed_omni.modules.bagel.helpers import config_cls, tiny_bagel_qwen2_cfg
 from veomni.models.module_utils import load_model_weights
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import accelerated
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.checkpoint_conversion import (
