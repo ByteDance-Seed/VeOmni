@@ -404,7 +404,7 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | pad_to_length | `bool` | `False` | Pad packed sequences to a fixed length (requires `dyn_bsz`). |
 | bsz_warmup_ratio | `float` | `0` | Ratio of batch size warmup steps. |
 | bsz_warmup_init_mbtoken | `int` | `200` | Initial number of tokens in a batch during warmup. |
-| enable_full_determinism | `bool` | `False` | Enable full determinism (bitwise alignment). |
+| enable_full_determinism | `bool` | `False` | Enable full determinism (bitwise alignment). On CUDA this also disables SDPA's memory-efficient and cuDNN backends (nondeterministic backward), so masked attention runs on math with a seq_len² transient peak. |
 | enable_batch_invariant_mode | `bool` | `False` | Enable batch invariant mode. |
 | sync_each_train_step | `bool` | `True` | Synchronize the accelerator before each training step's forward/backward work. Disable to allow async dataloader and H2D work to overlap with the next step. |
 | empty_cache_steps | `int` | `500` | Steps between device-cache cleanup calls. A non-positive value disables scheduled cleanup. |

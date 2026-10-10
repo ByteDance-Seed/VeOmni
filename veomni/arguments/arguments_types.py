@@ -1031,7 +1031,14 @@ class TrainingArguments:
     )
     enable_full_determinism: bool = field(
         default=False,
-        metadata={"help": "Enable full determinism."},
+        metadata={
+            "help": (
+                "Enable full determinism. Also turns off SDPA's memory-efficient and cuDNN "
+                "backends, whose backwards are nondeterministic, so masked attention falls "
+                "to math at a transient peak growing with seq_len^2 rather than seq_len -- "
+                "check the headroom before enabling it at long context."
+            )
+        },
     )
     enable_batch_invariant_mode: bool = field(
         default=False,

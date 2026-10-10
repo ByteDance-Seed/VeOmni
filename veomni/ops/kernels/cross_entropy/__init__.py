@@ -80,6 +80,12 @@ from ....utils.model_outputs import FusedLinearAuxOutput
 from .chunk_logprobs import chunk_logprobs_function  # noqa: F401 re-export
 from .chunk_loss import chunk_loss_function  # noqa: F401 re-export for legacy callers
 from .chunk_topk_distill import chunk_topk_distill_function  # noqa: F401 re-export
+
+# dLLM masked CE is deliberately not in KERNEL_REGISTRY: it is a distinct objective
+# (no label shift, masked positions only, per-token 1/(t*N) weights from the collator,
+# sample-count normalization) with one hardware-agnostic implementation and no HF
+# eager counterpart, so there is no OpSlot to bind. dLLM models call it directly.
+from .dllm import dllm_masked_cross_entropy  # noqa: F401 re-export
 from .eager import eager_cross_entropy
 
 

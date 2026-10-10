@@ -486,6 +486,20 @@ def enable_full_determinism(seed: int):
     """
     Helper function for reproducibility in distributed training.
     See https://pytorch.org/docs/stable/notes/randomness.html for details.
+
+    ``use_deterministic_algorithms(warn_only=True)`` cannot reach two of SDPA's
+    backends: the memory-efficient backward is nondeterministic and only warns, and
+    cuDNN refuses only when ``warn_only`` is false. Flash rejects a non-null
+    ``attn_mask``, so every masked attention lands on one of those two -- on
+    DiffusionGemma-26B-A4B two backwards of one micro-batch disagreed on almost every
+    parameter until the memory-efficient backend was disabled. cuDNN is disabled too:
+    ``TORCH_CUDNN_SDPA_PREFERRED`` puts it first in the priority on sm90, and
+    ``torch.backends.cudnn.enabled`` does not cover SDPA.
+
+    Masked attention then runs on math, which materialises the attention matrix: the
+    transient peak grows with seq_len^2 instead of seq_len (16 heads x head_dim 256:
+    80 -> 312 MiB per call at 1024 tokens, 249 -> 4320 MiB at 4096). Unmasked calls
+    stay on flash.
     """
 
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -507,6 +521,16 @@ def enable_full_determinism(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.enabled = False
+
+    if IS_CUDA_AVAILABLE:
+        torch.backends.cuda.enable_math_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        logger.info_rank0(
+            "Full determinism disabled SDPA's memory-efficient and cuDNN backends, whose "
+            "backwards are nondeterministic. Masked attention now runs on math, at a peak "
+            "that grows with seq_len^2 rather than seq_len."
+        )
 
     if IS_NPU_AVAILABLE:
         torch.npu.manual_seed(seed)
