@@ -1,9 +1,11 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 
 import veomni.ops.kernels.cross_entropy.chunk_loss as chunk_loss_module
+from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 def test_chunk_loss_reuses_valid_token_denominator(monkeypatch):
@@ -59,3 +61,53 @@ def test_chunk_loss_honors_explicit_shift_labels(monkeypatch):
     )
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_dispatch_forwards_chunk_size(monkeypatch):
+    import veomni.ops.kernels.cross_entropy as dispatch
+
+    seen = []
+
+    def record(*args, **kwargs):
+        seen.append(kwargs["chunk_size"])
+        return torch.tensor(0.0), None
+
+    monkeypatch.setattr(dispatch, "chunk_loss_function", record)
+    for size in (1024, 512, 256):
+        dispatch._chunk_loss_dispatch(hidden_states=None, weights=None, labels=None, chunk_size=size)
+    assert seen == [1024, 512, 256]
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires NPU"))]
+)
+def test_dispatch_loss_and_gradients_match_dense(monkeypatch, device):
+    import veomni.ops.kernels.cross_entropy as dispatch
+
+    # Non-SP shifts once; SP receives labels already shifted by the collator.
+    for sp_enabled in (False, True):
+        monkeypatch.setattr(
+            chunk_loss_module, "get_parallel_state", lambda sp=sp_enabled: SimpleNamespace(sp_enabled=sp)
+        )
+        monkeypatch.setattr(chunk_loss_module, "reduce_sequence_parallel_loss", lambda loss, count: loss)
+        torch.manual_seed(73)
+        h = torch.randn(2, 13, 7, device=device)
+        w = torch.randn(19, 7, device=device)
+        labels = torch.randint(0, 19, (2, 13), device=device)
+        labels[:, 2:6] = -100  # includes a fully ignored chunk
+        refs = None
+        for size in (32, 4, 3, 1):
+            x, weight = h.clone().requires_grad_(), w.clone().requires_grad_()
+            loss, _, _ = dispatch._chunk_loss_dispatch(
+                hidden_states=x, weights=weight, labels=labels, vocab_size=19, chunk_size=size
+            )
+            loss.backward()
+            if refs is None:
+                xr, wr = h.clone().requires_grad_(), w.clone().requires_grad_()
+                logits = torch.nn.functional.linear(xr if sp_enabled else xr[:, :-1], wr)
+                target = labels if sp_enabled else labels[:, 1:]
+                dense = torch.nn.functional.cross_entropy(logits.reshape(-1, 19), target.reshape(-1))
+                dense.backward()
+                refs = dense.detach(), xr.grad, wr.grad
+            for result, ref in zip((loss, x.grad, weight.grad), refs):
+                torch.testing.assert_close(result, ref, atol=2e-6, rtol=2e-5)

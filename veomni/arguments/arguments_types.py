@@ -391,6 +391,15 @@ class ChannelLossConfig:
         default=True,
         metadata={"help": "Log supervised token count for each channel."},
     )
+    release_cache: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Synchronize and release allocator cache after detached channel-loss CE on sampled steps. "
+                "This can lower peak memory before backward at the cost of extra synchronization."
+            )
+        },
+    )
     strict: bool = field(
         default=False,
         metadata={
@@ -1315,6 +1324,15 @@ class OpsImplementationConfig:
             "self.loss_function; unpatched HF models raise) | 'chunk_loss' (chunked "
             "F.linear+CE, hardware-agnostic) | 'npu' (chunk_loss + torch_npu gate) | "
             "'eager' (PyTorch F.cross_entropy)."
+        },
+    )
+    cross_entropy_loss_release_cache: bool = field(
+        default=False,
+        metadata={
+            "help": "Synchronize and release transient chunk-loss allocator cache before model backward. "
+            "This lowers peak accelerator memory for constrained profiles at the cost of a per-microbatch "
+            "synchronization. Applies to all 'chunk_loss'/'npu' dispatch paths (plain CE, return_log_probs, "
+            "and top-k distillation); no-op for 'eager'/'liger_kernel'."
         },
     )
     rms_norm_implementation: str = field(

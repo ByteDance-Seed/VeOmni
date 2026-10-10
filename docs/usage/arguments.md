@@ -225,6 +225,7 @@ NPU validation runs at two times:
 | attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation. Supported public values include `eager`, `sdpa`, `flash_attention_2/3/4`, `flash_attention_2_hub`, `flash_attention_3_hub`, `flex_attention`, `magi_attention`, and `native-sparse`. Under the VeOmni modeling backend, Flash, Flex, and Magi values resolve to SP-aware registry names. The opt-in Hub backends require `MODELING_BACKEND=veomni`, `kernels==0.16.0`, and a compatible version-1 artifact from `kernels-community/flash-attn2` or `kernels-community/flash-attn3`. Both short and normalized Hub names are rejected on Ascend NPU before HF preloading; dependency/download errors do not fall back to local kernels. Local FA2/FA3 remain the defaults. FlexAttention requires a model-provided native `BlockMask`; Ulysses currently requires it to be head-broadcast. MagiAttention requires the optional `--extra magi` install (`uv sync --extra gpu --extra magi`), a model-provided `MagiAttentionMask`, physical batch size 1, `cp_size == 1`, and zero attention dropout; it does not support KV-cache offsets. It uses the CUTLASS overlay on SM90 and CUTE DSL/JIT on SM100+. |
 | moe_implementation | `str` | `"fused_triton"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel; `eager` is the reference loop. A value still equal to the GPU default auto-resolves to `fused_npu` on NPU; explicit incompatible non-default overrides raise. |
 | cross_entropy_loss_implementation | `str` | `"liger_kernel"` | Cross-entropy loss. `liger_kernel` (default, GPU only) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `npu` is a back-compat alias for `chunk_loss`. `eager` is `F.cross_entropy`. |
+| cross_entropy_loss_release_cache | `bool` | `false` | Synchronize and release transient chunk-loss allocator cache after the chunked kernel returns. This can lower peak memory before model backward on constrained profiles, at the cost of per-microbatch synchronization and allocator churn. Applies to all `chunk_loss`/`npu` paths (plain CE, `return_log_probs`, top-k distillation); no-op for `eager`/`liger_kernel`. |
 | rms_norm_implementation | `str` | `"liger_kernel"` | RMSNorm. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
 | swiglu_mlp_implementation | `str` | `"liger_kernel"` | SwiGLU MLP. Known values: `liger_kernel` (default, GPU only), `eager`. There is no NPU backend, so a value still equal to the default auto-resolves to `eager` on NPU. |
 | rotary_pos_emb_implementation | `str` | `"liger_kernel"` | Rotary pos emb. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (per-model: DeepSeek-V3, DeepSeek-V4, Wan; GPU only), `eager`. DeepSeek-V4 and Wan reject the `liger_kernel` default because their rotary layout is partial / non-standard, and DeepSeek-V4 also rejects `npu`; both raise at model registration, so their configs must pin `triton` or `eager`. |
@@ -499,10 +500,27 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 
 This is an observability-only side channel. It computes detached per-token CE
 from the model loss inputs, aggregates by packed-sequence source metadata, and
-adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics. It does
-not change the returned training loss or gradients. Fused-loss backends may
-recompute the LM-head projection on sampled steps, so the default interval is
-10 steps; set `interval=1` for per-step metrics. DiT trainers and
+adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics.
+Sampled steps also report `samples/<source-id>__<source>`,
+`input_tokens/<source-id>__<source>`, `label_tokens/<source-id>__<source>`, and
+`label_tokens_per_sample/<source-id>__<source>`. These four counters reuse the
+same packed-segment alignment and per-token observer capture as channel loss.
+They add only compact integer reductions proportional to the number of sources;
+they do not launch another projection, full-vocabulary CE, or observer workspace.
+This side channel does not change the returned training loss or gradients.
+Observer-only CE failures are recorded before the shared capture preflight;
+they do not trigger another detached CE attempt. Non-strict mode skips invalid
+observations, while strict mode reports failures at the globally synchronized
+step end. Errors in the main training forward or loss still propagate normally. A failed
+forward discards pending observations without entering observer collectives.
+The default `chunk_loss` backend reuses the main loss projection, but the detached
+per-token CE still needs a chunk-sized full-vocabulary workspace. Other fused-loss
+backends may recompute the LM-head projection on sampled steps, so the default
+interval is 10 steps; set `interval=1` for per-step metrics. On memory-constrained
+profiles, `release_cache=true` synchronizes and releases the detached CE
+workspace after each sampled forward and before training backward. This does
+not change the objective or gradients, but adds synchronization and allocator
+churn. DiT trainers and
 `data.data_type="classification"` are not supported because they do not optimize
 a causal-LM objective. `BaseRLTrainer` is unsupported because it packs source
 alignment metadata after the common step lifecycle. In DPO training, only the policy-model forward is observed; the
@@ -523,6 +541,7 @@ distinct from the first emission.
 | token_count_metric_prefix | `str` | `"channel_tokens"` | Prefix for supervised token-count metrics. |
 | log_weighted_loss | `bool` | `True` | Log weighted loss metrics. |
 | log_token_count | `bool` | `True` | Log token-count metrics. |
+| release_cache | `bool` | `False` | Synchronize and release detached CE allocator cache after sampled forwards to lower memory carried into backward. |
 | strict | `bool` | `False` | Raise when source metadata is missing or cannot be aligned with packed segments; otherwise skip invalid batches. |
 
 ### GradientCheckpointingConfig
