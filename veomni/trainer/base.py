@@ -528,16 +528,16 @@ class BaseTrainer(Stateful, ABC):
             self.tqdm_callback,
             self.channel_loss_callback,
             self.wandb_callback,
-            self.profile_callback,
-            # Weights first, then the cursor: at resume the DCP load frees its
-            # materialization buffers before the dataloader prefetches, and at
-            # save a crash between the two leaves weights whose trainer state is
-            # merely absent, which resumes with a warning. Assets + DCP + HF
-            # share CheckpointCallback so the sidecar export runs before load.
+            # Weights first, then the cursor: preserve the current runtime's
+            # checkpoint lifecycle while profiling remains last below.
             self.checkpoint_callback,
             self.global_state_callback,
             self.evaluate_callback,
             self.moe_monitor_callback,
+            # Profile schedules use absolute global steps, so initialize them
+            # after checkpoint restore. Keep this callback last so its detached
+            # NPU sidecar wait cannot delay a later callback collective.
+            self.profile_callback,
         ]
         self.state = TrainerState()
 
