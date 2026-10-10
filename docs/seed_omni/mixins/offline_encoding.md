@@ -251,8 +251,8 @@ A missing module or method still fails before the first request runs.
   [one epoch for `offline_embedding`](../../../tests/seed_omni/test_omni_offline_cache_args.py#L60) and
   [the `data.data_type` match](../../../tests/seed_omni/test_omni_offline_cache_args.py#L76).
 - [`tests/seed_omni/test_offline_cache_writer.py`](../../../tests/seed_omni/test_offline_cache_writer.py):
-  [the writer round trip](../../../tests/seed_omni/test_offline_cache_writer.py#L46) and
-  [one writer per `dp_rank`](../../../tests/seed_omni/test_offline_cache_writer.py#L98).
+  [the writer round trip](../../../tests/seed_omni/test_offline_cache_writer.py#L50) and
+  [one writer per `dp_rank`](../../../tests/seed_omni/test_offline_cache_writer.py#L134).
 - [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
   [a step without an lr scheduler logs no lr](../../../tests/seed_omni/trainer/test_step_metrics_callback.py#L82).
 - [`tests/seed_omni/runtime/test_module_runtime.py`](../../../tests/seed_omni/runtime/test_module_runtime.py):
