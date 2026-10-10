@@ -51,7 +51,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal, Optional, Union, get_args
 
 import yaml
 
@@ -75,6 +75,8 @@ from .parser import _deep_update, _instantiate_recursive
 
 
 logger = logging.get_logger(__name__)
+
+OmniTrainingTask = Literal["online_training", "offline_embedding", "offline_training"]
 
 
 def _is_omni_checkpoint_root(path: Optional[str]) -> bool:
@@ -409,7 +411,10 @@ class OmniDataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal["seedomni"] = field(default="seedomni", metadata={"help": "Type of the training data."})
+    data_type: Literal["seedomni", "seedomni_cached"] = field(
+        default="seedomni",
+        metadata={"help": "Type of the training data; `seedomni_cached` reads an offline-cache dataset."},
+    )
     datasets_type: str = field(
         default="mapping",
         metadata={"help": "Type of the datasets."},
@@ -450,8 +455,10 @@ class OmniDataArguments:
     )
 
     def __post_init__(self):
-        if self.data_type != "seedomni":
-            raise ValueError(f"OmniTrainer only builds the seedomni transform; got data.data_type={self.data_type!r}.")
+        if self.data_type not in {"seedomni", "seedomni_cached"}:
+            raise ValueError(
+                f"OmniTrainer only builds the seedomni transforms; got data.data_type={self.data_type!r}."
+            )
         self.enable_multisource = self.train_path.endswith(".yaml")
 
         if self.enable_multisource:
@@ -563,6 +570,18 @@ class OmniTrainingArguments:
         default=0,
         metadata={"help": "MoE expert load heatmap interval. Not supported by OmniTrainer; must be <= 0 (disabled)."},
     )
+    training_task: OmniTrainingTask = field(
+        default="online_training",
+        metadata={
+            "help": "Training task. online_training: encode raw data online. offline_embedding: run the "
+            "graph's offline_encode nodes and write the cache. offline_training: train from the cache; a "
+            "module the training graph calls only through online_process is built on meta."
+        },
+    )
+    offline_cache_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Output directory for training_task='offline_embedding'."},
+    )
     graph_profile: OmniGraphProfileArguments = field(default_factory=OmniGraphProfileArguments)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
@@ -570,6 +589,19 @@ class OmniTrainingArguments:
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
+        if self.training_task not in get_args(OmniTrainingTask):
+            known = ", ".join(get_args(OmniTrainingTask))
+            raise ValueError(f"Unknown train.training_task {self.training_task!r}; expected one of: {known}.")
+        if self.training_task == "offline_embedding" and not self.offline_cache_dir:
+            raise ValueError(
+                "`train.offline_cache_dir` is required when `train.training_task` is 'offline_embedding'."
+            )
+        if self.training_task == "offline_embedding" and self.num_train_epochs != 1:
+            raise ValueError(
+                "`train.training_task='offline_embedding'` writes every sample it reads, so "
+                f"`train.num_train_epochs` must be 1; got {self.num_train_epochs}."
+            )
+
         if self.dyn_bsz_physical_overflow_ratio < 1.0:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
@@ -580,6 +612,13 @@ class OmniTrainingArguments:
         self.global_rank = int(os.getenv("RANK", 0))
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
         self._resolve_checkpoint_paths()
+        if self.training_task == "offline_embedding" and self.checkpoint.load_path:
+            raise ValueError(
+                "`train.checkpoint.load_path` is not supported with `train.training_task='offline_embedding'`: "
+                "its frozen modules have no checkpoint manager, so the weights would not be restored while the "
+                "dataloader position would. Point the encoder's `model_path` at an HF checkpoint instead; "
+                f"got load_path={self.checkpoint.load_path!r}."
+            )
         self._resolve_profile()
 
     def _derive_batch_config(self, accelerator: AcceleratorConfig) -> None:
@@ -659,6 +698,16 @@ def _validate_omni_accelerator(accelerator: AcceleratorConfig) -> None:
         raise ValueError("accelerator.torch_compile.enable is not supported by SeedOmni yet.")
 
 
+def _validate_training_task_data(train: OmniTrainingArguments, data: OmniDataArguments) -> None:
+    """Only ``offline_training`` reads an offline cache; the other tasks read raw ``seedomni`` data."""
+    if (train.training_task == "offline_training") != (data.data_type == "seedomni_cached"):
+        expected = "seedomni_cached" if train.training_task == "offline_training" else "seedomni"
+        raise ValueError(
+            f"`train.training_task={train.training_task!r}` needs `data.data_type={expected!r}`; "
+            f"got {data.data_type!r}."
+        )
+
+
 def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
     """Reject an eager module under a top-level ``fsdp_scope='model'`` before any weights load."""
     fsdp_config = accelerator.fsdp_config
@@ -702,6 +751,7 @@ class OmniArguments:
         self.train._derive_batch_config(self.model.accelerator)
 
         _validate_omni_accelerator(self.model.accelerator)
+        _validate_training_task_data(self.train, self.data)
 
     def _to_module_global_args(self) -> OmniModuleRuntimeArguments:
         """Project ``model`` defaults onto :class:`OmniModuleRuntimeArguments` for per-module merging."""

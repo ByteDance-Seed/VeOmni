@@ -119,23 +119,31 @@ def test_training_graph_rejects_missing_method():
         TrainingGraph([{"from": "a.encode", "to": "end"}], modules={"a": Mod()})
 
 
+_ONE_NODE_FSM = {
+    "initial": "run",
+    "states": {
+        "run": {
+            "body": [{"from": "a", "to": "end"}],
+            "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+        }
+    },
+}
+
+
 def test_generation_graph_rejects_missing_method():
     class Mod:
         pass
 
     with pytest.raises(ValueError, match=r"Mod\.generate"):
-        GenerationGraph(
-            {
-                "initial": "run",
-                "states": {
-                    "run": {
-                        "body": [{"from": "a", "to": "end"}],
-                        "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
-                    }
-                },
-            },
-            modules={"a": Mod()},
-        )
+        GenerationGraph(_ONE_NODE_FSM).validate_modules({"a": Mod()})
+
+
+def test_generation_graph_builds_without_the_modules_it_names():
+    """A training job may load only a subset (an ``offline_embedding`` run loads just the encoder)."""
+    graph = GenerationGraph(_ONE_NODE_FSM)
+
+    with pytest.raises(ValueError, match="not loaded: \\['a'\\]"):
+        graph.validate_modules({"vae": object()})
 
 
 def test_single_node_with_only_end_edge():
@@ -307,7 +315,36 @@ def test_omni_model_forward_runs_fake_module_chain():
 
     # Each Linear is ones-initialized, so a row of ones becomes 8, then 64.
     assert torch.allclose(batch["hidden"], torch.full((2, hidden_size), 64.0))
-    assert out == {"loss": None, "losses": {}}
+    assert out == {"loss": None, "losses": {}, "conversation_list": None}
+
+
+class _ListReplacingModule(PretrainedOmniModule):
+    """Training stand-in whose ``forward`` returns a new ``conversation_list`` instead of mutating it."""
+
+    config_class = _StubConfig
+
+    def __init__(self):
+        super().__init__(_StubConfig())
+
+    def forward(self, conversation_list=None, **kwargs):
+        del kwargs
+        return {"conversation_list": [*conversation_list, "encoded"]}
+
+
+def test_omni_model_forward_returns_the_conversation_list_the_graph_wrote():
+    """FSDP2's root pre-forward may copy the batch, so callers read the final list from the return value."""
+    config = OmniConfig(
+        _module_entries={"module_A": {"model_path": "module_A"}},
+        training_graphs={"default": [{"from": "module_A", "to": "end"}]},
+        generation_graphs=_minimal_generation_graphs(module="module_A"),
+    )
+    model = OmniModel(config, {"module_A": _ListReplacingModule()})
+    original = ["raw"]
+
+    out = model(dict(conversation_list=original))
+
+    assert out["conversation_list"] == ["raw", "encoded"]
+    assert original == ["raw"]
 
 
 class _ArtefactModule(PretrainedOmniModule):

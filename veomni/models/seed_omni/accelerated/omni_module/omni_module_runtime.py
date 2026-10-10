@@ -94,6 +94,14 @@ class ModuleRuntime(VeOmniModelRuntime):
     genuinely different topologies ("freeze the ViT, EP-shard the LLM, DDP the
     VAE") while sharing one build sequence.
 
+    ``train_args`` is the job-wide ``train:`` section (:class:`OmniTrainingArguments`),
+    shared by every module and ``None`` for inference builds. It is config, not a
+    train/infer switch (``for_inference`` is): the runtime reads ``training_task``
+    and the checkpoint paths from it. ``training_graph_methods`` is the set of
+    methods this run's training graph calls on this module, e.g.
+    ``{"online_process"}``; it is empty for inference builds and for a module the
+    graph never calls.
+
     Job-wide concerns (process-group init, data pipeline, trace metering, the
     train loop) are **never** run here — :class:`OmniTrainer` owns them once, and
     cascades its ``on_{train,epoch,step}_*`` hooks into each module so every
@@ -106,6 +114,7 @@ class ModuleRuntime(VeOmniModelRuntime):
 
     args: "OmniModuleRuntimeArguments"
     train_args: Optional["OmniTrainingArguments"] = None
+    training_graph_methods: frozenset[str] = frozenset()
     _has_trainable_parameters: Optional[bool] = None
 
     def __init__(
@@ -115,13 +124,15 @@ class ModuleRuntime(VeOmniModelRuntime):
         *,
         module_config: "OmniModuleConfig",
         global_accelerator: "AcceleratorConfig",
-        train: Optional["OmniTrainingArguments"] = None,
+        train_args: Optional["OmniTrainingArguments"] = None,
+        training_graph_methods: frozenset[str] = frozenset(),
         for_inference: bool = False,
     ):
         self.args = args
         self.model_name = module_name
         self.module_config = module_config
-        self.train_args = train
+        self.train_args = train_args
+        self.training_graph_methods = training_graph_methods
         self.optimizer = None
         self.lr_scheduler = None
         self._global_accelerator = global_accelerator
@@ -145,7 +156,14 @@ class ModuleRuntime(VeOmniModelRuntime):
             with self._scoped():
                 self._build_model()
                 self._build_model_assets()
+                if self.reads_offline_cache:
+                    # A composed ``fsdp_scope='model'`` wrap still loads it with the rest.
+                    self.model.requires_grad_(False)
+                    return
                 self._freeze_model_module()
+                if self.train_args is not None and self.train_args.training_task == "offline_embedding":
+                    # Trains nothing, so no module gets an optimizer or a checkpoint manager.
+                    self.model.requires_grad_(False)
                 self._build_parallelized_model()
                 if not self.wrap_omni_model:
                     self._scope_recompute_to_parallel_state()
@@ -185,6 +203,22 @@ class ModuleRuntime(VeOmniModelRuntime):
         if self.wrap_omni_model:
             return self._global_accelerator
         return self.args.accelerator
+
+    @property
+    def reads_offline_cache(self) -> bool:
+        """Whether this module only runs ``online_process`` on cached data.
+
+        True under ``train.training_task='offline_training'`` when the training
+        graph calls ``online_process`` and nothing else on this module.
+        ``online_process`` reads only the config, so the module is built on meta,
+        loads no weights, and has nothing to train or save. Any other method in
+        the graph needs the weights, so the module is then built in full.
+        """
+        return (
+            self.train_args is not None
+            and self.train_args.training_task == "offline_training"
+            and self.training_graph_methods == {"online_process"}
+        )
 
     @property
     def module_name(self) -> str:
@@ -260,7 +294,7 @@ class ModuleRuntime(VeOmniModelRuntime):
             config_path=self.module_config,
             weights_path=args.model_path,
             torch_dtype="float32" if acc.fsdp_config.mixed_precision.enable else "bfloat16",
-            init_device=acc.init_device,
+            init_device="meta" if self.reads_offline_cache else acc.init_device,
             ops_implementation=args.ops_implementation,
         )
         self.model_config = self.model.config
@@ -436,8 +470,8 @@ class ModuleRuntime(VeOmniModelRuntime):
         if not should_skip_hf_weight_load(load_path, self.args.lora_config):
             return False
 
-        # A parameterless module has no persistent state for HF or DCP to restore
-        # (e.g. a process-only stage), so there is nothing to materialize.
+        # A parameterless module has no persistent state for HF or DCP to restore,
+        # so there is nothing to materialize.
         if not self.model.state_dict():
             return True
 
@@ -598,7 +632,8 @@ def build_omni_module_runtime(
     *,
     module_config: "OmniModuleConfig",
     global_accelerator: "AcceleratorConfig",
-    train: Optional["OmniTrainingArguments"] = None,
+    train_args: Optional["OmniTrainingArguments"] = None,
+    training_graph_methods: frozenset[str] = frozenset(),
     for_inference: bool = False,
 ) -> ModuleRuntime:
     """Build the :class:`ModuleRuntime` for one module of a composed model."""
@@ -607,7 +642,8 @@ def build_omni_module_runtime(
         module_name=module_name,
         module_config=module_config,
         global_accelerator=global_accelerator,
-        train=train,
+        train_args=train_args,
+        training_graph_methods=training_graph_methods,
         for_inference=for_inference,
     )
 

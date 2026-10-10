@@ -141,6 +141,121 @@ def test_build_model_uses_the_config_the_omni_config_loaded(monkeypatch):
     assert captured["weights_path"] == "/tmp/hf-model"
 
 
+@pytest.mark.parametrize(
+    ("training_task", "graph_methods", "on_meta"),
+    [
+        ("offline_training", {"online_process"}, True),
+        ("offline_training", {"forward"}, False),
+        ("offline_training", {"online_process", "decode"}, False),
+        ("offline_training", set(), False),
+        ("offline_embedding", {"offline_encode"}, False),
+        ("online_training", {"encode"}, False),
+        (None, {"online_process"}, False),
+    ],
+)
+def test_only_a_cache_reading_module_is_built_on_meta(monkeypatch, training_task, graph_methods, on_meta):
+    """``online_process`` reads only the config, so a module the graph calls only
+    through it never needs weights. Any other method in the graph does.
+
+    ``None`` stands for an inference build, which has no train args.
+    """
+    captured = {}
+
+    def fake_build_foundation_model(**kwargs):
+        captured.update(kwargs)
+        model = nn.Linear(2, 2)
+        model.config = SimpleNamespace()
+        return model
+
+    monkeypatch.setattr("veomni.models.build_foundation_model", fake_build_foundation_model)
+    runtime = _offline_cache_runtime(training_task, frozenset(graph_methods))
+
+    assert runtime.reads_offline_cache is on_meta
+    runtime._build_model()
+
+    assert captured["init_device"] == ("meta" if on_meta else "cpu")
+
+
+def test_a_cache_reading_module_is_frozen_and_never_wrapped_trained_or_saved(monkeypatch):
+    calls = []
+    for step in (
+        "setup",
+        "_freeze_model_module",
+        "_build_parallelized_model",
+        "_scope_recompute_to_parallel_state",
+        "_build_optimizer",
+        "build_checkpoint",
+    ):
+        monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, _step=step, **k: calls.append(_step))
+    monkeypatch.setattr(ModuleRuntime, "_build_model_assets", lambda self: None)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+
+    def fake_build_model(self):
+        self.model = nn.Linear(2, 2)
+
+    monkeypatch.setattr(ModuleRuntime, "_build_model", fake_build_model)
+    train = SimpleNamespace(training_task="offline_training", checkpoint=SimpleNamespace(load_path=None))
+
+    runtime = ModuleRuntime(
+        SimpleNamespace(accelerator=_fsdp("module")),
+        "vae",
+        module_config=SimpleNamespace(),
+        global_accelerator=_fsdp("module"),
+        train_args=train,
+        training_graph_methods=frozenset({"online_process"}),
+    )
+
+    assert calls == ["setup"]
+    assert not any(p.requires_grad for p in runtime.model.parameters())
+
+
+def test_an_offline_embedding_run_loads_and_wraps_every_module_but_freezes_it(monkeypatch):
+    """It trains nothing, so the frozen module gets no optimizer and no checkpoint manager."""
+    calls = []
+    for step in ("setup", "_freeze_model_module", "_build_parallelized_model", "_scope_recompute_to_parallel_state"):
+        monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, _step=step, **k: calls.append(_step))
+    monkeypatch.setattr(ModuleRuntime, "_build_model_assets", lambda self: None)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+    monkeypatch.setattr(ModuleRuntime, "_build_model", lambda self: setattr(self, "model", nn.Linear(2, 2)))
+    train = SimpleNamespace(training_task="offline_embedding", checkpoint=SimpleNamespace(load_path=None))
+
+    runtime = ModuleRuntime(
+        SimpleNamespace(accelerator=_fsdp("module")),
+        "llm",
+        module_config=SimpleNamespace(),
+        global_accelerator=_fsdp("module"),
+        train_args=train,
+    )
+
+    assert calls == [
+        "setup",
+        "_freeze_model_module",
+        "_build_parallelized_model",
+        "_scope_recompute_to_parallel_state",
+    ]
+    assert not runtime.has_trainable_parameters
+    assert runtime.optimizer is None
+    assert getattr(runtime, "checkpoint", None) is None
+
+
+def _offline_cache_runtime(training_task, graph_methods):
+    runtime = _unbuilt(
+        model_config=None,
+        ops_implementation=None,
+        accelerator=SimpleNamespace(
+            init_device="cpu",
+            fsdp_config=SimpleNamespace(
+                fsdp_mode="fsdp2", fsdp_scope="module", mixed_precision=SimpleNamespace(enable=False)
+            ),
+        ),
+    )
+    runtime.module_config = SimpleNamespace(model_type="fake")
+    runtime.training_graph_methods = graph_methods
+    if training_task is not None:
+        runtime.train_args = SimpleNamespace(training_task=training_task)
+    return runtime
+
+
 # The base declares these as class attributes defaulting to ``None``, so a test
 # asserting ``is None`` after the call would pass even if the builder did nothing.
 # Seeding a sentinel makes the assertion carry the signal.
@@ -244,11 +359,11 @@ def test_the_constructor_stores_training_args_where_the_base_reads_them(monkeypa
     ):
         monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, **k: None)
     monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
-    train = SimpleNamespace(checkpoint=SimpleNamespace(load_path=None))
+    train = SimpleNamespace(training_task="online_training", checkpoint=SimpleNamespace(load_path=None))
     args = SimpleNamespace(accelerator=_fsdp("module"))
 
     runtime = ModuleRuntime(
-        args, "vision_encoder", module_config=SimpleNamespace(), global_accelerator=_fsdp("module"), train=train
+        args, "vision_encoder", module_config=SimpleNamespace(), global_accelerator=_fsdp("module"), train_args=train
     )
 
     assert vars(runtime)["train_args"] is train

@@ -255,14 +255,14 @@ class GenerationGraph:
         ``initial`` (str) and ``states`` (dict of state specs).  Each state's
         ``body`` is a list of inline ``{from, to}`` edge dicts; the node pool
         is derived from their endpoints.
+
+    Construction checks only the FSM's own structure. The endpoints are checked
+    against the loaded modules by :meth:`validate_modules` before a request
+    runs: a training job builds this graph too, but may load only a subset of
+    the modules it names (an ``offline_embedding`` run loads just the encoder).
     """
 
-    def __init__(
-        self,
-        generation_graph: Dict,
-        *,
-        modules: Optional[Mapping[str, Any]] = None,
-    ):
+    def __init__(self, generation_graph: Dict):
         # `done` is reserved — auto-injected below.  Users must NOT redeclare
         # it; doing so silently lets a custom body/transitions override the
         # framework's terminal semantics, which is exactly the kind of magic
@@ -293,9 +293,6 @@ class GenerationGraph:
                     if node is not None and node.name not in self._node_pool:
                         self._node_pool[node.name] = node
 
-        if modules is not None:
-            validate_graph_modules(self._node_pool.values(), modules)
-
         if self._initial not in self._states:
             raise KeyError(
                 f"GenerationGraph initial state '{self._initial}' not in declared states {sorted(self._states)}."
@@ -311,6 +308,10 @@ class GenerationGraph:
 
         # Runtime state — reset before each generate call.
         self._current: str = self._initial
+
+    def validate_modules(self, modules: Mapping[str, Any]) -> None:
+        """Every endpoint must name one of ``modules`` and an existing method on it."""
+        validate_graph_modules(self._node_pool.values(), modules)
 
     def reset(self) -> None:
         """Reset FSM to the initial state for a new generation request."""
