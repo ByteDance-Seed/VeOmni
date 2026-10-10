@@ -17,6 +17,12 @@ SP2/reference gradient-norm ratio as the CFG-disabled control. No additional
 CFG-specific gradient-norm scaling discrepancy was observed in this matrix.
 This is distinct from passing raw SP2 gradient parity.
 
+The SP2 scaling observation is retained as a separate, unresolved diagnostic
+item. Investigating or changing that behavior is outside the scope of this
+revision; no SP gradient compensation is included. The revision's compatibility
+conclusion concerns the absence of an observed additional CFG-specific scaling
+discrepancy, not a claim that the one-half factor is correct or harmless.
+
 ## Setup and comparison method
 
 | Item | Configuration |
