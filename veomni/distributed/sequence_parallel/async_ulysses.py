@@ -76,7 +76,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         group: ProcessGroup,
     ):
         sp_group = get_ulysses_sequence_parallel_group() if group is None else group
-        ulysses_size = get_ulysses_sequence_parallel_world_size()
+        ulysses_size = get_ulysses_sequence_parallel_world_size(sp_group)
 
         num_q_heads = q_weight.shape[0] // head_dim
         num_kv_heads = k_weight.shape[0] // head_dim
@@ -94,6 +94,9 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
             ctx.n_repeat = ulysses_size // num_kv_heads
             ctx.original_num_kv_heads = num_kv_heads
         else:
+            assert num_kv_heads % ulysses_size == 0, (
+                f"num_key_value_heads ({num_kv_heads}) must be divisible by ulysses_size ({ulysses_size})"
+            )
             ctx.need_repeat_kv = False
 
         # q projection
@@ -131,11 +134,11 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
 
         # q communication collect
         q = q_res()
-        q = unpadding_tensor_for_seqeunce_parallel(q, seq_dimension, unpadded_dim_size)
+        q = unpadding_tensor_for_seqeunce_parallel(q, seq_dimension, unpadded_dim_size, sp_group)
 
         # k communication collect
         k = k_res()
-        k = unpadding_tensor_for_seqeunce_parallel(k, seq_dimension, unpadded_dim_size)
+        k = unpadding_tensor_for_seqeunce_parallel(k, seq_dimension, unpadded_dim_size, sp_group)
 
         q = q.contiguous()
         k = k.contiguous()
@@ -176,7 +179,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
 
         # v communication collect
         v = v_res()
-        v = unpadding_tensor_for_seqeunce_parallel(v, seq_dimension, unpadded_dim_size)
+        v = unpadding_tensor_for_seqeunce_parallel(v, seq_dimension, unpadded_dim_size, sp_group)
 
         # save ctx for backward
         ctx.sp_group = sp_group
@@ -272,7 +275,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
 
         # v grad communication launch
         grad_v = grad_output[2].contiguous()
-        grad_v = padding_tensor_for_seqeunce_parallel(grad_v, dim=seq_dimension)
+        grad_v = padding_tensor_for_seqeunce_parallel(grad_v, dim=seq_dimension, group=sp_group)
         grad_v_res = all_to_all_tensor(
             grad_v,
             scatter_dim=seq_dimension,
@@ -326,7 +329,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
             )
 
         # k grad communication launch
-        grad_k = padding_tensor_for_seqeunce_parallel(grad_k, dim=seq_dimension)
+        grad_k = padding_tensor_for_seqeunce_parallel(grad_k, dim=seq_dimension, group=sp_group)
         grad_k_res = all_to_all_tensor(
             grad_k,
             scatter_dim=seq_dimension,
@@ -354,7 +357,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
             )
 
         # q grad communication launch
-        grad_q = padding_tensor_for_seqeunce_parallel(grad_q, dim=seq_dimension)
+        grad_q = padding_tensor_for_seqeunce_parallel(grad_q, dim=seq_dimension, group=sp_group)
         grad_q_res = all_to_all_tensor(
             grad_q,
             scatter_dim=seq_dimension,
@@ -423,7 +426,7 @@ class AsyncUlyssesOutputProjection(torch.autograd.Function):
         sp_group = get_ulysses_sequence_parallel_group() if group is None else group
 
         # out projection
-        hidden_states = padding_tensor_for_seqeunce_parallel(hidden_states, seq_dimension)
+        hidden_states = padding_tensor_for_seqeunce_parallel(hidden_states, seq_dimension, sp_group)
         hidden_states = all_to_all_tensor(
             hidden_states, scatter_dim=seq_dimension, gather_dim=head_dimension, group=sp_group
         )
@@ -485,7 +488,7 @@ class AsyncUlyssesOutputProjection(torch.autograd.Function):
 
         # output grad communication collect
         grad_o = grad_out_res()
-        grad_o = unpadding_tensor_for_seqeunce_parallel(grad_o, seq_dimension, unpadded_dim_size)
+        grad_o = unpadding_tensor_for_seqeunce_parallel(grad_o, seq_dimension, unpadded_dim_size, sp_group)
 
         return (
             grad_o,
