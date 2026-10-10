@@ -599,7 +599,7 @@ class TestGptOssFlops:
     def test_numerical(self, gpt_oss_counter):
         batch_seqlens = [12, 5]
         flops, promised_flops = gpt_oss_counter.estimate_flops(batch_seqlens, delta_time=1.0)
-        assert flops == pytest.approx(0.000326931456, rel=1e-9)
+        assert flops == pytest.approx(0.000328366848, rel=1e-9)
         assert promised_flops == 1000.0
 
     def test_sliding_attention_reduces_quadratic_flops(self, gpt_oss_config):

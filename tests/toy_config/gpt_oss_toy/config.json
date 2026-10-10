@@ -6,7 +6,7 @@
   "attention_dropout": 0.0,
   "bos_token_id": 199998,
   "eos_token_id": 199999,
-  "head_dim": 4,
+  "head_dim": 32,
   "hidden_act": "silu",
   "hidden_size": 16,
   "initializer_range": 0.02,
