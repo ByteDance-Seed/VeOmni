@@ -24,9 +24,8 @@ the `key_prefixes` map (source prefix → module prefix; the longest match wins)
 `build_config` (HF config → module config) and `build_assets` (tokenizer /
 processors); `tied_source_keys` names stored duplicates of tied weights. A
 layout gives both the offline convert and the
-[direct load and HF-layout export](training_and_inference.md#21-load-an-upstream-checkpoint-directly).
-Weight transforms beyond the rename belong in the module's own checkpoint
-tensor converter, which the layout's key converter wraps.
+[direct load and HF-layout export](training_and_inference.md#21-load-an-upstream-checkpoint-directly);
+the contract is in [Upstream Checkpoint Layout](hf_layout.md).
 
 ## 2. Write each module
 

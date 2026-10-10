@@ -99,11 +99,15 @@ with a registered layout loads through it, and any other type is an error.
 - **Limits.** Every module in the `modules` YAML must be one the layout cuts
   from the checkpoint and keep its default `model_path` (the module name). A
   model composed from several sources, like Qwen3 text + the Qwen3-VL ViT,
-  still needs split checkpoints. Expert-parallel streaming load
-  (`ep_sharded_stream_load`) is not supported for renamed keys yet.
+  still needs split checkpoints. Per-module `model_config` overrides apply to
+  the run but not to the exported `config.json`, which is the source's (a
+  warning lists them). Expert-parallel streaming load
+  (`ep_sharded_stream_load`) is not supported for renamed keys yet, and eager
+  inference loads each module onto a single device.
 
 The offline convert of such a family goes through the same layout, so a split
-checkpoint and the direct load hold identical module weights.
+checkpoint and the direct load hold identical module weights. To add a layout
+for a family, see [Upstream Checkpoint Layout](hf_layout.md).
 
 ## 3. Train
 
