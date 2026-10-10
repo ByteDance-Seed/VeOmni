@@ -64,6 +64,22 @@ parallel_plan = ParallelPlan(
 )
 ```
 
+### Plan owners
+
+Each plan key's parent module is that key's owner. `ParallelPlan.__init__` registers
+every distinct owner pattern in `extra_parallel_fsdp_no_shard_module[<name>]`, and the
+parallelizer wraps each matched owner as its own FSDP2 unit on that dimension's
+`<name>_fsdp` mesh. For the plan above, `model.layers.*.mlp.experts` is the `ep` owner.
+Do not set `extra_parallel_fsdp_no_shard_module` by hand.
+
+* Owners must not nest. A plan with both `decoder.weight` and `decoder.ngram.weight`
+  raises `ValueError`, because each owner would become its own unit.
+* Every owner must sit under a module whose class is listed in the model's
+  `_no_split_modules`. The parallelizer pairs owners only under those wrap targets.
+  An owner outside them is still sliced by the plan, but FSDP2 shards it again over
+  the regular mesh. Each rank then gathers a mix of other ranks' slices, and nothing
+  raises. A MoE MTP head is the usual case: see step 6 in [mtp.md](./mtp.md).
+
 
 
 ## Acknowledgements
