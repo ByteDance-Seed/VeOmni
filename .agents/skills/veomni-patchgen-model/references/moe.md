@@ -86,8 +86,9 @@ Two authoritative sources:
 1. Subclass `PerExpertFusedCheckpointTensorConverter` and set `model_name`, which
    prefixes its incomplete-checkpoint error. Inherit `can_handle`, `convert`,
    `finalize`, `fused_expert_target` and `for_expert_range` unchanged.
-2. Export the factory as in step 4 of the next list; `num_experts` is its only
-   argument.
+2. Export the factory `create_<m>_checkpoint_tensor_converter(model)` as in step
+   4 of the next list. It reads only `num_experts` from the config and returns
+   `<M>CheckpointTensorConverter(num_experts=...)`.
 3. Map the HF index with
    `convert_per_expert_fqn_mapping_to_fused(mapping, PER_EXPERT_SPLIT_TO_FUSED_PATTERN)`
    (`veomni/models/_moe_fused_weight_map.py`) and register it as
