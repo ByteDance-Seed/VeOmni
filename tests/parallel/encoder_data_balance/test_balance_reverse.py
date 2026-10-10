@@ -76,12 +76,15 @@ def main():
 
 
 def test_encoder_balance():
+    world_size = int(os.getenv("VEOMNI_BALANCE_WORLD_SIZE", "8"))
+    if world_size < 1:
+        raise ValueError("VEOMNI_BALANCE_WORLD_SIZE must be positive.")
     command = [
         sys.executable,
         "-m",
         "torch.distributed.run",
         "--nnodes=1",
-        "--nproc-per-node=8",
+        f"--nproc-per-node={world_size}",
         "--node-rank=0",
         "--master_addr=localhost",
         "--master_port=12345",
