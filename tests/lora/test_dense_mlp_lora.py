@@ -22,11 +22,13 @@ import pytest
 import torch
 from torch import nn
 
+from tests.tools.common_utils import ieee_fp32_matmul
 from veomni.arguments import OpsImplementationConfig
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.layers import LoraLinear
 from veomni.ops import OP_REGISTRY
 from veomni.ops.config import get_ops_config, set_ops_config
+from veomni.utils.device import get_device_type
 
 
 def _qwen3_mlp() -> nn.Module:
@@ -93,17 +95,13 @@ def _wrap(mlp: nn.Module) -> VeOmniLoraModel:
     return VeOmniLoraModel(mlp, VeOmniLoraConfig(r=4, lora_alpha=8, target_modules=_PROJECTIONS))
 
 
-def _device() -> str:
-    return "cuda" if torch.cuda.is_available() else "cpu"
-
-
 @pytest.mark.parametrize("impl", ["eager", "liger_kernel"])
 @pytest.mark.parametrize("family", list(_FAMILIES))
-def test_lora_projections_match_merged_weights(family: str, impl: str, monkeypatch: pytest.MonkeyPatch):
+# TF32 rounding of the separate adapter matmuls exceeds the fp32 tolerance below.
+@ieee_fp32_matmul()
+def test_lora_projections_match_merged_weights(family: str, impl: str):
     """Adapters on every projection must change the output exactly as their merged weights do."""
-    # TF32 rounding of the separate adapter matmuls exceeds the fp32 tolerance below.
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-    device = _device()
+    device = get_device_type()
     mlp = _build_mlp(family, impl, torch.float32, device)
     x = torch.randn(2, 5, 16, device=device)
     base_out = mlp(x)
@@ -131,7 +129,7 @@ def test_lora_projections_match_merged_weights(family: str, impl: str, monkeypat
 @pytest.mark.parametrize("family", list(_FAMILIES))
 def test_lora_projections_at_init_match_eager_row_bitwise(family: str):
     """The module path that LoRA takes must reproduce the eager ``swiglu_mlp`` row in bf16."""
-    device = _device()
+    device = get_device_type()
     mlp = _build_mlp(family, "eager", torch.bfloat16, device)
     x = torch.randn(2, 5, 16, device=device, dtype=torch.bfloat16)
     with torch.no_grad():
