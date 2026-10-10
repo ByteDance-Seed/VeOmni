@@ -141,6 +141,87 @@ def test_build_model_uses_the_config_the_omni_config_loaded(monkeypatch):
     assert captured["weights_path"] == "/tmp/hf-model"
 
 
+@pytest.mark.parametrize(
+    ("training_task", "support_cache", "on_meta"),
+    [
+        ("offline_training", True, True),
+        ("offline_training", False, False),
+        ("offline_embedding", True, False),
+        ("online_training", True, False),
+        (None, True, False),
+    ],
+)
+def test_only_a_cache_reading_module_is_built_on_meta(monkeypatch, training_task, support_cache, on_meta):
+    """``online_process`` reads only the config, so that module never needs weights.
+
+    ``None`` stands for an inference build, which has no train args.
+    """
+    captured = {}
+
+    def fake_build_foundation_model(**kwargs):
+        captured.update(kwargs)
+        model = nn.Linear(2, 2)
+        model.config = SimpleNamespace()
+        return model
+
+    monkeypatch.setattr("veomni.models.build_foundation_model", fake_build_foundation_model)
+    runtime = _offline_cache_runtime(training_task, support_cache)
+
+    assert runtime.reads_offline_cache is on_meta
+    runtime._build_model()
+
+    assert captured["init_device"] == ("meta" if on_meta else "cuda")
+
+
+def test_a_cache_reading_module_is_frozen_and_never_wrapped_trained_or_saved(monkeypatch):
+    calls = []
+    for step in (
+        "setup",
+        "_freeze_model_module",
+        "_build_parallelized_model",
+        "_scope_recompute_to_parallel_state",
+        "_build_optimizer",
+        "build_checkpoint",
+    ):
+        monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, _step=step, **k: calls.append(_step))
+    monkeypatch.setattr(ModuleRuntime, "_build_model_assets", lambda self: None)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+
+    def fake_build_model(self):
+        self.model = nn.Linear(2, 2)
+
+    monkeypatch.setattr(ModuleRuntime, "_build_model", fake_build_model)
+    train = SimpleNamespace(training_task="offline_training", checkpoint=SimpleNamespace(load_path=None))
+
+    runtime = ModuleRuntime(
+        SimpleNamespace(accelerator=_fsdp("module")),
+        "vae",
+        module_config=SimpleNamespace(support_cache=True),
+        global_accelerator=_fsdp("module"),
+        train=train,
+    )
+
+    assert calls == ["setup"]
+    assert not any(p.requires_grad for p in runtime.model.parameters())
+
+
+def _offline_cache_runtime(training_task, support_cache):
+    runtime = _unbuilt(
+        model_config=None,
+        ops_implementation=None,
+        accelerator=SimpleNamespace(
+            init_device="cuda",
+            fsdp_config=SimpleNamespace(
+                fsdp_mode="fsdp2", fsdp_scope="module", mixed_precision=SimpleNamespace(enable=False)
+            ),
+        ),
+    )
+    runtime.module_config = SimpleNamespace(model_type="fake", support_cache=support_cache)
+    if training_task is not None:
+        runtime.train_args = SimpleNamespace(training_task=training_task)
+    return runtime
+
+
 # The base declares these as class attributes defaulting to ``None``, so a test
 # asserting ``is None`` after the call would pass even if the builder did nothing.
 # Seeding a sentinel makes the assertion carry the signal.
@@ -244,7 +325,7 @@ def test_the_constructor_stores_training_args_where_the_base_reads_them(monkeypa
     ):
         monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, **k: None)
     monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
-    train = SimpleNamespace(checkpoint=SimpleNamespace(load_path=None))
+    train = SimpleNamespace(training_task="online_training", checkpoint=SimpleNamespace(load_path=None))
     args = SimpleNamespace(accelerator=_fsdp("module"))
 
     runtime = ModuleRuntime(

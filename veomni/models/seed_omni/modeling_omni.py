@@ -163,12 +163,11 @@ class OmniModel(PreTrainedModel):
 
         # Convert may split modules before any DAG/FSM exists. Build each graph
         # only when the config has one; :meth:`forward` / :meth:`generate` report
-        # the absence at train / infer time. A present graph checks endpoints
-        # against these modules during its own construction.
+        # the absence at train / infer time. The training graph checks its
+        # endpoints against these modules here; the generation graph only before
+        # a request (:meth:`GenerationGraph.validate_modules`).
         self.training_graph = TrainingGraph(config.training_graph, modules=modules) if config.training_graph else None
-        self.generation_graph = (
-            GenerationGraph(config.generation_graph, modules=modules) if config.generation_graphs else None
-        )
+        self.generation_graph = GenerationGraph(config.generation_graph) if config.generation_graphs else None
 
         self._last_printed_state: str | None = None
         self._generated: list[dict[str, Any]] = []
@@ -596,6 +595,7 @@ class OmniModel(PreTrainedModel):
                 "OmniModel.generate: this model has no generation graph. Pass `generation_graphs` "
                 f"(or place `{DEFAULT_GENERATION_GRAPH_FILE}` next to the checkpoint) to run inference."
             )
+        self.generation_graph.validate_modules({name: self.get_module(name) for name in self._module_names})
         ctx: dict[str, Any] = request
         generation_kwargs = self.resolve_generation_kwargs(generation_kwargs)
 

@@ -71,6 +71,7 @@ from ...distributed.parallel_state import clear_parallel_state, init_parallel_st
 from ...models.seed_omni.accelerated import OmniModelRuntime, build_omni_model_runtime
 from ...models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 from ...models.seed_omni.processing_omni import OmniProcessor
+from ...models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
 from ...ops.batch_invariant_ops import set_batch_invariant_mode
 from ...utils import helper, logging
 from ...utils.device import (
@@ -193,6 +194,7 @@ class OmniTrainer:
     step_env_metrics: Dict[str, Any] | None = None
     step_train_metrics: Dict[str, Any] | None = None
     LOG_SAMPLE: bool = True
+    offline_cache_writer: SeedOmniOfflineCacheWriter | None = None
 
     def __init__(self, args: OmniArguments):
         self.args = args
@@ -207,6 +209,7 @@ class OmniTrainer:
         # The dataset fixes train_steps, which the schedule needs.
         self._build_lr_scheduler()
         self._build_training_context()
+        self._build_offline_cache_writer()
         self._init_callbacks()
 
     @staticmethod
@@ -263,11 +266,19 @@ class OmniTrainer:
         clear_parallel_state()
 
     def _build_model_runtime(self) -> OmniModelRuntime:
-        """Build the composed model — every module built, wrapped and given its optimizer."""
+        """Build the composed model — every module built, wrapped and given its optimizer.
+
+        ``train.training_task='offline_embedding'`` trains nothing by design, so
+        only it may build no optimizer.
+        """
         model = build_omni_model_runtime(build_omni_model_runtime_args(self.args), train=self.args.train)
-        if model.optimizer is None:
+        if model.optimizer is None and self.args.train.training_task != "offline_embedding":
             raise ValueError("OmniTrainer has nothing to train: every module is frozen.")
         return model
+
+    def _build_offline_cache_writer(self) -> None:
+        if self.args.train.training_task == "offline_embedding":
+            self.offline_cache_writer = SeedOmniOfflineCacheWriter(self.args.train.offline_cache_dir)
 
     def _build_lr_scheduler(self) -> None:
         """Size the run, then let the model schedule over it."""
@@ -521,6 +532,31 @@ class OmniTrainer:
 
         self.on_step_end(loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
 
+    def offline_cache_step(self, data_iterator: Any) -> None:
+        """One encode-only step: run the training DAG without autograd and cache each conversation."""
+        if self.offline_cache_writer is None:
+            raise RuntimeError("offline_cache_step requires an initialized SeedOmniOfflineCacheWriter.")
+
+        micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self.state.global_step += 1
+
+        self.on_step_begin(micro_batches=micro_batches)
+        self.sync_before_train_step()
+
+        num_micro_steps = len(micro_batches)
+        for micro_step, micro_batch in enumerate(micro_batches):
+            self.model_reshard(micro_step, num_micro_steps)
+            micro_batch = self.preforward(micro_batch)
+            with (
+                torch.no_grad(),
+                self.model_fwd_context,
+                set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
+            ):
+                self.model.forward(micro_batch)
+            self.offline_cache_writer.save_conversation_list(micro_batch["conversation_list"])
+
+        self.on_step_end(loss=0.0, loss_dict={}, grad_norm=0.0)
+
     def train(self):
         args: OmniArguments = self.args
         self.on_train_begin()
@@ -544,9 +580,10 @@ class OmniTrainer:
                 use_background_prefetcher=args.data.dataloader.use_background_prefetcher,
             )
 
+            step_fn = self.offline_cache_step if args.train.training_task == "offline_embedding" else self.train_step
             for _ in range(self.start_step, args.train_steps):
                 try:
-                    self.train_step(self.data_iterator)
+                    step_fn(self.data_iterator)
                 except StopIteration:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break
@@ -560,6 +597,8 @@ class OmniTrainer:
                 self.data_iterator.stop()
 
         self.on_train_end()
+        if self.offline_cache_writer is not None:
+            self.offline_cache_writer.finalize()
 
         if self.data_iterator is not None and args.data.dataloader.use_background_prefetcher:
             self.data_iterator.stop()

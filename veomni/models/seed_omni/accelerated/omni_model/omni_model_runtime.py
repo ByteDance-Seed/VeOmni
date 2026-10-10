@@ -123,14 +123,20 @@ def _scoped_no_split_modules(module_runtimes: Mapping[str, ModuleRuntime]) -> li
     return list(dict.fromkeys(scoped))
 
 
-def _reject_lora_that_matched_nothing(module_runtimes: Mapping[str, ModuleRuntime]) -> None:
+def _reject_lora_that_matched_nothing(module_runtimes: Mapping[str, ModuleRuntime], train: Any = None) -> None:
     """Fail a LoRA run that left the composed model with nothing to train.
 
     A single module whose targets missed is normal — ``ModuleRuntime`` already
     logs and stays frozen. A sibling doing full-parameter SFT still trains.
     Raise only when LoRA was requested and **every** module is frozen, which
     would look like a healthy run whose loss never moves.
+
+    A ``train.training_task='offline_embedding'`` run is exempt: it trains
+    nothing by design.
     """
+    if getattr(train, "training_task", None) == "offline_embedding":
+        return
+
     requested = [name for name, runtime in module_runtimes.items() if bool(runtime.args.lora_config)]
     if not requested:
         return
@@ -426,6 +432,7 @@ class OmniModelRuntime:
         model = self.model
         ctx: dict[str, Any] = request
         modules = {name: self.get_module(name) for name in model._module_names}
+        model.generation_graph.validate_modules({name: model.get_module(name) for name in model._module_names})
         generation_kwargs = model.resolve_generation_kwargs(generation_kwargs)
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
         total_steps = 0
@@ -606,7 +613,7 @@ def build_omni_model_runtime(
         f"OmniModelRuntime: composed OmniModel with {len(module_runtimes)} module(s) ({list(module_runtimes)})."
     )
     if not for_inference:
-        _reject_lora_that_matched_nothing(module_runtimes)
+        _reject_lora_that_matched_nothing(module_runtimes, train)
     runtime = OmniModelRuntime(
         OmniModel(omni_config, {name: rt.omni_module for name, rt in module_runtimes.items()}),
         module_runtimes=module_runtimes,

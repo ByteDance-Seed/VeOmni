@@ -1,12 +1,9 @@
-"""``OfflineEncodingMixin``: per-run ``cache_mode``, the endpoint gate and its MRO contract."""
+"""``OfflineEncodingMixin``: the two offline-cache endpoints a ``support_cache`` module implements."""
 
 from __future__ import annotations
 
-import json
-
 import pytest
 import torch
-from transformers import PretrainedConfig
 
 from veomni.models.seed_omni import OfflineEncodingMixin
 from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
@@ -14,20 +11,11 @@ from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleM
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
-class DummyOfflineConfig(PretrainedConfig):
-    model_type = "dummy_offline_config"
-
-    def __init__(self, marker: str = "default", **kwargs: object) -> None:
-        self.marker = marker
-        super().__init__(**kwargs)
-
-
 class DummyOfflineModule(OfflineEncodingMixin, TrainingModuleMixin, BaseMixin):
-    def __init__(self, cache_mode: str = "full", support_cache: bool = True) -> None:
-        self.config = DummyOfflineConfig(support_cache=support_cache)
+    def __init__(self) -> None:
         self.calls: list[str] = []
         self._conversation_carrier: list[list[ConversationItem]] | None = None
-        super().__init__(cache_mode=cache_mode)
+        super().__init__()
 
     def offline_encode(self, **kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
         return {"encoded_cache": kwargs["pixel_values"]}
@@ -70,44 +58,6 @@ class DummyOfflineModule(OfflineEncodingMixin, TrainingModuleMixin, BaseMixin):
         return {"conversation_list": self._conversation_carrier}
 
 
-@pytest.mark.parametrize("cache_mode", ["full", "encode_only", "process_only"])
-def test_cache_mode_is_taken_from_the_constructor(cache_mode: str) -> None:
-    assert DummyOfflineModule(cache_mode=cache_mode).cache_mode == cache_mode
-
-
-def test_cache_mode_defaults_to_full() -> None:
-    assert DummyOfflineModule().cache_mode == "full"
-
-
-def test_unknown_cache_mode_is_rejected() -> None:
-    with pytest.raises(ValueError, match="cache_mode must be one of"):
-        DummyOfflineModule(cache_mode="offline_cache")
-
-
-def test_cached_mode_requires_support_cache() -> None:
-    assert DummyOfflineModule(cache_mode="full", support_cache=False).cache_mode == "full"
-    with pytest.raises(ValueError, match="requires DummyOfflineConfig.support_cache=True"):
-        DummyOfflineModule(cache_mode="encode_only", support_cache=False)
-
-
-def test_pre_forward_rejects_process_only_for_offline_encode() -> None:
-    module = DummyOfflineModule(cache_mode="process_only")
-
-    with pytest.raises(
-        ValueError, match="offline_encode requires cache_mode in .* current cache_mode is 'process_only'"
-    ):
-        module.pre_forward("offline_encode", conversation_list=[])
-
-
-def test_pre_forward_rejects_encode_only_for_online_process() -> None:
-    module = DummyOfflineModule(cache_mode="encode_only")
-
-    with pytest.raises(
-        ValueError, match="online_process requires cache_mode in .* current cache_mode is 'encode_only'"
-    ):
-        module.pre_forward("online_process", conversation_list=[])
-
-
 def test_offline_encoding_mixin_requires_tensor_endpoints() -> None:
     assert OfflineEncodingMixin.__abstractmethods__ == {"offline_encode", "online_process"}
 
@@ -116,75 +66,18 @@ def test_offline_encoding_mixin_is_not_module_mixin_subclass() -> None:
     assert not issubclass(OfflineEncodingMixin, BaseMixin)
 
 
-def test_cache_mode_is_set_before_the_model_body_and_kept_off_the_config(tmp_path) -> None:
-    """The native body branches on ``cache_mode`` to decide which sub-networks
-    to build at all (e.g. a VAE in ``encode_only`` never allocates its decoder),
-    so it must be visible inside the body, yet it is a per-run choice and must
-    not end up in ``config.json``.
-    """
-    seen: list[str] = []
-
-    class NativeBody:
-        def __init__(self, config: DummyOfflineConfig) -> None:
-            seen.append(self.cache_mode)
-            self.config = config
-
-    class Module(OfflineEncodingMixin, NativeBody):
+def test_a_module_missing_an_endpoint_cannot_be_built() -> None:
+    class EncodeOnly(OfflineEncodingMixin):
         def offline_encode(self, **kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
             return {}
 
-        def online_process(self, **kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
-            return {}
-
-    module = Module(DummyOfflineConfig(support_cache=True), cache_mode="encode_only")
-
-    assert seen == ["encode_only"]  # visible to the native body, not only afterwards
-    assert module.cache_mode == "encode_only"
-    module.config.save_pretrained(tmp_path)
-    saved = json.loads((tmp_path / "config.json").read_text())
-    assert saved["support_cache"] is True
-    assert "cache_mode" not in saved
-
-
-def test_sibling_offline_mixin_wins_mro_over_the_abstract_stubs() -> None:
-    """A module's concrete tensor call-sites must sit before this mixin in MRO.
-
-    ``offline_encode`` / ``online_process`` are abstract here; a module supplies
-    them from a sibling ``*OfflineMixin`` listed *first* in its bases, so the
-    real implementation resolves instead of the stub.
-    """
-
-    class SiblingOfflineMixin:
-        def offline_encode(self, **kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
-            return {"encoded_cache": kwargs["pixel_values"] * 2}
-
-        def online_process(self, **kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
-            return {"latents": kwargs["encoded_cache"]}
-
-    class Module(SiblingOfflineMixin, OfflineEncodingMixin):
-        def __init__(self) -> None:
-            self.config = DummyOfflineConfig(support_cache=True)
-
-    assert Module.__mro__.index(SiblingOfflineMixin) < Module.__mro__.index(OfflineEncodingMixin)
-    encoded_cache = Module().offline_encode(pixel_values=torch.ones(1))["encoded_cache"]
-    assert torch.equal(encoded_cache, torch.full((1,), 2.0))
+    with pytest.raises(TypeError, match="online_process"):
+        EncodeOnly()
 
 
 def test_offline_encoding_mixin_does_not_implement_decorated_hooks() -> None:
     markers = ("_omni_pre_context", "_omni_post_context")
     assert not [name for name, attr in vars(OfflineEncodingMixin).items() for m in markers if hasattr(attr, m)]
-
-
-def test_mixin_after_training_module_mixin_is_rejected_at_class_creation() -> None:
-    """``TrainingModuleMixin.pre_forward`` does not chain to ``super()``, so the gate would be skipped."""
-    with pytest.raises(TypeError, match="OfflineEncodingMixin must come before TrainingModuleMixin"):
-
-        class _WrongOrder(BaseMixin, TrainingModuleMixin, OfflineEncodingMixin):
-            def offline_encode(self, **kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
-                return {}
-
-            def online_process(self, **kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
-                return {}
 
 
 def test_decorated_hook_slots_can_bind_multiple_contexts() -> None:

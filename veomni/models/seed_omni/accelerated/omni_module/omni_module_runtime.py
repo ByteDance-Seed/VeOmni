@@ -145,6 +145,10 @@ class ModuleRuntime(VeOmniModelRuntime):
             with self._scoped():
                 self._build_model()
                 self._build_model_assets()
+                if self.reads_offline_cache:
+                    # A composed ``fsdp_scope='model'`` wrap still loads it with the rest.
+                    self.model.requires_grad_(False)
+                    return
                 self._freeze_model_module()
                 self._build_parallelized_model()
                 if not self.wrap_omni_model:
@@ -185,6 +189,20 @@ class ModuleRuntime(VeOmniModelRuntime):
         if self.wrap_omni_model:
             return self._global_accelerator
         return self.args.accelerator
+
+    @property
+    def reads_offline_cache(self) -> bool:
+        """Whether this module only runs ``online_process`` on cached data.
+
+        True under ``train.training_task='offline_training'`` for a config with
+        ``support_cache``: ``online_process`` reads only the config, so the
+        module is built on meta, loads no weights, and has nothing to train or save.
+        """
+        return (
+            self.train_args is not None
+            and self.train_args.training_task == "offline_training"
+            and bool(getattr(self.module_config, "support_cache", False))
+        )
 
     @property
     def module_name(self) -> str:
@@ -260,7 +278,7 @@ class ModuleRuntime(VeOmniModelRuntime):
             config_path=self.module_config,
             weights_path=args.model_path,
             torch_dtype="float32" if acc.fsdp_config.mixed_precision.enable else "bfloat16",
-            init_device=acc.init_device,
+            init_device="meta" if self.reads_offline_cache else acc.init_device,
             ops_implementation=args.ops_implementation,
         )
         self.model_config = self.model.config
@@ -436,8 +454,8 @@ class ModuleRuntime(VeOmniModelRuntime):
         if not should_skip_hf_weight_load(load_path, self.args.lora_config):
             return False
 
-        # A parameterless module has no persistent state for HF or DCP to restore
-        # (e.g. a process-only stage), so there is nothing to materialize.
+        # A parameterless module has no persistent state for HF or DCP to restore,
+        # so there is nothing to materialize.
         if not self.model.state_dict():
             return True
 
