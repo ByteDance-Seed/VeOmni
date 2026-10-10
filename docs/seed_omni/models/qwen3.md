@@ -16,14 +16,13 @@ storage.
 
 Config dir: `configs/seed_omni/Qwen/qwen3_0.6b/`.
 
-The omni config layout splits the old monolithic launcher into a `base.yaml` plus
-per-purpose module/graph files. Both training and inference take the **same**
-`base.yaml`.
+The layout follows [the shared config layout](../usage/training_and_inference.md#1-config-layout).
+Both training and inference take the **same** `base.yaml`.
 
 | File | Role |
 |------|------|
-| `qwen3_0.6b/train/base.yaml` | Top-level omni launcher: model paths, top-level `accelerator`, data, train, and the `infer` block. |
-| `qwen3_0.6b/train/modules_train.yaml` | Per-module training overrides. Add `--accelerator.ulysses_size N` to run it under uniform Ulysses SP — no separate SP config (see [§3.1](#31-sequence-parallelism-ulysses)). |
+| `qwen3_0.6b/train/base.yaml` | Launcher: model paths, `model.accelerator`, data, train, and the `infer` block. |
+| `qwen3_0.6b/train/modules_train.yaml` | Per-module training overrides. Add `--model.accelerator.ulysses_size N` for Ulysses SP (see [§3.1](#31-sequence-parallelism-ulysses)). |
 | `qwen3_0.6b/train/graph_train.yaml` | Training DAG (`qwen3_text_encoder → qwen3_llm → qwen3_text_encoder.decode`). |
 | `qwen3_0.6b/train/data.yaml` | Weighted multisource data list (Tulu-3 SFT mixture). |
 | `qwen3_0.6b/train/graph_infer.yaml` | Text chat generation graph (mapped under `model.model_config.infer_graph.infer_text`). |
@@ -69,7 +68,7 @@ upstream_sharded: true
 ```
 
 The on-disk row schema is documented in
-[`docs/seed_omni/data_format.md`](../data_format.md).
+[Data Format](../usage/data_format.md).
 
 ---
 
@@ -104,25 +103,22 @@ bash train.sh tasks/omni/train_omni.py \
 
 ### 3.1 Sequence parallelism (Ulysses)
 
-Uniform Ulysses SP (Arch B): the `qwen3_text_encoder` (wte) and the `qwen3_llm`
-backbone both shard the packed token sequence at the outer SP size. SP has **no
-dedicated config** — it is the normal `train/modules_train.yaml` plus
-`--accelerator.ulysses_size N`. The dataloader replicates each DP shard across the
+The `qwen3_text_encoder` (wte) and the `qwen3_llm` backbone both shard the packed
+token sequence at the shared SP size. SP has **no dedicated config**: add
+`--model.accelerator.ulysses_size N` (design in
+[Sequence Parallelism](../design/sequence_parallel.md)). The dataloader replicates each DP shard across the
 SP group; each module slices to its `1/sp` chunk, runs one forward, and all-gathers
 the output back:
 
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
-  --model.modules configs/seed_omni/Qwen/qwen3_0.6b/train/modules_train.yaml \
-  --accelerator.ulysses_size 4 \
+  --model.accelerator.ulysses_size 4 \
   --train.global_batch_size 16 --train.micro_batch_size 4
 ```
 
-- SP is **uniform**: set it once on the outer trainer
-  (`--accelerator.ulysses_size`); modules inherit it. `OmniTrainer` raises
-  unless every module's `ulysses_size` equals the outer size (no per-module
-  overrides). The wte is a per-token lookup, so its sequence shards exactly like
+- Every module inherits the global `ulysses_size`; do not set a per-module
+  `ulysses_size` (nothing validates that modules agree). The wte is a per-token lookup, so its sequence shards exactly like
   the LLM backbone.
 - `world % sp_size == 0`; a larger `micro_batch_size` gives longer packed
   sequences to slice across SP ranks.
@@ -337,18 +333,16 @@ Trainable params are `qwen3vl_vision.visual.merger.*`, the whole `qwen3_llm`
 backbone, and the masked text-encoder embedding (only the vision special-token
 rows receive gradient; the ViT blocks are frozen).
 
-**Sequence parallelism** — uniform Ulysses at the outer SP size: the ViT, the
-text-encoder and the LLM backbone all run SP=4. SP has **no dedicated config** — it
-is the normal `visual_instruction_tuning/modules_train.yaml` (the launcher's default
-`model.modules`) plus `--accelerator.ulysses_size N`. The dataloader replicates each
-DP shard across the SP group; each module slices to its `1/sp` chunk, runs one
-forward, and all-gathers the output back. Same uniform-SP / `TORCH_DISTRIBUTED_DEBUG`
-caveats as [§3.1](#31-sequence-parallelism-ulysses):
+**Sequence parallelism**: the ViT, the text encoder and the LLM backbone all run at
+the shared SP size. Add `--model.accelerator.ulysses_size N` to the launcher; the
+dataloader replicates each DP shard across the SP group, and each module slices to
+its `1/sp` chunk, runs one forward, and all-gathers the output back. Same caveats
+as [§3.1](#31-sequence-parallelism-ulysses):
 
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml \
-  --accelerator.ulysses_size 4 \
+  --model.accelerator.ulysses_size 4 \
   --train.global_batch_size 16 --train.micro_batch_size 4
 ```
 

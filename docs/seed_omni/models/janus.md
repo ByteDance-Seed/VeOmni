@@ -8,17 +8,33 @@ All paths below assume the upstream HuggingFace checkpoint lives at
 `/mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B`. Adjust to your
 own storage.
 
-Config dir: `configs/seed_omni/Janus/janus_1.3b/`
+## Modules
 
-The omni config layout splits the old monolithic launcher into a `base.yaml` plus
-per-purpose module/graph files. Both training and inference take the **same**
-`base.yaml`; its `model.*` block drives the trainer and its `infer.*` block
-drives the inferencer.
+| Module (`model_type`) | HF base | Role |
+|-----------------------|---------|------|
+| `janus_siglip` | `SiglipVisionModel` | encode **understanding** images to patch embeddings |
+| `janus_vqvae` | `JanusVQVAE` + generation heads | encode **generation** images / decode the VQ grid to pixels |
+| `janus_text_encoder` | LLaMA `wte` + `lm_head` | chat template, token embedding, LM head, `<boi>` / `<eoi>` emission |
+| `janus_llama` | patched `LlamaModel` | backbone (no `wte`, no `lm_head`) |
+
+The LLM is split into `text_encoder` + `llama` because the word-token embedding
+and the LM head are vocabulary-dependent: they mirror the discrete-image VQ codec
+on the text side. The split lets the graph treat text and image symmetrically
+(both have `encode` / `decode` nodes) and lets Janus own the boundary-token logic
+without the framework knowing about it. The training and generation graphs are
+walked through in [Architecture](../design/architecture.md#3-training-flow).
+
+## Config files
+
+Config dir: `configs/seed_omni/Janus/janus_1.3b/` (layout explained in
+[Training and Inference](../usage/training_and_inference.md#1-config-layout)).
+Training and inference take the **same** `base.yaml`; its `model.*` block drives
+the trainer and its `infer.*` block drives the inferencer.
 
 | File | Role |
 |------|------|
-| `train/base.yaml` | Top-level omni launcher: model paths, top-level `accelerator`, data, train, and the `infer` block. References the module/graph files below. |
-| `train/modules_train.yaml` | Per-module **training** overrides (`model` / `train` / `accelerator` per module). `janus_text_encoder` carries a embed-parallel `emb` extra-parallel block (see below). Add `--accelerator.ulysses_size N` to run it under uniform Ulysses SP — no separate SP config (see [Sequence parallelism](#sequence-parallelism-ulysses)). |
+| `train/base.yaml` | Launcher: model paths, `model.accelerator`, data, train, and the `infer` block. References the module/graph files below. |
+| `train/modules_train.yaml` | Per-module **training** overrides (`model` / `train` / `accelerator` per module). `janus_text_encoder` carries an embedding-parallel `emb` extra-parallel block (see below). Add `--model.accelerator.ulysses_size N` for Ulysses SP (see [Sequence parallelism](#sequence-parallelism-ulysses)). |
 | `packed/modules_train.yaml` | Same as `train/modules_train.yaml` plus `janus_text_encoder.processor_config.packed_preprocess: true`. |
 | `train/graph_train.yaml` | Training DAG — the file *is* the flat edge list. |
 | `packed/graph_train.yaml` | Packed training DAG (`pack_encode` / `pack_forward` / `pack_decode`). |
@@ -73,7 +89,7 @@ upstream_sharded: true
 Sources have heterogeneous schemas, so we use the VeOmni weighted multisource
 sampler (`multisource_datasets_type: veomni_weighted_multisource`) instead of an
 HF interleave. The on-disk row schema is documented in
-[`docs/seed_omni/data_format.md`](../data_format.md).
+[Data Format](../usage/data_format.md).
 
 ---
 
@@ -88,14 +104,14 @@ bash train.sh tasks/omni/train_omni.py \
 ```
 
 Packed training (CPU-built packed tokens/masks; modules only `masked_scatter`) uses
-`packed/base.yaml`. A single FSDP2 tree over the composed OmniModel (old
-`train_janus`-style wrap) uses `train/base_model_fsdp.yaml`, or add
-`--accelerator.fsdp_config.fsdp_scope model` to either launcher. Combined:
+`packed/base.yaml`. A single FSDP2 tree over the composed OmniModel uses
+`train/base_model_fsdp.yaml`, or add
+`--model.accelerator.fsdp_config.fsdp_scope model` to either launcher. Combined:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Janus/janus_1.3b/packed/base.yaml \
-  --accelerator.fsdp_config.fsdp_scope model
+  --model.accelerator.fsdp_config.fsdp_scope model
 ```
 
 Key knobs (override on the CLI, e.g. `--train.global_batch_size 32`):
@@ -105,15 +121,15 @@ Key knobs (override on the CLI, e.g. `--train.global_batch_size 32`):
 - `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
 - `--train.checkpoint.save_steps` / `--train.checkpoint.hf_save_steps` — DCP / HF save cadence.
 - `--train.wandb.enable false` — disable wandb for quick smoke runs.
-- `--accelerator.fsdp_config.fsdp_mode` — top-level FSDP mode (the omni schema lifts `accelerator` out of `train`).
-- `--model.modules.janus_llama.accelerator.fsdp_config.fsdp_mode eager` — per-module override (arbitrary nested keys deep-merge into the referenced module file).
+- `--model.accelerator.fsdp_config.fsdp_mode` — global FSDP mode, inherited by every module.
+- `--model.model_config.modules.janus_llama.accelerator.fsdp_config.fsdp_mode eager` — per-module override (arbitrary nested keys deep-merge into the referenced module file).
 
 ### Per-module parallelism
 
 Each module can carry its own `accelerator` block in `train/modules_train.yaml`; when a
 module's topology differs from the top-level one, the trainer builds it its **own**
 `ParallelState` (device mesh + process groups) on the full world, while modules that
-match the global topology reuse it. `janus_text_encoder` ships with a embed-parallel
+match the global topology reuse it. `janus_text_encoder` ships with an embedding-parallel
 **embedding** (`emb`) extra-parallel group; its `embed_tokens` is a `ShardedEmbedding`
 (see [Sharded Embedding](../../key_features/sharded_embedding.md)):
 
@@ -137,30 +153,23 @@ bash train.sh tasks/omni/train_omni.py \
 
 ### Sequence parallelism (Ulysses)
 
-SP is **uniform (Arch B)**: set the SP size on the outer trainer
-(`--accelerator.ulysses_size`) and every module inherits it. Classic
-single-pass Ulysses — the dataloader replicates each DP shard across the SP group,
-each module slices to its `1/sp` chunk, runs one forward, and all-gathers the
-output back. `OmniTrainer` raises unless all modules share the outer SP size (no
-per-module `ulysses_size` overrides). Decision record + deferred future work
-(data-balance, compute-packing, audio/video): [Module-Level Sequence Parallel](../module_level_sp.md).
-Historical memory/timing experiments that motivated dropping the old looped SP:
-[sp_loop_memory_experiments.md](../sp_loop_memory_experiments.md).
+Add `--model.accelerator.ulysses_size N`; every module inherits it, and there is no
+separate SP config. The dataloader replicates each DP shard across the SP group,
+each module slices to its `1/N` chunk, runs one forward, and all-gathers the output
+(see [Sequence Parallelism](../design/sequence_parallel.md)). SigLIP and VQVAE
+slice the image batch; the text encoder and LLaMA slice the token sequence.
 
-SP has **no dedicated config** — it is the normal `train/modules_train.yaml` plus
-`--accelerator.ulysses_size N` on the outer trainer; every module inherits that SP
-size. On **4 GPUs** with `ulysses_size 4` this gives `dp=1`. The
-`janus_text_encoder` `emb=4` extra-parallel composes here: on the 4-GPU box the
-`dp_shard_sp` mesh dim (`dp_shard=1 × ulysses=4`) IS the SP group, so the `emb`
-group and the `ulysses` group coincide — harmless, because the `ShardedEmbedding`
-lookup is a sequence-preserving all-to-all (each rank still gets embeds for exactly
+On **4 GPUs** with `ulysses_size 4` this gives `dp=1`. The `janus_text_encoder`
+`emb=4` extra-parallel group composes with it: on a 4-GPU box the `dp_shard_sp`
+mesh dim (`dp_shard=1 × ulysses=4`) is the SP group, so the `emb` group and the
+`ulysses` group coincide. That is harmless, because the `ShardedEmbedding` lookup
+is a sequence-preserving all-to-all (each rank still gets embeddings for exactly
 its own `1/sp` token shard):
 
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
-  --model.modules configs/seed_omni/Janus/janus_1.3b/train/modules_train.yaml \
-  --accelerator.ulysses_size 4 \
+  --model.accelerator.ulysses_size 4 \
   --train.global_batch_size 4 --train.micro_batch_size 1
 ```
 
@@ -188,8 +197,8 @@ Training continues from step 500 with the dataloader and RNG state restored.
 
 ## 5. Inference
 
-Two public launches are documented in
-[`seed_omni.md` §4.1](../seed_omni.md#41-two-launch-paths-native-hf-vs-veomni-inferencer):
+The two inference launches are described in
+[Training and Inference](../usage/training_and_inference.md#5-inference):
 
 * **Native HF** — `python tasks/omni/infer_omni_native.py --model_path <split-ckpt> …`
   (`OmniModel.from_pretrained`, `modeling.py`, no runtime).
@@ -229,9 +238,7 @@ for m in janus_siglip janus_vqvae janus_text_encoder janus_llama; do
 done
 ```
 
-Then pass `--model.model_path "$ASM"` to any of the commands below. (Verified:
-the `global_step_20` checkpoint loads all four modules and runs both the I2T and
-T2I graphs end-to-end.)
+Then pass `--model.model_path "$ASM"` to any of the commands below.
 
 **Image understanding (I2T / VQA)** — `infer/graph_infer_und.yaml`.
 

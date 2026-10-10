@@ -60,7 +60,7 @@ Video is decoded and frame-sampled once, in the data layer, and the item states
 the *source* clip's timeline in `meta["video_metadata"]`: its `fps`, its frame
 count, and the source-frame index of every frame kept. Ask it for times
 (`frame_timestamps()`, `duration`) rather than dividing those indices
-yourself — see `docs/seed_omni/av_video_design.md` for why that division is the
+yourself — see [Media](../design/media.md#3-timeline-rules) for why that division is the
 one thing worth centralising.
 
 A video stored as a list of pre-decoded frames (PIL images or encoded image
@@ -219,7 +219,7 @@ e.g. assistant prefix ``0``, boi/eoi/eos ``1``). Module-specific keys live in
 
 Modules read this list directly — chat template, tokenize, normalize, and
 patchify happen inside each SeedOmni module at forward time (see
-`seed_omni.md` § 3).
+[Architecture](../design/architecture.md#3-training-flow)).
 
 ## Janus multisource training
 
@@ -230,8 +230,7 @@ T2I + ShareGPT4V caption I2T). Launch with the bundled YAML:
 bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml
 ```
 
-See [`docs/seed_omni/example_models/janus.md`](example_models/janus.md)
-for the full convert → train → resume → infer pipeline.
+See [Janus](../models/janus.md) for the full convert → train → resume → infer pipeline.
 
 ## Custom datasets
 
@@ -260,13 +259,11 @@ That table is the single decode path, shared with inference request building
 (`OmniProcessor.__call__` → `fetch_media` → `build_conversation`), which is what
 makes the same clip mean the same thing on both sides: same payload type, same
 metadata on `item.meta`. Adding a modality there serves training and inference
-at once. Request building used to load media its own way and attach nothing, so
-an audio item built for inference carried no sampling rate — a fact its
-consumers require and cannot recover from the samples.
+at once.
 
-A preprocessor still returning the old
-`(constructed, image_refs, video_refs[, audio_refs])` raises a `ValueError`
-naming the source and the migration.
+A preprocessor returning a positional
+`(constructed, image_refs, video_refs[, audio_refs])` tuple raises a `ValueError`
+naming the source.
 
 Register with `@SEED_OMNI_PREPROCESSOR_REGISTRY.register("your_source")` and set
 `source_name: your_source` in the dataset config. Keep the same rules: route by

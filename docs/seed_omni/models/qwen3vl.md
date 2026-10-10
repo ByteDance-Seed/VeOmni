@@ -36,8 +36,8 @@ Config dir: `configs/seed_omni/Qwen/qwen3vl_2b/`
 
 | File | Role |
 |------|------|
-| `train/base.yaml` | Launcher: `model` / top-level `accelerator` / `data` (incl. `mm_configs`) / `train` + `infer` block. |
-| `train/modules_train.yaml` | Per-module training overrides (`qwen3vl_vision` / `qwen3vl_text_encoder` / `qwen3vl_llm`). Add `--accelerator.ulysses_size N` for uniform Ulysses SP — no separate SP config (see [§3.1](#31-sequence-parallelism-ulysses)). |
+| `train/base.yaml` | Launcher: `model` (incl. `model.accelerator`) / `data` (incl. `mm_configs`) / `train` + `infer` block. |
+| `train/modules_train.yaml` | Per-module training overrides (`qwen3vl_vision` / `qwen3vl_text_encoder` / `qwen3vl_llm`). Add `--model.accelerator.ulysses_size N` for Ulysses SP (see [§3.1](#31-sequence-parallelism-ulysses)). |
 | `train/graph_train.yaml` | Training DAG — flat edge list (`{qwen3vl_vision, qwen3vl_text_encoder.encode} → qwen3vl_llm → qwen3vl_text_encoder.decode → end`). |
 | `data.yaml` | Weighted multisource data list (ShareGPT4V images + LLaVA-Video). |
 | `infer/graph_infer.yaml` | Image/video-understanding (I2T / VQA) generation graph (`model.model_config.infer_type: vision_understanding`). |
@@ -92,7 +92,7 @@ upstream_sharded: true
 Video decoding is driven by `data.mm_configs` in `base.yaml`
 (`use_audio_in_video: false`, `fps`, `min_frames` / `max_frames`) — Qwen3-VL has
 no audio modality. The on-disk row schema is documented in
-[`docs/seed_omni/data_format.md`](../data_format.md).
+[Data Format](../usage/data_format.md).
 
 ---
 
@@ -114,10 +114,9 @@ Key knobs (override on the CLI):
 
 ### 3.1 Sequence parallelism (Ulysses)
 
-Uniform Ulysses SP (Arch B): set the SP size **once** on the outer trainer
-(`--accelerator.ulysses_size N`) and every module — vision tower, text encoder and
-LLM backbone — inherits it. SP has **no dedicated config**: it is the normal
-`train/modules_train.yaml` plus the outer flag. The dataloader replicates each DP shard
+Set the SP size once with `--model.accelerator.ulysses_size N`; every module (vision
+tower, text encoder and LLM backbone) inherits it, and there is no dedicated SP
+config (design in [Sequence Parallelism](../design/sequence_parallel.md)). The dataloader replicates each DP shard
 across the SP group; each module slices to its `1/sp` chunk, runs one forward, and
 all-gathers the output back — the in-model backbone `qwen3vl_llm` shards its
 DeepStack visual embeds, `visual_pos_masks` and 3-row M-RoPE `position_ids` too:
@@ -125,14 +124,12 @@ DeepStack visual embeds, `visual_pos_masks` and 3-row M-RoPE `position_ids` too:
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml \
-  --model.modules configs/seed_omni/Qwen/qwen3vl_2b/train/modules_train.yaml \
-  --accelerator.ulysses_size 4 \
+  --model.accelerator.ulysses_size 4 \
   --train.global_batch_size 16 --train.micro_batch_size 4
 ```
 
-- SP is **uniform**: set it once on the outer trainer
-  (`--accelerator.ulysses_size`); modules inherit it. `OmniTrainer` raises unless
-  every module's `ulysses_size` equals the outer size (no per-module overrides).
+- Every module inherits the global `ulysses_size`; do not set a per-module
+  `ulysses_size` (nothing validates that modules agree).
 - `world % ulysses_size == 0`; a larger `micro_batch_size` gives longer packed
   sequences to slice across SP ranks.
 - If your environment exports `TORCH_DISTRIBUTED_DEBUG=DETAIL`, **unset it** — its
@@ -196,9 +193,9 @@ done
 
 ### 5.2 Native eager (`infer_omni_native.py`)
 
-This is launch path 1 in [`seed_omni.md` §4.1](../seed_omni.md#41-two-launch-paths-native-hf-vs-veomni-inferencer)
-(`OmniModel.from_pretrained`, no VeOmni runtime). Path 2 is
-`tasks/omni/infer_omni.py` plus `base.yaml`.
+This is the native HF launch described in
+[Training and Inference](../usage/training_and_inference.md#5-inference)
+(`OmniModel.from_pretrained`, no VeOmni runtime); §5.1 is the VeOmni Inferencer.
 
 Single-process load — preprocess the request, then ``model.generate``:
 
@@ -236,11 +233,10 @@ A self-contained check builds the same sequence through both paths:
 
 ```text
 ref:  Qwen3VLForConditionalGeneration.model(input_ids, pixel_values, image_grid_thw)
-v2:   qwen3vl_vision → qwen3vl_text_encoder.encode → qwen3vl_llm
+split: qwen3vl_vision → qwen3vl_text_encoder.encode → qwen3vl_llm
 -> max abs diff 0.0 over last_hidden_state  (RESULT: ALIGNED)
 ```
 
-> **Scope**: this recipe covers image understanding (I2T). Ulysses sequence
-> parallelism is per-module (see [§3.1](#31-sequence-parallelism-ulysses)): the
-> vision tower and the in-model backbone `qwen3vl_llm` each support `module_sp > 1`
-> and can shard independently; the outer trainer always runs SP-disabled.
+> **Scope**: this check covers image understanding (I2T). Sequence parallelism
+> runs at one shared SP size across the vision tower, text encoder and backbone
+> (see [§3.1](#31-sequence-parallelism-ulysses)).

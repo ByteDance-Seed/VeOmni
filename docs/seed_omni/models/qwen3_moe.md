@@ -75,7 +75,7 @@ upstream_sharded: true
 ```
 
 The on-disk row schema is documented in
-[`docs/seed_omni/data_format.md`](../data_format.md).
+[Data Format](../usage/data_format.md).
 
 ---
 

@@ -258,7 +258,7 @@ The training run reads the cache through the
 [`seedomni_cached`](../../../veomni/data/seed_omni/seedomni_transform.py#L246)
 data transform. It unpickles each row, so point `data.train_path` only at a
 cache you trust. See the
-[Bagel offline VAE cache](../example_models/bagel.md#32-offline-vae-posterior-cache-two-stages)
+[Bagel offline VAE cache](../models/bagel.md#32-offline-vae-posterior-cache-two-stages)
 for a two-stage example.
 
 ### The generation graph in a cache run
@@ -290,14 +290,14 @@ A missing module or method still fails before the first request runs.
 - [`tests/seed_omni/mixins/test_offline_encoding_mixin.py`](../../../tests/seed_omni/mixins/test_offline_encoding_mixin.py):
   [a module missing an endpoint cannot be built](../../../tests/seed_omni/mixins/test_offline_encoding_mixin.py#L69),
   and the hook slots dispatch through `TrainingModuleMixin`.
-- [`tests/seed_omni/test_omni_offline_cache_args.py`](../../../tests/seed_omni/test_omni_offline_cache_args.py):
+- [`tests/seed_omni/arguments/test_offline_cache_args.py`](../../../tests/seed_omni/arguments/test_offline_cache_args.py):
   `train.training_task` values, the `offline_cache_dir` requirement,
-  [one epoch for `offline_embedding`](../../../tests/seed_omni/test_omni_offline_cache_args.py#L61),
-  [no `checkpoint.load_path` for `offline_embedding`](../../../tests/seed_omni/test_omni_offline_cache_args.py#L66) and
-  [the `data.data_type` match](../../../tests/seed_omni/test_omni_offline_cache_args.py#L84).
-- [`tests/seed_omni/test_offline_cache_writer.py`](../../../tests/seed_omni/test_offline_cache_writer.py):
-  [the writer round trip](../../../tests/seed_omni/test_offline_cache_writer.py#L50) and
-  [one writer per `dp_rank`](../../../tests/seed_omni/test_offline_cache_writer.py#L134).
+  [one epoch for `offline_embedding`](../../../tests/seed_omni/arguments/test_offline_cache_args.py#L61),
+  [no `checkpoint.load_path` for `offline_embedding`](../../../tests/seed_omni/arguments/test_offline_cache_args.py#L66) and
+  [the `data.data_type` match](../../../tests/seed_omni/arguments/test_offline_cache_args.py#L84).
+- [`tests/seed_omni/mixins/test_offline_cache_writer.py`](../../../tests/seed_omni/mixins/test_offline_cache_writer.py):
+  [the writer round trip](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L50) and
+  [one writer per `dp_rank`](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L134).
 - [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
   [a step without an lr scheduler logs no lr](../../../tests/seed_omni/trainer/test_step_metrics_callback.py#L82).
 - [`tests/seed_omni/runtime/test_module_runtime.py`](../../../tests/seed_omni/runtime/test_module_runtime.py):
@@ -307,11 +307,11 @@ A missing module or method still fails before the first request runs.
 - [`tests/seed_omni/runtime/test_omni_model_runtime.py`](../../../tests/seed_omni/runtime/test_omni_model_runtime.py):
   [each module gets the methods the training graph calls on it](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L341)
   and [the training graph must call the offline endpoint of its task](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L373).
-- [`tests/seed_omni/bagel/test_processing.py`](../../../tests/seed_omni/bagel/test_processing.py):
-  [`online_process` on a meta-built VAE](../../../tests/seed_omni/bagel/test_processing.py#L264) and the
-  [offline cache round trip](../../../tests/seed_omni/bagel/test_processing.py#L305).
-- [`tests/seed_omni/test_preprocessor.py`](../../../tests/seed_omni/test_preprocessor.py):
-  [the VAE preprocessor leaves cached posteriors alone](../../../tests/seed_omni/test_preprocessor.py#L394).
+- [`tests/seed_omni/modules/bagel/test_processing.py`](../../../tests/seed_omni/modules/bagel/test_processing.py):
+  [`online_process` on a meta-built VAE](../../../tests/seed_omni/modules/bagel/test_processing.py#L264) and the
+  [offline cache round trip](../../../tests/seed_omni/modules/bagel/test_processing.py#L305).
+- [`tests/seed_omni/data/test_preprocessor.py`](../../../tests/seed_omni/data/test_preprocessor.py):
+  [the VAE preprocessor leaves cached posteriors alone](../../../tests/seed_omni/data/test_preprocessor.py#L394).
 - [`tests/seed_omni/trainer/test_omni_trainer.py`](../../../tests/seed_omni/trainer/test_omni_trainer.py):
   [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L123), and
   [`offline_cache_step` writes every micro-batch without autograd](../../../tests/seed_omni/trainer/test_omni_trainer.py#L134).

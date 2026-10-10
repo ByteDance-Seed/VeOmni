@@ -19,13 +19,13 @@ Config dir: `configs/seed_omni/Bagel/bagel_7b_mot/`.
 | `bagel_flow_connector` | VAE↔LLM projections, timestep embedding | latent patch embedding, velocity prediction, denoise state |
 | `bagel_qwen2_mot` | Qwen2-MoT decoder backbone | text AR and flow-denoise hidden states |
 
-The omni config layout uses the same `base.yaml` for training and inference. The
-training block references `train/modules_train.yaml` and `train/graph_train.yaml`; the
+The [config layout](../usage/training_and_inference.md#1-config-layout) uses the
+same `base.yaml` for training and inference. The training block references `train/modules_train.yaml` and `train/graph_train.yaml`; the
 inference block maps each scenario to a separate generation graph.
 
 | File | Role |
 |------|------|
-| `train/base.yaml` | Top-level launcher: model paths, accelerator, data, train, and `infer` block. |
+| `train/base.yaml` | Launcher: model paths, `model.accelerator`, data, train, and `infer` block. |
 | `train/modules_train.yaml` | Per-module training paths. `bagel_qwen2_mot` is the accelerated class with `flex_attention`. |
 | `infer/modules_infer_eager.yaml` | Single-process inference: every module loads eager; MoT uses SDPA. |
 | `infer/modules_infer_fsdp.yaml` | Distributed inference: every module uses FSDP2; MoT uses FlexAttention. |
@@ -35,7 +35,7 @@ inference block maps each scenario to a separate generation graph.
 | `infer/graph_infer_edit.yaml` | Text+image to image edit. |
 | `data.yaml` | Weighted multisource data list. |
 
-The V2 Bagel wiring currently exposes understanding, generation, and edit.
+The BAGEL graphs cover understanding, generation, and edit.
 
 ---
 
@@ -328,7 +328,7 @@ the denoise prompt. The downstream denoise loop is shared with `infer_gen`.
 ## 5. Visualize the graphs
 
 ```bash
-python scripts/visualize_omni_graph.py \
+python scripts/seed_omni/visualize_graph.py \
   configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml
 # -> graphs/bagel_7b_mot_base/{training,infer_edit,infer_gen,infer_und}.mmd
 ```
@@ -344,9 +344,9 @@ YAML.
 The Bagel module and graph contracts cover carrier context-tag routing, generation
 state transitions, packing/cache behavior, and graph config structure. Packed
 MoT also compares Flex and Magi against eager SDPA on toy CE / MSE / gradients
-in `tests/seed_omni/bagel/test_bagel_accel_align.py`. Magi cases skip unless the
+in `tests/seed_omni/modules/bagel/test_bagel_accel_align.py`. Magi cases skip unless the
 SM90 CUTLASS overlay or SM100+ CUTE JIT backend is present.
 
 ```bash
-.venv/bin/python -m pytest -q tests/seed_omni/bagel
+.venv/bin/python -m pytest -q tests/seed_omni/modules/bagel
 ```
