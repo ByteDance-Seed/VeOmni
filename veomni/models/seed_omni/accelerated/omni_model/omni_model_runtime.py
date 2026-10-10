@@ -123,7 +123,9 @@ def _scoped_no_split_modules(module_runtimes: Mapping[str, ModuleRuntime]) -> li
     return list(dict.fromkeys(scoped))
 
 
-def _reject_lora_that_matched_nothing(module_runtimes: Mapping[str, ModuleRuntime], train: Any = None) -> None:
+def _reject_lora_that_matched_nothing(
+    module_runtimes: Mapping[str, ModuleRuntime], train_args: OmniTrainingArguments | None = None
+) -> None:
     """Fail a LoRA run that left the composed model with nothing to train.
 
     A single module whose targets missed is normal — ``ModuleRuntime`` already
@@ -134,7 +136,7 @@ def _reject_lora_that_matched_nothing(module_runtimes: Mapping[str, ModuleRuntim
     A ``train.training_task='offline_embedding'`` run is exempt: it trains
     nothing by design.
     """
-    if getattr(train, "training_task", None) == "offline_embedding":
+    if train_args is not None and train_args.training_task == "offline_embedding":
         return
 
     requested = [name for name, runtime in module_runtimes.items() if bool(runtime.args.lora_config)]
@@ -536,7 +538,9 @@ class OmniModelRuntime:
         import torch.distributed as dist
 
         if self.train_args is None:
-            raise ValueError("OmniModelRuntime.save_model_assets needs a training runtime (built with train=...).")
+            raise ValueError(
+                "OmniModelRuntime.save_model_assets needs a training runtime (built with train_args=...)."
+            )
         if self.train_args.global_rank == 0:
             save_directory = self.train_args.checkpoint.model_assets_dir
             self.save_pretrained(save_directory, save_module_weights=False)
@@ -581,14 +585,18 @@ class OmniModelRuntime:
 def build_omni_model_runtime(
     omni_model_runtime_args: OmniModelRuntimeArguments,
     *,
-    train: OmniTrainingArguments | None = None,
+    train_args: OmniTrainingArguments | None = None,
     for_inference: bool = False,
 ) -> OmniModelRuntime:
     """Compose a VeOmni-managed model from a resolved :class:`OmniModelRuntimeArguments`.
 
-    ``train`` is the global :class:`~....arguments.omni_arguments_types.OmniTrainingArguments`
-    (unset for inference) — forwarded to every :class:`ModuleRuntime` so its
-    checkpoint manager can resolve the shared ``save_path``/``output_dir``/``load_path``.
+    Args:
+        omni_model_runtime_args: The resolved model section (modules, graphs, global accelerator).
+        train_args: The job's ``train:`` config section (``OmniArguments.train``), not a
+            train/infer switch — ``for_inference`` is that. ``None`` for inference builds.
+            Forwarded unchanged to every :class:`ModuleRuntime`, which reads
+            ``training_task`` and the shared checkpoint ``save_path``/``output_dir``/``load_path``.
+        for_inference: Build for generation, which skips the optimizer and the training-only checks.
     """
     from ..omni_module.omni_module_runtime import build_omni_module_runtime
 
@@ -602,7 +610,7 @@ def build_omni_model_runtime(
             module_args,
             module_name=name,
             module_config=omni_config._module_configs[name],
-            train=train,
+            train_args=train_args,
             for_inference=for_inference,
             global_accelerator=omni_model_runtime_args.accelerator,
         )
@@ -613,12 +621,12 @@ def build_omni_model_runtime(
         f"OmniModelRuntime: composed OmniModel with {len(module_runtimes)} module(s) ({list(module_runtimes)})."
     )
     if not for_inference:
-        _reject_lora_that_matched_nothing(module_runtimes, train)
+        _reject_lora_that_matched_nothing(module_runtimes, train_args)
     runtime = OmniModelRuntime(
         OmniModel(omni_config, {name: rt.omni_module for name, rt in module_runtimes.items()}),
         module_runtimes=module_runtimes,
         omni_model_runtime_args=omni_model_runtime_args,
-        train_args=train,
+        train_args=train_args,
     )
     runtime._parallelize_composed_model(for_inference=for_inference)
     if not for_inference:
