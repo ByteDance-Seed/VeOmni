@@ -23,7 +23,7 @@ CUBE_CORE_NUM = get_npu_properties()['num_aicore']
     configs=get_autotune_config(multibuffer_list=(False,)),
     key=['H', 'K', 'V', 'BT'],
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT'])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         k,
         v,
@@ -42,7 +42,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         V: tl.constexpr,
         BT: tl.constexpr,
         BV: tl.constexpr,
-        NT: tl.constexpr,
+        NT,
         USE_G: tl.constexpr,
         USE_GK: tl.constexpr,
         USE_INITIAL_STATE: tl.constexpr,
