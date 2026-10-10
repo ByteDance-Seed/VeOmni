@@ -71,9 +71,9 @@ def test_lora_that_matched_nowhere_is_rejected():
 
 
 def test_an_offline_cache_pass_freezes_everything_by_design():
-    """``training_task: offline_embedding`` is usually the training YAML with one flag
-    overridden, so it carries the job's ``lora_config`` into a run that trains
-    nothing on purpose — which is why ``OmniTrainer`` allows an empty optimizer."""
+    """``training_task: offline_embedding`` may share the job's ``lora_config`` with the
+    training run, so it carries adapters into a run that trains nothing on purpose —
+    which is why ``OmniTrainer`` allows an empty optimizer."""
     _reject_lora_that_matched_nothing(
         {"llm": _runtime(lora=True, trainable=False)},
         SimpleNamespace(training_task="offline_embedding"),
