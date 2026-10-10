@@ -155,6 +155,38 @@ def test_amsgrad_matches_torch(cpu_mesh):
     )
 
 
+def test_maximize_matches_torch(cpu_mesh):
+    torch.manual_seed(8)
+    shape = (6, 4)
+    init = torch.randn(shape)
+
+    ref = nn.Parameter(init.clone())
+    swapped = _swap_param(init, cpu_mesh)
+
+    ref_opt = torch.optim.AdamW(
+        [ref], lr=1e-2, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, maximize=True, foreach=False
+    )
+    swap_opt = SwapAdamW(
+        [{"params": [swapped], "weight_decay": 0.1, "maximize": True}],
+        lr=1e-2,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        pin_memory=False,
+    )
+    # Force the elementwise path so this guards ``_update_param`` even on a host
+    # where an accelerator registers ``torch._fused_adamw_``.
+    swap_opt._use_fused = False
+
+    for _ in range(5):
+        grad = torch.randn(shape)
+        ref.grad = grad.clone()
+        swapped.grad = _partition(grad.clone(), cpu_mesh)
+        ref_opt.step()
+        swap_opt.step()
+
+        torch.testing.assert_close(swapped.to_local(), ref.detach(), atol=1e-6, rtol=1e-6)
+
+
 def test_param_groups_and_missing_grad(cpu_mesh):
     torch.manual_seed(4)
     init_a = torch.randn(4, 2)
@@ -195,7 +227,7 @@ def test_param_groups_and_missing_grad(cpu_mesh):
     torch.testing.assert_close(par_c.to_local(), ref_c.detach(), atol=1e-6, rtol=1e-6)
 
 
-def test_multi_optimizer_propagates_swap_flag(cpu_mesh):
+def test_multi_optimizer_steps_and_frees_storages(cpu_mesh):
     from veomni.optim.optimizer import MultiOptimizer
 
     torch.manual_seed(5)
@@ -208,8 +240,6 @@ def test_multi_optimizer_propagates_swap_flag(cpu_mesh):
     opt_b = SwapAdamW([{"params": [par_b], "weight_decay": 0.0}], lr=1e-2, pin_memory=False)
     multi = MultiOptimizer(nn.Module(), {"ep": opt_a, "non_extra_parallel": opt_b}, ["ep", "non_extra_parallel"])
 
-    assert multi._is_swap_optimizer is True
-
     par_a.grad = _partition(torch.randn(4, 2), cpu_mesh)
     par_b.grad = _partition(torch.randn(3, 2), cpu_mesh)
     multi.step()
@@ -220,12 +250,48 @@ def test_multi_optimizer_propagates_swap_flag(cpu_mesh):
             assert opt._device_states[param][key].untyped_storage().nbytes() == 0
 
 
-def test_checkpoint_guard_rejects_swap_optimizer(cpu_mesh):
-    from veomni.checkpoint.dcp_checkpointer import OptimizerState
-
-    init = torch.randn(2, 2)
+def test_state_dict_reads_from_host(cpu_mesh):
+    torch.manual_seed(6)
+    init = torch.randn(4, 3)
     param = _swap_param(init, cpu_mesh)
     opt = SwapAdamW([param], pin_memory=False)
 
-    with pytest.raises(RuntimeError, match="does not support checkpoint"):
-        OptimizerState._reject_swap_optimizer(opt)
+    param.grad = _partition(torch.randn(4, 3), cpu_mesh)
+    opt.step()
+
+    sd = opt.state_dict()
+    assert len(sd["state"]) == 1
+    (state,) = sd["state"].values()
+    for key in ("exp_avg", "exp_avg_sq"):
+        holder = state[key]
+        local = holder.to_local() if isinstance(holder, DTensor) else holder
+        assert local.device.type == "cpu", f"{key} should be read from host, got {local.device}"
+
+
+def test_state_dict_load_state_dict_round_trip(cpu_mesh):
+    torch.manual_seed(7)
+    init = torch.randn(4, 3)
+
+    src_param = _swap_param(init, cpu_mesh)
+    src = SwapAdamW([src_param], lr=1e-2, pin_memory=False)
+    for _ in range(3):
+        src_param.grad = _partition(torch.randn(4, 3), cpu_mesh)
+        src.step()
+
+    sd = src.state_dict()
+
+    dst_param = _swap_param(init, cpu_mesh)
+    dst = SwapAdamW([dst_param], lr=1e-2, pin_memory=False)
+    dst.load_state_dict(sd)
+
+    for key in ("exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(
+            dst._host_states[dst_param][key],
+            src._host_states[src_param][key],
+            atol=0,
+            rtol=0,
+        )
+    assert int(dst.state[dst_param]["step"]) == int(src.state[src_param]["step"])
+    # The loaded step must be owned by ``dst``, not aliased from the checkpoint's
+    # state dict: ``_bump_step`` mutates it in place, so an alias would bump ``src``.
+    assert dst.state[dst_param]["step"] is not src.state[src_param]["step"]

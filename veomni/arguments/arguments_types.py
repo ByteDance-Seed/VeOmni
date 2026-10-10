@@ -94,7 +94,7 @@ class OptimizerConfig:
             "help": (
                 "Optimizer type. Default to adamw. 'adamw_swap' keeps the AdamW moment states "
                 "on host memory and streams them to the device in batches to lower peak device "
-                "memory; it is NPU + FSDP2 only and does not support checkpointing."
+                "memory; it is NPU + FSDP2 only."
             )
         },
     )

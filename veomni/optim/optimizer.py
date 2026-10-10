@@ -305,9 +305,6 @@ class MultiOptimizer(Optimizer, Stateful):
         self.optimizers_dict = optimizers
         self._is_multi_optimizer: bool = True
         self.key_names = key_names
-        # Propagate the swap marker so ``OptimizerState``'s checkpoint guard
-        # also fires when the swap optimizer is wrapped in a MultiOptimizer (EP).
-        self._is_swap_optimizer = any(getattr(opt, "_is_swap_optimizer", False) for opt in optimizers.values())
 
     def step(self) -> None:
         for opt in self.optimizers_dict.values():

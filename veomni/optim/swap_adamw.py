@@ -30,10 +30,11 @@ Scope (v1)
   expert parallelism) are supported: under ExtraParallel the factory builds one
   ``SwapAdamW`` per parameter group inside a ``MultiOptimizer``. The factory
   (``veomni.optim.optimizer.build_optimizer``) enforces the device/mode scope.
-* Checkpoint save/load is **not** supported: the state tensors are intentionally
-  left with zero-sized storage between steps, so writing them out would produce a
-  corrupt checkpoint. ``veomni.checkpoint.dcp_checkpointer.OptimizerState``
-  refuses to persist this optimizer rather than silently writing zeros.
+* Checkpoint save/load reads and writes the host buffers directly: the state
+  holders keep their DTensor sharding metadata (mesh, placements, global shape)
+  but their local storage is pointed at the live host buffer, so DCP never
+  materializes optimizer states on the accelerator. See ``state_dict`` /
+  ``load_state_dict``.
 * The update kernel is ``torch._fused_adamw_`` on the accelerator (Ascend NPU
   registers it), applied per param group within each swapped-in batch. On CPU
   (unit tests) it falls back to plain elementwise AdamW math, which is
@@ -60,6 +61,7 @@ from ..utils.device import (
     get_torch_device,
     switch_to_specified_stream,
 )
+from ..utils.dtensor_utils import rewrap_dtensor_local
 
 
 logger = logging.get_logger(__name__)
@@ -97,8 +99,6 @@ class SwapAdamW(Optimizer):
             swap-in; a byte budget keeps a chunk from being one huge parameter or
             hundreds of tiny ones.
     """
-
-    _is_swap_optimizer = True
 
     def __init__(
         self,
@@ -197,14 +197,87 @@ class SwapAdamW(Optimizer):
                     device_state[key] = local_shard
                     local_shard.untyped_storage().resize_(0)
 
-                self.state[p].setdefault("step", 0)
+                if "step" not in self.state[p]:
+                    self.state[p]["step"] = torch.tensor(0.0)
                 self._host_states[p] = host_state
                 self._device_states[p] = device_state
 
     # -------------------------------------------------------------- checkpoint
 
+    def _bind_host_states(self) -> None:
+        """Rebind every state holder to its host buffer for DCP to read.
+
+        The DTensor shells in ``self.state`` keep their mesh/placements but their
+        local is the live host buffer, so DCP reads state off the accelerator. The
+        live buffer is bound, not copied - the base (device) optimizer hands DCP
+        live state too, so a snapshot would only add a full extra host copy.
+        """
+        for p, host_state in self._host_states.items():
+            for key, host_tensor in host_state.items():
+                holder = self.state[p][key]
+                if isinstance(holder, DTensor):
+                    self.state[p][key] = rewrap_dtensor_local(
+                        host_tensor,
+                        mesh=holder.device_mesh,
+                        placements=holder.placements,
+                        shape=torch.Size(holder.shape),
+                        stride=holder.stride(),
+                    )
+                else:
+                    self.state[p][key] = host_tensor
+
+    def state_dict(self):
+        """Optimizer state with all values read from host memory (see ``_bind_host_states``)."""
+        self._bind_host_states()
+        return super().state_dict()
+
+    def load_state_dict(self, state_dict) -> None:
+        """Load values into the host buffers without materializing them on device.
+
+        The base implementation casts every value to ``param.device`` (moving the
+        host buffers onto the accelerator), so the mapping is done here instead.
+        State is aligned to the current parameters by param-group position, as the
+        base class does; param-group hyperparameters are merged from the checkpoint.
+        """
+        groups = self.param_groups
+        saved_groups = state_dict["param_groups"]
+        if len(groups) != len(saved_groups):
+            raise ValueError("loaded state dict has a different number of parameter groups")
+        id_map = {}
+        for group, saved_group in zip(groups, saved_groups):
+            if len(group["params"]) != len(saved_group["params"]):
+                raise ValueError(
+                    "loaded state dict contains a parameter group that doesn't match the optimizer's group"
+                )
+            id_map.update(zip(saved_group["params"], group["params"]))
+            group.update({k: v for k, v in saved_group.items() if k != "params"})
+        for key, value in state_dict["state"].items():
+            param = id_map.get(key)
+            if param is not None:
+                self._load_param_state(param, value)
+
+    def _load_param_state(self, p: Tensor, value: dict) -> None:
+        host_state = self._host_states.get(p)
+        if host_state is None:
+            return
+        for key, loaded in value.items():
+            if key == "step":
+                # Own the value rather than aliasing the checkpoint's tensor:
+                # ``_bump_step`` mutates it in place, so an alias would corrupt it.
+                if isinstance(loaded, DTensor):
+                    loaded = _to_local(loaded)
+                scalar = loaded.item() if isinstance(loaded, torch.Tensor) else loaded
+                step = self.state[p]["step"]
+                if isinstance(step, torch.Tensor):
+                    step.fill_(scalar)
+                else:
+                    self.state[p]["step"] = scalar
+            elif key in host_state and loaded is not None:
+                source = _to_local(loaded) if isinstance(loaded, DTensor) else loaded
+                host_state[key].copy_(source.to(host_state[key].device))
+
     def swap_all_to_device(self) -> None:
-        """Swap in every parameter's states to the device (used around save/export)."""
+        """Swap in every parameter's states to the device (used by the tests; DCP save reads host directly)."""
         self._release_pending_storages()
         for p, host_state in self._host_states.items():
             for key, host_tensor in host_state.items():
@@ -231,18 +304,24 @@ class SwapAdamW(Optimizer):
         return sum(local_shard.numel() * local_shard.element_size() for _ in self._state_keys)
 
     def _device_free_bytes(self) -> int:
+        """Bytes this process can still allocate on the device.
+
+        ``total - allocated`` includes cached-but-unused allocator blocks that
+        ``mem_get_info`` under-reports (freed states return to the pool, not the
+        device), which would collapse the swap batch after the first big swap-in.
+        """
         device = get_torch_device()
-        try:
-            free, _total = device.mem_get_info()
-            return int(free)
-        except (AttributeError, RuntimeError):
-            pass
         try:
             total = int(device.get_device_properties(get_device_id()).total_memory)
             return total - int(device.memory_allocated())
-        except Exception:  # pragma: no cover - last-resort fallback
-            logger.warning_once("SwapAdamW could not determine free device memory; swapping states in one batch.")
-            return 1 << 62
+        except Exception:
+            try:
+                free, _total = device.mem_get_info()
+                return int(free)
+            except (AttributeError, RuntimeError):
+                pass
+        logger.warning_once("SwapAdamW could not determine free device memory; swapping states in one batch.")
+        return 1 << 62  # pragma: no cover
 
     def _batch_budget_bytes(self) -> int:
         if not self._use_streams:
@@ -322,13 +401,19 @@ class SwapAdamW(Optimizer):
         return index
 
     def _bump_step(self, p: Tensor) -> int:
-        step = int(self.state[p]["step"]) + 1
+        step = self.state[p]["step"]
+        if isinstance(step, torch.Tensor):
+            step = step.add_(1)
+            return int(step.item())
+        step = int(step) + 1
         self.state[p]["step"] = step
         return step
 
     def _update_param(self, p: Tensor, group: Dict[str, Any]) -> None:
         local_p = _to_local(p)
         grad = _to_local(p.grad)
+        if group.get("maximize", False):
+            grad = -grad
         device_state = self._device_states[p]
 
         beta1, beta2 = group["betas"]

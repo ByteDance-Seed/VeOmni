@@ -47,6 +47,7 @@ from ..optim.optimizer import restore_optimizer_param_group_defaults
 from ..utils import logging
 from ..utils.device import empty_cache, synchronize
 from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
+from ..utils.dtensor_utils import rewrap_dtensor_local
 from .checkpointer import CheckpointerBase
 from .layout import (
     DCP_MARKER_FILENAME,
@@ -314,23 +315,7 @@ class OptimizerState(Stateful):
         )
         self._load = load
 
-    @staticmethod
-    def _reject_swap_optimizer(optimizer) -> None:
-        """Refuse to persist ``adamw_swap``, whose device state is intentionally absent.
-
-        The swap optimizer frees its device-side state storage between steps and
-        keeps the values on host, so a DCP read would write zero-filled shards.
-        Failing here makes that loud instead of producing an unrestorable
-        checkpoint.
-        """
-        if getattr(optimizer, "_is_swap_optimizer", False):
-            raise RuntimeError(
-                "optimizer.type='adamw_swap' does not support checkpoint save/load yet. "
-                "Disable checkpointing/HF export for this run, or use optimizer.type='adamw'."
-            )
-
     def state_dict(self):
-        self._reject_swap_optimizer(self.optimizer)
         if self.should_extra_parallel_aware:
             logger.info_rank0(
                 "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"
@@ -352,7 +337,6 @@ class OptimizerState(Stateful):
         return get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
 
     def load_state_dict(self, state_dict):
-        self._reject_swap_optimizer(self.optimizer)
         optim_state_from_dcp_load = state_dict
         if self.should_extra_parallel_aware:
             # we need to drop ExtraParallel dim before loading them into optimizers
@@ -418,12 +402,16 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     if num_placements == 1:
         tensor_to_put = loaded_tensor.to_local()
     elif num_placements == 2:
-        tensor_to_put = DTensor.from_local(
-            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(fsdp_shard_dim)]
+        tensor_to_put = rewrap_dtensor_local(
+            loaded_tensor._local_tensor,
+            mesh=device_mesh,
+            placements=[Shard(fsdp_shard_dim)],
         )
     elif num_placements == 3:
-        tensor_to_put = DTensor.from_local(
-            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Replicate(), Shard(fsdp_shard_dim)]
+        tensor_to_put = rewrap_dtensor_local(
+            loaded_tensor._local_tensor,
+            mesh=device_mesh,
+            placements=[Replicate(), Shard(fsdp_shard_dim)],
         )
     else:
         raise RuntimeError(
@@ -480,7 +468,11 @@ def restore_extra_parallel_dim(
             placements = [Replicate(), Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
         else:
             placements = [Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
-        dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
+        dtensor = rewrap_dtensor_local(
+            orgin_tensor._local_tensor,
+            mesh=fsdp_mesh,
+            placements=placements,
+        )
     elif torch.is_tensor(orgin_tensor):
         # If there is no FSDP but only ExtraParallel
         dtensor = DTensor.from_local(orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=[Shard(0)])
