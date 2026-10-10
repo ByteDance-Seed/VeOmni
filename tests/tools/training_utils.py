@@ -51,6 +51,9 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },
+    # GLM-MoE-DSA folds its DSA top-k selection into the attention mask, which
+    # flash attention cannot consume.
+    "glm_moe_dsa": {"attn_implementation": "eager"},
     # Multimodal RoPE has no NPU backend in the Qwen-VL family.
     "qwen2vl": {"rotary_pos_emb_implementation": "eager"},
     "qwen25vl": {"rotary_pos_emb_implementation": "eager"},
@@ -100,6 +103,9 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # L20 runners where another job is still holding part of the card.
     "qwen3_5": {"cross_entropy_loss_implementation": "chunk_loss"},
     "qwen3_5_moe": {"cross_entropy_loss_implementation": "chunk_loss"},
+    # GLM-MoE-DSA folds its DSA top-k selection into the attention mask, which
+    # flash attention cannot consume.
+    "glm_moe_dsa": {"attn_implementation": "eager"},
     # GPT-OSS intentionally does not register a Triton MoE backend because its
     # native interleaved gate/up training layout needs either eager reference
     # math or the dedicated SM90-only Quack path. Keep the shared helper on the

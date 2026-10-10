@@ -29,6 +29,28 @@ def test_every_planned_parameter_owner_is_a_para_module():
     }
 
 
+def test_glm_moe_dsa_plan_owns_only_the_routed_experts_of_sparse_layers():
+    """The leading ``first_k_dense_replace`` layers have a dense MLP and no experts to shard."""
+    from pathlib import Path
+
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.models.auto import build_foundation_model
+    from veomni.ops import apply_ops_config
+    from veomni.ops.config.singleton import get_ops_config, set_ops_config
+
+    toy_config = Path(__file__).resolve().parents[1] / "toy_config" / "glm_moe_dsa_toy"
+    previous = get_ops_config()
+    apply_ops_config(make_eager_ops_config())
+    try:
+        model = build_foundation_model(config_path=str(toy_config), weights_path=None, init_device="meta")
+    finally:
+        set_ops_config(previous)
+
+    owners = model.get_parallel_plan().get_extra_parallel_fsdp_no_shard_info(model, "ep")
+    sparse_layers = range(model.config.first_k_dense_replace, model.config.num_hidden_layers)
+    assert sorted(owners) == [f"model.layers.{i}.mlp.experts" for i in sparse_layers]
+
+
 def test_owners_of_one_module_collapse_to_one_entry():
     plan = ParallelPlan(
         extra_parallel_plan={"ep": {"layers.*.experts.gate_up_proj": Shard(0), "layers.*.experts.down_proj": Shard(0)}}
