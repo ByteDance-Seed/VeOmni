@@ -184,6 +184,7 @@ jobs:
         # it runs on NPU via hccl).
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_moe_ep_sharded_load_matrix.py
+          uv run --frozen pytest -v -s -x tests/utils/test_ep_sharded_expert_stream_load.py
       - name: Run checkpoint tests
         run: |
           uv run --frozen pytest -v -s -x tests/checkpoints/
@@ -191,6 +192,8 @@ jobs:
         run: |
           uv run --frozen pytest -v -s -x tests/distributed/test_async_offload_unit.py
           uv run --frozen pytest -v -s -x tests/distributed/test_dummy_forward.py
+          uv run --frozen pytest -v -s -x tests/distributed/test_emb_parallel.py
+          uv run --frozen pytest -v -s -x tests/distributed/test_parallel_plan.py
       - name: Run data tests
         run: |
           uv run --frozen pytest -v -s -x tests/data

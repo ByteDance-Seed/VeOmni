@@ -127,7 +127,11 @@ description: "Create a pull request for the current branch. Handles uncommitted 
    ```
 
    Keep the template's own bullet/checkbox style. Fill every section: an empty
-   `### Test` section is the most common review blocker.
+   `### Test` section is the most common review blocker. If the PR adds an
+   extension point (a mixin, hook or callback other modules must implement),
+   name its `docs/` page under **Design & Code Changes**; with no such page,
+   write it first (see "Documenting an extension point" in `/veomni-develop`)
+   rather than claiming "Added/updated documentation".
 
 4. Tell the user the draft file path (so they know where to find it if they want to review later).
 

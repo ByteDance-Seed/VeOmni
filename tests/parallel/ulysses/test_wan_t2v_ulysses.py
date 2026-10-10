@@ -109,7 +109,7 @@ class WanT2VUlyssesTest(SequenceParallelTest):
             # entered through `__call__` rather than by calling its forward helper directly.
             entered = set()
             for i, block in enumerate(model.blocks):
-                block.register_forward_pre_hook(lambda mod, args, i=i: entered.add(i))
+                block.register_forward_pre_hook(lambda mod, args, i=i, entered=entered: entered.add(i))
             try:
                 _init_parallel_state(dp_size=self.world_size, ulysses_size=1, device_type=get_device_type(), name=None)
                 refs = {name: _forward_backward(model, *case, device) for name, case in CASES.items()}

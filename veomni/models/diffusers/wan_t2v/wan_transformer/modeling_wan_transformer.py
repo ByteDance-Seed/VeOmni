@@ -10,8 +10,8 @@ import torch.nn.functional as F
 from diffusers import WanTransformer3DModel as _WanTransformer3DModel
 from diffusers.models.transformers.transformer_wan import (
     WanAttention,
-    WanTransformerBlock,
     WanAttnProcessor,
+    WanTransformerBlock,
     _get_added_kv_projections,
     _get_qkv_projections,
 )

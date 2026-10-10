@@ -1,7 +1,11 @@
 from unittest.mock import MagicMock, patch
 
-import pytest
+import numpy as np
+import soundfile as sf
+import torch
+from PIL import Image
 
+from veomni.data.seed_omni.utils.media_metadata import AUDIO_METADATA_KEY
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modules.module_processing_base import bind_module_assets
 from veomni.models.seed_omni.processing_omni import OmniProcessor
@@ -18,7 +22,13 @@ class _RecordingPreprocessor:
         self._store.append(self._tag)
 
 
-def test_omni_processor_builds_conversation_and_runs_preprocessors_in_order():
+def _png(tmp_path, name: str = "frame.png") -> str:
+    path = tmp_path / name
+    Image.new("RGB", (16, 16), color=(1, 2, 3)).save(str(path))
+    return str(path)
+
+
+def test_omni_processor_builds_conversation_and_runs_preprocessors_in_order(tmp_path):
     calls: list[str] = []
     processor = OmniProcessor(
         {
@@ -27,8 +37,7 @@ def test_omni_processor_builds_conversation_and_runs_preprocessors_in_order():
         }
     )
 
-    with patch("veomni.models.seed_omni.processing_omni.load_image", return_value="img"):
-        model_input = processor(text="hello", images=["/tmp/fake.png"])
+    model_input = processor(text="hello", images=[_png(tmp_path)])
 
     assert calls == ["first", "second"]
     assert "conversation_list" in model_input
@@ -39,17 +48,56 @@ def test_omni_processor_builds_conversation_and_runs_preprocessors_in_order():
     assert conversation[1].value == "hello"
 
 
-def test_omni_processor_rejects_videos_instead_of_dropping_them():
-    """A request that cannot be honoured must say so, not come back text-only.
+def test_omni_processor_decodes_images_the_way_the_training_path_does(tmp_path):
+    """Request building shares the training transform's fetchers.
 
-    Nothing turns videos into conversation items yet. Discarding the argument
-    would hand back a request built from the prompt alone, which looks like a
-    successful call.
+    It used to have its own PIL-only loader, so the same file became a PIL image
+    for inference and a uint8 pixel tensor for training, and no metadata was
+    attached either way.
     """
     processor = OmniProcessor({"a": _RecordingPreprocessor("only", [])})
 
-    with pytest.raises(NotImplementedError, match="videos"):
-        processor(text="hello", videos=["/tmp/fake.mp4"])
+    conversation = processor(text="hello", images=_png(tmp_path))["conversation_list"]
+
+    assert conversation[0].type == "image"
+    assert isinstance(conversation[0].value, torch.Tensor)
+    assert conversation[0].value.dtype == torch.uint8
+
+
+def test_omni_processor_honours_audios_rather_than_dropping_them(tmp_path):
+    """``audios`` used to be unreachable: the parameter existed on
+    ``build_conversation`` but no caller ever passed it, so a request naming a
+    clip came back text-only."""
+    path = tmp_path / "speech.wav"
+    sf.write(str(path), np.zeros(800, dtype=np.float32), 16_000)
+    processor = OmniProcessor({"a": _RecordingPreprocessor("only", [])})
+
+    conversation = processor(text="transcribe", audios=str(path))["conversation_list"]
+
+    assert [item.type for item in conversation] == ["audio", "text"]
+    assert conversation[0].meta[AUDIO_METADATA_KEY].sampling_rate == 16_000
+
+
+def test_omni_processor_mm_configs_do_not_leak_into_generation_kwargs(tmp_path):
+    """Decode knobs are a named dict because ``**generation_kwargs`` would
+    otherwise swallow them and the clip would be decoded at the default rate."""
+    seen: list[dict] = []
+
+    class _CapturingPreprocessor:
+        def __call__(self, batch, inference=False, **kwargs) -> None:
+            del batch, inference
+            seen.append(kwargs.get("generation_kwargs"))
+
+    processor = OmniProcessor({"a": _CapturingPreprocessor()})
+
+    processor(
+        text="hi",
+        images=_png(tmp_path),
+        mm_configs={"image_max_pixels": 64},
+        max_new_tokens=8,
+    )
+
+    assert seen == [{"max_new_tokens": 8}]
 
 
 def test_omni_processor_preprocess_mutates_existing_conversation():

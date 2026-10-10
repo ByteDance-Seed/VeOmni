@@ -20,6 +20,16 @@ import torch
 from transformers import PreTrainedModel
 
 from .....utils import logging
+from ..minimax_h3_core.cfg_conditioning import (
+    packed_seq_params as _packed_seq_params,
+)
+from ..minimax_h3_core.cfg_conditioning import (
+    prepare_unconditional,
+    replace_text_layout,
+    validate_unconditional,
+    validate_unconditional_metadata,
+)
+from ..minimax_h3_core.training_objectives import resolve_cfg_scales
 from .configuration_minimax_h3_condition import MiniMaxH3ConditionModelConfig
 
 
@@ -29,27 +39,6 @@ logger = logging.get_logger(__name__)
 _MINIMAX_H3_FRAME_RATE = 24
 _MINIMAX_H3_TIME_DIVISION_FACTOR = 17
 _MINIMAX_H3_TIME_DIVISION_REMAINDER = 5
-
-
-def _packed_seq_params(pk: dict, device) -> dict[str, dict]:
-    """DiT/refiner segment params with host bounds, without reading device tensors back."""
-    from ..minimax_h3_core.packed_sequence import host_cu_seqlens
-
-    cu_host = host_cu_seqlens(pk)
-    text_len = int(pk["text_len"])
-    return {
-        "packed_seq_params": {
-            "cu_seqlens_q": pk["cu_seqlens"].to(device),
-            "cu_seqlens_host": cu_host,
-            "max_seqlen_q": cu_host[1],
-        },
-        "refiner_packed_seq_params": {
-            # [0, text_len] built on device, avoiding a host-to-device copy.
-            "cu_seqlens_q": torch.arange(2, dtype=torch.int32, device=device) * text_len,
-            "cu_seqlens_host": (0, text_len),
-            "max_seqlen_q": text_len,
-        },
-    }
 
 
 class MiniMaxH3ConditionModel(PreTrainedModel):
@@ -375,34 +364,68 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
 
     def _encode_text(self, prompt: str, keyframe_images, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode prompt + keyframe images via Qwen3VL → (last_hidden_state[0], text_token_tags)."""
-        from ..minimax_h3_core.minimax_h3_text_encoder import image_token_counts, presentation_fl2va
+        from ..minimax_h3_core.minimax_h3_text_encoder import encode_prompt
 
-        if keyframe_images and self._tokenizer:
-            pixel_values, image_grid_thw, counts = image_token_counts(self._processor, keyframe_images)
-            input_ids, text_token_tags = presentation_fl2va(self._tokenizer, prompt, counts)
-            input_ids = input_ids.unsqueeze(0).to(device)
-            attention_mask = torch.ones_like(input_ids)
-            pixel_values = pixel_values.to(device=device, dtype=torch.bfloat16)
-            image_grid_thw = image_grid_thw.to(device=device, dtype=torch.long)
+        encoded = encode_prompt(
+            self._text_encoder,
+            self._processor,
+            self._tokenizer,
+            prompt,
+            device=device,
+            dtype=torch.bfloat16,
+            keyframes=keyframe_images,
+        )
+        return encoded["prompt_embeds"], encoded["text_token_tags"]
 
-            prompt_embeds = self._text_encoder(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-            )
-        else:
-            # Text-only: use t2va presentation
-            from ..minimax_h3_core.minimax_h3_text_encoder import presentation_t2va
+    @torch.no_grad()
+    def add_unconditional_cache(
+        self, sample: dict, *, negative_prompt=" ", keyframe_images=None, ref_blocks=None, drop_visual: bool = False
+    ) -> dict:
+        """Encode and validate a paired negative condition for one decoded CPU sample.
 
-            input_ids, text_token_tags = presentation_t2va(self._tokenizer, prompt)
-            input_ids = input_ids.unsqueeze(0).to(device)
-            prompt_embeds = self._text_encoder(
-                input_ids=input_ids,
-                attention_mask=torch.ones_like(input_ids),
-            )
+        Supply the positive cache's original resized keyframes or prepared
+        Ref2VA blocks in the same order. Target/reference geometry and latent
+        anchors are reused; only the Qwen prefix is replaced. No DiT/VAE forward
+        is run. Save the result through the usual offline saver.
 
-        return prompt_embeds.to(device), text_token_tags
+        ``drop_visual=True`` is an experimental text-only Qwen negative. It
+        omits Qwen visual inputs, not the DiT latent anchors, and changes the
+        guidance direction. Both policies use the same paired-cache schema.
+        """
+        from ..minimax_h3_core.minimax_h3_text_encoder import encode_prompt
+
+        pk = sample["packed"]
+        if drop_visual:
+            keyframe_images, ref_blocks = None, None
+        elif pk.get("task") == "ref2va":
+            if keyframe_images or (pk["cond_rows"] > 0 and not ref_blocks):
+                raise ValueError("Ref2VA paired caches require their original prepared ref_blocks.")
+        elif ref_blocks or (pk["cond_rows"] > 0 and not keyframe_images):
+            raise ValueError("FL2VA paired caches require their original resized keyframe_images.")
+        if self._text_encoder is None or self._tokenizer is None:
+            raise ValueError("Load the condition model's Qwen encoder and processor before generating embeddings.")
+        if not isinstance(negative_prompt, str) or not negative_prompt:
+            raise ValueError('Use a nonempty negative_prompt; the native default is " " (one space).')
+        if ref_blocks and any(
+            block["kind"] not in ("image", "video") or int(block.get("ref_audio_t", 0)) > 0 for block in ref_blocks
+        ):
+            raise NotImplementedError("Ref2VA training supports visual references only.")
+        parameter = next(self._text_encoder.parameters())
+        encoded = encode_prompt(
+            self._text_encoder,
+            self._processor,
+            self._tokenizer,
+            negative_prompt,
+            device=parameter.device,
+            dtype=parameter.dtype,
+            keyframes=keyframe_images,
+            ref_blocks=ref_blocks,
+        )
+        encoded = {key: value.detach().cpu().contiguous() for key, value in encoded.items()}
+        prompt = encoded["prompt_embeds"]
+        negative_pk = replace_text_layout(pk, prompt.shape[0], encoded["text_token_tags"])
+        validate_unconditional(pk, negative_pk, prompt, sample["prompt_embeds"])
+        return dict(sample, unconditional_prompt_embeds=prompt, unconditional_packed=negative_pk)
 
     def _encode_video(self, video_tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
         """Encode video tensor [1,3,T,H,W] → latent [1,24,T_v,H/16,W/16].
@@ -537,7 +560,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
 
         Called by ``process_condition`` with one sample wrapped in single-element lists:
 
-        1. Sample shared timestep_id ~ Uniform(0, 999)
+        1. Sample shared timestep_id ~ Uniform(0, num_train_timesteps - 1)
         2. Compute sigma_video, sigma_audio from respective schedulers
         3. Add noise: noised = (1-sigma)*clean + sigma*noise
         4. Target = noise - clean (velocity)
@@ -643,7 +666,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         video_latent_shape = (T_v, pk["latent_h_patched"], pk["latent_w_patched"])
         audio_latent_shape = (audio_ch, T_a)
 
-        return {
+        sample = {
             "x": x,
             "audio_x": audio_x,
             "img_position_ids": pk["img_position_ids"].to(device),
@@ -672,3 +695,18 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             "t_audio": t_audio,
             "has_audio": has_audio,
         }
+        if cfg.training_cfg_scale > 1:
+            if not kwargs.get("unconditional_prompt_embeds") or not kwargs.get("unconditional_packed"):
+                raise ValueError("CFG requires per-sample unconditional_prompt_embeds and unconditional_packed.")
+            negative_prompt = kwargs["unconditional_prompt_embeds"][0]
+            negative_pk = kwargs["unconditional_packed"][0]
+            validate_unconditional_metadata(pk, negative_pk, negative_prompt, prompt)
+            sample["unconditional_inputs"] = prepare_unconditional(sample, pk, negative_pk, negative_prompt)
+            sample["training_cfg_scales"] = resolve_cfg_scales(
+                cfg.training_cfg_scale,
+                cfg.training_cfg_schedule,
+                t_video=t_video,
+                t_audio=t_audio,
+            )
+            sample["training_cfg_curvature_power"] = cfg.training_cfg_curvature_power
+        return sample
