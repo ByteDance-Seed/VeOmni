@@ -350,30 +350,24 @@ class OmniModel(PreTrainedModel):
     ) -> PretrainedOmniModule:
         """``from_pretrained`` for a module whose weights live in the upstream HF checkpoint.
 
-        Takes the same ``torch_dtype`` / ``device_map`` / ``attn_implementation``
-        options; ``torch_dtype="auto"`` is the checkpoint's dtype, and
-        ``device_map`` must name a single device (``"auto"`` picks the first
-        accelerator). Assets bind from the weight-free view's subfolder.
+        Takes the same ``torch_dtype`` (or ``dtype``) / ``device_map`` /
+        ``max_memory`` / ``attn_implementation`` options; ``torch_dtype="auto"``
+        is the checkpoint's dtype, and ``device_map="auto"`` spreads the module
+        over the visible devices as HF does. Assets bind from the weight-free
+        view's subfolder.
         """
-        from ...utils.device import get_device_type
         from .modules.module_processing_base import bind_module_assets
         from .utils.hf_layout import load_module_from_hf_source
 
         load_kwargs = dict(load_kwargs)
         device_map = load_kwargs.pop("device_map", None)
+        max_memory = load_kwargs.pop("max_memory", None)
         torch_dtype = load_kwargs.pop("torch_dtype", None)
+        dtype = load_kwargs.pop("dtype", None)
+        torch_dtype = torch_dtype if torch_dtype is not None else dtype
         attn_implementation = load_kwargs.pop("attn_implementation", None)
         if load_kwargs:
             raise ValueError(f"Loading from a HuggingFace checkpoint does not take {sorted(load_kwargs)}.")
-        if isinstance(device_map, Mapping):
-            devices = set(device_map.values())
-            if len(devices) != 1:
-                raise ValueError(
-                    f"Loading from a HuggingFace checkpoint needs a single-device device_map, got {device_map}."
-                )
-            device_map = next(iter(devices))
-        if device_map in (None, "auto"):
-            device_map = "cpu" if get_device_type() == "cpu" else f"{get_device_type()}:0"
         if torch_dtype == "auto":
             hf_config = source.layout.read_hf_config(source.path)
             torch_dtype = getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype", None)
@@ -384,7 +378,8 @@ class OmniModel(PreTrainedModel):
             module_config,
             source,
             name,
-            device=device_map,
+            device_map=device_map,
+            max_memory=max_memory,
             torch_dtype=torch_dtype,
             attn_implementation=attn_implementation,
         )

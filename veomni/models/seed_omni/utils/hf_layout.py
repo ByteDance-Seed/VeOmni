@@ -420,21 +420,70 @@ def attach_hf_source_converter(model: torch.nn.Module, source: HFSource, module_
     model._create_checkpoint_tensor_converter = factory
 
 
+_AUTO_DEVICE_MAPS = ("auto", "balanced", "balanced_low_0", "sequential")
+
+
+def _device_str(device: str | int | torch.device) -> str:
+    if isinstance(device, int):
+        from ....utils.device import get_device_type
+
+        return f"{get_device_type()}:{device}"
+    return str(device)
+
+
+def resolve_hf_source_device_map(
+    model: torch.nn.Module,
+    device_map: str | int | torch.device | Mapping[str, Any] | None,
+    max_memory: dict[int | str, int | str] | None = None,
+) -> dict[str, str | int | torch.device]:
+    """``from_pretrained``'s ``device_map`` semantics for a meta-built ``model``.
+
+    ``None`` is CPU, a device is ``{"": device}``, a mapping passes through, and
+    ``"auto"`` / ``"balanced"`` / ``"balanced_low_0"`` / ``"sequential"`` are
+    planned with accelerate over ``model._no_split_modules``, as HF does.
+    """
+    if device_map is None:
+        return {"": "cpu"}
+    if isinstance(device_map, Mapping):
+        return dict(device_map)
+    if not isinstance(device_map, str) or device_map not in _AUTO_DEVICE_MAPS:
+        return {"": device_map}
+
+    from accelerate import infer_auto_device_map
+    from accelerate.utils import get_balanced_memory, get_max_memory
+
+    no_split = list(getattr(model, "_no_split_modules", None) or [])
+    if device_map == "sequential":
+        budget = get_max_memory(max_memory)
+    else:
+        budget = get_balanced_memory(
+            model,
+            max_memory=max_memory,
+            no_split_module_classes=no_split,
+            low_zero=device_map == "balanced_low_0",
+        )
+    return infer_auto_device_map(model, max_memory=budget, no_split_module_classes=no_split)
+
+
 def load_module_from_hf_source(
     module_cls: type,
     config: OmniModuleConfig,
     source: HFSource,
     module_name: str,
     *,
-    device: str | torch.device,
+    device_map: str | int | torch.device | Mapping[str, Any] | None,
+    max_memory: dict[int | str, int | str] | None = None,
     torch_dtype: torch.dtype | None = None,
     attn_implementation: str | None = None,
 ) -> torch.nn.Module:
-    """Build module ``module_name`` from ``config`` and load its weights from ``source`` onto ``device``.
+    """Build module ``module_name`` from ``config`` and load its weights from ``source`` per ``device_map``.
 
     The unwrapped counterpart of ``from_pretrained`` for a module whose weights
     live in an upstream HF checkpoint (eager inference, bare
-    :meth:`OmniModel.from_pretrained`). Assets are not bound here.
+    :meth:`OmniModel.from_pretrained`). ``device_map`` / ``max_memory`` follow
+    :func:`resolve_hf_source_device_map`. A map that spans several devices loads
+    on CPU first and is then dispatched by accelerate, so host memory must hold
+    the module once. Assets are not bound here.
     """
     from ...module_utils import init_empty_weights, load_model_weights
 
@@ -446,7 +495,25 @@ def load_module_from_hf_source(
     with init_empty_weights():
         model = module_cls._from_config(config, **init_kwargs)
     attach_hf_source_converter(model, source, module_name)
-    load_model_weights(model, source.path, init_device=str(device))
+
+    device_map = resolve_hf_source_device_map(model, device_map, max_memory)
+    devices = {_device_str(device) for device in device_map.values()}
+    if "disk" in devices:
+        raise ValueError(
+            f"Loading '{module_name}' from a HuggingFace checkpoint cannot offload to disk: {device_map}."
+        )
+    if len(devices) == 1:
+        load_model_weights(model, source.path, init_device=devices.pop())
+        return model
+
+    from accelerate import dispatch_model
+
+    load_model_weights(model, source.path, init_device="cpu")
+    dispatch_model(
+        model,
+        device_map=device_map,
+        skip_keys=getattr(model, "_skip_keys_device_placement", None),
+    )
     return model
 
 
@@ -477,7 +544,9 @@ def convert_with_hf_layout(
     for name, module_config in module_configs.items():
         logger.info_rank0(f"convert: loading module '{name}' from {source.path}")
         module_cls = OMNI_MODEL_REGISTRY[module_config.model_type]()
-        module = load_module_from_hf_source(module_cls, module_config, source, name, device="cpu", torch_dtype=dtype)
+        module = load_module_from_hf_source(
+            module_cls, module_config, source, name, device_map="cpu", torch_dtype=dtype
+        )
         modules[name] = attach_module_assets(module, **assets[name])
     training_graphs, generation_graphs = layout.load_graphs(
         training_graph=training_graph, generation_graph=generation_graph

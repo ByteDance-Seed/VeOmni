@@ -295,30 +295,29 @@ class ModuleRuntime(VeOmniModelRuntime):
                 load_kwargs["attn_implementation"] = ops.attn_implementation
         # Before construction: slots read inside ``__init__`` need the binding.
         bind_ops_to_modeling(cls)
+        if dist.is_initialized():
+            device_map = {"": f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"}
+        else:
+            device_map = "auto"
         if self.hf_source is not None:
             from ...utils.hf_layout import load_module_from_hf_source
 
-            device = "cpu" if get_device_type() == "cpu" else f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"
             logger.info_rank0(
                 f"ModuleRuntime '{self.module_name}': eager inference load "
-                f"(model_type={model_type}, cls={cls.__name__}, device={device}) from {self.hf_source.path}"
+                f"(model_type={model_type}, cls={cls.__name__}, device_map={device_map}) from {self.hf_source.path}"
             )
             self.model = load_module_from_hf_source(
                 cls,
                 self.module_config,
                 self.hf_source,
                 self.module_name,
-                device=device,
+                device_map=device_map,
                 torch_dtype=torch.bfloat16,
                 attn_implementation=load_kwargs.get("attn_implementation"),
             ).eval()
             self.model_config = self.model.config
             self._build_model_assets()
             return
-        if dist.is_initialized():
-            device_map = {"": f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"}
-        else:
-            device_map = "auto"
         logger.info_rank0(
             f"ModuleRuntime '{self.module_name}': eager inference load "
             f"(model_type={model_type}, cls={cls.__name__}, device_map={device_map}) from {model_path}"

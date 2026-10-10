@@ -29,6 +29,7 @@ from veomni.models.seed_omni.utils.hf_layout import (
     OmniHFLayout,
     OmniHFModuleLayout,
     read_hf_source,
+    resolve_hf_source_device_map,
     resolve_omni_checkpoint_root,
     save_hf_source_checkpoint,
 )
@@ -219,6 +220,43 @@ def test_auto_dtype_is_the_checkpoint_dtype(hf_root):
     model = OmniModel.from_pretrained(str(root), torch_dtype="auto", device_map="cpu")
     for module in model.modules_dict.values():
         assert {param.dtype for param in module.parameters()} == {torch.bfloat16}
+
+
+def test_device_map_takes_its_from_pretrained_meaning(hf_root):
+    root, _ = hf_root
+    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
+    llm = model.modules_dict[LLM]
+    assert resolve_hf_source_device_map(llm, None) == {"": "cpu"}
+    assert resolve_hf_source_device_map(llm, 1) == {"": 1}
+    assert resolve_hf_source_device_map(llm, {"language_model": "cpu"}) == {"language_model": "cpu"}
+    for strategy in ("auto", "sequential"):
+        plan = resolve_hf_source_device_map(llm, strategy, max_memory={"cpu": "1GiB"})
+        assert set(plan.values()) == {"cpu"}
+
+
+def test_a_multi_device_map_loads_on_cpu_then_dispatches(hf_root, monkeypatch):
+    import accelerate
+
+    root, tensors = hf_root
+    dispatched = []
+
+    def fake_dispatch(model, device_map, **kwargs):
+        assert {param.device.type for param in model.parameters()} == {"cpu"}
+        dispatched.append((model, device_map))
+        return model
+
+    monkeypatch.setattr(accelerate, "dispatch_model", fake_dispatch)
+    device_map = {"first": "cpu", "second": "cuda:0"}
+    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map=device_map)
+
+    assert [plan for _, plan in dispatched] == [device_map] * len(model.modules_dict)
+    llm = model.modules_dict[LLM]
+    layout = model.config._hf_source.layout
+    for key, value in llm.state_dict().items():
+        assert torch.equal(value, tensors[layout.source_key(LLM, key)]), key
+
+    with pytest.raises(ValueError, match="cannot offload to disk"):
+        OmniModel.from_pretrained(str(root), device_map={"first": "cpu", "second": "disk"})
 
 
 @pytest.mark.parametrize("sharded", [False, True], ids=["single_file", "sharded"])

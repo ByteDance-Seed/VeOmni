@@ -102,8 +102,10 @@ with a registered layout loads through it, and any other type is an error.
   still needs split checkpoints. Per-module `model_config` overrides apply to
   the run but not to the exported `config.json`, which is the source's (a
   warning lists them). Expert-parallel streaming load
-  (`ep_sharded_stream_load`) is not supported for renamed keys yet, and eager
-  inference loads each module onto a single device.
+  (`ep_sharded_stream_load`) is not supported for renamed keys yet. Eager
+  loads take `device_map` as `from_pretrained` does; a module spread over
+  several devices (`"auto"`) is loaded on CPU first, so host memory must hold
+  it once.
 
 The offline convert of such a family goes through the same layout, so a split
 checkpoint and the direct load hold identical module weights. To add a layout
