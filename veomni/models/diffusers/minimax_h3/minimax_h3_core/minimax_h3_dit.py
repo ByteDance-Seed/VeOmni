@@ -187,6 +187,7 @@ class MiniMaxH3Attention(nn.Module):
             out_blocks = []
             o_wait, o_prev = None, None
             for i, b in enumerate(blocks):
+                w_next = None
                 if i + 1 < nb:  # launch block i+1: transfers while block i computes
                     w_next = _all_to_all_single(blocks[i + 1], 1, 0, sp_group, async_op=True)
                 full = _AsyncA2A.apply(w, b, 1, 0, sp_group)  # [SEQ, 1, 3, d]: this rank's head of block i
