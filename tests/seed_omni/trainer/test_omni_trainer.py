@@ -132,11 +132,12 @@ def test_an_offline_embedding_run_may_build_no_optimizer(monkeypatch):
 
 
 def test_offline_cache_step_writes_every_micro_batch_without_autograd():
+    """The cache is written from ``forward``'s return value: FSDP2 may hand the graph a copy of the batch."""
     grad_enabled = []
 
     def forward(micro_batch):
         grad_enabled.append(torch.is_grad_enabled())
-        micro_batch["conversation_list"].append("encoded")
+        return {"loss": None, "losses": {}, "conversation_list": [*micro_batch["conversation_list"], "encoded"]}
 
     trainer = OmniTrainer.__new__(OmniTrainer)
     trainer.model = SimpleNamespace(forward=forward)
