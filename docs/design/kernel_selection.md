@@ -14,7 +14,7 @@ selection knob.
 
 | Kernel | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
-| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_2_hub`, `flash_attention_3_hub`, `flash_attention_4`, `flex_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
+| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_2_hub`, `flash_attention_3_hub`, `flash_attention_4`, `flex_attention`, `aiter`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+) | `"eager"` | Model build via three `OpSlot`s (`pre`, `post`, `head`) |
@@ -128,6 +128,7 @@ model:
 | `flash_attention_3_hub` | Hub Flash Attention v3 | Yes | `kernels==0.16.0`, compatible `kernels-community/flash-attn3` version 1 artifact; VeOmni backend only, not Ascend NPU |
 | `flash_attention_4` | Flash Attention v4 | Yes | `flash-attn.cute` |
 | `flex_attention` | PyTorch FlexAttention | Yes | Native `BlockMask`; CUDA for compiled training |
+| `aiter` | aiter FMHA-v3 | Yes | AMD ROCm; `aiter` |
 | `native-sparse` | Sparse attention | No | — |
 
 Hub backends are explicit opt-ins; local FA2/FA3 remain the defaults. Config parsing
@@ -137,10 +138,20 @@ before HF preloading can silently select built-in NPU attention. Missing depende
 or artifact download failures raise instead of falling back to another kernel.
 
 When `MODELING_BACKEND=veomni` (the default), `__post_init__` automatically
-rewrites `flash_attention_2/3/4` and `flex_attention` to VeOmni SP-aware
-variants (`veomni_flash_attention_*_with_sp` and
+rewrites `flash_attention_2/3/4`, `flex_attention` and `aiter` to VeOmni
+SP-aware variants (`veomni_flash_attention_*_with_sp` and
 `veomni_flex_attention_with_sp`). All VeOmni names enter one
 `fused_attention_forward` facade and then dispatch to the selected backend.
+
+`aiter` reuses the FlashAttention adapter and only swaps the underlying
+kernels, so it behaves like `flash_attention_2` for packed/varlen inputs and
+Ulysses SP. It raises rather than silently ignoring what it cannot honour: a
+logits softcap on the dense path (no such argument) or under autograd (the
+forward applies it, the backward does not, so gradients would be wrong),
+attention sinks, and a `window_size` tuple that is neither 2 nor 3 elements
+wide (`None` is accepted and selects full attention). See
+[VeOmni on AMD ROCm](../hardware_support/rocm/README.md) for measured parity
+and speedup.
 
 FlexAttention requires a model-provided native `BlockMask`; VeOmni does not
 construct model-specific visibility. With Ulysses enabled, the mask must be

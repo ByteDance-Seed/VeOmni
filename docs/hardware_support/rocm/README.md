@@ -20,7 +20,8 @@ The image is based on `rocm/primus:v26.4` and ships a ROCm 7.14 stack tuned for 
 | torchvision | `0.27.0+rocm7.14.0a20260608` |
 | triton | `3.7.0+gitb4e20bbe.rocm7.14.0a20260608` |
 | flash-attn | `2.8.3` |
-| transformers | `5.12.1` |
+| aiter | `0.1.12.post2.dev214+gb5e03ed19` |
+| transformers | `5.16.1` |
 | diffusers | `0.37.0` |
 | python | `3.12` |
 
@@ -101,10 +102,66 @@ The image bakes in the following ROCm-specific environment variables (you can ov
 | `FLA_TILELANG` | `0` | Force the fla GatedDeltaNet Triton path; the tilelang ROCm backend in this stack has a HIP codegen bug |
 | `TOKENIZERS_PARALLELISM` | `false` | Suppress tokenizer fork warnings |
 
+## Use AMD AITER for better performance
+
+[AITER](https://github.com/ROCm/aiter) is AMD's kernel library for ROCm. VeOmni can route attention to its FMHA-v3 kernels instead of the default flash-attn 2.8.3 composable-kernel build:
+
+```yaml
+model:
+  ops_implementation:
+    attn_implementation: aiter
+```
+
+`aiter` comes from the base image rather than being installed by the Dockerfile, so VeOmni does not
+pin it. The distribution is named `amd_aiter`, not `aiter`:
+
+```bash
+python -c "from importlib.metadata import version; print(version('amd_aiter'))"
+```
+
+### Numerical parity
+
+Measured against a `flash_attention_2` baseline with the same seed and data
+(`transformers==5.16.1`, 8×MI308X):
+
+| model | run | result |
+|---|---|---|
+| Wan2.1-1.3B DiT | 30 steps, LoRA | \|Δ\| = 0 on every step — no observable difference |
+| Qwen3-Omni-30B | 25 steps, full SFT | max \|Δ\| = 0.02 (mean 0.006) |
+
+### Expected speedup
+
+Measured in end-to-end training with the default configs
+(`transformers==5.16.1`, 8×MI308X):
+
+| model | attention share of kernel time | s/step FA2 → aiter | speedup |
+|---|---|---|---|
+| Wan2.1-1.3B DiT | 57% | 5.00 → 4.00 | **1.25×** |
+| Qwen3-Omni-30B MoE | 7% (MoE group-gemm is 53%) | 27.0 → 26.0 | 1.04× |
+
+> Note: VeOmni packs short samples up to `max_seq_len`, so attention in the default Qwen run is block-diagonal and already cheap — that is why its speedup is lower than the sweep below, which feeds one unpacked sequence per step at the same length.
+
+The gain tracks attention's share of the step, and that share grows with sequence length, because attention is O(s²) while the rest of the step is linear. Sequence-length sweeps below are unchanged from the `transformers==5.12.1` run (relative speedups still apply; absolute s/step on 5.16.1 is lower for the default configs above).
+
+| Wan2.1-1.3B DiT (LoRA, ulysses 2) | 8,064 | 16,422 (default) | 32,256 (real 480P) |
+|---|---|---|---|
+| s/step FA2 → aiter | 2.56 → 2.33 | 5.42 → 4.25 | 16.00 → 11.78 |
+| speedup | 1.10× | 1.28× | **1.36×** |
+
+| Qwen3-Omni-30B MoE (full SFT) | 8,192 | 16,384 | 32,768 | 65,536 |
+|---|---|---|---|---|
+| s/step FA2 → aiter | 34 → 30 | 69 → 56 | 188 → 135 | 631 → 428 |
+| speedup | 1.13× | 1.23× | 1.39× | **1.47×** |
+
+Exclude the first step when benchmarking: aiter pays a one-time CK/FMHA-v3 kernel-load and JIT cost (~550 s on a cold cache) that goes away once the cache is warm.
+
 ## Known limitations
 
 Validated on 8×MI308X / ROCm 7.14. End-to-end training (FSDP2 sharding, Ulysses SP, expert parallel EP, VLM/Omni, DiT) works and aligns numerically. Known limitations:
 
-- **CUDA-only kernels** (FA3/FA4/Quack/FlashMLA/DSA, e.g. `gpt_oss`) fall back to triton/eager on ROCm, or are skipped.
+- **CUDA-only kernels** (FA3/FA4/Quack/FlashMLA/DSA, e.g. `gpt_oss`) fall back to triton/eager on ROCm, or are skipped. For attention specifically, `attn_implementation: aiter` is the ROCm-native alternative (see above).
+- **Attention sinks are not supported by `aiter`** — DeepSeek-V4 and `gpt_oss` raise a `ValueError` rather than having the sinks silently dropped. `flash_attention_2` drops them silently instead, since flash-attn 2.8.3 has no sink argument either, so use `eager` if you need them. aiter's kernels do accept a `sink_ptr`, so real support is possible later.
+- **`aiter` cannot train a model with an attention logits softcap.** On the dense (unpacked) path there is no softcap argument at all. On the packed/varlen path `logits_soft_cap` is honoured by the forward but not the backward — `_flash_attn_varlen_backward` takes no such argument and the backward CK kernels have no `_logits` variant — so gradients silently lose the `1 - tanh²(s / cap)` factor. Measured on gfx942 against an eager reference: the forward matches at every cap, while the gradient error reaches 4.6 / 14.4 / 18.8 for caps of 2.0 / 0.5 / 0.125 against a 0.0195 softcap-disabled control. VeOmni therefore raises under autograd and allows the cap for inference. Use `eager` to train such a model.
+- **`aiter` rejects a `window_size` tuple that is neither 2 nor 3 elements wide** (`None` is accepted and selects full attention), since flash-attn and aiter disagree on the tuple width and an unexpected width is a wiring bug rather than something to forward to the kernel.
 - **GatedDeltaNet (qwen3_5 / qwen3_5_moe)**: the tilelang ROCm backend has a HIP wrapper/codegen defect; set `FLA_TILELANG=0` to use the Triton fallback (validated to train and align correctly).
 - **DCP → HF weight consolidation**: the version guard in `veomni/checkpoint/dcp_consolidation.py` only allows torch `2.9`/`2.11` and rejects the image's torch `2.12`. Relax the guard or use a 2.9/2.11 ROCm torch build; otherwise disable `save_hf_weights`.

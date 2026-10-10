@@ -47,6 +47,7 @@ _VEOMNI_FLASH_ATTN_IMPL_MAPPING = {
     "veomni_flash_attention_3_with_sp": "flash_attention_3",
     "veomni_flash_attention_3_hub_with_sp": "flash_attention_3_hub",
     "veomni_flash_attention_4_with_sp": "flash_attention_4",
+    "veomni_flash_attention_aiter_with_sp": "aiter",
 }
 
 
@@ -100,6 +101,17 @@ def _load_veomni_flash_kernel(implementation: str) -> SimpleNamespace | object:
                 "VeOmni attention implementation `veomni_flash_attention_4_with_sp` requires "
                 "`flash_attn.cute` (FA4) to be importable."
             ) from e
+    elif implementation == "veomni_flash_attention_aiter_with_sp":
+        try:
+            import aiter  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "VeOmni attention implementation `veomni_flash_attention_aiter_with_sp` requires "
+                "`aiter` (AMD AI Tensor Engine for ROCm) to be importable."
+            ) from e
+        from .aiter import build_aiter_flash_kernels
+
+        return build_aiter_flash_kernels()
     else:
         raise ValueError(f"Unknown VeOmni flash attention implementation: {implementation}")
 
@@ -124,9 +136,9 @@ def patch_transformers_hub_kernel_loader_for_veomni():
     corresponding selected kernel functions instead.
 
     Local FA2 and FA3 are handled by explicit branches inside ``_lazy_imports``
-    and never reach the hub-kernel path. FA2-hub, FA3-hub, and FA4 keep their
-    VeOmni names so this adapter loads the pinned hub artifact or local FA4
-    implementation.
+    and never reach the hub-kernel path. FA2-hub, FA3-hub, FA4, and aiter keep
+    their VeOmni names so this adapter loads the pinned hub artifact, the local
+    FA4 implementation, or the aiter shim.
     """
     global _veomni_hub_kernel_loader_patch_applied
     global _original_load_and_register_attn_kernel
@@ -205,10 +217,11 @@ def flash_attention_forward(
        * FA2/FA3 → plain name (``"flash_attention_2"`` / ``"flash_attention_3"``)
          because ``_lazy_imports`` has an explicit branch for each and resolves
          them without touching the hub-kernel path.
-       * FA2-hub/FA3-hub/FA4 → keep their VeOmni names so Transformers v5's
+       * FA2-hub/FA3-hub/FA4/aiter → keep their VeOmni names so Transformers v5's
          hub-kernel fallback is intercepted by VeOmni's monkey-patch of
          ``load_and_register_attn_kernel``. It loads the pinned hub artifacts
-         for FA2-hub/FA3-hub and ``flash_attn.cute`` locally for FA4.
+         for FA2-hub/FA3-hub, ``flash_attn.cute`` locally for FA4, and the
+         ``aiter`` shim for aiter.
     """
     if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
         logger.warning_once(
@@ -306,6 +319,8 @@ def flash_attention_forward(
         fa_kernel_implementation = "veomni_flash_attention_3_hub_with_sp"
     elif module.config._attn_implementation == "veomni_flash_attention_4_with_sp":
         fa_kernel_implementation = "veomni_flash_attention_4_with_sp"  # intercepted by VeOmni hub-kernel patch
+    elif module.config._attn_implementation == "veomni_flash_attention_aiter_with_sp":
+        fa_kernel_implementation = "veomni_flash_attention_aiter_with_sp"  # intercepted by VeOmni hub-kernel patch
     else:
         raise ValueError(
             f"unknown attn_implementation for veomni flash_attention with SP support: {module.config._attn_implementation}"
