@@ -53,12 +53,15 @@ class Qwen3MoeCheckpointTensorConverter:
     merged tensors once all experts for a given (layer, projection) are collected.
 
     Args:
-        num_experts: Number of experts per MoE layer.
+        num_experts: Number of experts per MoE layer this converter stacks.
+        expert_offset: Checkpoint index of the first expert it stacks; experts
+            ``[expert_offset, expert_offset + num_experts)`` become rows ``0..num_experts-1``.
     """
 
-    def __init__(self, num_experts: int):
+    def __init__(self, num_experts: int, expert_offset: int = 0):
         self.num_experts = num_experts
-        # {(prefix, proj_name): {expert_id: tensor}}
+        self.expert_offset = expert_offset
+        # {(prefix, proj_name): {local_expert_id: tensor}}
         self._expert_buffer: Dict[Tuple[str, str], Dict[int, torch.Tensor]] = {}
         # {prefix: {proj_name: stacked_tensor}} for gate/up merge waiting
         self._stacked_buffer: Dict[str, Dict[str, torch.Tensor]] = {}
@@ -66,13 +69,33 @@ class Qwen3MoeCheckpointTensorConverter:
     def can_handle(self, name: str) -> bool:
         return bool(_EXPERT_PATTERN.match(name))
 
+    def fused_expert_target(self, name: str) -> Optional[Tuple[str, int]]:
+        match = _EXPERT_PATTERN.match(name)
+        if not match:
+            return None
+        prefix, expert_id_str, proj_name = match.groups()
+        fused_proj = "down_proj" if proj_name == "down_proj" else "gate_up_proj"
+        return f"{prefix}.experts.{fused_proj}", int(expert_id_str)
+
+    def for_expert_range(self, start: int, num_local: int) -> "Qwen3MoeCheckpointTensorConverter":
+        if start < 0 or num_local <= 0 or start + num_local > self.num_experts:
+            raise ValueError(
+                f"Expert range [{start}, {start + num_local}) is outside this converter's {self.num_experts} experts."
+            )
+        return type(self)(num_experts=num_local, expert_offset=self.expert_offset + start)
+
     def convert(self, name: str, tensor: "torch.Tensor") -> Optional[ConvertedCheckpointTensor]:
         match = _EXPERT_PATTERN.match(name)
         if not match:
             return None
 
         prefix, expert_id_str, proj_name = match.groups()
-        expert_id = int(expert_id_str)
+        expert_id = int(expert_id_str) - self.expert_offset
+        if not 0 <= expert_id < self.num_experts:
+            raise ValueError(
+                f"{name}: expert {int(expert_id_str)} is outside this converter's range "
+                f"[{self.expert_offset}, {self.expert_offset + self.num_experts})."
+            )
         buf_key = (prefix, proj_name)
 
         if buf_key not in self._expert_buffer:

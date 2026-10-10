@@ -55,8 +55,19 @@ def LTXSPAttention_forward(
     k_pe: torch.Tensor | None = None,
     perturbation_mask: torch.Tensor | None = None,
     all_perturbed: bool = False,
+    *,
+    sp_valid_length: int | None = None,
+    sp_context_length: int | None = None,
 ) -> torch.Tensor:
     is_cross_attention = context is not None
+
+    # Audio<->video cross-attention attends to the other modality, which is sliced across SP
+    # ranks like x. Gather it (and its key RoPE) back to the full, unpadded sequence.
+    context_length = sp_context_length
+    if is_cross_attention and context_length is not None and get_parallel_state().sp_enabled:
+        context = gather_outputs(context, gather_dim=1, padding_dim=1, unpad_dim_size=context_length)
+        if k_pe is not None:
+            k_pe = tuple(gather_outputs(t, gather_dim=2, padding_dim=2, unpad_dim_size=context_length) for t in k_pe)
 
     context = x if context is None else context
     use_attention = not all_perturbed
@@ -85,6 +96,11 @@ def LTXSPAttention_forward(
             k = gather_seq_scatter_heads(k, seq_dim=1, head_dim=2, group=ulysses_group)
             v_sp = gather_seq_scatter_heads(v_sp, seq_dim=1, head_dim=2, group=ulysses_group)
 
+            # Drop the Ulysses tail padding so no backend attends to it; restored below.
+            padded_length = q.shape[1]
+            valid_length = sp_valid_length or padded_length
+            q, k, v_sp = q[:, :valid_length], k[:, :valid_length], v_sp[:, :valid_length]
+
             sp_heads = heads // ulysses_size
 
             q = q.flatten(2, 3)
@@ -101,6 +117,7 @@ def LTXSPAttention_forward(
 
         if sp_enabled:
             out = out.unflatten(-1, (sp_heads, self.dim_head))
+            out = torch.nn.functional.pad(out, (0, 0, 0, 0, 0, padded_length - valid_length))
             out = gather_heads_scatter_seq(out, seq_dim=1, head_dim=2, group=ulysses_group)
             out = out.flatten(2, 3)
 
@@ -113,6 +130,28 @@ def LTXSPAttention_forward(
     return self.to_out(out)
 
 
+def _slice_transformer_args_for_sp(args, group):
+    """Slice every per-token field of ``args`` the way ``slice_input_tensor`` slices ``x``.
+
+    ``slice_input_tensor`` pads to a multiple of the SP size, so RoPE, per-token timesteps and
+    the AV cross-attention AdaLN inputs must be sliced the same way to stay aligned with ``x``.
+    Tensors whose sequence axis is not the token axis (e.g. per-sample or per-prompt) are kept.
+    """
+    num_tokens = args.x.shape[1]
+
+    def seq(t, dim):
+        return slice_input_tensor(t, dim=dim, group=group) if t.shape[dim] == num_tokens else t
+
+    updates = {"x": seq(args.x, 1), "positional_embeddings": tuple(seq(t, 2) for t in args.positional_embeddings)}
+    if args.cross_positional_embeddings is not None:
+        updates["cross_positional_embeddings"] = tuple(seq(t, 2) for t in args.cross_positional_embeddings)
+    for name in ("timesteps", "prompt_timestep", "cross_scale_shift_timestep", "cross_gate_timestep"):
+        t = getattr(args, name)
+        if t is not None and t.ndim > 1:
+            updates[name] = seq(t, 1)
+    return replace(args, **updates)
+
+
 def LTXVideoModel_forward(
     self: LTXModel,
     video: Modality | None,
@@ -122,60 +161,32 @@ def LTXVideoModel_forward(
     video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
     audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
 
-    if get_parallel_state().sp_enabled and video_args is not None:
-        video_args_x = slice_input_tensor(video_args.x, dim=1, group=get_parallel_state().sp_group)
-
-        cos_freq, sin_freq = video_args.positional_embeddings
-        cos_freq = slice_input_tensor(cos_freq, dim=2, group=get_parallel_state().sp_group)
-        sin_freq = slice_input_tensor(sin_freq, dim=2, group=get_parallel_state().sp_group)
-        positional_embeddings = (cos_freq, sin_freq)
-
-        sp_kwargs = dict(x=video_args_x, positional_embeddings=positional_embeddings)
-
-        timesteps = video_args.timesteps
-        if timesteps.shape[1] > 1:
-            sp_kwargs["timesteps"] = slice_input_tensor(timesteps, dim=1, group=get_parallel_state().sp_group)
-
-        prompt_timestep = video_args.prompt_timestep
-        if prompt_timestep is not None and prompt_timestep.shape[1] > 1:
-            sp_kwargs["prompt_timestep"] = slice_input_tensor(
-                prompt_timestep, dim=1, group=get_parallel_state().sp_group
-            )
-
-        video_args = replace(video_args, **sp_kwargs)
-
-    if get_parallel_state().sp_enabled and audio_args is not None:
-        audio_args_x = slice_input_tensor(audio_args.x, dim=1, group=get_parallel_state().sp_group)
-
-        cos_freq, sin_freq = audio_args.positional_embeddings
-        cos_freq = slice_input_tensor(cos_freq, dim=2, group=get_parallel_state().sp_group)
-        sin_freq = slice_input_tensor(sin_freq, dim=2, group=get_parallel_state().sp_group)
-        positional_embeddings = (cos_freq, sin_freq)
-
-        sp_kwargs = dict(x=audio_args_x, positional_embeddings=positional_embeddings)
-
-        timesteps = audio_args.timesteps
-        if timesteps.shape[1] > 1:
-            sp_kwargs["timesteps"] = slice_input_tensor(timesteps, dim=1, group=get_parallel_state().sp_group)
-
-        prompt_timestep = audio_args.prompt_timestep
-        if prompt_timestep is not None and prompt_timestep.shape[1] > 1:
-            sp_kwargs["prompt_timestep"] = slice_input_tensor(
-                prompt_timestep, dim=1, group=get_parallel_state().sp_group
-            )
-
-        audio_args = replace(audio_args, **sp_kwargs)
+    use_sp = get_parallel_state().sp_enabled
+    video_len = video_args.x.shape[1] if video_args is not None else None
+    audio_len = audio_args.x.shape[1] if audio_args is not None else None
+    if use_sp:
+        sp_group = get_parallel_state().sp_group
+        if video_args is not None:
+            video_args = _slice_transformer_args_for_sp(video_args, sp_group)
+        if audio_args is not None:
+            audio_args = _slice_transformer_args_for_sp(audio_args, sp_group)
 
     video_out, audio_out = self._process_transformer_blocks(
         video=video_args,
         audio=audio_args,
         perturbations=perturbations,
+        sp_video_length=video_len if use_sp else None,
+        sp_audio_length=audio_len if use_sp else None,
     )
 
-    if get_parallel_state().sp_enabled and video_out is not None:
-        video_out = replace(video_out, x=gather_outputs(video_out.x, gather_dim=1))
-    if get_parallel_state().sp_enabled and audio_out is not None:
-        audio_out = replace(audio_out, x=gather_outputs(audio_out.x, gather_dim=1))
+    if use_sp and video_out is not None:
+        video_out = replace(
+            video_out, x=gather_outputs(video_out.x, gather_dim=1, padding_dim=1, unpad_dim_size=video_len)
+        )
+    if use_sp and audio_out is not None:
+        audio_out = replace(
+            audio_out, x=gather_outputs(audio_out.x, gather_dim=1, padding_dim=1, unpad_dim_size=audio_len)
+        )
 
     vx = (
         self._process_output(

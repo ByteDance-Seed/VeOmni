@@ -28,7 +28,7 @@ load when an index mapping is supplied).
 
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, Generator, List, Optional, Protocol, Union
+from typing import TYPE_CHECKING, Callable, Dict, Generator, List, Optional, Protocol, Tuple, Union
 
 import torch
 from torch import nn
@@ -132,6 +132,24 @@ class CheckpointTensorConverter(Protocol):
         """
         ...
 
+    def fused_expert_target(self, name: str) -> Optional[Tuple[str, int]]:
+        """Optional streaming capability: ``(fused_name, expert_index)`` when ``name`` is
+        one expert's tensor that this converter stacks into row ``expert_index`` (dim-0)
+        of the fused parameter ``fused_name``; ``None`` for any other key.
+
+        A per-rank dim-0 streaming loader uses it to read only the experts in its own
+        ``Shard(0)`` range. Must be implemented together with :meth:`for_expert_range`;
+        a missing method means the converter cannot be streamed.
+        """
+        ...
+
+    def for_expert_range(self, start: int, num_local: int) -> "CheckpointTensorConverter":
+        """Optional streaming capability: a fresh converter that accepts only experts
+        ``[start, start + num_local)`` and emits fused tensors of ``num_local`` rows, the
+        rank-local ``Shard(0)`` slice of what this converter emits for all experts.
+        """
+        ...
+
 
 def checkpoint_converter_is_dim0_zero_pad(
     converter: Optional["CheckpointTensorConverter"],
@@ -170,6 +188,23 @@ def checkpoint_converter_record_skip_without_loading(
     fn = getattr(converter, "record_skip_without_loading", None)
     if callable(fn):
         fn(name)
+
+
+def checkpoint_converter_fused_expert_target(
+    converter: Optional["CheckpointTensorConverter"],
+    name: str,
+) -> Optional[Tuple[str, int]]:
+    """Safely query the optional :meth:`CheckpointTensorConverter.fused_expert_target`.
+
+    ``None`` unless *converter* claims ``name`` and implements both expert-streaming
+    capabilities (``fused_expert_target`` and ``for_expert_range``).
+    """
+    if converter is None or not converter.can_handle(name):
+        return None
+    fn = getattr(converter, "fused_expert_target", None)
+    if not callable(fn) or not callable(getattr(converter, "for_expert_range", None)):
+        return None
+    return fn(name)
 
 
 def get_checkpoint_tensor_converter(
