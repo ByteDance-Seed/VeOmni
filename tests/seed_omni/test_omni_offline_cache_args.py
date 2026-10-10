@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from veomni.arguments.arguments_types import CheckpointConfig
 from veomni.arguments.omni_arguments_types import (
     OmniDataArguments,
     OmniTrainingArguments,
@@ -60,6 +61,13 @@ def test_data_args_accepts_cached_seedomni() -> None:
 def test_an_offline_embedding_run_reads_each_sample_once() -> None:
     with pytest.raises(ValueError, match="num_train_epochs` must be 1"):
         OmniTrainingArguments(training_task="offline_embedding", offline_cache_dir="/tmp/cache", num_train_epochs=2)
+
+
+def test_an_offline_embedding_run_cannot_resume_from_a_checkpoint(tmp_path) -> None:
+    checkpoint = CheckpointConfig(output_dir=str(tmp_path), load_path=str(tmp_path / "checkpoints" / "global_step_1"))
+
+    with pytest.raises(ValueError, match="checkpoint.load_path"):
+        OmniTrainingArguments(training_task="offline_embedding", offline_cache_dir="/tmp/cache", checkpoint=checkpoint)
 
 
 @pytest.mark.parametrize(
