@@ -94,6 +94,11 @@ class ModuleRuntime(VeOmniModelRuntime):
     genuinely different topologies ("freeze the ViT, EP-shard the LLM, DDP the
     VAE") while sharing one build sequence.
 
+    ``train_args`` is the job-wide ``train:`` section (:class:`OmniTrainingArguments`),
+    shared by every module and ``None`` for inference builds. It is config, not a
+    train/infer switch (``for_inference`` is): the runtime reads ``training_task``
+    and the checkpoint paths from it.
+
     Job-wide concerns (process-group init, data pipeline, trace metering, the
     train loop) are **never** run here — :class:`OmniTrainer` owns them once, and
     cascades its ``on_{train,epoch,step}_*`` hooks into each module so every
@@ -115,13 +120,13 @@ class ModuleRuntime(VeOmniModelRuntime):
         *,
         module_config: "OmniModuleConfig",
         global_accelerator: "AcceleratorConfig",
-        train: Optional["OmniTrainingArguments"] = None,
+        train_args: Optional["OmniTrainingArguments"] = None,
         for_inference: bool = False,
     ):
         self.args = args
         self.model_name = module_name
         self.module_config = module_config
-        self.train_args = train
+        self.train_args = train_args
         self.optimizer = None
         self.lr_scheduler = None
         self._global_accelerator = global_accelerator
@@ -647,7 +652,7 @@ def build_omni_module_runtime(
     *,
     module_config: "OmniModuleConfig",
     global_accelerator: "AcceleratorConfig",
-    train: Optional["OmniTrainingArguments"] = None,
+    train_args: Optional["OmniTrainingArguments"] = None,
     for_inference: bool = False,
 ) -> ModuleRuntime:
     """Build the :class:`ModuleRuntime` for one module of a composed model."""
@@ -656,7 +661,7 @@ def build_omni_module_runtime(
         module_name=module_name,
         module_config=module_config,
         global_accelerator=global_accelerator,
-        train=train,
+        train_args=train_args,
         for_inference=for_inference,
     )
 

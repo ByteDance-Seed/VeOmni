@@ -271,7 +271,7 @@ class OmniTrainer:
         ``train.training_task='offline_embedding'`` trains nothing by design, so
         only it may build no optimizer.
         """
-        model = build_omni_model_runtime(build_omni_model_runtime_args(self.args), train=self.args.train)
+        model = build_omni_model_runtime(build_omni_model_runtime_args(self.args), train_args=self.args.train)
         if model.optimizer is None and self.args.train.training_task != "offline_embedding":
             raise ValueError("OmniTrainer has nothing to train: every module is frozen.")
         return model

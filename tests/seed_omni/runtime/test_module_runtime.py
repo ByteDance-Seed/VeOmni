@@ -198,7 +198,7 @@ def test_a_cache_reading_module_is_frozen_and_never_wrapped_trained_or_saved(mon
         "bagel_vae",
         module_config=SimpleNamespace(support_cache=True),
         global_accelerator=_fsdp("module"),
-        train=train,
+        train_args=train,
     )
 
     assert calls == ["setup"]
@@ -220,7 +220,7 @@ def test_an_offline_embedding_run_loads_and_wraps_every_module_but_freezes_it(mo
         "llm",
         module_config=SimpleNamespace(),
         global_accelerator=_fsdp("module"),
-        train=train,
+        train_args=train,
     )
 
     assert calls == [
@@ -358,7 +358,7 @@ def test_the_constructor_stores_training_args_where_the_base_reads_them(monkeypa
     args = SimpleNamespace(accelerator=_fsdp("module"))
 
     runtime = ModuleRuntime(
-        args, "vision_encoder", module_config=SimpleNamespace(), global_accelerator=_fsdp("module"), train=train
+        args, "vision_encoder", module_config=SimpleNamespace(), global_accelerator=_fsdp("module"), train_args=train
     )
 
     assert vars(runtime)["train_args"] is train
