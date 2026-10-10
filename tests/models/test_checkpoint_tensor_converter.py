@@ -481,11 +481,23 @@ class TestDeepseekV4ConverterConvert:
         assert converter.finalize() == []
 
     @pytest.mark.parametrize("target_model_prefix", ["model.", ""])
-    def test_scorer_export_round_trips_through_inference_format(self, monkeypatch, target_model_prefix):
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "layers.2.attn.indexer.weights_proj.weight",
+            # Reversing HF's ``.norm.`` -> ``.kv_norm.`` renaming used to turn these into ``attn.norm``.
+            "layers.0.attn.kv_norm.weight",
+            "layers.2.attn.indexer.compressor.norm.weight",
+            # Nested compressor projections used to export with a literal ``\2`` in the name.
+            "layers.2.attn.compressor.wkv.weight",
+            "layers.2.attn.compressor.wgate.weight",
+            "layers.2.attn.indexer.compressor.wkv.weight",
+        ],
+    )
+    def test_export_round_trips_through_inference_format(self, monkeypatch, target_model_prefix, source):
         from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
 
-        source = "layers.2.attn.indexer.weights_proj.weight"
-        target = f"{target_model_prefix}layers.2.self_attn.compressor.indexer.scorer.weights_proj.weight"
+        target = module.convert_deepseek_v4_checkpoint_key(source, target_model_prefix=target_model_prefix)
         weight = torch.randn(4, 8, dtype=torch.bfloat16)
         model = SimpleNamespace(config=SimpleNamespace(expert_dtype="fp8"), _veomni_fqn_to_index_mapping={source: 1})
         # Supply the gathered parameter stream; exercise the real export mapping.
