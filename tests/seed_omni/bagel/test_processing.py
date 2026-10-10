@@ -262,9 +262,9 @@ def test_mot_forward_post_scatters_virtual_marker_triplet_hidden_states() -> Non
 
 
 def test_bagel_vae_online_process_runs_on_a_meta_built_model() -> None:
-    """``offline_training`` builds a ``support_cache`` module on meta with no weights."""
+    """``offline_training`` builds the VAE on meta with no weights when the graph calls only ``online_process`` on it."""
     encode_model = _tiny_vae()
-    process_model = _tiny_vae(meta=True, support_cache=True)
+    process_model = _tiny_vae(meta=True)
     encoded_cache = encode_model.offline_encode(pixel_values=torch.zeros(1, 3, 8, 8))["encoded_cache"]
     item_cache = encoded_cache[0].reshape(2, process_model.config.z_channels, *encoded_cache.shape[-2:])
 
@@ -276,7 +276,7 @@ def test_bagel_vae_online_process_runs_on_a_meta_built_model() -> None:
 
 
 def test_bagel_vae_online_process_consumes_variable_size_cache_items_without_padding() -> None:
-    model = _tiny_vae(meta=True, support_cache=True)
+    model = _tiny_vae(meta=True)
     first = ConversationItem(
         type="image",
         value=torch.zeros(2, 2, 2, 1),
@@ -308,8 +308,8 @@ def test_bagel_vae_offline_cache_replay_keeps_img_tag_for_flow_connector(tmp_pat
     from veomni.data.seed_omni.seedomni_transform import process_seedomni_cached_example
     from veomni.models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
 
-    encode_model = _tiny_vae(support_cache=True)
-    process_model = _tiny_vae(meta=True, support_cache=True)
+    encode_model = _tiny_vae()
+    process_model = _tiny_vae(meta=True)
 
     def vae_image(tag: str) -> ConversationItem:
         return ConversationItem(

@@ -211,9 +211,9 @@ need this overlay matrix.
 
 Caching is not a special framework mode — it is a different `train_graph` plus a
 different dataset type. Each stage has its own modules / graph YAML, and
-`train.training_task` tells the trainer which stage it runs. `bagel_vae` opts in
-with `model_config.support_cache: true` (see
-[Offline Encoding](../mixins/offline_encoding.md#how-a-run-builds-a-support_cache-module)).
+`train.training_task` tells the trainer which stage it runs. `bagel_vae` can be
+cached because it mixes in `OfflineEncodingMixin`; no config flag declares it (see
+[Offline Encoding](../mixins/offline_encoding.md#how-a-run-builds-a-cached-module)).
 
 **Stage 1 — produce the cache** (`train.training_task: offline_embedding`). `offline_cache/modules_train.yaml` declares only
 `bagel_vae`, and the DAG is a single edge, so nothing else is built:
@@ -233,7 +233,9 @@ Samples without a VAE image get the preprocessor's dummy row encoded too, so
 every cached sample carries a VAE posterior.
 
 **Stage 2 — train from the cache** (`train.training_task: offline_training`).
-`bagel_vae` is built on meta and never loads its weights. `data.data_type`
+The graph calls only `online_process` on `bagel_vae`, so it is built on meta and
+never loads its weights. `with_cache/modules_train.yaml` is the same file as
+`train/modules_train.yaml`. `data.data_type`
 becomes `seedomni_cached` and `data.train_path` points at the stage-1 output
 directory. The cached items are marked as posteriors, so the VAE preprocessor
 leaves them alone:

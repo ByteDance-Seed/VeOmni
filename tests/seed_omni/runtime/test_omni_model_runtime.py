@@ -15,7 +15,11 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import MultiLRScheduler, OmniModelRuntime
+from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
+    MultiLRScheduler,
+    OmniModelRuntime,
+    _training_graph_methods,
+)
 from veomni.models.seed_omni.accelerated.utils import executor
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
@@ -331,3 +335,22 @@ def test_metric_meter_collect_drains_only_the_metered_modules():
 
     assert runtime.metric_meter_collect() == {"metered": (7.0, [3, 4])}
     assert runtime.metric_meter_collect() == {"metered": (0.0, [])}
+
+
+def test_each_module_gets_the_methods_the_training_graph_calls_on_it():
+    """An ``offline_training`` run builds a module on meta from this, so no config flag is needed."""
+    graph = [
+        {"from": "vae.online_process", "to": "connector.embed_latent"},
+        {"from": "vit", "to": "llm"},
+        {"from": "connector.embed_latent", "to": "llm"},
+        {"from": "llm", "to": "connector.decode_velocity"},
+        {"from": "connector.decode_velocity", "to": "end"},
+    ]
+
+    assert _training_graph_methods(graph) == {
+        "vae": {"online_process"},
+        "vit": {"forward"},
+        "connector": {"embed_latent", "decode_velocity"},
+        "llm": {"forward"},
+    }
+    assert _training_graph_methods([]) == {}

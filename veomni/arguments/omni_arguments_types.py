@@ -604,8 +604,8 @@ class OmniTrainingArguments:
         default="online_training",
         metadata={
             "help": "Training task. online_training: encode raw data online. offline_embedding: run the "
-            "`support_cache` modules' offline_encode and write the cache. offline_training: train from the "
-            "cache, with the `support_cache` modules built on meta."
+            "graph's offline_encode nodes and write the cache. offline_training: train from the cache; a "
+            "module the training graph calls only through online_process is built on meta."
         },
     )
     offline_cache_dir: Optional[str] = field(

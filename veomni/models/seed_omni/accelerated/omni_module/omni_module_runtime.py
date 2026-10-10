@@ -97,7 +97,10 @@ class ModuleRuntime(VeOmniModelRuntime):
     ``train_args`` is the job-wide ``train:`` section (:class:`OmniTrainingArguments`),
     shared by every module and ``None`` for inference builds. It is config, not a
     train/infer switch (``for_inference`` is): the runtime reads ``training_task``
-    and the checkpoint paths from it.
+    and the checkpoint paths from it. ``training_graph_methods`` is the set of
+    methods this run's training graph calls on this module, e.g.
+    ``{"online_process"}``; it is empty for inference builds and for a module the
+    graph never calls.
 
     Job-wide concerns (process-group init, data pipeline, trace metering, the
     train loop) are **never** run here — :class:`OmniTrainer` owns them once, and
@@ -111,6 +114,7 @@ class ModuleRuntime(VeOmniModelRuntime):
 
     args: "OmniModuleRuntimeArguments"
     train_args: Optional["OmniTrainingArguments"] = None
+    training_graph_methods: frozenset[str] = frozenset()
     _has_trainable_parameters: Optional[bool] = None
 
     def __init__(
@@ -121,12 +125,14 @@ class ModuleRuntime(VeOmniModelRuntime):
         module_config: "OmniModuleConfig",
         global_accelerator: "AcceleratorConfig",
         train_args: Optional["OmniTrainingArguments"] = None,
+        training_graph_methods: frozenset[str] = frozenset(),
         for_inference: bool = False,
     ):
         self.args = args
         self.model_name = module_name
         self.module_config = module_config
         self.train_args = train_args
+        self.training_graph_methods = training_graph_methods
         self.optimizer = None
         self.lr_scheduler = None
         self._global_accelerator = global_accelerator
@@ -202,14 +208,16 @@ class ModuleRuntime(VeOmniModelRuntime):
     def reads_offline_cache(self) -> bool:
         """Whether this module only runs ``online_process`` on cached data.
 
-        True under ``train.training_task='offline_training'`` for a config with
-        ``support_cache``: ``online_process`` reads only the config, so the
-        module is built on meta, loads no weights, and has nothing to train or save.
+        True under ``train.training_task='offline_training'`` when the training
+        graph calls ``online_process`` and nothing else on this module.
+        ``online_process`` reads only the config, so the module is built on meta,
+        loads no weights, and has nothing to train or save. Any other method in
+        the graph needs the weights, so the module is then built in full.
         """
         return (
             self.train_args is not None
             and self.train_args.training_task == "offline_training"
-            and bool(getattr(self.module_config, "support_cache", False))
+            and self.training_graph_methods == {"online_process"}
         )
 
     @property
@@ -653,6 +661,7 @@ def build_omni_module_runtime(
     module_config: "OmniModuleConfig",
     global_accelerator: "AcceleratorConfig",
     train_args: Optional["OmniTrainingArguments"] = None,
+    training_graph_methods: frozenset[str] = frozenset(),
     for_inference: bool = False,
 ) -> ModuleRuntime:
     """Build the :class:`ModuleRuntime` for one module of a composed model."""
@@ -662,6 +671,7 @@ def build_omni_module_runtime(
         module_config=module_config,
         global_accelerator=global_accelerator,
         train_args=train_args,
+        training_graph_methods=training_graph_methods,
         for_inference=for_inference,
     )
 
