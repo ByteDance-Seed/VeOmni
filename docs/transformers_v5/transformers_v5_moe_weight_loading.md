@@ -124,11 +124,10 @@ It reports each per-expert key's fused target and expert index
 `Shard(0)` expert range (`for_expert_range`). Each EP rank then reads only its
 own `E/ep` experts' tensors and stacks them straight into its local
 `[E/ep, ...]` slice. Per-expert keys of modules the model does not build, such
-as the Qwen3-Omni-MoE talker or the DeepSeek-V3 MTP layer, are skipped without
-being read. A converter that does not implement both methods, for example
-DeepSeek-V4's, still makes the streaming loader raise `NotImplementedError`.
-Streaming also needs the model's expert-parallel plan. GLM-MoE-DSA has none, so
-it loads its per-expert checkpoint through the regular, non-streaming path.
+as the Qwen3-Omni-MoE talker or the DeepSeek-V3 and GLM-5 MTP layers, are
+skipped without being read. A converter that does not implement both methods,
+for example DeepSeek-V4's, still makes the streaming loader raise
+`NotImplementedError`.
 
 ### Saving (VeOmni modeling -> checkpoint)
 

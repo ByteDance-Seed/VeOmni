@@ -30,8 +30,9 @@ and load by name.
         model.layers.{i}.mlp.experts.down_proj     [E, H, I]
 
 The checkpoint also ships its MTP block as trunk layer ``num_hidden_layers``
-(``model.layers.78`` for GLM-5), which the model does not build; its fused
-outputs are dropped as unexpected keys.
+(``model.layers.78`` for GLM-5), which the model does not build. The streaming
+loader skips those keys unread; the other loaders merge them and drop the fused
+outputs as unexpected keys.
 """
 
 from typing import Dict

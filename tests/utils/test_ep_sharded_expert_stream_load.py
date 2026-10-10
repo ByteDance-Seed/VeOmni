@@ -35,6 +35,7 @@ from torch.distributed.tensor import Shard
 import veomni.models.module_utils as module_utils
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.models.transformers.deepseek_v3.checkpoint_tensor_converter import DeepseekV3CheckpointTensorConverter
+from veomni.models.transformers.glm_moe_dsa.checkpoint_tensor_converter import GlmMoeDsaCheckpointTensorConverter
 from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import Qwen3MoeCheckpointTensorConverter
 from veomni.models.transformers.qwen3_omni_moe.checkpoint_tensor_converter import (
     Qwen3OmniMoeCheckpointTensorConverter,
@@ -294,6 +295,8 @@ class _PerExpertTrunkModel(nn.Module):
         pytest.param(Qwen3MoeCheckpointTensorConverter, "model.layers.0", None, id="qwen3_moe"),
         # DeepSeek-V3 ships its MTP layer as one extra trunk index the model does not build.
         pytest.param(DeepseekV3CheckpointTensorConverter, "model.layers.0", "model.layers.1", id="deepseek_v3"),
+        # So does GLM-5 (``model.layers.78``).
+        pytest.param(GlmMoeDsaCheckpointTensorConverter, "model.layers.0", "model.layers.1", id="glm_moe_dsa"),
         # VeOmni builds Qwen3-Omni-MoE with has_talker=False.
         pytest.param(
             Qwen3OmniMoeCheckpointTensorConverter,
