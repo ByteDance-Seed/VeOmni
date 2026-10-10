@@ -547,7 +547,7 @@ KERNEL_REGISTRY.register(
         op_name="cross_entropy_loss",
         variant="causal",
         factory=_liger_fused_ce_causal_factory,
-        hardware=HardwareRequirement(device_type="gpu"),
+        hardware=HardwareRequirement(device_type=["gpu", "mlu"]),
         description="Liger fused linear cross-entropy loss for causal LM (shifts labels, SP reduction)",
     )
 )
@@ -558,7 +558,7 @@ KERNEL_REGISTRY.register(
         op_name="cross_entropy_loss",
         variant="seq_cls",
         factory=_liger_fused_ce_seq_cls_factory,
-        hardware=HardwareRequirement(device_type="gpu"),
+        hardware=HardwareRequirement(device_type=["gpu", "mlu"]),
         description="Liger fused linear cross-entropy loss for sequence classification (no shift)",
     )
 )
