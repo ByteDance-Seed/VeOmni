@@ -37,17 +37,19 @@ Use this reference to decide which files to trust before editing SeedOmni.
 
 ## Docs
 
-- `docs/seed_omni/seed_omni.md`
-  - Authoritative architecture and developer guide. Start here for intent, but
-    verify schema details against current graph source.
-- `docs/seed_omni/av_video_design.md`
-  - Decided-but-unimplemented design for audio-bearing video. Read only when
-    adding an audio modality.
-- `docs/seed_omni/omni_v2_refactor_migration.md`
-  - Historical merge notes; its path map predates `accelerated/`. Read only for
-    the CPU preprocessor rationale, and verify every path against the tree.
-- `docs/seed_omni/example_models/janus.md`
-  - Janus pipeline notes when present.
+- `docs/seed_omni/design/architecture.md`
+  - Architecture: module split, conversation carrier, graph views, train and
+    generation flow, file map. Start here for intent, but verify schema details
+    against current graph source.
+- `docs/seed_omni/design/sequence_parallel.md`
+  - Ulysses contract and correctness invariants.
+- `docs/seed_omni/design/media.md`
+  - Video / audio reading and saving, plus the decided-but-unimplemented
+    audio-bearing video design. Read when touching media or adding audio.
+- `docs/seed_omni/usage/`
+  - `data_format.md`, `training_and_inference.md`, `adding_a_model.md`.
+- `docs/seed_omni/models/*.md`
+  - Per-model recipes (Janus, Qwen3, Qwen3 MoE, Qwen3-VL, BAGEL).
 
 ## Skill Resources
 

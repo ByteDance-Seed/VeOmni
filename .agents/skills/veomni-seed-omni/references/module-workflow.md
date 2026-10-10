@@ -37,7 +37,7 @@ Follow the existing folder shape:
 - `modeling.py`: weights, `forward`, and — if inference-capable — an in-file
   `InferenceMixin` (`generate()` + FSM state, listed before
   `PretrainedOmniModule` in the model class's bases; see §2.1 of
-  `docs/seed_omni/seed_omni.md`).
+  `docs/seed_omni/design/architecture.md`).
 - `accelerated/accelerated.py`: composable `TrainingMixin` / `VeOmniMixin` hooks (no
   `InferenceMixin` — that lives on `modeling.py` now), CPU preprocessor, and
   **IDE type stubs** for modeling APIs (see

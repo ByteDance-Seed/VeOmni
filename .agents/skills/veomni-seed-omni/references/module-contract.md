@@ -95,7 +95,7 @@ Critical SP rule: stash the **full (pre-slice)** per-sample seqlens, not the
 `if sp_size > 1:` slice). `OmniEnvironMeter` sums tokens
 + FLOPs over the `dp_group` (which excludes the replicated SP ranks), so the
 full-sample value counted once per DP shard reconstructs the global total; reading
-the sliced forward `data` would under-count by ~`sp`. See constraint 7c. A
+the sliced forward `data` would under-count by ~`sp`. See constraint 7e. A
 call-site that shouldn't be counted (e.g. a VQ codec's `decode`) simply stashes
 nothing → `[]`.
 

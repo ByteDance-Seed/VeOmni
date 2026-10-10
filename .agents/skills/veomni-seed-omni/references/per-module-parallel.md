@@ -51,15 +51,12 @@ backbone:
 
 ## Sequence Parallel (Ulysses)
 
-> **Architecture (2026-07-20, implemented — Arch B):** SeedOmni uses classic
-> single-pass Ulysses at ONE **uniform** SP size shared by the outer trainer and
-> every module. The earlier looped per-module SP (Arch A: outer SP=1, distinct
-> per-rank samples, per-sample loop + gather-to-owner + activation offload/ckpt +
-> `fsdp2_ac_patch`) is **deleted**. Decision record + deferred future work
-> (data-balance, compute-packing, audio/video halo): `docs/seed_omni/module_level_sp.md`.
+> SeedOmni uses classic single-pass Ulysses at ONE **uniform** SP size shared by
+> every module. Design, invariants and open limitations (item balancing for
+> audio/video encoders, compute-aware packing): `docs/seed_omni/design/sequence_parallel.md`.
 
-SP is **uniform**. Set the SP size on the outer trainer
-(`accelerator.ulysses_size`); every module inherits it through the per-module
+SP is **uniform**. Set the SP size on the global accelerator
+(`model.accelerator.ulysses_size`, CLI `--model.accelerator.ulysses_size`); every module inherits it through the per-module
 accelerator deep-merge in `build_omni_module_runtime_args`. Do NOT add per-module
 `ulysses_size` overrides — nothing validates uniformity, so an override silently
 produces a non-uniform run. The dataloader is the
@@ -69,7 +66,7 @@ rank of an SP group holds the SAME sample.
 
 A module with `sp_size = S > 1` runs classic single-pass Ulysses, with the SP
 slice/gather living INSIDE its own `pre_forward` / `post_forward` (no separate
-`sp_pre_forward` / `sp_post_forward` hooks — same shape as veomni v1 single-model
+`sp_pre_forward` / `sp_post_forward` hooks — same shape as single-model
 SP):
 
     kwargs = module.pre_forward(**data)    # if sp_size>1: pad + slice replicated sample to 1/S
@@ -79,7 +76,7 @@ SP):
 Forward AND backward both peak at ≈ `1/S` — no loop, no per-sample checkpoint, no
 CPU offload. `gather_outputs` uses autograd-aware `_Gather`; its backward
 all-reduce over the SP group is cancelled by FSDP2's grad averaging over the
-`dp_shard_sp` mesh, so gradients match the non-SP baseline (constraints 7a/7b).
+`dp_shard_sp` mesh, so gradients match the non-SP baseline (constraints 7c/7d).
 
 Primitives (`distributed/sequence_parallel`), each called from an
 `if get_parallel_state().sp_size > 1:` branch:
@@ -102,7 +99,7 @@ Which dim shards depends on the module's attention:
   replicated batch is exactly per-rank image balance. DDP modules AVG param grads
   over `fsdp_group` in `veomni_clip_grad_norm` /
   `veomni_omni_module_clip_grad_norm` when `sp_size > 1`, and set
-  `broadcast_buffers=False` under SP (constraints 7e).
+  `broadcast_buffers=False` under SP (constraint 7a).
 
 **Per-module group isolation.** Each module builds its OWN `ParallelState`/device
 mesh, so even at the same uniform SP size the modules hold distinct SP subgroup
@@ -129,7 +126,7 @@ flash-attention path, so SDPA leaves the sliced chunk ungathered while the
 cu_seqlens describe the full sequence (a `split_with_sizes` size mismatch).
 
 Metering must stash **pre-slice full-sample** seqlens in `pre_forward` (see
-`module-contract.md` + constraint 7c). All backbones (`qwen3/llm`, `janus/llama`,
+`module-contract.md` + constraint 7e). All backbones (`qwen3/llm`, `janus/llama`,
 `qwen3vl/llm`), the text encoder (`base/text_encoder`) and vision towers
 (`qwen3vl/vision`, `janus/siglip`, `janus/vqvae`) support `sp_size > 1`. The
 Qwen3-VL in-model backbone (`qwen3vl/llm`) slices the packed sequence INCLUDING

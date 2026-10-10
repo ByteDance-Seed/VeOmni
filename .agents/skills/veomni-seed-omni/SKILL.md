@@ -1,5 +1,5 @@
 ---
-name: seedomni-v2
+name: veomni-seed-omni
 description: "SeedOmni development guidance for Open-VeOmni. Use when adding or modifying `veomni/models/seed_omni/`, Omni modules, module mixins, CPU preprocessors, conversation carrier handling, training or generation graph YAML, SeedOmni split-checkpoint scripts, per-module accelerators, distributed/eager Omni inference, or SeedOmni validation. Triggers include: new OmniModule, modify SeedOmni module, wire graph, update `training_graph` or `generation_graph`, split SeedOmni checkpoint, add Preprocessor, change conversation_list flow, configure per-module FSDP2/DDP/emb/ep, or debug SeedOmni train/infer graph behavior."
 ---
 

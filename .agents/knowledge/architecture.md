@@ -7,9 +7,9 @@ This document describes VeOmni's architecture for AI coding agents. Read this to
 ```
 veomni/
 ├── arguments/          CLI argument parsing
-│   ├── arguments_types.py      V1 VeOmniArguments + the shared model-args base
+│   ├── arguments_types.py      VeOmniArguments + the shared model-args base
 │   ├── parser.py
-│   ├── omni_arguments_types.py V2 OmniArguments (launcher + per-module runtime)
+│   ├── omni_arguments_types.py SeedOmni OmniArguments (launcher + per-module runtime)
 │   └── omni_parser.py
 ├── checkpoint/         DCP-based distributed checkpoint save/load
 ├── data/               Data pipeline: datasets, collators, transforms, dynamic batching
@@ -94,6 +94,7 @@ veomni/
 │   │   ├── cross_entropy/  eager/liger/npu-chunk loss variants
 │   │   ├── gated_delta_rule/  Qwen3.5 linear-attention kernels
 │   │   ├── load_balancing_loss/  eager + triton variants
+│   │   ├── mhc/        TileKernels DeepSeek V4 pre/post/head adapters
 │   │   ├── rms_norm/   Liger/NPU/batch-invariant Triton RMSNorm
 │   │   ├── rotary/     Liger/NPU + DeepSeek V3 deterministic + Wan Triton
 │   │   ├── swiglu/     Liger SwiGLU MLP
@@ -122,7 +123,7 @@ veomni/
 │   │                   (eager, or FSDP/DDP via the runtime). Launched by
 │   │                   tasks/omni/{train,infer}_omni.py
 │   └── callbacks/      Training callbacks (checkpoint, evaluate, trace, etc.;
-│                       omni_callbacks/ holds the environ meter and graph
+│                       omni_callbacks/ holds the step metrics and graph
 │                       profile callbacks)
 └── utils/              Shared utilities (logging, device, constants, helpers)
 ```
@@ -183,11 +184,11 @@ Checkpointing is split three ways; `OmniTrainer` uses the same `CheckpointCallba
 
 - **When** — `CheckpointCallback` (`veomni/trainer/callbacks/checkpoint_callback.py`). It owns the every-N-steps/epochs cadence for DCP, HF/LoRA, and the one-shot tokenizer/config sidecars, and calls nothing but the trainer / model handles.
 - **What** — `BaseTrainer.load()` / `save_dcp()` / `save_hf_or_lora()` / `save_model_assets()`, one line each, fanning out to `self.model.<same name>()`. A trainer holding a second model (a DPO reference, a distillation teacher) extends the fan-out here without the callbacks learning about it.
-- **How** — `VeOmniModelRuntime` forwards to its `ModelCheckpointManager`, which owns the *ordering* (drain async saves, `empty_cache` around the DCP write, barrier, then export) — the part previously duplicated between the V1 callbacks and V2's per-module manager. The base's paths stop at the step directory; a multi-module model's subclass (`OmniModuleCheckpointManager`) overrides the path methods and `_checkpointer_kwargs()` to nest every artifact one level deeper under its module name via `veomni/checkpoint/layout.py`.
+- **How** — `VeOmniModelRuntime` forwards to its `ModelCheckpointManager`, which owns the *ordering* (drain async saves, `empty_cache` around the DCP write, barrier, then export) — the part previously duplicated between the standalone trainer's callbacks and SeedOmni's per-module manager. The base's paths stop at the step directory; a multi-module model's subclass (`OmniModuleCheckpointManager`) overrides the path methods and `_checkpointer_kwargs()` to nest every artifact one level deeper under its module name via `veomni/checkpoint/layout.py`.
 
 Only this model's lr_scheduler travels with the DCP write (the checkpointer pickles `state_dict` into a single `model/lr_scheduler.pt`; rank 0 writes, every rank reads). Weights and optimizer are two DCP directories (`model/ckpt/`, `model/optimizer/`). Job-level state — the dataloader cursor, the rng, the meters — belongs to `GlobalStateCallback` (`veomni/trainer/callbacks/global_state_callback.py`) as `loader/rank_{N}.pt` and `extra_state/rank_{N}.pt`, because with several models in one job there is one such record but N model checkpoints. That callback also writes the step's `checkpoint_manifest.json`. VeOmni 0.1.12 `extra_state/` resume is `veomni/checkpoint/legacy_v0_1_12.py` (delete that file to drop it). On-disk layout: `docs/usage/checkpoint.md`.
 
-Those cursor files are written **per rank**, where V2 writes a single rank-0 `trainer_state.pt`. The cursor is rank-local by construction: iterable datasets are `split_dataset_by_node`-sharded on `dp_rank` (`veomni/data/dataset.py:1509`), the multisource sampler filters on `_global_sample_idx % dp_size == dp_rank` (`:596`), and Energon takes `dp_rank` in its `WorkerConfig` (`:1645`). Restoring one rank's cursor everywhere makes every rank resume on rank 0's shard — replaying that slice and skipping the rest. Only the map-style path is rank-agnostic, which is why the single-file version looks correct until an iterable dataset resumes.
+Those cursor files are written **per rank**, where SeedOmni writes a single rank-0 `trainer_state.pt`. The cursor is rank-local by construction: iterable datasets are `split_dataset_by_node`-sharded on `dp_rank` (`veomni/data/dataset.py:1509`), the multisource sampler filters on `_global_sample_idx % dp_size == dp_rank` (`:596`), and Energon takes `dp_rank` in its `WorkerConfig` (`:1645`). Restoring one rank's cursor everywhere makes every rank resume on rank 0's shard — replaying that slice and skipping the rest. Only the map-style path is rank-agnostic, which is why the single-file version looks correct until an iterable dataset resumes.
 
 `BaseTrainer` adds the job-bound half:
 - `_build_dataloader()` -> data pipeline setup
@@ -198,7 +199,7 @@ Subclasses override specific methods (e.g., `compute_loss()`, custom data transf
 
 **Parallel-state scoping**: `BaseTrainer._setup(args)` registers `"base"` via `init_parallel_state_from_config` before seed/determinism — it is a staticmethod because everything it does is job-level and runs before any model exists. A model then derives its own mesh in `VeOmniModelRuntime.setup()`; `VeOmniModelRuntime.__init__` scopes the mesh-dependent build to that mesh, so the trainer's remaining build steps need no scope of their own. Run time is **per-op**: `forward_backward_step` wraps `use_parallel_state(self.model.parallel_state)` around forward, postforward, and backward so none of them hard-code `"base"` (DPO wraps policy vs reference itself). `clip_grad_norm()` still wraps itself. The `parallel_state` property is a by-name registry lookup, never a stored state object, so the registry stays the single source of truth. See `.agents/knowledge/constraints.md` §7 and `docs/design/local_parallel_state.md`.
 
-### V2 (`veomni.trainer.omni`) — SeedOmni graph trainers
+### SeedOmni graph trainers (`veomni.trainer.omni`)
 
 There are exactly **two** ways to build a SeedOmni model, and the trainer / inferencer holds exactly **one** model handle for either — `self.model`:
 
@@ -219,7 +220,7 @@ OmniInferencer                       -> tasks/omni/infer_omni.py
 └── self.model = OmniModelRuntime (any FSDP2/DDP module) | OmniModel (all eager)
 ```
 
-V2 reuses lower-level libraries (`distributed/`, `optim/`, `models/`, `data/`, `checkpoint/`) and does **not** inherit `BaseTrainer` — but `ModuleRuntime` **does** subclass `VeOmniModelRuntime`, because a module *is* one model's training unit; the composed-model and job layers are what V2 replaces.
+SeedOmni reuses lower-level libraries (`distributed/`, `optim/`, `models/`, `data/`, `checkpoint/`) and does **not** inherit `BaseTrainer` — but `ModuleRuntime` **does** subclass `VeOmniModelRuntime`, because a module *is* one model's training unit; the composed-model and job layers are what SeedOmni replaces.
 
 `ModuleRuntime(VeOmniModelRuntime)` inherits the whole build sequence (meta-init, freeze/LoRA, FSDP2/DDP wrap + weight load, optimizer, lr-scheduler, `ParallelState` registration) and overrides only where a *module* differs from a standalone model. `accelerator.fsdp_config.fsdp_scope` (`module` default, or `model`) chooses whether each module wraps itself or `OmniModelRuntime` `fully_shard`s the composed `OmniModel` once after all modules are meta-initialized. Under `model` scope, wrap targets are each child's `_no_split_modules` prefixed with that child's name (`janus_llama.LlamaDecoderLayer`, `janus_text_encoder.Embedding`), so a class name applies only under the child that declared it — `Embedding` is a valid unit under the text encoder but would shard the VQ codebook. Leftover params live on the OmniModel root and unshard via `OmniModel.forward()`.
 
@@ -268,7 +269,7 @@ Nothing is discarded. Projecting onto the slim, checkpoint-shaped `OmniConfig` i
 separate explicit step, `.to_hf_config()`, taken only where an HF artefact is needed:
 `build_omni_model_runtime()` and `OmniInferencer` (because `OmniModel` is a
 `PreTrainedModel` that needs one for `save_pretrained`), and the checkpoint export script.
-Graph-only consumers such as `scripts/visualize_omni_graph.py` use the runtime args
+Graph-only consumers such as `scripts/seed_omni/visualize_graph.py` use the runtime args
 directly and never convert.
 
 `OmniConfig` keeps two views of every module. `_module_entries[name]` is the root
@@ -307,7 +308,7 @@ All of this rests on `_deep_update` (`arguments/parser.py`), shared with `__inhe
 merging: nested mappings merge, lists and scalars replace, an explicit `None` clears, and
 an **empty mapping is a merge of nothing rather than an erasure** — which is how a layer
 says it has nothing to say about a key (`accelerator: {}`, a bare module name under
-`modules:`) without taking the layers below it down. See `tests/seed_omni/test_config_merge.py`.
+`modules:`) without taking the layers below it down. See `tests/seed_omni/arguments/test_config_merge.py`.
 
 `to_hf_config()` persists the model fields only (`model_path`, `model_config`,
 `processor_config`, `ops_implementation`) — never `accelerator`, for the same reason.
@@ -327,15 +328,15 @@ into an `OmniConfig` goes through `veomni.arguments.omni_arguments_types`
 `build_omni_module_runtime_args()`.
 Those resolution helpers stay next to `OmniArguments` so the launcher can type
 `model:` as the runtime config without an arguments ↔ accelerated import cycle.
-`from veomni.arguments import parse_args` does not import the Omni types, so a V1
-job does not load seed_omni.
+`from veomni.arguments import parse_args` does not import the Omni types, so a standalone
+trainer job does not load seed_omni.
 
 **Model-args inheritance**: `BaseModelArguments` (model fields, HDFS localization, the
 lazily parsed and per-index-path cached `fqn_to_index_mapping`) -> `ModelArguments`
 (adds load policy + `accelerator` + `optimizer`, i.e. one complete training unit) ->
-V2's `OmniModuleRuntimeArguments` / `OmniModelRuntimeArguments`. A knob that belongs to a
-training unit is therefore declared once and applies per module in V2 and to the one
-model in V1; `AcceleratorConfig.__post_init__` validates the mesh, `ModelArguments.__post_init__`
+SeedOmni's `OmniModuleRuntimeArguments` / `OmniModelRuntimeArguments`. A knob that belongs to a
+training unit is therefore declared once and applies per module in SeedOmni and to the one
+model in a standalone trainer; `AcceleratorConfig.__post_init__` validates the mesh, `ModelArguments.__post_init__`
 the load policy, so a per-module override is checked on the same terms as the top-level default.
 
 **Generation scenarios**: `OmniConfig` holds *every* FSM from `model.model_config.infer_graph` in
@@ -345,11 +346,11 @@ can still run `infer_und` — set `config.infer_type` and rebuild the model. `Om
 binds one FSM at `__init__`, so switching at runtime on an already-built model is not
 supported.
 
-**Parallel-state scoping (V2)**: each `ModuleRuntime` registers its `ParallelState` under its **module name** (registry key = checkpoint subdir) in the inherited `VeOmniModelRuntime.setup()`. `OmniModelRuntime.module_context` re-enters it through the module's own `_scoped()` (a no-op for an eager inference module, which never registers one). The orchestrator never wraps a module's private mesh — `OmniModelRuntime.clip_grad_norm()` combines each `module_runtime.clip_grad_norm()`.
+**Parallel-state scoping (SeedOmni)**: each `ModuleRuntime` registers its `ParallelState` under its **module name** (registry key = checkpoint subdir) in the inherited `VeOmniModelRuntime.setup()`. `OmniModelRuntime.module_context` re-enters it through the module's own `_scoped()` (a no-op for an eager inference module, which never registers one). The orchestrator never wraps a module's private mesh — `OmniModelRuntime.clip_grad_norm()` combines each `module_runtime.clip_grad_norm()`.
 
 ## Data Flow
 
-### V1 (BaseTrainer)
+### Standalone trainers (`BaseTrainer`)
 
 ```
 YAML Config -> VeOmniArguments -> Trainer
@@ -373,7 +374,7 @@ YAML Config -> VeOmniArguments -> Trainer
                             (with callbacks)
 ```
 
-### V2 (SeedOmni)
+### SeedOmni
 
 ```
 YAML Config -> OmniArguments
@@ -528,7 +529,7 @@ both unit workflows. See `.agents/knowledge/testing.md` before adding a test.
 | VLM SFT | `tasks/train_vlm.py` | `VLMTrainer` |
 | VLM RL | `tasks/train_vlm_rl.py` | `BaseRLTrainer` |
 | DiT | `tasks/train_dit.py` | `DitTrainer` |
-| Omni (V2) | `tasks/omni/train_omni.py` | `OmniTrainer` |
-| Omni infer (V2) | `tasks/omni/infer_omni.py` | `OmniInferencer` |
+| Omni | `tasks/omni/train_omni.py` | `OmniTrainer` |
+| Omni infer | `tasks/omni/infer_omni.py` | `OmniInferencer` |
 | Inference (text) | `tasks/infer/infer_text.py` | N/A |
 | Inference (VLM) | `tasks/infer/infer_qwen2_vl.py` | N/A |

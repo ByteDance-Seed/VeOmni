@@ -97,7 +97,7 @@ infer_gen: {initial: ..., states: {...}}
 infer_und: {initial: ..., states: {...}}
 ```
 
-`training_graph.yaml` is the same map idea, keyed by ``train_type`` (a lone DAG
+The `<checkpoint>/training_graph.yaml` sidecar is the same map idea, keyed by ``train_type`` (a lone DAG
 uses the name ``default``):
 
 ```yaml
