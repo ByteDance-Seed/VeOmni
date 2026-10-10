@@ -916,14 +916,15 @@ def _is_minimax_h3_path(filename: str) -> bool:
 
 @pytest.mark.parametrize("attention", ["sdpa", "veomni_flash_attention_2"])
 @pytest.mark.parametrize("mode", ["single", "packed"])
-def test_no_implicit_sync_in_minimax_h3_forward_backward(mode, attention):
+@pytest.mark.parametrize("cfg_mode", ["off", "per_sample"])
+def test_no_implicit_sync_in_minimax_h3_forward_backward(mode, attention, cfg_mode):
     """No implicit CUDA sync from MiniMax H3 modeling during a training step."""
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
     if attention != "sdpa" and importlib.util.find_spec("flash_attn") is None:
         pytest.skip("flash_attn package not installed.")
 
-    from tests.models.test_minimax_h3_packing import condition_model, raw_sample, tiny_model
+    from tests.models.test_minimax_h3_packing import cfg_condition, cfg_raw, condition_model, raw_sample, tiny_model
     from veomni.trainer.dit_trainer import DiTDataCollator
 
     fused = attention != "sdpa"
@@ -933,13 +934,15 @@ def test_no_implicit_sync_in_minimax_h3_forward_backward(mode, attention):
     config = tiny_model().config
     config._attn_implementation = attention
     model = type(tiny_model())(config).to(device=device, dtype=dtype)
-    raws = [raw_sample(3), raw_sample(5, "ref2va")][: 1 if mode == "single" else 2]
+    make_sample = cfg_raw if cfg_mode == "per_sample" else raw_sample
+    raws = [make_sample(3, "fl2va"), make_sample(5, "ref2va")][: 1 if mode == "single" else 2]
     for row in raws:
         row["use_gradient_checkpointing"] = True
         for key in ("input_latents", "audio_input_latents", "prompt_embeds"):
             row[key] = row[key].to(dtype)
+    condition = condition_model() if cfg_mode == "off" else cfg_condition()
     collated = _to_device_recursive(dict(DiTDataCollator()(raws)), device)
-    condition = condition_model().to(device)
+    condition = condition.to(device)
 
     def step():
         sum(model(**condition.process_condition(**collated)).loss.values()).backward()

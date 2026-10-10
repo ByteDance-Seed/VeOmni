@@ -38,12 +38,8 @@ from .minimax_h3_core.minimax_h3_audio_vae import MiniMaxH3AudioVAE
 from .minimax_h3_core.minimax_h3_dit import pack_audio, patchify_video
 from .minimax_h3_core.minimax_h3_text_encoder import (
     MiniMaxH3TextEncoder,
-    image_token_counts,
-    presentation_fl2va,
-    presentation_ref2va,
-    presentation_t2va,
-    sample_qwen_video_frames,
-    video_token_counts,
+    encode_prompt,
+    prepare_ref_prompt,
 )
 from .minimax_h3_core.minimax_h3_video_vae import MiniMaxH3VideoVAE
 from .minimax_h3_core.packed_sequence import build_packed_fl2va, host_cu_seqlens
@@ -604,70 +600,24 @@ class MiniMaxH3Unit_PromptEmbedder(PipelineUnit):
         )
 
     def preprocess_ref_blocks(self, pipe: MiniMaxH3Pipeline, prompt, ref_blocks):
-        pixel_values = image_grid_thw = pixel_values_videos = video_grid_thw = None
-        counters = {"image": 0, "audio": 0, "video": 0}
-        images, videos, timestamps_per_video, condition_labels = [], [], [], []
-        for block in ref_blocks:
-            kind = block["kind"]
-            if kind == "image":
-                counters["image"] += 1
-                condition_labels.append(("image", counters["image"]))
-                images.append(block["prepared_image"])
-            elif kind == "audio":
-                counters["audio"] += 1
-                condition_labels.append(("audio", counters["audio"]))
-            elif kind in ("video", "video_audio"):
-                if int(block["ref_audio_t"]) > 0:
-                    counters["audio"] += 1
-                    condition_labels.append(("audio", counters["audio"]))
-                counters["video"] += 1
-                condition_labels.append(("video", counters["video"]))
-                sampled, timestamps = sample_qwen_video_frames(block["prepared_frames"])
-                videos.append(np.stack([np.asarray(f) for f in sampled]))
-                timestamps_per_video.append(timestamps)
-            else:
-                raise ValueError(f"unknown reference kind: {kind}")
-
-        image_counts, video_counts, video_timestamps = [], [], []
-        if len(images) > 0:
-            pixel_values, image_grid_thw, image_counts = image_token_counts(pipe.processor, images)
-        if len(videos) > 0:
-            pixel_values_videos, video_grid_thw, video_counts, video_timestamps = video_token_counts(
-                pipe.processor, videos, timestamps_per_video
-            )
-        input_ids, text_token_tags = presentation_ref2va(
-            pipe.tokenizer, prompt, condition_labels, image_counts, video_counts, video_timestamps
-        )
-        return input_ids, text_token_tags, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw
+        return prepare_ref_prompt(pipe.processor, pipe.tokenizer, prompt, ref_blocks)
 
     def process(self, pipe: MiniMaxH3Pipeline, prompt, keyframes=None, ref_blocks=None, height=None, width=None):
         pipe.load_models_to_device(self.onload_model_names)
-        pixel_values = image_grid_thw = pixel_values_videos = video_grid_thw = None
-        if ref_blocks:
-            input_ids, text_token_tags, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw = (
-                self.preprocess_ref_blocks(pipe, prompt, ref_blocks)
-            )
-        elif keyframes:
+        if keyframes and not ref_blocks:
             keyframes = [img.convert("RGB").resize((width, height), Image.LANCZOS) for img in keyframes]
-            pixel_values, image_grid_thw, image_counts = image_token_counts(pipe.processor, keyframes)
-            input_ids, text_token_tags = presentation_fl2va(pipe.tokenizer, prompt, image_counts)
-        else:
-            input_ids, text_token_tags = presentation_t2va(pipe.tokenizer, prompt)
-
-        ids = input_ids.unsqueeze(0).to(pipe.device)
-        kwargs = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
-        if pixel_values is not None:
-            kwargs["pixel_values"] = pixel_values.to(pipe.device, pipe.torch_dtype)
-            kwargs["image_grid_thw"] = image_grid_thw.to(pipe.device, torch.long)
-        if pixel_values_videos is not None:
-            kwargs["pixel_values_videos"] = pixel_values_videos.to(pipe.device, pipe.torch_dtype)
-            kwargs["video_grid_thw"] = video_grid_thw.to(pipe.device, torch.long)
-        hidden = pipe.text_encoder(**kwargs)
-
-        return {
-            "prompt_embeds": hidden.to(pipe.device, pipe.torch_dtype),
-            "text_token_tags": text_token_tags.view(-1).to(pipe.device, torch.long),
-        }
+        encoded = encode_prompt(
+            pipe.text_encoder,
+            pipe.processor,
+            pipe.tokenizer,
+            prompt,
+            device=pipe.device,
+            dtype=pipe.torch_dtype,
+            keyframes=None if ref_blocks else keyframes,
+            ref_blocks=ref_blocks,
+        )
+        encoded["text_token_tags"] = encoded["text_token_tags"].to(pipe.device)
+        return encoded
 
 
 class MiniMaxH3Unit_InputVideoEmbedder(PipelineUnit):

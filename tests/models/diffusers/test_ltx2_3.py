@@ -54,8 +54,14 @@ def _sdpa_ops_config() -> SimpleNamespace:
     return ops
 
 
-_OFFICIAL_ATTENTION_FORWARD = Attention.forward
+_VENDORED_ATTENTION_FORWARD = Attention.forward
 _OFFICIAL_LTX_MODEL_FORWARD = LTXModel.forward
+
+
+def _official_attention_forward(self, *args, sp_valid_length=None, sp_context_length=None, **kwargs):
+    # The shared transformer block always passes the Ulysses lengths. They stay None without SP.
+    assert sp_valid_length is None and sp_context_length is None
+    return _VENDORED_ATTENTION_FORWARD(self, *args, **kwargs)
 
 
 class _MathSDPAAttention:
@@ -138,7 +144,7 @@ def test_ltx2_3_eager_forward_and_backward_match_vendored_reference():
 
         def call(model):
             if model is official:
-                Attention.forward = _OFFICIAL_ATTENTION_FORWARD
+                Attention.forward = _official_attention_forward
                 LTXModel.forward = _OFFICIAL_LTX_MODEL_FORWARD
                 inputs = official_inputs
             else:
