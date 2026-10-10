@@ -100,10 +100,12 @@ See `veomni/models/transformers/qwen3_moe/qwen3_moe_gpu_patch_gen_config.py` for
 
 ### Loading (HF safetensors -> VeOmni modeling)
 
-A runtime `CheckpointTensorConverter`
-(`veomni/models/transformers/qwen3_moe/checkpoint_tensor_converter.py`) is
-registered on every patchgen-generated model class. It converts per-expert HF
-keys at load time:
+A runtime `CheckpointTensorConverter` is registered on every patchgen-generated
+model class. For per-expert HF checkpoints, Qwen3-MoE, Qwen3.5-MoE (its MTP
+experts), Qwen3-Omni-MoE and DeepSeek-V3 all use thin subclasses of
+`PerExpertFusedCheckpointTensorConverter`
+(`veomni/models/_moe_per_expert_converter.py`). It converts per-expert HF keys
+at load time:
 
 ```
 HF per-expert:                             VeOmni fused:
@@ -112,15 +114,19 @@ HF per-expert:                             VeOmni fused:
   experts.{j}.down_proj.weight [H, I]   ->   experts.down_proj    [E, H, I]
 ```
 
-This eliminates the need for offline `moe_merge.py` preprocessing.
+This eliminates the need for offline `moe_merge.py` preprocessing. The converter
+does not dequantize: an FP8 per-expert checkpoint, such as the official
+DeepSeek-V3 release, raises `ValueError` and must be converted to BF16 first.
 
 With `model.ep_sharded_stream_load=true`, the converter also streams per rank.
 It reports each per-expert key's fused target and expert index
 (`fused_expert_target`), and builds a converter restricted to this rank's
 `Shard(0)` expert range (`for_expert_range`). Each EP rank then reads only its
 own `E/ep` experts' tensors and stacks them straight into its local
-`[E/ep, ...]` slice. A converter that does not implement both methods still
-makes the streaming loader raise `NotImplementedError`.
+`[E/ep, ...]` slice. Per-expert keys of modules the model does not build, such
+as the Qwen3-Omni-MoE talker or the DeepSeek-V3 MTP layer, are skipped without
+being read. A converter that does not implement both methods, for example
+DeepSeek-V4's, still makes the streaming loader raise `NotImplementedError`.
 
 ### Saving (VeOmni modeling -> checkpoint)
 
