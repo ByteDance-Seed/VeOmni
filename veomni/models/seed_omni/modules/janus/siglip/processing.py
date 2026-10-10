@@ -28,7 +28,7 @@ from .configuration import JanusSiglipConfig
 
 
 class JanusSiglipProcessor(JanusImageProcessor):
-    """Alias — keeps the per-module asset name explicit in the V2 docs."""
+    """Alias — keeps the per-module asset name explicit in the SeedOmni docs."""
 
 
 class JanusSiglipPreprocessor(ModulePreprocessorBase):

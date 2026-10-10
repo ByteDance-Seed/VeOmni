@@ -43,7 +43,7 @@ class FlowGenerationState:
         device: torch.device,
     ) -> None:
         if bool(generation_kwargs.get("enable_taylorseer", False)):
-            raise NotImplementedError("BAGEL infer_gen TaylorSeer is not implemented in the V2 graph path.")
+            raise NotImplementedError("BAGEL infer_gen TaylorSeer is not implemented in the SeedOmni graph path.")
 
         image_height = int(generation_kwargs.get("image_height", resolution))
         image_width = int(generation_kwargs.get("image_width", image_height))

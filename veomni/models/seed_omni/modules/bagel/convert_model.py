@@ -128,7 +128,7 @@ def convert_bagel_checkpoint(
     max_latent_size: int = 64,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Split an upstream BAGEL checkpoint into five V2 modules."""
+    """Split an upstream BAGEL checkpoint into five SeedOmni modules."""
     training_graphs, generation_graphs = load_family_graphs(
         "configs/seed_omni/Bagel/bagel_7b_mot",
         training="train/graph_train.yaml",

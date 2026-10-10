@@ -61,7 +61,7 @@ class VideoInputs:
     * ``audio`` — optional in-video waveform (``None`` when there is no audio
       track or extraction was disabled). No module consumes it yet; the intended
       wrapping and time-interleave are recorded in
-      ``docs/seed_omni/av_video_design.md``.
+      ``docs/seed_omni/design/media.md``.
 
     The two timelines are *not* here. They ride on the item's
     ``ConversationItem.meta`` under :data:`VIDEO_METADATA_KEY` and

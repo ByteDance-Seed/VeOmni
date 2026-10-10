@@ -24,7 +24,7 @@ class BagelChatMarkers(ChatMarkers):
 
 
 class BagelChatTemplate(TextEncoderChatTemplate):
-    """BAGEL-specific template over V2 conversation rows.
+    """BAGEL-specific template over SeedOmni conversation rows.
 
     The template is intentionally row-preserving: text rows are tokenized, and
     image rows are bracketed by marker text rows, but marker-image-marker packing

@@ -34,7 +34,7 @@ JANUS_GENERATION_KWARGS = {
 
 
 def convert_janus_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
-    """Split an upstream Janus checkpoint into four V2 modules.
+    """Split an upstream Janus checkpoint into four SeedOmni modules.
 
     A DeepSeek-format source (``model_type: multi_modality``) is first converted
     to the HF layout in a temporary directory.

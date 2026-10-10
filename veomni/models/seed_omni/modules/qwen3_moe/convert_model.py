@@ -34,7 +34,7 @@ from ...utils.convert_registry import OMNI_CONVERT_REGISTRY, attach_module_asset
 
 
 def convert_qwen3_moe_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
-    """Split an upstream Qwen3-MoE checkpoint into two V2 modules."""
+    """Split an upstream Qwen3-MoE checkpoint into two SeedOmni modules."""
     training_graphs, generation_graphs = load_family_graphs(
         "configs/seed_omni/Qwen/qwen3_30b_a3b/train",
         training="graph_train.yaml",

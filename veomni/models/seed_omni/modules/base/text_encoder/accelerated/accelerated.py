@@ -99,7 +99,7 @@ class TrainingMixin(TrainingModuleMixin):
     def decode_post(self, loss: torch.Tensor, logits: torch.Tensor) -> Dict[str, Any]:
         conversation = self._conversation_carrier
         self._conversation_carrier = None
-        # V2 single-loss protocol: drop logits, rename ``loss`` → ``_loss``.
+        # Single-loss protocol: drop logits, rename ``loss`` → ``_loss``.
         if loss is not None:
             return {"_loss": loss, "conversation_list": conversation}
         # TODO: scatter logits for rl training
@@ -222,7 +222,7 @@ class TrainingMixin(TrainingModuleMixin):
         this method used to call inline.
 
         (c) A span with no supervised token scores 0.0, matching the native
-        clamped denominator required by constraint 7b. Every fused backend
+        clamped denominator required by constraint 7d. Every fused backend
         normalizes by its own supervised-token count with no way to clamp it
         (Liger divides by ``n_non_ignore``, chunk_loss recounts the labels), so
         such a span is routed to the eager branch and given an explicit

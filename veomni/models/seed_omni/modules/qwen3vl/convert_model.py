@@ -36,7 +36,7 @@ else:
 
 
 def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
-    """Split an upstream Qwen3-VL checkpoint into three V2 modules."""
+    """Split an upstream Qwen3-VL checkpoint into three SeedOmni modules."""
     training_graphs, generation_graphs = load_family_graphs(
         "configs/seed_omni/Qwen/qwen3vl_2b",
         training="train/graph_train.yaml",

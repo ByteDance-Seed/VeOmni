@@ -1,6 +1,6 @@
 """BAGEL SeedOmni modules.
 
-The V2 graph keeps BAGEL modules split by producer/consumer boundaries:
+The SeedOmni graph keeps BAGEL modules split by producer/consumer boundaries:
 
 - training: text/SigLIP/VAE/flow hooks write embedded carrier items, then
   ``bagel_qwen2_mot.forward`` packs them into the MoT backbone and scatters

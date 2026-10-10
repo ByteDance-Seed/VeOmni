@@ -9,7 +9,7 @@
 #   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/train/base_model_fsdp.yaml
 #
 # Packed tokens + this wrap: use ../packed/base.yaml and add
-#   --accelerator.fsdp_config.fsdp_scope model
+#   --model.accelerator.fsdp_config.fsdp_scope model
 model:
   model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2
   model_config:

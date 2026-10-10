@@ -4,13 +4,13 @@ Mirrors the upstream ``chat_template.json``:
 
 * each turn is wrapped in ``<|im_start|>{role}\\n … <|im_end|>\\n``;
 * image / video become ``<|vision_start|><|image_pad|><|vision_end|>`` /
-  ``<|vision_start|><|video_pad|><|vision_end|>`` — in the V2 segment model the
+  ``<|vision_start|><|video_pad|><|vision_end|>`` — in the SeedOmni segment model the
   ``<|*_pad|>`` run is *not* tokenized; the sibling ``image`` / ``video`` item
   already carries the merged vision tokens, so the template emits
   ``<|vision_start|>`` text · the media item · ``<|vision_end|>`` text.
 
 Qwen3-VL has no audio modality (audio-in-video is an Omni feature — see
-``docs/seed_omni/av_video_design.md``, design-only).
+``docs/seed_omni/design/media.md``, design-only).
 
 Reuses :class:`TextEncoderChatTemplate` for tokenize / merge / pack; only the
 ChatML templating (:meth:`Qwen3VLChatTemplate.apply_chat_template`) and the
@@ -80,7 +80,7 @@ class Qwen3VLChatTemplate(TextEncoderChatTemplate):
                 # Image and video both wrap in <|vision_start|> … <|vision_end|>
                 # (the model uses <|image_pad|> / <|video_pad|> inside). Qwen3-VL has
                 # no audio modality — audio-in-video is an Omni feature (design-only,
-                # see docs/seed_omni/av_video_design.md).
+                # see docs/seed_omni/design/media.md).
                 out.append(self._build_conversation_item("text", markers.vision_start_token, role, loss_mask=0))
                 out.append(item)  # media row passed through verbatim (keeps value/source/meta)
                 out.append(self._build_conversation_item("text", markers.vision_end_token, role, loss_mask=0))
