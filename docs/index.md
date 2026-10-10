@@ -68,6 +68,7 @@ examples/qwen3.md
 examples/qwen3_5.md
 examples/qwen3_moe.md
 examples/qwen3_vl.md
+examples/qwen_image_edit.md
 examples/qwen3_omni_moe.md
 examples/qwen3_omni_offline_av.md
 examples/minimax_h3.md
@@ -85,6 +86,7 @@ examples/seed_oss.md
 key_features/model_loader.md
 key_features/preprocessor_registry.md
 key_features/ep_fsdp2.md
+key_features/async_activate_offload.md
 key_features/extra_parallel.md
 key_features/sharded_embedding.md
 key_features/ulysses.md

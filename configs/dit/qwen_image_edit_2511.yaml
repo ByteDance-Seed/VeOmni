@@ -1,9 +1,15 @@
 model:
-  # Use the transformer and condition components from the same pinned snapshot.
-  model_path: /path/to/Qwen-Image/transformer
+  # Transformer from Qwen-Image-Edit-2511; text_encoder, VAE, tokenizer, scheduler
+  # from Qwen-Image; processor from Qwen-Image-Edit-2511.
+  model_path: /path/to/Qwen-Image-Edit-2511/transformer
   condition_model_path: /path/to/Qwen-Image
-  config_path: /path/to/Qwen-Image/transformer/config.json
+  config_path: /path/to/Qwen-Image-Edit-2511/transformer/config.json
+  model_config:
+    zero_cond_t: true
   condition_model_cfg:
+    enable_edit: true
+    processor_path: /path/to/Qwen-Image-Edit-2511
+    text_encoder_attn_implementation: eager
     max_sequence_length: 512
     height: 1024
     width: 1024
@@ -39,7 +45,7 @@ model:
       enable_activation: false
 
 data:
-  train_path: /path/to/qwen_image_train.jsonl
+  train_path: /path/to/qwen_image_edit_train.jsonl
   train_size: 1000000000000
   dataloader:
     type: native
@@ -49,7 +55,7 @@ data:
   max_seq_len: 4096
   text_keys: text
   dyn_bsz_buffer_size: 200
-  source_name: Qwen-Image
+  source_name: Qwen-Image-Edit
   data_transform: dit_online
   mm_configs:
     data_dir: /path/to/images
@@ -61,13 +67,13 @@ train:
   enable_full_determinism: false
   empty_cache_steps: 500
   checkpoint:
-    output_dir: qwen-image-sft
+    output_dir: qwen-image-edit-2511-sft
     manager: dcp
     save_epochs: 1
     save_hf_weights: true
   max_steps: 500
-  num_train_epochs: 3
+  num_train_epochs: 2
   wandb:
     enable: false
     project: Qwen-Image
-    name: sft_qwen_image
+    name: sft_qwen_image_edit_2511

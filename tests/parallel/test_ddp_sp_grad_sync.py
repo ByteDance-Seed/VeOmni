@@ -175,7 +175,7 @@ def main() -> None:
     grad_norm = veomni_clip_grad_norm(model, MAX_GRAD_NORM)
 
     torch.testing.assert_close(
-        grad_norm,
+        grad_norm.item(),
         reference_norm.item(),
         rtol=1e-4,
         atol=1e-6,
