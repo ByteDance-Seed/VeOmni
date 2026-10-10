@@ -1885,7 +1885,18 @@ class DataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo"] = field(
+    data_type: Literal[
+        "plaintext",
+        "conversation",
+        "diffusion",
+        "diffusion_gemma",
+        "diffusion_gemma_mm",
+        "llada",
+        "llada_v",
+        "llada2_uni",
+        "classification",
+        "dpo",
+    ] = field(
         default="conversation",
         metadata={"help": "Type of the training data."},
     )
@@ -1939,12 +1950,14 @@ class DataArguments:
         if self.text_keys is None:
             if self.data_type == "plaintext":
                 self.text_keys = "content_split"
-            elif self.data_type == "conversation":
+            elif self.data_type in ("conversation", "llada", "llada_v", "llada2_uni"):
                 self.text_keys = "messages"
             elif self.data_type == "classification":
                 self.text_keys = "text"
             elif self.data_type == "dpo":
                 self.text_keys = "chosen"
+            elif self.data_type in ("diffusion", "diffusion_gemma", "diffusion_gemma_mm"):
+                pass
             else:
                 raise ValueError(f"Unknown data type: {self.data_type}")
 

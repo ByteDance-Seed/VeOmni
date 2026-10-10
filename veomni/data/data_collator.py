@@ -558,3 +558,277 @@ class PackingPostCollator(DataCollator):
         logits_list = logits.split(seq_lens, dim=0)
         outputs.logits = logits_list
         return outputs
+
+
+def _diffusion_gemma_num_canvases(feature: Dict[str, "torch.Tensor"]) -> int:
+    decoder_input_ids = feature["decoder_input_ids"]
+    if decoder_input_ids.ndim == 1:
+        return 1
+    if decoder_input_ids.ndim == 2:
+        return int(decoder_input_ids.shape[0])
+    raise ValueError(
+        "`decoder_input_ids` must be `(canvas_length,)` or `(num_canvases, canvas_length)`, "
+        f"got shape {tuple(decoder_input_ids.shape)}."
+    )
+
+
+def _as_canvas_stack(tensor: "torch.Tensor") -> "torch.Tensor":
+    return tensor.unsqueeze(0) if tensor.ndim == 1 else tensor
+
+
+def _diffusion_gemma_parts(
+    feature: Dict[str, "torch.Tensor"],
+) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+    """Canonicalize one feature to ``(ids, prompt_mask, canvases, labels, weight, context)``.
+
+    Shared by the padded and the packed path so a shape the one rejects cannot slip
+    through the other.
+    """
+    ids = feature["input_ids"]
+    length = int(ids.numel())
+    prompt_mask = feature.get("encoder_prompt_mask", torch.zeros_like(ids, dtype=torch.bool))
+    if int(prompt_mask.numel()) != length:
+        raise ValueError(
+            f"`encoder_prompt_mask` must be the same length as `input_ids` ({length}), got {int(prompt_mask.numel())}."
+        )
+    canvases = _as_canvas_stack(feature["decoder_input_ids"])
+    canvas_labels = _as_canvas_stack(feature["labels"])
+    canvas_weight = _as_canvas_stack(feature["loss_weight"])
+    if canvas_labels.shape != canvases.shape or canvas_weight.shape != canvases.shape:
+        raise ValueError(
+            "`labels` and `loss_weight` must match `decoder_input_ids` "
+            f"{tuple(canvases.shape)}, got {tuple(canvas_labels.shape)} and {tuple(canvas_weight.shape)}."
+        )
+    context = _as_canvas_stack(feature["decoder_context_mask"])
+    if int(context.shape[-1]) != length:
+        raise ValueError(
+            f"`decoder_context_mask` must be the same length as `input_ids` ({length}), got {int(context.shape[-1])}."
+        )
+    if int(context.shape[0]) != int(canvases.shape[0]):
+        raise ValueError(
+            "`decoder_context_mask` must have one row per canvas "
+            f"({int(canvases.shape[0])}), got {int(context.shape[0])}."
+        )
+    return ids, prompt_mask.bool(), canvases, canvas_labels, canvas_weight, context
+
+
+def _pad_canvas_stack(tensor: "torch.Tensor", max_canvases: int, value: float | int) -> "torch.Tensor":
+    extra = max_canvases - int(tensor.shape[0])
+    if extra <= 0:
+        return tensor
+    return F.pad(tensor, (0, 0, 0, extra), value=value)
+
+
+@dataclass
+class DiffusionGemmaCollator(DataCollator):
+    """Batching collator for DiffusionGemma's encoder-prompt / decoder-canvas layout.
+
+    Does not pack the way ``MainCollator`` does, and cannot: that packing concatenates
+    samples into one row and encodes boundaries in ``position_ids``, which assumes a
+    single sequence dimension shared by inputs and labels. DiffusionGemma has two
+    different ones -- a variable length prompt consumed by the encoder and a fixed
+    ``canvas_length`` canvas consumed by the decoder, related only through the KV cache.
+    So by default prompts are padded to the longest in the batch and canvases -- already
+    a fixed length from the data transform -- are simply stacked.
+
+    ``pack_samples`` packs the axis that *can* be packed. The encoder rows concatenate
+    with their boundaries in ``position_ids``, as ``MainCollator`` marks them; the
+    canvases go onto the canvas axis, where a canvas is still one segment in its own
+    row and sliding attention is undisturbed. See ``_packed_batch``.
+
+    Prompts are **left**-padded. Each decoder canvas continues after the last encoder
+    position visible to it. Left padding also keeps real tokens at the physical end of
+    the cache, which matters when generation uses a truncating sliding cache: right
+    padding would leave empty slots in that retained tail and evict valid prefix keys.
+
+    Also emits ``decoder_attention_mask`` over ``[encoder | canvas]``. The encoder half
+    is ``decoder_context_mask``, which every feature must carry: 1 on the prompt and
+    the clean canvases *before* the draw, 0 on the draw and everything after, so the
+    decoder cannot read the answer it is reconstructing. A missing key is an error --
+    defaulting to all-ones would leak the clean canvas into the decoder.
+
+    ``encoder_prompt_mask`` is left-padded with False (padding is not the prompt). Samples
+    that omit it are treated as having no prompt span, so ``mask_prompt_ar_loss`` does not
+    change their objective.
+
+    With images, ``mm_token_type_ids`` is left-padded alongside the prompt (padding is
+    tagged as text), while ``pixel_values`` and ``image_position_ids`` are concatenated
+    along the image dimension. Those two need no padding: the processor already emits a
+    fixed ``max_patches`` per image regardless of the source resolution and marks unused
+    patches with ``(-1, -1)`` in ``image_position_ids``.
+
+    ``compute_all_canvas_df_loss`` stacks ``K`` canvases on one feature as ``(K, C)``.
+    Those stay stacked as ``(B, K, C)`` here -- the encoder is **not** repeated.
+    The model runs the encoder once and ``config.canvas_batching`` decides whether the
+    decoder loops over the K canvases or folds them into its batch, sharing one KV
+    cache either way. Dummy canvases pad a mixed-K batch to ``max K`` with
+    ``IGNORE_INDEX`` / zero weight.     ``num_supervised_examples`` still counts
+    original features so the trainer divides by the number of examples.
+    """
+
+    pad_token_id: int = 0
+    pack_samples: bool = False
+    sp_size: int = 1
+
+    def __post_init__(self):
+        # Taken as a field rather than read off `get_parallel_state()` here, because a
+        # collator is pickled into the dataloader workers and the global state does not
+        # travel with it. The trainer, which builds this in the main process, passes it.
+        if self.sp_size > 1 and not self.pack_samples:
+            raise ValueError(
+                f"`sp_size` is {self.sp_size} but `pack_samples` is off. Sequence parallelism shards "
+                "the encoder row, and the padded path has one row per sample with its length set by "
+                "the longest prompt in the batch -- there is no single row to shard, and the sdpa mask "
+                "those rows need is quadratic in the length SP was turned on to grow. Set "
+                "`canvas_batching: flat_seq_pack`."
+            )
+
+    def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
+        if not features:
+            raise ValueError("DiffusionGemmaCollator received an empty feature list")
+
+        if self.pack_samples:
+            return self._packed_batch(features)
+
+        num_supervised_examples = sum(1 for feature in features if float(feature["loss_weight"].sum()) > 0)
+        max_canvases = max(_diffusion_gemma_num_canvases(feature) for feature in features)
+        prompt_len = max(int(f["input_ids"].numel()) for f in features)
+        input_ids, attention_mask, encoder_prompt_mask, mm_token_type_ids = [], [], [], []
+        decoder_input_ids, labels, loss_weight, decoder_context = [], [], [], []
+        for feature in features:
+            ids, prompt_mask, canvases, canvas_labels, canvas_weight, context = _diffusion_gemma_parts(feature)
+            pad = prompt_len - int(ids.numel())
+            input_ids.append(F.pad(ids, (pad, 0), value=self.pad_token_id))
+            attention_mask.append(F.pad(torch.ones_like(ids), (pad, 0), value=0))
+            encoder_prompt_mask.append(F.pad(prompt_mask, (pad, 0), value=False))
+            if "mm_token_type_ids" in feature:
+                mm_token_type_ids.append(F.pad(feature["mm_token_type_ids"], (pad, 0), value=0))
+            context = torch.stack([F.pad(row, (pad, 0), value=0) for row in context])
+            decoder_input_ids.append(_pad_canvas_stack(canvases, max_canvases, 0))
+            labels.append(_pad_canvas_stack(canvas_labels, max_canvases, IGNORE_INDEX))
+            loss_weight.append(_pad_canvas_stack(canvas_weight, max_canvases, 0))
+            decoder_context.append(_pad_canvas_stack(context, max_canvases, 0))
+
+        stacked_canvases = torch.stack(decoder_input_ids)
+        stacked_context = torch.stack(decoder_context).bool()
+        if max_canvases == 1:
+            stacked_canvases = stacked_canvases.squeeze(1)
+            stacked_labels = torch.stack(labels).squeeze(1)
+            stacked_weight = torch.stack(loss_weight).squeeze(1)
+            stacked_context = stacked_context.squeeze(1)
+        else:
+            stacked_labels = torch.stack(labels)
+            stacked_weight = torch.stack(loss_weight)
+        canvas_length = stacked_canvases.shape[-1]
+        batch = {
+            "input_ids": torch.stack(input_ids),
+            "attention_mask": torch.stack(attention_mask),
+            "encoder_prompt_mask": torch.stack(encoder_prompt_mask),
+            "decoder_input_ids": stacked_canvases,
+            "labels": stacked_labels,
+            "loss_weight": stacked_weight,
+            "decoder_attention_mask": F.pad(stacked_context, (0, canvas_length), value=True),
+            "num_supervised_examples": torch.tensor(num_supervised_examples, dtype=torch.long),
+        }
+
+        if mm_token_type_ids:
+            if len(mm_token_type_ids) != len(features):
+                raise ValueError(
+                    "Some samples carry `mm_token_type_ids` and some do not; the encoder needs the tag "
+                    "for the whole batch or none of it."
+                )
+            batch["mm_token_type_ids"] = torch.stack(mm_token_type_ids)
+        for key in ("pixel_values", "image_position_ids"):
+            tensors = [f[key] for f in features if key in f]
+            if tensors:
+                batch[key] = torch.cat(tensors, dim=0)
+        return batch
+
+    def _packed_batch(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
+        """One row for the whole batch: encoder tokens concatenated, canvases stacked.
+
+        Boundaries ride in ``position_ids``, which restarts at 0 on each sample -- the
+        convention ``prepare_fa_kwargs_from_position_ids`` reads and the one the model
+        turns into ``cu_seqlens`` for its varlen encoder kernels. So nothing is padded:
+        neither the prompts to the longest in the batch, nor the canvas counts to the
+        largest ``K``. A sample's cost is its own token count rather than the batch's
+        worst case, which is what lets a token budget hold across ragged data.
+
+        ``sp_size > 1`` adds the one exception: fewer than ``sp_size`` tokens at the end,
+        so the row divides across the sequence-parallel ranks that will shard it.
+
+        Each canvas keeps its own row on the canvas axis, with the encoder half of
+        ``decoder_attention_mask`` placed at its own sample's offset and False
+        everywhere else. That interval is how the model recovers which sample a canvas
+        belongs to (``canvas_owner_segments``), so it also has to be the thing that
+        stops a canvas reading a neighbour's prompt.
+        """
+        lengths: List[int] = []
+        ids_parts, position_parts, prompt_parts = [], [], []
+        canvas_parts, label_parts, weight_parts, context_parts = [], [], [], []
+        for feature in features:
+            for key in ("mm_token_type_ids", "pixel_values", "image_position_ids"):
+                if key in feature:
+                    raise ValueError(
+                        f"`pack_samples` cannot pack `{key}`: the packed encoder runs varlen attention "
+                        "kernels that carry no image block boundaries, so an image span would be "
+                        "attended as text. Pack text-only data, or leave `pack_samples` off."
+                    )
+            ids, prompt_mask, canvases, canvas_labels, canvas_weight, context = _diffusion_gemma_parts(feature)
+            lengths.append(int(ids.numel()))
+            ids_parts.append(ids)
+            position_parts.append(torch.arange(lengths[-1], dtype=torch.long, device=ids.device))
+            prompt_parts.append(prompt_mask)
+            canvas_parts.append(canvases)
+            label_parts.append(canvas_labels)
+            weight_parts.append(canvas_weight)
+            context_parts.append(context)
+
+        # Sequence parallelism shards this row, so it has to divide. The tail is its own
+        # segment -- a fresh restart in `position_ids` -- rather than an extension of the
+        # last sample, which would hand that sample `pad_size` extra keys to attend to
+        # and change its answer. `attention_mask` is 0 there so the AR term can tell the
+        # tail from data, and the canvas half of `decoder_attention_mask` is False so no
+        # canvas can read it.
+        #
+        # Padded here rather than sliced here: the slice happens in the encoder, which is
+        # the one place that knows the boundaries of the whole row. `cu_seqlens` cannot be
+        # recovered from a shard, and a full-length boundary vector travelling beside a
+        # sliced `position_ids` is a pair with no local invariant to check it by.
+        #
+        # One consequence to know about: being its own segment, the tail adds one to the
+        # segment count the row reports, so a caller supplying `encoder_ar_row_weight`
+        # would have to supply one more weight under SP than without it. Nothing hits
+        # this today -- this collator never emits that key, and `encoder_ar_targets`
+        # clamps a zero-count segment -- but the number is `sp_size`-dependent, which is
+        # not obvious from either end.
+        pad_size = -sum(lengths) % self.sp_size if self.sp_size > 1 else 0
+        if pad_size:
+            template = ids_parts[0]
+            ids_parts.append(torch.full((pad_size,), self.pad_token_id, dtype=template.dtype, device=template.device))
+            position_parts.append(torch.arange(pad_size, dtype=torch.long, device=template.device))
+            prompt_parts.append(torch.zeros(pad_size, dtype=prompt_parts[0].dtype, device=template.device))
+
+        total = sum(lengths) + pad_size
+        rows, start = [], 0
+        for length, context in zip(lengths, context_parts):
+            rows.append(F.pad(context.bool(), (start, total - start - length), value=False))
+            start += length
+        packed_context = torch.cat(rows, dim=0)
+        canvas_length = int(canvas_parts[0].shape[-1])
+        template = ids_parts[0]
+        attention_mask = torch.ones(1, total, dtype=template.dtype, device=template.device)
+        attention_mask[:, total - pad_size :] = 0
+        return {
+            "input_ids": torch.cat(ids_parts).unsqueeze(0),
+            "position_ids": torch.cat(position_parts).unsqueeze(0),
+            "attention_mask": attention_mask,
+            "encoder_prompt_mask": torch.cat(prompt_parts).unsqueeze(0),
+            "decoder_input_ids": torch.cat(canvas_parts).unsqueeze(0),
+            "labels": torch.cat(label_parts).unsqueeze(0),
+            "loss_weight": torch.cat(weight_parts).unsqueeze(0),
+            "decoder_attention_mask": F.pad(packed_context, (0, canvas_length), value=True).unsqueeze(0),
+            "num_supervised_examples": torch.tensor(
+                sum(1 for feature in features if float(feature["loss_weight"].sum()) > 0), dtype=torch.long
+            ),
+        }

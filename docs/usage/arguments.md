@@ -157,7 +157,7 @@ own `safetensor_idx_path`.
 | model_config | `Optional[Dict]` | `{}` | Values used to override the loaded foundation-model config. |
 | processor_config | `Optional[Dict]` | `{}` | Kwargs used to override the loaded processor / tokenizer config. See below. |
 | tokenizer_path | `Optional[str]` | `None` | Path to the tokenizer. Defaults to `config_path`. |
-| chat_template | `Optional[str]` | `None` | Registered chat-template name used to lay conversations out into training samples. Leave unset for data with no conversation structure (plaintext, diffusion) or for a model that formats prompts through its own processor (Qwen-Omni). |
+| chat_template | `Optional[str]` | `None` | Registered chat-template name used to lay conversations out into training samples. Leave unset for data with no conversation structure (plaintext, diffusion) or for a model that formats prompts through its own processor (Qwen-Omni). `tokenizer` drives the tokenizer's own template and supervises every token an assistant turn appends; `tokenizer_generation_prompt` supervises only what follows the generation prompt (the `gemma4_thinking` / `gemma4_no_thinking` variants build on it). |
 | safetensor_idx_path | `Optional[str]` | `None` | Path to `model.safetensors.index.json`. |
 | basic_modules | `Optional[List[str]]` | `[]` | Additional modules beyond `_no_split_modules` to shard in FSDP. |
 | lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
@@ -360,13 +360,13 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | eval_path | `Optional[str]` | `None` | Path of the evaluation dataset. |
 | train_size | `int` | `10_000_000` | Number of tokens for training (used to compute steps under dynamic batch). |
 | train_sample | `int` | `10_000` | Number of samples for training (used to compute steps under non-dynamic batch). |
-| data_type | `Literal["plaintext", "conversation", "diffusion", "classification", "dpo"]` | `"conversation"` | Type of the training data. |
+| data_type | `Literal["plaintext", "conversation", "diffusion", "diffusion_gemma", "diffusion_gemma_mm", "llada", "llada_v", "llada2_uni", "classification", "dpo"]` | `"conversation"` | Type of the training data. `diffusion_gemma` / `diffusion_gemma_mm` build DiffusionGemma canvases (text-only / text+image); `llada`, `llada_v`, `llada2_uni` apply the LLaDA-family masked-diffusion corruption to conversations. |
 | datasets_type | `str` | `"mapping"` | Single-source builder for a non-YAML `train_path`. Built-in values: `"mapping"`, `"iterable"`. |
 | dataset_repeat | `bool` | `false` | Iterable-only. If true, replay the stream so one epoch can reach `train.max_steps` when the dump is shorter than that cap. If false, one pass ends the epoch. Each pass drops the last incomplete DP round. Mapping ignores this. |
 | multisource_datasets_type | `str` | `"interleave"` | Dataset builder when `train_path` is a YAML. Built-in value: `"interleave"`. |
 | source_name | `str` | `None` | Dataset name. Loaded from multisource YAML if multisource is enabled. |
 | dyn_bsz_buffer_size | `int` | `200` | Buffer size for dynamic batch size. |
-| text_keys | `str` | `None` | Key to retrieve text from data. Auto-resolved: `"content_split"` for plaintext, `"messages"` for conversation, `"text"` for classification, `"chosen"` for DPO. |
+| text_keys | `str` | `None` | Key to retrieve text from data. Auto-resolved: `"content_split"` for plaintext, `"messages"` for conversation and the LLaDA family, `"text"` for classification, `"chosen"` for DPO; left unset for `diffusion` and DiffusionGemma data. |
 | max_seq_len | `int` | `2048` | Maximum sequence length. |
 | silent_exception | `bool` | `False` | Whether to ignore exceptions when loading data. |
 | dataloader | `DataloaderConfig` | — | DataLoader construction parameters. |
