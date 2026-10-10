@@ -18,7 +18,7 @@ from .data_collator import (
     MakeMicroBatchCollator,
     UnpackDataCollator,
 )
-from .data_loader import DistributedDataloader, build_dataloader
+from .data_loader import DistributedDataloader, build_dataloader, resolve_dyn_bsz_buffer_size
 from .data_transform import DATA_TRANSFORM_REGISTRY, build_data_transform
 from .dataset import build_dataset
 from .dummy_dataset import build_dummy_dataset
@@ -27,6 +27,7 @@ from .dummy_dataset import build_dummy_dataset
 __all__ = [
     "build_chat_template",
     "build_dataloader",
+    "resolve_dyn_bsz_buffer_size",
     "build_data_transform",
     "build_dummy_dataset",
     "DATA_TRANSFORM_REGISTRY",

@@ -14,7 +14,7 @@
 
 from collections import defaultdict
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Literal, Optional
 
 import torch
 
@@ -79,6 +79,7 @@ class VLMTrainingArguments(TrainingArguments):
 @dataclass
 class VLMMDataArguments(DataArguments):
     supports_torch_compile = True
+    data_modality: ClassVar[Literal["text", "multimodal", "diffusion"]] = "multimodal"
     mm_configs: Optional[Dict] = field(
         default_factory=dict,
         metadata={"help": "Config for multimodal input."},
