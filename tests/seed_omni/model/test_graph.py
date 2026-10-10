@@ -315,7 +315,36 @@ def test_omni_model_forward_runs_fake_module_chain():
 
     # Each Linear is ones-initialized, so a row of ones becomes 8, then 64.
     assert torch.allclose(batch["hidden"], torch.full((2, hidden_size), 64.0))
-    assert out == {"loss": None, "losses": {}}
+    assert out == {"loss": None, "losses": {}, "conversation_list": None}
+
+
+class _ListReplacingModule(PretrainedOmniModule):
+    """Training stand-in whose ``forward`` returns a new ``conversation_list`` instead of mutating it."""
+
+    config_class = _StubConfig
+
+    def __init__(self):
+        super().__init__(_StubConfig())
+
+    def forward(self, conversation_list=None, **kwargs):
+        del kwargs
+        return {"conversation_list": [*conversation_list, "encoded"]}
+
+
+def test_omni_model_forward_returns_the_conversation_list_the_graph_wrote():
+    """FSDP2's root pre-forward may copy the batch, so callers read the final list from the return value."""
+    config = OmniConfig(
+        _module_entries={"module_A": {"model_path": "module_A"}},
+        training_graphs={"default": [{"from": "module_A", "to": "end"}]},
+        generation_graphs=_minimal_generation_graphs(module="module_A"),
+    )
+    model = OmniModel(config, {"module_A": _ListReplacingModule()})
+    original = ["raw"]
+
+    out = model(dict(conversation_list=original))
+
+    assert out["conversation_list"] == ["raw", "encoded"]
+    assert original == ["raw"]
 
 
 class _ArtefactModule(PretrainedOmniModule):

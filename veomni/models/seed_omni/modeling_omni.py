@@ -476,6 +476,11 @@ class OmniModel(PreTrainedModel):
         collection and return value stay here. A runtime that wraps the modules
         passes one to unwrap them and scope each node to its module's mesh;
         without one each node runs as :meth:`_run_train_node`.
+
+        Returns the summed ``loss``, the per-node ``losses`` and the batch's
+        final ``conversation_list``. FSDP2's root pre-forward may rebuild the
+        batch's dicts and lists, so a caller that needs what the nodes wrote
+        reads it from the return value, not from the batch it passed in.
         """
         del args, kwargs
         run_node = node_runner if node_runner is not None else self._run_train_node
@@ -493,7 +498,11 @@ class OmniModel(PreTrainedModel):
             loss = batch.pop(LOSS_KEY, None)
             if loss is not None:
                 self._losses[node.name] = loss
-        return {"loss": _sum_losses(self._losses), "losses": dict(self._losses)}
+        return {
+            "loss": _sum_losses(self._losses),
+            "losses": dict(self._losses),
+            "conversation_list": batch.get("conversation_list"),
+        }
 
     def reset(self) -> None:
         """Clear per-request inference runtime state."""
