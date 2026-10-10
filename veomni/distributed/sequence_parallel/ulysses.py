@@ -203,10 +203,12 @@ class _Gather(torch.autograd.Function):
     - True (default): sum the grad across ranks. After a mid-model gather each
       rank consumed a DIFFERENT segment of the full sequence downstream, so its
       grads only cover its own rows — summing reconstructs the full grad.
-    - False: no all-reduce. Used at the model output, where the downstream loss
+    - False: no all-reduce. At the model output, where the downstream loss
       (e.g. the MiniMaxH3 wrapper's MSE over the full output) is identical on
-      every SP rank, so the incoming grad is already the true full grad and a
-      sum would multiply it by the SP world size.
+      every SP rank, the incoming grad is already the true full grad. The
+      data-parallel gradient reduction (FSDP2 over dp_shard_sp, DDP over
+      dp_sp) still averages over the SP ranks, so pair it with
+      ``grad_scale=True``; otherwise every gradient is scaled by 1/sp_size.
     """
 
     @staticmethod
