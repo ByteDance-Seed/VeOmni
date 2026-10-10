@@ -218,6 +218,7 @@ jobs:
         run: |
           uv run --frozen pytest -s -x tests/lora/test_target_mapping.py
           uv run --frozen pytest -s -x tests/lora/test_qwen3_5_moe_lora.py
+          uv run --frozen pytest -s -x tests/lora/test_dense_mlp_lora.py
           uv run --frozen pytest -s -x tests/lora/test_veomni_lora_moe_native.py
           uv run --frozen pytest -s -x tests/lora/test_lora_trainer_saveload.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_eager.py
