@@ -127,7 +127,7 @@ class FluxUlyssesPaddingTest(SequenceParallelTest):
                     diff_sq += (g - ref_grads[n]).pow(2).sum().item()
                     ref_sq += ref_grads[n].pow(2).sum().item()
                 grad_err = (diff_sq / ref_sq) ** 0.5
-                if out_err > 1e-3 or grad_err > 1e-3:
+                if out_err > 1e-5 or grad_err > 1e-3:
                     failures.append(f"{name}: output rel err {out_err:.2e}, grad rel err {grad_err:.2e}")
             assert not failures, "\n".join(failures)
         finally:
