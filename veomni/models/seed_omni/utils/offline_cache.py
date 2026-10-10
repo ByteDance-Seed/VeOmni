@@ -30,6 +30,11 @@ from .conversation import ConversationItem
 logger = logging.get_logger(__name__)
 
 
+def _first_rank_of_its_dp_rank(dp_ranks: list[int], rank: int) -> bool:
+    """Whether global ``rank`` is the lowest of the ranks sharing its ``dp_rank``."""
+    return dp_ranks.index(dp_ranks[rank]) == rank
+
+
 class SeedOmniOfflineCacheWriter:
     """Write cached SeedOmni conversation-carrier samples as parquet shards."""
 
@@ -37,6 +42,13 @@ class SeedOmniOfflineCacheWriter:
         parallel_state = get_parallel_state()
         self.rank = parallel_state.dp_rank if parallel_state.dp_rank >= 0 else int(os.getenv("RANK", 0))
         self.world_size = parallel_state.dp_size if parallel_state.dp_size > 0 else int(os.getenv("WORLD_SIZE", 1))
+        # SP / CP / TP ranks of one data-parallel group hold the same batch and
+        # would write the same shard paths, so only the first of them writes.
+        self.writes = True
+        if dist.is_available() and dist.is_initialized():
+            dp_ranks = [None] * dist.get_world_size()
+            dist.all_gather_object(dp_ranks, self.rank)
+            self.writes = _first_rank_of_its_dp_rank(dp_ranks, dist.get_rank())
         self.save_path = save_path
         self.max_rows_per_shard = max_rows_per_shard
         self.shard_index = 0
@@ -90,6 +102,8 @@ class SeedOmniOfflineCacheWriter:
         return value
 
     def save_conversation_list(self, conversation_list: list[list[ConversationItem]]) -> None:
+        if not self.writes:
+            return
         for sample in conversation_list:
             persisted = [self._cpu_recursive(item) for item in sample]
             if not persisted:
@@ -118,7 +132,7 @@ class SeedOmniOfflineCacheWriter:
         if distributed:
             dist.barrier()
 
-        if not distributed or self.rank == 0:
+        if not distributed or dist.get_rank() == 0:
             self._compact_shard_names()
 
         if distributed:
