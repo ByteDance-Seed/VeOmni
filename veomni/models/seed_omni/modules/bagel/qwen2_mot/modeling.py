@@ -11,6 +11,8 @@ from torch.nn.functional import scaled_dot_product_attention
 from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
 from transformers.utils import ModelOutput
 
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+
 from ....utils.conversation import ConversationItem
 from ...module_modeling_base import PretrainedOmniModule
 from ..sources import (
@@ -530,7 +532,7 @@ def _sdpa_context(device: torch.device):
     dispatcher cannot pick MATH (OOM) or a newer CUDNN kernel. CPU/NPU keep the
     default dispatcher because Efficient is CUDA-only.
     """
-    if device.type == "cuda":
+    if IS_CUDA_AVAILABLE and device.type == get_device_type():
         return sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION])
     return nullcontext()
 
