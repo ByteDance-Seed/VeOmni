@@ -21,16 +21,18 @@ from typing import Any
 
 
 class OfflineEncodingMixin(ABC):
-    """The two graph endpoints of a module whose config has ``support_cache``.
+    """The two graph endpoints of a module that can be encoded offline.
 
-    ``train.training_task`` picks which one a run uses, and the module's
-    modules / graph YAML wire it in:
+    Mixing this in is what makes a module cacheable; no config flag declares it.
+    The graph YAML picks which endpoint a run calls, and ``train.training_task``
+    must match it:
 
     * ``offline_embedding`` — the graph runs :meth:`offline_encode`, and the
       trainer writes the encoded conversations to ``train.offline_cache_dir``.
     * ``offline_training`` — the graph runs :meth:`online_process` on the
-      cached conversations. The module is built on meta and never loads its
-      weights, so :meth:`online_process` must read only the config.
+      cached conversations. If the graph calls nothing else on the module, it
+      is built on meta and never loads its weights, so :meth:`online_process`
+      must read only the config.
     * ``online_training`` — neither; the module encodes through its normal endpoint.
     """
 
