@@ -23,6 +23,8 @@ on random inputs. This guards against:
 Tests are skipped on non-NPU hosts so the same test suite runs in any CI runner.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -476,6 +478,109 @@ class TestNPULightningIndexer:
 
         assert compressed_len % compress_rate == 0  # The old implementation incorrectly passed zero.
         assert seen_residuals == [[expected_residual], [expected_residual]]
+
+    def test_packed_tnd_forwards_segment_boundaries(self, monkeypatch):
+        from veomni.ops.kernels.deepseek_v4 import npu_lightning_indexer as module
+
+        calls = []
+
+        class FakeOps:
+            @staticmethod
+            def lightning_indexer_metadata(*args, **kwargs):
+                calls.append(("metadata", kwargs))
+                return torch.empty(1, dtype=torch.int32, device=DEVICE)
+
+            @staticmethod
+            def lightning_indexer(q, k, weights, top_k, **kwargs):
+                calls.append(("indexer", kwargs))
+                shape = (q.shape[0], 1, top_k)
+                return (
+                    torch.zeros(shape, dtype=torch.int32, device=q.device),
+                    torch.zeros(shape, dtype=torch.float32, device=q.device),
+                )
+
+        monkeypatch.setattr(module, "_ops", lambda: FakeOps)
+        q = torch.zeros((1, 8, 32, 128), dtype=torch.bfloat16, device=DEVICE)
+        compressed_kv = torch.zeros((1, 2, 128), dtype=torch.bfloat16, device=DEVICE)
+        weights = torch.zeros((1, 8, 32), dtype=torch.float32, device=DEVICE)
+        indices, _ = module.npu_lightning_indexer(
+            q,
+            compressed_kv,
+            weights,
+            1,
+            compress_rate=4,
+            packed_sequence_slices=((0, 4), (4, 8)),
+        )
+
+        assert indices.shape == (1, 8, 1)
+        for _, kwargs in calls:
+            assert kwargs["layout_q"] == "TND"
+            assert kwargs["layout_k"] == "TND"
+            assert kwargs["cu_seqlens_q"].tolist() == [0, 4, 8]
+            assert kwargs["cu_seqlens_k"].tolist() == [0, 1, 2]
+            assert kwargs["cmp_residual_k"].tolist() == [0, 0]
+
+class TestNPUAttentionDispatch:
+    def test_packed_sequence_forwards_sparse_metadata(self, monkeypatch):
+        from transformers import AutoConfig
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as modeling
+
+        config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+        config._attn_implementation = "eager"
+        layer_idx = config.layer_types.index("compressed_sparse_attention")
+        attention = modeling.DeepseekV4Attention(config, layer_idx).to(device=DEVICE, dtype=torch.bfloat16).eval()
+        seq_len = 8
+        compressed_len = seq_len // config.compress_rates["compressed_sparse_attention"]
+        topk_indices = torch.zeros((1, seq_len, 1), dtype=torch.int32, device=DEVICE)
+        calls = {}
+
+        class FakeCompressor(torch.nn.Module):
+            compress_rate = config.compress_rates["compressed_sparse_attention"]
+
+            def forward(self, hidden_states, *args, **kwargs):
+                calls["return_topk_indices"] = kwargs["return_topk_indices"]
+                compressed_kv = torch.zeros(
+                    (1, 1, compressed_len, config.head_dim), dtype=torch.bfloat16, device=DEVICE
+                )
+                block_bias = torch.zeros((1, 1, seq_len, compressed_len), dtype=torch.bfloat16, device=DEVICE)
+                candidates = SimpleNamespace(topk_indices=topk_indices)
+                return compressed_kv, block_bias, candidates
+
+        def fake_attention_interface(module, query, key, value, attention_mask, **kwargs):
+            calls["npu_compressed_len"] = kwargs.get("npu_compressed_len")
+            calls["npu_compressed_topk_indices"] = kwargs.get("npu_compressed_topk_indices")
+            output = torch.zeros(
+                (query.shape[0], query.shape[-2], query.shape[1], query.shape[-1]),
+                dtype=query.dtype,
+                device=query.device,
+            )
+            return output, None
+
+        attention.compressor = FakeCompressor()
+        monkeypatch.setattr(modeling.ALL_ATTENTION_FUNCTIONS, "get_interface", lambda *args: fake_attention_interface)
+        cos = torch.ones((1, seq_len, config.qk_rope_head_dim), dtype=torch.bfloat16, device=DEVICE)
+        sin = torch.zeros_like(cos)
+        hidden_states = torch.randn((1, seq_len, config.hidden_size), dtype=torch.bfloat16, device=DEVICE)
+        position_ids = torch.arange(seq_len // 2, device=DEVICE).repeat(2).unsqueeze(0)
+        attention_mask = torch.zeros((1, 1, seq_len, seq_len), dtype=torch.bfloat16, device=DEVICE)
+
+        try:
+            modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="npu"))
+            attention(
+                hidden_states,
+                {attention.rope_layer_type: (cos, sin)},
+                position_ids,
+                attention_mask,
+                packed_sequence_slices=((0, seq_len // 2), (seq_len // 2, seq_len)),
+                packed_compression_metadata=object(),
+            )
+        finally:
+            modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
+
+        assert calls["return_topk_indices"] is True
+        assert calls["npu_compressed_len"] == compressed_len
+        assert calls["npu_compressed_topk_indices"] is topk_indices
 
 class TestNPUSparseFlashMLA:
     @staticmethod

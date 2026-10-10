@@ -321,10 +321,17 @@ def deepseek_v4_indexer_forward_npu_patched(
         (torch.arange(seq_len, device=position_ids.device) + query_offset).unsqueeze(0).expand_as(position_ids)
     )
     packed_ranges = None if rate_metadata is None else packed_compressed_causal_ranges(rate_metadata)
-    single_full_sequence = packed_sequence_slices is None or (
-        len(packed_sequence_slices) == 1
+    packed_npu_supported = packed_sequence_slices is None or (
+        batch == 1
         and packed_sequence_slices[0][0] == 0
-        and packed_sequence_slices[0][1] == seq_len
+        and packed_sequence_slices[-1][1] == seq_len
+    )
+    packed_positions_are_canonical = packed_sequence_slices is None or all(
+        torch.equal(
+            position_ids[0, start:end],
+            torch.arange(end - start, device=position_ids.device),
+        )
+        for start, end in packed_sequence_slices
     )
     use_npu = (
         indexer_implementation == "npu"
@@ -332,19 +339,26 @@ def deepseek_v4_indexer_forward_npu_patched(
         and cache_layer is None
         and not cp_enabled
         and not parallel_state.ulysses_enabled
-        and single_full_sequence
+        and packed_npu_supported
         and compressed_len > 0
-        and torch.equal(position_ids, canonical_positions)
+        and (packed_positions_are_canonical if packed_sequence_slices is not None else torch.equal(position_ids, canonical_positions))
     )
     if indexer_implementation == "npu" and not use_npu and compressed_len > 0:
         raise ValueError(
             "dsa_indexer_implementation='npu' was requested outside the fused Lightning Indexer "
-            "contract (training/prefill, one full sequence with canonical positions, no SP/CP)"
+            "contract (training/prefill, canonical packed positions, no SP/CP)"
         )
     if use_npu:
         from veomni.ops.kernels.deepseek_v4.npu_lightning_indexer import npu_lightning_indexer
 
-        top_k_indices, _ = npu_lightning_indexer(q, compressed_kv, weights, top_k, compress_rate=self.compress_rate)
+        top_k_indices, _ = npu_lightning_indexer(
+            q,
+            compressed_kv,
+            weights,
+            top_k,
+            compress_rate=self.compress_rate,
+            packed_sequence_slices=packed_sequence_slices,
+        )
         return top_k_indices.to(torch.long)
     # Operand dtypes are the kernel's contract and are enforced by
     # ``v4_lighting_indexer`` itself, which reports the offending dtype. Only
@@ -558,6 +572,13 @@ def deepseek_v4_attention_forward_npu_patched(
     # alone and claims the compact path on hosts where the kernel cannot run and the
     # dispatch silently falls back to eager -- which then ignores the indices and
     # uses the dense mask, so the compact work is wasted at best.
+    packed_sequence_slices = kwargs.get("packed_sequence_slices")
+    seq_len = q.shape[-2]
+    packed_npu_supported = packed_sequence_slices is None or (
+        q.shape[0] == 1
+        and packed_sequence_slices[0][0] == 0
+        and packed_sequence_slices[-1][1] == seq_len
+    )
     use_npu_sparse = (
         veomni_dsa_attention_implementation.value == "npu"
         and past_key_values is None
@@ -565,7 +586,7 @@ def deepseek_v4_attention_forward_npu_patched(
         and q.dtype == torch.bfloat16
         and not ulysses_enabled
         and not cp_enabled
-        and kwargs.get("packed_sequence_slices") is None
+        and packed_npu_supported
     )
     use_compact_sparse_indices = (
         veomni_dsa_attention_implementation.value == "tilelang"
@@ -623,6 +644,7 @@ def deepseek_v4_attention_forward_npu_patched(
     if use_npu_sparse and compressed_candidates is not None:
         kwargs["npu_compressed_topk_indices"] = compressed_candidates.topk_indices
         kwargs["npu_compressed_len"] = compressed_len
+        kwargs["npu_packed_sequence_slices"] = packed_sequence_slices
     if mask_free_sparse:
         kwargs["sparse_topk_indices"] = build_packed_sparse_attention_indices(
             position_ids=compressor_position_ids,
@@ -790,6 +812,7 @@ def deepseek_v4_eager_attention_forward_npu_patched(
             cmp_mask_mode=3,
             ori_win_left=module.sliding_window - 1,
             ori_win_right=0,
+            packed_sequence_slices=kwargs.get("npu_packed_sequence_slices"),
         )
         return output, None
     # Operand dtypes are the kernel's contract and are enforced by
