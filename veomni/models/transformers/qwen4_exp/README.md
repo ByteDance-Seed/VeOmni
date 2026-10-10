@@ -8,6 +8,7 @@ Supported in this first stage:
 
 - GPU and NPU VLM supervised fine-tuning with `ulysses_size=1` and `cp_size=1`.
 - Eager or SDPA QSA correctness paths.
+- NPU-only opt-in QSA Triton token-selection with packed-varlen segment isolation.
 - VeOmni fused cross-entropy and fused MoE dispatch.
 - Concurrent PLE and MoE expert parallelism: PLE tables use the persistent
   two-dimensional `ple_fsdp × ple` layout while expert tensors use the
@@ -39,8 +40,10 @@ Known limitations:
 
 - Ulysses/context sequence parallelism is rejected because PLE n-gram context
   and QSA global token indices need dedicated distributed semantics.
-- The production QSA kernel is not integrated. Upstream eager/SDPA QSA builds
-  dense masks and is suitable only for short correctness validation.
+- On NPU, the QSA Triton kernel is opt-in via `qsa_indexer_implementation: triton`;
+  eager remains the default. GPU modeling retains its upstream eager/SDPA QSA
+  path and does not include this Triton indexer integration. Packed routing
+  supports standard causal segments, not arbitrary custom masks.
 - Distributed PLE training expects pretrained or DCP weights. Initializing from
   scratch after PLE parameters become DTensors is not supported by the upstream
   Hugging Face initializer.
