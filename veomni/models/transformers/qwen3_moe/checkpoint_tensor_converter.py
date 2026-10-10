@@ -28,7 +28,7 @@ at load time, eliminating the need for offline checkpoint merging.
         model.layers.{i}.mlp.experts.down_proj     [E, H, I]
 """
 
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 from veomni.models.checkpoint.expert_fusion import PerExpertSplitToFusedConverter
 from veomni.models.checkpoint.moe_map import (
@@ -45,6 +45,21 @@ class Qwen3MoeCheckpointTensorConverter(PerExpertSplitToFusedConverter):
 
     family_name = "Qwen3MoE"
     expert_pattern = _EXPERT_PATTERN
+
+    def fused_expert_target(self, name: str) -> Optional[Tuple[str, int]]:
+        match = self.expert_pattern.match(name)
+        if not match:
+            return None
+        prefix, expert_id_str, proj_name = match.groups()
+        fused_proj = "down_proj" if proj_name == "down_proj" else "gate_up_proj"
+        return f"{prefix}.experts.{fused_proj}", int(expert_id_str)
+
+    def for_expert_range(self, start: int, num_local: int) -> "Qwen3MoeCheckpointTensorConverter":
+        if start < 0 or num_local <= 0 or start + num_local > self.num_experts:
+            raise ValueError(
+                f"Expert range [{start}, {start + num_local}) is outside this converter's {self.num_experts} experts."
+            )
+        return type(self)(num_experts=num_local, expert_offset=self.expert_offset + start)
 
 
 def create_qwen3_moe_checkpoint_tensor_converter(model):

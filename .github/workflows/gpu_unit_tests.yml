@@ -157,9 +157,11 @@ jobs:
           uv run --frozen pytest -s -x tests/utils/test_rank0_load_and_broadcast_weights.py
       - name: Run MoE ep_sharded_stream_load matrix (non-PEFT)
         # Fake EP MoE model: {plain, rank0 broadcast, ep_sharded} x {merged,
-        # per-expert} bit-identical load + the per-expert->fused streaming bail.
+        # per-expert} bit-identical load, per-rank expert stacking, and the bail
+        # for a converter that cannot stream.
         run: |
           uv run --frozen pytest -s -x tests/utils/test_moe_ep_sharded_load_matrix.py
+          uv run --frozen pytest -s -x tests/utils/test_ep_sharded_expert_stream_load.py
       - name: Run checkpoint tests
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/
@@ -170,6 +172,7 @@ jobs:
           uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
           uv run --frozen pytest -s -x tests/distributed/test_hccl_premul_sum.py
           uv run --frozen pytest -s -x tests/distributed/test_emb_parallel.py
+          uv run --frozen pytest -s -x tests/distributed/test_parallel_plan.py
           uv run --frozen pytest -s -x tests/distributed/test_reduce_scatter_fp32_accumulation.py
           uv run --frozen pytest -s -x tests/distributed/test_gradient_checkpointing.py
           uv run --frozen pytest -s -x tests/distributed/test_torch_compile.py

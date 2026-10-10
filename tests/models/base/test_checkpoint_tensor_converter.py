@@ -22,6 +22,7 @@ import torch
 
 from veomni.models.checkpoint.convert import (
     ConvertedCheckpointTensor,
+    checkpoint_converter_fused_expert_target,
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
@@ -150,6 +151,55 @@ def _make_expert_tensor(proj: str, expert_id: int) -> torch.Tensor:
     # Fill with expert_id + small offset per proj for easy verification
     offset = {"gate_proj": 0.0, "up_proj": 0.1, "down_proj": 0.2}[proj]
     return torch.full(shape, expert_id + offset)
+
+
+class TestQwen3MoeConverterExpertRange:
+    def test_fused_expert_target_names_the_fused_param_and_expert_row(self):
+        converter = Qwen3MoeCheckpointTensorConverter(num_experts=4)
+        assert converter.fused_expert_target("model.layers.0.mlp.experts.3.up_proj.weight") == (
+            "model.layers.0.mlp.experts.gate_up_proj",
+            3,
+        )
+        assert converter.fused_expert_target("model.layers.0.mlp.experts.1.down_proj.weight") == (
+            "model.layers.0.mlp.experts.down_proj",
+            1,
+        )
+        assert converter.fused_expert_target("model.layers.0.mlp.experts.gate_up_proj") is None
+
+    def test_helper_requires_both_expert_streaming_capabilities(self):
+        converter = Qwen3MoeCheckpointTensorConverter(num_experts=4)
+        name = "model.layers.0.mlp.experts.3.up_proj.weight"
+        assert checkpoint_converter_fused_expert_target(converter, name) == (
+            "model.layers.0.mlp.experts.gate_up_proj",
+            3,
+        )
+
+        class _TargetOnly:
+            can_handle = converter.can_handle
+            fused_expert_target = converter.fused_expert_target
+
+        assert checkpoint_converter_fused_expert_target(_TargetOnly(), name) is None
+        assert checkpoint_converter_fused_expert_target(None, name) is None
+
+    def test_range_converter_stacks_only_its_experts_as_local_rows(self):
+        local = Qwen3MoeCheckpointTensorConverter(num_experts=4).for_expert_range(2, 2)
+        tensors = {expert: torch.full((1, 2), float(expert)) for expert in (2, 3)}
+
+        assert local.convert("model.layers.0.mlp.experts.2.down_proj.weight", tensors[2]) is None
+        converted = local.convert("model.layers.0.mlp.experts.3.down_proj.weight", tensors[3])
+
+        assert converted.name == "model.layers.0.mlp.experts.down_proj"
+        torch.testing.assert_close(converted.tensor, torch.stack([tensors[2], tensors[3]]))
+        assert local.finalize() == []
+
+    def test_range_converter_rejects_experts_outside_its_range(self):
+        local = Qwen3MoeCheckpointTensorConverter(num_experts=4).for_expert_range(2, 2)
+        with pytest.raises(ValueError, match="outside this converter's range"):
+            local.convert("model.layers.0.mlp.experts.1.down_proj.weight", torch.zeros(1, 2))
+
+    def test_range_must_fit_in_the_converter(self):
+        with pytest.raises(ValueError, match="outside this converter's 4 experts"):
+            Qwen3MoeCheckpointTensorConverter(num_experts=4).for_expert_range(3, 2)
 
 
 class TestQwen3MoeConverterFactory:

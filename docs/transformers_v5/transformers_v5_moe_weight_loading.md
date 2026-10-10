@@ -112,6 +112,14 @@ HF per-expert:                             VeOmni fused:
 
 This eliminates the need for offline `moe_merge.py` preprocessing.
 
+With `model.ep_sharded_stream_load=true`, the converter also streams per rank.
+It reports each per-expert key's fused target and expert index
+(`fused_expert_target`), and builds a converter restricted to this rank's
+`Shard(0)` expert range (`for_expert_range`). Each EP rank then reads only its
+own `E/ep` experts' tensors and stacks them straight into its local
+`[E/ep, ...]` slice. A converter that does not implement both methods still
+makes the streaming loader raise `NotImplementedError`.
+
 ### Saving (VeOmni modeling -> checkpoint)
 
 When `model.safetensors.index.json` from a per-expert HF checkpoint is used for

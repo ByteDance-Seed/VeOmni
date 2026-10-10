@@ -30,13 +30,19 @@ class PerExpertSplitToFusedConverter:
     Family converters keep their regex and ``num_experts``. The shared path
     raises on ``finalize`` if any expert or gate/up pair is missing, so an
     incomplete checkpoint cannot load as fused zeros.
+
+    Args:
+        num_experts: Number of experts per MoE layer this converter stacks.
+        expert_offset: Checkpoint index of the first expert it stacks; experts
+            ``[expert_offset, expert_offset + num_experts)`` become rows ``0..num_experts-1``.
     """
 
     family_name = "MoE"
     expert_pattern: Pattern[str] = PER_EXPERT_SPLIT_TO_FUSED_PATTERN
 
-    def __init__(self, num_experts: int):
+    def __init__(self, num_experts: int, expert_offset: int = 0):
         self.num_experts = num_experts
+        self.expert_offset = expert_offset
         self._expert_buffer: dict[tuple[str, str], dict[int, torch.Tensor]] = {}
         self._stacked_buffer: dict[str, dict[str, torch.Tensor]] = {}
 
@@ -49,9 +55,15 @@ class PerExpertSplitToFusedConverter:
             return None
 
         prefix, expert_id_str, projection = match.groups()
+        expert_id = int(expert_id_str) - self.expert_offset
+        if not 0 <= expert_id < self.num_experts:
+            raise ValueError(
+                f"{name}: expert {int(expert_id_str)} is outside this converter's range "
+                f"[{self.expert_offset}, {self.expert_offset + self.num_experts})."
+            )
         buffer_key = (prefix, projection)
         expert_buffer = self._expert_buffer.setdefault(buffer_key, {})
-        expert_buffer[int(expert_id_str)] = tensor
+        expert_buffer[expert_id] = tensor
         if len(expert_buffer) < self.num_experts:
             return None
 
