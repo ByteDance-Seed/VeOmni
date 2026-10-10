@@ -1336,7 +1336,10 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
     expected_csa = sum(kind == "compressed_sparse_attention" for kind in config.layer_types) if tilelang else 0
     assert counts["sparse_attn_tilelang"] == 2 * expected_layers, counts
     assert counts["v4_lighting_indexer"] == 2 * expected_csa, counts
-    forward_tol, grad_tol = (1e-4, 1e-4) if dtype == torch.float32 else (8e-3, 1e-1)
+    # bf16: two ULPs of the tensor's max. The shard and the full batch run the
+    # expert GEMMs over different token counts, so a few elements round apart by
+    # up to two ULPs (measured 1.33e-2 with the eager MoE row).
+    forward_tol, grad_tol = (1e-4, 1e-4) if dtype == torch.float32 else (2**-6, 1e-1)
     _assert_close_to_scale(local.detach(), baseline[:, begin : begin + local_len], forward_tol, "forward")
     for name, summed in summed_grads.items():
         _assert_close_to_scale(summed, baseline_grads[name], grad_tol, name)
