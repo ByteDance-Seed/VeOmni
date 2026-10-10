@@ -58,7 +58,7 @@ class FluxJointAttentionUlyssesTest(SequenceParallelTest):
     def test_matches_full_sequence_reference(self):
         group = self._get_process_group()
         device = torch.device(get_device_type(), self.rank)
-        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
         dim, num_heads, head_dim, txt_len, img_len = 64, 4, 16, 4, 16
         assert txt_len % self.world_size == 0 and img_len % self.world_size == 0  # isolate from padding
 
