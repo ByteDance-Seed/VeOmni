@@ -543,6 +543,13 @@ class VeOmniModelRuntime:
         opt = self.args.optimizer
         from ..optim import build_optimizer
 
+        if opt.type == "adamw_swap":
+            if self.args.accelerator.fsdp_config.offload:
+                raise ValueError(
+                    "optimizer.type='adamw_swap' cannot be combined with "
+                    "model.accelerator.fsdp_config.offload; both move training state to host."
+                )
+
         self.optimizer = build_optimizer(
             self.model,
             lr=opt.lr,
