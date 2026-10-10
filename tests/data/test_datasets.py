@@ -720,7 +720,7 @@ def test_iterable_hf_dataset_repeat_passes_do_not_overlap_across_workers(tmp_pat
 
     def file_per_pass(seq):
         files_read, i = [], 0
-        while i + sizes[seq[i]] <= len(seq):
+        while i < len(seq) and i + sizes[seq[i]] <= len(seq):
             files_read.append(seq[i])
             i += sizes[seq[i]]
         return files_read
