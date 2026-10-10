@@ -163,7 +163,7 @@ own `safetensor_idx_path`.
 | lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
 | ops_implementation | `OpsImplementationConfig` | — | Attention / MoE kernel configuration. |
 | broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
-| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
+| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint (for an HF per-expert MoE checkpoint, only its own experts' tensors, when the model's checkpoint converter supports it, e.g. Qwen3-MoE / Qwen3.5-MoE). Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule for this model. |
 | accelerator | `AcceleratorConfig` | — | Parallelism, sharding, and placement for this model. |
 
@@ -756,6 +756,12 @@ implementations also differ. These timings measure collective latency, not model
 | enable_async_activation | `bool` | `False` | Enable async activation offload via stream-based D2H/H2D. Mutually exclusive with `enable_activation`. When `activation_offload_modules` is empty, targets are discovered from `model._no_split_modules`; missing or unmatched model metadata fails closed. |
 | activation_offload_modules | `List[str]` | `[]` | Optional module name patterns for async offload, overriding `_no_split_modules` auto-discovery. Supports segment-aware glob (`model.layers.*` matches direct children only) and `{*}` for sequential groups (`model.layers.{*}`). |
 | activation_offload_host_cache_limit_gb | `float` | `4.0` | Idle-cache cap of **one** host-buffer pool, in GB. The trainer applies offload once with this limit, so it is the cap for that call. Each extra `apply_async_activation_offload` given only this limit gets its own pool (caps add); pass the same `host_buffer_pool` to share one cap. Bounds the idle cache only — in-flight offloads may temporarily exceed it. Set to `0` to disable reuse. |
+
+SeedOmni (`OmniTrainer`) applies async activation offload per module, from each
+module's merged accelerator, under either `fsdp_scope`. Each module gets its own
+pool, so `activation_offload_host_cache_limit_gb` caps each module and the caps
+add. A module with no `_no_split_modules` (or none matching the patterns) fails
+closed; give it a per-module `offload_config.enable_async_activation: false`.
 
 Async activation offload is enabled for CUDA/NPU tensors only; CPU tensors pass
 through unchanged. Only private, dense, contiguous activations are swapped so
