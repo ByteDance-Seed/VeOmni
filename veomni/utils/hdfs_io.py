@@ -14,6 +14,7 @@
 
 import os
 import shutil
+import subprocess
 from typing import IO, Any
 
 from .logging import get_logger
@@ -108,12 +109,10 @@ def copy(src: str, dst: str, **kwargs) -> bool:
 
 
 def _isdir(file_path: str) -> bool:
-    """hdfs mkdir"""
+    """hdfs capable to check whether a file_path is a directory"""
     if file_path.startswith("hdfs"):
-        _run_cmd(_hdfs_cmd(f"-test -d {file_path}"))
-    else:
-        return os.path.isdir(file_path)
-    return True
+        return _run_cmd(_hdfs_cmd(f"-test -d {file_path}")) == 0
+    return os.path.isdir(file_path)
 
 
 def isdir(path: str, **kwargs) -> bool:
@@ -134,12 +133,13 @@ def isdir(path: str, **kwargs) -> bool:
 
 
 def _listdir(path: str, **kwargs) -> list:
-    """hdfs listdir"""
+    """hdfs listdir, returns the entry names like os.listdir()"""
     if path.startswith("hdfs"):
-        _run_cmd(_hdfs_cmd(f"-ls {path}"))
-    else:
-        return os.listdir(path)
-    return True
+        returncode, output = _run_cmd_output(_hdfs_cmd(f"-ls -C {path}"))
+        if returncode != 0:
+            raise FileNotFoundError(f"Failed to list {path} (hdfs exit code {returncode}).")
+        return [os.path.basename(line.rstrip("/")) for line in output.splitlines() if line.strip()]
+    return os.listdir(path)
 
 
 def listdir(path: str, **kwargs) -> list:
@@ -233,6 +233,11 @@ def open(path: str, mode: str = "r") -> IO[Any]:
 
 def _run_cmd(cmd: str, timeout=None):
     return os.system(cmd)
+
+
+def _run_cmd_output(cmd: str, timeout=None) -> tuple[int, str]:
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    return result.returncode, result.stdout
 
 
 def _hdfs_cmd(cmd: str) -> str:
