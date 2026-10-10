@@ -612,6 +612,13 @@ class OmniTrainingArguments:
         self.global_rank = int(os.getenv("RANK", 0))
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
         self._resolve_checkpoint_paths()
+        if self.training_task == "offline_embedding" and self.checkpoint.load_path:
+            raise ValueError(
+                "`train.checkpoint.load_path` is not supported with `train.training_task='offline_embedding'`: "
+                "its frozen modules have no checkpoint manager, so the weights would not be restored while the "
+                "dataloader position would. Point the encoder's `model_path` at an HF checkpoint instead; "
+                f"got load_path={self.checkpoint.load_path!r}."
+            )
         self._resolve_profile()
 
     def _derive_batch_config(self, accelerator: AcceleratorConfig) -> None:
