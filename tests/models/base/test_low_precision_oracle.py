@@ -125,9 +125,10 @@ _EAGER_EXPERTS = {"_experts_implementation": "eager"}
 # VeOmni's tensorized ``fast_pos_embed_interpolate`` patches (Qwen3-VL and
 # Qwen3.5) cast the bilinear weights to BF16 before the four-way sum. Hugging
 # Face 5.16.1 keeps them in FP32 (``get_vision_interpolation_indices_and_weights``).
-# Measured max abs on H20 is 4.9e-3 at |logits| <= 0.71, about one BF16 ULP.
+# Measured max abs at |logits| <= 0.71 is 4.9e-3 on H20 (about one BF16 ULP)
+# and 1.27e-2 on L20 (qwen3_vl_moe, 3/5120 elements, about three ULPs).
 # Qwen3-Omni keeps the HF method and is bitwise.
-_QWEN3_VL_POS_EMBED = {"logits_equal": False, "atol": 1e-2}
+_QWEN3_VL_POS_EMBED = {"logits_equal": False, "atol": 2e-2}
 
 # ``veomni_sdpa`` pins EFFICIENT_ATTENTION for masked calls. HF's default
 # dispatch picks cuDNN attention on H20. Forward is bitwise, but backward

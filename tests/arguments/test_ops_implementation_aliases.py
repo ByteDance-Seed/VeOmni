@@ -27,6 +27,8 @@ def warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     messages: list[str] = []
     monkeypatch.setattr(arguments_types.logger, "warning_rank0", lambda msg, *a, **k: messages.append(msg))
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    # Ascend NPU rejects Hub attention and re-resolves GPU defaults, which these name tests do not cover.
+    monkeypatch.setattr(import_utils, "is_torch_npu_available", lambda: False)
     return messages
 
 
@@ -60,7 +62,6 @@ def test_fused_mlu_triton_resolves_to_fused_triton(warnings: list[str], monkeypa
 def test_legacy_fused_moe_resolves_per_host(
     mlu: bool, apex: bool, expected: str, warnings: list[str], monkeypatch: pytest.MonkeyPatch
 ):
-    monkeypatch.setattr(import_utils, "is_torch_npu_available", lambda: False)
     monkeypatch.setattr(import_utils, "is_torch_mlu_available", lambda: mlu)
     monkeypatch.setattr(import_utils, "is_apex_mlu_available", lambda: apex)
     assert OpsImplementationConfig(moe_implementation="fused").moe_implementation == expected
