@@ -170,7 +170,7 @@ def test_only_a_cache_reading_module_is_built_on_meta(monkeypatch, training_task
     assert runtime.reads_offline_cache is on_meta
     runtime._build_model()
 
-    assert captured["init_device"] == ("meta" if on_meta else "cuda")
+    assert captured["init_device"] == ("meta" if on_meta else "cpu")
 
 
 def test_a_cache_reading_module_is_frozen_and_never_wrapped_trained_or_saved(monkeypatch):
@@ -239,7 +239,7 @@ def _offline_cache_runtime(training_task, support_cache):
         model_config=None,
         ops_implementation=None,
         accelerator=SimpleNamespace(
-            init_device="cuda",
+            init_device="cpu",
             fsdp_config=SimpleNamespace(
                 fsdp_mode="fsdp2", fsdp_scope="module", mixed_precision=SimpleNamespace(enable=False)
             ),
