@@ -7,6 +7,10 @@ import triton
 import triton.language as tl
 
 
+_DEFAULT_BK = 128
+_DEFAULT_KERNEL_NUM = 24
+
+
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
@@ -82,7 +86,9 @@ def chunk_scaled_dot_kkt_fwd_kernel(
                 col_indices = tl.arange(0, BT)[None, :]
                 tril_mask = (row_indices > col_indices).to(tl.float32)
                 tril_mask = tril_mask * T_mask[:, None]
-                masked_dot = dot_product * tril_mask
+                # Padded dot lanes can be NaN on Ascend, and multiplying
+                # those lanes by a zero mask does not clear NaN.
+                masked_dot = tl.where(tril_mask != 0.0, dot_product, 0.0)
                 b_A += masked_dot
 
             if USE_G:
@@ -284,8 +290,8 @@ def chunk_scaled_dot_kkt_fwd(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     beta = beta.transpose(1, 2).contiguous()
     g = g.transpose(1, 2).contiguous()
-    BK = 128
-    kernel_num = 24
+    BK = _DEFAULT_BK
+    kernel_num = _DEFAULT_KERNEL_NUM
 
     if gk is None:
         A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
