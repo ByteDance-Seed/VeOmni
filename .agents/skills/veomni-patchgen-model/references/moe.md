@@ -67,11 +67,10 @@ Two authoritative sources:
   → subclass `PerExpertFusedCheckpointTensorConverter`
   (`veomni/models/_moe_per_expert_converter.py`), as
   `veomni/models/transformers/qwen3_moe/checkpoint_tensor_converter.py`
-  (also qwen3_omni_moe / deepseek_v3 / glm_moe_dsa) does. Do not copy its stacking logic.
+  (also qwen3_omni_moe / deepseek_v3) does. Do not copy its stacking logic.
   Its regex, `PER_EXPERT_SPLIT_TO_FUSED_PATTERN`, only matches *HF-side* keys,
   so a v5-saved fused-key checkpoint passes through the converter untouched —
-  no round-trip hazard. Subclassing also gives `ep_sharded_stream_load` support
-  once the model has an EP parallel plan (glm_moe_dsa does not yet).
+  no round-trip hazard. Subclassing also gives `ep_sharded_stream_load` support.
 - **HF ships per-expert keys under other names** (e.g. DeepSeek-V4's `w1/w2/w3`)
   → template = `veomni/models/transformers/deepseek_v4/checkpoint_tensor_converter.py`.
   A custom converter must implement `fused_expert_target` + `for_expert_range`

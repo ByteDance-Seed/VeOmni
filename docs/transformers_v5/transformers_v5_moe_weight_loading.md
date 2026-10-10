@@ -102,8 +102,8 @@ See `veomni/models/transformers/qwen3_moe/qwen3_moe_gpu_patch_gen_config.py` for
 
 A runtime `CheckpointTensorConverter` is registered on every patchgen-generated
 model class. For per-expert HF checkpoints, Qwen3-MoE, Qwen3.5-MoE (its MTP
-experts), Qwen3-Omni-MoE, DeepSeek-V3 and GLM-MoE-DSA (GLM-5) all use thin
-subclasses of `PerExpertFusedCheckpointTensorConverter`
+experts), Qwen3-Omni-MoE and DeepSeek-V3 all use thin subclasses of
+`PerExpertFusedCheckpointTensorConverter`
 (`veomni/models/_moe_per_expert_converter.py`). It converts per-expert HF keys
 at load time:
 
@@ -127,8 +127,6 @@ own `E/ep` experts' tensors and stacks them straight into its local
 as the Qwen3-Omni-MoE talker or the DeepSeek-V3 MTP layer, are skipped without
 being read. A converter that does not implement both methods, for example
 DeepSeek-V4's, still makes the streaming loader raise `NotImplementedError`.
-Streaming also needs the model's expert-parallel plan. GLM-MoE-DSA has none, so
-it loads its per-expert checkpoint through the regular, non-streaming path.
 
 ### Saving (VeOmni modeling -> checkpoint)
 
