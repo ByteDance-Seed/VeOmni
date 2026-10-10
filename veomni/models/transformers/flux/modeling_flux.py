@@ -290,15 +290,18 @@ class FluxJointAttention(torch.nn.Module):
         q, k = self.apply_rope(q, k, image_rotary_emb)
         hidden_states = flash_attention(q, k, v, causal=False, attn_mask=attn_mask)
 
+        # Text and image were gathered separately, so scatter them back separately; a joint scatter
+        # would hand each rank a slice of the concatenated [text, image] sequence instead of its own tokens.
+        text_len = q_b.shape[2]
+        hidden_states_b, hidden_states_a = hidden_states[:, :, :text_len], hidden_states[:, :, text_len:]
         if get_parallel_state().ulysses_enabled:
-            hidden_states = gather_heads_scatter_seq(hidden_states, seq_dim=2, head_dim=1)
+            hidden_states_b = gather_heads_scatter_seq(hidden_states_b, seq_dim=2, head_dim=1)
+            hidden_states_a = gather_heads_scatter_seq(hidden_states_a, seq_dim=2, head_dim=1)
 
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
-        hidden_states = hidden_states.to(q.dtype)
-        hidden_states_b, hidden_states_a = (
-            hidden_states[:, : hidden_states_b.shape[1]],
-            hidden_states[:, hidden_states_b.shape[1] :],
-        )
+        hidden_states_b = hidden_states_b.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
+        hidden_states_a = hidden_states_a.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
+        hidden_states_b = hidden_states_b.to(q.dtype)
+        hidden_states_a = hidden_states_a.to(q.dtype)
         if ipadapter_kwargs_list is not None:
             hidden_states_a = interact_with_ipadapter(hidden_states_a, q_a, **ipadapter_kwargs_list)
 
