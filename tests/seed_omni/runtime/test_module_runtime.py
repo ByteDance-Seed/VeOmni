@@ -205,6 +205,35 @@ def test_a_cache_reading_module_is_frozen_and_never_wrapped_trained_or_saved(mon
     assert not any(p.requires_grad for p in runtime.model.parameters())
 
 
+def test_an_offline_embedding_run_loads_and_wraps_every_module_but_freezes_it(monkeypatch):
+    """It trains nothing, so the frozen module gets no optimizer and no checkpoint manager."""
+    calls = []
+    for step in ("setup", "_freeze_model_module", "_build_parallelized_model", "_scope_recompute_to_parallel_state"):
+        monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, _step=step, **k: calls.append(_step))
+    monkeypatch.setattr(ModuleRuntime, "_build_model_assets", lambda self: None)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+    monkeypatch.setattr(ModuleRuntime, "_build_model", lambda self: setattr(self, "model", nn.Linear(2, 2)))
+    train = SimpleNamespace(training_task="offline_embedding", checkpoint=SimpleNamespace(load_path=None))
+
+    runtime = ModuleRuntime(
+        SimpleNamespace(accelerator=_fsdp("module")),
+        "llm",
+        module_config=SimpleNamespace(),
+        global_accelerator=_fsdp("module"),
+        train=train,
+    )
+
+    assert calls == [
+        "setup",
+        "_freeze_model_module",
+        "_build_parallelized_model",
+        "_scope_recompute_to_parallel_state",
+    ]
+    assert not runtime.has_trainable_parameters
+    assert runtime.optimizer is None
+    assert getattr(runtime, "checkpoint", None) is None
+
+
 def _offline_cache_runtime(training_task, support_cache):
     runtime = _unbuilt(
         model_config=None,

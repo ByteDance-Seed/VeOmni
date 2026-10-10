@@ -150,6 +150,9 @@ class ModuleRuntime(VeOmniModelRuntime):
                     self.model.requires_grad_(False)
                     return
                 self._freeze_model_module()
+                if self.train_args is not None and self.train_args.training_task == "offline_embedding":
+                    # Trains nothing, so no module gets an optimizer or a checkpoint manager.
+                    self.model.requires_grad_(False)
                 self._build_parallelized_model()
                 if not self.wrap_omni_model:
                     self._scope_recompute_to_parallel_state()
