@@ -1446,12 +1446,26 @@ def post_process_after_weight_loading(
     """
     parameter_names_left = parameter_names_left or set()
 
+    validate_missing = getattr(type(model), "_validate_checkpoint_missing_parameters", None)
+    if callable(validate_missing):
+        validate_missing(model, parameter_names_left)
+
     for name, buffer in buffer_dict.items():
         _dispatch_buffer(model, name, buffer, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu)
     if parameter_names_left:
         logger.info_rank0(f"Find missing key(s) in state dict: {parameter_names_left}, initialize them.")
         for name in sorted(parameter_names_left):
             _init_parameter(model, name, parameter_names_left=parameter_names_left)
+
+    # to_empty() clones every tensor, so any sharing beyond the input/output embedding
+    # pair below is lost. Models that tie whole submodules (DiffusionGemma shares its
+    # entire transformer stack between encoder and decoder) restore it here. The lookup
+    # goes through the class rather than the instance so that a wrapper forwarding unknown
+    # attributes via `__getattr__` (PEFT and friends) cannot accidentally opt in.
+    retie_shared_weights = getattr(type(model), "retie_shared_weights", None)
+    if callable(retie_shared_weights):
+        retied = retie_shared_weights(model)
+        logger.info_rank0(f"Re-tied {retied} shared parameter(s) after weight loading.")
 
     # to_empty() leaves embeddings untied (except under FSDP2 swap-tensor);
     # re-tie only when the config asks for it. Nested multimodal layouts can
@@ -1470,7 +1484,11 @@ def post_process_after_weight_loading(
         try:
             input_embeddings = model.get_input_embeddings()
             output_embeddings = model.get_output_embeddings()
-            output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
+            # Nothing to tie when there is no distinct output projection (e.g.
+            # SeedOmni ``TextEncoder`` with tied weights reuses the input
+            # embedding directly via ``F.linear`` and exposes no ``lm_head``).
+            if output_embeddings is not None and output_embeddings is not input_embeddings:
+                output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
         except Exception as e:
             logger.info_rank0(f"Failed to tie embeddings: {e}")
             raise RuntimeError("Failed to tie input/output embeddings") from e
