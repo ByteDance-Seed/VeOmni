@@ -211,12 +211,11 @@ need this overlay matrix.
 
 Caching is not a special framework mode — it is a different `train_graph` plus a
 different dataset type. A module opts in with `model_config.support_cache: true`,
-and the trainer turns `train.train_type` into that module's `cache_mode`
-constructor argument (see
+and `train.cache_mode` becomes that module's `cache_mode` constructor argument
+(see
 [Offline Encoding](../mixins/offline_encoding.md#how-a-run-picks-cache_mode)).
 
-**Stage 1 — produce the cache** (`train.train_type: offline_cache` ⇒ VAE cache
-mode `encode_only`). `offline_cache/modules_train.yaml` declares only
+**Stage 1 — produce the cache** (`train.cache_mode: encode_only`). `offline_cache/modules_train.yaml` declares only
 `bagel_vae`, and the DAG is a single edge, so nothing else is built:
 
 ```bash
@@ -231,9 +230,8 @@ bagel_vae.offline_encode -> end
 Posteriors are written to `train.offline_cache_dir`
 (`outputs/bagel_vae_cached_dataset` by default), reading normal `seedomni` data.
 
-**Stage 2 — train from the cache** (`train.train_type: train_with_cache` ⇒ VAE
-cache mode `process_only`, which makes the VAE preprocessor return `None` and
-skips CPU image prep entirely). `data.data_type` becomes `seedomni_cached` and
+**Stage 2 — train from the cache** (`train.cache_mode: process_only`, which makes
+the VAE preprocessor return `None` and skips CPU image prep entirely). `data.data_type` becomes `seedomni_cached` and
 `data.train_path` points at the stage-1 output directory:
 
 ```bash

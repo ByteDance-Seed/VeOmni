@@ -55,21 +55,18 @@ decisions, so they live in different places:
 | `encode_only` | `offline_encode` | Produce the cache. Requires `support_cache=True`. |
 | `process_only` | `online_process` | Train from the cache. Requires `support_cache=True`. |
 
-`model.train_type` is unrelated: it selects the training graph, not the cache
-mode.
+`model.model_config.train_type` is unrelated: it selects the training graph, not
+the cache mode.
 
 ## How a run picks `cache_mode`
 
-The trainer derives each module's `cache_mode` from the workflow,
-`train.train_type`
-([`OmniTrainingArguments.module_cache_mode`](../../../veomni/arguments/omni_arguments_types.py#L637)).
-Only modules whose config has `support_cache` leave `full`:
-
-| `train.train_type` | `support_cache: true` | otherwise |
-|--------------------|-----------------------|-----------|
-| `offline_cache` | `encode_only` | `full` |
-| `train_with_cache` | `process_only` | `full` |
-| `train` | `full` | `full` |
+A run sets one `train.cache_mode` (`full` by default), and each module whose
+config has `support_cache` is built in it; every other module stays `full`
+([`OmniTrainingArguments.module_cache_mode`](../../../veomni/arguments/omni_arguments_types.py#L639)).
+The mode also picks the trainer's loop: `encode_only` runs the graph without
+autograd and writes each conversation to `train.offline_cache_dir`, which it
+requires, and builds no optimizer; `process_only` and `full` train. A
+`process_only` run reads the cache back with `data.data_type: seedomni_cached`.
 
 [`ModuleRuntime.cache_mode`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L191)
 is the single source of the mode. Inference builds have no train arguments, so
@@ -266,7 +263,7 @@ for a two-stage example.
   - [MRO order of the sibling mixin](../../../tests/seed_omni/mixins/test_offline_encoding_mixin.py#L149) and
     [rejection of the wrong base order](../../../tests/seed_omni/mixins/test_offline_encoding_mixin.py#L178).
 - [`tests/seed_omni/runtime/test_module_runtime.py`](../../../tests/seed_omni/runtime/test_module_runtime.py):
-  - [workflow → `cache_mode` → constructor kwarg](../../../tests/seed_omni/runtime/test_module_runtime.py#L155);
+  - [`train.cache_mode` → module `cache_mode` → constructor kwarg](../../../tests/seed_omni/runtime/test_module_runtime.py#L155);
   - [a module that ignored its `cache_mode`](../../../tests/seed_omni/runtime/test_module_runtime.py#L182) and
     [a trainable module in a reduced mode](../../../tests/seed_omni/runtime/test_module_runtime.py#L197) are rejected.
 - [`tests/seed_omni/model/test_processor.py`](../../../tests/seed_omni/model/test_processor.py):

@@ -51,7 +51,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal, Optional, Union, get_args
 
 import yaml
 
@@ -76,8 +76,7 @@ from .parser import _deep_update, _instantiate_recursive
 
 logger = logging.get_logger(__name__)
 
-OMNI_TRAIN_WORKFLOWS = {"train", "offline_cache", "train_with_cache", "train_and_cache"}
-_WORKFLOW_CACHE_MODES = {"offline_cache": "encode_only", "train_with_cache": "process_only"}
+OmniCacheMode = Literal["full", "encode_only", "process_only"]
 
 
 def _is_omni_checkpoint_root(path: Optional[str]) -> bool:
@@ -601,10 +600,16 @@ class OmniTrainingArguments:
         default=0,
         metadata={"help": "MoE expert load heatmap interval. Not supported by OmniTrainer; must be <= 0 (disabled)."},
     )
-    train_type: Optional[str] = field(default=None, metadata={"help": "SeedOmni training workflow."})
+    cache_mode: OmniCacheMode = field(
+        default="full",
+        metadata={
+            "help": "Offline-encoding mode of every module whose config has `support_cache`: "
+            "'full' encodes online, 'encode_only' writes the offline cache, 'process_only' trains from it."
+        },
+    )
     offline_cache_dir: Optional[str] = field(
         default=None,
-        metadata={"help": "Output directory for train_type='offline_cache'."},
+        metadata={"help": "Output directory for cache_mode='encode_only'."},
     )
     graph_profile: OmniGraphProfileArguments = field(default_factory=OmniGraphProfileArguments)
     wandb: WandbConfig = field(default_factory=WandbConfig)
@@ -613,14 +618,11 @@ class OmniTrainingArguments:
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
-        self.train_type = self.train_type or "train"
-        if self.train_type not in OMNI_TRAIN_WORKFLOWS:
-            known = ", ".join(sorted(OMNI_TRAIN_WORKFLOWS))
-            raise ValueError(f"Unknown train.train_type {self.train_type!r}; expected one of: {known}.")
-        if self.train_type == "train_and_cache":
-            raise NotImplementedError("`train.train_type: train_and_cache` is reserved and is not implemented yet.")
-        if self.train_type == "offline_cache" and not self.offline_cache_dir:
-            raise ValueError("`train.offline_cache_dir` is required when `train.train_type` is 'offline_cache'.")
+        if self.cache_mode not in get_args(OmniCacheMode):
+            known = ", ".join(get_args(OmniCacheMode))
+            raise ValueError(f"Unknown train.cache_mode {self.cache_mode!r}; expected one of: {known}.")
+        if self.cache_mode == "encode_only" and not self.offline_cache_dir:
+            raise ValueError("`train.offline_cache_dir` is required when `train.cache_mode` is 'encode_only'.")
 
         if self.dyn_bsz_physical_overflow_ratio < 1.0:
             raise ValueError(
@@ -634,15 +636,13 @@ class OmniTrainingArguments:
         self._resolve_checkpoint_paths()
         self._resolve_profile()
 
-    def module_cache_mode(self, support_cache: bool) -> str:
-        """The ``cache_mode`` this workflow builds a module in (see ``OfflineEncodingMixin``).
+    def module_cache_mode(self, support_cache: bool) -> OmniCacheMode:
+        """The ``cache_mode`` a module is built in (see ``OfflineEncodingMixin``).
 
-        Only a module whose config has ``support_cache`` runs from a cache; every
-        other module, and every other workflow, is ``full``.
+        Only a module whose config has ``support_cache`` follows ``train.cache_mode``;
+        every other module encodes online, as ``full``.
         """
-        if not support_cache:
-            return "full"
-        return _WORKFLOW_CACHE_MODES.get(self.train_type, "full")
+        return self.cache_mode if support_cache else "full"
 
     def _derive_batch_config(self, accelerator: AcceleratorConfig) -> None:
         acc = accelerator

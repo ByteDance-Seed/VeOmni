@@ -80,7 +80,7 @@ def test_ranks_reduce_the_same_step_metrics(tmp_path):
 
 
 def test_offline_cache_logs_no_lr_without_an_lr_scheduler(tmp_path):
-    """``offline_cache`` freezes every module, so the composed model has no lr scheduler."""
+    """An ``encode_only`` run freezes every module, so the composed model has no lr scheduler."""
     mp.spawn(_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path), False), nprocs=2, join=True)
 
     train = json.loads((tmp_path / "rank0.json").read_text())["train"]

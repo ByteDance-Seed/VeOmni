@@ -143,23 +143,23 @@ def test_build_model_uses_the_config_the_omni_config_loaded(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("train_type", "support_cache", "cache_mode"),
+    ("train_cache_mode", "support_cache", "cache_mode"),
     [
-        ("offline_cache", True, "encode_only"),
-        ("train_with_cache", True, "process_only"),
-        ("train", True, "full"),
-        ("train_with_cache", False, "full"),
+        ("encode_only", True, "encode_only"),
+        ("process_only", True, "process_only"),
+        ("full", True, "full"),
+        ("process_only", False, "full"),
         (None, True, "full"),
     ],
 )
-def test_build_model_hands_the_workflows_cache_mode_to_the_constructor(
-    monkeypatch, train_type, support_cache, cache_mode
+def test_build_model_hands_the_runs_cache_mode_to_the_constructor(
+    monkeypatch, train_cache_mode, support_cache, cache_mode
 ):
-    """``cache_mode`` is a constructor kwarg derived from ``train.train_type``.
+    """``cache_mode`` is a constructor kwarg read from ``train.cache_mode``.
 
-    It must not travel through ``model_config``: the launcher's graph-selecting
-    ``train_type`` key is stripped there, which used to leave every module in
-    ``full``. ``None`` stands for an inference build, which has no train args.
+    It must not travel through ``model_config``, which is persisted with the
+    checkpoint while the mode belongs to one run. ``None`` stands for an
+    inference build, which has no train args.
     """
     captured = {}
 
@@ -171,7 +171,7 @@ def test_build_model_hands_the_workflows_cache_mode_to_the_constructor(
         return model
 
     monkeypatch.setattr("veomni.models.build_foundation_model", fake_build_foundation_model)
-    runtime = _cache_mode_runtime(train_type, support_cache)
+    runtime = _cache_mode_runtime(train_cache_mode, support_cache)
 
     assert runtime.cache_mode == cache_mode
     runtime._build_model()
@@ -188,7 +188,7 @@ def test_build_model_rejects_a_module_that_ignored_its_cache_mode(monkeypatch):
         return model
 
     monkeypatch.setattr("veomni.models.build_foundation_model", fake_build_foundation_model)
-    runtime = _cache_mode_runtime("train_with_cache", True)
+    runtime = _cache_mode_runtime("process_only", True)
 
     with pytest.raises(ValueError, match="must mix in OfflineEncodingMixin"):
         runtime._build_model()
@@ -196,7 +196,7 @@ def test_build_model_rejects_a_module_that_ignored_its_cache_mode(monkeypatch):
 
 def test_reduced_cache_mode_requires_a_frozen_module():
     """A reduced-mode module lacks sub-networks, so it must never be checkpointed."""
-    runtime = _cache_mode_runtime("offline_cache", True)
+    runtime = _cache_mode_runtime("encode_only", True)
     runtime.model = nn.Linear(2, 2)
 
     with pytest.raises(ValueError, match="requires a fully frozen module"):
@@ -206,7 +206,7 @@ def test_reduced_cache_mode_requires_a_frozen_module():
     runtime._check_cache_mode_is_frozen()
 
 
-def _cache_mode_runtime(train_type, support_cache):
+def _cache_mode_runtime(train_cache_mode, support_cache):
     from functools import partial
 
     from veomni.arguments.omni_arguments_types import OmniTrainingArguments
@@ -222,8 +222,8 @@ def _cache_mode_runtime(train_type, support_cache):
         ),
     )
     runtime.module_config = SimpleNamespace(model_type="fake", support_cache=support_cache)
-    if train_type is not None:
-        train_args = SimpleNamespace(train_type=train_type)
+    if train_cache_mode is not None:
+        train_args = SimpleNamespace(cache_mode=train_cache_mode)
         train_args.module_cache_mode = partial(OmniTrainingArguments.module_cache_mode, train_args)
         runtime.train_args = train_args
     return runtime

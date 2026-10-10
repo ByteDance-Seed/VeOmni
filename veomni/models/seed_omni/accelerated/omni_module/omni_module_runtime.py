@@ -191,8 +191,8 @@ class ModuleRuntime(VeOmniModelRuntime):
     def cache_mode(self) -> str:
         """The ``OfflineEncodingMixin`` cache mode this run builds the module in.
 
-        A per-run choice, so it is derived from the training workflow and handed
-        to the model constructor, never written onto the module config; only a
+        A per-run choice, so it is read from ``train.cache_mode`` and handed to
+        the model constructor, never written onto the module config; only a
         config with ``support_cache`` can leave ``full``. The model side and the
         data side (:class:`OmniProcessor`) both read it from here.
         """

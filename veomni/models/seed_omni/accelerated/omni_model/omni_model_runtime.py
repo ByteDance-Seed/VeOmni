@@ -131,10 +131,10 @@ def _reject_lora_that_matched_nothing(module_runtimes: Mapping[str, ModuleRuntim
     Raise only when LoRA was requested and **every** module is frozen, which
     would look like a healthy run whose loss never moves.
 
-    ``offline_cache`` is exempt: it freezes every module by design (and is
-    usually the training YAML with only ``--train.train_type`` overridden).
+    An ``encode_only`` run is exempt: it freezes every module by design (and is
+    usually the training YAML with only ``--train.cache_mode`` overridden).
     """
-    if getattr(train, "train_type", None) == "offline_cache":
+    if getattr(train, "cache_mode", None) == "encode_only":
         return
 
     requested = [name for name, runtime in module_runtimes.items() if bool(runtime.args.lora_config)]
