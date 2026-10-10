@@ -112,7 +112,7 @@ def copy(src: str, dst: str, **kwargs) -> bool:
 def _isdir(file_path: str) -> bool:
     """hdfs isdir"""
     if file_path.startswith("hdfs"):
-        return _run_cmd(_hdfs_cmd(f"-test -d {file_path}")) == 0
+        return _run_hdfs(["-test", "-d", file_path]).returncode == 0
     return os.path.isdir(file_path)
 
 
@@ -136,7 +136,7 @@ def isdir(path: str, **kwargs) -> bool:
 def _listdir(path: str, **kwargs) -> list:
     """hdfs listdir"""
     if path.startswith("hdfs"):
-        result = subprocess.run(_hdfs_cmd(f"-ls {path}"), shell=True, capture_output=True, text=True)
+        result = _run_hdfs(["-ls", path])
         if result.returncode != 0:
             raise FileNotFoundError(f"hdfs ls {path} failed: {result.stderr.strip()}")
         names = []
@@ -241,6 +241,13 @@ def open(path: str, mode: str = "r") -> IO[Any]:
 
 def _run_cmd(cmd: str, timeout=None):
     return os.system(cmd)
+
+
+def _run_hdfs(args: list) -> "subprocess.CompletedProcess":
+    """Run `hdfs dfs <args>` without a shell so paths are passed as single, intact arguments."""
+    if not _HDFS_BIN_PATH:
+        raise FileNotFoundError("hdfs executable not found on PATH")
+    return subprocess.run([_HDFS_BIN_PATH, "dfs", *args], shell=False, capture_output=True, text=True)
 
 
 def _hdfs_cmd(cmd: str) -> str:
