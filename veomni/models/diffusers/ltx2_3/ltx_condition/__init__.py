@@ -1,4 +1,6 @@
-from ....loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+"""Register the local LTX 2.3 condition config and model."""
+
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
 @MODEL_CONFIG_REGISTRY.register("LTXVideoConditionModel")
@@ -9,7 +11,7 @@ def register_ltx_condition_config():
 
 
 @MODELING_REGISTRY.register("LTXVideoConditionModel")
-def register_ltx_condition_modeling(architecture: str = None):
+def register_ltx_condition_modeling(_architecture: str | None = None):
     from .modeling_ltx2_3_condition import LTXVideoConditionModel
 
     return LTXVideoConditionModel

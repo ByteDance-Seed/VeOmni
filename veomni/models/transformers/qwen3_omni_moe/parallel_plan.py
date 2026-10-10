@@ -21,3 +21,19 @@ def get_parallel_plan():
         }
     )
     return parallel_plan
+
+
+def get_thinker_parallel_plan():
+    ep_plan = {
+        "model.layers.*.mlp.experts.gate_up_proj": Shard(0),
+        "model.layers.*.mlp.experts.down_proj": Shard(0),
+    }
+    return ParallelPlan(extra_parallel_plan={"ep": ep_plan})
+
+
+def get_text_parallel_plan():
+    ep_plan = {
+        "layers.*.mlp.experts.gate_up_proj": Shard(0),
+        "layers.*.mlp.experts.down_proj": Shard(0),
+    }
+    return ParallelPlan(extra_parallel_plan={"ep": ep_plan})

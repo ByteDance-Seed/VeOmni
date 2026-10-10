@@ -27,7 +27,9 @@ Users can directly load models from HuggingFace and start the training process b
 
 ### 1. Create Your Model Implementation
 
-First, create a new modeling file for your model implementation. Custom models should inherit from `PreTrainedModel` and implement the necessary methods.
+Create a model package under `veomni/models/transformers/`. Declare
+model changes in a patchgen config and generate the modeling file; do not edit
+the generated output directly.
 
 
 ### 2. Register Your Model
@@ -48,32 +50,31 @@ class YourCustomConfig(PretrainedConfig):
 You can also use the model configuration from HuggingFace if you are only modifying the modeling component of an existing HuggingFace model.
 
 
-Here's a complete example of adding a new model:
+Register the generated model class from the package's `__init__.py`:
 
 ```python
-# veomni/models/transformers/your_custom_model.py
+# veomni/models/transformers/your_custom_model/__init__.py
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
-from transformers import PreTrainedModel, PretrainedConfig
+from .configuration_your_custom_model import YourCustomConfig
 
-class YourCustomConfig(PretrainedConfig):
-    model_type = "your_custom_model"
-    architectures = ["YourCustomModel"]
 
-class YourCustomModel(PreTrainedModel):
-    config_class = YourCustomConfig
+@MODEL_CONFIG_REGISTRY.register("your_custom_model")
+def register_config():
+    return YourCustomConfig
 
-    def __init__(self, config):
-        super().__init__(config)
-        # Initialize your model components
 
-    def forward(self, input_ids, **kwargs):
-        ...
+@MODELING_REGISTRY.register("your_custom_model")
+def register_modeling(architecture: str):
+    from .generated.patched_modeling_your_custom_model_gpu import YourCustomModel
 
-# Register your model
-ModelClass = YourCustomModel
+    return YourCustomModel
 ```
 
-Check existing model implementations in the `veomni/models/transformers/` and `veomni/models/diffusers/` directory for reference.
+Import the package from `veomni/models/transformers/__init__.py` so the
+decorators run at package import time. See the
+[new-model guide](../usage/support_new_models/guide_and_checklist.md) for the
+patchgen config and validation workflow.
 
 ### 4. Loading Your Model
 

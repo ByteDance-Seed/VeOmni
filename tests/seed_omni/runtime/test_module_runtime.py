@@ -60,7 +60,7 @@ def test_omni_runtime_arguments_are_model_arguments():
 
 
 def test_module_checkpoint_manager_is_a_model_checkpoint_manager():
-    from veomni.models.checkpoint_manager import ModelCheckpointManager
+    from veomni.models.checkpoint import ModelCheckpointManager
     from veomni.models.seed_omni.utils.checkpoint import OmniModuleCheckpointManager
 
     assert issubclass(OmniModuleCheckpointManager, ModelCheckpointManager)

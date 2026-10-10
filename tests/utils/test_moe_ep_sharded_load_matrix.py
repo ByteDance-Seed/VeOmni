@@ -61,7 +61,7 @@ from torch.distributed.tensor import DTensor, Shard
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
-from veomni.models.checkpoint_tensor_loading import ConvertedCheckpointTensor
+from veomni.models.checkpoint.convert import ConvertedCheckpointTensor
 from veomni.utils import helper
 from veomni.utils.device import get_dist_comm_backend, get_torch_device
 
@@ -133,7 +133,7 @@ class _StreamablePerExpertFuseConverter(_PerExpertFuseConverter):
     def fused_expert_target(self, name: str) -> tuple[str, int]:
         return "moe.experts", int(name[len(self._PREFIX) :])
 
-    def for_expert_range(self, start: int, num_local: int) -> "_StreamablePerExpertFuseConverter":
+    def for_expert_range(self, start: int, num_local: int) -> _StreamablePerExpertFuseConverter:
         return _StreamablePerExpertFuseConverter(num_local, self.offset + start)
 
 

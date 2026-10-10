@@ -75,10 +75,10 @@ from veomni.lora.moe_layers import (
     _LORA_SPEC_KEYS,
     LoraIndependentExperts,
     LoraSharedExperts,
-    _group_routing_assignments,
     apply_independent_moe_lora,
     apply_shared_moe_lora,
 )
+from veomni.ops.kernels.moe_experts_lora.routing import group_routing_assignments
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 from .utils import (
@@ -86,6 +86,7 @@ from .utils import (
     experts_module_globs,
     find_all_matching_modules,
     find_first_matching_module,
+    fused_triton_moe_ops,
     load_lora_config,
 )
 
@@ -153,7 +154,7 @@ def test_group_routing_assignments_matches_one_hot_reference(top_k_index, num_ex
         top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
         expected.append((int(expert_idx), top_k_pos, token_idx))
 
-    actual = list(_group_routing_assignments(top_k_index, num_experts))
+    actual = list(group_routing_assignments(top_k_index, num_experts))
 
     assert len(actual) == len(expected)
     for actual_group, expected_group in zip(actual, expected, strict=True):
@@ -165,7 +166,7 @@ def test_group_routing_assignments_matches_one_hot_reference(top_k_index, num_ex
 def test_group_routing_assignments_skips_padding_expert():
     top_k_index = torch.tensor([[0, 3], [3, 1]])
 
-    actual = list(_group_routing_assignments(top_k_index, num_experts=3))
+    actual = list(group_routing_assignments(top_k_index, num_experts=3))
 
     assert [expert_idx for expert_idx, _, _ in actual] == [0, 1]
 
@@ -246,6 +247,138 @@ def test_layout_validate_and_wrap(toy_dir: str, mode: str):
                 f"{fqn}/{mode}/{spec_name}: expected lora_A ndim={expected_lora_ndim}, "
                 f"got {a_w.ndim} (shape={tuple(a_w.shape)})"
             )
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_wrapper_selects_op_impl(mode: str):
+    """Wrapper constructs ``moe_experts_lora`` from the experts' ``moe_experts`` handle."""
+    from veomni.ops.config import get_ops_config, set_ops_config
+
+    model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
+    patterns = lora_cfg["target_parameters"]
+    sample_fqn, _ = find_first_matching_module(model, experts_module_globs(patterns))
+    _apply(
+        mode,
+        model,
+        target_parameter_patterns=patterns,
+        r=lora_cfg["rank"],
+        lora_alpha=lora_cfg["alpha"],
+        freeze_base_model=True,
+    )
+    wrapper_e = model.get_submodule(sample_fqn)
+    assert wrapper_e.veomni_moe_lora.op == "moe_experts_lora"
+    assert wrapper_e.veomni_moe_lora.variant == mode
+    assert wrapper_e.veomni_moe_lora.impl == "eager"
+
+    if not IS_CUDA_AVAILABLE:
+        return
+    saved_cfg = get_ops_config()
+    try:
+        torch.manual_seed(0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model_f = build_toy("qwen3_moe_toy", ops=fused_triton_moe_ops())
+        lora_cfg_f = resolve_fused_moe_lora_targets(model_f, load_lora_config("qwen3_moe_toy"))
+        fqn_f, _ = find_first_matching_module(model_f, experts_module_globs(lora_cfg_f["target_parameters"]))
+        _apply(
+            mode,
+            model_f,
+            target_parameter_patterns=lora_cfg_f["target_parameters"],
+            r=lora_cfg_f["rank"],
+            lora_alpha=lora_cfg_f["alpha"],
+            freeze_base_model=True,
+        )
+        wrapper_f = model_f.get_submodule(fqn_f)
+        assert wrapper_f.veomni_moe_lora.impl == "fused_triton"
+    finally:
+        set_ops_config(saved_cfg)
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_wrapper_follows_experts_handle_not_global_config(mode: str):
+    """A global config installed after model build must not change the wrapped experts' impl."""
+    from veomni.ops.config import get_ops_config, set_ops_config
+
+    model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
+    patterns = lora_cfg["target_parameters"]
+    sample_fqn, experts = find_first_matching_module(model, experts_module_globs(patterns))
+    assert experts.veomni_moe.impl == "eager"
+    saved_cfg = get_ops_config()
+    try:
+        set_ops_config(fused_triton_moe_ops())
+        _apply(
+            mode,
+            model,
+            target_parameter_patterns=patterns,
+            r=lora_cfg["rank"],
+            lora_alpha=lora_cfg["alpha"],
+            freeze_base_model=True,
+        )
+    finally:
+        set_ops_config(saved_cfg)
+    assert model.get_submodule(sample_fqn).veomni_moe_lora.impl == "eager"
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+@pytest.mark.parametrize("base_impl", ["fused_triton", "fused_quack"])
+def test_wrapper_uses_eager_when_lora_row_is_unavailable(monkeypatch, mode: str, base_impl: str):
+    from types import SimpleNamespace
+
+    from veomni.lora.moe_layers import _moe_lora_op
+    from veomni.ops import OP_REGISTRY
+
+    monkeypatch.setattr(OP_REGISTRY, "list_available", lambda op, variant: ["eager"])
+    base_layer = SimpleNamespace(veomni_moe=SimpleNamespace(impl=base_impl))
+
+    assert _moe_lora_op(base_layer, mode).impl == "eager"
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_wrapper_constructs_on_mocked_mlu_with_default_ops_config(monkeypatch, mode: str):
+    """MLU keeps the default ``fused_triton`` MoE row, but has no ``fused_triton`` MoE-LoRA row."""
+    pytest.importorskip("triton")
+    from transformers import Qwen3MoeConfig
+
+    from veomni.arguments import OpsImplementationConfig
+    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import Qwen3MoeExperts
+    from veomni.ops import OP_REGISTRY, VeomniOp
+    from veomni.ops.config import get_ops_config, set_ops_config
+
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: True)
+    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "mlu")
+    monkeypatch.setattr("veomni.ops.platform.requirement.IS_MLU_AVAILABLE", True)
+    # Handles are interned by triple; keep CUDA-resolved rows out and MLU-resolved rows in this test.
+    monkeypatch.setattr(VeomniOp, "_intern", {})
+
+    ops = OpsImplementationConfig()
+    assert ops.moe_implementation == "fused_triton"
+    assert "fused_triton" not in OP_REGISTRY.list_available("moe_experts_lora", mode)
+    with pytest.raises(RuntimeError, match="not registered for device 'mlu'"):
+        VeomniOp("moe_experts_lora", mode, "fused_triton")
+
+    config = Qwen3MoeConfig(hidden_size=16, moe_intermediate_size=8, num_experts=4, hidden_act="silu")
+    saved_cfg = get_ops_config()
+    set_ops_config(ops)
+    try:
+        experts = Qwen3MoeExperts(config)
+        assert experts.veomni_moe.impl == "fused_triton"
+        wrapper = _wrapper_cls(mode)(experts, r=2, lora_alpha=4)
+    finally:
+        set_ops_config(saved_cfg)
+    assert wrapper.veomni_moe_lora.impl == "eager"
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_wrapper_rejects_non_silu_experts(mode: str):
+    from transformers.activations import GELUActivation
+
+    model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
+    _, experts = find_first_matching_module(model, experts_module_globs(lora_cfg["target_parameters"]))
+    experts.act_fn = GELUActivation()
+
+    with pytest.raises(ValueError, match="only supports SiLU"):
+        _wrapper_cls(mode)(experts, r=lora_cfg["rank"], lora_alpha=lora_cfg["alpha"])
+    assert "gate_up_proj" in experts._parameters
 
 
 @pytest.mark.parametrize("mode", _MODE_CASES)

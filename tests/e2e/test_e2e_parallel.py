@@ -8,7 +8,7 @@ import pytest
 import torch
 import yaml
 
-from veomni.models.auto import build_foundation_model
+from veomni.models import build_foundation_model
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability, get_torch_device
 from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available
 
@@ -223,7 +223,7 @@ deepseek_v4_text_smoke_test_cases = [
         # gather around compressors). Exercise SP=1 vs SP=2 alignment.
         2,
         # The GPU fused-MoE path now preserves DeepSeek-V4's ``swiglu_limit``
-        # clamp, so keep the smoke test on the default fused_triton MoE path.
+        # clamp, so keep the smoke test on the default triton MoE path.
         # EP remains disabled here because the surrounding V4 e2e coverage is
         # an SP alignment smoke test, not an EP alignment test.
         1,
@@ -701,6 +701,27 @@ def test_wan_dit_uses_bfloat16_and_flash_attention():
             "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
         ]
         assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
+
+
+def test_deepseek_v4_e2e_casts_fused_triton_moe_to_bfloat16():
+    command_list = prepare_exec_cmd(
+        ["train_text_test"],
+        "deepseek_v4",
+        "./tests/toy_config/deepseek_v4_toy",
+        model_path="./deepseek_v4",
+        train_path="./dummy_text",
+        output_dir="./deepseek_v4",
+        is_moe=True,
+        max_ep_size=1,
+    )
+
+    assert command_list
+    for _, cmd_kwargs in command_list:
+        assert cmd_kwargs["extra_args"] == [
+            "--model.accelerator.fsdp_config.mixed_precision.enable=True",
+            "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+            "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+        ]
 
 
 @_gpt_oss_fa4_quack_skip

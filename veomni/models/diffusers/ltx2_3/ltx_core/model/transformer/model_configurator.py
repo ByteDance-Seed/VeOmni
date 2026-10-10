@@ -4,7 +4,7 @@ from ltx_core.model.model_protocol import ModelConfigurator
 from ltx_core.model.transformer.model import LTXModel, LTXModelType
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.text_projection import create_caption_projection
-from ltx_core.model.transformer.transformer import DEFAULT_TRANSFORMER_OPS, TransformerOpsConfig
+from ltx_core.model.transformer.transformer import TransformerOpsConfig
 from ltx_core.utils import check_config_value
 
 
@@ -15,7 +15,9 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
     """
 
     @classmethod
-    def from_config(cls, config: dict, ops: TransformerOpsConfig = DEFAULT_TRANSFORMER_OPS) -> LTXModel:
+    def from_config(cls, config: dict, ops: TransformerOpsConfig | None = None) -> LTXModel:
+        if ops is None:
+            ops = TransformerOpsConfig()
         # Build caption projections for 19B models (projection handled in transformer).
         caption_projection, audio_caption_projection = _build_caption_projections(config, is_av=True)
 
@@ -78,7 +80,9 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
     """
 
     @classmethod
-    def from_config(cls, config: dict, ops: TransformerOpsConfig = DEFAULT_TRANSFORMER_OPS) -> LTXModel:
+    def from_config(cls, config: dict, ops: TransformerOpsConfig | None = None) -> LTXModel:
+        if ops is None:
+            ops = TransformerOpsConfig()
         # Build caption projection for 19B model (projection handled in transformer).
         caption_projection, _ = _build_caption_projections(config, is_av=False)
 

@@ -9,9 +9,11 @@ everything beneath them moved.
 `dsa_indexer_loss` trains it with DeepSeek-V3.2 eq. (4): the KL from the real CSA
 attention distribution, restricted to the candidates the indexer itself selected,
 to `softmax(index_score)`. The teacher is recomputed in the forward by
-`sparse_mqa_target_fwd` from the TileLang attention's own log-sum-exp, summed over
-CSA layers, normalised per query token, scaled by `dsa_indexer_loss_coef` and added
-to the total loss.
+`sparse_mqa_target_fwd` from the TileLang attention's own base-2 log-sum-exp,
+summed over CSA layers, normalised per query token, scaled by
+`dsa_indexer_loss_coef` and added to the total loss. The base is part of the
+operator contract because the target and backward kernels reconstruct
+probabilities with `exp2`.
 
 The objective requires sequence parallelism switched off. Ulysses and context
 parallelism are the only two modes that enable it and the gate refuses both, for
@@ -127,9 +129,9 @@ overrides, so a bound checked in `DeepseekV4Config.__post_init__` would read
 `config.json` and never the YAML line contradicting it. The two implementation
 fields cannot live there either: they are `OpsImplementationConfig` fields, and
 neither dataclass can see the disagreement alone.
-`validate_build_prerequisites` is the earliest point that holds the finished config
-and the installed ops config together, and it runs before any rank reads a weight. It
-reads the ops config off the installed singleton rather than taking it as an argument,
+`validate_build_prerequisites` is the earliest point that holds the finished model
+config and installed ops-selection config together, and it runs before any rank
+reads a weight. It reads the ops config from the installed singleton rather than taking it as an argument,
 which is what keeps the builder's hook a no-argument call that any config can
 implement.
 
@@ -167,22 +169,19 @@ projections' gradients under both settings, not on `kl.grad_fn`, because the pro
 is exactly what a refactor could satisfy while delivering nothing.
 
 **The two flags are fields of `DeepseekV4Config`, not of
-`OpsImplementationConfig`.** They started on the ops config next to
-`dsa_indexer_implementation`, which reads naturally — the objective needs those
-two kernels — but conflates a training objective with a kernel backend, and the
-model already had the right precedent one field away: `output_router_logits` /
-`router_aux_loss_coef` configure this model's other auxiliary objective, live on
-its config, and are folded into the loss from `self.config` in the same forward.
-Three things followed from moving them:
+`OpsImplementationConfig`.** The model config owns training objectives, while
+`OpsImplementationConfig` selects kernel backends. This matches
+`output_router_logits` / `router_aux_loss_coef`, which configure the model's
+other auxiliary objective and are folded into the loss from `self.config` in
+the same forward. This ownership has three useful properties:
 
 - The model-type allow-list became unnecessary and was deleted. A flag on a
   model-agnostic dataclass can be set on any model, so it had to be refused for
   every model that does not implement it; a field on `DeepseekV4Config` cannot be
   set on GLM MoE DSA at all.
-- `OpsConfigSlot` went back to holding only implementation strings. The slots are
-  module-level globals on the generated modeling module, so two models built from
-  it — a DPO policy and its reference — shared one value, and the second `bind`
-  decided for both. `self.config` is per-instance.
+- `self.config` is per-instance, just like the `VeomniOp` handles constructed
+  by each generated model instance. A DPO policy and reference can therefore
+  retain independent model objectives and resolved kernels.
 - Declaring the fields is load-bearing, not tidiness. `model.model_config`
   overrides reach the config as `from_dict` kwargs, which are applied only for
   keys the constructed config already answers `hasattr` for and dropped silently
@@ -246,13 +245,13 @@ predicate, because neither keeps the model config: both take a config in
 `__init__` and retain only scalars off it. Giving them one means patching
 `__init__`, and the only route patchgen offers is `override_method` on it —
 restating the whole upstream body for one attribute, as the NPU config does for
-its `position_bias` sharding. (`modify_init` reads like the tool for this and is
-not: it is declared in `patch_spec.py` and unimplemented in the generator, so it
-silently produces nothing.) Threading the decision is both smaller and stronger:
+its `position_bias` sharding. `modify_init` now inlines extra `__init__`
+statements after the upstream body, so a one-attribute bind no longer needs a
+full `__init__` restatement. Threading the decision is both smaller and stronger:
 one evaluation per layer per forward cannot disagree with itself mid-call, and the
 HCA compressor takes the same parameter and ignores it only because its shared
 call site demands one signature —
-`tests/models/test_generated_call_site_signatures.py` is what enforces that, and
+`tests/models/transformers/test_generated_call_site_signatures.py` is what enforces that, and
 it is what caught the NPU compressors missing it.
 
 The layer gate keys on `layer_type` rather than on `module.compressor.indexer`

@@ -113,7 +113,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
 ## Start training on NPU
 
 Qwen3.5 runs on Ascend NPUs, but its GatedDeltaNet kernels are **not** auto-selected: all three
-OpSlot-driven ops (`rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule`) default to `fla`,
+model-local kernels (`rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule`) default to `fla`,
 which requires a GPU and raises on NPU. They must be set explicitly.
 
 ### Kernel backends
@@ -150,7 +150,7 @@ and `triton-ascend` on a mutually compatible release set.
 `npu_ascendc` is a second NPU backend for `chunk_gated_delta_rule` that delegates the heavy GDN
 compute to the external [`fla_npu`](https://github.com/flashserve/flash-linear-attention-npu)
 package (registered as `torch.ops.npu.*` fused ops); only the Triton glue stays vendored under
-`_ascend/triton_core`. It coexists with `npu` (pure vendored Triton), which remains the fallback.
+`veomni/ops/kernels/gated_delta_rule/vendor/triton_core`. It coexists with `npu` (pure vendored Triton), which remains the fallback.
 Set only `chunk_gated_delta_rule` to `npu_ascendc`; keep `rms_norm_gated` / `causal_conv1d` on `npu`:
 
 ```yaml
@@ -190,8 +190,8 @@ cd torch_custom/fla_npu/ && bash build.sh
 pip list | grep fla_npu   # verify it is installed
 ```
 
-If `fla_npu` is absent when `npu_ascendc` is selected, the backend raises an actionable error at
-`OpSlot.bind()` time (pointing back to the install step or to `npu` / `eager`).
+If `fla_npu` is absent when `npu_ascendc` is selected, the backend raises an actionable error when
+the model constructs its `VeomniOp` handle (pointing back to the install step or to `npu` / `eager`).
 
 ### Qwen3.5-9B VL Training
 
@@ -282,7 +282,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
 
 ### Selecting linear-attention kernels
 
-GatedDeltaNet has three OpSlot-driven kernels: `rms_norm_gated`, `causal_conv1d`, and
+GatedDeltaNet has three instance-local kernels: `rms_norm_gated`, `causal_conv1d`, and
 `chunk_gated_delta_rule`. All three default to `fla` — the FLA Triton kernels shipped under the
 `gpu` extra, which is the recommended value on GPU and required for varlen training.
 

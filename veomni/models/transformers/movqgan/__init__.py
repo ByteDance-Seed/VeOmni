@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
+
+"""Register the local MoVQGAN config, model, and processor."""
+
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
 
 
 @MODEL_CONFIG_REGISTRY.register("movqgan")
@@ -22,7 +25,7 @@ def register_movqgan_config():
 
 
 @MODELING_REGISTRY.register("movqgan")
-def register_movqgan_modeling(architecture: str):
+def register_movqgan_modeling(_architecture: str):
     from .modeling_movqgan import MoVQGAN
 
     return MoVQGAN

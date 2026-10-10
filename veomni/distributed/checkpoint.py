@@ -17,6 +17,20 @@ from torch.utils.checkpoint import (
 )
 
 
+def _checkpoint_fsdp_module(run_function):
+    """The FSDP-wrapped module around ``run_function``, if checkpoint has one.
+
+    Reentrant checkpoint historically received a module or a bound method.
+    Registry wrappers, ``functools.partial``, and bare functions have no
+    ``__self__``; skipping the handle patch leaves extra allgather rather than
+    crashing the backward.
+    """
+    if isinstance(run_function, torch.nn.Module):
+        return run_function
+    module = getattr(run_function, "__self__", None)
+    return module if isinstance(module, torch.nn.Module) else None
+
+
 class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, run_function, preserve_rng_state, *args):
@@ -56,12 +70,13 @@ class CheckpointFunction(torch.autograd.Function):
         with torch.no_grad():
             outputs = run_function(*args)
 
-        # patch code, remove the extra allgather with use_reentrant + ckpt
-        if not isinstance(ctx.run_function, torch.nn.Module):
-            ctx.patch_module = ctx.run_function.__self__
-        else:
-            ctx.patch_module = ctx.run_function
-        state = _get_module_fsdp_state_if_fully_sharded_module(ctx.patch_module)
+        # patch code, remove the extra allgather with use_reentrant + ckpt.
+        # HF wraps ``partial(super().__call__, ...)`` and tests may pass a bare
+        # function; those have no ``__self__``, so skip the FSDP handle patch.
+        ctx.patch_module = _checkpoint_fsdp_module(ctx.run_function)
+        state = (
+            _get_module_fsdp_state_if_fully_sharded_module(ctx.patch_module) if ctx.patch_module is not None else None
+        )
         if state:
             handle = _module_handle(state, ctx.patch_module)
             if handle:
@@ -79,7 +94,9 @@ class CheckpointFunction(torch.autograd.Function):
             )
         # patch code, remove the extra allgather with use_reentrant + ckpt
         handle = None
-        state = _get_module_fsdp_state_if_fully_sharded_module(ctx.patch_module)
+        state = (
+            _get_module_fsdp_state_if_fully_sharded_module(ctx.patch_module) if ctx.patch_module is not None else None
+        )
         if state:
             handle = _module_handle(state, ctx.patch_module)
             if handle:

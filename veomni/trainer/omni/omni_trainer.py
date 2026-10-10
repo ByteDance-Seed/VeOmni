@@ -71,7 +71,7 @@ from ...distributed.parallel_state import clear_parallel_state, init_parallel_st
 from ...models.seed_omni.accelerated import OmniModelRuntime, build_omni_model_runtime
 from ...models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 from ...models.seed_omni.processing_omni import OmniProcessor
-from ...ops.batch_invariant_ops import set_batch_invariant_mode
+from ...ops.batch_invariant import set_batch_invariant_mode
 from ...utils import helper, logging
 from ...utils.device import (
     get_device_type,

@@ -28,49 +28,26 @@ at load time, eliminating the need for offline checkpoint merging.
         model.layers.{i}.mlp.experts.down_proj     [E, H, I]
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
-import torch
-
-from ....utils import logging
-from ..._moe_fused_weight_map import (
+from veomni.models.checkpoint.expert_fusion import PerExpertSplitToFusedConverter
+from veomni.models.checkpoint.moe_map import (
     PER_EXPERT_SPLIT_TO_FUSED_PATTERN,
     convert_per_expert_fqn_mapping_to_fused,
 )
-from ...checkpoint_tensor_loading import ConvertedCheckpointTensor
 
 
-logger = logging.get_logger(__name__)
-
-# Matches per-expert split keys like: model.layers.0.mlp.experts.3.gate_proj.weight
 _EXPERT_PATTERN = PER_EXPERT_SPLIT_TO_FUSED_PATTERN
 
 
-class Qwen3MoeCheckpointTensorConverter:
-    """Converts per-expert split checkpoint keys to stacked & merged v5 format.
+class Qwen3MoeCheckpointTensorConverter(PerExpertSplitToFusedConverter):
+    """Converts per-expert split checkpoint keys to stacked & merged v5 format."""
 
-    Buffers per-expert tensors as they stream from safetensor files, and emits
-    merged tensors once all experts for a given (layer, projection) are collected.
-
-    Args:
-        num_experts: Number of experts per MoE layer this converter stacks.
-        expert_offset: Checkpoint index of the first expert it stacks; experts
-            ``[expert_offset, expert_offset + num_experts)`` become rows ``0..num_experts-1``.
-    """
-
-    def __init__(self, num_experts: int, expert_offset: int = 0):
-        self.num_experts = num_experts
-        self.expert_offset = expert_offset
-        # {(prefix, proj_name): {local_expert_id: tensor}}
-        self._expert_buffer: Dict[Tuple[str, str], Dict[int, torch.Tensor]] = {}
-        # {prefix: {proj_name: stacked_tensor}} for gate/up merge waiting
-        self._stacked_buffer: Dict[str, Dict[str, torch.Tensor]] = {}
-
-    def can_handle(self, name: str) -> bool:
-        return bool(_EXPERT_PATTERN.match(name))
+    family_name = "Qwen3MoE"
+    expert_pattern = _EXPERT_PATTERN
 
     def fused_expert_target(self, name: str) -> Optional[Tuple[str, int]]:
-        match = _EXPERT_PATTERN.match(name)
+        match = self.expert_pattern.match(name)
         if not match:
             return None
         prefix, expert_id_str, proj_name = match.groups()
@@ -83,70 +60,6 @@ class Qwen3MoeCheckpointTensorConverter:
                 f"Expert range [{start}, {start + num_local}) is outside this converter's {self.num_experts} experts."
             )
         return type(self)(num_experts=num_local, expert_offset=self.expert_offset + start)
-
-    def convert(self, name: str, tensor: "torch.Tensor") -> Optional[ConvertedCheckpointTensor]:
-        match = _EXPERT_PATTERN.match(name)
-        if not match:
-            return None
-
-        prefix, expert_id_str, proj_name = match.groups()
-        expert_id = int(expert_id_str) - self.expert_offset
-        if not 0 <= expert_id < self.num_experts:
-            raise ValueError(
-                f"{name}: expert {int(expert_id_str)} is outside this converter's range "
-                f"[{self.expert_offset}, {self.expert_offset + self.num_experts})."
-            )
-        buf_key = (prefix, proj_name)
-
-        if buf_key not in self._expert_buffer:
-            self._expert_buffer[buf_key] = {}
-        self._expert_buffer[buf_key][expert_id] = tensor
-
-        # Check if all experts collected for this (prefix, proj)
-        if len(self._expert_buffer[buf_key]) < self.num_experts:
-            return None
-
-        # Stack all experts: [E, I, H] or [E, H, I]
-        stacked = torch.stack([self._expert_buffer[buf_key][i] for i in range(self.num_experts)])
-        del self._expert_buffer[buf_key]
-
-        if proj_name == "down_proj":
-            return ConvertedCheckpointTensor(f"{prefix}.experts.down_proj", stacked)
-
-        # gate_proj or up_proj — buffer for merging with the other
-        if prefix not in self._stacked_buffer:
-            self._stacked_buffer[prefix] = {}
-        self._stacked_buffer[prefix][proj_name] = stacked
-
-        if "gate_proj" in self._stacked_buffer[prefix] and "up_proj" in self._stacked_buffer[prefix]:
-            gate = self._stacked_buffer[prefix].pop("gate_proj")
-            up = self._stacked_buffer[prefix].pop("up_proj")
-            if not self._stacked_buffer[prefix]:
-                del self._stacked_buffer[prefix]
-            merged = torch.cat([gate, up], dim=1)  # [E, 2*I, H]
-            return ConvertedCheckpointTensor(f"{prefix}.experts.gate_up_proj", merged)
-
-        return None
-
-    def finalize(self) -> List[ConvertedCheckpointTensor]:
-        """Validate that all buffers were flushed.
-
-        Raises RuntimeError if any buffers remain unflushed, since incomplete
-        expert tensors cannot be merged into valid fused format and indicate
-        a corrupted or incomplete checkpoint.
-        """
-        errors: List[str] = []
-        if self._expert_buffer:
-            unflushed = {k: len(v) for k, v in self._expert_buffer.items()}
-            errors.append(
-                f"unflushed per-expert buffer (incomplete experts, expected {self.num_experts}): {unflushed}"
-            )
-        if self._stacked_buffer:
-            unflushed = {k: list(v.keys()) for k, v in self._stacked_buffer.items()}
-            errors.append(f"unflushed stacked buffer (missing gate/up pair): {unflushed}")
-        if errors:
-            raise RuntimeError("Qwen3MoE checkpoint converter: incomplete checkpoint detected. " + "; ".join(errors))
-        return []
 
 
 def create_qwen3_moe_checkpoint_tensor_converter(model):

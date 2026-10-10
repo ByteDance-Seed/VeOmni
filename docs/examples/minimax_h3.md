@@ -306,7 +306,7 @@ references, forward-local SP padding and fail-closed inputs. SP collectives are
 mocked there, so it does not establish distributed SP parity. The FA2/FA3 call
 site is checked for all four backends with a kernel stub that asserts the
 varlen layout; kernel correctness itself is covered by
-`tests/ops/test_flash_attn_varlen_padding.py`.
+`tests/ops/attention/flash/test_flash_attention.py`.
 No end-to-end speedup or convergence is claimed. Benchmark against an equivalent,
 tuned non-packed baseline before claiming a performance improvement.
 
@@ -345,7 +345,7 @@ pipe = MiniMaxH3Pipeline.from_pretrained(
     transformer_config_path="pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer/config.json",
     transformer_weights_path="pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer",
     ops_implementation=OpsImplementationConfig(
-        attn_implementation="eager",
+        attn_implementation="sdpa",
         rotary_pos_emb_implementation="eager",
         rms_norm_implementation="eager",
         swiglu_mlp_implementation="eager",

@@ -32,6 +32,14 @@ from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torc
 _PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
 
 
+def _load_dsv4_toy_config():
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config._attn_implementation = "eager"
+    return config
+
+
 def _broadcast_module(module: torch.nn.Module) -> None:
     for param in module.parameters():
         dist.broadcast(param.data, src=0)
@@ -66,14 +74,12 @@ def _run_deepseek_v4_attention_sp_fw_bw(
         world_size=world_size,
     )
 
-    from transformers import AutoConfig
-
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
     _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
 
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(0)
     # Layer 0 is HCA (compressor). Layer type with sliding-only is unavailable on
     # the toy config, so disable the compressor when we want pure sliding MQA.
@@ -207,16 +213,15 @@ def _run_deepseek_v4_indexer_sp_equivalence(rank: int, world_size: int, init_fil
         world_size=world_size,
     )
 
-    from transformers import AutoConfig
-
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+    from veomni.ops.config import set_ops_config
 
     _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
-    dsv4.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+    set_ops_config(SimpleNamespace(dsa_indexer_implementation="tilelang"))
 
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(1)
     indexer = dsv4.DeepseekV4CSACompressor(config).indexer.to(device=device_type, dtype=torch.bfloat16)
     with torch.no_grad():

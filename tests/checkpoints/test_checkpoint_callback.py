@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from veomni.checkpoint import layout
-from veomni.models.checkpoint_manager import ModelCheckpointManager
+from veomni.models.checkpoint import ModelCheckpointManager
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import (
     CheckpointCallback,
@@ -273,9 +273,9 @@ class TestCheckpointCallbackTrainEndWait:
         trainer.wait_for_pending_save.assert_called_once_with()
 
 
-@patch("veomni.models.checkpoint_manager.build_checkpointer")
-@patch("veomni.models.checkpoint_manager.dist")
-@patch("veomni.models.checkpoint_manager.helper")
+@patch("veomni.models.checkpoint.manager.build_checkpointer")
+@patch("veomni.models.checkpoint.manager.dist")
+@patch("veomni.models.checkpoint.manager.helper")
 class TestModelCheckpointManagerSaveContract:
     """``stage_dir`` keys its staging directory on the ``path`` given to ``save``.
 
