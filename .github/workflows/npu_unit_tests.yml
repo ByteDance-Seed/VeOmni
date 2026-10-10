@@ -171,6 +171,7 @@ jobs:
           uv run --frozen pytest -v -s -x tests/models/test_minimax_h3_packing.py
           uv run --frozen pytest -v -s -x tests/lora/test_vlm_lora.py
           uv run --frozen pytest -v -s -x tests/models/test_checkpoint_tensor_converter.py
+          uv run --frozen pytest -v -s -x tests/models/test_glm_moe_dsa.py
       - name: Run SeedOmni unit tests
         run: |
           uv run --frozen pytest -v -s -x tests/seed_omni

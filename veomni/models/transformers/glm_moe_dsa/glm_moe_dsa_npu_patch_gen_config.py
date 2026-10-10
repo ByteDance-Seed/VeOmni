@@ -8,6 +8,7 @@ from veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config imp
     PatchedDeepseekV3Experts,
     deepseek_v3_get_parallel_plan_patched,
     deepseek_v3_moe_forward_patched,
+    deepseek_v3_topk_router_forward_patched,
 )
 from veomni.patchgen.patch_spec import PatchConfig
 
@@ -31,8 +32,8 @@ config.add_import(
 )
 
 # This config is much smaller than the GPU sibling: besides
-# `GlmMoeDsaForCausalLM.forward` it only shares the MoE and parallel-plan
-# patches, so the GPU indexer / attention ports do not reach the NPU build.
+# `GlmMoeDsaForCausalLM.forward` it only shares the routed-expert block and
+# parallel-plan patches, so the GPU indexer / attention ports do not reach the NPU build.
 # The DSA top-k selection therefore relies on upstream's `indices=` hand-off
 # here; VeOmni's `flash_attention_forward` rejects that kwarg rather than
 # silently running dense attention.
@@ -46,13 +47,19 @@ config.add_post_import_block(
     """
 )
 
-# Same MoE and parallel-plan patches as the GPU config, so GPU and NPU runs
-# share one expert layout and EP plan.
+# Same routed-expert block and parallel-plan patches as the GPU config, so GPU
+# and NPU runs share one expert layout, router numerics and EP plan.
 config.replace_class(
     "GlmMoeDsaExperts",
     replacement=PatchedDeepseekV3Experts,
     name_map=_DEEPSEEK_V3_NAME_MAP,
     description="Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path",
+)
+config.override_method(
+    "GlmMoeDsaTopkRouter.forward",
+    replacement=deepseek_v3_topk_router_forward_patched,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Disable autocast around fp32 router linear for VeRL actor/rollout parity",
 )
 config.override_method(
     "GlmMoeDsaMoE.forward",
