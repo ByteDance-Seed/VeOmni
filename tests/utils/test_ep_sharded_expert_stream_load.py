@@ -15,9 +15,11 @@
 """Per-expert -> fused stacking under ``load_model_weights_ep_sharded``, on CPU.
 
 Each EP rank is simulated in turn with a stub parallel state over a model whose
-expert parameters already hold the rank-local ``[E/ep, ...]`` shape, mirroring
-Qwen3.5-MoE: the trunk experts are fused in the checkpoint while the MTP experts
-are stored per expert and go through ``Qwen3MoeCheckpointTensorConverter``.
+expert parameters already hold the rank-local ``[E/ep, ...]`` shape. Most cases
+mirror Qwen3.5-MoE: the trunk experts are fused in the checkpoint while the MTP
+experts are stored per expert and go through ``Qwen3MoeCheckpointTensorConverter``.
+The all-per-expert trunk case covers the Qwen3-MoE, DeepSeek-V3 and
+Qwen3-Omni-MoE checkpoint layouts.
 """
 
 from pathlib import Path
@@ -32,7 +34,12 @@ from torch.distributed.tensor import Shard
 
 import veomni.models.module_utils as module_utils
 from veomni.distributed.parallel_plan import ParallelPlan
+from veomni.models.transformers.deepseek_v3.checkpoint_tensor_converter import DeepseekV3CheckpointTensorConverter
+from veomni.models.transformers.glm_moe_dsa.checkpoint_tensor_converter import GlmMoeDsaCheckpointTensorConverter
 from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import Qwen3MoeCheckpointTensorConverter
+from veomni.models.transformers.qwen3_omni_moe.checkpoint_tensor_converter import (
+    Qwen3OmniMoeCheckpointTensorConverter,
+)
 
 
 NUM_EXPERTS, HIDDEN, INTERMEDIATE, EP_SIZE = 4, 3, 2, 2
@@ -254,6 +261,88 @@ def test_a_checkpoint_with_more_experts_than_the_model_raises(monkeypatch, tmp_p
 
     with pytest.raises(RuntimeError, match=rf"\({NUM_EXPERTS} experts\): unexpected experts \[{NUM_EXPERTS}\]\.$"):
         _load_as_rank(monkeypatch, tmp_path, 0, _meta_model())
+
+
+class _PerExpertTrunkModel(nn.Module):
+    """A one-layer MoE trunk under ``root`` whose checkpoint stores every expert per expert."""
+
+    def __init__(self, root: str, converter_cls) -> None:
+        super().__init__()
+        parent = self
+        for part in root.split("."):
+            parent.add_module(part, nn.Module())
+            parent = getattr(parent, part)
+        parent.layers = nn.ModuleList([_layer(NUM_EXPERTS // EP_SIZE)])
+        self.root = root
+        self.converter_cls = converter_cls
+        self.config = SimpleNamespace(tie_word_embeddings=False)
+
+    def get_parallel_plan(self) -> ParallelPlan:
+        return ParallelPlan(
+            extra_parallel_plan={
+                "ep": {f"{self.root}.layers.*.mlp.experts.{proj}": Shard(0) for proj in ("gate_up_proj", "down_proj")}
+            }
+        )
+
+    @staticmethod
+    def _create_checkpoint_tensor_converter(model):
+        return model.converter_cls(num_experts=NUM_EXPERTS)
+
+
+@pytest.mark.parametrize(
+    "converter_cls, built, unbuilt",
+    [
+        pytest.param(Qwen3MoeCheckpointTensorConverter, "model.layers.0", None, id="qwen3_moe"),
+        # DeepSeek-V3 ships its MTP layer as one extra trunk index the model does not build.
+        pytest.param(DeepseekV3CheckpointTensorConverter, "model.layers.0", "model.layers.1", id="deepseek_v3"),
+        # So does GLM-5 (``model.layers.78``).
+        pytest.param(GlmMoeDsaCheckpointTensorConverter, "model.layers.0", "model.layers.1", id="glm_moe_dsa"),
+        # VeOmni builds Qwen3-Omni-MoE with has_talker=False.
+        pytest.param(
+            Qwen3OmniMoeCheckpointTensorConverter,
+            "thinker.model.layers.0",
+            "talker.model.layers.0",
+            id="qwen3_omni_moe",
+        ),
+    ],
+)
+def test_an_all_per_expert_trunk_streams_into_the_local_fused_slice(
+    monkeypatch, tmp_path, converter_cls, built, unbuilt
+):
+    generator = torch.Generator().manual_seed(0)
+    state = {}
+    for layer in filter(None, (built, unbuilt)):
+        for expert in range(NUM_EXPERTS):
+            for proj, shape in (
+                ("gate_proj", (INTERMEDIATE, HIDDEN)),
+                ("up_proj", (INTERMEDIATE, HIDDEN)),
+                ("down_proj", (HIDDEN, INTERMEDIATE)),
+            ):
+                state[f"{layer}.mlp.experts.{expert}.{proj}.weight"] = torch.randn(*shape, generator=generator)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    save_file(state, str(tmp_path / "model.safetensors"))
+
+    ep_rank = 1
+    with torch.device("meta"):
+        model = _PerExpertTrunkModel(built.rsplit(".layers.", 1)[0], converter_cls)
+    read_keys = _load_as_rank(monkeypatch, tmp_path, ep_rank, model)
+
+    num_local = NUM_EXPERTS // EP_SIZE
+    local = range(ep_rank * num_local, (ep_rank + 1) * num_local)
+    key = f"{built}.mlp.experts.{{expert}}.{{proj}}.weight"
+    experts = model.get_submodule(f"{built}.mlp.experts")
+    want_gate_up = torch.stack(
+        [
+            torch.cat([state[key.format(expert=e, proj="gate_proj")], state[key.format(expert=e, proj="up_proj")]])
+            for e in local
+        ]
+    )
+    want_down = torch.stack([state[key.format(expert=e, proj="down_proj")] for e in local])
+    torch.testing.assert_close(experts.gate_up_proj.data, want_gate_up, atol=0, rtol=0)
+    torch.testing.assert_close(experts.down_proj.data, want_down, atol=0, rtol=0)
+    assert {int(k.split(".experts.")[1].split(".")[0]) for k in read_keys} == set(local)
+    if unbuilt is not None:
+        assert not any(k.startswith(unbuilt + ".") for k in read_keys)
 
 
 def test_per_expert_keys_of_an_unbuilt_module_are_skipped_unread(monkeypatch, tmp_path):

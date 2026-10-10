@@ -237,18 +237,14 @@ class DeepseekV3TopkRouter(nn.Module):
 # Source: veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config
 # ======================================================================
 # ================================================================
-# Patch: DeepseekV3Experts (named ``DeepseekV3NaiveMoe`` before transformers 5.16)
+# Patch: DeepseekV3Experts (DeepSeek-V3 named it ``*NaiveMoe`` before transformers 5.16)
 # 1. Drop upstream ``@use_experts_implementation`` decorator — it dispatches
 #    to ``grouped_mm`` / HF fused paths and bypasses VeOmni's fused MoE.
 # 2. OpSlot guard for fused-MoE: when ``veomni_moe_experts_forward`` is bound
 #    to a non-eager kernel (the ``moe_implementation`` ops-config field is
 #    not ``"eager"``), call ``fused_moe_forward`` with stacked ``gate_up_proj``.
-#    Otherwise fall through to the eager loop. This is the same dispatch
-#    qwen3_moe / qwen3_omni_moe / v4 deepseek_v3 use; an earlier draft of this
-#    patch keyed on a ``config._moe_implementation`` attribute that was never
-#    wired up by the framework, so EP runs always took the eager branch and
-#    crashed on EP-sharded ``gate_up_proj[expert_idx]`` lookups for global
-#    expert ids.
+#    Otherwise fall through to the eager loop, which indexes experts by
+#    global id and therefore fails on EP-sharded ``[E/ep, ...]`` weights.
 # Layout matches v5 upstream (direct, no transpose):
 #   gate_up_proj [E, 2*I, H],  down_proj [E, H, I]
 # ================================================================
@@ -330,9 +326,9 @@ class DeepseekV3MoE(nn.Module):
     # 1. Feed the top-k indices chosen by the router into the MoE load-balance
     #    monitor. Symmetric to the ``maybe_replay_indices`` call other families make
     #    in their SparseMoeBlock patches. No-op when no monitor is active.
-    #    transformers 5.16 folded the family-specific top-k math (sigmoid + bias
-    #    correction + group routing) from ``DeepseekV3MoE.route_tokens_to_experts``
-    #    into ``DeepseekV3TopkRouter.forward``, which now returns
+    #    transformers 5.16 folded DeepSeek-V3's top-k math (sigmoid + bias
+    #    correction + group routing) from ``MoE.route_tokens_to_experts`` into
+    #    ``TopkRouter.forward``, which now returns
     #    ``(router_logits, topk_weights, topk_indices)``.
     # ================================================================
     def forward(self, hidden_states):
