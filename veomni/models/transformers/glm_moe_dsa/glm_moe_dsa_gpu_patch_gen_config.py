@@ -9,6 +9,7 @@ from veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config imp
     PatchedDeepseekV3Experts,
     deepseek_v3_get_parallel_plan_patched,
     deepseek_v3_moe_forward_patched,
+    deepseek_v3_topk_router_forward_patched,
 )
 from veomni.patchgen.patch_spec import PatchConfig
 
@@ -29,8 +30,9 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 
-# The NPU sibling config shares only the MoE and parallel-plan patches with this
-# module; the indexer / attention ports here do not propagate to it.
+# The NPU sibling config shares only the routed-expert block and parallel-plan
+# patches with this module; the indexer / attention ports here do not propagate
+# to it.
 config.add_post_import_block(
     """
     # ── OpSlot declarations ──────────────────────────────────────────────────
@@ -62,6 +64,18 @@ config.replace_class(
     replacement=PatchedDeepseekV3Experts,
     name_map=_DEEPSEEK_V3_NAME_MAP,
     description="Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path",
+)
+
+# ================================================================
+# Patch: GlmMoeDsaTopkRouter.forward
+# 1. Disable autocast around the fp32 router ``F.linear``; an outer autocast
+#    would otherwise override the explicit ``.type(torch.float32)``.
+# ================================================================
+config.override_method(
+    "GlmMoeDsaTopkRouter.forward",
+    replacement=deepseek_v3_topk_router_forward_patched,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Disable autocast around fp32 router linear for VeRL actor/rollout parity",
 )
 
 # ================================================================

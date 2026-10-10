@@ -11,6 +11,8 @@
 #  Patches applied:
 #    - class_replacement: GlmMoeDsaExperts
 #      Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path
+#    - method_override: GlmMoeDsaTopkRouter.forward
+#      Disable autocast around fp32 router linear for VeRL actor/rollout parity
 #    - method_override: GlmMoeDsaMoE.forward
 #      Report top-k indices to the MoE load-balance monitor
 #    - method_override: GlmMoeDsaForCausalLM.get_parallel_plan
@@ -511,6 +513,12 @@ class GlmMoeDsaMLP(nn.Module):
         return down_proj
 
 
+# ======================================================================
+# [MODIFIED CLASS] GlmMoeDsaTopkRouter
+# Methods patched: forward
+# ======================================================================
+
+
 class GlmMoeDsaTopkRouter(nn.Module):
     def __init__(self, config: GlmMoeDsaConfig):
         super().__init__()
@@ -524,9 +532,21 @@ class GlmMoeDsaTopkRouter(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
         self.e_score_correction_bias = nn.Buffer(torch.zeros((self.num_experts), dtype=torch.float32))
 
+    # ================================================================
+    # Patch: GlmMoeDsaTopkRouter.forward
+    # 1. Wrap the router F.linear in ``torch.autocast(enabled=False)`` so the
+    #    explicit fp32 cast isn't silently reverted by an outer autocast context.
+    #    Required for VeRL actor/rollout numerical parity.
+    # ================================================================
     def forward(self, hidden_states):
         hidden_states = hidden_states.view(-1, self.hidden_dim)
-        router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+        # --- Patch.1 ---
+        # Disable autocast to ensure fp32 computation — autocast overrides
+        # explicit .type(torch.float32) in F.linear, causing precision mismatch
+        # between actor (autocast bf16) and rollout (no autocast, native fp32).
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+        # --- Patch.1 ---
         scores = router_logits.sigmoid()
         scores_for_choice = scores + self.e_score_correction_bias
         group_scores = (
