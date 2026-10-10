@@ -107,7 +107,7 @@ class LTX2UlyssesTest(SequenceParallelTest):
         apply_veomni_ltx_transformer_patch()
         group = self._get_process_group()
         device = torch.device(get_device_type(), self.rank)
-        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
 
         failures = []
         for with_audio in (False, True):
