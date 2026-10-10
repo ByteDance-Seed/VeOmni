@@ -107,7 +107,7 @@ If the model needs a new data source, add a preprocessor as described in
 - Implement `dummy_inputs()` for any encoder whose modality can be absent from a
   micro-batch, so FSDP stays aligned.
 - Under Ulysses, slice in `pre_forward` and gather in `post_forward`; see
-  [Sequence Parallelism](../design/sequence_parallel.md).
+  [Sequence Parallelism](../distributed/sequence_parallel.md).
 - For inference, emit `module_signal` strings to drive FSM transitions and clear
   private buffers in `reset_local_inference_state()` /
   `reset_global_inference_state()` / `finalize()`.

@@ -95,15 +95,11 @@ Common overrides:
 - `--train.wandb.enable false`: disable wandb for quick runs.
 - `--model.accelerator.fsdp_config.fsdp_mode`: the global FSDP mode.
 
-### Per-module parallelism
+### Parallelism
 
-Each module may carry its own `accelerator` block in the `modules` YAML. A module
-whose topology differs from the global one gets its **own** `ParallelState`
-(device mesh and process groups) on the full world; modules that match the global
-topology reuse it. That is how one job can mix FSDP2, FSDP2 with an embedding
-(`emb`) or expert (`ep`) extra-parallel group, DDP, and eager modules. For
-example, a vocabulary-sharded text encoder (see
-[Sharded Embedding](../../key_features/sharded_embedding.md)):
+Each module may carry its own `accelerator` block in the `modules` YAML (FSDP2,
+DDP, an `emb` or `ep` extra parallel group), for example a vocabulary-sharded
+text encoder:
 
 ```yaml
 # modules_train.yaml
@@ -114,13 +110,11 @@ janus_text_encoder:
     extra_parallel_placement_innermost: [false]
 ```
 
-`--model.accelerator.fsdp_config.fsdp_scope model` instead wraps the composed
-`OmniModel` in a single FSDP2 tree. It cannot be combined with eager modules.
-
-### Sequence parallelism
-
-Set `--model.accelerator.ulysses_size N`; every module inherits it. The design and
-its constraints are in [Sequence Parallelism](../design/sequence_parallel.md).
+Sequence parallelism is set once for the whole job with
+`--model.accelerator.ulysses_size N`. What a module may choose, what the job
+shares, and why SP is not a per-module setting are covered in
+[Per-Module Parallelism](../distributed/per_module_parallelism.md) and
+[Sequence Parallelism](../distributed/sequence_parallel.md).
 
 If your environment exports `TORCH_DISTRIBUTED_DEBUG=DETAIL`, unset it: its
 `_ProcessGroupWrapper` lacks the coalesced all-gather that FSDP2's tied-head

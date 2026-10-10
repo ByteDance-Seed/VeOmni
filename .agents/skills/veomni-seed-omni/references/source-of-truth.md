@@ -41,8 +41,12 @@ Use this reference to decide which files to trust before editing SeedOmni.
   - Architecture: module split, conversation carrier, graph views, train and
     generation flow, file map. Start here for intent, but verify schema details
     against current graph source.
-- `docs/seed_omni/design/sequence_parallel.md`
-  - Ulysses contract and correctness invariants.
+- `docs/seed_omni/distributed/per_module_parallelism.md`
+  - What each module may choose (FSDP2, DDP, eager, `emb` / `ep` groups,
+    frozen) versus what the job shares, per-module `ParallelState`, clipping.
+- `docs/seed_omni/distributed/sequence_parallel.md`
+  - Ulysses contract, why SP is one size for the whole graph, correctness
+    invariants.
 - `docs/seed_omni/design/media.md`
   - Video / audio reading and saving, plus the decided-but-unimplemented
     audio-bearing video design. Read when touching media or adding audio.

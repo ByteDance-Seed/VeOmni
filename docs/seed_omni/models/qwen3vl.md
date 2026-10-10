@@ -116,7 +116,7 @@ Key knobs (override on the CLI):
 
 Set the SP size once with `--model.accelerator.ulysses_size N`; every module (vision
 tower, text encoder and LLM backbone) inherits it, and there is no dedicated SP
-config (design in [Sequence Parallelism](../design/sequence_parallel.md)). The dataloader replicates each DP shard
+config (design in [Sequence Parallelism](../distributed/sequence_parallel.md)). The dataloader replicates each DP shard
 across the SP group; each module slices to its `1/sp` chunk, runs one forward, and
 all-gathers the output back — the in-model backbone `qwen3vl_llm` shards its
 DeepStack visual embeds, `visual_pos_masks` and 3-row M-RoPE `position_ids` too:

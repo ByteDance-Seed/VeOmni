@@ -1,7 +1,8 @@
 # Per-Module Parallelism
 
 Read this before editing per-module `accelerator` blocks, DDP/FSDP2 behavior,
-extra parallel dimensions, or distributed/eager inference configs.
+extra parallel dimensions, or distributed/eager inference configs. The user-facing
+version is `docs/seed_omni/distributed/per_module_parallelism.md`.
 
 ## Config Ownership
 
@@ -53,7 +54,7 @@ backbone:
 
 > SeedOmni uses classic single-pass Ulysses at ONE **uniform** SP size shared by
 > every module. Design, invariants and open limitations (item balancing for
-> audio/video encoders, compute-aware packing): `docs/seed_omni/design/sequence_parallel.md`.
+> audio/video encoders, compute-aware packing): `docs/seed_omni/distributed/sequence_parallel.md`.
 
 SP is **uniform**. Set the SP size on the global accelerator
 (`model.accelerator.ulysses_size`, CLI `--model.accelerator.ulysses_size`); every module inherits it through the per-module

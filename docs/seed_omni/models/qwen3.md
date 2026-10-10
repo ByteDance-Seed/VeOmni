@@ -106,7 +106,7 @@ bash train.sh tasks/omni/train_omni.py \
 The `qwen3_text_encoder` (wte) and the `qwen3_llm` backbone both shard the packed
 token sequence at the shared SP size. SP has **no dedicated config**: add
 `--model.accelerator.ulysses_size N` (design in
-[Sequence Parallelism](../design/sequence_parallel.md)). The dataloader replicates each DP shard across the
+[Sequence Parallelism](../distributed/sequence_parallel.md)). The dataloader replicates each DP shard across the
 SP group; each module slices to its `1/sp` chunk, runs one forward, and all-gathers
 the output back:
 

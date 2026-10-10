@@ -264,7 +264,7 @@ constraint: modules may `return {}` and the FSM skips the edge.
 
 With Ulysses enabled, each module slices the replicated sample inside its own
 `pre_forward` and all-gathers in its `post_forward`; see
-[Sequence Parallelism](sequence_parallel.md).
+[Sequence Parallelism](../distributed/sequence_parallel.md).
 
 ## 4. Generation flow
 

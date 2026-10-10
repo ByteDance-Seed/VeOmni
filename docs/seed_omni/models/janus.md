@@ -156,7 +156,7 @@ bash train.sh tasks/omni/train_omni.py \
 Add `--model.accelerator.ulysses_size N`; every module inherits it, and there is no
 separate SP config. The dataloader replicates each DP shard across the SP group,
 each module slices to its `1/N` chunk, runs one forward, and all-gathers the output
-(see [Sequence Parallelism](../design/sequence_parallel.md)). SigLIP and VQVAE
+(see [Sequence Parallelism](../distributed/sequence_parallel.md)). SigLIP and VQVAE
 slice the image batch; the text encoder and LLaMA slice the token sequence.
 
 On **4 GPUs** with `ulysses_size 4` this gives `dp=1`. The `janus_text_encoder`
