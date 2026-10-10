@@ -1,4 +1,4 @@
-"""``OfflineEncodingMixin``: the two offline-cache endpoints a ``support_cache`` module implements."""
+"""``OfflineEncodingMixin``: the two offline-cache endpoints a cacheable module implements."""
 
 from __future__ import annotations
 

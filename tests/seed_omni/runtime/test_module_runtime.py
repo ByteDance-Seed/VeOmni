@@ -142,17 +142,20 @@ def test_build_model_uses_the_config_the_omni_config_loaded(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("training_task", "support_cache", "on_meta"),
+    ("training_task", "graph_methods", "on_meta"),
     [
-        ("offline_training", True, True),
-        ("offline_training", False, False),
-        ("offline_embedding", True, False),
-        ("online_training", True, False),
-        (None, True, False),
+        ("offline_training", {"online_process"}, True),
+        ("offline_training", {"forward"}, False),
+        ("offline_training", {"online_process", "decode"}, False),
+        ("offline_training", set(), False),
+        ("offline_embedding", {"offline_encode"}, False),
+        ("online_training", {"encode"}, False),
+        (None, {"online_process"}, False),
     ],
 )
-def test_only_a_cache_reading_module_is_built_on_meta(monkeypatch, training_task, support_cache, on_meta):
-    """``online_process`` reads only the config, so that module never needs weights.
+def test_only_a_cache_reading_module_is_built_on_meta(monkeypatch, training_task, graph_methods, on_meta):
+    """``online_process`` reads only the config, so a module the graph calls only
+    through it never needs weights. Any other method in the graph does.
 
     ``None`` stands for an inference build, which has no train args.
     """
@@ -165,7 +168,7 @@ def test_only_a_cache_reading_module_is_built_on_meta(monkeypatch, training_task
         return model
 
     monkeypatch.setattr("veomni.models.build_foundation_model", fake_build_foundation_model)
-    runtime = _offline_cache_runtime(training_task, support_cache)
+    runtime = _offline_cache_runtime(training_task, frozenset(graph_methods))
 
     assert runtime.reads_offline_cache is on_meta
     runtime._build_model()
@@ -196,9 +199,10 @@ def test_a_cache_reading_module_is_frozen_and_never_wrapped_trained_or_saved(mon
     runtime = ModuleRuntime(
         SimpleNamespace(accelerator=_fsdp("module")),
         "vae",
-        module_config=SimpleNamespace(support_cache=True),
+        module_config=SimpleNamespace(),
         global_accelerator=_fsdp("module"),
         train_args=train,
+        training_graph_methods=frozenset({"online_process"}),
     )
 
     assert calls == ["setup"]
@@ -234,7 +238,7 @@ def test_an_offline_embedding_run_loads_and_wraps_every_module_but_freezes_it(mo
     assert getattr(runtime, "checkpoint", None) is None
 
 
-def _offline_cache_runtime(training_task, support_cache):
+def _offline_cache_runtime(training_task, graph_methods):
     runtime = _unbuilt(
         model_config=None,
         ops_implementation=None,
@@ -245,7 +249,8 @@ def _offline_cache_runtime(training_task, support_cache):
             ),
         ),
     )
-    runtime.module_config = SimpleNamespace(model_type="fake", support_cache=support_cache)
+    runtime.module_config = SimpleNamespace(model_type="fake")
+    runtime.training_graph_methods = graph_methods
     if training_task is not None:
         runtime.train_args = SimpleNamespace(training_task=training_task)
     return runtime

@@ -6,7 +6,7 @@ afterwards.
 
 - Mixin: [`OfflineEncodingMixin`](../../../veomni/models/seed_omni/mixins/offline_encoding_mixin.py#L23)
 - Run selector: [`train.training_task`](../../../veomni/arguments/omni_arguments_types.py#L573)
-- Meta build: [`ModuleRuntime.reads_offline_cache`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L202)
+- Meta build: [`ModuleRuntime.reads_offline_cache`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L208)
 
 ## Why cache a module's encoder
 
@@ -36,24 +36,24 @@ module cuts at the boundary between the expensive deterministic part and the
 cheap per-step part: for a VAE, `offline_encode` stops at the posterior, and
 `online_process` samples and scales the latent.
 
-## `support_cache` and `train.training_task`
+## What decides caching: the mixin, the graph and `train.training_task`
 
-Whether a module *can* use a cache and whether this run *does* are separate
-decisions, so they live in different places:
+Three things decide whether a module is cached. None of them is a config flag:
 
-| Name | Where it lives | Meaning |
+| What | Where it lives | Decides |
 |------|----------------|---------|
-| `support_cache` | `config.support_cache`, saved in `config.json`, or set per run with `model_config: {support_cache: true}` in the modules YAML | This module has the two offline endpoints and takes part in offline caching. |
-| `training_task` | `train.training_task`, one value per run | What this run does. |
+| Capability | The module mixes in `OfflineEncodingMixin` | That the module has the two offline endpoints. A graph can call them only on such a module: [`validate_graph_modules`](../../../veomni/models/seed_omni/graphs/base.py#L162) rejects a missing method at build time. |
+| Endpoint | The graph YAML, as `module.offline_encode` or `module.online_process` | Which endpoint this run calls on the module. |
+| Run | `train.training_task`, one value per run | How the trainer loops, and whether a module is built on meta. |
 
 `train.training_task` takes one of three values, named after the DiT trainer's
 tasks:
 
-| `training_task` | What the run does | What a `support_cache` module does |
-|-----------------|-------------------|------------------------------------|
-| `online_training` (default) | Trains from raw data. | Nothing special: it is built, loaded and encodes online like any module. |
+| `training_task` | What the run does | What a cached module does |
+|-----------------|-------------------|---------------------------|
+| `online_training` (default) | Trains from raw data. | Nothing special: the graph calls its online encode endpoint, and it is built like any module. |
 | `offline_embedding` | Reads raw `seedomni` data once (`train.num_train_epochs: 1`), runs the graph without autograd and writes each encoded conversation to `train.offline_cache_dir`, which it requires. Every module is frozen: no optimizer, no lr scheduler, no checkpoint manager. | Full load, frozen; the graph calls its `offline_encode`. |
-| `offline_training` | Trains from the cache, read back with `data.data_type: seedomni_cached`. | Built on meta, never loaded, frozen; the graph calls its `online_process`. |
+| `offline_training` | Trains from the cache, read back with `data.data_type: seedomni_cached`. | The graph calls only its `online_process`, so it is built on meta, never loaded, and frozen. |
 
 `OmniArguments` ([`_validate_training_task_data`](../../../veomni/arguments/omni_arguments_types.py#L694)) rejects
 a run whose `data.data_type` does not match: only `offline_training` reads
@@ -61,26 +61,32 @@ a run whose `data.data_type` does not match: only `offline_training` reads
 
 Which modules exist and which endpoint each graph node calls stay in the
 modules / graph YAML: each task has its own pair. `training_task` only decides
-how the trainer loops and how a `support_cache` module is built.
+how the trainer loops and how a cached module is built.
 
-## How a run builds a `support_cache` module
+## How a run builds a cached module
 
 This follows the DiT trainer's condition model: either the module is loaded in
 full, or it is built on meta.
 
 - **`offline_training`.**
-  [`ModuleRuntime.reads_offline_cache`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L202)
-  is true, so
-  [`_build_model`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L273)
+  [`build_omni_model_runtime`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L596)
+  collects the methods the training graph calls on each module
+  ([`_training_graph_methods`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L127))
+  and hands each `ModuleRuntime` its own set.
+  [`ModuleRuntime.reads_offline_cache`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L208)
+  is true when that set is exactly `{"online_process"}`. Then
+  [`_build_model`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L281)
   passes `init_device="meta"`, and the
-  [training build stops](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L153)
+  [training build stops](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L159)
   right after `requires_grad_(False)`: no parallel wrap, no weight load, no
   optimizer, no checkpoint manager. `online_process` therefore must read only
-  the config, never a parameter or buffer. Under `fsdp_scope: model` the
-  composed wrap still loads every module, this one included.
+  the config, never a parameter or buffer. A module the graph calls through any
+  other method as well needs its weights, so it is built in full. Under
+  `fsdp_scope: model` the composed wrap still loads every module, the cached
+  ones included.
 - **`offline_embedding`.** Every module, cached or not, is built, loaded and
   wrapped like any other, then
-  [frozen](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L158):
+  [frozen](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L164):
   the run trains nothing, so no module gets an optimizer or a checkpoint
   manager, and [`OmniTrainer`](../../../veomni/trainer/omni/omni_trainer.py#L275)
   allows the empty optimizer.
@@ -89,37 +95,22 @@ full, or it is built on meta.
 Inference builds have no train arguments, so they always build the module in
 full.
 
-### When `support_cache` and the graph disagree
+### Examples with BAGEL
 
-`support_cache` is read only under `offline_training`, and a config without the
-field counts as `false`. It is a declaration: nothing checks it against what the
-module implements or what the graph calls. The examples use BAGEL's two cache
-stages.
-
-- **A module without `support_cache`: the normal case.** It is built like any
-  other module in every task: loaded, frozen or not per its own config, wrapped,
-  and trained. In BAGEL's training run only `bagel_vae` declares
-  `support_cache: true`. The LLM, the ViT, the text encoder and the flow
-  connector do not take part in caching, so they load and train as usual.
-- **The graph calls `online_process`, but the module lacks `support_cache`.**
-  For example, `bagel_vae.online_process` is in the training graph, but the
-  modules YAML omits `support_cache: true`. The run still works, because
-  `online_process` reads only the config. The module, however, is loaded in
-  full and wrapped, and unless it is frozen it also gets an optimizer and a
-  checkpoint manager. Its weights never receive a gradient, so the run pays the
-  memory, load time and checkpoint size that the cache was meant to remove.
-- **`support_cache: true` on a module whose graph method needs weights.** For
-  example, `support_cache: true` on `bagel_siglip_navit` while the graph still
-  calls its forward. The module is built on meta without weights.
+- **The training run.** Its graph calls `bagel_vae.online_process` and nothing
+  else on `bagel_vae`, so the VAE is built on meta. The LLM, the ViT, the text
+  encoder and the flow connector are called through their usual methods, so
+  they load and train as usual. Its modules YAML is the online training run's;
+  only the VAE's edge changes, from `bagel_vae.encode` to
+  `bagel_vae.online_process`.
+- **A cached module that still needs its weights.** If a graph also called
+  `bagel_vae.decode`, for example for a reconstruction loss, the VAE would be
+  built in full, because decoding reads its weights.
+- **A graph that names a missing endpoint.** An `online_process` or
+  `offline_encode` node on a module that does not mix in
+  `OfflineEncodingMixin` fails at build time:
   [`validate_graph_modules`](../../../veomni/models/seed_omni/graphs/base.py#L162)
-  checks only that the method exists, so the build passes. The first step then
-  fails deep inside an operator on meta tensors. Declare `support_cache` only on
-  a module that mixes in `OfflineEncodingMixin`, and let the `offline_training`
-  graph call only its `online_process`.
-- **The encoding graph names a module without `offline_encode`.** This fails at
-  build time, because
-  [`validate_graph_modules`](../../../veomni/models/seed_omni/graphs/base.py#L162)
-  reports the missing method. `support_cache` plays no part here.
+  reports the missing method.
 
 The data side needs no switch. The
 [`SeedOmniCollator`](../../../veomni/data/seed_omni/collator.py#L26) always runs
@@ -176,8 +167,8 @@ weights are loaded by `ModuleRuntime`.
 
 | Function | Module's job | Called by | Effect |
 |----------|--------------|-----------|--------|
-| [`offline_encode(**kwargs) -> dict`](../../../veomni/models/seed_omni/mixins/offline_encoding_mixin.py#L38) | **Must implement** on the sibling `*OfflineMixin`. Turn tensor inputs into deterministic cache tensors. | The graph node whose method is `offline_encode`, through [`execute_train_node`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L27) | Produces the cache artifacts. Abstract on the mixin, so a module without it cannot be instantiated. |
-| [`online_process(**kwargs) -> dict`](../../../veomni/models/seed_omni/mixins/offline_encoding_mixin.py#L42) | **Must implement** on the sibling `*OfflineMixin`, without touching weights. Turn cache tensors back into the tensors training needs. | The graph node whose method is `online_process`, through [`execute_train_node`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L27) | Materializes runtime tensors from the cache. Abstract on the mixin, like `offline_encode`. |
+| [`offline_encode(**kwargs) -> dict`](../../../veomni/models/seed_omni/mixins/offline_encoding_mixin.py#L40) | **Must implement** on the sibling `*OfflineMixin`. Turn tensor inputs into deterministic cache tensors. | The graph node whose method is `offline_encode`, through [`execute_train_node`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L27) | Produces the cache artifacts. Abstract on the mixin, so a module without it cannot be instantiated. |
+| [`online_process(**kwargs) -> dict`](../../../veomni/models/seed_omni/mixins/offline_encoding_mixin.py#L44) | **Must implement** on the sibling `*OfflineMixin`, without touching weights. Turn cache tensors back into the tensors training needs. | The graph node whose method is `online_process`, through [`execute_train_node`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L27) | Materializes runtime tensors from the cache. Abstract on the mixin, like `offline_encode`. |
 | `@pre_forward("offline_encode")`, `@post_forward("offline_encode")`, and the same for `online_process` | **Must write** on the module. Translate between the graph's conversation payload and the endpoint's tensors. The mixin defines none. | [`TrainingModuleMixin.pre_forward`](../../../veomni/models/seed_omni/mixins/training_module_mixin.py#L59) / [`post_forward`](../../../veomni/models/seed_omni/mixins/training_module_mixin.py#L66) | The endpoint receives tensors and the graph receives the hook's output. |
 
 ### What each hook does
@@ -260,12 +251,11 @@ A missing module or method still fails before the first request runs.
 ## Current scope
 
 - **Cached modules are not checkpointed.** They are frozen in both cache tasks,
-  and [fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L550),
+  and [fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L558),
   so a checkpoint never holds a meta module.
-- **`support_cache` is not validated.** A `support_cache` module whose
-  `offline_training` graph calls a weight-reading method fails at its first
-  step, not at build time (see
-  [When `support_cache` and the graph disagree](#when-support_cache-and-the-graph-disagree)).
+- **Weight reads in `online_process` are not detected at build time.** A
+  module whose `online_process` reads a parameter or buffer passes the build on
+  meta and fails at its first step.
 - **No per-module checkpoint hooks.** Checkpoint I/O stays with
   [`OmniModuleCheckpointManager`](../../../veomni/models/seed_omni/utils/checkpoint.py#L30).
 
@@ -279,9 +269,11 @@ A missing module or method still fails before the first request runs.
   [one epoch for `offline_embedding`](../../../tests/seed_omni/test_omni_offline_cache_args.py#L60) and
   [the `data.data_type` match](../../../tests/seed_omni/test_omni_offline_cache_args.py#L76).
 - [`tests/seed_omni/runtime/test_module_runtime.py`](../../../tests/seed_omni/runtime/test_module_runtime.py):
-  [only an `offline_training` + `support_cache` module is built on meta](../../../tests/seed_omni/runtime/test_module_runtime.py#L154),
-  [it is frozen and never wrapped, trained or saved](../../../tests/seed_omni/runtime/test_module_runtime.py#L176),
-  and [an `offline_embedding` run freezes every module](../../../tests/seed_omni/runtime/test_module_runtime.py#L208).
+  [only a module the `offline_training` graph calls just through `online_process` is built on meta](../../../tests/seed_omni/runtime/test_module_runtime.py#L156),
+  [it is frozen and never wrapped, trained or saved](../../../tests/seed_omni/runtime/test_module_runtime.py#L179),
+  and [an `offline_embedding` run freezes every module](../../../tests/seed_omni/runtime/test_module_runtime.py#L212).
+- [`tests/seed_omni/runtime/test_omni_model_runtime.py`](../../../tests/seed_omni/runtime/test_omni_model_runtime.py):
+  [each module gets the methods the training graph calls on it](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L340).
 - [`tests/seed_omni/test_offline_cache_writer.py`](../../../tests/seed_omni/test_offline_cache_writer.py):
   [the `seedomni_cached` transform](../../../tests/seed_omni/test_offline_cache_writer.py#L32), the
   [writer round trip](../../../tests/seed_omni/test_offline_cache_writer.py#L50) and
