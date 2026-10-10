@@ -633,6 +633,20 @@ def causal_conv1d_bwd_impl(
     if initial_state is not None:
         BD = 32
         BT = min(8, triton.next_power_of_2(triton.cdiv(max(16, B * T), NUM_CORES)))
+        # dh0 below is split into cdiv(W, BT) slots and summed. The multi-slot
+        # path over-counts, so never tile narrower than the convolution window:
+        # that keeps cdiv(W, BT) == 1 and the single-slot path.
+        #
+        # Widening BT is only within the budget derived above while W <= 8, which
+        # is also the range that budget was derived for. Say so rather than
+        # silently exceeding it.
+        if W > 8:
+            raise NotImplementedError(
+                f"causal_conv1d backward with initial_state supports conv widths up to 8, got {W}. "
+                "Beyond that the tile needed to keep dh0 on its single-slot path no longer fits the "
+                "BT=8/BD=32 UB budget this branch is sized for."
+            )
+        BT = max(BT, triton.next_power_of_2(W))
     else:
         BD = 32
         BT = min(32, triton.next_power_of_2(triton.cdiv(max(16, B * T), NUM_CORES)))
