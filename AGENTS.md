@@ -44,8 +44,9 @@ source .venv/bin/activate
 ```
 
 This installs `transformers==5.16.1` via the `transformers-stable` dependency
-group. `gpu` / `npu` / `npu_aarch64` are mutually exclusive hardware extras;
-each is a complete superset for that accelerator. MagiAttention is an
+group. `gpu` / `rocm` / `npu` / `npu_aarch64` are mutually exclusive hardware
+extras; each is a superset for that accelerator (`rocm` leaves out flash-attn and
+aiter, which have no ROCm wheels). MagiAttention is an
 optional `--extra magi` that combines with `gpu` (`uv sync --extra gpu --extra magi`).
 New code must target transformers v5 and FSDP2.
 See `.agents/knowledge/uv.md` and `.agents/knowledge/constraints.md`.
