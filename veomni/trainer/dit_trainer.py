@@ -494,10 +494,6 @@ class DiTTrainer:
 
     def preforward(self, micro_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass."""
-        if self.training_task == "offline_training":
-            prepare_batch = getattr(self.condition_model, "prepare_condition_batch", None)
-            if prepare_batch is not None:
-                micro_batch = prepare_batch(micro_batch)
 
         def _to_device(v: Any) -> Any:
             if isinstance(v, torch.Tensor):

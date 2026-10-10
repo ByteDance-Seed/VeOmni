@@ -21,13 +21,13 @@ from transformers import PreTrainedModel
 
 from .....utils import logging
 from ..minimax_h3_core.cfg_conditioning import (
-    load_empty_embedding,
+    packed_seq_params as _packed_seq_params,
+)
+from ..minimax_h3_core.cfg_conditioning import (
     prepare_unconditional,
     replace_text_layout,
     validate_unconditional,
-)
-from ..minimax_h3_core.cfg_conditioning import (
-    packed_seq_params as _packed_seq_params,
+    validate_unconditional_metadata,
 )
 from ..minimax_h3_core.training_objectives import resolve_cfg_scales
 from .configuration_minimax_h3_condition import MiniMaxH3ConditionModelConfig
@@ -53,15 +53,11 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         self._tokenizer = None
         self._scheduler_video = None
         self._scheduler_audio = None
-        self._cfg_batch_token = object()
 
         if not config.skip_encoder_load:
             self._init_encoders(config)
 
         self._init_schedulers(config)
-        self._empty_embedding = None
-        if config.training_cfg_scale > 1 and config.cfg_unconditional_mode == "shared_empty":
-            self._empty_embedding = load_empty_embedding(config.cfg_unconditional_path)
 
     # ── Initialization ────────────────────────────────────────────────
 
@@ -382,15 +378,30 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         return encoded["prompt_embeds"], encoded["text_token_tags"]
 
     @torch.no_grad()
-    def encode_unconditional(self, *, negative_prompt=" ", keyframe_images=None, ref_blocks=None) -> dict:
-        """Return CPU Qwen tensors for a shared or per-sample negative condition.
+    def add_unconditional_cache(
+        self, sample: dict, *, negative_prompt=" ", keyframe_images=None, ref_blocks=None, drop_visual: bool = False
+    ) -> dict:
+        """Encode and validate a paired negative condition for one decoded CPU sample.
 
-        With no references, encode the native T2VA single-space presentation.
-        For paired caches, pass the conditional cache's resized keyframes or
-        prepared Ref2VA blocks in the same order. No DiT/VAE forward is run.
+        Supply the positive cache's original resized keyframes or prepared
+        Ref2VA blocks in the same order. Target/reference geometry and latent
+        anchors are reused; only the Qwen prefix is replaced. No DiT/VAE forward
+        is run. Save the result through the usual offline saver.
+
+        ``drop_visual=True`` is an experimental text-only Qwen negative. It
+        omits Qwen visual inputs, not the DiT latent anchors, and changes the
+        guidance direction. Both policies use the same paired-cache schema.
         """
         from ..minimax_h3_core.minimax_h3_text_encoder import encode_prompt
 
+        pk = sample["packed"]
+        if drop_visual:
+            keyframe_images, ref_blocks = None, None
+        elif pk.get("task") == "ref2va":
+            if keyframe_images or (pk["cond_rows"] > 0 and not ref_blocks):
+                raise ValueError("Ref2VA paired caches require their original prepared ref_blocks.")
+        elif ref_blocks or (pk["cond_rows"] > 0 and not keyframe_images):
+            raise ValueError("FL2VA paired caches require their original resized keyframe_images.")
         if self._text_encoder is None or self._tokenizer is None:
             raise ValueError("Load the condition model's Qwen encoder and processor before generating embeddings.")
         if not isinstance(negative_prompt, str) or not negative_prompt:
@@ -410,26 +421,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             keyframes=keyframe_images,
             ref_blocks=ref_blocks,
         )
-        return {key: value.detach().cpu().contiguous() for key, value in encoded.items()}
-
-    def add_unconditional_cache(
-        self, sample: dict, *, negative_prompt=" ", keyframe_images=None, ref_blocks=None
-    ) -> dict:
-        """Augment one decoded CPU sample with independently encoded negative fields.
-
-        Reuses the positive target/reference geometry and latent anchors, changing
-        only the Qwen prefix length and tags. Save the returned sample through the
-        usual offline saver. Input references must be the original prepared ones.
-        """
-        pk = sample["packed"]
-        if pk.get("task") == "ref2va":
-            if keyframe_images or (pk["cond_rows"] > 0 and not ref_blocks):
-                raise ValueError("Ref2VA paired caches require their original prepared ref_blocks.")
-        elif ref_blocks or (pk["cond_rows"] > 0 and not keyframe_images):
-            raise ValueError("FL2VA paired caches require their original resized keyframe_images.")
-        encoded = self.encode_unconditional(
-            negative_prompt=negative_prompt, keyframe_images=keyframe_images, ref_blocks=ref_blocks
-        )
+        encoded = {key: value.detach().cpu().contiguous() for key, value in encoded.items()}
         prompt = encoded["prompt_embeds"]
         negative_pk = replace_text_layout(pk, prompt.shape[0], encoded["text_token_tags"])
         validate_unconditional(pk, negative_pk, prompt, sample["prompt_embeds"])
@@ -526,38 +518,9 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
 
     # ── process_condition (add noise + pack) ──────────────────────────
 
-    def prepare_condition_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
-        """Validate offline CFG caches on CPU; never trust a cached validation marker."""
-        if self.config.training_cfg_scale == 1:
-            return batch
-        batch = dict(batch)
-        prompts, layouts = [], []
-        for index, positive_pk in enumerate(batch["packed"]):
-            if self.config.cfg_unconditional_mode == "shared_empty":
-                prompt = self._empty_embedding
-                negative_pk = replace_text_layout(positive_pk, prompt.shape[0])
-            else:
-                if not batch.get("unconditional_prompt_embeds") or not batch.get("unconditional_packed"):
-                    raise ValueError("CFG per_sample requires unconditional_prompt_embeds and unconditional_packed.")
-                prompt = batch["unconditional_prompt_embeds"][index]
-                negative_pk = batch["unconditional_packed"][index]
-            validate_unconditional(positive_pk, negative_pk, prompt, batch["prompt_embeds"][index])
-            prompts.append(prompt)
-            layouts.append(negative_pk)
-        # A per-instance token is regenerated at the host boundary; serialized
-        # markers from offline caches cannot bypass validation.
-        batch["_cfg_batch_token"] = [self._cfg_batch_token] * len(prompts)
-        batch["unconditional_prompt_embeds"] = prompts
-        batch["unconditional_packed"] = layouts
-        return batch
-
     @torch.no_grad()
     def process_condition(self, **collated_inputs) -> dict[str, Any]:
         """Prepare each sample independently, preserving its conditioning RNG order."""
-        if self.config.training_cfg_scale > 1:
-            tokens = collated_inputs.get("_cfg_batch_token", [])
-            if not tokens or any(token is not getattr(self, "_cfg_batch_token", None) for token in tokens):
-                collated_inputs = self.prepare_condition_batch(collated_inputs)
         count = len(collated_inputs["input_latents"])
         if count == 0:
             raise ValueError("H3 requires a nonempty sample list.")
@@ -733,8 +696,11 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             "has_audio": has_audio,
         }
         if cfg.training_cfg_scale > 1:
+            if not kwargs.get("unconditional_prompt_embeds") or not kwargs.get("unconditional_packed"):
+                raise ValueError("CFG requires per-sample unconditional_prompt_embeds and unconditional_packed.")
             negative_prompt = kwargs["unconditional_prompt_embeds"][0]
             negative_pk = kwargs["unconditional_packed"][0]
+            validate_unconditional_metadata(pk, negative_pk, negative_prompt, prompt)
             sample["unconditional_inputs"] = prepare_unconditional(sample, pk, negative_pk, negative_prompt)
             sample["training_cfg_scales"] = resolve_cfg_scales(
                 cfg.training_cfg_scale,

@@ -94,8 +94,6 @@ def test_cfg_hessian_and_shape_contract():
         {"training_cfg_curvature_power": 3},
         {"training_cfg_curvature_power": float("nan")},
         {"training_cfg_curvature_power": float("inf")},
-        {"cfg_unconditional_mode": "unknown"},
-        {"training_cfg_scale": 4, "cfg_unconditional_mode": "shared_empty"},
     ],
 )
 def test_cfg_configuration_rejects_invalid_options(options):
@@ -211,49 +209,50 @@ def test_cfg_branches_share_noise_references_and_rng(task):
         )
 
 
-def test_cfg_validates_before_trainer_device_transfer(monkeypatch):
+def test_cfg_training_does_not_repeat_cache_value_validation(monkeypatch):
     from veomni.models.diffusers.minimax_h3.minimax_h3_core import cfg_conditioning
-    from veomni.trainer.dit_trainer import DiTTrainer
 
-    cond = cfg_condition()
-    trainer = DiTTrainer.__new__(DiTTrainer)
-    trainer.training_task = "offline_training"
-    trainer.base = SimpleNamespace(model=SimpleNamespace(condition_model=cond), device="meta", LOG_SAMPLE=False)
-    checked = []
-    validate_layout = cfg_conditioning._validate_layout
-
-    def validate_on_host(pk):
-        checked.append(pk["text_pos"].device.type)
-        validate_layout(pk)
-
-    monkeypatch.setattr(cfg_conditioning, "_validate_layout", validate_on_host)
-    result = trainer.preforward(dict(DiTDataCollator()([cfg_raw()])))
-    assert checked == ["cpu", "cpu"]
-    assert result["unconditional_prompt_embeds"][0].device.type == "meta"
-    assert result["_cfg_batch_token"][0] is cond._cfg_batch_token
-
-
-def test_cfg_cached_marker_cannot_skip_validation():
-    import pickle
-
-    cond = cfg_condition()
     row = cfg_raw()
-    row["_cfg_batch_token"] = pickle.loads(pickle.dumps(cond._cfg_batch_token))
-    row["unconditional_prompt_embeds"][0, 0] = float("nan")
-    with pytest.raises(ValueError, match="finite"):
-        prepare(cond, [row])
+    cfg_conditioning.validate_unconditional(
+        row["packed"], row["unconditional_packed"], row["unconditional_prompt_embeds"], row["prompt_embeds"]
+    )
+
+    def unexpected_validation(*args):
+        raise AssertionError("Cache values must not be revalidated during training.")
+
+    monkeypatch.setattr(cfg_conditioning, "_validate_layout", unexpected_validation)
+    sample = prepare(cfg_condition(), [row])[0]
+    assert "unconditional_inputs" in sample
 
 
-@pytest.mark.parametrize("task", ["offline_training", "online_training", "offline_embedding"])
-def test_dit_device_transfer_without_host_hook_is_unchanged(task):
-    from veomni.trainer.dit_trainer import DiTTrainer
+@pytest.mark.parametrize(
+    "malformation", [None, "width", "geometry", "image_rows", "audio_rows", "coordinates", "tags"]
+)
+def test_cfg_metadata_validation_needs_no_tensor_values(malformation):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.cfg_conditioning import validate_unconditional_metadata
 
-    trainer = DiTTrainer.__new__(DiTTrainer)
-    trainer.training_task = task
-    trainer.base = SimpleNamespace(model=SimpleNamespace(condition_model=object()), device="meta", LOG_SAMPLE=False)
-    transferred = trainer.preforward({"packed": [{"indices": torch.arange(4), "length": 4}]})
-    assert transferred["packed"][0]["indices"].device.type == "meta"
-    assert transferred["packed"][0]["length"] == 4
+    row = cfg_raw()
+    positive, negative = (
+        {key: value.to("meta") if isinstance(value, torch.Tensor) else value for key, value in row[name].items()}
+        for name in ("packed", "unconditional_packed")
+    )
+    prompt = row["unconditional_prompt_embeds"].to("meta")
+    if malformation == "width":
+        prompt = prompt[:, :16]
+    elif malformation == "geometry":
+        negative["latent_t"] += 1
+    elif malformation in ("image_rows", "audio_rows"):
+        key = "img_pos" if malformation == "image_rows" else "audio_pos"
+        negative[key] = negative[key][:-1]
+    elif malformation == "coordinates":
+        negative["img_position_ids"] = negative["img_position_ids"][:, :-1]
+    elif malformation == "tags":
+        negative["token_tags"] = negative["token_tags"][:-1]
+    if malformation:
+        with pytest.raises(ValueError):
+            validate_unconditional_metadata(positive, negative, prompt, row["prompt_embeds"].to("meta"))
+    else:
+        validate_unconditional_metadata(positive, negative, prompt, row["prompt_embeds"].to("meta"))
 
 
 def test_cfg_remapping_does_not_recompute_unique(monkeypatch):
@@ -269,10 +268,10 @@ def test_cfg_remapping_does_not_recompute_unique(monkeypatch):
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("mode", ["shared_empty", "fl2va", "ref2va"])
-def test_unconditional_cache_producer_matches_native_presentation(monkeypatch, tmp_path, mode):
-    from safetensors.torch import save_file
-
+@pytest.mark.parametrize("mode", ["fl2va", "ref2va"])
+@pytest.mark.parametrize("finite", [True, False])
+@pytest.mark.parametrize("drop_visual", [False, True])
+def test_unconditional_cache_producer_matches_native_presentation(monkeypatch, mode, finite, drop_visual):
     from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_text_encoder as text
 
     class Tokenizer:
@@ -291,7 +290,7 @@ def test_unconditional_cache_producer_matches_native_presentation(monkeypatch, t
         def forward(self, **kwargs):
             assert not torch.is_grad_enabled()
             self.calls.append(kwargs)
-            return kwargs["input_ids"][0, :, None].float().expand(-1, 32) * self.weight
+            return kwargs["input_ids"][0, :, None].float().expand(-1, 32) * (self.weight if finite else float("nan"))
 
     monkeypatch.setattr(
         text, "image_token_counts", lambda processor, images: (torch.ones(1, 3), torch.ones(1, 3), [2])
@@ -300,38 +299,66 @@ def test_unconditional_cache_producer_matches_native_presentation(monkeypatch, t
     cond._text_encoder = Encoder()
     cond._tokenizer = Tokenizer()
     image = object()
-    if mode == "shared_empty":
-        encoded = cond.encode_unconditional()
+    row = raw_sample(task=mode)
+    kwargs = (
+        {"keyframe_images": [image]}
+        if mode == "fl2va"
+        else {"ref_blocks": [{"kind": "image", "prepared_image": image}]}
+    )
+    if drop_visual:
+        kwargs["drop_visual"] = True
+    if not finite:
+        with pytest.raises(ValueError, match="finite"):
+            cond.add_unconditional_cache(row, **kwargs)
+        return
+    paired = cond.add_unconditional_cache(row, **kwargs)
+    encoded = {
+        "prompt_embeds": paired["unconditional_prompt_embeds"],
+        "text_token_tags": paired["unconditional_packed"]["token_tags"][: paired["unconditional_packed"]["text_len"]],
+    }
+    if drop_visual:
         expected_ids, expected_tags = text.presentation_t2va(cond._tokenizer, " ")
-        path = tmp_path / "empty.safetensors"
-        save_file(encoded, str(path))
-        consumer = cfg_condition(cfg_unconditional_mode="shared_empty", cfg_unconditional_path=str(path))
-        sample = prepare(consumer, [raw_sample()])[0]
-        torch.testing.assert_close(sample["unconditional_inputs"]["prompt_embeds"], encoded["prompt_embeds"])
+        assert "pixel_values" not in cond._text_encoder.calls[0]
+    elif mode == "fl2va":
+        expected_ids, expected_tags = text.presentation_fl2va(cond._tokenizer, " ", [2])
     else:
-        row = raw_sample(task=mode)
-        kwargs = (
-            {"keyframe_images": [image]}
-            if mode == "fl2va"
-            else {"ref_blocks": [{"kind": "image", "prepared_image": image}]}
-        )
-        paired = cond.add_unconditional_cache(row, **kwargs)
-        encoded = {
-            "prompt_embeds": paired["unconditional_prompt_embeds"],
-            "text_token_tags": paired["unconditional_packed"]["token_tags"][
-                : paired["unconditional_packed"]["text_len"]
-            ],
-        }
-        if mode == "fl2va":
-            expected_ids, expected_tags = text.presentation_fl2va(cond._tokenizer, " ", [2])
-        else:
-            expected_ids, expected_tags = text.presentation_ref2va(cond._tokenizer, " ", [("image", 1)], [2], [], [])
-        assert paired["input_latents"] is row["input_latents"]
-        prepare(cfg_condition(), [paired])
+        expected_ids, expected_tags = text.presentation_ref2va(cond._tokenizer, " ", [("image", 1)], [2], [], [])
+    assert paired["input_latents"] is row["input_latents"]
+    anchor = "keyframe_cond_anchor" if mode == "fl2va" else "ref_visual_anchor"
+    assert paired[anchor] is row[anchor]
+    prepared = prepare(cfg_condition(), [paired])[0]
+    negative = prepared["unconditional_inputs"]
+    torch.testing.assert_close(
+        negative["x"][0, negative["img_pos_info"]["position_ids"]],
+        prepared["x"][0, prepared["img_pos_info"]["position_ids"]],
+    )
     torch.testing.assert_close(cond._text_encoder.calls[0]["input_ids"][0], expected_ids)
     torch.testing.assert_close(encoded["text_token_tags"], expected_tags)
     assert encoded["prompt_embeds"].shape == (len(expected_ids), 32)
     assert not encoded["prompt_embeds"].requires_grad
+
+
+@pytest.mark.parametrize("task", ["fl2va", "ref2va"])
+def test_text_only_negative_does_not_require_visual_sources(monkeypatch, task):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_text_encoder as text
+
+    def encode(encoder, processor, tokenizer, prompt, **kwargs):
+        assert prompt == " "
+        assert kwargs["keyframes"] is None
+        assert kwargs["ref_blocks"] is None
+        return {"prompt_embeds": torch.ones(1, 32), "text_token_tags": torch.ones(1, dtype=torch.long)}
+
+    monkeypatch.setattr(text, "encode_prompt", encode)
+    cond = condition_model()
+    cond._text_encoder = torch.nn.Linear(1, 1)
+    cond._tokenizer = object()
+    row = raw_sample(task=task)
+    paired = cond.add_unconditional_cache(row, drop_visual=True)
+    assert "unconditional_prompt_embeds" not in row
+    assert paired["unconditional_packed"]["cond_rows"] == row["packed"]["cond_rows"]
+    output = tiny_model()(**prepare(cfg_condition(), [paired])[0])
+    assert all(torch.isfinite(loss) for loss in output.loss.values())
+    sum(output.loss.values()).backward()
 
 
 @pytest.mark.parametrize("task", ["fl2va", "ref2va"])
@@ -437,38 +464,7 @@ def test_cfg_packed_matches_serial_loss_and_gradients():
             torch.testing.assert_close(a.grad, b.grad, rtol=3e-4, atol=3e-5)
 
 
-def test_cfg_shared_empty_is_loaded_once_and_reuses_reference_layout(tmp_path):
-    from safetensors.torch import save_file
-
-    path = tmp_path / "unconditional.safetensors"
-    save_file({"prompt_embeds": torch.randn(1, 32), "text_token_tags": torch.ones(1, dtype=torch.long)}, str(path))
-    cond = cfg_condition(cfg_unconditional_mode="shared_empty", cfg_unconditional_path=str(path))
-    path.unlink()
-    row = raw_sample(5, "ref2va")
-    negative = prepare(cond, [row])[0]["unconditional_inputs"]
-    assert negative["prompt_embeds"].shape == (1, 32)
-    assert negative["cond_rows"] == row["packed"]["cond_rows"]
-
-
-@pytest.mark.parametrize("invalid", ["nan", "visual_tag", "missing_tags"])
-def test_cfg_rejects_invalid_shared_embedding(tmp_path, invalid):
-    from safetensors.torch import save_file
-
-    tensors = {"prompt_embeds": torch.randn(1, 32), "text_token_tags": torch.ones(1, dtype=torch.long)}
-    if invalid == "nan":
-        tensors["prompt_embeds"][0, 0] = float("nan")
-    elif invalid == "visual_tag":
-        tensors["text_token_tags"].zero_()
-    else:
-        tensors.pop("text_token_tags")
-    path = tmp_path / "invalid.safetensors"
-    save_file(tensors, str(path))
-    with pytest.raises(ValueError):
-        cfg_condition(cfg_unconditional_mode="shared_empty", cfg_unconditional_path=str(path))
-
-
-@pytest.mark.parametrize("mode", ["per_sample", "shared_empty"])
-def test_scale_one_requires_no_negative_and_preserves_output(mode):
+def test_scale_one_requires_no_negative_and_preserves_output():
     row = raw_sample()
     torch.manual_seed(8)
     expected = prepare(condition_model(), [row])[0]
@@ -479,7 +475,6 @@ def test_scale_one_requires_no_negative_and_preserves_output(mode):
             skip_encoder_load=True,
             num_train_timesteps=16,
             training_cfg_scale=1,
-            cfg_unconditional_mode=mode,
         )
     )
     actual = prepare(cond, [row])[0]
@@ -496,7 +491,9 @@ def test_scale_one_requires_no_negative_and_preserves_output(mode):
 
 
 @pytest.mark.parametrize("malformation", ["width", "nan", "reference", "tags", "layout"])
-def test_cfg_negative_validation(malformation):
+def test_cfg_offline_negative_validation(malformation):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.cfg_conditioning import validate_unconditional
+
     row = cfg_raw()
     if malformation == "width":
         row["unconditional_prompt_embeds"] = torch.randn(2, 16)
@@ -510,7 +507,9 @@ def test_cfg_negative_validation(malformation):
     else:
         row["unconditional_packed"]["text_pos"] += 1
     with pytest.raises(ValueError):
-        prepare(cfg_condition(), [row])
+        validate_unconditional(
+            row["packed"], row["unconditional_packed"], row["unconditional_prompt_embeds"], row["prompt_embeds"]
+        )
 
 
 def test_cfg_checkpointing_and_silent_audio_match():

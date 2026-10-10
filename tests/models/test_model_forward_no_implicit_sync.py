@@ -836,8 +836,8 @@ def _is_minimax_h3_path(filename: str) -> bool:
 
 @pytest.mark.parametrize("attention", ["sdpa", "veomni_flash_attention_2_with_sp"])
 @pytest.mark.parametrize("mode", ["single", "packed"])
-@pytest.mark.parametrize("cfg_mode", ["off", "per_sample", "shared_empty"])
-def test_no_implicit_sync_in_minimax_h3_forward_backward(monkeypatch, tmp_path, mode, attention, cfg_mode):
+@pytest.mark.parametrize("cfg_mode", ["off", "per_sample"])
+def test_no_implicit_sync_in_minimax_h3_forward_backward(monkeypatch, mode, attention, cfg_mode):
     """No implicit CUDA sync from MiniMax H3 modeling during a training step."""
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
@@ -863,17 +863,8 @@ def test_no_implicit_sync_in_minimax_h3_forward_backward(monkeypatch, tmp_path, 
         row["use_gradient_checkpointing"] = True
         for key in ("input_latents", "audio_input_latents", "prompt_embeds"):
             row[key] = row[key].to(dtype)
-    if cfg_mode == "shared_empty":
-        from safetensors.torch import save_file
-
-        path = tmp_path / "unconditional.safetensors"
-        save_file({"prompt_embeds": torch.randn(1, 32), "text_token_tags": torch.ones(1, dtype=torch.long)}, str(path))
-        condition = cfg_condition(cfg_unconditional_mode=cfg_mode, cfg_unconditional_path=str(path))
-    else:
-        condition = condition_model() if cfg_mode == "off" else cfg_condition()
-    # Exercise the real host boundary before transfer, including enabled CFG.
-    host_batch = condition.prepare_condition_batch(dict(DiTDataCollator()(raws)))
-    collated = _to_device_recursive(host_batch, device)
+    condition = condition_model() if cfg_mode == "off" else cfg_condition()
+    collated = _to_device_recursive(dict(DiTDataCollator()(raws)), device)
     condition = condition.to(device)
 
     def step():

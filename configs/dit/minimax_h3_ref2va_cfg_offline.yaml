@@ -15,8 +15,6 @@ model:
     training_cfg_schedule: constant
     # Relative conditional curvature: 1 / scale**power; 0 disables attenuation.
     training_cfg_curvature_power: 2.0
-    cfg_unconditional_mode: per_sample
-    # Alternatively: shared_empty plus a local cfg_unconditional_path.
 
   lora_config:
     rank: 64

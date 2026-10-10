@@ -28,8 +28,6 @@ class MiniMaxH3ConditionModelConfig(PretrainedConfig):
         training_cfg_scale: float = 1.0,
         training_cfg_schedule: str = "constant",
         training_cfg_curvature_power: float = 2.0,
-        cfg_unconditional_mode: str = "per_sample",
-        cfg_unconditional_path: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -55,12 +53,6 @@ class MiniMaxH3ConditionModelConfig(PretrainedConfig):
             raise ValueError("training_cfg_schedule must be constant or sigma.")
         if not math.isfinite(training_cfg_curvature_power) or not 0 <= training_cfg_curvature_power <= 2:
             raise ValueError("training_cfg_curvature_power must be finite and in [0, 2].")
-        if cfg_unconditional_mode not in ("per_sample", "shared_empty"):
-            raise ValueError("cfg_unconditional_mode must be per_sample or shared_empty.")
-        if training_cfg_scale > 1 and cfg_unconditional_mode == "shared_empty" and not cfg_unconditional_path:
-            raise ValueError("shared_empty CFG requires cfg_unconditional_path.")
         self.training_cfg_scale = training_cfg_scale
         self.training_cfg_schedule = training_cfg_schedule
         self.training_cfg_curvature_power = training_cfg_curvature_power
-        self.cfg_unconditional_mode = cfg_unconditional_mode
-        self.cfg_unconditional_path = cfg_unconditional_path

@@ -211,12 +211,7 @@ YAML Config -> VeOmniArguments -> Trainer
 ## DiT Fixed Microbatches
 
 `DiTTrainer` honors `train.micro_batch_size` and keeps `dyn_bsz=false`.
-`DiTDataCollator` produces dict-of-lists microbatches.
-For offline training, `preforward` calls the optional condition-model
-`prepare_condition_batch(batch)` hook on CPU before recursively transferring
-tensors to the accelerator. H3 uses it to validate cached CFG embeddings and
-layouts; models without the hook keep the same transfer behavior. The hook
-returns the batch and must not sample training noise. The subsequent
+`DiTDataCollator` produces dict-of-lists microbatches; the existing
 `get_condition` / `process_condition` / model-forward path is unchanged.
 Models return sample-mean scalar losses, and the trainer divides by the number
 of accumulation microbatches. Packing and SP/CP handling remain model-owned.

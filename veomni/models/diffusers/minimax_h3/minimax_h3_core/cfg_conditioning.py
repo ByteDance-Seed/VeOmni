@@ -1,7 +1,6 @@
 """Prepare a negative H3 branch without resampling targets, noise or references."""
 
 import torch
-from safetensors.torch import load_file
 
 from .packed_sequence import host_cu_seqlens
 
@@ -24,22 +23,10 @@ def packed_seq_params(pk, device):
     }
 
 
-def load_empty_embedding(path):
-    """Read an actual encoder output once; never fabricate an all-zero condition."""
-    tensors = load_file(path, device="cpu")
-    prompt = tensors.get("prompt_embeds")
-    tags = tensors.get("text_token_tags")
-    if prompt is None or tags is None:
-        raise ValueError("Empty embedding requires prompt_embeds and text_token_tags.")
-    _validate_prompt(prompt)
-    if tags.shape != (prompt.shape[0],) or tags.dtype not in (torch.int32, torch.int64) or not torch.all(tags == 1):
-        raise ValueError("shared_empty requires text-only token tags matching the embedding length.")
-    return prompt
-
-
 def _validate_prompt(prompt):
+    """Check negative embedding values once when creating a CPU cache."""
     if isinstance(prompt, torch.Tensor) and prompt.device.type != "cpu":
-        raise ValueError("Validate CFG embeddings on CPU before transferring the batch to the accelerator.")
+        raise ValueError("Validate CFG embeddings on CPU when creating the cache.")
     if (
         not isinstance(prompt, torch.Tensor)
         or prompt.ndim != 2
@@ -53,7 +40,7 @@ def _validate_prompt(prompt):
 def _validate_layout(pk):
     """CFG remapping supports upstream compact [text | cond | audio | video] only."""
     if any(isinstance(value, torch.Tensor) and value.device.type != "cpu" for value in pk.values()):
-        raise ValueError("Validate CFG packed layouts on CPU before transferring the batch to the accelerator.")
+        raise ValueError("Validate CFG packed layouts on CPU when creating the cache.")
     length, text_len, cond = int(pk["seq_len"]), int(pk["text_len"]), int(pk["cond_rows"])
     audio_len, image_len = pk["audio_pos"].numel(), pk["img_pos"].numel()
     if text_len < 1 or cond < 0 or cond > image_len or length != text_len + audio_len + image_len:
@@ -87,11 +74,11 @@ def _validate_layout(pk):
         raise ValueError("CFG requires one compact segment per sample.")
 
 
-def replace_text_layout(pk, text_len, text_token_tags=None):
-    """Replace a validated compact prefix, preserving visual-latent references.
+def replace_text_layout(pk, text_len, text_token_tags):
+    """Replace a compact Qwen prefix using the paired encoder's token tags.
 
-    The caller validates the input/output layouts on CPU before device transfer.
-    Paired caches supply the encoder's tags; shared-empty uses text-only tags.
+    The cache producer validates the result on CPU before saving it. Target and
+    visual-latent reference geometry stay unchanged.
     """
     old_len = pk["text_len"]
     delta = text_len - old_len
@@ -105,7 +92,7 @@ def replace_text_layout(pk, text_len, text_token_tags=None):
     grid[:, text_len:] = pk["img_position_ids"][:, old_len:]
     grid[:, text_len:, 0] += delta
     result["img_position_ids"] = grid
-    tags = pk["token_tags"].new_ones(text_len) if text_token_tags is None else text_token_tags
+    tags = text_token_tags
     if tags.shape != (text_len,) or tags.dtype not in (torch.int32, torch.int64):
         raise ValueError("Negative text_token_tags must be integer [text_len].")
     result["token_tags"] = torch.cat((tags, pk["token_tags"][old_len:]))
@@ -114,16 +101,36 @@ def replace_text_layout(pk, text_len, text_token_tags=None):
     return result
 
 
+def validate_unconditional_metadata(positive_pk, negative_pk, prompt, positive_prompt):
+    """Check cache shapes and scalar geometry without reading tensor values."""
+    for pk in (positive_pk, negative_pk):
+        length, text_len, cond = pk["seq_len"], pk["text_len"], pk["cond_rows"]
+        image_len, audio_len = pk["img_pos"].numel(), pk["audio_pos"].numel()
+        if text_len < 1 or cond < 0 or cond > image_len or length != text_len + image_len + audio_len:
+            raise ValueError("CFG requires a compact packed layout with nonempty text.")
+        if pk["text_pos"].shape != (text_len,) or pk["img_pos"].ndim != 1 or pk["audio_pos"].ndim != 1:
+            raise ValueError("CFG packed index shapes must match their modality lengths.")
+        if pk["img_position_ids"].shape != (1, length, 3) or pk["token_tags"].shape != (length,):
+            raise ValueError("CFG packed coordinates and token tags must match seq_len.")
+    geometry = ("latent_t", "latent_h_patched", "latent_w_patched", "audio_t", "audio_channel", "cond_rows")
+    if any(positive_pk[key] != negative_pk[key] for key in geometry) or any(
+        positive_pk[key].numel() != negative_pk[key].numel() for key in ("img_pos", "audio_pos")
+    ):
+        raise ValueError("Conditional and unconditional target/reference geometry must match.")
+    if (
+        not isinstance(prompt, torch.Tensor)
+        or not prompt.is_floating_point()
+        or prompt.shape != (negative_pk["text_len"], positive_prompt.shape[-1])
+    ):
+        raise ValueError("unconditional embedding length/width does not match the packed layout/model.")
+
+
 def validate_unconditional(positive_pk, negative_pk, prompt, positive_prompt):
-    """Validate cached CFG inputs on the host, before the trainer's device transfer."""
+    """Validate paired CPU cache values at creation time, not on every step."""
+    validate_unconditional_metadata(positive_pk, negative_pk, prompt, positive_prompt)
     _validate_prompt(prompt)
     for pk in (positive_pk, negative_pk):
         _validate_layout(pk)
-    geometry = ("latent_t", "latent_h_patched", "latent_w_patched", "audio_t", "audio_channel", "cond_rows")
-    if any(positive_pk[key] != negative_pk[key] for key in geometry):
-        raise ValueError("Conditional and unconditional target/reference geometry must match.")
-    if prompt.shape != (negative_pk["text_len"], positive_prompt.shape[-1]):
-        raise ValueError("unconditional embedding length/width does not match the packed layout/model.")
     for key in ("img_pos", "audio_pos"):
         p = positive_pk["img_position_ids"][0, positive_pk[key]].clone()
         n = negative_pk["img_position_ids"][0, negative_pk[key]].clone()
@@ -134,7 +141,7 @@ def validate_unconditional(positive_pk, negative_pk, prompt, positive_prompt):
 
 
 def prepare_unconditional(sample, positive_pk, negative_pk, prompt):
-    """Remap host-validated inputs without device-value checks or a second unique operation."""
+    """Remap paired cache inputs without value checks or a second unique operation."""
     device = sample["x"].device
     result = {
         key: sample[key]
