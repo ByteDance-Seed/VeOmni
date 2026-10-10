@@ -479,7 +479,7 @@ class TestGlobalStateCallbackJobState:
 
     def test_train_end_writes_the_cursor_for_the_export_that_follows(self, mock_dist, tmp_path):
         """A run ending off the cadence still exports, and that export writes the
-        step's DCP (``ModelCheckpointManager._prepare_export``). Model state at a
+        step's DCP (``ModelCheckpointManager.prepare_export``). Model state at a
         step with no cursor beside it is a step nothing can resume from, so the
         cursor follows the export."""
         mock_dist.is_initialized.return_value = False

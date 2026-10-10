@@ -403,16 +403,18 @@ def attach_hf_source_converter(model: torch.nn.Module, source: HFSource, module_
             f"(modules: {sorted(layout.modules)}). Under an HF model_path every module must come from the layout."
         )
     inner_factory = getattr(type(model), "_create_checkpoint_tensor_converter", None)
+    # Read off the bare module now: the factory may later be handed a LoRA
+    # wrapper, whose names carry a ``base_model.model.`` prefix.
+    module_keys = {name for name, _ in model.named_parameters(remove_duplicate=False)}
+    module_keys.update(name for name, _ in model.named_buffers(remove_duplicate=False))
+    absent_tied = frozenset(
+        key
+        for key in layout.tied_source_keys
+        if (routed := layout.route(key)) is not None and routed[0] == module_name and routed[1] not in module_keys
+    )
 
     def factory(live_model: torch.nn.Module) -> HFSourceKeyConverter:
         inner = inner_factory(live_model) if inner_factory is not None else None
-        live_keys = {name for name, _ in live_model.named_parameters(remove_duplicate=False)}
-        live_keys.update(name for name, _ in live_model.named_buffers(remove_duplicate=False))
-        absent_tied = frozenset(
-            key
-            for key in layout.tied_source_keys
-            if (routed := layout.route(key)) is not None and routed[0] == module_name and routed[1] not in live_keys
-        )
         return HFSourceKeyConverter(layout, module_name, inner, absent_tied)
 
     model._create_checkpoint_tensor_converter = factory

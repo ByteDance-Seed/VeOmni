@@ -38,7 +38,7 @@ TEXT_ENCODER = "qwen3_text_encoder"
 LLM = "qwen3_llm"
 
 
-def _qwen3_config() -> Qwen3Config:
+def _qwen3_config(*, tied: bool = True) -> Qwen3Config:
     return Qwen3Config(
         vocab_size=16,
         hidden_size=16,
@@ -48,7 +48,7 @@ def _qwen3_config() -> Qwen3Config:
         num_key_value_heads=1,
         head_dim=8,
         max_position_embeddings=64,
-        tie_word_embeddings=True,
+        tie_word_embeddings=tied,
         dtype="bfloat16",
     )
 
@@ -60,7 +60,8 @@ def _source_tensors(config: Qwen3Config) -> dict[str, torch.Tensor]:
     torch.manual_seed(0)
     model = Qwen3ForCausalLM(config).to(torch.bfloat16)
     tensors = {key: value.detach().clone().contiguous() for key, value in model.state_dict().items()}
-    tensors["lm_head.weight"] = tensors["model.embed_tokens.weight"].clone()
+    if config.tie_word_embeddings:
+        tensors["lm_head.weight"] = tensors["model.embed_tokens.weight"].clone()
     return tensors
 
 
@@ -79,8 +80,8 @@ def _save_tokenizer(path: Path) -> None:
     ).save_pretrained(path)
 
 
-def _write_hf_checkpoint(root: Path, *, sharded: bool) -> dict[str, torch.Tensor]:
-    config = _qwen3_config()
+def _write_hf_checkpoint(root: Path, *, sharded: bool, tied: bool = True) -> dict[str, torch.Tensor]:
+    config = _qwen3_config(tied=tied)
     root.mkdir(parents=True)
     config.save_pretrained(root)
     _save_tokenizer(root)
@@ -198,6 +199,21 @@ def test_omni_model_loads_every_module_weight_from_the_hf_root(hf_root):
     assert "infer_text" in model.config.generation_graphs
 
 
+def test_an_untied_head_loads_even_through_a_wrapper(tmp_path):
+    root = tmp_path / "Qwen3-untied"
+    tensors = _write_hf_checkpoint(root, sharded=False, tied=False)
+    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
+    text_encoder = model.modules_dict[TEXT_ENCODER]
+    assert torch.equal(text_encoder.lm_head.weight, tensors["lm_head.weight"])
+
+    # A LoRA wrapper prefixes every name; the head must still be read.
+    wrapper = torch.nn.Module()
+    wrapper.base_model = text_encoder
+    converter = text_encoder._create_checkpoint_tensor_converter(wrapper)
+    assert not converter.should_skip_without_loading("lm_head.weight")
+    assert converter.should_skip_without_loading("model.norm.weight")
+
+
 def test_auto_dtype_is_the_checkpoint_dtype(hf_root):
     root, _ = hf_root
     model = OmniModel.from_pretrained(str(root), torch_dtype="auto", device_map="cpu")
@@ -270,3 +286,16 @@ def test_hf_view_modules_must_all_come_from_the_layout(hf_root):
         _validate_hf_view_modules(view, {**ok, "qwen3vl_vision": OmniModuleRuntimeArguments(model_path="/x")})
     with pytest.raises(ValueError, match="sets its own model_path"):
         _validate_hf_view_modules(view, {**ok, LLM: OmniModuleRuntimeArguments(model_path="/elsewhere/qwen3_llm")})
+
+
+def test_a_training_export_needs_safetensors_in_the_source(tmp_path):
+    from veomni.arguments.omni_arguments_types import _check_hf_source_exportable
+
+    root = tmp_path / "Qwen3-bin"
+    tensors = _write_hf_checkpoint(root, sharded=False)
+    (root / "model.safetensors").unlink()
+    torch.save(tensors, root / "pytorch_model.bin")
+    view = resolve_omni_checkpoint_root(root)
+
+    with pytest.raises(ValueError, match="needs safetensors weights"):
+        _check_hf_source_exportable(view)

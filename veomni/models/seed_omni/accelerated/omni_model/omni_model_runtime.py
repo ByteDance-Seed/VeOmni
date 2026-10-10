@@ -657,7 +657,7 @@ class OmniModelRuntime:
         if not trained:
             return
         for module_runtime in trained.values():
-            module_runtime.checkpoint._prepare_export(state, stage)
+            module_runtime.checkpoint.prepare_export(state, stage)
         save_path = layout.hf_export_dir(next(iter(trained.values())).checkpoint.step_dir(state))
         save_hf_source_checkpoint(
             self.hf_source,

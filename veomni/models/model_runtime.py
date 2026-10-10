@@ -625,7 +625,7 @@ class VeOmniModelRuntime:
         """Export this model in whichever format it was trained in.
 
         An in-flight async DCP must be on disk before conversion reads it, so
-        this drains first. ``_prepare_export`` waits again if it has to write
+        this drains first. ``prepare_export`` waits again if it has to write
         a DCP of its own.
         """
         self.checkpoint.wait_for_pending_save()
