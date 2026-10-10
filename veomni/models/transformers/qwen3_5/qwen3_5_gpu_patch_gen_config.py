@@ -666,12 +666,17 @@ def qwen3_5_decoder_layer_forward_patched(
 
 @config.add_helper
 def _mtp_loss_weight(text_config):
-    """Resolve the MTP loss weight, or None when MTP is disabled."""
+    """Resolve head construction independently of loss scaling when explicitly enabled."""
+    enabled = getattr(text_config, "mtp_enabled", None)
+    if enabled is False:
+        return None
     weight = getattr(text_config, "mtp_loss_weight", None)
+    if weight is None:
+        weight = 0.0 if enabled else None
     if weight is None:
         return None
     weight = float(weight)
-    if weight <= 0.0:
+    if weight <= 0.0 and not enabled:
         return None
     if int(getattr(text_config, "mtp_num_hidden_layers", 0) or 0) <= 0:
         return None
@@ -705,9 +710,8 @@ def compute_mtp_loss(mtp_loss_fn, hidden_states, mtp_labels, weights, vocab_size
         safe_labels.new_zeros(()),
     )
 
-    loss_kwargs = dict(kwargs)
-    loss_kwargs.pop("shift_labels", None)
-    loss_kwargs["num_items_in_batch"] = valid_target_count.clamp_min(1)
+    # MTP is ordinary teacher-forced CE at temperature 1. Never inherit the
+    # policy's return_log_probs/teacher_topk/temperature or its token denominator.
     mtp_loss, _, _ = mtp_loss_fn(
         logits=None,
         labels=safe_labels,
@@ -715,8 +719,10 @@ def compute_mtp_loss(mtp_loss_fn, hidden_states, mtp_labels, weights, vocab_size
         hidden_states=flat_hidden_states,
         weights=weights,
         shift_labels=safe_labels,
-        **loss_kwargs,
+        num_items_in_batch=valid_target_count.clamp_min(1),
     )
+    if mtp_loss is None:
+        raise RuntimeError("MTP requires a scalar cross-entropy loss, not fused log-prob outputs.")
     return mtp_loss * has_valid_target.to(mtp_loss.dtype)
 
 
@@ -1619,6 +1625,10 @@ class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Causal
         ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
 
+    # Declare the scalar so ModelOutput/FSDP2 pytree traversal sees its graph,
+    # including when the policy forward returns log_probs instead of a loss.
+    mtp_loss: torch.Tensor | None = None
+
 
 @config.add_helper_after("Qwen3_5ModelOutputWithPast")
 @dataclass
@@ -1792,6 +1802,10 @@ def qwen3_5_forconditional_generation_get_metadata_collate_func(self):
     return collate_multimodal_metadata  # noqa: F821 defined via add_helper
 
 
+# Patch: Qwen3_5ForConditionalGeneration.forward
+# 1. Explicit MTP scheduling permits label-free RL and log-prob-only evaluation.
+# 2. Fused policy log-probs bypass the dense vocabulary projection.
+# 3. Return raw MTP CE and optionally isolate its gradients from the foundation.
 @config.override_method(
     "Qwen3_5ForConditionalGeneration.forward",
     description="Support fused cross entropy path in Qwen3_5ForConditionalGeneration.forward",
@@ -1811,12 +1825,19 @@ def qwen3_5_forconditional_generation_forward_patched(
     cache_position: torch.LongTensor | None = None,
     logits_to_keep: int | torch.Tensor = 0,
     mtp_labels: torch.LongTensor | None = None,
+    compute_mtp: bool | None = None,
+    mtp_detach_encoder: bool = False,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen3_5CausalLMOutputWithLogProbs:
     """Run conditional generation and combine foundation and weighted MTP losses."""
-    requires_mtp_context = self.mtp is not None and labels is not None
-    if requires_mtp_context and mtp_labels is None:
-        raise ValueError("Qwen3.5 MTP loss requires `mtp_labels` when `labels` are provided.")
+    # --- Patch.1 ---
+    requires_mtp_context = (self.mtp is not None and labels is not None) if compute_mtp is None else compute_mtp
+    if requires_mtp_context:
+        if self.mtp is None or mtp_labels is None:
+            raise ValueError("Qwen3.5 MTP requires an enabled head and explicit `mtp_labels`.")
+        if past_key_values is not None or kwargs.get("use_cache", False):
+            raise ValueError("MTP training requires full sequences with use_cache=False.")
+    # --- Patch.1 ---
 
     model_kwargs = dict(kwargs)
     model_kwargs["return_mtp_context"] = requires_mtp_context
@@ -1854,7 +1875,9 @@ def qwen3_5_forconditional_generation_forward_patched(
                 **kwargs,
             )
         else:
-            logits = self.lm_head(hidden_states)
+            # --- Patch.2 ---
+            logits = None if kwargs.get("return_log_probs", False) else self.lm_head(hidden_states)
+            # --- Patch.2 ---
             loss, _, fused_linear_aux = self.loss_function(
                 logits=logits,
                 labels=labels,
@@ -1870,14 +1893,18 @@ def qwen3_5_forconditional_generation_forward_patched(
     else:
         logits = self.lm_head(hidden_states)
 
+    # --- Patch.3 ---
     loss_dict = None
+    mtp_loss = None
     if requires_mtp_context:
         mtp_context = getattr(outputs, "mtp_context", None)
         if mtp_context is None:
             raise RuntimeError("Qwen3.5 MTP context was requested but the language model did not return it.")
         mtp_hidden_states = self.mtp(
-            hidden_states=outputs[0],
-            inputs_embeds=mtp_context["inputs_embeds"],
+            hidden_states=outputs[0].detach() if mtp_detach_encoder else outputs[0],
+            inputs_embeds=(
+                mtp_context["inputs_embeds"].detach() if mtp_detach_encoder else mtp_context["inputs_embeds"]
+            ),
             position_embeddings=mtp_context["position_embeddings"],
             attention_mask=mtp_context["attention_mask"],
             position_ids=mtp_context["position_ids"],
@@ -1891,12 +1918,13 @@ def qwen3_5_forconditional_generation_forward_patched(
             mtp_loss_fn,
             mtp_hidden_states,
             mtp_labels,
-            weights=self.lm_head.weight,
+            weights=self.lm_head.weight.detach() if mtp_detach_encoder else self.lm_head.weight,
             vocab_size=self.config.text_config.vocab_size,
             **kwargs,
         )
         weight = _mtp_loss_weight(self.config.text_config)  # noqa: F821 defined via add_helper
-        loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
+        if loss is not None:
+            loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
 
     output = Qwen3_5CausalLMOutputWithLogProbs(
         loss=loss,
@@ -1906,9 +1934,11 @@ def qwen3_5_forconditional_generation_forward_patched(
         attentions=outputs.attentions,
         rope_deltas=outputs.rope_deltas,
         fused_linear_aux=fused_linear_aux,
+        mtp_loss=mtp_loss,
     )
     if loss_dict is not None:
         output.loss = loss_dict
+    # --- Patch.3 ---
     return output
 
 
