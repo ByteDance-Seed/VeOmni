@@ -227,6 +227,42 @@ class EnvironMeterCallback(Callback):
             parallel_state=self.parallel_state,
         )
 
+    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        """Initialize the metric process groups before the first training step.
+
+        NCCL initializes a process-group communicator lazily on its first collective.
+        The environment meter first uses the DP-only group after forward, backward,
+        and the optimizer update.  Long-context jobs can legitimately leave almost no
+        free device memory at that point, making even NCCL's tiny communicator
+        allocation fail although the training step itself completed.  These exact
+        collectives run while optimizer state is still unmaterialized, so their
+        communicator memory is part of the steady-state budget from the start.
+        """
+        parallel_state = self.parallel_state
+        if not parallel_state.is_initialized:
+            return
+
+        all_reduce([0.0, 0.0, 0.0], op="sum", group=parallel_state.dp_group)
+        all_reduce([0.0], op="sum", group=parallel_state.fsdp_group)
+        # Extra-parallel gradient clipping reduces over both the para-FSDP
+        # subgroup and the para group.  Their NCCL communicators are otherwise
+        # created lazily only after the first long-context backward, when no
+        # allocation headroom may remain.
+        for para_name in parallel_state.extra_parallel_names:
+            if not parallel_state.extra_parallel_enabled(para_name):
+                continue
+            para_fsdp_mesh = parallel_state.extra_parallel_fsdp_device_mesh[para_name]
+            if para_fsdp_mesh is not None:
+                all_reduce(
+                    [0.0],
+                    op="sum",
+                    group=para_fsdp_mesh[f"{para_name}_fsdp"].get_group(),
+                )
+            para_group = parallel_state.extra_parallel_group(para_name)
+            if para_group is not None:
+                all_reduce([0.0], op="sum", group=para_group)
+        logger.info_rank0("Training-metric and gradient-norm NCCL groups initialized before training.")
+
     def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         for micro_batch in micro_batches:
             self.trainer.environ_meter.add(micro_batch)

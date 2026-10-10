@@ -34,7 +34,8 @@ from abc import ABC
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import asdict
-from typing import Any, Callable, Dict, List
+from datetime import timedelta
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -86,6 +87,26 @@ from .callbacks import (
 
 
 logger = logging.get_logger(__name__)
+
+
+def _init_process_group() -> None:
+    if dist.is_initialized():
+        return
+
+    backend = get_dist_comm_backend()
+    kwargs: dict[str, Any] = {"backend": backend}
+    timeout_seconds = os.getenv("NCCL_TIMEOUT")
+    if backend == "nccl" and timeout_seconds is not None:
+        try:
+            timeout_value = int(timeout_seconds)
+        except ValueError as error:
+            raise ValueError(f"NCCL_TIMEOUT must be a positive integer, got {timeout_seconds!r}") from error
+        if timeout_value <= 0:
+            raise ValueError(f"NCCL_TIMEOUT must be a positive integer, got {timeout_seconds!r}")
+        kwargs["timeout"] = timedelta(seconds=timeout_value)
+
+    logger.info(f"Process group timeout: {kwargs.get('timeout', 'backend default')}")
+    dist.init_process_group(**kwargs)
 
 
 class BackgroundPrefetcher:
@@ -261,6 +282,11 @@ class BaseTrainer(Stateful, ABC):
     train_dataset: Dataset
     collate_fn: DataCollator
     train_dataloader: DistributedDataloader
+    #: What one sample costs against the ``dyn_bsz`` token budget. ``None`` takes the
+    #: default -- the sample's ``attention_mask`` sum -- which is right when a sample is
+    #: one sequence through one stack. Set alongside ``collate_fn``, by whichever
+    #: ``_build_collate_fn`` knows the model runs a second stack over the same tokens.
+    dyn_bsz_length_fn: Optional[Callable[[Dict[str, Any]], int]] = None
 
     # Training context
     model_fwd_context: Any
@@ -349,8 +375,7 @@ class BaseTrainer(Stateful, ABC):
         device = torch.device(device_str)
 
         # Initialize distributed process group
-        if not dist.is_initialized():
-            dist.init_process_group(backend=get_dist_comm_backend())
+        _init_process_group()
 
         logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
 
@@ -473,6 +498,7 @@ class BaseTrainer(Stateful, ABC):
             dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
             dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
+            dyn_bsz_length_fn=self.dyn_bsz_length_fn,
             seed=args.train.seed,
             collate_fn=self.collate_fn,
             save_steps=args.train.checkpoint.save_steps,
@@ -620,6 +646,14 @@ class BaseTrainer(Stateful, ABC):
             self.LOG_SAMPLE = False
         return micro_batch
 
+    def on_micro_batches_ready(self, micro_batches: List[Dict[str, torch.Tensor]]) -> None:
+        """Hook run once per optimizer step, before the micro-batch loop.
+
+        No-op by default. Lets a subclass precompute step-level statistics that
+        `postforward` needs but cannot derive from a single micro-batch -- the way
+        `micro_batches_token_len` is precomputed for the token-normalized losses.
+        """
+
     def postforward(
         self, outputs: ModelOutput, micro_batch: Dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -759,6 +793,7 @@ class BaseTrainer(Stateful, ABC):
         # token num for fixed_ce_loss in postforward
         self.micro_batches_token_len = count_loss_token(micro_batches)
         self.global_micro_batches_token_len = reduce_global_loss_token(self.micro_batches_token_len)
+        self.on_micro_batches_ready(micro_batches)
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):

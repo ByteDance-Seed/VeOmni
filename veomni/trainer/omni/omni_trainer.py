@@ -75,13 +75,12 @@ from ...ops.batch_invariant_ops import set_batch_invariant_mode
 from ...utils import helper, logging
 from ...utils.device import (
     get_device_type,
-    get_dist_comm_backend,
     get_torch_device,
     is_nccl_backend,
     synchronize,
 )
 from ...utils.omni_helper import OmniEnvironMeter
-from ..base import VeOmniIter
+from ..base import VeOmniIter, _init_process_group
 from ..callbacks import (
     CheckpointCallback,
     EvaluateCallback,
@@ -223,8 +222,7 @@ class OmniTrainer:
         get_torch_device().set_device(device_str)
         device = torch.device(device_str)
 
-        if not dist.is_initialized():
-            dist.init_process_group(backend=get_dist_comm_backend())
+        _init_process_group()
 
         logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
 

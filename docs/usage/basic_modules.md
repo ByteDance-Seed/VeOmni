@@ -27,6 +27,14 @@
         --train.wandb.name your_experiment_name
     ```
 
+    Launch-time environment variables:
+
+    | Env var | Effect |
+    |---------|--------|
+    | `NNODES`, `NODE_RANK`, `NPROC_PER_NODE`, `MASTER_ADDR`, `MASTER_PORT` | Read by `train.sh` to build the `torchrun` command. |
+    | `RDZV_ENDPOINT` | Multi-node rendezvous endpoint. Defaults to `MASTER_ADDR:MASTER_PORT`; an IPv6 `MASTER_ADDR` is bracketed (`[addr]:port`). |
+    | `NCCL_TIMEOUT` | Positive integer, in seconds. The trainer passes it as the NCCL process-group timeout; unset keeps the backend default. Ignored for non-NCCL backends. |
+
 ## Arguments
 **Default Parameter Access**:  
 VeOmni offers a unified argument management system, which can be easily extended to support custom arguments. About the default arguments explanation, you can refer to the [Config arguments Explanation](arguments.md). A basic argument example is defined in [`arguments_types.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/arguments/arguments_types.py).
