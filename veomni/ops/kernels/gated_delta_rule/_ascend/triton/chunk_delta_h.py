@@ -245,6 +245,7 @@ def chunk_gated_delta_rule_fwd_h(
         chunk_size: int = 64,  # default:64
         save_new_value: bool = True,
         cu_seqlens: Optional[torch.LongTensor] = None,
+        BV: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, u.shape[-1]
     BT = chunk_size
@@ -259,8 +260,6 @@ def chunk_gated_delta_rule_fwd_h(
 
     h = k.new_empty(B, NT, H, K, V).permute(0, 2, 1, 3, 4).contiguous()
     final_state = k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
-
-    BV = 128
 
     v_new = torch.empty_like(u).permute(0, 2, 1, 3).contiguous() if save_new_value else None
     k = k.permute(0, 2, 1, 3).contiguous()
@@ -527,6 +526,7 @@ def chunk_gated_delta_rule_bwd_dhu(
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
     chunk_indices: torch.LongTensor | None = None,
     use_exp2: bool = False,
+    BV: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *q.shape, do.shape[-1]
     # N: the actual number of sequences in the batch with either equal or variable lengths
@@ -543,8 +543,6 @@ def chunk_gated_delta_rule_bwd_dhu(
     dh = q.new_empty(B, NT, H, K, V)
     dh0 = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
     dv2 = torch.empty_like(dv)
-
-    BV = 128
 
     g = g.permute(0, 2, 1).contiguous()
 

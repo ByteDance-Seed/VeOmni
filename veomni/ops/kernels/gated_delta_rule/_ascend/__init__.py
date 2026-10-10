@@ -19,7 +19,7 @@ derive from fla_npu commit c2e3d83f as redistributed by MindSpeed-MM. The verbat
 kernels keep their upstream headers; VeOmni-authored glue (the ``triton_core``
 package ``__init__`` and the adapted ``flash_gated_delta_rule.py``) carries
 VeOmni's own header. Treat the kernels as a drop-in vendor blob so they stay
-diff-able against upstream — do not hand-edit kernel logic. VeOmni's registry-facing
+diff-able against upstream — keep local changes limited to documented hardware launch geometry. VeOmni's registry-facing
 wrappers live one level up (``npu_causal_conv1d.py`` and the
 ``chunk_gated_delta_rule`` factories in the package ``__init__``); those are the
 only entry points other code should call.
