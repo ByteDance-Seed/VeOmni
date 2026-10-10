@@ -688,11 +688,14 @@ class MiniMaxH3DiT(nn.Module):
         if sp_group is not None:
             # Rebuild the full packed sequence so the output position
             # index_select / update_mask below see the original layout. The
-            # backward splits without all-reduce (grad_scale=False,
-            # sum_grad=False): the downstream loss is replicated across the SP
-            # ranks, so a sum would multiply the gradient by the SP world size.
-            video_logits = _Gather.apply(sp_group, video_logits, 0, False, False)
-            audio_logits = _Gather.apply(sp_group, audio_logits, 0, False, False)
+            # downstream loss is replicated across the SP ranks, so the
+            # backward keeps this rank's slice of the full gradient without an
+            # all-reduce (sum_grad=False). The data-parallel gradient reduction
+            # (FSDP2 over dp_shard_sp, DDP over dp_sp) also averages over the
+            # SP ranks, so the slice is scaled by the SP world size
+            # (grad_scale=True) to compensate.
+            video_logits = _Gather.apply(sp_group, video_logits, 0, True, False)
+            audio_logits = _Gather.apply(sp_group, audio_logits, 0, True, False)
 
         video_logits = video_logits.index_select(0, infer_out_pos.to(device))
         audio_logits = audio_logits.index_select(0, audio_pos.to(device))
