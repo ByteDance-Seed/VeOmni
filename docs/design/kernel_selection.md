@@ -16,7 +16,7 @@ selection knob.
 |--------|-------------|------------------|---------|----------------|
 | Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_2_hub`, `flash_attention_3_hub`, `flash_attention_4`, `flex_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
-| DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
+| DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4, SM90+), `triton` (DeepSeek-V4, AMD MFMA) | `"eager"` | Model build via `OpsConfigSlot` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+) | `"eager"` | Model build via three `OpSlot`s (`pre`, `post`, `head`) |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | `"liger_kernel"` (GPU) | `apply_ops_config()` (before model build) |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
@@ -174,6 +174,19 @@ to `eager` and never silently falls back after `tilelang` is selected. The mHC
 implementation is provided by the `tile-kernels` package.
 TileKernels' training path supports forward and backward with BF16 activations
 and DeepSeek V4's `hc_mult=4` layout.
+
+On AMD GPUs, `dsa_attention_implementation: triton` is the counterpart to the
+TileLang sparse attention: same compact index list, same dispatch conditions,
+backed by Triton sparse-MLA kernels that currently ship in Primus (put its
+source tree on `PYTHONPATH`; it is imported lazily). The indexer loss and the
+mask-free packed path remain `tilelang`-only, and the indexer and mHC have no
+AMD backend yet, so leave those two on `eager`:
+
+```yaml
+model:
+  ops_implementation:
+    dsa_attention_implementation: triton
+```
 
 ---
 
