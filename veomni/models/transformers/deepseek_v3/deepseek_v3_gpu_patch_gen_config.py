@@ -98,7 +98,7 @@ config.add_post_import_block(
 
 
 # ================================================================
-# Patch: DeepseekV3Experts (named ``DeepseekV3NaiveMoe`` before transformers 5.16)
+# Patch: DeepseekV3Experts (DeepSeek-V3 named it ``*NaiveMoe`` before transformers 5.16)
 # 1. Drop upstream ``@use_experts_implementation`` decorator — it dispatches
 #    to ``grouped_mm`` / HF fused paths and bypasses VeOmni's fused MoE.
 # 2. OpSlot guard for fused-MoE: when ``veomni_moe_experts_forward`` is bound
@@ -217,9 +217,9 @@ def deepseek_v3_topk_router_forward_patched(self, hidden_states):
 # 1. Feed the top-k indices chosen by the router into the MoE load-balance
 #    monitor. Symmetric to the ``maybe_replay_indices`` call other families make
 #    in their SparseMoeBlock patches. No-op when no monitor is active.
-#    transformers 5.16 folded the family-specific top-k math (sigmoid + bias
-#    correction + group routing) from ``DeepseekV3MoE.route_tokens_to_experts``
-#    into ``DeepseekV3TopkRouter.forward``, which now returns
+#    transformers 5.16 folded DeepSeek-V3's top-k math (sigmoid + bias
+#    correction + group routing) from ``MoE.route_tokens_to_experts`` into
+#    ``TopkRouter.forward``, which now returns
 #    ``(router_logits, topk_weights, topk_indices)``.
 # ================================================================
 @config.override_method(
