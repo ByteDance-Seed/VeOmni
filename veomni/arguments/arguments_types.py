@@ -85,7 +85,7 @@ class OptimizerConfig:
     norms use AdamW.
     """
 
-    type: Literal["adamw", "anyprecision_adamw", "muon"] = field(
+    type: Literal["adamw", "adafactor", "anyprecision_adamw", "muon"] = field(
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
     )
