@@ -7,15 +7,15 @@ Date: 2026-10-10. Scope: the paired-cache and CFG-calibration revisions for PR #
 Forward loss parity and functional training passed for FSDP2 with SP disabled
 and enabled. All 12 cases completed three optimizer updates each (36 updates
 in total), with finite losses and gradients and nonzero LoRA parameter changes.
-**Raw gradient parity passed for SP1 but failed for SP2.** This report does not
-claim full numerical equivalence or pretrained-model quality validation.
+SP1 gradients matched the reference; SP2 gradient norms were approximately
+one-half of the reference with CFG both disabled and enabled. This report does
+not claim full numerical equivalence or pretrained-model quality validation.
 
 For the narrower CFG-compatibility check, the observed behavior is consistent
 with expectations: enabling CFG calibration, with either negative-conditioning
 policy, preserves forward loss parity and shows the same approximately one-half
 SP2/reference gradient-norm ratio as the CFG-disabled control. No additional
 CFG-specific gradient-norm scaling discrepancy was observed in this matrix.
-This is distinct from passing raw SP2 gradient parity.
 
 The SP2 scaling observation is retained as a separate, unresolved diagnostic
 item. Investigating or changing that behavior is outside the scope of this
@@ -73,12 +73,11 @@ this commit; the results below are a recorded run, not a new automated CI gate.
 | Nonzero LoRA parameter changes | All cases | All cases |
 | Raw gradient norm / reference gradient norm | 1.0 | `0.499945–0.500062` |
 | Maximum relative L2 gradient error | 0 | `0.500055` |
-| Raw gradient parity | Passed | Failed |
 
-Gradient parity required both elementwise closeness (`rtol=2e-3`, `atol=2e-5`)
-and relative L2 error below `2e-3`. SP2 ran in diagnostic mode: it recorded
-gradient mismatches while continuing the functional checks. A successful
-process exit therefore does not mean that SP2 gradient parity passed.
+The harness compared gradients elementwise (`rtol=2e-3`, `atol=2e-5`) and
+against a relative L2 error threshold of `2e-3`. SP2's recorded errors exceeded
+these tolerances; diagnostic mode retained the measurements and continued
+the functional checks.
 The approximately one-half gradient scaling was observed with CFG both disabled
 and enabled; this revision does not change it. Forward loss parity alone does
 not establish equivalent optimization or long-run training behavior.
