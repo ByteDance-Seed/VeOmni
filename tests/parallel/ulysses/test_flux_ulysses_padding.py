@@ -89,7 +89,7 @@ class FluxUlyssesPaddingTest(SequenceParallelTest):
     def test_matches_non_sp_reference(self):
         group = self._get_process_group()
         device = torch.device(get_device_type(), self.rank)
-        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
         model = _build_model(device)
 
         try:
