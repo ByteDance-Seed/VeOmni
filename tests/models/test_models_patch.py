@@ -425,6 +425,13 @@ TEST_CASES = [
         id="deepseek_v3",
     ),
     pytest.param(
+        "./tests/toy_config/glm_moe_dsa_toy/config.json",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="glm_moe_dsa",
+    ),
+    pytest.param(
         "./tests/toy_config/deepseek_v4_toy/config.json",
         True,
         # DeepSeek-V4 ships eager-only attention (head_dim=512 > FA cap,
@@ -472,6 +479,18 @@ def test_models_patch_fwd_bwd(
         hf_model_modes = [ModelMode("hf", "eager")]
         moe_impl = "fused_npu" if get_device_type() == "npu" else "fused_triton"
         veomni_model_modes = [ModelMode("veomni", "eager", moe_implementation=moe_impl)]
+
+    # GLM-MoE-DSA folds its DSA top-k selection into the attention mask, which
+    # only ``eager`` / ``sdpa`` support; flash attention would discard it and
+    # raises. Compare HF eager against VeOmni's eager expert loop and its fused
+    # MoE path, the one expert parallelism runs on.
+    if case_id == "glm_moe_dsa":
+        hf_model_modes = [ModelMode("hf", "eager")]
+        moe_impl = "fused_npu" if get_device_type() == "npu" else "fused_triton"
+        veomni_model_modes = [
+            ModelMode("veomni", "eager"),
+            ModelMode("veomni", "eager", moe_implementation=moe_impl),
+        ]
 
     # Qwen3.5 compatibility:
     # - HF backend doesn't support the test's position_ids test cases.

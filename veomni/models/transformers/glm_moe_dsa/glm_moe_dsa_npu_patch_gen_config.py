@@ -4,7 +4,14 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
+from veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config import (
+    PatchedDeepseekV3Experts,
+    deepseek_v3_get_parallel_plan_patched,
+    deepseek_v3_moe_forward_patched,
+)
 from veomni.patchgen.patch_spec import PatchConfig
+
+from .glm_moe_dsa_gpu_patch_gen_config import _DEEPSEEK_V3_NAME_MAP
 
 
 config = PatchConfig(
@@ -13,6 +20,9 @@ config = PatchConfig(
     description="GLM-5 with NPU replacements",
 )
 
+config.add_import("veomni.ops", names=["fused_moe_forward"])
+config.add_import("veomni.utils.moe_monitor", names=["record_router_indices"])
+
 # Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` can
 # return per-token log-probs in the unified output dataclass.
 config.add_import(
@@ -20,11 +30,11 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 
-# This config is much smaller than the GPU sibling: it only patches
-# `GlmMoeDsaForCausalLM.forward` and shares no patch bodies with it, so the
-# GPU indexer / attention ports do not reach the NPU build. The DSA top-k
-# selection therefore relies on upstream's `indices=` hand-off here;
-# VeOmni's `flash_attention_forward` rejects that kwarg rather than
+# This config is much smaller than the GPU sibling: besides
+# `GlmMoeDsaForCausalLM.forward` it only shares the MoE and parallel-plan
+# patches, so the GPU indexer / attention ports do not reach the NPU build.
+# The DSA top-k selection therefore relies on upstream's `indices=` hand-off
+# here; VeOmni's `flash_attention_forward` rejects that kwarg rather than
 # silently running dense attention.
 config.add_post_import_block(
     """
@@ -32,7 +42,29 @@ config.add_post_import_block(
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     """
+)
+
+# Same MoE and parallel-plan patches as the GPU config, so GPU and NPU runs
+# share one expert layout and EP plan.
+config.replace_class(
+    "GlmMoeDsaExperts",
+    replacement=PatchedDeepseekV3Experts,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path",
+)
+config.override_method(
+    "GlmMoeDsaMoE.forward",
+    replacement=deepseek_v3_moe_forward_patched,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Report top-k indices to the MoE load-balance monitor",
+)
+config.override_method(
+    "GlmMoeDsaForCausalLM.get_parallel_plan",
+    replacement=deepseek_v3_get_parallel_plan_patched,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Register GlmMoeDsa expert parallel plan for v5 generated modeling",
 )
 
 

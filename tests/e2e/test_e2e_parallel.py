@@ -210,6 +210,15 @@ text_test_cases = [
         None,  # max_sp_size
         None,  # max_ep_size
     ),
+    pytest.param(
+        "glm_moe_dsa",
+        "./tests/toy_config/glm_moe_dsa_toy",
+        True,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        1,  # max_sp_size: the DSA attention / indexer has no sequence-parallel path
+        None,  # max_ep_size
+    ),
 ]
 
 deepseek_v4_text_smoke_test_cases = [

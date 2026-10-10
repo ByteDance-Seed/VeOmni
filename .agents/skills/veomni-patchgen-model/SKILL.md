@@ -272,7 +272,11 @@ config.override_method(
 
 `name_map` rewrites symbol references *inside* the replacement body so the shared
 function transparently targets the correct class namespace. Use it to avoid
-duplicating ~hundreds of lines per sibling model.
+duplicating ~hundreds of lines per sibling model. `replace_class` takes it too:
+glm_moe_dsa reuses DeepSeek-V3's `PatchedDeepseekV3Experts` with
+`name_map={"DeepseekV3": "GlmMoeDsa"}`. The rewrite is plain text substitution,
+so it also reaches comments and docstrings; word a shared patch's comments so
+they stay true after the prefix is swapped.
 
 **Common v5 patch set** (steal from qwen3):
 

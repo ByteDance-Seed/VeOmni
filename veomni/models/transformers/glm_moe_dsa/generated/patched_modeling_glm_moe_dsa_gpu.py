@@ -9,6 +9,12 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - class_replacement: GlmMoeDsaExperts
+#      Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path
+#    - method_override: GlmMoeDsaMoE.forward
+#      Report top-k indices to the MoE load-balance monitor
+#    - method_override: GlmMoeDsaForCausalLM.get_parallel_plan
+#      Register GlmMoeDsa expert parallel plan for v5 generated modeling
 #    - method_override: GlmMoeDsaIndexer.forward
 #      Use cuDNN Frontend DSA indexer kernels when supported
 #    - method_override: GlmMoeDsaAttention.forward
@@ -28,7 +34,7 @@ from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_experts_implementation, use_kernel_forward_from_hub
+from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
@@ -42,16 +48,19 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
+# Additional imports for patches
+from veomni.ops import fused_moe_forward
+
 # Additional import blocks for patches
 # ── OpSlot declarations ──────────────────────────────────────────────────
 # Bound at model-build time by _bind_veomni_ops() in auto.py.
 from veomni.ops.dispatch import OpsConfigSlot, OpSlot
-
-# Additional imports for patches
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
+from veomni.utils.moe_monitor import record_router_indices
 
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
 veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
 
@@ -724,7 +733,28 @@ class GlmMoeDsaTopkRouter(nn.Module):
         return router_logits, topk_weights, topk_indices
 
 
-@use_experts_implementation
+# ======================================================================
+# [PATCHED CLASS] GlmMoeDsaExperts
+# Original class replaced with: PatchedDeepseekV3Experts
+# Reason: Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path
+# Source: veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config
+# ======================================================================
+# ================================================================
+# Patch: GlmMoeDsaExperts (DeepSeek-V3 named it ``*NaiveMoe`` before transformers 5.16)
+# 1. Drop upstream ``@use_experts_implementation`` decorator — it dispatches
+#    to ``grouped_mm`` / HF fused paths and bypasses VeOmni's fused MoE.
+# 2. OpSlot guard for fused-MoE: when ``veomni_moe_experts_forward`` is bound
+#    to a non-eager kernel (the ``moe_implementation`` ops-config field is
+#    not ``"eager"``), call ``fused_moe_forward`` with stacked ``gate_up_proj``.
+#    Otherwise fall through to the eager loop. This is the same dispatch
+#    qwen3_moe / qwen3_omni_moe / v4 deepseek_v3 use; an earlier draft of this
+#    patch keyed on a ``config._moe_implementation`` attribute that was never
+#    wired up by the framework, so EP runs always took the eager branch and
+#    crashed on EP-sharded ``gate_up_proj[expert_idx]`` lookups for global
+#    expert ids.
+# Layout matches v5 upstream (direct, no transpose):
+#   gate_up_proj [E, 2*I, H],  down_proj [E, H, I]
+# ================================================================
 class GlmMoeDsaExperts(nn.Module):
     """Collection of expert weights stored as 3D tensors."""
 
@@ -744,6 +774,20 @@ class GlmMoeDsaExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
+
+        # Modification: OpSlot guard — use fused MoE kernel when bound.
+        if veomni_moe_experts_forward.use_non_eager_impl:
+            return fused_moe_forward(
+                num_experts=self.num_experts,
+                routing_weights=top_k_weights.to(final_hidden_states.dtype),
+                selected_experts=top_k_index,
+                hidden_states=hidden_states,
+                fc1_1_weight=None,
+                fc1_2_weight=None,
+                fc2_weight=self.down_proj,
+                fc1_1_2_weight=self.gate_up_proj,
+            )
+
         with torch.no_grad():
             expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
             expert_mask = expert_mask.permute(2, 1, 0)
@@ -764,6 +808,12 @@ class GlmMoeDsaExperts(nn.Module):
         return final_hidden_states
 
 
+# ======================================================================
+# [MODIFIED CLASS] GlmMoeDsaMoE
+# Methods patched: forward
+# ======================================================================
+
+
 class GlmMoeDsaMoE(nn.Module):
     """
     A mixed expert module containing shared experts.
@@ -778,10 +828,26 @@ class GlmMoeDsaMoE(nn.Module):
             config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    # ================================================================
+    # Patch: GlmMoeDsaMoE.forward
+    # 1. Feed the top-k indices chosen by the router into the MoE load-balance
+    #    monitor. Symmetric to the ``maybe_replay_indices`` call other families make
+    #    in their SparseMoeBlock patches. No-op when no monitor is active.
+    #    transformers 5.16 folded DeepSeek-V3's top-k math (sigmoid + bias
+    #    correction + group routing) from ``MoE.route_tokens_to_experts`` into
+    #    ``TopkRouter.forward``, which now returns
+    #    ``(router_logits, topk_weights, topk_indices)``.
+    # ================================================================
+    def forward(self, hidden_states):
         residuals = hidden_states
         orig_shape = hidden_states.shape
         _, topk_weights, topk_indices = self.gate(hidden_states)
+        # --- Patch.1 ---
+        # Hand the actual top-k indices used by this layer to the load-balance
+        # monitor. Keyed on ``self.gate`` so the monitor's layer order matches the
+        # router module identity.
+        record_router_indices(self.gate, topk_indices)
+        # --- Patch.1 ---
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
         hidden_states = hidden_states + self.shared_experts(residuals)
@@ -945,7 +1011,7 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] GlmMoeDsaForCausalLM
-# Methods patched: forward
+# Methods patched: get_parallel_plan, forward
 # ======================================================================
 
 
@@ -1038,6 +1104,15 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    # ================================================================
+    # Patch: GlmMoeDsaForCausalLM.get_parallel_plan
+    # 1. Register VeOmni EP parallel plan on the v5 generated class.
+    # ================================================================
+    def get_parallel_plan(self):
+        from ..parallel_plan import get_parallel_plan as _get_parallel_plan
+
+        return _get_parallel_plan()
 
 
 __all__ = ["GlmMoeDsaPreTrainedModel", "GlmMoeDsaModel", "GlmMoeDsaForCausalLM"]
