@@ -134,6 +134,33 @@ def _training_graph_methods(training_graph: list[dict]) -> dict[str, frozenset[s
     return {module: frozenset(called) for module, called in methods.items()}
 
 
+_OFFLINE_ENDPOINT_OF_TASK = {"offline_embedding": "offline_encode", "offline_training": "online_process"}
+
+
+def _reject_graph_that_mismatches_training_task(
+    graph_methods: Mapping[str, frozenset[str]], train_args: OmniTrainingArguments
+) -> None:
+    """A run's training graph must call the offline endpoint of its ``training_task`` and no other."""
+    task = train_args.training_task
+    expected = _OFFLINE_ENDPOINT_OF_TASK.get(task)
+    nodes_by_endpoint = {
+        endpoint: sorted(f"{module}.{endpoint}" for module, called in graph_methods.items() if endpoint in called)
+        for endpoint in _OFFLINE_ENDPOINT_OF_TASK.values()
+    }
+    if expected is not None and not nodes_by_endpoint[expected]:
+        raise ValueError(
+            f"train.training_task={task!r} needs a training graph that calls `<module>.{expected}`, "
+            "but this graph calls it on no module. Use the graph YAML written for this task."
+        )
+    for endpoint, nodes in nodes_by_endpoint.items():
+        if endpoint != expected and nodes:
+            owner = next(t for t, e in _OFFLINE_ENDPOINT_OF_TASK.items() if e == endpoint)
+            raise ValueError(
+                f"The training graph calls {nodes}, which only train.training_task={owner!r} runs; "
+                f"this run has train.training_task={task!r}."
+            )
+
+
 def _reject_lora_that_matched_nothing(
     module_runtimes: Mapping[str, ModuleRuntime], train_args: OmniTrainingArguments | None = None
 ) -> None:
@@ -608,7 +635,8 @@ def build_omni_model_runtime(
             Forwarded unchanged to every :class:`ModuleRuntime`, which reads
             ``training_task`` and the shared checkpoint ``save_path``/``output_dir``/``load_path``.
             Each module also gets the methods the training graph calls on it, which decide
-            whether an ``offline_training`` run builds it on meta.
+            whether an ``offline_training`` run builds it on meta. The graph must call the
+            offline endpoint of ``training_task`` and no other.
         for_inference: Build for generation, which skips the optimizer and the training-only checks.
     """
     from ..omni_module.omni_module_runtime import build_omni_module_runtime
@@ -617,6 +645,8 @@ def build_omni_model_runtime(
     omni_config.load_checkpoint_sidecars(omni_model_runtime_args.resolved_model_path)
     module_runtime_args = omni_model_runtime_args.modules
     graph_methods = {} if for_inference else _training_graph_methods(omni_config.training_graph)
+    if not for_inference and train_args is not None:
+        _reject_graph_that_mismatches_training_task(graph_methods, train_args)
     module_runtimes: dict[str, ModuleRuntime] = {}
     for name in omni_config.module_names:
         module_args = module_runtime_args[name]

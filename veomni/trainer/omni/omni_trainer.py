@@ -555,8 +555,8 @@ class OmniTrainer:
                 self.model_fwd_context,
                 set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
             ):
-                self.model.forward(micro_batch)
-            self.offline_cache_writer.save_conversation_list(micro_batch["conversation_list"])
+                result: Dict[str, Any] = self.model.forward(micro_batch)
+            self.offline_cache_writer.save_conversation_list(result["conversation_list"])
 
         self.on_step_end(loss=0.0, loss_dict={}, grad_norm=0.0)
 
