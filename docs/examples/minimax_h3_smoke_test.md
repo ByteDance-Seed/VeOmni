@@ -10,6 +10,13 @@ in total), with finite losses and gradients and nonzero LoRA parameter changes.
 **Raw gradient parity passed for SP1 but failed for SP2.** This report does not
 claim full numerical equivalence or pretrained-model quality validation.
 
+For the narrower CFG-compatibility check, the observed behavior is consistent
+with expectations: enabling CFG calibration, with either negative-conditioning
+policy, preserves forward loss parity and shows the same approximately one-half
+SP2/reference gradient-norm ratio as the CFG-disabled control. No additional
+CFG-specific gradient-norm scaling discrepancy was observed in this matrix.
+This is distinct from passing raw SP2 gradient parity.
+
 ## Setup and comparison method
 
 | Item | Configuration |
@@ -66,9 +73,33 @@ Gradient parity required both elementwise closeness (`rtol=2e-3`, `atol=2e-5`)
 and relative L2 error below `2e-3`. SP2 ran in diagnostic mode: it recorded
 gradient mismatches while continuing the functional checks. A successful
 process exit therefore does not mean that SP2 gradient parity passed.
-The approximately one-half gradient scaling remains unchanged and is outside
-this revision's fixes. Forward loss parity alone does not establish equivalent
-optimization or long-run training behavior.
+The approximately one-half gradient scaling was observed with CFG both disabled
+and enabled; this revision does not change it. Forward loss parity alone does
+not establish equivalent optimization or long-run training behavior.
+
+### CFG-enabled versus CFG-disabled SP behavior
+
+Each range below covers both FL2VA and Ref2VA, with three steps per task.
+Ratios compare each distributed gradient norm with its own same-weight,
+same-input unsharded reference using the same CFG configuration. They do not
+compare CFG-enabled gradients directly with CFG-disabled gradients: CFG
+calibration changes the objective and therefore the gradients.
+
+| CFG configuration | SP1/reference gradient-norm ratio | SP2/reference gradient-norm ratio |
+| --- | --- | --- |
+| Disabled | `1.000000` | `0.499971–0.500009` |
+| Enabled, keep visual | `1.000000` | `0.499945–0.500033` |
+| Enabled, drop visual | `1.000000` | `0.499980–0.500062` |
+
+The comparable ratios, finite gradients, successful loss comparisons, and
+nonzero LoRA updates support the expected functional compatibility of CFG
+calibration with FSDP2/SP in the tested cases. This is a descriptive comparison
+of the recorded results, not a new gradient-parity pass criterion. The run did
+not separately validate elementwise parity after multiplying SP2 gradients by
+two, or establish gradient-direction equivalence after rescaling. It also did
+not include a pristine-upstream GPU control, so these results do not attribute
+the scaling discrepancy to a particular upstream change or rule out a harness
+or integration effect.
 
 ### Three-step loss traces
 
