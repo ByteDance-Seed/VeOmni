@@ -221,8 +221,8 @@ class WanSPAttnProcessor(WanAttnProcessor):
                 freqs_cos: torch.Tensor,
                 freqs_sin: torch.Tensor,
             ):
-                cos = freqs_cos[..., 0::2].repeat_interleave(2, dim=-1).contiguous()
-                sin = freqs_sin[..., 1::2].repeat_interleave(2, dim=-1).contiguous()
+                cos = freqs_cos[..., 0::2].to(torch.float32).repeat_interleave(2, dim=-1).contiguous()
+                sin = freqs_sin[..., 1::2].to(torch.float32).repeat_interleave(2, dim=-1).contiguous()
                 x_float = hidden_states.to(torch.float32)
                 x_out = torch_npu.npu_rotary_mul(x_float, cos, sin, rotary_mode="interleave")
                 return x_out.to(hidden_states.dtype)
