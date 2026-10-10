@@ -34,6 +34,7 @@ from veomni.models import build_foundation_model
 from veomni.models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 from veomni.utils.device import get_device_type
 
+from .minimax_h3_condition.modeling_minimax_h3_condition import MINIMAX_H3_FRAME_RATE
 from .minimax_h3_core.flow_match_scheduler import FlowMatchScheduler
 from .minimax_h3_core.minimax_h3_audio_vae import MiniMaxH3AudioVAE
 from .minimax_h3_core.minimax_h3_dit import pack_audio, patchify_video
@@ -346,6 +347,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         self.processor = None
         self.imgvid_cond_noise_aug = 0.999
         self.audio_cond_noise_aug = 1.0
+
         self.in_iteration_models = ("dit",)
         self.units = [
             MiniMaxH3Unit_ShapeChecker(),
@@ -359,6 +361,17 @@ class MiniMaxH3Pipeline(BasePipeline):
         ]
         self.model_fn = model_fn_minimax_h3
         self.compilable_models = ["dit"]
+
+    @property
+    def frame_rate(self) -> int:
+        """Frames per second this pipeline generates at, and only generates at.
+
+        Exposed beside ``audio_vae.sample_rate`` so a caller writing the clip out
+        takes both rates off the model rather than restating them: the pipeline
+        never resamples, so a container written at any other rate plays at the
+        wrong speed and drifts out of sync with the audio.
+        """
+        return MINIMAX_H3_FRAME_RATE
 
     @staticmethod
     def from_pretrained(
@@ -586,7 +599,7 @@ class MiniMaxH3Unit_NoiseInitializer(PipelineUnit):
             rand_device=rand_device,
             rand_torch_dtype=pipe.torch_dtype,
         )
-        audio_latent_t = round(num_frames / 24.0 * 40.0)
+        audio_latent_t = round(num_frames / MINIMAX_H3_FRAME_RATE * 40.0)
         audio_latents = pipe.generate_noise(
             (2, 32, audio_latent_t), seed=seed, rand_device=rand_device, rand_torch_dtype=pipe.torch_dtype
         )

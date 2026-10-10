@@ -125,7 +125,7 @@ accelerator:
 
 ## Status and roadmap
 
-Today, `ShardedEmbedding` is the operator only; no model in this repository builds it yet. The SeedOmni V2 text encoder is the first planned user, calling it in its own forward. Two follow-ups are tracked in [#1270](https://github.com/ByteDance-Seed/VeOmni/issues/1270):
+The SeedOmni base `TextEncoder` ([modeling.py](../../veomni/models/seed_omni/modules/base/text_encoder/modeling.py)) builds `embed_tokens` as a `ShardedEmbedding`, so every SeedOmni text encoder (Janus, Qwen3, Qwen3-VL, BAGEL) uses it, and its tied head calls `embed_tokens.project`. The Janus training configs enable `emb`. Two follow-ups are tracked in [#1270](https://github.com/ByteDance-Seed/VeOmni/issues/1270):
 
 - Unify it with the Qwen3.8 (`qwen4_exp`) PLE lookup, which uses the same vocab-row partition but keeps the hidden dim persistently sharded. It gathers activations rather than parameters; see [qwen4_exp_ple_2d_parallelism.md](../design/qwen4_exp_ple_2d_parallelism.md).
 - Bind the text embedding, PLE and n-gram tables of every transformers model to this operator through the parallel plan.

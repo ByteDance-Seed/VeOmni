@@ -343,7 +343,6 @@ def build_foundation_model(
         "attn_implementation": attn_implementation,
         "trust_remote_code": True,
     }
-
     if attn_implementation not in (
         "veomni_flex_attention_with_sp",
         "veomni_magi_attention_with_sp",

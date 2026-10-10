@@ -15,7 +15,12 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import MultiLRScheduler, OmniModelRuntime
+from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
+    MultiLRScheduler,
+    OmniModelRuntime,
+    _reject_graph_that_mismatches_training_task,
+    _training_graph_methods,
+)
 from veomni.models.seed_omni.accelerated.utils import executor
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
@@ -331,3 +336,46 @@ def test_metric_meter_collect_drains_only_the_metered_modules():
 
     assert runtime.metric_meter_collect() == {"metered": (7.0, [3, 4])}
     assert runtime.metric_meter_collect() == {"metered": (0.0, [])}
+
+
+def test_each_module_gets_the_methods_the_training_graph_calls_on_it():
+    """An ``offline_training`` run builds a module on meta from this, so no config flag is needed."""
+    graph = [
+        {"from": "vae.online_process", "to": "connector.embed_latent"},
+        {"from": "vit", "to": "llm"},
+        {"from": "connector.embed_latent", "to": "llm"},
+        {"from": "llm", "to": "connector.decode_velocity"},
+        {"from": "connector.decode_velocity", "to": "end"},
+    ]
+
+    assert _training_graph_methods(graph) == {
+        "vae": {"online_process"},
+        "vit": {"forward"},
+        "connector": {"embed_latent", "decode_velocity"},
+        "llm": {"forward"},
+    }
+    assert _training_graph_methods([]) == {}
+
+
+@pytest.mark.parametrize(
+    ("training_task", "vae_methods", "error"),
+    [
+        ("online_training", {"encode"}, None),
+        ("offline_embedding", {"offline_encode"}, None),
+        ("offline_training", {"online_process"}, None),
+        ("offline_embedding", {"encode"}, "calls it on no module"),
+        ("offline_training", {"encode"}, "calls it on no module"),
+        ("online_training", {"online_process"}, "only train.training_task='offline_training' runs"),
+        ("online_training", {"offline_encode"}, "only train.training_task='offline_embedding' runs"),
+        ("offline_training", {"online_process", "offline_encode"}, "only train.training_task='offline_embedding'"),
+    ],
+)
+def test_the_training_graph_must_call_the_offline_endpoint_of_its_task(training_task, vae_methods, error):
+    graph_methods = {"vae": frozenset(vae_methods), "llm": frozenset({"forward"})}
+    train_args = SimpleNamespace(training_task=training_task)
+
+    if error is None:
+        _reject_graph_that_mismatches_training_task(graph_methods, train_args)
+    else:
+        with pytest.raises(ValueError, match=error):
+            _reject_graph_that_mismatches_training_task(graph_methods, train_args)

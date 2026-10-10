@@ -33,6 +33,39 @@ from veomni.utils.import_utils import is_torch_version_greater_than
 logger = helper.create_logger(__name__)
 
 
+def _attach_weight_conversions_from_mro(model: torch.nn.Module) -> None:
+    """Recover class-name converters after FSDP2 wraps the module class.
+
+    ``fully_shard`` builds a subclass whose ``__name__`` no longer matches the
+    registered mapping. ``model_type`` fallback is wrong for Bagel: eager and
+    accelerated share ``bagel_qwen2_mot``, but only accelerated exports fused
+    QKV through converters. Walk the MRO until a class-name mapping hits.
+    """
+    if getattr(model, "_weight_conversions", None) is not None:
+        return
+
+    from transformers.conversion_mapping import get_checkpoint_conversion_mapping
+
+    for cls in type(model).__mro__:
+        conversions = get_checkpoint_conversion_mapping(cls.__name__)
+        if conversions is not None:
+            model._weight_conversions = list(conversions)
+            return
+
+
+def _revert_model_weight_conversions_for_hf(
+    model: Optional[torch.nn.Module],
+    state_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    if model is None or not getattr(model, "_export_hf_checkpoint_with_weight_conversions", False):
+        return state_dict
+
+    from transformers.core_model_loading import revert_weight_conversion
+
+    _attach_weight_conversions_from_mro(model)
+    return revert_weight_conversion(model, state_dict)
+
+
 @torch.no_grad()
 def get_model_save_state(
     model: torch.nn.Module,
@@ -50,6 +83,7 @@ def get_model_save_state(
     # Use flat state dict so DCP FQNs match the original HF weight_map keys
     # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
     save_state = ModelState(model, parallel_state=parallel_state).state_dict()
+    save_state = _revert_model_weight_conversions_for_hf(model, save_state)
 
     # Convert float32 tensors to bfloat16 on a copy of the state dict,
     # so the original model parameters remain unchanged.
@@ -155,6 +189,7 @@ def _save_hf_safetensor_legacy(
     model_assets: Optional[Sequence],
     ckpt_manager: str,
     output_dir: Optional[str],
+    model: Optional[torch.nn.Module],
 ):
     """Legacy HuggingFace safetensors save via checkpoint conversion (rank-0 only)."""
     model_state_dict = ckpt_to_state_dict(
@@ -162,6 +197,7 @@ def _save_hf_safetensor_legacy(
         ckpt_manager=ckpt_manager,
         output_dir=output_dir,
     )
+    model_state_dict = _revert_model_weight_conversions_for_hf(model, model_state_dict)
     save_model_weights(save_hf_safetensor_path, model_state_dict, model_assets=model_assets)
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_hf_safetensor_path} successfully!")
 
@@ -240,6 +276,7 @@ def save_hf_safetensor(
                 model_assets,
                 ckpt_manager,
                 output_dir,
+                model,
             )
 
     # Ensure all ranks finish saving before anyone proceeds

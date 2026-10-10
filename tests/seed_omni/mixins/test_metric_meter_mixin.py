@@ -263,6 +263,27 @@ def test_multisource_tracker_steps_even_when_no_module_aligns(single_process_met
     assert calls == [([0, 1], [0, 0])]
 
 
+def test_multisource_tracker_survives_a_step_with_no_tokens(monkeypatch):
+    """The zero seqlens of a step where no module aligns (e.g. a VAE-only cache pass)."""
+
+    def _gather_one_rank(out, obj, group=None):
+        out[0] = obj
+
+    monkeypatch.setattr(helper.dist, "all_gather_object", _gather_one_rank)
+    tracker = helper.MultiSourceInfoTracker.__new__(helper.MultiSourceInfoTracker)
+    tracker.dataloader = None
+    tracker.parallel_state = SimpleNamespace(dp_size=1, dp_group=None, tp_enabled=False)
+    tracker.accumulate_counter = {}
+    tracker.batch_idx = 0
+    tracker.names = ["a", "b"]
+    tracker.boundary_type = "token"
+
+    metrics = tracker.step([0, 1], [0, 0])
+
+    assert metrics["multi_source/step_consumed_ratio/a"] == 0.0
+    assert metrics["multi_source/step_consumed_samples"] == 2
+
+
 def _two_rank_step_main(rank: int, rendezvous: str, out_dir: str) -> None:
     """Rank 1 lists its modules in another order, and only rank 0's vision happens to align."""
     import veomni.utils.dist_utils as dist_utils

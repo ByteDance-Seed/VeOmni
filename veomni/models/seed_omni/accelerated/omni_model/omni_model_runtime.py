@@ -26,6 +26,7 @@ import torch
 from .....distributed.clip_grad_norm import veomni_omni_model_clip_grad_norm
 from .....distributed.parallel_state import use_parallel_state
 from .....utils.logging import get_logger
+from ...graphs.training_graph import TrainingGraph
 from ...mixins import MetricMeterMixin, MetricMeterResult
 from ...modeling_omni import OmniModel
 from ...utils.graph_profiler import GraphProfiler
@@ -123,14 +124,59 @@ def _scoped_no_split_modules(module_runtimes: Mapping[str, ModuleRuntime]) -> li
     return list(dict.fromkeys(scoped))
 
 
-def _reject_lora_that_matched_nothing(module_runtimes: Mapping[str, ModuleRuntime]) -> None:
+def _training_graph_methods(training_graph: list[dict]) -> dict[str, frozenset[str]]:
+    """The methods the training graph calls on each module, e.g. ``{"bagel_vae": {"online_process"}}``."""
+    if not training_graph:
+        return {}
+    methods: dict[str, set[str]] = {}
+    for node in TrainingGraph(training_graph).active_nodes():
+        methods.setdefault(node.module, set()).add(node.method)
+    return {module: frozenset(called) for module, called in methods.items()}
+
+
+_OFFLINE_ENDPOINT_OF_TASK = {"offline_embedding": "offline_encode", "offline_training": "online_process"}
+
+
+def _reject_graph_that_mismatches_training_task(
+    graph_methods: Mapping[str, frozenset[str]], train_args: OmniTrainingArguments
+) -> None:
+    """A run's training graph must call the offline endpoint of its ``training_task`` and no other."""
+    task = train_args.training_task
+    expected = _OFFLINE_ENDPOINT_OF_TASK.get(task)
+    nodes_by_endpoint = {
+        endpoint: sorted(f"{module}.{endpoint}" for module, called in graph_methods.items() if endpoint in called)
+        for endpoint in _OFFLINE_ENDPOINT_OF_TASK.values()
+    }
+    if expected is not None and not nodes_by_endpoint[expected]:
+        raise ValueError(
+            f"train.training_task={task!r} needs a training graph that calls `<module>.{expected}`, "
+            "but this graph calls it on no module. Use the graph YAML written for this task."
+        )
+    for endpoint, nodes in nodes_by_endpoint.items():
+        if endpoint != expected and nodes:
+            owner = next(t for t, e in _OFFLINE_ENDPOINT_OF_TASK.items() if e == endpoint)
+            raise ValueError(
+                f"The training graph calls {nodes}, which only train.training_task={owner!r} runs; "
+                f"this run has train.training_task={task!r}."
+            )
+
+
+def _reject_lora_that_matched_nothing(
+    module_runtimes: Mapping[str, ModuleRuntime], train_args: OmniTrainingArguments | None = None
+) -> None:
     """Fail a LoRA run that left the composed model with nothing to train.
 
     A single module whose targets missed is normal — ``ModuleRuntime`` already
     logs and stays frozen. A sibling doing full-parameter SFT still trains.
     Raise only when LoRA was requested and **every** module is frozen, which
     would look like a healthy run whose loss never moves.
+
+    A ``train.training_task='offline_embedding'`` run is exempt: it trains
+    nothing by design.
     """
+    if train_args is not None and train_args.training_task == "offline_embedding":
+        return
+
     requested = [name for name, runtime in module_runtimes.items() if bool(runtime.args.lora_config)]
     if not requested:
         return
@@ -426,6 +472,7 @@ class OmniModelRuntime:
         model = self.model
         ctx: dict[str, Any] = request
         modules = {name: self.get_module(name) for name in model._module_names}
+        model.generation_graph.validate_modules({name: model.get_module(name) for name in model._module_names})
         generation_kwargs = model.resolve_generation_kwargs(generation_kwargs)
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
         total_steps = 0
@@ -529,7 +576,9 @@ class OmniModelRuntime:
         import torch.distributed as dist
 
         if self.train_args is None:
-            raise ValueError("OmniModelRuntime.save_model_assets needs a training runtime (built with train=...).")
+            raise ValueError(
+                "OmniModelRuntime.save_model_assets needs a training runtime (built with train_args=...)."
+            )
         if self.train_args.global_rank == 0:
             save_directory = self.train_args.checkpoint.model_assets_dir
             self.save_pretrained(save_directory, save_module_weights=False)
@@ -574,20 +623,30 @@ class OmniModelRuntime:
 def build_omni_model_runtime(
     omni_model_runtime_args: OmniModelRuntimeArguments,
     *,
-    train: OmniTrainingArguments | None = None,
+    train_args: OmniTrainingArguments | None = None,
     for_inference: bool = False,
 ) -> OmniModelRuntime:
     """Compose a VeOmni-managed model from a resolved :class:`OmniModelRuntimeArguments`.
 
-    ``train`` is the global :class:`~....arguments.omni_arguments_types.OmniTrainingArguments`
-    (unset for inference) — forwarded to every :class:`ModuleRuntime` so its
-    checkpoint manager can resolve the shared ``save_path``/``output_dir``/``load_path``.
+    Args:
+        omni_model_runtime_args: The resolved model section (modules, graphs, global accelerator).
+        train_args: The job's ``train:`` config section (``OmniArguments.train``), not a
+            train/infer switch — ``for_inference`` is that. ``None`` for inference builds.
+            Forwarded unchanged to every :class:`ModuleRuntime`, which reads
+            ``training_task`` and the shared checkpoint ``save_path``/``output_dir``/``load_path``.
+            Each module also gets the methods the training graph calls on it, which decide
+            whether an ``offline_training`` run builds it on meta. The graph must call the
+            offline endpoint of ``training_task`` and no other.
+        for_inference: Build for generation, which skips the optimizer and the training-only checks.
     """
     from ..omni_module.omni_module_runtime import build_omni_module_runtime
 
     omni_config = omni_model_runtime_args.to_hf_config()
     omni_config.load_checkpoint_sidecars(omni_model_runtime_args.resolved_model_path)
     module_runtime_args = omni_model_runtime_args.modules
+    graph_methods = {} if for_inference else _training_graph_methods(omni_config.training_graph)
+    if not for_inference and train_args is not None:
+        _reject_graph_that_mismatches_training_task(graph_methods, train_args)
     module_runtimes: dict[str, ModuleRuntime] = {}
     for name in omni_config.module_names:
         module_args = module_runtime_args[name]
@@ -595,7 +654,8 @@ def build_omni_model_runtime(
             module_args,
             module_name=name,
             module_config=omni_config._module_configs[name],
-            train=train,
+            train_args=train_args,
+            training_graph_methods=graph_methods.get(name, frozenset()),
             for_inference=for_inference,
             global_accelerator=omni_model_runtime_args.accelerator,
         )
@@ -606,12 +666,12 @@ def build_omni_model_runtime(
         f"OmniModelRuntime: composed OmniModel with {len(module_runtimes)} module(s) ({list(module_runtimes)})."
     )
     if not for_inference:
-        _reject_lora_that_matched_nothing(module_runtimes)
+        _reject_lora_that_matched_nothing(module_runtimes, train_args)
     runtime = OmniModelRuntime(
         OmniModel(omni_config, {name: rt.omni_module for name, rt in module_runtimes.items()}),
         module_runtimes=module_runtimes,
         omni_model_runtime_args=omni_model_runtime_args,
-        train_args=train,
+        train_args=train_args,
     )
     runtime._parallelize_composed_model(for_inference=for_inference)
     if not for_inference:

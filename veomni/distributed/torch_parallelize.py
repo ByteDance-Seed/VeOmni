@@ -98,7 +98,7 @@ def _has_extra_parallel_plan(model: nn.Module) -> bool:
     The question both ExtraParallel guards below actually need to ask. A plan is
     a property of the *model*, unlike ``ParallelState.any_extra_parallel_enabled``,
     which only says an ep dim exists in the mesh — and a mesh dim is inherited by
-    every sub-module of a SeedOmni V2 config, including the ones that have no
+    every sub-module of a SeedOmni config, including the ones that have no
     experts.
     """
     plan = get_runtime_parallel_plan(model)
@@ -241,7 +241,7 @@ def _materialize_and_load_weights(
         else:
             if ep_sharded_stream_load:
                 # The flag is set once for a whole run, but this helper runs once
-                # per model -- once per OmniModule under SeedOmni V2 -- and a model
+                # per model -- once per OmniModule under SeedOmni -- and a model
                 # with no ExtraParallel plan (vision encoder, VAE, connector) has
                 # no expert tensors to stream. Skipping is not a silent degrade:
                 # there was never a fast path to take here, and refusing instead
@@ -917,7 +917,7 @@ def parallelize_model_ddp(
     # DDP module's experts are whole. Refuse rather than load full tensors into a
     # model whose plan says they are sharded -- until now the meta crash below hid
     # this combination. Keyed on the model's plan, not on
-    # ``any_extra_parallel_enabled``: a SeedOmni V2 sub-module inherits the global
+    # ``any_extra_parallel_enabled``: a SeedOmni sub-module inherits the global
     # accelerator's ep dim whether or not it owns any experts, so the mesh alone
     # would refuse a plan-less DDP vision tower that is perfectly fine.
     if parallel_state.any_extra_parallel_enabled and _has_extra_parallel_plan(model):
@@ -960,6 +960,16 @@ def parallelize_model_ddp(
                 f"{unmaterialized[:5]}{'...' if len(unmaterialized) > 5 else ''}"
             )
 
+    # PyTorch DDP rejects modules with zero trainable params. Fully-frozen
+    # encoders (e.g. Seedream offline_cache OE/ViT/VAE under ``no_grad``) still
+    # need the meta→device materialize + weight load above; skip the DDP wrap
+    # and return the bare replica (FSDP2 path already accepts all-frozen).
+    if not any(p.requires_grad for p in model.parameters()):
+        logger.info_rank0(
+            f"Skipping DDP wrap for fully-frozen module {type(model).__name__} (no trainable parameters)."
+        )
+        return model
+
     # ``broadcast_buffers=False`` because FSDP2 syncs no buffers at all, and a
     # module's buffer semantics must not change with the ``fsdp_mode`` a config
     # happened to pick. Nothing is lost: rank0's copy is either identical to the
@@ -969,6 +979,7 @@ def parallelize_model_ddp(
         model,
         device_ids=[parallel_state.local_rank],
         process_group=parallel_state.dp_group,
+        find_unused_parameters=True,
         broadcast_buffers=False,
     )
 

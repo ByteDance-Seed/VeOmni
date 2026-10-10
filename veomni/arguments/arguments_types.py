@@ -115,7 +115,7 @@ class OptimizerConfig:
     )
     weight_decay: float = field(
         default=0,
-        metadata={"help": "L2 regularization strength."},
+        metadata={"help": "Weight decay. AdamW applies it decoupled, outside the gradient."},
     )
     no_decay_modules: List[str] = field(
         default_factory=list,
@@ -133,11 +133,11 @@ class OptimizerConfig:
         default="per_module",
         metadata={
             "help": (
-                "Which parameters max_grad_norm is computed over. 'per_module' clips each "
-                "module against its own norm; 'global' clips every module against one norm "
-                "taken across all of them. A single-model job has one module, so the two "
-                "agree; 'global' only becomes meaningful once an omni model owns several, "
-                "and is not implemented yet."
+                "How OmniTrainer applies max_grad_norm across OmniModules. "
+                "'per_module' (default): clip each module to max_grad_norm independently, "
+                "then report sqrt(sum n_i^2). "
+                "'global': measure each module unclipped, total=sqrt(sum n_i^2), then scale "
+                "all modules by one coefficient (single-model / seedream gradient_clip_val semantics)."
             )
         },
     )
@@ -247,13 +247,6 @@ class OptimizerConfig:
             )
         },
     )
-
-    def __post_init__(self):
-        if self.grad_clip_scope == "global":
-            raise NotImplementedError(
-                "model.optimizer.grad_clip_scope='global' needs a clip that spans several "
-                "modules, which arrives with the omni module runtime. Use 'per_module'."
-            )
 
 
 @dataclass
@@ -1805,6 +1798,10 @@ class ModelArguments(BaseModelArguments):
                 )
 
 
+# Omni modules inherit this same training-unit shape.
+ModelRuntimeArguments = ModelArguments
+
+
 # ================================ Data Arguments ======================================
 #
 # Hierarchy:
@@ -1878,10 +1875,15 @@ class DataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo"] = field(
-        default="conversation",
-        metadata={"help": "Type of the training data."},
-    )
+    data_type: Literal[
+        "plaintext",
+        "conversation",
+        "diffusion",
+        "classification",
+        "dpo",
+        "seedomni",
+        "seedomni_cached",
+    ] = field(default="conversation", metadata={"help": "Type of the training data."})
     datasets_type: str = field(
         default="mapping",
         metadata={"help": "Type of the datasets."},
@@ -1938,6 +1940,11 @@ class DataArguments:
                 self.text_keys = "text"
             elif self.data_type == "dpo":
                 self.text_keys = "chosen"
+            elif self.data_type in {"seedomni", "seedomni_cached"}:
+                # SeedOmni modules own their own tokenization; the transform
+                # reads ``conversations`` / ``images`` columns directly and
+                # cached rows carry ``conversation_list`` directly. Leave it unset.
+                pass
             else:
                 raise ValueError(f"Unknown data type: {self.data_type}")
 

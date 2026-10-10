@@ -11,6 +11,7 @@ error only if they still have nothing to run.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from ....utils.registry import Registry  # VeOmni shared name→factory registry; not seed_omni-local.
@@ -24,6 +25,97 @@ if TYPE_CHECKING:
 OMNI_CONVERT_REGISTRY = Registry("OmniConvert")
 
 ConvertFn = Callable[..., dict[str, Any]]
+
+GraphFiles = str | Mapping[str, str]
+
+
+def attach_module_assets(
+    module: PretrainedOmniModule,
+    *,
+    tokenizer: Any = None,
+    processor: Any = None,
+    image_processor: Any = None,
+    video_processor: Any = None,
+) -> PretrainedOmniModule:
+    """Hang HF assets on ``module`` so its ``save_pretrained`` writes them into the module subfolder.
+
+    These are the attributes a module's preprocessor binds at load time, so a
+    converted module saves exactly what the loaded one reads back.
+    """
+    for attr, asset in (
+        ("_tokenizer", tokenizer),
+        ("_processor", processor),
+        ("_image_processor", image_processor),
+        ("_video_processor", video_processor),
+    ):
+        if asset is not None:
+            setattr(module, attr, asset)
+    return module
+
+
+def _repo_config_dir(relative: str | Path) -> Path:
+    """Walk up from this file to ``<repo>/<relative>``."""
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / relative
+        if candidate.is_dir():
+            return candidate
+    raise FileNotFoundError(
+        f"Could not find {relative} above {__file__}. "
+        "Pass training_graph= / generation_graph= explicitly, or run convert from a VeOmni checkout."
+    )
+
+
+def _read_graph_files(config_dir: Path, files: GraphFiles, value_type: type) -> dict[str, Any]:
+    """Read one scenario-map file, or ``{scenario: file}`` where each file holds a single graph."""
+    from ..configuration_omni import OmniConfig
+
+    if isinstance(files, str):
+        return OmniConfig._read_graph_file(str(config_dir / files), value_type)
+    graphs: dict[str, Any] = {}
+    for scenario, file in files.items():
+        payload = OmniConfig._read_graph_file(str(config_dir / file), value_type)
+        if len(payload) != 1:
+            raise ValueError(f"{config_dir / file} holds {len(payload)} scenarios; expected one for {scenario!r}.")
+        graphs[scenario] = next(iter(payload.values()))
+    return graphs
+
+
+def load_family_graphs(
+    config_dir: str | Path,
+    *,
+    training: GraphFiles,
+    generation: GraphFiles,
+    training_graph: str | Path | None = None,
+    generation_graph: str | Path | None = None,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
+    """Read a family's default training DAGs and generation FSMs from ``configs/``.
+
+    ``config_dir`` is repo-relative (e.g. ``configs/seed_omni/Janus/janus_1.3b``);
+    ``training`` / ``generation`` name files under it. ``training_graph`` /
+    ``generation_graph`` are caller-supplied YAML paths that replace the
+    defaults, so a converter still runs outside a checkout when both are given.
+    """
+    from ..configuration_omni import OmniConfig
+
+    root: Path | None = None
+
+    def configs() -> Path:
+        nonlocal root
+        if root is None:
+            root = _repo_config_dir(config_dir)
+        return root
+
+    training_graphs = (
+        OmniConfig._read_graph_file(str(training_graph), list)
+        if training_graph is not None
+        else _read_graph_files(configs(), training, list)
+    )
+    generation_graphs = (
+        OmniConfig._read_graph_file(str(generation_graph), dict)
+        if generation_graph is not None
+        else _read_graph_files(configs(), generation, dict)
+    )
+    return training_graphs, generation_graphs
 
 
 def _save_converted_omni(
@@ -119,5 +211,7 @@ def _run_converter(model_path: str, **kwargs) -> dict[str, Any]:
 
 __all__ = [
     "OMNI_CONVERT_REGISTRY",
+    "attach_module_assets",
     "convert_checkpoint",
+    "load_family_graphs",
 ]

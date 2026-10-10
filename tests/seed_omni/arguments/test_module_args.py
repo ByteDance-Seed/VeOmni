@@ -7,6 +7,7 @@ depending on any real model's configs.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -82,7 +83,7 @@ def test_runtime_config_keeps_the_full_launcher_view():
 
 
 def test_to_hf_config_projects_onto_the_checkpoint_view():
-    """Each module becomes one flat checkpoint entry; ops stay on the runtime args."""
+    """Each module becomes one flat checkpoint entry, kernels included."""
     runtime_cfg = _model_runtime()
     cfg = runtime_cfg.to_hf_config()
 
@@ -97,13 +98,15 @@ def test_to_hf_config_projects_onto_the_checkpoint_view():
     # sourced from a different HF model — instead of silently re-deriving the
     # wrong `checkpoint_root/module_name` path). It still never reaches an
     # actually persisted checkpoint: `OmniConfig.to_dict` renames every entry
-    # back to its own subfolder. Ops live on the runtime args and are never
-    # written onto OmniConfig.
+    # back to its own subfolder. Kernels are carried so the checkpoint
+    # remembers what each module was trained with.
     assert entry["model_path"] == runtime_cfg.modules[MODULE_A].model_path
     for name in (MODULE_A, MODULE_B):
         runtime_ops = runtime_cfg.modules[name].ops_implementation
         assert runtime_ops.attn_implementation is not None
-        assert "ops_implementation" not in cfg._module_entries[name]
+        assert cfg._module_entries[name]["ops_implementation"]["attn_implementation"] == (
+            runtime_ops.attn_implementation
+        )
 
 
 def test_hf_export_strips_model_path_from_the_persisted_checkpoint():
@@ -318,7 +321,142 @@ def test_runtime_to_hf_config_roundtrips_through_checkpoint(tmp_path):
     for name in hf_cfg.module_names:
         assert reloaded._module_entries[name]["model_path"] == name
         assert os.path.basename(loaded_from[name]) == name
-        assert not reloaded._module_entries[name].get("ops_implementation")
+        assert (
+            reloaded._module_entries[name]["ops_implementation"]["attn_implementation"]
+            == runtime_cfg.modules[name].ops_implementation.attn_implementation
+        )
+
+
+def _exported_root(tmp_path) -> Path:
+    exported = tmp_path / "exported"
+    _with_module_configs(_model_runtime(model_path=str(tmp_path)).to_hf_config()).save_pretrained(exported)
+    return exported
+
+
+def _exported_attn(exported: Path, name: str) -> str:
+    return OmniConfig.from_pretrained(exported)._module_entries[name]["ops_implementation"]["attn_implementation"]
+
+
+def _args_over(exported: Path, modules: dict | str | None = None) -> OmniArguments:
+    model_config = {} if modules is None else {"modules": modules}
+    return OmniArguments(
+        model=OmniModelRuntimeArguments(model_path=str(exported), model_config=model_config),
+        data=OmniDataArguments(train_path=""),
+        infer=OmniInferArguments(),
+    )
+
+
+def _with_checkpoint_accelerator(exported: Path, **by_module: str) -> None:
+    """Hand-write an ``accelerator`` onto checkpoint entries.
+
+    Export never writes one — ``to_hf_config`` projects the model fields only —
+    so a hand-written ``config.json`` is the only way this layer carries one.
+    """
+    config_file = exported / "config.json"
+    payload = json.loads(config_file.read_text(encoding="utf-8"))
+    for name, mode in by_module.items():
+        payload["_module_entries"][name]["accelerator"] = {"fsdp_config": {"fsdp_mode": mode}}
+    config_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def test_launcher_module_args_win_over_the_persisted_kernels(tmp_path):
+    """Persisting kernels does not freeze them into the checkpoint.
+
+    The eager-inference path (``OmniInferencer``) hands
+    ``OmniModel.from_pretrained`` a ``config=`` projected from the launcher's
+    per-module args, so a relaunch that changes a kernel must see its own value.
+    """
+    exported = _exported_root(tmp_path)
+    assert _exported_attn(exported, MODULE_B) not in (None, "sdpa")
+
+    relaunched = _model_runtime(model_path=str(tmp_path))
+    relaunched.modules[MODULE_B].ops_implementation.attn_implementation = "sdpa"
+
+    from_launcher = relaunched.to_hf_config()
+    assert from_launcher._module_entries[MODULE_B]["ops_implementation"]["attn_implementation"] == "sdpa"
+
+
+def test_the_checkpoint_fills_in_what_the_launcher_yaml_leaves_out(tmp_path):
+    """A launcher YAML does not shut the checkpoint's own values out.
+
+    ``modules_train.yaml`` pins each module's attention and no infer YAML repeats
+    it, so without the checkpoint layer an inference run would silently drop to
+    the global value.
+    """
+    from veomni.arguments import OpsImplementationConfig
+
+    exported = _exported_root(tmp_path)
+    # `fake_module_a` is pinned to eager attention, unlike the global default:
+    # a module whose exported value matched the global would pass whether or
+    # not the checkpoint was consulted.
+    trained_attn = _exported_attn(exported, MODULE_A)
+    assert trained_attn != OpsImplementationConfig().attn_implementation
+
+    modules = build_omni_model_runtime_args(
+        _args_over(exported, str(_cfg_dir() / "infer/modules_infer_eager.yaml")), for_inference=True
+    ).modules
+
+    # The infer YAML names no kernels, so the exported ones stand...
+    assert modules[MODULE_A].ops_implementation.attn_implementation == trained_attn
+    # ...and it does name parallelism, which the checkpoint must not undo.
+    assert modules[MODULE_A].accelerator.fsdp_config.fsdp_mode == "eager"
+
+
+def test_a_launcher_yaml_still_wins_where_it_names_the_same_field(tmp_path):
+    """The checkpoint is a default, not a freeze; deep-merged per field."""
+    exported = _exported_root(tmp_path)
+    modules_yaml = {MODULE_A: {}, MODULE_B: {"ops_implementation": {"attn_implementation": "sdpa"}}}
+
+    modules = build_omni_model_runtime_args(_args_over(exported, modules_yaml)).modules
+
+    assert modules[MODULE_B].ops_implementation.attn_implementation == "sdpa"
+    # Untouched by the YAML, so still the exported value rather than the global.
+    assert modules[MODULE_A].ops_implementation.attn_implementation == _exported_attn(exported, MODULE_A)
+
+
+def test_a_checkpoint_accelerator_overlay_reaches_training(tmp_path):
+    """Parallelism layers like everything else, and the YAML still wins."""
+    exported = _exported_root(tmp_path)
+    _with_checkpoint_accelerator(exported, **{MODULE_A: "ddp", MODULE_B: "ddp"})
+
+    modules = build_omni_model_runtime_args(
+        _args_over(exported, {MODULE_A: {}, MODULE_B: {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2"}}}})
+    ).modules
+
+    assert modules[MODULE_A].accelerator.fsdp_config.fsdp_mode == "ddp"
+    assert modules[MODULE_B].accelerator.fsdp_config.fsdp_mode == "fsdp2"
+
+
+def test_inference_stays_eager_over_a_checkpoint_accelerator(tmp_path):
+    """A checkpoint must not make an inference run distributed on its own."""
+    exported = _exported_root(tmp_path)
+    _with_checkpoint_accelerator(exported, **{MODULE_A: "fsdp2", MODULE_B: "fsdp2"})
+
+    modules = build_omni_model_runtime_args(
+        _args_over(exported, {MODULE_A: {}, MODULE_B: {"accelerator": {"fsdp_config": {"fsdp_mode": "ddp"}}}}),
+        for_inference=True,
+    ).modules
+
+    # `{}` names the module without saying anything about it, so the layers beneath it stand.
+    assert modules[MODULE_A].accelerator.fsdp_config.fsdp_mode == "eager"
+    # Still overridable by the run's own YAML, which is the layer above.
+    assert modules[MODULE_B].accelerator.fsdp_config.fsdp_mode == "ddp"
+
+
+def test_a_launcher_less_inference_run_is_eager_and_keeps_the_exported_kernels(tmp_path):
+    """No ``modules:`` YAML at all: the checkpoint decides the module set."""
+    exported = _exported_root(tmp_path)
+    _with_checkpoint_accelerator(exported, **{MODULE_A: "fsdp2"})
+    trained_attn = _exported_attn(exported, MODULE_A)
+
+    modules = build_omni_model_runtime_args(_args_over(exported), for_inference=True).modules
+
+    assert set(modules) == {MODULE_A, MODULE_B}
+    assert modules[MODULE_A].accelerator.fsdp_config.fsdp_mode == "eager"
+    assert not modules[MODULE_A].broadcast_model_weights_from_rank0
+    # The eager default masks parallelism only — the exported kernels still land.
+    assert modules[MODULE_A].ops_implementation.attn_implementation == trained_attn
+    assert Path(modules[MODULE_A].model_path) == exported / MODULE_A
 
 
 def test_build_model_runtime_args_reads_graphs_from_omni_checkpoint(tmp_path):
@@ -335,6 +473,29 @@ def test_build_model_runtime_args_reads_graphs_from_omni_checkpoint(tmp_path):
     cfg = build_omni_model_runtime_args(args)
     assert cfg.training_graph == runtime_cfg.training_graph
     assert cfg.infer_types == runtime_cfg.infer_types
+
+
+def test_a_launcher_infer_graph_does_not_inherit_the_checkpoint_infer_type(tmp_path):
+    """The checkpoint's ``infer_type`` names one of its own scenarios, not the launcher's."""
+    infer_dir = _cfg_dir() / "infer"
+    runtime_cfg = _model_runtime(
+        model_path=str(tmp_path),
+        infer_graph={"infer_und": str(infer_dir / "graph_infer_und.yaml")},
+        infer_type="infer_und",
+    )
+    export_root = tmp_path / "exported"
+    _with_module_configs(runtime_cfg.to_hf_config()).save_pretrained(export_root)
+    assert OmniConfig.from_pretrained(export_root).infer_type == "infer_und"
+
+    args = OmniArguments(
+        model=OmniModelRuntimeArguments(
+            model_path=str(export_root),
+            model_config={"infer_graph": {"understanding": str(infer_dir / "graph_infer_und.yaml")}},
+        ),
+        data=OmniDataArguments(train_path=""),
+        infer=OmniInferArguments(),
+    )
+    assert build_omni_model_runtime_args(args, for_inference=True).infer_type == "understanding"
 
 
 def test_build_model_runtime_args_keeps_every_training_scenario_from_omni_checkpoint(tmp_path):
