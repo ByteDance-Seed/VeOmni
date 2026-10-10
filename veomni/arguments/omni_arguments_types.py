@@ -596,6 +596,11 @@ class OmniTrainingArguments:
             raise ValueError(
                 "`train.offline_cache_dir` is required when `train.training_task` is 'offline_embedding'."
             )
+        if self.training_task == "offline_embedding" and self.num_train_epochs != 1:
+            raise ValueError(
+                "`train.training_task='offline_embedding'` writes every sample it reads, so "
+                f"`train.num_train_epochs` must be 1; got {self.num_train_epochs}."
+            )
 
         if self.dyn_bsz_physical_overflow_ratio < 1.0:
             raise ValueError(
@@ -686,6 +691,16 @@ def _validate_omni_accelerator(accelerator: AcceleratorConfig) -> None:
         raise ValueError("accelerator.torch_compile.enable is not supported by SeedOmni yet.")
 
 
+def _validate_training_task_data(train: OmniTrainingArguments, data: OmniDataArguments) -> None:
+    """Only ``offline_training`` reads an offline cache; the other tasks read raw ``seedomni`` data."""
+    if (train.training_task == "offline_training") != (data.data_type == "seedomni_cached"):
+        expected = "seedomni_cached" if train.training_task == "offline_training" else "seedomni"
+        raise ValueError(
+            f"`train.training_task={train.training_task!r}` needs `data.data_type={expected!r}`; "
+            f"got {data.data_type!r}."
+        )
+
+
 def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
     """Reject an eager module under a top-level ``fsdp_scope='model'`` before any weights load."""
     fsdp_config = accelerator.fsdp_config
@@ -729,6 +744,7 @@ class OmniArguments:
         self.train._derive_batch_config(self.model.accelerator)
 
         _validate_omni_accelerator(self.model.accelerator)
+        _validate_training_task_data(self.train, self.data)
 
     def _to_module_global_args(self) -> OmniModuleRuntimeArguments:
         """Project ``model`` defaults onto :class:`OmniModuleRuntimeArguments` for per-module merging."""
