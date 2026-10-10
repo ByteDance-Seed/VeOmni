@@ -51,7 +51,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal, Optional, Union, get_args
 
 import yaml
 
@@ -75,6 +75,8 @@ from .parser import _deep_update, _instantiate_recursive
 
 
 logger = logging.get_logger(__name__)
+
+OmniTrainingTask = Literal["online_training", "offline_embedding", "offline_training"]
 
 
 def _is_omni_checkpoint_root(path: Optional[str]) -> bool:
@@ -409,7 +411,10 @@ class OmniDataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal["seedomni"] = field(default="seedomni", metadata={"help": "Type of the training data."})
+    data_type: Literal["seedomni", "seedomni_cached"] = field(
+        default="seedomni",
+        metadata={"help": "Type of the training data; `seedomni_cached` reads an offline-cache dataset."},
+    )
     datasets_type: str = field(
         default="mapping",
         metadata={"help": "Type of the datasets."},
@@ -450,8 +455,10 @@ class OmniDataArguments:
     )
 
     def __post_init__(self):
-        if self.data_type != "seedomni":
-            raise ValueError(f"OmniTrainer only builds the seedomni transform; got data.data_type={self.data_type!r}.")
+        if self.data_type not in {"seedomni", "seedomni_cached"}:
+            raise ValueError(
+                f"OmniTrainer only builds the seedomni transforms; got data.data_type={self.data_type!r}."
+            )
         self.enable_multisource = self.train_path.endswith(".yaml")
 
         if self.enable_multisource:
@@ -563,6 +570,18 @@ class OmniTrainingArguments:
         default=0,
         metadata={"help": "MoE expert load heatmap interval. Not supported by OmniTrainer; must be <= 0 (disabled)."},
     )
+    training_task: OmniTrainingTask = field(
+        default="online_training",
+        metadata={
+            "help": "Training task. online_training: encode raw data online. offline_embedding: run the "
+            "`support_cache` modules' offline_encode and write the cache. offline_training: train from the "
+            "cache, with the `support_cache` modules built on meta."
+        },
+    )
+    offline_cache_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Output directory for training_task='offline_embedding'."},
+    )
     graph_profile: OmniGraphProfileArguments = field(default_factory=OmniGraphProfileArguments)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
@@ -570,6 +589,14 @@ class OmniTrainingArguments:
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
+        if self.training_task not in get_args(OmniTrainingTask):
+            known = ", ".join(get_args(OmniTrainingTask))
+            raise ValueError(f"Unknown train.training_task {self.training_task!r}; expected one of: {known}.")
+        if self.training_task == "offline_embedding" and not self.offline_cache_dir:
+            raise ValueError(
+                "`train.offline_cache_dir` is required when `train.training_task` is 'offline_embedding'."
+            )
+
         if self.dyn_bsz_physical_overflow_ratio < 1.0:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."

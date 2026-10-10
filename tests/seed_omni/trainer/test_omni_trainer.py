@@ -114,7 +114,48 @@ def test_the_trainer_refuses_a_model_with_nothing_to_train(monkeypatch):
         MagicMock(return_value=SimpleNamespace(optimizer=None)),
     )
     trainer = OmniTrainer.__new__(OmniTrainer)
-    trainer.args = SimpleNamespace(train=SimpleNamespace())
+    trainer.args = SimpleNamespace(train=SimpleNamespace(training_task="online_training"))
 
     with pytest.raises(ValueError, match="every module is frozen"):
         trainer._build_model_runtime()
+
+
+def test_an_offline_embedding_run_may_build_no_optimizer(monkeypatch):
+    """It runs only the frozen modules' ``offline_encode``, so it trains nothing by design."""
+    monkeypatch.setattr("veomni.trainer.omni.omni_trainer.build_omni_model_runtime_args", MagicMock())
+    built = SimpleNamespace(optimizer=None)
+    monkeypatch.setattr("veomni.trainer.omni.omni_trainer.build_omni_model_runtime", MagicMock(return_value=built))
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.args = SimpleNamespace(train=SimpleNamespace(training_task="offline_embedding"))
+
+    assert trainer._build_model_runtime() is built
+
+
+def test_offline_cache_step_writes_every_micro_batch_without_autograd():
+    grad_enabled = []
+
+    def forward(micro_batch):
+        grad_enabled.append(torch.is_grad_enabled())
+        micro_batch["conversation_list"].append("encoded")
+
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.model = SimpleNamespace(forward=forward)
+    trainer.args = SimpleNamespace(train=SimpleNamespace(enable_batch_invariant_mode=False))
+    trainer.model_fwd_context = nullcontext()
+    trainer.state = TrainerState(global_step=0)
+    trainer.offline_cache_writer = MagicMock()
+    trainer.on_step_begin = MagicMock()
+    trainer.on_step_end = MagicMock()
+    trainer.sync_before_train_step = MagicMock()
+    trainer.model_reshard = MagicMock()
+    trainer.preforward = lambda micro_batch: micro_batch
+
+    trainer.offline_cache_step(iter([[{"conversation_list": ["a"]}, {"conversation_list": ["b"]}]]))
+
+    assert grad_enabled == [False, False]
+    assert [c.args[0] for c in trainer.offline_cache_writer.save_conversation_list.call_args_list] == [
+        ["a", "encoded"],
+        ["b", "encoded"],
+    ]
+    assert trainer.state.global_step == 1
+    trainer.on_step_end.assert_called_once_with(loss=0.0, loss_dict={}, grad_norm=0.0)

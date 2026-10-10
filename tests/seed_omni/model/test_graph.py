@@ -119,23 +119,31 @@ def test_training_graph_rejects_missing_method():
         TrainingGraph([{"from": "a.encode", "to": "end"}], modules={"a": Mod()})
 
 
+_ONE_NODE_FSM = {
+    "initial": "run",
+    "states": {
+        "run": {
+            "body": [{"from": "a", "to": "end"}],
+            "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+        }
+    },
+}
+
+
 def test_generation_graph_rejects_missing_method():
     class Mod:
         pass
 
     with pytest.raises(ValueError, match=r"Mod\.generate"):
-        GenerationGraph(
-            {
-                "initial": "run",
-                "states": {
-                    "run": {
-                        "body": [{"from": "a", "to": "end"}],
-                        "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
-                    }
-                },
-            },
-            modules={"a": Mod()},
-        )
+        GenerationGraph(_ONE_NODE_FSM).validate_modules({"a": Mod()})
+
+
+def test_generation_graph_builds_without_the_modules_it_names():
+    """A training job may load only a subset (an ``offline_embedding`` run loads just the encoder)."""
+    graph = GenerationGraph(_ONE_NODE_FSM)
+
+    with pytest.raises(ValueError, match="not loaded: \\['a'\\]"):
+        graph.validate_modules({"vae": object()})
 
 
 def test_single_node_with_only_end_edge():
