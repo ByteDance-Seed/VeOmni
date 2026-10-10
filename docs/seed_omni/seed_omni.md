@@ -325,7 +325,10 @@ uses that method verbatim. A node's identity is its canonical
 - **`GenerationGraph`** — a **finite-state machine**. Each `state.body` is a
   list of inline `{from, to}` edges to run that step; `transitions` pick the
   next state by `module_signal` (a string a module writes into `ctx`) or
-  `default`.
+  `default`. Building it checks only the FSM's structure; the modules and
+  methods its nodes name are checked at the start of `OmniModel.generate`, so a
+  training run that loads only some modules, such as an offline-cache stage,
+  can still carry the checkpoint's generation graph.
 
 ### 2.4 `OmniModel` — the runtime (`modeling_omni.py`)
 

@@ -76,7 +76,7 @@ from .parser import _deep_update, _instantiate_recursive
 
 logger = logging.get_logger(__name__)
 
-OmniCacheMode = Literal["full", "encode_only", "process_only"]
+OmniTrainingTask = Literal["online_training", "offline_embedding", "offline_training"]
 
 
 def _is_omni_checkpoint_root(path: Optional[str]) -> bool:
@@ -600,16 +600,17 @@ class OmniTrainingArguments:
         default=0,
         metadata={"help": "MoE expert load heatmap interval. Not supported by OmniTrainer; must be <= 0 (disabled)."},
     )
-    cache_mode: OmniCacheMode = field(
-        default="full",
+    training_task: OmniTrainingTask = field(
+        default="online_training",
         metadata={
-            "help": "Offline-encoding mode of every module whose config has `support_cache`: "
-            "'full' encodes online, 'encode_only' writes the offline cache, 'process_only' trains from it."
+            "help": "Training task. online_training: encode raw data online. offline_embedding: run the "
+            "`support_cache` modules' offline_encode and write the cache. offline_training: train from the "
+            "cache, with the `support_cache` modules built on meta."
         },
     )
     offline_cache_dir: Optional[str] = field(
         default=None,
-        metadata={"help": "Output directory for cache_mode='encode_only'."},
+        metadata={"help": "Output directory for training_task='offline_embedding'."},
     )
     graph_profile: OmniGraphProfileArguments = field(default_factory=OmniGraphProfileArguments)
     wandb: WandbConfig = field(default_factory=WandbConfig)
@@ -618,11 +619,13 @@ class OmniTrainingArguments:
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
-        if self.cache_mode not in get_args(OmniCacheMode):
-            known = ", ".join(get_args(OmniCacheMode))
-            raise ValueError(f"Unknown train.cache_mode {self.cache_mode!r}; expected one of: {known}.")
-        if self.cache_mode == "encode_only" and not self.offline_cache_dir:
-            raise ValueError("`train.offline_cache_dir` is required when `train.cache_mode` is 'encode_only'.")
+        if self.training_task not in get_args(OmniTrainingTask):
+            known = ", ".join(get_args(OmniTrainingTask))
+            raise ValueError(f"Unknown train.training_task {self.training_task!r}; expected one of: {known}.")
+        if self.training_task == "offline_embedding" and not self.offline_cache_dir:
+            raise ValueError(
+                "`train.offline_cache_dir` is required when `train.training_task` is 'offline_embedding'."
+            )
 
         if self.dyn_bsz_physical_overflow_ratio < 1.0:
             raise ValueError(
@@ -635,14 +638,6 @@ class OmniTrainingArguments:
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
         self._resolve_checkpoint_paths()
         self._resolve_profile()
-
-    def module_cache_mode(self, support_cache: bool) -> OmniCacheMode:
-        """The ``cache_mode`` a module is built in (see ``OfflineEncodingMixin``).
-
-        Only a module whose config has ``support_cache`` follows ``train.cache_mode``;
-        every other module encodes online, as ``full``.
-        """
-        return self.cache_mode if support_cache else "full"
 
     def _derive_batch_config(self, accelerator: AcceleratorConfig) -> None:
         acc = accelerator

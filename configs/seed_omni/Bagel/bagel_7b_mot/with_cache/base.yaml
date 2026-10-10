@@ -60,7 +60,7 @@ data:
     prefetch_factor: 2
 
 train:
-  cache_mode: process_only
+  training_task: offline_training
   seed: 42
   num_train_epochs: 1
   global_batch_size: 32

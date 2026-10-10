@@ -61,7 +61,7 @@ data:
     prefetch_factor: 2
 
 train:
-  cache_mode: encode_only
+  training_task: offline_embedding
   offline_cache_dir: outputs/bagel_vae_cached_dataset
   seed: 42
   num_train_epochs: 1

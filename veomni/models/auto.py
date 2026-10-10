@@ -244,15 +244,11 @@ def build_foundation_model(
     encoder_data_balance: Optional[bool] = False,
     encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
     ops_implementation: Optional[OpsImplementationConfig] = None,
-    model_kwargs: Optional[Dict[str, Any]] = None,
 ) -> "PreTrainedModel":
     """
     Builds the foundation model.
 
     If weights_path is provided, it loads the pre-trained weights, otherwise it initializes weights.
-
-    ``model_kwargs`` are passed to the model constructor rather than written onto
-    the config — for per-run choices such as SeedOmni's ``cache_mode``.
 
     Ops dispatch: callers must pass ``ops_implementation`` *or* pre-install a
     singleton via ``apply_ops_config(...)``. There is no silent all-eager
@@ -347,12 +343,6 @@ def build_foundation_model(
         "attn_implementation": attn_implementation,
         "trust_remote_code": True,
     }
-    if model_kwargs:
-        overlap = sorted(init_kwargs.keys() & model_kwargs.keys())
-        if overlap:
-            raise ValueError(f"build_foundation_model: model_kwargs must not override {overlap}.")
-        init_kwargs.update(model_kwargs)
-
     if attn_implementation not in (
         "veomni_flex_attention_with_sp",
         "veomni_magi_attention_with_sp",

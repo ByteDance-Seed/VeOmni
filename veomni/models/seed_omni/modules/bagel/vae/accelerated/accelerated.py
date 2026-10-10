@@ -23,7 +23,7 @@ from .....utils.conversation import ConversationItem
 from ...sources import BAGEL_CONTEXT_KEY, BAGEL_VAE_CONTEXT
 from ..configuration import BagelVAEConfig
 from ..modeling import BagelVAE, select_bagel_vae_context_items
-from ..processing import BAGEL_VAE_PIXEL_SHAPE, crop_latent_to_image_shape
+from ..processing import BAGEL_VAE_PIXEL_SHAPE, BAGEL_VAE_POSTERIOR, crop_latent_to_image_shape
 
 
 def _posterior_from_cache(
@@ -41,7 +41,7 @@ def _posterior_from_cache(
     )
 
 
-class BagelVAEOfflineMixin:
+class BagelVAEOfflineMixin(OfflineEncodingMixin):
     """Offline-cache tensor endpoints and training-graph hooks for VAE encode / process."""
 
     config: BagelVAEConfig
@@ -105,6 +105,7 @@ class BagelVAEOfflineMixin:
                 cache_tensor = cache_tensor.reshape(2, z_channels, *cache_tensor.shape[-2:])
             item.value = cache_tensor.detach().to(device=self.device, dtype=self.dtype)
             item.meta[BAGEL_CONTEXT_KEY] = BAGEL_VAE_CONTEXT
+            item.meta[BAGEL_VAE_POSTERIOR] = True
         return {"conversation_list": conversation}
 
     @pre_forward("online_process")
@@ -301,7 +302,7 @@ class MeterMixin(MetricMeterMixin):
         return 6 * total_macs / 1e12
 
 
-class VeOmniMixin(BaseMixin, BagelVAEOfflineMixin, OfflineEncodingMixin, TrainingMixin, MeterMixin):
+class VeOmniMixin(BaseMixin, BagelVAEOfflineMixin, TrainingMixin, MeterMixin):
     """Carrier hooks for raw-image VAE encode and latent decode.
 
     ``encode_context()`` / ``decode_generated()`` already live on the native

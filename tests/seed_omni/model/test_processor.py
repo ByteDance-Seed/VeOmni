@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import soundfile as sf
@@ -206,55 +206,6 @@ def test_omni_processor_from_config_forwards_module_processor_config(mock_read_m
         config_overrides={},
         packed_preprocess=True,
     )
-
-
-@patch("veomni.models.seed_omni.processing_omni.OMNI_MODEL_REGISTRY")
-@patch("veomni.models.seed_omni.processing_omni.read_model_type", return_value="encoder_type")
-def test_omni_processor_from_config_forwards_a_non_full_cache_mode(mock_read_model_type, mock_registry):
-    """The data side must build in the ``cache_mode`` the live module was built in."""
-    del mock_read_model_type
-    fake_mod_cls = MagicMock()
-    mock_registry.__getitem__.return_value = MagicMock(return_value=fake_mod_cls)
-    config = OmniConfig(
-        _module_entries={"vae": {"model_path": "vae"}, "llm": {"model_path": "llm"}},
-        training_graphs={"default": [{"from": "vae", "to": "llm"}, {"from": "llm", "to": "end"}]},
-        generation_graphs={"infer_gen": {"initial": "run", "states": {}}},
-    )
-
-    OmniProcessor.from_config(
-        config, checkpoint_root="/tmp/checkpoint_root", cache_modes={"vae": "process_only", "llm": "full"}
-    )
-
-    assert fake_mod_cls.preprocessor_class.from_pretrained.call_args_list == [
-        call("/tmp/checkpoint_root/vae", config_overrides={}, cache_mode="process_only"),
-        call("/tmp/checkpoint_root/llm", config_overrides={}),
-    ]
-
-
-def test_bind_module_assets_forwards_the_models_cache_mode():
-    captured = {}
-
-    class _Preprocessor:
-        @classmethod
-        def from_pretrained(cls, path, **kwargs):
-            captured[path] = kwargs
-            return None
-
-    class _CachedModule:
-        preprocessor_class = _Preprocessor
-        cache_mode = "process_only"
-
-    class _FullModule:
-        preprocessor_class = _Preprocessor
-        cache_mode = "full"
-
-    bind_module_assets(_CachedModule(), checkpoint_path="cached", config_overrides={"support_cache": True})
-    bind_module_assets(_FullModule(), checkpoint_path="full")
-
-    assert captured == {
-        "cached": {"config_overrides": {"support_cache": True}, "cache_mode": "process_only"},
-        "full": {"config_overrides": None},
-    }
 
 
 class _TwoAssetPreprocessor:

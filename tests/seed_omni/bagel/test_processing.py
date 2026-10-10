@@ -15,7 +15,11 @@ from tests.seed_omni.bagel.helpers import (
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated.accelerated import TrainingMixin
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
-from veomni.models.seed_omni.modules.bagel.vae.processing import BAGEL_VAE_PIXEL_SHAPE, BagelVAEProcessor
+from veomni.models.seed_omni.modules.bagel.vae.processing import (
+    BAGEL_VAE_PIXEL_SHAPE,
+    BAGEL_VAE_POSTERIOR,
+    BagelVAEProcessor,
+)
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
 
 
@@ -257,40 +261,22 @@ def test_mot_forward_post_scatters_virtual_marker_triplet_hidden_states() -> Non
     assert torch.equal(text_item.value, hidden_states[9:11])
 
 
-def test_bagel_vae_process_only_skips_codec_modules() -> None:
+def test_bagel_vae_online_process_runs_on_a_meta_built_model() -> None:
+    """``offline_training`` builds a ``support_cache`` module on meta with no weights."""
     encode_model = _tiny_vae()
-    process_model = _tiny_vae(support_cache=True, cache_mode="process_only")
+    process_model = _tiny_vae(meta=True, support_cache=True)
     encoded_cache = encode_model.offline_encode(pixel_values=torch.zeros(1, 3, 8, 8))["encoded_cache"]
     item_cache = encoded_cache[0].reshape(2, process_model.config.z_channels, *encoded_cache.shape[-2:])
 
-    assert not hasattr(process_model, "encoder")
-    assert not hasattr(process_model, "decoder")
+    assert process_model.encoder.conv_in.weight.is_meta
     latents = process_model.online_process(encoded_cache=item_cache)["latents"]
     assert isinstance(latents, list)
     assert latents[0].shape == item_cache.shape[1:]
-
-    with pytest.raises(RuntimeError, match="VAE encoder"):
-        process_model.encode(pixel_values=torch.zeros(1, 3, 8, 8))
-    with pytest.raises(RuntimeError, match="VAE decoder"):
-        process_model.decode(latents=torch.zeros(1, 2, 2, 2))
-
-
-def test_bagel_vae_encode_only_skips_decoder_module() -> None:
-    model = _tiny_vae(support_cache=True, cache_mode="encode_only")
-
-    assert hasattr(model, "encoder")
-    assert not hasattr(model, "decoder")
-    assert model.offline_encode(pixel_values=torch.zeros(1, 3, 8, 8))["encoded_cache"].shape[:2] == (
-        1,
-        2 * model.config.z_channels,
-    )
-
-    with pytest.raises(RuntimeError, match="VAE decoder"):
-        model.decode(latents=torch.zeros(1, 2, 2, 2))
+    assert not latents[0].is_meta
 
 
 def test_bagel_vae_online_process_consumes_variable_size_cache_items_without_padding() -> None:
-    model = _tiny_vae(support_cache=True, cache_mode="process_only")
+    model = _tiny_vae(meta=True, support_cache=True)
     first = ConversationItem(
         type="image",
         value=torch.zeros(2, 2, 2, 1),
@@ -322,8 +308,8 @@ def test_bagel_vae_offline_cache_replay_keeps_img_tag_for_flow_connector(tmp_pat
     from veomni.data.seed_omni.seedomni_transform import process_seedomni_cached_example
     from veomni.models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
 
-    encode_model = _tiny_vae(support_cache=True, cache_mode="encode_only")
-    process_model = _tiny_vae(support_cache=True, cache_mode="process_only")
+    encode_model = _tiny_vae(support_cache=True)
+    process_model = _tiny_vae(meta=True, support_cache=True)
 
     def vae_image(tag: str) -> ConversationItem:
         return ConversationItem(
@@ -346,6 +332,7 @@ def test_bagel_vae_offline_cache_replay_keeps_img_tag_for_flow_connector(tmp_pat
     writer.flush()
     dataset = load_dataset("parquet", data_files=[str(tmp_path / "shard_000000.parquet")], split="train")
     replayed = [process_seedomni_cached_example(dataset[0])[0]["conversation_list"]]
+    assert all(item.meta[BAGEL_VAE_POSTERIOR] for item in replayed[0])
 
     pre = process_model.pre_forward("online_process", conversation_list=replayed)
     out = process_model.online_process(**pre)
@@ -376,37 +363,7 @@ def test_bagel_vae_offline_cache_replay_keeps_img_tag_for_flow_connector(tmp_pat
     assert gen_item.meta["flow_velocity_target"].shape == (16, 2)
 
 
-def test_bagel_vae_cache_mode_reaches_the_model_through_build_foundation_model() -> None:
-    from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.models import build_foundation_model
-
-    config = config_cls("bagel_vae")(
-        resolution=8, ch=32, ch_mult=[1], num_res_blocks=1, z_channels=2, downsample=1, support_cache=True
-    )
-
-    model = build_foundation_model(
-        config_path=config,
-        init_device="cpu",
-        torch_dtype="float32",
-        ops_implementation=OpsImplementationConfig(),
-        model_kwargs={"cache_mode": "process_only"},
-    )
-
-    assert model.cache_mode == "process_only"
-    assert not hasattr(model, "encoder")
-    assert not hasattr(model, "decoder")
-    assert "cache_mode" not in model.config.to_dict()
-
-    with pytest.raises(ValueError, match="must not override"):
-        build_foundation_model(
-            config_path=config,
-            init_device="cpu",
-            ops_implementation=OpsImplementationConfig(),
-            model_kwargs={"config": config},
-        )
-
-
-def _tiny_vae(cache_mode="full", **config_overrides):
+def _tiny_vae(meta=False, **config_overrides):
     BagelVAE = model_cls("bagel_vae")
     BagelVAEConfig = config_cls("bagel_vae")
     config_kwargs = dict(
@@ -422,6 +379,7 @@ def _tiny_vae(cache_mode="full", **config_overrides):
         downsample=1,
     )
     config_kwargs.update(config_overrides)
-    model = BagelVAE(BagelVAEConfig(**config_kwargs), cache_mode=cache_mode)
+    with torch.device("meta" if meta else "cpu"):
+        model = BagelVAE(BagelVAEConfig(**config_kwargs))
     model._image_processor = BagelVAEProcessor.from_config(model.config)
     return model

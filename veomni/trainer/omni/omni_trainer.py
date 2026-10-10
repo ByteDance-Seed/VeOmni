@@ -268,17 +268,16 @@ class OmniTrainer:
     def _build_model_runtime(self) -> OmniModelRuntime:
         """Build the composed model — every module built, wrapped and given its optimizer.
 
-        Each module derives its offline-encoding ``cache_mode`` from
-        ``self.args.train`` (:attr:`ModuleRuntime.cache_mode`). An ``encode_only``
-        run freezes every module by design, so only it may build no optimizer.
+        ``train.training_task='offline_embedding'`` trains nothing by design, so
+        only it may build no optimizer.
         """
         model = build_omni_model_runtime(build_omni_model_runtime_args(self.args), train=self.args.train)
-        if model.optimizer is None and self.args.train.cache_mode != "encode_only":
+        if model.optimizer is None and self.args.train.training_task != "offline_embedding":
             raise ValueError("OmniTrainer has nothing to train: every module is frozen.")
         return model
 
     def _build_offline_cache_writer(self) -> None:
-        if self.args.train.cache_mode == "encode_only":
+        if self.args.train.training_task == "offline_embedding":
             self.offline_cache_writer = SeedOmniOfflineCacheWriter(self.args.train.offline_cache_dir)
 
     def _build_lr_scheduler(self) -> None:
@@ -307,7 +306,6 @@ class OmniTrainer:
         processor = OmniProcessor.from_config(
             self.model.config,
             checkpoint_root=args.model.model_path,
-            cache_modes={name: rt.cache_mode for name, rt in self.model.module_runtimes.items()},
         )
         # FSDP-anchor dummy tensors are only exercised by the training (inference=False)
         # branch. The model runtime is already built, so every module's own
@@ -585,7 +583,7 @@ class OmniTrainer:
                 use_background_prefetcher=args.data.dataloader.use_background_prefetcher,
             )
 
-            step_fn = self.offline_cache_step if args.train.cache_mode == "encode_only" else self.train_step
+            step_fn = self.offline_cache_step if args.train.training_task == "offline_embedding" else self.train_step
             for _ in range(self.start_step, args.train_steps):
                 try:
                     step_fn(self.data_iterator)

@@ -5,48 +5,30 @@ import pytest
 from veomni.arguments.omni_arguments_types import OmniDataArguments, OmniTrainingArguments
 
 
-def test_omni_training_args_default_to_online_encoding() -> None:
-    args = OmniTrainingArguments()
-
-    assert args.cache_mode == "full"
+def test_omni_training_args_default_to_online_training() -> None:
+    assert OmniTrainingArguments().training_task == "online_training"
 
 
 def test_omni_training_args_requires_offline_cache_dir() -> None:
     with pytest.raises(ValueError, match="offline_cache_dir"):
-        OmniTrainingArguments(cache_mode="encode_only")
+        OmniTrainingArguments(training_task="offline_embedding")
 
 
 def test_omni_training_args_accepts_offline_cache_dir() -> None:
-    args = OmniTrainingArguments(cache_mode="encode_only", offline_cache_dir="/tmp/cache")
+    args = OmniTrainingArguments(training_task="offline_embedding", offline_cache_dir="/tmp/cache")
 
-    assert args.cache_mode == "encode_only"
+    assert args.training_task == "offline_embedding"
     assert args.offline_cache_dir == "/tmp/cache"
 
 
 def test_omni_training_args_trains_from_a_cache_without_a_cache_dir() -> None:
-    assert OmniTrainingArguments(cache_mode="process_only").cache_mode == "process_only"
+    assert OmniTrainingArguments(training_task="offline_training").training_task == "offline_training"
 
 
-@pytest.mark.parametrize("cache_mode", ["offline_cache", "train_with_cache", "other"])
-def test_omni_training_args_rejects_unknown_cache_mode(cache_mode) -> None:
-    with pytest.raises(ValueError, match=f"Unknown train.cache_mode '{cache_mode}'"):
-        OmniTrainingArguments(cache_mode=cache_mode)
-
-
-@pytest.mark.parametrize(
-    ("cache_mode", "support_cache", "expected"),
-    [
-        ("encode_only", True, "encode_only"),
-        ("process_only", True, "process_only"),
-        ("full", True, "full"),
-        ("encode_only", False, "full"),
-        ("process_only", False, "full"),
-    ],
-)
-def test_only_modules_that_support_a_cache_follow_cache_mode(cache_mode, support_cache, expected) -> None:
-    args = OmniTrainingArguments(cache_mode=cache_mode, offline_cache_dir="/tmp/cache")
-
-    assert args.module_cache_mode(support_cache) == expected
+@pytest.mark.parametrize("training_task", ["encode_only", "process_only", "other"])
+def test_omni_training_args_rejects_unknown_training_task(training_task) -> None:
+    with pytest.raises(ValueError, match=f"Unknown train.training_task '{training_task}'"):
+        OmniTrainingArguments(training_task=training_task)
 
 
 def test_data_args_accepts_cached_seedomni() -> None:

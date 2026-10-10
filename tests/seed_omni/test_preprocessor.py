@@ -17,7 +17,6 @@ picklable ``Preprocessor`` run inside ``SeedOmniCollator``:
 import copy
 import pickle
 
-import pytest
 import torch
 
 from veomni.data.seed_omni.collator import SeedOmniCollator
@@ -39,9 +38,9 @@ from veomni.models.seed_omni.modules.bagel.text_encoder.modeling import (
 from veomni.models.seed_omni.modules.bagel.text_encoder.processing import (
     BagelTextEncoderPreprocessor,
 )
-from veomni.models.seed_omni.modules.bagel.vae.configuration import BagelVAEConfig
 from veomni.models.seed_omni.modules.bagel.vae.processing import (
     BAGEL_VAE_PIXEL_SHAPE,
+    BAGEL_VAE_POSTERIOR,
     BagelVAEPreprocessor,
     BagelVAEProcessor,
 )
@@ -392,30 +391,26 @@ def test_bagel_siglip_preprocessor_keeps_bs4_sample_aligned_for_0_2_4_images():
             assert len(context_items) == 1
 
 
-def test_bagel_vae_process_only_skips_preprocessor(tmp_path):
-    cache_dir = tmp_path / "support_cache"
-    BagelVAEConfig(support_cache=True).save_pretrained(str(cache_dir))
-    assert BagelVAEPreprocessor.from_pretrained(str(cache_dir), cache_mode="process_only") is None
-    assert isinstance(
-        BagelVAEPreprocessor.from_pretrained(str(cache_dir), cache_mode="encode_only"), BagelVAEPreprocessor
+def test_bagel_vae_preprocessor_leaves_cached_posteriors_alone():
+    """An ``offline_training`` batch: ``offline_encode`` already turned every VAE
+    row (its dummies included) into a posterior, so nothing is re-processed or added."""
+    pre = BagelVAEPreprocessor(
+        BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
+        dtype=torch.bfloat16,
+        dummy_pixel_values=torch.zeros(3, 2, 2, dtype=torch.bfloat16),
+        dummy_pixel_shape=torch.tensor([2, 2], dtype=torch.long),
     )
-    assert isinstance(BagelVAEPreprocessor.from_pretrained(str(cache_dir)), BagelVAEPreprocessor)
+    posterior = torch.randn(2, 4, 1, 1)
+    meta = {_IMG_TAG_KEY: "gen", BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, BAGEL_VAE_POSTERIOR: True}
+    batch = [
+        [ConversationItem(type="image", value=posterior, role="assistant", meta=dict(meta))],
+        [ConversationItem(type="image", value=posterior.clone(), role="assistant", meta=dict(meta), is_dummy=True)],
+    ]
 
+    pre(_b(batch))
 
-def test_bagel_vae_process_only_preprocessor_honours_support_cache_override(tmp_path):
-    """`with_cache/modules_train.yaml` sets `model_config: {support_cache: true}`
-    over a checkpoint saved without it; the preprocessor must see that override
-    the same way the live model's config does.
-    """
-    full_dir = tmp_path / "full_on_disk"
-    BagelVAEConfig().save_pretrained(str(full_dir))
-
-    with pytest.raises(ValueError, match="support_cache=True"):
-        BagelVAEPreprocessor.from_pretrained(str(full_dir), cache_mode="process_only")
-    overridden = BagelVAEPreprocessor.from_pretrained(
-        str(full_dir), config_overrides={"support_cache": True}, cache_mode="process_only"
-    )
-    assert overridden is None
+    assert [len(sample) for sample in batch] == [1, 1]
+    assert batch[0][0].value is posterior
 
 
 def test_bagel_preprocessors_route_inference_edit_prompt_context():

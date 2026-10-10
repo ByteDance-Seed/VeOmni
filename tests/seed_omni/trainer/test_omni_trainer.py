@@ -114,7 +114,7 @@ def test_the_trainer_refuses_a_model_with_nothing_to_train(monkeypatch):
         MagicMock(return_value=SimpleNamespace(optimizer=None)),
     )
     trainer = OmniTrainer.__new__(OmniTrainer)
-    trainer.args = SimpleNamespace(train=SimpleNamespace(cache_mode="full"))
+    trainer.args = SimpleNamespace(train=SimpleNamespace(training_task="online_training"))
 
     with pytest.raises(ValueError, match="every module is frozen"):
         trainer._build_model_runtime()

@@ -145,8 +145,11 @@ class ModuleRuntime(VeOmniModelRuntime):
             with self._scoped():
                 self._build_model()
                 self._build_model_assets()
+                if self.reads_offline_cache:
+                    # A composed ``fsdp_scope='model'`` wrap still loads it with the rest.
+                    self.model.requires_grad_(False)
+                    return
                 self._freeze_model_module()
-                self._check_cache_mode_is_frozen()
                 self._build_parallelized_model()
                 if not self.wrap_omni_model:
                     self._scope_recompute_to_parallel_state()
@@ -188,17 +191,18 @@ class ModuleRuntime(VeOmniModelRuntime):
         return self.args.accelerator
 
     @property
-    def cache_mode(self) -> str:
-        """The ``OfflineEncodingMixin`` cache mode this run builds the module in.
+    def reads_offline_cache(self) -> bool:
+        """Whether this module only runs ``online_process`` on cached data.
 
-        A per-run choice, so it is read from ``train.cache_mode`` and handed to
-        the model constructor, never written onto the module config; only a
-        config with ``support_cache`` can leave ``full``. The model side and the
-        data side (:class:`OmniProcessor`) both read it from here.
+        True under ``train.training_task='offline_training'`` for a config with
+        ``support_cache``: ``online_process`` reads only the config, so the
+        module is built on meta, loads no weights, and has nothing to train or save.
         """
-        if self.train_args is None:
-            return "full"
-        return self.train_args.module_cache_mode(bool(getattr(self.module_config, "support_cache", False)))
+        return (
+            self.train_args is not None
+            and self.train_args.training_task == "offline_training"
+            and bool(getattr(self.module_config, "support_cache", False))
+        )
 
     @property
     def module_name(self) -> str:
@@ -291,24 +295,13 @@ class ModuleRuntime(VeOmniModelRuntime):
         from .....models import build_foundation_model
 
         acc = self.mesh_accelerator
-        cache_mode = self.cache_mode
         self.model = build_foundation_model(
             config_path=self.module_config,
             weights_path=args.model_path,
             torch_dtype="float32" if acc.fsdp_config.mixed_precision.enable else "bfloat16",
-            init_device=acc.init_device,
+            init_device="meta" if self.reads_offline_cache else acc.init_device,
             ops_implementation=args.ops_implementation,
-            model_kwargs=None if cache_mode == "full" else {"cache_mode": cache_mode},
         )
-        built_mode = getattr(self.model, "cache_mode", "full")
-        if built_mode != cache_mode:
-            # HF's ``PreTrainedModel.__init__`` swallows unknown kwargs, so a
-            # module without ``OfflineEncodingMixin`` would silently build in ``full``.
-            raise ValueError(
-                f"ModuleRuntime '{self.module_name}': {type(self.model).__name__} was built with "
-                f"cache_mode={built_mode!r}, expected {cache_mode!r}; a `support_cache` module "
-                "must mix in OfflineEncodingMixin."
-            )
         self.model_config = self.model.config
 
     def _build_model_assets(self) -> None:
@@ -364,20 +357,6 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         logger.info_rank0(f"ModuleRuntime '{self.module_name}': freeze + LoRA")
         super()._freeze_model_module()
-
-    def _check_cache_mode_is_frozen(self) -> None:
-        """Reject a trainable module outside ``cache_mode='full'``.
-
-        A reduced mode drops sub-networks (an ``encode_only`` VAE has no
-        decoder), so its weights must never be saved: a checkpoint of it would
-        be an incomplete module. Fully frozen modules get no checkpoint manager
-        (:meth:`build_checkpoint`), which is what keeps them out of saves.
-        """
-        if self.cache_mode != "full" and any(p.requires_grad for p in self.model.parameters()):
-            raise ValueError(
-                f"ModuleRuntime '{self.module_name}': cache_mode={self.cache_mode!r} requires a fully "
-                "frozen module, but it has trainable parameters."
-            )
 
     def on_lora_matched_nothing(self) -> None:
         """A module the LoRA config did not target simply stays frozen.
@@ -496,8 +475,8 @@ class ModuleRuntime(VeOmniModelRuntime):
         if not should_skip_hf_weight_load(load_path, self.args.lora_config):
             return False
 
-        # A parameterless module has no persistent state for HF or DCP to restore
-        # (e.g. a process-only stage), so there is nothing to materialize.
+        # A parameterless module has no persistent state for HF or DCP to restore,
+        # so there is nothing to materialize.
         if not self.model.state_dict():
             return True
 

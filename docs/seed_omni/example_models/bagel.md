@@ -210,12 +210,12 @@ need this overlay matrix.
 ### 3.2 Offline VAE posterior cache (two stages)
 
 Caching is not a special framework mode — it is a different `train_graph` plus a
-different dataset type. A module opts in with `model_config.support_cache: true`,
-and `train.cache_mode` becomes that module's `cache_mode` constructor argument
-(see
-[Offline Encoding](../mixins/offline_encoding.md#how-a-run-picks-cache_mode)).
+different dataset type. Each stage has its own modules / graph YAML, and
+`train.training_task` tells the trainer which stage it runs. `bagel_vae` opts in
+with `model_config.support_cache: true` (see
+[Offline Encoding](../mixins/offline_encoding.md#how-a-run-builds-a-support_cache-module)).
 
-**Stage 1 — produce the cache** (`train.cache_mode: encode_only`). `offline_cache/modules_train.yaml` declares only
+**Stage 1 — produce the cache** (`train.training_task: offline_embedding`). `offline_cache/modules_train.yaml` declares only
 `bagel_vae`, and the DAG is a single edge, so nothing else is built:
 
 ```bash
@@ -229,10 +229,14 @@ bagel_vae.offline_encode -> end
 
 Posteriors are written to `train.offline_cache_dir`
 (`outputs/bagel_vae_cached_dataset` by default), reading normal `seedomni` data.
+Samples without a VAE image get the preprocessor's dummy row encoded too, so
+every cached sample carries a VAE posterior.
 
-**Stage 2 — train from the cache** (`train.cache_mode: process_only`, which makes
-the VAE preprocessor return `None` and skips CPU image prep entirely). `data.data_type` becomes `seedomni_cached` and
-`data.train_path` points at the stage-1 output directory:
+**Stage 2 — train from the cache** (`train.training_task: offline_training`).
+`bagel_vae` is built on meta and never loads its weights. `data.data_type`
+becomes `seedomni_cached` and `data.train_path` points at the stage-1 output
+directory. The cached items are marked as posteriors, so the VAE preprocessor
+leaves them alone:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \

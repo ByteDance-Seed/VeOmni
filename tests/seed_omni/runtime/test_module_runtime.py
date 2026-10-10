@@ -139,27 +139,22 @@ def test_build_model_uses_the_config_the_omni_config_loaded(monkeypatch):
 
     assert captured["config_path"] is runtime.module_config
     assert captured["weights_path"] == "/tmp/hf-model"
-    assert captured["model_kwargs"] is None
 
 
 @pytest.mark.parametrize(
-    ("train_cache_mode", "support_cache", "cache_mode"),
+    ("training_task", "support_cache", "on_meta"),
     [
-        ("encode_only", True, "encode_only"),
-        ("process_only", True, "process_only"),
-        ("full", True, "full"),
-        ("process_only", False, "full"),
-        (None, True, "full"),
+        ("offline_training", True, True),
+        ("offline_training", False, False),
+        ("offline_embedding", True, False),
+        ("online_training", True, False),
+        (None, True, False),
     ],
 )
-def test_build_model_hands_the_runs_cache_mode_to_the_constructor(
-    monkeypatch, train_cache_mode, support_cache, cache_mode
-):
-    """``cache_mode`` is a constructor kwarg read from ``train.cache_mode``.
+def test_only_a_cache_reading_module_is_built_on_meta(monkeypatch, training_task, support_cache, on_meta):
+    """``online_process`` reads only the config, so that module never needs weights.
 
-    It must not travel through ``model_config``, which is persisted with the
-    checkpoint while the mode belongs to one run. ``None`` stands for an
-    inference build, which has no train args.
+    ``None`` stands for an inference build, which has no train args.
     """
     captured = {}
 
@@ -167,65 +162,63 @@ def test_build_model_hands_the_runs_cache_mode_to_the_constructor(
         captured.update(kwargs)
         model = nn.Linear(2, 2)
         model.config = SimpleNamespace()
-        model.cache_mode = (kwargs["model_kwargs"] or {}).get("cache_mode", "full")
         return model
 
     monkeypatch.setattr("veomni.models.build_foundation_model", fake_build_foundation_model)
-    runtime = _cache_mode_runtime(train_cache_mode, support_cache)
+    runtime = _offline_cache_runtime(training_task, support_cache)
 
-    assert runtime.cache_mode == cache_mode
+    assert runtime.reads_offline_cache is on_meta
     runtime._build_model()
 
-    assert captured["model_kwargs"] == (None if cache_mode == "full" else {"cache_mode": cache_mode})
+    assert captured["init_device"] == ("meta" if on_meta else "cuda")
 
 
-def test_build_model_rejects_a_module_that_ignored_its_cache_mode(monkeypatch):
-    """HF swallows the kwarg on a class without ``OfflineEncodingMixin``."""
+def test_a_cache_reading_module_is_frozen_and_never_wrapped_trained_or_saved(monkeypatch):
+    calls = []
+    for step in (
+        "setup",
+        "_freeze_model_module",
+        "_build_parallelized_model",
+        "_scope_recompute_to_parallel_state",
+        "_build_optimizer",
+        "build_checkpoint",
+    ):
+        monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, _step=step, **k: calls.append(_step))
+    monkeypatch.setattr(ModuleRuntime, "_build_model_assets", lambda self: None)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
 
-    def fake_build_foundation_model(**kwargs):
-        model = nn.Linear(2, 2)
-        model.config = SimpleNamespace()
-        return model
+    def fake_build_model(self):
+        self.model = nn.Linear(2, 2)
 
-    monkeypatch.setattr("veomni.models.build_foundation_model", fake_build_foundation_model)
-    runtime = _cache_mode_runtime("process_only", True)
+    monkeypatch.setattr(ModuleRuntime, "_build_model", fake_build_model)
+    train = SimpleNamespace(training_task="offline_training", checkpoint=SimpleNamespace(load_path=None))
 
-    with pytest.raises(ValueError, match="must mix in OfflineEncodingMixin"):
-        runtime._build_model()
+    runtime = ModuleRuntime(
+        SimpleNamespace(accelerator=_fsdp("module")),
+        "bagel_vae",
+        module_config=SimpleNamespace(support_cache=True),
+        global_accelerator=_fsdp("module"),
+        train=train,
+    )
 
-
-def test_reduced_cache_mode_requires_a_frozen_module():
-    """A reduced-mode module lacks sub-networks, so it must never be checkpointed."""
-    runtime = _cache_mode_runtime("encode_only", True)
-    runtime.model = nn.Linear(2, 2)
-
-    with pytest.raises(ValueError, match="requires a fully frozen module"):
-        runtime._check_cache_mode_is_frozen()
-
-    runtime.model.requires_grad_(False)
-    runtime._check_cache_mode_is_frozen()
+    assert calls == ["setup"]
+    assert not any(p.requires_grad for p in runtime.model.parameters())
 
 
-def _cache_mode_runtime(train_cache_mode, support_cache):
-    from functools import partial
-
-    from veomni.arguments.omni_arguments_types import OmniTrainingArguments
-
+def _offline_cache_runtime(training_task, support_cache):
     runtime = _unbuilt(
         model_config=None,
         ops_implementation=None,
         accelerator=SimpleNamespace(
-            init_device="meta",
+            init_device="cuda",
             fsdp_config=SimpleNamespace(
                 fsdp_mode="fsdp2", fsdp_scope="module", mixed_precision=SimpleNamespace(enable=False)
             ),
         ),
     )
     runtime.module_config = SimpleNamespace(model_type="fake", support_cache=support_cache)
-    if train_cache_mode is not None:
-        train_args = SimpleNamespace(cache_mode=train_cache_mode)
-        train_args.module_cache_mode = partial(OmniTrainingArguments.module_cache_mode, train_args)
-        runtime.train_args = train_args
+    if training_task is not None:
+        runtime.train_args = SimpleNamespace(training_task=training_task)
     return runtime
 
 
@@ -325,7 +318,6 @@ def test_the_constructor_stores_training_args_where_the_base_reads_them(monkeypa
         "_build_model",
         "_build_model_assets",
         "_freeze_model_module",
-        "_check_cache_mode_is_frozen",
         "_build_parallelized_model",
         "_scope_recompute_to_parallel_state",
         "_build_optimizer",
@@ -333,7 +325,7 @@ def test_the_constructor_stores_training_args_where_the_base_reads_them(monkeypa
     ):
         monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, **k: None)
     monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
-    train = SimpleNamespace(checkpoint=SimpleNamespace(load_path=None))
+    train = SimpleNamespace(training_task="online_training", checkpoint=SimpleNamespace(load_path=None))
     args = SimpleNamespace(accelerator=_fsdp("module"))
 
     runtime = ModuleRuntime(

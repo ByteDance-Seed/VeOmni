@@ -131,10 +131,10 @@ def _reject_lora_that_matched_nothing(module_runtimes: Mapping[str, ModuleRuntim
     Raise only when LoRA was requested and **every** module is frozen, which
     would look like a healthy run whose loss never moves.
 
-    An ``encode_only`` run is exempt: it freezes every module by design (and is
-    usually the training YAML with only ``--train.cache_mode`` overridden).
+    A ``train.training_task='offline_embedding'`` run is exempt: it trains
+    nothing by design.
     """
-    if getattr(train, "cache_mode", None) == "encode_only":
+    if getattr(train, "training_task", None) == "offline_embedding":
         return
 
     requested = [name for name, runtime in module_runtimes.items() if bool(runtime.args.lora_config)]
@@ -432,6 +432,7 @@ class OmniModelRuntime:
         model = self.model
         ctx: dict[str, Any] = request
         modules = {name: self.get_module(name) for name in model._module_names}
+        model.generation_graph.validate_modules({name: model.get_module(name) for name in model._module_names})
         generation_kwargs = model.resolve_generation_kwargs(generation_kwargs)
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
         total_steps = 0

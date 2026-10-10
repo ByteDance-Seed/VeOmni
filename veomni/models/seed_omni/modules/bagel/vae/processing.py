@@ -21,7 +21,6 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 
-from ....mixins.offline_encoding_mixin import OfflineEncodingMixin
 from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from ..sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT, bagel_context
@@ -414,6 +413,8 @@ def route_image_contexts(
 
 
 BAGEL_VAE_PIXEL_SHAPE = "bagel_vae_pixel_shape"
+# Set by ``offline_encode``: the item already holds its cached posterior, not pixels.
+BAGEL_VAE_POSTERIOR = "bagel_vae_posterior"
 
 
 class BagelVAEPreprocessor(ModulePreprocessorBase):
@@ -437,25 +438,17 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
         module_path: str,
         *,
         config_overrides: dict[str, Any] | None = None,
-        cache_mode: str = OfflineEncodingMixin.DEFAULT_CACHE_MODE,
         **kwargs: Any,
-    ) -> BagelVAEPreprocessor | None:
+    ) -> BagelVAEPreprocessor:
         """Build straight from the checkpoint dir — no model instance needed.
 
-        Returns ``None`` under ``cache_mode="process_only"``: training then reads
-        already-preprocessed cached conversations, so no CPU image prep is needed
-        for this module. ``cache_mode`` is the mode the live model was built in
-        (``ModuleRuntime.cache_mode``), so the two sides cannot disagree.
         BAGEL ships no standalone ``preprocessor_config.json``; the image
         processor is derived from the module's own ``config.json``, with
         ``config_overrides`` (the module's YAML ``model_config:`` block) on top.
         """
         del kwargs
-        # ``model_config=`` (not ``**kwargs``): HF drops kwargs the class does not
-        # declare, and ``support_cache`` is one, so the gate below would miss it.
+        # ``model_config=`` (not ``**kwargs``): HF drops kwargs the class does not declare.
         config = BagelVAEConfig.from_pretrained(module_path, model_config=config_overrides)
-        if OfflineEncodingMixin.validate_cache_mode(cache_mode, config) == "process_only":
-            return None
         return cls(BagelVAEProcessor.from_config(config))
 
     def bind_dummy_inputs(self, config: BagelVAEConfig, dtype: torch.dtype | None = None) -> None:
@@ -482,7 +475,9 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
                 iter_desired_items([sample], types=["image"], meta={BAGEL_CONTEXT_KEY: [BAGEL_VAE_CONTEXT]})
             )
             if sample_image_items:
-                image_items.extend(item for item in sample_image_items if not item.is_dummy)
+                image_items.extend(
+                    item for item in sample_image_items if not item.is_dummy and not item.meta.get(BAGEL_VAE_POSTERIOR)
+                )
             elif not inference:
                 missing_samples.append(sample)
 
