@@ -39,6 +39,8 @@
 #      Support VeOmni VLM SFT masks and PLE ids, with an explicit SP guard
 #    - method_override: Qwen4ExpForConditionalGeneration.forward
 #      Use VeOmni fused loss for Qwen4-Exp VLM SFT without MTP loss
+#    - method_override: Qwen4ExpTextSparseMoeBlock.forward
+#      Call maybe_replay_indices for RL router replay
 #
 # ==============================================================================
 
@@ -1059,6 +1061,12 @@ class Qwen4ExpTextTopKRouter(nn.Module):
         return router_logits, router_scores, router_indices
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen4ExpTextSparseMoeBlock
+# Methods patched: forward
+# ======================================================================
+
+
 class Qwen4ExpTextSparseMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1067,23 +1075,26 @@ class Qwen4ExpTextSparseMoeBlock(nn.Module):
         self.shared_expert = Qwen4ExpTextMLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
+    # ================================================================
+    # Patch: Qwen4ExpTextSparseMoeBlock.forward (MoE router replay)
+    # Same contract as Qwen3.5-MoE: when an RL framework has installed a
+    # replay manager via ``set_active_replay``, the manager may substitute
+    # ``selected_experts`` with previously recorded target indices. The
+    # manager's sole responsibility is choosing indices; all model-specific
+    # post-topk weight math (softmax recompute, gather, renorm, dtype cast)
+    # is replicated here so the cross-framework controller stays
+    # model-agnostic.
+    # ================================================================
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
         shared_expert_output = self.shared_expert(hidden_states_reshaped)
         router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
-        # MoE router replay: when an RL framework has installed a manager via
-        # ``set_active_replay``, the manager may substitute ``selected_experts``
-        # with previously recorded target indices. The manager's sole
-        # responsibility is choosing indices; all model-specific post-topk
-        # weight math (softmax recompute, gather, renorm, dtype cast) is
-        # replicated here so the cross-framework controller stays
-        # model-agnostic. transformers v5.8 fixed Qwen3.5-MoE's ``TopKRouter``
-        # the same way as Qwen3-MoE (#715): it now returns pre-softmax
+        # MoE router replay: the Qwen4-Exp ``TopKRouter`` returns pre-softmax
         # ``router_logits`` and discards its internal post-softmax matrix after
-        # top-k, so we recompute ``softmax`` here to feed the RR contract.
-        # Qwen4-Exp's native router always renormalizes the top-k probs, so
-        # the gathered weights are renormalized unconditionally.
+        # top-k, so we recompute ``softmax`` here. The
+        # native router always renormalizes the top-k probs, so the gathered
+        # weights are renormalized unconditionally.
         if get_active_replay() is not None:
             target_dtype = routing_weights.dtype
             routing_scores = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
