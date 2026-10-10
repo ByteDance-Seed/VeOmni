@@ -12,13 +12,13 @@
 # Prerequisite — split the upstream Qwen3-VL checkpoint:
 #   python scripts/seed_omni/convert_model.py \
 #     --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-VL-2B-Instruct \
-#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct-v2
+#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct
 #
 # Produces three module sub-folders (qwen3vl_vision / qwen3vl_text_encoder /
 # qwen3vl_llm) under model.model.model_path.
 
 model:
-  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct-v2
+  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct
   model_config:
     modules: configs/seed_omni/Qwen/qwen3vl_2b/train/modules_train.yaml
     train_graph: configs/seed_omni/Qwen/qwen3vl_2b/train/graph_train.yaml

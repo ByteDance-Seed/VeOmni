@@ -40,7 +40,7 @@ dispatches to `modules/qwen3_moe/convert_model.py`, splitting the weights into
 ```bash
 python scripts/seed_omni/convert_model.py \
   --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-30B-A3B \
-  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B-v2
+  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B
 ```
 
 Notes:
@@ -98,7 +98,7 @@ shipped `ep=4` needs ≥ 4 GPUs (`train.sh` auto-detects the count and launches 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Qwen/qwen3_30b_a3b/train/base.yaml \
-  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B-v2
+  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B
 ```
 
 Key knobs:
@@ -114,7 +114,7 @@ Key knobs:
 ```bash
 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Qwen/qwen3_30b_a3b/train/base.yaml \
-  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B-v2 \
+  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B \
   --train.max_steps 20 --train.global_batch_size 8 --train.micro_batch_size 1 \
   --data.max_seq_len 2048 --train.checkpoint.save_steps 10 --train.wandb.enable false
 ```
@@ -130,7 +130,7 @@ Resume by pointing `load_path` at that directory:
 ```bash
 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Qwen/qwen3_30b_a3b/train/base.yaml \
-  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B-v2 \
+  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B \
   --train.checkpoint.load_path outputs/qwen3_30b_a3b_omni_sft/checkpoints/global_step_500
 ```
 
@@ -148,7 +148,7 @@ the full 128-expert weights. No torchrun / EP.
 ```bash
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Qwen/qwen3_30b_a3b/train/base.yaml \
-  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B-v2 \
+  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B \
   --model.model_config.infer_type infer_text \
   --infer.prompt "Give me a short introduction to large language models." \
   --infer.output_dir qwen3moe_out \
@@ -163,7 +163,7 @@ modules, inits the process group, and runs each module's forward under its own
 ```bash
 bash train.sh tasks/omni/infer_omni.py \
   configs/seed_omni/Qwen/qwen3_30b_a3b/train/base.yaml \
-  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B-v2 \
+  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B \
   --model.model_config.modules configs/seed_omni/Qwen/qwen3_30b_a3b/infer/modules_infer_fsdp.yaml \
   --model.model_config.infer_type infer_text \
   --infer.prompt "Give me a short introduction to large language models." \

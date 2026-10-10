@@ -48,14 +48,14 @@ module:
 ```bash
 python scripts/seed_omni/convert_model.py \
   --model_path /mnt/hdfs/user_dir/veomni_omni/models/transformers/BAGEL-7B-MoT \
-  --output_dir /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT-v2
+  --output_dir /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
 ```
 
 The family is picked from the source `config.json` (`model_type: bagel`). The
 output root becomes `model.model_path` in `base.yaml`. It contains:
 
 ```text
-BAGEL-7B-MoT-v2/
+BAGEL-7B-MoT/
 ├── config.json               # module entries, infer_type, generation_kwargs
 ├── training_graph.yaml
 ├── generation_graph.yaml     # infer_und / infer_gen / infer_edit
@@ -151,7 +151,7 @@ Quick smoke run:
 ```bash
 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
-  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT-v2 \
+  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT \
   --train.max_steps 10 \
   --train.global_batch_size 8 \
   --train.micro_batch_size 1 \
@@ -264,7 +264,7 @@ python tasks/omni/infer_omni.py \
   configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
   --model.model_config.infer_type infer_und \
   --model.model_config.modules configs/seed_omni/Bagel/bagel_7b_mot/infer/modules_infer_eager.yaml \
-  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT-v2 \
+  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT \
   --infer.images /path/to/image.jpg \
   --infer.prompt "Describe this image." \
   --infer.output_dir bagel_out
@@ -281,7 +281,7 @@ python tasks/omni/infer_omni.py \
   configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
   --model.model_config.infer_type infer_gen \
   --model.model_config.modules configs/seed_omni/Bagel/bagel_7b_mot/infer/modules_infer_eager.yaml \
-  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT-v2 \
+  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT \
   --infer.prompt "A watercolor painting of a small cabin beside a lake." \
   --infer.output_dir bagel_out \
   --infer.generation_kwargs.num_timesteps 50 \
@@ -311,7 +311,7 @@ python tasks/omni/infer_omni.py \
   configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
   --model.model_config.infer_type infer_edit \
   --model.model_config.modules configs/seed_omni/Bagel/bagel_7b_mot/infer/modules_infer_eager.yaml \
-  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT-v2 \
+  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT \
   --infer.images /path/to/source.jpg \
   --infer.prompt "Make it look like a snowy evening." \
   --infer.output_dir bagel_out

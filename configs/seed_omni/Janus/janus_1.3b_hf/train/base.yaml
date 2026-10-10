@@ -23,7 +23,7 @@
 #     --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
 #     --infer.output_dir outputs/runtime_hf_fsdp
 model:
-  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2
+  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
   ops_implementation:
     attn_implementation: flash_attention_2
   accelerator:

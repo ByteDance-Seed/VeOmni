@@ -54,7 +54,7 @@ tokenizer) and `qwen3vl_llm/` (backbone).
 ```bash
 python scripts/seed_omni/convert_model.py \
   --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-VL-2B-Instruct \
-  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct-v2
+  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct
 ```
 
 The `output_dir` becomes `model.model_path` in `base.yaml`.
@@ -212,7 +212,7 @@ CLI equivalent:
 
 ```bash
 python tasks/omni/infer_omni_native.py \
-  --model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct-v2 \
+  --model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct \
   --infer_type vision_understanding \
   --prompt "Describe this image." \
   --image /path/to/image.jpg \

@@ -38,7 +38,7 @@ into `qwen3_text_encoder/` (embeddings + tokenizer) and `qwen3_llm/` (backbone).
 ```bash
 python scripts/seed_omni/convert_model.py \
   --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
-  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-v2
+  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
 ```
 
 The `output_dir` becomes `model.model_path` in `base.yaml`.
@@ -93,7 +93,7 @@ Quick 1-node smoke run (no wandb, tiny step budget):
 ```bash
 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
-  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-v2 \
+  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B \
   --train.max_steps 15 \
   --train.global_batch_size 8 \
   --train.micro_batch_size 1 \
@@ -154,7 +154,7 @@ directly:
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
   --model.model_config.infer_type infer_text \
-  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-v2 \
+  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B \
   --infer.prompt "What is 2+2?" \
   --infer.output_dir qwen3_out \
   --infer.generation_kwargs.max_new_tokens 1024
@@ -188,7 +188,7 @@ monolithic `Qwen3ForCausalLM` and through the split path
 ```bash
 python scripts/seed_omni/check_qwen3_alignment.py \
   --base /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
-  --split /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-v2
+  --split /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
 # -> max|logit diff| ~8e-5, CE loss identical to 6 d.p. (RESULT: ALIGNED)
 ```
 
@@ -297,11 +297,11 @@ then let the launcher compose them. `model.model_path` is the Qwen3-0.6B root
 ```bash
 python scripts/seed_omni/convert_model.py \
   --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
-  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-v2
+  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
 
 python scripts/seed_omni/convert_model.py \
   --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-VL-2B-Instruct \
-  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct-v2
+  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct
 ```
 
 At train time the `out_hidden_size` override retargets the merger and its
@@ -317,7 +317,7 @@ suffix:
 | File | Role |
 |------|------|
 | `visual_instruction_tuning/base.yaml` | Launcher (model paths, accelerator, data, train, infer). |
-| `visual_instruction_tuning/modules_train.yaml` | All overrides: `qwen3vl_vision` merger retarget (`out_hidden_size`) + `disable_deepstack` + `freeze`; `qwen3_text_encoder` image mode + special-token freeze. Add `--accelerator.ulysses_size N` for uniform Ulysses SP — no separate SP config (see [§7.5](#75-train-on-sharegpt4v)). |
+| `visual_instruction_tuning/modules_train.yaml` | All overrides: `qwen3vl_vision` merger retarget (`out_hidden_size`) + `disable_deepstack` + `freeze`; `qwen3_text_encoder` image mode + special-token freeze. Add `--model.accelerator.ulysses_size N` for Ulysses SP; there is no separate SP config (see [§7.5](#75-train-on-sharegpt4v)). |
 | `visual_instruction_tuning/graph_train.yaml` | `{qwen3vl_vision, qwen3_text_encoder.encode} → qwen3_llm → qwen3_text_encoder.decode → end`. |
 | `visual_instruction_tuning/data.yaml` | ShareGPT4V captions (image + text). |
 | `visual_instruction_tuning/graph_infer.yaml` | I2T generation FSM. |
@@ -382,6 +382,19 @@ python tasks/omni/infer_omni.py \
   --model.model_config.modules.qwen3vl_vision.model_path hf_ckpt/qwen3vl_vision \
   --model.model_config.modules.qwen3_text_encoder.model_path hf_ckpt/qwen3_text_encoder \
   --model.model_config.modules.qwen3_llm.model_path hf_ckpt/qwen3_llm
+```
+
+A trained checkpoint of this recipe is available at
+`/mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-Visual-Instruction-Tuning`. It is a
+complete split checkpoint (root `config.json` plus graph sidecars), so it also
+loads without the launcher:
+
+```bash
+python tasks/omni/infer_omni_native.py \
+  --model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-Visual-Instruction-Tuning \
+  --infer_type understanding \
+  --prompt "Describe this image briefly." \
+  --image /path/to/image.jpg
 ```
 
 > **Scope**: this is a deliberately minimal setup (frozen ViT blocks + a retargeted

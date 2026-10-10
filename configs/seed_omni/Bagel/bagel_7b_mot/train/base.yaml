@@ -1,7 +1,7 @@
 # VeOmni training / inference config for OmniModel - BAGEL-7B-MoT.
 
 model:
-  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT-v2
+  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
   model_config:
     modules: configs/seed_omni/Bagel/bagel_7b_mot/train/modules_train.yaml
     train_graph: configs/seed_omni/Bagel/bagel_7b_mot/train/graph_train.yaml
