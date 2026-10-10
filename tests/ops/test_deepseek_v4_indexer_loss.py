@@ -563,6 +563,53 @@ def test_the_npu_backend_refuses_the_objective_rather_than_dropping_it():
 
 
 @_HDFS_STDENV_DEPRECATION_FILTER
+def test_npu_csa_compressor_returns_structured_sparse_candidates(monkeypatch):
+    """NPU sparse attention consumes CompressedCandidates.topk_indices."""
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as npu
+
+    topk_indices = torch.zeros((1, 3, 2), dtype=torch.int32, device=DEVICE)
+
+    class Projection:
+        def __call__(self, hidden_states):
+            return hidden_states.new_zeros((*hidden_states.shape[:2], 16))
+
+    class Indexer:
+        def __call__(self, *args, **kwargs):
+            return topk_indices
+
+    class RotaryConfig:
+        qk_rope_head_dim = 8
+
+    class Rotary:
+        config = RotaryConfig()
+
+    class Compressor:
+        compress_rate = 4
+        head_dim = 8
+        kv_proj = Projection()
+        gate_proj = Projection()
+        indexer = Indexer()
+        rotary_emb = Rotary()
+        position_bias = torch.zeros((4, 8), dtype=torch.float32, device=DEVICE)
+
+    monkeypatch.setattr(npu, "veomni_qat_fake_quant_kv", lambda tensor, *_args: tensor)
+    hidden_states = torch.zeros((1, 3, 8), dtype=torch.bfloat16, device=DEVICE)
+    _, _, candidates = npu.DeepseekV4CSACompressor.forward(
+        Compressor(),
+        hidden_states=hidden_states,
+        q_residual=hidden_states,
+        position_ids=torch.arange(3, device=DEVICE).unsqueeze(0),
+        past_key_values=None,
+        layer_idx=0,
+        return_topk_indices=True,
+        build_block_bias=False,
+    )
+
+    assert isinstance(candidates, npu.CompressedCandidates)
+    assert candidates.topk_indices is topk_indices
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
 @pytest.mark.parametrize("coef", [0.5, 1.0, 100.0])
 def test_indexer_loss_coef_accepts_finite_positive_weights(coef):
     """The other half of the bound: the check must not reject the ordinary weights."""

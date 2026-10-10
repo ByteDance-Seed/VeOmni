@@ -30,11 +30,14 @@ model:
     rms_norm_implementation: eager
     rotary_pos_emb_implementation: eager
     swiglu_mlp_implementation: eager
-    # dsa_indexer_implementation / dsa_attention_implementation /
-    # mhc_implementation all default to "eager" already (their "tilelang"
-    # backends are CUDA SM90+ only) — no override needed for NPU, left unset
-    # here on purpose so a future CUDA run of this same file doesn't need
-    # editing.
+    # Select the Ascend CANN implementations for the DeepSeek-V4 indexer,
+    # sparse attention, and mHC paths. The NPU mHC adapter uses fused CANN
+    # pre/post kernels while keeping the final head collapse in eager PyTorch.
+    # These explicit selections make this configuration NPU-specific; use the
+    # GPU configuration (or override them) for CUDA runs.
+    dsa_indexer_implementation: npu
+    dsa_attention_implementation: npu
+    mhc_implementation: npu
   optimizer:
     type: adamw
     lr: 3.0e-4

@@ -16,11 +16,13 @@ import importlib
 import inspect
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
+import yaml
 
 from veomni.ops.kernels.deepseek_v4 import linear_bf16_fp32
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
@@ -586,6 +588,51 @@ def test_deepseek_v4_stateless_forward_does_not_create_decode_cache():
     assert seen_caches and all(isinstance(cache, DynamicCache) for cache in seen_caches)
     assert isinstance(output.past_key_values, DynamicCache)
 
+
+def test_deepseek_v4_npu_config_collator_preserves_packed_segments_for_model():
+    from transformers import AutoConfig
+
+    from veomni.data.data_collator import PackingCollator
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as modeling
+
+    npu_config = yaml.safe_load(Path("configs/text/deepseek_v4_npu.yaml").read_text())
+    assert npu_config["train"].get("dyn_bsz", True) is True
+    assert npu_config["train"]["micro_batch_size"] == 1
+
+    lengths = (5, 3)
+    features = [
+        {
+            "input_ids": torch.arange(length),
+            "labels": torch.arange(length),
+            "attention_mask": torch.ones(length, dtype=torch.long),
+            "position_ids": torch.arange(length),
+        }
+        for length in lengths
+    ]
+    batch = PackingCollator()(features)
+    seq_len = sum(lengths)
+    assert batch["cu_seq_lens_q"].tolist() == [0, lengths[0], seq_len]
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    model = modeling.DeepseekV4Model(config)
+    seen_slices = []
+    for layer in model.layers:
+
+        def passthrough(self, hidden_states, **kwargs):
+            seen_slices.append(kwargs.get("packed_sequence_slices"))
+            return hidden_states
+
+        layer.forward = types.MethodType(passthrough, layer)
+
+    model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        position_ids=batch["position_ids"],
+        cu_seq_lens_q=batch["cu_seq_lens_q"],
+        use_cache=False,
+    )
+    assert seen_slices
+    assert all(slices == ((0, lengths[0]), (lengths[0], seq_len)) for slices in seen_slices)
 
 def test_deepseek_v4_stateless_model_reaches_tilelang_indexer(monkeypatch):
     _require_tilelang_cuda()

@@ -1385,19 +1385,25 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
-    dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = field(
+    dsa_indexer_implementation: Literal["eager", "cudnn", "npu", "tilelang"] = field(
         default="eager",
-        metadata={"help": "DeepSeek sparse attention top-k indexer implementation: 'eager', 'cudnn', or 'tilelang'."},
+        metadata={
+            "help": "DeepSeek sparse attention top-k indexer implementation: 'eager', 'cudnn', 'npu', or 'tilelang'."
+        },
     )
-    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "tilelang"] = field(
+    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "npu", "tilelang"] = field(
         default="eager",
-        metadata={"help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', or 'tilelang'."},
+        metadata={
+            "help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', 'npu', or 'tilelang'."
+        },
     )
-    mhc_implementation: Literal["eager", "tilelang"] = field(
+    mhc_implementation: Literal["eager", "npu", "tilelang"] = field(
         default="eager",
         metadata={
             "help": "Manifold-constrained Hyper-Connection implementation. 'tilelang' enables the "
-            "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'eager' uses PyTorch."
+            "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'npu' enables the "
+            "Ascend CANN fused pre/post path with a PyTorch final-head collapse (requires NPU BF16 "
+            "and cann_ops_transformer); 'eager' uses PyTorch."
         },
     )
     qat_implementation: Literal["none", "fp8_blockwise"] = field(
@@ -1844,6 +1850,10 @@ class DataloaderConfig:
     drop_last: bool = field(
         default=True,
         metadata={"help": "Whether to drop the last incomplete batch."},
+    )
+    shuffle: bool = field(
+        default=True,
+        metadata={"help": "Whether to shuffle dataset indices each epoch."},
     )
     pin_memory: bool = field(
         default=True,
