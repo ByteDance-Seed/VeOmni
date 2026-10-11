@@ -30,6 +30,7 @@ from torch.utils.checkpoint import noop_context_fn
 from ..arguments import MixedPrecisionConfig
 from ..arguments.arguments_types import validate_low_precision_reduce_scatter_comm
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
+from ..models.module_utils import retie_model_shared_weights
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
@@ -189,6 +190,9 @@ def _materialize_and_load_weights(
         # so the rest would train on whatever ``to_empty()`` left behind.
         _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
         _reset_hf_initialized_flag(model)
+        retie_model_shared_weights(
+            model, "checkpoint-resume materialization" if should_skip_hf_weight_load else "random init"
+        )
         # Random init is unnecessary when the checkpoint will overwrite every parameter.
         if not should_skip_hf_weight_load:
             model.init_weights()

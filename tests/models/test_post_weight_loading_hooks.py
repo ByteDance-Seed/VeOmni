@@ -59,6 +59,37 @@ def test_shared_submodules_are_retied_after_loading():
     assert model.encoder.weight is model.decoder.weight
 
 
+@pytest.mark.parametrize("should_skip_hf_weight_load", [True, False], ids=["checkpoint_resume", "random_init"])
+def test_shared_submodules_are_retied_when_no_hf_weights_are_loaded(should_skip_hf_weight_load):
+    """``to_empty`` breaks the tie on these paths too, and nothing else restores it.
+
+    A checkpoint resume skips the HF load, so without the hook the encoder trains as an
+    independent copy of the decoder with optimizer state of its own.
+    """
+    from veomni.distributed.torch_parallelize import _materialize_and_load_weights
+
+    class Initializable(_SharedStack):
+        def init_weights(self):
+            pass
+
+    with torch.device("meta"):
+        model = Initializable()
+    model.encoder.weight = model.decoder.weight
+
+    _materialize_and_load_weights(
+        model,
+        weights_path="unused" if should_skip_hf_weight_load else None,
+        materialize_device="cpu",
+        should_skip_hf_weight_load=should_skip_hf_weight_load,
+        is_peft_model=False,
+        adapter_path=None,
+        broadcast_from_rank0=False,
+    )
+
+    assert not model.decoder.weight.is_meta
+    assert model.encoder.weight is model.decoder.weight
+
+
 def test_the_missing_parameter_validator_sees_the_missing_names_before_they_are_initialized():
     model = _SharedStack()
 

@@ -1434,6 +1434,23 @@ def rank0_load_and_broadcast_weights(
         prepare_fqn_to_index_mapping_for_model(model, fqn_to_index_mapping)
 
 
+def retie_model_shared_weights(model: Union["nn.Module", "PreTrainedModel"], after: str) -> None:
+    """Run the model class's ``retie_shared_weights`` hook, if it defines one.
+
+    to_empty() clones every tensor, so any sharing beyond the input/output embedding
+    pair is lost. Models that tie whole submodules (DiffusionGemma shares its entire
+    transformer stack between encoder and decoder) restore it through this hook. Every
+    path that materializes the model must call it, including the ones that skip the HF
+    weight load, or the alias trains as an independent copy. The lookup goes through the
+    class rather than the instance so that a wrapper forwarding unknown attributes via
+    `__getattr__` (PEFT and friends) cannot accidentally opt in.
+    """
+    retie_shared_weights = getattr(type(model), "retie_shared_weights", None)
+    if callable(retie_shared_weights):
+        retied = retie_shared_weights(model)
+        logger.info_rank0(f"Re-tied {retied} shared parameter(s) after {after}.")
+
+
 def post_process_after_weight_loading(
     model: Union["nn.Module", "PreTrainedModel"],
     buffer_dict,
@@ -1457,15 +1474,7 @@ def post_process_after_weight_loading(
         for name in sorted(parameter_names_left):
             _init_parameter(model, name, parameter_names_left=parameter_names_left)
 
-    # to_empty() clones every tensor, so any sharing beyond the input/output embedding
-    # pair below is lost. Models that tie whole submodules (DiffusionGemma shares its
-    # entire transformer stack between encoder and decoder) restore it here. The lookup
-    # goes through the class rather than the instance so that a wrapper forwarding unknown
-    # attributes via `__getattr__` (PEFT and friends) cannot accidentally opt in.
-    retie_shared_weights = getattr(type(model), "retie_shared_weights", None)
-    if callable(retie_shared_weights):
-        retied = retie_shared_weights(model)
-        logger.info_rank0(f"Re-tied {retied} shared parameter(s) after weight loading.")
+    retie_model_shared_weights(model, "weight loading")
 
     # to_empty() leaves embeddings untied (except under FSDP2 swap-tensor);
     # re-tie only when the config asks for it. Nested multimodal layouts can
