@@ -988,10 +988,18 @@ def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(mon
         return minimax_h3_dit._sdpa_varlen_attention(q, k, v, tuple(bounds.tolist()), self.softmax_scale, True)
 
     def bind_packed_name(module, *, is_causal, impl=None):
-        # github/main mocks `_load_veomni_flash_kernel` so this case never
-        # constructs a real FA backend. FA3 is CUDA SM90-only.
+        # Only the name is bound, so this case never constructs a real FA backend. FA3 is CUDA SM90-only.
         module.is_causal = is_causal
         module.config._attn_implementation = impl
+
+    if backend.endswith("_hub"):
+        from veomni.ops import install
+
+        # Model init preloads the kernel. Serve the locally installed build instead of a ~1 GB Hub download.
+        local = "veomni_" + backend.removesuffix("_hub")
+        monkeypatch.setattr(
+            install, "_load_hub_flash_kernel", lambda repo: install._load_veomni_local_flash_kernel(local)
+        )
 
     monkeypatch.setattr(minimax_h3_dit.MiniMaxH3Attention, "_run_packed_attention", wrapped)
     monkeypatch.setattr(h3_modeling, "bind_minimax_attention", bind_packed_name)
