@@ -1,0 +1,58 @@
+{
+  "architectures": [
+    "DiffusionGemmaForBlockDiffusion"
+  ],
+  "boi_token_id": 1021,
+  "canvas_length": 16,
+  "dtype": "bfloat16",
+  "eoi_token_id": 1022,
+  "eos_token_id": [
+    1
+  ],
+  "image_token_id": 1023,
+  "initializer_range": 0.02,
+  "model_type": "diffusion_gemma",
+  "text_config": {
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "bos_token_id": 2,
+    "dtype": "bfloat16",
+    "eos_token_id": 1,
+    "final_logit_softcapping": 30.0,
+    "global_head_dim": 64,
+    "head_dim": 32,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "hidden_size": 256,
+    "initializer_range": 0.02,
+    "intermediate_size": 512,
+    "max_position_embeddings": 512,
+    "model_type": "diffusion_gemma_text",
+    "moe_intermediate_size": 128,
+    "num_attention_heads": 4,
+    "num_experts": 8,
+    "num_global_key_value_heads": 2,
+    "num_hidden_layers": 6,
+    "num_key_value_heads": 2,
+    "pad_token_id": 0,
+    "rms_norm_eps": 1e-06,
+    "rope_parameters": {
+      "full_attention": {
+        "partial_rotary_factor": 0.25,
+        "rope_theta": 1000000.0,
+        "rope_type": "proportional"
+      },
+      "sliding_attention": {
+        "rope_theta": 10000.0,
+        "rope_type": "default"
+      }
+    },
+    "sliding_window": 16,
+    "tie_word_embeddings": true,
+    "top_k_experts": 2,
+    "use_bidirectional_attention": "vision",
+    "vocab_size": 1024
+  },
+  "tie_word_embeddings": true,
+  "vision_config": null,
+  "vision_soft_tokens_per_image": 280
+}
