@@ -70,15 +70,17 @@ def build_trainer():
             data=SimpleNamespace(max_seq_len=1024, text_keys="messages", data_type="diffusion_gemma"),
             train=SimpleNamespace(seed=42, dyn_bsz=False, num_train_epochs=1),
         ),
-        model_config=SimpleNamespace(
-            canvas_length=CANVAS_LENGTH,
-            max_canvases=4,
-            canvas_start=0,
-            compute_all_canvas_df_loss=True,
-            get_text_config=lambda: text_config,
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(
+                canvas_length=CANVAS_LENGTH,
+                max_canvases=4,
+                canvas_start=0,
+                compute_all_canvas_df_loss=True,
+                get_text_config=lambda: text_config,
+            ),
+            tokenizer=None,
+            chat_template=FakeChatTemplate(),
         ),
-        tokenizer=None,
-        chat_template=FakeChatTemplate(),
         state=SimpleNamespace(epoch=0),
         on_epoch_begin=lambda: None,
     )
