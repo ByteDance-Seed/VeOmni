@@ -1,0 +1,56 @@
+# LLaDA-MoE-7B-A1B-Instruct masked-diffusion SFT with DllmTrainer.
+#
+#   bash train.sh tasks/train_dllm.py configs/dllm/llada_moe_7b.yaml
+#
+# The checkpoint needs a Qwen3-MoE-schema config.json first (the weight keys are unchanged;
+# per-expert tensors are fused at load time):
+#   python scripts/convert_lladamoe_to_veomni.py --src LLaDA-MoE-7B-A1B-Instruct --dst LLaDA-MoE-7B-A1B-Instruct-veomni
+#
+# Same objective as configs/dllm/llada_8b.yaml, with the Bailing `llada_moe` chat template.
+# The load-balancing loss is off, as in upstream LLaDA-MoE training; set
+# `output_router_logits: true` in the model config to add `router_aux_loss_coef * aux_loss`.
+model:
+  model_path: LLaDA-MoE-7B-A1B-Instruct-veomni
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_triton
+  chat_template: llada_moe
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_decay_style: cosine
+    weight_decay: 0.1
+    max_grad_norm: 1.0
+  accelerator:
+    ulysses_size: 1  # Ulysses SP; must divide num_attention_heads (16), combines with ep_size
+    ep_size: 8
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: llada
+  max_seq_len: 4096
+  train_size: 750000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  global_batch_size: 32
+  micro_batch_size: 1
+  num_train_epochs: 1
+  checkpoint:
+    output_dir: LLaDA-MoE-7B-A1B-Instruct-sft
+    manager: dcp
+    save_steps: 500
+    save_hf_weights: true
+  wandb:
+    project: VeOmni
+    name: LLaDA-MoE-7B-A1B-Instruct-sft
