@@ -136,6 +136,7 @@ jobs:
         run: |
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_model_runtime.py
+          uv run --frozen pytest -s -x tests/models/test_post_weight_loading_hooks.py
           uv run --frozen pytest -s -x tests/models/test_runtime_chat_template.py
           uv run --frozen pytest -s -x tests/models/test_generated_modeling_imports.py
           uv run --frozen pytest -s -x tests/models/test_transformers_upgrade_compat.py
@@ -147,7 +148,7 @@ jobs:
           uv run --frozen pytest -s -x tests/models/test_minimax_h3_packing.py
           uv run --frozen pytest -s -x tests/models/test_diffusion_gemma.py tests/models/test_diffusion_gemma_*.py
           uv run --frozen pytest -s -x tests/models/test_llada.py tests/models/test_llada_*.py
-          uv run --frozen pytest -s -x tests/trainer/test_dllm_sample_count.py tests/trainer/test_dllm_nonfinite.py
+          uv run --frozen pytest -s -x tests/trainer/test_dllm_sample_count.py tests/trainer/test_dllm_nonfinite.py tests/trainer/test_trace_callback.py
           uv run --frozen pytest -s -x tests/lora/test_vlm_lora.py
           uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
           uv run --frozen pytest -s -x tests/models/test_models_logits_equal_v5.py
@@ -201,6 +202,7 @@ jobs:
           uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_parity.py
           uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_smoke.py
           uv run --frozen pytest -s -x tests/optim/test_optimizer_vlm_param_groups.py
+          uv run --frozen pytest -s -x tests/optim/test_adafactor_fsdp2.py
       - name: Run LoRA e2e tests
         # peft ships under the `gpu` extra, so the earlier
         # `uv sync --frozen --extra gpu --group dev` step is sufficient — no extra sync needed here.
