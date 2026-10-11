@@ -172,9 +172,13 @@ class ParallelPlan:
         # resume that truncated shard is assigned over the correctly assembled parameter,
         # leaving every rank with one rank's experts. The spec describes the parameter
         # rather than the name, so an alias reuses the one already resolved for it.
+        # An existing entry is overwritten too: a model whose aliases are only tied in
+        # ``post_shard`` (DiffusionGemma built with weights, under ``no_init_weights``)
+        # had its alias walked above as a separate, unsharded parameter, and that stale
+        # ``Replicate`` entry would hide the sharded parameter now living at the name.
         for fqn, param in model.named_parameters(remove_duplicate=False):
             spec_info = getattr(param, "spec_info", None)
-            if spec_info is not None and fqn not in fqn2spec_info:
+            if spec_info is not None:
                 fqn2spec_info[fqn] = spec_info
 
         model._fqn2spec_info = fqn2spec_info
