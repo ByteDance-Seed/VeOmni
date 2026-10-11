@@ -118,6 +118,11 @@ fused-qkv attention, per-expert MoE). Conversion rewrites `config.json`
 as one more numbered shard (`model-00014-of-00014.safetensors`; VeOmni reads shard numbers
 from these names), and writes one index covering both. Per-expert tensors
 are fused into `gate_up_proj` / `down_proj` at load time. `decoder/` and `vae/` are unused.
+The GlmImage `preprocessor_config.json` is written without its `processor_class`: with
+it, `AutoProcessor` tries to build the full GlmImage processor, which needs a
+`processor_config.json` the checkpoint does not ship, and the run is left with no
+tokenizer for the chat template. With `data_type: llada2_uni`, `DllmTrainer` refuses a
+checkpoint converted before this change at startup; reconvert it.
 
 ```shell
 python scripts/convert_llada2uni_to_veomni.py --src LLaDA2.0-Uni --dst LLaDA2.0-Uni-veomni
@@ -188,6 +193,13 @@ The vision/VQ weights stay frozen: the codebook argmax is not differentiable, so
 backbone loss cannot reach them. A rank whose micro-batch has no image still runs a
 dummy 2x2-patch encode and discards the codes, so FSDP all-gathers stay symmetric.
 The experts are sharded over `model.accelerator.ep_size` like LLaDA-MoE.
+
+Training uses the same objective as the rest of the family: one masking ratio per
+sample and full bidirectional attention over the sequence. The checkpoint was pretrained
+with block diffusion instead (block-causal attention over 32-token blocks), which this
+path does not implement. On the same samples the upstream model scores about 5.5 masked
+loss under bidirectional attention against 0.6–1.3 with its block-causal mask, so expect
+a high starting loss: SFT here also adapts the model to the bidirectional objective.
 
 ## Launch
 

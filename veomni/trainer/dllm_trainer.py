@@ -212,6 +212,13 @@ class DllmTrainer:
                 )
         else:
             return
+        if runtime.chat_template is None:
+            raise ValueError(
+                f"`data_type: {args.data.data_type}` needs `model.chat_template`, and it needs the tokenizer at "
+                f"{args.model.tokenizer_path} to load. A `processor_class` in its preprocessor_config.json makes "
+                "AutoProcessor build that processor instead; reconvert the checkpoint so that "
+                "preprocessor_config.json has no `processor_class` (scripts/convert_llada2uni_to_veomni.py does)."
+            )
         if runtime.processor is None:
             runtime.model_assets.append(self.image_processor)
 

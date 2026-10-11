@@ -23,7 +23,8 @@ weights are fused at load time. The converter
   2. symlinks the backbone shards and the image tokenizer as one more shard
      (``model-00014-of-00014.safetensors`` after 13 backbone shards) and writes one index
      covering both;
-  3. copies the GlmImage ``preprocessor_config.json`` and the tokenizer files.
+  3. writes the GlmImage ``preprocessor_config.json`` without ``processor_class`` and copies
+     the tokenizer files.
 
 ``decoder/`` and ``vae/`` (image generation) are not used.
 
@@ -147,6 +148,17 @@ def merge_index(backbone_index: dict, image_tokenizer_keys: list) -> dict:
     return {"metadata": backbone_index.get("metadata", {}), "weight_map": weight_map}
 
 
+def convert_preprocessor_config(src_cfg: dict) -> dict:
+    """Keep the image preprocessing, drop the claim of a full ``GlmImageProcessor``.
+
+    With ``processor_class`` set, ``AutoProcessor`` builds the GlmImage processor bundle,
+    which needs a ``processor_config.json`` this checkpoint does not ship, and the model
+    runtime is left with no tokenizer. Without it, ``AutoProcessor`` falls back to the
+    tokenizer, and ``AutoImageProcessor`` still resolves ``image_processor_type``.
+    """
+    return {k: v for k, v in src_cfg.items() if k != "processor_class"}
+
+
 def _symlink(target: str, link: str) -> None:
     if os.path.lexists(link):
         os.remove(link)
@@ -180,10 +192,11 @@ def convert_checkpoint(src: str, dst: str, copy_tokenizer: bool = True) -> None:
         json.dump(index, f, indent=2)
     print(f"[weights] symlinked {len(shards)} backbone shard(s) and the image tokenizer (no rename)")
 
-    shutil.copy2(
-        os.path.join(image_tokenizer_dir, "preprocessor_config.json"), os.path.join(dst, "preprocessor_config.json")
-    )
-    print("[aux] copied the GlmImage preprocessor_config.json")
+    with open(os.path.join(image_tokenizer_dir, "preprocessor_config.json")) as f:
+        preprocessor_cfg = convert_preprocessor_config(json.load(f))
+    with open(os.path.join(dst, "preprocessor_config.json"), "w") as f:
+        json.dump(preprocessor_cfg, f, indent=2)
+    print("[aux] wrote the GlmImage preprocessor_config.json (without processor_class)")
     if copy_tokenizer:
         for fn in os.listdir(src):
             if fn.startswith(("tokenizer", "special_tokens", "generation_config", "vocab", "merges", "chat_template")):
@@ -249,7 +262,9 @@ def self_test() -> None:
         except ValueError:
             continue
         raise AssertionError(f"{keys} must be refused")
-    print("self-test OK: LLaDA2.0-Uni config mapping and index merge valid.")
+    preprocessor = {"image_processor_type": "GlmImageImageProcessor", "processor_class": "GlmImageProcessor"}
+    assert convert_preprocessor_config(preprocessor) == {"image_processor_type": "GlmImageImageProcessor"}
+    print("self-test OK: LLaDA2.0-Uni config mapping, index merge and preprocessor config valid.")
 
 
 def main() -> None:

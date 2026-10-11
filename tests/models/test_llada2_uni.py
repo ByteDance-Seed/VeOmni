@@ -307,6 +307,53 @@ def test_converter_self_test():
     _converter().self_test()
 
 
+def test_trainer_refuses_image_data_without_a_chat_template(monkeypatch):
+    from veomni.trainer import dllm_trainer
+
+    image_processor = types.SimpleNamespace(patch_size=PATCH, merge_size=1, temporal_patch_size=1)
+    monkeypatch.setattr(dllm_trainer.AutoImageProcessor, "from_pretrained", lambda path: image_processor)
+    trainer = object.__new__(dllm_trainer.DllmTrainer)
+    model_config = types.SimpleNamespace(
+        model_type="llada2_uni", vision_config=types.SimpleNamespace(patch_size=PATCH)
+    )
+    trainer.base = types.SimpleNamespace(
+        args=types.SimpleNamespace(
+            data=types.SimpleNamespace(data_type="llada2_uni"), model=types.SimpleNamespace(tokenizer_path="ckpt")
+        ),
+        model=types.SimpleNamespace(model_config=model_config, chat_template=None, processor=None, model_assets=[]),
+    )
+    with pytest.raises(ValueError, match="needs `model.chat_template`"):
+        trainer._build_image_processor()
+
+
+@pytest.mark.skipif(not os.path.exists(REAL_CKPT), reason="LLaDA2.0-Uni checkpoint not mounted")
+def test_converted_checkpoint_loads_a_tokenizer_for_the_chat_template(tmp_path):
+    from transformers import AutoImageProcessor
+    from transformers.processing_utils import ProcessorMixin
+
+    from veomni.models.auto import build_processor
+
+    converter = _converter()
+    with open(os.path.join(REAL_CKPT, "config.json")) as f:
+        src_cfg = json.load(f)
+    with open(os.path.join(REAL_CKPT, "image_tokenizer", "config.json")) as f:
+        image_cfg = json.load(f)
+    with open(os.path.join(REAL_CKPT, "image_tokenizer", "preprocessor_config.json")) as f:
+        preprocessor_cfg = json.load(f)
+    cfg = converter.convert_config(src_cfg, image_cfg, converter.resolve_mask_token_id(REAL_CKPT))
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    (tmp_path / "preprocessor_config.json").write_text(
+        json.dumps(converter.convert_preprocessor_config(preprocessor_cfg))
+    )
+    for name in ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
+        (tmp_path / name).write_bytes(open(os.path.join(REAL_CKPT, name), "rb").read())
+
+    loaded = build_processor(str(tmp_path))
+    assert not isinstance(loaded, ProcessorMixin)
+    assert build_chat_template("llada2_uni", loaded) is not None
+    assert type(AutoImageProcessor.from_pretrained(str(tmp_path))).__name__ == "GlmImageImageProcessor"
+
+
 @pytest.mark.skipif(not os.path.exists(REAL_CKPT), reason="LLaDA2.0-Uni checkpoint not mounted")
 def test_model_matches_the_real_checkpoint_layout():
     from safetensors import safe_open
