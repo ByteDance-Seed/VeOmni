@@ -26,7 +26,9 @@ veomni/
 │   │                   (build, freeze/LoRA, parallelize, optimizer,
 │   │                   lr-scheduler, grad clip, its own ParallelState)
 │   ├── checkpoint_manager.py  ModelCheckpointManager: DCP / HF / LoRA I/O (runtime-owned)
-│   ├── transformers/   Per-model patches (one subpackage per model family)
+│   ├── transformers/   Per-model patches (one subpackage per model family).
+│   │                   `diffusion_gemma` and `llada*` are vendored modeling,
+│   │                   not patchgen `generated/` trees.
 │   └── diffusers/      Diffusion model families (Wan, LTX, Qwen-Image)
 ├── optim/              Optimizer and LR scheduler construction
 │   ├── optimizer.py    build_optimizer() factory + MultiOptimizer wrapper.

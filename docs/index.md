@@ -77,6 +77,7 @@ examples/ltx-2.3.md
 examples/qwen3_dpo.md
 examples/seed_oss.md
 examples/diffusion_gemma.md
+examples/llada.md
 ```
 
 ```{toctree}

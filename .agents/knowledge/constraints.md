@@ -241,8 +241,9 @@ Core files:
 
 ## DiffusionGemma and dLLM
 
-29. **DiffusionGemma modeling is vendored, not patchgen-generated**
+29. **DiffusionGemma and the LLaDA family are vendored, not patchgen-generated**
     - `veomni/models/transformers/diffusion_gemma/` overrides HuggingFace's built-in `diffusion_gemma` (present in transformers 5.16.1) with canvas training, packing, FFPA/DG_PREFIX/hole/varlen kernels and generation. Do not convert it to patchgen until those extensions live upstream. Do not edit a `generated/` tree for it; there is none.
+    - `llada`, `llada_moe`, `llada_v` and `llada2_uni` are also vendored mask predictors (HuggingFace does not ship them). Bidirectional packed attention, Ulysses image-slot slicing and MoE aux-loss reduction live in `llada/dllm_utils.py`; see source-numbered 46 below.
 
 Comments in that package, the dLLM kernels, and their tests say "constraint N" using the **source-numbered** list from the original DiffusionGemma work (24–45), not the VeOmni-wide numbers above. Resume RNG is keyed on `global_step` because `GlobalStateCallback` persists only the default CPU and device RNGs. Accelerator, optimizer and chat template live on `model.*` in this tree. The load-bearing rules:
 
@@ -254,4 +255,4 @@ Comments in that package, the dLLM kernels, and their tests say "constraint N" u
 - `flex_attention` needs uncompiled BlockMasks, a raised Dynamo budget, contiguous q/k/v; at the 26B recipe it is slower than sdpa, which stays the default (source 30–31). See `docs/examples/diffusion_gemma.md`.
 - Packed encoder rows need `wide_varlen_attention`; `dyn_bsz` is refused without `canvas_batching: flat_seq_pack`; a sample costs `L + K*C`; images cannot pack; bf16 packed-vs-apart equivalence is not assertable (source 32–38).
 - Ulysses only under `flat_seq_pack` + `attn_dg_prefix`; collect on the `ulysses` mesh dimension, not flattened `sp` (source 39).
-- LLaDA packed rows: count segments not rows, reduce aux loss after the per-sample division, SP via `sum_over_ulysses_shards` (source 46).
+- LLaDA packed rows: count segments not rows, reduce aux loss after the per-sample division, SP via `sum_over_ulysses_shards` (source 46). `create_bidirectional_mask` returns `None` for `veomni_flash_*`; sdpa/eager need `bidirectional_attention_mask` from `position_ids` or a packed row attends across samples. Under Ulysses, `pixel_values` stay whole and `ulysses_local_image_slots` keeps the shard's image rows; vision towers are pinned to sdpa.
