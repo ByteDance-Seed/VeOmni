@@ -1,0 +1,38 @@
+{
+    "architectures": [
+        "LLaDAVForConditionalGeneration"
+    ],
+    "model_type": "llada_v",
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "bos_token_id": 126080,
+    "eos_token_id": 126081,
+    "pad_token_id": 126081,
+    "hidden_act": "silu",
+    "hidden_size": 64,
+    "head_dim": 16,
+    "intermediate_size": 128,
+    "mask_token_id": 126336,
+    "max_position_embeddings": 4096,
+    "mlp_bias": false,
+    "num_attention_heads": 4,
+    "num_hidden_layers": 2,
+    "num_key_value_heads": 4,
+    "rms_norm_eps": 1e-05,
+    "rope_theta": 500000.0,
+    "tie_word_embeddings": false,
+    "torch_dtype": "float32",
+    "vocab_size": 126464,
+    "mm_hidden_size": 32,
+    "mm_vision_select_layer": -1,
+    "vision_config": {
+        "model_type": "siglip_vision_model",
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_attention_heads": 2,
+        "num_hidden_layers": 2,
+        "image_size": 56,
+        "patch_size": 14,
+        "vision_use_head": false
+    }
+}
