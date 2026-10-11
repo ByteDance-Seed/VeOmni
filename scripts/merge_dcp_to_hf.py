@@ -12,11 +12,12 @@ from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import torch
 from safetensors.torch import save_file
-from transformers import AutoConfig, AutoProcessor, AutoTokenizer, GenerationConfig
+from transformers import AutoProcessor, AutoTokenizer, GenerationConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 
 from veomni.checkpoint.dcp_checkpointer import _get_sharding_plan, _process_shard
 from veomni.checkpoint.layout import weights_dir
+from veomni.models.loader import get_model_config
 from veomni.utils import helper
 
 
@@ -361,11 +362,14 @@ def merge_to_hf_pt(
         aliased_keys = _aliased_hf_keys(model_assets_dir)
         logger.info(f"Loading model assets from {model_assets_dir}")
         model_assets = []
+        # Through VeOmni's config registry, as training saved it: transformers may ship its
+        # own class for the same `model_type` (DiffusionGemma does), and re-saving through
+        # that one rewrites the config into a form the VeOmni class cannot read back.
         try:
-            config = AutoConfig.from_pretrained(model_assets_dir)
+            config = get_model_config(model_assets_dir)
             model_assets.append(config)
         except Exception as e:
-            logger.warning(f"Failed to load AutoConfig: {e}")
+            logger.warning(f"Failed to load the model config: {e}")
 
         try:
             processor = AutoProcessor.from_pretrained(model_assets_dir, trust_remote_code=True)

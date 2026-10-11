@@ -56,7 +56,7 @@ def test_merge_preserves_generation_config(tmp_path, monkeypatch):
             num_workers=num_workers,
         )
 
-    monkeypatch.setattr(module, "AutoConfig", FakeLoader("config"))
+    monkeypatch.setattr(module, "get_model_config", FakeLoader("config").from_pretrained)
     monkeypatch.setattr(module, "AutoProcessor", FakeLoader("processor"))
     monkeypatch.setattr(module, "GenerationConfig", FakeLoader("generation_config"))
     monkeypatch.setattr(module, "save_model_weights", fake_save_model_weights)
@@ -97,7 +97,7 @@ def test_merge_rejects_invalid_generation_config_before_weight_conversion(tmp_pa
         def from_pretrained(*args, **kwargs):
             raise ValueError("invalid generation config")
 
-    monkeypatch.setattr(module, "AutoConfig", SuccessfulLoader)
+    monkeypatch.setattr(module, "get_model_config", SuccessfulLoader.from_pretrained)
     monkeypatch.setattr(module, "AutoProcessor", SuccessfulLoader)
     monkeypatch.setattr(module, "GenerationConfig", BrokenGenerationConfig)
     monkeypatch.setattr(
@@ -148,7 +148,7 @@ def test_merge_falls_back_to_tokenizer_when_assets_have_no_processor(tmp_path, m
     ):
         captured["assets"] = [asset.kind for asset in model_assets]
 
-    monkeypatch.setattr(module, "AutoConfig", ConfigLoader)
+    monkeypatch.setattr(module, "get_model_config", ConfigLoader.from_pretrained)
     monkeypatch.setattr(module, "AutoProcessor", MissingProcessor)
     monkeypatch.setattr(module, "AutoTokenizer", TokenizerLoader)
     monkeypatch.setattr(module, "save_model_weights", fake_save_model_weights)
@@ -175,7 +175,7 @@ def test_merge_rejects_unloadable_tokenizer_assets_before_weight_conversion(tmp_
         def from_pretrained(*args, **kwargs):
             raise ValueError("invalid tokenizer assets")
 
-    monkeypatch.setattr(module, "AutoConfig", ConfigLoader)
+    monkeypatch.setattr(module, "get_model_config", ConfigLoader.from_pretrained)
     monkeypatch.setattr(module, "AutoProcessor", BrokenLoader)
     monkeypatch.setattr(module, "AutoTokenizer", BrokenLoader)
     monkeypatch.setattr(
@@ -209,7 +209,7 @@ def test_merge_rejects_broken_processor_assets_instead_of_downgrading(tmp_path, 
         def from_pretrained(*args, **kwargs):
             pytest.fail("processor-backed assets must not downgrade to tokenizer-only")
 
-    monkeypatch.setattr(module, "AutoConfig", ConfigLoader)
+    monkeypatch.setattr(module, "get_model_config", ConfigLoader.from_pretrained)
     monkeypatch.setattr(module, "AutoProcessor", BrokenProcessor)
     monkeypatch.setattr(module, "AutoTokenizer", WorkingTokenizer)
     monkeypatch.setattr(
@@ -328,6 +328,42 @@ def test_aliased_keys_name_the_duplicates_and_nothing_else():
     # Nothing canonical may be named for dropping.
     assert "model.decoder.embed_tokens.weight" not in aliased
     assert "model.decoder.layers.0.experts.gate_up_proj" not in aliased
+
+
+@pytest.mark.skipif(
+    not (ROOT / "tests/toy_config/diffusion_gemma_toy").is_dir(), reason="needs the DiffusionGemma toy config"
+)
+def test_exported_config_reads_back_through_the_veomni_class(tmp_path, monkeypatch):
+    """The exported config must be loadable by the code that trains on it.
+
+    transformers ships its own `diffusion_gemma` config class, which serializes the
+    full-attention width as a heterogeneous `per_layer_config`. VeOmni's class reads
+    `global_head_dim` instead and refuses the global `head_dim` of such a config, so an
+    export re-saved through `AutoConfig` could not be trained from again.
+    """
+    import json
+
+    module = _load_script()
+    toy_config = ROOT / "tests/toy_config/diffusion_gemma_toy"
+    captured = {}
+
+    def fake_save_model_weights(output_dir, checkpoint_path, *, model_assets, **kwargs):
+        captured["assets"] = model_assets
+
+    monkeypatch.setattr(module, "save_model_weights", fake_save_model_weights)
+    module.merge_to_hf_pt("dcp", "hf", str(toy_config))
+
+    configs = [asset for asset in captured["assets"] if type(asset).__name__ == "DiffusionGemmaConfig"]
+    assert len(configs) == 1, [type(asset).__name__ for asset in captured["assets"]]
+    configs[0].save_pretrained(tmp_path)
+
+    text_config = json.loads((tmp_path / "config.json").read_text())["text_config"]
+    assert "per_layer_config" not in text_config
+    assert text_config["global_head_dim"] == 64
+
+    reloaded = module.get_model_config(str(tmp_path))
+    assert reloaded.text_config.head_dim == configs[0].text_config.head_dim
+    assert reloaded.text_config.global_head_dim == 64
 
 
 def test_the_sharding_plan_drops_only_the_named_aliases(tmp_path):
