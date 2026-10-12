@@ -93,8 +93,8 @@ class OmniInferencer:
         self.args = args
 
         self.omni_model_runtime = build_omni_model_runtime_args(args, for_inference=True)
-        # Read after the build: an HF ``model_path`` is redirected to its weight-free split view.
-        self.checkpoint_root = args.model.model_path
+        # Read after the build: an HF ``model_path`` sets ``seed_omni_model_path`` to its weight-free view.
+        self.checkpoint_root = self.omni_model_runtime.resolved_model_path
 
         self._distributed = any(
             _module_needs_distributed(self.omni_model_runtime.modules[name])

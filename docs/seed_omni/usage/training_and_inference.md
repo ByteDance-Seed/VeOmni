@@ -83,13 +83,14 @@ is by the root `config.json`'s `model_type`: `omni` is a split checkpoint, a typ
 with a registered layout loads through it, and any other type is an error.
 
 - **Load.** Each process writes a weight-free view of the split checkpoint (module
-  configs, tokenizer / processors, root config and graphs) to a temp directory,
-  and `model.model_path` is pointed at it, so configs and preprocessors load
-  exactly as from a split root. Module weights are read from the upstream
-  checkpoint at weight-load time: each HF key is renamed onto the module that
-  owns it, and keys owned by other modules are skipped without being read. This
-  works for training (FSDP2, DDP, rank-0 broadcast, `fsdp_scope: model`) and
-  for eager and distributed inference.
+  configs, tokenizer / processors, root config and graphs) to a temp directory
+  and records it as `model.seed_omni_model_path`; `model.model_path` stays the
+  upstream root. Configs and preprocessors read the view like any split root.
+  Module weights are read from the upstream checkpoint at weight-load time:
+  each HF key is renamed onto the module that owns it, and keys owned by other
+  modules are skipped without being read. This works for training (FSDP2, DDP,
+  rank-0 broadcast, `fsdp_scope: model`) and for eager and distributed
+  inference.
 - **Save.** The HF export (`save_hf_weights`) is one checkpoint in the upstream
   layout under `global_step_N/hf_ckpt/`: the same keys, dtypes, shard files and
   non-weight files as the source, so it loads wherever the source does

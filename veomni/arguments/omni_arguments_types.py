@@ -95,11 +95,13 @@ DEFAULT_SCENARIO = "default"
 
 
 def _resolve_hf_checkpoint_view(model_runtime: OmniModelRuntimeArguments) -> str:
-    """Point ``model.model_path`` at a weight-free split view when it names an upstream HF checkpoint.
+    """Set ``seed_omni_model_path`` to the weight-free split view when ``model_path`` is upstream HF.
 
-    Everything downstream (module configs, assets, the collator's
-    preprocessors, inference) then reads the view like any split checkpoint,
+    ``model.model_path`` is never rewritten: loggers and saved launch args keep
+    the user-facing path. Downstream (module configs, assets, the collator's
+    preprocessors, inference) reads :attr:`OmniModelRuntimeArguments.seed_omni_model_path`,
     while module weights still come from the HF checkpoint the view records.
+    A split root sets ``seed_omni_model_path`` equal to ``model_path``.
     """
     from ..models.seed_omni.utils.hf_layout import read_hf_source, resolve_omni_checkpoint_root
 
@@ -109,9 +111,10 @@ def _resolve_hf_checkpoint_view(model_runtime: OmniModelRuntimeArguments) -> str
         source = read_hf_source(view)
         logger.info_rank0(
             f"OmniModel: `model.model_path` is a HuggingFace `{source.model_type}` checkpoint; "
-            f"loading its modules through the {source.model_type} HF layout (view: {view})."
+            f"loading its modules through the {source.model_type} HF layout "
+            f"(seed_omni_model_path: {view})."
         )
-        model_runtime.model_path = view
+    model_runtime.seed_omni_model_path = view
     return view
 
 
@@ -174,19 +177,19 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         raise ValueError("`model.model_path` (split-checkpoint root) is required for OmniModel.")
 
     # ``model_path`` is already local: ``BaseModelArguments.__post_init__`` localizes
-    # it, so per-module subfolders join against a path that exists on disk and
-    # ``_try_load_omni_checkpoint_config`` below can open its ``config.json``.
-    model_path = _resolve_hf_checkpoint_view(model_runtime)
+    # it. ``seed_omni_model_path`` is the root configs / assets / graphs are read
+    # from (a weight-free view when ``model_path`` is an upstream HF checkpoint).
+    seed_omni_model_path = _resolve_hf_checkpoint_view(model_runtime)
     if not for_inference and args.train.checkpoint.save_hf_weights:
-        _check_hf_source_exportable(model_path)
-    omni_cfg = _try_load_omni_checkpoint_config(model_path)
+        _check_hf_source_exportable(seed_omni_model_path)
+    omni_cfg = _try_load_omni_checkpoint_config(seed_omni_model_path)
 
     # The checkpoint's per-module fields are their own layer, kept separate from
     # the launcher YAML so `build_omni_module_runtime_args` can slot the inference
     # `fsdp_mode: eager` default between the two — see its docstring for the
     # full order.
     ckpt_modules = (
-        {name: _checkpoint_module_fields(omni_cfg, model_path, name) for name in omni_cfg.module_names}
+        {name: _checkpoint_module_fields(omni_cfg, seed_omni_model_path, name) for name in omni_cfg.module_names}
         if omni_cfg is not None
         else None
     )
@@ -236,12 +239,12 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
 
     modules = build_omni_module_runtime_args(
         _to_module_global_args(model_runtime),
-        model_path,
+        seed_omni_model_path,
         train_modules,
         for_inference=for_inference,
         checkpoint_modules=ckpt_modules,
     )
-    _validate_hf_view_modules(model_path, modules)
+    _validate_hf_view_modules(seed_omni_model_path, modules)
     for module_args in modules.values():
         _validate_omni_accelerator(module_args.accelerator)
     _validate_composed_wrap(model_runtime.accelerator, modules)
@@ -258,6 +261,7 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
     model_kwargs = {name: getattr(model_runtime, name) for name in shared_fields}
     return OmniModelRuntimeArguments(
         **model_kwargs,
+        seed_omni_model_path=seed_omni_model_path,
         modules=modules,
         training_graphs=training_graphs,
         generation_graphs=generation_graphs,

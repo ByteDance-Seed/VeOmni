@@ -326,6 +326,40 @@ def test_hf_view_modules_must_all_come_from_the_layout(hf_root):
         _validate_hf_view_modules(view, {**ok, LLM: OmniModuleRuntimeArguments(model_path="/elsewhere/qwen3_llm")})
 
 
+def test_build_runtime_args_keeps_model_path_and_sets_seed_omni_model_path(hf_root):
+    from veomni.arguments.omni_arguments_types import (
+        OmniArguments,
+        OmniDataArguments,
+        OmniInferArguments,
+        OmniModelRuntimeArguments,
+        build_omni_model_runtime_args,
+    )
+
+    root, _ = hf_root
+    cfg = Path(__file__).resolve().parents[3] / "configs" / "seed_omni" / "Qwen" / "qwen3_0.6b" / "train"
+    args = OmniArguments(
+        model=OmniModelRuntimeArguments(
+            model_path=str(root),
+            model_config={
+                "modules": str(cfg / "modules_train.yaml"),
+                "train_graph": str(cfg / "graph_train.yaml"),
+                "infer_graph": str(cfg / "graph_infer.yaml"),
+            },
+        ),
+        data=OmniDataArguments(train_path=""),
+        infer=OmniInferArguments(),
+    )
+    runtime = build_omni_model_runtime_args(args)
+
+    assert args.model.model_path == str(root)
+    assert runtime.model_path == str(root)
+    assert args.model.seed_omni_model_path == runtime.seed_omni_model_path
+    assert runtime.seed_omni_model_path != str(root)
+    assert os.path.isfile(os.path.join(runtime.seed_omni_model_path, "hf_source.json"))
+    assert runtime.resolved_model_path == runtime.seed_omni_model_path
+    assert all(module.model_path.startswith(runtime.seed_omni_model_path) for module in runtime.modules.values())
+
+
 def test_a_training_export_needs_safetensors_in_the_source(tmp_path):
     from veomni.arguments.omni_arguments_types import _check_hf_source_exportable
 
