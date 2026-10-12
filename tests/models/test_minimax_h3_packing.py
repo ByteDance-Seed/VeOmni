@@ -1507,7 +1507,8 @@ def test_h3_fp32_heads_support_multistep_bf16_anchors(task):
     video, audio = row["input_latents"], row["audio_input_latents"]
     scheduler = FlowMatchScheduler()
     scheduler.set_timesteps(3)
-    for timestep in scheduler.timesteps[:2]:
+    for step, timestep in enumerate(scheduler.timesteps[:2]):
+        t = float(1.0 - scheduler.sigmas[step])
         with torch.no_grad():
             video_pred, audio_pred = model_fn_minimax_h3(
                 model,
@@ -1515,8 +1516,8 @@ def test_h3_fp32_heads_support_multistep_bf16_anchors(task):
                 audio,
                 row["packed"],
                 row["prompt_embeds"],
-                t_video=0.5,
-                t_audio=0.5,
+                t_video=t,
+                t_audio=t,
                 **{"keyframe_cond_anchor" if task == "fl2va" else "ref_visual_anchor": anchor},
             )
         assert video_pred.dtype == audio_pred.dtype == torch.float32
