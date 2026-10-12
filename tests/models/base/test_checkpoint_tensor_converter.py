@@ -425,11 +425,23 @@ class TestDeepseekV4ConverterConvert:
         assert converter.finalize() == []
 
     @pytest.mark.parametrize("target_model_prefix", ["model.", ""])
-    def test_scorer_export_round_trips_through_inference_format(self, monkeypatch, target_model_prefix):
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "layers.2.attn.indexer.weights_proj.weight",
+            # Reversing HF's ``.norm.`` -> ``.kv_norm.`` renaming used to turn these into ``attn.norm``.
+            "layers.0.attn.kv_norm.weight",
+            "layers.2.attn.indexer.compressor.norm.weight",
+            # Nested compressor projections used to export with a literal ``\2`` in the name.
+            "layers.2.attn.compressor.wkv.weight",
+            "layers.2.attn.compressor.wgate.weight",
+            "layers.2.attn.indexer.compressor.wkv.weight",
+        ],
+    )
+    def test_export_round_trips_through_inference_format(self, monkeypatch, target_model_prefix, source):
         from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
 
-        source = "layers.2.attn.indexer.weights_proj.weight"
-        target = f"{target_model_prefix}layers.2.self_attn.compressor.indexer.scorer.weights_proj.weight"
+        target = module.convert_deepseek_v4_checkpoint_key(source, target_model_prefix=target_model_prefix)
         weight = torch.randn(4, 8, dtype=torch.bfloat16)
         model = SimpleNamespace(config=SimpleNamespace(expert_dtype="fp8"), _veomni_fqn_to_index_mapping={source: 1})
         monkeypatch.setattr(module, "export_weights", lambda model: iter([(target, weight)]))
@@ -464,7 +476,8 @@ class TestDeepseekV4ConverterConvert:
             config=SimpleNamespace(expert_dtype=expert_dtype),
             _veomni_fqn_to_index_mapping={origin: 1, "layers.0.attn.wq_a.scale": 1},
         )
-        monkeypatch.setattr(module, "export_weights", lambda model: iter([(origin, weight)]))
+        target = module.convert_deepseek_v4_checkpoint_key(origin)
+        monkeypatch.setattr(module, "export_weights", lambda model: iter([(target, weight)]))
         monkeypatch.setattr(export_quant, "fp8_weight_quant", fake_fp8_weight_quant)
 
         exported = dict(DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS).export_weights(model))
