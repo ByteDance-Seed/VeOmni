@@ -1,10 +1,13 @@
 """Native H3 model-owned packing, without pretrained weights or encoders."""
 
 import copy
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from veomni.models.diffusers.minimax_h3.minimax_h3_condition.configuration_minimax_h3_condition import (
@@ -25,13 +28,13 @@ from veomni.trainer.dit_trainer import DiTDataCollator
 from veomni.utils.import_utils import is_torch_npu_available
 
 
-def tiny_model():
+def tiny_model(num_attention_heads=2):
     return MiniMaxH3DiTModel(
         MiniMaxH3DiTModelConfig(
             hidden_size=32,
             num_layers=2,
             token_refiner_num_layers=1,
-            num_attention_heads=2,
+            num_attention_heads=num_attention_heads,
             attention_head_dim=16,
             ffn_hidden_size=64,
             text_dim=32,
@@ -910,6 +913,42 @@ def test_sequence_parallel_padding_remains_forward_local(monkeypatch, task):
     assert out.predictions[0].shape == (1, 24, 2, 4, 6)
     with pytest.raises(ValueError, match="sequence parallelism"):
         model(**batch([sample, sample]))
+
+
+def _check_sequence_parallel_gradients(rank, init_method, cases):
+    dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=2, timeout=timedelta(seconds=60))
+    try:
+        minimax_h3_dit.IS_NPU_AVAILABLE = False
+        core.ATTENTION_IMPLEMENTATION = "torch"
+        minimax_h3_dit.get_ulysses_sequence_parallel_group = lambda: dist.group.WORLD
+        for case, heads, state, sample, expected_loss, expected_grads in cases:
+            model = tiny_model(heads)
+            model.load_state_dict(state)
+            loss = sum(model(**sample).loss.values())
+            torch.testing.assert_close(loss, expected_loss, rtol=2e-5, atol=2e-5, msg=case)
+            loss.backward()
+            for name, param in model.named_parameters():
+                # FSDP2 shards over dp_shard_sp, so its reduce-scatter averages over the SP ranks too.
+                grad = param.grad.clone()
+                dist.all_reduce(grad)
+                torch.testing.assert_close(grad / 2, expected_grads[name], rtol=2e-4, atol=2e-5, msg=f"{case} {name}")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo required")
+def test_sequence_parallel_gradients_match_single_rank_after_sp_average(tmp_path):
+    cases = []
+    # Two heads leave one head block per SP rank; four heads exercise the pipelined multi-block exchange.
+    for task, heads in (("fl2va", 2), ("ref2va", 2), ("fl2va", 4)):
+        torch.manual_seed(5)
+        model = tiny_model(heads)
+        sample = prepare(condition_model(), [raw_sample(3, task)])[0]
+        loss = sum(model(**sample).loss.values())
+        loss.backward()
+        grads = {name: param.grad.clone() for name, param in model.named_parameters()}
+        cases.append((f"{task} heads={heads}", heads, model.state_dict(), sample, loss.detach(), grads))
+    mp.spawn(_check_sequence_parallel_gradients, args=((tmp_path / "rendezvous").as_uri(), cases), nprocs=2)
 
 
 _NPU_REJECTS_HUB = pytest.mark.skipif(is_torch_npu_available(), reason="Hub attention is rejected on Ascend NPU.")
