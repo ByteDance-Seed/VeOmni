@@ -211,6 +211,14 @@ class SwapAdamW(Optimizer):
         local is the live host buffer, so DCP reads state off the accelerator. The
         live buffer is bound, not copied - the base (device) optimizer hands DCP
         live state too, so a snapshot would only add a full extra host copy.
+
+        Async saves are still safe: torch's ``FileSystemWriter`` is a
+        ``BlockingAsyncStager``, so ``dcp.async_save`` deep-copies the state dict
+        synchronously on the calling thread before the background write starts -
+        steps taken after the call cannot tear the checkpoint. That staging copy
+        transiently doubles host optimizer-state memory; sync saves read the live
+        buffers directly with no copy. Pinned by
+        ``test_async_save_snapshots_state_before_later_steps``.
         """
         for p, host_state in self._host_states.items():
             for key, host_tensor in host_state.items():
@@ -383,6 +391,7 @@ class SwapAdamW(Optimizer):
         """
         self._release_pending_storages()
         stream_context = switch_to_specified_stream(self._in_stream) if self._use_streams else nullcontext()
+        start_index = index
         bytes_moved = 0
         budget = self._batch_budget_bytes()
         with stream_context:
@@ -393,7 +402,10 @@ class SwapAdamW(Optimizer):
                 self._swap_in_param(params[index])
                 bytes_moved += param_bytes
                 index += 1
-        if bytes_moved == 0:
+        # Progress is measured by index, not bytes: a rank whose active params all
+        # have empty local shards (uneven EP/FSDP sharding) moves zero bytes yet
+        # still advances, and must not trip the "could not fit" guard.
+        if index == start_index:
             raise RuntimeError(
                 "SwapAdamW could not fit any optimizer state on device. "
                 "Increase optimizer.swap_mem_fraction_static or reduce the parameter size."
@@ -457,7 +469,9 @@ class SwapAdamW(Optimizer):
         steps = []
         for p in params:
             step = self._bump_step(p)
-            steps.append(torch.tensor(step, dtype=torch.int64, device=device))
+            # float32 matches torch's own fused AdamW step contract
+            # (``_get_scalar_dtype(is_fused=True)``); some kernels reject int64.
+            steps.append(torch.tensor(step, dtype=torch.float32, device=device))
         torch._fused_adamw_(
             [_to_local(p) for p in params],
             [_to_local(p.grad) for p in params],
