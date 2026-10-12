@@ -36,27 +36,25 @@ through untouched — the fused shape already equals the modeling layout, so
 dispatch copies them into place.
 
 The talker tower (`talker.model.layers.{i}.mlp.experts.*`) uses the same
-per-expert convention; the regex matches both tower prefixes so standalone
-talker tensors (if ever loaded through this converter) are handled uniformly.
+per-expert convention and the regex matches it too, but VeOmni builds the
+model with `has_talker=False` and sizes this converter from the thinker
+config. Talker keys therefore end up unexpected: `ep_sharded_stream_load`
+skips them unread, while the whole-tensor loaders stack and then drop them.
 """
 
 from typing import Dict
 
-from veomni.models.checkpoint.expert_fusion import PerExpertSplitToFusedConverter
-from veomni.models.checkpoint.moe_map import (
+from ..._moe_per_expert_converter import PerExpertFusedCheckpointTensorConverter
+from ...checkpoint.moe_map import (
     PER_EXPERT_SPLIT_TO_FUSED_PATTERN,
     convert_per_expert_fqn_mapping_to_fused,
 )
 
 
-_EXPERT_PATTERN = PER_EXPERT_SPLIT_TO_FUSED_PATTERN
+class Qwen3OmniMoeCheckpointTensorConverter(PerExpertFusedCheckpointTensorConverter):
+    """Per-expert -> fused converter for Qwen3-Omni-MoE thinker experts."""
 
-
-class Qwen3OmniMoeCheckpointTensorConverter(PerExpertSplitToFusedConverter):
-    """Stack per-expert gate/up/down tensors into v5 fused layout at load time."""
-
-    family_name = "Qwen3OmniMoe"
-    expert_pattern = _EXPERT_PATTERN
+    model_name = "Qwen3OmniMoe"
 
 
 def create_qwen3_omni_moe_checkpoint_tensor_converter(model):
@@ -76,4 +74,4 @@ def create_qwen3_omni_moe_checkpoint_tensor_converter(model):
 
 def convert_qwen3_omni_moe_fqn_to_index_mapping(fqn_to_index_mapping: Dict[str, int]) -> Dict[str, int]:
     """Align HF safetensors index keys with fused thinker expert parameter names."""
-    return convert_per_expert_fqn_mapping_to_fused(fqn_to_index_mapping, _EXPERT_PATTERN)
+    return convert_per_expert_fqn_mapping_to_fused(fqn_to_index_mapping, PER_EXPERT_SPLIT_TO_FUSED_PATTERN)
