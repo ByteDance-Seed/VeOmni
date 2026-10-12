@@ -12,6 +12,7 @@ Layout
 * ``base_mixin.py`` — :class:`BaseMixin` (runtime hook registry)
 * ``training_module_mixin.py`` — :class:`TrainingModuleMixin` (``pre_forward`` / ``post_forward``)
 * ``inference_module_mixin.py`` — :class:`InferenceModuleMixin` (runtime ``pre_generate`` / ``post_generate``)
+* ``offline_encoding_mixin.py`` — :class:`OfflineEncodingMixin` (offline-cache ``cache_mode`` + endpoints)
 * ``modules/<family>/<sub>/modeling.py``::
 
     class Xxx(PretrainedOmniModule): ...

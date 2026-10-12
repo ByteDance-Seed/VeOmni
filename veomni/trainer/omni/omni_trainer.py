@@ -80,6 +80,7 @@ from ...utils.device import (
     is_nccl_backend,
     synchronize,
 )
+from ...utils.omni_helper import OmniEnvironMeter
 from ..base import VeOmniIter
 from ..callbacks import (
     CheckpointCallback,
@@ -185,7 +186,8 @@ class OmniTrainer:
     model_fwd_context: Any
     model_bwd_context: Any
 
-    # OmniStepMetricsCallback.on_step_end: training metrics (loss, grad_norm, lr, …).
+    environ_meter: OmniEnvironMeter  # see in OmniStepMetricsCallback
+    # OmniStepMetricsCallback.on_step_end: training + efficiency metrics (loss, grad_norm, lr, mfu, …).
     # WandbTraceCallback.on_step_end: logs step_env_metrics.
     # TqdmCallback.on_step_end: progress-bar postfix from step_train_metrics.
     step_env_metrics: Dict[str, Any] | None = None

@@ -71,6 +71,7 @@ examples/qwen3_vl.md
 examples/qwen3_omni_moe.md
 examples/qwen3_omni_offline_av.md
 examples/minimax_h3.md
+examples/minimax_h3_smoke_test.md
 examples/wan2.1.md
 examples/wan2.1_I2V_1.3B.md
 examples/ltx-2.3.md
@@ -86,10 +87,19 @@ key_features/model_loader.md
 key_features/preprocessor_registry.md
 key_features/ep_fsdp2.md
 key_features/extra_parallel.md
+key_features/sharded_embedding.md
 key_features/ulysses.md
 key_features/lora.md
 key_features/mtp.md
 
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: SeedOmni
+
+seed_omni/mixins/metric_meter.md
+seed_omni/mixins/offline_encoding.md
 ```
 
 ```{toctree}

@@ -205,6 +205,19 @@ def test_build_chat_template_builds_both_kinds():
     assert not isinstance(build_chat_template("chatml", _VisionTokenizer()), MultimodalChatTemplate)
 
 
+@pytest.mark.parametrize(
+    "template_name, tokenizer_cls",
+    [("chatml", _VisionTokenizer), ("qwen3_5", _VisionTokenizer), ("gpt_oss", _PrefixStableTokenizer)],
+)
+def test_a_text_template_built_from_a_processor_encodes_through_its_tokenizer(template_name, tokenizer_cls):
+    # The runtime passes the processor whenever the checkpoint ships one.
+    tokenizer = tokenizer_cls()
+    template = build_chat_template(template_name, _Processor(tokenizer))
+
+    assert not isinstance(template, MultimodalChatTemplate)
+    assert template.tokenizer is tokenizer
+
+
 def test_build_chat_template_still_rejects_unknown_names():
     with pytest.raises(ValueError, match="Unknown ChatTemplate name"):
         build_chat_template("no_such_template", _VisionTokenizer())

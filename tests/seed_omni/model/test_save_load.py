@@ -151,6 +151,27 @@ def test_omni_config_from_pretrained_hydrates_graph_sidecars(tmp_path):
     assert config._module_configs[FAKE_A].hidden_size == HIDDEN_SIZE
 
 
+def test_an_unsafe_infer_type_fails_when_the_config_is_built():
+    """Not at save time: that runs on rank 0 alone, after the module weights are written."""
+    with pytest.raises(ValueError, match="Invalid infer_type 'infer und'"):
+        OmniConfig(
+            _module_entries=_chain_modules(),
+            training_graphs={"default": _chain_edges()},
+            generation_graphs={"infer und": _minimal_generation_graph()},
+        )
+
+
+def test_an_unsafe_infer_type_in_the_generation_sidecar_fails_the_load(tmp_path):
+    _write_omni_checkpoint(tmp_path)
+    sidecar = tmp_path / DEFAULT_GENERATION_GRAPH_FILE
+    graphs = yaml.safe_load(sidecar.read_text(encoding="utf-8"))
+    graphs["generation/v2"] = graphs.pop("infer_und")
+    sidecar.write_text(yaml.safe_dump(graphs, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Invalid infer_type 'generation/v2'"):
+        OmniConfig.from_pretrained(tmp_path)
+
+
 def test_loaded_module_config_applies_slot_overwrites_with_ops_priority(tmp_path):
     """A module config is the file, then the composed model's overwrites.
 
