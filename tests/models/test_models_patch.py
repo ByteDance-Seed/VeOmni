@@ -480,10 +480,11 @@ def test_models_patch_fwd_bwd(
         moe_impl = "fused_npu" if get_device_type() == "npu" else "fused_triton"
         veomni_model_modes = [ModelMode("veomni", "eager", moe_implementation=moe_impl)]
 
-    # GLM-MoE-DSA folds its DSA top-k selection into the attention mask, which
-    # only ``eager`` / ``sdpa`` support; flash attention would discard it and
-    # raises. Compare HF eager against VeOmni's eager expert loop and its fused
-    # MoE path, the one expert parallelism runs on.
+    # Under the default ``dsa_attention_implementation=eager``, GLM-MoE-DSA folds
+    # its DSA top-k selection into the attention mask, which only ``eager`` /
+    # ``sdpa`` support; flash attention would discard it and raises. Compare HF
+    # eager against VeOmni's eager expert loop and its fused MoE path, the one
+    # expert parallelism runs on.
     if case_id == "glm_moe_dsa":
         hf_model_modes = [ModelMode("hf", "eager")]
         moe_impl = "fused_npu" if get_device_type() == "npu" else "fused_triton"
