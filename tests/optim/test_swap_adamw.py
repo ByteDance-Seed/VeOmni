@@ -295,3 +295,100 @@ def test_state_dict_load_state_dict_round_trip(cpu_mesh):
     # The loaded step must be owned by ``dst``, not aliased from the checkpoint's
     # state dict: ``_bump_step`` mutates it in place, so an alias would bump ``src``.
     assert dst.state[dst_param]["step"] is not src.state[src_param]["step"]
+
+
+# ---------------------------------------------------------------------------
+# rewrap_dtensor_local (veomni.utils.dtensor_utils)
+# ---------------------------------------------------------------------------
+
+
+def test_rewrap_dtensor_local_same_device(cpu_mesh):
+    from veomni.utils.dtensor_utils import rewrap_dtensor_local
+
+    local = torch.arange(8.0)
+    dt = rewrap_dtensor_local(local, mesh=cpu_mesh, placements=[Shard(0)])
+    assert isinstance(dt, DTensor)
+    assert dt.to_local().device.type == "cpu"
+    assert tuple(dt.shape) == (8,)  # one-rank mesh -> global == local
+    assert dt.placements == (Shard(0),)
+
+
+def test_rewrap_dtensor_local_infers_global_shape(cpu_mesh):
+    from veomni.utils.dtensor_utils import rewrap_dtensor_local
+
+    local = torch.arange(6.0)
+    inferred = rewrap_dtensor_local(local, mesh=cpu_mesh, placements=[Shard(0)])
+    explicit = rewrap_dtensor_local(local, mesh=cpu_mesh, placements=[Shard(0)], shape=torch.Size([6]), stride=(1,))
+    assert inferred.shape == explicit.shape == torch.Size([6])
+    assert inferred.stride() == explicit.stride() == (1,)
+
+
+def test_rewrap_dtensor_local_does_not_move_mismatched_local(cpu_mesh):
+    """A local that is not on the mesh's device takes the direct-construction
+    branch (no ``from_local`` device copy), so it stays where it is."""
+    from veomni.utils.dtensor_utils import rewrap_dtensor_local
+
+    local = torch.empty(5, device="meta")
+    dt = rewrap_dtensor_local(local, mesh=cpu_mesh, placements=[Shard(0)])
+    assert isinstance(dt, DTensor)
+    assert dt.to_local().device.type == "meta"
+    assert tuple(dt.shape) == (5,)
+
+
+def test_async_save_snapshots_state_before_later_steps(cpu_mesh, tmp_path):
+    """``dcp.async_save`` must capture the state at the save call, not at write time.
+
+    ``_bind_host_states`` hands DCP the *live* host buffers. That is safe because
+    torch's ``FileSystemWriter`` is a ``BlockingAsyncStager``: it deep-copies the
+    state dict synchronously on the calling thread before the background write
+    starts, so steps taken after ``async_save`` returns cannot tear the
+    checkpoint. This test pins that invariant: it fails if staging ever becomes
+    asynchronous.
+    """
+    from types import SimpleNamespace
+
+    import torch.distributed.checkpoint as dcp
+
+    from veomni.checkpoint.dcp_checkpointer import OptimizerState
+
+    torch.manual_seed(9)
+    parallel_state = SimpleNamespace(dp_mode="fsdp2")
+    model = nn.Linear(4, 4)
+    opt = SwapAdamW(list(model.parameters()), lr=1e-2, pin_memory=False)
+
+    def step(seed: int) -> None:
+        torch.manual_seed(seed)
+        for param in model.parameters():
+            param.grad = torch.randn_like(param)
+        opt.step()
+
+    step(0)
+    step(1)
+    future = dcp.async_save(
+        state_dict={"optimizer": OptimizerState(model, opt, parallel_state=parallel_state)},
+        checkpoint_id=tmp_path,
+    )
+    # The staging copy ran inside async_save, so this captures exactly the saved state.
+    snapshot = {
+        param: {key: tensor.clone() for key, tensor in state.items()} for param, state in opt._host_states.items()
+    }
+    snapshot_steps = {param: int(opt.state[param]["step"]) for param in snapshot}
+
+    step(2)  # Keep training: mutates the live host buffers while the write runs.
+    step(3)
+    future.result()
+
+    dst_model = nn.Linear(4, 4)
+    dst_opt = SwapAdamW(list(dst_model.parameters()), lr=1e-2, pin_memory=False)
+    dcp.load(
+        {"optimizer": OptimizerState(dst_model, dst_opt, parallel_state=parallel_state, load=True)},
+        checkpoint_id=tmp_path,
+    )
+    for src_param, dst_param in zip(model.parameters(), dst_model.parameters()):
+        assert int(dst_opt.state[dst_param]["step"]) == snapshot_steps[src_param]
+        for key in ("exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(
+                dst_opt._host_states[dst_param][key], snapshot[src_param][key], atol=0.0, rtol=0.0
+            )
+            # The live buffers moved past the snapshot, so the match above is meaningful.
+            assert not torch.equal(snapshot[src_param][key], opt._host_states[src_param][key])
