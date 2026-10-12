@@ -413,8 +413,6 @@ def npu_sparse_flash_mla(
     packed_sequence_slices=None,
 ) -> torch.Tensor:
     """Sparse shared-KV attention with BSND and packed TND dispatch."""
-    if _custom_ops() is None:
-        raise ImportError("cann_ops_transformer is required for NPU sparse FlashMLA.")
     if cmp_ratio == 0:
         cmp_ratio = 1
     batch, seq_len, _, head_dim = q.shape
@@ -436,6 +434,8 @@ def npu_sparse_flash_mla(
             )
     else:
         indices = None
+    if _custom_ops() is None:
+        raise ImportError("cann_ops_transformer is required for NPU sparse FlashMLA.")
 
     use_tnd = packed_sequence_slices is not None and len(packed_sequence_slices) > 1
     if use_tnd:
