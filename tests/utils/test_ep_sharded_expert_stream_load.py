@@ -22,6 +22,7 @@ The all-per-expert trunk case covers the Qwen3-MoE, DeepSeek-V3 and
 Qwen3-Omni-MoE checkpoint layouts.
 """
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -474,3 +475,74 @@ def test_deepseek_v4_fp8_weights_and_scales_stream_with_their_owner(monkeypatch,
     assert {k for k in read_keys if ".ffn.experts." in k} == {
         f"layers.0.ffn.experts.{e}.{proj}.{part}" for e in local for proj in scales for part in ("weight", "scale")
     }
+
+
+def _save_split_by_suffix(path: Path, state: dict, scales_first: bool) -> None:
+    """Write ``.scale`` tensors and everything else to two shards, scales in the first one or the last one."""
+    scales = {k: v for k, v in state.items() if k.endswith(".scale")}
+    rest = {k: v for k, v in state.items() if not k.endswith(".scale")}
+    first, second = (scales, rest) if scales_first else (rest, scales)
+    path.mkdir(parents=True, exist_ok=True)
+    weight_map = {}
+    for i, shard in enumerate((first, second), start=1):
+        fname = f"model-0000{i}-of-00002.safetensors"
+        save_file(shard, str(path / fname))
+        weight_map.update(dict.fromkeys(shard, fname))
+    (path / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}))
+
+
+@pytest.mark.parametrize("ep_rank", range(EP_SIZE))
+@pytest.mark.parametrize("scales_first", (True, False), ids=("scales_first", "scales_last"))
+@pytest.mark.parametrize(
+    "q_a_stem", ("layers.0.attn.wq_a", "model.layers.0.self_attn.q_a_proj"), ids=("raw_dense", "hf_named_dense")
+)
+def test_deepseek_v4_fp8_pairs_split_across_shards(monkeypatch, tmp_path, ep_rank, scales_first, q_a_stem):
+    """Weight and scale may sit in different shards, in either order. An HF-named FP8
+    dense weight is claimed only by dtype (``can_handle_tensor``), not by name."""
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if fp8_dtype is None:
+        pytest.skip("torch.float8_e4m3fn is unavailable")
+
+    state = {
+        "head.weight": torch.full((5, HIDDEN), 0.25),
+        f"{q_a_stem}.weight": torch.full((Q_A_DIM, HIDDEN), 1.5).to(fp8_dtype),
+        f"{q_a_stem}.scale": torch.tensor([[5.0]]),
+    }
+    for expert in range(NUM_EXPERTS):
+        for proj, shape in _DSV4_EXPERT_SHAPES:
+            stem = f"layers.0.ffn.experts.{expert}.{proj}"
+            state[f"{stem}.weight"] = torch.full(shape, float(expert + 1)).to(fp8_dtype)
+            state[f"{stem}.scale"] = torch.tensor([[2.0]])
+    _save_split_by_suffix(tmp_path, state, scales_first)
+
+    with torch.device("meta"):
+        model = _DeepseekV4StreamModel()
+    _load_as_rank(monkeypatch, tmp_path, ep_rank, model)
+
+    experts = model.model.layers[0].mlp.experts
+    for row, e in enumerate(_dsv4_local_experts(ep_rank)):
+        torch.testing.assert_close(experts.down_proj.data[row], torch.full((HIDDEN, INTERMEDIATE), 2.0 * (e + 1)))
+    q_a = model.model.layers[0].self_attn.q_a_proj.weight.data
+    torch.testing.assert_close(q_a, torch.full((Q_A_DIM, HIDDEN), 7.5), atol=0, rtol=0)
+
+
+def test_deepseek_v4_orphan_scale_loads_like_the_whole_tensor_loader(monkeypatch, tmp_path):
+    """A dequantized BF16 weight whose ``.scale`` stayed behind: the converter returns the
+    scale at ``finalize``, which is dropped as unexpected rather than failing the load."""
+    q_a = torch.full((Q_A_DIM, HIDDEN), 1.5)
+    state = {
+        "head.weight": torch.full((5, HIDDEN), 0.25),
+        "layers.0.attn.wq_a.weight": q_a,
+        "layers.0.attn.wq_a.scale": torch.tensor([[5.0]]),
+    }
+    for expert in range(NUM_EXPERTS):
+        for proj, shape in _DSV4_EXPERT_SHAPES:
+            state[f"layers.0.ffn.experts.{expert}.{proj}.weight"] = torch.zeros(shape)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    save_file(state, str(tmp_path / "model.safetensors"))
+
+    with torch.device("meta"):
+        model = _DeepseekV4StreamModel()
+    _load_as_rank(monkeypatch, tmp_path, 0, model)
+
+    torch.testing.assert_close(model.model.layers[0].self_attn.q_a_proj.weight.data, q_a, atol=0, rtol=0)
