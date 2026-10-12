@@ -287,6 +287,49 @@ KERNEL_REGISTRY.register(
 )
 
 
+def _make_moe_experts_situ_adapter(raw_forward):
+    """Adapt the situ fused MoE kernel to the OpSlot call signature.
+
+    Reads the SituGLU ``beta`` / ``linear_beta`` off the experts module's
+    ``act_fn`` (the HF ``SituAndMul`` module stores both as attributes).
+    """
+
+    def adapter(self, hidden_states, top_k_index, top_k_weights):
+        act = self.act_fn
+        return raw_forward(
+            num_experts=self.num_experts,
+            routing_weights=top_k_weights.to(hidden_states.dtype),
+            selected_experts=top_k_index,
+            hidden_states=hidden_states,
+            fc1_1_weight=None,
+            fc1_2_weight=None,
+            fc2_weight=self.down_proj,
+            fc1_1_2_weight=self.gate_up_proj,
+            beta=getattr(act, "beta", 1.0),
+            linear_beta=getattr(act, "linear_beta", None),
+        )
+
+    return adapter
+
+
+def _npu_situ_kernel_factory():
+    from .npu_situ_gemm import npu_situ_fused_moe_forward
+
+    return _make_moe_experts_situ_adapter(npu_situ_fused_moe_forward)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu",
+        op_name="moe_experts",
+        variant="kimi_k3",
+        factory=_npu_situ_kernel_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="NPU group-gemm situ fused MoE forward (Kimi-K3 SituGLU experts, EP-aware)",
+    )
+)
+
+
 def _mlu_kernel_factory():
     from .mlu_group_gemm import mlu_group_gemm_fused_moe_forward
 
