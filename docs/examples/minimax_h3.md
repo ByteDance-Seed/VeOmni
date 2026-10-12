@@ -379,3 +379,256 @@ video, audio = pipe(
 **Important**:
 
 - `num_frames` must satisfy `(N-5) % 17 == 0`, otherwise the Video VAE raises an error
+
+## Prepared Ref2VA with CFG-aware LoRA
+
+Use [minimax_h3_ref2va_cfg_offline.yaml](../../configs/dit/minimax_h3_ref2va_cfg_offline.yaml)
+with a compatible Ref2VA checkpoint and prepared visual-reference caches.
+It uses the existing `DiTTrainer`, native LoRA, FSDP2 and model-owned packing.
+It does **not** add raw-reference encoding, audio-reference support or a
+Training Adapter downloader. A training/de-distillation adapter is separate from
+the trainable LoRA; this recipe does not load one implicitly.
+
+```text
+Prepared video/audio latents + paired conditions
+                         |
+            Shared timestep and noise
+                /                 \
+Negative layout                   Positive layout
+(same targets and visual anchors)       |
+        |                               |
+Current DiT (no gradient)       Current DiT (gradient enabled)
+                \                 /
+                CFG-aware FM objective
+                         |
+          Existing trainer and optimizer
+```
+
+### Cache contract
+
+The existing `dit_offline` transform deserializes **every column** using Python
+pickle. Only load trusted caches. The following table describes the decoded
+objects, not a new byte-storage schema or a direct Magnus-table reader.
+
+| Field | Decoded value | Purpose |
+| --- | --- | --- |
+| `input_latents` | Float tensor `[1,24,T,H,W]` | Clean video target |
+| `audio_input_latents` | Float tensor `[C,32,Ta]` | Clean audio target |
+| `prompt_embeds` | Float tensor `[L,D]` | Conditional Qwen representation |
+| `packed` | Dictionary from `build_packed_ref2va` | Conditional positions and segment bounds |
+| `ref_visual_anchor` | Float tensor `[cond_rows,96]` | Prepared reference image/video rows |
+| `has_audio` | Boolean | Set false for placeholder audio; its loss is zero |
+| `unconditional_prompt_embeds` | Float tensor `[Lu,D]` | Required per sample when CFG calibration is enabled |
+| `unconditional_packed` | Dictionary from the same layout builder | Required with the negative embedding; uses `Lu` and its own text token tags |
+
+The negative condition is independently encoded for each sample. By default, it
+retains the same reference visual context in the Qwen representation. It cannot derive those
+embeddings by truncating or zeroing the conditional embedding. Both packed
+layouts must have identical target/reference geometry, reference order and
+compact `[text | cond | audio | video]` structure. Text lengths may differ.
+Use the same source references and compatible encoder checkpoint for both caches;
+structural checks cannot prove that two embeddings have the same semantic origin.
+
+The default negative prompt is exactly `" "` (**one space**, not `""`), matching
+native inference. Tokenization uses `add_special_tokens=False`, so an empty
+string has no automatically inserted prompt tokens; the Ref2VA presentation
+also rejects an empty string. A single space provides a nonempty placeholder
+without a descriptive caption. This is an encoding convention, not a
+mathematical requirement of CFG.
+
+Use the same FL2VA/Ref2VA presentation, encoder checkpoint, resized keyframes or
+prepared reference blocks as the conditional cache, including reference order
+and video timestamps. This is the default negative policy and matches the
+repository's optional two-pass inference CFG. It does not establish the original
+model's distillation procedure or guarantee quality preservation.
+
+#### Rationale and experimental scope
+
+H3 is CFG-distilled: its conditional prediction already incorporates learned
+guidance. CFG calibration uses a detached negative prediction from the current
+model to transform the conditional prediction before applying flow-matching
+supervision. The content of that negative condition therefore determines the
+guidance direction being calibrated; it is not an arbitrary placeholder. This
+training objective may mitigate loss of distilled guidance during fine-tuning,
+but does not guarantee that it will prevent quality degradation.
+
+Keeping the Qwen visual context makes the positive and negative conditions differ
+primarily in their text prompt. This is the compatibility default because it
+follows VeOmni's existing negative-condition construction. It is not evidence
+that H3's original distillation used exactly this condition-dropping policy.
+Likewise, single-pass inference from a distilled model does not reveal how its
+teacher constructed negative conditions during training.
+
+For controlled experiments, `drop_visual=True` generates a text-only Qwen
+negative instead. It drops both the caption and Qwen-side visual information,
+but **preserves DiT reference latent anchors**; it is not fully unconditional.
+The contrast now includes differences in Qwen visual-semantic context as well
+as text. This is a different guidance direction, not an equivalent or merely
+cheaper implementation of the default. As a related community precedent,
+[AI Toolkit's static-prompt encoder](https://github.com/ostris/ai-toolkit/blob/2fde764876d096f7bee8b5f5bd137b43aeee773a/extensions_built_in/sd_trainer/SDTrainer.py#L143-L151)
+first encodes without per-sample control images, with a blank-control fallback
+for models that require images. This motivates an experimental option, not a
+claim that the two training implementations are equivalent.
+
+Limited internal experiments observed better quality stability with
+Qwen-visual-free negatives in some runs. Dataset coverage, training horizons,
+and evaluation coverage were limited, so these observations are preliminary
+and do not establish a generally superior policy. The option remains opt-in.
+The policy is chosen when generating paired caches, not by overriding a
+training flag on an existing dataset. Both policies share the same paired-cache
+schema and CFG-calibrated loss, without a separate shared-embedding loader.
+
+Further controlled experiments are planned with matched data, initialization,
+and training hyperparameters. Evaluation will compare prompt adherence,
+reference fidelity, temporal stability, and quality degradation across multiple
+checkpoints. Results can inform future recommendations; these quality studies
+are separate from distributed correctness smoke tests and are not prerequisites
+for this implementation.
+
+### Generate unconditional caches
+
+The condition model's `add_unconditional_cache` helper reuses native inference's
+Qwen presentation and encoding code. Run it while preparing the dataset,
+using the already-loaded condition model in evaluation mode with its Qwen
+encoder on the desired device. No DiT or VAE forward is needed for this call.
+The new fields contain CPU tensors; the original sample and latent anchors are
+preserved.
+
+```python
+# `condition_model` is the encoder-loaded MiniMaxH3ConditionModel used to
+# produce the conditional caches (skip_encoder_load=False).
+condition_model.eval()
+
+# Per-sample Ref2VA cache. `sample` is the decoded CPU sample from the table
+# above; refs are its original prepared reference blocks, in the same order.
+# An image block contains kind="image", prepared_image=<resized PIL image>.
+# A visual-video block contains kind="video", prepared_frames=<24 FPS frames>,
+# ref_audio_t=0. Use the same preparation as for the positive cache.
+sample_with_negative = condition_model.add_unconditional_cache(
+    sample, negative_prompt=" ", ref_blocks=refs
+)
+
+# For FL2VA, instead supply the original resized keyframe images:
+fl2va_with_negative = condition_model.add_unconditional_cache(
+    fl2va_sample, negative_prompt=" ", keyframe_images=keyframe_images
+)
+
+# Experimental text-only Qwen negative, supported for both FL2VA and Ref2VA.
+# No source images/frames are needed; the sample's DiT latent anchors remain.
+text_only_negative = condition_model.add_unconditional_cache(
+    sample, negative_prompt=" ", drop_visual=True
+)
+# Save each augmented sample using the existing OfflineEmbeddingSaver.save().
+```
+
+`add_unconditional_cache` writes `unconditional_prompt_embeds` and
+`unconditional_packed`. It rebuilds the Qwen prefix length/tags and shifts the
+target/reference positions consistently. It cannot recover original references
+from a conditional embedding; keep the prepared source images/frames available
+during dataset creation for the default policy. Reference audio is not supported
+by this recipe. Neither policy infers negatives by truncating positive embeddings.
+
+The text-only experiment has precedent in AI Toolkit's
+[cached unconditional prompt construction](https://github.com/ostris/ai-toolkit/blob/2fde764876d096f7bee8b5f5bd137b43aeee773a/extensions_built_in/sd_trainer/SDTrainer.py).
+Released H3 inference in
+[AI Toolkit](https://github.com/ostris/ai-toolkit/blob/2fde764876d096f7bee8b5f5bd137b43aeee773a/extensions_built_in/diffusion_models/minimax_h3/src/pipeline.py)
+and [vLLM-Omni](https://github.com/vllm-project/vllm-omni/blob/4c5541cfc17143f80bdb89bbb7a5840b08bb52c6/vllm_omni/diffusion/models/minimax_h3/pipeline_minimax_h3.py)
+uses the CFG-distilled single-pass path. This absence of an inference negative
+branch does **not** identify the negative-conditioning policy of the original
+distillation teacher.
+
+### CFG-calibrated FM and loss settings
+
+Let `p` and `u` be conditional and detached unconditional FM velocities from the
+**same current model**, including its trainable LoRA, and `y = noise - clean`.
+The negative pass runs first under `no_grad`; it is not a frozen-base teacher.
+
+There is one objective, with a configurable curvature exponent `k`:
+
+```text
+p_calibrated = (p + (s - 1) * stopgrad(u)) / s
+loss = s ** (2 - k) * MSE(p_calibrated, y)
+```
+
+| `training_cfg_curvature_power` | Relative conditional curvature | At `s=4` |
+| --- | --- | --- |
+| `2.0` (default) | `1/s²` | `1/16` |
+| `1.0` | `1/s` | `1/4` |
+| `0.0` | `1` | `1` |
+
+Any finite value in `[0, 2]` is supported. CFG-calibrated FM is a descriptive
+name for the existing CFG-aware transformation, not a novel algorithm: `k=2`
+is the inverse-CFG formula and `k=0` is algebraically equivalent to
+`MSE(p, s*y - (s-1)*stopgrad(u))` (the target-guidance form).
+The optimum is unchanged for fixed `u` and `s`, but the gradient scale changes.
+With sigma-dependent scales this also reweights different samples/modalities;
+it cannot in general be replaced by a single learning-rate change. Loss values
+are not directly comparable across curvature settings, and this objective does
+not guarantee preservation of generation quality.
+
+This objective distills guidance into the conditional prediction. At inference,
+the default `cfg_scale=1` uses that prediction directly; applying additional
+inference-time CFG can compound the guidance and should be validated separately.
+
+`sigma = 1 - t` is the effective noise level from the existing scheduler. With
+`training_cfg_schedule: sigma`, video and audio use their respective sigmas:
+`s = 1 + (training_cfg_scale - 1) * sigma`. For a configured scale of `4`,
+`sigma=0.1` gives `s=1.3`, while `sigma=0.9` gives `s=3.7`. This concentrates
+stronger CFG calibration at high noise and leaves low-noise examples closer to
+ordinary FM, giving them more room to learn from new data. `constant` instead
+applies the configured scale at every noise level, equally to video and audio,
+and is the default in the example recipe.
+
+The existing shifts strongly favor high sigma. Enumerating all 1,000 scheduler
+indices at scale `4`, before model-dtype rounding, gives:
+
+| Modality / shift | Mean scale | Median scale | Scale > 3 | Scale < 2 |
+| --- | ---: | ---: | ---: | ---: |
+| Video / 12 | 3.53 | 3.77 | 85.8% | 3.9% |
+| Audio / 3 | 3.03 | 3.25 | 60.0% | 14.2% |
+
+Therefore sigma scheduling gives relatively little low-noise relief for video
+with the shipped shifts. Separate modality scales are an **opt-in training
+heuristic** based on their effective corruption levels, not a reconstruction
+of a known original distillation scale. Native inference applies a single CFG
+scale to both modalities. A quality ablation is needed to establish whether
+per-modality scheduling helps; the formula alone does not show this. Neither
+schedule changes the noise sampling distribution or guarantees quality.
+
+| Condition config key | Default | Meaning |
+| --- | --- | --- |
+| `training_cfg_scale` | `1.0` | Scale one disables the extra branch and preserves upstream RNG/loss behavior |
+| `training_cfg_schedule` | `constant` | `constant` uses the configured scale everywhere; `sigma` varies it with each modality's effective noise level |
+| `training_cfg_curvature_power` | `2.0` | Curvature exponent `k` in `[0,2]`; relative curvature `1/s**k` |
+
+Noise sampling is unchanged from upstream: a uniform scheduler index is shared
+by video and audio, with their respective existing shifts. Existing scheduler
+weights are retained; no additional sigma-bin weights are applied.
+No mixed raw-FM objective, stochastic CFG gate, step warmup or drift anchor is
+silently enabled by this configuration.
+
+### Validation boundary
+
+`add_unconditional_cache` runs full value validation on CPU before returning
+the sample: negative embedding finiteness, compact positions, modality tags
+and matching target/reference coordinates. Custom cache producers must call
+`validate_unconditional(positive_packed, negative_packed, negative_embedding,
+positive_embedding)` from `minimax_h3_core.cfg_conditioning` before saving each
+sample. Values are not re-scanned every epoch; caches must remain unchanged
+after validation. Training does not filter or repair NaN embeddings.
+
+At training time, H3 checks only tensor shapes, modality row counts and scalar
+geometry. These metadata checks do not read tensor values and work after the
+ordinary device transfer. Remapping reuses the positive branch's noise,
+reference rows and unique timesteps. No validation markers or shared
+`DiTTrainer` changes are required.
+
+CPU tiny-model tests cover the objective gradients, paired noise, reference
+geometry, cached embeddings, checkpoint recomputation and packed/serial loss
+equivalence. The accelerator sync test covers CFG disabled and paired CFG inputs;
+running that test requires a GPU. Existing H3 packing restrictions remain, including no multi-sample
+checkpoint offload. The [four-GPU smoke test report](minimax_h3_smoke_test.md)
+records forward loss parity and parameter updates for SP1/SP2, together with
+an unresolved SP2 raw-gradient scaling discrepancy. It is not a full numerical
+equivalence or production-quality validation. Pretrained quality and throughput
+still require dedicated evaluation.
