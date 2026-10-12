@@ -143,7 +143,7 @@ Checkpointing is split three ways; `OmniTrainer` uses the same `CheckpointCallba
 
 Only this model's lr_scheduler travels with the DCP write (the checkpointer pickles `state_dict` into a single `model/lr_scheduler.pt`; rank 0 writes, every rank reads). Weights and optimizer are two DCP directories (`model/ckpt/`, `model/optimizer/`). Job-level state — the dataloader cursor, the rng, the meters — belongs to `GlobalStateCallback` (`veomni/trainer/callbacks/global_state_callback.py`) as `loader/rank_{N}.pt` and `extra_state/rank_{N}.pt`, because with several models in one job there is one such record but N model checkpoints. That callback also writes the step's `checkpoint_manifest.json`. VeOmni 0.1.12 `extra_state/` resume is `veomni/checkpoint/legacy_v0_1_12.py` (delete that file to drop it). On-disk layout: `docs/usage/checkpoint.md`.
 
-Those cursor files are written **per rank**, where V2 writes a single rank-0 `trainer_state.pt`. The cursor is rank-local by construction: iterable datasets are `split_dataset_by_node`-sharded on `dp_rank` (`veomni/data/dataset.py:1509`), the multisource sampler filters on `_global_sample_idx % dp_size == dp_rank` (`:596`), and Energon takes `dp_rank` in its `WorkerConfig` (`:1645`). Restoring one rank's cursor everywhere makes every rank resume on rank 0's shard — replaying that slice and skipping the rest. Only the map-style path is rank-agnostic, which is why the single-file version looks correct until an iterable dataset resumes.
+Those cursor files are written **per rank**, where V2 writes a single rank-0 `trainer_state.pt`. The cursor is rank-local by construction (all in `veomni/data/dataset.py`): `_shard_iterable` wraps iterable datasets in a `ShardedIterableDataset` on `dp_rank`, `WeightedMultiSourceDataset.__iter__` filters on `_global_sample_idx % dp_size == dp_rank`, and `build_energon_dataset` passes `dp_rank` to its `WorkerConfig`. Restoring one rank's cursor everywhere makes every rank resume on rank 0's shard — replaying that slice and skipping the rest. Only the map-style path is rank-agnostic, which is why the single-file version looks correct until an iterable dataset resumes.
 
 `BaseTrainer` adds the job-bound half:
 - `_build_dataloader()` -> data pipeline setup
@@ -257,7 +257,9 @@ configs/
 ```
 tests/
 ├── models/  Kernel-aware model loading, integration, and helper tests
-├── kernels/        Registry contracts and per-family kernel tests
+├── ops/            Op registry contracts and per-family kernel tests
+├── arguments/      Argument parsing and ops_implementation alias tests
+├── seed_omni/      SeedOmni graph, runtime, trainer and e2e tests
 ├── data/           Data pipeline, collator, transform tests
 ├── parallel/       Distributed parallelism tests (ulysses, data balance)
 ├── distributed/    dummy forward, torch.compile, FSDP equivalence, grad ckpt
