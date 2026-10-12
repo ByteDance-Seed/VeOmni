@@ -147,8 +147,7 @@ DeepSeek-V4 selects these kernels with `dsa_indexer_implementation: tilelang` an
 `dsa_attention_implementation: tilelang`. Both default to `eager`; unsupported
 cache, position, or dropout layouts retain the upstream eager implementation.
 On AMD GPUs, `dsa_attention_implementation: triton` selects the same sparse
-attention backed by AMD-AGI/Primus' Triton sparse-MLA kernels, which are
-imported lazily and need the Primus source tree on `PYTHONPATH`.
+attention backed by Triton sparse-MLA kernels adapted from AMD-AGI/Primus.
 DeepSeek V4 selects the mHC adapters with `mhc_implementation: tilelang`; once
 selected, unsupported dtype, layout, or hardware raises instead of falling
 back to eager.

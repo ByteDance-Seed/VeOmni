@@ -177,10 +177,9 @@ and DeepSeek V4's `hc_mult=4` layout.
 
 On AMD GPUs, `dsa_attention_implementation: triton` is the counterpart to the
 TileLang sparse attention: same compact index list, same dispatch conditions,
-backed by Triton sparse-MLA kernels that currently ship in Primus (put its
-source tree on `PYTHONPATH`; it is imported lazily). The indexer loss and the
-mask-free packed path remain `tilelang`-only, and the indexer and mHC have no
-AMD backend yet, so leave those two on `eager`:
+backed by Triton sparse-MLA kernels adapted from AMD-AGI/Primus. The indexer
+loss and the mask-free packed path remain `tilelang`-only, and the indexer and
+mHC have no AMD backend yet, so leave those two on `eager`:
 
 ```yaml
 model:

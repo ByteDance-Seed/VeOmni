@@ -12,18 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Adapted from AMD-AGI/Primus (v4_sparse_mla_adapter.py, MIT License); modified for VeOmni.
+# Portions of this file are adapted from AMD-AGI/Primus under the following license:
+#
+# Copyright © 2025 Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# Adapted from AMD-AGI/Primus (v4_sparse_mla_adapter.py); modified for VeOmni.
 
-"""DeepSeek-V4 sparse MQA on AMD GPUs via Primus' Triton sparse-MLA kernels.
+"""DeepSeek-V4 sparse MQA on AMD GPUs via Triton sparse-MLA kernels.
 
-Same interface as ``tilelang_sparse_mla.sparse_attn_tilelang``. The kernels take
-one flat KV pool and a token-major index list, so this module appends a zero
-rope block, rebases per-sample indices onto the pool and pads ``topk``.
+Same interface as ``tilelang_sparse_mla.sparse_attn_tilelang``. The kernels in
+``triton_sparse_mla_fwd`` / ``triton_sparse_mla_bwd`` take one flat KV pool and a
+token-major index list, so this module appends a zero rope block, rebases
+per-sample indices onto the pool and pads ``topk``.
 """
 
 from __future__ import annotations
-
-import os
 
 import torch
 
@@ -32,34 +55,21 @@ from ....utils.device import get_torch_device
 
 # The kernels need a nonzero rope block (``d_qk > kv_lora_rank``) but never read it.
 ROPE_PAD = 64
-# Primus' adapter pads topk to a multiple of 64 for backends with 64-wide dKV tiles.
+# topk is padded with -1 to a multiple of 64, the operand layout the kernels are validated on.
 TOPK_ALIGN = 64
-# The default backward schedule needs 160 KiB of LDS; these select the small-LDS one.
-_LDS_BUDGET_KNOBS = {"PRIMUS_DSA_BWD_NUM_STAGES": "1", "PRIMUS_DSA_DKV_SAFE": "1"}
+# The default backward schedule needs 160 KiB of LDS; at or below this, use the small-LDS one.
 _SMALL_LDS_BYTES = 64 * 1024
 
 
-def _apply_lds_budget(device: torch.device) -> None:
-    """Select the small-LDS backward schedule on 64 KiB-LDS devices; exported values win."""
+def _has_small_lds(device: torch.device) -> bool:
     properties = get_torch_device().get_device_properties(device)
-    if getattr(properties, "shared_memory_per_block", 0) > _SMALL_LDS_BYTES:
-        return
-    for name, value in _LDS_BUDGET_KNOBS.items():
-        os.environ.setdefault(name, value)
+    return getattr(properties, "shared_memory_per_block", 0) <= _SMALL_LDS_BYTES
 
 
 def _load_kernels():
-    try:
-        from primus.backends.megatron.core.transformer.v4_attention_kernels._triton_v2 import (
-            sparse_mla_bwd_v4_triton,
-            sparse_mla_fwd_v4_triton,
-        )
-    except ImportError as exc:
-        raise ImportError(
-            "dsa_attention_implementation='triton' could not import the DeepSeek-V4 sparse-MLA Triton "
-            "kernels from Primus (primus.backends.megatron.core.transformer.v4_attention_kernels._triton_v2): "
-            f"{exc}. Put the Primus source tree on PYTHONPATH."
-        ) from exc
+    from .triton_sparse_mla_bwd import sparse_mla_bwd_v4_triton
+    from .triton_sparse_mla_fwd import sparse_mla_fwd_v4_triton
+
     return sparse_mla_fwd_v4_triton, sparse_mla_bwd_v4_triton
 
 
@@ -91,7 +101,6 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
         batch, seq_len, num_heads, head_dim = q.shape
         kv_len = kv.shape[1]
         forward, backward = _load_kernels()
-        _apply_lds_budget(q.device)
 
         q_kernel = _pad_rope(q.reshape(batch * seq_len, num_heads, head_dim))
         kv_kernel = _pad_rope(kv.reshape(batch * kv_len, 1, head_dim))
@@ -102,6 +111,7 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
         )
         ctx.save_for_backward(q_kernel, kv_kernel, o, lse, pool_indices, attn_sink)
         ctx.backward_fn = backward
+        ctx.small_lds = _has_small_lds(q.device)
         ctx.shape = (batch, seq_len, num_heads, head_dim, kv_len)
         ctx.sm_scale = float(sm_scale)
         return o.reshape(batch, seq_len, num_heads, head_dim)
@@ -121,6 +131,7 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
             attn_sink=attn_sink,
             kv_lora_rank=head_dim,
             scale=ctx.sm_scale,
+            small_lds=ctx.small_lds,
         )
         dq = dq[..., :head_dim].reshape(batch, seq_len, num_heads, head_dim)
         dkv = dkv[:, 0, :head_dim].reshape(batch, kv_len, head_dim)

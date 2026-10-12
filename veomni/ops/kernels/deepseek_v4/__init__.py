@@ -14,10 +14,10 @@
 
 """DeepSeek V4 model-specific GPU kernels.
 
-The TileLang kernels are adapted from radixark/miles; the Triton sparse attention
-wraps AMD-AGI/Primus' sparse-MLA kernels. Imports stay inside the public wrappers
-because TileLang (NVIDIA SM90+) and Triton sparse-MLA (AMD MFMA) are optional,
-GPU-only dependencies. Importing VeOmni on CPU or NPU must not load either.
+The TileLang kernels are adapted from radixark/miles and the Triton sparse-MLA
+kernels from AMD-AGI/Primus. Imports stay inside the public wrappers because both
+are GPU-only (TileLang on NVIDIA SM90+, the Triton kernels on AMD ROCm). Importing
+VeOmni on CPU or NPU must not load either.
 """
 
 from typing import TYPE_CHECKING

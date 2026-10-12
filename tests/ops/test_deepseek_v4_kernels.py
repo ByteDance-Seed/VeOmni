@@ -39,35 +39,40 @@ def test_kernel_package_does_not_import_tilelang_eagerly():
 
 
 @pytest.mark.parametrize(
-    ("q_dtype", "sink_dtype", "match"),
-    [(torch.float32, torch.float32, "bfloat16"), (torch.bfloat16, torch.bfloat16, "float32")],
+    ("q_dtype", "kv_dtype", "sink_dtype", "match"),
+    [
+        (torch.float32, torch.bfloat16, torch.float32, "bfloat16"),
+        (torch.bfloat16, torch.float32, torch.float32, "bfloat16"),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, "float32"),
+    ],
 )
-def test_triton_sparse_mla_rejects_unsupported_dtypes(q_dtype, sink_dtype, match):
+def test_triton_sparse_mla_rejects_unsupported_dtypes(q_dtype, kv_dtype, sink_dtype, match):
     from veomni.ops.kernels.deepseek_v4.triton_sparse_mla import sparse_attn_triton
 
     q = torch.empty(1, 2, 4, 16, dtype=q_dtype)
-    kv = torch.empty(1, 2, 16, dtype=torch.bfloat16)
+    kv = torch.empty(1, 2, 16, dtype=kv_dtype)
     sink = torch.empty(4, dtype=sink_dtype)
 
     with pytest.raises(ValueError, match=match):
         sparse_attn_triton(q, kv, sink, torch.zeros(1, 2, 4, dtype=torch.int32))
 
 
-def test_triton_wrapper_rejects_non_rocm(monkeypatch):
+@pytest.mark.parametrize(("hip_version", "device_available"), [(None, True), ("7.14", False)])
+def test_triton_wrapper_rejects_unsupported_runtime(monkeypatch, hip_version, device_available):
     import veomni.ops.kernels.deepseek_v4 as kernels
 
-    monkeypatch.setattr(kernels.torch.version, "hip", None, raising=False)
-    monkeypatch.setattr(kernels, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(kernels.torch.version, "hip", hip_version, raising=False)
+    monkeypatch.setattr(kernels, "IS_CUDA_AVAILABLE", device_available)
 
     with pytest.raises(RuntimeError, match="AMD ROCm"):
         kernels.sparse_attn_triton(*(torch.empty(0),) * 4)
 
 
 def _flat_pool_sparse_mla_kernels():
-    """Torch stand-ins for the Primus kernels: ``q [T, H, d_qk]``, ``kv [N, 1, d_qk]``, indices ``[T, K]``.
+    """Torch stand-ins for the Triton kernels: ``q [T, H, d_qk]``, ``kv [N, 1, d_qk]``, indices ``[T, K]``.
 
-    The real backward leaves the rope block of ``dq``/``dkv`` uninitialized, so the
-    stand-in fills it with NaN.
+    The stand-in backward poisons the padded rope channels with NaN so an incorrect
+    gradient slice cannot pass silently.
     """
     from veomni.ops.kernels.deepseek_v4.triton_sparse_mla import ROPE_PAD, TOPK_ALIGN
 
@@ -82,7 +87,8 @@ def _flat_pool_sparse_mla_kernels():
         out = pool_attention(q, kv, indices, attn_sink, kv_lora_rank, scale)
         return out.to(q.dtype), q.new_zeros(q.shape[:2], dtype=torch.float32)
 
-    def backward(q, kv, o, grad, indices, lse, attn_sink, kv_lora_rank, scale):
+    def backward(q, kv, o, grad, indices, lse, attn_sink, kv_lora_rank, scale, small_lds):
+        assert small_lds is True
         with torch.enable_grad():
             leaves = [t.detach().float().requires_grad_() for t in (q, kv, attn_sink)]
             out = pool_attention(*leaves[:2], indices, leaves[2], kv_lora_rank, scale)
@@ -98,7 +104,7 @@ def test_triton_sparse_mla_wrapper_matches_reference_through_the_flat_pool(monke
     from veomni.ops.kernels.deepseek_v4 import triton_sparse_mla
 
     monkeypatch.setattr(triton_sparse_mla, "_load_kernels", _flat_pool_sparse_mla_kernels)
-    monkeypatch.setattr(triton_sparse_mla, "_apply_lds_budget", lambda device: None)
+    monkeypatch.setattr(triton_sparse_mla, "_has_small_lds", lambda device: True)
 
     torch.manual_seed(0)
     batch, seqlen, kv_len, heads, dim, topk = 2, 5, 7, 4, 16, 6
@@ -118,6 +124,49 @@ def test_triton_sparse_mla_wrapper_matches_reference_through_the_flat_pool(monke
     actual.backward(grad)
 
     torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
+    for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad.float(), expected_grad.float(), rtol=2e-2, atol=2e-2)
+
+
+def test_triton_sparse_mla_rank_chunk_caps_long_sequence_workspace():
+    from veomni.ops.kernels.deepseek_v4.triton_sparse_mla_bwd import (
+        _MAX_RANK_CHUNK_WORKSPACE_BYTES,
+        _rank_chunk_workspace_bytes,
+        _select_rank_chunk,
+    )
+
+    short_chunk = _select_rank_chunk(total_tokens=4096, num_heads=64, d_qk=576, topk=640)
+    assert short_chunk == 256
+
+    for total_tokens in (32768, 131072):
+        chunk = _select_rank_chunk(total_tokens, num_heads=64, d_qk=576, topk=640)
+        assert chunk > 0 and chunk & (chunk - 1) == 0
+        assert _rank_chunk_workspace_bytes(total_tokens, 64, 576, chunk) <= _MAX_RANK_CHUNK_WORKSPACE_BYTES
+
+
+def test_triton_sparse_attention_forward_backward_with_invalid_indices():
+    if torch.version.hip is None or not IS_CUDA_AVAILABLE:
+        pytest.skip("DeepSeek V4 Triton sparse attention requires an AMD ROCm GPU")
+    from veomni.ops.kernels.deepseek_v4 import sparse_attn_triton
+
+    torch.manual_seed(1)
+    batch, seqlen, heads, dim, kv_len, topk = 1, 32, 8, 512, 48, 65
+    q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    sinks = torch.randn(heads, device=DEVICE, requires_grad=True)
+    indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
+    indices[..., -6:-3] = -1
+    indices[..., -3:] = kv_len
+    scale = dim**-0.5
+
+    actual = sparse_attn_triton(q, kv, sinks, indices, scale)
+    expected = _sparse_attention_reference(q, kv, sinks, indices, scale)
+    torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
+
+    grad = torch.randn(batch, heads, seqlen, dim, device=DEVICE, dtype=actual.dtype).transpose(1, 2)
+    assert not grad.is_contiguous()
+    expected_grads = torch.autograd.grad((expected * grad.float()).sum(), (q, kv, sinks))
+    actual.backward(grad)
     for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
         torch.testing.assert_close(actual_grad.float(), expected_grad.float(), rtol=2e-2, atol=2e-2)
 
