@@ -383,6 +383,7 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | persistent_workers | `bool` | `False` | Keep DataLoader worker processes alive between iterator recreations. |
 | in_order | `bool` | `True` | Return worker-loaded batches in first-in, first-out order. Set `False` to avoid slow worker head-of-line blocking for uneven sample decode costs; checkpoint/resume ordering is not guaranteed in this mode. |
 | drop_last | `bool` | `True` | Whether to drop the last incomplete batch. |
+| shuffle | `bool` | `True` | Shuffle the training data. Mapping datasets shuffle the sampler order, reseeded from `train.seed` each epoch; iterable datasets shuffle through a streaming buffer. DiT `offline_embedding` forces `False`. |
 | pin_memory | `bool` | `True` | Whether to pin memory for the dataloader. |
 | worker_num_threads | `Optional[int]` | `None` | Number of PyTorch threads used by each DataLoader worker. |
 | use_background_prefetcher | `bool` | `False` | Enable background prefetching around the DataLoader. |
@@ -863,7 +864,6 @@ derived argument groups below.
 | --- | --- | --- | --- |
 | mm_configs | `Optional[Dict]` | `{}` | Multimodal input configuration. |
 | offline_embedding_save_dir | `Optional[str]` | `None` | Directory used to save offline embeddings. |
-| shuffle | `bool` | `True` | Shuffle the training dataset. |
 
 ### DiTTrainingArguments
 
