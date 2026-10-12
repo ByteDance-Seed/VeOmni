@@ -93,7 +93,7 @@ def test_dataloader_shuffle_reaches_sampler(monkeypatch, task, shuffle):
 
 
 @pytest.mark.parametrize("shuffle", [True, False])
-def test_dataloader_shuffle_reaches_dataset_builder(monkeypatch, shuffle):
+def test_dataloader_shuffle_reaches_base_trainer_builders(monkeypatch, shuffle):
     trainer = _trainer(monkeypatch, "offline_training", micro_batch_size=1, shuffle=shuffle)
     built = {}
 
@@ -105,6 +105,11 @@ def test_dataloader_shuffle_reaches_dataset_builder(monkeypatch, shuffle):
     base = SimpleNamespace(args=trainer.base.args, data_transform=None)
     BaseTrainer._build_dataset(base)
     assert built["shuffle"] is shuffle
+
+    base.train_dataset = [({"value": torch.ones(1)},) for _ in range(4)]
+    base.collate_fn = DiTDataCollator()
+    BaseTrainer._build_dataloader(base)
+    assert base.train_dataloader.sampler.shuffle is shuffle
 
 
 class _Condition:
