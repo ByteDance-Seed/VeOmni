@@ -30,6 +30,10 @@ def rms_norm_forward_npu(self, x):
 
 def standard_rms_norm_forward_npu(hidden_states, weight, eps):
     """NPU optimized implementation for RMSNorm."""
+    if hidden_states.dtype != weight.dtype:
+        # aclnnRmsNorm has no fp32-x + bf16-gamma (or vice versa) overload;
+        # align defensively (same policy as ``rms_norm_forward_npu`` above).
+        hidden_states = hidden_states.to(weight.dtype)
     return torch_npu.npu_rms_norm(hidden_states, weight, eps)[0]
 
 
