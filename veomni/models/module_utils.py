@@ -51,6 +51,7 @@ from .checkpoint_tensor_loading import (
     checkpoint_converter_is_dim0_zero_pad,
     checkpoint_converter_record_skip_without_loading,
     checkpoint_converter_should_skip_without_loading,
+    checkpoint_converter_supports_expert_streaming,
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
@@ -750,11 +751,15 @@ def load_model_weights_ep_sharded(
     # Per-expert -> fused stacking streams when the converter can name each key's fused
     # target and expert row (``fused_expert_target``) and build a converter restricted to
     # this rank's ``Shard(0)`` row range (``for_expert_range``): the rank then reads only
-    # its own experts and stacks exactly its local slice. Any other transform (reshape,
-    # dtype change, a converter without those capabilities) needs the whole tensor set,
-    # so raise before materialising anything.
+    # its own experts and stacks exactly its local slice.
+    #
+    # Converters that already advertise those capabilities may also claim non-expert keys
+    # (renames, FP8/FP4 weight+scale pairs). Those are streamed as whole tensors in the
+    # main loop. A converter that claims a key but lacks expert-streaming capabilities
+    # still needs the whole tensor set for every transform, so raise before materialising.
     expert_converter = None
     expert_range: Optional[Tuple[int, int]] = None
+    supports_expert_streaming = checkpoint_converter_supports_expert_streaming(converter)
     # Per-expert keys whose fused target the model does not build (e.g. a checkpoint's MTP
     # experts when MTP is off): unexpected keys, skipped without reading.
     unbuilt_expert_keys = set()
@@ -773,6 +778,9 @@ def load_model_weights_ep_sharded(
                 continue
             target = checkpoint_converter_fused_expert_target(converter, bare_name)
             if target is None:
+                if supports_expert_streaming:
+                    # Non-expert convert (rename / dequant); handled in the main loop.
+                    continue
                 raise NotImplementedError(
                     f"ep_sharded_stream_load: checkpoint-tensor converter "
                     f"{type(converter).__name__} needs a non-dim0-zero-pad transform for key "
@@ -874,6 +882,39 @@ def load_model_weights_ep_sharded(
                         parameter_names_to_load.discard(fused_name)
                         n_ep += 1
                     continue
+                # Whole-tensor converter path: renames and quantized weight+scale pairs that
+                # are not ExtraParallel. Must run before the unexpected-key skip so companion
+                # scale keys (absent from the model) are still fed to the converter. Only
+                # converters that already stream experts are allowed here; others were refused
+                # in the up-front scan.
+                if (
+                    converter is not None
+                    and supports_expert_streaming
+                    and converter.can_handle(bare_name)
+                    and not checkpoint_converter_is_dim0_zero_pad(converter, bare_name)
+                ):
+                    converted = maybe_convert_checkpoint_tensor(bare_name, f.get_tensor(raw_name), converter)
+                    if converted is None:
+                        continue
+                    dest = _apply_peft_override(converted.name)
+                    if parallel_plan._get_shard_parameter_groupname(dest) is not None:
+                        raise NotImplementedError(
+                            f"ep_sharded_stream_load: converter emitted ExtraParallel key '{dest}' from "
+                            f"non-expert source '{bare_name}'. Per-expert keys must go through "
+                            f"fused_expert_target / for_expert_range."
+                        )
+                    if dest in buffer_dict:
+                        buffer_dict[dest] = converted.tensor.clone()
+                        n_buf += 1
+                    elif dest in parameter_names_to_load:
+                        _dispatch_parameter(
+                            model, dest, converted.tensor, dtensor_factory, parallel_plan, dtensor_to_cpu
+                        )
+                        parameter_names_to_load.discard(dest)
+                        n_dense += 1
+                    else:
+                        logger.info_rank0(f"Unexpected key in state dict: {dest}.")
+                    continue
                 if name in buffer_dict:  # persistent buffers: read whole
                     buffer_dict[name] = f.get_tensor(raw_name).clone()
                     n_buf += 1
@@ -940,15 +981,30 @@ def load_model_weights_ep_sharded(
                     n_ep += 1
                 else:
                     if converter is not None and converter.can_handle(bare_name):
-                        # A streamable (dim-0 zero-pad) converter must only touch
-                        # ExtraParallel tables; a dense key would need its conversion
-                        # applied here, which this path does not do -> bail.
+                        # Claimed-by-name keys should have taken the whole-tensor
+                        # converter path above (or been refused in the up-front scan).
                         raise NotImplementedError(
                             f"ep_sharded_stream_load: converter handles non-ExtraParallel key '{name}'."
                         )
                     tensor = f.get_tensor(raw_name)
-                    _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
+                    # ``can_handle_tensor`` catches quantized dense weights whose names
+                    # do not change (e.g. DeepSeek-V4 FP8 attention): dequant needs the
+                    # tensor dtype, so the by-name path above cannot see them.
+                    converted = maybe_convert_checkpoint_tensor(bare_name, tensor, converter)
+                    if converted is None:
+                        continue
+                    dest = _apply_peft_override(converted.name)
+                    if dest != name and dest not in parameter_names_to_load and dest not in buffer_dict:
+                        logger.info_rank0(f"Unexpected key in state dict: {dest}.")
+                        continue
+                    if dest in buffer_dict:
+                        buffer_dict[dest] = converted.tensor.clone()
+                        n_buf += 1
+                        continue
+                    _dispatch_parameter(model, dest, converted.tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
+                    parameter_names_to_load.discard(dest)
                     n_dense += 1
+                    continue
                 parameter_names_to_load.discard(name)
         empty_cache()
 
