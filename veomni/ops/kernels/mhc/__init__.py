@@ -71,13 +71,13 @@ for variant, factory, description in (
 
 
 for variant, factory, description in (
-    ("pre", _mhc_pre_npu_factory, "Ascend fused DeepSeek V4 mHC pre/Sinkhorn/collapse"),
-    ("post", _mhc_post_npu_factory, "Ascend fused DeepSeek V4 mHC residual post-mix"),
-    ("head", _mhc_head_npu_factory, "DeepSeek V4 final mHC collapse on Ascend"),
+    ("pre", _mhc_pre_npu_factory, "Ascend CANN fused DeepSeek V4 mHC pre/Sinkhorn/collapse"),
+    ("post", _mhc_post_npu_factory, "Ascend CANN fused DeepSeek V4 mHC residual post-mix"),
+    ("head", _mhc_head_npu_factory, "DeepSeek V4 final mHC collapse by CANN on Ascend"),
 ):
     KERNEL_REGISTRY.register(
         KernelSpec(
-            name="npu",
+            name="cann",
             op_name="mhc",
             variant=variant,
             factory=factory,

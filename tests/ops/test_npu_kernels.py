@@ -565,7 +565,7 @@ class TestNPUAttentionDispatch:
         attention_mask = torch.zeros((1, 1, seq_len, seq_len), dtype=torch.bfloat16, device=DEVICE)
 
         try:
-            modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="npu"))
+            modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="cann"))
             attention(
                 hidden_states,
                 {attention.rope_layer_type: (cos, sin)},

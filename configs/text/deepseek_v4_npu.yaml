@@ -35,9 +35,9 @@ model:
     # pre/post kernels while keeping the final head collapse in eager PyTorch.
     # These explicit selections make this configuration NPU-specific; use the
     # GPU configuration (or override them) for CUDA runs.
-    dsa_indexer_implementation: npu
-    dsa_attention_implementation: npu
-    mhc_implementation: npu
+    dsa_indexer_implementation: cann
+    dsa_attention_implementation: cann
+    mhc_implementation: cann
   optimizer:
     type: adamw
     lr: 3.0e-4

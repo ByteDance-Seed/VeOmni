@@ -174,8 +174,8 @@ def test_npu_mhc_pre_forward_backward_matches_eager():
 
 
 @pytest.mark.parametrize("variant", ["pre", "post", "head"])
-def test_npu_mhc_registry_entries(variant):
-    assert "npu" in KERNEL_REGISTRY.list_available("mhc", variant)
+def test_cann_mhc_registry_entries(variant):
+    assert "cann" in KERNEL_REGISTRY.list_available("mhc", variant)
 
 
 @pytest.mark.parametrize("variant", ["pre", "post", "head"])

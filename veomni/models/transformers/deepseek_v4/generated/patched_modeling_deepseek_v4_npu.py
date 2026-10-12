@@ -1183,10 +1183,10 @@ class DeepseekV4Indexer(nn.Module):
 
         # --- Patch.1 ---
         indexer_implementation = veomni_dsa_indexer_implementation.value
-        if indexer_implementation not in {"eager", "npu", "tilelang"}:
+        if indexer_implementation not in {"eager", "cann", "tilelang"}:
             raise ValueError(
                 "DeepSeek-V4 does not support "
-                f"dsa_indexer_implementation={indexer_implementation!r}; expected 'eager', 'npu' or 'tilelang'"
+                f"dsa_indexer_implementation={indexer_implementation!r}; expected 'eager', 'cann' or 'tilelang'"
             )
         # A local query row ``i`` is global row ``query_offset + i``; off the context
         # parallel path ``query_offset`` is zero and this is the arange it always was.
@@ -1205,7 +1205,7 @@ class DeepseekV4Indexer(nn.Module):
             for start, end in packed_sequence_slices
         )
         use_npu = (
-            indexer_implementation == "npu"
+            indexer_implementation == "cann"
             and hidden_states.device.type == "npu"
             and cache_layer is None
             and not cp_enabled
@@ -1218,9 +1218,9 @@ class DeepseekV4Indexer(nn.Module):
                 else torch.equal(position_ids, canonical_positions)
             )
         )
-        if indexer_implementation == "npu" and not use_npu and compressed_len > 0:
+        if indexer_implementation == "cann" and not use_npu and compressed_len > 0:
             raise ValueError(
-                "dsa_indexer_implementation='npu' was requested outside the fused Lightning Indexer "
+                "dsa_indexer_implementation='cann' was requested outside the fused Lightning Indexer "
                 "contract (training/prefill, canonical packed positions, no SP/CP)"
             )
         if use_npu:
@@ -1561,14 +1561,14 @@ def eager_attention_forward(
 ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     # --- Patch.1 ---
     attention_implementation = veomni_dsa_attention_implementation.value
-    if attention_implementation not in {"eager", "npu", "tilelang"}:
+    if attention_implementation not in {"eager", "cann", "tilelang"}:
         raise ValueError(
             "DeepSeek-V4 does not support "
-            f"dsa_attention_implementation={attention_implementation!r}; expected 'eager', 'npu' or 'tilelang'"
+            f"dsa_attention_implementation={attention_implementation!r}; expected 'eager', 'cann' or 'tilelang'"
         )
     compressed_len = int(kwargs.get("npu_compressed_len", 0))
     use_npu = (
-        attention_implementation == "npu"
+        attention_implementation == "cann"
         and query.device.type == "npu"
         and query.dtype == torch.bfloat16
         and key.dtype == torch.bfloat16
@@ -1576,8 +1576,8 @@ def eager_attention_forward(
         and key.shape[1] == 1
         and compressed_len > 0
     )
-    if attention_implementation == "npu" and not use_npu and compressed_len > 0:
-        raise ValueError("dsa_attention_implementation='npu' requires BF16 NPU tensors, one KV head and dropout=0")
+    if attention_implementation == "cann" and not use_npu and compressed_len > 0:
+        raise ValueError("dsa_attention_implementation='cann' requires BF16 NPU tensors, one KV head and dropout=0")
     if use_npu:
         from veomni.ops.kernels.deepseek_v4.npu_sparse_flash_mla import npu_sparse_flash_mla
 
@@ -1899,7 +1899,7 @@ class DeepseekV4Attention(nn.Module):
             q.shape[0] == 1 and packed_sequence_slices[0][0] == 0 and packed_sequence_slices[-1][1] == seq_len
         )
         use_npu_sparse = (
-            veomni_dsa_attention_implementation.value == "npu"
+            veomni_dsa_attention_implementation.value == "cann"
             and past_key_values is None
             and q.device.type == "npu"
             and q.dtype == torch.bfloat16
