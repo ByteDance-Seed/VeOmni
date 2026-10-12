@@ -31,6 +31,10 @@ from veomni.models.checkpoint_tensor_loading import (
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
+from veomni.models.transformers.deepseek_v3.checkpoint_tensor_converter import (
+    DeepseekV3CheckpointTensorConverter,
+    create_deepseek_v3_checkpoint_tensor_converter,
+)
 from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
     DeepseekV4CheckpointTensorConverter,
     _dequantize_scaled_weight,
@@ -318,9 +322,16 @@ class TestQwen3MoeConverterFinalize:
             converter.finalize()
 
 
-class TestQwen3MoeConverterExpertRange:
-    def test_fused_expert_target_names_the_fused_param_and_expert_row(self):
-        converter = Qwen3MoeCheckpointTensorConverter(num_experts=4)
+_PER_EXPERT_CONVERTERS = pytest.mark.parametrize(
+    "converter_cls",
+    [Qwen3MoeCheckpointTensorConverter, Qwen3OmniMoeCheckpointTensorConverter, DeepseekV3CheckpointTensorConverter],
+)
+
+
+@_PER_EXPERT_CONVERTERS
+class TestPerExpertConverterExpertRange:
+    def test_fused_expert_target_names_the_fused_param_and_expert_row(self, converter_cls):
+        converter = converter_cls(num_experts=4)
         assert converter.fused_expert_target("model.layers.0.mlp.experts.3.up_proj.weight") == (
             "model.layers.0.mlp.experts.gate_up_proj",
             3,
@@ -331,8 +342,8 @@ class TestQwen3MoeConverterExpertRange:
         )
         assert converter.fused_expert_target("model.layers.0.mlp.experts.gate_up_proj") is None
 
-    def test_helper_requires_both_expert_streaming_capabilities(self):
-        converter = Qwen3MoeCheckpointTensorConverter(num_experts=4)
+    def test_helper_requires_both_expert_streaming_capabilities(self, converter_cls):
+        converter = converter_cls(num_experts=4)
         name = "model.layers.0.mlp.experts.3.up_proj.weight"
         assert checkpoint_converter_fused_expert_target(converter, name) == (
             "model.layers.0.mlp.experts.gate_up_proj",
@@ -346,8 +357,9 @@ class TestQwen3MoeConverterExpertRange:
         assert checkpoint_converter_fused_expert_target(_TargetOnly(), name) is None
         assert checkpoint_converter_fused_expert_target(None, name) is None
 
-    def test_range_converter_stacks_only_its_experts_as_local_rows(self):
-        local = Qwen3MoeCheckpointTensorConverter(num_experts=4).for_expert_range(2, 2)
+    def test_range_converter_stacks_only_its_experts_as_local_rows(self, converter_cls):
+        local = converter_cls(num_experts=4).for_expert_range(2, 2)
+        assert type(local) is converter_cls
         tensors = {expert: torch.full((1, 2), float(expert)) for expert in (2, 3)}
 
         assert local.convert("model.layers.0.mlp.experts.2.down_proj.weight", tensors[2]) is None
@@ -357,14 +369,26 @@ class TestQwen3MoeConverterExpertRange:
         torch.testing.assert_close(converted.tensor, torch.stack([tensors[2], tensors[3]]))
         assert local.finalize() == []
 
-    def test_range_converter_rejects_experts_outside_its_range(self):
-        local = Qwen3MoeCheckpointTensorConverter(num_experts=4).for_expert_range(2, 2)
+    def test_range_converter_rejects_experts_outside_its_range(self, converter_cls):
+        local = converter_cls(num_experts=4).for_expert_range(2, 2)
         with pytest.raises(ValueError, match="outside this converter's range"):
             local.convert("model.layers.0.mlp.experts.1.down_proj.weight", torch.zeros(1, 2))
 
-    def test_range_must_fit_in_the_converter(self):
+    def test_range_must_fit_in_the_converter(self, converter_cls):
         with pytest.raises(ValueError, match="outside this converter's 4 experts"):
-            Qwen3MoeCheckpointTensorConverter(num_experts=4).for_expert_range(3, 2)
+            converter_cls(num_experts=4).for_expert_range(3, 2)
+
+    def test_fp8_experts_raise_instead_of_loading_unscaled(self, converter_cls):
+        converter = converter_cls(num_experts=4)
+        fp8 = torch.zeros(1, 2).to(torch.float8_e4m3fn)
+        with pytest.raises(ValueError, match="does not dequantize"):
+            converter.convert("model.layers.0.mlp.experts.0.down_proj.weight", fp8)
+
+    def test_incomplete_checkpoint_error_names_the_model(self, converter_cls):
+        converter = converter_cls(num_experts=4)
+        converter.convert("model.layers.0.mlp.experts.0.down_proj.weight", torch.zeros(1, 2))
+        with pytest.raises(RuntimeError, match=f"^{converter_cls.model_name} checkpoint converter: incomplete"):
+            converter.finalize()
 
 
 class TestQwen3MoeConverterFactory:
@@ -372,6 +396,14 @@ class TestQwen3MoeConverterFactory:
         model = SimpleNamespace(config=SimpleNamespace(num_experts=8))
         converter = create_qwen3_moe_checkpoint_tensor_converter(model)
         assert isinstance(converter, Qwen3MoeCheckpointTensorConverter)
+        assert converter.num_experts == 8
+
+
+class TestDeepseekV3ConverterFactory:
+    def test_factory_reads_routed_expert_count(self):
+        model = SimpleNamespace(config=SimpleNamespace(n_routed_experts=8))
+        converter = create_deepseek_v3_checkpoint_tensor_converter(model)
+        assert isinstance(converter, DeepseekV3CheckpointTensorConverter)
         assert converter.num_experts == 8
 
 
