@@ -10,7 +10,8 @@ veomni/
 ├── checkpoint/         DCP-based distributed checkpoint save/load
 ├── data/               Data pipeline: datasets, collators, transforms, dynamic batching
 │   ├── multimodal/     Vision, audio, video preprocessing and chat templates
-│   └── diffusion/      Diffusion model data loading
+│   ├── diffusion/      Diffusion model data loading
+│   └── seed_omni/      SeedOmni preprocessing, transform, and collator
 ├── distributed/        All parallelism strategies
 │   ├── parallel_state.py   init_parallel_state_from_config(), ParallelState, mesh setup
 │   ├── torch_parallelize.py  build_parallelize_model(), parallelize_model_fsdp2()
@@ -20,6 +21,7 @@ veomni/
 │   ├── hccl_premul_sum.py  Idempotent HCCL PREMUL_SUM collective compatibility patch
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
+│   ├── context_parallel/  DeepSeek-V4 sparse-attention CP: window sharding and collectives
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
 ├── models/      Model loading, patchgen configs, and kernel-aware modeling
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
@@ -30,6 +32,9 @@ veomni/
 │   ├── checkpoint/     Weight I/O, tensor conversion, and ModelCheckpointManager
 │   ├── transformers/   Model classes/configs with instance-local VeomniOp handles
 │   ├── diffusers/      Diffusion model families
+│   ├── seed_omni/      SeedOmni V2 composed model: config/modeling/processing,
+│   │                   train/generation graphs, and per-module bases
+│   ├── utils/          Modeling-side attention helpers and non-VeomniOp MoE fallbacks
 │   └── loss_utils/     Model-facing CE, load-balancing, and chunked-loss policy
 ├── optim/              Optimizer and LR scheduler construction
 │   ├── optimizer.py    build_optimizer() factory + MultiOptimizer wrapper.
@@ -247,6 +252,8 @@ configs/
 │       └── <model>.yaml
 ├── dit/                    Diffusion model configs
 │   └── <model>.yaml
+├── seed_omni/              SeedOmni graph configs
+│   └── <model>/            (graph_{train,infer}.yaml + train/, infer/ graph and modules configs)
 └── model_configs/          Base model architecture configs
     └── <family>/
         └── <Model>.json    (HuggingFace-compatible config.json)
