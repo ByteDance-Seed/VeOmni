@@ -217,8 +217,14 @@ def test_flux_forward_keeps_construction_impls():
     )
 
 
-def test_ltx_forward_keeps_construction_impls():
-    from veomni.models.diffusers.ltx2_3.ltx_transformer.modeling_ltx2_3_transformer import LTXVideoTransformerModel
+def test_ltx_forward_keeps_construction_impls(monkeypatch):
+    from veomni.models.diffusers.ltx2_3.ltx_transformer import modeling_ltx2_3_transformer as ltx_modeling
+
+    # The registry installs VeOmni's LTX forwards before building. This test builds the class directly.
+    monkeypatch.setattr(ltx_modeling.Attention, "forward", ltx_modeling.Attention.forward)
+    monkeypatch.setattr(ltx_modeling.LTXModel, "forward", ltx_modeling.LTXModel.forward)
+    ltx_modeling.apply_veomni_ltx_transformer_patch()
+    LTXVideoTransformerModel = ltx_modeling.LTXVideoTransformerModel
 
     config = tiny_ltx2_3_config()
     inputs = {
