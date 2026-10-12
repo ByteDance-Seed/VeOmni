@@ -444,9 +444,7 @@ class TestHcclPremulSum:
 
 class TestNPULightningIndexer:
     @pytest.mark.parametrize(("seq_len", "expected_residual"), [(17, 1), (18, 2)])
-    def test_uses_original_key_length_for_causal_compression_residual(
-        self, monkeypatch, seq_len, expected_residual
-    ):
+    def test_uses_original_key_length_for_causal_compression_residual(self, monkeypatch, seq_len, expected_residual):
         from veomni.ops.kernels.deepseek_v4 import npu_lightning_indexer as module
 
         seen_residuals = []
@@ -520,6 +518,7 @@ class TestNPULightningIndexer:
             assert kwargs["cu_seqlens_k"].tolist() == [0, 1, 2]
             assert kwargs["cmp_residual_k"].tolist() == [0, 0]
 
+
 class TestNPUAttentionDispatch:
     def test_packed_sequence_forwards_sparse_metadata(self, monkeypatch):
         from transformers import AutoConfig
@@ -582,6 +581,7 @@ class TestNPUAttentionDispatch:
         assert calls["npu_compressed_len"] == compressed_len
         assert calls["npu_compressed_topk_indices"] is topk_indices
 
+
 class TestNPUSparseFlashMLA:
     @staticmethod
     def _inputs(index_topk):
@@ -602,6 +602,7 @@ class TestNPUSparseFlashMLA:
 
         with pytest.raises(ValueError, match=r"index_topk=1025 exceeds sfmla K limit \(1024\)"):
             npu_sparse_flash_mla(*self._inputs(1025), cmp_ratio=4)
+
 
 # ---------------------------------------------------------------------------
 # Kernel registry NPU registrations sanity checks

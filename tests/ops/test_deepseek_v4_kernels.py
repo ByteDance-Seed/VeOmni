@@ -634,6 +634,7 @@ def test_deepseek_v4_npu_config_collator_preserves_packed_segments_for_model():
     assert seen_slices
     assert all(slices == ((0, lengths[0]), (lengths[0], seq_len)) for slices in seen_slices)
 
+
 def test_deepseek_v4_stateless_model_reaches_tilelang_indexer(monkeypatch):
     _require_tilelang_cuda()
     from transformers import AutoConfig

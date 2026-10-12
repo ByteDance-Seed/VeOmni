@@ -33,8 +33,6 @@ _MHC_GPU_AVAILABLE = (
 _MHC_NPU_AVAILABLE = IS_NPU_AVAILABLE and importlib.util.find_spec("cann_ops_transformer") is not None
 
 
-
-
 def _eager_pre(x, fn, scale, base, norm_eps, hc_mult, sinkhorn_iters, hc_eps):
     flat = x.flatten(start_dim=2).float()
     flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
