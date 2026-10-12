@@ -1530,7 +1530,7 @@
 
 
  class DeepseekV4Attention(nn.Module):
-@@ -796,48 +1804,222 @@
+@@ -796,48 +1804,223 @@
          position_ids: torch.Tensor,
          attention_mask: torch.Tensor | None,
          past_key_values: Cache | None = None,
@@ -1712,10 +1712,11 @@
 +        # Not ``kv.shape[-2] - q.shape[-2]``: that assumed the query and
 +        # full-resolution KV lengths are equal, which is what CP breaks.
 +        compressed_len = compressed_kv.shape[2] if self.compressor is not None else 0
-+        if use_npu_sparse and compressed_candidates is not None:
-+            kwargs["npu_compressed_topk_indices"] = compressed_candidates.topk_indices
++        if use_npu_sparse:
 +            kwargs["npu_compressed_len"] = compressed_len
 +            kwargs["npu_packed_sequence_slices"] = packed_sequence_slices
++            if compressed_candidates is not None:
++                kwargs["npu_compressed_topk_indices"] = compressed_candidates.topk_indices
 +        if mask_free_sparse:
 +            kwargs["sparse_topk_indices"] = build_packed_sparse_attention_indices(
 +                position_ids=compressor_position_ids,
@@ -1775,7 +1776,7 @@
              self,
              q,
              kv,
-@@ -846,22 +2028,65 @@
+@@ -846,22 +2029,65 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -1852,7 +1853,7 @@
 
 
  class DeepseekV4HyperConnection(nn.Module):
-@@ -912,22 +2137,30 @@
+@@ -912,22 +2138,30 @@
          # doubly-stochastic manifold). Each output gets its own learned scale.
          self.scale = nn.Parameter(torch.empty(3))
 
@@ -1894,7 +1895,7 @@
          pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
          post = 2 * torch.sigmoid(post_w * post_scale + post_b)
          comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
-@@ -936,11 +2169,14 @@
+@@ -936,11 +2170,14 @@
          for _ in range(self.hc_sinkhorn_iters - 1):
              comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
              comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
@@ -1912,7 +1913,7 @@
 
 
  class DeepseekV4HyperHead(nn.Module):
-@@ -956,10 +2192,27 @@
+@@ -956,10 +2193,27 @@
          self.hc_scale = nn.Parameter(torch.empty(1))
 
      def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1940,7 +1941,7 @@
 
 
  class DeepseekV4MLP(nn.Module):
-@@ -974,17 +2227,65 @@
+@@ -974,17 +2228,65 @@
          self.act_fn = ACT2FN[config.hidden_act]
          self.limit = config.swiglu_limit
 
@@ -2013,7 +2014,7 @@
          super().__init__()
          self.num_experts = config.num_local_experts
          self.hidden_dim = config.hidden_size
-@@ -993,32 +2294,77 @@
+@@ -993,32 +2295,77 @@
          self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
          self.act_fn = ACT2FN[config.hidden_act]
          self.limit = config.swiglu_limit
@@ -2104,7 +2105,7 @@
 
 
  class DeepseekV4TopKRouter(nn.Module):
-@@ -1032,14 +2378,28 @@
+@@ -1032,14 +2379,28 @@
          self.routed_scaling_factor = config.routed_scaling_factor
          self.e_score_correction_bias = nn.Buffer(torch.zeros(self.num_experts))
 
@@ -2136,7 +2137,7 @@
 
 
  class DeepseekV4HashRouter(nn.Module):
-@@ -1062,23 +2422,54 @@
+@@ -1062,23 +2423,54 @@
          self.tid2eid = nn.Buffer(torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), persistent=True)
 
      def forward(
@@ -2195,7 +2196,7 @@
          self.shared_experts = DeepseekV4MLP(config)
 
      def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None) -> torch.Tensor:
-@@ -1093,6 +2484,12 @@
+@@ -1093,6 +2485,12 @@
          return routed + self.shared_experts(residual)
 
 
@@ -2208,7 +2209,7 @@
  class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
      r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
      two places:
-@@ -1122,26 +2519,54 @@
+@@ -1122,26 +2520,54 @@
          hidden_states: torch.Tensor,
          input_ids: torch.Tensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -2278,7 +2279,7 @@
 
 
  @auto_docstring
-@@ -1252,6 +2677,12 @@
+@@ -1252,6 +2678,12 @@
                  init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
@@ -2291,7 +2292,7 @@
  @auto_docstring
  class DeepseekV4Model(DeepseekV4PreTrainedModel):
      def __init__(self, config: DeepseekV4Config):
-@@ -1271,6 +2702,20 @@
+@@ -1271,6 +2703,20 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -2312,7 +2313,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1283,38 +2728,188 @@
+@@ -1283,38 +2729,188 @@
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -2511,7 +2512,7 @@
                  hidden_states,
                  position_embeddings=position_embeddings,
                  position_ids=position_ids,
-@@ -1323,9 +2918,88 @@
+@@ -1323,9 +2919,88 @@
                  past_key_values=past_key_values,
                  **kwargs,
              )
@@ -2601,7 +2602,7 @@
 
 
  def load_balancing_loss_func(
-@@ -1397,6 +3071,12 @@
+@@ -1397,6 +3072,12 @@
      return overall_loss * num_experts
 
 
@@ -2614,7 +2615,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1416,6 +3096,17 @@
+@@ -1416,6 +3097,17 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -2632,7 +2633,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1430,36 +3121,12 @@
+@@ -1430,36 +3122,12 @@
          output_router_logits: bool | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -2671,7 +2672,7 @@
              input_ids=input_ids,
              attention_mask=attention_mask,
              position_ids=position_ids,
-@@ -1471,26 +3138,183 @@
+@@ -1471,26 +3139,183 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -2868,7 +2869,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1498,7 +3322,20 @@
+@@ -1498,7 +3323,20 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

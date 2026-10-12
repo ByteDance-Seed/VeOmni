@@ -520,22 +520,26 @@ class TestNPULightningIndexer:
 
 
 class TestNPUAttentionDispatch:
-    def test_packed_sequence_forwards_sparse_metadata(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("layer_type", "has_candidates"),
+        [("compressed_sparse_attention", True), ("heavily_compressed_attention", False)],
+    )
+    def test_packed_sequence_forwards_compression_metadata(self, monkeypatch, layer_type, has_candidates):
         from transformers import AutoConfig
 
         from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as modeling
 
         config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
         config._attn_implementation = "eager"
-        layer_idx = config.layer_types.index("compressed_sparse_attention")
+        layer_idx = config.layer_types.index(layer_type)
         attention = modeling.DeepseekV4Attention(config, layer_idx).to(device=DEVICE, dtype=torch.bfloat16).eval()
         seq_len = 8
-        compressed_len = seq_len // config.compress_rates["compressed_sparse_attention"]
+        compressed_len = max(1, seq_len // config.compress_rates[layer_type])
         topk_indices = torch.zeros((1, seq_len, 1), dtype=torch.int32, device=DEVICE)
         calls = {}
 
         class FakeCompressor(torch.nn.Module):
-            compress_rate = config.compress_rates["compressed_sparse_attention"]
+            compress_rate = config.compress_rates[layer_type]
 
             def forward(self, hidden_states, *args, **kwargs):
                 calls["return_topk_indices"] = kwargs["return_topk_indices"]
@@ -543,12 +547,13 @@ class TestNPUAttentionDispatch:
                     (1, 1, compressed_len, config.head_dim), dtype=torch.bfloat16, device=DEVICE
                 )
                 block_bias = torch.zeros((1, 1, seq_len, compressed_len), dtype=torch.bfloat16, device=DEVICE)
-                candidates = SimpleNamespace(topk_indices=topk_indices)
+                candidates = SimpleNamespace(topk_indices=topk_indices) if has_candidates else None
                 return compressed_kv, block_bias, candidates
 
         def fake_attention_interface(module, query, key, value, attention_mask, **kwargs):
             calls["npu_compressed_len"] = kwargs.get("npu_compressed_len")
             calls["npu_compressed_topk_indices"] = kwargs.get("npu_compressed_topk_indices")
+            calls["npu_packed_sequence_slices"] = kwargs.get("npu_packed_sequence_slices")
             output = torch.zeros(
                 (query.shape[0], query.shape[-2], query.shape[1], query.shape[-1]),
                 dtype=query.dtype,
@@ -579,7 +584,8 @@ class TestNPUAttentionDispatch:
 
         assert calls["return_topk_indices"] is True
         assert calls["npu_compressed_len"] == compressed_len
-        assert calls["npu_compressed_topk_indices"] is topk_indices
+        assert calls["npu_compressed_topk_indices"] is (topk_indices if has_candidates else None)
+        assert calls["npu_packed_sequence_slices"] == ((0, seq_len // 2), (seq_len // 2, seq_len))
 
 
 class TestNPUSparseFlashMLA:

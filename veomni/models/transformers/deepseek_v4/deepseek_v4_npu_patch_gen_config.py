@@ -640,10 +640,11 @@ def deepseek_v4_attention_forward_npu_patched(
     # Not ``kv.shape[-2] - q.shape[-2]``: that assumed the query and
     # full-resolution KV lengths are equal, which is what CP breaks.
     compressed_len = compressed_kv.shape[2] if self.compressor is not None else 0
-    if use_npu_sparse and compressed_candidates is not None:
-        kwargs["npu_compressed_topk_indices"] = compressed_candidates.topk_indices
+    if use_npu_sparse:
         kwargs["npu_compressed_len"] = compressed_len
         kwargs["npu_packed_sequence_slices"] = packed_sequence_slices
+        if compressed_candidates is not None:
+            kwargs["npu_compressed_topk_indices"] = compressed_candidates.topk_indices
     if mask_free_sparse:
         kwargs["sparse_topk_indices"] = build_packed_sparse_attention_indices(
             position_ids=compressor_position_ids,
