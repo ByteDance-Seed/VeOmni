@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from transformers import GenerationConfig, PretrainedConfig, PreTrainedModel, PreTrainedTokenizer, ProcessorMixin
 
     from ..distributed.parallel_plan import ParallelPlan
+    from .checkpoint_tensor_loading import CheckpointTensorConverter
 
     ModelAssets = Union[GenerationConfig, PretrainedConfig, PreTrainedTokenizer, ProcessorMixin]
 
@@ -145,16 +146,23 @@ def init_empty_weights():
 @dataclass
 class StateDictIterator:
     filepath: str
+    # Keys for which this returns True are passed over without reading their tensor.
+    skip_key: Optional[Callable[[str], bool]] = None
 
     def __iter__(self) -> Generator[Tuple[str, "torch.Tensor"], None, None]:
+        skip_key = self.skip_key
         if self.filepath.endswith(".safetensors"):
             with safe_open(self.filepath, framework="pt", device="cpu") as f:
                 for key in f.keys():
+                    if skip_key is not None and skip_key(key):
+                        continue
                     yield key, f.get_tensor(key)
 
         else:
             state_dict = torch.load(self.filepath, map_location="cpu", weights_only=True, mmap=True)
             for key in state_dict.keys():
+                if skip_key is not None and skip_key(key):
+                    continue
                 yield key, state_dict[key]
 
 
@@ -166,10 +174,36 @@ class BroadcastMetadata:
     dtype: Optional["torch.dtype"]
 
 
-def _load_state_dict(weights_path: str, **kwargs) -> List["StateDictIterator"]:
+def _load_state_dict(
+    weights_path: str, skip_key: Optional[Callable[[str], bool]] = None, **kwargs
+) -> List["StateDictIterator"]:
     """
     Loads (sharded) state dict in transformers' format.
     """
+    iterators = _resolve_state_dict_iterators(weights_path, **kwargs)
+    for iterator in iterators:
+        iterator.skip_key = skip_key
+    return iterators
+
+
+def _skip_without_loading_fn(
+    model: "nn.Module", converter: Optional["CheckpointTensorConverter"]
+) -> Optional[Callable[[str], bool]]:
+    """Checkpoint keys the converter discards by name, recorded as skipped and never read."""
+    if converter is None or not callable(getattr(converter, "should_skip_without_loading", None)):
+        return None
+
+    def skip_key(raw_key: str) -> bool:
+        key = _convert_weight_key(raw_key, model)
+        if not checkpoint_converter_should_skip_without_loading(converter, key):
+            return False
+        checkpoint_converter_record_skip_without_loading(converter, key)
+        return True
+
+    return skip_key
+
+
+def _resolve_state_dict_iterators(weights_path: str, **kwargs) -> List["StateDictIterator"]:
     cache_kwargs = {"_raise_exceptions_for_missing_entries": False, **kwargs}
     resolved_weight_file = cached_file(weights_path, SAFE_WEIGHTS_NAME, **cache_kwargs)
     if resolved_weight_file:
@@ -405,7 +439,7 @@ def load_model_weights(
     converter = get_checkpoint_tensor_converter(model)
     if converter is None and is_peft_model:
         converter = get_checkpoint_tensor_converter(model.get_base_model())
-    state_dict_iterators = _load_state_dict(weights_path)
+    state_dict_iterators = _load_state_dict(weights_path, skip_key=_skip_without_loading_fn(model, converter))
 
     def _dispatch_kv(name: str, tensor: "torch.Tensor") -> None:
         if name in buffer_dict.keys():  # persistent buffers
@@ -1367,7 +1401,11 @@ def rank0_load_and_broadcast_weights(
         del tensor
 
     # --- Broadcast shard count ---
-    state_dict_iterators = _load_state_dict(weights_path) if global_rank == 0 else None
+    state_dict_iterators = (
+        _load_state_dict(weights_path, skip_key=_skip_without_loading_fn(model, converter))
+        if global_rank == 0
+        else None
+    )
     shard_count = len(state_dict_iterators) if global_rank == 0 else 0
     logger.info_rank0(f"rank0_load_and_broadcast_weights: {shard_count=} ")
     shard_count_tensor = torch.tensor(
