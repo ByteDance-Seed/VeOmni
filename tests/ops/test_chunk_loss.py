@@ -131,6 +131,52 @@ def test_chunk_loss_logits_bias_without_grad(monkeypatch):
     torch.testing.assert_close(weights.grad, grad_w)
 
 
+def test_chunk_loss_logits_bias_projects_only_supervised_rows(monkeypatch):
+    monkeypatch.setattr(chunk_loss_module, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+    projected_rows = []
+    linear = F.linear
+
+    def counting_linear(input, weight, bias=None):
+        projected_rows.append(input.shape[0])
+        return linear(input, weight, bias)
+
+    torch.manual_seed(0)
+    hidden_states = torch.randn(2, 5, 4, requires_grad=True)
+    weights = torch.randn(6, 4, requires_grad=True)
+    logits_bias = torch.randn(2, 5, 6, requires_grad=True)
+    labels = torch.tensor([[-100, -100, -100, 1, 2], [-100, 3, -100, -100, -100]])
+
+    monkeypatch.setattr(F, "linear", counting_linear)
+    loss, _ = chunk_loss_module.chunk_loss_function(
+        hidden_states, weights, labels, chunk_size=2, shift_labels=labels, logits_bias=logits_bias
+    )
+    monkeypatch.setattr(F, "linear", linear)
+    loss.backward()
+
+    assert projected_rows == [2, 1]
+    expected = _reference_loss_and_grads(hidden_states, weights, logits_bias, labels)
+    torch.testing.assert_close(loss, expected[0])
+    torch.testing.assert_close(hidden_states.grad, expected[1])
+    torch.testing.assert_close(weights.grad, expected[2])
+    torch.testing.assert_close(logits_bias.grad, expected[3])
+
+
+def test_chunk_loss_logits_bias_with_nothing_supervised_scores_zero(monkeypatch):
+    monkeypatch.setattr(chunk_loss_module, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+    hidden_states = torch.randn(1, 3, 4, requires_grad=True)
+    weights = torch.randn(6, 4, requires_grad=True)
+    logits_bias = torch.randn(1, 3, 6, requires_grad=True)
+    labels = torch.full((1, 3), -100)
+
+    loss, _ = chunk_loss_module.chunk_loss_function(
+        hidden_states, weights, labels, chunk_size=2, shift_labels=labels, logits_bias=logits_bias
+    )
+    loss.backward()
+
+    assert loss.item() == 0.0
+    assert not hidden_states.grad.any() and not weights.grad.any() and not logits_bias.grad.any()
+
+
 def test_chunk_loss_rejects_logits_bias_with_mismatched_rows(monkeypatch):
     monkeypatch.setattr(chunk_loss_module, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
     with pytest.raises(ValueError, match="logits_bias rows"):

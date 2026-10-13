@@ -164,10 +164,9 @@ class TrainingMixin(BaseTrainingMixin):
         """``CE(lm_head(h) + markov(x), labels)``, token-mean over the ``dp_sp`` mesh like the main head.
 
         A bias-free untied head goes through ``chunk_loss`` with the Markov
-        residual as its ``logits_bias``, so only one chunk of fp32 logits is
-        live. It scores every row, unsupervised ones included: dropping them
-        first would copy the ``[S, vocab]`` bias. Any other head materializes
-        the supervised rows' logits.
+        residual as its ``logits_bias``, which projects only the supervised
+        rows and keeps one chunk of their fp32 logits live. Any other head
+        materializes the supervised rows' logits.
         """
         num_supervised_tokens = (labels != IGNORE_INDEX).sum()
         if not self.config.tie_word_embeddings and self.lm_head is not None and self.lm_head.bias is None:

@@ -51,34 +51,56 @@ class ChunkLoss(torch.autograd.Function):
         loss_kwargs_chunks: list[Any],
         chunk_size: int,
         logits_bias: torch.Tensor | None = None,
+        row_chunks: list[torch.Tensor] | None = None,
     ):
         if head_bias is not None:
             raise NotImplementedError("head_bias is not supported in ChunkLoss")
 
         device = hidden_states.device
         accumulated_loss = torch.tensor(0.0, device=device)
-        grad_inputs = torch.empty_like(hidden_states)
         grad_weight = torch.zeros_like(head_weight)
         need_bias_grad = logits_bias is not None and ctx.needs_input_grad[6]
-        grad_logits_bias = torch.zeros_like(logits_bias) if need_bias_grad else None
-
-        grad_inputs_chunks = torch.split(grad_inputs, chunk_size, dim=1)
-        hidden_states_chunks = torch.split(hidden_states, chunk_size, dim=1)
-        num_chunks = len(hidden_states_chunks)
-        bias_chunks = torch.split(logits_bias, chunk_size, dim=1) if logits_bias is not None else [None] * num_chunks
-        grad_bias_chunks = torch.split(grad_logits_bias, chunk_size, dim=1) if need_bias_grad else None
         argnums = (0, 1, 3) if need_bias_grad else (0, 1)
 
-        for i in range(num_chunks):
-            chunk_grads, (chunk_loss, _) = torch.func.grad_and_value(loss_forward, argnums=argnums, has_aux=True)(
-                hidden_states_chunks[i], head_weight, None, bias_chunks[i], **loss_kwargs_chunks[i]
-            )
-
-            accumulated_loss.add_(chunk_loss)
-            grad_inputs_chunks[i].copy_(chunk_grads[0])
-            grad_weight.add_(chunk_grads[1])
+        if row_chunks is not None:
+            # Chunks are index sets over the flattened rows; rows in none of them
+            # are never projected and get a zero gradient.
+            flat_hidden = hidden_states.reshape(-1, hidden_states.size(-1))
+            flat_bias = logits_bias.reshape(-1, logits_bias.size(-1)) if logits_bias is not None else None
+            grad_inputs = hidden_states.new_zeros(flat_hidden.shape)
+            grad_logits_bias = logits_bias.new_zeros(flat_bias.shape) if need_bias_grad else None
+            for rows, loss_kwargs in zip(row_chunks, loss_kwargs_chunks):
+                bias_rows = flat_bias.index_select(0, rows) if flat_bias is not None else None
+                chunk_grads, (chunk_loss, _) = torch.func.grad_and_value(loss_forward, argnums=argnums, has_aux=True)(
+                    flat_hidden.index_select(0, rows), head_weight, None, bias_rows, **loss_kwargs
+                )
+                accumulated_loss.add_(chunk_loss)
+                grad_inputs.index_copy_(0, rows, chunk_grads[0])
+                grad_weight.add_(chunk_grads[1])
+                if need_bias_grad:
+                    grad_logits_bias.index_copy_(0, rows, chunk_grads[2])
+            grad_inputs = grad_inputs.view(hidden_states.shape)
             if need_bias_grad:
-                grad_bias_chunks[i].copy_(chunk_grads[2])
+                grad_logits_bias = grad_logits_bias.view(logits_bias.shape)
+        else:
+            grad_inputs = torch.empty_like(hidden_states)
+            grad_logits_bias = torch.zeros_like(logits_bias) if need_bias_grad else None
+            grad_inputs_chunks = torch.split(grad_inputs, chunk_size, dim=1)
+            hidden_states_chunks = torch.split(hidden_states, chunk_size, dim=1)
+            num_chunks = len(hidden_states_chunks)
+            bias_chunks = (
+                torch.split(logits_bias, chunk_size, dim=1) if logits_bias is not None else [None] * num_chunks
+            )
+            grad_bias_chunks = torch.split(grad_logits_bias, chunk_size, dim=1) if need_bias_grad else None
+            for i in range(num_chunks):
+                chunk_grads, (chunk_loss, _) = torch.func.grad_and_value(loss_forward, argnums=argnums, has_aux=True)(
+                    hidden_states_chunks[i], head_weight, None, bias_chunks[i], **loss_kwargs_chunks[i]
+                )
+                accumulated_loss.add_(chunk_loss)
+                grad_inputs_chunks[i].copy_(chunk_grads[0])
+                grad_weight.add_(chunk_grads[1])
+                if need_bias_grad:
+                    grad_bias_chunks[i].copy_(chunk_grads[2])
 
         ctx.need_bias_grad = need_bias_grad
         ctx.save_for_backward(grad_inputs, grad_weight, *((grad_logits_bias,) if need_bias_grad else ()))
@@ -93,7 +115,7 @@ class ChunkLoss(torch.autograd.Function):
             grad_weight = grad_weight * grad_output[0]
             if grad_logits_bias is not None:
                 grad_logits_bias = grad_logits_bias * grad_output[0]
-        return grad_input, grad_weight, None, None, None, None, grad_logits_bias
+        return grad_input, grad_weight, None, None, None, None, grad_logits_bias, None
 
 
 def chunk_loss_function(
@@ -114,7 +136,9 @@ def chunk_loss_function(
     ``logits_bias`` is an optional additive term per row, shaped like the logits
     (``hidden_states.shape[:-1] + (vocab,)``) and differentiable. It is sliced
     along with the hidden states, so only one chunk of fp32 logits is ever live;
-    the bias and its gradient are the only full-size tensors.
+    the bias and its gradient are the only full-size tensors. With a bias only
+    the supervised rows are projected, ``chunk_size`` of them at a time: a
+    caller cannot drop the others itself without copying the bias.
     """
     sp_enabled = get_parallel_state().sp_enabled
     if logits_bias is not None and logits_bias.shape[:-1] != hidden_states.shape[:-1]:
@@ -136,6 +160,10 @@ def chunk_loss_function(
         hidden_states = hidden_states.unsqueeze(0)
         if logits_bias is not None:
             logits_bias = logits_bias.unsqueeze(0)
+    if hidden_states.shape[:-1] != labels.shape:
+        raise ValueError(
+            f"hidden_states rows {tuple(hidden_states.shape[:-1])} do not match labels {tuple(labels.shape)}."
+        )
 
     def ce_loss_func(
         hidden_states, weight, bias, logits_bias, labels, num_items_in_batch, ignore_index=-100, **kwargs
@@ -160,11 +188,18 @@ def chunk_loss_function(
         )
         return loss, logits
 
-    chunk_labels = torch.split(labels, chunk_size, dim=1)
     num_valid_tokens = (labels != ignore_index).sum()
     # A rank with nothing supervised scores 0.0 rather than 0 / 0, so its NaN
     # cannot survive the token-weighted reduction below.
     num_items_in_batch = num_valid_tokens.clamp(min=1)
+
+    row_chunks = None
+    if logits_bias is not None:
+        flat_labels = labels.reshape(-1)
+        row_chunks = list(torch.split((flat_labels != ignore_index).nonzero().squeeze(-1), chunk_size))
+        chunk_labels = [flat_labels.index_select(0, rows) for rows in row_chunks]
+    else:
+        chunk_labels = torch.split(labels, chunk_size, dim=1)
 
     loss_kwargs_chunks = [
         {"labels": chunk_labels[i], "ignore_index": ignore_index, "num_items_in_batch": num_items_in_batch}
@@ -172,7 +207,7 @@ def chunk_loss_function(
     ]
 
     chunk_loss = ChunkLoss.apply(
-        hidden_states, weights, None, ce_loss_func, loss_kwargs_chunks, chunk_size, logits_bias
+        hidden_states, weights, None, ce_loss_func, loss_kwargs_chunks, chunk_size, logits_bias, row_chunks
     )
 
     # Match ``ForCausalLMLoss``: reduce over the SP group when SP is enabled, or
