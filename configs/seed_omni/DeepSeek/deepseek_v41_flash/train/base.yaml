@@ -91,6 +91,8 @@ train:
     save_epochs: 0
     # The module folders this writes are the training layout, not the released
     # one; re-exporting to the released fp8/fp4 packing is a separate step.
+    # A trained n-gram module's tables are left as per-rank shards; finish them
+    # with `python scripts/merge_hf_export.py <step>/hf_ckpt` before loading.
     save_hf_weights: false
   wandb:
     enable: true
