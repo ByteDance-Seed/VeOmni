@@ -55,14 +55,14 @@ tasks:
 | `offline_embedding` | Reads raw `seedomni` data once (`train.num_train_epochs: 1`), runs the graph without autograd and writes each encoded conversation to `train.offline_cache_dir`, which it requires. Every module is frozen: no optimizer, no lr scheduler, no checkpoint manager. | Full load, frozen; the graph calls its `offline_encode`. |
 | `offline_training` | Trains from the cache, read back with `data.data_type: seedomni_cached`. | The graph calls only its `online_process`, so it is built on meta, never loaded, and frozen. |
 
-`OmniArguments` ([`_validate_training_task_data`](../../../veomni/arguments/omni_arguments_types.py#L731)) rejects
+`OmniArguments` ([`_validate_training_task_data`](../../../veomni/arguments/omni_arguments_types.py#L724)) rejects
 a run whose `data.data_type` does not match: only `offline_training` reads
-`seedomni_cached`. It also rejects `train.checkpoint.load_path` under
-`offline_embedding`
-([`OmniTrainingArguments.__post_init__`](../../../veomni/arguments/omni_arguments_types.py#L645)):
-frozen modules have no checkpoint manager, so the encoder's weights would not
-be restored while the dataloader position would. Point the encoder's
-`model_path` at an HF checkpoint instead.
+`seedomni_cached`.
+
+`offline_embedding` freezes every module, so it never writes or restores module
+weights. A resume of that task only needs the dataloader cursor
+(`GlobalStateCallback`); encoder weights always come from each module's
+`model_path`.
 
 Which modules exist and which endpoint each graph node calls stay in the
 modules / graph YAML: each task has its own pair, e.g. BAGEL's
@@ -247,11 +247,13 @@ The pieces that complete this workflow are in place:
 [`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L538)
 runs the encoding run, and
 [`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L104)
-persists each conversation. The step writes the `conversation_list` that
-[`OmniModel.forward` returns](../../../veomni/models/seed_omni/modeling_omni.py#L504),
-not the micro-batch it passed in: under `fsdp_scope: model`, FSDP2's root
-pre-forward may rebuild the batch's dicts and lists, so what the post-hooks
-merge would not reach the trainer's copy. Ranks that share a `dp_rank` (SP, CP or TP peers)
+persists each conversation from the micro-batch's `conversation_list`. The
+training graph must only mutate `ConversationItem` fields in place (for
+example `value` and `meta`); it must not replace the list, append items, or
+drop items. Structural changes belong in the processor / collator stage,
+before the graph runs. Under that contract the trainer still sees the encoded
+items after FSDP2's root pre-forward, which may rebuild the outer dicts and
+lists but keeps the same item objects. Ranks that share a `dp_rank` (SP, CP or TP peers)
 hold the same batch, so
 [only the first of them writes](../../../veomni/models/seed_omni/utils/offline_cache.py#L33).
 The training run reads the cache through the
@@ -269,7 +271,7 @@ generation graph names, e.g. BAGEL's encoding run loads only `bagel_vae`. So
 checks it against the loaded modules
 ([`GenerationGraph.validate_modules`](../../../veomni/models/seed_omni/graphs/generation_graph.py#L312))
 at the start of
-[`OmniModel.generate`](../../../veomni/models/seed_omni/modeling_omni.py#L607).
+[`OmniModel.generate`](../../../veomni/models/seed_omni/modeling_omni.py#L569).
 A missing module or method still fails before the first request runs.
 
 ## Current scope
@@ -292,9 +294,8 @@ A missing module or method still fails before the first request runs.
   and the hook slots dispatch through `TrainingModuleMixin`.
 - [`tests/seed_omni/arguments/test_offline_cache_args.py`](../../../tests/seed_omni/arguments/test_offline_cache_args.py):
   `train.training_task` values, the `offline_cache_dir` requirement,
-  [one epoch for `offline_embedding`](../../../tests/seed_omni/arguments/test_offline_cache_args.py#L61),
-  [no `checkpoint.load_path` for `offline_embedding`](../../../tests/seed_omni/arguments/test_offline_cache_args.py#L66) and
-  [the `data.data_type` match](../../../tests/seed_omni/arguments/test_offline_cache_args.py#L84).
+  [one epoch for `offline_embedding`](../../../tests/seed_omni/arguments/test_offline_cache_args.py#L60),
+  [the `data.data_type` match](../../../tests/seed_omni/arguments/test_offline_cache_args.py#L76).
 - [`tests/seed_omni/mixins/test_offline_cache_writer.py`](../../../tests/seed_omni/mixins/test_offline_cache_writer.py):
   [the writer round trip](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L50) and
   [one writer per `dp_rank`](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L134).
@@ -316,5 +317,4 @@ A missing module or method still fails before the first request runs.
   [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L123), and
   [`offline_cache_step` writes every micro-batch without autograd](../../../tests/seed_omni/trainer/test_omni_trainer.py#L134).
 - [`tests/seed_omni/model/test_graph.py`](../../../tests/seed_omni/model/test_graph.py):
-  [a generation graph builds without the modules it names](../../../tests/seed_omni/model/test_graph.py#L141), and
-  [`OmniModel.forward` returns the `conversation_list` the graph wrote](../../../tests/seed_omni/model/test_graph.py#L334).
+  [a generation graph builds without the modules it names](../../../tests/seed_omni/model/test_graph.py#L141).
