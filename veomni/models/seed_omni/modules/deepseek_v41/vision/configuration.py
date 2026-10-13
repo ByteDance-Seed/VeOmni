@@ -16,10 +16,10 @@
 
 from typing import Optional
 
-from transformers import PretrainedConfig
+from ...module_configuration_base import OmniModuleConfig
 
 
-class DeepseekV41VisionEncoderConfig(PretrainedConfig):
+class DeepseekV41VisionEncoderConfig(OmniModuleConfig):
     """DeepSeek-V4.1's vision tower.
 
     Fields are the checkpoint's ``vision_config`` verbatim, plus ``out_hidden_size``

@@ -39,18 +39,18 @@ be checked against it.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from ....utils.conversation import ConversationItem, is_dummy
+from ....utils.conversation import ConversationItem
 from ...base.llm_packing import pack_llm_conversations_for_forward
 from .decode import DeepseekV41DecodeCache, decode_backbone_step
 
 
-def build_image_mask(conversation_list: List[ConversationItem], device: torch.device) -> Optional[torch.Tensor]:
+def build_image_mask(conversation_list: list[ConversationItem], device: torch.device) -> torch.Tensor | None:
     """``[1, S]`` true inside an image span, or None when the prompt has no image.
 
     None rather than an all-false mask, matching what ``forward`` documents: the
@@ -64,7 +64,7 @@ def build_image_mask(conversation_list: List[ConversationItem], device: torch.de
     """
     flags = []
     for item in conversation_list:
-        if is_dummy(item):
+        if item.is_dummy:
             continue
         flags.append(torch.full((item.value.size(0),), item.type == "image", dtype=torch.bool, device=device))
     if not flags or not any(bool(flag.any()) for flag in flags):
@@ -75,14 +75,14 @@ def build_image_mask(conversation_list: List[ConversationItem], device: torch.de
 class DeepseekV41LlmInferenceMixin:
     """FSM ``generate`` for the CED backbone.
 
-    Listed *before* ``OmniPreTrainedModel`` in the bases: the base ships no-op
+    Listed *before* ``PretrainedOmniModule`` in the bases: the base ships no-op
     ``reset_*_inference_state`` defaults, and MRO resolves left to right, so put
     second these would shadow the real ones below and the caches would survive
     across requests -- a second conversation decoding against the first one's
     sliding window, silently.
     """
 
-    _decode_cache: Optional[DeepseekV41DecodeCache]
+    _decode_cache: DeepseekV41DecodeCache | None
     _next_position: int
 
     def reset_local_inference_state(self) -> None:
@@ -95,19 +95,19 @@ class DeepseekV41LlmInferenceMixin:
 
     def generate(
         self,
-        conversation_list: Optional[List[ConversationItem]] = None,
-        ngram_embeds: Optional[List[torch.Tensor]] = None,
+        conversation_list: list[ConversationItem] | None = None,
+        ngram_embeds: list[torch.Tensor] | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         if getattr(self, "_decode_cache", None) is None:
             return self._prefill(conversation_list, ngram_embeds)
         return self._step(conversation_list, ngram_embeds, kwargs)
 
     def _prefill(
         self,
-        conversation_list: List[ConversationItem],
-        ngram_embeds: Optional[List[torch.Tensor]],
-    ) -> Dict[str, Any]:
+        conversation_list: list[ConversationItem],
+        ngram_embeds: list[torch.Tensor] | None,
+    ) -> dict[str, Any]:
         """One batched backbone forward, capturing the decode caches from it.
 
         Short prompts (and configs with no encoder/decoder split) go through
@@ -162,9 +162,9 @@ class DeepseekV41LlmInferenceMixin:
 
     def _prefill_per_position(
         self,
-        conversation_list: List[ConversationItem],
-        ngram_embeds: Optional[List[torch.Tensor]],
-    ) -> Dict[str, Any]:
+        conversation_list: list[ConversationItem],
+        ngram_embeds: list[torch.Tensor] | None,
+    ) -> dict[str, Any]:
         """Step the prompt one token at a time.
 
         The reference implementation for the batched-capture path. Each step is
@@ -193,10 +193,10 @@ class DeepseekV41LlmInferenceMixin:
 
     def _step(
         self,
-        conversation_list: List[ConversationItem],
-        ngram_embeds: Optional[List[torch.Tensor]],
-        kwargs: Dict[str, Any],
-    ) -> Dict[str, Any]:
+        conversation_list: list[ConversationItem],
+        ngram_embeds: list[torch.Tensor] | None,
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
         tail = conversation_list[-1]
         if tail.type != "output":
             raise ValueError(
@@ -208,7 +208,7 @@ class DeepseekV41LlmInferenceMixin:
         inputs_embeds, ngram_embeds = self._this_step_inputs(tail, ngram_embeds)
         n_tokens = int(inputs_embeds.shape[1])
         spec_ids = tail.meta.get("dspark_spec_ids")
-        ngram_commit: Optional[Callable[[int], None]] = kwargs.get("dspark_ngram_commit")
+        ngram_commit: Callable[[int], None] | None = kwargs.get("dspark_ngram_commit")
 
         if n_tokens == 1 or spec_ids is None:
             spec_hiddens = self._run_spec(tail)
@@ -257,10 +257,10 @@ class DeepseekV41LlmInferenceMixin:
     def _verify_block(
         self,
         inputs_embeds: torch.Tensor,
-        ngram_embeds: Optional[List[torch.Tensor]],
-        spec_ids: Optional[torch.Tensor],
-        lm_head_weight: Optional[torch.Tensor],
-        sampling: Dict[str, Any],
+        ngram_embeds: list[torch.Tensor] | None,
+        spec_ids: torch.Tensor | None,
+        lm_head_weight: torch.Tensor | None,
+        sampling: dict[str, Any],
     ) -> tuple:
         """Run K draft tokens, keep the AR prefix, roll the KV back on the first miss.
 
@@ -314,7 +314,7 @@ class DeepseekV41LlmInferenceMixin:
         tail.meta["dspark_embeds"] = filled.squeeze(0) if filled.shape[0] == 1 else filled
 
     @staticmethod
-    def _token_ngram(ngram_embeds: Optional[List[torch.Tensor]], index: int) -> Optional[List[torch.Tensor]]:
+    def _token_ngram(ngram_embeds: list[torch.Tensor] | None, index: int) -> list[torch.Tensor] | None:
         if ngram_embeds is None:
             return None
         return [row[:, index : index + 1] for row in ngram_embeds]
@@ -323,7 +323,7 @@ class DeepseekV41LlmInferenceMixin:
         self,
         hidden_states: torch.Tensor,
         lm_head_weight: torch.Tensor,
-        sampling: Dict[str, Any],
+        sampling: dict[str, Any],
     ) -> int:
         last = hidden_states[:, -1, :] if hidden_states.dim() == 3 else hidden_states[-1]
         logits = F.linear(last, lm_head_weight)
@@ -359,7 +359,7 @@ class DeepseekV41LlmInferenceMixin:
         dist.broadcast(agreed, src=0)
         return int(agreed.item())
 
-    def _run_spec(self, tail: ConversationItem) -> Optional[torch.Tensor]:
+    def _run_spec(self, tail: ConversationItem) -> torch.Tensor | None:
         """Draft a block from the previous verified token, matching official decode ``forward_spec``.
 
         The first generated token only fills ``dspark_main``; official
@@ -388,7 +388,7 @@ class DeepseekV41LlmInferenceMixin:
     def _this_step_inputs(
         self,
         tail: ConversationItem,
-        ngram_embeds: Optional[List[torch.Tensor]],
+        ngram_embeds: list[torch.Tensor] | None,
     ) -> tuple:
         """Embeddings and n-gram rows for *this* decode step, same width.
 
@@ -425,7 +425,7 @@ class DeepseekV41LlmInferenceMixin:
             ngram_embeds = None if ngram_embeds is None else [row[:, -1:] for row in ngram_embeds]
         return inputs_embeds, ngram_embeds
 
-    def _emit(self, conversation_list: List[ConversationItem], hidden_states: torch.Tensor) -> Dict[str, Any]:
+    def _emit(self, conversation_list: list[ConversationItem], hidden_states: torch.Tensor) -> dict[str, Any]:
         hidden = self._tail_hidden(hidden_states)
         if conversation_list and conversation_list[-1].type == "output":
             # In-place: appending a second output lets maybe_merge_outputs cat the

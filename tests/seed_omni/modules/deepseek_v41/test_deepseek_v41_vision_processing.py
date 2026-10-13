@@ -16,7 +16,7 @@
 
 Inference hands the processor a PIL image, but the SeedOmni V2 data layer decodes
 every image to a ``(C, H, W) uint8`` tensor before it reaches a module
-(``veomni.data.seed_omni.image_utils.fetch_images``). Both inputs have to produce
+(``veomni.data.seed_omni.utils.image.fetch_images``). Both inputs have to produce
 the same patches: the resize plan runs on PIL, so the tensor path is only correct
 if it reproduces the PIL image exactly.
 """
@@ -28,7 +28,7 @@ import pytest
 import torch
 from PIL import Image
 
-from veomni.data.seed_omni.image_utils import fetch_images
+from veomni.data.seed_omni.utils.image import fetch_images
 from veomni.models.seed_omni.modules.deepseek_v41.vision.processing import (
     DeepseekV41VisionImageProcessor,
     DeepseekV41VisionPreprocessor,

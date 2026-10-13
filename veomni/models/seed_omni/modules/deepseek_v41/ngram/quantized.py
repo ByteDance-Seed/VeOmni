@@ -33,9 +33,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ......distributed.emb_parallel import AllToAllEmbedding, ShardedEmbedding
 from ......distributed.parallel_state import get_parallel_state
-from ......ops.kernels.embed import AllToAllEmbedding
-from ....mixins.emb_parallel_mixin import EmbParallelMixin
 from ..dequant import dequant_fp8_blockwise
 from ..quant_scheme import QUANT_BLOCK_SIZE, SCALE_DTYPE
 
@@ -53,10 +52,10 @@ def dequantize_rows(rows: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return dequantized.view(*rows.shape[:-1], columns)
 
 
-class DeepseekV41NgramTable(nn.Embedding):
+class DeepseekV41NgramTable(ShardedEmbedding):
     """One n-gram memory table, optionally over the released fp8 rows.
 
-    ``quant_dtype=None`` is an ordinary ``nn.Embedding``. The converted
+    ``quant_dtype=None`` is an ordinary :class:`ShardedEmbedding`. The converted
     checkpoint keeps ``weight_quantization``, so both train and infer stay on
     the fp8 tables.
 
@@ -104,39 +103,26 @@ class DeepseekV41NgramTable(nn.Embedding):
         return getattr(self, "weight_scale", None) is not None
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        """Gather ``ids``, vocab-parallel when the plan split this table over ``emb``.
+
+        A quantized table is two tensors, the fp8 rows and their block scales.
+        Both are dispatched over the same group with the same ids, so each lands
+        on the rank owning that row, and the pair is reassembled in input order
+        before being dequantized locally. Shipping fp8 rows and scales rather
+        than dequantizing first is also the cheaper exchange -- 257 bytes a row
+        against the 512 a bf16 row would cost.
+        """
         if not self.is_quantized:
             return super().forward(ids)
-        return dequantize_rows(F.embedding(ids, self.weight), F.embedding(ids, self.weight_scale))
+        if not self._is_split():
+            return dequantize_rows(F.embedding(ids, self.weight), F.embedding(ids, self.weight_scale))
+        self._check_own_fsdp_unit()
+        group = get_parallel_state().extra_parallel_group("emb")
+        # int8 for transport: the collectives are byte moves either way, and fp8
+        # dtypes are not something every backend will accept.
+        rows = AllToAllEmbedding.apply(group, ids, self.weight.view(torch.int8)).view(torch.float8_e4m3fn)
+        scales = AllToAllEmbedding.apply(group, ids, self.weight_scale.view(torch.int8)).view(SCALE_DTYPE)
+        return dequantize_rows(rows, scales)
 
 
-def ngram_table_lookup(table: DeepseekV41NgramTable, ids: torch.Tensor) -> torch.Tensor:
-    """Gather ``ids`` from ``table``, vocab-parallel when the ``emb`` group is on.
-
-    :meth:`EmbParallelMixin.emb_parallel_lookup` cannot be used directly for a
-    quantized table: it hands one weight tensor to ``AllToAllEmbedding``, and a
-    quantized table is two. Both are dispatched over the same group with the
-    same ids, so each lands on the rank owning that row, and the pair is
-    reassembled in input order before being dequantized locally.
-
-    Shipping the fp8 rows and their scales rather than dequantizing first is
-    also the cheaper exchange -- 257 bytes a row against the 512 a bf16 row
-    would cost.
-    """
-    if not table.is_quantized:
-        return EmbParallelMixin.emb_parallel_lookup(table, ids)
-    if not EmbParallelMixin.emb_parallel_active():
-        return table(ids)
-
-    group = get_parallel_state().extra_parallel_group("emb")
-    # int8 for transport: the collectives are byte moves either way, and fp8
-    # dtypes are not something every backend will accept.
-    rows = AllToAllEmbedding.apply(group, ids, EmbParallelMixin.emb_local_weight(table.weight).view(torch.int8)).view(
-        torch.float8_e4m3fn
-    )
-    scales = AllToAllEmbedding.apply(
-        group, ids, EmbParallelMixin.emb_local_weight(table.weight_scale).view(torch.int8)
-    ).view(SCALE_DTYPE)
-    return dequantize_rows(rows, scales)
-
-
-__all__ = ["DeepseekV41NgramTable", "dequantize_rows", "ngram_table_lookup"]
+__all__ = ["DeepseekV41NgramTable", "dequantize_rows"]

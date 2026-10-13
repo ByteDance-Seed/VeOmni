@@ -25,7 +25,7 @@ from typing import List, Tuple
 
 import torch
 
-from ....utils.conversation import ConversationItem, is_dummy
+from ....utils.conversation import ConversationItem
 
 
 def pack_ngram_inputs(
@@ -55,7 +55,7 @@ def pack_ngram_inputs(
     mask: List[torch.Tensor] = []
     for sample in conversations:
         for item in sample:
-            if is_dummy(item):
+            if item.is_dummy:
                 continue
             if item.type == "text":
                 token_ids = item.meta.get("input_ids")

@@ -26,7 +26,7 @@ where the residual stream would be ~102 KB/token.
 
 The two tables hold 196.6B of the model's parameters. They are expected to stay
 frozen and in FP8, row-sharded over the ``emb`` extra-parallel group
-(:class:`EmbParallelMixin`), which puts ~23 GiB on each of 8 ranks.
+(:class:`~veomni.distributed.emb_parallel.ShardedEmbedding`), which puts ~23 GiB on each of 8 ranks.
 """
 
 from typing import Any, Dict, List, Optional
@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 
-from ....omni_pretrained_model import OmniPreTrainedModel
+from ...module_modeling_base import PretrainedOmniModule
 from ..quant_scheme import quantized_storage_dtype
 from .checkpoint import create_ngram_table_converter
 from .configuration import DeepseekV41NgramConfig
@@ -47,10 +47,10 @@ from .hashing import (
     rolling_hash,
 )
 from .inference import DeepseekV41NgramInferenceMixin
-from .quantized import DeepseekV41NgramTable, ngram_table_lookup
+from .quantized import DeepseekV41NgramTable
 
 
-class DeepseekV41Ngram(DeepseekV41NgramInferenceMixin, OmniPreTrainedModel):
+class DeepseekV41Ngram(DeepseekV41NgramInferenceMixin, PretrainedOmniModule):
     """Two n-gram hash tables plus the hashing that addresses them.
 
     ``token_map`` is a **persistent** buffer: it collapses token ids that
@@ -174,9 +174,7 @@ class DeepseekV41Ngram(DeepseekV41NgramInferenceMixin, OmniPreTrainedModel):
         no reshaping here, and the result is bit-identical to a full-table
         lookup.
         """
-        return [
-            ngram_table_lookup(table, hash_ids[:, :, layer_index]) for layer_index, table in enumerate(self.tables)
-        ]
+        return [table(hash_ids[:, :, layer_index]) for layer_index, table in enumerate(self.tables)]
 
     def forward(  # type: ignore[override]
         self,

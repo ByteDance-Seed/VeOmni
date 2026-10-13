@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import math
 from functools import lru_cache
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -48,13 +48,12 @@ from torch.nn.functional import scaled_dot_product_attention
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 from veomni.utils.import_utils import is_flash_attn_2_available
 
-from ....omni_pretrained_model import OmniPreTrainedModel
 from ....utils.conversation import ConversationItem
+from ...module_modeling_base import PretrainedOmniModule
 from .configuration import DeepseekV41VisionEncoderConfig
 from .processing import (
     _OMNI_TOKEN_TYPES,
     _OMNI_VIT_GRID,
-    _SOURCE,
     IMAGE,
     IMAGE_END,
     IMAGE_NEW_LINE,
@@ -82,7 +81,7 @@ class _VisualOutputSlot(NamedTuple):
 
 
 @lru_cache(maxsize=32)
-def _vision_freqs(n_h: int, n_w: int, dim: int, theta: float) -> Tuple[torch.Tensor, torch.Tensor]:
+def _vision_freqs(n_h: int, n_w: int, dim: int, theta: float) -> tuple[torch.Tensor, torch.Tensor]:
     """2D RoPE cos/sin for an ``n_h x n_w`` patch grid, ``(n_h * n_w, 1, dim)`` each.
 
     The first half of ``dim`` rotates by the row index and the second half by the
@@ -273,11 +272,11 @@ class DeepseekV41Aligner(nn.Module):
 
 
 def build_deepseek_v41_vit_batch(
-    items: List[ConversationItem],
+    items: list[ConversationItem],
     *,
     device: torch.device,
     dtype: torch.dtype,
-) -> Tuple[torch.Tensor, List[List[int]], List[torch.Tensor], List[_VisualOutputSlot]]:
+) -> tuple[torch.Tensor, list[list[int]], list[torch.Tensor], list[_VisualOutputSlot]]:
     """One packed ViT batch from CPU-preprocessed image items."""
     patches, grids, token_types, slots = [], [], [], []
     for item in items:
@@ -290,13 +289,13 @@ def build_deepseek_v41_vit_batch(
 
 
 def build_deepseek_v41_vit_metadata(
-    grids: List[List[int]],
+    grids: list[list[int]],
     rope_dim: int,
     rope_theta: float,
     device: torch.device,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """``cu_seqlens`` at the image boundaries plus the concatenated 2D RoPE tables."""
-    cu: List[int] = [0]
+    cu: list[int] = [0]
     cos_parts, sin_parts = [], []
     for n_h, n_w in grids:
         cu.append(cu[-1] + n_h * n_w)
@@ -311,26 +310,25 @@ def build_deepseek_v41_vit_metadata(
     }
 
 
-def scatter_deepseek_v41_visual_embeds(slots: List[_VisualOutputSlot], spans: torch.Tensor) -> None:
+def scatter_deepseek_v41_visual_embeds(slots: list[_VisualOutputSlot], spans: torch.Tensor) -> None:
     """Write each image's assembled span back onto its conversation item."""
     for item_span, slot in zip(torch.split(spans, [s.span_len for s in slots], dim=0), slots):
         slot.item.value = item_span
-        slot.item.source = _SOURCE
 
 
 class InferenceMixin:
     """FSM ``generate`` -- encode every user image and scatter its span.
 
-    Listed before :class:`OmniPreTrainedModel` in the bases so MRO resolves this
+    Listed before :class:`PretrainedOmniModule` in the bases so MRO resolves this
     ``generate`` rather than the base's no-op; this module holds no state across
     FSM steps, so there is nothing to reset.
     """
 
     def generate(
         self,
-        conversation_list: Optional[List[ConversationItem]] = None,
+        conversation_list: list[ConversationItem] | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         del kwargs
         items = [p for p in conversation_list if p.type == "image" and p.role == "user"]
         if not items:
@@ -342,7 +340,7 @@ class InferenceMixin:
         return {"conversation_list": conversation_list}
 
 
-class DeepseekV41VisionEncoder(InferenceMixin, OmniPreTrainedModel):
+class DeepseekV41VisionEncoder(InferenceMixin, PretrainedOmniModule):
     """DeepSeek-V4.1 vision tower: ViT + aligner + the three learned span delimiters."""
 
     config_class = DeepseekV41VisionEncoderConfig
@@ -389,9 +387,9 @@ class DeepseekV41VisionEncoder(InferenceMixin, OmniPreTrainedModel):
     def _encode(
         self,
         pixel_values: torch.Tensor,
-        grids: List[List[int]],
-        token_types: List[torch.Tensor],
-        vit_metadata: Dict[str, Any],
+        grids: list[list[int]],
+        token_types: list[torch.Tensor],
+        vit_metadata: dict[str, Any],
     ) -> torch.Tensor:
         features = self.vision(
             pixel_values.to(self.dtype),
@@ -409,12 +407,12 @@ class DeepseekV41VisionEncoder(InferenceMixin, OmniPreTrainedModel):
 
     def forward(  # type: ignore[override]
         self,
-        pixel_values: Optional[torch.Tensor] = None,
-        grids: Optional[List[List[int]]] = None,
-        token_types: Optional[List[torch.Tensor]] = None,
-        vit_metadata: Optional[Dict[str, Any]] = None,
+        pixel_values: torch.Tensor | None = None,
+        grids: list[list[int]] | None = None,
+        token_types: list[torch.Tensor] | None = None,
+        vit_metadata: dict[str, Any] | None = None,
         **kwargs,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         del kwargs
         return {"image_embeds": self._encode(pixel_values, grids, token_types, vit_metadata)}
 

@@ -62,7 +62,7 @@ def image_item(n_tokens):
 
 
 def dummy_item(n):
-    return ConversationItem(type="text", value=torch.randn(n, HIDDEN), role="dummy", meta={})
+    return ConversationItem(type="text", value=torch.randn(n, HIDDEN), role="user", is_dummy=True, meta={})
 
 
 class TestAlignmentWithTheBackboneRow:
@@ -175,7 +175,7 @@ class TestContractWithTheBackbone:
         ]
 
     def test_the_ngram_rows_are_accepted_by_the_backbone(self):
-        from tests.seed_omni.test_deepseek_v41_accelerated import make_config
+        from tests.seed_omni.modules.deepseek_v41.test_deepseek_v41_accelerated import make_config
         from veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated.accelerated import (
             DeepseekV41LlmAccelerated,
         )
@@ -192,7 +192,7 @@ class TestContractWithTheBackbone:
     def test_the_text_only_packing_would_be_rejected(self):
         """Guards the check itself: `pack_input_ids` drops image spans, and a row
         built that way is exactly what the backbone must refuse."""
-        from tests.seed_omni.test_deepseek_v41_accelerated import make_config
+        from tests.seed_omni.modules.deepseek_v41.test_deepseek_v41_accelerated import make_config
         from veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated.accelerated import (
             DeepseekV41LlmAccelerated,
         )

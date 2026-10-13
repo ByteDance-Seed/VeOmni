@@ -30,7 +30,7 @@ samples, which keeps the token ids on the carrier like everything else.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import torch
 
@@ -42,13 +42,13 @@ from .packing import pack_ngram_inputs
 class DeepseekV41NgramInferenceMixin:
     """FSM ``generate`` for the two hash tables.
 
-    Listed *before* ``OmniPreTrainedModel`` in the bases so the base's no-op
+    Listed *before* ``PretrainedOmniModule`` in the bases so the base's no-op
     ``reset_*_inference_state`` defaults do not shadow these by MRO. A surviving
     cache would not raise -- it would hash the next conversation's first tokens
     against the previous one's tail.
     """
 
-    _ngram_cache: Optional[DeepseekV41NgramCache]
+    _ngram_cache: DeepseekV41NgramCache | None
 
     def reset_local_inference_state(self) -> None:
         return
@@ -59,9 +59,9 @@ class DeepseekV41NgramInferenceMixin:
 
     def generate(
         self,
-        conversation_list: Optional[List[ConversationItem]] = None,
+        conversation_list: list[ConversationItem] | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         del kwargs
         if getattr(self, "_ngram_cache", None) is None:
             self._ngram_cache = DeepseekV41NgramCache.from_config(self.config)
@@ -94,7 +94,7 @@ class DeepseekV41NgramInferenceMixin:
             "dspark_ngram_commit": dspark_ngram_commit,
         }
 
-    def _sampled_token(self, conversation_list: List[ConversationItem]) -> tuple:
+    def _sampled_token(self, conversation_list: list[ConversationItem]) -> tuple:
         """The ids the text encoder just sampled, and their always-true mask."""
         tail = conversation_list[-1]
         token_ids = tail.meta.get("input_ids")

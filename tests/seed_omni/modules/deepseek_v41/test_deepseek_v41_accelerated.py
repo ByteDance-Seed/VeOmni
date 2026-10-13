@@ -104,7 +104,7 @@ def image(length):
 
 
 def dummy(length):
-    return ConversationItem(type="text", value=torch.randn(length, HIDDEN), role="dummy")
+    return ConversationItem(type="text", value=torch.randn(length, HIDDEN), role="user", is_dummy=True)
 
 
 class TestImageMask:
@@ -350,7 +350,11 @@ class TestDummyAnchor:
     def test_the_dummy_image_gets_a_zero_gradient(self, model):
         anchor = torch.randn(9, HIDDEN, requires_grad=True)
         conversation = [
-            [text(4), text(3, role="assistant"), ConversationItem(type="image", value=anchor, role="dummy")]
+            [
+                text(4),
+                text(3, role="assistant"),
+                ConversationItem(type="image", value=anchor, role="user", is_dummy=True),
+            ]
         ]
         packed = torch.cat([part.value for part in conversation[0][:2]])
 
@@ -363,7 +367,7 @@ class TestDummyAnchor:
 
     def test_inference_leaves_the_row_alone(self, model):
         anchor = torch.randn(9, HIDDEN, requires_grad=True)
-        conversation = [[text(4), ConversationItem(type="image", value=anchor, role="dummy")]]
+        conversation = [[text(4), ConversationItem(type="image", value=anchor, role="user", is_dummy=True)]]
 
         model.eval()
         out = model.forward_pre(conversation_list=conversation)

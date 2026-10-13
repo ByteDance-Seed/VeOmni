@@ -46,10 +46,10 @@ unconditionally; V4.1 does it only when ``norm_topk_prob and num_experts_per_tok
 
 from typing import Any, Dict, List, Optional
 
-from transformers import PretrainedConfig
+from ...module_configuration_base import OmniModuleConfig
 
 
-class DeepseekV41LlmConfig(PretrainedConfig):
+class DeepseekV41LlmConfig(OmniModuleConfig):
     """The backbone's shape, taken verbatim from the checkpoint's ``text_config``.
 
     ``compress_ratios`` has one entry per layer **including the DSpark draft

@@ -39,15 +39,14 @@ import torch
 from PIL import Image, ImageOps
 from transformers.image_processing_utils import BaseImageProcessor
 
-from ....processing import ModulePreprocessorBase
 from ....utils.conversation import ConversationItem, iter_desired_items
+from ...module_processing_base import ModulePreprocessorBase
 from .configuration import DeepseekV41VisionEncoderConfig
 
 
 TEXT = -1
 IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(4)
 
-_SOURCE = "deepseek_v41_vision"
 #: Per-item meta written by the CPU worker and popped on the main process.
 _OMNI_VIT_GRID = "_omni_vit_grid"
 _OMNI_TOKEN_TYPES = "_omni_token_types"
@@ -235,11 +234,10 @@ class DeepseekV41VisionPreprocessor(ModulePreprocessorBase):
         del kwargs
         saw_real_image = False
         for sample in conversation_list:
-            items = list(iter_desired_items([sample], types=["image"], roles=["user"]))
+            items = [it for it in iter_desired_items([sample], types=["image"], roles=["user"]) if not it.is_dummy]
             for item in items:
                 patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = self._image_processor.preprocess_one(item.value)
                 item.value = patches.to(dtype=self._dtype)
-                item.source = _SOURCE
                 item.meta[_OMNI_VIT_GRID] = [n_vit_h, n_vit_w]
                 item.meta[_OMNI_TOKEN_TYPES] = image_token_types(n_llm_h, n_llm_w)
                 saw_real_image = True
@@ -256,8 +254,8 @@ class DeepseekV41VisionPreprocessor(ModulePreprocessorBase):
             ConversationItem(
                 type="image",
                 value=self._dummy_patches,
-                role="dummy",
-                source=_SOURCE,
+                role="user",
+                is_dummy=True,
                 meta={
                     _OMNI_VIT_GRID: list(self._dummy_grid),
                     _OMNI_TOKEN_TYPES: self._dummy_types.clone(),

@@ -17,10 +17,10 @@
 import math
 from typing import Any, Dict, List, Optional
 
-from transformers import PretrainedConfig
+from ...module_configuration_base import OmniModuleConfig
 
 
-class DeepseekV41NgramConfig(PretrainedConfig):
+class DeepseekV41NgramConfig(OmniModuleConfig):
     """Bucket layout of DeepSeek-V4.1's two n-gram memory tables.
 
     Every field is copied verbatim from the monolithic checkpoint's

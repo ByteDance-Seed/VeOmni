@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 from ....utils.conversation import ConversationItem
 from ...base.text_encoder.chat_template import TextEncoderChatTemplate
@@ -82,7 +82,7 @@ RESPONSE_FORMAT_TEMPLATE = (
 REASONING_EFFORT_TEMPLATE = (
     "Reasoning Effort: {budget} (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
 )
-REASONING_EFFORT_MAPPINGS: Dict[str, int] = {"low": 50, "high": 75, "max": 100}
+REASONING_EFFORT_MAPPINGS: dict[str, int] = {"low": 50, "high": 75, "max": 100}
 DEFAULT_REASONING_EFFORT = "high"
 
 TOOLS_TEMPLATE = """## Tools
@@ -120,7 +120,7 @@ def to_json(value: Any) -> str:
         return json.dumps(value, ensure_ascii=True)
 
 
-def split_tool_name(name: str, namespace: Optional[str] = None) -> Tuple[Optional[str], str]:
+def split_tool_name(name: str, namespace: str | None = None) -> tuple[str | None, str]:
     """Split ``namespace::name``, refusing a qualifier that contradicts ``namespace``."""
     prefix, separator, bare_name = name.partition("::")
     if separator:
@@ -132,7 +132,7 @@ def split_tool_name(name: str, namespace: Optional[str] = None) -> Tuple[Optiona
     return namespace, name
 
 
-def tool_name_for_encoding(tool: Dict[str, Any]) -> str:
+def tool_name_for_encoding(tool: dict[str, Any]) -> str:
     namespace = tool.get("namespace")
     if isinstance(namespace, dict):
         namespace = namespace["name"]
@@ -140,7 +140,7 @@ def tool_name_for_encoding(tool: Dict[str, Any]) -> str:
     return name if namespace is None else f"{namespace}::{name}"
 
 
-def tools_from_openai_format(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def tools_from_openai_format(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Flatten OpenAI ``{"function": {...}}`` wrappers into namespace-qualified defs."""
     functions = []
     for tool in tools:
@@ -155,7 +155,7 @@ def tools_from_openai_format(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return functions
 
 
-def tool_calls_from_openai_format(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def tool_calls_from_openai_format(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     calls = []
     for tool_call in tool_calls:
         function = tool_call["function"]
@@ -167,7 +167,7 @@ def tool_calls_from_openai_format(tool_calls: List[Dict[str, Any]]) -> List[Dict
     return calls
 
 
-def render_tools(tools: List[Dict[str, Any]]) -> str:
+def render_tools(tools: list[dict[str, Any]]) -> str:
     return TOOLS_TEMPLATE.format(
         tool_schemas="\n".join(to_json(tool) for tool in tools),
         dsml=DSML_TOKEN,
@@ -179,7 +179,7 @@ def render_tools(tools: List[Dict[str, Any]]) -> str:
     )
 
 
-def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
+def encode_arguments_to_dsml(tool_call: dict[str, Any]) -> str:
     """One ``<｜DSML｜ parameter>`` row per argument, JSON-encoding non-strings.
 
     Arguments arrive as a dict, a JSON string, or -- from some clients -- a
@@ -212,7 +212,7 @@ def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
     )
 
 
-def render_reasoning_effort(effort: Union[str, int, None]) -> str:
+def render_reasoning_effort(effort: str | int | None) -> str:
     """The numeric effort prefix; only the first turn of a thinking-mode prompt gets it."""
     if effort is None:
         effort = DEFAULT_REASONING_EFFORT
@@ -246,7 +246,7 @@ class _Turn:
     """One role's consecutive items, as the template sees them."""
 
     role: str
-    items: List[ConversationItem]
+    items: list[ConversationItem]
 
 
 class DeepseekV41ChatTemplate(TextEncoderChatTemplate):
@@ -263,7 +263,7 @@ class DeepseekV41ChatTemplate(TextEncoderChatTemplate):
         self,
         tokenizer: Any,
         thinking_mode: str = "thinking",
-        reasoning_effort: Union[str, int, None] = None,
+        reasoning_effort: str | int | None = None,
     ):
         super().__init__(tokenizer)
         self.chat_markers = DeepseekV41ChatMarkers()
@@ -273,7 +273,7 @@ class DeepseekV41ChatTemplate(TextEncoderChatTemplate):
         self.reasoning_effort = reasoning_effort
         self.image_placeholder_id = self._optional_token_id(IMAGE_PLACEHOLDER)
 
-    def _optional_token_id(self, token: str) -> Optional[int]:
+    def _optional_token_id(self, token: str) -> int | None:
         """Token id, or ``None`` when this tokenizer revision spells the token differently."""
         token_id = self.tokenizer.convert_tokens_to_ids(token)
         unk = getattr(self.tokenizer, "unk_token_id", None)
@@ -284,12 +284,12 @@ class DeepseekV41ChatTemplate(TextEncoderChatTemplate):
     # ── Turn assembly ─────────────────────────────────────────────────────────
 
     @staticmethod
-    def _group_turns(sample: List[ConversationItem]) -> Tuple[List[_Turn], List[ConversationItem]]:
-        """Consecutive same-role items become one turn; ``dummy`` rows are set aside."""
-        turns: List[_Turn] = []
-        dummies: List[ConversationItem] = []
+    def _group_turns(sample: list[ConversationItem]) -> tuple[list[_Turn], list[ConversationItem]]:
+        """Consecutive same-role items become one turn; ``is_dummy`` rows are set aside."""
+        turns: list[_Turn] = []
+        dummies: list[ConversationItem] = []
         for item in sample:
-            if item.role == "dummy":
+            if item.is_dummy:
                 dummies.append(item)
                 continue
             if turns and turns[-1].role == item.role:
@@ -299,7 +299,7 @@ class DeepseekV41ChatTemplate(TextEncoderChatTemplate):
         return turns, dummies
 
     @staticmethod
-    def _last_user_turn(turns: List[_Turn]) -> int:
+    def _last_user_turn(turns: list[_Turn]) -> int:
         """Index of the turn that triggers the assistant header.
 
         A mid-conversation system message counts as a user turn in V4.1 -- that is
@@ -311,7 +311,7 @@ class DeepseekV41ChatTemplate(TextEncoderChatTemplate):
                 return index
         return -1
 
-    def _sample_options(self, sample: List[ConversationItem]) -> Tuple[str, Union[str, int, None]]:
+    def _sample_options(self, sample: list[ConversationItem]) -> tuple[str, str | int | None]:
         """Per-sample ``(thinking_mode, reasoning_effort)``, from the first item's meta."""
         thinking_mode, effort = self.thinking_mode, self.reasoning_effort
         for item in sample:
@@ -324,7 +324,7 @@ class DeepseekV41ChatTemplate(TextEncoderChatTemplate):
 
     # ── Templating ────────────────────────────────────────────────────────────
 
-    def apply_chat_template(self, sample: List[ConversationItem]) -> List[ConversationItem]:
+    def apply_chat_template(self, sample: list[ConversationItem]) -> list[ConversationItem]:
         turns, dummies = self._group_turns(sample)
         thinking_mode, effort = self._sample_options(sample)
         last_user = self._last_user_turn(turns)
@@ -334,7 +334,7 @@ class DeepseekV41ChatTemplate(TextEncoderChatTemplate):
         # reasoning before the last user turn" compaction is switched off.
         drop_thinking = not any(turn.items[0].meta.get("tools") for turn in turns)
 
-        out: List[ConversationItem] = []
+        out: list[ConversationItem] = []
         prefix = self.chat_markers.bos_token
         if thinking_mode == "thinking":
             prefix += SYSTEM_SP_TOKEN + render_reasoning_effort(effort)
@@ -366,7 +366,7 @@ class DeepseekV41ChatTemplate(TextEncoderChatTemplate):
         return out
 
     @staticmethod
-    def _emits_assistant_header(turns: List[_Turn], index: int) -> bool:
+    def _emits_assistant_header(turns: list[_Turn], index: int) -> bool:
         """Whether this turn is followed by ``<｜Assistant｜>`` + a thinking transition.
 
         Two conditions, both from ``render_message``'s transition block: the turn
@@ -396,8 +396,8 @@ class DeepseekV41ChatTemplate(TextEncoderChatTemplate):
             return header + THINKING_START_TOKEN
         return header + THINKING_END_TOKEN
 
-    def _render_system(self, turn: _Turn, index: int) -> List[ConversationItem]:
-        out: List[ConversationItem] = []
+    def _render_system(self, turn: _Turn, index: int) -> list[ConversationItem]:
+        out: list[ConversationItem] = []
         # Turn 0's `<｜System｜>` is already in the prefix; a mid-conversation system
         # message carries its own.
         text = SYSTEM_SP_TOKEN if index > 0 else ""
@@ -415,8 +415,8 @@ class DeepseekV41ChatTemplate(TextEncoderChatTemplate):
         out.append(self._build_conversation_item("text", text, "user", loss_mask=0))
         return out
 
-    def _render_user(self, turn: _Turn) -> List[ConversationItem]:
-        out: List[ConversationItem] = [self._build_conversation_item("text", USER_SP_TOKEN, "user", loss_mask=0)]
+    def _render_user(self, turn: _Turn) -> list[ConversationItem]:
+        out: list[ConversationItem] = [self._build_conversation_item("text", USER_SP_TOKEN, "user", loss_mask=0)]
         for item in turn.items:
             if item.type == "text":
                 text = str(item.value)
@@ -439,7 +439,7 @@ class DeepseekV41ChatTemplate(TextEncoderChatTemplate):
         last_user: int,
         thinking_mode: str,
         drop_thinking: bool,
-    ) -> List[ConversationItem]:
+    ) -> list[ConversationItem]:
         first = turn.items[0]
         content = "".join(str(item.value) for item in turn.items if item.type == "text")
 
@@ -471,7 +471,7 @@ class DeepseekV41ChatTemplate(TextEncoderChatTemplate):
             body += EOS_TOKEN
         return [self._build_conversation_item("text", body, "assistant", loss_mask=1)]
 
-    def tokenize(self, parts: List[ConversationItem]) -> None:
+    def tokenize(self, parts: list[ConversationItem]) -> None:
         """The base tokenize, plus a surviving copy of the ids in ``meta``.
 
         ``encode`` overwrites each text item's ``value`` with its embedding, so
@@ -489,7 +489,7 @@ class DeepseekV41ChatTemplate(TextEncoderChatTemplate):
                 part.meta["input_ids"] = part.value.detach().clone()
 
     @staticmethod
-    def merge_text_embeds(parts: List[ConversationItem]) -> List[ConversationItem]:
+    def merge_text_embeds(parts: list[ConversationItem]) -> list[ConversationItem]:
         """The base merge, keeping the stashed ids in step with ``value``.
 
         The base concatenates ``value`` / ``labels`` / ``attention_mask``; the
@@ -504,7 +504,7 @@ class DeepseekV41ChatTemplate(TextEncoderChatTemplate):
                 part.meta["input_ids"] = part.value.detach().clone()
         return merged
 
-    def apply_generation_prompt(self, sample: List[ConversationItem]) -> List[ConversationItem]:
+    def apply_generation_prompt(self, sample: list[ConversationItem]) -> list[ConversationItem]:
         """No-op: :meth:`apply_chat_template` already ends on the assistant header.
 
         V4.1 attaches the header to the user turn rather than opening the assistant

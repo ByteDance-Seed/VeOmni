@@ -35,7 +35,7 @@ from veomni.ops.kernels.cross_entropy.eager import eager_cross_entropy
 from veomni.utils.constants import IGNORE_INDEX
 
 from .....mixins.training_module_mixin import post_forward, pre_forward
-from .....utils.conversation import ConversationItem, is_dummy
+from .....utils.conversation import ConversationItem
 from ....base.text_encoder.accelerated import TrainingMixin as BaseTrainingMixin
 from ....base.text_encoder.accelerated import VeOmniMixin as BaseVeOmniMixin
 from ..chat_template import DeepseekV41ChatTemplate
@@ -150,7 +150,7 @@ class TrainingMixin(BaseTrainingMixin):
         for sample in conversation_list or []:
             sample_start = len(unsupervised)
             for part in sample:
-                if is_dummy(part):
+                if part.is_dummy:
                     continue
                 if part.type == "text":
                     unsupervised.extend([False] * part.meta["labels"].shape[0])
@@ -168,7 +168,7 @@ class TrainingMixin(BaseTrainingMixin):
         chunks = []
         for sample in conversation_list or []:
             for part in sample:
-                if is_dummy(part):
+                if part.is_dummy:
                     continue
                 rows = part.meta.get(meta_key)
                 if rows is None:

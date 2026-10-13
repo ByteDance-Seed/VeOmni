@@ -8,7 +8,7 @@
 # The converter streams through the shards rather than building the model, so
 # it does not need the weights to fit in RAM. Dtypes stay as released (fp8/fp4);
 # training dequantizes the llm at load.
-#   python scripts/convert_model.py \
+#   python scripts/seed_omni/convert_model.py \
 #     --model_path /mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash \
 #     --output_dir /mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash
 #

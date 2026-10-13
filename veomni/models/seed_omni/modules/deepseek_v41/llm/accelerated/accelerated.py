@@ -49,7 +49,7 @@ from .......utils.tensor_utils import unflatten
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from .....utils.conversation import ConversationItem, is_dummy
+from .....utils.conversation import ConversationItem
 from ....base.llm_packing import pack_llm_conversations_for_forward, scatter_llm_hidden_states
 from ...ngram.packing import pack_ngram_inputs
 from ...quant_scheme import quantized_storage_dtype
@@ -81,7 +81,7 @@ def build_packed_image_mask(
     saw_image = False
     for sample in conversations:
         for item in sample:
-            if is_dummy(item):
+            if item.is_dummy:
                 continue
             length = item.value.size(0)
             is_image = item.type == "image"
@@ -96,7 +96,7 @@ def fold_dummy_anchors(
     inputs_embeds: torch.Tensor,
     conversations: List[List[ConversationItem]],
 ) -> torch.Tensor:
-    """Add ``0 * mean`` of every ``dummy`` item so its encoder stays in the backward.
+    """Add ``0 * mean`` of every ``is_dummy`` item so its encoder stays in the backward.
 
     The packer skips dummy items, so without this a text-only micro-batch drops
     the ViT's output before the loss. The ViT's FSDP unit then never runs its
@@ -105,7 +105,7 @@ def fold_dummy_anchors(
     """
     for sample in conversations:
         for item in sample:
-            if is_dummy(item) and isinstance(item.value, torch.Tensor):
+            if item.is_dummy and isinstance(item.value, torch.Tensor):
                 inputs_embeds = inputs_embeds + item.value.mean().to(inputs_embeds.device, inputs_embeds.dtype) * 0
     return inputs_embeds
 
@@ -284,7 +284,7 @@ class TrainingMixin(TrainingModuleMixin):
             row_iter = iter(unflatten(rows, pack_shape))
             for sample in conversation:
                 for part in sample:
-                    if is_dummy(part):
+                    if part.is_dummy:
                         continue
                     part.meta[meta_key] = next(row_iter)
             if next(row_iter, None) is not None:

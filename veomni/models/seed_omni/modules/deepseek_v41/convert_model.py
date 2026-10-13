@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Split the released DeepSeek-V4.1 checkpoint into SeedOmni V2 modules.
+"""Split the released DeepSeek-V4.1 checkpoint into SeedOmni modules.
 
 Registered under ``OMNI_CONVERT_REGISTRY["deepseek_v41"]`` and dispatched by
-``scripts/convert_model.py``.
+``scripts/seed_omni/convert_model.py``. To rewrite only some subfolders, pass
+``--extra modules=deepseek_v41_ngram,deepseek_v41_llm``.
 
 Unlike the other families' converters this one never builds the model. The
 released checkpoint is 510 GB across 48 shards and 96,085 tensors. Tensors are
@@ -68,13 +69,13 @@ import json
 import os
 import shutil
 import tempfile
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Iterable
 
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from ...utils.convert_registry import OMNI_CONVERT_REGISTRY
+from ...utils.convert_registry import OMNI_CONVERT_REGISTRY, load_family_graphs
 from .dequant import fuse_gate_up
 
 
@@ -112,9 +113,9 @@ class ShardWriter:
     def __init__(self, output_dir: str, shard_bytes: int = SHARD_BYTES) -> None:
         self.output_dir = output_dir
         self.shard_bytes = shard_bytes
-        self._pending: Dict[str, torch.Tensor] = {}
+        self._pending: dict[str, torch.Tensor] = {}
         self._pending_bytes = 0
-        self._weight_map: Dict[str, int] = {}
+        self._weight_map: dict[str, int] = {}
         self._total_bytes = 0
         self._shard_index = 0
         os.makedirs(output_dir, exist_ok=True)
@@ -180,7 +181,7 @@ class ShardWriter:
     def _final(index: int, total: int) -> str:
         return f"model-{index + 1:05d}-of-{total:05d}.safetensors"
 
-    def finalize(self, config: Optional[Any] = None) -> int:
+    def finalize(self, config: Any | None = None) -> int:
         """Rename the shards, write the index, and return the tensor count."""
         self._flush()
         total = self._shard_index
@@ -235,8 +236,8 @@ class TensorSource:
                 "large to scan; a single-file checkpoint is not the released layout."
             )
         with open(index_path) as handle:
-            self.weight_map: Dict[str, str] = json.load(handle)["weight_map"]
-        self._handles: Dict[str, Any] = {}
+            self.weight_map: dict[str, str] = json.load(handle)["weight_map"]
+        self._handles: dict[str, Any] = {}
 
     def __contains__(self, name: str) -> bool:
         return name in self.weight_map
@@ -252,7 +253,7 @@ class TensorSource:
             self._handles[file_name] = handle
         return handle.get_tensor(name)
 
-    def get_released(self, name: str) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def get_released(self, name: str) -> tuple[torch.Tensor, torch.Tensor | None]:
         """A weight in the dtype it shipped in, and its scale, unmodified.
 
         ``None`` means the tensor was never quantized -- norms, biases, the
@@ -284,7 +285,7 @@ class Emitter:
     source tensor, not of a conversion mode.
     """
 
-    def __init__(self, source: "TensorSource", writer: "ShardWriter") -> None:
+    def __init__(self, source: TensorSource, writer: ShardWriter) -> None:
         self.source = source
         self.writer = writer
 
@@ -294,14 +295,14 @@ class Emitter:
         if scale is not None:
             self.writer.add(f"{target}_scale", scale)
 
-    def emit_tensor(self, target: str, tensor: torch.Tensor, scale: Optional[torch.Tensor] = None) -> None:
+    def emit_tensor(self, target: str, tensor: torch.Tensor, scale: torch.Tensor | None = None) -> None:
         """For tensors the converter builds rather than reads -- fused, stacked, baked."""
         self.writer.add(target, tensor)
         if scale is not None:
             self.writer.add(f"{target}_scale", scale)
 
 
-def build_compressed_token_map(tokenizer) -> Tuple[List[int], int]:
+def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
     """Collapse token ids that normalize alike, as the released engram does.
 
     Ported from ``inference/engram.py`` rather than imported: the reference is
@@ -331,7 +332,7 @@ def build_compressed_token_map(tokenizer) -> Tuple[List[int], int]:
     )
 
     backend = tokenizer.backend_tokenizer
-    key_to_new: Dict[str, int] = {}
+    key_to_new: dict[str, int] = {}
     lookup = [0] * len(tokenizer)
     for token_id in range(len(tokenizer)):
         text = backend.decode([token_id], skip_special_tokens=False)
@@ -440,7 +441,7 @@ def convert_ngram(source: TensorSource, output_dir: str, config, model_path: str
     return writer.finalize(config)
 
 
-def _llm_attention_names(layer: int) -> Dict[str, str]:
+def _llm_attention_names(layer: int) -> dict[str, str]:
     """Released -> module, for one layer's attention block."""
     prefix = f"layers.{layer}.attn"
     target = f"model.layers.{layer}.self_attn"
@@ -467,7 +468,7 @@ def _llm_attention_names(layer: int) -> Dict[str, str]:
     return names
 
 
-def _llm_layer_names(layer: int) -> Dict[str, str]:
+def _llm_layer_names(layer: int) -> dict[str, str]:
     """Released -> module, for everything in one layer except the experts.
 
     The two norms are renamed rather than passed through: the released
@@ -498,7 +499,7 @@ def _llm_layer_names(layer: int) -> Dict[str, str]:
     return names
 
 
-def _mtp_layer_names(stage: int) -> Dict[str, str]:
+def _mtp_layer_names(stage: int) -> dict[str, str]:
     """Released ``mtp.{stage}.*`` -> ``model.mtp.{stage}.*``, same inner mapping as a backbone layer."""
     return {
         released.replace(f"layers.{stage}", f"mtp.{stage}", 1): target.replace(
@@ -508,7 +509,7 @@ def _mtp_layer_names(stage: int) -> Dict[str, str]:
     }
 
 
-def convert_llm(source: TensorSource, output_dir: str, config, engram_layer_ids: List[int]) -> int:
+def convert_llm(source: TensorSource, output_dir: str, config, engram_layer_ids: list[int]) -> int:
     """The 40 decoder layers, DSpark stages, the Engram connections and the final norm."""
     writer = ShardWriter(os.path.join(output_dir, "deepseek_v41_llm"))
     emitter = Emitter(source, writer)
@@ -607,7 +608,7 @@ def _convert_layer_experts(
     gc.collect()
 
 
-def _build_configs(hf_config: Dict[str, Any]):
+def _build_configs(hf_config: dict[str, Any]):
     """The four module configs, from the released ``config.json``."""
     import veomni.models.seed_omni.modules  # noqa: F401
     from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
@@ -658,19 +659,25 @@ def _build_configs(hf_config: Dict[str, Any]):
 def convert_deepseek_v41_checkpoint(
     model_path: str,
     output_dir: str,
-    modules: Optional[Iterable[str]] = None,
+    modules: Iterable[str] | str | None = None,
+    training_graph: str | None = None,
+    generation_graph: str | None = None,
     **kwargs,
-) -> None:
-    """Split the released DeepSeek-V4.1 checkpoint into four module subfolders.
+) -> dict[str, Any]:
+    """Stream the released DeepSeek-V4.1 checkpoint into four module subfolders.
 
-    Dtypes stay as released. Training dequantizes at load.
+    Dtypes stay as released. Training dequantizes at load. Takes ``output_dir``,
+    so :func:`~veomni.models.seed_omni.utils.convert_registry.convert_checkpoint`
+    leaves the subfolders to this function and writes only the root config and
+    graph sidecars from what it returns.
 
     Args:
-        modules: Which subfolders to write, defaulting to all four. A folder is
-            self-contained, so converting one does not invalidate the others --
-            which is the point, since the experts are 269 GiB and a rerun to
-            pick up a fix in, say, the n-gram ``token_map`` should not repay
-            that.
+        modules: Which subfolders to write, defaulting to all four; a
+            comma-separated string as ``--extra modules=...`` passes it. A
+            folder is self-contained, so converting one does not invalidate the
+            others -- which is the point, since the experts are 269 GiB and a
+            rerun to pick up a fix in, say, the n-gram ``token_map`` should not
+            repay that. The root config always names all four.
     """
     if "precision" in kwargs:
         raise TypeError(
@@ -679,10 +686,20 @@ def convert_deepseek_v41_checkpoint(
         )
     if kwargs:
         raise TypeError(f"unexpected convert kwargs {sorted(kwargs)}")
+    if isinstance(modules, str):
+        modules = [name.strip() for name in modules.split(",") if name.strip()]
     selected = set(modules) if modules is not None else set(MODULES)
     unknown = selected - set(MODULES)
     if unknown:
         raise ValueError(f"unknown modules {sorted(unknown)}; expected a subset of {list(MODULES)}")
+
+    training_graphs, generation_graphs = load_family_graphs(
+        "configs/seed_omni/DeepSeek/deepseek_v41_flash",
+        training="train/graph_train.yaml",
+        generation={"vision_understanding": "infer/graph_infer.yaml"},
+        training_graph=training_graph,
+        generation_graph=generation_graph,
+    )
 
     with open(os.path.join(model_path, "config.json")) as handle:
         hf_config = json.load(handle)
@@ -719,8 +736,20 @@ def convert_deepseek_v41_checkpoint(
         count = convert_llm(source, output_dir, llm_config, list(ngram_config.layer_ids))
         print(f"  {count} tensors")
 
+    # The root config loads every module's config.json, including the ones a
+    # partial run skipped; a folder converted earlier keeps the config it has.
+    configs = dict(zip(MODULES, (vision_config, text_encoder_config, ngram_config, llm_config)))
+    for name in sorted(set(MODULES) - selected):
+        if not os.path.isfile(os.path.join(output_dir, name, "config.json")):
+            configs[name].save_pretrained(os.path.join(output_dir, name))
+
     source.close()
-    print(f"\nDone. Split checkpoint saved to: {output_dir}")
+    return {
+        "module_names": list(MODULES),
+        "training_graphs": training_graphs,
+        "generation_graphs": generation_graphs,
+        "infer_type": "vision_understanding",
+    }
 
 
 @OMNI_CONVERT_REGISTRY.register("deepseek_v41")

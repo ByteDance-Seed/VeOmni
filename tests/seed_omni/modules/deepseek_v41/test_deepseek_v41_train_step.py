@@ -46,7 +46,7 @@ from veomni.models.seed_omni.modules.deepseek_v41.vision.accelerated.accelerated
     DeepseekV41VisionEncoderAccelerated,
 )
 from veomni.models.seed_omni.modules.deepseek_v41.vision.configuration import DeepseekV41VisionEncoderConfig
-from veomni.models.seed_omni.modules.deepseek_v41.vision.processing import _SOURCE, image_token_types
+from veomni.models.seed_omni.modules.deepseek_v41.vision.processing import image_token_types
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.ops.kernels.cross_entropy import ForCausalLMLoss
 from veomni.utils.constants import IGNORE_INDEX
@@ -261,8 +261,8 @@ def build_toy_omni(modules) -> OmniModel:
     if isinstance(edges, dict):
         edges = edges["training_graph"]
     config = OmniConfig(
-        modules={name: {"subfolder": name} for name in modules},
-        training_graph=edges,
+        _module_entries={name: {"model_path": name} for name in modules},
+        training_graphs={"default": edges},
         generation_graphs=_DUMMY_GENERATION,
         infer_type="infer_und",
     )
@@ -273,8 +273,8 @@ def dummy_image_item() -> ConversationItem:
     return ConversationItem(
         type="image",
         value=torch.zeros(1, 3, 4, 4),
-        role="dummy",
-        source=_SOURCE,
+        role="user",
+        is_dummy=True,
         meta={
             "_omni_vit_grid": [1, 1],
             "_omni_token_types": image_token_types(1, 1),

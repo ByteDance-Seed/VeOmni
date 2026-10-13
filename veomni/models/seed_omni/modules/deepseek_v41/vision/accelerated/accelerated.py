@@ -39,7 +39,6 @@ from ..modeling import (
     build_deepseek_v41_vit_metadata,
     scatter_deepseek_v41_visual_embeds,
 )
-from ..processing import _SOURCE
 
 
 class TrainingMixin(TrainingModuleMixin):
@@ -47,7 +46,7 @@ class TrainingMixin(TrainingModuleMixin):
 
     Every user image in the micro-batch goes through one packed forward. When a
     micro-batch holds no image at all, the CPU worker has appended a single
-    ``role="dummy"`` anchor item, which travels the same path -- it carries patches
+    ``is_dummy`` user-image anchor, which travels the same path -- it carries patches
     and a grid exactly like a real one, so the FSDP collectives still fire and the
     branch stays out of the forward.
     """
@@ -68,8 +67,8 @@ class TrainingMixin(TrainingModuleMixin):
     ) -> Dict[str, Any]:
         self._conversation_carrier = conversation_list
         items = list(iter_desired_items(conversation_list, types=["image"], roles=["user"]))
-        if not items:
-            items = list(iter_desired_items(conversation_list, types=["image"], roles=["dummy"], sources=[_SOURCE]))
+        real_items = [item for item in items if not item.is_dummy]
+        items = real_items or items
         pixel_values, grids, token_types, slots = build_deepseek_v41_vit_batch(
             items, device=self.device, dtype=self.dtype
         )

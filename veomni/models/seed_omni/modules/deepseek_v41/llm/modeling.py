@@ -46,13 +46,13 @@ There is no HF ``past_key_values``.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ....omni_pretrained_model import OmniPreTrainedModel
+from ...module_modeling_base import PretrainedOmniModule
 from .attention import (
     DeepseekV41AttentionCache,
     DeepseekV41RotaryEmbedding,
@@ -100,13 +100,13 @@ class DeepseekV41Backbone(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
-        ngram_embeds: Optional[List[torch.Tensor]] = None,
-        image_mask: Optional[torch.Tensor] = None,
-        capture: Optional[List[DeepseekV41AttentionCache]] = None,
-        capture_seq_len: Optional[int] = None,
+        ngram_embeds: list[torch.Tensor] | None = None,
+        image_mask: torch.Tensor | None = None,
+        capture: list[DeepseekV41AttentionCache] | None = None,
+        capture_seq_len: int | None = None,
         return_draft_hiddens: bool = False,
-        shard: Optional[SequenceShard] = None,
-    ) -> Dict[str, Any]:
+        shard: SequenceShard | None = None,
+    ) -> dict[str, Any]:
         """``shard`` runs this rank's rows of a sequence-parallel row.
 
         Every per-token input -- embeddings, positions, n-gram rows, image mask
@@ -148,10 +148,10 @@ class DeepseekV41Backbone(nn.Module):
         hidden_streams = expand_to_streams(inputs_embeds, self.config.hc_mult)
         pre_mix = identity_pre_mix(hidden_streams, self.config.hc_mult)
 
-        router_logits: List[torch.Tensor] = []
-        indexer_terms: List[IndexerLossTerms] = []
+        router_logits: list[torch.Tensor] = []
+        indexer_terms: list[IndexerLossTerms] = []
         draft_targets = set(self.config.dspark_target_layer_ids)
-        draft_inputs: Dict[int, torch.Tensor] = {}
+        draft_inputs: dict[int, torch.Tensor] = {}
 
         for layer_idx, layer in enumerate(self.layers):
             if str(layer_idx) in self.engram:
@@ -206,7 +206,7 @@ class DeepseekV41Backbone(nn.Module):
         # why it cannot be reused here.
         hidden_states = self.norm(mhc_collapse(hidden_streams, pre_mix))
 
-        outputs: Dict[str, Any] = {
+        outputs: dict[str, Any] = {
             "hidden_states": hidden_states,
             "router_logits": router_logits,
         }
@@ -239,11 +239,11 @@ class DeepseekV41Backbone(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
-        ngram_embeds: Optional[List[torch.Tensor]] = None,
-        image_mask: Optional[torch.Tensor] = None,
-        capture: Optional[List[DeepseekV41AttentionCache]] = None,
-        capture_seq_len: Optional[int] = None,
-    ) -> Dict[str, Any]:
+        ngram_embeds: list[torch.Tensor] | None = None,
+        image_mask: torch.Tensor | None = None,
+        capture: list[DeepseekV41AttentionCache] | None = None,
+        capture_seq_len: int | None = None,
+    ) -> dict[str, Any]:
         """Prefill capture: encoder on the full prompt, decoder on the last window.
 
         Training uses :meth:`forward`. Official decode still runs every layer
@@ -278,22 +278,22 @@ class DeepseekV41Backbone(nn.Module):
         shared = SharedAttentionState()
         hidden_streams = expand_to_streams(inputs_embeds, self.config.hc_mult)
         pre_mix = identity_pre_mix(hidden_streams, self.config.hc_mult)
-        draft_inputs: Dict[int, torch.Tensor] = {}
-        router_logits: List[torch.Tensor] = []
-        indexer_terms: List[IndexerLossTerms] = []
+        draft_inputs: dict[int, torch.Tensor] = {}
+        router_logits: list[torch.Tensor] = []
+        indexer_terms: list[IndexerLossTerms] = []
         draft_targets = set(self.config.dspark_target_layer_ids)
 
         def run_layer(
             layer_idx: int,
             *,
-            layer_plans: Dict,
-            layer_capture_seq_len: Optional[int],
-            layer_ngram: Optional[List[torch.Tensor]],
-            layer_image_mask: Optional[torch.Tensor],
-            layer_token_mask: Optional[torch.Tensor],
+            layer_plans: dict,
+            layer_capture_seq_len: int | None,
+            layer_ngram: list[torch.Tensor] | None,
+            layer_image_mask: torch.Tensor | None,
+            layer_token_mask: torch.Tensor | None,
             layer_position_ids: torch.Tensor,
-            compress_hidden: Optional[torch.Tensor] = None,
-            compress_position_ids: Optional[torch.Tensor] = None,
+            compress_hidden: torch.Tensor | None = None,
+            compress_position_ids: torch.Tensor | None = None,
         ) -> None:
             nonlocal hidden_streams, pre_mix
             layer = self.layers[layer_idx]
@@ -358,7 +358,7 @@ class DeepseekV41Backbone(nn.Module):
             draft_hiddens = [hidden[:, -width:] for hidden in draft_hiddens]
 
         hidden_states = self.norm(mhc_collapse(hidden_streams, pre_mix))
-        outputs: Dict[str, Any] = {
+        outputs: dict[str, Any] = {
             "hidden_states": hidden_states,
             "router_logits": router_logits,
         }
@@ -373,10 +373,10 @@ class DeepseekV41Backbone(nn.Module):
 
     def seed_dspark_windows(
         self,
-        draft_hiddens: List[torch.Tensor],
+        draft_hiddens: list[torch.Tensor],
         position_ids: torch.Tensor,
-        caches: List[DeepseekV41AttentionCache],
-    ) -> Optional[torch.Tensor]:
+        caches: list[DeepseekV41AttentionCache],
+    ) -> torch.Tensor | None:
         """Write each DSpark stage's window KV from the backbone's target-layer inputs."""
         if not self.mtp:
             return None
@@ -396,10 +396,10 @@ class DeepseekV41Backbone(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
-        draft_hiddens: List[torch.Tensor],
-        shard: Optional[SequenceShard] = None,
-        input_ids: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        draft_hiddens: list[torch.Tensor],
+        shard: SequenceShard | None = None,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Teacher-forced DSpark on the packed row.
 
         Returns the ``[B, S, hidden]`` LM-head input and, given the packed
@@ -442,7 +442,7 @@ class DeepseekV41Backbone(nn.Module):
         self,
         draft_embeds: torch.Tensor,
         position: int,
-        caches: List[DeepseekV41AttentionCache],
+        caches: list[DeepseekV41AttentionCache],
         main_x: torch.Tensor,
     ) -> torch.Tensor:
         """One DSpark block after a verified token, matching official ``forward_spec``.
@@ -468,7 +468,7 @@ class DeepseekV41Backbone(nn.Module):
         return self.mtp[-1].collapse_draft(hidden_streams, pre_mix)
 
 
-class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
+class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, PretrainedOmniModule):
     """``deepseek_v41_llm`` -- the CED backbone as an OmniModule.
 
     Takes ``inputs_embeds`` because the embedding belongs to the sibling text
@@ -487,7 +487,7 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
     supports_gradient_checkpointing = True
 
     @staticmethod
-    def _create_checkpoint_tensor_converter(model: "DeepseekV41Llm"):
+    def _create_checkpoint_tensor_converter(model: DeepseekV41Llm):
         """Dequant fp8/fp4 into bf16 when this module was built for training."""
         from ..checkpoint_tensor_converter import create_deepseek_v41_llm_checkpoint_tensor_converter
 
@@ -575,7 +575,7 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
         """Whether ``forward`` runs the teacher-forced DSpark stages this step."""
         return self.training and bool(self.model.mtp) and any(p.requires_grad for p in self.model.mtp.parameters())
 
-    def _trainable_backbone_layer_ids(self) -> Optional[set]:
+    def _trainable_backbone_layer_ids(self) -> set | None:
         if self.config.trainable_layer_ids is not None:
             return set(self.config.trainable_layer_ids)
         n = self.config.n_trainable_layers
@@ -585,17 +585,17 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
 
     def forward(  # type: ignore[override]
         self,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        ngram_embeds: Optional[List[torch.Tensor]] = None,
-        image_mask: Optional[torch.Tensor] = None,
-        capture: Optional[List[DeepseekV41AttentionCache]] = None,
-        capture_seq_len: Optional[int] = None,
+        inputs_embeds: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        ngram_embeds: list[torch.Tensor] | None = None,
+        image_mask: torch.Tensor | None = None,
+        capture: list[DeepseekV41AttentionCache] | None = None,
+        capture_seq_len: int | None = None,
         return_draft_hiddens: bool = False,
-        sequence_shard: Optional[SequenceShard] = None,
-        dspark_input_ids: Optional[torch.Tensor] = None,
+        sequence_shard: SequenceShard | None = None,
+        dspark_input_ids: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """``[B, S, hidden]`` embeddings -> ``[B, S, hidden]`` hidden states.
 
         ``position_ids`` restarts at zero per packed sample and is the only place
