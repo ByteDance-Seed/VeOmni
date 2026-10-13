@@ -186,6 +186,26 @@ def test_only_a_cacheable_module_is_built_on_meta_for_offline_training(monkeypat
     assert captured["init_device"] == ("meta" if on_meta else "cpu")
 
 
+@pytest.mark.parametrize(("accelerated_cls", "on_meta"), [(_CacheableModule, True), (None, False)])
+def test_the_class_the_omni_registries_build_decides_the_meta_build(monkeypatch, accelerated_cls, on_meta):
+    """The real lookup prefers the accelerated class, so a marker there (as on BAGEL's VAE) is what counts."""
+    from veomni.models.seed_omni import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_MODEL_REGISTRY
+
+    monkeypatch.delenv("MODELING_BACKEND", raising=False)
+    model_type = "offline_cache_marker_test"
+    OMNI_MODEL_REGISTRY[model_type] = lambda: nn.Linear
+    if accelerated_cls is not None:
+        OMNI_ACCELERATED_MODEL_REGISTRY[model_type] = lambda: accelerated_cls
+    try:
+        runtime = _offline_cache_runtime("offline_training")
+        runtime.module_config = SimpleNamespace(model_type=model_type, architectures=None)
+        assert runtime.reads_offline_cache is on_meta
+    finally:
+        del OMNI_MODEL_REGISTRY[model_type]
+        if accelerated_cls is not None:
+            del OMNI_ACCELERATED_MODEL_REGISTRY[model_type]
+
+
 def test_a_cache_reading_module_is_frozen_and_never_wrapped_trained_or_saved(monkeypatch):
     calls = []
     for step in (

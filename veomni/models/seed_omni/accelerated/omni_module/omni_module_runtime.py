@@ -157,6 +157,10 @@ class ModuleRuntime(VeOmniModelRuntime):
                     # Stay on meta. ``OmniModelRuntime._parallelize_composed_model``
                     # detaches this module before the composed wrap so it is not
                     # materialised with the rest under ``fsdp_scope='model'``.
+                    logger.info_rank0(
+                        f"ModuleRuntime '{self.module_name}': mixes in OfflineEncodingMixin, so "
+                        "offline_training reads it from the cache; left on meta, frozen and unwrapped."
+                    )
                     self.model.requires_grad_(False)
                     return
                 self._freeze_model_module()
