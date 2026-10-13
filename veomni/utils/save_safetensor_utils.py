@@ -152,12 +152,17 @@ def _consolidation_process_group():
 
 
 def _whole_rows(tensor: torch.Tensor) -> bool:
-    """True when every shard of ``tensor`` is a run of complete dim-0 rows."""
+    """True when every shard of ``tensor`` is a run of complete dim-0 rows.
+
+    An FSDP-wrapped table is also split along dim 1, so this holds only under
+    ``extra_parallel_only``. ``_StridedShard`` subclasses ``Shard`` but its
+    local rows are not contiguous.
+    """
     from torch.distributed.tensor import DTensor, Replicate, Shard
 
     if not isinstance(tensor, DTensor):
         return True
-    return all(isinstance(p, Replicate) or (isinstance(p, Shard) and p.dim == 0) for p in tensor.placements)
+    return all(isinstance(p, Replicate) or (type(p) is Shard and p.dim == 0) for p in tensor.placements)
 
 
 def _deferred_merge_fqns(model: torch.nn.Module, save_state: Dict[str, torch.Tensor]) -> Set[str]:
@@ -296,11 +301,19 @@ def _row_shards(sharded_path: str, fqn: str, shape: List[int], nbytes: int) -> t
 
 
 def _merge_rows(sharded_path: str, output_path: str, fqn: str, shape: List[int], nbytes: int) -> None:
-    """Append ``fqn``'s row shards into a one-tensor safetensors file, a chunk at a time."""
+    """Append ``fqn``'s row shards into a one-tensor safetensors file, a chunk at a time.
+
+    Written under a temporary name and renamed into place: an append-only mount
+    may refuse to truncate the partial file an interrupted merge left behind.
+    """
     dtype, shards = _row_shards(sharded_path, fqn, shape, nbytes)
     header = json.dumps({fqn: {"dtype": dtype, "shape": shape, "data_offsets": [0, nbytes]}}).encode()
     header += b" " * (-len(header) % 8)
-    with open(output_path, "wb") as out:
+    partial_path = output_path + ".partial"
+    for stale in (partial_path, output_path):
+        if os.path.exists(stale):
+            os.remove(stale)
+    with open(partial_path, "wb") as out:
         out.write(struct.pack("<Q", len(header)))
         out.write(header)
         for path, start, end in shards:
@@ -313,9 +326,10 @@ def _merge_rows(sharded_path: str, output_path: str, fqn: str, shape: List[int],
                         raise OSError(f"{path} ended {remaining} bytes early.")
                     out.write(chunk)
                     remaining -= len(chunk)
-    written, data_start = _read_safetensors_header(output_path)
-    if written[fqn]["shape"] != shape or os.path.getsize(output_path) != data_start + nbytes:
-        raise OSError(f"{output_path} does not hold the {nbytes} bytes of {fqn} it was written with.")
+    written, data_start = _read_safetensors_header(partial_path)
+    if written[fqn]["shape"] != shape or os.path.getsize(partial_path) != data_start + nbytes:
+        raise OSError(f"{partial_path} does not hold the {nbytes} bytes of {fqn} it was written with.")
+    os.replace(partial_path, output_path)
 
 
 def merge_pending_hf_shards(save_path: str, num_threads: Optional[int] = None) -> None:
@@ -332,6 +346,16 @@ def merge_pending_hf_shards(save_path: str, num_threads: Optional[int] = None) -
         pending = json.load(f)
     tensors = pending["tensors"]
     sharded_path = os.path.join(save_path, pending["sharded_dir"])
+    index_path = os.path.join(save_path, "model.safetensors.index.json")
+    weight_map = {}
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+    if any(weight_map.get(fqn) != t["file"] for fqn, t in tensors.items()):
+        raise ValueError(
+            f"{index_path} is missing or does not name the files {marker} lists: the save stopped "
+            "before writing it. Export this checkpoint again."
+        )
     start_time = time.time()
     with ThreadPoolExecutor(max_workers=num_threads or len(tensors)) as pool:
         futures = [

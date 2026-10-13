@@ -62,6 +62,10 @@ def _local_rows(rank: int) -> torch.Tensor:
     return (torch.arange(ROWS * COLS, dtype=torch.float32).view(ROWS, COLS) + 100 * rank).to(torch.bfloat16)
 
 
+def _wide_table() -> torch.Tensor:
+    return torch.arange(2 * ROWS * 2 * COLS, dtype=torch.float32).view(2 * ROWS, 2 * COLS).to(torch.bfloat16)
+
+
 def _replicated() -> dict:
     generator = torch.Generator().manual_seed(0)
     return {
@@ -82,16 +86,21 @@ def _worker(rank: int, init_file: str, save_path: str) -> None:
     dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=WORLD_SIZE)
     try:
         from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import distribute_tensor
 
         from veomni.checkpoint.dcp_checkpointer import restore_extra_parallel_dim
 
         mesh = init_device_mesh("cpu", (1, WORLD_SIZE), mesh_dim_names=("emb_fsdp", "emb"))
         table = restore_extra_parallel_dim(_local_rows(rank), mesh, mesh["emb_fsdp"], ep_shard_dim=0)
+        # As an FSDP-wrapped emb table is placed: rows by emb, then columns by FSDP.
+        fsdp_mesh = init_device_mesh("cpu", (2, WORLD_SIZE // 2), mesh_dim_names=("fsdp", "emb"))
+        wide = distribute_tensor(_wide_table(), fsdp_mesh, [Shard(1), Shard(0)])
         model = _model(
             SimpleNamespace(para_name="emb", placement=Shard(0)),
             SimpleNamespace(para_name="emb", placement=Replicate()),
+            wide=SimpleNamespace(para_name="emb", placement=Shard(0)),
         )
-        _export(model, {"table": table, **_replicated()}, save_path)
+        _export(model, {"table": table, "wide": wide, **_replicated()}, save_path)
     finally:
         dist.destroy_process_group()
 
@@ -113,11 +122,13 @@ def test_an_emb_sharded_table_is_kept_split_and_merged_offline():
 
         weight_map = json.loads((Path(save_path) / "model.safetensors.index.json").read_text())["weight_map"]
         pending = json.loads((Path(save_path) / HF_PENDING_MERGE_FILENAME).read_text())["tensors"]
-        assert set(weight_map) == {"table", "dense", "bias"}
+        assert set(weight_map) == {"table", "wide", "dense", "bias"}
         assert pending == {"table": {"file": weight_map["table"], "shape": [WORLD_SIZE * ROWS, COLS], "nbytes": 192}}
-        # Only the table waits; the replicated dense weight is just as oversized but has one copy.
+        # Only the table waits: the replicated dense weight is just as oversized but has
+        # one copy, and the column-split table's shards are not whole rows.
         assert not (Path(save_path) / weight_map["table"]).exists()
         assert (Path(save_path) / weight_map["dense"]).exists()
+        assert (Path(save_path) / weight_map["wide"]).exists()
         shards = sorted(p.name for p in (Path(save_path) / HF_SHARDED_DIRNAME).iterdir())
         assert len(shards) == WORLD_SIZE
         assert all(weight_map["table"].replace("model-", "") in name for name in shards)
@@ -143,12 +154,13 @@ def test_an_emb_sharded_table_is_kept_split_and_merged_offline():
         loaded = _load_export(save_path)
         expected_table = torch.cat([_local_rows(rank) for rank in range(WORLD_SIZE)])
         torch.testing.assert_close(loaded["table"], expected_table, atol=0, rtol=0)
+        torch.testing.assert_close(loaded["wide"], _wide_table(), atol=0, rtol=0)
         for name, value in _replicated().items():
             torch.testing.assert_close(loaded[name], value, atol=0, rtol=0)
         _resolve_safetensors_shards(save_path)
 
 
-def test_a_small_emb_table_or_an_unplanned_tensor_is_consolidated_as_before():
+def test_an_oversized_table_not_row_sharded_by_emb_is_consolidated_as_before():
     state = {"table": _local_rows(0), **_replicated()}
     for model in (
         _model(SimpleNamespace(para_name="emb", placement=Replicate())),
@@ -172,6 +184,17 @@ def test_a_merge_interrupted_before_its_marker_is_removed_can_run_again():
                 save_utils.merge_pending_hf_shards(save_path)
         save_utils.merge_pending_hf_shards(save_path)
         torch.testing.assert_close(_load_export(save_path)["table"], table, atol=0, rtol=0)
+
+
+def test_a_merge_refuses_an_export_whose_save_stopped_before_its_index():
+    table = torch.cat([_local_rows(rank) for rank in range(WORLD_SIZE)])
+    with tempfile.TemporaryDirectory() as save_path:
+        _export(_model(SimpleNamespace(para_name="emb", placement=Shard(0))), {"table": table}, save_path)
+        os.remove(Path(save_path) / "model.safetensors.index.json")
+        with pytest.raises(ValueError, match="Export this checkpoint again"):
+            save_utils.merge_pending_hf_shards(save_path)
+        assert (Path(save_path) / HF_PENDING_MERGE_FILENAME).exists()
+        assert any((Path(save_path) / HF_SHARDED_DIRNAME).iterdir())
 
 
 def test_two_tables_sharing_source_files_each_get_a_file_of_their_own():

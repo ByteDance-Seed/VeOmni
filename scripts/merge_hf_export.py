@@ -65,9 +65,16 @@ def main() -> None:
         )
     if not exports:
         logger.info(f"No {HF_PENDING_MERGE_FILENAME} under {args.path}: nothing to merge.")
+    failed = []
     for export in exports:
         logger.info(f"Merging {export}")
-        merge_pending_hf_shards(export, num_threads=args.num_threads)
+        try:
+            merge_pending_hf_shards(export, num_threads=args.num_threads)
+        except Exception:
+            logger.exception(f"Could not merge {export}; its marker and shards are kept.")
+            failed.append(export)
+    if failed:
+        raise SystemExit(f"{len(failed)} of {len(exports)} export(s) not merged: {', '.join(failed)}")
 
 
 if __name__ == "__main__":
