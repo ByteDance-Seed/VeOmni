@@ -728,3 +728,17 @@ def test_iterable_hf_dataset_repeat_passes_do_not_overlap_across_workers(tmp_pat
     w0, w1 = file_per_pass(per_worker[0]), file_per_pass(per_worker[1])
     overlaps = sum(a == b for a, b in zip(w0, w1))
     assert overlaps == 0, f"{overlaps}/{min(len(w0), len(w1))} passes had both workers read the same shard"
+
+
+def test_iterable_workers_keep_hf_epoch_private():
+    from datasets import Dataset as HFDataset
+
+    hf_stream = HFDataset.from_dict({"x": list(range(32))}).to_iterable_dataset(num_shards=4)
+    hf_stream = hf_stream.shuffle(seed=0, buffer_size=8)
+    stream = ShardedIterableDataset(hf_stream, repeat=False, seed=42)
+    loader = torch.utils.data.DataLoader(stream, batch_size=None, num_workers=2)
+    rows = sorted(int(sample["x"]) for sample in loader)
+    assert rows == list(range(32))
+    # HF keeps the epoch in memory shared with every DataLoader worker; a worker
+    # writing it races the others, and the parent would see the write.
+    assert hf_stream.epoch == 0
