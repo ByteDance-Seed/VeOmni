@@ -641,12 +641,7 @@ class TestDsparkTrainStep:
         """Chunked draft CE gives the materialized-logits loss and gradients for h, lm_head and the bias."""
         from veomni.models.seed_omni.modules.deepseek_v41.text_encoder.accelerated import accelerated
 
-        real = accelerated._markov_residual_cross_entropy
-        monkeypatch.setattr(
-            accelerated,
-            "_markov_residual_cross_entropy",
-            lambda *args, **kwargs: real(*args, markov_chunk_size=3, **kwargs),
-        )
+        monkeypatch.setattr(accelerated, "_DSPARK_CHUNK_SIZE", 3)
         te = DeepseekV41TextEncoderAccelerated(tiny_text_config())
         torch.manual_seed(0)
         draft = torch.randn(11, HIDDEN, requires_grad=True)
@@ -666,6 +661,18 @@ class TestDsparkTrainStep:
         torch.testing.assert_close(loss, expected)
         for got, want in zip(chunked, (draft.grad, te.lm_head.weight.grad, markov_bias.grad)):
             torch.testing.assert_close(got, want)
+
+    def test_a_span_with_no_draft_label_scores_zero(self):
+        """A rank whose rows are all unsupervised adds 0.0 to the reduction, not NaN."""
+        te = DeepseekV41TextEncoderAccelerated(tiny_text_config())
+        draft = torch.randn(4, HIDDEN, requires_grad=True)
+        markov_bias = torch.randn(4, VOCAB, requires_grad=True)
+
+        loss = te._dspark_loss(draft, markov_bias, torch.full((4,), IGNORE_INDEX))
+        loss.backward()
+
+        assert loss.item() == 0.0
+        assert torch.isfinite(draft.grad).all() and torch.isfinite(markov_bias.grad).all()
 
 
 def _has_grad(module, prefix: str) -> bool:
