@@ -19,6 +19,7 @@ tests/
 │   ├── test_model_registry.py      # Model loader registry (HF vs VeOmni)
 │   ├── test_checkpoint_tensor_converter.py  # Checkpoint tensor conversion (e.g. Qwen3MoE fuse)
 │   ├── test_deepseek_v4_fused_moe.py  # DeepSeek-V4 fused MoE swiglu_limit plumbing
+│   ├── test_glm_moe_dsa.py         # GLM-MoE-DSA EP plan and MoE monitor wiring (CPU)
 │   ├── test_padded_packed_loss.py   # Padded vs packed (cu_seqlens) loss equivalence
 │   ├── test_models_logits_equal_v5.py  # HF↔VeOmni logits through the real loader
 │   └── utils.py                    # ModelMode, prepare_model_modes, prepare_data
@@ -66,6 +67,7 @@ tests/
 │   ├── test_fsdp_equivalence.py         # Single-GPU vs FSDP2 grad equivalence
 │   ├── test_gradient_checkpointing.py   # Checkpoint kwargs and recomputed-input grad cleanup
 │   ├── test_emb_parallel.py             # ShardedEmbedding lookup / tied projection vs dense, through FSDP2 (CPU gloo)
+│   ├── test_parallel_plan.py            # ParallelPlan: every planned parameter's owner is wrapped on its para mesh
 │   └── test_dummy_forward.py            # Asymmetric multimodal forward (NCCL hang prevention)
 │
 ├── seed_omni/                      # SeedOmni multi-module models, runtime and trainer
@@ -97,6 +99,7 @@ tests/
 │
 ├── utils/                          # Misc utility tests
 │   ├── test_count_flops.py                       # FLOPs estimation
+│   ├── test_ep_sharded_expert_stream_load.py     # ep_sharded_stream_load per-rank per-expert stacking (CPU)
 │   ├── test_extra_parallel_clip_grad_norm.py      # Grad clipping with EP/EMB dims (8 GPUs)
 │   ├── test_helper.py                             # EnvironMeter utility (8 GPUs)
 │   ├── test_model_loader.py                       # Model loading (4 GPUs)
@@ -166,7 +169,7 @@ Additional per-directory helpers:
 | Liger kernel | `True`, `False` (VeOmni only) |
 
 **Models covered**:
-- Text / MoE: llama3_1, qwen2, qwen3_5, qwen3_5_moe, seed_oss, deepseek_v3, deepseek_v4
+- Text / MoE: llama3_1, qwen2, qwen3_5, qwen3_5_moe, seed_oss, deepseek_v3, deepseek_v4, glm_moe_dsa (`eager` attention only)
 - VLM: qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
 - Omni: qwen2_5_omni, qwen3_omni_moe
 
