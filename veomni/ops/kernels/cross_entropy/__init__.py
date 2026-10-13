@@ -101,6 +101,11 @@ def ForCausalLMLoss(
     hidden_states = kwargs.pop("hidden_states", None)
     weights = kwargs.pop("weights", None)
     loss_reduction_group = kwargs.pop("loss_reduction_group", None)
+    if kwargs.pop("logits_bias", None) is not None:
+        raise NotImplementedError(
+            "logits_bias is only supported by cross_entropy_loss_implementation='chunk_loss'; "
+            "with eager CE, add it to the logits before the call."
+        )
     # Per-call log-probs dispatch: when the caller passes `return_log_probs=True`
     # (the model `forward` simply forwards it through `**kwargs`), skip the loss
     # path and route hidden_states+weights+labels through the chunked log-probs
@@ -391,6 +396,8 @@ def _chunk_loss_dispatch(
     chunk_size = kwargs.pop("chunk_size", 1024)
 
     if return_log_probs:
+        if kwargs.get("logits_bias") is not None:
+            raise NotImplementedError("logits_bias is supported by the chunk_loss loss path, not return_log_probs.")
         hidden_states = kwargs.get("hidden_states")
         weights = kwargs.get("weights")
         labels = kwargs.get("labels")

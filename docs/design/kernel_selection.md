@@ -203,6 +203,13 @@ The `npu` chunk-loss binds only to `ForCausalLM` and
 `labels[..., 1:]` shift (incompatible with token-level classification
 labels).
 
+`chunk_loss_function` also takes an optional `logits_bias`: a differentiable
+term added to each row's logits, shaped like the logits
+(`hidden_states.shape[:-1] + (vocab,)`). It is sliced with the hidden states,
+so only one chunk of fp32 logits is live. Use it for heads whose logits are
+`lm_head(h)` plus a per-token residual (DeepSeek-V4.1's DSpark Markov term).
+Liger and eager do not take it; `ForCausalLMLoss` raises if it is passed.
+
 Selecting `liger_kernel` requires that the model's forward pass provide
 `hidden_states=` and `weights=self.lm_head.weight` through
 `self.loss_function(...)` — the Liger fused linear+CE kernel does the
