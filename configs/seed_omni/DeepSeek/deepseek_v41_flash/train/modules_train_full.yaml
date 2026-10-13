@@ -21,7 +21,8 @@
 # Why 256 cards. At ~64 GB of state per H20 (the rest is activations) the
 # floor is 166 cards, but three counts have to divide the card count:
 #
-#   * `extra_parallel_only` needs emb == dp, so emb is the card count.
+#   * `extra_parallel_only` needs emb to span the FSDP axis (dp_shard x
+#     cp_size), so emb is the card count.
 #   * the vocabulary (129280) and the padded table rows (384006400, 384016896)
 #     divide by 64, 128 and 256, not by 192.
 #   * EP must divide the 384 routed experts: 64 or 128, never 256.

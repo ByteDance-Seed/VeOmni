@@ -29,11 +29,13 @@
 # If it OOMs, in order of what it costs the run:
 #   * export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (fragmentation);
 #   * freeze the text encoder: its replicated lm_head grad and moments are ~4 GB;
-#   * trainable_layer_ids on the llm: each frozen layer frees ~1.3 GB a card.
+#   * trainable_layer_ids on the llm: each frozen layer frees its fp32 grad and
+#     momentum, ~0.85 GB a card (its fp32 master copy stays).
 #
-# The counts that must divide 128: emb == dp for extra_parallel_only, so emb is
-# 128; the vocabulary (129280) and the padded table rows divide by 128; EP 64
-# divides the 384 routed experts, leaving ep_fsdp 2.
+# The counts that must divide 128: extra_parallel_only needs emb to span the
+# whole FSDP axis (dp_shard x cp_size), so emb is 128 at any cp_size; the
+# vocabulary (129280) and the padded table rows divide by 128; EP 64 divides the
+# 384 routed experts, leaving ep_fsdp 2.
 #
 # Muon at the AdamW lr starts with steps about a fifth of AdamW's
 # (muon_adjust_lr_fn=match_rms_adamw matches AdamW's steady state, not its

@@ -18,8 +18,8 @@ model:
 
   accelerator:
     init_device: meta
-    # extra_parallel_only needs emb == dp, so raising this halves emb with it;
-    # see base.yaml for what context parallelism shards.
+    # emb spans dp_shard x cp_size (128 at any value here); see base.yaml for
+    # what context parallelism shards.
     cp_size: 1
     gradient_checkpointing:
       enable: false
