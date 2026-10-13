@@ -274,14 +274,17 @@ The pieces that complete this workflow are in place:
 [`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L538)
 runs the encoding run, and
 [`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L179)
-persists each conversation from the micro-batch's `conversation_list`. The
-training graph must only mutate `ConversationItem` fields in place (for
-example `value` and `meta`); it must not replace the list, append items, or
-drop items. Structural changes belong in the processor / collator stage,
-before the graph runs. Under that contract the trainer still sees the encoded
-items after FSDP2's root pre-forward, which may rebuild the outer dicts and
-lists but keeps the same item objects. Ranks that share a `dp_rank` (SP, CP or TP peers)
-hold the same batch, so
+persists each conversation of the `conversation_list` that
+[`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L524)
+returns. The training graph must only mutate `ConversationItem` fields in
+place (for example `value` and `meta`); it must not replace the list, append
+items, or drop items. Structural changes belong in the processor / collator
+stage, before the graph runs. The trainer still reads the list from the return
+value, not from the micro-batch it passed in: under `fsdp_scope: model` with
+mixed precision, FSDP2's root pre-forward casts the inputs with
+`dataclasses.replace`, so the graph updates copies of the micro-batch's items.
+Ranks that share a `dp_rank` (SP, CP or
+TP peers) hold the same batch, so
 [only the first of them writes](../../../veomni/models/seed_omni/utils/offline_cache.py#L36).
 The training run reads the cache through the
 [`seedomni_cached`](../../../veomni/data/seed_omni/seedomni_transform.py#L246)
@@ -298,7 +301,7 @@ generation graph names, e.g. BAGEL's encoding run loads only `bagel_vae`. So
 checks it against the loaded modules
 ([`GenerationGraph.validate_modules`](../../../veomni/models/seed_omni/graphs/generation_graph.py#L312))
 at the start of
-[`OmniModel.generate`](../../../veomni/models/seed_omni/modeling_omni.py#L569).
+[`OmniModel.generate`](../../../veomni/models/seed_omni/modeling_omni.py#L643).
 A missing module or method still fails before the first request runs.
 
 ## Current scope
@@ -349,9 +352,9 @@ A missing module or method still fails before the first request runs.
 - [`tests/seed_omni/data/test_preprocessor.py`](../../../tests/seed_omni/data/test_preprocessor.py):
   [the VAE preprocessor leaves cached posteriors alone](../../../tests/seed_omni/data/test_preprocessor.py#L394).
 - [`tests/seed_omni/trainer/test_omni_trainer.py`](../../../tests/seed_omni/trainer/test_omni_trainer.py):
-  [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L124),
-  [the writer opens after the trainer state is restored](../../../tests/seed_omni/trainer/test_omni_trainer.py#L135), and
-  [`offline_cache_step` writes every micro-batch without autograd](../../../tests/seed_omni/trainer/test_omni_trainer.py#L158).
+  [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L125),
+  [the writer opens after the trainer state is restored](../../../tests/seed_omni/trainer/test_omni_trainer.py#L136), and
+  [`offline_cache_step` writes every micro-batch without autograd](../../../tests/seed_omni/trainer/test_omni_trainer.py#L159).
 - [`tests/checkpoints/test_checkpoint_callback.py`](../../../tests/checkpoints/test_checkpoint_callback.py):
   [the writer's position is saved and restored with the cursor](../../../tests/checkpoints/test_checkpoint_callback.py#L632).
 - [`tests/seed_omni/model/test_graph.py`](../../../tests/seed_omni/model/test_graph.py):
