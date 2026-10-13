@@ -1351,6 +1351,59 @@ def test_base_trainer_preserves_declared_callback_order_for_profile_resume(monke
     assert events[names.index("profile")][1] == 4
 
 
+def test_omni_trainer_restores_cursor_before_profile_initialization(monkeypatch, tmp_path):
+    from veomni.trainer.omni import omni_trainer as omni_mod
+
+    events = []
+    profiler_args = []
+
+    def stub_factory(name):
+        def create(trainer):
+            def on_train_begin(state):
+                events.append((name, state.global_step))
+                if name == "global_state":
+                    state.global_step = 4
+
+            return SimpleNamespace(on_train_begin=on_train_begin)
+
+        return create
+
+    for class_name, name in (
+        ("OmniStepMetricsCallback", "metrics"),
+        ("TqdmCallback", "tqdm"),
+        ("WandbTraceCallback", "wandb"),
+        ("GraphProfileCallback", "graph"),
+        ("CheckpointCallback", "checkpoint"),
+        ("GlobalStateCallback", "global_state"),
+        ("EvaluateCallback", "evaluate"),
+    ):
+        monkeypatch.setattr(omni_mod, class_name, stub_factory(name))
+
+    # Exercise the real profile lifecycle without initializing a device mesh.
+    def profile_factory(trainer):
+        callback = object.__new__(trace_callback.ProfileTraceCallback)
+        callback.trainer = trainer
+        return callback
+
+    monkeypatch.setattr(omni_mod, "ProfileTraceCallback", profile_factory)
+    monkeypatch.setattr(
+        trace_callback.helper,
+        "create_profiler",
+        lambda **kwargs: profiler_args.append(kwargs) or SimpleNamespace(start=lambda: None),
+    )
+    trainer = object.__new__(omni_mod.OmniTrainer)
+    profile = ProfileConfig(enable=True, start_step=5, end_step=6, trace_dir=str(tmp_path))
+    profile.this_rank = True
+    trainer.args = SimpleNamespace(train=SimpleNamespace(profile=profile, global_rank=0))
+    trainer._init_callbacks()
+    assert trainer._callbacks[-1] is trainer.profile_callback
+    trainer.on_train_begin()
+    assert events.index(("checkpoint", 0)) < events.index(("global_state", 0))
+    assert trainer.state.global_step == 4
+    assert profiler_args[0]["start_step"] == 1
+    assert profiler_args[0]["end_step"] == 2
+
+
 def test_profile_callback_skips_elapsed_window(monkeypatch):
     warnings = []
     profile_config = SimpleNamespace(enable=True, start_step=5, end_step=6, this_rank=True)

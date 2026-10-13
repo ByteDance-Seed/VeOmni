@@ -282,6 +282,7 @@ class OmniTrainer:
             dataset_name=args.data.dataset_name,
             transform=self.data_transform,
             seed=args.train.seed,
+            shuffle=args.data.dataloader.shuffle,
             **asdict(args.data),
         )
         dataset_length = None if not hasattr(self.train_dataset, "__len__") else len(self.train_dataset)
@@ -364,13 +365,14 @@ class OmniTrainer:
             self.step_metrics_callback,
             self.tqdm_callback,
             self.wandb_callback,
-            self.profile_callback,
             self.graph_profile_callback,
             # Weights first, then the cursor — same order and reasons as
             # ``BaseTrainer._init_callbacks``.
             self.checkpoint_callback,
             self.global_state_callback,
             self.evaluate_callback,
+            # Rebase the absolute trace window only after the resumed cursor is restored.
+            self.profile_callback,
         ]
         self.state = TrainerState()
 
