@@ -163,7 +163,7 @@ own `safetensor_idx_path`.
 | lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
 | ops_implementation | `OpsImplementationConfig` | — | Attention / MoE kernel configuration. |
 | broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
-| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
+| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint (for an HF per-expert MoE checkpoint, only its own experts' tensors, when the model's checkpoint converter supports it, e.g. Qwen3-MoE / Qwen3.5-MoE). Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule for this model. |
 | accelerator | `AcceleratorConfig` | — | Parallelism, sharding, and placement for this model. |
 
@@ -383,6 +383,7 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | persistent_workers | `bool` | `False` | Keep DataLoader worker processes alive between iterator recreations. |
 | in_order | `bool` | `True` | Return worker-loaded batches in first-in, first-out order. Set `False` to avoid slow worker head-of-line blocking for uneven sample decode costs; checkpoint/resume ordering is not guaranteed in this mode. |
 | drop_last | `bool` | `True` | Whether to drop the last incomplete batch. |
+| shuffle | `bool` | `True` | Shuffle the training data. Mapping datasets shuffle the sampler order, reseeded from `train.seed` each epoch; iterable datasets (including iterable multisource sources) shuffle through a streaming buffer. Energon datasets ignore it. DiT `offline_embedding` forces `False`. |
 | pin_memory | `bool` | `True` | Whether to pin memory for the dataloader. |
 | worker_num_threads | `Optional[int]` | `None` | Number of PyTorch threads used by each DataLoader worker. |
 | use_background_prefetcher | `bool` | `False` | Enable background prefetching around the DataLoader. |
@@ -863,7 +864,6 @@ derived argument groups below.
 | --- | --- | --- | --- |
 | mm_configs | `Optional[Dict]` | `{}` | Multimodal input configuration. |
 | offline_embedding_save_dir | `Optional[str]` | `None` | Directory used to save offline embeddings. |
-| shuffle | `bool` | `True` | Shuffle the training dataset. |
 
 ### DiTTrainingArguments
 

@@ -7,3 +7,5 @@ For CPU offload, `cpu_offload_param_patterns` selects parameters by full paramet
 DCP load preserves offloaded CPU storage instead of temporarily materializing the optimizer on the accelerator. Precision-sensitive restores reject dtype changes and incomplete optimizer fields, including wholly absent lazy states for unused parameters. Such checkpoints need an explicit migration; silent initialization from pre-load compute weights is unsafe.
 
 CPU tests cover FP32 reference updates, cold optimizer-state restoration, missing-field rejection and precision migration rejection. Accelerator transfers, DTensor layouts and multi-rank DCP cold resume still require native qualification on each hardware profile.
+
+Resume validates saved tensor shapes and dtypes before DCP reads. Precision-sensitive optimizers must expose complete target state for every trainable parameter; use a fresh optimizer when resuming rather than one initialized for only a subset of parameters. Partial ordinary AdamW state remains supported. These checks allocate no additional master or moment tensors.

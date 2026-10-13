@@ -82,16 +82,44 @@ def _requires_exact_optimizer_recipe(optimizer):
     return any(_requires_exact_optimizer_recipe(child) for child in children.values())
 
 
+def _validate_exact_optimizer_state_targets(optimizer):
+    """Validate parameter inventory even when PyTorch skips partial-state initialization."""
+    children = optimizer if isinstance(optimizer, dict) else getattr(optimizer, "optimizers_dict", {})
+    if children:
+        for child in children.values():
+            _validate_exact_optimizer_state_targets(child)
+        return
+    if not getattr(optimizer, "requires_exact_state_dtypes", False):
+        return
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if not param.requires_grad:
+                continue
+            fields = optimizer.state.get(param, {})
+            missing = {"master_weight", "exp_avg", "exp_avg_sq", "step"}.difference(fields)
+            if missing:
+                raise RuntimeError(
+                    "Incomplete precision-sensitive optimizer target state: "
+                    f"missing {sorted(missing)} for parameter shape {tuple(param.shape)}; "
+                    "use a fresh optimizer for resume or explicitly migrate its state"
+                )
+
+
 class _ModelStrictLoadPlanner(DefaultLoadPlanner):
     """Allow partial optimizer state while requiring a complete full-model DCP."""
 
     def __init__(
-        self, strict_model: bool, strict_optimizer_dtype: bool = False, strict_optimizer_recipe: bool = False
+        self,
+        strict_model: bool,
+        strict_optimizer_dtype: bool = False,
+        strict_optimizer_recipe: bool = False,
+        optimizer=None,
     ):
         super().__init__(allow_partial_load=True)
         self.strict_model = strict_model
         self.strict_optimizer_dtype = strict_optimizer_dtype
         self.strict_optimizer_recipe = strict_optimizer_recipe
+        self.optimizer = optimizer
 
     def create_local_plan(self):
         if self.strict_optimizer_recipe:
@@ -107,6 +135,8 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
             # optimizer.load_state_dict sees them. Validate original metadata
             # before any read can erase evidence of a precision-policy change.
             assert self.metadata is not None
+            if any(path and path[0] == "optimizer" for path in self.mappings.values()):
+                _validate_exact_optimizer_state_targets(self.optimizer)
             for key, path in self.mappings.items():
                 if (
                     not path
@@ -123,6 +153,12 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
                     )
                 if not torch.is_tensor(target):
                     continue
+                source_shape = getattr(source, "size", None)
+                if source_shape != target.shape:
+                    raise RuntimeError(
+                        f"DCP optimizer shape mismatch for {key}: saved={source_shape}, configured={target.shape}; "
+                        "explicit shape migration is required"
+                    )
                 source_dtype = getattr(getattr(source, "properties", None), "dtype", None)
                 if source_dtype != target.dtype:
                     raise RuntimeError(
@@ -1105,6 +1141,7 @@ class DistributedCheckpointer(CheckpointerBase):
                     strict_model=not trainable_only,
                     strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(state.get("optimizer")),
                     strict_optimizer_recipe=_requires_exact_optimizer_recipe(state.get("optimizer")),
+                    optimizer=state.get("optimizer"),
                 ),
             )
             cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
@@ -1120,6 +1157,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 strict_model=not trainable_only,
                 strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(state.get("optimizer")),
                 strict_optimizer_recipe=_requires_exact_optimizer_recipe(state.get("optimizer")),
+                optimizer=state.get("optimizer"),
             ),
         )
         if wants_optimizer:
@@ -1133,6 +1171,7 @@ class DistributedCheckpointer(CheckpointerBase):
                     strict_model=False,
                     strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(state.get("optimizer")),
                     strict_optimizer_recipe=_requires_exact_optimizer_recipe(state.get("optimizer")),
+                    optimizer=state.get("optimizer"),
                 ),
             )
 
