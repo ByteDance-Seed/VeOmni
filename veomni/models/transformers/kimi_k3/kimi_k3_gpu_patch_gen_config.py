@@ -859,12 +859,36 @@ def kimi_pretrained_init_weights_patched(self, module):
         module.gate_up_proj.data.normal_(mean=0.0, std=std)
         module.down_proj.data.normal_(mean=0.0, std=std)
         return
+    if isinstance(module, KimiRMSNorm):
+        # Modification: FSDP2 meta flow materializes with to_empty (all
+        # zeros) and relies on init_weights() to re-initialize; the
+        # construction-time torch.ones in KimiRMSNorm.__init__ never runs
+        # on meta. Without this branch every norm weight stays zero ->
+        # dead forward (logits==0, loss==ln(V)) and zero upstream grads.
+        module.weight.data.fill_(1.0)
+        return
+    if isinstance(module, (nn.LayerNorm, nn.RMSNorm)):
+        # Modification: vision tower (MoonViT / PatchMerger) norms hit the
+        # same to_empty zeroing; restore construction defaults (ones, zero
+        # bias).
+        module.weight.data.fill_(1.0)
+        if getattr(module, "bias", None) is not None:
+            module.bias.data.zero_()
+        return
     if isinstance(module, KimiDeltaAttention):
         # Modification: HF leaves `dt_bias` as uninitialized `torch.empty`;
         # zero it so the KDA gate stays finite under random init (checked-in
-        # weights overwrite this). A_log and the ShortConvolution weights are
-        # already initialized at construction.
+        # weights overwrite this).
+        # Modification (KDA zero-grad root cause): construction-time init is
+        # lost to FSDP2 to_empty. ShortConvolution is an nn.Conv1d subclass
+        # matching no branch below -> q/k/v conv weights stay zero ->
+        # q=k=v=0 -> chunk_kda sits at an exact bilinear saddle -> zero
+        # grads for the whole KDA branch. Restore construction defaults:
+        # Conv1d reset_parameters and A_log=log(U[1,16]).
         module.dt_bias.data.zero_()
+        module.A_log.data.uniform_(1.0, 16.0).log_()
+        for _conv in (module.q_conv1d, module.k_conv1d, module.v_conv1d):
+            _conv.reset_parameters()
     if isinstance(module, nn.Linear):
         module.weight.data.normal_(mean=0.0, std=std)
         if module.bias is not None:
@@ -897,10 +921,32 @@ def kimi_k3_pretrained_init_weights_patched(self, module):
         module.gate_up_proj.data.normal_(mean=0.0, std=std)
         module.down_proj.data.normal_(mean=0.0, std=std)
         return
+    if isinstance(module, KimiRMSNorm):
+        # Modification: FSDP2 meta flow materializes with to_empty (all
+        # zeros) and relies on init_weights() to re-initialize; the
+        # construction-time torch.ones in KimiRMSNorm.__init__ never runs
+        # on meta. Without this branch every norm weight stays zero ->
+        # dead forward (logits==0, loss==ln(V)) and zero upstream grads.
+        module.weight.data.fill_(1.0)
+        return
+    if isinstance(module, (nn.LayerNorm, nn.RMSNorm)):
+        # Modification: vision tower (MoonViT / PatchMerger) norms hit the
+        # same to_empty zeroing; restore construction defaults (ones, zero
+        # bias).
+        module.weight.data.fill_(1.0)
+        if getattr(module, "bias", None) is not None:
+            module.bias.data.zero_()
+        return
     if isinstance(module, KimiDeltaAttention):
         # Modification: HF leaves `dt_bias` as uninitialized `torch.empty`;
         # zero it so the KDA gate stays finite under random init.
+        # Modification (KDA zero-grad root cause): same to_empty loss as
+        # the text-model copy -- restore ShortConvolution (nn.Conv1d)
+        # weights and A_log construction defaults.
         module.dt_bias.data.zero_()
+        module.A_log.data.uniform_(1.0, 16.0).log_()
+        for _conv in (module.q_conv1d, module.k_conv1d, module.v_conv1d):
+            _conv.reset_parameters()
 
     if hasattr(module, "class_embedding"):
         module.class_embedding.data.normal_(mean=0.0, std=std)

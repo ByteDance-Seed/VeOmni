@@ -495,7 +495,7 @@
  class KimiPreTrainedModel(PreTrainedModel):
      config_class = KimiLinearConfig
      base_model_prefix = "model"
-@@ -1350,8 +1445,23 @@
+@@ -1350,8 +1445,47 @@
      }
      _is_stateful = True
 
@@ -510,16 +510,40 @@
 +            module.gate_up_proj.data.normal_(mean=0.0, std=std)
 +            module.down_proj.data.normal_(mean=0.0, std=std)
 +            return
++        if isinstance(module, KimiRMSNorm):
++            # Modification: FSDP2 meta flow materializes with to_empty (all
++            # zeros) and relies on init_weights() to re-initialize; the
++            # construction-time torch.ones in KimiRMSNorm.__init__ never runs
++            # on meta. Without this branch every norm weight stays zero ->
++            # dead forward (logits==0, loss==ln(V)) and zero upstream grads.
++            module.weight.data.fill_(1.0)
++            return
++        if isinstance(module, (nn.LayerNorm, nn.RMSNorm)):
++            # Modification: vision tower (MoonViT / PatchMerger) norms hit the
++            # same to_empty zeroing; restore construction defaults (ones, zero
++            # bias).
++            module.weight.data.fill_(1.0)
++            if getattr(module, "bias", None) is not None:
++                module.bias.data.zero_()
++            return
 +        if isinstance(module, KimiDeltaAttention):
 +            # Modification: HF leaves `dt_bias` as uninitialized `torch.empty`;
 +            # zero it so the KDA gate stays finite under random init (checked-in
-+            # weights overwrite this). A_log and the ShortConvolution weights are
-+            # already initialized at construction.
++            # weights overwrite this).
++            # Modification (KDA zero-grad root cause): construction-time init is
++            # lost to FSDP2 to_empty. ShortConvolution is an nn.Conv1d subclass
++            # matching no branch below -> q/k/v conv weights stay zero ->
++            # q=k=v=0 -> chunk_kda sits at an exact bilinear saddle -> zero
++            # grads for the whole KDA branch. Restore construction defaults:
++            # Conv1d reset_parameters and A_log=log(U[1,16]).
 +            module.dt_bias.data.zero_()
++            module.A_log.data.uniform_(1.0, 16.0).log_()
++            for _conv in (module.q_conv1d, module.k_conv1d, module.v_conv1d):
++                _conv.reset_parameters()
          if isinstance(module, nn.Linear):
              module.weight.data.normal_(mean=0.0, std=std)
              if module.bias is not None:
-@@ -1378,8 +1488,15 @@
+@@ -1378,8 +1512,15 @@
      return hidden_states.to(v.dtype)
 
 
@@ -536,7 +560,7 @@
          super().__init__(config)
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
-@@ -1395,14 +1512,12 @@
+@@ -1395,14 +1536,12 @@
              self.output_attn_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
              self.output_attn_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
 
@@ -556,7 +580,7 @@
          self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
          self.gradient_checkpointing = False
          # Initialize weights and apply final processing
-@@ -1516,6 +1631,12 @@
+@@ -1516,6 +1655,12 @@
          ).view(batch_size, seq_len, hidden_size)
 
 
@@ -569,7 +593,7 @@
  class KimiLinearForCausalLM(KimiPreTrainedModel, GenerationMixin):
      @classmethod
      def _supports_default_dynamic_cache(cls) -> bool:
-@@ -1532,32 +1653,25 @@
+@@ -1532,32 +1677,25 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -617,7 +641,7 @@
          output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
          output_hidden_states = (
              output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-@@ -1577,22 +1691,59 @@
+@@ -1577,22 +1715,59 @@
              cache_position=cache_position,
          )
 
@@ -685,7 +709,7 @@
 
 
  def multihead_attention(
-@@ -2368,6 +2519,12 @@
+@@ -2368,6 +2543,12 @@
          return x
 
 
@@ -698,7 +722,7 @@
  class KimiK3PreTrainedModel(PreTrainedModel):
      config_class = KimiK3Config
      base_model_prefix = "model"
-@@ -2385,13 +2542,26 @@
+@@ -2385,13 +2566,48 @@
 
      def _init_weights(self, module):
          # important: this ported version of Llava isn't meant for training from scratch - only
@@ -719,14 +743,36 @@
 +            module.gate_up_proj.data.normal_(mean=0.0, std=std)
 +            module.down_proj.data.normal_(mean=0.0, std=std)
 +            return
++        if isinstance(module, KimiRMSNorm):
++            # Modification: FSDP2 meta flow materializes with to_empty (all
++            # zeros) and relies on init_weights() to re-initialize; the
++            # construction-time torch.ones in KimiRMSNorm.__init__ never runs
++            # on meta. Without this branch every norm weight stays zero ->
++            # dead forward (logits==0, loss==ln(V)) and zero upstream grads.
++            module.weight.data.fill_(1.0)
++            return
++        if isinstance(module, (nn.LayerNorm, nn.RMSNorm)):
++            # Modification: vision tower (MoonViT / PatchMerger) norms hit the
++            # same to_empty zeroing; restore construction defaults (ones, zero
++            # bias).
++            module.weight.data.fill_(1.0)
++            if getattr(module, "bias", None) is not None:
++                module.bias.data.zero_()
++            return
 +        if isinstance(module, KimiDeltaAttention):
 +            # Modification: HF leaves `dt_bias` as uninitialized `torch.empty`;
 +            # zero it so the KDA gate stays finite under random init.
++            # Modification (KDA zero-grad root cause): same to_empty loss as
++            # the text-model copy -- restore ShortConvolution (nn.Conv1d)
++            # weights and A_log construction defaults.
 +            module.dt_bias.data.zero_()
++            module.A_log.data.uniform_(1.0, 16.0).log_()
++            for _conv in (module.q_conv1d, module.k_conv1d, module.v_conv1d):
++                _conv.reset_parameters()
 
          if hasattr(module, "class_embedding"):
              module.class_embedding.data.normal_(mean=0.0, std=std)
-@@ -2442,13 +2612,37 @@
+@@ -2442,13 +2658,37 @@
          self.projector_ln_eps = config.projector_ln_eps
 
 
@@ -765,7 +811,7 @@
          super().__init__(config)
 
          vt_config = VisionTowerConfig(config.vision_config)
-@@ -2469,6 +2663,19 @@
+@@ -2469,6 +2709,19 @@
          self.language_model = KimiLinearForCausalLM(config.text_config)
          self.post_init()
 
@@ -785,7 +831,7 @@
          if hasattr(self.language_model, "dtype"):
              target_dtype = self.language_model.dtype
              self.vision_tower = self.vision_tower.to(dtype=target_dtype)
-@@ -2492,8 +2699,14 @@
+@@ -2492,8 +2745,14 @@
      def get_decoder(self):
          return self.language_model.get_decoder()
 
@@ -802,7 +848,7 @@
 
      def resize_token_embeddings(self, new_num_tokens: int | None = None, pad_to_multiple_of=None) -> nn.Embedding:
          model_embeds = self.language_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
-@@ -2638,35 +2851,46 @@
+@@ -2638,35 +2897,46 @@
          image_features = self.vision_tower(pixel_values, grid_thws)
          return image_features
 
@@ -870,7 +916,7 @@
 
          if inputs_embeds is None:
              # 1. Extra the input embeddings
-@@ -2678,15 +2902,7 @@
+@@ -2678,15 +2948,7 @@
                  if self.mm_projector:
                      image_features = self.mm_projector(image_features)
 
@@ -887,7 +933,7 @@
                  inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
                      image_features,
                      inputs_embeds,
-@@ -2728,46 +2944,86 @@
+@@ -2728,46 +2990,86 @@
                  attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
                  position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
 
@@ -998,7 +1044,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2833,3 +3089,8 @@
+@@ -2833,3 +3135,8 @@
 
      def _reorder_cache(self, *args, **kwargs):
          return self.language_model._reorder_cache(*args, **kwargs)
