@@ -155,6 +155,34 @@ If model config or tokenizer is missing from the output:
 - Check that the directory contains `config.json` and tokenizer files
 - Verify the model type is supported by HuggingFace's `AutoConfig` and `AutoProcessor`
 
+## Finishing an HF Export with Unmerged Tables
+
+The training-time HF export (`train.checkpoint.save_hf_weights`) consolidates
+every tensor into its `model-*.safetensors` file except one kind. A tensor that
+embedding parallelism (`emb`) shards by rows and that is larger than one output
+file (5 GB) is left as the per-rank shards DCP wrote. Consolidating it would mean
+one rank streaming the whole tensor into one file while every other rank waits:
+about an hour for each of DeepSeek-V4.1's 197 GB n-gram tables on an HDFS mount.
+
+Such an export holds, beside the usual files:
+
+- `sharded/`: each rank's rows of the deferred tensors, as `shard-*-model-*.safetensors`;
+- `pending_merge.json`: the deferred tensors and the output files they belong in.
+
+`model.safetensors.index.json` already lists every tensor, the deferred files
+included, but loaders refuse the directory while `pending_merge.json` is there.
+Write the missing files off the training job:
+
+```bash
+python scripts/merge_hf_export.py <output_dir>/checkpoints/global_step_N/hf_ckpt
+```
+
+The argument may be one export or any directory above several; every export
+holding a marker below it is merged. Each output file is written by one thread
+(`--num-threads` caps how many at once) and is still a single stream, so on a
+slow mount, copy the export to local disk, merge there, and copy it back. The
+marker is removed before the shards, so an interrupted merge can be rerun.
+
 ## See Also
 
 - [Basic Modules](basic_modules.md) - Understanding VeOmni's checkpoint saving

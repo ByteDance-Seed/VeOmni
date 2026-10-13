@@ -204,7 +204,18 @@ def _skip_without_loading_fn(
     return skip_key
 
 
+def _refuse_unmerged_export(weights_path: str) -> None:
+    from ..checkpoint.layout import HF_PENDING_MERGE_FILENAME
+
+    if os.path.isfile(os.path.join(weights_path, HF_PENDING_MERGE_FILENAME)):
+        raise RuntimeError(
+            f"{weights_path} is an HF export whose row-sharded tables are still split by rank "
+            f"(see {HF_PENDING_MERGE_FILENAME}). Run `python scripts/merge_hf_export.py {weights_path}` first."
+        )
+
+
 def _resolve_state_dict_iterators(weights_path: str, **kwargs) -> List["StateDictIterator"]:
+    _refuse_unmerged_export(weights_path)
     cache_kwargs = {"_raise_exceptions_for_missing_entries": False, **kwargs}
     resolved_weight_file = cached_file(weights_path, SAFE_WEIGHTS_NAME, **cache_kwargs)
     if resolved_weight_file:
@@ -506,6 +517,7 @@ def _resolve_safetensors_shards(weights_path: str, **kwargs) -> Tuple[Dict[str, 
     (``model.safetensors.index.json`` + ``model-0000x-of-0000y.safetensors``)
     and single-file (``model.safetensors``) layouts.
     """
+    _refuse_unmerged_export(weights_path)
     cache_kwargs = {"_raise_exceptions_for_missing_entries": False, **kwargs}
     resolved_index = cached_file(weights_path, SAFE_WEIGHTS_INDEX_NAME, **cache_kwargs)
     if resolved_index:
