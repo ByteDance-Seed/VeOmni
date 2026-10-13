@@ -442,6 +442,13 @@ def WanTransformer3DModel_forward(
         freqs_sin = freqs_sin[:, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
         rotary_emb = (freqs_cos, freqs_sin)
 
+    # Cast rotary_emb to compute dtype for checkpoint dtype consistency.
+    # WanRotaryPosEmbed stores frequencies in float64/float32, but FSDP2
+    # cast_forward_inputs casts checkpoint args to param_dtype during the
+    # first forward while recomputation uses the original high-precision
+    # tensors, causing CheckpointError with use_reentrant=False.
+    rotary_emb = tuple(f.to(hidden_states.dtype) for f in rotary_emb)
+
     # 4. Transformer blocks
     if torch.is_grad_enabled() and self.gradient_checkpointing:
         for block in self.blocks:
