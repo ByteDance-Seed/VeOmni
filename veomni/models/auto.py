@@ -77,10 +77,11 @@ def check_model_build_prerequisites(config: PretrainedConfig) -> None:
     plain ``getattr`` for the same reason: a config that has nothing to refuse should
     not have to say so.
 
-    ``DeepseekV4Config.validate_build_prerequisites`` is the only implementation
-    today. It refuses a Lightning Indexer KL objective configured without the TileLang
-    indexer and attention it is defined in terms of -- a disagreement between a model
-    field and two kernel selections, which no single dataclass can see.
+    ``DeepseekV4Config.validate_build_prerequisites`` refuses a Lightning Indexer KL
+    objective configured without the TileLang indexer and attention it is defined in
+    terms of -- a disagreement between a model field and two kernel selections, which
+    no single dataclass can see. ``DeepseekV41LlmConfig``'s refuses Ulysses, since that
+    backbone shards its sequence over context parallelism only.
     """
     validate = getattr(config, "validate_build_prerequisites", None)
     if callable(validate):

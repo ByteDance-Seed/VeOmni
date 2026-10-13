@@ -222,11 +222,11 @@ class TrainingMixin(TrainingModuleMixin):
         this method used to call inline.
 
         (c) A span with no supervised token scores 0.0, matching the native
-        clamped denominator required by constraint 7d. Every fused backend
-        normalizes by its own supervised-token count with no way to clamp it
-        (Liger divides by ``n_non_ignore``, chunk_loss recounts the labels), so
-        such a span is routed to the eager branch and given an explicit
-        denominator instead of dividing 0 by 0.
+        clamped denominator required by constraint 7d. A fused backend
+        normalizes by its own supervised-token count (Liger divides by
+        ``n_non_ignore`` with no way to clamp it; chunk_loss clamps its recount
+        at 1), so such a span is routed to the eager branch and given an
+        explicit denominator rather than relying on the backend.
 
         (d) ``IGNORE_INDEX`` rows are dropped before the linear. Liger fused
         linear+CE still GEMMs every remaining row (ignore only zeros the
