@@ -159,7 +159,9 @@ class ModuleRuntime(VeOmniModelRuntime):
                 self._build_model()
                 self._build_model_assets()
                 if self.reads_offline_cache:
-                    # A composed ``fsdp_scope='model'`` wrap still loads it with the rest.
+                    # Stay on meta. ``OmniModelRuntime._parallelize_composed_model``
+                    # detaches this module before the composed wrap so it is not
+                    # materialised with the rest under ``fsdp_scope='model'``.
                     self.model.requires_grad_(False)
                     return
                 self._freeze_model_module()

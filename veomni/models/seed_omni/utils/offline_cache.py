@@ -67,19 +67,29 @@ class SeedOmniOfflineCacheWriter:
         it finds into one contiguous range, quietly presenting the leftovers of
         the earlier run as part of this cache.
 
-        Every rank checks the same directory before any of them flushes, so
-        this fails on all ranks together rather than deadlocking one of them.
+        Every rank checks the directory, then the results are all-gathered so a
+        non-empty directory fails on every rank together. A barrier after a
+        clean check keeps a fast rank from flushing its first shard while a
+        slow rank is still checking.
         """
         existing = [
             name for name in os.listdir(self.save_path) if name.startswith("shard_") and name.endswith(".parquet")
         ]
-        if existing:
+        has_existing = bool(existing)
+        distributed = dist.is_available() and dist.is_initialized()
+        if distributed:
+            flags = [None] * dist.get_world_size()
+            dist.all_gather_object(flags, has_existing)
+            has_existing = any(flags)
+        if has_existing:
             raise FileExistsError(
                 f"SeedOmni offline cache directory '{self.save_path}' already contains "
-                f"{len(existing)} shard(s). Writing here would overwrite some and silently "
+                f"shard parquet file(s). Writing here would overwrite some and silently "
                 f"keep the rest. Point `save_path` at a new directory, or delete the existing "
                 f"shards first."
             )
+        if distributed:
+            dist.barrier()
 
     @staticmethod
     def _cpu_recursive(value: Any) -> Any:

@@ -146,3 +146,79 @@ def test_sp_peers_write_one_copy_of_their_batch(tmp_path) -> None:
         for row in load_dataset("parquet", data_files=[str(cache_dir / shard)], split="train")
     )
     assert values == ["dp0-step0", "dp0-step1", "dp1-step0", "dp1-step1"]
+
+
+def _existing_shard_check_rank_main(rank: int, rendezvous: str, cache_dir: str, out_dir: str) -> None:
+    """Rank 0 plants a shard after a barrier that only the other ranks wait on first.
+
+    The writer must all-gather the check and barrier after a clean result, so a
+    late rank cannot see an early rank's first flush as an init-time conflict.
+    """
+    import veomni.models.seed_omni.utils.offline_cache as offline_cache
+
+    offline_cache.get_parallel_state = lambda: SimpleNamespace(dp_rank=rank, dp_size=2)
+    dist.init_process_group(backend="gloo", init_method=f"file://{rendezvous}", world_size=2, rank=rank)
+    try:
+        # Both ranks construct writers against an empty directory; the barrier
+        # inside the check keeps them aligned before either can flush.
+        writer = SeedOmniOfflineCacheWriter(cache_dir, max_rows_per_shard=1)
+        writer.save_conversation_list([[ConversationItem(type="text", value=f"r{rank}", role="user")]])
+        writer.finalize()
+        with open(f"{out_dir}/rank{rank}.json", "w") as f:
+            json.dump({"ok": True}, f)
+    except Exception as exc:  # noqa: BLE001 - surface to the parent process
+        with open(f"{out_dir}/rank{rank}.json", "w") as f:
+            json.dump({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, f)
+        raise
+    finally:
+        dist.destroy_process_group()
+
+
+def test_existing_shard_check_agrees_across_ranks_before_any_flush(tmp_path) -> None:
+    cache_dir = tmp_path / "cache"
+    mp.spawn(
+        _existing_shard_check_rank_main,
+        args=(str(tmp_path / "rendezvous"), str(cache_dir), str(tmp_path)),
+        nprocs=2,
+    )
+    for rank in range(2):
+        payload = json.loads((tmp_path / f"rank{rank}.json").read_text())
+        assert payload["ok"], payload
+    assert sorted(path.name for path in cache_dir.glob("shard_*.parquet")) == [
+        "shard_000000.parquet",
+        "shard_000001.parquet",
+    ]
+
+
+def _existing_shard_reject_rank_main(rank: int, rendezvous: str, cache_dir: str, out_dir: str) -> None:
+    import veomni.models.seed_omni.utils.offline_cache as offline_cache
+
+    offline_cache.get_parallel_state = lambda: SimpleNamespace(dp_rank=rank, dp_size=2)
+    dist.init_process_group(backend="gloo", init_method=f"file://{rendezvous}", world_size=2, rank=rank)
+    try:
+        try:
+            SeedOmniOfflineCacheWriter(cache_dir, max_rows_per_shard=1)
+        except FileExistsError as exc:
+            with open(f"{out_dir}/rank{rank}.json", "w") as f:
+                json.dump({"raised": True, "msg": str(exc)}, f)
+        else:
+            with open(f"{out_dir}/rank{rank}.json", "w") as f:
+                json.dump({"raised": False}, f)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_existing_shard_check_fails_on_every_rank_together(tmp_path) -> None:
+    """A non-empty directory must raise on all ranks after the all-gather, not hang one."""
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    (cache_dir / "shard_000000.parquet").write_bytes(b"stale")
+
+    mp.spawn(
+        _existing_shard_reject_rank_main,
+        args=(str(tmp_path / "rendezvous"), str(cache_dir), str(tmp_path)),
+        nprocs=2,
+    )
+    for rank in range(2):
+        payload = json.loads((tmp_path / f"rank{rank}.json").read_text())
+        assert payload["raised"] is True
