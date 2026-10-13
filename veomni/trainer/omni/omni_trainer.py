@@ -282,6 +282,7 @@ class OmniTrainer:
             dataset_name=args.data.dataset_name,
             transform=self.data_transform,
             seed=args.train.seed,
+            shuffle=args.data.dataloader.shuffle,
             **asdict(args.data),
         )
         dataset_length = None if not hasattr(self.train_dataset, "__len__") else len(self.train_dataset)
