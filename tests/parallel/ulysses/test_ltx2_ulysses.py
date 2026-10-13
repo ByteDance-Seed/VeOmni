@@ -1,4 +1,4 @@
-"""Multi-process regression test for LTX-2.3 under Ulysses SP.
+"""Multi-process regression test for LTX-2.3/2.5 under Ulysses SP.
 
 Covers two gaps in `LTXVideoModel_forward` / `LTXSPAttention_forward`:
 
@@ -10,6 +10,7 @@ Covers two gaps in `LTXVideoModel_forward` / `LTXSPAttention_forward`:
 
 Runs a tiny random-weight model with SP off and with Ulysses SP on, video-only and audio+video,
 with and without gradient checkpointing, and compares predictions and SP-reduced grads.
+The LTX-2.5 AV case also covers keyframe embeddings and a clean first-frame mask.
 """
 
 import pytest
@@ -48,7 +49,8 @@ CASES = {
 }
 
 
-def _build_model(device, with_audio, gradient_checkpointing):
+def _build_model(device, with_audio, gradient_checkpointing, ltx25=False):
+    """Build a deterministic LTX-2.3 or LTX-2.5 model on the requested device."""
     config = LTXVideoTransformerModelConfig(
         in_channels=8,
         out_channels=8,
@@ -63,6 +65,11 @@ def _build_model(device, with_audio, gradient_checkpointing):
         audio_in_channels=8,
         audio_out_channels=8,
         audio_cross_attention_dim=32,
+        ff_bias=not ltx25,
+        use_keyframes_abs_pos_embedding=ltx25,
+        apply_gated_attention=ltx25,
+        cross_attention_adaln=ltx25,
+        caption_proj_before_connector=ltx25,
     )
     torch.manual_seed(0)
     model = LTXVideoTransformerModel(config).to(device).float()
@@ -74,6 +81,7 @@ def _build_model(device, with_audio, gradient_checkpointing):
 
 
 def _forward_backward(model, frames, height, width, audio_frames, device):
+    """Return predictions and parameter gradients for a reproducible modality sample."""
     gen = torch.Generator().manual_seed(1)
 
     def randn(*shape):
@@ -85,6 +93,10 @@ def _forward_backward(model, frames, height, width, audio_frames, device):
         encoder_hidden_states=[randn(1, 5, 32)],
         training_target=[randn(1, 8, frames, height, width)],
     )
+    if model.config.use_keyframes_abs_pos_embedding:
+        kwargs["video_loss_mask"] = [
+            torch.cat([torch.zeros(height * width), torch.ones((frames - 1) * height * width)]).to(device)
+        ]
     if audio_frames:
         kwargs.update(
             audio_hidden_states=[randn(1, 2, audio_frames, 4)],
@@ -105,21 +117,22 @@ class LTX2UlyssesTest(SequenceParallelTest):
 
     @pytest.mark.skipif(runner_device_count() < 2, reason="device_count should be >= 2")
     def test_matches_non_sp_reference(self):
+        """Compare LTX predictions and reduced gradients across DP and Ulysses states."""
         apply_veomni_ltx_transformer_patch()
         group = self._get_process_group()
         device = torch.device(get_device_type(), self.rank)
         torch.set_float32_matmul_precision("highest")
 
         failures = []
-        for with_audio in (False, True):
+        for version, with_audio in (("2.3", False), ("2.3", True), ("2.5", True)):
             for gradient_checkpointing in (False, True):
-                model = _build_model(device, with_audio, gradient_checkpointing)
+                model = _build_model(device, with_audio, gradient_checkpointing, ltx25=version == "2.5")
                 cases = {name: case for name, case in CASES.items() if bool(case[3]) == with_audio}
                 with use_parallel_state(self.dp_state):
                     refs = {name: _forward_backward(model, *case, device) for name, case in cases.items()}
 
                 for name, case in cases.items():
-                    tag = f"{name}{' (ckpt)' if gradient_checkpointing else ''}"
+                    tag = f"{version}/{name}{' (ckpt)' if gradient_checkpointing else ''}"
                     try:
                         with use_parallel_state(self.sp_state):
                             preds, grads = _forward_backward(model, *case, device)
