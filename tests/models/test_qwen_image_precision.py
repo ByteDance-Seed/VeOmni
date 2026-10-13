@@ -10,7 +10,7 @@ from PIL import Image
 from safetensors.torch import load_file, save_file
 from torch.utils.checkpoint import CheckpointError, _CheckpointFrame
 
-from tests.models.test_qwen_image_training import snapshot, transformer
+from tests.models.test_qwen_image_training import cpu_diffusers_normalization, snapshot, transformer
 from tests.precision.qwen_image import capture, compare, encode, prepare, sha256, tensor_difference, verify_fixture
 from veomni.arguments.arguments_types import MixedPrecisionConfig
 from veomni.distributed.parallel_state import ParallelState, use_parallel_state
@@ -118,7 +118,7 @@ def test_parallel_builder_preserves_checkpoint_validation(monkeypatch):
 
 
 @pytest.fixture(scope="module")
-def runs(tmp_path_factory):
+def runs(tmp_path_factory, cpu_diffusers_normalization):
     root = tmp_path_factory.mktemp("qwen_precision")
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)

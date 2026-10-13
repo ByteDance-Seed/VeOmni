@@ -35,7 +35,7 @@ DIFFUSERS_FORWARD = DiffusersQwenImageTransformer.forward
 
 
 @pytest.fixture(scope="module", autouse=True)
-def single_process_rank(tmp_path_factory):
+def single_process_rank(tmp_path_factory, cpu_diffusers_normalization):
     from veomni.models.diffusers.qwen_image.qwen_image_condition import modeling_qwen_image_condition
 
     # The CPU loader materializes checkpoint tensors on distributed rank zero.
@@ -51,6 +51,17 @@ def single_process_rank(tmp_path_factory):
     finally:
         torch.distributed.destroy_process_group()
         parallel_state.clear_parallel_state()
+
+
+@pytest.fixture(scope="module")
+def cpu_diffusers_normalization():
+    from diffusers.models import normalization
+
+    # Diffusers 0.37 selects NPU RMSNorm by package availability, even for CPU inputs.
+    # These CPU tests must use its native PyTorch path on Ascend runners as well.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(normalization, "is_torch_npu_available", lambda: False)
+        yield
 
 
 def eager_ops():
