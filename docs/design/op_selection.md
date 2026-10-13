@@ -21,16 +21,16 @@ If a field is not in this table, it is not an op-selection knob.
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
-| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
-| RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
-| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
-| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU), `"npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU), `"npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
-| Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU; NPU config normalizes this default to `eager`) | `"triton"` | Model `__init__` via an instance-local `VeomniOp` |
-| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU) | `"triton"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Model `__init__` stores `self.qat_implementation`; patched helpers consume that bound recipe |
 
 `qat_implementation` has no per-model registry variants. `fp8_blockwise` is
@@ -39,13 +39,14 @@ Constructed DeepSeek-V4 modules freeze the recipe on `self.qat_implementation`;
 changing the process-global ops config later does not retarget an existing
 instance.
 
-**Most optimized-op defaults are GPU-oriented.** On Ascend NPU, values still
-equal to the dataclass defaults automatically resolve to `npu` for RMSNorm,
-rotary embedding and its vision-layout selection; to `chunk_loss` for
-cross-entropy; to `fused_npu` for MoE; and to `eager` for SwiGLU and
-load-balancing loss. Explicit non-default overrides are retained and rejected
-when unsupported. Qwen3.5's three GatedDeltaNet fields are model-specific and
-are not auto-resolved. Their `fla` default also registers on Ascend NPU. Set
+**The seven general-purpose op fields default per host.** They default to
+`None`, and config `__post_init__` fills each unset field from the host table.
+On Ascend NPU, unset fields resolve to `npu` for RMSNorm, rotary embedding and
+its vision-layout selection; to `chunk_loss` for cross-entropy; to `fused_npu`
+for MoE; and to `eager` for SwiGLU and load-balancing loss. Explicit
+values are never rewritten, so an explicit GPU value such as `liger_kernel` or
+`fused_triton` raises on NPU. Qwen3.5's three GatedDeltaNet fields are
+model-specific and are not in the host table. Their `fla` default also registers on Ascend NPU. Set
 them to `npu` to use the vendored Ascend kernels instead, not to `eager`,
 because the causal-convolution and gated-delta-rule `eager` fallbacks do not
 support dynamic-batch `cu_seqlens`.
@@ -386,10 +387,9 @@ model:
 | `triton` | Fused tensor-native `[N, E]` implementation | `triton` on GPU |
 | `eager` | Pure-PyTorch tensor-native `[N, E]` reference | — |
 
-Normal NPU config construction maps every value equal to the dataclass default
-`triton`—including an explicit YAML value—to `eager` before registry binding.
-The optimized `triton` implementation is GPU-only; select `eager` in current
-NPU configs.
+The default is `triton` on GPU and `eager` on NPU and MLU. The optimized
+`triton` implementation is GPU-only, so an explicit `triton` raises at config
+validation on NPU.
 
 This loss has no compatibility facade or process-global dispatch. Each MoE model creates
 `VeomniOp("load_balancing_loss", "standard", impl)` in `__init__`, then
@@ -421,10 +421,9 @@ model:
 ```
 
 **Field:** `OpsImplementationConfig.moe_implementation`
-**Default:** `"fused_triton"` (GPU). On NPU, a value still equal to this
-dataclass default—including an explicit YAML value—is normalized to
-`"fused_npu"`. Set `"fused_npu"` explicitly for clarity; incompatible
-non-default overrides such as `"fused_quack"` raise at config validation time.
+**Default:** when the field is unset, `"fused_triton"` on GPU, `"fused_npu"`
+on NPU, and `"fused_mlu"` on MLU with Apex (`"fused_triton"` without it). Explicit values are never rewritten; incompatible ones such as
+`"fused_triton"` or `"fused_quack"` on NPU raise at config validation time.
 
 The mode and op backend are expressed as a single field. After the
 default-value compatibility normalization above, remaining hardware mismatches

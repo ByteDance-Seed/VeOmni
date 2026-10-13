@@ -64,11 +64,27 @@ def _call(impl: str, variant: str, hidden, routing, selected, fc1, fc2, loras, *
     )
 
 
-def _run_fused_vs_eager(impl: str, variant: str, *, concentrated_routing: bool = False):
+_SHAPES = {
+    "small": dict(B=32, H=64, I=96, E=4, top_k=2, r=8),
+    # qwen3_moe_toy expert dimensions: the kernel tiles see production-sized H and I.
+    "qwen3_moe": dict(B=64, H=2048, I=768, E=16, top_k=2, r=16),
+}
+
+
+def _run_fused_vs_eager(
+    impl: str,
+    variant: str,
+    *,
+    shape: str = "small",
+    base_trainable: bool = True,
+    concentrated_routing: bool = False,
+):
     torch.manual_seed(0)
     device = torch.device("npu" if impl == "fused_npu" else "cuda")
     dtype = torch.bfloat16
-    B, H, I, E, top_k, r = (256 if concentrated_routing else 32), 64, 96, 4, 2, 8
+    B, H, I, E, top_k, r = (_SHAPES[shape][key] for key in ("B", "H", "I", "E", "top_k", "r"))
+    if concentrated_routing:
+        B = 256
     hidden = 0.1 * torch.randn(B, H, device=device, dtype=dtype)
     routing = torch.softmax(torch.randn(B, top_k, device=device, dtype=torch.float32), dim=-1).to(dtype)
     selected = (
@@ -83,19 +99,19 @@ def _run_fused_vs_eager(impl: str, variant: str, *, concentrated_routing: bool =
     hidden_f = hidden.detach().requires_grad_(True)
     routing_e = routing.detach().clone().requires_grad_(True)
     routing_f = routing.detach().clone().requires_grad_(True)
-    fc1_e = fc1.detach().clone().requires_grad_(True)
-    fc1_f = fc1.detach().clone().requires_grad_(True)
-    fc2_e = fc2.detach().clone().requires_grad_(True)
-    fc2_f = fc2.detach().clone().requires_grad_(True)
+    fc1_e = fc1.detach().clone().requires_grad_(base_trainable)
+    fc1_f = fc1.detach().clone().requires_grad_(base_trainable)
+    fc2_e = fc2.detach().clone().requires_grad_(base_trainable)
+    fc2_f = fc2.detach().clone().requires_grad_(base_trainable)
     lora_e = [t.detach().clone().requires_grad_(True) for t in loras]
     lora_f = [t.detach().clone().requires_grad_(True) for t in loras]
+    case = f"[{impl}/{variant}/{shape}/base_trainable={base_trainable}]"
 
     out_e = _call("eager", variant, hidden_e, routing_e, selected, fc1_e, fc2_e, lora_e, num_experts=E)
     out_f = _call(impl, variant, hidden_f, routing_f, selected, fc1_f, fc2_f, lora_f, num_experts=E)
     fwd_l2 = _l2_rel(out_f, out_e)
     assert fwd_l2 <= _FWD_L2REL_TOL, (
-        f"[{impl}/{variant}] forward L2 rel {fwd_l2:.4%} > {_FWD_L2REL_TOL:.2%} "
-        f"(eager_norm={out_e.float().norm().item():.3e})"
+        f"{case} forward L2 rel {fwd_l2:.4%} > {_FWD_L2REL_TOL:.2%} (eager_norm={out_e.float().norm().item():.3e})"
     )
 
     go = (0.1 * torch.randn_like(out_e)).detach()
@@ -104,14 +120,17 @@ def _run_fused_vs_eager(impl: str, variant: str, *, concentrated_routing: bool =
     gradient_pairs = [
         ("hidden_states", hidden_e, hidden_f),
         ("routing_weights", routing_e, routing_f),
-        ("fc1_1_2_weight", fc1_e, fc1_f),
-        ("fc2_weight", fc2_e, fc2_f),
     ]
+    if base_trainable:
+        gradient_pairs += [("fc1_1_2_weight", fc1_e, fc1_f), ("fc2_weight", fc2_e, fc2_f)]
+    else:
+        for name, eager_input, fused_input in (("fc1_1_2_weight", fc1_e, fc1_f), ("fc2_weight", fc2_e, fc2_f)):
+            assert eager_input.grad is None and fused_input.grad is None, f"{case} frozen {name} received a gradient"
     gradient_pairs.extend(zip(_LORA_KEYS, lora_e, lora_f, strict=True))
     for name, eager_input, fused_input in gradient_pairs:
         l2 = _l2_rel(fused_input.grad, eager_input.grad)
         assert l2 <= _GRAD_L2REL_TOL, (
-            f"[{impl}/{variant}] {name} grad L2 rel {l2:.4%} > {_GRAD_L2REL_TOL:.2%} "
+            f"{case} {name} grad L2 rel {l2:.4%} > {_GRAD_L2REL_TOL:.2%} "
             f"(eager_norm={eager_input.grad.float().norm().item():.3e})"
         )
 
@@ -222,9 +241,11 @@ def test_moe_experts_lora_eager_matches_manual_oracle_forward_and_all_gradients(
     not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
     reason="triton moe_experts_lora needs a GPU + triton",
 )
+@pytest.mark.parametrize("shape", list(_SHAPES))
+@pytest.mark.parametrize("base_trainable", [True, False], ids=["base_trainable", "base_frozen"])
 @pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_triton_matches_eager(variant):
-    _run_fused_vs_eager("fused_triton", variant)
+def test_triton_matches_eager(variant, base_trainable, shape):
+    _run_fused_vs_eager("fused_triton", variant, shape=shape, base_trainable=base_trainable)
 
 
 @pytest.mark.skipif(
@@ -237,9 +258,11 @@ def test_triton_matches_eager_with_concentrated_routes(variant):
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="npu moe_experts_lora needs torch_npu")
+@pytest.mark.parametrize("shape", list(_SHAPES))
+@pytest.mark.parametrize("base_trainable", [True, False], ids=["base_trainable", "base_frozen"])
 @pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_npu_matches_eager(variant):
-    _run_fused_vs_eager("fused_npu", variant)
+def test_npu_matches_eager(variant, base_trainable, shape):
+    _run_fused_vs_eager("fused_npu", variant, shape=shape, base_trainable=base_trainable)
 
 
 @pytest.mark.skipif(

@@ -17,10 +17,8 @@ from veomni.utils.device import get_device_type
 from .launch_utils import find_free_port
 
 
-# NPU ops_implementation overrides per model. The public
-# ``OpsImplementationConfig`` defaults are GPU-optimal (Liger / Triton / fused Triton MoE) and
-# raise on NPU at config validation time, so every NPU test must override
-# every per-op field. ``_NPU_OPS_DEFAULTS`` is the baseline; entries in
+# NPU ops_implementation overrides per model. Every per-op field is pinned so
+# NPU tests do not depend on the host defaults. ``_NPU_OPS_DEFAULTS`` is the baseline; entries in
 # ``_NPU_PER_MODEL_OVERRIDES`` (DeepSeek-V3/V4, Qwen-VL family) pin
 # specific fields to ``eager`` where the model has no NPU kernel.
 _NPU_OPS_DEFAULTS: Dict[str, str] = {
@@ -29,6 +27,7 @@ _NPU_OPS_DEFAULTS: Dict[str, str] = {
     "cross_entropy_loss_implementation": "chunk_loss",
     "rms_norm_implementation": "npu",
     "rotary_pos_emb_implementation": "npu",
+    "rotary_pos_emb_vision_implementation": "npu",
     "swiglu_mlp_implementation": "eager",  # no NPU backend
     # The Triton load-balancing-loss row is CUDA-only, so NPU resolution rejects
     # it even when ``triton-ascend`` is installed. Pin to eager.
@@ -119,7 +118,7 @@ def resolve_ops_overrides(model_name: Optional[str]) -> List[str]:
 
     On GPU returns per-model overrides for models whose patched ops disable a
     default backend (for example Wan's RoPE and DeepSeek-V4's eager-only
-    attention); empty otherwise — dataclass defaults are GPU-optimal. On NPU
+    attention); empty otherwise — the GPU host defaults are used. On NPU
     returns the NPU-supported backend per op, with per-model eager fallbacks for
     ops without an NPU kernel for that model.
     """

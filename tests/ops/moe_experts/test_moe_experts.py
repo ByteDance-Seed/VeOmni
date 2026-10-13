@@ -388,6 +388,7 @@ def _run_fused_vs_eager(
     seed: int = 0,
     device: torch.device | None = None,
     data_scale: float = 0.4,
+    require_active_clamp: bool = False,
 ):
     torch.manual_seed(seed)
     if device is None:
@@ -411,6 +412,12 @@ def _run_fused_vs_eager(
     eager = resolve_op("moe_experts", "standard", "eager").wrapper
     other = resolve_op("moe_experts", "standard", impl).wrapper
     kwargs = {"num_experts": num_experts, "swiglu_limit": swiglu_limit}
+    if require_active_clamp:
+        assert swiglu_limit is not None
+        routed_hidden = hidden[:, None, :].expand(-1, top_k, -1)
+        gate = torch.einsum("tkh,tkfh->tkf", routed_hidden, fc1_1[selected])
+        up = torch.einsum("tkh,tkfh->tkf", routed_hidden, fc1_2[selected])
+        assert (gate > swiglu_limit).any() or (up.abs() > swiglu_limit).any()
     if merged:
         hidden_e, routing_e, fc1_12_e, fc2_e = map(make_grad_leaf, (hidden, routing, fc1_12, fc2))
         hidden_o, routing_o, fc1_12_o, fc2_o = map(make_grad_leaf, (hidden, routing, fc1_12, fc2))
@@ -712,15 +719,23 @@ def test_gpt_oss_quack_matches_eager():
     not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
     reason="triton fused MoE needs a GPU + triton",
 )
-def test_fused_vs_eager_helper_has_useful_signal_on_cuda():
+@pytest.mark.parametrize("swiglu_limit", (None, 1.0))
+def test_fused_vs_eager_helper_has_useful_signal_on_cuda(swiglu_limit: float | None):
     """The NPU/MLU helper must keep a useful reference signal on the GPU path."""
-    _run_fused_vs_eager("fused_triton")
-    _run_fused_vs_eager("fused_triton", merged=True)
+    require_active_clamp = swiglu_limit is not None
+    _run_fused_vs_eager("fused_triton", swiglu_limit=swiglu_limit, require_active_clamp=require_active_clamp)
+    _run_fused_vs_eager(
+        "fused_triton", swiglu_limit=swiglu_limit, merged=True, require_active_clamp=require_active_clamp
+    )
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU fused MoE needs torch_npu")
-def test_npu_matches_eager():
-    _run_fused_vs_eager("fused_npu")
+@pytest.mark.parametrize("merged", (False, True), ids=("split", "merged"))
+@pytest.mark.parametrize("swiglu_limit", (None, 1.0))
+def test_npu_matches_eager(swiglu_limit: float | None, merged: bool):
+    _run_fused_vs_eager(
+        "fused_npu", swiglu_limit=swiglu_limit, merged=merged, require_active_clamp=swiglu_limit is not None
+    )
 
 
 @pytest.mark.skipif(not IS_MLU_AVAILABLE, reason="MLU fused MoE needs torch_mlu")

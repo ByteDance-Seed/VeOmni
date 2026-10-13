@@ -15,7 +15,7 @@
 import math
 import os
 import sys
-from dataclasses import MISSING, dataclass, field, fields
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar, Dict, List, Literal, Optional, Tuple
 
@@ -1200,14 +1200,14 @@ class TrainingArguments:
 # NPU; a value in ``_NPU_REQUIRED[field]`` raises off NPU.
 #
 # Hardcoded rather than inferred from registry requirements because backend
-# names alone do not capture per-model compatibility. The NPU default
-# normalization step runs before this allow-list validation.
+# names alone do not capture per-model compatibility. Unset fields take their
+# host default before this allow-list validation.
 _NPU_ALLOWED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"npu"}),
     "rotary_pos_emb_implementation": frozenset({"npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
     "swiglu_mlp_implementation": frozenset(),
-    "load_balancing_loss_implementation": frozenset({"triton"}),
+    "load_balancing_loss_implementation": frozenset(),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss"}),
     "moe_implementation": frozenset({"fused_npu"}),
 }
@@ -1219,28 +1219,44 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
     "moe_implementation": frozenset({"fused_npu"}),
 }
 
-_NPU_DEFAULT_FALLBACK: Dict[str, str] = {
-    "rms_norm_implementation": "npu",
-    "rotary_pos_emb_implementation": "npu",
-    "rotary_pos_emb_vision_implementation": "npu",
-    "swiglu_mlp_implementation": "eager",
-    "load_balancing_loss_implementation": "eager",
-    "cross_entropy_loss_implementation": "chunk_loss",
-    "moe_implementation": "fused_npu",
-}
-
 # MLU compatibility tables for ``_validate_implementations``.
 # ``fused_triton`` is the same group-gemm as on GPU; ``fused_mlu`` is Apex grouped-GEMM.
 _MLU_ALLOWED: Dict[str, frozenset] = {
     "moe_implementation": frozenset({"fused_mlu", "fused_triton"}),
 }
 
-_MLU_DEFAULT_FALLBACK: Dict[str, str] = {
-    "rms_norm_implementation": "eager",
-    "rotary_pos_emb_implementation": "eager",
+# Host defaults for the general-purpose kernel fields, applied only to fields left
+# unset (``None``). An explicit value is never rewritten, so an explicit GPU kernel
+# on NPU raises instead of silently running something else.
+_GPU_DEFAULT_IMPLEMENTATIONS: Dict[str, str] = {
+    "moe_implementation": "fused_triton",
+    "cross_entropy_loss_implementation": "liger_kernel",
+    "rms_norm_implementation": "liger_kernel",
+    "swiglu_mlp_implementation": "liger_kernel",
+    "rotary_pos_emb_implementation": "liger_kernel",
+    "rotary_pos_emb_vision_implementation": "eager",
+    "load_balancing_loss_implementation": "triton",
+}
+
+_NPU_DEFAULT_IMPLEMENTATIONS: Dict[str, str] = {
+    "moe_implementation": "fused_npu",
+    "cross_entropy_loss_implementation": "chunk_loss",
+    "rms_norm_implementation": "npu",
     "swiglu_mlp_implementation": "eager",
+    "rotary_pos_emb_implementation": "npu",
+    "rotary_pos_emb_vision_implementation": "npu",
     "load_balancing_loss_implementation": "eager",
+}
+
+# ``_apply_host_defaults`` swaps in ``fused_mlu`` for MoE when Apex MLU is installed.
+_MLU_DEFAULT_IMPLEMENTATIONS: Dict[str, str] = {
+    "moe_implementation": "fused_triton",
     "cross_entropy_loss_implementation": "eager",
+    "rms_norm_implementation": "eager",
+    "swiglu_mlp_implementation": "eager",
+    "rotary_pos_emb_implementation": "eager",
+    "rotary_pos_emb_vision_implementation": "eager",
+    "load_balancing_loss_implementation": "eager",
 }
 
 # Values renamed by the OpSlot -> VeomniOp migration. They still parse, resolve to
@@ -1283,12 +1299,12 @@ _REJECTED_IMPLEMENTATION_VALUES: Dict[str, Dict[str, str]] = {
 class OpsImplementationConfig:
     """model.ops_implementation.* — kernel backend selection per op.
 
-    Defaults are GPU-optimal (Liger / Triton / fused Triton MoE). On NPU, values
-    still equal to the dataclass defaults listed in ``_NPU_DEFAULT_FALLBACK``
-    are automatically mapped to NPU-compatible or eager implementations;
-    explicit non-default overrides are validated and unsupported values raise.
-    Per-op fields are ``str`` so third-party backends can register without
-    changing this dataclass.
+    The general-purpose kernel fields default to ``None`` and take the host
+    default in ``__post_init__``: ``_GPU_DEFAULT_IMPLEMENTATIONS`` (Liger /
+    Triton / fused Triton MoE), ``_NPU_DEFAULT_IMPLEMENTATIONS`` or
+    ``_MLU_DEFAULT_IMPLEMENTATIONS``. Explicit values are never rewritten; they
+    are validated and unsupported values raise. Per-op fields are ``str`` so
+    third-party backends can register without changing this dataclass.
 
     NPU validation runs at two times:
 
@@ -1309,8 +1325,7 @@ class OpsImplementationConfig:
     Backends: ``"eager"`` (HF reference, always available),
     ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"npu"`` (Ascend),
     ``"triton"`` (CUDA ``triton``). Load-balancing loss has a CUDA Triton
-    backend; on NPU, values equal to the dataclass default are normalized to
-    ``"eager"`` before registry binding.
+    backend; its NPU default is ``"eager"``.
     """
 
     attn_implementation: Optional[
@@ -1344,60 +1359,65 @@ class OpsImplementationConfig:
             "MODELING_BACKEND=veomni. Pass a veomni_* name to select that adapter directly."
         },
     )
-    moe_implementation: str = field(
-        default="fused_triton",
+    moe_implementation: Optional[str] = field(
+        default=None,
         metadata={
-            "help": "MoE experts forward. 'fused_triton' (default, GPU SM70+ or MLU) | "
+            "help": "MoE experts forward. 'fused_triton' (GPU SM70+ or MLU) | "
             "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | "
             "'fused_mlu' (MLU Apex grouped-GEMM) | 'eager'. "
-            "On NPU, a default-valued 'fused_triton' selection maps to 'fused_npu'; "
-            "incompatible non-default overrides raise."
+            "Unset: 'fused_triton' on GPU, 'fused_npu' on NPU, 'fused_mlu' on MLU with Apex "
+            "and 'fused_triton' otherwise."
         },
     )
-    cross_entropy_loss_implementation: str = field(
-        default="liger_kernel",
+    cross_entropy_loss_implementation: Optional[str] = field(
+        default=None,
         metadata={
-            "help": "Cross-entropy loss. 'liger_kernel' (default, GPU; fused linear+CE — "
+            "help": "Cross-entropy loss. 'liger_kernel' (GPU; fused linear+CE — "
             "requires VeOmni-patched modeling that passes hidden_states=/weights= to "
             "self.loss_function; unpatched HF models raise) | 'chunk_loss' (chunked "
             "F.linear+CE, hardware-agnostic) | 'eager' (PyTorch F.cross_entropy). "
-            "'npu' is a deprecated alias for 'chunk_loss'."
+            "'npu' is a deprecated alias for 'chunk_loss'. "
+            "Unset: 'liger_kernel' on GPU, 'chunk_loss' on NPU, 'eager' on MLU."
         },
     )
-    rms_norm_implementation: str = field(
-        default="liger_kernel",
+    rms_norm_implementation: Optional[str] = field(
+        default=None,
         metadata={
-            "help": "RMSNorm. 'liger_kernel' (default, GPU) | 'npu' (torch_npu; the unweighted "
+            "help": "RMSNorm. 'liger_kernel' (GPU) | 'npu' (torch_npu; the unweighted "
             "variant has no NPU kernel and uses 'eager') | "
-            "'triton' (DeepSeek-V3 batch-invariant; GPU only) | 'eager'."
+            "'triton' (DeepSeek-V3 batch-invariant; GPU only) | 'eager'. "
+            "Unset: 'liger_kernel' on GPU, 'npu' on NPU, 'eager' on MLU."
         },
     )
-    swiglu_mlp_implementation: str = field(
-        default="liger_kernel",
+    swiglu_mlp_implementation: Optional[str] = field(
+        default=None,
         metadata={
-            "help": "SwiGLU MLP. 'liger_kernel' (default, GPU) | 'eager'. No NPU backend — NPU users must set 'eager'."
+            "help": "SwiGLU MLP. 'liger_kernel' (GPU) | 'eager'. No NPU backend. "
+            "Unset: 'liger_kernel' on GPU, 'eager' on NPU and MLU."
         },
     )
-    rotary_pos_emb_implementation: str = field(
-        default="liger_kernel",
+    rotary_pos_emb_implementation: Optional[str] = field(
+        default=None,
         metadata={
-            "help": "Rotary positional embedding. 'liger_kernel' (default, GPU) | "
+            "help": "Rotary positional embedding. 'liger_kernel' (GPU) | "
             "'npu' | 'triton' (per-model: DeepSeek-V3 deterministic, "
-            "DeepSeek-V4 fused partial-interleaved, Wan; GPU only) | 'eager'."
+            "DeepSeek-V4 fused partial-interleaved, Wan; GPU only) | 'eager'. "
+            "Unset: 'liger_kernel' on GPU, 'npu' on NPU, 'eager' on MLU."
         },
     )
-    rotary_pos_emb_vision_implementation: str = field(
-        default="eager",
+    rotary_pos_emb_vision_implementation: Optional[str] = field(
+        default=None,
         metadata={
             "help": "Rank-3 vision layout for full rotary positional embedding. "
-            "Uses the same 'rope' op with an independent implementation choice: 'npu' | 'eager' (default)."
+            "Uses the same 'rope' op with an independent implementation choice: 'npu' | 'eager'. "
+            "Unset: 'npu' on NPU, 'eager' elsewhere."
         },
     )
-    load_balancing_loss_implementation: str = field(
-        default="triton",
+    load_balancing_loss_implementation: Optional[str] = field(
+        default=None,
         metadata={
-            "help": "MoE load-balancing loss. 'triton' (default; needs 'triton' on CUDA) | 'eager'. "
-            "On NPU, config normalization maps the default 'triton' value to 'eager'."
+            "help": "MoE load-balancing loss. 'triton' (needs 'triton' on CUDA) | 'eager'. "
+            "Unset: 'triton' on GPU, 'eager' on NPU and MLU."
         },
     )
     rms_norm_gated_implementation: str = field(
@@ -1498,6 +1518,7 @@ class OpsImplementationConfig:
         }.get(implementation, implementation)
 
     def __post_init__(self):
+        self._apply_host_defaults()
         self._apply_deprecated_aliases()
         self.attn_implementation = self.normalize_hub_attention_backend(self.attn_implementation)
         if get_env("MODELING_BACKEND") == "veomni":
@@ -1515,8 +1536,6 @@ class OpsImplementationConfig:
                 logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
 
-        self._apply_npu_default_fallback()
-        self._apply_mlu_default_fallback()
         self._validate_implementations()
 
     def _apply_deprecated_aliases(self) -> None:
@@ -1551,54 +1570,21 @@ class OpsImplementationConfig:
             f"Set {field_name}={new!r} explicitly; the old value will be removed in a future release."
         )
 
-    def _apply_npu_default_fallback(self):
-        """Auto-resolve GPU-only defaults to NPU-compatible alternatives.
+    def _apply_host_defaults(self) -> None:
+        """Fill the kernel fields left unset (``None``) with this host's defaults."""
+        from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available, is_torch_npu_available
 
-        When running on NPU, fields still at their GPU default are automatically
-        swapped to the NPU fallback from ``_NPU_DEFAULT_FALLBACK``. Explicit
-        user overrides (non-default values) are left untouched and will be
-        caught by ``_validate_implementations`` if unsupported.
-        """
-        from ..utils.import_utils import is_torch_npu_available
-
-        if not is_torch_npu_available():
-            return
-
-        gpu_defaults = {f.name: f.default for f in fields(self) if f.default is not MISSING}
-        for field_name, npu_value in _NPU_DEFAULT_FALLBACK.items():
-            if field_name not in gpu_defaults:
-                continue
-            current = getattr(self, field_name)
-            if current == gpu_defaults[field_name]:
-                setattr(self, field_name, npu_value)
-                logger.info_rank0(
-                    f"{field_name}: auto-resolved GPU default {current!r} -> {npu_value!r} on Ascend NPU."
-                )
-
-    def _apply_mlu_default_fallback(self):
-        """Auto-resolve GPU-only defaults to MLU-compatible alternatives.
-
-        When running on MLU, fields still at their GPU default are silently
-        swapped to the MLU fallback from ``_MLU_DEFAULT_FALLBACK``. Explicit
-        user overrides (non-default values) are left untouched and will be
-        caught by ``_validate_implementations`` if unsupported.
-        """
-        from ..utils.import_utils import is_torch_mlu_available
-
-        if not is_torch_mlu_available():
-            return
-
-        gpu_defaults = {f.name: f.default for f in fields(self) if f.default is not MISSING}
-        for field_name, mlu_value in _MLU_DEFAULT_FALLBACK.items():
-            if field_name not in gpu_defaults:
-                continue
-
-            current = getattr(self, field_name)
-            if current == gpu_defaults[field_name]:
-                setattr(self, field_name, mlu_value)
-                logger.info_rank0(
-                    f"{field_name}: auto-resolved GPU default {current!r} -> {mlu_value!r} on Cambricon MLU."
-                )
+        if is_torch_npu_available():
+            defaults = _NPU_DEFAULT_IMPLEMENTATIONS
+        elif is_torch_mlu_available():
+            defaults = dict(_MLU_DEFAULT_IMPLEMENTATIONS)
+            if is_apex_mlu_available():
+                defaults["moe_implementation"] = "fused_mlu"
+        else:
+            defaults = _GPU_DEFAULT_IMPLEMENTATIONS
+        for field_name, value in defaults.items():
+            if getattr(self, field_name) is None:
+                setattr(self, field_name, value)
 
     def _validate_implementations(self):
         """Fail fast on hardware/op mismatch at config-parse time.
@@ -1625,8 +1611,8 @@ class OpsImplementationConfig:
                 allowed = sorted(npu_ok | {"eager"})
                 raise ValueError(
                     f"{field_name}={value!r} is not supported on Ascend NPU. "
-                    f"Set to one of {allowed}; 'eager' is the universal fallback "
-                    f"for ops with no NPU kernel for the current model."
+                    f"Set to one of {allowed}, or leave it unset for the NPU default; "
+                    f"'eager' is the universal fallback for ops with no NPU kernel for the current model."
                 )
             if not on_npu and value in _NPU_REQUIRED.get(field_name, frozenset()):
                 raise ValueError(f"{field_name}={value!r} requires Ascend NPU but none is available.")

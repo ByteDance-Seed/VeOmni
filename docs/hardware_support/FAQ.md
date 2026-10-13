@@ -67,15 +67,15 @@ model:
 > **Configuration Location**: See the [operator implementation arguments](../usage/arguments.md#opsimplementationconfig).
 
 **NPU Optimized Operators**:
-VeOmni automatically maps default-valued general operator settings to NPU-compatible
-implementations:
+General operator settings left unset resolve to NPU-compatible implementations on NPU:
 
 - `npu_group_gemm`: [MoE GroupGEMM kernel](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/moe_experts/standard/npu.py)
 - `npu_rms_norm`: [RMS normalization kernel](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/rms_norm/standard/npu.py)
 - `npu_rotary_mul`: [RoPE positional encoding kernel](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/rope/full/npu.py)
 
-**Note**: Only fields that still equal their dataclass defaults are auto-mapped. Explicit
-non-default overrides are preserved and rejected if unsupported. Attention continues to use
+**Note**: Only unset fields take the NPU default. Explicit values are preserved and rejected
+if unsupported, so remove or replace GPU-only values such as `liger_kernel` and `fused_triton`
+when reusing a GPU YAML. Attention continues to use
 the configured HuggingFace attention backend. Qwen3.5's `rms_norm_gated`, `causal_conv1d`,
 and `chunk_gated_delta_rule` fields are model-specific and must be set to `npu` explicitly.
 
