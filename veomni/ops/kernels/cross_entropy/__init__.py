@@ -74,16 +74,12 @@ import torch.nn as nn
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import reduce_sequence_parallel_loss
-from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available, is_torch_npu_available
 from ....utils.model_outputs import FusedLinearAuxOutput
 from .chunk_logprobs import chunk_logprobs_function  # noqa: F401 re-export
 from .chunk_loss import chunk_loss_function  # noqa: F401 re-export for legacy callers
 from .chunk_topk_distill import chunk_topk_distill_function  # noqa: F401 re-export
 from .eager import eager_cross_entropy
-
-
-logger = logging.get_logger(__name__)
 
 
 def ForCausalLMLoss(
@@ -104,6 +100,7 @@ def ForCausalLMLoss(
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, FusedLinearAuxOutput | None]:
     hidden_states = kwargs.pop("hidden_states", None)
     weights = kwargs.pop("weights", None)
+    loss_reduction_group = kwargs.pop("loss_reduction_group", None)
     # Per-call log-probs dispatch: when the caller passes `return_log_probs=True`
     # (the model `forward` simply forwards it through `**kwargs`), skip the loss
     # path and route hidden_states+weights+labels through the chunked log-probs
@@ -183,16 +180,16 @@ def ForCausalLMLoss(
 
     sp_enabled = get_parallel_state().sp_enabled
 
-    # veomni sp patch
-    if not sp_enabled:
-        # Shift so that tokens < n predict n
-        if shift_labels is None:
+    # Explicitly prepared targets take precedence. SeedOmni V2 uses this for
+    # segment-boundary-aware shifts that cannot be reconstructed here.
+    if shift_labels is None:
+        if not sp_enabled:
+            # Shift so that tokens < n predict n
             labels = nn.functional.pad(labels, (0, 1), value=ignore_index)
             shift_labels = labels[..., 1:].contiguous()
-    else:
-        if shift_labels is not None:
-            logger.warning_once("labels have been shifted in dataloader when `sp_enabeld=True`, ignore shift_labels.")
-        shift_labels = labels
+        else:
+            # The SP collator has already shifted labels before sharding.
+            shift_labels = labels
 
     # Flatten the tokens
     shift_labels = shift_labels.view(-1)
@@ -214,10 +211,11 @@ def ForCausalLMLoss(
         **kwargs,
     )
 
-    # Reduce loss when using sp
-    if sp_enabled:
-        num_valid_tokens = (labels != ignore_index).sum()
-        loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
+    # An explicit group lets SeedOmni V2 reduce over its full DP+SP FSDP mesh,
+    # while existing callers retain the unified-SP-group default.
+    if sp_enabled or loss_reduction_group is not None:
+        num_valid_tokens = (shift_labels != ignore_index).sum()
+        loss = reduce_sequence_parallel_loss(loss, num_valid_tokens, group=loss_reduction_group)
     return loss, logits, None
 
 
