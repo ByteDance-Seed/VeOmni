@@ -290,15 +290,25 @@ class OmniModelRuntime:
             return
 
         modules = self.module_runtimes
-        wrap_units = _scoped_no_split_modules(modules)
+        # Cache readers stay on meta and must not go through the composed
+        # materialisation path: ``skip_hf_weight_load`` still calls ``to_empty``.
+        cache_readers = {
+            name: self.model._modules.pop(name) for name, runtime in modules.items() if runtime.reads_offline_cache
+        }
+        modules_to_wrap = {name: runtime for name, runtime in modules.items() if name not in cache_readers}
+        wrap_units = _scoped_no_split_modules(modules_to_wrap)
         self.model._no_split_modules = wrap_units
 
         kwargs: dict[str, Any] = {
             "cpu_load_param_name": None,
-            "module_skip_hf_weight_load": {name: runtime.skip_hf_weight_load for name, runtime in modules.items()},
-            "module_is_peft_model": {name: bool(runtime.args.lora_config) for name, runtime in modules.items()},
+            "module_skip_hf_weight_load": {
+                name: runtime.skip_hf_weight_load for name, runtime in modules_to_wrap.items()
+            },
+            "module_is_peft_model": {
+                name: bool(runtime.args.lora_config) for name, runtime in modules_to_wrap.items()
+            },
             "module_adapter_path": {
-                name: (runtime.args.lora_config or {}).get("lora_adapter") for name, runtime in modules.items()
+                name: (runtime.args.lora_config or {}).get("lora_adapter") for name, runtime in modules_to_wrap.items()
             },
         }
         if any(kwargs["module_is_peft_model"].values()):
@@ -312,9 +322,14 @@ class OmniModelRuntime:
         )
         opt = args.optimizer
         muon_expert_zero_comm = bool(opt) and opt.type == "muon" and opt.muon_expert_zero_comm
-        weights_path = {name: runtime.args.model_path for name, runtime in modules.items()}
+        weights_path = {name: runtime.args.model_path for name, runtime in modules_to_wrap.items()}
 
-        logger.info_rank0(f"OmniModelRuntime: wrapping composed OmniModel (fsdp_scope='model') over {list(modules)}.")
+        logger.info_rank0(
+            f"OmniModelRuntime: wrapping composed OmniModel (fsdp_scope='model') over "
+            f"{list(modules_to_wrap)}"
+            + (f"; leaving cache reader(s) on meta: {list(cache_readers)}" if cache_readers else "")
+            + "."
+        )
         # ``OmniTrainer._setup`` registered ``base`` from the same top-level accelerator.
         with use_parallel_state("base"):
             self.model = build_parallelize_model(
@@ -339,8 +354,14 @@ class OmniModelRuntime:
                 **kwargs,
             )
 
+        for name, module in cache_readers.items():
+            self.model.add_module(name, module)
+            modules[name].model = module
+
         if not for_inference:
-            for runtime in modules.values():
+            for name, runtime in modules.items():
+                if name in cache_readers:
+                    continue
                 runtime.build_after_omni_model_wrap()
 
     def __getattr__(self, name: str) -> Any:

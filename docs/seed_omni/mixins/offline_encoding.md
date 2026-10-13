@@ -93,12 +93,13 @@ full, or it is built on meta.
   the config, never a parameter or buffer: parameters are meta tensors, and
   buffers keep the values the constructor gave them, not the checkpoint's. A
   module the graph calls through any other method as well needs its weights,
-  so it is built in full. Under
-  `fsdp_scope: model` the composed wrap still loads every module, the cached
-  ones included.
+  so it is built in full. Under `fsdp_scope: model`,
+  [`_parallelize_composed_model`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L270)
+  detaches cache readers before the composed wrap so they stay on meta and are
+  not materialised with the rest.
 - **`offline_embedding`.** Every module, cached or not, is built, loaded and
   wrapped like any other, then
-  [frozen](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L164):
+  [frozen](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L166):
   the run trains nothing, so no module gets an optimizer or a checkpoint
   manager, and [`OmniTrainer`](../../../veomni/trainer/omni/omni_trainer.py#L275)
   allows the empty optimizer.
