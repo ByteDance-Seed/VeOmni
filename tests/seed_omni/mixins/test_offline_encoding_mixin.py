@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 import torch
 
 from veomni.models.seed_omni import OfflineEncodingMixin
@@ -58,21 +57,19 @@ class DummyOfflineModule(OfflineEncodingMixin, TrainingModuleMixin, BaseMixin):
         return {"conversation_list": self._conversation_carrier}
 
 
-def test_offline_encoding_mixin_requires_tensor_endpoints() -> None:
-    assert OfflineEncodingMixin.__abstractmethods__ == {"offline_encode", "online_process"}
-
-
 def test_offline_encoding_mixin_is_not_module_mixin_subclass() -> None:
     assert not issubclass(OfflineEncodingMixin, BaseMixin)
 
 
-def test_a_module_missing_an_endpoint_cannot_be_built() -> None:
-    class EncodeOnly(OfflineEncodingMixin):
-        def offline_encode(self, **kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
+def test_the_mixin_is_a_marker_that_names_no_method() -> None:
+    """A module picks its own offline method names; the graph YAML names them."""
+
+    class CustomNames(OfflineEncodingMixin):
+        def to_posterior(self, **kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
             return {}
 
-    with pytest.raises(TypeError, match="online_process"):
-        EncodeOnly()
+    assert [name for name in vars(OfflineEncodingMixin) if not name.startswith("__")] == []
+    assert isinstance(CustomNames(), OfflineEncodingMixin)
 
 
 def test_offline_encoding_mixin_does_not_implement_decorated_hooks() -> None:

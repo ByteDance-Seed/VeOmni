@@ -262,7 +262,7 @@ def test_mot_forward_post_scatters_virtual_marker_triplet_hidden_states() -> Non
 
 
 def test_bagel_vae_online_process_runs_on_a_meta_built_model() -> None:
-    """``offline_training`` builds the VAE on meta with no weights when the graph calls only ``online_process`` on it."""
+    """``offline_training`` builds the VAE on meta with no weights, because it mixes in ``OfflineEncodingMixin``."""
     encode_model = _tiny_vae()
     process_model = _tiny_vae(meta=True)
     encoded_cache = encode_model.offline_encode(pixel_values=torch.zeros(1, 3, 8, 8))["encoded_cache"]

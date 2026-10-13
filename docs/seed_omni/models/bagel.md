@@ -233,8 +233,8 @@ Samples without a VAE image get the preprocessor's dummy row encoded too, so
 every cached sample carries a VAE posterior.
 
 **Stage 2 — train from the cache** (`train.training_task: offline_training`).
-The graph calls only `online_process` on `bagel_vae`, so it is built on meta and
-never loads its weights. `with_cache/modules_train.yaml` is the same file as
+`bagel_vae` mixes in `OfflineEncodingMixin`, so it is built on meta and never
+loads its weights; the graph calls its `online_process`. `with_cache/modules_train.yaml` is the same file as
 `train/modules_train.yaml`. `data.data_type`
 becomes `seedomni_cached` and `data.train_path` points at the stage-1 output
 directory. The cached items are marked as posteriors, so the VAE preprocessor

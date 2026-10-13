@@ -36,6 +36,7 @@ from .....utils import logging
 from .....utils.checkpoint_utils import should_skip_hf_weight_load
 from .....utils.device import get_device_type
 from ....model_runtime import VeOmniModelRuntime
+from ...mixins.offline_encoding_mixin import OfflineEncodingMixin
 from ...utils.checkpoint import OmniModuleCheckpointManager
 from ..utils.dispatch import unwrap_module_chain
 
@@ -98,10 +99,7 @@ class ModuleRuntime(VeOmniModelRuntime):
     ``train_args`` is the job-wide ``train:`` section (:class:`OmniTrainingArguments`),
     shared by every module and ``None`` for inference builds. It is config, not a
     train/infer switch (``for_inference`` is): the runtime reads ``training_task``
-    and the checkpoint paths from it. ``training_graph_methods`` is the set of
-    methods this run's training graph calls on this module, e.g.
-    ``{"online_process"}``; it is empty for inference builds and for a module the
-    graph never calls.
+    and the checkpoint paths from it.
 
     Job-wide concerns (process-group init, data pipeline, trace metering, the
     train loop) are **never** run here — :class:`OmniTrainer` owns them once, and
@@ -115,7 +113,6 @@ class ModuleRuntime(VeOmniModelRuntime):
 
     args: "OmniModuleRuntimeArguments"
     train_args: Optional["OmniTrainingArguments"] = None
-    training_graph_methods: frozenset[str] = frozenset()
     hf_source: Optional["HFSource"] = None
     _has_trainable_parameters: Optional[bool] = None
 
@@ -127,7 +124,6 @@ class ModuleRuntime(VeOmniModelRuntime):
         module_config: "OmniModuleConfig",
         global_accelerator: "AcceleratorConfig",
         train_args: Optional["OmniTrainingArguments"] = None,
-        training_graph_methods: frozenset[str] = frozenset(),
         for_inference: bool = False,
         hf_source: Optional["HFSource"] = None,
     ):
@@ -136,7 +132,6 @@ class ModuleRuntime(VeOmniModelRuntime):
         self.module_config = module_config
         self.hf_source = hf_source
         self.train_args = train_args
-        self.training_graph_methods = training_graph_methods
         self.optimizer = None
         self.lr_scheduler = None
         self._global_accelerator = global_accelerator
@@ -212,19 +207,20 @@ class ModuleRuntime(VeOmniModelRuntime):
 
     @property
     def reads_offline_cache(self) -> bool:
-        """Whether this module only runs ``online_process`` on cached data.
+        """Whether this module runs on cached data, built on meta.
 
-        True under ``train.training_task='offline_training'`` when the training
-        graph calls ``online_process`` and nothing else on this module.
-        ``online_process`` reads only the config, so the module is built on meta,
-        loads no weights, and has nothing to train or save. Any other method in
-        the graph needs the weights, so the module is then built in full.
+        True under ``train.training_task='offline_training'`` for a module whose
+        class mixes in :class:`OfflineEncodingMixin`: that task reads every
+        cacheable module from the cache, so the module loads no weights and has
+        nothing to train or save. The class is resolved from the config because
+        this decides the init device before the module exists.
         """
-        return (
-            self.train_args is not None
-            and self.train_args.training_task == "offline_training"
-            and self.training_graph_methods == {"online_process"}
-        )
+        if self.train_args is None or self.train_args.training_task != "offline_training":
+            return False
+        from .....models.loader import get_model_class
+
+        model_cls = get_model_class(self.module_config)
+        return isinstance(model_cls, type) and issubclass(model_cls, OfflineEncodingMixin)
 
     @property
     def weights_path(self) -> Optional[str]:
@@ -711,7 +707,6 @@ def build_omni_module_runtime(
     module_config: "OmniModuleConfig",
     global_accelerator: "AcceleratorConfig",
     train_args: Optional["OmniTrainingArguments"] = None,
-    training_graph_methods: frozenset[str] = frozenset(),
     for_inference: bool = False,
     hf_source: Optional["HFSource"] = None,
 ) -> ModuleRuntime:
@@ -722,7 +717,6 @@ def build_omni_module_runtime(
         module_config=module_config,
         global_accelerator=global_accelerator,
         train_args=train_args,
-        training_graph_methods=training_graph_methods,
         for_inference=for_inference,
         hf_source=hf_source,
     )

@@ -29,6 +29,7 @@ from veomni.distributed import parallel_state
 from veomni.distributed.parallel_state import ParallelState
 from veomni.models.model_runtime import VeOmniModelRuntime
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
+from veomni.models.seed_omni.mixins.offline_encoding_mixin import OfflineEncodingMixin
 
 
 def _fsdp(scope: str, mode: str = "fsdp2") -> SimpleNamespace:
@@ -141,21 +142,23 @@ def test_build_model_uses_the_config_the_omni_config_loaded(monkeypatch):
     assert captured["weights_path"] == "/tmp/hf-model"
 
 
+class _CacheableModule(OfflineEncodingMixin, nn.Linear):
+    pass
+
+
 @pytest.mark.parametrize(
-    ("training_task", "graph_methods", "on_meta"),
+    ("training_task", "model_cls", "on_meta"),
     [
-        ("offline_training", {"online_process"}, True),
-        ("offline_training", {"forward"}, False),
-        ("offline_training", {"online_process", "decode"}, False),
-        ("offline_training", set(), False),
-        ("offline_embedding", {"offline_encode"}, False),
-        ("online_training", {"encode"}, False),
-        (None, {"online_process"}, False),
+        ("offline_training", _CacheableModule, True),
+        ("offline_training", nn.Linear, False),
+        ("offline_embedding", _CacheableModule, False),
+        ("online_training", _CacheableModule, False),
+        (None, _CacheableModule, False),
     ],
 )
-def test_only_a_cache_reading_module_is_built_on_meta(monkeypatch, training_task, graph_methods, on_meta):
-    """``online_process`` reads only the config, so a module the graph calls only
-    through it never needs weights. Any other method in the graph does.
+def test_only_a_cacheable_module_is_built_on_meta_for_offline_training(monkeypatch, training_task, model_cls, on_meta):
+    """``offline_training`` reads every module that mixes in ``OfflineEncodingMixin`` from the cache,
+    whichever of its methods the graph names; no other module and no other task does.
 
     ``None`` stands for an inference build, which has no train args.
     """
@@ -168,7 +171,8 @@ def test_only_a_cache_reading_module_is_built_on_meta(monkeypatch, training_task
         return model
 
     monkeypatch.setattr("veomni.models.build_foundation_model", fake_build_foundation_model)
-    runtime = _offline_cache_runtime(training_task, frozenset(graph_methods))
+    monkeypatch.setattr("veomni.models.loader.get_model_class", lambda config: model_cls)
+    runtime = _offline_cache_runtime(training_task)
 
     assert runtime.reads_offline_cache is on_meta
     runtime._build_model()
@@ -194,6 +198,7 @@ def test_a_cache_reading_module_is_frozen_and_never_wrapped_trained_or_saved(mon
         self.model = nn.Linear(2, 2)
 
     monkeypatch.setattr(ModuleRuntime, "_build_model", fake_build_model)
+    monkeypatch.setattr("veomni.models.loader.get_model_class", lambda config: _CacheableModule)
     train = SimpleNamespace(training_task="offline_training", checkpoint=SimpleNamespace(load_path=None))
 
     runtime = ModuleRuntime(
@@ -202,7 +207,6 @@ def test_a_cache_reading_module_is_frozen_and_never_wrapped_trained_or_saved(mon
         module_config=SimpleNamespace(),
         global_accelerator=_fsdp("module"),
         train_args=train,
-        training_graph_methods=frozenset({"online_process"}),
     )
 
     assert calls == ["setup"]
@@ -238,7 +242,7 @@ def test_an_offline_embedding_run_loads_and_wraps_every_module_but_freezes_it(mo
     assert getattr(runtime, "checkpoint", None) is None
 
 
-def _offline_cache_runtime(training_task, graph_methods):
+def _offline_cache_runtime(training_task):
     runtime = _unbuilt(
         model_config=None,
         ops_implementation=None,
@@ -250,7 +254,6 @@ def _offline_cache_runtime(training_task, graph_methods):
         ),
     )
     runtime.module_config = SimpleNamespace(model_type="fake")
-    runtime.training_graph_methods = graph_methods
     if training_task is not None:
         runtime.train_args = SimpleNamespace(training_task=training_task)
     return runtime
