@@ -1859,6 +1859,13 @@ class DataloaderConfig:
         default=True,
         metadata={"help": "Whether to drop the last incomplete batch."},
     )
+    shuffle: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to shuffle the training data: the sampler order of mapping datasets "
+            "(reseeded each epoch) and the streaming shuffle buffer of iterable datasets."
+        },
+    )
     pin_memory: bool = field(
         default=True,
         metadata={"help": "Whether to pin memory for dataloader."},
