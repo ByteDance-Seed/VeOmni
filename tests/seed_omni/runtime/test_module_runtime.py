@@ -38,6 +38,7 @@ def _fsdp(scope: str, mode: str = "fsdp2") -> SimpleNamespace:
 def _unbuilt(model: nn.Module | None = None, **args_fields) -> ModuleRuntime:
     """A ModuleRuntime with its fields set but no build run."""
     args_fields.setdefault("accelerator", _fsdp("module"))
+    args_fields.setdefault("needs_distributed_build", args_fields["accelerator"].fsdp_config.fsdp_mode != "eager")
     runtime = ModuleRuntime.__new__(ModuleRuntime)
     runtime._global_accelerator = _fsdp("module")
     runtime.model = model
@@ -421,7 +422,7 @@ def test_distributed_inference_wraps_lora_before_loading_weights(monkeypatch):
     accelerator.fsdp_config.mixed_precision = SimpleNamespace(enable=True)
 
     ModuleRuntime(
-        SimpleNamespace(accelerator=accelerator),
+        SimpleNamespace(accelerator=accelerator, needs_distributed_build=True),
         "llm",
         module_config=SimpleNamespace(),
         global_accelerator=_fsdp("module"),
@@ -498,7 +499,9 @@ def test_an_eager_inference_module_forwards_without_a_parallel_state(monkeypatch
     enter; its scope is a no-op rather than a registry lookup that would fail."""
     model = _RecordAmbientState()
     monkeypatch.setattr(ModuleRuntime, "_init_eager_inference", lambda self: setattr(self, "model", model))
-    args = SimpleNamespace(accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="eager")))
+    args = SimpleNamespace(
+        accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="eager")), needs_distributed_build=False
+    )
 
     runtime = ModuleRuntime(
         args, "vision_encoder", module_config=SimpleNamespace(), global_accelerator=_fsdp("module"), for_inference=True
