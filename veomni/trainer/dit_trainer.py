@@ -367,7 +367,7 @@ class DiTTrainer:
             else:
                 self.offline_embedding_save_dir = args.data.offline_embedding_save_dir
 
-            args.data.drop_last = False
+            args.data.dataloader.drop_last = False
             args.data.dataloader.shuffle = False
             args.train.checkpoint.save_epochs = 0
             args.train.checkpoint.save_hf_weights = False
@@ -376,7 +376,7 @@ class DiTTrainer:
             args.train.dataloader_batch_size = args.train.micro_batch_size
             args.train.gradient_accumulation_steps = 1
             logger.info_rank0(
-                f"Task offline_embedding. Drop last: {args.data.drop_last}, shuffle: {args.data.dataloader.shuffle}"
+                f"Task offline_embedding. Drop last: {args.data.dataloader.drop_last}, shuffle: {args.data.dataloader.shuffle}"
             )
             args.train.num_train_epochs = 1
 
