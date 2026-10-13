@@ -78,52 +78,6 @@ _DEEPSEEK_V4_WEIGHT_RENAMINGS = [
     for transform in (get_checkpoint_conversion_mapping("deepseek_v4") or [])
     if isinstance(transform, WeightRenaming)
 ]
-# NOTE: Transformers's DeepSeek-V4 weight reverse renaming is buggy, manually fix it here.
-_INDEXER_REVERSE_RENAMINGS = [
-    WeightRenaming(
-        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.scorer\.weights_proj\.",
-        target_patterns=r"layers.\1.attn.indexer.weights_proj.",
-    ),
-    WeightRenaming(
-        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.q_b_proj\.",
-        target_patterns=r"layers.\1.attn.indexer.wq_b.",
-    ),
-    WeightRenaming(
-        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.position_bias$",
-        target_patterns=r"layers.\1.attn.indexer.compressor.ape",
-    ),
-    WeightRenaming(
-        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.kv_proj\.",
-        target_patterns=r"layers.\1.attn.indexer.compressor.wkv.",
-    ),
-    WeightRenaming(
-        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.gate_proj\.",
-        target_patterns=r"layers.\1.attn.indexer.compressor.wgate.",
-    ),
-    WeightRenaming(
-        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.kv_norm\.",
-        target_patterns=r"layers.\1.attn.indexer.compressor.norm.",
-    ),
-]
-_NESTED_REVERSE_RENAMINGS = [
-    WeightRenaming(
-        source_patterns=rf"^layers\.(\d+)\.self_attn\.(.+)\.{target}\.",
-        target_patterns=rf"layers.\1.attn.\2.{source}.",
-    )
-    for source, target in (
-        ("wq_a", "q_a_proj"),
-        ("wq_b", "q_b_proj"),
-        ("wkv", "kv_proj"),
-        ("wgate", "gate_proj"),
-        ("wo_a", "o_a_proj"),
-        ("wo_b", "o_b_proj"),
-    )
-]
-_DEEPSEEK_V4_WEIGHT_REVERSE_RENAMINGS = [
-    *_INDEXER_REVERSE_RENAMINGS,
-    *_NESTED_REVERSE_RENAMINGS,
-    *[transform.reverse_transform() for transform in reversed(_DEEPSEEK_V4_WEIGHT_RENAMINGS)],
-]
 _FP4_E2M1_VALUES = (
     0.0,
     0.5,
@@ -393,6 +347,13 @@ class DeepseekV4CheckpointTensorConverter:
         expert_dtype = config.expert_dtype
         scale_fmt = "ue8m0"
         scale_dtype = torch.float8_e8m0fnu if expert_dtype == "fp4" else torch.float32
+        # HF's renamings are not invertible (e.g. reversing ``.norm.`` -> ``.kv_norm.`` also rewrites the native
+        # ``attn.kv_norm``), so map names back by inverting the load-time renaming over the checkpoint index.
+        origin_names = {
+            convert_deepseek_v4_checkpoint_key(origin, target_model_prefix=self.target_model_prefix): origin
+            for origin in fqn_to_index_mapping
+            if not _is_mtp_checkpoint_key(origin)
+        }
         export_weight_names = set()
         for name, param in export_weights(model):
             # 1. replace mlp.experts.0.(gate_proj|up_proj|down_proj).weight to mlp.experts.0.(w1|w2|w3).weight
@@ -402,10 +363,8 @@ class DeepseekV4CheckpointTensorConverter:
                 name = ".".join(fields)
 
             # 2. reverse the renaming
-            origin, _ = rename_source_key(
-                name.removeprefix(self.target_model_prefix), _DEEPSEEK_V4_WEIGHT_REVERSE_RENAMINGS, []
-            )
-            assert origin in fqn_to_index_mapping, f"Unexpected exported weight name: {name}, origin: {origin}"
+            origin = origin_names.get(name)
+            assert origin is not None, f"Unexpected exported weight name: {name}"
 
             # 3. check if the weight needs to be quantized
             scale_name = None
