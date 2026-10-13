@@ -88,6 +88,10 @@ deepseek_v41_ngram:
 
 deepseek_v41_llm:
   model_path: deepseek_v41_llm
+  # Each rank reads only its own experts' shards rather than taking a
+  # broadcast of the whole module from rank 0.
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
   model_config:
     # Checkpoint files stay fp8/fp4. Clearing this makes the module allocate
     # bf16 Parameters; DeepseekV41DequantConverter spends the scales at load.
