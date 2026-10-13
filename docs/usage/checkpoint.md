@@ -34,7 +34,7 @@ nothing else. The two exports are inference artifacts that resume never reads.
 | `extra_state/rank_{R}.pt` | `global_step`, `environ_meter`, `channel_loss_callback`, `offline_cache_writer` (SeedOmni `offline_embedding` only), `torch_rng_state`. | Rank R |
 | `hf_ckpt/` | `model*.safetensors`, its index, and the model assets. Written when `train.checkpoint.save_hf_weights` is set and the run is not LoRA. | Rank 0, after a collective gather |
 | `lora_ckpt/` | `adapter_config.json`, `adapter_model.safetensors`. Written instead of `hf_ckpt/` when `model.lora_config` is set. | Rank 0, after a collective gather |
-| `checkpoint_manifest.json` | Format version, `global_step`, world size. Trainer-level completion only. | Rank 0, last |
+| `checkpoint_manifest.json` | Format version, `global_step`, world size, and `model_state`: whether the step has a `model/` at all. Trainer-level completion only. | Rank 0, last |
 | `model_assets/[<module>/]` | Each model's config / tokenizer / processor, once per run at train start. Nested like `hf_ckpt/`; a SeedOmni run loaded from an upstream HF checkpoint writes both flat, in that checkpoint's layout ([Upstream Checkpoint Layout](../seed_omni/usage/hf_layout.md)). | Rank 0 |
 
 **Model assets** is whatever that model's runtime `model_assets` list carries, in type terms
@@ -128,6 +128,14 @@ runs DDP while `janus_llama` runs FSDP2, so each records a different topology.
 Resume discovery accepts a `global_step_{N}/` directory only when both halves
 are there, so a crash mid-save leaves a directory that is skipped rather than
 half-loaded.
+
+The one step with a single half is a run that saves no model state. SeedOmni's
+`offline_embedding` freezes every module, so no module has a checkpoint
+manager and the step has no `model/`. Its manifest records
+[`model_state: false`](../../veomni/checkpoint/layout.py#L259), and the manifest
+alone then marks the step complete. Without that field, the same tree would look
+like a step whose shards never started. A manifest written before the field
+existed counts as carrying model state.
 
 Rewriting a step — a restarted run reaching the same step again — deletes the
 markers first, so an interrupted rewrite cannot leave a stale one standing over

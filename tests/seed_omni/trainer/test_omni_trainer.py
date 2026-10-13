@@ -133,6 +133,17 @@ def test_an_offline_embedding_run_may_build_no_optimizer(monkeypatch):
     assert trainer._build_model_runtime() is built
 
 
+@pytest.mark.parametrize(("managers", "saves"), [((None, None), False), ((None, object()), True)])
+def test_a_trainer_saves_model_state_only_if_some_module_has_a_checkpoint_manager(managers, saves):
+    """``offline_embedding`` freezes every module, so none has a manager and a step is only the cursor."""
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.model = SimpleNamespace(
+        module_runtimes={f"m{i}": SimpleNamespace(checkpoint=manager) for i, manager in enumerate(managers)}
+    )
+
+    assert trainer.saves_model_state is saves
+
+
 def test_the_offline_cache_writer_opens_after_the_trainer_state_is_restored(monkeypatch):
     """``on_train_begin`` hands the writer its saved shard position; opening first would reject the resumed cache."""
     monkeypatch.setattr("veomni.trainer.omni.omni_trainer.synchronize", MagicMock())

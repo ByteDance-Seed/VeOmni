@@ -400,6 +400,17 @@ class OmniTrainer:
         """
         self.model.load()
 
+    @property
+    def saves_model_state(self) -> bool:
+        """Whether a DCP save writes any module's state.
+
+        False when every module is fully frozen, as in ``offline_embedding``: no
+        module has a checkpoint manager, so a step is only the trainer's cursor
+        and ``GlobalStateCallback`` marks its manifest so ``load_path: auto``
+        still finds it.
+        """
+        return any(runtime.checkpoint is not None for runtime in self.model.module_runtimes.values())
+
     def save_dcp(self, state: TrainerState) -> None:
         """Write every composed model's distributed checkpoint (train resume).
 

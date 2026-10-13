@@ -202,7 +202,8 @@ class GlobalStateCallback(Callback):
         # Every rank's cursor is down by now, so the trainer-level half of the
         # step can be recorded. Model completeness is DCP's ``.metadata`` under
         # ``model/``, discovered from the filesystem — this file does not list
-        # modules.
+        # modules. A trainer whose ``saves_model_state`` is False writes no
+        # ``model/``, so the manifest says the cursor is the whole step.
         manifest_error: Optional[Exception] = None
         if self.rank == 0:
             try:
@@ -210,6 +211,7 @@ class GlobalStateCallback(Callback):
                     step_root,
                     global_step=state.global_step,
                     world_size=args.train.world_size,
+                    model_state=bool(getattr(self.trainer, "saves_model_state", True)),
                 )
             except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
                 logger.error(f"[RANK {self.rank}] failed to write the manifest under {step_root}", exc_info=True)
