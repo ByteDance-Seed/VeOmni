@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 import math
 from typing import NamedTuple
 
@@ -439,13 +438,10 @@ class MiniMaxH3DiT(nn.Module):
     ):
         super().__init__()
         self._block_offload_enabled = False
-        # Same shim HF puts on a PreTrainedModel, so the block loop below reads
-        # the checkpoint function off the instance: the recompute policy is
-        # installed by replacing this attribute, exactly as it is for a model
-        # that checkpoints through HF layers. The default is what the loop did
-        # before the policy existed, for runs that enable checkpointing through
-        # the data pipeline while the policy stays inactive.
-        self._gradient_checkpointing_func = functools.partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
+        # HF's marker: ``gradient_checkpointing_enable()`` walks ``modules()`` and writes both
+        # this flag and ``_gradient_checkpointing_func`` here, so the block loop below reads the
+        # run's setting and the policy's per-block decisions without owning a strategy itself.
+        self.gradient_checkpointing = False
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_channels_latents = latents_dim
@@ -568,8 +564,6 @@ class MiniMaxH3DiT(nn.Module):
         img_pos_for_infer_output_info,
         packed_seq_params,
         refiner_packed_seq_params,
-        use_gradient_checkpointing=False,
-        use_gradient_checkpointing_offload=False,
         update_audio_mask=None,
         skip_mask_out_condition=False,
         packed_batch=False,
@@ -591,8 +585,8 @@ class MiniMaxH3DiT(nn.Module):
         sp_group = get_ulysses_sequence_parallel_group()
         sp_world = dist.get_world_size(sp_group) if sp_group is not None else 1
         sp_rank = dist.get_rank(sp_group) if sp_group is not None else 0
-        if packed_batch and (sp_world != 1 or self._block_offload_enabled or use_gradient_checkpointing_offload):
-            raise ValueError("H3 multi-sample packing does not support sequence parallelism or offload.")
+        if packed_batch and (sp_world != 1 or self._block_offload_enabled):
+            raise ValueError("H3 multi-sample packing does not support sequence parallelism or block offload.")
 
         cu_seqlens = packed_seq_params["cu_seqlens_q"].to(torch.int32)
         max_seqlen = int(packed_seq_params["max_seqlen_q"])
@@ -663,9 +657,8 @@ class MiniMaxH3DiT(nn.Module):
         # dropped by the index_select below.
         cu_bounds = _PackedBounds(cu_seqlens.to(device), cu_host) if packed_batch else cu_host
         block_swap = self._block_swap if self._block_offload_enabled else 0
-        # Every block takes the same arguments; what differs per block is the
-        # recompute decision, which the framework folds into the instance's
-        # ``_gradient_checkpointing_func``.
+        # Every block takes the same arguments; only the recompute decision differs, and
+        # the bound policy folds that into ``self._gradient_checkpointing_func``.
         block_kwargs = {
             "t_emb": t_emb,
             "combined_indices": combined_indices,
@@ -685,10 +678,7 @@ class MiniMaxH3DiT(nn.Module):
                         b.to("cpu")
                     for b in self.blocks[block_swap:]:
                         b.to(device)
-            if use_gradient_checkpointing_offload:
-                with torch.autograd.graph.save_on_cpu():
-                    hidden = self._gradient_checkpointing_func(block, hidden, **block_kwargs)
-            elif use_gradient_checkpointing:
+            if self.gradient_checkpointing:
                 hidden = self._gradient_checkpointing_func(block, hidden, **block_kwargs)
             else:
                 hidden = block(hidden, **block_kwargs)

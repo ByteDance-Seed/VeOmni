@@ -413,7 +413,14 @@ class GradientCheckpointingConfig:
 
     enable: bool = field(
         default=True,
-        metadata={"help": "Enable gradient checkpointing."},
+        metadata={
+            "help": (
+                "Enable gradient checkpointing. Master switch: with it off recompute_layers, "
+                "selective_recompute_layers and save_ops have no effect. A model that decides "
+                "checkpointing from its input data rather than from this config is not switched "
+                "off by it: it keeps recomputing, in full."
+            )
+        },
     )
     debug: bool = field(
         default=False,
@@ -423,7 +430,15 @@ class GradientCheckpointingConfig:
     )
     enable_reentrant: bool = field(
         default=False,
-        metadata={"help": "Use reentrant gradient checkpointing."},
+        metadata={
+            "help": (
+                "Use reentrant gradient checkpointing. Kept off by default, and not usable "
+                "on a model that installs its own checkpoint function and passes its block "
+                "arguments by keyword (MiniMax-H3): reentrant checkpointing saves positional "
+                "tensors only, so the first recomputed block raises. torch also refuses "
+                "enable_reentrant=True together with SAC."
+            )
+        },
     )
     early_stop: bool = field(
         default=True,
@@ -448,7 +463,7 @@ class GradientCheckpointingConfig:
                 "counts the trainable one, the one with more blocks if both train; list "
                 "a class in model.basic_modules to count that one instead. A model "
                 "calling torch.utils.checkpoint directly does not honour it and is "
-                "reported."
+                "reported. Ignored when enable=False."
             )
         },
     )
@@ -460,8 +475,8 @@ class GradientCheckpointingConfig:
                 "keep the operators named in save_ops and recompute the rest — counted "
                 "from the front of the recomputed range, the rest of the range "
                 "recomputing in full. 0 (default) = SAC off, N = the first N, a value "
-                "above the length of that range means the whole range. Needs enable=True "
-                "and enable_reentrant=False."
+                "above the length of that range means the whole range. Ignored when "
+                "enable=False, and needs enable_reentrant=False."
             )
         },
     )

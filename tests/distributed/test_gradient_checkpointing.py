@@ -7,12 +7,17 @@ from functools import partial
 import pytest
 import torch
 import torch.nn as nn
+from torch.distributed.fsdp import FSDPModule
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.checkpoint import CheckpointPolicy, noop_context_fn
 
 from veomni.arguments import GradientCheckpointingConfig, MixedPrecisionConfig
 from veomni.distributed.checkpoint import CheckpointFunction
 from veomni.distributed.torch_parallelize import build_parallelize_model
+from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer import (
+    MiniMaxH3DiTModelConfig,
+)
+from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import MiniMaxH3DiTModel
 from veomni.utils import recompute_utils
 
 
@@ -262,6 +267,47 @@ def test_the_default_config_leaves_the_checkpointing_alone():
     assert all(layer._gradient_checkpointing_func is sentinel for layer in model.layers)
 
 
+def test_checkpointing_off_is_a_master_switch(captured_warnings):
+    """``enable=False`` switches recomputation off: every other setting is inert.
+
+    No block is checkpointed, so the counts describe nothing — not even as a
+    full-recompute plan — and the values that went unused are named in one warning.
+    """
+    config = GradientCheckpointingConfig(
+        enable=False, recompute_layers=15, selective_recompute_layers=10, save_ops=["aten.foo.default"]
+    )
+
+    policy = _policy_from_config(config)
+
+    assert policy.enabled is False
+    assert policy.active is False
+    assert policy.context_fn is None
+    # "No block recomputes", not the default plan: nothing may re-enter checkpointing.
+    assert _plan_decisions(policy) == [recompute_utils.Decision.DIRECT] * BLOCK_TOTAL
+
+    model = _ToyModel(depth=4)
+    sentinel = object()
+    for layer in model.layers:
+        layer._gradient_checkpointing_func = sentinel
+
+    assert recompute_utils.apply_recompute_policy(model, policy).bound is False
+    assert all(layer._gradient_checkpointing_func is sentinel for layer in model.layers)
+
+    message = "\n".join(captured_warnings)
+    assert "enable=False" in message
+    assert "recompute_layers=15" in message
+    assert "selective_recompute_layers=10" in message
+    assert "save_ops" in message
+
+
+def test_only_the_defaults_switch_off_without_a_warning(captured_warnings):
+    """With nothing else configured there is nothing to ignore, so switching off is silent."""
+    policy = _policy_from_config(GradientCheckpointingConfig(enable=False))
+
+    assert policy.active is False
+    assert not any("enable=False" in message for message in captured_warnings)
+
+
 def test_build_policy_clamps_counts_the_config_would_have_rejected(captured_warnings):
     """The dataclass rejects an out-of-range count; the direct entry point clamps it and says so."""
     policy = _policy(recompute_layers=-5, selective_recompute_layers=-4)
@@ -303,7 +349,6 @@ def test_save_ops_without_sac_is_reported(captured_warnings):
 @pytest.mark.parametrize(
     "overrides, reason",
     [
-        ({"enabled": False}, "enable=True"),
         ({"enable_reentrant": True}, "enable_reentrant=False"),
         ({"offload_active": True}, "activation offload"),
     ],
@@ -405,22 +450,6 @@ class _FoldedModel(nn.Module):
         return x
 
 
-class _SelfContainedModel(nn.Module):
-    """MiniMax-H3 style: the container installs its own default checkpoint function."""
-
-    _no_split_modules = ["_ToyLayer"]
-
-    def __init__(self, depth=2):
-        super().__init__()
-        self.blocks = nn.ModuleList(_ToyLayer() for _ in range(depth))
-        self._gradient_checkpointing_func = partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
-
-    def forward(self, x):
-        for block in self.blocks:
-            x = self._gradient_checkpointing_func(block, x)
-        return x
-
-
 class _KeywordToyLayer(nn.Module):
     """A block whose arguments arrive by keyword, the way MiniMax-H3 passes its own."""
 
@@ -511,6 +540,39 @@ def test_configured_module_names_the_main_stack():
     stack, _ = recompute_utils.discover_block_stack(model, ["_VisionBlock"])
 
     assert stack.fqn == "visual.blocks"
+
+
+def _swap_class_as_fsdp2_does(module: nn.Module):
+    """Rewrite ``module.__class__`` the way ``fully_shard`` does.
+
+    Torch builds ``type(f"FSDP{cls.__name__}", (FSDPModule, cls), dct)`` and
+    assigns it, leaving the original class in the MRO
+    (``torch/distributed/fsdp/_fully_shard/_fully_shard.py``).
+    """
+    cls = type(module)
+    module.__class__ = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
+
+
+def test_the_stack_survives_fsdps_class_swap(monkeypatch):
+    """A composed FSDP run applies the policy after sharding, so blocks are already ``FSDP<T>``."""
+    recorder = _Recorder()
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", recorder)
+    model = _ToyModel(depth=4)
+    for layer in model.layers:
+        layer.gradient_checkpointing = True
+        layer._gradient_checkpointing_func = recorder
+        _swap_class_as_fsdp2_does(layer)
+    _swap_class_as_fsdp2_does(model.layers)
+
+    stack, _ = recompute_utils.discover_block_stack(model)
+    report = recompute_utils.apply_recompute_policy(model, _policy(recompute_layers=1))
+    for layer in model.layers:
+        layer._gradient_checkpointing_func(partial(layer, x=torch.zeros(1)))
+
+    assert type(model.layers[0]).__name__ == "FSDP_ToyLayer"
+    assert stack is not None and stack.fqn == "layers" and stack.total == 4
+    assert report.bound_blocks == 4
+    assert len(recorder.calls) == 1  # the last block is still the one that gets checkpointed
 
 
 def _plan_decisions(policy, total=BLOCK_TOTAL):
@@ -837,24 +899,10 @@ def test_container_entry_point_resolves_the_block(monkeypatch):
     assert recorder.calls[0]["context_fn"] is noop_context_fn  # SAC is the first of the range
 
 
-def test_a_containers_own_checkpoint_function_checkpoints_without_a_policy(monkeypatch):
-    """The default an H3-style container brings must work with no policy at all."""
+def test_the_policy_replaces_the_container_entry_point(monkeypatch):
     recorder = _Recorder()
     monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", recorder)
-    model = _SelfContainedModel(depth=2)
-
-    out = model(torch.zeros(4))
-
-    assert len(recorder.calls) == 2  # one per block, through the container's own function
-    assert recorder.calls[0]["use_reentrant"] is False
-    assert "context_fn" not in recorder.calls[0]
-    assert torch.equal(out, torch.full((4,), 2.0))
-
-
-def test_a_containers_own_checkpoint_function_is_replaced_by_the_policy(monkeypatch):
-    recorder = _Recorder()
-    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", recorder)
-    model = _SelfContainedModel(depth=4)
+    model = _FoldedModel(depth=4, single_depth=0)
 
     report = recompute_utils.apply_recompute_policy(
         model,
@@ -967,6 +1015,81 @@ def test_reentrant_refuses_keyword_arguments_through_checkpoint_forward():
         recompute_utils.checkpoint_forward(model.blocks[-1], True, False, torch.zeros(2), shift=1.0)
 
     assert "enable_reentrant=True" in str(failure.value)
+
+
+def _tiny_h3_model(depth=3):
+    """The smallest MiniMaxH3DiTModel that builds: the real classes, so the wiring is the production one."""
+    return MiniMaxH3DiTModel(
+        MiniMaxH3DiTModelConfig(
+            hidden_size=32,
+            num_layers=depth,
+            token_refiner_num_layers=1,
+            num_attention_heads=2,
+            attention_head_dim=8,
+            ffn_hidden_size=64,
+            text_dim=8,
+            timestep_input_dim=8,
+            time_embed_hidden_size=32,
+            time_embed_dim=32,
+            adaln_out_features=576,
+            final_adaln_out_features=64,
+            rope_inv_freq_len=8,
+        )
+    )
+
+
+class _SkippingRecorder(_Recorder):
+    """Records the checkpoint call without running it: a packed H3 block needs a whole batch."""
+
+    def __call__(self, func, *args, **kwargs):
+        self.calls.append(kwargs)
+        self.funcs.append(func)
+        return args[-1]
+
+
+def test_the_h3_dit_arms_nothing_itself():
+    """H3 owns no recompute strategy: HF's enable is what puts both attributes on its DiT."""
+    model = _tiny_h3_model()
+    dit = model.dit
+
+    assert hasattr(dit, "gradient_checkpointing")  # the marker HF's enable walks for
+    assert dit.gradient_checkpointing is False
+    assert "_gradient_checkpointing_func" not in vars(dit)
+
+    model.gradient_checkpointing_enable({"use_reentrant": False})  # the run's own entry point
+
+    assert dit.gradient_checkpointing is True
+    assert "_gradient_checkpointing_func" in vars(dit)
+
+
+def test_the_policy_decides_the_h3_blocks_flavour(monkeypatch):
+    """The block loop reads the flag and the bound function; the policy decides per block.
+
+    Called exactly as the runtime does it — HF's enable on the wrapper, then the policy on
+    the wrapper — so the function the loop ends up calling is the framework's container
+    closure, and the last block, inside the selective range, is checkpointed with SAC's kwargs.
+    """
+    recorder = _SkippingRecorder()
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", recorder)
+    model = _tiny_h3_model()
+    model.gradient_checkpointing_enable({"use_reentrant": False})
+
+    report = recompute_utils.apply_recompute_policy(
+        model,
+        recompute_utils.RecomputePolicy(recompute_layers=2, selective_recompute_layers=2, context_fn=noop_context_fn),
+    )
+
+    # No block carries an entry point of its own; the two the enable wrote (wrapper and DiT)
+    # are containers, and the loop's one is what decides per block.
+    assert (report.patched_blocks, report.patched_containers) == (0, 2)
+    assert report.covered
+
+    dit = model.dit
+    dit._gradient_checkpointing_func(dit.blocks[-1], torch.zeros(1))  # the last block is inside the SAC range
+
+    assert recorder.calls == [
+        {"use_reentrant": False, "context_fn": noop_context_fn, "early_stop": True},
+    ]
 
 
 def test_unbound_block_falls_back_to_full_recomputation(monkeypatch):
@@ -1273,6 +1396,13 @@ def test_direct_block_keeps_the_module_hooks():
 def test_policy_active_flag(recompute_n, selective_n, active):
     policy = recompute_utils.RecomputePolicy(recompute_layers=recompute_n, selective_recompute_layers=selective_n)
     assert policy.active is active
+
+
+def test_a_disabled_policy_is_inactive_whatever_the_counts_say():
+    """``apply`` and ``checkpoint_forward`` read ``active``, so a directly built policy
+    has to switch off on its own, not only through ``build_policy``."""
+    for counts in ({"recompute_layers": -1}, {"recompute_layers": 5}, {"selective_recompute_layers": 5}):
+        assert recompute_utils.RecomputePolicy(enabled=False, **counts).active is False
 
 
 def test_plan_block_saturates_when_selective_exceeds_the_range():

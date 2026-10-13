@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import functools
 import importlib
+from collections.abc import Collection
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -341,11 +342,13 @@ def _build_context_fn(extra_op_names: Sequence[str] | None) -> Callable[[], tupl
 class RecomputePolicy:
     """Immutable recomputation policy for one training run.
 
-    ``context_fn`` is None whenever SAC is unavailable (disabled, reentrant, or
-    activation offload owns the checkpoint boundary); the layer counts still
+    ``enabled`` is the run's master switch
+    (``model.accelerator.gradient_checkpointing.enable``): with it off every other
+    field is inert and the policy never binds anything, whatever the layer counts
+    say. ``context_fn`` is None whenever SAC is unavailable (reentrant, or
+    activation offload owns the checkpoint boundary); the layer counts then still
     decide the full-recompute range, which every model that arms checkpointing at
-    all does honour. With ``enabled=False`` an HF-style model never arms it, so
-    the plan is then computed and logged but nothing runs it.
+    all does honour.
 
     ``recompute_context`` is the run's own context for the recompute half of every
     checkpointed block — SAC and full alike. A model that needs its parallelism
@@ -354,6 +357,7 @@ class RecomputePolicy:
     overwrite the per-block decisions this policy just applied.
     """
 
+    enabled: bool = True  # False = the whole policy is switched off, counts and SAC alike
     # ``plan_block`` clamps both counts against the model depth.
     recompute_layers: int = -1  # -1 = every layer, N = the last N, 0 = none
     selective_recompute_layers: int = 0  # 0 = SAC off, N = the first N of the recomputed layers
@@ -365,6 +369,8 @@ class RecomputePolicy:
     @property
     def active(self) -> bool:
         """Whether the policy asks for anything the default does not already do."""
+        if not self.enabled:
+            return False
         return self.recompute_layers != -1 or self.selective_recompute_layers > 0
 
 
@@ -382,14 +388,18 @@ def build_policy(
 ) -> RecomputePolicy:
     """Build the run's :class:`RecomputePolicy` from ``model.accelerator.gradient_checkpointing``.
 
+    ``enabled`` is the run's master switch: with it off the policy is the inert
+    one, whatever the remaining fields say, and the configured values are named in
+    a single warning so they are not ignored silently.
+
     ``recompute_layers`` blocks at the end of the stack recompute, and the
     ``selective_recompute_layers`` at the front of that range run SAC; both counts
     are clamped against the model depth by :func:`plan_block`, and the whole plan is
-    logged once here, at rank 0. SAC requires ``enabled`` and non-reentrant
-    checkpointing; whenever it cannot be honoured the counts are kept and only
-    ``context_fn`` is dropped, so those layers fall back to full recomputation with
-    a warning. A ``save_ops`` entry that is neither a known group nor a real operator
-    is still passed through, and surfaces later as an unresolved-operator warning.
+    logged once here, at rank 0. SAC requires non-reentrant checkpointing; whenever
+    it cannot be honoured the counts are kept and only ``context_fn`` is dropped, so
+    those layers fall back to full recomputation with a warning. A ``save_ops`` entry
+    that is neither a known group nor a real operator is still passed through, and
+    surfaces later as an unresolved-operator warning.
 
     ``recompute_context`` is the caller's own context for the recompute half of every
     block (see :class:`RecomputePolicy`); it is carried through untouched and only
@@ -398,6 +408,28 @@ def build_policy(
     This entry point is also called directly, so it clamps an out-of-range count
     with a warning; the config dataclass rejects the same values earlier.
     """
+    # Checkpointing off: no block is checkpointed at all, so the counts and
+    # ``save_ops`` describe nothing. Name the values that go unused, then hand
+    # back a policy whose plan is "no block recomputes" whatever a caller reads.
+    if not enabled:
+        ignored = [
+            f"recompute_layers={recompute_layers}" if recompute_layers != -1 else None,
+            f"selective_recompute_layers={selective_recompute_layers}" if selective_recompute_layers > 0 else None,
+            f"save_ops={list(save_ops)}" if save_ops else None,
+        ]
+        if any(name is not None for name in ignored):
+            logger.warning_once(
+                f"{', '.join(name for name in ignored if name is not None)} ignored: "
+                "model.accelerator.gradient_checkpointing.enable=False switches recomputation off altogether"
+            )
+        return RecomputePolicy(
+            enabled=False,
+            recompute_layers=0,
+            recompute_context=recompute_context,
+            early_stop=early_stop,
+            use_reentrant=enable_reentrant,
+        )
+
     if recompute_layers < -1:
         logger.warning_once(f"recompute_layers={recompute_layers} is below -1, using -1 (every layer)")
         recompute_layers = -1
@@ -432,12 +464,7 @@ def build_policy(
 
     context_fn = None
     if sac_layers > 0:
-        if not enabled:
-            logger.warning_once(
-                "SAC ignored: it needs model.accelerator.gradient_checkpointing.enable=True; "
-                "the affected layers fall back to full recomputation"
-            )
-        elif enable_reentrant:
+        if enable_reentrant:
             logger.warning_once(
                 "SAC ignored: it needs enable_reentrant=False; the affected layers fall back to full recomputation"
             )
@@ -739,12 +766,13 @@ def _stack_rank(candidates: Sequence[_Candidate], declared_rank: dict[str, int])
        (applied by the caller), which no ordering can depend on.
     """
     undeclared = len(declared_rank)
+
+    def rank(module: nn.Module) -> int:
+        name = _matched_class_name(module, declared_rank)
+        return undeclared if name is None else declared_rank[name]
+
     declared = min(
-        (
-            declared_rank.get(type(module).__name__, undeclared)
-            for candidate in candidates
-            for module in candidate.modules
-        ),
+        (rank(module) for candidate in candidates for module in candidate.modules),
         default=undeclared,
     )
     trainable = any(
@@ -760,8 +788,23 @@ def _parent_fqn(fqn: str) -> str:
     return fqn.rsplit(".", 1)[0] if "." in fqn else ""
 
 
-def _matching_children(container: nn.Module, class_names: set) -> tuple[nn.Module, ...]:
-    return tuple(child for child in container if type(child).__name__ in class_names)
+def _matched_class_name(module: nn.Module, class_names: Collection[str]) -> str | None:
+    """The declared block class ``module`` belongs to, or ``None``.
+
+    Matched through the MRO, not on ``type(module).__name__`` alone: a wrapper
+    may rewrite ``module.__class__`` and FSDP2 does exactly that, swapping in
+    ``FSDP<ClassName>`` (torch ``_fully_shard``). The class it replaces stays in
+    the MRO, so the declared name is still readable there — which keeps
+    discovery working when the policy is applied after sharding.
+    """
+    for cls in type(module).__mro__:
+        if cls.__name__ in class_names:
+            return cls.__name__
+    return None
+
+
+def _matching_children(container: nn.Module, class_names: Collection[str]) -> tuple[nn.Module, ...]:
+    return tuple(child for child in container if _matched_class_name(child, class_names) is not None)
 
 
 def _as_stack(*candidates: _Candidate) -> BlockStack:
@@ -825,6 +868,8 @@ def apply_recompute_policy(
     to call for every model and in tests that only assert HF's own kwargs.
     """
     if not policy.active:
+        # Nothing is bound: every checkpoint entry point keeps the function HF's
+        # own enable wrote, so the model checkpoints exactly as its configuration says.
         return RecomputeReport(policy=policy)
 
     # ``basic_modules`` is the configured list, so its order decides between
@@ -850,8 +895,8 @@ def apply_recompute_policy(
             patched_blocks += 1
         else:
             # A non-block holding the entry point is the container of a
-            # hand-written loop (flux style) or a model that arms the function
-            # itself (MiniMax-H3 style); either way the policy now reaches it.
+            # hand-written loop (flux style), which calls it with the block as
+            # its first argument; the closure resolves that block's decision.
             patched_containers += 1
         module._gradient_checkpointing_func = (
             _block_checkpoint_func(binding) if binding is not None else _container_checkpoint_func(policy)

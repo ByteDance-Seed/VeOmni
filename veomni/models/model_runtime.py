@@ -369,10 +369,12 @@ class VeOmniModelRuntime:
         A runtime that requires a recompute context cannot run reentrant
         checkpointing — torch takes no ``context_fn`` there — so the run would
         recompute with the wrong parallel state current instead of failing. It is
-        rejected here rather than left to the first checkpointed block.
+        rejected here rather than left to the first checkpointed block. With
+        checkpointing off there is no such call and ``enable_reentrant`` says
+        nothing, so the combination is only rejected while it can take effect.
         """
         gc_cfg = self.args.accelerator.gradient_checkpointing
-        if self._recompute_context() is not None and gc_cfg.enable_reentrant:
+        if gc_cfg.enable and self._recompute_context() is not None and gc_cfg.enable_reentrant:
             raise ValueError(
                 f"{type(self).__name__} recomputes inside its own context, which "
                 "model.accelerator.gradient_checkpointing.enable_reentrant=True cannot express: "
