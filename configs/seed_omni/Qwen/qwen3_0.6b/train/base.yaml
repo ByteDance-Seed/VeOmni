@@ -8,13 +8,12 @@
 #     --infer.prompt "What is 2+2?" \
 #     --infer.output_dir qwen3_out
 #
-# Prerequisite — split the upstream Qwen3 checkpoint:
-#   python scripts/seed_omni/convert_model.py \
-#     --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
-#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
+# model_path is the upstream Qwen3 checkpoint, loaded through the qwen3 HF layout;
+# HF exports keep its layout. A split root from scripts/seed_omni/convert_model.py
+# works too.
 
 model:
-  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
+  model_path: /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B
   model_config:
     modules: configs/seed_omni/Qwen/qwen3_0.6b/train/modules_train.yaml
     train_graph: configs/seed_omni/Qwen/qwen3_0.6b/train/graph_train.yaml

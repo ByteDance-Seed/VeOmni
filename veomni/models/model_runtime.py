@@ -232,6 +232,11 @@ class VeOmniModelRuntime:
 
         return should_skip_hf_weight_load(self.train_args.checkpoint.load_path, self.args.lora_config)
 
+    @property
+    def weights_path(self) -> Optional[str]:
+        """Checkpoint the initial weights are read from."""
+        return self.args.model_path
+
     def _build_model(self) -> None:
         """Meta-init the model from its config via the registry-aware loader."""
         from .auto import build_foundation_model
@@ -374,9 +379,7 @@ class VeOmniModelRuntime:
         # Customized parallelize model.
         customized_parallelize_model_function = getattr(self.model, "build_parallelize_model", None)
         if callable(customized_parallelize_model_function):
-            parallelized_model = customized_parallelize_model_function(
-                weights_path=self.args.model_path, args=self.args
-            )
+            parallelized_model = customized_parallelize_model_function(weights_path=self.weights_path, args=self.args)
             if parallelized_model is not None:
                 self.model = parallelized_model
                 self.model.train()
@@ -414,7 +417,7 @@ class VeOmniModelRuntime:
         self.model = torch_parallelize.build_parallelize_model(
             self.model,
             init_device=args.accelerator.init_device,
-            weights_path=args.model_path,
+            weights_path=self.weights_path,
             should_skip_hf_weight_load=skip_hf_weight_load,
             enable_reshard_after_forward=args.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.accelerator.fsdp_config.mixed_precision,
@@ -622,7 +625,7 @@ class VeOmniModelRuntime:
         """Export this model in whichever format it was trained in.
 
         An in-flight async DCP must be on disk before conversion reads it, so
-        this drains first. ``_prepare_export`` waits again if it has to write
+        this drains first. ``prepare_export`` waits again if it has to write
         a DCP of its own.
         """
         self.checkpoint.wait_for_pending_save()

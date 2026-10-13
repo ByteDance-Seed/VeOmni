@@ -12,6 +12,22 @@ Use the live model conversion scripts as examples:
 - `veomni/models/seed_omni/utils/convert_registry.py` (`convert_checkpoint`,
   `attach_module_assets`, `load_family_graphs`)
 
+## Prefer an HF layout
+
+When every module is a key-prefix slice of the upstream checkpoint, register an
+`OmniHFLayout` in `modules/<family>/hf_layout.py` (reference:
+`modules/qwen3/hf_layout.py`, machinery in `utils/hf_layout.py`) instead of a
+converter. One declaration gives the offline convert, the direct load from the
+upstream root (training and inference), and the HF export in the upstream
+layout. Weight transforms beyond the rename go in the module's checkpoint
+tensor converter, not the layout. List stored duplicates of tied weights in
+`tied_source_keys`. Keep a converter only when the split needs more than
+renames (several sources, re-packed tensors, generated assets).
+
+Validate a layout with a round trip: load the upstream root, export with
+`save_hf_source_checkpoint`, and compare keys, dtypes, shards and values
+against the source (`tests/seed_omni/model/test_hf_layout.py`).
+
 ## Rules
 
 - A family converter is registered in `OMNI_CONVERT_REGISTRY` under the upstream

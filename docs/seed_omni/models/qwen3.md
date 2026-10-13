@@ -29,11 +29,19 @@ Both training and inference take the **same** `base.yaml`.
 
 ---
 
-## 1. Convert the checkpoint
+## 1. Checkpoint
 
-The converter reads `model_type` from the HF `config.json` and dispatches to the
-Qwen3 family converter (`modules/qwen3/convert_model.py`), splitting the weights
-into `qwen3_text_encoder/` (embeddings + tokenizer) and `qwen3_llm/` (backbone).
+Qwen3 registers an HF layout (`modules/qwen3/hf_layout.py`), so `model.model_path`
+can be the **upstream checkpoint itself** — `base.yaml` already points at
+`/mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B`. The layout routes `model.embed_tokens.*`
+(and `lm_head.*`) plus the tokenizer to `qwen3_text_encoder`, and the rest of
+`model.*` to `qwen3_llm`; the graphs default to the YAML in this config dir. HF
+exports are then written in the upstream layout (see
+[Load an upstream checkpoint directly](../usage/training_and_inference.md#21-load-an-upstream-checkpoint-directly)).
+
+The offline split still works, through the same layout, and is what a composed
+model such as [§7](#7-visual-instruction-tuning-qwen3-06b-into-image-understanding)
+needs:
 
 ```bash
 python scripts/seed_omni/convert_model.py \
@@ -41,9 +49,11 @@ python scripts/seed_omni/convert_model.py \
   --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
 ```
 
-The `output_dir` becomes `model.model_path` in `base.yaml`.
+Either root works as `model.model_path`.
 (Qwen3-0.6B has `tie_word_embeddings=True`, so `qwen3_text_encoder` stores only
-`embed_tokens` and the decode head reuses that table via `embed_tokens.project`.)
+`embed_tokens` and the decode head reuses that table via `embed_tokens.project`.
+The upstream file still stores a copy as `lm_head.weight`; the load skips it and
+the export rewrites it from the trained embedding.)
 
 ---
 
@@ -81,7 +91,7 @@ bash train.sh tasks/omni/train_omni.py \
 
 Key knobs (override on the CLI):
 
-- `--model.model_path` — split-checkpoint root from step 1.
+- `--model.model_path` — the upstream Qwen3 root, or a split root from step 1.
 - `--train.global_batch_size` / `--train.micro_batch_size` — global vs. per-step micro batch.
 - `--data.max_seq_len` — packed sequence length.
 - `--model.optimizer.lr` — learning rate (global default; override per module in `train/modules_train.yaml`).
@@ -93,7 +103,7 @@ Quick 1-node smoke run (no wandb, tiny step budget):
 ```bash
 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
-  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B \
+  --model.model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
   --train.max_steps 15 \
   --train.global_batch_size 8 \
   --train.micro_batch_size 1 \
@@ -145,24 +155,25 @@ bash train.sh tasks/omni/train_omni.py \
 ## 5. Inference
 
 `tasks/omni/infer_omni.py` runs the `infer_text` generation graph (the default
-and only `model.model_config.infer_type` for Qwen3). `--model.model_path` is a
-**split-checkpoint root** holding `qwen3_text_encoder/` and `qwen3_llm/`;
-`base.yaml` already points it at the step-1 converter output, so you can infer
-directly:
+and only `model.model_config.infer_type` for Qwen3). `--model.model_path` is the
+upstream Qwen3 root (what `base.yaml` points at) or a split root holding
+`qwen3_text_encoder/` and `qwen3_llm/`:
 
 ```bash
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
   --model.model_config.infer_type infer_text \
-  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B \
+  --model.model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
   --infer.prompt "What is 2+2?" \
   --infer.output_dir qwen3_out \
   --infer.generation_kwargs.max_new_tokens 1024
 # -> "<think> ... the sum of 2 plus 2, which is 4 ..." (coherent chat output)
 ```
 
-To infer from a **trained** checkpoint, assemble a flat root from the per-module
-`hf_ckpt/` subfolders (same pattern as Janus):
+A run trained from the upstream root exports `hf_ckpt/` as one Qwen3 checkpoint,
+so infer from it directly with `--model.model_path <step_dir>/hf_ckpt` (it loads
+in `transformers` too). A run trained from a split root exports one `hf_ckpt/`
+subfolder per module; assemble a flat root from them (same pattern as Janus):
 
 ```bash
 STEP=outputs/qwen3_0.6b_omni_sft/checkpoints/global_step_500

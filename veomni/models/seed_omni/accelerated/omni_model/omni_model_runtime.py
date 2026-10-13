@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 
 import torch
 
+from .....checkpoint import layout
 from .....distributed.clip_grad_norm import veomni_omni_model_clip_grad_norm
 from .....distributed.parallel_state import use_parallel_state
 from .....utils.logging import get_logger
@@ -30,6 +31,7 @@ from ...graphs.training_graph import TrainingGraph
 from ...mixins import MetricMeterMixin, MetricMeterResult
 from ...modeling_omni import OmniModel
 from ...utils.graph_profiler import GraphProfiler
+from ...utils.hf_layout import HFSource, copy_source_non_weight_files, save_hf_source_checkpoint
 from ..utils.executor import TrainNodeRunner, execute_generation_node
 from ..utils.modules import save_module_subdirectory
 
@@ -221,7 +223,12 @@ class OmniModelRuntime:
     training graph. :meth:`get_module`, :meth:`clip_grad_norm`, :meth:`generate` and
     :meth:`save_pretrained` stay on this wrapper, and so do
     :attr:`optimizer` / :attr:`lr_scheduler`, which step every module's own.
+
+    :attr:`hf_source` is set when the modules were read from an upstream HF
+    checkpoint; exports then write that checkpoint's layout.
     """
+
+    hf_source: HFSource | None = None
 
     def __init__(
         self,
@@ -230,11 +237,13 @@ class OmniModelRuntime:
         module_runtimes: Mapping[str, ModuleRuntime] | None = None,
         omni_model_runtime_args: OmniModelRuntimeArguments | None = None,
         train_args: OmniTrainingArguments | None = None,
+        hf_source: HFSource | None = None,
     ) -> None:
         self.model = model
         self.module_runtimes = dict(module_runtimes or {})
         self.omni_model_runtime_args = omni_model_runtime_args
         self.train_args = train_args
+        self.hf_source = hf_source
         self.optimizer: MultiOptimizer | None = None
         self.lr_scheduler: MultiLRScheduler | None = None
         self._step_profiler: GraphProfiler | None = None
@@ -312,7 +321,7 @@ class OmniModelRuntime:
         )
         opt = args.optimizer
         muon_expert_zero_comm = bool(opt) and opt.type == "muon" and opt.muon_expert_zero_comm
-        weights_path = {name: runtime.args.model_path for name, runtime in modules.items()}
+        weights_path = {name: runtime.weights_path for name, runtime in modules.items()}
 
         logger.info_rank0(f"OmniModelRuntime: wrapping composed OmniModel (fsdp_scope='model') over {list(modules)}.")
         # ``OmniTrainer._setup`` registered ``base`` from the same top-level accelerator.
@@ -572,7 +581,11 @@ class OmniModelRuntime:
         model.config.save_pretrained(save_directory)
 
     def save_model_assets(self) -> None:
-        """Write the omni-root HF layout (config + graphs + module sidecars, no weights)."""
+        """Write the omni-root HF layout (config + graphs + module sidecars, no weights).
+
+        Under an HF ``model_path`` the export is the source's own layout instead,
+        so the assets are the source's non-weight files.
+        """
         import torch.distributed as dist
 
         if self.train_args is None:
@@ -581,7 +594,10 @@ class OmniModelRuntime:
             )
         if self.train_args.global_rank == 0:
             save_directory = self.train_args.checkpoint.model_assets_dir
-            self.save_pretrained(save_directory, save_module_weights=False)
+            if self.hf_source is not None:
+                copy_source_non_weight_files(self.hf_source.path, save_directory)
+            else:
+                self.save_pretrained(save_directory, save_module_weights=False)
             logger.info_rank0(f"OmniModelRuntime: saved OmniModel assets to {save_directory}.")
         if dist.is_initialized():
             dist.barrier()
@@ -610,9 +626,44 @@ class OmniModelRuntime:
             module_runtime.save_dcp(state)
 
     def save_hf_or_lora(self, state: TrainerState, stage: str = "step_end") -> None:
-        """Export every module's HF weights / LoRA adapter."""
-        for module_runtime in self.module_runtimes.values():
-            module_runtime.save_hf_or_lora(state, stage=stage)
+        """Export every module's HF weights / LoRA adapter.
+
+        Under an HF ``model_path`` the full-parameter modules export together as
+        one checkpoint in the source's own layout (``hf_ckpt/``), which loads
+        wherever the source does; LoRA adapters still export per module.
+        """
+        if self.hf_source is None:
+            for module_runtime in self.module_runtimes.values():
+                module_runtime.save_hf_or_lora(state, stage=stage)
+            return
+        self._save_hf_source_layout(state, stage)
+
+    def _save_hf_source_layout(self, state: TrainerState, stage: str) -> None:
+        """One merged export in the source layout.
+
+        A frozen module (no checkpoint manager) and a LoRA module's base still
+        hold the source weights, so :func:`save_hf_source_checkpoint` copies
+        their tensors from the source rather than gathering them.
+        """
+        trained: dict[str, ModuleRuntime] = {}
+        for name, module_runtime in self.module_runtimes.items():
+            checkpoint = module_runtime.checkpoint
+            if checkpoint is None:
+                continue
+            if checkpoint.trainable_only:
+                checkpoint.save_lora(state, stage=stage)
+            else:
+                trained[name] = module_runtime
+        if not trained:
+            return
+        for module_runtime in trained.values():
+            module_runtime.checkpoint.prepare_export(state, stage)
+        save_path = layout.hf_export_dir(next(iter(trained.values())).checkpoint.step_dir(state))
+        save_hf_source_checkpoint(
+            self.hf_source,
+            {name: (rt.model, rt.checkpoint.parallel_state) for name, rt in trained.items()},
+            save_path,
+        )
 
     def wait_for_pending_save(self) -> None:
         """Drain every module's in-flight async checkpoint writes."""
@@ -658,9 +709,10 @@ def build_omni_model_runtime(
             training_graph_methods=graph_methods.get(name, frozenset()),
             for_inference=for_inference,
             global_accelerator=omni_model_runtime_args.accelerator,
+            hf_source=omni_config._hf_source,
         )
         module_runtimes[name] = module_runtime
-        logger.info_rank0(f"OmniModelRuntime: built ModuleRuntime '{name}' from {module_args.model_path}")
+        logger.info_rank0(f"OmniModelRuntime: built ModuleRuntime '{name}' from {module_runtime.weights_path}")
 
     logger.info_rank0(
         f"OmniModelRuntime: composed OmniModel with {len(module_runtimes)} module(s) ({list(module_runtimes)})."
@@ -672,6 +724,7 @@ def build_omni_model_runtime(
         module_runtimes=module_runtimes,
         omni_model_runtime_args=omni_model_runtime_args,
         train_args=train_args,
+        hf_source=omni_config._hf_source,
     )
     runtime._parallelize_composed_model(for_inference=for_inference)
     if not for_inference:
