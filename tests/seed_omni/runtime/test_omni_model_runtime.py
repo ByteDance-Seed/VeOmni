@@ -392,12 +392,14 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
     vae.reads_offline_cache = True
     vae.model = meta_module
     vae.args = SimpleNamespace(model_path="vae", lora_config=None)
+    vae.weights_path = "vae"
     vae.build_after_omni_model_wrap = MagicMock()
 
     llm = MagicMock()
     llm.reads_offline_cache = False
     llm.model = model.module_b
     llm.args = SimpleNamespace(model_path="llm", lora_config=None)
+    llm.weights_path = "llm"
     llm.skip_hf_weight_load = False
     llm.build_after_omni_model_wrap = MagicMock()
 
@@ -462,3 +464,46 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
     assert vae.model is meta_module
     llm.build_after_omni_model_wrap.assert_called_once()
     vae.build_after_omni_model_wrap.assert_not_called()
+
+
+def _exporting_runtime(checkpoint):
+    return SimpleNamespace(model=MagicMock(name="model"), checkpoint=checkpoint, save_hf_or_lora=MagicMock())
+
+
+def test_an_hf_source_run_exports_trained_modules_as_one_source_layout_checkpoint(monkeypatch):
+    from veomni.models.seed_omni.accelerated.omni_model import omni_model_runtime
+    from veomni.models.seed_omni.utils.hf_layout import HFSource
+
+    full = _exporting_runtime(MagicMock(trainable_only=False))
+    full.checkpoint.step_dir.return_value = "/run/checkpoints/global_step_4"
+    lora = _exporting_runtime(MagicMock(trainable_only=True))
+    frozen = _exporting_runtime(None)
+    saved = MagicMock()
+    monkeypatch.setattr(omni_model_runtime, "save_hf_source_checkpoint", saved)
+    source = HFSource(path="/hf/Qwen3", model_type="qwen3")
+    runtime = OmniModelRuntime(
+        MagicMock(), module_runtimes={"full": full, "lora": lora, "frozen": frozen}, hf_source=source
+    )
+    state = SimpleNamespace(global_step=4)
+
+    runtime.save_hf_or_lora(state, stage="train_end")
+
+    lora.checkpoint.save_lora.assert_called_once_with(state, stage="train_end")
+    full.checkpoint.prepare_export.assert_called_once_with(state, "train_end")
+    full.checkpoint.save_hf_or_lora.assert_not_called()
+    saved.assert_called_once_with(
+        source, {"full": (full.model, full.checkpoint.parallel_state)}, "/run/checkpoints/global_step_4/hf_ckpt"
+    )
+    for module in (full, lora, frozen):
+        module.save_hf_or_lora.assert_not_called()
+
+
+def test_a_split_run_exports_every_module_on_its_own():
+    modules = {name: _exporting_runtime(MagicMock()) for name in ("a", "b")}
+    runtime = OmniModelRuntime(MagicMock(), module_runtimes=modules)
+    state = SimpleNamespace(global_step=2)
+
+    runtime.save_hf_or_lora(state, stage="step_end")
+
+    for module in modules.values():
+        module.save_hf_or_lora.assert_called_once_with(state, stage="step_end")
