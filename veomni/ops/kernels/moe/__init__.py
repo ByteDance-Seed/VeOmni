@@ -38,6 +38,7 @@ def fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    assume_distinct_experts: bool = False,
 ):
     if _fused_moe_forward is None:
         raise NotImplementedError("No fused MoE kernel is available. Please check your environment.")
@@ -59,6 +60,7 @@ def fused_moe_forward(
         fc2_weight,
         fc1_1_2_weight,
         swiglu_limit=swiglu_limit,
+        assume_distinct_experts=assume_distinct_experts,
     )
 
 
@@ -166,6 +168,14 @@ def _make_moe_experts_adapter(raw_forward):
     ``swiglu_limit`` is read from ``self.limit`` when present (DeepSeek-V4
     style clamped SwiGLU); legacy MoE experts modules without that attribute
     fall through to ``None`` and pay zero overhead.
+
+    ``assume_distinct_experts`` is read from ``self.assume_distinct_experts``
+    when present and defaults to ``False`` (the conservative ``max_M`` bound).
+    Routers whose expert selection is guaranteed distinct (e.g. the DeepSeek-V4
+    learned top-k layers) set it to ``True`` on the experts module to opt into
+    the tight grouped-GEMM bound; anything that does not set it keeps the safe
+    conservative bound, so an unaudited or future router cannot silently get an
+    unsafe tight bound.
     """
 
     def adapter(self, hidden_states, top_k_index, top_k_weights):
@@ -179,6 +189,7 @@ def _make_moe_experts_adapter(raw_forward):
             fc2_weight=self.down_proj,
             fc1_1_2_weight=self.gate_up_proj,
             swiglu_limit=getattr(self, "limit", None),
+            assume_distinct_experts=getattr(self, "assume_distinct_experts", False),
         )
 
     return adapter

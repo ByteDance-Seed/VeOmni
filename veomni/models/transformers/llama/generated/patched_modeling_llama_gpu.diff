@@ -125,11 +125,17 @@
          input_dtype = hidden_states.dtype
          hidden_states = hidden_states.to(torch.float32)
          variance = hidden_states.pow(2).mean(-1, keepdim=True)
-@@ -134,30 +168,34 @@
+@@ -134,30 +168,35 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
--@use_kernel_forward_from_hub("rotary_pos_emb")
++# ======================================================================
++# [PATCHED FUNCTION] apply_rotary_pos_emb
++# Reason: OpSlot guard for Liger fused RoPE
++# Source: veomni.models.transformers.llama.llama_gpu_patch_gen_config
++# ======================================================================
++# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
+ @use_kernel_forward_from_hub("rotary_pos_emb")
 -def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 -    """Applies Rotary Position Embedding to the query and key tensors.
 -
@@ -148,12 +154,6 @@
 -    Returns:
 -        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
 -    """
-+# ======================================================================
-+# [PATCHED FUNCTION] apply_rotary_pos_emb
-+# Reason: OpSlot guard for Liger fused RoPE
-+# Source: veomni.models.transformers.llama.llama_gpu_patch_gen_config
-+# ======================================================================
-+# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
 +def apply_rotary_pos_emb(
 +    q: torch.Tensor,
 +    k: torch.Tensor,
@@ -179,7 +179,7 @@
 
 
  class LlamaMLP(nn.Module):
-@@ -171,7 +209,12 @@
+@@ -171,7 +210,12 @@
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
 
@@ -192,7 +192,7 @@
          down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
          return down_proj
 
-@@ -343,6 +386,12 @@
+@@ -343,6 +387,12 @@
      }
 
 
@@ -205,7 +205,7 @@
  @auto_docstring
  class LlamaModel(LlamaPreTrainedModel):
      def __init__(self, config: LlamaConfig):
-@@ -361,6 +410,7 @@
+@@ -361,6 +411,7 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -213,7 +213,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -378,7 +428,7 @@
+@@ -378,7 +429,7 @@
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
          if inputs_embeds is None:
@@ -222,7 +222,7 @@
 
          if use_cache and past_key_values is None:
              past_key_values = DynamicCache(config=self.config)
-@@ -417,6 +467,12 @@
+@@ -417,6 +468,12 @@
          )
 
 
@@ -235,7 +235,7 @@
  @auto_docstring
  class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -433,6 +489,7 @@
+@@ -433,6 +490,7 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -243,7 +243,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -448,23 +505,11 @@
+@@ -448,23 +506,11 @@
          **kwargs: Unpack[TransformersKwargs],
      ) -> CausalLMOutputWithPast:
          r"""
@@ -272,7 +272,7 @@
              input_ids=input_ids,
              attention_mask=attention_mask,
              position_ids=position_ids,
-@@ -475,24 +520,107 @@
+@@ -475,24 +521,107 @@
          )
 
          hidden_states = outputs.last_hidden_state

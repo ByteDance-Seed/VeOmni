@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OmniInferencer — SeedOmni V2 inference driver.
+"""OmniInferencer — SeedOmni inference driver.
 
 Standalone from :class:`OmniTrainer`, and like it holds exactly one model
 handle: ``self.model``.  Which of the two SeedOmni build paths produces it
@@ -25,7 +25,7 @@ overrides deep-merged into the launcher base):
   :meth:`OmniModel.from_pretrained`, with standard ``PreTrainedModel``
   sub-modules placed by ``device_map``.
 * any FSDP2 / DDP / ExtraParallel module — the handle is an
-  :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`
+  :class:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModelRuntime`
   composing one :class:`ModuleRuntime` per module.
 """
 
@@ -38,14 +38,17 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from ...arguments import OmniArguments
-from ...arguments.omni_arguments_types import OmniModuleRuntimeArguments
-from ...models.seed_omni.accelerator import OmniModelRuntime
+from ...arguments.omni_arguments_types import (
+    OmniArguments,
+    OmniModuleRuntimeArguments,
+    build_omni_model_runtime_args,
+)
+from ...models.seed_omni.accelerated import OmniModelRuntime, build_omni_model_runtime
 from ...models.seed_omni.modeling_omni import OmniModel
 from ...models.seed_omni.processing_omni import OmniProcessor
 from ...models.seed_omni.utils.graph_profiler import GraphProfiler
 from ...utils import helper
-from .omni_trainer import OmniTrainer
+from .omni_trainer import OmniTrainer, batch_to_device
 
 
 logger = helper.create_logger(__name__)
@@ -68,11 +71,18 @@ class InferenceRequest:
 
     prompt: str
     images: list[Any] = field(default_factory=list)
+    audios: list[Any] = field(default_factory=list)
+    videos: list[Any] = field(default_factory=list)
+    # Decode knobs forwarded to the media fetchers (``fps`` / ``max_frames`` /
+    # ``use_audio_in_video`` / …). A clip with sound is one entry in ``videos``
+    # plus ``use_audio_in_video``, never a video paired with an entry in
+    # ``audios`` — see :meth:`OmniProcessor.__call__`.
+    mm_configs: dict[str, Any] = field(default_factory=dict)
     generation_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 class OmniInferencer:
-    """SeedOmni V2 inference driver over a single model handle."""
+    """SeedOmni inference driver over a single model handle."""
 
     model: OmniModel | OmniModelRuntime
     processor: OmniProcessor
@@ -80,15 +90,16 @@ class OmniInferencer:
     def __init__(self, args: OmniArguments):
         self.args = args
 
-        self.checkpoint_root = args.model.model_path
-        self.omni_model_runtime = args.resolve_model(for_inference=True)
+        self.omni_model_runtime = build_omni_model_runtime_args(args, for_inference=True)
+        # Read after the build: an HF ``model_path`` sets ``seed_omni_model_path`` to its weight-free view.
+        self.checkpoint_root = self.omni_model_runtime.resolved_model_path
 
         self._distributed = any(
             _module_needs_distributed(self.omni_model_runtime.modules[name])
             for name in self.omni_model_runtime.module_names
         )
         if self._distributed:
-            self.device = OmniTrainer.setup_distributed(args)
+            self.device = OmniTrainer._setup(args, save_launch_args=False)
         helper.set_seed(args.infer.seed, args.infer.enable_full_determinism)
         if args.infer.enable_full_determinism:
             logger.info_rank0(
@@ -99,7 +110,7 @@ class OmniInferencer:
         self._build_model()
 
         # Nest artefacts under <output_dir>/<infer_type>/ (infer_type is resolved
-        # during resolve_model(for_inference=True) when left unset).
+        # during build_omni_model_runtime_args(for_inference=True) when left unset).
         infer_type = args.model.launcher_config("infer_type")
         args.infer.output_dir = os.path.join(args.infer.output_dir, infer_type)
         logger.info_rank0(f"OmniInferencer: model_path = {self.checkpoint_root}")
@@ -128,14 +139,16 @@ class OmniInferencer:
         """
         self.module_names = self.omni_model_runtime.module_names
         if self._distributed:
-            self.model = OmniModelRuntime.from_model_runtime(
+            self.model = build_omni_model_runtime(
                 self.omni_model_runtime,
                 for_inference=True,
             )
         else:
+            config = self.omni_model_runtime.to_hf_config()
+            config.load_checkpoint_sidecars(self.checkpoint_root)
             self.model = OmniModel.from_pretrained(
                 self.checkpoint_root,
-                config=self.omni_model_runtime.to_hf_config(),
+                config=config,
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
             ).eval()
@@ -146,10 +159,8 @@ class OmniInferencer:
         self.processor = OmniProcessor.from_config(self.model.config, checkpoint_root=self.checkpoint_root)
         self.model_config = self.model.config
 
-    # ── Inference entry point ─────────────────────────────────────────────────
-
     def _runtime_generation_kwargs(self) -> dict[str, Any]:
-        """Return per-request generation kwargs with the resolved V2 scenario attached."""
+        """Return per-request generation kwargs with the resolved scenario attached."""
         infer_args = self.args.infer
         generation_kwargs = dict(infer_args.generation_kwargs)
         requested_infer_type = generation_kwargs.get("infer_type")
@@ -169,6 +180,9 @@ class OmniInferencer:
         request = InferenceRequest(
             prompt=infer_args.prompt,
             images=list(infer_args.images),
+            audios=list(infer_args.audios),
+            videos=list(infer_args.videos),
+            mm_configs=dict(infer_args.mm_configs),
             generation_kwargs=self._runtime_generation_kwargs(),
         )
         ctx = self._run(request)
@@ -181,7 +195,7 @@ class OmniInferencer:
         *,
         output_dir: str,
     ) -> None:
-        """Persist reply / images / trace from one ``generate`` call.
+        """Persist the reply, the FSM trace and any generated media from one ``generate`` call.
 
         Under a distributed launch every rank runs the FSM (the collectives need
         all ranks) and — with replicated/greedy decoding — produces the same
@@ -199,16 +213,8 @@ class OmniInferencer:
         if reply:
             logger.info_rank0(f"--- reply ---\n{reply}\n-------------")
 
-        images_out = [
-            item["value"]
-            for item in ctx["generated"]
-            if isinstance(item, dict) and item.get("type") == "image" and item.get("value") is not None
-        ]
-        for idx, image in enumerate(images_out):
-            out_path = os.path.join(output_dir, f"generated_image_{idx}.png")
-            image.save(out_path)
-            logger.info_rank0(f"finalize: image #{idx} → {out_path}")
-
+        # Before the media: decoding a waveform or an image can fail, and the
+        # trace is what you would reach for to find out why the FSM got there.
         profiler = ctx.get("profiler")
         trace = profiler.save_records() if isinstance(profiler, GraphProfiler) else []
         trace_path = os.path.join(output_dir, "trace.txt")
@@ -216,8 +222,10 @@ class OmniInferencer:
             f.write("\n".join(trace) + "\n")
         logger.info_rank0(f"finalize: FSM trace ({len(trace)} lines) → {trace_path}")
 
-        if not reply and not images_out:
-            logger.warning_rank0("finalize: FSM produced no reply and no images.")
+        written = _save_generated_media(ctx["generated"], output_dir)
+
+        if not reply and not written:
+            logger.warning_rank0("finalize: FSM produced no reply and no media.")
 
     def _begin_graph_trace(self) -> GraphProfiler | None:
         """Open a per-request FSM trace on the VeOmni runtime handle.
@@ -234,13 +242,70 @@ class OmniInferencer:
         request_dict = self.processor(
             text=req.prompt,
             images=req.images or None,
+            audios=req.audios or None,
+            videos=req.videos or None,
+            mm_configs=req.mm_configs or None,
             inference=True,
         )
+        if self._distributed:
+            # Every module sits on this rank's device, as in training. An eager
+            # ``device_map="auto"`` load may spread modules across devices, so
+            # there each module's ``pre_generate`` places its own inputs.
+            request_dict = batch_to_device(request_dict, self.device)
         self.model.reset()
         profiler = self._begin_graph_trace()
         with torch.no_grad():
             generated = self.model.generate(request_dict, generation_kwargs=req.generation_kwargs)
         return {"generated": generated, "profiler": profiler}
+
+
+def _generated_items(generated: list[dict[str, Any]], item_type: str) -> list[dict[str, Any]]:
+    """The emitted items of one modality that actually carry a value.
+
+    A graph can append a typed row and leave it unfilled — a talker round that
+    produced no speech, for instance — and such a row must not become a file.
+    """
+    return [
+        item
+        for item in generated
+        if isinstance(item, dict) and item.get("type") == item_type and item.get("value") is not None
+    ]
+
+
+def _save_generated_media(generated: list[dict[str, Any]], output_dir: str) -> dict[str, int]:
+    """Write the non-text modalities one ``generate`` call produced, a file per item.
+
+    Split out of :meth:`OmniInferencer.finalize` because this is the only part
+    of inference that has to know how each modality is encoded on disk; keeping
+    it here leaves ``finalize`` a readable list of what gets persisted.
+
+    Each item goes to its modality's saver in ``MEDIA_SAVERS`` together with its
+    whole ``meta``; which facts a modality needs (an audio rate, a clip's fps and
+    sound rate) is the saver's business, not this loop's. Those facts come from
+    the item rather than a default here because only the emitting module knows
+    them — the audio tower, the codec and the talker do not even share a rate. A
+    clip with sound is one ``video`` item and one muxed file, not an ``.mp4``
+    plus a stray ``.wav``.
+
+    The data-layer import sits in the body to keep the boundary legible: this
+    function is the only place the trainer reaches into ``data/`` for IO.
+
+    Returns the number of files written per modality, omitting modalities that
+    produced none, so the caller can distinguish "generated nothing" from
+    "generated something".
+    """
+    from ...data.seed_omni.utils.media import MEDIA_SAVERS
+
+    written: dict[str, int] = {}
+    for item_type, saver in MEDIA_SAVERS.items():
+        items = _generated_items(generated, item_type)
+        for idx, item in enumerate(items):
+            out_path = os.path.join(output_dir, f"generated_{item_type}_{idx}{saver.suffix}")
+            saver.save(out_path, item["value"], item.get("meta"))
+            logger.info_rank0(f"finalize: {item_type} #{idx} → {out_path}")
+        if items:
+            written[item_type] = len(items)
+    return written
 
 
 def _extract_generated_text(generated: list[dict[str, Any]]) -> str:

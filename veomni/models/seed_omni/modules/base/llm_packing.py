@@ -26,7 +26,7 @@ import torch
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 from veomni.utils.tensor_utils import naflatten
 
-from ...utils.conversation import ConversationItem, is_dummy
+from ...utils.conversation import ConversationItem
 
 
 def pack_llm_conversations_for_forward(
@@ -44,7 +44,7 @@ def pack_llm_conversations_for_forward(
     for sample in conversations:
         sample_lengths = 0
         for item in sample:
-            if is_dummy(item):
+            if item.is_dummy:
                 continue
             embeds = item.value
             embeds_length = embeds.size(0)
@@ -83,7 +83,7 @@ def scatter_llm_hidden_states(
     hidden_states_list_iter = iter(hidden_states_list)
     for sample in conversation_list:
         for part in sample:
-            if is_dummy(part):
+            if part.is_dummy:
                 continue
             part.value = next(hidden_states_list_iter)
     if next(hidden_states_list_iter, None) is not None:

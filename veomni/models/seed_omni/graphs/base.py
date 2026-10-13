@@ -1,14 +1,14 @@
 """
-Shared data types for the SeedOmni V2 graph.
+Shared data types for the SeedOmni graph.
 
 ``OmniConfig`` no longer declares separate ``nodes`` / ``edges`` pools.  Both
 the training DAG (``training_graph``) and the inference FSM
 (``generation_graph``) are written as plain lists of **edges**, and each edge
 endpoint is a self-describing ``module[.method]`` string::
 
-    {from: janus_siglip,       to: janus_llama}        # bare → default method
-    {from: janus_vqvae.encode, to: janus_llama}        # explicit method
-    {from: janus_text_encoder.decode, to: end}         # leaf → virtual sink
+    {from: module_A,       to: module_B}        # bare → default method
+    {from: module_A.encode, to: module_B}       # explicit method
+    {from: module_C.decode, to: end}            # leaf → virtual sink
 
 An endpoint string therefore *is* the node — there is no indirection through a
 named pool.  A node's identity is its canonical ``"<module>.<method>"`` form
@@ -19,15 +19,13 @@ named pool.  A node's identity is its canonical ``"<module>.<method>"`` form
 - a **dotted** endpoint (``module.method``) uses that method verbatim in both
   views.
 
-The same underlying ``nn.Module`` may appear under several methods — e.g. a VQ
-codec with both ``janus_vqvae.encode`` (pixels → embeds) and
-``janus_vqvae.decode`` (LLM hidden → CE loss).  These are independent nodes
-that happen to share weights.
+The same underlying ``nn.Module`` may appear under several methods — e.g.
+``module_A.encode`` and ``module_A.decode``.  These are independent nodes that
+happen to share weights.
 
-Data flows through the shared ``conversation_list`` carrier (training) or the
-FSM ``ctx`` dict (inference) — modules read/write keys directly on those shared
-objects; edges declare execution-order / topology only and do **not** route
-individual tensor fields.
+Data flows through a shared training ``batch`` dict or the FSM ``ctx`` dict —
+modules read/write keys directly on those shared objects; edges declare
+execution-order / topology only and do **not** route individual tensor fields.
 
 Reserved sink keyword
 ---------------------
@@ -54,8 +52,9 @@ See the :class:`~veomni.models.seed_omni.graphs.training_graph.TrainingGraph` an
 docstrings for the full schema.
 """
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 
 END: str = "end"
@@ -118,7 +117,7 @@ class EdgeDef:
     is ``None`` and the edge is a virtual sink.
 
     Data is **not** routed through edges — training modules share the
-    ``conversation_list`` carrier; inference modules merge outputs into ``ctx``.
+    ``batch`` dict; inference modules merge outputs into ``ctx``.
     """
 
     from_: str
@@ -158,3 +157,22 @@ class EdgeDef:
     def is_sink(self) -> bool:
         """True iff this edge terminates at the virtual ``end`` sink."""
         return self.to == END
+
+
+def validate_graph_modules(nodes: Iterable[NodeDef], modules: Mapping[str, Any]) -> None:
+    """Every endpoint must name a provided module and an existing method."""
+    unknown = sorted({node.module for node in nodes} - set(modules))
+    if unknown:
+        raise ValueError(f"Omni graphs reference modules that are not loaded: {unknown}. Loaded: {sorted(modules)}.")
+    missing: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for node in nodes:
+        key = (node.module, node.method)
+        if key in seen:
+            continue
+        seen.add(key)
+        module = modules[node.module]
+        if getattr(module, node.method, None) is None:
+            missing.append(f"{type(module).__name__}.{node.method}")
+    if missing:
+        raise ValueError(f"Omni graphs reference methods that are not implemented on the loaded modules: {missing}.")

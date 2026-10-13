@@ -20,7 +20,7 @@ import torch
 
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import MainCollator, build_data_transform
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.torch_compile import (
     CompileConfig,
     mark_compile_step_begin,
@@ -150,7 +150,7 @@ class VLMModelRuntime(VeOmniModelRuntime):
         )
 
     def _freeze_model_module(self):
-        train_args: VLMTrainingArguments = self.train
+        train_args: VLMTrainingArguments = self.train_args
         model_config = self.model_config
         lora_enabled = bool(self.args.lora_config)
         is_omni = model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe")
@@ -207,7 +207,7 @@ class VLMModelRuntime(VeOmniModelRuntime):
         # KeyError: 'betas' on the first step after resume.
         param_groups = []
         if vit_params:
-            param_groups.append({"params": vit_params, "lr": self.train.vit_lr})
+            param_groups.append({"params": vit_params, "lr": self.train_args.vit_lr})
         if other_params:
             param_groups.append({"params": other_params, "lr": self.args.optimizer.lr})
 
@@ -224,17 +224,15 @@ class VLMTrainer:
         self.base.device = self.base._setup(args)  # registers ParallelState("base") before seed
         self.base.model = self._build_model_runtime()
 
-        # rewrite build_data_transform to support multimodal transform
-        self._build_data_transform()
-
-        self.base._build_dataset()
-
-        # rewrite build_collate_fn to support multimodal collate_fn
-        self._build_collate_fn()
-
-        self.base._build_dataloader()
+        with use_parallel_state(self.base.model.parallel_state):
+            # rewrite build_data_transform to support multimodal transform
+            self._build_data_transform()
+            self.base._build_dataset()
+            # rewrite build_collate_fn to support multimodal collate_fn
+            self._build_collate_fn()
+            self.base._build_dataloader()
         self.base._build_lr_scheduler()
-        self.base._build_training_context()
+        self.base._build_training_context(self.base.model)
         self.base._init_callbacks()
 
     def _build_model_runtime(self) -> VLMModelRuntime:
@@ -253,12 +251,12 @@ class VLMTrainer:
             model_type,
             processor=self.base.model.processor,
             chat_template=self.base.model.chat_template,
-            position_id_func=self.base.model.get_position_id_func(),
+            position_id_func=self.base.model.unwrapped_module.get_position_id_func(),
             **args.data.mm_configs,
         )
 
     def _build_collate_fn(self):
-        model = self.base.model
+        model = self.base.model.unwrapped_module
         # The model owns its modality-specific collate topology — mirrors
         # get_position_id_func. Both hooks are optional capabilities: text
         # models / pipelines that don't wire them simply fall back (the ViT
@@ -307,7 +305,7 @@ class VLMTrainer:
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
-        self.base._reset_async_activation_offload_if_enabled()
+        self.base._reset_async_activation_offload_if_enabled(self.base.model)
         self.on_step_begin(micro_batches=micro_batches)
 
         # Forward and backward for each micro batch

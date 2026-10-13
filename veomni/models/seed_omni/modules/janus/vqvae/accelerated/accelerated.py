@@ -15,14 +15,11 @@ from .......distributed.sequence_parallel import gather_outputs, slice_input_ten
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from .....utils.conversation import ConversationItem, is_dummy, iter_desired_items
+from .....utils.conversation import ConversationItem, iter_desired_items
 from ..configuration import JanusVqvaeConfig
 from ..modeling import JanusVqvae
 from ..processing import JanusVqvaeProcessor
 from .packed import PackedTrainingMixin
-
-
-_SOURCE = "janus_vqvae"
 
 
 class TrainingMixin(TrainingModuleMixin):
@@ -48,9 +45,9 @@ class TrainingMixin(TrainingModuleMixin):
         conversation_list: Optional[list[list[ConversationItem]]] = None,
     ) -> Dict[str, Any]:
         self._conversation_carrier = conversation_list
-        # Real gen images and worker-built dummies both carry source == _SOURCE
+        # Real gen images and worker-built dummies are both assistant images
         # (normalized on CPU by the JanusVqvaePreprocessor); stack + move.
-        items = list(iter_desired_items(conversation_list, types=["image"], sources=[_SOURCE]))
+        items = list(iter_desired_items(conversation_list, types=["image"], roles=["assistant"]))
         pixel_values = torch.stack([it.value for it in items], dim=0).to(
             device=self.device, dtype=self.dtype, non_blocking=True
         )
@@ -58,7 +55,7 @@ class TrainingMixin(TrainingModuleMixin):
         # worker-injected dummy (the whole batch is dummy); if any image is real
         # it is False. Passed as a scalar so ``encode`` can short-circuit to a
         # dummy output when there is no anchor to maintain.
-        is_dummy_flag = all(is_dummy(it) for it in items)
+        is_dummy_flag = all(it.is_dummy for it in items)
         # Metering: this rank's OWN image count, stashed BEFORE the SP slice below.
         # The meter sums over the DP group only, so each rank reports just its own
         # images (not the SP peers that hold the same replicated batch) — identical
@@ -99,9 +96,9 @@ class TrainingMixin(TrainingModuleMixin):
             vq_token_ids = vq_token_ids.narrow(0, 0, self._sp_own_len)
         conversation = self._conversation_carrier
         self._conversation_carrier = None
-        # encode returns one (embed, VQ-id) row per fed item, in source order; scatter
-        # them back onto the same source items (real or dummy alike).
-        items = list(iter_desired_items(conversation, types=["image"], sources=[_SOURCE]))
+        # encode returns one (embed, VQ-id) row per fed item, in conversation order;
+        # scatter them back onto the same items (real or dummy alike).
+        items = list(iter_desired_items(conversation, types=["image"], roles=["assistant"]))
         for item, emb, ids in zip(items, image_embeds, vq_token_ids, strict=True):
             item.value = emb.to(dtype=self.dtype)
             item.meta["janus_vqvae_labels"] = ids.to(dtype=torch.long)
@@ -137,8 +134,8 @@ class TrainingMixin(TrainingModuleMixin):
     ) -> tuple[torch.Tensor, torch.Tensor, bool]:
         hidden_chunks: list[torch.Tensor] = []
         label_chunks: list[torch.Tensor] = []
-        # Real gen images and worker-built dummies are both tagged ``source ==
-        # _SOURCE`` (and carry real-shaped ``janus_vqvae_labels`` after encode), so
+        # Real gen images and worker-built dummies are both assistant images (and
+        # carry real-shaped ``janus_vqvae_labels`` after encode), so
         # they build the teacher-forcing span identically. ``all_dummy`` is the
         # batch-level flag returned to ``decode``: True only when *every* gen span
         # is a dummy. Dummy spans are additionally masked with -100 labels so that
@@ -150,7 +147,7 @@ class TrainingMixin(TrainingModuleMixin):
             prev_hidden: torch.Tensor | None = None
             for part in sample:
                 hidden_states = part.value
-                if part.source == _SOURCE:
+                if part.type == "image" and part.role == "assistant":
                     saw_span = True
                     if prev_hidden is None:
                         raise ValueError(
@@ -162,7 +159,7 @@ class TrainingMixin(TrainingModuleMixin):
                     assert vq_labels.shape[0] == hidden_states.shape[0]
                     span_hidden = torch.cat([prev_hidden[-1:], hidden_states[:-1]], dim=0)
                     hidden_chunks.append(span_hidden)
-                    if is_dummy(part):
+                    if part.is_dummy:
                         vq_labels = torch.full_like(vq_labels, -100)
                     else:
                         all_dummy = False

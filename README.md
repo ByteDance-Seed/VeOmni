@@ -32,7 +32,7 @@ Our guiding principles when building VeOmni are:
 
 ## 🔥 Latest News
 - [2025/11] Our Paper [OmniScale: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo](https://arxiv.org/abs/2508.02317) was accepted by AAAI 2026
-- [2025/09] We release first offical release [v0.1.0](https://github.com/ByteDance-Seed/VeOmni/pull/75) of VeOmni.
+- [2025/09] We released VeOmni's first official version, [v0.1.0](https://github.com/ByteDance-Seed/VeOmni/pull/75).
 - [2025/08] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./docs/assets/wechat.png). Feel free to join us!
 - [2025/04] We release VeOmni!
 
@@ -79,8 +79,9 @@ Our guiding principles when building VeOmni are:
 | [GPT-OSS](https://huggingface.co/openai/gpt-oss-120b)    | 120B                          | [gpt_oss_120b_lora_ep4.yaml](configs/text/gpt_oss_120b_lora_ep4.yaml) |
 | [Qwen2-3 Omni](https://huggingface.co/Qwen)              | 7B/30BA3B                     | [qwen25_omni.yaml](configs/multimodal/qwen25_omni/qwen25_omni.yaml)   |
 | [Wan](https://huggingface.co/Wan-AI)                     | Wan2.1-I2V-14B-480P           | [wan_sft.yaml](configs/dit/wan_sft.yaml)                              |
+| [MiniMax H3](docs/examples/minimax_h3.md)                | Checkpoint-dependent          | [FL2VA](configs/dit/minimax_h3_fl2va_offline.yaml); [Ref2VA](configs/dit/minimax_h3_ref2va_cfg_offline.yaml) |
 | [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3)     | Checkpoint-dependent          | [ltx2_av_lora.yaml](configs/dit/ltx2_av_lora.yaml); [training guide](docs/examples/ltx-2.3.md) |
-| Omni Model (SeedOmni V2)                                 | Any Modality Training         | [base.yaml](configs/seed_omni/Janus/janus_1.3b/train/base.yaml); [training guide](docs/seed_omni/seed_omni_v2.md) |
+| Omni Model (SeedOmni)                                 | Any Modality Training         | [base.yaml](configs/seed_omni/Janus/janus_1.3b/train/base.yaml); [training guide](docs/seed_omni/usage/training_and_inference.md) |
 
 Support new models to VeOmni see [Support New Models](https://veomni.readthedocs.io/en/latest/usage/support_new_models/guide_and_checklist.html)
 

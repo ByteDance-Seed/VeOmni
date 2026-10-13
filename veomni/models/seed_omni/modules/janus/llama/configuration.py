@@ -3,8 +3,8 @@
 Mirrors HuggingFace :class:`transformers.LlamaConfig` (dropping nothing —
 the backbone re-uses every Llama hyper-parameter), wrapped in
 ``text_config`` so the checkpoint payload matches the original
-``JanusForConditionalGeneration`` schema and ``scripts/convert_model.py``
-can copy it verbatim.
+``JanusForConditionalGeneration`` schema and
+``scripts/seed_omni/convert_model.py`` can copy it verbatim.
 
 Adds two Janus-specific token IDs at the top level:
 
@@ -21,10 +21,12 @@ The ``model_type`` literal here is the lookup key for
 
 from typing import Any, Dict, Optional
 
-from transformers import LlamaConfig, PretrainedConfig
+from transformers import LlamaConfig
+
+from ...module_configuration_base import OmniModuleConfig
 
 
-class JanusLlamaConfig(PretrainedConfig):
+class JanusLlamaConfig(OmniModuleConfig):
     """Top-level config for the Janus LLaMA backbone (no wte, no lm_head)."""
 
     model_type = "janus_llama"

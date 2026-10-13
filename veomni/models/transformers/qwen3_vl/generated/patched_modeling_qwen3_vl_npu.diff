@@ -554,11 +554,17 @@
          input_dtype = hidden_states.dtype
          hidden_states = hidden_states.to(torch.float32)
          variance = hidden_states.pow(2).mean(-1, keepdim=True)
-@@ -408,30 +743,34 @@
+@@ -408,30 +743,35 @@
          return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
--@use_kernel_forward_from_hub("rotary_pos_emb")
++# ======================================================================
++# [PATCHED FUNCTION] apply_rotary_pos_emb
++# Reason: OpSlot guard for NPU fused RoPE
++# Source: veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config
++# ======================================================================
++# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
+ @use_kernel_forward_from_hub("rotary_pos_emb")
 -def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 -    """Applies Rotary Position Embedding to the query and key tensors.
 -
@@ -577,12 +583,6 @@
 -    Returns:
 -        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
 -    """
-+# ======================================================================
-+# [PATCHED FUNCTION] apply_rotary_pos_emb
-+# Reason: OpSlot guard for NPU fused RoPE
-+# Source: veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config
-+# ======================================================================
-+# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
 +def apply_rotary_pos_emb(
 +    q: torch.Tensor,
 +    k: torch.Tensor,
@@ -608,7 +608,7 @@
 
 
  @use_kernelized_func(apply_rotary_pos_emb)
-@@ -466,14 +805,33 @@
+@@ -466,14 +806,33 @@
              self.head_dim, eps=config.rms_norm_eps
          )  # thus post q_norm does not need reshape
 
@@ -642,7 +642,7 @@
          input_shape = hidden_states.shape[:-1]
          hidden_shape = (*input_shape, -1, self.head_dim)
 
-@@ -485,7 +843,8 @@
+@@ -485,7 +844,8 @@
          query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
          if past_key_values is not None:
@@ -652,7 +652,7 @@
 
          attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
              self.config._attn_implementation, eager_attention_forward
-@@ -603,6 +962,12 @@
+@@ -603,6 +963,12 @@
              init.copy_(module.inv_freq, inv_freq)
 
 
@@ -665,7 +665,7 @@
  class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
      config: Qwen3VLVisionConfig
      input_modalities = ("image", "video")
-@@ -651,74 +1016,246 @@
+@@ -651,74 +1017,246 @@
 
          self.post_init()
 
@@ -962,7 +962,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -730,11 +1267,94 @@
+@@ -730,11 +1268,94 @@
 
          merged_hidden_states = self.merger(hidden_states)
 
@@ -1057,7 +1057,7 @@
 
 
  @auto_docstring(
-@@ -851,9 +1471,23 @@
+@@ -851,9 +1472,23 @@
              past_key_values=past_key_values,
          )
 
@@ -1081,7 +1081,7 @@
          visual_pos_masks = visual_pos_masks.to(hidden_states.device)
          visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
          hidden_states = hidden_states.clone()
-@@ -862,6 +1496,12 @@
+@@ -862,6 +1497,12 @@
          return hidden_states
 
 
@@ -1094,7 +1094,7 @@
  @auto_docstring
  class Qwen3VLModel(Qwen3VLPreTrainedModel):
      base_model_prefix = "model"
-@@ -870,11 +1510,10 @@
+@@ -870,11 +1511,10 @@
 
      def __init__(self, config):
          super().__init__(config)
@@ -1110,7 +1110,7 @@
          self.post_init()
 
      def get_vision_position_ids(
-@@ -1034,6 +1673,13 @@
+@@ -1034,6 +1674,13 @@
          # Same implementation as for images
          return self.get_image_features(pixel_values_videos, video_grid_thw, **kwargs)
 
@@ -1124,7 +1124,7 @@
      @accepts_precomputed_kwargs(modality="image")
      @can_return_tuple
      @auto_docstring
-@@ -1042,57 +1688,40 @@
+@@ -1042,57 +1689,40 @@
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -1204,7 +1204,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1144,6 +1773,24 @@
+@@ -1144,6 +1774,24 @@
              position_ids = None
          return position_ids
 
@@ -1229,7 +1229,7 @@
      @auto_docstring
      @can_return_tuple
      def forward(
-@@ -1157,48 +1804,189 @@
+@@ -1157,48 +1805,189 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1436,7 +1436,7 @@
              visual_pos_masks = image_mask | video_mask
              deepstack_visual_embeds = []
              image_mask_joint = image_mask[visual_pos_masks]
-@@ -1208,25 +1996,71 @@
+@@ -1208,25 +1997,71 @@
                  embed_joint[image_mask_joint, :] = img_embed
                  embed_joint[video_mask_joint, :] = vid_embed
                  deepstack_visual_embeds.append(embed_joint)
@@ -1513,7 +1513,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1234,13 +2068,17 @@
+@@ -1234,13 +2069,17 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1532,7 +1532,7 @@
              rope_deltas=self.rope_deltas,
          )
 
-@@ -1255,6 +2093,12 @@
+@@ -1255,6 +2094,12 @@
      """
 
      rope_deltas: torch.LongTensor | None = None
@@ -1545,7 +1545,7 @@
 
 
  class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
-@@ -1295,6 +2139,16 @@
+@@ -1295,6 +2140,16 @@
          """
          return self.model.get_image_features(pixel_values, image_grid_thw, **kwargs)
 
@@ -1562,7 +1562,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1309,48 +2163,15 @@
+@@ -1309,48 +2164,15 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1616,7 +1616,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1361,27 +2182,55 @@
+@@ -1361,27 +2183,55 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1680,7 +1680,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -1569,6 +2418,47 @@
+@@ -1569,6 +2419,47 @@
 
          return input_ids, model_kwargs
 

@@ -1,13 +1,15 @@
-"""Split a Qwen3-MoE checkpoint into SeedOmni V2 module subfolders.
+"""Split a Qwen3-MoE checkpoint into SeedOmni modules.
 
 Registered under ``OMNI_CONVERT_REGISTRY["qwen3_moe"]`` and dispatched by
-``scripts/convert_model.py`` (via :func:`convert_checkpoint`).
+``scripts/seed_omni/convert_model.py`` (via :func:`convert_checkpoint`).
+Graphs come from ``configs/seed_omni/Qwen/qwen3_30b_a3b/train/``.
 
 The upstream is a standard HF checkpoint (``Qwen3MoeForCausalLM``); no DeepSeek
--> HF pre-step is needed (unlike Janus).  ``Qwen3MoeForCausalLM.from_pretrained``
-merges the per-expert HF weights into the v5 **fused** layout at load time via
-the registered ``Qwen3MoeCheckpointTensorConverter``, so the saved backbone
-subfolder is already fused.
+-> HF pre-step is needed (unlike Janus).  The source is loaded with the stock
+transformers class, whose weight-conversion mapping merges the per-expert HF
+weights into the v5 **fused** layout; the VeOmni patched class skips that
+mapping (VeOmni's own loader fuses instead), so it would leave the experts at
+their init.  The saved backbone subfolder is therefore already fused.
 
 The text encoder (``embed_tokens`` + ``lm_head``) is vocabulary-only and
 MoE-agnostic, so it reuses the dense ``qwen3_text_encoder`` module verbatim.
@@ -21,25 +23,25 @@ Output layout::
 
 from __future__ import annotations
 
-import os
+from typing import Any
 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, Qwen3MoeForCausalLM
 from transformers.initialization import no_init_weights
 
 from veomni.models.module_utils import init_empty_weights
-from veomni.utils.device import IS_NPU_AVAILABLE
 
-from ...utils.convert_registry import OMNI_CONVERT_REGISTRY
-
-
-if IS_NPU_AVAILABLE:
-    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_npu import Qwen3MoeForCausalLM
-else:
-    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import Qwen3MoeForCausalLM
+from ...utils.convert_registry import OMNI_CONVERT_REGISTRY, attach_module_assets, load_family_graphs
 
 
-def convert_qwen3_moe_checkpoint(model_path: str, output_dir: str, **kwargs) -> None:
-    """Split an upstream Qwen3-MoE checkpoint into two V2 module subfolders."""
+def convert_qwen3_moe_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
+    """Split an upstream Qwen3-MoE checkpoint into two SeedOmni modules."""
+    training_graphs, generation_graphs = load_family_graphs(
+        "configs/seed_omni/Qwen/qwen3_30b_a3b/train",
+        training="graph_train.yaml",
+        generation={"infer_text": "graph_infer.yaml"},
+        training_graph=kwargs.pop("training_graph", None),
+        generation_graph=kwargs.pop("generation_graph", None),
+    )
     del kwargs
     print(f"Loading Qwen3-MoE from: {model_path}")
     import veomni.models.seed_omni.modules  # noqa: F401
@@ -51,8 +53,10 @@ def convert_qwen3_moe_checkpoint(model_path: str, output_dir: str, **kwargs) -> 
     Qwen3TextEncoder = OMNI_MODEL_REGISTRY["qwen3_text_encoder"]()
     Qwen3TextEncoderConfig = OMNI_CONFIG_REGISTRY["qwen3_text_encoder"]()
 
-    # from_pretrained merges per-expert HF weights into the fused v5 layout.
-    model = Qwen3MoeForCausalLM.from_pretrained(model_path, device_map="cpu")
+    model, loading_info = Qwen3MoeForCausalLM.from_pretrained(model_path, device_map="cpu", output_loading_info=True)
+    if loading_info["missing_keys"]:
+        missing = sorted(loading_info["missing_keys"])
+        raise RuntimeError(f"Qwen3-MoE weights missing from {model_path}: {missing[:8]} ({len(missing)} total)")
     model.eval()
     cfg = model.config
 
@@ -69,12 +73,8 @@ def convert_qwen3_moe_checkpoint(model_path: str, output_dir: str, **kwargs) -> 
     if not cfg.tie_word_embeddings and model.lm_head is not None:
         src_sd = {k: v.detach().clone() for k, v in model.lm_head.state_dict().items()}
         te.lm_head.load_state_dict(src_sd, assign=True)
-
-    te_dir = os.path.join(output_dir, "qwen3_text_encoder")
-    te.save_pretrained(te_dir, safe_serialization=True)
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    tokenizer.save_pretrained(te_dir)
-    print(f"  saved → {te_dir} (tie_word_embeddings={cfg.tie_word_embeddings})")
+    attach_module_assets(te, tokenizer=AutoTokenizer.from_pretrained(model_path, trust_remote_code=True))
+    print(f"  tie_word_embeddings={cfg.tie_word_embeddings}")
 
     print("Extracting qwen3_moe_llm ...")
     llm_cfg = Qwen3MoeLlmConfig(text_config=cfg.to_dict())
@@ -84,11 +84,12 @@ def convert_qwen3_moe_checkpoint(model_path: str, output_dir: str, **kwargs) -> 
     src = {k: v for k, v in model.model.state_dict().items() if not k.startswith("embed_tokens.")}
     llm.language_model.load_state_dict(src, assign=True)
 
-    llm_dir = os.path.join(output_dir, "qwen3_moe_llm")
-    llm.save_pretrained(llm_dir, safe_serialization=True)
-    print(f"  saved → {llm_dir} (fused experts; no embed_tokens / no lm_head)")
-
-    print(f"\nDone.  Split checkpoint saved to: {output_dir}")
+    return {
+        "modules": {"qwen3_text_encoder": te, "qwen3_moe_llm": llm},
+        "training_graphs": training_graphs,
+        "generation_graphs": generation_graphs,
+        "infer_type": "infer_text",
+    }
 
 
 @OMNI_CONVERT_REGISTRY.register("qwen3_moe")

@@ -19,7 +19,9 @@ use different sequence-parallel groups while preserving the simple
 Registration maintains two independent mappings:
 
 - The **named registry** maps logical module names to states. Registering an
-  existing name logs a warning and returns the existing state.
+  existing name logs at debug and returns the existing state. Single-model
+  trainers do this on every run (`_setup` then `VeOmniModelRuntime.setup`
+  both register `"base"`).
 - The **topology cache** reuses a state when every topology-defining argument
   matches. Different names can therefore refer to the same state without
   creating duplicate process groups.

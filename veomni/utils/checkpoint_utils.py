@@ -47,14 +47,6 @@ def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
     the shards beside it may still be streaming out of an async save, and a
     module's markers say nothing about the cursor.
 
-    SeedOmni V2 (``OmniTrainer``) does not write a manifest: its orchestrator
-    state is ``global_step_N/trainer_state.pt``, written by
-    ``OmniGlobalStateCallback.save_global_state`` in the same step as the
-    per-module DCP saves, and it is exactly the file
-    :meth:`OmniGlobalStateCallback.load_global_state` reads when it resumes from
-    this path. Until that callback moves onto the manifest, the file stands in
-    for one.
-
     A pre-split checkpoint has no manifest and is recognised by the ``.metadata``
     that used to sit at the step root, but only while the step is *entirely*
     pre-split. Drop that branch together with
@@ -80,10 +72,6 @@ def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
     # Both halves, not just the manifest: the manifest lands as soon as the
     # cursor files do, while the shards of an async save are still streaming.
     if checkpoint_is_complete(checkpoint_path):
-        return step
-
-    # SeedOmni V2's stand-in for the manifest; see the docstring.
-    if exists(os.path.join(checkpoint_path, "trainer_state.pt")):
         return step
 
     # Delete this import (and veomni/checkpoint/legacy_v0_1_12.py) to stop

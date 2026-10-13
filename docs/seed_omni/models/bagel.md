@@ -1,0 +1,352 @@
+# BAGEL-7B-MoT (SeedOmni)
+
+End-to-end recipe for training and inferring **BAGEL-7B-MoT** as a SeedOmni
+graph model. The upstream BAGEL checkpoint is split into five OmniModules: text
+embedding / LM head, SigLIP-NaViT understanding tower, VAE codec, flow connector,
+and Qwen2-MoT backbone.
+
+All paths below assume the upstream BAGEL checkpoint lives at
+`/mnt/hdfs/user_dir/veomni_omni/models/transformers/BAGEL-7B-MoT`. Adjust to your
+own storage.
+
+Config dir: `configs/seed_omni/Bagel/bagel_7b_mot/`.
+
+| Module | Holds | Role |
+|--------|-------|------|
+| `bagel_text_encoder` | tokenizer, token embedding, LM head | text/template markers, text logits, image-marker embeddings |
+| `bagel_siglip_navit` | SigLIP-NaViT tower + connector | user image context for understanding and edit prompts |
+| `bagel_vae` | VAE encoder/decoder | assistant image training latents, edit context latents, generated latent decode |
+| `bagel_flow_connector` | VAE↔LLM projections, timestep embedding | latent patch embedding, velocity prediction, denoise state |
+| `bagel_qwen2_mot` | Qwen2-MoT decoder backbone | text AR and flow-denoise hidden states |
+
+The [config layout](../usage/training_and_inference.md#1-config-layout) uses the
+same `base.yaml` for training and inference. The training block references `train/modules_train.yaml` and `train/graph_train.yaml`; the
+inference block maps each scenario to a separate generation graph.
+
+| File | Role |
+|------|------|
+| `train/base.yaml` | Launcher: model paths, `model.accelerator`, data, train, and `infer` block. |
+| `train/modules_train.yaml` | Per-module training paths. `bagel_qwen2_mot` is the accelerated class with `flex_attention`. |
+| `infer/modules_infer_eager.yaml` | Single-process inference: every module loads eager; MoT uses SDPA. |
+| `infer/modules_infer_fsdp.yaml` | Distributed inference: every module uses FSDP2; MoT uses FlexAttention. |
+| `train/graph_train.yaml` | Training DAG. |
+| `infer/graph_infer_und.yaml` | Image/text understanding to text. |
+| `infer/graph_infer_gen.yaml` | Text to image generation. |
+| `infer/graph_infer_edit.yaml` | Text+image to image edit. |
+| `data.yaml` | Weighted multisource data list. |
+
+The BAGEL graphs cover understanding, generation, and edit.
+
+---
+
+## 1. Convert the checkpoint
+
+The converter reads upstream `llm_config.json`, `vit_config.json`,
+`ema.safetensors`, and `ae.safetensors`, then writes one sub-checkpoint per
+module:
+
+```bash
+python scripts/seed_omni/convert_model.py \
+  --model_path /mnt/hdfs/user_dir/veomni_omni/models/transformers/BAGEL-7B-MoT \
+  --output_dir /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
+```
+
+The family is picked from the source `config.json` (`model_type: bagel`). The
+output root becomes `model.model_path` in `base.yaml`. It contains:
+
+```text
+BAGEL-7B-MoT/
+├── config.json               # module entries, infer_type, generation_kwargs
+├── training_graph.yaml
+├── generation_graph.yaml     # infer_und / infer_gen / infer_edit
+├── bagel_text_encoder/
+├── bagel_siglip_navit/
+├── bagel_vae/
+├── bagel_flow_connector/
+└── bagel_qwen2_mot/
+```
+
+`bagel_text_encoder` also stores the tokenizer, re-saved from the upstream
+checkpoint via `AutoTokenizer`; SigLIP-NaViT and VAE save their processors next
+to their weights.
+
+---
+
+## 2. Prepare data
+
+`data.yaml` lists a weighted multisource mixture:
+
+```yaml
+sources:
+  - /mnt/hdfs/user_dir/dataset/imagenet1k_train
+  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/data
+  - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k
+  - /mnt/hdfs/user_dir/dataset/seed_edit_p23_multi_turn
+names:
+  - imagenet1k
+  - tulu-3-sft-mixture
+  - sharegpt4v_cap_100k
+  - seed_edit_p23_multi_turn
+schedule:
+  - { schedule_type: const, weights: [0.4, 0.2, 0.2, 0.2] }
+```
+
+`ConversationItem`s carry no module ownership: each Bagel module selects its
+rows by `type` / `role` / `meta` tags. Bagel defines two private meta keys in
+`veomni/models/seed_omni/modules/bagel/sources.py`:
+
+| Key | Values | Meaning |
+|---|---|---|
+| `BAGEL_CONTEXT_KEY` (`"bagel_context"`) | `BAGEL_SIGLIP_CONTEXT` (`"siglip"`), `BAGEL_VAE_CONTEXT` (`"vae"`) | Which image copy a row is: SigLIP-NaViT understanding features, or VAE latent context/target. The vision start/end marker rows around each copy carry the same tag. |
+| `BAGEL_PHASE_KEY` (`"bagel_phase"`) | `start_token`, `flow_query`, `flow_hidden`, `flow_velocity`, `generated_latent` | Inference-only step of a `type="output"` row (see §4). |
+
+The VAE CPU preprocessor (`route_image_contexts`) expands each raw training
+image by its data-layer `_img_tag` into context copies:
+
+- `und` → one `BAGEL_SIGLIP_CONTEXT` copy for SigLIP-NaViT.
+- `gen` → one `BAGEL_VAE_CONTEXT` copy, the flow-matching target.
+- `edit` → a `BAGEL_VAE_CONTEXT` copy followed by a `BAGEL_SIGLIP_CONTEXT`
+  copy of the same image. `_img_tag` alone cannot tell these two apart, which
+  is why the context tag exists.
+
+At inference, raw user images have no `_img_tag`; they become SigLIP context,
+plus a VAE context copy when `infer_type` is `infer_edit`.
+
+A sample with no image for SigLIP-NaViT or the VAE gets an FSDP placeholder
+flagged `is_dummy=True`. It keeps the context tag (and a representative
+`role` / `_img_tag`: `user`/`und` for SigLIP, `assistant`/`gen` for the VAE),
+so the encoder selects it with the same filter as real rows; packing and loss
+code skip it via `item.is_dummy`.
+
+---
+
+## 3. Train
+
+Training uses the accelerated Qwen2-MoT class from `train/modules_train.yaml`. The
+default packed attention backend is FlexAttention.
+
+```bash
+bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml
+```
+
+The training DAG is:
+
+```text
+bagel_text_encoder.encode          -> bagel_qwen2_mot
+bagel_siglip_navit                 -> bagel_qwen2_mot
+bagel_vae.encode                   -> bagel_flow_connector.embed_latent
+bagel_flow_connector.embed_latent  -> bagel_qwen2_mot
+bagel_qwen2_mot                    -> bagel_text_encoder.decode
+bagel_qwen2_mot                    -> bagel_flow_connector.decode_velocity
+```
+
+`bagel_flow_connector.embed_latent` patchifies VAE latents, samples the training
+noise/timestep, writes the velocity target, and projects noised latent patches
+into LLM space. `bagel_flow_connector.decode_velocity` consumes the MoT hidden
+states for those latent query positions and computes the flow velocity loss.
+
+Quick smoke run:
+
+```bash
+bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
+  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT \
+  --train.max_steps 10 \
+  --train.global_batch_size 8 \
+  --train.micro_batch_size 1 \
+  --train.wandb.enable false
+```
+
+### 3.1 Attention backends
+
+`bagel_qwen2_mot` keeps one packed visibility metadata and materializes it as
+Flex, Magi, or SDPA. Visibility is the same in all three:
+`same_document & (causal | same_full_span) & ~foreign_noise_key`. Packed MoT
+training does not use FlashAttention-2.
+
+| Backend | Class | Config | Use |
+|---------|-------|--------|-----|
+| FlexAttention | accelerated | `train/modules_train.yaml`, `infer/modules_infer_fsdp.yaml` | Default packed training / FSDP inference |
+| MagiAttention | accelerated | CLI override onto `bagel_qwen2_mot` | SM90+ fused training; see nfunc below |
+| SDPA | eager | `infer/modules_infer_eager.yaml` | Single-process inference and the dense-mask oracle |
+
+Leave the YAML on `flex_attention` unless you are opting into Magi. Enable Magi
+from the CLI (the launcher rewrites it to `veomni_magi_attention_with_sp`):
+
+```bash
+bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
+  --model.model_config.modules.bagel_qwen2_mot.ops_implementation.attn_implementation magi_attention \
+  --train.micro_batch_size 1
+```
+
+Magi requires physical batch size 1, `cp_size == 1`, and NVIDIA SM90 or newer.
+Ulysses still works. On 8 ranks, `--model.accelerator.ulysses_size 4` gives
+`dp_shard=2` and SP4. Packed Magi/Flex is the training (and FSDP prefill) path;
+the denoise loop still uses FlashAttention-2. The Magi adapter contract is in
+[`docs/transformers_v5/veomni_fused_attention.md`](../../transformers_v5/veomni_fused_attention.md).
+
+#### SM90 nfunc vs dataset
+
+On SM90, Magi uses a precompiled CUTLASS overlay. `nfunc` is baked at install
+time: it is the HSTU interval count for the worst query in a sample, not the
+Magi range-list length. The installer default is `1,3,5`. A later exact
+`uv sync` removes the overlay, so rerun the installer before SM90 Magi runs.
+
+Text-only and single-image gen samples are typically `nfunc=1`. Multi-turn
+`seed_edit_p23_multi_turn` punches noise-key holes, so nfunc grows with the
+number of assistant images (about `2G-1`). That mixture needs **nfunc ≥ 11**:
+
+```bash
+bash scripts/kernel/install_magi_sm90.sh --nfunc 1,3,5,7,9,11
+```
+
+If a sample's runtime nfunc is missing from the compiled matrix, the kernel
+fails with `Compile-time kNFunc (...) must match runtime arbitrary_func_num (...)`.
+SM100+ uses CUTE DSL/JIT and compiles unseen nfunc at runtime, so it does not
+need this overlay matrix.
+
+### 3.2 Offline VAE posterior cache (two stages)
+
+Caching is not a special framework mode — it is a different `train_graph` plus a
+different dataset type. Each stage has its own modules / graph YAML, and
+`train.training_task` tells the trainer which stage it runs. `bagel_vae` can be
+cached because it mixes in `OfflineEncodingMixin`; no config flag declares it (see
+[Offline Encoding](../mixins/offline_encoding.md#how-a-run-builds-a-cached-module)).
+
+**Stage 1 — produce the cache** (`train.training_task: offline_embedding`). `offline_cache/modules_train.yaml` declares only
+`bagel_vae`, and the DAG is a single edge, so nothing else is built:
+
+```bash
+bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Bagel/bagel_7b_mot/offline_cache/base.yaml
+```
+
+```text
+bagel_vae.offline_encode -> end
+```
+
+Posteriors are written to `train.offline_cache_dir`
+(`outputs/bagel_vae_cached_dataset` by default), reading normal `seedomni` data.
+Samples without a VAE image get the preprocessor's dummy row encoded too, so
+every cached sample carries a VAE posterior.
+
+**Stage 2 — train from the cache** (`train.training_task: offline_training`).
+The graph calls only `online_process` on `bagel_vae`, so it is built on meta and
+never loads its weights. `with_cache/modules_train.yaml` is the same file as
+`train/modules_train.yaml`. `data.data_type`
+becomes `seedomni_cached` and `data.train_path` points at the stage-1 output
+directory. The cached items are marked as posteriors, so the VAE preprocessor
+leaves them alone:
+
+```bash
+bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Bagel/bagel_7b_mot/with_cache/base.yaml
+```
+
+The DAG matches §3 except that `bagel_vae.online_process` replaces
+`bagel_vae.encode` as the latent source — it rehydrates the cached posterior
+instead of encoding pixels.
+
+---
+
+## 4. Inference
+
+`tasks/omni/infer_omni.py` selects a generation graph with `--model.model_config.infer_type`.
+Use `infer/modules_infer_eager.yaml` for a single-process run or
+`infer/modules_infer_fsdp.yaml` with `bash train.sh` for a torchrun/FSDP2 run.
+
+### 4.1 Understanding
+
+```bash
+python tasks/omni/infer_omni.py \
+  configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
+  --model.model_config.infer_type infer_und \
+  --model.model_config.modules configs/seed_omni/Bagel/bagel_7b_mot/infer/modules_infer_eager.yaml \
+  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT \
+  --infer.images /path/to/image.jpg \
+  --infer.prompt "Describe this image." \
+  --infer.output_dir bagel_out
+```
+
+`infer_und` runs SigLIP-NaViT for the prompt image, inserts image marker
+embeddings via the text encoder, and then uses Qwen2-MoT + text encoder AR
+decode until `text_done`.
+
+### 4.2 Text-to-image generation
+
+```bash
+python tasks/omni/infer_omni.py \
+  configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
+  --model.model_config.infer_type infer_gen \
+  --model.model_config.modules configs/seed_omni/Bagel/bagel_7b_mot/infer/modules_infer_eager.yaml \
+  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT \
+  --infer.prompt "A watercolor painting of a small cabin beside a lake." \
+  --infer.output_dir bagel_out \
+  --infer.generation_kwargs.num_timesteps 50 \
+  --infer.generation_kwargs.timestep_shift 3.0
+```
+
+`infer_gen` runs prompt prefill, then loops:
+
+```text
+flow_connector.prepare_denoise_query
+  -> text_encoder.encode_image_markers
+  -> qwen2_mot.denoise_branch
+  -> flow_connector.decode_velocity_from_hidden
+  -> qwen2_mot.collect_velocity
+  -> flow_connector.advance_denoise
+```
+
+Each step moves the tail `output` row through `BAGEL_PHASE_KEY` values
+`flow_query` → `flow_hidden` → `flow_velocity`. When the denoise state emits
+`image_complete`, the row is re-tagged `generated_latent` and
+`bagel_vae.decode_generated` decodes it.
+
+### 4.3 Image edit
+
+```bash
+python tasks/omni/infer_omni.py \
+  configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
+  --model.model_config.infer_type infer_edit \
+  --model.model_config.modules configs/seed_omni/Bagel/bagel_7b_mot/infer/modules_infer_eager.yaml \
+  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT \
+  --infer.images /path/to/source.jpg \
+  --infer.prompt "Make it look like a snowy evening." \
+  --infer.output_dir bagel_out
+```
+
+Edit first builds context from both image branches: VAE encodes the
+`BAGEL_VAE_CONTEXT` copy of the edit image, SigLIP-NaViT encodes the
+`BAGEL_SIGLIP_CONTEXT` copy as visual
+context, and `flow_connector.embed_context_latents` projects the VAE context into
+the denoise prompt. The downstream denoise loop is shared with `infer_gen`.
+
+---
+
+## 5. Visualize the graphs
+
+```bash
+python scripts/seed_omni/visualize_graph.py \
+  configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml
+# -> graphs/bagel_7b_mot_base/{training,infer_edit,infer_gen,infer_und}.mmd
+```
+
+The visualized graphs are generated from the same config loader path as training
+and inference, so regenerate them after changing module entrypoints or graph
+YAML.
+
+---
+
+## 6. Contract checks
+
+The Bagel module and graph contracts cover carrier context-tag routing, generation
+state transitions, packing/cache behavior, and graph config structure. Packed
+MoT also compares Flex and Magi against eager SDPA on toy CE / MSE / gradients
+in `tests/seed_omni/modules/bagel/test_bagel_accel_align.py`. Magi cases skip unless the
+SM90 CUTLASS overlay or SM100+ CUTE JIT backend is present.
+
+```bash
+.venv/bin/python -m pytest -q tests/seed_omni/modules/bagel
+```

@@ -3,7 +3,7 @@
 `train.checkpoint.output_dir` is the run root. Every per-step artifact lives
 under `output_dir/checkpoints/global_step_{N}/` (`train.checkpoint.save_path`);
 the model assets are written once to `output_dir/model_assets/`
-(`output_dir/model_assets/<module>/` in a [multi-module job](#multi-module-jobs-seedomni-v2)).
+(`output_dir/model_assets/<module>/` in a [multi-module job](#multi-module-jobs-seedomni)).
 
 ```
 checkpoints/global_step_{N}/
@@ -21,7 +21,7 @@ checkpoints/global_step_{N}/
 A step directory is split by *who owns the state*. `model/`, `loader/` and
 `extra_state/` are the resume tree — everything needed to continue training and
 nothing else. The two exports are inference artifacts that resume never reads.
-`<module>/` appears only in a [multi-module job](#multi-module-jobs-seedomni-v2).
+`<module>/` appears only in a [multi-module job](#multi-module-jobs-seedomni).
 
 ## What each path holds
 
@@ -35,7 +35,7 @@ nothing else. The two exports are inference artifacts that resume never reads.
 | `hf_ckpt/` | `model*.safetensors`, its index, and the model assets. Written when `train.checkpoint.save_hf_weights` is set and the run is not LoRA. | Rank 0, after a collective gather |
 | `lora_ckpt/` | `adapter_config.json`, `adapter_model.safetensors`. Written instead of `hf_ckpt/` when `model.lora_config` is set. | Rank 0, after a collective gather |
 | `checkpoint_manifest.json` | Format version, `global_step`, world size. Trainer-level completion only. | Rank 0, last |
-| `model_assets/[<module>/]` | Each model's config / tokenizer / processor, once per run at train start. Nested like `hf_ckpt/`. | Rank 0 |
+| `model_assets/[<module>/]` | Each model's config / tokenizer / processor, once per run at train start. Nested like `hf_ckpt/`; a SeedOmni run loaded from an upstream HF checkpoint writes both flat, in that checkpoint's layout ([Upstream Checkpoint Layout](../seed_omni/usage/hf_layout.md)). | Rank 0 |
 
 **Model assets** is whatever that model's runtime `model_assets` list carries, in type terms
 `Union[PretrainedConfig, GenerationConfig, PreTrainedTokenizer, ProcessorMixin]`
@@ -67,9 +67,9 @@ Three splits in the tree above are deliberate:
   is not what a LoRA run resumes from; see
   [LoRA checkpoints](../key_features/lora.md#4-checkpoint-saving).
 
-## Multi-module jobs (SeedOmni V2)
+## Multi-module jobs (SeedOmni)
 
-A V2 job trains several modules side by side, each with its own weights,
+A SeedOmni job trains several modules side by side, each with its own weights,
 optimizer, scheduler and accelerator config. Module names are the keys of
 `model.model_config.modules`, declared in a `modules_train.yaml`, and they become
 directory names verbatim. `model/`, the exports and `model_assets/` nest one
@@ -157,13 +157,10 @@ Checkpoints from older layouts have no manifest; discovery falls back to a
 only while the step is still entirely pre-split. See
 [Resuming older checkpoints](#resuming-older-checkpoints).
 
-SeedOmni V2 (`OmniTrainer`) writes the model half through the same
-`ModelCheckpointManager`, so its `model/<name>/` markers are the ones above, but
-its trainer half is `OmniGlobalStateCallback`, which keeps the orchestrator's
-step counter, dataloader and RNG in a single rank-0 `trainer_state.pt` and
-writes no manifest. Discovery accepts that file in the manifest's place — it is
-what the same callback reads back on resume — until the callback moves onto the
-manifest.
+SeedOmni (`OmniTrainer`) writes both halves the same way: the model half through
+`ModelCheckpointManager`, one `model/<name>/` per module, and the trainer half
+through the shared `GlobalStateCallback`, so its steps carry the same per-rank
+`loader/` and `extra_state/` files and the same manifest.
 
 ## Staged and asynchronous saves
 
@@ -177,17 +174,24 @@ avoid.
 With `stage_dir` (synchronous), the whole `model/` subtree — both DCP
 directories and `lr_scheduler.pt` — is written to node-local scratch and copied
 into the step directory afterwards, with every `.metadata` copied last. The
-staging directory is never part of the checkpoint itself.
+staging directory is never part of the checkpoint itself. The copy's collectives
+run on a dedicated Gloo group rather than the training backend, bounded by
+`train.checkpoint.save_timeout_seconds` (Gloo's 30-minute default when unset):
+the ranks not copying wait on it for the whole copy. A multi-node staged save
+therefore needs working Gloo networking (for example `GLOO_SOCKET_IFNAME`), and a
+misconfiguration only shows at the first checkpoint.
 
 With `save_async` (unstaged), `model/` is written in place and the call returns
 while the DCP write is still in flight. `lr_scheduler.pt` is written first, by
 rank 0, before either DCP save starts. Weights and optimizer are two independent
-saves, each holding its own future and its own Gloo process group so they
-overlap rather than serialise. Nothing downstream waits for them: the cursor
+saves, each holding its own future and its own Gloo process group (also bounded
+by `save_timeout_seconds`) so they overlap rather than serialise. Nothing downstream waits for them: the cursor
 files and the manifest claim only what they cover, and the shards answer for
 themselves through the `.metadata` DCP writes last. Pending saves are drained at
 the next save of the same kind and at train end; a drain that finds a failed
-save raises on every rank, not just the one that saw it.
+save raises on every rank, not just the one that saw it, agreeing on that
+save's own Gloo group so the ranks whose write finished first wait there
+rather than on the training backend.
 
 ## Resuming older checkpoints
 
@@ -208,9 +212,9 @@ What those older shapes looked like:
 |-----|----------------|
 | 0.1.12 | Step root *was* the DCP directory (`.metadata` + fused `__{i}_{rank}.distcp`); `extra_state/extra_state_rank_{R}.pt` mixed the scheduler and the job cursor; the LoRA adapter went to `<output_dir>/global_step_{N}/`, a sibling of `checkpoints/` |
 | 0.2.x flat | The same, with the cursor split out into `trainer_state_rank_{R}.pt` and `extra_state_rank_{R}.pt` left holding the scheduler alone |
-| SeedOmni V2 modules | Nested per module, but one level too shallow: `global_step_{N}/<module>/` was the DCP directory *and* the HF export directory, so safetensors landed on top of the shards |
+| SeedOmni modules | Nested per module, but one level too shallow: `global_step_{N}/<module>/` was the DCP directory *and* the HF export directory, so safetensors landed on top of the shards |
 
-The same fallbacks resolve a V2 module checkpoint, because they are applied
+The same fallbacks resolve a SeedOmni module checkpoint, because they are applied
 *within* a module's directory: a module whose `model/<name>/` is absent falls
 back to `<name>/` at the step root.
 

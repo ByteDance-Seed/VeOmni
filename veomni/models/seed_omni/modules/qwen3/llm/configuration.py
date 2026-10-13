@@ -2,10 +2,12 @@
 
 from typing import Any, Dict, Optional
 
-from transformers import PretrainedConfig, Qwen3Config
+from transformers import Qwen3Config
+
+from ...module_configuration_base import OmniModuleConfig
 
 
-class Qwen3LlmConfig(PretrainedConfig):
+class Qwen3LlmConfig(OmniModuleConfig):
     """Top-level config for the Qwen3 AR backbone (no wte, no lm_head)."""
 
     model_type = "qwen3_llm"

@@ -5,16 +5,18 @@ The ``model_type`` literal here is the lookup key for
 
 The whole vision-side hyper-parameters travel under ``vision_config`` —
 that mirrors the original :class:`transformers.JanusVisionConfig` schema so
-the ``scripts/convert_model.py`` extractor can dump the field unchanged.
+the ``scripts/seed_omni/convert_model.py`` extractor can dump the field
+unchanged.
 """
 
 from typing import Any, Dict, Optional
 
-from transformers import PretrainedConfig
 from transformers.models.janus.configuration_janus import JanusVisionConfig
 
+from ...module_configuration_base import OmniModuleConfig
 
-class JanusSiglipConfig(PretrainedConfig):
+
+class JanusSiglipConfig(OmniModuleConfig):
     """Top-level config for the Janus SigLIP encoder + aligner."""
 
     model_type = "janus_siglip"

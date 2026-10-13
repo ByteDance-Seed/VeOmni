@@ -18,25 +18,29 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 
 from veomni.utils.constants import IGNORE_INDEX
 
-from ...utils.conversation import ConversationItem, is_dummy
+from ...utils.conversation import ConversationItem
+from ..base.packing import (
+    PACKED_ATTENTION_MASK,
+    PACKED_FEATURES,
+    PACKED_HIDDEN,
+    PACKED_INPUT_IDS,
+    PACKED_LABELS,
+    PACKED_POSITION_IDS,
+    as_1d_long,
+    ensure_packed_batch_dim,
+    fold_dummy_anchor,
+    masked_scatter_embeds,
+    shift_packed_labels,
+)
 
 
 JANUS_NUM_IMAGE_TOKENS = 576
-SIGLIP_SOURCE = "janus_siglip"
-VQVAE_SOURCE = "janus_vqvae"
 
 # Keys written onto the training batch by :class:`JanusTextEncoderPreprocessor`
 # when ``packed_preprocess`` is set.
-PACKED_INPUT_IDS = "packed_input_ids"
-PACKED_LABELS = "packed_labels"
-PACKED_ATTENTION_MASK = "packed_attention_mask"
-PACKED_POSITION_IDS = "packed_position_ids"
-PACKED_FEATURES = "packed_features"
-PACKED_HIDDEN = "packed_hidden"
 UND_IMAGE_MASK = "und_image_mask"
 GEN_IMAGE_MASK = "gen_image_mask"
 PIXEL_VALUES_UND = "pixel_values_und"
@@ -44,13 +48,6 @@ PIXEL_VALUES_GEN = "pixel_values_gen"
 UND_NUM_REAL = "und_num_real"
 GEN_NUM_REAL = "gen_num_real"
 VQ_TOKEN_IDS = "vq_token_ids"
-
-
-def _as_1d_long(value: Any) -> torch.Tensor:
-    tensor = value if isinstance(value, torch.Tensor) else torch.tensor(value, dtype=torch.long)
-    if tensor.dim() == 0:
-        tensor = tensor.unsqueeze(0)
-    return tensor.reshape(-1).to(dtype=torch.long)
 
 
 def pack_janus_conversations(
@@ -91,17 +88,17 @@ def pack_janus_conversations(
         sample_und: list[torch.Tensor] = []
         sample_gen: list[torch.Tensor] = []
         for part in sample:
-            if is_dummy(part):
+            if part.is_dummy:
                 if not isinstance(part.value, torch.Tensor):
                     continue
-                if part.source == SIGLIP_SOURCE:
+                if part.type == "image" and part.role == "user":
                     und_dummy_pixels.append(part.value)
-                elif part.source == VQVAE_SOURCE:
+                elif part.type == "image" and part.role == "assistant":
                     gen_dummy_pixels.append(part.value)
                 continue
             if part.type == "text":
-                token_ids = _as_1d_long(part.value)
-                labels = _as_1d_long(part.meta.get("labels", torch.full_like(token_ids, IGNORE_INDEX)))
+                token_ids = as_1d_long(part.value)
+                labels = as_1d_long(part.meta.get("labels", torch.full_like(token_ids, IGNORE_INDEX)))
                 sample_ids.append(token_ids)
                 sample_labels.append(labels)
                 sample_und.append(torch.zeros(token_ids.numel(), dtype=torch.bool))
@@ -116,7 +113,7 @@ def pack_janus_conversations(
                 )
             sample_ids.append(pad_ids.clone())
             sample_labels.append(ignore.clone())
-            if part.source == SIGLIP_SOURCE or (part.source is None and part.role == "user"):
+            if part.role == "user":
                 sample_und.append(ones_img)
                 sample_gen.append(zeros_img)
                 und_pixels.append(part.value)
@@ -184,43 +181,6 @@ def _stack_pixels(real: list[torch.Tensor], dummy: list[torch.Tensor]) -> torch.
     return torch.stack(stacked, dim=0)
 
 
-def ensure_packed_batch_dim(tensor: torch.Tensor) -> torch.Tensor:
-    """``[T, D]`` → ``[1, T, D]``; leave ``[1, T, ...]`` unchanged."""
-    if tensor.dim() == 2:
-        return tensor.unsqueeze(0)
-    return tensor
-
-
-def masked_scatter_embeds(
-    packed_features: torch.Tensor,
-    mask: torch.Tensor,
-    embeds: torch.Tensor,
-) -> torch.Tensor:
-    """Write ``embeds`` onto ``packed_features`` where ``mask`` is True.
-
-    ``embeds`` is ``[N, S, D]`` or ``[N * S, D]``. ``mask`` is ``[1, T]`` / ``[T]``.
-    """
-    packed = ensure_packed_batch_dim(packed_features)
-    if mask.dim() == 1:
-        mask = mask.unsqueeze(0)
-    hidden = embeds
-    if hidden.dim() == 3:
-        hidden = hidden.reshape(-1, hidden.size(-1))
-    mask_3d = mask.unsqueeze(-1).expand_as(packed)
-    n_true = int(mask.sum().item()) if mask.device.type == "cpu" else hidden.size(0)
-    if hidden.size(0) != n_true and mask.device.type == "cpu":
-        raise ValueError(f"masked_scatter_embeds: mask selects {n_true} tokens but embeds has {hidden.size(0)} rows.")
-    return packed.masked_scatter(mask_3d, hidden.to(device=packed.device, dtype=packed.dtype))
-
-
-def fold_dummy_anchor(target: torch.Tensor, dummy: torch.Tensor | None) -> torch.Tensor:
-    """Keep dummy activations on the autograd graph without changing values."""
-    if dummy is None:
-        return target
-    anchor = dummy.mean().to(device=target.device, dtype=target.dtype) * 0
-    return target + anchor
-
-
 def teacher_force_vq_hidden(packed_hidden: torch.Tensor, gen_image_mask: torch.Tensor) -> torch.Tensor:
     """Hidden states that predict each gen-image token (token *before* the mask).
 
@@ -233,16 +193,8 @@ def teacher_force_vq_hidden(packed_hidden: torch.Tensor, gen_image_mask: torch.T
     return selected.unsqueeze(0) if selected.dim() == 2 else selected
 
 
-def shift_packed_labels(packed_labels: torch.Tensor) -> torch.Tensor:
-    """Causal LM shift: drop token 0, pad IGNORE_INDEX at the end."""
-    labels = packed_labels[..., 1:].contiguous()
-    return F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
-
-
 __all__ = [
     "JANUS_NUM_IMAGE_TOKENS",
-    "SIGLIP_SOURCE",
-    "VQVAE_SOURCE",
     "PACKED_INPUT_IDS",
     "PACKED_LABELS",
     "PACKED_ATTENTION_MASK",

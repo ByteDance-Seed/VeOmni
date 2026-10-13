@@ -489,17 +489,6 @@ def get_parallel_state_by_name(name: str) -> "ParallelState":
     return _PARALLEL_STATE_REGISTRY[name]
 
 
-def is_parallel_state_registered(name: str) -> bool:
-    """True when ``name`` has a ParallelState in the global registry.
-
-    Distributed Omni modules register their state via
-    ``init_parallel_state_from_config(name=...)`` in
-    :meth:`VeOmniModelRuntime.setup`; eager inference modules never do. Callers
-    use this to decide whether a module's forward must be scoped by name.
-    """
-    return name in _PARALLEL_STATE_REGISTRY
-
-
 def _init_parallel_state(
     dp_size: int = 1,
     dp_replicate_size: int = 1,
@@ -528,8 +517,11 @@ def _init_parallel_state(
     directly to build a topology no job config can express — a CPU mesh, or a
     rank layout unrelated to ``WORLD_SIZE``.
 
-    If ``name`` is already registered, log a warning and return the existing
-    state without building, caching, or overwriting anything.
+    If ``name`` is already registered, log at debug and return the existing
+    state without building, caching, or overwriting anything. Single-model
+    trainers hit this on every run: ``BaseTrainer._setup`` registers ``"base"``
+    and ``VeOmniModelRuntime.setup`` registers the same name from the same
+    accelerator. A warning there trains people to ignore warnings.
 
     ``name=None`` claims no registry key, for a caller that holds the returned
     state itself rather than looking it up later — it would otherwise have to
@@ -541,7 +533,7 @@ def _init_parallel_state(
     global _PARALLEL_STATE
 
     if name is not None and name in _PARALLEL_STATE_REGISTRY:
-        logger.warning(
+        logger.debug(
             f"Parallel state {name!r} is already registered; returning the existing state without rebuilding."
         )
         return _PARALLEL_STATE_REGISTRY[name]
@@ -617,11 +609,13 @@ def _init_parallel_state(
     extra_parallel_fsdp_device_mesh = {f"{para_name}": None for para_name in extra_parallel_names}
     extra_parallel_flat_device_mesh = {f"{para_name}": None for para_name in extra_parallel_names}
 
+    # With TP disabled, the last mesh dimension has stride-1 ranks. Keep
+    # Ulysses inside CP so its groups can stay within a node when CP spans nodes.
     mesh_shape = []
     mesh_dim_names = []
     for d, dim_name in zip(
-        [pp_size, dp_replicate_size, dp_shard_size, ulysses_size, cp_size, tp_size],
-        ["pp", "dp_replicate", "dp_shard", "ulysses", "cp", "tp"],
+        [pp_size, dp_replicate_size, dp_shard_size, cp_size, ulysses_size, tp_size],
+        ["pp", "dp_replicate", "dp_shard", "cp", "ulysses", "tp"],
     ):
         if d > 1 or dim_name in ["dp_shard"]:
             mesh_shape.append(d)
@@ -649,14 +643,14 @@ def _init_parallel_state(
         dp_mesh_dim_names.append("dp_shard")
         dp_shard_sp_mesh_dim_names.append("dp_shard")
         dp_sp_mesh_dim_names.append("dp_shard")
-    if ulysses_size > 1:
-        dp_shard_sp_mesh_dim_names.append("ulysses")
-        sp_mesh_dim_names.append("ulysses")
-        dp_sp_mesh_dim_names.append("ulysses")
     if cp_size > 1:
         dp_shard_sp_mesh_dim_names.append("cp")
         sp_mesh_dim_names.append("cp")
         dp_sp_mesh_dim_names.append("cp")
+    if ulysses_size > 1:
+        dp_shard_sp_mesh_dim_names.append("ulysses")
+        sp_mesh_dim_names.append("ulysses")
+        dp_sp_mesh_dim_names.append("ulysses")
 
     if dp_mesh_dim_names != []:
         device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")

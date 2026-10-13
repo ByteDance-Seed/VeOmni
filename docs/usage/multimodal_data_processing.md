@@ -8,9 +8,9 @@ The multimodal data pipeline lives in `veomni/data/multimodal/` and handles:
 
 1. **Preprocessing** (`preprocess.py`) — converts raw data samples into a unified conversation format via the [Preprocessor Registry](../key_features/preprocessor_registry.md).
 
-> **SeedOmni V2 (Janus / Bagel):** uses `data_type: seedomni` and a flat
+> **SeedOmni (Janus / Bagel):** uses `data_type: seedomni` and a flat
 > chat JSON with `type="image"` routed by `role`. See
-> [SeedOmni V2 Data Format](../seed_omni/data_format.md) for the full schema and
+> [SeedOmni Data Format](../seed_omni/usage/data_format.md) for the full schema and
 > I2T / T2I / interleave examples.
 2. **Image processing** (`image_utils.py`) — loads images, resizes them to fit pixel budgets while preserving aspect ratio and ViT patch alignment.
 3. **Video processing** (`video_utils.py`) — loads videos (via torchcodec), samples frames by FPS, resizes spatially, and optionally extracts audio.
@@ -98,6 +98,12 @@ and patch construction. Qwen3-VL/Qwen3.5 chat templates compute frame times as
 `frames_indices / fps` and average the first/last frame times within each temporal
 patch. This uses the source's average FPS; exact timing for variable-frame-rate
 containers would require retaining decoder presentation timestamps separately.
+
+The Qwen-Omni transform also forwards this metadata with `do_sample_frames=False`.
+Its processors use Hugging Face `VideoMetadata.sampled_fps` to calculate
+`video_second_per_grid = temporal_patch_size / sampled_fps` for audio/video token
+interleaving and position precomputation. This accounts for frame-count limits
+without adding fields to VeOmni metadata.
 
 ### Spatial Resize Parameters
 

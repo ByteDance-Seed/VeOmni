@@ -47,10 +47,7 @@ def _stub_runtime(name, *, processor=None, tokenizer=None):
 def _build(runtime, monkeypatch):
     """Drive the merged assets step; skip the HF load so the stub's preprocessor stands."""
 
-    def _fail(path, **kwargs):
-        raise FileNotFoundError(path)
-
-    monkeypatch.setattr("veomni.models.auto.build_processor", _fail)
+    monkeypatch.setattr("veomni.models.auto.build_processor", lambda *a, **k: None)
     VeOmniModelRuntime._build_model_assets(runtime)
 
 
@@ -71,6 +68,19 @@ def test_a_text_template_is_built_from_the_tokenizer(monkeypatch):
     _build(runtime, monkeypatch)
 
     assert isinstance(runtime.chat_template, ChatTemplate)
+
+
+@pytest.mark.parametrize("template_name", ["chatml", "qwen3_5"])
+def test_a_text_template_gets_the_tokenizer_even_when_a_processor_loaded(template_name, monkeypatch):
+    """A text template encodes through ``self.tokenizer``; handed the processor it
+    would call tokenizer methods on an object that has none."""
+    tokenizer = _VisionTokenizer()
+    runtime = _stub_runtime(template_name, processor=_Processor(tokenizer), tokenizer=tokenizer)
+
+    _build(runtime, monkeypatch)
+
+    assert not isinstance(runtime.chat_template, MultimodalChatTemplate)
+    assert runtime.chat_template.tokenizer is tokenizer
 
 
 @pytest.mark.parametrize("no_template", [None, ""])

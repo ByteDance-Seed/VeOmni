@@ -2,8 +2,10 @@
 
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 
+from ...module_configuration_base import OmniModuleConfig
 
-class BagelQwen2MoTConfig(Qwen2Config):
+
+class BagelQwen2MoTConfig(OmniModuleConfig, Qwen2Config):
     """Qwen2 config with BAGEL's runtime MoT defaults.
 
     The upstream ``llm_config.json`` is a plain Qwen2 config. BAGEL's loader

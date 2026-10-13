@@ -1,4 +1,4 @@
-"""SeedOmni V2 native eager inference — simple process, then generate.
+"""SeedOmni native eager inference — simple process, then generate.
 
 Loads a split checkpoint with ``OmniModel.from_pretrained`` and preprocesses
 requests through :class:`~veomni.models.seed_omni.processing_omni.OmniProcessor`
@@ -9,7 +9,7 @@ Examples
 Janus image understanding:
 
     python tasks/omni/infer_omni_native.py \\
-        --model_path /mnt/hdfs/.../Janus-1.3B-hf \\
+        --model_path /mnt/hdfs/.../Janus-1.3B \\
         --infer_type infer_und \\
         --prompt "Describe this image briefly." \\
         --image /path/to/image.jpg
@@ -32,7 +32,7 @@ logger = helper.create_logger(__name__)
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="SeedOmni V2 native inference (split checkpoint, checkpoint-driven load).",
+        description="SeedOmni native inference (split checkpoint, checkpoint-driven load).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -68,11 +68,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     helper.set_seed(args.seed)
+    # Only forward `infer_type` when the flag was given: passing None overrides
+    # the scenario the checkpoint saved and falls back to the first one.
+    scenario = {"infer_type": args.infer_type} if args.infer_type is not None else {}
     model = OmniModel.from_pretrained(
         args.model_path,
         device_map="auto",
         torch_dtype="auto",
-        infer_type=args.infer_type,
+        **scenario,
     ).eval()
     processor = OmniProcessor.from_pretrained(args.model_path)
     model_input = processor(

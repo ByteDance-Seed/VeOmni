@@ -54,18 +54,17 @@ logger = logging.get_logger(__name__)
 
 
 def _omni_registries():
-    """Lazily fetch the SeedOmni V2 sub-module registries.
+    """Lazily fetch the SeedOmni sub-module registries.
 
-    SeedOmni V2 splits a composite model (e.g. Janus) into self-contained
-    sub-modules — ``janus_siglip`` / ``janus_vqvae`` / ``janus_llama`` /
-    ``janus_text_encoder`` — whose ``model_type`` values are **not** in HF's
-    ``CONFIG_MAPPING`` and live in their own registries rather than
+    SeedOmni splits a composite model into self-contained sub-modules
+    (``module_A`` / ``module_B`` / …) whose ``model_type`` values are **not**
+    in HF's ``CONFIG_MAPPING`` and live in their own registries rather than
     ``MODEL_CONFIG_REGISTRY`` / ``MODELING_REGISTRY`` / ``MODEL_PROCESSOR_REGISTRY``.
 
     The ``get_model_*`` functions below consult these so the shared
     :func:`veomni.models.build_foundation_model` / :func:`build_processor`
     loader path works for an OmniModule sub-module exactly like a normal
-    single model (``OmniTrainer._build_model`` builds each sub-module this
+    single model (``OmniTrainer._build_model_runtime`` builds each sub-module this
     way).  Imported lazily (inside the loader functions) to avoid a circular
     import: ``veomni.models.seed_omni`` modeling imports back into
     ``veomni.models``.
@@ -79,18 +78,6 @@ def _omni_registries():
     )
 
     return OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY, OMNI_PROCESSOR_REGISTRY
-
-
-def raise_unsupported_veomni_modeling(model_name: str) -> None:
-    # Gate for models whose VeOmni modeling path has NOT been ported to the
-    # patchgen/generated flow. ``get_model_class`` in this module short-circuits
-    # when MODELING_BACKEND=hf, so this function is only reached when the caller
-    # wants VeOmni's patched classes — fail loudly instead of returning a stub
-    # that would silently produce broken graphs.
-    raise RuntimeError(
-        f"{model_name} does not have a VeOmni modeling path. Set MODELING_BACKEND=hf "
-        f"to bypass VeOmni patches and load upstream HuggingFace classes directly."
-    )
 
 
 def get_model_config(config_path: str, **kwargs):
@@ -120,7 +107,7 @@ def get_model_config(config_path: str, **kwargs):
                 config_dict["model_type"] if "model_type" in config_dict else config_dict["_class_name"]
             )  # diffusers use _class_name
             kwargs.pop("trust_remote_code", None)
-            # SeedOmni V2 sub-module configs (janus_siglip / ...) live in the
+            # SeedOmni sub-module configs (``module_A`` / …) live in the
             # OMNI registry, not MODEL_CONFIG_REGISTRY.
             omni_config_registry, _, _ = _omni_registries()
             if model_type in set(omni_config_registry.valid_keys()):
@@ -152,11 +139,20 @@ def get_model_processor(processor_path: str, **kwargs):
                 )
                 return processor
         except Exception:  # load from veomni (custom / OmniModule processor)
-            # SeedOmni V2 sub-module processors are keyed by ``model_type``
+            # SeedOmni sub-module processors are keyed by ``model_type``
             # (read from the module's ``config.json``), not by processor class
             # name — consult the OMNI registry first.
             try:
-                cfg_dict, _ = PretrainedConfig.get_config_dict(processor_path)
+                # Forward the hub-resolution options the caller gave
+                # ``AutoProcessor``; without them a private repo or a pinned
+                # revision fails this read, and the `except` below turns that
+                # into a silent "not an omni module" verdict.
+                hub_kwargs = {
+                    key: kwargs[key]
+                    for key in ("token", "revision", "cache_dir", "subfolder", "local_files_only")
+                    if key in kwargs
+                }
+                cfg_dict, _ = PretrainedConfig.get_config_dict(processor_path, **hub_kwargs)
                 omni_model_type = cfg_dict.get("model_type")
             except Exception:
                 omni_model_type = None
@@ -188,13 +184,17 @@ def get_model_class(model_config: PretrainedConfig):
     model_type = model_config.model_type
     modeling_backend = get_env("MODELING_BACKEND")
     if not modeling_backend == "hf":
-        # SeedOmni V2 sub-modules resolve to their OmniModule class via the
+        # SeedOmni sub-modules resolve to their OmniModule class via the
         # OMNI registry (keyed by model_type; the factory takes no arch_name).
+        # A module built here is a graph participant, so prefer the subclass
+        # that carries the graph hooks; the HF-native class is the fallback.
         _, omni_model_registry, _ = _omni_registries()
         if model_type in set(omni_model_registry.valid_keys()):
             from .seed_omni.modules import OMNI_ACCELERATED_MODEL_REGISTRY
 
-            return OMNI_ACCELERATED_MODEL_REGISTRY[model_type]()
+            if model_type in set(OMNI_ACCELERATED_MODEL_REGISTRY.valid_keys()):
+                return OMNI_ACCELERATED_MODEL_REGISTRY[model_type]()
+            return omni_model_registry[model_type]()
         return MODELING_REGISTRY[model_type](arch_name)
     if type(model_config) in AutoModelForImageTextToText._model_mapping.keys():  # assume built-in models
         load_class = AutoModelForImageTextToText

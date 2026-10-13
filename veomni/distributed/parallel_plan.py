@@ -105,13 +105,20 @@ class ParallelPlan:
         # API: only parameters already selected by ``extra_parallel_plan`` may
         # opt into the persistent complementary shard.
         self.extra_parallel_persistent_modules = extra_parallel_persistent_modules or {}
-        # Every module that owns a planned parameter gets its own FSDP unit on the
-        # extra-parallel mesh. A module left out falls into its layer's regular
-        # FSDP unit, which re-shards its already-sliced params over the FSDP mesh.
+        # Every planned parameter's owner must be wrapped on its para mesh: an owner left out
+        # would be re-sharded over the regular FSDP mesh, mixing different ranks' slices.
         self.extra_parallel_fsdp_no_shard_module = {
             para_name: {".".join(fqn.split(".")[:-1]) for fqn in plan}
             for para_name, plan in self.extra_parallel_plan.items()
         }
+        for para_name, owners in self.extra_parallel_fsdp_no_shard_module.items():
+            for outer in owners:
+                for inner in owners:
+                    if inner != outer and check_fqn_match(outer + ".*", inner):
+                        raise ValueError(
+                            f"{para_name} plan owners {outer!r} and {inner!r} are nested; each would become its own "
+                            f"{para_name}_fsdp unit, so put every planned parameter of one subtree under one module."
+                        )
 
     def apply(self, model: nn.Module, extra_parallel_fsdp_device_mesh: Dict[str, DeviceMesh]):
         """
@@ -212,6 +219,21 @@ class ParallelPlan:
 
         for fqn, param in model.named_parameters():
             assert hasattr(param, "spec_info"), f"Internal Error: {fqn=} with {param=} is omitted"
+
+        # A parameter registered under several names is reported once by
+        # ``named_parameters``, so the loops above keyed ``fqn2spec_info`` by whichever
+        # name came first. State dicts are not deduplicated: they carry every name.
+        # ``_apply_extra_parallel_dim`` looks each name up here and silently skips the
+        # ones it does not find, so an unregistered alias of a sharded parameter is
+        # written to DCP with the ExtraParallel dimension still collapsed -- an
+        # ``[E/ep, ...]`` local shard recorded as the whole ``[E, ...]`` tensor -- and on
+        # resume that truncated shard is assigned over the correctly assembled parameter,
+        # leaving every rank with one rank's experts. The spec describes the parameter
+        # rather than the name, so an alias reuses the one already resolved for it.
+        for fqn, param in model.named_parameters(remove_duplicate=False):
+            spec_info = getattr(param, "spec_info", None)
+            if spec_info is not None and fqn not in fqn2spec_info:
+                fqn2spec_info[fqn] = spec_info
 
         model._fqn2spec_info = fqn2spec_info
         return fqn2spec_info

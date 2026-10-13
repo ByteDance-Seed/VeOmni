@@ -66,20 +66,22 @@ def all_reduce(
         return data.tolist()
 
 
-def any_rank_failed(failed: bool) -> bool:
+def any_rank_failed(failed: bool, group: Optional[Any] = None) -> bool:
     """Whether *any* rank hit an error, so every rank can agree on what to do next.
 
     MAX rather than SUM: one failure is enough, and SUM would overflow int32 on a
-    large enough group.
+    large enough group. ``group`` defaults to the training group; a gloo group
+    reduces on CPU, so the device follows its backend.
     """
     if not dist.is_initialized():
         return failed
-    flag = torch.tensor([1 if failed else 0], dtype=torch.int32, device=get_device_type())
-    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    device = "cpu" if group is not None and dist.get_backend(group) == "gloo" else get_device_type()
+    flag = torch.tensor([1 if failed else 0], dtype=torch.int32, device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
     return bool(flag.item())
 
 
-def raise_if_any_rank_failed(error: Optional[BaseException], what: str) -> None:
+def raise_if_any_rank_failed(error: Optional[BaseException], what: str, group: Optional[Any] = None) -> None:
     """Turn one rank's error into an error on every rank.
 
     Work that is split across ranks -- one rank writes a replicated file, one
@@ -90,8 +92,23 @@ def raise_if_any_rank_failed(error: Optional[BaseException], what: str) -> None:
 
     The reduction inside is itself the synchronization point, and every rank
     reaches it on every path, so it replaces rather than accompanies a barrier.
+
+    ``group`` goes straight to :func:`any_rank_failed`. Pass the group the work
+    itself ran on when ranks can reach this far apart: they wait out that skew
+    inside the reduction, and on the training backend a long enough wait is what
+    the NCCL watchdog aborts the process over.
     """
-    if any_rank_failed(error is not None):
+    try:
+        failed = any_rank_failed(error is not None, group=group)
+    except BaseException as group_error:
+        # The group can be the very thing that broke -- a gloo group whose peers
+        # timed out is how ``work`` failed in the first place. Keep this rank's
+        # own error as the cause, or the log shows the connection closing and
+        # not what closed it.
+        if error is not None:
+            raise group_error from error
+        raise
+    if failed:
         raise error or RuntimeError(f"{what} failed on another rank")
 
 

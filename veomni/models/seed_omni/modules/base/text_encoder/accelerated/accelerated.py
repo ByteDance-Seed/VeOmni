@@ -23,10 +23,9 @@ from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from .....mixins.base_mixin import BaseMixin
-from .....mixins.emb_parallel_mixin import EmbParallelMixin
 from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from .....utils.conversation import ConversationItem, is_dummy
+from .....utils.conversation import ConversationItem
 from ..chat_template import TextEncoderChatTemplate
 from ..configuration import TextEncoderConfig
 from ..modeling import TextEncoder, scatter_text_encoder_embeds
@@ -106,16 +105,6 @@ class TrainingMixin(TrainingModuleMixin):
         # TODO: scatter logits for rl training
         return {"conversation_list": conversation}
 
-    def _embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Vocab-parallel lookup when the ``emb`` extra-parallel group is active.
-
-        Overrides the native ``self.embed_tokens(input_ids)`` shortcut so every
-        family picks up ``AllToAllEmbedding`` under ``emb`` (mixed in via
-        :class:`~....mixins.emb_parallel_mixin.EmbParallelMixin`); off ``emb`` it
-        is exactly the native call.
-        """
-        return self.emb_parallel_lookup(self.embed_tokens, input_ids)
-
     def _prepare_encode_inputs(
         self,
         conversation_list: Optional[list[list[ConversationItem]]],
@@ -142,7 +131,7 @@ class TrainingMixin(TrainingModuleMixin):
         for sample in conversation_list:
             sample_start = decode_len
             for part in sample:
-                if is_dummy(part):
+                if part.is_dummy:
                     continue
                 hidden_states = part.value
                 if hidden_states.dim() == 3:
@@ -180,25 +169,6 @@ class TrainingMixin(TrainingModuleMixin):
         # orders after the backbone kernels on the GPU stream without a CPU stall.
         shift_labels = shift_labels.to(device=hidden_states.device, non_blocking=True)
         return hidden_states, shift_labels
-
-    def _project(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Tied-head projection that stays FSDP2-safe.
-
-        The native :meth:`~.modeling.TextEncoder._project` reads
-        ``embed_tokens.weight`` directly, which is only safe off-FSDP (pure HF
-        inference): under FSDP2 that read bypasses the embedding's own
-        unshard/reshard hook (``encode`` and ``decode`` are separate graph-node
-        forward calls, so there's no guarantee ``embed_tokens`` was unsharded by
-        this call), leaving a sharded ``DTensor`` that a plain ``F.linear``
-        can't multiply against the (unsharded) activation. ``emb_parallel_project``
-        (mixed in via :class:`~....mixins.emb_parallel_mixin.EmbParallelMixin`)
-        explicitly gathers the weight first — vocab-parallel when the ``emb``
-        extra-parallel group is active, otherwise a plain ``full_tensor()``
-        all-gather — so this override, not the native one, must run at train time.
-        """
-        if not self.config.tie_word_embeddings:
-            return self.lm_head(hidden_states)
-        return self.emb_parallel_project(hidden_states, self.embed_tokens.weight)
 
     @staticmethod
     def _drop_unsupervised_decode_rows(
@@ -240,8 +210,9 @@ class TrainingMixin(TrainingModuleMixin):
         fused linear+CE kernel (Liger / chunk_loss) and never materializes the
         ``[T, V]`` logits. Passing ``logits=None`` + ``hidden_states`` + ``weights``
         is what opts into that contract; a tied or biased head cannot (the fused
-        kernels take a weight tensor only, no bias, and the tied weight needs the
-        gather in :meth:`_project`), so it keeps an explicit projection and eager CE.
+        kernels take a weight tensor only, no bias, and the tied weight is only
+        reachable through ``embed_tokens.project``), so it keeps an explicit
+        projection and eager CE.
 
         (b) ``loss_reduction_group=fsdp_group`` token-weights the loss mean across
         the whole ``dp_sp`` mesh — required once SP is enabled, since each rank only
@@ -251,7 +222,7 @@ class TrainingMixin(TrainingModuleMixin):
         this method used to call inline.
 
         (c) A span with no supervised token scores 0.0, matching the native
-        clamped denominator required by constraint 7b. Every fused backend
+        clamped denominator required by constraint 7d. Every fused backend
         normalizes by its own supervised-token count with no way to clamp it
         (Liger divides by ``n_non_ignore``, chunk_loss recounts the labels), so
         such a span is routed to the eager branch and given an explicit
@@ -265,7 +236,12 @@ class TrainingMixin(TrainingModuleMixin):
         """
         loss: torch.Tensor | None = None
         logits: torch.Tensor | None = None
-        target_labels = labels if labels is not None else shift_labels
+        # Whatever the loss will actually score, so the row filter of (d) and
+        # the (c) denominator agree with it. ``ForCausalLMLoss`` gives explicit
+        # ``shift_labels`` precedence over ``labels``, so a caller passing both
+        # would otherwise have its rows dropped, and its supervised tokens
+        # counted, against the unshifted tensor the loss then ignores.
+        target_labels = shift_labels if shift_labels is not None else labels
         fsdp_group = get_parallel_state().fsdp_group
         num_supervised_tokens = None if target_labels is None else (target_labels != IGNORE_INDEX).sum()
 
@@ -337,11 +313,10 @@ class MeterMixin(MetricMeterMixin):
 
     # Token lengths come from ``metric_meter_set_seqlens`` in ``encode_pre`` (the
     # full pre-slice packed length); ``decode`` stashes nothing and contributes
-    # no tokens (its lm_head FLOPs are covered by the ``encode`` count). So the
-    # default ``metric_meter_token_lengths`` (drains the stash) is used as-is.
+    # no tokens (its lm_head FLOPs are covered by the ``encode`` count).
 
 
-class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin, EmbParallelMixin):
+class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
     """Shared training / inference plumbing for every text encoder.
 
     No ``InferenceMixin`` here: FSM ``generate`` and its sampling /
@@ -382,12 +357,14 @@ class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin, EmbParallelMixin):
 
 
 class TextEncoderAccelerated(VeOmniMixin, TextEncoder):
-    """Training/runtime text encoder — vocab-parallel embed + SP-aware CE.
+    """Training/runtime text encoder — SP-aware hooks + fused-CE ``decode``.
 
-    ``_embed_tokens`` / ``_project`` / ``decode`` overrides (FSDP2-/``emb``-safe)
-    live on :class:`TrainingMixin` above so every family's own accelerated
-    composition — which mixes in *its own* ``TrainingMixin(BaseTrainingMixin)``
-    rather than this class — inherits them too.
+    The ``decode`` override lives on :class:`TrainingMixin` above so every
+    family's own accelerated composition — which mixes in *its own*
+    ``TrainingMixin(BaseTrainingMixin)`` rather than this class — inherits it
+    too. Vocab-parallel lookup and the tied projection need no override: the
+    native ``embed_tokens`` is a
+    :class:`~veomni.distributed.emb_parallel.ShardedEmbedding`.
     """
 
 

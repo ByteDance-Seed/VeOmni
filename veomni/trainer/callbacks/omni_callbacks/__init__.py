@@ -12,19 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SeedOmni V2 (OmniTrainer) callbacks — not shared with single-model trainers."""
+"""SeedOmni (OmniTrainer) callbacks — not shared with single-model trainers."""
 
-from .environ_meter_callback import OmniEnvironMeterCallback
-from .global_state_callback import OmniGlobalStateCallback, OmniRootAssetsCallback
 from .graph_profile_callback import GraphProfileCallback
-from .module_checkpoint_callback import OmniModuleDcpCallback, OmniModuleHfCallback
+from .step_metrics_callback import OmniStepMetricsCallback
 
 
 __all__ = [
     "GraphProfileCallback",
-    "OmniEnvironMeterCallback",
-    "OmniGlobalStateCallback",
-    "OmniModuleDcpCallback",
-    "OmniModuleHfCallback",
-    "OmniRootAssetsCallback",
+    "OmniStepMetricsCallback",
 ]

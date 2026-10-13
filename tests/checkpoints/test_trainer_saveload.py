@@ -382,7 +382,7 @@ def test_frozen_omni_module_resume_loads_hf_weights(tmp_path):
         "eager",
         "--model.ops_implementation.load_balancing_loss_implementation",
         "eager",
-        # SeedOmni V2 keeps the parallel plan on `model.accelerator`, not `train.*`.
+        # SeedOmni keeps the parallel plan on `model.accelerator`, not `train.*`.
         "--model.accelerator.fsdp_config.fsdp_mode",
         "fsdp2",
         "--model.accelerator.fsdp_config.forward_prefetch",

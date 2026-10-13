@@ -5,9 +5,11 @@ from unittest.mock import patch
 
 import torch
 
-from veomni.arguments import OmniArguments, build_module_runtime_args, parse_omni_args
+from veomni.arguments.omni_arguments_types import OmniArguments, build_omni_module_runtime_args
+from veomni.arguments.omni_parser import parse_omni_args
 from veomni.distributed import torch_parallelize
-from veomni.models.seed_omni.accelerator.module_runtime import ModuleRuntime
+from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
+from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.trainer.omni import OmniTrainer
 
 
@@ -42,15 +44,21 @@ def main() -> None:
     # ModuleRuntime assumes the orchestrator has already initialized distributed
     # state. Only that setup half is needed for this focused runner — the graphs,
     # data pipeline and train loop are irrelevant to weight loading.
-    OmniTrainer.setup_distributed(args)
+    OmniTrainer._setup(args, save_launch_args=False)
 
-    # Bypass `resolve_omni_model` (which would demand training/generation graph
+    # Bypass `build_omni_model_runtime_args` (which would demand training/generation graph
     # YAML) and build just this one module's args off the split-checkpoint root.
-    module_args = build_module_runtime_args(
+    module_args = build_omni_module_runtime_args(
         args._to_module_global_args(),
         args.model.model_path,
         {MODULE_NAME: {"model_path": MODULE_NAME}},
     )[MODULE_NAME]
+
+    # A module config is only ever loaded through the composed OmniConfig.
+    omni_config = OmniConfig(
+        _module_entries={MODULE_NAME: {"model_path": MODULE_NAME}}, training_graphs={}, generation_graphs={}
+    )
+    omni_config.load_checkpoint_sidecars(args.model.model_path)
 
     module_dcp_path = Path(args.train.checkpoint.load_path) / MODULE_NAME
     assert not module_dcp_path.exists(), "The frozen module must not have a DCP payload in this regression scenario."
@@ -61,7 +69,13 @@ def main() -> None:
         "load_model_weights",
         wraps=original_load_model_weights,
     ) as load_model_weights:
-        module_runtime = ModuleRuntime(module_args, module_name=MODULE_NAME, train=args.train)
+        module_runtime = ModuleRuntime(
+            module_args,
+            module_name=MODULE_NAME,
+            module_config=omni_config._module_configs[MODULE_NAME],
+            global_accelerator=args.model.accelerator,
+            train=args.train,
+        )
 
     assert module_runtime.has_trainable_parameters is False
     assert load_model_weights.call_count == 1, "A frozen module with persistent state must load its HF snapshot."

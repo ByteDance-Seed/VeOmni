@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-click smoke test for the SeedOmni V2 (omni_v2) models.
+# One-click smoke test for the SeedOmni models.
 #
 # For each selected model it runs a SHORT training run (a couple of optimizer
 # steps) followed by a SHORT inference run, then prints a PASS/FAIL summary.

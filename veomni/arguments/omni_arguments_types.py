@@ -12,17 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Launcher argument schema for SeedOmni V2 training + inference.
+"""Launcher argument schema for SeedOmni training + inference.
 
 A single ``base.yaml`` drives both
 :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer` and
 :class:`~veomni.trainer.omni.omni_inferencer.OmniInferencer`.
 
-The model blocks extend :mod:`veomni.arguments.arguments_types`: both
-:class:`OmniModuleRuntimeArguments` and :class:`OmniModelRuntimeArguments`
-subclass ``ModelArguments``, so the model fields, the ``accelerator`` /
-``optimizer`` pair, HDFS localization and the cached ``fqn_to_index_mapping`` are
-declared once and shared with the V1 ``ModelArguments``. Only ``data`` /
+The model blocks extend :mod:`veomni.arguments.arguments_types`. Both
+:class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_config.OmniModuleRuntimeArguments`
+and
+:class:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_config.OmniModelRuntimeArguments`
+subclass ``ModelArguments``. The model fields, the ``accelerator`` /
+``optimizer`` pair, HDFS localization and the cached ``fqn_to_index_mapping``
+are declared once and shared with ``ModelArguments``. Only ``data`` /
 ``train`` / ``infer`` are Omni's own.
 
 Omni-specific layout:
@@ -31,22 +33,17 @@ Omni-specific layout:
   ``model_path``, ``model_config``, ``ops_implementation``, ``accelerator`` and
   ``optimizer``, plus the modules it composes.
 * Per-module overrides live in ``model.model_config.modules`` YAML;
-  :meth:`OmniArguments.resolve_model` merges them into
+  :func:`build_omni_model_runtime_args` merges them into
   :attr:`OmniModelRuntimeArguments.modules` (each entry is
   :class:`OmniModuleRuntimeArguments`: same flat fields).
 * ``data`` / ``train`` / ``infer`` remain launcher-wide.
 
-``OmniModelRuntimeArguments`` and its resolution helpers (``resolve_omni_model``,
-``build_omni_model_runtime``, ...) live in this same module rather than a separate
-``model_runtime.py``: :class:`OmniArguments.model` is typed as
-``OmniModelRuntimeArguments`` and :meth:`OmniArguments.resolve_model` /
-:meth:`OmniArguments._to_module_global_args` call the resolution helpers directly,
-which would otherwise form an import cycle (``OmniArguments`` -> resolver ->
-``OmniModelRuntimeArguments`` -> back to ``OmniArguments`` for the ``args:
-OmniArguments`` parameter type) across two files.
+The runtime *classes* live next to :class:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModelRuntime`
+/ :class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime`.
+Resolution helpers (``build_omni_model_runtime_args``, ``build_omni_module_runtime_args``, …)
+stay in this module so :class:`OmniArguments` can call them without an
+arguments ↔ accelerated import cycle.
 """
-
-from __future__ import annotations
 
 import math
 import os
@@ -54,8 +51,15 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional, Union, get_args
 
+import yaml
+
+from ..models.seed_omni.accelerated.omni_model.omni_model_config import OmniModelRuntimeArguments
+from ..models.seed_omni.accelerated.omni_module.omni_module_config import (
+    OmniModuleRuntimeArguments,
+    hf_module_model_config,
+)
 from ..utils import logging
 from ..utils.fs import is_non_local
 from .arguments_types import (
@@ -66,92 +70,20 @@ from .arguments_types import (
     ModelArguments,
     ProfileConfig,
     WandbConfig,
-    _resolve_hdfs_path,
 )
 from .parser import _deep_update, _instantiate_recursive
 
 
 logger = logging.get_logger(__name__)
 
-OMNI_TRAIN_WORKFLOWS = {"train", "offline_cache", "train_with_cache", "train_and_cache"}
-LAUNCHER_CONFIG_KEYS = frozenset({"modules", "train_graph", "train_type", "infer_graph", "infer_type"})
+OmniTrainingTask = Literal["online_training", "offline_embedding", "offline_training"]
 
 
-def _hf_module_model_config(model_config: dict | None) -> dict:
-    """Drop launcher layout keys before merging or exporting per-module ``model_config``."""
-    if not model_config:
-        return {}
-    return {key: value for key, value in model_config.items() if key not in LAUNCHER_CONFIG_KEYS}
-
-
-@dataclass
-class OmniModuleRuntimeArguments(ModelArguments):
-    """Per-module runtime — one module's slice of a composed Omni model.
-
-    ``ModelArguments`` already is a complete training unit: the model
-    fields plus this module's own ``accelerator`` and ``optimizer``, with
-    ``model_path`` localized and ``fqn_to_index_mapping`` parsed lazily and cached
-    per index path (several modules routinely share one checkpoint). All this adds
-    is the projection onto an :class:`OmniConfig` entry.
-    """
-
-    @property
-    def needs_distributed_build(self) -> bool:
-        """True when this module must be built under a process group, not loaded whole.
-
-        ``eager`` is the inference default and means one rank holds the module
-        entire, loaded through ``device_map`` with no collectives. Anything else
-        -- FSDP2, DDP, expert parallelism, vocab parallelism -- needs a
-        :class:`ParallelState` and a sharded build.
-
-        The two parallelisms that are *not* ``fsdp_mode`` are the reason this is
-        a property rather than a comparison written out at each call site. A
-        module can ask for ``ep`` or ``emb`` while leaving ``fsdp_mode`` alone,
-        and reading only ``fsdp_mode`` then sends it down the single-process
-        path -- where the sharding quietly does not happen and the whole module
-        is loaded on every rank. DeepSeek-V4.1 is both cases: its n-gram tables
-        shard over ``emb`` and nothing else, and one of them is 91.6 GiB.
-        """
-        fsdp_mode = self.accelerator.fsdp_config.fsdp_mode
-        if fsdp_mode and str(fsdp_mode).lower() not in ("eager",):
-            return True
-        return self.accelerator.ep_size > 1 or any(size > 1 for size in self.accelerator.extra_parallel_sizes or ())
-
-    def to_hf_config(self, module_name: str) -> dict:
-        """Project onto this module's slim :class:`OmniConfig` entry.
-
-        ``model_path`` is carried through explicitly (not just ``subfolder:
-        module_name``): by the time this runs, ``build_module_runtime_args`` /
-        ``_resolve_model_path`` has already resolved it to an absolute path —
-        usually ``<checkpoint_root>/<module_name>``, but a launcher YAML module
-        override may point it at a wholly different checkpoint (e.g. Qwen3
-        visual-instruction-tuning composing ``qwen3_llm``/``qwen3_text_encoder``
-        from one HF model with ``qwen3vl_vision`` from another). Dropping it
-        and re-deriving ``checkpoint_root/module_name`` downstream (as
-        :meth:`~....models.seed_omni.configuration_omni.OmniConfig.resolve_module_path`
-        does for anything without an explicit ``model_path``) would silently
-        resolve to the wrong path for that module.
-        """
-        model_block: dict = {
-            "ops_implementation": asdict(self.ops_implementation),
-        }
-        if self.model_path:
-            model_block["model_path"] = self.model_path
-        overrides = _hf_module_model_config(self.model_config)
-        if overrides:
-            model_block["model_config"] = deepcopy(overrides)
-        return {
-            "subfolder": module_name,
-            "model": model_block,
-            "processor_config": deepcopy(self.processor_config or {}),
-        }
-
-
-def _is_omni_checkpoint_root(path: str | None) -> bool:
+def _is_omni_checkpoint_root(path: Optional[str]) -> bool:
     return bool(path) and os.path.isfile(os.path.join(str(path), "config.json"))
 
 
-def _try_load_omni_checkpoint_config(path: str | None):
+def _try_load_omni_checkpoint_config(path: Optional[str]):
     if not _is_omni_checkpoint_root(path):
         return None
     from ..models.seed_omni.configuration_omni import OmniConfig
@@ -162,127 +94,120 @@ def _try_load_omni_checkpoint_config(path: str | None):
 DEFAULT_SCENARIO = "default"
 
 
-@dataclass
-class OmniModelRuntimeArguments(ModelArguments):
-    """One composed Omni model — a training unit plus the modules it decomposes into.
+def _resolve_hf_checkpoint_view(model_runtime: OmniModelRuntimeArguments) -> str:
+    """Set ``seed_omni_model_path`` to the weight-free split view when ``model_path`` is upstream HF.
 
-    YAML supplies the inherited ``model_path``, ``model_config``,
-    ``ops_implementation``, ``accelerator`` and ``optimizer``, which double as the
-    defaults each module's own block is merged over. :func:`resolve_omni_model`
-    fills ``modules``, the graph scenario maps, and the scenario keys.
+    ``model.model_path`` is never rewritten: loggers and saved launch args keep
+    the user-facing path. Downstream (module configs, assets, the collator's
+    preprocessors, inference) reads :attr:`OmniModelRuntimeArguments.seed_omni_model_path`,
+    while module weights still come from the HF checkpoint the view records.
+    A split root sets ``seed_omni_model_path`` equal to ``model_path``.
     """
+    from ..models.seed_omni.utils.hf_layout import read_hf_source, resolve_omni_checkpoint_root
 
-    modules: dict[str, OmniModuleRuntimeArguments] = field(default_factory=dict)
-    training_graphs: dict[str, Any] = field(default_factory=dict)
-    generation_graphs: dict[str, Any] = field(default_factory=dict)
-    train_type: str | None = None
-    infer_type: str | None = None
-    generation_kwargs: dict[str, Any] = field(default_factory=dict)
-
-    def launcher_config(self, key: str, default: Any = None) -> Any:
-        """Read a launcher layout key from ``model_config`` (``modules``, graphs, …)."""
-        return (self.model_config or {}).get(key, default)
-
-    def set_launcher_config(self, key: str, value: Any) -> None:
-        if self.model_config is None:
-            self.model_config = {}
-        self.model_config[key] = value
-
-    @property
-    def resolved_model_path(self) -> str:
-        path = self.model_path
-        if not path:
-            raise ValueError("`model.model_path` (split-checkpoint root) is required for OmniModel V2.")
-        return path
-
-    @property
-    def module_names(self) -> list[str]:
-        return list(self.modules)
-
-    @property
-    def train_types(self) -> list[str]:
-        return list(self.training_graphs)
-
-    @property
-    def infer_types(self) -> list[str]:
-        return list(self.generation_graphs)
-
-    @property
-    def training_graph(self) -> list[dict]:
-        from ..models.seed_omni.configuration_omni import select_graph
-
-        graph = select_graph(
-            self.training_graphs,
-            self.train_type,
-            empty_hint="Populate `model.model_config.train_graph` with at least one scenario.",
-            unknown_hint="train_type",
+    model_path = model_runtime.model_path
+    view = resolve_omni_checkpoint_root(model_path)
+    if view != model_path:
+        source = read_hf_source(view)
+        logger.info_rank0(
+            f"OmniModel: `model.model_path` is a HuggingFace `{source.model_type}` checkpoint; "
+            f"loading its modules through the {source.model_type} HF layout "
+            f"(seed_omni_model_path: {view})."
         )
-        return list(graph)
+    model_runtime.seed_omni_model_path = view
+    return view
 
-    @property
-    def generation_graph(self) -> dict:
-        from ..models.seed_omni.configuration_omni import select_graph
 
-        return select_graph(
-            self.generation_graphs,
-            self.infer_type,
-            empty_hint="Populate `model.model_config.infer_graph` with at least one scenario.",
-            unknown_hint="infer_type",
-        )
+def _check_hf_source_exportable(model_path: str) -> None:
+    """Fail at startup, not at the first HF save, when the source cannot be written back."""
+    from ..models.seed_omni.utils.hf_layout import read_hf_source, source_weight_files
 
-    def module_checkpoint_subfolder(self, name: str) -> str:
-        if name not in self.modules:
-            known = ", ".join(self.modules) or "(none)"
-            raise KeyError(f"Module {name!r} not found in model runtime; known modules: {known}.")
-        return name
+    source = read_hf_source(model_path)
+    if source is None:
+        return
+    try:
+        source_weight_files(source.path)
+    except FileNotFoundError as e:
+        raise ValueError(
+            f"`train.checkpoint.save_hf_weights` exports in the source layout, which needs safetensors weights: {e} "
+            "Convert the checkpoint to safetensors, or disable save_hf_weights."
+        ) from e
 
-    def to_hf_config(self):
-        """Project onto the checkpoint-shaped HF :class:`~veomni.models.seed_omni.configuration_omni.OmniConfig`."""
-        from ..models.seed_omni.configuration_omni import OmniConfig
 
-        module_entries = {name: mod.to_hf_config(name) for name, mod in self.modules.items()}
-        return OmniConfig.from_dict(
-            {
-                "training_graph": deepcopy(self.training_graph),
-                "generation_graphs": deepcopy(self.generation_graphs),
-                "infer_type": self.infer_type,
-                "generation_kwargs": dict(self.generation_kwargs),
-                "modules": module_entries,
-            }
+def _validate_hf_view_modules(model_path: str, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
+    """Under an HF ``model_path`` every module is one the family layout cuts from that checkpoint."""
+    from ..models.seed_omni.utils.hf_layout import read_hf_source
+
+    source = read_hf_source(model_path)
+    if source is None:
+        return
+    layout_modules = set(source.layout.modules)
+    for name, module_args in modules.items():
+        if name not in layout_modules:
+            raise ValueError(
+                f"Module {name!r} is not part of the `{source.model_type}` HF layout "
+                f"(modules: {sorted(layout_modules)}); an HF `model.model_path` only loads the family's own modules. "
+                "Convert the checkpoint to compose other modules."
+            )
+        if os.path.normpath(str(module_args.model_path)) != os.path.normpath(os.path.join(model_path, name)):
+            raise ValueError(
+                f"Module {name!r} sets its own model_path ({module_args.model_path!r}), but `model.model_path` is a "
+                f"HuggingFace `{source.model_type}` checkpoint every module loads from. Drop the per-module "
+                "model_path, or convert the checkpoint to compose modules from several sources."
+            )
+    overrides = {
+        name: sorted(keys) for name, args in modules.items() if (keys := hf_module_model_config(args.model_config))
+    }
+    if overrides:
+        logger.warning_rank0(
+            f"Per-module model_config overrides {overrides} apply to this run, but an HF export of the "
+            f"`{source.model_type}` checkpoint keeps its source config.json; an override that changes the "
+            "architecture will not be reflected there."
         )
 
 
-def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> OmniModelRuntimeArguments:
-    """Resolve ``args.model`` launcher fields into a fully populated :class:`OmniModelRuntimeArguments`."""
+def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool = False) -> OmniModelRuntimeArguments:
+    """Resolve ``args.model`` launcher fields into a fully populated :class:`OmniModelRuntimeArguments`.
+
+    Set ``for_inference=True`` to apply the all-eager inference accelerator
+    default on top of ``model.model_config.modules``.
+    """
     model_runtime = args.model
     if not model_runtime.model_path:
-        raise ValueError("`model.model_path` (split-checkpoint root) is required for OmniModel V2.")
+        raise ValueError("`model.model_path` (split-checkpoint root) is required for OmniModel.")
 
     # ``model_path`` is already local: ``BaseModelArguments.__post_init__`` localizes
-    # it, so per-module subfolders join against a path that exists on disk and
-    # ``_try_load_omni_checkpoint_config`` below can open its ``config.json``.
-    model_path = model_runtime.model_path
-    omni_cfg = _try_load_omni_checkpoint_config(model_path)
+    # it. ``seed_omni_model_path`` is the root configs / assets / graphs are read
+    # from (a weight-free view when ``model_path`` is an upstream HF checkpoint).
+    seed_omni_model_path = _resolve_hf_checkpoint_view(model_runtime)
+    if not for_inference and args.train.checkpoint.save_hf_weights:
+        _check_hf_source_exportable(seed_omni_model_path)
+    omni_cfg = _try_load_omni_checkpoint_config(seed_omni_model_path)
 
-    train_modules = model_runtime.launcher_config("modules")
-    if train_modules is None and omni_cfg is not None:
-        train_modules = {
-            name: {
-                "model_path": omni_cfg.module_checkpoint_subfolder(name),
-                **({"ops_implementation": ops} if (ops := omni_cfg.module_ops_implementation(name)) else {}),
-                **({"model_config": overrides} if (overrides := omni_cfg.module_model_config(name)) else {}),
-            }
-            for name in omni_cfg.module_names
-        }
-    if train_modules is None:
+    # The checkpoint's per-module fields are their own layer, kept separate from
+    # the launcher YAML so `build_omni_module_runtime_args` can slot the inference
+    # `fsdp_mode: eager` default between the two — see its docstring for the
+    # full order.
+    ckpt_modules = (
+        {name: _checkpoint_module_fields(omni_cfg, seed_omni_model_path, name) for name in omni_cfg.module_names}
+        if omni_cfg is not None
+        else None
+    )
+    yaml_modules = model_runtime.launcher_config("modules")
+    if ckpt_modules is None and yaml_modules is None:
         raise ValueError(
             "`model.model_config.modules` (per-module override YAML) is required when "
             "`model_path` is not a self-contained omni checkpoint."
         )
+    # The YAML, when there is one, decides the module *set*: only modules it
+    # names are built, so a launcher can compose a subset (or point a module at
+    # another checkpoint) without the root's every module tagging along.
+    train_modules = yaml_modules if yaml_modules is not None else {name: {} for name in ckpt_modules}
 
     train_graph = model_runtime.launcher_config("train_graph")
-    if train_graph is None and omni_cfg is not None:
-        train_graph = {DEFAULT_SCENARIO: omni_cfg.training_graph}
+    train_graph_from_ckpt = train_graph is None and omni_cfg is not None
+    if train_graph_from_ckpt:
+        train_graph = omni_cfg.training_graphs or None
     if train_graph is None:
         raise ValueError(
             "`model.model_config.train_graph` is required when `model_path` has no omni "
@@ -290,7 +215,8 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
         )
 
     infer_graph = model_runtime.launcher_config("infer_graph")
-    if not infer_graph and omni_cfg is not None:
+    infer_graph_from_ckpt = not infer_graph and omni_cfg is not None
+    if infer_graph_from_ckpt:
         infer_graph = omni_cfg.generation_graphs
     if not infer_graph:
         raise ValueError(
@@ -298,22 +224,30 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
             "`config.json` generation graphs."
         )
 
+    # A checkpoint's train_type / infer_type names one of *its* scenarios, so it
+    # only applies while the graphs are the checkpoint's too: a launcher graph
+    # override brings its own scenario names.
     train_type = model_runtime.launcher_config("train_type")
     infer_type = model_runtime.launcher_config("infer_type")
-    if infer_type is None and omni_cfg is not None:
+    if train_type is None and train_graph_from_ckpt:
+        train_type = omni_cfg.train_type
+    if infer_type is None and infer_graph_from_ckpt:
         infer_type = omni_cfg.infer_type
 
     train_type = _resolve_graph_type(args, model_runtime, train_graph, "train_type", train_type)
     infer_type = _resolve_graph_type(args, model_runtime, infer_graph, "infer_type", infer_type)
 
-    modules = build_module_runtime_args(
+    modules = build_omni_module_runtime_args(
         _to_module_global_args(model_runtime),
-        model_path,
+        seed_omni_model_path,
         train_modules,
         for_inference=for_inference,
+        checkpoint_modules=ckpt_modules,
     )
+    _validate_hf_view_modules(seed_omni_model_path, modules)
     for module_args in modules.values():
         _validate_omni_accelerator(module_args.accelerator)
+    _validate_composed_wrap(model_runtime.accelerator, modules)
     training_graphs = _load_graph_map(train_graph)
     generation_graphs = _load_graph_map(infer_graph)
     if train_type is not None and train_type not in training_graphs:
@@ -327,6 +261,7 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
     model_kwargs = {name: getattr(model_runtime, name) for name in shared_fields}
     return OmniModelRuntimeArguments(
         **model_kwargs,
+        seed_omni_model_path=seed_omni_model_path,
         modules=modules,
         training_graphs=training_graphs,
         generation_graphs=generation_graphs,
@@ -336,126 +271,97 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
     )
 
 
-def build_omni_model_runtime(
+def build_omni_module_runtime_args(
     global_args: OmniModuleRuntimeArguments,
-    model_path: str | os.PathLike,
-    train_graph: str | os.PathLike | Mapping[str, Any] | list | dict,
-    infer_graph: str | os.PathLike | Mapping[str, Any] | list | dict,
-    train_modules: str | os.PathLike | dict[str, Any],
-    train_type: str | None = None,
-    infer_type: str | None = None,
-    generation_kwargs: dict[str, Any] | None = None,
+    model_path: Union[str, os.PathLike],
+    modules: Union[str, os.PathLike, dict[str, Any]],
     *,
     for_inference: bool = False,
-    accelerator: Any = None,
-    optimizer: Any = None,
-) -> OmniModelRuntimeArguments:
-    """Build a resolved :class:`OmniModelRuntimeArguments` from launcher YAML paths (tests / export)."""
-    # Localize before splitting into modules, the order `resolve_omni_model` gets for
-    # free from `BaseModelArguments.__post_init__`. Joining subfolders onto a remote
-    # root instead would let each module localize `<remote_root>/<module>` separately:
-    # the local cache dir is keyed on a hash of the source path, so the root and its
-    # modules would land in unrelated directories and the root would no longer be a
-    # prefix of them -- which anything re-deriving `<root>/<module>` relies on.
-    model_path = _resolve_hdfs_path(str(model_path))
-
-    modules = build_module_runtime_args(
-        global_args,
-        model_path,
-        train_modules,
-        for_inference=for_inference,
-    )
-    training_graphs = _load_graph_map(train_graph)
-    generation_graphs = _load_graph_map(infer_graph)
-    if train_type is not None and train_type not in training_graphs:
-        known = ", ".join(training_graphs)
-        raise KeyError(f"Unknown train_type {train_type!r}; expected one of: {known}.")
-    if infer_type is not None and infer_type not in generation_graphs:
-        known = ", ".join(generation_graphs)
-        raise KeyError(f"Unknown infer_type {infer_type!r}; expected one of: {known}.")
-
-    shared_fields = {f.name for f in fields(ModelArguments)}
-    model_kwargs = {name: getattr(global_args, name) for name in shared_fields if name != "model_path"}
-    if accelerator is not None:
-        model_kwargs["accelerator"] = accelerator
-    if optimizer is not None:
-        model_kwargs["optimizer"] = optimizer
-    return OmniModelRuntimeArguments(
-        model_path=str(model_path),
-        **model_kwargs,
-        modules=modules,
-        training_graphs=training_graphs,
-        generation_graphs=generation_graphs,
-        train_type=train_type,
-        infer_type=infer_type,
-        generation_kwargs=dict(generation_kwargs or {}),
-    )
-
-
-def build_module_runtime_args(
-    global_args: OmniModuleRuntimeArguments,
-    model_path: str | os.PathLike,
-    modules: str | os.PathLike | dict[str, Any],
-    *,
-    for_inference: bool = False,
+    checkpoint_modules: Optional[dict[str, Any]] = None,
 ) -> dict[str, OmniModuleRuntimeArguments]:
-    """Merge launcher module YAML onto ``global_args`` without loading graphs."""
+    """Merge launcher module YAML onto ``global_args`` without loading graphs.
+
+    Layers, weakest first:
+
+    1. ``global_args`` — the launcher's global ``model:`` block.
+    2. ``checkpoint_modules`` — the checkpoint's ``_module_entries``. The only
+       layer that knows a module individually without the user restating it:
+       the kernels it was exported with, its ``model_config``, an
+       ``accelerator`` overlay if the entry carries one.
+    3. the synthesized ``fsdp_mode: eager`` inference default (``for_inference``).
+    4. ``modules`` — the launcher's per-module YAML.
+
+    Layer 3 sits above the checkpoint rather than below it because parallelism
+    belongs to a run and not to a checkpoint — the same reason ``to_hf_config``
+    declines to persist ``accelerator`` at all. Were it below, a checkpoint
+    carrying an ``accelerator`` block would turn an inference run distributed
+    that never asked to be, and `eager` is what an inference run gets unless its
+    own YAML says otherwise. A checkpoint ``accelerator`` therefore reaches
+    training and is masked for inference.
+    """
     modules_overrides = _load_launcher_yaml(modules)
     modules_overrides = _resolve_model_path(model_path, modules_overrides)
-
-    if for_inference:
-        modules_overrides = _deep_update(
-            _resolve_default_accelerator(modules_overrides, {}),
-            modules_overrides,
-        )
+    checkpoint_defaults = _resolve_model_path(model_path, deepcopy(checkpoint_modules) if checkpoint_modules else {})
+    # `broadcast_model_weights_from_rank0` is only meaningful for `fsdp2`; forcing
+    # it off alongside `fsdp_mode: eager` keeps the single-process eager-inference
+    # default from inheriting a rank0-broadcast load policy that cannot run
+    # without a wrap.
+    #
+    # Mixed precision is off for the same reason it is on when training: it
+    # exists to keep fp32 master weights for an optimizer, and inference has no
+    # optimizer. Left on, it builds every module at float32 and calls
+    # `model.float()`, which upcasts whatever the checkpoint stored -- including
+    # a quantized model's fp8 weights and scales, since those are floating point
+    # too. DeepSeek-V4.1's backbone grew to 40 GiB of replicated fp32 that way,
+    # and its fp8 GEMMs would have been handed fp32 operands. These are defaults,
+    # so a config that wants fp32 inference can still ask for it.
+    inference_default = (
+        {
+            "broadcast_model_weights_from_rank0": False,
+            "accelerator": {"fsdp_config": {"fsdp_mode": "eager", "mixed_precision": {"enable": False}}},
+        }
+        if for_inference
+        else {}
+    )
 
     base_dict = _module_base(asdict(global_args))
     runtime_modules: dict[str, OmniModuleRuntimeArguments] = {}
     for name, override in modules_overrides.items():
-        module_args = _instantiate_recursive(
-            OmniModuleRuntimeArguments,
-            _deep_update(deepcopy(base_dict), override),
-        )
-        runtime_modules[name] = module_args
+        merged = deepcopy(base_dict)
+        for layer in (checkpoint_defaults.get(name, {}), inference_default, override):
+            _deep_update(merged, layer)
+        runtime_modules[name] = _instantiate_recursive(OmniModuleRuntimeArguments, merged)
     return runtime_modules
 
 
-def build_module_args(config, name: str) -> OmniModuleRuntimeArguments:
-    """Instantiate :class:`OmniModuleRuntimeArguments` from an ``OmniConfig.modules`` entry."""
-    cfg = config.modules.get(name, None)
-    if cfg is None:
-        raise KeyError(f"Module '{name}' not found in OmniConfig.modules")
-    if not isinstance(cfg, dict):
-        raise TypeError(f"Module '{name}' must be a mapping for build_module_args().")
-    return _instantiate_recursive(OmniModuleRuntimeArguments, _normalize_module_cfg(cfg))
+def _checkpoint_module_fields(omni_cfg, checkpoint_root: str, name: str) -> dict[str, Any]:
+    """What the checkpoint's entry for ``name`` contributes, keyed on launcher fields.
 
-
-def _normalize_module_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Flatten checkpoint-shaped module entries onto launcher fields."""
-    cfg = deepcopy(cfg)
-    cfg.pop("subfolder", None)
-    model_block = cfg.pop("model", None)
-    if isinstance(model_block, dict):
-        for key, value in model_block.items():
-            if key not in cfg:
-                cfg[key] = value
-    return cfg
+    An entry is already keyed on :class:`OmniModuleRuntimeArguments` names
+    (``model_path``, ``model_config``, ``processor_config``,
+    ``ops_implementation``). ``model_path`` goes through ``resolve_module_path``
+    so an entry pointing outside the root keeps its own path instead of being
+    re-derived as ``<root>/<name>``.
+    """
+    fields = deepcopy(omni_cfg._module_entries[name])
+    fields["model_path"] = omni_cfg.resolve_module_path(checkpoint_root, name)
+    return fields
 
 
 def _to_module_global_args(model_runtime: OmniModelRuntimeArguments) -> OmniModuleRuntimeArguments:
     """Project omni-model defaults onto :class:`OmniModuleRuntimeArguments` for per-module merging."""
     shared_fields = {f.name for f in fields(ModelArguments)}
     model_kwargs = {name: getattr(model_runtime, name) for name in shared_fields}
-    model_kwargs["model_config"] = _hf_module_model_config(model_kwargs.get("model_config"))
+    model_kwargs["model_config"] = hf_module_model_config(model_kwargs.get("model_config"))
     return OmniModuleRuntimeArguments(**model_kwargs)
 
 
 def _resolve_graph_type(
-    args: OmniArguments,
+    args: "OmniArguments",
     model_runtime: OmniModelRuntimeArguments,
-    graph: str | dict[str, str],
+    graph: Union[str, dict[str, str]],
     config_key: str,
-    selected: str | None = None,
+    selected: Optional[str] = None,
 ) -> str:
     graph_field = "train_graph" if config_key == "train_type" else "infer_graph"
 
@@ -492,7 +398,7 @@ def _graph_scenario_specs(spec: Any) -> dict[str, Any]:
 
 
 def _load_graph_map(
-    spec: str | os.PathLike | Mapping[str, Any] | list | None,
+    spec: Optional[Union[str, os.PathLike, Mapping[str, Any], list]],
 ) -> dict[str, Any]:
     specs = _graph_scenario_specs(spec)
     if not specs:
@@ -506,19 +412,18 @@ def _load_graph_map(
     return graphs
 
 
-def _load_launcher_yaml(spec: str | os.PathLike | dict | list | None):
+def _load_launcher_yaml(spec: Optional[Union[str, os.PathLike, dict, list]]):
     if spec is None:
         return {}
     if isinstance(spec, (str, os.PathLike)):
-        from .omni_parser import load_yaml_with_inherit
-
-        return load_yaml_with_inherit(str(spec))
+        with open(spec) as f:
+            return yaml.safe_load(f)
     return deepcopy(spec)
 
 
 def _resolve_model_path(
-    model_path: str | os.PathLike,
-    modules_config: dict[str, Any] | None,
+    model_path: Union[str, os.PathLike],
+    modules_config: Optional[dict[str, Any]],
 ) -> dict[str, Any]:
     """Join a relative per-module ``model_path`` under the checkpoint root.
 
@@ -532,44 +437,13 @@ def _resolve_model_path(
     for mod_cfg in modules_config.values():
         if not isinstance(mod_cfg, dict):
             continue
-        resolved = mod_cfg.get("model_path") or mod_cfg.get("weights_path")
+        resolved = mod_cfg.get("model_path")
         if resolved is None:
             continue
         if not os.path.isabs(resolved) and not is_non_local(resolved):
             resolved = os.path.join(checkpoint_root, resolved)
         mod_cfg["model_path"] = resolved
     return modules_config
-
-
-def _resolve_default_accelerator(
-    train_modules_config: dict[str, Any],
-    infer_modules_overrides: dict[str, Any] | None,
-) -> dict[str, Any]:
-    # `broadcast_model_weights_from_rank0` is only meaningful for `fsdp2`; forcing it off here
-    # alongside `fsdp_mode: eager` keeps the common single-process eager-inference default
-    # from inheriting a rank0-broadcast load policy that cannot run without a wrap.
-    #
-    # Mixed precision is off for the same reason it is on when training: it
-    # exists to keep fp32 master weights for an optimizer, and inference has no
-    # optimizer. Left on, it builds every module at float32 and calls
-    # `model.float()`, which upcasts whatever the checkpoint stored -- including
-    # a quantized model's fp8 weights and scales, since those are floating point
-    # too. DeepSeek-V4.1's backbone grew to 40 GiB of replicated fp32 that way,
-    # and its fp8 GEMMs would have been handed fp32 operands. These are defaults,
-    # so a config that wants fp32 inference can still ask for it.
-    eager_by_module = {
-        name: {
-            "broadcast_model_weights_from_rank0": False,
-            "accelerator": {
-                "fsdp_config": {
-                    "fsdp_mode": "eager",
-                    "mixed_precision": {"enable": False},
-                },
-            },
-        }
-        for name in train_modules_config
-    }
-    return _deep_update(eager_by_module, infer_modules_overrides)
 
 
 def _module_base(global_dict: dict[str, Any]) -> dict[str, Any]:
@@ -604,6 +478,33 @@ class OmniInferArguments:
     )
     prompt: str = field(default="", metadata={"help": "User text prompt (required at generate time)."})
     images: list[str] = field(default_factory=list, metadata={"help": "Reference image paths / URLs."})
+    audios: list[str] = field(
+        default_factory=list,
+        metadata={"help": "Standalone audio clip paths / URLs. Sound belonging to a video goes in `videos`."},
+    )
+    videos: list[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Reference video paths / URLs. For a clip with sound, keep it here and set "
+                "`use_audio_in_video: true` under `mm_configs` rather than also listing it under `audios`."
+            )
+        },
+    )
+    mm_configs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "Decode knobs forwarded to every media fetcher (e.g. fps / max_frames / frames_fps / "
+                "image_max_pixels / video_max_pixels / audio_sampling_rate / use_audio_in_video). Free-form, "
+                "and named to match "
+                "training's `data.mm_configs`: both bags reach the same fetchers, so a key means the same "
+                "thing on either side and each fetcher ignores the ones it does not read. Set a group in "
+                "the launcher YAML, override one key with `--infer.mm_configs.<key> <value>`. Not inherited "
+                "from `data.mm_configs` — an inference run states its own decode budget."
+            )
+        },
+    )
     output_dir: str = field(default="output", metadata={"help": "Root output directory."})
     seed: int = field(default=42, metadata={"help": "Random seed."})
     enable_full_determinism: bool = field(
@@ -623,14 +524,10 @@ class OmniInferArguments:
 
 @dataclass
 class OmniDataArguments:
-    """``data.*`` for OmniModel V2."""
+    """``data.*`` for OmniModel."""
 
     train_path: str = field(
         metadata={"help": "Local path/HDFS path of the training data. Use comma to separate multiple datasets."},
-    )
-    eval_path: str | None = field(
-        default=None,
-        metadata={"help": "path of the evaluation data. If None, use a subset of train_path."},
     )
     train_size: int = field(
         default=10_000_000,
@@ -642,15 +539,10 @@ class OmniDataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal[
-        "plaintext",
-        "conversation",
-        "diffusion",
-        "classification",
-        "dpo",
-        "seedomni",
-        "seedomni_cached",
-    ] = field(default="conversation", metadata={"help": "Type of the training data."})
+    data_type: Literal["seedomni", "seedomni_cached"] = field(
+        default="seedomni",
+        metadata={"help": "Type of the training data; `seedomni_cached` reads an offline-cache dataset."},
+    )
     datasets_type: str = field(
         default="mapping",
         metadata={"help": "Type of the datasets."},
@@ -659,37 +551,42 @@ class OmniDataArguments:
         default="interleave",
         metadata={"help": "Type of the datasets for multisource training."},
     )
-    source_name: str = field(
+    source_name: Optional[str] = field(
         default=None,
-        metadata={"help": "Dataset name for training. If multisource, dataset name will be loaded from yaml config."},
+        metadata={
+            "help": (
+                "Preprocessor for samples that carry no `source_name` of their own. If multisource, "
+                "dataset names are loaded from the yaml config."
+            )
+        },
     )
     dyn_bsz_buffer_size: int = field(
         default=200,
         metadata={"help": "Buffer size for dynamic batch size."},
     )
-    text_keys: str = field(
-        default=None,
-        metadata={"help": "Key to get text from the training data."},
-    )
-    chat_template: str = field(
-        default="default",
-        metadata={"help": "Chat template to use."},
-    )
     max_seq_len: int = field(
         default=2048,
         metadata={"help": "Maximum sequence length in training."},
     )
-    silent_exception: bool = field(
-        default=False,
-        metadata={"help": "Whether to ignore exceptions when loading data. Defaults to ``False``"},
-    )
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
-    mm_configs: dict | None = field(
+    mm_configs: Optional[dict] = field(
         default_factory=dict,
-        metadata={"help": "Config for multimodal input (forwarded to the seedomni data transform)."},
+        metadata={
+            "help": (
+                "Config for multimodal input (forwarded to the seedomni data transform, which hands it to "
+                "both the source preprocessor and every media fetcher). `infer.mm_configs` is the same bag "
+                "for an inference run; the decode keys mean the same thing in both. A source that stores "
+                "videos as pre-decoded frame lists must set `frames_fps` to the rate the frames were taken "
+                "at — a list carries no timing, and is refused rather than given a default."
+            )
+        },
     )
 
     def __post_init__(self):
+        if self.data_type not in {"seedomni", "seedomni_cached"}:
+            raise ValueError(
+                f"OmniTrainer only builds the seedomni transforms; got data.data_type={self.data_type!r}."
+            )
         self.enable_multisource = self.train_path.endswith(".yaml")
 
         if self.enable_multisource:
@@ -697,27 +594,13 @@ class OmniDataArguments:
         else:
             self.dataset_name = self.datasets_type
 
-        if self.text_keys is None:
-            if self.data_type == "plaintext":
-                self.text_keys = "content_split"
-            elif self.data_type == "conversation":
-                self.text_keys = "messages"
-            elif self.data_type == "classification":
-                self.text_keys = "text"
-            elif self.data_type == "dpo":
-                self.text_keys = "chosen"
-            elif self.data_type in {"seedomni", "seedomni_cached"}:
-                pass
-            else:
-                raise ValueError(f"Unknown data type: {self.data_type}")
-
         if self.dataloader.num_workers == 0:
             self.dataloader.prefetch_factor = None
 
 
 @dataclass
 class OmniTrainingArguments:
-    """``train.*`` for OmniModel V2 — parallelism and optimizer live on ``model``."""
+    """``train.*`` for OmniModel — parallelism and optimizer live on ``model``."""
 
     dyn_bsz: bool = field(
         default=True,
@@ -727,17 +610,13 @@ class OmniTrainingArguments:
         default=1,
         metadata={"help": "Micro batch size. The number of samples per iteration on each device."},
     )
-    global_batch_size: int | None = field(
+    global_batch_size: Optional[int] = field(
         default=None,
         metadata={"help": "Global batch size. If None, use `micro_batch_size` * `data_parallel_size`."},
     )
     num_train_epochs: int = field(
         default=1,
         metadata={"help": "Epochs to train."},
-    )
-    pad_to_length: bool = field(
-        default=False,
-        metadata={"help": "Pad packed sequences to a fixed length when using dynamic batch size."},
     )
     bsz_warmup_ratio: float = field(
         default=0,
@@ -811,24 +690,25 @@ class OmniTrainingArguments:
         default=42,
         metadata={"help": "Random seed."},
     )
-    max_steps: int | None = field(
+    max_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
     )
     moe_load_balance_monitor_interval: int = field(
         default=0,
+        metadata={"help": "MoE expert load heatmap interval. Not supported by OmniTrainer; must be <= 0 (disabled)."},
+    )
+    training_task: OmniTrainingTask = field(
+        default="online_training",
         metadata={
-            "help": (
-                "Log MoE expert load heatmap every N steps. 0 = disabled. Counts are "
-                "all-reduced across EP and DP groups so the heatmap is global. "
-                "Wandb logging is performed only when train.wandb.enable=True."
-            )
+            "help": "Training task. online_training: encode raw data online. offline_embedding: run the "
+            "graph's offline_encode nodes and write the cache. offline_training: train from the cache; a "
+            "module the training graph calls only through online_process is built on meta."
         },
     )
-    train_type: str | None = field(default=None, metadata={"help": "SeedOmni V2 training workflow."})
-    offline_cache_dir: str | None = field(
+    offline_cache_dir: Optional[str] = field(
         default=None,
-        metadata={"help": "Output directory for train_type='offline_cache'."},
+        metadata={"help": "Output directory for training_task='offline_embedding'."},
     )
     graph_profile: OmniGraphProfileArguments = field(default_factory=OmniGraphProfileArguments)
     wandb: WandbConfig = field(default_factory=WandbConfig)
@@ -837,14 +717,18 @@ class OmniTrainingArguments:
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
-        self.train_type = self.train_type or "train"
-        if self.train_type not in OMNI_TRAIN_WORKFLOWS:
-            known = ", ".join(sorted(OMNI_TRAIN_WORKFLOWS))
-            raise ValueError(f"Unknown train.train_type {self.train_type!r}; expected one of: {known}.")
-        if self.train_type == "train_and_cache":
-            raise NotImplementedError("`train.train_type: train_and_cache` is reserved and is not implemented yet.")
-        if self.train_type == "offline_cache" and not self.offline_cache_dir:
-            raise ValueError("`train.offline_cache_dir` is required when `train.train_type` is 'offline_cache'.")
+        if self.training_task not in get_args(OmniTrainingTask):
+            known = ", ".join(get_args(OmniTrainingTask))
+            raise ValueError(f"Unknown train.training_task {self.training_task!r}; expected one of: {known}.")
+        if self.training_task == "offline_embedding" and not self.offline_cache_dir:
+            raise ValueError(
+                "`train.offline_cache_dir` is required when `train.training_task` is 'offline_embedding'."
+            )
+        if self.training_task == "offline_embedding" and self.num_train_epochs != 1:
+            raise ValueError(
+                "`train.training_task='offline_embedding'` writes every sample it reads, so "
+                f"`train.num_train_epochs` must be 1; got {self.num_train_epochs}."
+            )
 
         if self.dyn_bsz_physical_overflow_ratio < 1.0:
             raise ValueError(
@@ -856,6 +740,13 @@ class OmniTrainingArguments:
         self.global_rank = int(os.getenv("RANK", 0))
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
         self._resolve_checkpoint_paths()
+        if self.training_task == "offline_embedding" and self.checkpoint.load_path:
+            raise ValueError(
+                "`train.checkpoint.load_path` is not supported with `train.training_task='offline_embedding'`: "
+                "its frozen modules have no checkpoint manager, so the weights would not be restored while the "
+                "dataloader position would. Point the encoder's `model_path` at an HF checkpoint instead; "
+                f"got load_path={self.checkpoint.load_path!r}."
+            )
         self._resolve_profile()
 
     def _derive_batch_config(self, accelerator: AcceleratorConfig) -> None:
@@ -923,21 +814,47 @@ def _validate_omni_accelerator(accelerator: AcceleratorConfig) -> None:
     ``AcceleratorConfig.__post_init__``; the ``ep_sharded_stream_load`` /
     ``broadcast_model_weights_from_rank0`` exclusion runs in
     ``ModelArguments.__post_init__``. Neither is repeated here. What is left is the
-    V2-only ``torch_compile`` ban (V1 supports it, with its own validation in
-    ``VeOmniArguments``).
+    SeedOmni-only ``torch_compile`` ban (single-model trainers support it, with
+    their own validation in ``VeOmniArguments``).
 
     Called once for the top-level default (``model.accelerator``, at ``OmniArguments.__post_init__``
-    time, before modules are resolved) and once per module (in :func:`resolve_omni_model`, after
+    time, before modules are resolved) and once per module (in :func:`build_omni_model_runtime_args`, after
     ``modules`` merges each module's own ``accelerator:`` YAML override) so a per-module override is
     validated too, not just the global default.
     """
     if accelerator.torch_compile.enable:
-        raise ValueError("accelerator.torch_compile.enable is not supported by SeedOmni V2 yet.")
+        raise ValueError("accelerator.torch_compile.enable is not supported by SeedOmni yet.")
+
+
+def _validate_training_task_data(train: OmniTrainingArguments, data: OmniDataArguments) -> None:
+    """Only ``offline_training`` reads an offline cache; the other tasks read raw ``seedomni`` data."""
+    if (train.training_task == "offline_training") != (data.data_type == "seedomni_cached"):
+        expected = "seedomni_cached" if train.training_task == "offline_training" else "seedomni"
+        raise ValueError(
+            f"`train.training_task={train.training_task!r}` needs `data.data_type={expected!r}`; "
+            f"got {data.data_type!r}."
+        )
+
+
+def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
+    """Reject an eager module under a top-level ``fsdp_scope='model'`` before any weights load."""
+    fsdp_config = accelerator.fsdp_config
+    if fsdp_config.fsdp_scope != "model" or fsdp_config.fsdp_mode == "eager":
+        return
+    eager = sorted(
+        name for name, module_args in modules.items() if module_args.accelerator.fsdp_config.fsdp_mode == "eager"
+    )
+    if eager:
+        raise ValueError(
+            "fsdp_scope='model' wraps the composed OmniModel once, so no module can be loaded "
+            f"unwrapped; these use fsdp_mode='eager': {eager}. Run with fsdp_scope='module', or "
+            "give them fsdp2 / ddp."
+        )
 
 
 @dataclass
 class OmniArguments:
-    """Root launcher config for SeedOmni V2."""
+    """Root launcher config for SeedOmni."""
 
     model: OmniModelRuntimeArguments = field(default_factory=OmniModelRuntimeArguments)
     data: OmniDataArguments = field(default_factory=OmniDataArguments)
@@ -955,34 +872,20 @@ class OmniArguments:
                 "Otherwise, each node will save checkpoints to its local directory, which may cause inconsistencies or job failures."
             )
 
+        assert self.train.moe_load_balance_monitor_interval <= 0, (
+            "OmniTrainer does not support the MoE router monitor; set train.moe_load_balance_monitor_interval=0."
+        )
+
         self.train._derive_batch_config(self.model.accelerator)
 
-        if self.train.pad_to_length:
-            if not self.train.dyn_bsz:
-                logger.warning_rank0(
-                    "pad_to_length is enabled without dyn_bsz, which is not supported. "
-                    "Please set pad_to_length to False or enable dyn_bsz."
-                )
-                self.train.pad_to_length = False
-            else:
-                self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
-                logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
-
         _validate_omni_accelerator(self.model.accelerator)
-
-    def resolve_model(self, *, for_inference: bool = False) -> OmniModelRuntimeArguments:
-        """Build a resolved :class:`OmniModelRuntimeArguments`.
-
-        Set ``for_inference=True`` to apply the all-eager inference accelerator
-        default on top of ``model.model_config.modules``.
-        """
-        return resolve_omni_model(self, for_inference=for_inference)
+        _validate_training_task_data(self.train, self.data)
 
     def _to_module_global_args(self) -> OmniModuleRuntimeArguments:
         """Project ``model`` defaults onto :class:`OmniModuleRuntimeArguments` for per-module merging."""
         return _to_module_global_args(self.model)
 
-    def compute_train_steps(self, dataset_length: int | None = None):
+    def compute_train_steps(self, dataset_length: Optional[int] = None):
         if self.train.dyn_bsz:
             assert self.data.max_seq_len is not None and self.data.train_size is not None, (
                 "data.max_seq_len and data.train_size are required."
@@ -1008,9 +911,6 @@ class OmniArguments:
 
 
 __all__ = [
-    "DEFAULT_SCENARIO",
-    "LAUNCHER_CONFIG_KEYS",
-    "OMNI_TRAIN_WORKFLOWS",
     "OmniArguments",
     "OmniDataArguments",
     "OmniGraphProfileArguments",
@@ -1018,10 +918,6 @@ __all__ = [
     "OmniModelRuntimeArguments",
     "OmniModuleRuntimeArguments",
     "OmniTrainingArguments",
-    "_hf_module_model_config",
-    "_is_omni_checkpoint_root",
-    "build_module_args",
-    "build_module_runtime_args",
-    "build_omni_model_runtime",
-    "resolve_omni_model",
+    "build_omni_module_runtime_args",
+    "build_omni_model_runtime_args",
 ]

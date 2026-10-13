@@ -29,6 +29,7 @@ usage/arguments.md
 usage/basic_modules.md
 usage/multimodal_data_processing.md
 usage/data_packing_and_dyn_bsz.md
+usage/dit_microbatching.md
 usage/support_new_models/guide_and_checklist.md
 usage/support_new_models/qwen3_vl_example.md
 usage/support_new_models/qwen3_omni_moe_example.md
@@ -70,6 +71,7 @@ examples/qwen3_vl.md
 examples/qwen3_omni_moe.md
 examples/qwen3_omni_offline_av.md
 examples/minimax_h3.md
+examples/minimax_h3_smoke_test.md
 examples/wan2.1.md
 examples/wan2.1_I2V_1.3B.md
 examples/ltx-2.3.md
@@ -85,21 +87,38 @@ key_features/model_loader.md
 key_features/preprocessor_registry.md
 key_features/ep_fsdp2.md
 key_features/extra_parallel.md
+key_features/sharded_embedding.md
 key_features/ulysses.md
 key_features/lora.md
+key_features/mtp.md
 
 ```
 
 ```{toctree}
 :maxdepth: 1
-:caption: SeedOmni V2
+:caption: SeedOmni
 
-seed_omni/seed_omni_v2.md
-seed_omni/data_format.md
-seed_omni/av_video_design.md
-seed_omni/example_models/janus.md
-seed_omni/example_models/qwen3.md
-seed_omni/example_models/qwen3vl.md
+seed_omni/design/architecture.md
+seed_omni/design/media.md
+seed_omni/usage/training_and_inference.md
+seed_omni/usage/data_format.md
+seed_omni/usage/adding_a_model.md
+seed_omni/usage/hf_layout.md
+seed_omni/distributed/per_module_parallelism.md
+seed_omni/distributed/sequence_parallel.md
+seed_omni/mixins/metric_meter.md
+seed_omni/mixins/offline_encoding.md
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: SeedOmni Models
+
+seed_omni/models/janus.md
+seed_omni/models/qwen3.md
+seed_omni/models/qwen3_moe.md
+seed_omni/models/qwen3vl.md
+seed_omni/models/bagel.md
 ```
 
 ```{toctree}

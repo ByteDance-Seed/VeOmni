@@ -19,9 +19,9 @@ from torch.nn.functional import scaled_dot_product_attention
 
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
-from ....omni_pretrained_model import OmniPreTrainedModel
 from ....utils.conversation import ConversationItem, iter_desired_items
-from ..sources import BAGEL_SIGLIP_CONTEXT
+from ...module_modeling_base import PretrainedOmniModule
+from ..sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT
 
 
 if IS_CUDA_AVAILABLE:
@@ -46,7 +46,7 @@ def select_siglip_image_items(
         iter_desired_items(
             conversation_list,
             types=["image"],
-            sources=[BAGEL_SIGLIP_CONTEXT],
+            meta={BAGEL_CONTEXT_KEY: [BAGEL_SIGLIP_CONTEXT]},
         )
     )
 
@@ -90,7 +90,7 @@ def scatter_siglip_image_embeds(
     lengths = token_lens.detach().cpu().reshape(-1).tolist()
     for item, length in zip(image_items, lengths, strict=True):
         item.value = image_embeds[offset : offset + int(length)].to(device=device, dtype=dtype)
-        item.source = BAGEL_SIGLIP_CONTEXT
+        item.meta[BAGEL_CONTEXT_KEY] = BAGEL_SIGLIP_CONTEXT
         offset += int(length)
 
     if offset != int(image_embeds.shape[0]):
@@ -100,7 +100,7 @@ def scatter_siglip_image_embeds(
 class InferenceMixin:
     """FSM ``generate`` — HF ``GenerationMixin`` analog.
 
-    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
+    Listed *before* :class:`~...module_modeling_base.PretrainedOmniModule` in
     :class:`BagelSiglipNavit`'s bases for consistency with every other
     module's native / accelerated split (see ``janus/llama/modeling.py`` for
     the full MRO rationale where a competing no-op default exists).
@@ -130,7 +130,7 @@ class InferenceMixin:
         return {"conversation_list": batched[0]}
 
 
-class BagelSiglipNavit(InferenceMixin, OmniPreTrainedModel):
+class BagelSiglipNavit(InferenceMixin, PretrainedOmniModule):
     config_class = BagelSiglipNavitConfig
     image_processor_class = BagelSiglipNavitProcessor
     preprocessor_class = BagelSiglipNavitPreprocessor

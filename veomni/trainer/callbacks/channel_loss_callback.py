@@ -111,9 +111,17 @@ class ChannelLossComputer:
         """Walk common wrappers to find the module whose forward calls ``loss_function``."""
 
         visited = set()
-        cur: torch.nn.Module | None = model
+        cur: Any = model
         while cur is not None and id(cur) not in visited:
             visited.add(id(cur))
+            if not isinstance(cur, torch.nn.Module):
+                nxt = getattr(cur, "unwrapped_module", None)
+                if nxt is None:
+                    nxt = getattr(cur, "model", None)
+                if isinstance(nxt, torch.nn.Module) and nxt is not cur:
+                    cur = nxt
+                    continue
+                return None
             cls_name = type(cur).__name__
             is_native_lora = any(cls.__name__ == "VeOmniLoraModel" for cls in type(cur).__mro__)
             if is_native_lora:
@@ -156,6 +164,15 @@ class ChannelLossComputer:
         if self._installed:
             return
 
+        # ``trainer.model`` is a VeOmniModelRuntime handle: reads forward via
+        # ``__getattr__``, writes do not. Peel it (and DDP) before patching.
+        if not isinstance(model, torch.nn.Module):
+            unwrapped = getattr(model, "unwrapped_module", None)
+            if not isinstance(unwrapped, torch.nn.Module):
+                unwrapped = getattr(model, "model", None)
+            if isinstance(unwrapped, torch.nn.Module):
+                model = unwrapped
+
         host = self._resolve_loss_fn_host(model)
         if host is None or not hasattr(host, "loss_function"):
             logger.warning_rank0(
@@ -165,7 +182,15 @@ class ChannelLossComputer:
             )
         else:
             self._original_loss_fn = host.loss_function
-            host.loss_function = self._wrapped_loss_fn
+            wrapper = self._wrapped_loss_fn
+            host.loss_function = wrapper
+            if host.loss_function is not wrapper:
+                raise RuntimeError(
+                    "Channel loss wrap did not stick on "
+                    f"{type(host).__name__} (outer={type(model).__name__}); "
+                    "the runtime handle forwards reads but not writes — pass "
+                    "the nn.Module."
+                )
             self._model_ref = host
             logger.info_rank0(
                 f"Channel loss: wrapped {type(host).__name__}.loss_function (outer={type(model).__name__})."
@@ -887,7 +912,8 @@ class ChannelLossCallback(Callback):
     def on_train_begin(self, state: TrainerState, **kwargs: Any) -> None:
         if not self.enabled:
             return
-        self.computer.install(self.trainer.model)
+        model = getattr(self.trainer.model, "unwrapped_module", self.trainer.model)
+        self.computer.install(model)
         logger.info_rank0(
             "Channel loss enabled "
             f"(interval={self.config.interval}, source_id_keys={self.config.source_id_keys}, "

@@ -72,7 +72,7 @@ def _sp_state(monkeypatch, *, sp_size: int = 1, sp_rank: int = 0):
     """Stand-in ParallelState for the SP aggregation helpers.
 
     The computer takes its SP group from the ParallelState it is handed (there are
-    no module-level group getters — constraint 7d), so ``sp_rank`` is injected by
+    no module-level group getters — constraint 7f), so ``sp_rank`` is injected by
     patching the rank lookup for the fake group.
     """
     group = object() if sp_size > 1 else None
@@ -85,7 +85,7 @@ def _bypass_base_state_scope(monkeypatch, *modules):
     """Neutralize ``use_parallel_state("base")`` in hand-built trainer tests.
 
     The ``"base"`` registry entry is created by ``BaseTrainer._setup`` (constraint
-    7d), which these tests skip — they build the trainer with ``object.__new__``
+    7f), which these tests skip — they build the trainer with ``object.__new__``
     and drive one production method directly.
     """
     for module in modules:

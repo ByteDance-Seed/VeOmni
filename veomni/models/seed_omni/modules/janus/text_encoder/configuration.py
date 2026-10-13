@@ -31,3 +31,8 @@ class JanusTextEncoderConfig(TextEncoderConfig):
     """
 
     model_type = "janus_text_encoder"
+
+    # transformers v5 swaps an ``__init__``-less config subclass for a dataclass
+    # one that skips the parents' ``__init__`` (and with it their defaults).
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)

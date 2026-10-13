@@ -30,6 +30,11 @@ from .conversation import ConversationItem
 logger = logging.get_logger(__name__)
 
 
+def _first_rank_of_its_dp_rank(dp_ranks: list[int], rank: int) -> bool:
+    """Whether global ``rank`` is the lowest of the ranks sharing its ``dp_rank``."""
+    return dp_ranks.index(dp_ranks[rank]) == rank
+
+
 class SeedOmniOfflineCacheWriter:
     """Write cached SeedOmni conversation-carrier samples as parquet shards."""
 
@@ -37,13 +42,44 @@ class SeedOmniOfflineCacheWriter:
         parallel_state = get_parallel_state()
         self.rank = parallel_state.dp_rank if parallel_state.dp_rank >= 0 else int(os.getenv("RANK", 0))
         self.world_size = parallel_state.dp_size if parallel_state.dp_size > 0 else int(os.getenv("WORLD_SIZE", 1))
+        # SP / CP / TP ranks of one data-parallel group hold the same batch and
+        # would write the same shard paths, so only the first of them writes.
+        self.writes = True
+        if dist.is_available() and dist.is_initialized():
+            dp_ranks = [None] * dist.get_world_size()
+            dist.all_gather_object(dp_ranks, self.rank)
+            self.writes = _first_rank_of_its_dp_rank(dp_ranks, dist.get_rank())
         self.save_path = save_path
         self.max_rows_per_shard = max_rows_per_shard
         self.shard_index = 0
         self.buffer: list[dict[str, bytes]] = []
         self.rows_written = 0
         os.makedirs(save_path, exist_ok=True)
+        self._reject_existing_shards()
         logger.info_rank0(f"SeedOmni offline cache writer saving parquet shards under {save_path}.")
+
+    def _reject_existing_shards(self) -> None:
+        """Refuse to write into a directory that already holds cache shards.
+
+        Shard names are a pure function of rank and write order, so a second
+        run over the same directory overwrites the low shards and leaves the
+        high ones behind. :meth:`_compact_shard_names` then renumbers whatever
+        it finds into one contiguous range, quietly presenting the leftovers of
+        the earlier run as part of this cache.
+
+        Every rank checks the same directory before any of them flushes, so
+        this fails on all ranks together rather than deadlocking one of them.
+        """
+        existing = [
+            name for name in os.listdir(self.save_path) if name.startswith("shard_") and name.endswith(".parquet")
+        ]
+        if existing:
+            raise FileExistsError(
+                f"SeedOmni offline cache directory '{self.save_path}' already contains "
+                f"{len(existing)} shard(s). Writing here would overwrite some and silently "
+                f"keep the rest. Point `save_path` at a new directory, or delete the existing "
+                f"shards first."
+            )
 
     @staticmethod
     def _cpu_recursive(value: Any) -> Any:
@@ -52,7 +88,7 @@ class SeedOmniOfflineCacheWriter:
                 type=value.type,
                 value=SeedOmniOfflineCacheWriter._cpu_recursive(value.value),
                 role=value.role,
-                source=value.source,
+                is_dummy=value.is_dummy,
                 meta=SeedOmniOfflineCacheWriter._cpu_recursive(value.meta),
             )
         if isinstance(value, dict):
@@ -66,6 +102,8 @@ class SeedOmniOfflineCacheWriter:
         return value
 
     def save_conversation_list(self, conversation_list: list[list[ConversationItem]]) -> None:
+        if not self.writes:
+            return
         for sample in conversation_list:
             persisted = [self._cpu_recursive(item) for item in sample]
             if not persisted:
@@ -94,7 +132,7 @@ class SeedOmniOfflineCacheWriter:
         if distributed:
             dist.barrier()
 
-        if not distributed or self.rank == 0:
+        if not distributed or dist.get_rank() == 0:
             self._compact_shard_names()
 
         if distributed:
