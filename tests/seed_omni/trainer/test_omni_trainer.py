@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -156,21 +157,24 @@ def test_the_offline_cache_writer_opens_after_the_trainer_state_is_restored(monk
 
 
 def test_offline_cache_step_writes_every_micro_batch_without_autograd():
-    """The graph writes encoded values into the items in place; the writer gets those same items."""
+    """The writer gets the items ``forward`` returns: an FSDP2 input cast hands the graph copies to encode."""
     grad_enabled = []
 
     def forward(micro_batch):
         grad_enabled.append(torch.is_grad_enabled())
-        for sample in micro_batch["conversation_list"]:
+        copies = [
+            [dataclasses.replace(item, meta=dict(item.meta)) for item in s] for s in micro_batch["conversation_list"]
+        ]
+        for sample in copies:
             for item in sample:
                 item.value = f"encoded-{item.value}"
                 item.meta["cache"] = "vae"
+        return {"loss": None, "losses": {}, "conversation_list": copies}
 
     micro_batches = [
         {"conversation_list": [[ConversationItem(type="image", value=name, role="user", meta={})]]}
         for name in ("a", "b")
     ]
-    lists_before = [mb["conversation_list"] for mb in micro_batches]
     items_before = [mb["conversation_list"][0][0] for mb in micro_batches]
 
     trainer = OmniTrainer.__new__(OmniTrainer)
@@ -189,9 +193,8 @@ def test_offline_cache_step_writes_every_micro_batch_without_autograd():
 
     assert grad_enabled == [False, False]
     saved = [c.args[0] for c in trainer.offline_cache_writer.save_conversation_list.call_args_list]
-    assert [s is before for s, before in zip(saved, lists_before)] == [True, True]
     assert [len(s) == 1 and len(s[0]) == 1 for s in saved] == [True, True]
-    assert [s[0][0] is item for s, item in zip(saved, items_before)] == [True, True]
+    assert [(item.value, item.meta) for item in items_before] == [("a", {}), ("b", {})]
     assert [(s[0][0].value, s[0][0].meta) for s in saved] == [
         ("encoded-a", {"cache": "vae"}),
         ("encoded-b", {"cache": "vae"}),

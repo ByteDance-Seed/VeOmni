@@ -267,13 +267,16 @@ The pieces that complete this workflow are in place:
 [`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L535)
 runs the encoding run, and
 [`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L179)
-persists each conversation from the micro-batch's `conversation_list`. The
-training graph must only mutate `ConversationItem` fields in place (for
-example `value` and `meta`); it must not replace the list, append items, or
-drop items. Structural changes belong in the processor / collator stage,
-before the graph runs. Under that contract the trainer still sees the encoded
-items after FSDP2's root pre-forward, which may rebuild the outer dicts and
-lists but keeps the same item objects. Ranks that share a `dp_rank` (SP, CP or
+persists each conversation of the `conversation_list` that
+[`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L460)
+returns. The training graph must only mutate `ConversationItem` fields in
+place (for example `value` and `meta`); it must not replace the list, append
+items, or drop items. Structural changes belong in the processor / collator
+stage, before the graph runs. The trainer still reads the list from the return
+value, not from the micro-batch it passed in: under `fsdp_scope: model` with
+mixed precision, FSDP2's root pre-forward casts the inputs with
+`dataclasses.replace`, so the graph updates copies of the micro-batch's items.
+Ranks that share a `dp_rank` (SP, CP or
 TP peers) hold the same batch, so
 [only the first of them writes](../../../veomni/models/seed_omni/utils/offline_cache.py#L36).
 The training run reads the cache through the
