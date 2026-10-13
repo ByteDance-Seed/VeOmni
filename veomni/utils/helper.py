@@ -832,9 +832,9 @@ def make_list(item):
 
 
 class ProfilerWithMem:
-    """Thin wrapper that toggles CUDA-allocator tracing around profiler.step().
+    """Thin wrapper that toggles allocator history around profiler start/stop.
 
-    This is intentionally CUDA-only; Ascend memory events are owned by
+    CUDA and MLU expose allocator snapshots; Ascend memory events are owned by
     ``torch_npu.profiler`` and remain in its trace output.
     """
 
@@ -1115,7 +1115,7 @@ def create_profiler(
         base_profiler._veomni_npu_analysis_mode = effective_npu_analysis_mode
         base_profiler._veomni_npu_sidecars = npu_sidecars
         return base_profiler
-    if IS_CUDA_AVAILABLE and profile_memory:
+    if (IS_CUDA_AVAILABLE or IS_MLU_AVAILABLE) and profile_memory:
         return ProfilerWithMem(base_profiler)
     return base_profiler
 

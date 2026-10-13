@@ -1418,3 +1418,37 @@ def test_profile_callback_skips_elapsed_window(monkeypatch):
     assert callback._profile_active is False
     assert callback.profiler is None
     assert warnings == ["Profiling window [5, 6) has no remaining steps after global step 5; profiling is skipped."]
+
+
+@pytest.mark.parametrize("backend", ["cuda", "mlu"])
+@pytest.mark.parametrize("profile_memory", [False, True])
+def test_non_npu_profiler_records_allocator_history(monkeypatch, tmp_path, backend, profile_memory):
+    events = []
+    inner = SimpleNamespace(start=lambda: events.append("start"), stop=lambda: events.append("stop"))
+    fake_profiler = SimpleNamespace(
+        ProfilerActivity=SimpleNamespace(CPU="cpu", CUDA="cuda", MLU="mlu"),
+        schedule=lambda **kwargs: kwargs,
+        profile=lambda **kwargs: inner,
+    )
+    monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", backend == "cuda")
+    monkeypatch.setattr(helper, "IS_MLU_AVAILABLE", backend == "mlu")
+    monkeypatch.setattr(helper.torch, "profiler", fake_profiler)
+    monkeypatch.setattr(
+        helper,
+        "get_torch_device",
+        lambda: SimpleNamespace(memory=SimpleNamespace(_record_memory_history=lambda **kw: events.append(kw))),
+    )
+    profiler = helper.create_profiler(
+        start_step=1,
+        end_step=2,
+        trace_dir=str(tmp_path),
+        record_shapes=False,
+        profile_memory=profile_memory,
+        with_stack=False,
+        with_modules=False,
+        global_rank=0,
+    )
+    profiler.start()
+    profiler.stop()
+    assert events == (["start", {}, "stop", {"enabled": None}] if profile_memory else ["start", "stop"])
