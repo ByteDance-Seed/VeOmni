@@ -328,6 +328,7 @@ def test_bagel_vae_offline_cache_replay_keeps_img_tag_for_flow_connector(tmp_pat
     encoded = encode_model.post_forward("offline_encode", **out)["conversation_list"]
 
     writer = SeedOmniOfflineCacheWriter(str(tmp_path))
+    writer.open()
     writer.save_conversation_list(encoded)
     writer.flush()
     dataset = load_dataset("parquet", data_files=[str(tmp_path / "shard_000000.parquet")], split="train")
