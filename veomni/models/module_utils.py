@@ -55,6 +55,7 @@ from .checkpoint_tensor_loading import (
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
+from .load_plan import LoadLayout, LoadPlanEntry, build_load_plan, execute_load_plan
 
 
 if TYPE_CHECKING:
@@ -650,6 +651,12 @@ def load_model_weights_ep_sharded(
     ``[E/ep, ...]`` with ``parallel_plan=None`` so it is not sliced again, then
     the FSDP ``dtensor_factory`` shards it over the ``ep_fsdp`` sub-mesh.
 
+    A checkpoint that needs no converter transform streams through a
+    :class:`~veomni.models.load_plan.LoadPlan`: it is planned from the safetensors
+    headers first, so a shape mismatch fails on every rank before any tensor is
+    read. Persistent ExtraParallel parameters and converter-claimed keys take the
+    loop below.
+
     Raises ``NotImplementedError`` when the checkpoint/model is unsupported: no
     ExtraParallel ``get_parallel_plan``, or a checkpoint-tensor converter whose
     transform needs the whole tensor set. Three converter transforms stay streamable:
@@ -759,6 +766,48 @@ def load_model_weights_ep_sharded(
             and not checkpoint_converter_is_dim0_zero_pad(converter, bare_name)
         )
 
+    dtensor_to_cpu = init_device == "cpu"
+
+    def _finish_load() -> None:
+        if is_peft_model and adapter_path:
+            # Stream the LoRA adapter the same per-rank way as the base: independent MoE
+            # LoRA (3-D ``Shard(0)`` in the runtime plan) is read one dim-0 expert slice
+            # per rank; shared/dense LoRA (not in the plan) is read whole on every rank
+            # (replicated). When ``adapter_path`` is None (fresh build) the LoRA params
+            # stay un-loaded and are kaiming-A/zero-B init'd below.
+            _stream_lora_adapter_ep_sharded(
+                model,
+                adapter_path,
+                init_device,
+                dtensor_factory,
+                parallel_plan,
+                parameter_names_to_load,
+                param_shapes,
+                parallel_state,
+                dtensor_to_cpu,
+            )
+        post_process_after_weight_loading(
+            model, buffer_dict, parameter_names_to_load, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu
+        )
+
+    if _load_plan_streams_checkpoint(model, converter, (_convert_weight_key(key, model) for key in key_to_file)):
+        _stream_ep_sharded_by_load_plan(
+            model,
+            key_to_file,
+            file_to_path,
+            target_name=lambda key: _apply_peft_override(_convert_weight_key(key, model)),
+            init_device=init_device,
+            dtensor_factory=dtensor_factory,
+            parallel_plan=parallel_plan,
+            parallel_state=parallel_state,
+            param_shapes=param_shapes,
+            parameter_names_to_load=parameter_names_to_load,
+            buffer_dict=buffer_dict,
+            dtensor_to_cpu=dtensor_to_cpu,
+        )
+        _finish_load()
+        return
+
     # Up-front scan of the *raw checkpoint keys* for a converter's non-dim0-zero-pad
     # transforms. It must run over raw keys rather than in the per-destination main loop:
     # a per-expert key (e.g. ``model.layers.0.mlp.experts.3.gate_proj.weight``) has no
@@ -844,7 +893,6 @@ def load_model_weights_ep_sharded(
             expert_converter = converter.for_expert_range(*expert_range)
 
     model.to_empty(device=init_device)
-    dtensor_to_cpu = init_device == "cpu"
 
     keys_by_file: Dict[str, List[str]] = {}
     for key, fname in key_to_file.items():
@@ -1040,27 +1088,85 @@ def load_model_weights_ep_sharded(
         f"skipped {n_skipped} converter-declared tensors without reading; stacked {n_expert_reads} local "
         f"per-expert tensors and skipped {n_remote_experts} other ranks' without reading."
     )
+    _finish_load()
 
-    if is_peft_model and adapter_path:
-        # Stream the LoRA adapter the same per-rank way as the base: independent MoE
-        # LoRA (3-D ``Shard(0)`` in the runtime plan) is read one dim-0 expert slice
-        # per rank; shared/dense LoRA (not in the plan) is read whole on every rank
-        # (replicated). When ``adapter_path`` is None (fresh build) the LoRA params
-        # stay un-loaded and are kaiming-A/zero-B init'd below.
-        _stream_lora_adapter_ep_sharded(
-            model,
-            adapter_path,
-            init_device,
-            dtensor_factory,
-            parallel_plan,
-            parameter_names_to_load,
-            param_shapes,
-            parallel_state,
-            dtensor_to_cpu,
-        )
 
-    post_process_after_weight_loading(
-        model, buffer_dict, parameter_names_to_load, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu
+def _load_plan_streams_checkpoint(model: "nn.Module", converter, bare_names) -> bool:
+    """Whether :func:`_stream_ep_sharded_by_load_plan` can load this checkpoint.
+
+    It can when no checkpoint key needs a converter transform: a converter can
+    claim a key by name (``can_handle``) or by dtype (``can_handle_tensor``, which
+    needs the tensor). Persistent ExtraParallel parameters (e.g. Qwen4-Exp PLE)
+    are not covered yet either.
+    """
+    if any(spec.persistent_fsdp_shard_dim is not None for spec in getattr(model, "_fqn2spec_info", {}).values()):
+        return False
+    if converter is None:
+        return True
+    if callable(getattr(converter, "can_handle_tensor", None)):
+        return False
+    return not any(converter.can_handle(name) for name in bare_names)
+
+
+def _stream_ep_sharded_by_load_plan(
+    model: "nn.Module",
+    key_to_file: Dict[str, str],
+    file_to_path: Dict[str, str],
+    *,
+    target_name: Callable[[str], str],
+    init_device: str,
+    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]],
+    parallel_plan: "ParallelPlan",
+    parallel_state: Any,
+    param_shapes: Dict[str, tuple],
+    parameter_names_to_load: set,
+    buffer_dict: Dict[str, "torch.Tensor"],
+    dtensor_to_cpu: bool,
+) -> None:
+    """Stream a checkpoint that needs no converter transform through a :class:`LoadPlan`.
+
+    ExtraParallel parameters load this rank's ``Shard(0)`` rows; dense parameters
+    and buffers load whole, and FSDP's ``dtensor_factory`` shards dense parameters.
+    """
+
+    def _layout(name: str) -> LoadLayout:
+        shard_group = parallel_plan._get_shard_parameter_groupname(name)
+        if shard_group is None:
+            return LoadLayout.whole(param_shapes[name])
+        para_size, para_rank, _ = _ep_dim0_slice_meta(parallel_state, shard_group, param_shapes[name][0])
+        return LoadLayout.dim0_shard(param_shapes[name], para_rank, para_size)
+
+    plan = build_load_plan(
+        key_to_file,
+        file_to_path,
+        target_name=target_name,
+        parameter_layouts={name: _layout(name) for name in parameter_names_to_load},
+        buffer_shapes={name: tuple(buffer.shape) for name, buffer in buffer_dict.items()},
+    )
+    for name in plan.unexpected_keys:
+        logger.info_rank0(f"Unexpected key in state dict: {name}.")
+
+    model.to_empty(device=init_device)
+    counts = {"sliced": 0, "dense": 0, "buffer": 0}
+
+    def _dispatch(entry: LoadPlanEntry, tensor: "torch.Tensor") -> None:
+        if entry.is_buffer:
+            buffer_dict[entry.target] = tensor.clone()
+            counts["buffer"] += 1
+            return
+        if parallel_plan._get_shard_parameter_groupname(entry.target) is not None:
+            # Already this rank's rows -> parallel_plan=None (do not slice again).
+            _dispatch_parameter(model, entry.target, tensor, dtensor_factory, None, dtensor_to_cpu)
+            counts["sliced"] += 1
+        else:
+            _dispatch_parameter(model, entry.target, tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
+            counts["dense"] += 1
+        parameter_names_to_load.discard(entry.target)
+
+    execute_load_plan(plan, file_to_path, _dispatch)
+    logger.info_rank0(
+        f"ep_sharded_stream_load (load plan): read {counts['sliced']} ExtraParallel-sliced, {counts['dense']} dense, "
+        f"{counts['buffer']} buffer tensors/rank; skipped {len(plan.unexpected_keys)} unexpected tensors without reading."
     )
 
 
