@@ -68,32 +68,34 @@ def snapshot(tmp_path_factory):
     vocab = {token: idx for idx, token in enumerate(special + sorted(ByteLevel.alphabet()))}
     tokenizer = Qwen2Tokenizer(vocab=vocab, merges=[], pad_token=special[0], eos_token=special[2])
     tokenizer.add_special_tokens({"additional_special_tokens": special[1:]})
-    tokenizer.save_pretrained(root / "tokenizer")
     # Qwen2VLProcessor needs vision-related special tokens for edit mode.
     vision_tokens = [
         "<|vision_start|>",
         "<|vision_end|>",
         "<|image_pad|>",
+        "<|video_pad|>",
         "<|object_ref_start|>",
         "<|object_ref_end|>",
         "<|box_start|>",
         "<|box_end|>",
     ]
     tokenizer.add_special_tokens({"additional_special_tokens": vision_tokens})
-    try:
-        from transformers import Qwen2VLImageProcessor, Qwen2VLProcessor
+    tokenizer.save_pretrained(root / "tokenizer")
+    from transformers import Qwen2VLImageProcessor, Qwen2VLProcessor, Qwen2VLVideoProcessor
 
-        image_processor = Qwen2VLImageProcessor(
-            patch_size=2,
-            merge_size=1,
-            temporal_patch_size=1,
-            min_pixels=16,
-            max_pixels=1024,
-        )
-        processor = Qwen2VLProcessor(image_processor=image_processor, tokenizer=tokenizer)
-        processor.save_pretrained(root / "processor")
-    except Exception:
-        pass
+    processor_kwargs = {
+        "patch_size": 2,
+        "merge_size": 1,
+        "temporal_patch_size": 1,
+        "min_pixels": 16,
+        "max_pixels": 1024,
+    }
+    processor = Qwen2VLProcessor(
+        image_processor=Qwen2VLImageProcessor(**processor_kwargs),
+        video_processor=Qwen2VLVideoProcessor(**processor_kwargs),
+        tokenizer=tokenizer,
+    )
+    processor.save_pretrained(root / "processor")
     config = Qwen2_5_VLConfig(
         text_config={
             "vocab_size": len(tokenizer),
@@ -120,9 +122,10 @@ def snapshot(tmp_path_factory):
             "window_size": 8,
             "fullatt_block_indexes": [0],
         },
-        image_token_id=len(tokenizer) - 1,
-        video_token_id=len(tokenizer) - 2,
-        vision_start_token_id=len(tokenizer) - 3,
+        image_token_id=tokenizer.convert_tokens_to_ids("<|image_pad|>"),
+        video_token_id=tokenizer.convert_tokens_to_ids("<|video_pad|>"),
+        vision_start_token_id=tokenizer.convert_tokens_to_ids("<|vision_start|>"),
+        vision_end_token_id=tokenizer.convert_tokens_to_ids("<|vision_end|>"),
     )
     Qwen2_5_VLForConditionalGeneration(config).save_pretrained(root / "text_encoder")
     AutoencoderKLQwenImage(
@@ -143,6 +146,15 @@ def snapshot(tmp_path_factory):
         shift_terminal=0.02,
     ).save_pretrained(root / "scheduler")
     return root
+
+
+def test_edit_snapshot_maps_visual_token_ids_by_name(snapshot):
+    tokenizer = Qwen2Tokenizer.from_pretrained(snapshot / "tokenizer")
+    config = Qwen2_5_VLConfig.from_pretrained(snapshot / "text_encoder")
+    assert config.image_token_id == tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    assert config.video_token_id == tokenizer.convert_tokens_to_ids("<|video_pad|>")
+    assert config.vision_start_token_id == tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    assert config.vision_end_token_id == tokenizer.convert_tokens_to_ids("<|vision_end|>")
 
 
 def condition_model(snapshot, recipe="diffsynth", offline=False, **kwargs):
@@ -390,8 +402,6 @@ def test_backbone_reference_forward_and_gradients(snapshot, encoded):
 
 def edit_condition_model(snapshot, **kwargs):
     processor_path = str(snapshot / "processor")
-    if not (Path(processor_path) / "tokenizer.json").exists():
-        pytest.skip("Qwen2VLProcessor could not be created in this environment.")
     config = MODEL_CONFIG_REGISTRY["QwenImageConditionModel"]().from_pretrained(
         str(snapshot),
         height=16,
