@@ -763,7 +763,7 @@ class ModelingCodeGenerator:
                 replacement_source = strip_patch_decorators(replacement_source)
 
                 # Rename the class (simple text replacement for class definition line)
-                old_name = patch.replacement.__name__
+                old_name = _apply_name_map(patch.replacement.__name__, patch.name_map)
                 if old_name != original_class.name:
                     # Replace "class OldName" with "class NewName"
                     replacement_source = replacement_source.replace(

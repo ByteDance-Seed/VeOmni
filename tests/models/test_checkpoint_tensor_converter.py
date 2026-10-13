@@ -19,6 +19,7 @@ Tests the base protocol helpers (get_checkpoint_tensor_converter, maybe_convert_
 and per-model converter implementations (e.g. Qwen3MoeCheckpointTensorConverter).
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
 
@@ -27,8 +28,13 @@ import torch
 
 from veomni.models.checkpoint_tensor_loading import (
     ConvertedCheckpointTensor,
+    checkpoint_converter_fused_expert_target,
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
+)
+from veomni.models.transformers.deepseek_v3.checkpoint_tensor_converter import (
+    DeepseekV3CheckpointTensorConverter,
+    create_deepseek_v3_checkpoint_tensor_converter,
 )
 from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
     DeepseekV4CheckpointTensorConverter,
@@ -37,6 +43,10 @@ from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
     convert_deepseek_v4_checkpoint_key,
     convert_deepseek_v4_fqn_to_index_mapping,
     create_deepseek_v4_checkpoint_tensor_converter,
+)
+from veomni.models.transformers.glm_moe_dsa.checkpoint_tensor_converter import (
+    GlmMoeDsaCheckpointTensorConverter,
+    create_glm_moe_dsa_checkpoint_tensor_converter,
 )
 from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import (
     Qwen3MoeCheckpointTensorConverter,
@@ -317,12 +327,166 @@ class TestQwen3MoeConverterFinalize:
             converter.finalize()
 
 
+_PER_EXPERT_CONVERTERS = pytest.mark.parametrize(
+    "converter_cls",
+    [
+        Qwen3MoeCheckpointTensorConverter,
+        Qwen3OmniMoeCheckpointTensorConverter,
+        DeepseekV3CheckpointTensorConverter,
+        GlmMoeDsaCheckpointTensorConverter,
+    ],
+)
+
+
+@_PER_EXPERT_CONVERTERS
+class TestPerExpertConverterExpertRange:
+    def test_fused_expert_target_names_the_fused_param_and_expert_row(self, converter_cls):
+        converter = converter_cls(num_experts=4)
+        assert converter.fused_expert_target("model.layers.0.mlp.experts.3.up_proj.weight") == (
+            "model.layers.0.mlp.experts.gate_up_proj",
+            3,
+        )
+        assert converter.fused_expert_target("model.layers.0.mlp.experts.1.down_proj.weight") == (
+            "model.layers.0.mlp.experts.down_proj",
+            1,
+        )
+        assert converter.fused_expert_target("model.layers.0.mlp.experts.gate_up_proj") is None
+
+    def test_helper_requires_both_expert_streaming_capabilities(self, converter_cls):
+        converter = converter_cls(num_experts=4)
+        name = "model.layers.0.mlp.experts.3.up_proj.weight"
+        assert checkpoint_converter_fused_expert_target(converter, name) == (
+            "model.layers.0.mlp.experts.gate_up_proj",
+            3,
+        )
+
+        class _TargetOnly:
+            can_handle = converter.can_handle
+            fused_expert_target = converter.fused_expert_target
+
+        assert checkpoint_converter_fused_expert_target(_TargetOnly(), name) is None
+        assert checkpoint_converter_fused_expert_target(None, name) is None
+
+    def test_range_converter_stacks_only_its_experts_as_local_rows(self, converter_cls):
+        local = converter_cls(num_experts=4).for_expert_range(2, 2)
+        assert type(local) is converter_cls
+        tensors = {expert: torch.full((1, 2), float(expert)) for expert in (2, 3)}
+
+        assert local.convert("model.layers.0.mlp.experts.2.down_proj.weight", tensors[2]) is None
+        converted = local.convert("model.layers.0.mlp.experts.3.down_proj.weight", tensors[3])
+
+        assert converted.name == "model.layers.0.mlp.experts.down_proj"
+        torch.testing.assert_close(converted.tensor, torch.stack([tensors[2], tensors[3]]))
+        assert local.finalize() == []
+
+    def test_range_converter_rejects_experts_outside_its_range(self, converter_cls):
+        local = converter_cls(num_experts=4).for_expert_range(2, 2)
+        with pytest.raises(ValueError, match="outside this converter's range"):
+            local.convert("model.layers.0.mlp.experts.1.down_proj.weight", torch.zeros(1, 2))
+
+    def test_range_must_fit_in_the_converter(self, converter_cls):
+        with pytest.raises(ValueError, match="outside this converter's 4 experts"):
+            converter_cls(num_experts=4).for_expert_range(3, 2)
+
+    def test_fp8_experts_raise_instead_of_loading_unscaled(self, converter_cls):
+        converter = converter_cls(num_experts=4)
+        fp8 = torch.zeros(1, 2).to(torch.float8_e4m3fn)
+        with pytest.raises(ValueError, match="does not dequantize"):
+            converter.convert("model.layers.0.mlp.experts.0.down_proj.weight", fp8)
+
+    def test_incomplete_checkpoint_error_names_the_model(self, converter_cls):
+        converter = converter_cls(num_experts=4)
+        converter.convert("model.layers.0.mlp.experts.0.down_proj.weight", torch.zeros(1, 2))
+        with pytest.raises(RuntimeError, match=f"^{converter_cls.model_name} checkpoint converter: incomplete"):
+            converter.finalize()
+
+
 class TestQwen3MoeConverterFactory:
     def test_factory_creates_converter(self):
         model = SimpleNamespace(config=SimpleNamespace(num_experts=8))
         converter = create_qwen3_moe_checkpoint_tensor_converter(model)
         assert isinstance(converter, Qwen3MoeCheckpointTensorConverter)
         assert converter.num_experts == 8
+
+
+class TestDeepseekV3ConverterFactory:
+    def test_factory_reads_routed_expert_count(self):
+        model = SimpleNamespace(config=SimpleNamespace(n_routed_experts=8))
+        converter = create_deepseek_v3_checkpoint_tensor_converter(model)
+        assert isinstance(converter, DeepseekV3CheckpointTensorConverter)
+        assert converter.num_experts == 8
+
+
+class TestGlmMoeDsaConverter:
+    def test_factory_reads_routed_expert_count(self):
+        model = SimpleNamespace(config=SimpleNamespace(n_routed_experts=8))
+        converter = create_glm_moe_dsa_checkpoint_tensor_converter(model)
+        assert isinstance(converter, GlmMoeDsaCheckpointTensorConverter)
+        assert converter.num_experts == 8
+
+    @pytest.fixture
+    def eager_ops(self):
+        from tests.tools.training_utils import make_eager_ops_config
+        from veomni.ops import apply_ops_config
+        from veomni.ops.config.singleton import get_ops_config, set_ops_config
+
+        previous = get_ops_config()
+        apply_ops_config(make_eager_ops_config())
+        try:
+            yield
+        finally:
+            set_ops_config(previous)
+
+    def test_per_expert_checkpoint_loads_into_fused_experts(self, tmp_path, eager_ops):
+        """The released GLM-5 layout: per-expert routed experts plus an unbuilt MTP layer."""
+        from safetensors.torch import save_file
+
+        from veomni.models.auto import build_foundation_model
+        from veomni.models.module_utils import load_model_weights
+
+        toy_config = Path(__file__).resolve().parents[1] / "toy_config" / "glm_moe_dsa_toy"
+        model = build_foundation_model(
+            config_path=str(toy_config), weights_path=None, torch_dtype="float32", init_device="cpu"
+        )
+        config = model.config
+        generator = torch.Generator().manual_seed(0)
+        expected = {name: torch.randn(param.shape, generator=generator) for name, param in model.state_dict().items()}
+
+        on_disk = {}
+        for name, tensor in expected.items():
+            if name.endswith(".mlp.experts.gate_up_proj"):
+                prefix = name.removesuffix(".gate_up_proj")
+                gate, up = tensor.chunk(2, dim=1)
+                for expert in range(tensor.shape[0]):
+                    on_disk[f"{prefix}.{expert}.gate_proj.weight"] = gate[expert].contiguous()
+                    on_disk[f"{prefix}.{expert}.up_proj.weight"] = up[expert].contiguous()
+            elif name.endswith(".mlp.experts.down_proj"):
+                prefix = name.removesuffix(".down_proj")
+                for expert in range(tensor.shape[0]):
+                    on_disk[f"{prefix}.{expert}.down_proj.weight"] = tensor[expert].contiguous()
+            else:
+                on_disk[name] = tensor
+        assert not any(name.endswith((".gate_up_proj", ".experts.down_proj")) for name in on_disk)
+
+        mtp_layer = config.num_hidden_layers
+        inter, hidden = config.moe_intermediate_size, config.hidden_size
+        for expert in range(config.n_routed_experts):
+            prefix = f"model.layers.{mtp_layer}.mlp.experts.{expert}"
+            on_disk[f"{prefix}.gate_proj.weight"] = torch.randn(inter, hidden, generator=generator)
+            on_disk[f"{prefix}.up_proj.weight"] = torch.randn(inter, hidden, generator=generator)
+            on_disk[f"{prefix}.down_proj.weight"] = torch.randn(hidden, inter, generator=generator)
+
+        config.save_pretrained(tmp_path)
+        save_file(on_disk, str(tmp_path / "model.safetensors"))
+        loaded = build_foundation_model(
+            config_path=str(tmp_path), weights_path=None, torch_dtype="float32", init_device="cpu"
+        )
+        load_model_weights(loaded, str(tmp_path), init_device="cpu")
+
+        loaded_state = loaded.state_dict()
+        assert loaded_state.keys() == expected.keys()
+        mismatched = [name for name, tensor in loaded_state.items() if not torch.equal(tensor, expected[name])]
+        assert mismatched == []
 
 
 class TestQwen3MoeConverterIntegration:
@@ -481,11 +645,23 @@ class TestDeepseekV4ConverterConvert:
         assert converter.finalize() == []
 
     @pytest.mark.parametrize("target_model_prefix", ["model.", ""])
-    def test_scorer_export_round_trips_through_inference_format(self, monkeypatch, target_model_prefix):
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "layers.2.attn.indexer.weights_proj.weight",
+            # Reversing HF's ``.norm.`` -> ``.kv_norm.`` renaming used to turn these into ``attn.norm``.
+            "layers.0.attn.kv_norm.weight",
+            "layers.2.attn.indexer.compressor.norm.weight",
+            # Nested compressor projections used to export with a literal ``\2`` in the name.
+            "layers.2.attn.compressor.wkv.weight",
+            "layers.2.attn.compressor.wgate.weight",
+            "layers.2.attn.indexer.compressor.wkv.weight",
+        ],
+    )
+    def test_export_round_trips_through_inference_format(self, monkeypatch, target_model_prefix, source):
         from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
 
-        source = "layers.2.attn.indexer.weights_proj.weight"
-        target = f"{target_model_prefix}layers.2.self_attn.compressor.indexer.scorer.weights_proj.weight"
+        target = module.convert_deepseek_v4_checkpoint_key(source, target_model_prefix=target_model_prefix)
         weight = torch.randn(4, 8, dtype=torch.bfloat16)
         model = SimpleNamespace(config=SimpleNamespace(expert_dtype="fp8"), _veomni_fqn_to_index_mapping={source: 1})
         # Supply the gathered parameter stream; exercise the real export mapping.
