@@ -667,7 +667,10 @@ def load_model_weights_ep_sharded(
         of non-ExtraParallel keys (e.g. DeepSeek-V4's renames and FP8 weight+scale
         pairs): every rank reads them whole and dispatches the converter's outputs,
         including its ``finalize`` outputs, as :func:`load_model_weights` does. Such
-        an output landing on an ExtraParallel parameter raises.
+        an output landing on an ExtraParallel parameter raises. The expert-range
+        converter's ``finalize`` outputs (e.g. orphan expert scales) are rank-local,
+        so they are only logged as unexpected keys; one naming a model parameter or
+        buffer raises.
 
     PEFT is supported. Base-checkpoint keys are remapped to their PEFT
     ``base_layer`` FQNs (:func:`build_lora_key_overrides`) and streamed exactly
@@ -1015,10 +1018,19 @@ def load_model_weights_ep_sharded(
         # whole-tensor loader does (typically logged as unexpected keys).
         for result in finalized:
             _dispatch_whole_converted(result, result.name)
-    if expert_converter is not None and expert_converter.finalize():
-        raise NotImplementedError(
-            "ep_sharded_stream_load cannot dispatch converter outputs produced only at finalize time."
-        )
+    if expert_converter is not None:
+        # E.g. DeepSeek-V4 ``.scale`` keys left beside BF16 expert weights. These come
+        # from this rank's experts only, so they may not be dispatched into the model
+        # (other ranks would not do the same); unexpected keys are logged, as the
+        # whole-tensor loader does.
+        for result in expert_converter.finalize():
+            dest = _apply_peft_override(result.name)
+            if dest in parameter_names_to_load or dest in buffer_dict:
+                raise NotImplementedError(
+                    f"ep_sharded_stream_load: expert-range converter emitted '{dest}' at finalize time; "
+                    f"rank-local finalize outputs cannot be dispatched."
+                )
+            logger.info_rank0(f"Unexpected key in state dict: {dest}.")
 
     logger.info_rank0(
         f"ep_sharded_stream_load: read {n_ep} ExtraParallel-sliced, {n_dense} dense, {n_buf} buffer tensors/rank; "

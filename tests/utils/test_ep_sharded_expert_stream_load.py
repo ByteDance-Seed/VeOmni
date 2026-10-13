@@ -546,3 +546,32 @@ def test_deepseek_v4_orphan_scale_loads_like_the_whole_tensor_loader(monkeypatch
     _load_as_rank(monkeypatch, tmp_path, 0, model)
 
     torch.testing.assert_close(model.model.layers[0].self_attn.q_a_proj.weight.data, q_a, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("ep_rank", range(EP_SIZE))
+def test_deepseek_v4_orphan_expert_scales_beside_bf16_experts_are_dropped(monkeypatch, tmp_path, ep_rank):
+    """Expert ``.scale`` keys left beside dequantized BF16 expert weights: each rank's
+    expert-range converter returns its orphan scales at ``finalize``, which are dropped
+    as unexpected (as on the whole-tensor loader) instead of failing the load."""
+    generator = torch.Generator().manual_seed(0)
+    state = {
+        "head.weight": torch.randn(5, HIDDEN, generator=generator),
+        "layers.0.attn.wq_a.weight": torch.randn(Q_A_DIM, HIDDEN, generator=generator),
+    }
+    for expert in range(NUM_EXPERTS):
+        for proj, shape in _DSV4_EXPERT_SHAPES:
+            stem = f"layers.0.ffn.experts.{expert}.{proj}"
+            state[f"{stem}.weight"] = torch.randn(*shape, generator=generator)
+            state[f"{stem}.scale"] = torch.tensor([[2.0]])
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    save_file(state, str(tmp_path / "model.safetensors"))
+
+    with torch.device("meta"):
+        model = _DeepseekV4StreamModel()
+    read_keys = _load_as_rank(monkeypatch, tmp_path, ep_rank, model)
+
+    local = _dsv4_local_experts(ep_rank)
+    expert = "layers.0.ffn.experts.{}.{}.weight"
+    want_down = torch.stack([state[expert.format(e, "w2")] for e in local])
+    torch.testing.assert_close(model.model.layers[0].mlp.experts.down_proj.data, want_down, atol=0, rtol=0)
+    assert {int(k.split(".experts.")[1].split(".")[0]) for k in read_keys if ".ffn.experts." in k} == set(local)
