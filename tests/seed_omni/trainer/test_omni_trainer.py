@@ -11,6 +11,7 @@ import torch
 
 from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
+from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.omni.omni_trainer import OmniTrainer, cascade_module_reshard
 
@@ -132,11 +133,22 @@ def test_an_offline_embedding_run_may_build_no_optimizer(monkeypatch):
 
 
 def test_offline_cache_step_writes_every_micro_batch_without_autograd():
+    """The graph writes encoded values into the items in place; the writer gets those same items."""
     grad_enabled = []
 
     def forward(micro_batch):
         grad_enabled.append(torch.is_grad_enabled())
-        micro_batch["conversation_list"].append("encoded")
+        for sample in micro_batch["conversation_list"]:
+            for item in sample:
+                item.value = f"encoded-{item.value}"
+                item.meta["cache"] = "vae"
+
+    micro_batches = [
+        {"conversation_list": [[ConversationItem(type="image", value=name, role="user", meta={})]]}
+        for name in ("a", "b")
+    ]
+    lists_before = [mb["conversation_list"] for mb in micro_batches]
+    items_before = [mb["conversation_list"][0][0] for mb in micro_batches]
 
     trainer = OmniTrainer.__new__(OmniTrainer)
     trainer.model = SimpleNamespace(forward=forward)
@@ -150,12 +162,16 @@ def test_offline_cache_step_writes_every_micro_batch_without_autograd():
     trainer.model_reshard = MagicMock()
     trainer.preforward = lambda micro_batch: micro_batch
 
-    trainer.offline_cache_step(iter([[{"conversation_list": ["a"]}, {"conversation_list": ["b"]}]]))
+    trainer.offline_cache_step(iter([micro_batches]))
 
     assert grad_enabled == [False, False]
-    assert [c.args[0] for c in trainer.offline_cache_writer.save_conversation_list.call_args_list] == [
-        ["a", "encoded"],
-        ["b", "encoded"],
+    saved = [c.args[0] for c in trainer.offline_cache_writer.save_conversation_list.call_args_list]
+    assert [s is before for s, before in zip(saved, lists_before)] == [True, True]
+    assert [len(s) == 1 and len(s[0]) == 1 for s in saved] == [True, True]
+    assert [s[0][0] is item for s, item in zip(saved, items_before)] == [True, True]
+    assert [(s[0][0].value, s[0][0].meta) for s in saved] == [
+        ("encoded-a", {"cache": "vae"}),
+        ("encoded-b", {"cache": "vae"}),
     ]
     assert trainer.state.global_step == 1
     trainer.on_step_end.assert_called_once_with(loss=0.0, loss_dict={}, grad_norm=0.0)

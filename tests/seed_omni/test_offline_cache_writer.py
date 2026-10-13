@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import pickle
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -190,14 +191,22 @@ def test_existing_shard_check_agrees_across_ranks_before_any_flush(tmp_path) -> 
     ]
 
 
-def _existing_shard_reject_rank_main(rank: int, rendezvous: str, cache_dir: str, out_dir: str) -> None:
+def _existing_shard_reject_rank_main(rank: int, rendezvous: str, cache_dirs: list[str], out_dir: str) -> None:
     import veomni.models.seed_omni.utils.offline_cache as offline_cache
 
     offline_cache.get_parallel_state = lambda: SimpleNamespace(dp_rank=rank, dp_size=2)
-    dist.init_process_group(backend="gloo", init_method=f"file://{rendezvous}", world_size=2, rank=rank)
+    # A rank that skipped the all-gathered verdict would sit in the post-check
+    # barrier alone; the timeout turns that hang into a failure.
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{rendezvous}",
+        world_size=2,
+        rank=rank,
+        timeout=timedelta(seconds=60),
+    )
     try:
         try:
-            SeedOmniOfflineCacheWriter(cache_dir, max_rows_per_shard=1)
+            SeedOmniOfflineCacheWriter(cache_dirs[rank], max_rows_per_shard=1)
         except FileExistsError as exc:
             with open(f"{out_dir}/rank{rank}.json", "w") as f:
                 json.dump({"raised": True, "msg": str(exc)}, f)
@@ -209,14 +218,15 @@ def _existing_shard_reject_rank_main(rank: int, rendezvous: str, cache_dir: str,
 
 
 def test_existing_shard_check_fails_on_every_rank_together(tmp_path) -> None:
-    """A non-empty directory must raise on all ranks after the all-gather, not hang one."""
-    cache_dir = tmp_path / "cache"
-    cache_dir.mkdir()
-    (cache_dir / "shard_000000.parquet").write_bytes(b"stale")
+    """A shard only rank 0 can see must still fail rank 1, not leave it waiting."""
+    cache_dirs = [tmp_path / "cache_rank0", tmp_path / "cache_rank1"]
+    for cache_dir in cache_dirs:
+        cache_dir.mkdir()
+    (cache_dirs[0] / "shard_000000.parquet").write_bytes(b"stale")
 
     mp.spawn(
         _existing_shard_reject_rank_main,
-        args=(str(tmp_path / "rendezvous"), str(cache_dir), str(tmp_path)),
+        args=(str(tmp_path / "rendezvous"), [str(d) for d in cache_dirs], str(tmp_path)),
         nprocs=2,
     )
     for rank in range(2):
