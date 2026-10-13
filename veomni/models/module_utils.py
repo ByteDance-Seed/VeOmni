@@ -751,6 +751,14 @@ def load_model_weights_ep_sharded(
         _, para_rank, expected_full0 = _ep_dim0_slice_meta(parallel_state, shard_group, target0)
         return para_rank * target0, target0, expected_full0
 
+    def _converter_transforms(bare_name: str) -> bool:
+        """Whether the converter claims ``bare_name`` for more than a dim-0 zero-pad."""
+        return (
+            converter is not None
+            and converter.can_handle(bare_name)
+            and not checkpoint_converter_is_dim0_zero_pad(converter, bare_name)
+        )
+
     # Up-front scan of the *raw checkpoint keys* for a converter's non-dim0-zero-pad
     # transforms. It must run over raw keys rather than in the per-destination main loop:
     # a per-expert key (e.g. ``model.layers.0.mlp.experts.3.gate_proj.weight``) has no
@@ -783,7 +791,7 @@ def load_model_weights_ep_sharded(
             bare_name = _convert_weight_key(raw_name, model)
             if checkpoint_converter_should_skip_without_loading(converter, bare_name):
                 continue
-            if not converter.can_handle(bare_name) or checkpoint_converter_is_dim0_zero_pad(converter, bare_name):
+            if not _converter_transforms(bare_name):
                 continue
             target = checkpoint_converter_fused_expert_target(converter, bare_name)
             if target is None:
@@ -913,15 +921,10 @@ def load_model_weights_ep_sharded(
                     continue
                 # Whole-tensor converter path: renames and quantized weight+scale pairs that
                 # are not ExtraParallel. Must run before the unexpected-key skip so companion
-                # scale keys (absent from the model) are still fed to the converter. Only
-                # converters that already stream experts are allowed here; others were refused
-                # in the up-front scan.
-                if (
-                    converter is not None
-                    and supports_expert_streaming
-                    and converter.can_handle(bare_name)
-                    and not checkpoint_converter_is_dim0_zero_pad(converter, bare_name)
-                ):
+                # scale keys (absent from the model) are still fed to the converter. Converters
+                # without expert-streaming capabilities never get here: the up-front scan
+                # refused them.
+                if _converter_transforms(bare_name):
                     converted = maybe_convert_checkpoint_tensor(bare_name, f.get_tensor(raw_name), converter)
                     if converted is not None:
                         _dispatch_whole_converted(converted, bare_name)
@@ -944,7 +947,7 @@ def load_model_weights_ep_sharded(
                     # overlap and zero-fill the tail. Otherwise the checkpoint must
                     # match the model exactly.
                     zero_pad = checkpoint_converter_is_dim0_zero_pad(converter, bare_name)
-                    if converter is not None and converter.can_handle(bare_name) and not zero_pad:
+                    if _converter_transforms(bare_name):
                         # A converter that fuses/reshapes this key can't be streamed.
                         raise NotImplementedError(
                             f"ep_sharded_stream_load: converter applies a non-dim0-zero-pad "
@@ -992,8 +995,8 @@ def load_model_weights_ep_sharded(
                     n_ep += 1
                 else:
                     if converter is not None and converter.can_handle(bare_name):
-                        # Claimed-by-name keys should have taken the whole-tensor
-                        # converter path above (or been refused in the up-front scan).
+                        # Only a dim-0 zero-pad key gets here (other claimed keys took
+                        # the whole-tensor converter path); it must be an ExtraParallel table.
                         raise NotImplementedError(
                             f"ep_sharded_stream_load: converter handles non-ExtraParallel key '{name}'."
                         )
