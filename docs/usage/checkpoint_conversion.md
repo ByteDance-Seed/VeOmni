@@ -161,8 +161,10 @@ The training-time HF export (`train.checkpoint.save_hf_weights`) consolidates
 every tensor into its `model-*.safetensors` file except one kind. A tensor that
 embedding parallelism (`emb`) shards by whole rows (`Shard(0)`) and that is
 larger than one output file (5 GB) is left as the per-rank shards DCP wrote.
-This applies only to the distributed export (`ckpt_manager: dcp`, torch >= 2.9,
-not on NPU); the other export paths still consolidate every tensor. Consolidating it would mean
+Whole rows means the table is not also FSDP-sharded by columns, so the module
+sets `extra_parallel_only: true`, as the DeepSeek-V4.1 n-gram configs do. This
+applies only to the distributed export (`ckpt_manager: dcp`, torch >= 2.9, not
+on NPU); other tables and export paths still consolidate every tensor. Consolidating it would mean
 one rank streaming the whole tensor into one file while every other rank waits:
 about an hour for each of DeepSeek-V4.1's 197 GB n-gram tables on an HDFS mount.
 
@@ -188,8 +190,9 @@ It is still one stream per file; local disk is faster when there is room.
 Until the shards are removed the table takes twice its size on disk.
 
 Before writing, the merge checks that the shards cover exactly the rows and
-bytes the export recorded. If one is missing or foreign it raises and leaves
-the marker and shards in place. The marker is removed before the shards, so an
+bytes the export recorded. If one is missing or foreign, or the index is
+missing, it raises and leaves the marker and shards in place. The script goes
+on to the next export and exits non-zero at the end. The marker is removed before the shards, so an
 interrupted merge can be rerun.
 
 ## See Also
