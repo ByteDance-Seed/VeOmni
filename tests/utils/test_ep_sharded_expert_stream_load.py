@@ -25,6 +25,7 @@ Qwen3-Omni-MoE checkpoint layouts.
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -33,6 +34,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch.distributed.tensor import Shard
 
+import veomni.models.load_plan as load_plan
 import veomni.models.module_utils as module_utils
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.models.transformers.deepseek_v3.checkpoint_tensor_converter import DeepseekV3CheckpointTensorConverter
@@ -123,8 +125,21 @@ def _write_checkpoint(path: Path) -> dict:
     return state
 
 
-def _load_as_rank(monkeypatch, weights_path: Path, ep_rank: int, model: nn.Module) -> list:
-    """Stream ``weights_path`` into ``model`` as ``ep_rank``; return the keys read whole."""
+def _load_as_rank(
+    monkeypatch,
+    weights_path: Path,
+    ep_rank: int,
+    model: nn.Module,
+    sliced_reads: Optional[dict] = None,
+    read_keys: Optional[list] = None,
+) -> list:
+    """Stream ``weights_path`` into ``model`` as ``ep_rank``; return the keys read whole.
+
+    ``sliced_reads``, when given, collects ``{key: index}`` for every partial read
+    (a ``get_slice`` handle that was indexed, not just asked for its shape).
+    ``read_keys``, when given, is the list the whole reads are appended to, so a
+    caller can inspect it after the load raises.
+    """
     parallel_state = SimpleNamespace(
         extra_parallel_enabled=lambda name: True,
         extra_parallel_sizes={"ep": EP_SIZE},
@@ -132,7 +147,8 @@ def _load_as_rank(monkeypatch, weights_path: Path, ep_rank: int, model: nn.Modul
     )
     monkeypatch.setattr(module_utils, "get_parallel_state", lambda: parallel_state)
 
-    read_keys = []
+    if read_keys is None:
+        read_keys = []
 
     class _RecordingSafeOpen:
         def __init__(self, *args, **kwargs):
@@ -147,6 +163,20 @@ def _load_as_rank(monkeypatch, weights_path: Path, ep_rank: int, model: nn.Modul
                     read_keys.append(key)
                     return handle.get_tensor(key)
 
+                def get_slice(self, key):
+                    sl = handle.get_slice(key)
+
+                    class _Slice:
+                        def __getitem__(self, index):
+                            if sliced_reads is not None:
+                                sliced_reads[key] = index
+                            return sl[index]
+
+                        def __getattr__(self, attr):
+                            return getattr(sl, attr)
+
+                    return _Slice()
+
                 def __getattr__(self, attr):
                     return getattr(handle, attr)
 
@@ -157,6 +187,7 @@ def _load_as_rank(monkeypatch, weights_path: Path, ep_rank: int, model: nn.Modul
             return self._handle.__exit__(*exc)
 
     monkeypatch.setattr(module_utils, "safe_open", _RecordingSafeOpen)
+    monkeypatch.setattr(load_plan, "safe_open", _RecordingSafeOpen)
     module_utils.load_model_weights_ep_sharded(model, str(weights_path), init_device="cpu")
     return read_keys
 
@@ -575,3 +606,180 @@ def test_deepseek_v4_orphan_expert_scales_beside_bf16_experts_are_dropped(monkey
     want_down = torch.stack([state[expert.format(e, "w2")] for e in local])
     torch.testing.assert_close(model.model.layers[0].mlp.experts.down_proj.data, want_down, atol=0, rtol=0)
     assert {int(k.split(".experts.")[1].split(".")[0]) for k in read_keys if ".ffn.experts." in k} == set(local)
+
+
+GATE_UP = "model.layers.0.mlp.experts.gate_up_proj"
+DOWN = "model.layers.0.mlp.experts.down_proj"
+
+
+class _FusedMoeModel(nn.Module):
+    """Fused trunk experts, a dense head and a persistent buffer; no converter."""
+
+    _create_checkpoint_tensor_converter = None
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([_layer(NUM_EXPERTS // EP_SIZE)])
+        self.model.register_buffer("rope_scale", torch.empty(HIDDEN))
+        self.lm_head = nn.Linear(HIDDEN, 5, bias=False)
+        self.config = SimpleNamespace(tie_word_embeddings=False)
+
+    def get_parallel_plan(self) -> ParallelPlan:
+        return ParallelPlan(
+            extra_parallel_plan={
+                "ep": {f"model.layers.*.mlp.experts.{p}": Shard(0) for p in ("gate_up_proj", "down_proj")}
+            }
+        )
+
+
+def _write_fused_checkpoint(path: Path, num_experts: int = NUM_EXPERTS) -> dict:
+    generator = torch.Generator().manual_seed(0)
+    state = {
+        GATE_UP: torch.randn(num_experts, 2 * INTERMEDIATE, HIDDEN, generator=generator),
+        DOWN: torch.randn(num_experts, HIDDEN, INTERMEDIATE, generator=generator),
+        "lm_head.weight": torch.randn(5, HIDDEN, generator=generator),
+        "model.rope_scale": torch.randn(HIDDEN, generator=generator),
+        # The model builds no MTP layer.
+        "mtp.layers.0.mlp.experts.down_proj": torch.randn(num_experts, HIDDEN, INTERMEDIATE, generator=generator),
+    }
+    path.mkdir(parents=True, exist_ok=True)
+    save_file(state, str(path / "model.safetensors"))
+    return state
+
+
+def _spy_load_plan(monkeypatch) -> list:
+    plans = []
+    execute = module_utils.execute_load_plan
+
+    def _execute(plan, *args, **kwargs):
+        plans.append(plan)
+        return execute(plan, *args, **kwargs)
+
+    monkeypatch.setattr(module_utils, "execute_load_plan", _execute)
+    return plans
+
+
+@pytest.mark.parametrize("ep_rank", range(EP_SIZE))
+def test_a_converter_free_checkpoint_streams_through_the_load_plan(monkeypatch, tmp_path, ep_rank):
+    state = _write_fused_checkpoint(tmp_path)
+    with torch.device("meta"):
+        model = _FusedMoeModel()
+    plans = _spy_load_plan(monkeypatch)
+    sliced = {}
+
+    read_keys = _load_as_rank(monkeypatch, tmp_path, ep_rank, model, sliced)
+
+    assert len(plans) == 1
+    num_local = NUM_EXPERTS // EP_SIZE
+    rows = slice(ep_rank * num_local, (ep_rank + 1) * num_local)
+    experts = model.model.layers[0].mlp.experts
+    torch.testing.assert_close(experts.gate_up_proj.data, state[GATE_UP][rows], atol=0, rtol=0)
+    torch.testing.assert_close(experts.down_proj.data, state[DOWN][rows], atol=0, rtol=0)
+    torch.testing.assert_close(model.lm_head.weight.data, state["lm_head.weight"], atol=0, rtol=0)
+    torch.testing.assert_close(model.model.rope_scale, state["model.rope_scale"], atol=0, rtol=0)
+    # Experts are read as this rank's rows only; the unbuilt MTP tensor is never read.
+    assert sorted(read_keys) == ["lm_head.weight", "model.rope_scale"]
+    assert {key: index[0] for key, index in sliced.items()} == {GATE_UP: rows, DOWN: rows}
+
+
+def test_a_converter_that_claims_no_key_streams_through_the_load_plan(monkeypatch, tmp_path):
+    """Qwen3-MoE's converter fuses per-expert keys; a fused checkpoint gives it nothing to do."""
+    state = _write_fused_checkpoint(tmp_path)
+    with torch.device("meta"):
+        model = _FusedMoeModel()
+    model._create_checkpoint_tensor_converter = lambda m: Qwen3MoeCheckpointTensorConverter(num_experts=NUM_EXPERTS)
+    plans = _spy_load_plan(monkeypatch)
+
+    _load_as_rank(monkeypatch, tmp_path, 1, model)
+
+    assert len(plans) == 1
+    torch.testing.assert_close(
+        model.model.layers[0].mlp.experts.down_proj.data, state[DOWN][NUM_EXPERTS // EP_SIZE :], atol=0, rtol=0
+    )
+
+
+def test_a_converter_claimed_key_keeps_the_converter_loop(monkeypatch, tmp_path):
+    _write_checkpoint(tmp_path)
+    plans = _spy_load_plan(monkeypatch)
+
+    _load_as_rank(monkeypatch, tmp_path, 0, _meta_model())
+
+    assert plans == []
+
+
+@pytest.mark.parametrize("ep_rank", range(EP_SIZE))
+def test_a_load_plan_shape_mismatch_raises_on_every_rank_before_any_read(monkeypatch, tmp_path, ep_rank):
+    _write_fused_checkpoint(tmp_path, num_experts=NUM_EXPERTS + EP_SIZE)
+    with torch.device("meta"):
+        model = _FusedMoeModel()
+    sliced, read_keys = {}, []
+
+    with pytest.raises(RuntimeError, match=r"has shape \(6, \d, \d\), but model tensor .* is \(4, \d, \d\) in total"):
+        _load_as_rank(monkeypatch, tmp_path, ep_rank, model, sliced, read_keys)
+
+    assert sliced == {} and read_keys == []
+    assert all(p.is_meta for p in model.parameters())
+
+
+def test_a_load_plan_rejects_two_keys_loading_one_tensor(tmp_path):
+    save_file({"a.weight": torch.zeros(2), "b.weight": torch.zeros(2)}, str(tmp_path / "model.safetensors"))
+
+    with pytest.raises(RuntimeError, match="both load model tensor 'w'"):
+        load_plan.build_load_plan(
+            {"a.weight": "model.safetensors", "b.weight": "model.safetensors"},
+            {"model.safetensors": str(tmp_path / "model.safetensors")},
+            target_name=lambda key: "w",
+            parameter_layouts={"w": load_plan.LoadLayout.whole((2,))},
+            buffer_shapes={},
+        )
+
+
+def test_load_layout_dim0_shard_covers_its_rows_of_the_whole_tensor():
+    layout = load_plan.LoadLayout.dim0_shard((2, 4, 3), rank=1, world_size=3)
+
+    assert layout.global_shape == (6, 4, 3)
+    assert layout.region == (slice(2, 4), slice(0, 4), slice(0, 3))
+    assert not layout.is_whole
+    assert load_plan.LoadLayout.dim0_shard((2, 4), rank=0, world_size=1).is_whole
+    assert load_plan.LoadLayout.whole(()).is_whole
+    with pytest.raises(ValueError, match="0-dim"):
+        load_plan.LoadLayout.dim0_shard((), rank=0, world_size=2)
+
+
+class _ClaimsByDtype:
+    def can_handle(self, name):
+        return False
+
+    def can_handle_tensor(self, name, tensor):
+        return tensor.dtype == torch.float8_e4m3fn
+
+
+_FUSED_NAMES = [GATE_UP, "lm_head.weight"]
+
+
+@pytest.mark.parametrize(
+    "persistent, converter, names, expected",
+    [
+        pytest.param(set(), None, _FUSED_NAMES, True, id="no_converter"),
+        pytest.param(
+            set(), Qwen3MoeCheckpointTensorConverter(NUM_EXPERTS), _FUSED_NAMES, True, id="converter_claims_nothing"
+        ),
+        pytest.param(
+            set(),
+            Qwen3MoeCheckpointTensorConverter(NUM_EXPERTS),
+            [*_FUSED_NAMES, PER_EXPERT.format(expert=0, proj="gate_proj")],
+            False,
+            id="converter_claims_a_key",
+        ),
+        # Whether it claims a key depends on tensor dtypes the plan cannot see by name.
+        pytest.param(set(), _ClaimsByDtype(), _FUSED_NAMES, False, id="converter_claims_by_dtype"),
+        # Persistent ExtraParallel parameters (Qwen4-Exp PLE) carry their own DTensor layout.
+        pytest.param({"model.ple.weight"}, None, _FUSED_NAMES, False, id="persistent_param"),
+    ],
+)
+def test_which_checkpoints_the_load_plan_streams(persistent, converter, names, expected):
+    parallel_plan = SimpleNamespace(is_persistent_parameter=lambda name: name in persistent)
+    parameter_names = {GATE_UP, "lm_head.weight", "model.ple.weight"}
+
+    assert module_utils._load_plan_streams_checkpoint(parallel_plan, parameter_names, converter, names) is expected
