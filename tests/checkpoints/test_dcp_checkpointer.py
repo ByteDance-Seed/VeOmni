@@ -779,6 +779,21 @@ class TestDdpMetaInit:
 
         assert parallelize_model_ddp(nn.Linear(2, 2)) is not None
 
+    def test_loads_a_fully_frozen_model_without_a_ddp_wrap(self, wrap_ddp, monkeypatch):
+        """DDP rejects a module whose parameters all have ``requires_grad=False``."""
+        materialize = lambda model, *args, **kwargs: model.to_empty(device="cpu")  # noqa: E731
+        loader = MagicMock(side_effect=materialize)
+        monkeypatch.setattr(torch_parallelize, "load_model_weights", loader)
+        with init_empty_weights():
+            model = _MetaInitModel()
+        model.requires_grad_(False)
+
+        wrapped = wrap_ddp(model, weights_path="hf-path", init_device="meta")
+
+        assert wrapped is model
+        assert loader.call_args.args[1] == "hf-path"
+        assert not model.weight.is_meta
+
     def test_reports_parameters_the_loader_left_on_meta(self, wrap_ddp, monkeypatch):
         # A loader that fills nothing would otherwise fail inside DDP's
         # constructor on Tensor.item(), naming neither parameter nor cause.

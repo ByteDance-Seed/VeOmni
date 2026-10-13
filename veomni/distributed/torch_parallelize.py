@@ -909,7 +909,8 @@ def parallelize_model_ddp(
     does either — ``build_model`` returns an empty model and ``BaseTrainer`` has
     no load step of its own — so the wrap used to reach DDP's constructor with
     meta parameters and die there on ``Tensor.item()``. A model that arrives with
-    real weights already loaded must not be touched here.
+    real weights already loaded must not be touched here. A model with no
+    parameter that requires grad is loaded but returned unwrapped.
     """
     parallel_state = get_parallel_state()
 

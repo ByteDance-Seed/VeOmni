@@ -124,12 +124,14 @@ full, or it is built on meta.
   [`_parallelize_composed_model`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L241)
   detaches cache readers before the composed wrap so they stay on meta and are
   not materialised with the rest.
-- **`offline_embedding`.** Every module, cached or not, is built, loaded and
-  wrapped like any other, then
-  [frozen](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L169):
-  the run trains nothing, so no module gets an optimizer or a checkpoint
-  manager, and [`OmniTrainer`](../../../veomni/trainer/omni/omni_trainer.py#L275)
-  allows the empty optimizer.
+- **`offline_embedding`.** Every module, cached or not, is built and
+  [frozen](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L169),
+  then loaded and wrapped like any other: the run trains nothing, so no module
+  gets an optimizer or a checkpoint manager, and
+  [`OmniTrainer`](../../../veomni/trainer/omni/omni_trainer.py#L275) allows the
+  empty optimizer. A `fsdp_mode: ddp` module is
+  [loaded but left unwrapped](../../../veomni/distributed/torch_parallelize.py#L968),
+  because DDP rejects a module with no parameter that requires grad.
 - **`online_training`.** The module is built like any other.
 
 Inference builds have no train arguments, so they always build the module in
