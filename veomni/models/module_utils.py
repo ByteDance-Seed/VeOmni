@@ -790,7 +790,12 @@ def load_model_weights_ep_sharded(
             model, buffer_dict, parameter_names_to_load, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu
         )
 
-    if _load_plan_streams_checkpoint(model, converter, (_convert_weight_key(key, model) for key in key_to_file)):
+    if _load_plan_streams_checkpoint(
+        parallel_plan,
+        parameter_names_to_load,
+        converter,
+        (_convert_weight_key(key, model) for key in key_to_file),
+    ):
         _stream_ep_sharded_by_load_plan(
             model,
             key_to_file,
@@ -1091,7 +1096,7 @@ def load_model_weights_ep_sharded(
     _finish_load()
 
 
-def _load_plan_streams_checkpoint(model: "nn.Module", converter, bare_names) -> bool:
+def _load_plan_streams_checkpoint(parallel_plan: "ParallelPlan", parameter_names, converter, bare_names) -> bool:
     """Whether :func:`_stream_ep_sharded_by_load_plan` can load this checkpoint.
 
     It can when no checkpoint key needs a converter transform: a converter can
@@ -1099,7 +1104,7 @@ def _load_plan_streams_checkpoint(model: "nn.Module", converter, bare_names) -> 
     needs the tensor). Persistent ExtraParallel parameters (e.g. Qwen4-Exp PLE)
     are not covered yet either.
     """
-    if any(spec.persistent_fsdp_shard_dim is not None for spec in getattr(model, "_fqn2spec_info", {}).values()):
+    if any(parallel_plan.is_persistent_parameter(name) for name in parameter_names):
         return False
     if converter is None:
         return True

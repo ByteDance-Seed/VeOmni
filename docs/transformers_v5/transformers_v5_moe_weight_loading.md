@@ -139,13 +139,17 @@ converter that emits an ExtraParallel parameter from such a key, rather than
 through `fused_expert_target`, raises `NotImplementedError`.
 
 A checkpoint whose keys need no converter transform does not go through this
-key-by-key loop. Examples are fused experts in the modeling layout (Qwen3.5-MoE's
-trunk) and any checkpoint the model's converter claims no key of. Such a
-checkpoint streams through a load plan (`veomni/models/load_plan.py`): every
-model tensor is mapped to its checkpoint tensor and to the region this rank holds
-(its `Shard(0)` rows for an ExtraParallel parameter, the whole tensor otherwise).
-The plan is built from the safetensors headers only, so a shape mismatch or two
-keys loading one tensor fails on every rank before any data is read. This is the
+key-by-key loop. That covers a model without a converter and any checkpoint the
+model's converter claims no key of, such as one whose experts are all stored fused
+in the modeling layout. The decision is per checkpoint: one claimed key (for
+example Qwen3.5-MoE's per-expert MTP experts) sends the whole checkpoint through
+the loop. Such a checkpoint streams through a load plan
+(`veomni/models/load_plan.py`): every model tensor is mapped to its checkpoint
+tensor and to the region this rank holds (its `Shard(0)` rows for an
+ExtraParallel parameter, the whole tensor otherwise). The plan is built from the
+safetensors headers only, so a shape mismatch, for dense parameters and buffers
+as well as ExtraParallel ones, or two keys loading one tensor fails on every rank
+before any data is read. This is the
 first stage of [#1297](https://github.com/ByteDance-Seed/VeOmni/issues/1297).
 Two cases still take the converter loop:
 

@@ -57,6 +57,8 @@ class LoadLayout:
     def dim0_shard(cls, local_shape: Sequence[int], rank: int, world_size: int) -> "LoadLayout":
         """Rank ``rank``'s even ``Shard(0)`` chunk of a tensor whose local shape is ``local_shape``."""
         local_shape = tuple(local_shape)
+        if not local_shape:
+            raise ValueError("A 0-dim tensor has no rows to shard along dim 0.")
         rows = local_shape[0]
         global_shape = (rows * world_size, *local_shape[1:])
         region = (slice(rank * rows, (rank + 1) * rows), *(slice(0, size) for size in local_shape[1:]))

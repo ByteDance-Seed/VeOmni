@@ -743,6 +743,8 @@ def test_load_layout_dim0_shard_covers_its_rows_of_the_whole_tensor():
     assert not layout.is_whole
     assert load_plan.LoadLayout.dim0_shard((2, 4), rank=0, world_size=1).is_whole
     assert load_plan.LoadLayout.whole(()).is_whole
+    with pytest.raises(ValueError, match="0-dim"):
+        load_plan.LoadLayout.dim0_shard((), rank=0, world_size=2)
 
 
 class _ClaimsByDtype:
@@ -753,24 +755,31 @@ class _ClaimsByDtype:
         return tensor.dtype == torch.float8_e4m3fn
 
 
+_FUSED_NAMES = [GATE_UP, "lm_head.weight"]
+
+
 @pytest.mark.parametrize(
-    "spec_info, converter, expected",
+    "persistent, converter, names, expected",
     [
-        pytest.param({}, None, True, id="no_converter"),
-        pytest.param({}, Qwen3MoeCheckpointTensorConverter(NUM_EXPERTS), True, id="converter_claims_nothing"),
-        pytest.param({}, Qwen3MoeCheckpointTensorConverter(NUM_EXPERTS), False, id="converter_claims_a_key"),
-        # Whether it claims a key depends on tensor dtypes the plan cannot see by name.
-        pytest.param({}, _ClaimsByDtype(), False, id="converter_claims_by_dtype"),
-        # Persistent ExtraParallel parameters (Qwen4-Exp PLE) carry their own DTensor layout.
+        pytest.param(set(), None, _FUSED_NAMES, True, id="no_converter"),
         pytest.param(
-            {"model.ple.weight": SimpleNamespace(persistent_fsdp_shard_dim=1)}, None, False, id="persistent_param"
+            set(), Qwen3MoeCheckpointTensorConverter(NUM_EXPERTS), _FUSED_NAMES, True, id="converter_claims_nothing"
         ),
+        pytest.param(
+            set(),
+            Qwen3MoeCheckpointTensorConverter(NUM_EXPERTS),
+            [*_FUSED_NAMES, PER_EXPERT.format(expert=0, proj="gate_proj")],
+            False,
+            id="converter_claims_a_key",
+        ),
+        # Whether it claims a key depends on tensor dtypes the plan cannot see by name.
+        pytest.param(set(), _ClaimsByDtype(), _FUSED_NAMES, False, id="converter_claims_by_dtype"),
+        # Persistent ExtraParallel parameters (Qwen4-Exp PLE) carry their own DTensor layout.
+        pytest.param({"model.ple.weight"}, None, _FUSED_NAMES, False, id="persistent_param"),
     ],
 )
-def test_which_checkpoints_the_load_plan_streams(request, spec_info, converter, expected):
-    model = SimpleNamespace(_fqn2spec_info=spec_info)
-    names = [GATE_UP, "lm_head.weight"]
-    if request.node.callspec.id == "converter_claims_a_key":
-        names.append(PER_EXPERT.format(expert=0, proj="gate_proj"))
+def test_which_checkpoints_the_load_plan_streams(persistent, converter, names, expected):
+    parallel_plan = SimpleNamespace(is_persistent_parameter=lambda name: name in persistent)
+    parameter_names = {GATE_UP, "lm_head.weight", "model.ple.weight"}
 
-    assert module_utils._load_plan_streams_checkpoint(model, converter, names) is expected
+    assert module_utils._load_plan_streams_checkpoint(parallel_plan, parameter_names, converter, names) is expected
