@@ -34,13 +34,16 @@ from veomni.utils.save_safetensor_utils import merge_pending_hf_shards
 logger = helper.create_logger(__name__)
 
 
-def pending_exports(root: str) -> list[str]:
-    found = []
+def scan(root: str) -> tuple[list[str], list[str]]:
+    """Exports below ``root`` holding a marker, and shard directories with no marker beside them."""
+    pending, orphaned = [], []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d != HF_SHARDED_DIRNAME]
         if HF_PENDING_MERGE_FILENAME in filenames:
-            found.append(dirpath)
-    return sorted(found)
+            pending.append(dirpath)
+        elif HF_SHARDED_DIRNAME in dirnames:
+            orphaned.append(os.path.join(dirpath, HF_SHARDED_DIRNAME))
+        dirnames[:] = [d for d in dirnames if d != HF_SHARDED_DIRNAME]
+    return sorted(pending), sorted(orphaned)
 
 
 def main() -> None:
@@ -54,9 +57,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    exports = pending_exports(args.path)
+    exports, orphaned = scan(args.path)
+    for shard_dir in orphaned:
+        logger.warning(
+            f"{shard_dir} has no {HF_PENDING_MERGE_FILENAME} beside it: left over from an interrupted save or "
+            "merge. Check the export loads, then delete it."
+        )
     if not exports:
-        raise SystemExit(f"No {HF_PENDING_MERGE_FILENAME} under {args.path}: nothing to merge.")
+        logger.info(f"No {HF_PENDING_MERGE_FILENAME} under {args.path}: nothing to merge.")
     for export in exports:
         logger.info(f"Merging {export}")
         merge_pending_hf_shards(export, num_threads=args.num_threads)

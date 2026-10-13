@@ -17,9 +17,10 @@ import json
 import os
 import re
 import shutil
+import struct
 import time
 from datetime import timedelta
-from typing import Dict, Optional, Sequence, Set
+from typing import Dict, List, Optional, Sequence, Set
 
 import torch
 import torch.distributed as dist
@@ -150,12 +151,22 @@ def _consolidation_process_group():
     return _consolidation_group
 
 
+def _whole_rows(tensor: torch.Tensor) -> bool:
+    """True when every shard of ``tensor`` is a run of complete dim-0 rows."""
+    from torch.distributed.tensor import DTensor, Replicate, Shard
+
+    if not isinstance(tensor, DTensor):
+        return True
+    return all(isinstance(p, Replicate) or (isinstance(p, Shard) and p.dim == 0) for p in tensor.placements)
+
+
 def _deferred_merge_fqns(model: torch.nn.Module, save_state: Dict[str, torch.Tensor]) -> Set[str]:
     """Row-sharded ``emb`` tensors too large for one output file.
 
     Consolidating one means a single rank streaming the whole table into one
     file while every other rank waits. Their per-rank shards are kept instead,
     and :func:`merge_pending_hf_shards` writes them out off the training job.
+    Only whole-row shards qualify: the merge appends them in row order.
     """
     from torch.distributed.tensor import Shard
 
@@ -164,9 +175,9 @@ def _deferred_merge_fqns(model: torch.nn.Module, save_state: Dict[str, torch.Ten
     for fqn, tensor in save_state.items():
         spec = spec_info.get(fqn)
         # A parameter the plan does not name still gets a spec, placed Replicate.
-        if spec is None or spec.para_name != "emb" or not isinstance(spec.placement, Shard):
+        if spec is None or spec.para_name != "emb" or spec.placement != Shard(0):
             continue
-        if tensor.numel() * tensor.element_size() > _MAX_SHARD_BYTES:
+        if tensor.numel() * tensor.element_size() > _MAX_SHARD_BYTES and _whole_rows(tensor):
             deferred.add(fqn)
     return deferred
 
@@ -189,14 +200,15 @@ def _consolidate_all_but_deferred(
     sharded_path: str,
     save_path: str,
     fqn_to_index_mapping: Dict[str, int],
-    deferred: Set[str],
-    tensor_bytes: Dict[str, int],
+    deferred: Dict[str, Dict],
+    total_size: int,
 ) -> None:
     """Consolidate every output file but the deferred ones; leave those as per-rank shards.
 
     Ranks split the files as ``consolidate_safetensors_files_on_every_rank``
-    does. Rank 0 then writes the index for the whole export, the deferred
-    files included, and a marker naming the files still to be merged.
+    does. Rank 0 then writes the marker naming the files still to be merged
+    (with each tensor's shape and size, which the merge checks against), drops
+    the other files' shards, and writes the index for the whole export.
     """
     from torch.distributed.checkpoint._consolidate_hf_safetensors import _consolidate_safetensors_files
     from torch.distributed.checkpoint._hf_utils import _gen_file_name
@@ -217,49 +229,122 @@ def _consolidate_all_but_deferred(
     if rank != 0:
         return
 
+    # Marker first: until it exists nothing tells a loader or the merge that the
+    # index names files that are not there yet.
+    pending = {
+        "sharded_dir": layout.HF_SHARDED_DIRNAME,
+        "tensors": {fqn: {"file": file_of[fqn], **deferred[fqn]} for fqn in sorted(deferred)},
+    }
+    with open(os.path.join(save_path, layout.HF_PENDING_MERGE_FILENAME), "w") as f:
+        json.dump(pending, f, indent=2)
     deferred_indices = {fqn_to_index_mapping[fqn] for fqn in deferred}
     for name in os.listdir(sharded_path):
         match = _SHARD_FILE.match(name)
         if match is None or int(match.group("index")) not in deferred_indices:
             os.remove(os.path.join(sharded_path, name))
-    index = {"metadata": {"total_size": sum(tensor_bytes.values())}, "weight_map": file_of}
+    index = {"metadata": {"total_size": total_size}, "weight_map": file_of}
     with open(os.path.join(save_path, "model.safetensors.index.json"), "w") as f:
         json.dump(index, f, indent=2)
-    pending = {"sharded_dir": layout.HF_SHARDED_DIRNAME, "weight_map": {fqn: file_of[fqn] for fqn in sorted(deferred)}}
-    with open(os.path.join(save_path, layout.HF_PENDING_MERGE_FILENAME), "w") as f:
-        json.dump(pending, f, indent=2)
     logger.info(
         f"Left {len(deferred)} row-sharded tensor(s) unmerged under {sharded_path}: "
         f"run `python scripts/merge_hf_export.py {save_path}` before loading this export."
     )
 
 
+_COPY_CHUNK_BYTES = 64 << 20
+
+
+def _read_safetensors_header(path: str) -> tuple[dict, int]:
+    """``(header, data_start)`` of a safetensors file."""
+    with open(path, "rb") as f:
+        (length,) = struct.unpack("<Q", f.read(8))
+        return json.loads(f.read(length)), 8 + length
+
+
+def _row_shards(sharded_path: str, fqn: str, shape: List[int], nbytes: int) -> tuple[str, List[tuple]]:
+    """``(dtype, [(path, start, end), ...])`` of ``fqn``'s shards in row order, checked to tile it exactly."""
+    from torch.distributed.checkpoint._hf_utils import _get_dcp_custom_metadata
+
+    found = []
+    for name in sorted(os.listdir(sharded_path)):
+        path = os.path.join(sharded_path, name)
+        header, data_start = _read_safetensors_header(path)
+        if fqn not in header:
+            continue
+        entry = header[fqn]
+        offsets = _get_dcp_custom_metadata(header)[fqn]["saved_offsets"]
+        start, end = entry["data_offsets"]
+        found.append((offsets, entry["shape"], entry["dtype"], path, data_start + start, data_start + end))
+    found.sort(key=lambda shard: shard[0][0])
+
+    dtypes = {shard[2] for shard in found}
+    next_row = 0
+    for offsets, shard_shape, _, path, *_ in found:
+        if offsets[0] != next_row or any(offsets[1:]) or shard_shape[1:] != shape[1:]:
+            raise ValueError(
+                f"{fqn}: shard {path} holds rows {offsets[0]}..{offsets[0] + shard_shape[0]} of shape "
+                f"{shard_shape} where rows from {next_row} of width {shape[1:]} were expected."
+            )
+        next_row += shard_shape[0]
+    total = sum(end - start for *_, start, end in found)
+    if len(dtypes) != 1 or next_row != shape[0] or total != nbytes:
+        raise ValueError(
+            f"{fqn}: the shards under {sharded_path} cover {next_row} of {shape[0]} rows and {total} of "
+            f"{nbytes} bytes (dtypes {sorted(dtypes)}); a shard is missing or belongs to another export."
+        )
+    return dtypes.pop(), [(path, start, end) for *_, path, start, end in found]
+
+
+def _merge_rows(sharded_path: str, output_path: str, fqn: str, shape: List[int], nbytes: int) -> None:
+    """Append ``fqn``'s row shards into a one-tensor safetensors file, a chunk at a time."""
+    dtype, shards = _row_shards(sharded_path, fqn, shape, nbytes)
+    header = json.dumps({fqn: {"dtype": dtype, "shape": shape, "data_offsets": [0, nbytes]}}).encode()
+    header += b" " * (-len(header) % 8)
+    with open(output_path, "wb") as out:
+        out.write(struct.pack("<Q", len(header)))
+        out.write(header)
+        for path, start, end in shards:
+            with open(path, "rb") as src:
+                src.seek(start)
+                remaining = end - start
+                while remaining:
+                    chunk = src.read(min(remaining, _COPY_CHUNK_BYTES))
+                    if not chunk:
+                        raise OSError(f"{path} ended {remaining} bytes early.")
+                    out.write(chunk)
+                    remaining -= len(chunk)
+    written, data_start = _read_safetensors_header(output_path)
+    if written[fqn]["shape"] != shape or os.path.getsize(output_path) != data_start + nbytes:
+        raise OSError(f"{output_path} does not hold the {nbytes} bytes of {fqn} it was written with.")
+
+
 def merge_pending_hf_shards(save_path: str, num_threads: Optional[int] = None) -> None:
     """Write out the files an HF export deferred, then drop its marker and shards.
 
-    One thread per output file by default; each file is still written by a
-    single stream, so point ``save_path`` at local disk when the export is
-    large and copy the result afterwards.
+    Each file is written sequentially, which an append-only mount accepts, and
+    memory stays at one copy chunk per file. Files are written in parallel, one
+    thread each by default. Nothing is removed unless every file checks out.
     """
-    from torch.distributed.checkpoint._consolidate_hf_safetensors import _consolidate_safetensors_files
+    from concurrent.futures import ThreadPoolExecutor
 
-    from veomni.checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
-
-    apply_dcp_consolidation_patch()
     marker = os.path.join(save_path, layout.HF_PENDING_MERGE_FILENAME)
     with open(marker) as f:
         pending = json.load(f)
-    weight_map = pending["weight_map"]
+    tensors = pending["tensors"]
     sharded_path = os.path.join(save_path, pending["sharded_dir"])
     start_time = time.time()
-    _consolidate_safetensors_files(
-        sharded_path, save_path, weight_map, num_threads=num_threads or len(set(weight_map.values()))
-    )
+    with ThreadPoolExecutor(max_workers=num_threads or len(tensors)) as pool:
+        futures = [
+            pool.submit(_merge_rows, sharded_path, os.path.join(save_path, t["file"]), fqn, t["shape"], t["nbytes"])
+            for fqn, t in tensors.items()
+        ]
+        for future in futures:
+            future.result()
     # Marker first: a crash after it leaves a complete export and stray shards,
     # never a marker pointing at shards that are gone.
     os.remove(marker)
     shutil.rmtree(sharded_path, ignore_errors=True)
-    logger.info(f"Merged {len(weight_map)} deferred tensor(s) into {save_path} in {time.time() - start_time:.2f}s")
+    logger.info(f"Merged {len(tensors)} deferred tensor(s) into {save_path} in {time.time() - start_time:.2f}s")
 
 
 def _save_hf_safetensor_distributed(
@@ -301,10 +386,13 @@ def _save_hf_safetensor_distributed(
     else:
         fqn_to_index_mapping = _size_balanced_index_mapping(save_state)
 
-    deferred = _deferred_merge_fqns(model, save_state)
+    deferred = {
+        fqn: {"shape": list(save_state[fqn].shape), "nbytes": save_state[fqn].numel() * save_state[fqn].element_size()}
+        for fqn in _deferred_merge_fqns(model, save_state)
+    }
     if deferred:
-        fqn_to_index_mapping = _isolate_deferred(fqn_to_index_mapping, deferred)
-        tensor_bytes = {fqn: tensor.numel() * tensor.element_size() for fqn, tensor in save_state.items()}
+        fqn_to_index_mapping = _isolate_deferred(fqn_to_index_mapping, set(deferred))
+        total_size = sum(tensor.numel() * tensor.element_size() for tensor in save_state.values())
 
     # Consolidation runs on every rank, one output file each, instead of in the
     # writer's finish step: there only the coordinator rewrites the whole model
@@ -334,7 +422,7 @@ def _save_hf_safetensor_distributed(
     if dist.is_initialized():
         dist.barrier()
     if deferred:
-        _consolidate_all_but_deferred(sharded_path, save_path, fqn_to_index_mapping, deferred, tensor_bytes)
+        _consolidate_all_but_deferred(sharded_path, save_path, fqn_to_index_mapping, deferred, total_size)
     elif dist.is_initialized():
         consolidate_safetensors_files_on_every_rank(
             input_dir=sharded_path,

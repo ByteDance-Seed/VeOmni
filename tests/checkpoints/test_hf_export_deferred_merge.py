@@ -24,6 +24,7 @@ and a marker instead, loaders refuse the directory, and
 import importlib.util
 import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,9 +50,9 @@ ROWS, COLS = 3, 8
 MAX_SHARD_BYTES = 100
 
 
-def _model(table_spec, dense_spec=None) -> nn.Module:
+def _model(table_spec, dense_spec=None, **more_specs) -> nn.Module:
     model = nn.Module()
-    model._fqn2spec_info = {"table": table_spec}
+    model._fqn2spec_info = {"table": table_spec, **more_specs}
     if dense_spec is not None:
         model._fqn2spec_info["dense"] = dense_spec
     return model
@@ -69,12 +70,12 @@ def _replicated() -> dict:
     }
 
 
-def _export(model, state, save_path) -> None:
+def _export(model, state, save_path, fqn_to_index_mapping=None) -> None:
     with (
         patch.object(save_utils, "_MAX_SHARD_BYTES", MAX_SHARD_BYTES),
         patch.object(save_utils, "get_model_save_state", lambda *args, **kwargs: dict(state)),
     ):
-        save_utils._save_hf_safetensor_distributed(model, save_path, None, None)
+        save_utils._save_hf_safetensor_distributed(model, save_path, fqn_to_index_mapping, None)
 
 
 def _worker(rank: int, init_file: str, save_path: str) -> None:
@@ -111,9 +112,9 @@ def test_an_emb_sharded_table_is_kept_split_and_merged_offline():
         mp.spawn(_worker, args=(os.path.join(tmp, "init"), save_path), nprocs=WORLD_SIZE, join=True)
 
         weight_map = json.loads((Path(save_path) / "model.safetensors.index.json").read_text())["weight_map"]
-        pending = json.loads((Path(save_path) / HF_PENDING_MERGE_FILENAME).read_text())["weight_map"]
+        pending = json.loads((Path(save_path) / HF_PENDING_MERGE_FILENAME).read_text())["tensors"]
         assert set(weight_map) == {"table", "dense", "bias"}
-        assert pending == {"table": weight_map["table"]}
+        assert pending == {"table": {"file": weight_map["table"], "shape": [WORLD_SIZE * ROWS, COLS], "nbytes": 192}}
         # Only the table waits; the replicated dense weight is just as oversized but has one copy.
         assert not (Path(save_path) / weight_map["table"]).exists()
         assert (Path(save_path) / weight_map["dense"]).exists()
@@ -124,6 +125,16 @@ def test_an_emb_sharded_table_is_kept_split_and_merged_offline():
         for resolve in (_resolve_safetensors_shards, _resolve_state_dict_iterators):
             with pytest.raises(RuntimeError, match="merge_hf_export"):
                 resolve(save_path)
+
+        # A lost shard is refused before anything is written or removed.
+        broken = save_path + "_broken"
+        shutil.copytree(save_path, broken)
+        os.remove(Path(broken) / HF_SHARDED_DIRNAME / shards[1])
+        with pytest.raises(ValueError, match="shard"):
+            save_utils.merge_pending_hf_shards(broken)
+        assert (Path(broken) / HF_PENDING_MERGE_FILENAME).exists()
+        assert len(list((Path(broken) / HF_SHARDED_DIRNAME).iterdir())) == WORLD_SIZE - 1
+        assert not (Path(broken) / weight_map["table"]).exists()
 
         save_utils.merge_pending_hf_shards(save_path)
 
@@ -142,6 +153,7 @@ def test_a_small_emb_table_or_an_unplanned_tensor_is_consolidated_as_before():
     for model in (
         _model(SimpleNamespace(para_name="emb", placement=Replicate())),
         _model(SimpleNamespace(para_name="ep", placement=Shard(0))),
+        _model(SimpleNamespace(para_name="emb", placement=Shard(1))),
         nn.Module(),
     ):
         with tempfile.TemporaryDirectory() as save_path:
@@ -162,6 +174,26 @@ def test_a_merge_interrupted_before_its_marker_is_removed_can_run_again():
         torch.testing.assert_close(_load_export(save_path)["table"], table, atol=0, rtol=0)
 
 
+def test_two_tables_sharing_source_files_each_get_a_file_of_their_own():
+    tables = {
+        name: torch.cat([_local_rows(rank) + offset for rank in range(WORLD_SIZE)])
+        for name, offset in (("table", 0), ("table2", 7))
+    }
+    state = {**tables, **_replicated()}
+    spec = SimpleNamespace(para_name="emb", placement=Shard(0))
+    with tempfile.TemporaryDirectory() as save_path:
+        _export(_model(spec, table2=spec), state, save_path, {"table": 1, "dense": 1, "table2": 2, "bias": 2})
+        weight_map = json.loads((Path(save_path) / "model.safetensors.index.json").read_text())["weight_map"]
+        pending = json.loads((Path(save_path) / HF_PENDING_MERGE_FILENAME).read_text())["tensors"]
+        assert set(pending) == {"table", "table2"}
+        files = [weight_map[name] for name in ("table", "table2", "dense", "bias")]
+        assert len(set(files[:2])) == 2 and not set(files[:2]) & set(files[2:])
+        save_utils.merge_pending_hf_shards(save_path)
+        loaded = _load_export(save_path)
+        for name, value in state.items():
+            torch.testing.assert_close(loaded[name], value, atol=0, rtol=0)
+
+
 def test_the_merge_script_finds_every_pending_export_below_a_root():
     spec = importlib.util.spec_from_file_location(
         "merge_hf_export", Path(__file__).resolve().parents[2] / "scripts" / "merge_hf_export.py"
@@ -175,4 +207,6 @@ def test_the_merge_script_finds_every_pending_export_below_a_root():
                 Path(root, module, HF_PENDING_MERGE_FILENAME).write_text("{}")
         # A marker inside the shard directory is not an export.
         Path(root, "llm", HF_SHARDED_DIRNAME, HF_PENDING_MERGE_FILENAME).write_text("{}")
-        assert script.pending_exports(root) == [os.path.join(root, "ngram"), os.path.join(root, "text_encoder")]
+        pending, orphaned = script.scan(root)
+        assert pending == [os.path.join(root, "ngram"), os.path.join(root, "text_encoder")]
+        assert orphaned == [os.path.join(root, "llm", HF_SHARDED_DIRNAME)]
