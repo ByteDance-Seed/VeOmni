@@ -561,6 +561,9 @@ class OmniTrainer:
     def train(self):
         args: OmniArguments = self.args
         self.on_train_begin()
+        # After on_train_begin, which hands it the shard position saved with the cursor.
+        if self.offline_cache_writer is not None:
+            self.offline_cache_writer.open()
         logger.info(
             f"Rank{args.train.local_rank} Start training. "
             f"Start step: {self.start_step}. "

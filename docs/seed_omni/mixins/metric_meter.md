@@ -162,8 +162,8 @@ reported per module under `trace/<module>/` and there is no top-level
 `consume_tokens` is part of
 [`OmniEnvironMeter.state_dict()`](../../../veomni/utils/omni_helper.py#L111),
 which `GlobalStateCallback`
-[saves](../../../veomni/trainer/callbacks/global_state_callback.py#L138) and
-[restores](../../../veomni/trainer/callbacks/global_state_callback.py#L288), so
+[saves](../../../veomni/trainer/callbacks/global_state_callback.py#L142) and
+[restores](../../../veomni/trainer/callbacks/global_state_callback.py#L298), so
 the cumulative counters survive a resume.
 
 ## Rules for a correct implementation

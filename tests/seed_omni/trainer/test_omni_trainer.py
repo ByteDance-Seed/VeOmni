@@ -132,6 +132,29 @@ def test_an_offline_embedding_run_may_build_no_optimizer(monkeypatch):
     assert trainer._build_model_runtime() is built
 
 
+def test_the_offline_cache_writer_opens_after_the_trainer_state_is_restored(monkeypatch):
+    """``on_train_begin`` hands the writer its saved shard position; opening first would reject the resumed cache."""
+    monkeypatch.setattr("veomni.trainer.omni.omni_trainer.synchronize", MagicMock())
+    calls = []
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.args = SimpleNamespace(
+        train=SimpleNamespace(local_rank=0, num_train_epochs=0),
+        data=SimpleNamespace(dataloader=SimpleNamespace(use_background_prefetcher=False)),
+        train_steps=1,
+    )
+    trainer.start_step = trainer.start_epoch = 0
+    trainer.on_train_begin = lambda: calls.append("on_train_begin")
+    trainer.on_train_end = lambda: calls.append("on_train_end")
+    trainer.offline_cache_writer = MagicMock()
+    trainer.offline_cache_writer.open.side_effect = lambda: calls.append("open")
+    trainer.offline_cache_writer.finalize.side_effect = lambda: calls.append("finalize")
+    trainer.destroy_distributed = MagicMock()
+
+    trainer.train()
+
+    assert calls == ["on_train_begin", "open", "on_train_end", "finalize"]
+
+
 def test_offline_cache_step_writes_every_micro_batch_without_autograd():
     """The graph writes encoded values into the items in place; the writer gets those same items."""
     grad_enabled = []
