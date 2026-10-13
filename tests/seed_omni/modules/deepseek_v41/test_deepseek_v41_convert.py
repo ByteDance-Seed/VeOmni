@@ -610,6 +610,65 @@ class TestConversionOptions:
             convert_deepseek_v41_checkpoint(path, str(tmp_path / "out"), modules=["deepseek_v41_brain"])
 
 
+def _write_released_config(path):
+    """The released ``config.json``'s shape: ``text_config`` plus ``engram_*``, ``vision_config``."""
+    text = {k: v for k, v in llm_config().to_dict().items() if not k.startswith("_")}
+    text.update(
+        engram_layer_ids=ENGRAM_LAYERS,
+        engram_num_embeddings=[1024],
+        engram_max_ngram_size=3,
+        engram_n_heads=2,
+        engram_head_dim=16,
+        engram_vocab_size=4096,
+        engram_compressed_vocab_size=100,
+        engram_pad_token_id=2,
+    )
+    vision = {"num_hidden_layers": 1, "hidden_size": HIDDEN, "num_attention_heads": 4, "intermediate_size": 128}
+    with open(os.path.join(path, "config.json"), "w") as handle:
+        json.dump({"model_type": "deepseek_v41", "text_config": text, "vision_config": vision}, handle)
+
+
+class TestThroughTheRegistry:
+    def test_a_partial_run_into_a_fresh_directory_still_loads(self, tmp_path, released):
+        """``--extra modules=deepseek_v41_llm`` writes one folder, yet the root names all four.
+
+        The root config reads each module's config.json, so the folders a
+        partial run skipped still need one.
+        """
+        from veomni.models.seed_omni.configuration_omni import OmniConfig
+        from veomni.models.seed_omni.modules.deepseek_v41.convert_model import MODULES
+        from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
+
+        _, _, path = released
+        _write_released_config(path)
+        output = tmp_path / "omni"
+
+        convert_checkpoint(path, str(output), modules="deepseek_v41_llm")
+
+        assert (output / "deepseek_v41_llm" / "model.safetensors.index.json").is_file() or (
+            output / "deepseek_v41_llm" / "model.safetensors"
+        ).is_file()
+        for name in set(MODULES) - {"deepseek_v41_llm"}:
+            assert not any(f.endswith(".safetensors") for f in os.listdir(output / name))
+        config = OmniConfig.from_pretrained(output)
+        assert list(config.module_names) == list(MODULES)
+        assert config.infer_type == "vision_understanding"
+        assert config.training_graph
+
+    def test_the_llm_keeps_the_released_engram_layers(self, tmp_path, released):
+        """The llm's engram connection sits on the layers the tables feed, not its defaults."""
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig
+        from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
+
+        _, _, path = released
+        _write_released_config(path)
+        convert_checkpoint(path, str(tmp_path / "omni"), modules="deepseek_v41_llm")
+
+        llm = DeepseekV41LlmConfig.from_pretrained(tmp_path / "omni" / "deepseek_v41_llm")
+        assert llm.engram_layer_ids == ENGRAM_LAYERS
+        assert llm.engram_n_heads == 2
+
+
 class TestVisionPassthrough:
     def _convert(self, tmp_path, path):
         from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY

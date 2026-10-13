@@ -644,7 +644,12 @@ def _build_configs(hf_config: dict[str, Any]):
         pad_token_id=text["engram_pad_token_id"],
         weight_quantization=dict(quant) if quant else None,
     )
-    llm_fields = {k: v for k, v in text.items() if not k.startswith("engram_") and k != "model_type"}
+    # The llm declares the engram fields that shape its connection to the
+    # tables; the rest describe the tables and belong to the ngram config.
+    llm_engram = {"engram_layer_ids", "engram_max_ngram_size", "engram_n_heads", "engram_head_dim"}
+    llm_fields = {
+        k: v for k, v in text.items() if (not k.startswith("engram_") or k in llm_engram) and k != "model_type"
+    }
     # The experts' storage format is a quantization_config key upstream, and a
     # field on the module config here because the QAT path reads it per forward.
     llm_fields["expert_dtype"] = (quant or {}).get("expert_dtype", "fp8")
