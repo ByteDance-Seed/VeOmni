@@ -416,9 +416,7 @@ class GradientCheckpointingConfig:
         metadata={
             "help": (
                 "Enable gradient checkpointing. Master switch: with it off recompute_layers, "
-                "selective_recompute_layers and save_ops have no effect. A model that decides "
-                "checkpointing from its input data rather than from this config is not switched "
-                "off by it: it keeps recomputing, in full."
+                "selective_recompute_layers and save_ops have no effect."
             )
         },
     )
@@ -433,9 +431,9 @@ class GradientCheckpointingConfig:
         metadata={
             "help": (
                 "Use reentrant gradient checkpointing. Kept off by default, and not usable "
-                "on a model that installs its own checkpoint function and passes its block "
-                "arguments by keyword (MiniMax-H3): reentrant checkpointing saves positional "
-                "tensors only, so the first recomputed block raises. torch also refuses "
+                "on a model whose block loop passes its block arguments by keyword "
+                "(MiniMax-H3): reentrant checkpointing saves positional tensors only, so "
+                "the first recomputed block raises. torch also refuses "
                 "enable_reentrant=True together with SAC."
             )
         },

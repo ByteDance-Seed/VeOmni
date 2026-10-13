@@ -1067,28 +1067,32 @@ def test_the_policy_decides_the_h3_blocks_flavour(monkeypatch):
 
     Called exactly as the runtime does it — HF's enable on the wrapper, then the policy on
     the wrapper — so the function the loop ends up calling is the framework's container
-    closure, and the last block, inside the selective range, is checkpointed with SAC's kwargs.
+    closure, which hands every block it is given that block's own decision.
     """
     recorder = _SkippingRecorder()
     monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", recorder)
     model = _tiny_h3_model()
     model.gradient_checkpointing_enable({"use_reentrant": False})
 
+    # Three blocks: the last two are recomputed, the front one of those selectively.
     report = recompute_utils.apply_recompute_policy(
         model,
-        recompute_utils.RecomputePolicy(recompute_layers=2, selective_recompute_layers=2, context_fn=noop_context_fn),
+        recompute_utils.RecomputePolicy(recompute_layers=2, selective_recompute_layers=1, context_fn=noop_context_fn),
     )
 
+    assert report.bound_blocks == 3  # the stack the policy found on the real DiT
     # No block carries an entry point of its own; the two the enable wrote (wrapper and DiT)
     # are containers, and the loop's one is what decides per block.
     assert (report.patched_blocks, report.patched_containers) == (0, 2)
     assert report.covered
 
     dit = model.dit
-    dit._gradient_checkpointing_func(dit.blocks[-1], torch.zeros(1))  # the last block is inside the SAC range
+    dit._gradient_checkpointing_func(dit.blocks[1], torch.zeros(1))  # inside the selective range
+    dit._gradient_checkpointing_func(dit.blocks[2], torch.zeros(1))  # recomputed, but not selectively
 
     assert recorder.calls == [
         {"use_reentrant": False, "context_fn": noop_context_fn, "early_stop": True},
+        {"use_reentrant": False, "early_stop": True},
     ]
 
 

@@ -20,15 +20,20 @@ differs from a standalone model are the places that override it.
 """
 
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch.nn as nn
+from torch.utils.checkpoint import noop_context_fn
 
+from veomni.arguments import GradientCheckpointingConfig
 from veomni.distributed import parallel_state
-from veomni.distributed.parallel_state import ParallelState
+from veomni.distributed.parallel_state import ParallelState, use_parallel_state
 from veomni.models.model_runtime import VeOmniModelRuntime
+from veomni.models.seed_omni.accelerated.omni_module import omni_module_runtime
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
+from veomni.utils import recompute_utils
 
 
 def _fsdp(scope: str, mode: str = "fsdp2") -> SimpleNamespace:
@@ -38,6 +43,7 @@ def _fsdp(scope: str, mode: str = "fsdp2") -> SimpleNamespace:
 def _unbuilt(model: nn.Module | None = None, **args_fields) -> ModuleRuntime:
     """A ModuleRuntime with its fields set but no build run."""
     args_fields.setdefault("accelerator", _fsdp("module"))
+    args_fields.setdefault("basic_modules", [])
     runtime = ModuleRuntime.__new__(ModuleRuntime)
     runtime._global_accelerator = _fsdp("module")
     runtime.model = model
@@ -238,7 +244,6 @@ def test_the_constructor_stores_training_args_where_the_base_reads_them(monkeypa
         "_build_model_assets",
         "_freeze_model_module",
         "_build_parallelized_model",
-        "_scope_recompute_to_parallel_state",
         "_build_optimizer",
         "build_checkpoint",
     ):
@@ -266,7 +271,6 @@ def test_only_the_top_level_scope_decides_wrap_omni_model(monkeypatch, top_level
         "_build_model_assets",
         "_freeze_model_module",
         "_build_parallelized_model",
-        "_scope_recompute_to_parallel_state",
         "_build_optimizer",
         "build_checkpoint",
     ):
@@ -292,6 +296,151 @@ def test_a_module_under_the_omni_model_wrap_applies_async_activation_offload_fir
     runtime._build_parallelized_model()
 
     assert applied == [runtime]
+
+
+class _CheckpointableLinear(nn.Linear):
+    """An HF-style model: it owns the ``gradient_checkpointing_enable`` entry point."""
+
+    def __init__(self, log=None):
+        super().__init__(2, 2)
+        self.log = [] if log is None else log
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        self.log.append(("enable", gradient_checkpointing_kwargs))
+
+
+class _RecordingParallelState:
+    """Stands in for ``use_parallel_state(name)``, recording where it was entered."""
+
+    def __init__(self, name, log):
+        self.name = name
+        self.log = log
+
+    def __enter__(self):
+        self.log.append(self.name)
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def _recompute_accelerator(**gc_fields):
+    return SimpleNamespace(
+        gradient_checkpointing=GradientCheckpointingConfig(**gc_fields),
+        offload_config=SimpleNamespace(enable_activation=False, enable_async_activation=False),
+        torch_compile=SimpleNamespace(enable=False),
+    )
+
+
+def test_the_recompute_apply_enables_first_then_applies_the_policy(monkeypatch):
+    """The module's ParallelState is folded into the policy, never armed as a second enable.
+
+    Enabling again *after* the apply rewrites every block's entry point, which is
+    how the composed path used to lose both the layer filter and SAC.
+    """
+    calls = []
+    model = _CheckpointableLinear(calls)
+    monkeypatch.setattr(
+        recompute_utils,
+        "apply_recompute_policy",
+        lambda wrapped, policy, **kwargs: calls.append(("apply", wrapped, policy)),
+    )
+    accelerator = _recompute_accelerator(enable=True, recompute_layers=1, selective_recompute_layers=1)
+
+    _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
+
+    assert [call[0] for call in calls] == ["enable", "apply"]
+    enable_kwargs = calls[0][1]
+    assert enable_kwargs["use_reentrant"] is False and enable_kwargs["early_stop"] is True
+
+    _, wrapped, policy = calls[1]
+    assert wrapped is model
+    assert (policy.recompute_layers, policy.selective_recompute_layers) == (1, 1)
+    assert isinstance(policy.recompute_context, partial)
+    assert policy.recompute_context.func is use_parallel_state
+    assert policy.recompute_context.args == ("vision_encoder",)
+
+
+def test_the_enable_scopes_recompute_to_the_modules_parallel_state(monkeypatch):
+    """Blocks the policy does not bind keep HF's function, so the enable must carry
+    the module's ParallelState itself — the default config binds nothing."""
+    entered = []
+    model = _CheckpointableLinear()
+    monkeypatch.setattr(omni_module_runtime, "use_parallel_state", lambda name: _RecordingParallelState(name, entered))
+    accelerator = _recompute_accelerator(enable=True)  # the defaults: nothing is bound selectively
+
+    _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
+
+    context_fn = model.log[0][1]["context_fn"]
+    assert context_fn is not noop_context_fn
+    forward_ctx, recompute_ctx = context_fn()
+    with forward_ctx:
+        assert entered == []
+    with recompute_ctx:
+        assert entered == ["vision_encoder"]
+
+
+def test_the_enable_keeps_torchs_default_without_a_parallel_state(monkeypatch):
+    """A module with no state of its own has nothing to fold in."""
+    model = _CheckpointableLinear()
+    monkeypatch.setattr(ModuleRuntime, "_recompute_context", lambda self: None)
+    accelerator = _recompute_accelerator(enable=True)
+
+    _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
+
+    assert model.log[0][1]["context_fn"] is noop_context_fn
+
+
+def test_the_recompute_apply_ranks_the_stacks_by_the_modules_basic_modules(monkeypatch):
+    """Ranking the block stacks is what ``basic_modules`` is for, and the composed scope
+    has to rank them like the ``fsdp_scope='module'`` wrap does, or one configuration
+    would bind different stacks in the two scopes."""
+    seen = []
+    model = _CheckpointableLinear()
+    monkeypatch.setattr(
+        recompute_utils,
+        "apply_recompute_policy",
+        lambda wrapped, policy, **kwargs: seen.append(kwargs),
+    )
+    accelerator = _recompute_accelerator(enable=True)
+
+    _unbuilt(model, accelerator=accelerator, basic_modules=["BlockA"])._apply_recompute_policy()
+
+    assert seen == [{"basic_modules": ["BlockA"]}]
+
+
+def test_reentrant_checkpointing_is_rejected_for_a_scoped_module(monkeypatch):
+    """Reentrant checkpointing takes no ``context_fn``, so a module that must recompute
+    inside its ParallelState cannot use it: the run would recompute with the wrong state
+    current. Rejected, not silently scoped out."""
+    model = _CheckpointableLinear()
+    accelerator = _recompute_accelerator(enable=True, enable_reentrant=True)
+
+    with pytest.raises(ValueError, match="enable_reentrant"):
+        _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
+
+    assert model.log == []
+
+
+def test_reentrant_checkpointing_is_only_rejected_while_checkpointing_is_on():
+    """``enable_reentrant`` says nothing with checkpointing off: no reentrant
+    checkpoint call happens, so the policy is built instead of failing the run."""
+    accelerator = _recompute_accelerator(enable=False, enable_reentrant=True)
+
+    policy = _unbuilt(accelerator=accelerator)._build_recompute_policy()
+
+    assert policy.use_reentrant is True
+
+
+def test_the_recompute_apply_is_a_no_op_when_checkpointing_is_off(monkeypatch):
+    calls = []
+    model = _CheckpointableLinear(calls)
+    monkeypatch.setattr(recompute_utils, "apply_recompute_policy", lambda *args, **kwargs: calls.append(("apply",)))
+    accelerator = SimpleNamespace(gradient_checkpointing=GradientCheckpointingConfig(enable=False))
+
+    _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
+
+    assert calls == []
 
 
 def test_distributed_inference_wraps_lora_before_loading_weights(monkeypatch):
