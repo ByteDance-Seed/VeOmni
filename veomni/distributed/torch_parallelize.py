@@ -33,6 +33,7 @@ from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_lo
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
+from .emb_parallel import ShardedEmbedding
 from .fsdp2.reduce_scatter import (
     ReduceScatterTransportPolicy,
     register_fp32_reduce_scatter_with_low_precision_transport,
@@ -476,6 +477,9 @@ def _finish_without_fsdp_wrap(
     _divide_extra_parallel_grads_like_fsdp(model, parallel_state, fqn2spec_info)
     # Read by the grad clipper, which averages the replicated parameters' grads.
     model._extra_parallel_only = True
+    for module in model.modules():
+        if isinstance(module, ShardedEmbedding):
+            module.outside_fsdp = True
     return model
 
 
