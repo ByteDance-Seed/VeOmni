@@ -132,11 +132,16 @@ class GlobalStateCallback(Callback):
         channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
         channel_loss_state = channel_loss_callback.state_dict() if channel_loss_callback is not None else {}
 
+        # Flushes before it reports, so the rows this cursor covers are on disk.
+        offline_cache_writer = getattr(self.trainer, "offline_cache_writer", None)
+        offline_cache_writer_state = offline_cache_writer.state_dict() if offline_cache_writer is not None else None
+
         return {
             "global_step": state.global_step,
             "train_dataloader": train_dataloader_state,
             "environ_meter": self.trainer.environ_meter.state_dict(),
             "channel_loss_callback": channel_loss_state,
+            "offline_cache_writer": offline_cache_writer_state,
             "torch_rng_state": torch.get_rng_state(),
             "device_rng_state": get_device_rng_state(),
         }
@@ -280,6 +285,11 @@ class GlobalStateCallback(Callback):
         channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
         if channel_loss_state is not None and channel_loss_callback is not None:
             channel_loss_callback.load_state_dict(channel_loss_state)
+
+        offline_cache_writer_state = global_state.get("offline_cache_writer")
+        offline_cache_writer = getattr(self.trainer, "offline_cache_writer", None)
+        if offline_cache_writer_state is not None and offline_cache_writer is not None:
+            offline_cache_writer.load_state_dict(offline_cache_writer_state)
 
         if self.trainer.train_dataloader is not None and global_state.get("train_dataloader") is not None:
             self.trainer.train_dataloader.load_state_dict(global_state["train_dataloader"])

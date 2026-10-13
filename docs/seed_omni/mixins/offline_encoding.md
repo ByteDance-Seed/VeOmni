@@ -60,9 +60,22 @@ a run whose `data.data_type` does not match: only `offline_training` reads
 `seedomni_cached`.
 
 `offline_embedding` freezes every module, so it never writes or restores module
-weights. A resume of that task only needs the dataloader cursor
-(`GlobalStateCallback`); encoder weights always come from each module's
-`model_path`.
+weights; encoder weights always come from each module's `model_path`. A resume
+of that task (`train.checkpoint.load_path` pointing at a saved step) restores
+the dataloader cursor and the cache writer's position together, both through
+`GlobalStateCallback`:
+
+- Saving the cursor first
+  [flushes the writer](../../../veomni/models/seed_omni/utils/offline_cache.py#L90),
+  so every row the cursor covers is on disk.
+- On resume the writer
+  [reopens at the saved shard position](../../../veomni/models/seed_omni/utils/offline_cache.py#L131)
+  and deletes this rank's shards written after it. The restored cursor replays
+  those steps, so keeping them would cache those samples twice.
+- Resume fails if the cache was already finalized, because finalizing renumbers
+  the shards. It also fails if the data-parallel size changed.
+- A run without a saved writer position still
+  [refuses a directory that holds shards](../../../veomni/models/seed_omni/utils/offline_cache.py#L108).
 
 Which modules exist and which endpoint each graph node calls stay in the
 modules / graph YAML: each task has its own pair, e.g. BAGEL's
@@ -247,7 +260,7 @@ The result:
 The pieces that complete this workflow are in place:
 [`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L538)
 runs the encoding run, and
-[`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L104)
+[`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L179)
 persists each conversation from the micro-batch's `conversation_list`. The
 training graph must only mutate `ConversationItem` fields in place (for
 example `value` and `meta`); it must not replace the list, append items, or
@@ -256,7 +269,7 @@ before the graph runs. Under that contract the trainer still sees the encoded
 items after FSDP2's root pre-forward, which may rebuild the outer dicts and
 lists but keeps the same item objects. Ranks that share a `dp_rank` (SP, CP or TP peers)
 hold the same batch, so
-[only the first of them writes](../../../veomni/models/seed_omni/utils/offline_cache.py#L33).
+[only the first of them writes](../../../veomni/models/seed_omni/utils/offline_cache.py#L36).
 The training run reads the cache through the
 [`seedomni_cached`](../../../veomni/data/seed_omni/seedomni_transform.py#L246)
 data transform. It unpickles each row, so point `data.train_path` only at a
@@ -298,8 +311,11 @@ A missing module or method still fails before the first request runs.
   [one epoch for `offline_embedding`](../../../tests/seed_omni/arguments/test_offline_cache_args.py#L60),
   [the `data.data_type` match](../../../tests/seed_omni/arguments/test_offline_cache_args.py#L76).
 - [`tests/seed_omni/mixins/test_offline_cache_writer.py`](../../../tests/seed_omni/mixins/test_offline_cache_writer.py):
-  [the writer round trip](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L50) and
-  [one writer per `dp_rank`](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L134).
+  [the writer round trip](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L51),
+  [one writer per `dp_rank`](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L218),
+  [a resumed writer keeps every row its cursor covers and drops the replayed ones](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L133),
+  [a finalized cache](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L161) or [another dp size](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L174) cannot be resumed into, and
+  [a shard only one rank sees fails every rank](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L304).
 - [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
   [a step without an lr scheduler logs no lr](../../../tests/seed_omni/trainer/test_step_metrics_callback.py#L82).
 - [`tests/seed_omni/runtime/test_module_runtime.py`](../../../tests/seed_omni/runtime/test_module_runtime.py):
@@ -315,7 +331,10 @@ A missing module or method still fails before the first request runs.
 - [`tests/seed_omni/data/test_preprocessor.py`](../../../tests/seed_omni/data/test_preprocessor.py):
   [the VAE preprocessor leaves cached posteriors alone](../../../tests/seed_omni/data/test_preprocessor.py#L394).
 - [`tests/seed_omni/trainer/test_omni_trainer.py`](../../../tests/seed_omni/trainer/test_omni_trainer.py):
-  [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L123), and
-  [`offline_cache_step` writes every micro-batch without autograd](../../../tests/seed_omni/trainer/test_omni_trainer.py#L134).
+  [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L124),
+  [the writer opens after the trainer state is restored](../../../tests/seed_omni/trainer/test_omni_trainer.py#L135), and
+  [`offline_cache_step` writes every micro-batch without autograd](../../../tests/seed_omni/trainer/test_omni_trainer.py#L158).
+- [`tests/checkpoints/test_checkpoint_callback.py`](../../../tests/checkpoints/test_checkpoint_callback.py):
+  [the writer's position is saved and restored with the cursor](../../../tests/checkpoints/test_checkpoint_callback.py#L632).
 - [`tests/seed_omni/model/test_graph.py`](../../../tests/seed_omni/model/test_graph.py):
   [a generation graph builds without the modules it names](../../../tests/seed_omni/model/test_graph.py#L141).
