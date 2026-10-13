@@ -1,6 +1,6 @@
 --- a/veomni/models/transformers/kimi_k3/source/modeling_kimi_k3.py
 +++ b/patched_modeling_kimi_k3_gpu.py
-@@ -1,22 +1,45 @@
+@@ -1,22 +1,51 @@
 -# coding=utf-8
 -# Copyright 2025-2026 The Moonshot AI Team and HuggingFace Inc. team. All rights reserved.
 +# ==============================================================================
@@ -52,6 +52,12 @@
 +#      Init fused expert weights (in-place, NPU-safe) and zero the KDA dt_bias
 +#    - method_override: KimiK3PreTrainedModel._init_weights
 +#      Init fused expert weights (in-place, NPU-safe) and zero the KDA dt_bias
++#    - method_override: KimiK3ForConditionalGeneration.get_position_id_func
++#      VLM trainer data hook: K3 derives positions inside the modeling (vision divided-fixed pos-emb from grid_thws, NoPE MLA, recurrent KDA); return an arange stub for generic consumers
++#    - method_override: KimiK3ForConditionalGeneration.get_extra_collate_infos
++#      K3 SP contract: text tokens are seq-sharded (ulysses) but the vision tower runs redundantly on every SP rank -- pixel_values/grid_thws stay full (no sp-slice). grid_thws (num_images, 3) cats along dim 0 like image_grid_thw. Tuple form; MainCollator expands it to DataCollateInfo.
++#    - method_override: KimiK3ForConditionalGeneration.get_dyn_bsz_length_fn
++#      Dynamic-batching length hook: K3 expands one media_pad placeholder per image to grid_t*h*w/(mh*mw) merged features inside the model (occupation table), so the packer's attention_mask-only budget must add the expanded vision length (matches the stage-7 len_post budgeting). Closes over merge ints only -- picklable for worker-side dynamic batching.
 +#    - method_override: KimiLinearForCausalLM.get_parallel_plan
 +#      Register KimiLinear expert parallel plan for v5 generated modeling
 +#    - method_override: KimiK3ForConditionalGeneration.get_parallel_plan
@@ -62,7 +68,7 @@
  import math
  import os
  from collections.abc import Callable, Sequence
-@@ -25,12 +48,12 @@
+@@ -25,12 +54,12 @@
 
  import numpy as np
  import torch
@@ -77,7 +83,7 @@
  from transformers.activations import ACT2FN, PytorchGELUTanh
  from transformers.cache_utils import Cache
  from transformers.configuration_utils import PretrainedConfig
-@@ -38,46 +61,60 @@
+@@ -38,46 +67,60 @@
  from transformers.masking_utils import create_causal_mask
  from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
  from transformers.modeling_layers import GradientCheckpointingLayer
@@ -158,7 +164,7 @@
 
  # Flash attention (vision tower only): patchgen hoists conditional imports to
  # the module top level, so `flash_attn_varlen_func` is unconditionally None
-@@ -87,6 +124,12 @@
+@@ -87,6 +130,12 @@
  flash_attn_varlen_func = None
 
 
@@ -171,7 +177,7 @@
  # Register Moonshot-specific activation functions
  class SituAndMul(nn.Module):
      """
-@@ -99,7 +142,14 @@
+@@ -99,7 +148,14 @@
          self.beta = beta
          self.linear_beta = linear_beta
 
@@ -186,7 +192,7 @@
          d = x.shape[-1] // 2
          gate = x[..., :d].to(torch.float32)
          up = x[..., d:].to(torch.float32)
-@@ -245,50 +295,109 @@
+@@ -245,50 +301,109 @@
          return self.conv_states[self.last_linear_layer] is not None
 
 
@@ -320,7 +326,7 @@
 
 
  class KimiMLP(nn.Module):
-@@ -608,7 +717,6 @@
+@@ -608,7 +723,6 @@
          operate on the padded layout (equal shard lengths); unpad/repad use
          the full-sequence attention_mask exactly like the non-SP path.
          """
@@ -328,7 +334,7 @@
 
          _timing = os.environ.get("K3_KDA_SP_TIMING") == "1"
          if _timing:
-@@ -889,6 +997,12 @@
+@@ -889,6 +1003,12 @@
          return o
 
 
@@ -341,7 +347,7 @@
  class KimiMoEGate(nn.Module):
      """
      MoEGate adapted from Deepseek-V3.
-@@ -922,10 +1036,9 @@
+@@ -922,10 +1042,9 @@
          self.reset_parameters()
 
      def reset_parameters(self) -> None:
@@ -353,7 +359,7 @@
      def forward(self, hidden_states):
          bsz, seq_len, h = hidden_states.shape
          # compute gating score
-@@ -945,7 +1058,7 @@
+@@ -945,7 +1064,7 @@
              )
 
          # select top-k experts
@@ -362,7 +368,7 @@
          scores = scores.view(bsz * seq_len, -1)
          scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
          if self.num_expert_group > 1 and self.num_expert_group > self.topk_group:
-@@ -990,13 +1103,29 @@
+@@ -990,13 +1109,29 @@
          return topk_idx, topk_weight
 
 
@@ -397,7 +403,7 @@
          super().__init__()
          self.config = config
          self.hidden_dim = config.hidden_size
-@@ -1008,20 +1137,16 @@
+@@ -1008,20 +1143,16 @@
          self.moe_hidden_size = config.routed_expert_hidden_size if self.use_latent_moe else config.hidden_size
          self.latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
 
@@ -426,7 +432,7 @@
          if config.num_shared_experts is not None:
              intermediate_size = config.moe_intermediate_size * config.num_shared_experts
              self.shared_experts = KimiMLP(
-@@ -1055,10 +1180,9 @@
+@@ -1055,10 +1186,9 @@
          if self.use_latent_moe:
              hidden_states = self.routed_expert_down_proj(hidden_states)
 
@@ -440,7 +446,7 @@
 
          if self.use_latent_moe:
              if self.latent_moe_use_norm:
-@@ -1070,41 +1194,6 @@
+@@ -1070,41 +1200,6 @@
          if self.config.num_shared_experts is not None:
              y = y + self.shared_experts(identity)
          return y
@@ -482,7 +488,7 @@
 
 
  class KimiDecoderLayer(GradientCheckpointingLayer):
-@@ -1336,6 +1425,12 @@
+@@ -1336,6 +1431,12 @@
          return prefix_sum, block_residual
 
 
@@ -495,7 +501,7 @@
  class KimiPreTrainedModel(PreTrainedModel):
      config_class = KimiLinearConfig
      base_model_prefix = "model"
-@@ -1350,8 +1445,47 @@
+@@ -1350,8 +1451,47 @@
      }
      _is_stateful = True
 
@@ -543,7 +549,7 @@
          if isinstance(module, nn.Linear):
              module.weight.data.normal_(mean=0.0, std=std)
              if module.bias is not None:
-@@ -1378,8 +1512,15 @@
+@@ -1378,8 +1518,15 @@
      return hidden_states.to(v.dtype)
 
 
@@ -560,7 +566,7 @@
          super().__init__(config)
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
-@@ -1395,14 +1536,12 @@
+@@ -1395,14 +1542,12 @@
              self.output_attn_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
              self.output_attn_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
 
@@ -580,7 +586,7 @@
          self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
          self.gradient_checkpointing = False
          # Initialize weights and apply final processing
-@@ -1516,6 +1655,12 @@
+@@ -1516,6 +1661,12 @@
          ).view(batch_size, seq_len, hidden_size)
 
 
@@ -593,7 +599,7 @@
  class KimiLinearForCausalLM(KimiPreTrainedModel, GenerationMixin):
      @classmethod
      def _supports_default_dynamic_cache(cls) -> bool:
-@@ -1532,32 +1677,25 @@
+@@ -1532,32 +1683,25 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -641,7 +647,7 @@
          output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
          output_hidden_states = (
              output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-@@ -1577,22 +1715,59 @@
+@@ -1577,22 +1721,59 @@
              cache_position=cache_position,
          )
 
@@ -709,7 +715,7 @@
 
 
  def multihead_attention(
-@@ -2368,6 +2543,12 @@
+@@ -2368,6 +2549,12 @@
          return x
 
 
@@ -722,7 +728,7 @@
  class KimiK3PreTrainedModel(PreTrainedModel):
      config_class = KimiK3Config
      base_model_prefix = "model"
-@@ -2385,13 +2566,48 @@
+@@ -2385,13 +2572,48 @@
 
      def _init_weights(self, module):
          # important: this ported version of Llava isn't meant for training from scratch - only
@@ -772,13 +778,13 @@
 
          if hasattr(module, "class_embedding"):
              module.class_embedding.data.normal_(mean=0.0, std=std)
-@@ -2442,13 +2658,37 @@
+@@ -2442,13 +2664,37 @@
          self.projector_ln_eps = config.projector_ln_eps
 
 
 +# ======================================================================
 +# [MODIFIED CLASS] KimiK3ForConditionalGeneration
-+# Methods patched: __init__, tie_weights, forward, get_parallel_plan
++# Methods patched: __init__, tie_weights, forward, get_position_id_func, get_extra_collate_infos, get_dyn_bsz_length_fn, get_parallel_plan
 +# ======================================================================
 +
 +
@@ -811,7 +817,7 @@
          super().__init__(config)
 
          vt_config = VisionTowerConfig(config.vision_config)
-@@ -2469,6 +2709,19 @@
+@@ -2469,6 +2715,19 @@
          self.language_model = KimiLinearForCausalLM(config.text_config)
          self.post_init()
 
@@ -831,7 +837,7 @@
          if hasattr(self.language_model, "dtype"):
              target_dtype = self.language_model.dtype
              self.vision_tower = self.vision_tower.to(dtype=target_dtype)
-@@ -2492,8 +2745,14 @@
+@@ -2492,8 +2751,14 @@
      def get_decoder(self):
          return self.language_model.get_decoder()
 
@@ -848,7 +854,7 @@
 
      def resize_token_embeddings(self, new_num_tokens: int | None = None, pad_to_multiple_of=None) -> nn.Embedding:
          model_embeds = self.language_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
-@@ -2638,35 +2897,46 @@
+@@ -2638,35 +2903,46 @@
          image_features = self.vision_tower(pixel_values, grid_thws)
          return image_features
 
@@ -916,7 +922,7 @@
 
          if inputs_embeds is None:
              # 1. Extra the input embeddings
-@@ -2678,15 +2948,7 @@
+@@ -2678,15 +2954,7 @@
                  if self.mm_projector:
                      image_features = self.mm_projector(image_features)
 
@@ -933,7 +939,7 @@
                  inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
                      image_features,
                      inputs_embeds,
-@@ -2728,46 +2990,86 @@
+@@ -2728,46 +2996,86 @@
                  attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
                  position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
 
@@ -1044,10 +1050,36 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2833,3 +3135,8 @@
+@@ -2833,3 +3141,34 @@
 
      def _reorder_cache(self, *args, **kwargs):
          return self.language_model._reorder_cache(*args, **kwargs)
++
++    def get_position_id_func(self):
++        def _kimi_k3_position_ids(input_ids=None, **kwargs):
++            if input_ids is None:
++                return None
++            return torch.arange(input_ids.shape[-1], device=input_ids.device).expand_as(input_ids)
++
++        return _kimi_k3_position_ids
++
++    def get_extra_collate_infos(self):
++        return {
++            "pixel_values": (0, False, None, None),
++            "grid_thws": (0, False, None, None),
++        }
++
++    def get_dyn_bsz_length_fn(self):
++        # Return a picklable partial of the module-level length fn in
++        # veomni.data.data_transform: trainer-state checkpointing pickles the
++        # dynamic-batching strategy (incl. this fn) by reference, so closures
++        # defined here (method locals) would break torch.save.
++        from functools import partial
++
++        from veomni.data.data_transform import kimi_k3_expanded_length
++
++        merge = getattr(self.config, "merge_kernel_size", (2, 2)) or (2, 2)
++        return partial(kimi_k3_expanded_length, int(merge[0]), int(merge[1]))
 +
 +    def get_parallel_plan(self):
 +        from ..parallel_plan import get_parallel_plan as _get_parallel_plan

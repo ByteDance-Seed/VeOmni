@@ -30,6 +30,22 @@ if TYPE_CHECKING:
 DATA_TRANSFORM_REGISTRY = Registry("DataTransform")
 
 
+def kimi_k3_expanded_length(mh: int, mw: int, sample) -> int:
+    """Module-level (picklable-by-reference) dynamic-batching length for K3.
+
+    K3 expands one media_pad placeholder per image to t*h*w/(mh*mw) merged
+    features inside the model (occupation table), so the packer budget must
+    add the expanded vision length. Used via functools.partial by the model
+    hook ``get_dyn_bsz_length_fn`` -- must stay module-level so trainer-state
+    checkpointing can pickle it by reference."""
+    n_text = int(sample["attention_mask"].sum())
+    grids = sample.get("grid_thws", None)
+    if grids is None or int(getattr(grids, "shape", (0,))[0]) == 0:
+        return n_text
+    n_feat = int(grids.prod(dim=-1).sum().item()) // (mh * mw)
+    return n_text + n_feat - int(grids.shape[0])
+
+
 def _get_exact_token_id(tokenizer: "PreTrainedTokenizer", token: str, fallback_token: str | None = None) -> int:
     candidates = (token,) if fallback_token is None else (token, fallback_token)
     unk_token_id = getattr(tokenizer, "unk_token_id", None)
@@ -558,4 +574,57 @@ def process_sample_qwen_omni(
             user_i += 1
         labels[assis_i + 2 : user_start_index[user_i] - 1] = input_ids[assis_i + 2 : user_start_index[user_i] - 1]
     model_inputs["labels"] = labels
+    return [model_inputs]
+
+
+@DATA_TRANSFORM_REGISTRY.register("kimi_k3")
+def process_sample_kimi_k3(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    chat_template: "ChatTemplate",
+    position_id_func: "Callable",
+    **kwargs,
+):
+    """Kimi K3 multimodal processing (single image + caption), stage-7 faithful.
+
+    One ``<|media_pad|>`` placeholder per image -- the modeling expands it to
+    the merged patch grid from ``grid_thws``. Labels supervise only the caption
+    tail (everything up to and including ``<|media_end|>`` is masked). Position
+    ids are computed inside the modeling (divided-fixed vision pos-emb, NoPE
+    MLA, recurrent KDA), so ``position_id_func`` is accepted but unused.
+    """
+    from .multimodal.image_utils import load_image_from_path
+
+    caption = str(sample.get("caption", "")).strip()
+    if not caption:
+        return []
+
+    width = int(sample["width"])
+    height = int(sample["height"])
+    text = f"<|media_begin|>image {width}x{height}<|media_content|><|media_pad|><|media_end|> {caption}"
+
+    tokenizer = getattr(processor, "tokenizer", None) or getattr(chat_template, "tokenizer", None)
+    if tokenizer is None:
+        raise ValueError(
+            "kimi_k3 transform needs a tokenizer (processor.tokenizer or chat_template.tokenizer); "
+            "check model.tokenizer_path points at the kimi_k3_hf repository."
+        )
+    media_end_id = tokenizer.encode("<|media_end|>")[0]
+    input_ids = tokenizer.encode(text) + [tokenizer.eos_token_id]
+    media_end_pos = input_ids.index(media_end_id)
+    labels = [-100] * (media_end_pos + 1) + input_ids[media_end_pos + 1 :]
+
+    image = load_image_from_path(str(sample["image"])).convert("RGB")
+    image_processor = getattr(processor, "image_processor", processor)
+    out = image_processor.preprocess([{"type": "image", "image": image}], return_tensors="pt")
+
+    model_inputs = {
+        # 1-D per-sample tensors: MainCollator packs along dim=-1 then unsqueezes
+        # dim 0, so 2-D per-sample tensors would produce a 3-D packed batch.
+        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+        "attention_mask": torch.ones(len(input_ids), dtype=torch.long),
+        "labels": torch.tensor(labels, dtype=torch.long),
+        "pixel_values": out["pixel_values"],
+        "grid_thws": out["grid_thws"],
+    }
     return [model_inputs]

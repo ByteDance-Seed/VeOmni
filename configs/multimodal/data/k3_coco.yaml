@@ -1,0 +1,10 @@
+# Kimi K3 COCO caption SFT source.
+# Produced by: k3_workspace/tools/coco_to_conversations.py (COCO val2017 captions,
+# 25014 samples; fields: image / width / height / caption).
+sources:
+- /home/w00991160/k3_workspace/data/k3_coco_val2017.jsonl
+names:
+- kimi_k3_coco
+schedule:
+- schedule_type: const
+  weights: [1.0]

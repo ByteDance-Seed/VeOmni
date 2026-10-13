@@ -33,6 +33,12 @@
 #      Init fused expert weights (in-place, NPU-safe) and zero the KDA dt_bias
 #    - method_override: KimiK3PreTrainedModel._init_weights
 #      Init fused expert weights (in-place, NPU-safe) and zero the KDA dt_bias
+#    - method_override: KimiK3ForConditionalGeneration.get_position_id_func
+#      VLM trainer data hook: K3 derives positions inside the modeling (vision divided-fixed pos-emb from grid_thws, NoPE MLA, recurrent KDA); return an arange stub for generic consumers
+#    - method_override: KimiK3ForConditionalGeneration.get_extra_collate_infos
+#      K3 SP contract: text tokens are seq-sharded (ulysses) but the vision tower runs redundantly on every SP rank -- pixel_values/grid_thws stay full (no sp-slice). grid_thws (num_images, 3) cats along dim 0 like image_grid_thw. Tuple form; MainCollator expands it to DataCollateInfo.
+#    - method_override: KimiK3ForConditionalGeneration.get_dyn_bsz_length_fn
+#      Dynamic-batching length hook: K3 expands one media_pad placeholder per image to grid_t*h*w/(mh*mw) merged features inside the model (occupation table), so the packer's attention_mask-only budget must add the expanded vision length (matches the stage-7 len_post budgeting). Closes over merge ints only -- picklable for worker-side dynamic batching.
 #    - method_override: KimiLinearForCausalLM.get_parallel_plan
 #      Register KimiLinear expert parallel plan for v5 generated modeling
 #    - method_override: KimiK3ForConditionalGeneration.get_parallel_plan
@@ -2660,7 +2666,7 @@ class ProjectorConfig:
 
 # ======================================================================
 # [MODIFIED CLASS] KimiK3ForConditionalGeneration
-# Methods patched: __init__, tie_weights, forward, get_parallel_plan
+# Methods patched: __init__, tie_weights, forward, get_position_id_func, get_extra_collate_infos, get_dyn_bsz_length_fn, get_parallel_plan
 # ======================================================================
 
 
@@ -3135,6 +3141,32 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
 
     def _reorder_cache(self, *args, **kwargs):
         return self.language_model._reorder_cache(*args, **kwargs)
+
+    def get_position_id_func(self):
+        def _kimi_k3_position_ids(input_ids=None, **kwargs):
+            if input_ids is None:
+                return None
+            return torch.arange(input_ids.shape[-1], device=input_ids.device).expand_as(input_ids)
+
+        return _kimi_k3_position_ids
+
+    def get_extra_collate_infos(self):
+        return {
+            "pixel_values": (0, False, None, None),
+            "grid_thws": (0, False, None, None),
+        }
+
+    def get_dyn_bsz_length_fn(self):
+        # Return a picklable partial of the module-level length fn in
+        # veomni.data.data_transform: trainer-state checkpointing pickles the
+        # dynamic-batching strategy (incl. this fn) by reference, so closures
+        # defined here (method locals) would break torch.save.
+        from functools import partial
+
+        from veomni.data.data_transform import kimi_k3_expanded_length
+
+        merge = getattr(self.config, "merge_kernel_size", (2, 2)) or (2, 2)
+        return partial(kimi_k3_expanded_length, int(merge[0]), int(merge[1]))
 
     def get_parallel_plan(self):
         from ..parallel_plan import get_parallel_plan as _get_parallel_plan

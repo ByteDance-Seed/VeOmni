@@ -1,0 +1,38 @@
+model:
+  config_path: tests/toy_config/kimi_k3_stage6
+  model_path: null
+  tokenizer_path: /home/w00991160/k3_workspace/kimi_k3_hf
+  ops_implementation:
+    attn_implementation: veomni_flash_attention_2_with_sp
+    rms_norm_implementation: npu
+    cross_entropy_loss_implementation: chunk_loss
+    moe_implementation: fused_npu
+    chunk_kda_implementation: ascendc
+    situ_and_mul_implementation: npu
+  optimizer:
+    lr: 1.0e-3
+    lr_decay_style: cosine
+  accelerator:
+    gradient_checkpointing:
+      enable_reentrant: false
+    init_device: meta
+    ulysses_size: 2
+    ep_size: 2
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+data:
+  train_path: configs/multimodal/data/k3_coco.yaml
+  data_type: conversation
+  max_seq_len: 1024
+  mm_configs: {}
+
+train:
+  num_train_epochs: 1
+  micro_batch_size: 1
+  global_batch_size: 8
+  max_steps: 30
+  checkpoint:
+    output_dir: k3_stage6_trainer_smoke
+    manager: dcp
+    save_hf_weights: false

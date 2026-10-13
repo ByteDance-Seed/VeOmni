@@ -28,7 +28,10 @@ from veomni.models.transformers.kimi_k3.kimi_k3_gpu_patch_gen_config import (
     PatchedKimiK3SparseMoeBlock,
     kimi_k3_for_conditional_generation_forward_patched,
     kimi_k3_for_conditional_generation_init_patched,
+    kimi_k3_get_dyn_bsz_length_fn_patched,
+    kimi_k3_get_extra_collate_infos_patched,
     kimi_k3_get_parallel_plan_patched,
+    kimi_k3_get_position_id_func_patched,
     kimi_k3_pretrained_init_weights_patched,
     kimi_k3_tie_weights_patched,
     kimi_linear_for_causal_lm_forward_patched,
@@ -168,6 +171,25 @@ config.override_method(
 )
 
 # ── Parallel plans ───────────────────────────────────────────────────────────
+
+
+config.override_method(
+    "KimiK3ForConditionalGeneration.get_position_id_func",
+    replacement=kimi_k3_get_position_id_func_patched,
+    description="VLM trainer data hook (arange stub; positions are model-internal)",
+)
+
+config.override_method(
+    "KimiK3ForConditionalGeneration.get_extra_collate_infos",
+    replacement=kimi_k3_get_extra_collate_infos_patched,
+    description="K3 SP contract: redundant vision per SP rank (no sp-slice on pixel_values/grid_thws)",
+)
+
+config.override_method(
+    "KimiK3ForConditionalGeneration.get_dyn_bsz_length_fn",
+    replacement=kimi_k3_get_dyn_bsz_length_fn_patched,
+    description="Dynamic-batching length: add model-side-expanded vision tokens to the pack budget",
+)
 
 
 config.override_method(

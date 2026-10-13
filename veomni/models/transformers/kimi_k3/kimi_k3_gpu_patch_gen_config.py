@@ -961,6 +961,56 @@ def kimi_k3_pretrained_init_weights_patched(self, module):
             module.weight.data[module.padding_idx].zero_()
 
 
+@config.override_method(
+    "KimiK3ForConditionalGeneration.get_position_id_func",
+    description="VLM trainer data hook: K3 derives positions inside the modeling "
+    "(vision divided-fixed pos-emb from grid_thws, NoPE MLA, recurrent KDA); "
+    "return an arange stub for generic consumers",
+)
+def kimi_k3_get_position_id_func_patched(self):
+    def _kimi_k3_position_ids(input_ids=None, **kwargs):
+        if input_ids is None:
+            return None
+        return torch.arange(input_ids.shape[-1], device=input_ids.device).expand_as(input_ids)
+
+    return _kimi_k3_position_ids
+
+
+@config.override_method(
+    "KimiK3ForConditionalGeneration.get_extra_collate_infos",
+    description="K3 SP contract: text tokens are seq-sharded (ulysses) but the vision tower runs "
+    "redundantly on every SP rank -- pixel_values/grid_thws stay full (no sp-slice). "
+    "grid_thws (num_images, 3) cats along dim 0 like image_grid_thw. Tuple form; "
+    "MainCollator expands it to DataCollateInfo.",
+)
+def kimi_k3_get_extra_collate_infos_patched(self):
+    return {
+        "pixel_values": (0, False, None, None),
+        "grid_thws": (0, False, None, None),
+    }
+
+
+@config.override_method(
+    "KimiK3ForConditionalGeneration.get_dyn_bsz_length_fn",
+    description="Dynamic-batching length hook: K3 expands one media_pad placeholder per image "
+    "to grid_t*h*w/(mh*mw) merged features inside the model (occupation table), so the "
+    "packer's attention_mask-only budget must add the expanded vision length (matches the "
+    "stage-7 len_post budgeting). Closes over merge ints only -- picklable for "
+    "worker-side dynamic batching.",
+)
+def kimi_k3_get_dyn_bsz_length_fn_patched(self):
+    # Return a picklable partial of the module-level length fn in
+    # veomni.data.data_transform: trainer-state checkpointing pickles the
+    # dynamic-batching strategy (incl. this fn) by reference, so closures
+    # defined here (method locals) would break torch.save.
+    from functools import partial
+
+    from veomni.data.data_transform import kimi_k3_expanded_length
+
+    merge = getattr(self.config, "merge_kernel_size", (2, 2)) or (2, 2)
+    return partial(kimi_k3_expanded_length, int(merge[0]), int(merge[1]))
+
+
 # Parallel plans (EP for the fused expert weights)
 
 

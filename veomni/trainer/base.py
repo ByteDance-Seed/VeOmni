@@ -458,6 +458,13 @@ class BaseTrainer(Stateful, ABC):
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
         dataloader_kwargs.pop("use_background_prefetcher", None)
+        # Optional model hook: multimodal models that expand modality placeholders
+        # inside the model (single-token placeholders) report the expanded length so
+        # dynamic batching budgets the true sequence cost. Text models: no-op.
+        _model = getattr(self.model, "unwrapped_module", self.model)
+        _get_length_fn = getattr(_model, "get_dyn_bsz_length_fn", None)
+        if _get_length_fn is not None:
+            dataloader_kwargs["dyn_bsz_length_fn"] = _get_length_fn()
         self.train_dataloader = build_dataloader(
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,
