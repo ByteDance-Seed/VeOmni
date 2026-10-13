@@ -60,6 +60,11 @@ def is_flash_attn_impl(impl: str) -> bool:
     return "flash_attention" in impl
 
 
+def is_sdpa_attn_impl(impl: str) -> bool:
+    """True when the selected attention impl is PyTorch SDPA."""
+    return impl in ("sdpa", "veomni_sdpa")
+
+
 # ── Gradient checkpointing ────────────────────────────────────────────
 
 try:

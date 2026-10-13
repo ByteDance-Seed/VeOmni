@@ -22,6 +22,7 @@ from .core import (
     bind_minimax_attention,
     gradient_checkpoint_forward,
     is_flash_attn_impl,
+    is_sdpa_attn_impl,
     minimax_attention,
 )
 
@@ -202,8 +203,8 @@ class MiniMaxH3Attention(nn.Module):
         return out
 
     def _segment_attention(self, q, k, v, *, cu_seqlens, compatibility_mode=False):
-        """Attend inside each segment: the bound flash handle per segment, otherwise SDPA."""
-        if not is_flash_attn_impl(self.config._attn_implementation):
+        """Attend inside each segment with the bound handle; SDPA when SDPA is bound or for packed compatibility."""
+        if compatibility_mode or is_sdpa_attn_impl(self.config._attn_implementation):
             return _sdpa_varlen_attention(
                 q,
                 k,

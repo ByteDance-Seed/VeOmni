@@ -26,6 +26,17 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from veomni.models.loss_utils import load_balancing_loss
 from veomni.ops import VeomniOp
+from veomni.utils.device import IS_CUDA_AVAILABLE
+
+
+# (num_experts, top_k, num_layers, batch_size, seq_len)
+_MEMORY_CONFIGS = [
+    (8, 2, 1, 4, 128),
+    (32, 4, 2, 2, 256),
+    (60, 8, 4, 4, 512),
+    (60, 8, 28, 2, 4096),
+    (128, 4, 32, 1, 8192),
+]
 
 
 class _RecordingOp:
@@ -113,3 +124,44 @@ def test_eager_helper_matches_hf_with_mask_and_layer_grads():
             atol=EAGER_GRAD_ATOL,
             rtol=EAGER_GRAD_RTOL,
         )
+
+
+def _peak_bytes(fn) -> int:
+    baseline = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    fn()
+    torch.cuda.synchronize()
+    return torch.cuda.max_memory_allocated() - baseline
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs a GPU")
+@pytest.mark.parametrize("num_experts,top_k,num_layers,batch_size,seq_len", _MEMORY_CONFIGS)
+def test_triton_helper_training_forward_uses_less_peak_memory_than_hf(
+    num_experts: int, top_k: int, num_layers: int, batch_size: int, seq_len: int
+):
+    """Training-forward peak of the modeling path, per-layer ``torch.cat`` included, vs HF.
+
+    Forward only, with the per-layer logits requiring grad as in training; the
+    backward peak is not compared.
+    """
+    pytest.importorskip("triton")
+    torch.manual_seed(0)
+    layers = tuple(
+        torch.randn(batch_size * seq_len, num_experts, device="cuda", requires_grad=True) for _ in range(num_layers)
+    )
+    triton = VeomniOp("load_balancing_loss", "standard", "triton")
+
+    def run_hf() -> None:
+        hf_load_balancing_loss(layers, num_experts, top_k)
+
+    def run_triton() -> None:
+        load_balancing_loss(layers, num_experts, top_k, op=triton)
+
+    run_hf()
+    run_triton()
+    torch.cuda.synchronize()
+
+    hf_peak = _peak_bytes(run_hf)
+    triton_peak = _peak_bytes(run_triton)
+
+    assert triton_peak < hf_peak, f"triton helper peak {triton_peak} B >= HF peak {hf_peak} B"

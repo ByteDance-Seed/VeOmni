@@ -287,8 +287,9 @@ def _sdpa_backed_flash_handle(calls: list):
     return record
 
 
-def test_minimax_h3_flash_single_sample_runs_handle_per_segment():
-    """Single-sample and Ulysses attention call the flash handle per segment, with no mask or varlen metadata."""
+@pytest.mark.parametrize("impl", ["veomni_flash_attention_2", "veomni_sage_attention"])
+def test_minimax_h3_single_sample_runs_configured_handle_per_segment(impl: str):
+    """Single-sample and Ulysses attention call the configured handle per segment, with no mask or varlen metadata."""
     torch.manual_seed(0)
     attn = _tiny_attention()
     hidden = torch.randn(6, 16)
@@ -297,7 +298,7 @@ def test_minimax_h3_flash_single_sample_runs_handle_per_segment():
 
     calls: list = []
     attn.veomni_attn = _sdpa_backed_flash_handle(calls)
-    attn.config._attn_implementation = "veomni_flash_attention_2"
+    attn.config._attn_implementation = impl
     out = attn(hidden, **kwargs)
 
     assert [call["length"] for call in calls] == [2, 4]
