@@ -29,12 +29,13 @@ because they must be derived from the *same* segmentation the embeddings were:
   sequence, so a stale or differently-packed tensor would pair every token with
   another token's memory.
 
-**Sequence parallelism** does not use the shared path's attention all-to-all.
-The compression groups, the candidate blocks and the compressed-history
-visibility are built from the whole row in Python before any kernel runs, so
-``forward_pre`` hands the backbone a :class:`SequenceShard` carrying the full
-positions alongside this rank's rows, and the attention gathers its one KV
-head instead of scattering query heads (see :mod:`..sequence_shard`).
+**Context parallelism** (``cp_size``, the mesh DeepSeek-V4 uses) splits the
+packed row; Ulysses is refused at build. The compression groups, the
+candidate blocks and the compressed-history visibility are built from the whole
+row in Python before any kernel runs, so ``forward_pre`` hands the backbone a
+:class:`SequenceShard` carrying the full positions alongside this rank's rows,
+and the attention gathers its one KV head instead of scattering query heads
+(see :mod:`..sequence_shard`).
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -137,7 +138,7 @@ def shard_packed_row(
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[List[torch.Tensor]], Optional[torch.Tensor], SequenceShard]:
     """Pad the packed row to a multiple of ``size`` and keep this rank's rows.
 
-    Every SP rank holds the same packed row. The pad is appended as one more
+    Every CP rank holds the same packed row. The pad is appended as one more
     packed sample, positions restarting at zero: sample boundaries are read off
     the positions, so no real token can attend to it. Zeros at every pad
     position would instead make each pad token its own sample.
@@ -208,9 +209,9 @@ class TrainingMixin(TrainingModuleMixin):
         )
 
         ps = get_parallel_state()
-        if ps.sp_size > 1:
+        if ps.cp_size > 1:
             inputs_embeds, position_ids, ngram_embeds, image_mask, self._sequence_shard = shard_packed_row(
-                inputs_embeds, position_ids, ngram_embeds, image_mask, ps.sp_group, ps.sp_rank, ps.sp_size
+                inputs_embeds, position_ids, ngram_embeds, image_mask, ps.cp_group, ps.cp_rank, ps.cp_size
             )
             kwargs["sequence_shard"] = self._sequence_shard
 
@@ -268,7 +269,7 @@ class TrainingMixin(TrainingModuleMixin):
             if outputs.get(key) is not None
         }
         if shard is not None:
-            # Every SP rank scores the full row downstream, so each one needs
+            # Every CP rank scores the full row downstream, so each one needs
             # all of it back. The gather's summed backward is the size-times
             # convention FSDP's division by dp * sp undoes.
             hidden_states = shard.gather(hidden_states).narrow(1, 0, shard.valid_len)

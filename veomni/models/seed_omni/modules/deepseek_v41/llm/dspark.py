@@ -346,7 +346,7 @@ class DeepseekV41DSparkBlock(GradientCheckpointingLayer):
         if shard is None:
             main_idxs = self._main_window_indices(position_ids)
         else:
-            main_kv = shard.gather(main_kv)
+            main_kv = shard.gather_kv(main_kv)
             main_idxs = shard.local_rows(self._main_window_indices(shard.position_ids))
         pool = torch.cat([main_kv, kv], dim=1)
         own_idxs = main_kv.shape[1] + torch.arange(seq_len, device=hidden_states.device, dtype=torch.int32)

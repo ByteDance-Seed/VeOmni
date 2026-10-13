@@ -24,10 +24,11 @@ model:
 
   accelerator:
     init_device: meta
-    # Sequence parallelism splits each packed row across `ulysses_size` ranks;
-    # `deepseek_v41_llm` gathers only its single KV head (llm/sequence_shard.py).
-    # It shrinks the per-token activations, not the per-layer expert weights.
-    ulysses_size: 1
+    # Context parallelism splits each packed row across `cp_size` ranks, the
+    # mesh DeepSeek-V4 uses; `deepseek_v41_llm` gathers only its single KV head
+    # (llm/sequence_shard.py) and refuses `ulysses_size > 1`. It shrinks the
+    # per-token activations, not the per-layer expert weights.
+    cp_size: 1
     # Per-module in modules_train.yaml. The ViT does not declare
     # `gradient_checkpointing`, so a top-level enable would trip HF's check.
     gradient_checkpointing:

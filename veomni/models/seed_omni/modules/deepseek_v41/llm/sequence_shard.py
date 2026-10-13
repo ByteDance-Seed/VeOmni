@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""One rank's rows of a packed sequence split across the sequence-parallel group.
+"""One rank's rows of a packed sequence split across the context-parallel group.
 
 V4.1 attention is multi-query: 64 query heads read one 512-wide KV head. So
-sequence parallelism keeps everything query-side on the rank's own contiguous
+context parallelism keeps everything query-side on the rank's own contiguous
 rows -- the projections, the indexer, the sparse attention and its teacher,
 the MoE, mHC and Engram -- and gathers only the KV side to the full row: the
 window KV, and the compressor projections whose groups pool across it. That
@@ -26,6 +26,10 @@ equal work.
 The compression plans, the window indices and the compressed-history
 visibility are built from the full ``position_ids`` held here, exactly as an
 unsharded forward builds them; each consumer then narrows to its rows.
+
+The group is ``ParallelState.cp_group``, the mesh DeepSeek-V4 shards over, and
+the window KV is gathered with the same :func:`all_gather_kv`. A Ulysses group
+would be wrong rather than slow: nothing here scatters heads.
 """
 
 from __future__ import annotations
@@ -35,6 +39,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from ......distributed.context_parallel.dsa_cp import all_gather_kv
 from ......distributed.sequence_parallel import gather_outputs
 
 
@@ -83,6 +88,10 @@ class SequenceShard:
         rank's queries read a different part of the gathered row.
         """
         return gather_outputs(x, gather_dim=1, group=self.group)
+
+    def gather_kv(self, kv: torch.Tensor) -> torch.Tensor:
+        """The single MQA KV head, ``[B, local_len, D]`` -> ``[B, full_len, D]``."""
+        return all_gather_kv(kv.unsqueeze(1), self.group).squeeze(1)
 
     def local_rows(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's rows of a full-row tensor, along dim 1."""

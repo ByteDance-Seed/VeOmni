@@ -2,7 +2,7 @@
 # <=1024-token copy. Sampled with the V4.1 tokenizer, a tulu conversation runs
 # 922 tokens on average, p99 7k, max 48k; 0.9% are over 8k. Nothing on the
 # SeedOmni V2 path truncates them, so a single sample can be that long --
-# size micro_batch_size / ulysses_size for the tail, not the mean.
+# size micro_batch_size / cp_size for the tail, not the mean.
 sources:
   - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/data
   - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k

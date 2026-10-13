@@ -46,6 +46,7 @@ unconditionally; V4.1 does it only when ``norm_topk_prob and num_experts_per_tok
 
 from typing import Any, Dict, List, Optional
 
+from ......distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
 from ...module_configuration_base import OmniModuleConfig
 
 
@@ -285,6 +286,20 @@ class DeepseekV41LlmConfig(OmniModuleConfig):
             self.dspark_n_routed_experts or self.n_routed_experts,
             self.dspark_num_experts_per_tok or self.num_experts_per_tok,
         )
+
+    def validate_build_prerequisites(self) -> None:
+        """Refuse Ulysses before any weight is read; the backbone shards over ``cp_size``.
+
+        ``build_foundation_model`` calls this inside the module's own parallel
+        state. Ulysses would replicate the row across its group: the backbone
+        neither scatters heads nor reads ``ulysses_group``.
+        """
+        if is_parallel_state_initialized() and get_parallel_state().ulysses_size > 1:
+            raise ValueError(
+                f"deepseek_v41_llm shards the sequence over context parallelism; got "
+                f"ulysses_size={get_parallel_state().ulysses_size}. Set cp_size instead "
+                "(the single KV head is gathered, query heads never move)."
+            )
 
     def validate_layer_schedule(self) -> None:
         """Refuse a schedule whose pieces disagree with each other.

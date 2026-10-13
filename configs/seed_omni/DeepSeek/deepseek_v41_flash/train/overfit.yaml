@@ -19,7 +19,7 @@ model:
 
   accelerator:
     init_device: meta
-    ulysses_size: 1
+    cp_size: 1
     gradient_checkpointing:
       enable: false
       enable_reentrant: false

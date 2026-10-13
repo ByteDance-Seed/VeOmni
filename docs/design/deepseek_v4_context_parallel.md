@@ -29,7 +29,7 @@ communication than necessary to get it.
 |----|----|
 | Contiguous sharding, `cp_size` in {2, 4} verified | Zigzag / load-balanced sharding |
 | All-gather for full-resolution KV, compressed rows and compressor halos | P2P halos; multi-hop halos |
-| DeepSeek-V4 only, via an allow-list | Any other model |
+| DeepSeek-V4 and the SeedOmni DeepSeek-V4.1 modules, via an allow-list | Any other model |
 | GPU-only (`check_context_parallel_supported` rejects NPU) | Ascend/NPU CP |
 | `cp_size > 1` with `ulysses_size == 1` | Hybrid CP x Ulysses |
 | Training | KV cache and decode paths |
@@ -226,6 +226,28 @@ Recorded because the reasons were discoveries, not tidying.
 | the plan scoped the CP admission gate to `parallel_state.py` | both `parallel_state.py` and `AcceleratorConfig._resolve_topology` | The arguments layer held its own model-agnostic `assert cp_size == 1`, which aborts on the CLI and trainer path before `ParallelState` is ever constructed. Two gates now carry the same hybrid-only refusal. |
 | no `shard_packed_compression_metadata` | new helper in `packed_utils.py` | Only the module holding the hidden states knows they are one shard, so only it can shard the global metadata — and per-window and per-query arrays shard differently (see the decision on index spaces above). |
 | "there is no sequence-length divisibility constraint beyond `S % cp_size == 0`" | `cp_size <= S / max(compress_rates)` | Found during implementation, from the halo geometry. See "Sequence length and compression rate". |
+
+## DeepSeek-V4.1 under SeedOmni
+
+The SeedOmni DeepSeek-V4.1 backbone (`veomni/models/seed_omni/modules/deepseek_v41/llm/`)
+shards over the same `cp` mesh with the same contiguous layout, and gathers its
+window KV with the same `all_gather_kv`. Two things differ:
+
+- **It shards in the module, not the collator.** Its training hook packs the
+  conversation into one row, pads it to a multiple of `cp_size` with one extra
+  packed sample, and hands the backbone a `SequenceShard` with the full
+  `position_ids`, so compression plans and window indices are built from the
+  full row on every rank.
+- **Its compressor gathers full-resolution projections** instead of exchanging
+  halos, so it has no `cp_size <= S / max(compress_rates)` bound, at the cost
+  of more traffic.
+
+All four V4.1 modules are on the allow-list because the mesh is shared: the
+vision tower and the n-gram tables run whole rows, and the text encoder slices
+on `sp_group`, which is the cp group when CP is on. `ulysses_size > 1` is refused
+by `DeepseekV41LlmConfig.validate_build_prerequisites`. The parity check is
+`tests/seed_omni/modules/deepseek_v41/test_deepseek_v41_sequence_shard.py`, on
+gloo at 2 and 4 ranks.
 
 ## Open questions
 

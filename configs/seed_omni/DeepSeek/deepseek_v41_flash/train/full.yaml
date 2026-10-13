@@ -18,7 +18,7 @@ model:
   accelerator:
     init_device: meta
     # Raise for sequences longer than one card's activations hold; see base.yaml.
-    ulysses_size: 1
+    cp_size: 1
     gradient_checkpointing:
       enable: false
       enable_reentrant: false

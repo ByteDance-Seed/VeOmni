@@ -47,7 +47,20 @@ logger = logging.get_logger(__name__)
 # false — so the shards are never gathered, each rank attends only within its own
 # 1/cp_size of the sequence, and the run trains to a plausible loss curve while
 # being silently wrong.
-CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
+#
+# SeedOmni builds each module separately under the shared mesh, so every module
+# of a family is checked. The DeepSeek-V4.1 llm shards the row over cp itself;
+# its vision tower and n-gram tables run whole rows, and its text encoder slices
+# on ``sp_group``, which is the cp group when CP is on.
+CONTEXT_PARALLEL_MODEL_TYPES = frozenset(
+    {
+        "deepseek_v4",
+        "deepseek_v41_llm",
+        "deepseek_v41_ngram",
+        "deepseek_v41_text_encoder",
+        "deepseek_v41_vision",
+    }
+)
 
 
 def check_model_build_prerequisites(config: PretrainedConfig) -> None:

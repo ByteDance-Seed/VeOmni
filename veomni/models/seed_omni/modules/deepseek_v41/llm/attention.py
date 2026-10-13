@@ -62,7 +62,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Sequence
 
 import torch
 import torch.nn as nn
@@ -96,10 +96,10 @@ class SharedAttentionState:
     which is why this is three fields and not one bundle.
     """
 
-    compress_kv: Optional[torch.Tensor] = None
-    index_k: Optional[torch.Tensor] = None
-    topk_idxs: Optional[torch.Tensor] = None
-    candidates: Optional[torch.Tensor] = None
+    compress_kv: torch.Tensor | None = None
+    index_k: torch.Tensor | None = None
+    topk_idxs: torch.Tensor | None = None
+    candidates: torch.Tensor | None = None
 
 
 @dataclass
@@ -125,10 +125,10 @@ class DeepseekV41AttentionCache:
 
     sliding_window: int
     compress_ratio: int
-    window: Optional[torch.Tensor] = None
-    compress_kv: Optional[torch.Tensor] = None
-    index_k: Optional[torch.Tensor] = None
-    pending: Optional[torch.Tensor] = None
+    window: torch.Tensor | None = None
+    compress_kv: torch.Tensor | None = None
+    index_k: torch.Tensor | None = None
+    pending: torch.Tensor | None = None
 
     @property
     def window_len(self) -> int:
@@ -144,7 +144,7 @@ class DeepseekV41AttentionCache:
         if self.window.shape[1] > self.sliding_window:
             self.window = self.window[:, -self.sliding_window :]
 
-    def snapshot(self) -> Dict[str, Optional[torch.Tensor]]:
+    def snapshot(self) -> dict[str, torch.Tensor | None]:
         """Clone every carried tensor so a rejected draft can roll this layer back."""
         return {
             "window": None if self.window is None else self.window.clone(),
@@ -153,7 +153,7 @@ class DeepseekV41AttentionCache:
             "pending": None if self.pending is None else self.pending.clone(),
         }
 
-    def restore(self, snap: Dict[str, Optional[torch.Tensor]]) -> None:
+    def restore(self, snap: dict[str, torch.Tensor | None]) -> None:
         self.window = snap["window"]
         self.compress_kv = snap["compress_kv"]
         self.index_k = snap["index_k"]
@@ -176,7 +176,7 @@ class IndexerLossTerms:
     uniform: torch.Tensor
 
 
-def indexer_kl_terms(index_score: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def indexer_kl_terms(index_score: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-query ``KL(target || softmax(index_score))``, and its uniform reference.
 
     Ported from ``deepseek_v4``'s helper of the same name, which is DeepSeek-V3.2
@@ -262,7 +262,7 @@ class CompressionPlan:
         groups = torch.arange(self.compressed_len, device=device)
         return (groups >= self.range_starts.unsqueeze(-1)) & (groups < self.range_ends.unsqueeze(-1))
 
-    def narrow_queries(self, start: int, end: int) -> "CompressionPlan":
+    def narrow_queries(self, start: int, end: int) -> CompressionPlan:
         """Keep the full compressed axis, but only the query rows ``[start, end)``.
 
         CED prefill compresses the encoder on the whole prompt, then replays the
@@ -278,7 +278,7 @@ class CompressionPlan:
         )
 
 
-def sequence_slices_from_positions(position_ids: torch.Tensor) -> Tuple[Tuple[int, int], ...]:
+def sequence_slices_from_positions(position_ids: torch.Tensor) -> tuple[tuple[int, int], ...]:
     """Recover the packed samples' ``[start, end)`` spans from their positions.
 
     The packed collator restarts ``position_ids`` at zero on each sample, so a
@@ -309,7 +309,7 @@ def trailing_partial_group(
     hidden_states: torch.Tensor,
     position_ids: torch.Tensor,
     ratio: int,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """Hidden states ``_absorb`` would leave pending after this packed sequence.
 
     Walks the same packed slices as :func:`build_compression_plans`. A complete
@@ -330,8 +330,8 @@ def trailing_partial_group(
 def build_compression_plans(
     config: DeepseekV41LlmConfig,
     position_ids: torch.Tensor,
-    sequence_slices: Optional[Sequence[Tuple[int, int]]] = None,
-) -> Dict[int, CompressionPlan]:
+    sequence_slices: Sequence[tuple[int, int]] | None = None,
+) -> dict[int, CompressionPlan]:
     """One plan per distinct non-zero ``compress_ratio``, for this forward.
 
     ``sequence_slices`` are the ``[start, end)`` token spans of the packed
@@ -360,9 +360,9 @@ def build_compression_plans(
 
     device = position_ids.device
     positions = position_ids[0]
-    plans: Dict[int, CompressionPlan] = {}
+    plans: dict[int, CompressionPlan] = {}
     for ratio in sorted({r for r in config.compress_ratios if r > 0}):
-        starts: List[int] = []
+        starts: list[int] = []
         for begin, end in sequence_slices:
             starts.extend(range(begin, end - ratio + 1, ratio))
         window_starts = torch.tensor(starts, device=device, dtype=torch.long)
@@ -483,7 +483,7 @@ class DeepseekV41RotaryEmbedding(nn.Module):
         smooth = 1 - ramp
         return freqs / factor * (1 - smooth) + freqs * smooth
 
-    def forward(self, positions: torch.Tensor, compressed: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, positions: torch.Tensor, compressed: bool) -> tuple[torch.Tensor, torch.Tensor]:
         """``[..., ]`` positions -> half-sized fp32 ``(cos, sin)`` with a trailing pair axis."""
         inv_freq = self.compress_inv_freq if compressed else self.main_inv_freq
         freqs = positions.float().unsqueeze(-1) * inv_freq
@@ -521,7 +521,7 @@ class DeepseekV41Compressor(nn.Module):
         self,
         hidden_states: torch.Tensor,
         plan: CompressionPlan,
-        shard: Optional[SequenceShard] = None,
+        shard: SequenceShard | None = None,
     ) -> torch.Tensor:
         """``[B, S, hidden]`` -> ``[B, n_groups, head_dim]``, unrotated.
 
@@ -674,7 +674,7 @@ class DeepseekV41Indexer(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         return_scores: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """``[B, S, index_topk]`` int32 group indices, ``-1`` where nothing was reachable.
 
         With ``return_scores``, also the student distribution the indexer loss
@@ -808,13 +808,13 @@ class DeepseekV41Attention(nn.Module):
         position_ids: torch.Tensor,
         rotary_emb: DeepseekV41RotaryEmbedding,
         shared: SharedAttentionState,
-        plans: Dict[int, CompressionPlan],
-        capture: Optional[DeepseekV41AttentionCache] = None,
-        capture_seq_len: Optional[int] = None,
-        compress_hidden: Optional[torch.Tensor] = None,
-        compress_position_ids: Optional[torch.Tensor] = None,
-        shard: Optional[SequenceShard] = None,
-    ) -> Tuple[torch.Tensor, Optional[IndexerLossTerms]]:
+        plans: dict[int, CompressionPlan],
+        capture: DeepseekV41AttentionCache | None = None,
+        capture_seq_len: int | None = None,
+        compress_hidden: torch.Tensor | None = None,
+        compress_position_ids: torch.Tensor | None = None,
+        shard: SequenceShard | None = None,
+    ) -> tuple[torch.Tensor, IndexerLossTerms | None]:
         """``[B, S, hidden]``, and this layer's indexer KL when it builds one.
 
         The second value is ``None`` for every layer that owns no indexer and for
@@ -866,7 +866,7 @@ class DeepseekV41Attention(nn.Module):
         if shard is None:
             topk_idxs = self._window_indices(position_ids, seq_len)
         else:
-            kv = shard.gather(kv)
+            kv = shard.gather_kv(kv)
             topk_idxs = shard.local_rows(self._window_indices(shard.position_ids, shard.full_len))
         if self.compress_ratio:
             compress_kv, compress_idxs, student = self._compressed_kv(
@@ -923,7 +923,7 @@ class DeepseekV41Attention(nn.Module):
         topk_idxs: torch.Tensor,
         lse: torch.Tensor,
         student: torch.Tensor,
-        valid_rows: Optional[torch.Tensor] = None,
+        valid_rows: torch.Tensor | None = None,
     ) -> IndexerLossTerms:
         """Score the indexer against the attention it feeds.
 
@@ -993,14 +993,14 @@ class DeepseekV41Attention(nn.Module):
         position_ids: torch.Tensor,
         rotary_emb: DeepseekV41RotaryEmbedding,
         shared: SharedAttentionState,
-        plans: Dict[int, CompressionPlan],
+        plans: dict[int, CompressionPlan],
         offset: int,
-        capture: Optional[DeepseekV41AttentionCache] = None,
-        capture_seq_len: Optional[int] = None,
-        compress_hidden: Optional[torch.Tensor] = None,
-        compress_position_ids: Optional[torch.Tensor] = None,
-        shard: Optional[SequenceShard] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        capture: DeepseekV41AttentionCache | None = None,
+        capture_seq_len: int | None = None,
+        compress_hidden: torch.Tensor | None = None,
+        compress_position_ids: torch.Tensor | None = None,
+        shard: SequenceShard | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """The shared compressed KV and this layer's selection into it.
 
         The ordering here is the one invariant worth stating: a source layer's
@@ -1053,7 +1053,7 @@ class DeepseekV41Attention(nn.Module):
                 "kv_source_layer_ids must contain a layer at or before it"
             )
 
-        student: Optional[torch.Tensor] = None
+        student: torch.Tensor | None = None
         if self.indexer is not None:
             if shared.index_k is None:
                 raise RuntimeError(

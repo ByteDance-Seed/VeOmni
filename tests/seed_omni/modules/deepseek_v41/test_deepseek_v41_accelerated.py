@@ -298,16 +298,16 @@ class TestIndexerKlFoldIn:
         assert fold_indexer_kl_loss({"indexer_kl_total": torch.tensor(1.0)}, 0.0) is None
 
 
-class TestSequenceParallelSlice:
+class TestContextParallelSlice:
     def test_forward_pre_hands_the_backbone_its_rows_and_the_full_positions(self, monkeypatch):
         """Rows of every per-token input, and a shard whose positions cover the
         padded row: the pad restarts at zero so it is a sample of its own."""
         import veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated.accelerated as module
 
         class FakeState:
-            sp_size = 4
-            sp_rank = 3
-            sp_group = None
+            cp_size = 4
+            cp_rank = 3
+            cp_group = None
 
         monkeypatch.setattr(module, "get_parallel_state", lambda: FakeState())
         config = make_config()
@@ -331,6 +331,41 @@ class TestSequenceParallelSlice:
         ids = conversation[0][0].meta["input_ids"].tolist() + [0] * 3 + conversation[1][0].meta["input_ids"].tolist()
         assert out["dspark_input_ids"][0].tolist() == ids
 
+    def test_a_ulysses_group_does_not_shard_the_row(self, monkeypatch):
+        """``sp_size`` counts Ulysses too; the backbone shards over ``cp_size`` only."""
+        import veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated.accelerated as module
+
+        class FakeState:
+            cp_size = 1
+            sp_size = 4
+
+        monkeypatch.setattr(module, "get_parallel_state", lambda: FakeState())
+        out = DeepseekV41LlmAccelerated(make_config()).forward_pre(conversation_list=[[text(5)]])
+
+        assert "sequence_shard" not in out
+        assert out["inputs_embeds"].shape[1] == 5
+
+    def test_ulysses_is_refused_at_build(self, monkeypatch):
+        import veomni.models.seed_omni.modules.deepseek_v41.llm.configuration as configuration
+
+        class FakeState:
+            ulysses_size = 2
+
+        monkeypatch.setattr(configuration, "is_parallel_state_initialized", lambda: True)
+        monkeypatch.setattr(configuration, "get_parallel_state", lambda: FakeState())
+        with pytest.raises(ValueError, match="Set cp_size instead"):
+            make_config().validate_build_prerequisites()
+
+        FakeState.ulysses_size = 1
+        make_config().validate_build_prerequisites()
+
+    def test_every_v41_module_may_build_under_cp(self):
+        """SeedOmni checks each module against the CP allow-list under the shared mesh."""
+        from veomni.models.auto import CONTEXT_PARALLEL_MODEL_TYPES
+        from veomni.models.seed_omni.modules.deepseek_v41.convert_model import MODULES
+
+        assert set(MODULES) <= CONTEXT_PARALLEL_MODEL_TYPES
+
 
 class TestDummyAnchor:
     """A text-only micro-batch still runs the ViT on a dummy image, and that output
@@ -342,7 +377,7 @@ class TestDummyAnchor:
         import veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated.accelerated as module
 
         class FakeState:
-            sp_size = 1
+            cp_size = 1
 
         monkeypatch.setattr(module, "get_parallel_state", lambda: FakeState())
         return DeepseekV41LlmAccelerated(make_config())
