@@ -159,8 +159,10 @@ If model config or tokenizer is missing from the output:
 
 The training-time HF export (`train.checkpoint.save_hf_weights`) consolidates
 every tensor into its `model-*.safetensors` file except one kind. A tensor that
-embedding parallelism (`emb`) shards by rows and that is larger than one output
-file (5 GB) is left as the per-rank shards DCP wrote. Consolidating it would mean
+embedding parallelism (`emb`) shards by whole rows (`Shard(0)`) and that is
+larger than one output file (5 GB) is left as the per-rank shards DCP wrote.
+This applies only to the distributed export (`ckpt_manager: dcp`, torch >= 2.9,
+not on NPU); the other export paths still consolidate every tensor. Consolidating it would mean
 one rank streaming the whole tensor into one file while every other rank waits:
 about an hour for each of DeepSeek-V4.1's 197 GB n-gram tables on an HDFS mount.
 
@@ -178,10 +180,17 @@ python scripts/merge_hf_export.py <output_dir>/checkpoints/global_step_N/hf_ckpt
 ```
 
 The argument may be one export or any directory above several; every export
-holding a marker below it is merged. Each output file is written by one thread
-(`--num-threads` caps how many at once) and is still a single stream, so on a
-slow mount, copy the export to local disk, merge there, and copy it back. The
-marker is removed before the shards, so an interrupted merge can be rerun.
+holding a marker below it is merged, and a `sharded/` directory left without a
+marker is reported. Each output file is written by one thread (`--num-threads`
+caps how many at once), appending the shards in row order a 64 MB chunk at a
+time, so memory stays small and an append-only mount such as HDFS FUSE works.
+It is still one stream per file; local disk is faster when there is room.
+Until the shards are removed the table takes twice its size on disk.
+
+Before writing, the merge checks that the shards cover exactly the rows and
+bytes the export recorded. If one is missing or foreign it raises and leaves
+the marker and shards in place. The marker is removed before the shards, so an
+interrupted merge can be rerun.
 
 ## See Also
 
