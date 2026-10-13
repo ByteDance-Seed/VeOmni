@@ -95,6 +95,7 @@ def chunk_loss_function(
     num_items_in_batch: Optional[int] = None,
     ignore_index: int = -100,
     shift_labels: Optional[torch.Tensor] = None,
+    loss_reduction_group: Optional[Any] = None,
     **kwargs,
 ) -> torch.Tensor:
     sp_enabled = get_parallel_state().sp_enabled
@@ -103,6 +104,11 @@ def chunk_loss_function(
     elif not sp_enabled:
         labels = labels[..., 1:].contiguous()
         hidden_states = hidden_states[..., :-1, :].contiguous()
+    # Flat ``[N, H]`` rows with ``[N]`` targets, as a caller that has already
+    # dropped its unsupervised rows passes them, are one sequence of ``N``.
+    if labels.dim() == 1:
+        labels = labels.unsqueeze(0)
+        hidden_states = hidden_states.unsqueeze(0)
 
     def ce_loss_func(hidden_states, weight, bias, labels, num_items_in_batch, ignore_index=-100, **kwargs):
         # Use ``reshape`` instead of ``view`` because the per-chunk tensors come
@@ -124,7 +130,10 @@ def chunk_loss_function(
         return loss, logits
 
     chunk_labels = torch.split(labels, chunk_size, dim=1)
-    num_items_in_batch = (labels != ignore_index).sum()
+    num_valid_tokens = (labels != ignore_index).sum()
+    # A rank with nothing supervised scores 0.0 rather than 0 / 0, so its NaN
+    # cannot survive the token-weighted reduction below.
+    num_items_in_batch = num_valid_tokens.clamp(min=1)
 
     loss_kwargs_chunks = [
         {"labels": chunk_labels[i], "ignore_index": ignore_index, "num_items_in_batch": num_items_in_batch}
@@ -133,9 +142,8 @@ def chunk_loss_function(
 
     chunk_loss = ChunkLoss.apply(hidden_states, weights, None, ce_loss_func, loss_kwargs_chunks, chunk_size)
 
-    # Match ``ForCausalLMLoss`` SP behavior so chunk_loss can back both
-    # ForCausalLM and ForConditionalGeneration heads when SP is enabled.
-    if sp_enabled:
-        num_valid_tokens = (labels != ignore_index).sum()
-        chunk_loss = reduce_sequence_parallel_loss(chunk_loss, num_valid_tokens)
+    # Match ``ForCausalLMLoss``: reduce over the SP group when SP is enabled, or
+    # over the caller's explicit group (SeedOmni V2 passes its dp_sp FSDP group).
+    if sp_enabled or loss_reduction_group is not None:
+        chunk_loss = reduce_sequence_parallel_loss(chunk_loss, num_valid_tokens, group=loss_reduction_group)
     return chunk_loss, None
