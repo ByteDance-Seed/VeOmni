@@ -103,8 +103,8 @@ Training from an upstream root:
   [`_check_hf_source_exportable`](../../../veomni/arguments/omni_arguments_types.py#L121) checks the source has safetensors.
 - [`OmniConfig.load_checkpoint_sidecars`](../../../veomni/models/seed_omni/configuration_omni.py#L421) records the `HFSource`, which each `ModuleRuntime` receives.
 - `ModuleRuntime._build_model` builds the module on meta and
-  [attaches the key converter](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L362);
-  [`weights_path`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L226) is the upstream root.
+  [attaches the key converter](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L366);
+  [`weights_path`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L230) is the upstream root.
 - The FSDP2 / DDP wrap (per module, or [composed](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L306)) loads weights:
   - [`load_model_weights`](../../../veomni/models/module_utils.py#L404) and the [rank-0 broadcast loader](../../../veomni/models/module_utils.py#L1125) skip keys the converter declares, without reading them;
   - [`HFSourceKeyConverter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L320) renames the module's own keys and hands them to the module's converter.

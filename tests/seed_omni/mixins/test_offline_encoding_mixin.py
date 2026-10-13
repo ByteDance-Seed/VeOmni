@@ -1,4 +1,4 @@
-"""``OfflineEncodingMixin``: the two offline-cache endpoints a cacheable module implements."""
+"""``OfflineEncodingMixin``: the marker of a cacheable module, whose offline methods it names itself."""
 
 from __future__ import annotations
 
