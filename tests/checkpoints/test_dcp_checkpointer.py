@@ -2542,6 +2542,17 @@ class TestResumeDiscovery:
 
         assert self._validate(step) == 10
 
+    @pytest.mark.parametrize(("model_state", "accepted"), [(False, True), (True, False)])
+    def test_a_cursor_only_step_is_accepted_only_when_its_manifest_says_so(self, tmp_path, model_state, accepted):
+        """An ``offline_embedding`` step has no ``model/`` at all, because every module is frozen.
+        Without the manifest's word, the same tree is a step whose shards never started."""
+        from veomni.checkpoint import layout
+
+        step = tmp_path / "global_step_10"
+        layout.write_manifest(str(step), global_step=10, world_size=1, model_state=model_state)
+
+        assert self._validate(step) == (10 if accepted else None)
+
     def test_a_legacy_step_is_accepted_by_its_own_marker(self, tmp_path):
         from veomni.checkpoint.legacy_v0_1_12 import marker_path
 

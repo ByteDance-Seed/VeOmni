@@ -630,12 +630,16 @@ class TestGlobalStateCallbackJobState:
         assert trainer.state.global_step == 7
 
     def test_the_offline_cache_writer_resumes_with_the_cursor(self, mock_dist, tmp_path):
-        """The cursor is saved only after the writer flushed, and the position comes back with it."""
+        """The cursor is saved only after the writer flushed, and the position comes back with it.
+
+        The run saves no model state, so the cursor alone makes the step complete for ``load_path: auto``.
+        """
         mock_dist.is_initialized.return_value = False
         trainer = _make_mock_trainer(save_path=str(tmp_path / "ckpt"))
         trainer.train_dataloader = None
         trainer.data_iterator = None
         trainer.environ_meter.state_dict.return_value = {}
+        trainer.saves_model_state = False
         writer = SeedOmniOfflineCacheWriter(str(tmp_path / "cache"), max_rows_per_shard=10)
         writer.open()
         writer.save_conversation_list([[ConversationItem(type="text", value="s0", role="user")]])
@@ -645,6 +649,9 @@ class TestGlobalStateCallbackJobState:
 
         assert writer.buffer == []
         assert (tmp_path / "cache" / "shard_000000.parquet").exists()
+        step_root = str(tmp_path / "ckpt" / "global_step_10")
+        assert not os.path.exists(os.path.join(step_root, layout.MODEL_DIRNAME))
+        assert layout.checkpoint_is_complete(step_root)
 
         resumed = _make_mock_trainer()
         resumed.args.train.checkpoint.load_path = str(tmp_path / "ckpt" / "global_step_10")
