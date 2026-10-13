@@ -978,7 +978,7 @@ def qwen2_5_vl_for_conditional_generation_init_patched(self, config):
     super().__init__(config)
     self.model = Qwen2_5_VLModel(config)
     self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    impl = resolve_op_impl("cross_entropy_loss_implementation")
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()

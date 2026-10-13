@@ -68,6 +68,14 @@ def test_legacy_fused_moe_resolves_per_host(
     assert len(warnings) == 1 and expected in warnings[0]
 
 
+@pytest.mark.parametrize("on_npu", [False, True], ids=["gpu", "npu"])
+def test_npu_cross_entropy_resolves_to_chunk_loss(on_npu: bool, warnings: list[str], monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(import_utils, "is_torch_npu_available", lambda: on_npu)
+    config = OpsImplementationConfig(cross_entropy_loss_implementation="npu")
+    assert config.cross_entropy_loss_implementation == "chunk_loss"
+    assert len(warnings) == 1 and "chunk_loss" in warnings[0]
+
+
 def test_qwen3_5_rms_norm_value_is_rejected_at_parse_time(warnings: list[str]):
     with pytest.raises(ValueError, match="variant name .*'offset'"):
         OpsImplementationConfig(rms_norm_implementation="qwen3_5")

@@ -52,7 +52,7 @@ when the selected implementation runs.
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
-| `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla`, `flash_qla`, `npu`, `npu_ascendc` as supported by the family |
+| `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `npu`, `npu_ascendc` as supported by the family |
 | `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `cudnn`, or `flashmla_cudnn` by variant |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang` |
 
@@ -126,6 +126,13 @@ stable semantic differences. Device and compute-capability support belong in
 the hardware requirement, while optional import packages belong in `requires`,
 so availability metadata cannot drift into the description.
 
+Implementation names identify the implementation source, not the device it
+runs on. An `npu` row must call a third-party Ascend implementation such as
+`torch_npu`, vendored MindSpeed Triton, or `fla_npu`. PyTorch math that only
+runs on NPU is `eager`. MoE keeps the `fused_npu` name to match the other
+`fused_*` group-gemm backends. A library that runs on several devices, such as
+`fla`, registers one row per device under its library name.
+
 For a raw pair, `forward` returns `(output, SavedState)`, and `backward`
 returns one gradient entry for every positional tensor passed to the generated
 wrapper. Tensor inputs must therefore be positional; non-tensor attributes
@@ -170,6 +177,12 @@ triple, and always calls the row's wrapper. `models.build_foundation_model`
 installs the `OpsImplementationConfig` object in `ops/config.py` before
 constructing the model. Changing the installed config later does not
 retarget handles that already exist.
+
+A config field such as `rms_norm_implementation` is shared by every variant
+of its op. Consumers of a variant with variant-scoped deprecated aliases pass
+`resolve_op_impl(field, variant=...)`. For example, the former `npu` name of
+the `unweighted` RMSNorm was PyTorch math, so `npu` resolves to `eager` there
+while the weighted variants keep their `torch_npu` rows.
 
 The registry wrapper is the canonical tensor contract for an op variant;
 it is not a collection of model-specific adapters. Transformations that vary

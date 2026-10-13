@@ -310,7 +310,7 @@ from veomni.ops.config import resolve_op_impl
 from veomni.ops import VeomniOp
 
 # In the model constructor:
-impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+impl = resolve_op_impl("cross_entropy_loss_implementation")
 self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
 self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
 

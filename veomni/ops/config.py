@@ -21,10 +21,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from ..utils import logging
+
 
 if TYPE_CHECKING:
     from ..arguments.arguments_types import OpsImplementationConfig
 
+
+logger = logging.get_logger(__name__)
 
 _ops_config: OpsImplementationConfig | None = None
 
@@ -40,18 +44,25 @@ def get_ops_config() -> Any:
     return _ops_config
 
 
-def resolve_op_impl(field: str, *, npu_as: str | None = None, eager_as: str | None = None) -> str:
+def resolve_op_impl(field: str, *, variant: str | None = None, eager_as: str | None = None) -> str:
     """Return the impl name on the installed ops config, or ``eager``.
 
-    ``npu_as`` remaps the ``npu`` CE name to ``chunk_loss``. ``eager_as``
-    remaps ``eager`` for modeling without a local ``eager_attention_forward``,
-    which the ``attention/standard/eager`` row requires. Missing config is
-    eager so unit tests can construct a module without ``set_ops_config``.
+    ``variant`` applies the variant-scoped deprecated aliases for fields shared
+    by several variants, such as ``rms_norm_implementation='npu'`` on the
+    ``unweighted`` variant. ``eager_as`` remaps ``eager`` for modeling without a
+    local ``eager_attention_forward``, which the ``attention/standard/eager``
+    row requires. Missing config is eager so unit tests can construct a module
+    without ``set_ops_config``.
     """
     cfg = get_ops_config()
     impl = "eager" if cfg is None else getattr(cfg, field, "eager")
-    if npu_as is not None and impl == "npu":
-        return npu_as
+    if variant is not None:
+        from ..arguments.arguments_types import _DEPRECATED_VARIANT_IMPLEMENTATION_ALIASES
+
+        alias = _DEPRECATED_VARIANT_IMPLEMENTATION_ALIASES.get(field, {}).get(variant, {}).get(impl)
+        if alias is not None:
+            logger.info_once(f"{field}={impl!r} has no third-party {variant!r} kernel; {variant!r} uses {alias!r}.")
+            impl = alias
     if eager_as is not None and impl == "eager":
         return eager_as
     return impl

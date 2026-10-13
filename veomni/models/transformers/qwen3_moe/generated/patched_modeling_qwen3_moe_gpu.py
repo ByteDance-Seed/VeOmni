@@ -695,7 +695,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
-        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        impl = resolve_op_impl("cross_entropy_loss_implementation")
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.veomni_lb = VeomniOp(
@@ -806,7 +806,7 @@ class Qwen3MoeForSequenceClassification(GenericForSequenceClassification, Qwen3M
         self.num_labels = config.num_labels
         self.model = Qwen3MoeModel(config)
         self.score = nn.Linear(config.get_text_config().hidden_size, self.num_labels, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        impl = resolve_op_impl("cross_entropy_loss_implementation")
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForSequenceClassificationLoss, op=self.veomni_ce)
         self.post_init()

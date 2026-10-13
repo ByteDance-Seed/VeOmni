@@ -21,7 +21,7 @@ If a field is not in this table, it is not an op-selection knob.
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
-| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
@@ -45,16 +45,28 @@ rotary embedding and its vision-layout selection; to `chunk_loss` for
 cross-entropy; to `fused_npu` for MoE; and to `eager` for SwiGLU and
 load-balancing loss. Explicit non-default overrides are retained and rejected
 when unsupported. Qwen3.5's three GatedDeltaNet fields are model-specific and
-are not auto-resolved: set them to `npu` explicitly because the
-causal-convolution and gated-delta-rule `eager` fallbacks do not support
-dynamic-batch `cu_seqlens`.
+are not auto-resolved. Their `fla` default also registers on Ascend NPU. Set
+them to `npu` to use the vendored Ascend kernels instead, not to `eager`,
+because the causal-convolution and gated-delta-rule `eager` fallbacks do not
+support dynamic-batch `cu_seqlens`.
+
+**`npu` names a third-party Ascend kernel.** An `npu` row calls a third-party
+implementation such as `torch_npu`, vendored MindSpeed Triton, or `fla_npu`.
+PyTorch math that merely runs on NPU is `eager`. MoE keeps `fused_npu`, in line
+with the other `fused_*` group-gemm backends. Values the former registry named
+`npu` without a third-party kernel still parse as deprecated aliases.
+`cross_entropy_loss_implementation: npu` resolves to `chunk_loss`. The
+`unweighted` RMSNorm variant (Flux, LTX-2.3, DeepSeek-V4) resolves
+`rms_norm_implementation: npu` to `eager`, while the weighted variants keep
+their `torch_npu` rows. Any other variant without a row for the selected value
+fails at model build and lists the registered implementations.
 
 The general per-op fields are typed as plain `str` (not `Literal`), so
 third-party backends can call `register_op(...)` without modifying
 `OpsImplementationConfig`.
 
-Renamed values such as `veomni_*_with_sp` and `moe_implementation: fused` still
-parse with a deprecation warning; see the deprecated-values table in
+Renamed values such as `veomni_*_with_sp`, `moe_implementation: fused`, and
+`cross_entropy_loss_implementation: npu` still parse with a deprecation warning; see the deprecated-values table in
 [Arguments](../usage/arguments.md#deprecated-values).
 
 ---
@@ -199,7 +211,7 @@ and DeepSeek V4's `hc_mult=4` layout.
 ```yaml
 model:
   ops_implementation:
-    cross_entropy_loss_implementation: liger_kernel   # default; set to "chunk_loss" / "npu" / "eager" on NPU
+    cross_entropy_loss_implementation: liger_kernel   # default; set to "chunk_loss" / "eager" on NPU
 ```
 
 **Field:** `OpsImplementationConfig.cross_entropy_loss_implementation`
@@ -210,8 +222,10 @@ model:
 |-------|---------------|---|
 | `liger_kernel` | Fused linear + CE raw forward/backward | `liger-kernel` package + CUDA |
 | `chunk_loss` | Chunked `F.linear` + CE with one global denominator | — |
-| `npu` | Config alias resolved to `chunk_loss` by `resolve_op_impl(..., npu_as="chunk_loss")` | Ascend NPU config |
 | `eager` | PyTorch `F.linear`/`F.cross_entropy` | — |
+
+`npu` is a deprecated alias that `OpsImplementationConfig` resolves to
+`chunk_loss`. It never had a third-party NPU kernel.
 
 All registered rows implement the same token-level `standard` contract:
 `(hidden_or_logits, labels, weight, *, ignore_index, num_items_in_batch)`.
@@ -264,7 +278,7 @@ model:
 | Value | Implementation | Requirements |
 |-------|---------------|---|
 | `liger_kernel` | Registered Liger RMSNorm row | `liger-kernel` package |
-| `npu` | Registered `torch_npu.npu_rms_norm` row | `torch_npu` |
+| `npu` | Registered `torch_npu.npu_rms_norm` row for `standard`, `offset`, and `deepseek_v4`; `unweighted` resolves `npu` to `eager` | `torch_npu` |
 | `triton` | Registered model-specific Triton row (for example DeepSeek-V3 batch-invariant RMSNorm) | `triton` |
 | `eager` | Registered PyTorch reference row | — |
 
@@ -309,9 +323,9 @@ and optional-package requirements when the handle is constructed.
 Qwen2, Qwen3, Qwen3-MoE, Qwen2-VL, DeepSeek-V3, DeepSeek-V4, Llama,
 Seed-OSS. DeepSeek-V4 supports weighted and unweighted RMSNorm plus a
 clamp-preserving Liger silu*mul path for shared experts. Its partial
-interleaved RoPE has no Liger equivalent, so `liger_kernel` is rejected for
-`rotary_pos_emb_implementation` on that model; the supported values are
-`triton` and `eager`.
+interleaved RoPE has no Liger or `torch_npu` equivalent, so `liger_kernel` and
+`npu` are rejected for `rotary_pos_emb_implementation` on that model; the
+supported values are `triton` and `eager`.
 
 ### Key files
 
@@ -325,7 +339,8 @@ interleaved RoPE has no Liger equivalent, so `liger_kernel` is rejected for
 ## 4. Qwen3.5 GatedDeltaNet Ops
 
 Qwen3.5 exposes three additional model-specific op fields. They default to
-the GPU `fla` implementations, so NPU users must select `npu` explicitly:
+`fla`, which registers CUDA, MLU, and Ascend NPU rows. To use the vendored
+Ascend kernels, select `npu` explicitly:
 
 ```yaml
 model:
@@ -337,9 +352,9 @@ model:
 
 | Field | GPU values | NPU value | Eager limitation |
 |---|---|---|---|
-| `rms_norm_gated_implementation` | `fla` | `npu` | HuggingFace reference implementation |
-| `causal_conv1d_implementation` | `fla` | `npu` | No `cu_seqlens` path |
-| `chunk_gated_delta_rule_implementation` | `fla`, `flash_qla` (NVIDIA SM90-SM100) | `npu`, `npu_ascendc` | No `cu_seqlens` path |
+| `rms_norm_gated_implementation` | `fla` | `fla`, `npu` | HuggingFace reference implementation |
+| `causal_conv1d_implementation` | `fla` | `fla`, `npu` | No `cu_seqlens` path |
+| `chunk_gated_delta_rule_implementation` | `fla`, `flash_qla` (NVIDIA SM90-SM100) | `fla`, `npu`, `npu_ascendc` | No `cu_seqlens` path |
 
 The NPU gated RMSNorm uses `torch_npu`. The NPU causal Conv1D and gated
 delta-rule implementations additionally require `triton-ascend`. For the gated

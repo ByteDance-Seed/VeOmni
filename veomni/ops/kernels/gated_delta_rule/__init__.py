@@ -82,6 +82,16 @@ register_op(
 register_op(
     "rms_norm_gated",
     "standard",
+    "fla",
+    description="flash-linear-attention fused RMSNorm with a SiLU gate",
+    wrapper=rms_fla.wrapper,
+    requirement=NpuKernelRequirement(),
+    requires=("fla",),
+)
+
+register_op(
+    "rms_norm_gated",
+    "standard",
     "npu",
     description="Fused RMSNorm with a SiLU gate using torch_npu",
     wrapper=rms_npu.wrapper,
@@ -113,6 +123,16 @@ register_op(
     description="flash-linear-attention depthwise causal convolution with variable-length support",
     wrapper=conv_fla.wrapper,
     requirement=MluKernelRequirement(),
+    requires=("fla",),
+)
+
+register_op(
+    "causal_conv1d",
+    "standard",
+    "fla",
+    description="flash-linear-attention depthwise causal convolution with variable-length support",
+    wrapper=conv_fla.wrapper,
+    requirement=NpuKernelRequirement(),
     requires=("fla",),
 )
 
@@ -152,6 +172,16 @@ register_op(
     description="flash-linear-attention chunked gated delta rule with variable-length support",
     wrapper=chunk_fla.wrapper,
     requirement=MluKernelRequirement(),
+    requires=("fla",),
+)
+
+register_op(
+    "chunk_gated_delta_rule",
+    "standard",
+    "fla",
+    description="flash-linear-attention chunked gated delta rule with variable-length support",
+    wrapper=chunk_fla.wrapper,
+    requirement=NpuKernelRequirement(),
     requires=("fla",),
 )
 

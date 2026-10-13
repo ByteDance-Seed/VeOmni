@@ -1027,7 +1027,7 @@ def qwen3_5_moe_forcausallm_init_patched(self, config):
     self.router_aux_loss_coef = config.router_aux_loss_coef
     self.num_experts = config.num_experts
     self.num_experts_per_tok = config.num_experts_per_tok
-    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    impl = resolve_op_impl("cross_entropy_loss_implementation")
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.veomni_lb = VeomniOp(
@@ -1154,7 +1154,7 @@ def qwen3_5_moe_forconditional_generation_init_patched(self, config):
     super().__init__(config)
     self.model = Qwen3_5MoeModel(config)
     self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    impl = resolve_op_impl("cross_entropy_loss_implementation")
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.veomni_lb = VeomniOp(

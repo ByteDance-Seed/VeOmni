@@ -2253,7 +2253,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.spatial_merge_size = config.vision_config.spatial_merge_size
         self.rope_deltas = None
-        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        impl = resolve_op_impl("cross_entropy_loss_implementation")
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()

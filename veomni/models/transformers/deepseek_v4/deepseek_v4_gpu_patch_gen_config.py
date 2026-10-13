@@ -202,10 +202,7 @@ config.add_import(
 
 @config.add_helper
 def _deepseek_v4_rope_op() -> VeomniOp:
-    impl = resolve_op_impl("rotary_pos_emb_implementation")
-    if impl in {"npu", "liger_kernel"}:
-        impl = "eager"
-    return VeomniOp("rope", "deepseek_v4", impl)
+    return VeomniOp("rope", "deepseek_v4", resolve_op_impl("rotary_pos_emb_implementation"))
 
 
 # ================================================================
@@ -237,7 +234,7 @@ def deepseek_v4_rms_norm_forward_patched(self, hidden_states: torch.Tensor) -> t
 def deepseek_v4_unweighted_rmsnorm_init_patched(self, eps: float = 1.0e-6) -> None:
     nn.Module.__init__(self)
     self.eps = eps
-    impl = resolve_op_impl("rms_norm_implementation")
+    impl = resolve_op_impl("rms_norm_implementation", variant="unweighted")
     self.veomni_unweighted_rms_norm = VeomniOp("rms_norm", "unweighted", impl)
 
 
@@ -1918,7 +1915,7 @@ def deepseek_v4_forcausallm_init_patched(self, config):
     self.router_aux_loss_coef = config.router_aux_loss_coef
     self.num_experts = config.num_local_experts
     self.num_experts_per_tok = config.num_experts_per_tok
-    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    impl = resolve_op_impl("cross_entropy_loss_implementation")
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.veomni_lb = VeomniOp(

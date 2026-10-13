@@ -64,7 +64,8 @@ def test_resolve_op_impl_reads_ops_config():
     assert resolve_op_impl("cross_entropy_loss_implementation") == "chunk_loss"
 
 
-def test_resolve_op_impl_remaps_npu_ce_alias():
-    set_ops_config(SimpleNamespace(cross_entropy_loss_implementation="npu"))
-    assert resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss") == "chunk_loss"
-    assert resolve_op_impl("cross_entropy_loss_implementation") == "npu"
+def test_resolve_op_impl_applies_variant_scoped_aliases():
+    with ops_config_scope(SimpleNamespace(rms_norm_implementation="npu")):
+        assert resolve_op_impl("rms_norm_implementation") == "npu"
+        assert resolve_op_impl("rms_norm_implementation", variant="standard") == "npu"
+        assert resolve_op_impl("rms_norm_implementation", variant="unweighted") == "eager"

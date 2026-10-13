@@ -1208,7 +1208,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
     "swiglu_mlp_implementation": frozenset(),
     "load_balancing_loss_implementation": frozenset({"triton"}),
-    "cross_entropy_loss_implementation": frozenset({"chunk_loss", "npu"}),
+    "cross_entropy_loss_implementation": frozenset({"chunk_loss"}),
     "moe_implementation": frozenset({"fused_npu"}),
 }
 
@@ -1216,7 +1216,6 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"npu"}),
     "rotary_pos_emb_implementation": frozenset({"npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
-    "cross_entropy_loss_implementation": frozenset({"npu"}),
     "moe_implementation": frozenset({"fused_npu"}),
 }
 
@@ -1260,6 +1259,15 @@ _DEPRECATED_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, str]] = {
         )
     },
     "moe_implementation": {"fused_mlu_triton": "fused_triton"},
+    # ``npu`` names a third-party NPU kernel; the old CE ``npu`` was ``chunk_loss``.
+    "cross_entropy_loss_implementation": {"npu": "chunk_loss"},
+}
+
+# Variant-scoped aliases for fields shared by several variants, applied by
+# ``resolve_op_impl(field, variant=...)``. The value stays valid for the other
+# variants. These old ``npu`` rows were PyTorch math, not third-party kernels.
+_DEPRECATED_VARIANT_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, Dict[str, str]]] = {
+    "rms_norm_implementation": {"unweighted": {"npu": "eager"}},
 }
 
 # Values that were never implementation names and have no implementation equivalent.
@@ -1352,14 +1360,15 @@ class OpsImplementationConfig:
             "help": "Cross-entropy loss. 'liger_kernel' (default, GPU; fused linear+CE — "
             "requires VeOmni-patched modeling that passes hidden_states=/weights= to "
             "self.loss_function; unpatched HF models raise) | 'chunk_loss' (chunked "
-            "F.linear+CE, hardware-agnostic) | 'npu' (chunk_loss + torch_npu gate) | "
-            "'eager' (PyTorch F.cross_entropy)."
+            "F.linear+CE, hardware-agnostic) | 'eager' (PyTorch F.cross_entropy). "
+            "'npu' is a deprecated alias for 'chunk_loss'."
         },
     )
     rms_norm_implementation: str = field(
         default="liger_kernel",
         metadata={
-            "help": "RMSNorm. 'liger_kernel' (default, GPU) | 'npu' | "
+            "help": "RMSNorm. 'liger_kernel' (default, GPU) | 'npu' (torch_npu; the unweighted "
+            "variant has no NPU kernel and uses 'eager') | "
             "'triton' (DeepSeek-V3 batch-invariant; GPU only) | 'eager'."
         },
     )

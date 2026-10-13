@@ -39,7 +39,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
             dim,
             dim_out=dim,
         )
-        impl = resolve_op_impl("rms_norm_implementation")
+        impl = resolve_op_impl("rms_norm_implementation", variant="unweighted")
         self.veomni_rms_norm_unweighted = VeomniOp("rms_norm", "unweighted", impl)
 
     def forward(
@@ -113,7 +113,7 @@ class Embeddings1DConnector(torch.nn.Module):
             self.learnable_registers = torch.nn.Parameter(
                 torch.rand(self.num_learnable_registers, self.inner_dim, dtype=torch.bfloat16) * 2.0 - 1.0
             )
-        impl = resolve_op_impl("rms_norm_implementation")
+        impl = resolve_op_impl("rms_norm_implementation", variant="unweighted")
         self.veomni_rms_norm_unweighted = VeomniOp("rms_norm", "unweighted", impl)
 
     def _replace_padded_with_learnable_registers(

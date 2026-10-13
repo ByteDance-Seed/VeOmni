@@ -55,6 +55,14 @@ def _build_ours(config: DeepseekV4Config, ops: SimpleNamespace | None = None):
         return _dsv4_cls()(config)
 
 
+@pytest.mark.parametrize("impl", ["liger_kernel", "npu"])
+def test_deepseek_v4_rope_rejects_impls_without_a_v4_kernel(impl):
+    ops = eager_ops_config()
+    ops.rotary_pos_emb_implementation = impl
+    with pytest.raises(KeyError, match=rf"'rope' variant='deepseek_v4' impl='{impl}'"):
+        _build_ours(_tiny_config(), ops)
+
+
 def test_deepseek_v4_shared_mlp_passes_swiglu_limit():
     config = _tiny_config()
     model = _build_ours(config)

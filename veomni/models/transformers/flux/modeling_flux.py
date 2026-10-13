@@ -96,7 +96,9 @@ class RMSNorm(torch.nn.Module):
         else:
             self.weight = None
             variant = "unweighted"
-        self.veomni_rms_norm = VeomniOp("rms_norm", variant, resolve_op_impl("rms_norm_implementation"))
+        self.veomni_rms_norm = VeomniOp(
+            "rms_norm", variant, resolve_op_impl("rms_norm_implementation", variant=variant)
+        )
 
     def forward(self, hidden_states):
         """Apply the interned ``rms_norm`` handle."""
