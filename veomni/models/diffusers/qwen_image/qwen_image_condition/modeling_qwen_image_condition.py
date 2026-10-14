@@ -4,7 +4,9 @@ from typing import Any
 
 import torch
 from diffusers import AutoencoderKLQwenImage, FlowMatchEulerDiscreteScheduler
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import CONDITION_IMAGE_SIZE, calculate_dimensions
 from torchvision.transforms import InterpolationMode, functional
 from transformers import PreTrainedModel, Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwen2VLProcessor
 
@@ -237,11 +239,21 @@ class QwenImageConditionModel(PreTrainedModel):
         all_masks: list[torch.Tensor] = []
         for item, edit_images in zip(prompt, edit_images_per_sample):
             edit_images = self._as_list(edit_images)
+            if not edit_images:
+                raise ValueError("Qwen-Image edit requires at least one source image per sample.")
             base_img_prompt = "".join(img_prompt_template.format(i + 1) for i in range(len(edit_images)))
             txt = template.format(base_img_prompt + item)
+            # Match EditPlus inference; the VAE path keeps the original images.
+            condition_images = []
+            image_processor = VaeImageProcessor()
+            for image in edit_images:
+                width, height = calculate_dimensions(CONDITION_IMAGE_SIZE, image.width / image.height)
+                if min(width, height) <= 0:
+                    raise ValueError("Qwen-Image edit source aspect ratio produces an empty condition image.")
+                condition_images.append(image_processor.resize(image, height, width))
             model_inputs = self.processor(
                 text=txt,
-                images=edit_images,
+                images=condition_images,
                 padding=True,
                 return_tensors="pt",
             ).to(device)
@@ -305,18 +317,55 @@ class QwenImageConditionModel(PreTrainedModel):
         latent_height, latent_width = int(parameters.shape[-2]), int(parameters.shape[-1])
         return parameters, [(1, latent_height // 2, latent_width // 2)]
 
-    @torch.no_grad()
-    def get_condition(self, inputs, images, **kwargs) -> dict[str, Any]:
-        prompts = inputs if isinstance(inputs, list) else [inputs]
-        if not prompts or len(prompts) != len(images) or not all(isinstance(prompt, str) for prompt in prompts):
+    def _split_image_inputs(self, inputs, outputs, images):
+        """Split ordered input/output image placeholders after generic loading."""
+        samples = self._as_list(inputs)
+        if not samples or len(samples) != len(images):
             raise ValueError("Qwen-Image expects equally sized, nonempty lists of text prompts and target images.")
+        if outputs is not None and len(outputs) != len(samples):
+            raise ValueError("Qwen-Image inputs and outputs must have the same sample count.")
+        prompts, targets, sources = [], [], []
+        for index, (sample_inputs, sample_images) in enumerate(zip(samples, images)):
+            # Retain the text-only direct-call API used by precision diagnostics.
+            if isinstance(sample_inputs, str) and not self.config.enable_edit:
+                sample_inputs = [("text", sample_inputs)]
+                sample_outputs = [("image", None)]
+            else:
+                sample_outputs = outputs[index] if outputs is not None else None
+            if not isinstance(sample_inputs, (list, tuple)) or not isinstance(sample_outputs, (list, tuple)):
+                raise ValueError("Qwen-Image inputs/outputs must be lists of (modality, value) pairs.")
+            texts, source_count = [], 0
+            for entry in sample_inputs:
+                if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                    raise ValueError("Qwen-Image inputs must contain (modality, value) pairs.")
+                modality, value = entry
+                if modality == "text" and isinstance(value, str):
+                    texts.append(value)
+                elif modality == "image" and value is None:
+                    source_count += 1
+                else:
+                    raise ValueError("Qwen-Image inputs support text and image placeholders only.")
+            if (
+                len(texts) != 1
+                or len(sample_outputs) != 1
+                or not isinstance(sample_outputs[0], (list, tuple))
+                or tuple(sample_outputs[0]) != ("image", None)
+            ):
+                raise ValueError("Qwen-Image expects one text prompt and exactly one target image placeholder.")
+            if self.config.enable_edit != (source_count > 0):
+                raise ValueError("Qwen-Image edit requires source images; text-to-image inputs must not contain them.")
+            sample_images = self._as_list(sample_images)
+            if len(sample_images) != source_count + 1:
+                raise ValueError("Qwen-Image image count must match input and output placeholders in order.")
+            prompts.append(texts[0])
+            sources.append(sample_images[:source_count])
+            targets.append(sample_images[source_count:])
+        return prompts, targets, sources
 
-        outputs_list = kwargs.get("outputs") or []
-        edit_images_per_sample = None
+    @torch.no_grad()
+    def get_condition(self, inputs, images, outputs=None, **kwargs) -> dict[str, Any]:
+        prompts, images, edit_images_per_sample = self._split_image_inputs(inputs, outputs, images)
         if self.config.enable_edit:
-            edit_images_per_sample = [sample_outputs.get("edit_images", []) for sample_outputs in outputs_list]
-            if len(edit_images_per_sample) != len(prompts):
-                raise ValueError("Qwen-Image edit training requires one source-image list per sample.")
             prompt_embeds, prompt_embeds_mask = self._get_qwen_edit_prompt_embeds(prompts, edit_images_per_sample)
         else:
             prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompt=prompts)

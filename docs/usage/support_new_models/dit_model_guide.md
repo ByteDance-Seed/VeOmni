@@ -150,6 +150,30 @@ image streams across SP ranks and gathers the image stream back before the
 output head, mirroring the Wan/Flux pattern. `num_attention_heads` must be
 divisible by `ulysses_size`.
 
+The `Qwen-Image` and `Qwen-Image-Edit` preprocessors preserve the raw record
+aliases (`prompt`/`text`/`caption`, `image_path`/`target_image`, and the Edit
+`source_image(s)`/`edit_image(s)` aliases). They normalize them to modality
+pairs, matching the shared multimodal data convention:
+
+```python
+# One Edit sample after preprocessing, before image loading:
+inputs = [("image", None), ("text", "Make the car red")]
+outputs = [("image", None)]
+images = ["source.png", "target.png"]
+videos = []
+```
+
+For multiple references, add an input image placeholder for each source and
+keep all source images before the single target image. Text-to-image samples
+have only the text input and target image. The generic `dit_online` transform
+loads this one image list; the Qwen condition model validates the placeholders
+and splits sources from the target. It resizes a separate copy of each source
+to the EditPlus 384×384 condition area for VL encoding, preserving aspect ratio
+and the reference pipeline's rounding and interpolation. The VAE path applies
+the configured `height`, `width`, and `image_resize_mode` to the originals.
+`configs/dit/qwen_image_edit_2511.yaml` enables this Edit-2511 path and its
+`zero_cond_t` modulation. Existing encoded Qwen caches are unchanged.
+
 ### Config Bridge — `to_diffuser_dict()` and `to_dict()`
 
 `to_diffuser_dict()` uses Python's `inspect` module to extract exactly the

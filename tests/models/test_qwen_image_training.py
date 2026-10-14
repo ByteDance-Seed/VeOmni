@@ -406,11 +406,6 @@ def test_backbone_reference_forward_and_gradients(snapshot, encoded):
             torch.testing.assert_close(param.grad, reference_param.grad, atol=2e-6, rtol=1e-5)
 
 
-# ---------------------------------------------------------------------------
-# Qwen-Image-Edit tests
-# ---------------------------------------------------------------------------
-
-
 def edit_condition_model(snapshot, **kwargs):
     processor_path = str(snapshot / "processor")
     config = MODEL_CONFIG_REGISTRY["QwenImageConditionModel"]().from_pretrained(
@@ -443,19 +438,22 @@ def test_edit_preprocessor_contract(tmp_path):
     tgt = tmp_path / "tgt.png"
     Image.new("RGB", (8, 8)).save(src)
     Image.new("RGB", (8, 8)).save(tgt)
-    prompt, outputs, images, videos = qwen_image_edit_preprocess(
+    inputs, outputs, images, videos = qwen_image_edit_preprocess(
         {"prompt": "make it red", "source_image": "src.png", "target_image": "tgt.png"},
         data_dir=str(tmp_path),
     )
-    assert prompt == "make it red"
-    assert outputs == {"edit_images": [str(src)]}
-    assert images == [str(tgt)]
+    assert inputs == [("image", None), ("text", "make it red")]
+    assert outputs == [("image", None)]
+    assert images == [str(src), str(tgt)]
     assert videos == []
-    prompt, outputs, images, _ = qwen_image_edit_preprocess(
+    inputs, outputs, images, _ = qwen_image_edit_preprocess(
         {"text": "edit", "edit_images": ["a.png", "b.png"], "image": "c.png"},
     )
-    assert outputs == {"edit_images": ["a.png", "b.png"]}
-    assert images == ["c.png"]
+    assert inputs == [("image", None), ("image", None), ("text", "edit")]
+    assert outputs == [("image", None)]
+    assert images == ["a.png", "b.png", "c.png"]
+    with pytest.raises(ValueError, match="source"):
+        qwen_image_edit_preprocess({"prompt": "x", "image": "y.png", "edit_images": []})
     with pytest.raises(ValueError, match="source"):
         qwen_image_edit_preprocess({"prompt": "x", "image": "y.png"})
     with pytest.raises(ValueError, match="target"):
@@ -479,22 +477,71 @@ def test_edit_yaml_config():
     assert args.model.model_config["zero_cond_t"] is True
 
 
-def test_edit_condition_and_zero_cond_t(snapshot):
+def test_edit_condition_and_zero_cond_t(snapshot, tmp_path):
     condition = edit_condition_model(snapshot)
-    target_images = [Image.new("RGB", (16, 16), color="red")]
-    source_images = [Image.new("RGB", (16, 16), color="blue")]
-    outputs = [{"edit_images": source_images}]
-    encoded = condition.get_condition(inputs=["make it red"], images=[target_images], outputs=outputs)
+    for name, color in [("source", "blue"), ("reference", "green"), ("target", "red")]:
+        Image.new("RGB", (24, 16), color=color).save(tmp_path / f"{name}.png")
+    transform = build_data_transform("dit_online", data_dir=str(tmp_path))
+    example = {
+        "prompt": "make it red",
+        "source_images": ["source.png", "reference.png"],
+        "target_image": "target.png",
+    }
+    features = transform(example, source_name="Qwen-Image-Edit")
+    batch = DiTDataCollator()(features)
+    encoded = condition.get_condition(**batch)
     assert "edit_latents" in encoded and "edit_img_shapes" in encoded
+    torch.testing.assert_close(encoded["latents"][0], condition._encode_image_to_latents(batch["images"][0][-1])[0])
+    for actual, source in zip(encoded["edit_latents"][0], batch["images"][0][:-1]):
+        torch.testing.assert_close(actual, condition._encode_image_to_latents(source)[0])
     packed = condition.process_condition(**encoded)
     # hidden_states includes target + source tokens; training_target only target.
     hidden = packed["hidden_states"][0]
     target = packed["training_target"][0]
     assert hidden.shape[1] > target.shape[1]
     combined_shapes = packed["img_shapes"][0]
-    assert len(combined_shapes) == 2
+    assert len(combined_shapes) == 3
     model = edit_transformer().eval()
-    with torch.no_grad():
-        out = model(**packed)
+    before = model.proj_out.weight.detach().clone()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    out = model(**packed)
     prediction = out.predictions[0]
     assert prediction.shape == target.shape
+    out.loss["mse_loss"].backward()
+    assert torch.isfinite(model.proj_out.weight.grad).all()
+    optimizer.step()
+    assert not torch.equal(before, model.proj_out.weight)
+
+
+def test_edit_prompt_resize_matches_diffusers(snapshot, monkeypatch):
+    from diffusers.image_processor import VaeImageProcessor
+    from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import CONDITION_IMAGE_SIZE, calculate_dimensions
+
+    condition = edit_condition_model(snapshot)
+    source = Image.effect_noise((128, 64), 30).convert("RGB")
+    original = source.tobytes()
+    processor = condition.processor
+    seen = []
+
+    def record_processor(**kwargs):
+        seen.extend(kwargs["images"])
+        return processor(**kwargs)
+
+    monkeypatch.setattr(condition, "processor", record_processor)
+    condition._get_qwen_edit_prompt_embeds(["edit"], [[source]])
+    width, height = calculate_dimensions(CONDITION_IMAGE_SIZE, 2)
+    expected = VaeImageProcessor().resize(source, height, width)
+    assert seen[0].size == expected.size
+    assert seen[0].tobytes() == expected.tobytes()
+    assert source.size == (128, 64) and source.tobytes() == original
+
+
+def test_edit_rejects_mismatched_modality_placeholders(snapshot):
+    condition = edit_condition_model(snapshot)
+    source = Image.new("RGB", (16, 16))
+    with pytest.raises(ValueError, match="image count"):
+        condition.get_condition(
+            inputs=[[("image", None), ("text", "edit")]], outputs=[[("image", None)]], images=[[source]]
+        )
+    with pytest.raises(ValueError, match="source images"):
+        condition.get_condition(inputs=[[("text", "edit")]], outputs=[[("image", None)]], images=[[source]])

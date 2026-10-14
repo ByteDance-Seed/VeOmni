@@ -36,7 +36,7 @@ def qwen_image_preprocess(conversations, **kwargs):
     data_dir = kwargs.get("data_dir", "")
     if data_dir and isinstance(image, str) and not os.path.isabs(image) and "://" not in image:
         image = os.path.join(data_dir, image)
-    return prompt, {}, [image], []
+    return [("text", prompt)], [("image", None)], [image], []
 
 
 @PREPROCESSOR_REGISTRY.register("Qwen-Image-Edit")
@@ -75,7 +75,7 @@ def qwen_image_edit_preprocess(conversations, **kwargs):
         raise ValueError("Qwen-Image-Edit data requires one of: prompt, text, caption, instruction.")
     if target_image is None:
         raise ValueError("Qwen-Image-Edit data requires one of: target_image, image, image_bytes, image_path.")
-    if edit_images is None:
+    if not edit_images:
         raise ValueError("Qwen-Image-Edit data requires one of: edit_image(s), source_image(s), src_image(s).")
     if not isinstance(prompt, str):
         raise ValueError("Qwen-Image-Edit requires a text prompt.")
@@ -93,7 +93,8 @@ def qwen_image_edit_preprocess(conversations, **kwargs):
 
     target_image = _resolve(target_image)
     edit_images = [_resolve(img) for img in edit_images]
-    return prompt, {"edit_images": edit_images}, [target_image], []
+    inputs = [("image", None)] * len(edit_images) + [("text", prompt)]
+    return inputs, [("image", None)], edit_images + [target_image], []
 
 
 @PREPROCESSOR_REGISTRY.register("minimax_h3")
