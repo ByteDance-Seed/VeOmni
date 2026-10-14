@@ -55,9 +55,9 @@ model:
     ulysses_size: 1
     gradient_checkpointing:
       enable: true
-      # recompute_layers: 15  # 开启重计算的层数, 从最后一层往前数: -1 = 全部层(默认), 0 = 不重算, 超过总层数取总层数
-      # selective_recompute_layers: 10  # 其中走选择重计算(SAC)的层数, 从重算区间前段数: 0 = 不开(默认), 超过重算区间长度取整个区间
-      # save_ops: ["attn"]  # SAC 下不做重计算的算子, 默认 attn (SDPA 类 op MUST_SAVE, 其余重算); [] 等价 attn
+      # recompute_layers: 15  # blocks that recompute, counted from the last block: -1 = every block (default), 0 = none, above the model depth means every block
+      # selective_recompute_layers: 10  # of those, the blocks that run selective activation checkpointing (SAC), counted from the front of the range: 0 = off (default), above the range length means the whole range
+      # save_ops: ["attn"]  # operators SAC keeps instead of recomputing; default attn (the SDPA-like ops are MUST_SAVE, the rest recompute); [] means the same as attn
     fsdp_config:
       fsdp_mode: fsdp2
       mixed_precision:
