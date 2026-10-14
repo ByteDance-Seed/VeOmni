@@ -142,6 +142,7 @@ jobs:
           uv run --frozen pytest -s -x tests/models/test_generated_modeling_imports.py
           uv run --frozen pytest -s -x tests/models/test_transformers_upgrade_compat.py
           uv run --frozen pytest -s -x tests/models/test_qwen_image_training.py tests/models/test_qwen_image_precision.py
+          uv run --frozen pytest -s -x tests/models/test_wan_i2v_training.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -s -x tests/models/test_qwen3_5_moe_mtp.py
           uv run --frozen pytest -s -x tests/models/test_vlm_trainer.py

@@ -83,16 +83,32 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         )
         self.negative_prompt_embeds = prompt_embeds[0].unsqueeze(0)
 
-    def _encode_video_to_latents(self, video: torch.Tensor) -> torch.Tensor:
+    def _preprocess_video(self, video: torch.Tensor) -> torch.Tensor:
         # resize video to max size
         height, width = video.shape[-2:]
         size = min(self.config.video_max_size, min(width, height))
         video = functional.resize(video, size, interpolation=InterpolationMode.BICUBIC).float().clamp(0, 255)
         video = self.video_processor.preprocess_video(video)
-        video = video.to(device=self.vae.device, dtype=self.vae.dtype)
-        # save mean & logvar
-        posterior: DiagonalGaussianDistribution = self.vae.encode(video).latent_dist
-        return posterior.parameters
+        return video.to(device=self.vae.device, dtype=self.vae.dtype)
+
+    def _encode_video_to_latents(self, video: torch.Tensor) -> torch.Tensor:
+        return self.vae.encode(self._preprocess_video(video)).latent_dist.parameters
+
+    def _encode_image_condition(self, video: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode the normalized first frame followed by zeros, as Wan I2V inference does."""
+        batch, _, frames, _, _ = video.shape
+        temporal_factor = self.vae.config.scale_factor_temporal
+        if (frames - 1) % temporal_factor:
+            raise ValueError(f"Wan I2V needs 1 + k * {temporal_factor} video frames; got {frames}.")
+        condition_video = torch.zeros_like(video)
+        condition_video[:, :, :1] = video[:, :, :1]
+        parameters = self.vae.encode(condition_video).latent_dist.parameters
+        latent_height, latent_width = parameters.shape[-2:]
+        mask = video.new_zeros(batch, 1, frames, latent_height, latent_width)
+        mask[:, :, :1] = 1
+        mask = torch.cat([mask[:, :, :1].repeat_interleave(temporal_factor, dim=2), mask[:, :, 1:]], dim=2)
+        mask = mask.view(batch, -1, temporal_factor, latent_height, latent_width).transpose(1, 2)
+        return parameters, mask
 
     def _normalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
         latents_mean = torch.tensor(
@@ -125,10 +141,19 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         )  # bs, seqlen, dim
         context_list = [u.unsqueeze(0) for u in prompt_embeds]
         latents_list: list[torch.Tensor] = []
+        image_latents_list, masks = [], []
         for sample_videos in videos:
             assert len(sample_videos) == 1, "Only one video per sample is supported for T2V"
-            latents_list.append(self._encode_video_to_latents(sample_videos[0]))  # 1, c, f, h, w
-        return {"latents": latents_list, "context": context_list}
+            video = self._preprocess_video(sample_videos[0])
+            latents_list.append(self.vae.encode(video).latent_dist.parameters)
+            if self.config.image_conditioning:
+                image_parameters, mask = self._encode_image_condition(video)
+                image_latents_list.append(image_parameters)
+                masks.append(mask)
+        condition = {"latents": latents_list, "context": context_list}
+        if self.config.image_conditioning:
+            condition.update(image_latents=image_latents_list, mask=masks)
+        return condition
 
     def rng_state_dict(self) -> dict[str, torch.Tensor]:
         """Snapshot the noise/timestep generator for the job-level checkpoint.
@@ -143,7 +168,19 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         """Restore a snapshot produced by :meth:`rng_state_dict`."""
         self.generator.set_state(state["generator"])
 
-    def process_condition(self, latents: list[torch.Tensor], context: list[torch.Tensor]) -> dict[str, Any]:
+    def process_condition(
+        self,
+        latents: list[torch.Tensor],
+        context: list[torch.Tensor],
+        image_latents: list[torch.Tensor] | None = None,
+        mask: list[torch.Tensor] | None = None,
+    ) -> dict[str, Any]:
+        if not latents or len(latents) != len(context):
+            raise ValueError("Wan latents and context must have the same nonzero sample count.")
+        if self.config.image_conditioning and (
+            image_latents is None or mask is None or len(image_latents) != len(latents) or len(mask) != len(latents)
+        ):
+            raise ValueError("Wan I2V requires full image_latents and mask; regenerate legacy offline embeddings.")
         if not self._timesteps_ready:
             self.scheduler.set_timesteps(self.config.num_train_timesteps, device=latents[0].device)
             self._timesteps_ready = True
@@ -154,9 +191,19 @@ class WanTransformer3DConditionModel(PreTrainedModel):
             "training_target": [],
             "latents": [],
         }
-        for sample_latents, sample_context in zip(latents, context):
+        if self.config.image_conditioning:
+            packed_conditions.update(image_latents=[], mask=[])
+        for index, (sample_latents, sample_context) in enumerate(zip(latents, context)):
             norm_latents = DiagonalGaussianDistribution(sample_latents).mode()
             norm_latents = self._normalize_latents(norm_latents)
+            if self.config.image_conditioning:
+                parameters, sample_mask = image_latents[index], mask[index]
+                expected_mask = (norm_latents.shape[0], self.vae.config.scale_factor_temporal, *norm_latents.shape[2:])
+                if parameters.shape != sample_latents.shape or tuple(sample_mask.shape) != expected_mask:
+                    raise ValueError("Wan I2V condition posterior and mask must match the full target video grid.")
+                image_condition = self._normalize_latents(DiagonalGaussianDistribution(parameters).mode())
+                packed_conditions["image_latents"].append(image_condition.to(norm_latents))
+                packed_conditions["mask"].append(sample_mask.to(norm_latents))
             noise = torch.randn(  # TODO: use randn_like(generator=self.generator) when updating to torch 2.10.0
                 norm_latents.shape, dtype=norm_latents.dtype, device=self.generator.device, generator=self.generator
             ).to(self.generator.device)

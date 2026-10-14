@@ -174,6 +174,29 @@ the configured `height`, `width`, and `image_resize_mode` to the originals.
 `configs/dit/qwen_image_edit_2511.yaml` enables this Edit-2511 path and its
 `zero_cond_t` modulation. Existing encoded Qwen caches are unchanged.
 
+### Wan I2V conditioning
+
+The non-expanded-timestep I2V path (Wan2.2 I2V-A14B) uses
+`model.condition_model_cfg.image_conditioning: true`. A local snapshot's
+`transformer/config.json` also enables this mode when `in_channels` differs
+from `out_channels`. TI2V-5B uses `expand_timesteps` instead; T2V uses neither.
+
+For channel-concatenated I2V, the condition model preprocesses the video once,
+keeps its first normalized image frame, fills subsequent image frames with
+zeros, and VAE-encodes that complete condition video. It stores the raw
+condition posterior in `image_latents` and the temporal mask in `mask` alongside
+the target posterior and text context. `process_condition` normalizes both
+posteriors, and the DiT concatenates `[noisy_target, mask, image_condition]`.
+Copying the first latent across time is not equivalent to encoding zero-valued
+image frames. Legacy I2V offline embeddings missing `image_latents` or `mask`
+must be regenerated; the code rejects them rather than synthesizing a condition.
+
+The frame count must be `1 + k * vae.config.scale_factor_temporal`. The A14B
+example sets `data.mm_configs.frame_factor: 4` and `frame_factor_remainder: 1`
+to enforce this during video sampling. These settings follow A14B's VAE and
+must be checked when switching snapshots. T2V and expanded-timestep TI2V
+retain their existing condition fields.
+
 ### Config Bridge — `to_diffuser_dict()` and `to_dict()`
 
 `to_diffuser_dict()` uses Python's `inspect` module to extract exactly the

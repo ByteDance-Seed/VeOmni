@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 from diffusers import WanTransformer3DModel as _WanTransformer3DModel
-from diffusers.models.activations import GELU
 from diffusers.models.transformers.transformer_wan import (
     WanAttention,
     WanAttnProcessor,
@@ -21,7 +20,9 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
+    gather_heads_scatter_seq,
     gather_outputs,
+    gather_seq_scatter_heads,
     slice_input_tensor,
 )
 from .....utils import logging
@@ -52,17 +53,6 @@ def wan_eager_attention_forward(
         query, key, value, attn_mask=attention_mask, dropout_p=dropout, scale=scaling, is_causal=False
     )
     return attn_output.transpose(1, 2), None
-
-
-# Patch diffusers GELU to use torch_npu.fast_gelu on NPU.
-if IS_NPU_AVAILABLE and torch_npu is not None:
-
-    def _gelu_npu(self, gate: torch.Tensor) -> torch.Tensor:
-        if gate.device.type == "npu":
-            return torch_npu.fast_gelu(gate)
-        return torch.nn.functional.gelu(gate, approximate=self.approximate)
-
-    GELU.gelu = _gelu_npu
 
 
 class WanAttentionKernelModule:
@@ -181,14 +171,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
         query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
 
-        try:
-            import torch_npu
-
-            _is_npu = True
-        except ImportError:
-            _is_npu = False
-
-        if _is_npu:
+        if IS_NPU_AVAILABLE and torch_npu is not None and query.device.type == "npu":
             query = torch_npu.npu_rms_norm(query, attn.norm_q.weight, epsilon=attn.norm_q.eps)[0]
             key = torch_npu.npu_rms_norm(key, attn.norm_k.weight, epsilon=attn.norm_k.eps)[0]
         else:
@@ -200,6 +183,18 @@ class WanSPAttnProcessor(WanAttnProcessor):
         value = value.unflatten(2, (attn.heads, -1))
 
         use_sp = get_parallel_state().sp_enabled and not is_cross_attention
+        padded_seq_len = None
+        if use_sp:
+            group = get_parallel_state().ulysses_group
+            query, key, value = (
+                gather_seq_scatter_heads(tensor, seq_dim=1, head_dim=2, group=group) for tensor in (query, key, value)
+            )
+            if rotary_emb is None:
+                raise ValueError("Wan sequence parallel self-attention requires full rotary position tables.")
+            sequence_length = rotary_emb[0].shape[1]
+            padded_seq_len = query.shape[1]
+            # Padding is only for communication; it must not enter softmax.
+            query, key, value = (tensor[:, :sequence_length] for tensor in (query, key, value))
 
         if rotary_emb is not None:
 
@@ -227,14 +222,11 @@ class WanSPAttnProcessor(WanAttnProcessor):
                 x_out = torch_npu.npu_rotary_mul(x_float, cos, sin, rotary_mode="interleave")
                 return x_out.to(hidden_states.dtype)
 
-            try:
-                import torch_npu
-
-                _is_npu = True
-            except ImportError:
-                _is_npu = False
-
-            _apply_rope = apply_rotary_emb_npu if _is_npu else apply_rotary_emb
+            _apply_rope = (
+                apply_rotary_emb_npu
+                if IS_NPU_AVAILABLE and torch_npu is not None and query.device.type == "npu"
+                else apply_rotary_emb
+            )
             query = _apply_rope(query, *rotary_emb)
             key = _apply_rope(key, *rotary_emb)
 
@@ -276,16 +268,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
             )[0]
             hidden_states_img = hidden_states_img.flatten(2, 3).type_as(query)
 
-        query_length = query.shape[1]
-        key_length = key.shape[1]
-        if use_sp:
-            query_length *= get_parallel_state().ulysses_size
-            key_length *= get_parallel_state().ulysses_size
-        attention_kwargs = (
-            _get_wan_full_sequence_varlen_kwargs(query, key, value, query_length=query_length, key_length=key_length)
-            if use_flash_attention
-            else {}
-        )
+        attention_kwargs = _get_wan_full_sequence_varlen_kwargs(query, key, value) if use_flash_attention else {}
         hidden_states_out = attention_interface(
             kernel_module,
             query.transpose(1, 2),
@@ -294,20 +277,23 @@ class WanSPAttnProcessor(WanAttnProcessor):
             attention_mask=attention_mask,
             dropout=0.0,
             is_causal=False,
-            skip_ulysses=is_cross_attention,
+            skip_ulysses=True,
             **attention_kwargs,
         )[0]
 
+        if use_sp:
+            hidden_states_out = F.pad(hidden_states_out, (0, 0, 0, 0, 0, padded_seq_len - hidden_states_out.shape[1]))
+            hidden_states_out = gather_heads_scatter_seq(
+                hidden_states_out, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
+            )
+
         hidden_states_out = hidden_states_out.flatten(2, 3)
-        # FIX: was `hidden_states = hidden_states.type_as(query)` which incorrectly
-        # cast the *input* tensor instead of the attention output.
         hidden_states_out = hidden_states_out.type_as(query)
 
         if hidden_states_img is not None:
             hidden_states_out = hidden_states_out + hidden_states_img
 
-        out_weight = attn.to_out[0].weight if hasattr(attn.to_out[0], "weight") else attn.to_out[0].base_layer.weight
-        hidden_states_out = hidden_states_out.type_as(out_weight)
+        hidden_states_out = hidden_states_out.to(_get_weight_dtype(attn.to_out[0]))
         hidden_states_out = attn.to_out[0](hidden_states_out)
         hidden_states_out = attn.to_out[1](hidden_states_out)
         return hidden_states_out
@@ -339,55 +325,21 @@ def WanTransformer3DModel_forward(
 ):
     batch_size, num_channels, num_frames, height, width = hidden_states.shape
 
-    # in_channels=36: [noise(16), image_latent(16), mask(4)] -> 36 channels
-    # in_channels=48: [noise(16), image_latent(16), mask(16)] -> 48 channels
-    is_i2v_36ch = self.config.in_channels == 36 and num_channels == 16
-    is_i2v_48ch = self.config.in_channels == 48 and num_channels == 16
-
-    if is_i2v_36ch or is_i2v_48ch:
-        mask_ch = 4 if is_i2v_36ch else 16
-        in_ch_label = 36 if is_i2v_36ch else 48
-
-        if image_latents is None:
-            logger.warning_once(
-                f"image_latents is None for I2V model (in_channels={in_ch_label}). Padding with zeros. "
-                "This should only be used for debugging; please provide real image_latents!"
-            )
-            image_latents = torch.zeros_like(hidden_states)
-
-        if mask is None:
-            logger.warning_once(
-                f"mask is None for I2V model (in_channels={in_ch_label}). Using default mask "
-                "(first frame = 1, rest = 0). Please provide a real mask for better results!"
-            )
-            mask = torch.zeros(
-                (batch_size, 1, num_frames, height, width),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
-            mask[:, :, 0, :, :] = 1.0
-
-        # Ensure image_latents has the correct time dimension.
-        if image_latents.shape[2] == 1:
-            image_latents = image_latents.repeat(1, 1, num_frames, 1, 1)
-        elif image_latents.shape[2] != num_frames:
+    if num_channels != self.config.in_channels:
+        mask_channels = self.config.in_channels - 2 * num_channels
+        if num_channels != self.config.out_channels or mask_channels <= 0:
+            raise ValueError("Wan noisy latent channels do not match the transformer configuration.")
+        if image_latents is None or mask is None:
+            raise ValueError("Wan I2V requires full image_latents and mask from the condition model.")
+        if image_latents.shape != hidden_states.shape:
             raise ValueError(
-                f"image_latents time dim {image_latents.shape[2]} must be 1 or match noise T dim {num_frames}"
+                "Wan I2V image_latents must match the full noisy video shape; first-frame repetition is invalid."
             )
-
-        # Ensure mask has the correct channel and time dimensions.
-        if mask.shape[1] == 1:
-            mask = mask.repeat(1, mask_ch, 1, 1, 1)
-        elif mask.shape[1] != mask_ch:
-            raise ValueError(f"mask channel dim must be 1 or {mask_ch}, got {mask.shape[1]}")
-        if mask.shape[2] == 1:
-            mask = mask.repeat(1, 1, num_frames, 1, 1)
-        elif mask.shape[2] != num_frames:
-            raise ValueError(f"mask time dim {mask.shape[2]} must be 1 or match noise T dim {num_frames}")
-
-        # Concatenate: [noise_latent(16), mask(mask_ch), image_latent(16)] -> in_ch_label channels
-        # Order matches diffusers WanImageToVideoPipeline: latents, [mask, condition]
-        hidden_states = torch.cat([hidden_states, mask, image_latents], dim=1)
+        expected_mask = (batch_size, mask_channels, num_frames, height, width)
+        if tuple(mask.shape) != expected_mask:
+            raise ValueError(f"Wan I2V mask shape must be {expected_mask}, got {tuple(mask.shape)}.")
+        # Match WanImageToVideoPipeline: noisy latents, temporal mask, VAE condition.
+        hidden_states = torch.cat([hidden_states, mask.to(hidden_states), image_latents.to(hidden_states)], dim=1)
         num_channels = hidden_states.shape[1]
 
     p_t, p_h, p_w = self.config.patch_size
@@ -399,13 +351,11 @@ def WanTransformer3DModel_forward(
     rotary_emb = self.rope(hidden_states)
     # 2. Patch embedding: (B, C, F, H, W) → (B, seq, inner_dim)
     hidden_states = self.patch_embedding(hidden_states)
-    try:
-        import torch_npu
-
+    if IS_NPU_AVAILABLE and torch_npu is not None and hidden_states.device.type == "npu":
         B, C = hidden_states.shape[:2]
         S = hidden_states.shape[2:].numel()
         hidden_states = torch_npu.npu_confusion_transpose(hidden_states, [0, 2, 1], [B, C, S], transpose_first=False)
-    except (ImportError, ModuleNotFoundError):
+    else:
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
     # 3. Condition embedding
@@ -432,15 +382,8 @@ def WanTransformer3DModel_forward(
         if ts_seq_len is not None:
             timestep_proj = slice_input_tensor(timestep_proj, dim=1, group=get_parallel_state().sp_group)
 
-        # Slice rotary embeddings to the local rank's positions (no gradient).
-        freqs_cos, freqs_sin = rotary_emb
-        ulysses_size = get_parallel_state().ulysses_size
-        ulysses_rank = get_parallel_state().ulysses_rank
-        seq_len = freqs_cos.shape[1]
-        chunk = seq_len // ulysses_size
-        freqs_cos = freqs_cos[:, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
-        freqs_sin = freqs_sin[:, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
-        rotary_emb = (freqs_cos, freqs_sin)
+        # Keep full positions: self-attention gathers the sequence and discards
+        # communication padding before applying RoPE and computing attention.
 
     # Cast rotary_emb to compute dtype for checkpoint dtype consistency.
     # WanRotaryPosEmbed stores frequencies in float64/float32, but FSDP2
@@ -469,7 +412,13 @@ def WanTransformer3DModel_forward(
     # SP: gather before output head – every rank holds the full sequence so
     # that the loss is identical across SP ranks.
     if get_parallel_state().sp_enabled:
-        hidden_states = gather_outputs(hidden_states, gather_dim=1)
+        hidden_states = gather_outputs(
+            hidden_states,
+            gather_dim=1,
+            padding_dim=1,
+            unpad_dim_size=post_patch_num_frames * post_patch_height * post_patch_width,
+            group=get_parallel_state().sp_group,
+        )
 
     # 5. Output: norm → projection → unpatchify
     if temb.ndim == 3:
@@ -574,36 +523,6 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
             img_lat = image_latents[i] if image_latents is not None else None
             msk = mask[i] if mask is not None else None
 
-            # I2V: when the model expects 36/48 channels but input has 16, derive
-            # image_latents and mask if the caller didn't provide them.
-            # The actual channel concatenation is handled inside
-            # WanTransformer3DModel_forward so that this wrapper stays decoupled
-            # from the model's internal channel layout.
-            is_i2v = self.config.in_channels in (36, 48) and hs.shape[1] == 16
-
-            if is_i2v:
-                if img_lat is None:
-                    # Use the first frame of norm_latents as the image condition.
-                    # Previously this was derived from training_target, but in
-                    # expand_timesteps mode training_target[:,:,0] is always zero,
-                    # causing the model to never see real image conditions during
-                    # training and producing white/blank output at inference.
-                    norm_lat = latents[i]
-                    if norm_lat is None:
-                        raise ValueError(
-                            "norm_latents is required for I2V training when image_latents is not provided"
-                        )
-                    img_lat = norm_lat[:, :, 0:1, :, :]  # [B, 16, 1, H, W]
-
-                if msk is None:
-                    B, _C, T, H, W = hs.shape
-                    msk = torch.zeros(
-                        (B, 1, T, H, W),
-                        device=hs.device,
-                        dtype=hs.dtype,
-                    )
-                    msk[:, :, 0, :, :] = 1.0
-
             # Call the SP-patched diffusers forward for each sample.
             prediction = _WanTransformer3DModel.forward(
                 self,
@@ -624,7 +543,7 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
                 target = target[:, :, :min_t, :min_h, :min_w]
 
             per_sample_loss = F.mse_loss(prediction.float(), target.float(), reduction="none")
-            per_sample_loss = per_sample_loss.view(per_sample_loss.shape[0], -1).mean(dim=1)
+            per_sample_loss = per_sample_loss.reshape(per_sample_loss.shape[0], -1).mean(dim=1)
             per_sample_losses.append(per_sample_loss)
 
         loss = torch.cat(per_sample_losses).mean()

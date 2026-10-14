@@ -2,6 +2,8 @@ model:
   model_path: Wan2.2-I2V-A14B-Diffusers/transformer
   condition_model_path: Wan2.2-I2V-A14B-Diffusers
   config_path: VeOmni/configs/model_configs/wan/wan2.2_i2v_14b.json
+  condition_model_cfg:
+    image_conditioning: true
   ops_implementation:
     # Wan's RoPE has a non‑standard signature (rope_apply takes a single
     # tensor plus freqs/head_dim kwargs) so the framework's default
@@ -41,6 +43,8 @@ data:
   mm_configs:
     fps: 12
     max_frames: 100
+    frame_factor: 4
+    frame_factor_remainder: 1
 train:
   global_batch_size: 8
   micro_batch_size: 1
