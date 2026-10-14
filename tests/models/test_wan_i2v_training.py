@@ -29,7 +29,9 @@ def condition_factory(monkeypatch):
     torch.set_num_threads(1)
     monkeypatch.setattr(condition_module, "get_device_type", lambda: "cpu")
     monkeypatch.setattr(condition_module, "get_parallel_state", lambda: SimpleNamespace(dp_rank=0))
-    monkeypatch.setattr(transformer_module, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+    monkeypatch.setattr(
+        transformer_module, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=False, sp_enabled=False)
+    )
     monkeypatch.setattr(
         transformer_module._WanTransformer3DModel, "forward", transformer_module.WanTransformer3DModel_forward
     )
@@ -153,6 +155,33 @@ def test_wan_rejects_incomplete_patches(condition_factory, grid):
     model = transformer_module.WanTransformer3DModel(config)
     latents = torch.zeros(1, 4, *grid)
     with pytest.raises(ValueError, match="latent dimensions must be divisible by patch_size"):
+        model(
+            latents=latents,
+            hidden_states=latents,
+            timestep=torch.zeros(1),
+            encoder_hidden_states=torch.zeros(1, 3, 8),
+            training_target=latents,
+        )
+
+
+def test_wan_rejects_context_parallelism(condition_factory, monkeypatch):
+    config = WanTransformer3DModelConfig(
+        in_channels=4,
+        out_channels=4,
+        num_layers=1,
+        num_attention_heads=2,
+        attention_head_dim=8,
+        text_dim=8,
+        freq_dim=8,
+        ffn_dim=32,
+    )
+    config._attn_implementation = "eager"
+    model = transformer_module.WanTransformer3DModel(config)
+    monkeypatch.setattr(
+        transformer_module, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, sp_enabled=True)
+    )
+    latents = torch.zeros(1, 4, 1, 2, 2)
+    with pytest.raises(NotImplementedError, match="not context parallelism"):
         model(
             latents=latents,
             hidden_states=latents,

@@ -326,6 +326,13 @@ def WanTransformer3DModel_forward(
     mask: torch.Tensor | None = None,
     **kwargs,
 ):
+    parallel_state = get_parallel_state()
+    if parallel_state.cp_enabled:
+        raise NotImplementedError(
+            "WanTransformer3DModel supports Ulysses sequence parallelism, but not context parallelism; "
+            "set model.accelerator.cp_size=1."
+        )
+
     batch_size, num_channels, num_frames, height, width = hidden_states.shape
 
     if num_channels != self.config.in_channels:
@@ -384,11 +391,11 @@ def WanTransformer3DModel_forward(
     if encoder_hidden_states_image is not None:
         encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
-    if get_parallel_state().sp_enabled:
-        hidden_states = slice_input_tensor(hidden_states, dim=1, group=get_parallel_state().sp_group)
+    if parallel_state.sp_enabled:
+        hidden_states = slice_input_tensor(hidden_states, dim=1, group=parallel_state.sp_group)
 
         if ts_seq_len is not None:
-            timestep_proj = slice_input_tensor(timestep_proj, dim=1, group=get_parallel_state().sp_group)
+            timestep_proj = slice_input_tensor(timestep_proj, dim=1, group=parallel_state.sp_group)
 
         # Keep full positions: self-attention gathers the sequence and discards
         # communication padding before applying RoPE and computing attention.
@@ -419,13 +426,13 @@ def WanTransformer3DModel_forward(
 
     # SP: gather before output head – every rank holds the full sequence so
     # that the loss is identical across SP ranks.
-    if get_parallel_state().sp_enabled:
+    if parallel_state.sp_enabled:
         hidden_states = gather_outputs(
             hidden_states,
             gather_dim=1,
             padding_dim=1,
             unpad_dim_size=post_patch_num_frames * post_patch_height * post_patch_width,
-            group=get_parallel_state().sp_group,
+            group=parallel_state.sp_group,
         )
 
     # 5. Output: norm → projection → unpatchify
