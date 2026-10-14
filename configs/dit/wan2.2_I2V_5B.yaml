@@ -1,7 +1,7 @@
 model:
   model_path: Wan-AI/Wan2___2-TI2V-5B-Diffusers/transformer
   condition_model_path: Wan-AI/Wan2___2-TI2V-5B-Diffusers
-  config_path: VeOmni/configs/model_configs/wan/wan2.2_i2v_5b.json
+  config_path: configs/model_configs/wan/wan2.2_i2v_5b.json
   ops_implementation:
     rotary_pos_emb_implementation: eager
     rms_norm_implementation: eager
