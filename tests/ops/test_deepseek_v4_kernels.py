@@ -38,6 +38,139 @@ def test_kernel_package_does_not_import_tilelang_eagerly():
     assert ("tilelang" in sys.modules) is before
 
 
+@pytest.mark.parametrize(
+    ("q_dtype", "kv_dtype", "sink_dtype", "match"),
+    [
+        (torch.float32, torch.bfloat16, torch.float32, "bfloat16"),
+        (torch.bfloat16, torch.float32, torch.float32, "bfloat16"),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, "float32"),
+    ],
+)
+def test_triton_sparse_mla_rejects_unsupported_dtypes(q_dtype, kv_dtype, sink_dtype, match):
+    from veomni.ops.kernels.deepseek_v4.triton_sparse_mla import sparse_attn_triton
+
+    q = torch.empty(1, 2, 4, 16, dtype=q_dtype)
+    kv = torch.empty(1, 2, 16, dtype=kv_dtype)
+    sink = torch.empty(4, dtype=sink_dtype)
+
+    with pytest.raises(ValueError, match=match):
+        sparse_attn_triton(q, kv, sink, torch.zeros(1, 2, 4, dtype=torch.int32))
+
+
+@pytest.mark.parametrize(("hip_version", "device_available"), [(None, True), ("7.14", False)])
+def test_triton_wrapper_rejects_unsupported_runtime(monkeypatch, hip_version, device_available):
+    import veomni.ops.kernels.deepseek_v4 as kernels
+
+    monkeypatch.setattr(kernels.torch.version, "hip", hip_version, raising=False)
+    monkeypatch.setattr(kernels, "IS_CUDA_AVAILABLE", device_available)
+
+    with pytest.raises(RuntimeError, match="AMD ROCm"):
+        kernels.sparse_attn_triton(*(torch.empty(0),) * 4)
+
+
+def _flat_pool_sparse_mla_kernels():
+    """Torch stand-ins for the Triton kernels: ``q [T, H, d_qk]``, ``kv [N, 1, d_qk]``, indices ``[T, K]``.
+
+    The stand-in backward poisons the padded rope channels with NaN so an incorrect
+    gradient slice cannot pass silently.
+    """
+    from veomni.ops.kernels.deepseek_v4.triton_sparse_mla import ROPE_PAD, TOPK_ALIGN
+
+    def pool_attention(q, kv, indices, attn_sink, kv_lora_rank, scale):
+        assert q.shape[-1] == kv.shape[-1] == kv_lora_rank + ROPE_PAD
+        assert indices.dtype == torch.int32 and indices.shape[-1] % TOPK_ALIGN == 0
+        return _sparse_attention_reference(
+            q[None, ..., :kv_lora_rank], kv[None, :, 0, :kv_lora_rank], attn_sink, indices[None], scale
+        )[0]
+
+    def forward(q, kv, indices, attn_sink, kv_lora_rank, scale):
+        out = pool_attention(q, kv, indices, attn_sink, kv_lora_rank, scale)
+        return out.to(q.dtype), q.new_zeros(q.shape[:2], dtype=torch.float32)
+
+    def backward(q, kv, o, grad, indices, lse, attn_sink, kv_lora_rank, scale, small_lds):
+        assert small_lds is True
+        with torch.enable_grad():
+            leaves = [t.detach().float().requires_grad_() for t in (q, kv, attn_sink)]
+            out = pool_attention(*leaves[:2], indices, leaves[2], kv_lora_rank, scale)
+            dq, dkv, d_sink = torch.autograd.grad(out, leaves, grad.float())
+        dq[..., kv_lora_rank:] = float("nan")
+        dkv[..., kv_lora_rank:] = float("nan")
+        return dq.to(q.dtype), dkv.to(kv.dtype), d_sink
+
+    return forward, backward
+
+
+def test_triton_sparse_mla_wrapper_matches_reference_through_the_flat_pool(monkeypatch):
+    from veomni.ops.kernels.deepseek_v4 import triton_sparse_mla
+
+    monkeypatch.setattr(triton_sparse_mla, "_load_kernels", _flat_pool_sparse_mla_kernels)
+    monkeypatch.setattr(triton_sparse_mla, "_has_small_lds", lambda device: True)
+
+    torch.manual_seed(0)
+    batch, seqlen, kv_len, heads, dim, topk = 2, 5, 7, 4, 16, 6
+    scale = dim**-0.5
+    q = torch.randn(batch, seqlen, heads, dim, dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(batch, kv_len, dim, dtype=torch.bfloat16, requires_grad=True)
+    sinks = torch.randn(heads, requires_grad=True)
+    indices = torch.randint(kv_len, (batch, seqlen, topk), dtype=torch.int32)
+    indices[..., -1] = -1
+    # Past this sample's KV but inside the flat pool: must not read sample 1's keys.
+    indices[0, :, -2] = kv_len
+
+    actual = triton_sparse_mla.sparse_attn_triton(q, kv, sinks, indices, scale)
+    expected = _sparse_attention_reference(q, kv, sinks, indices, scale)
+    grad = torch.randn_like(actual)
+    expected_grads = torch.autograd.grad((expected * grad.float()).sum(), (q, kv, sinks))
+    actual.backward(grad)
+
+    torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
+    for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad.float(), expected_grad.float(), rtol=2e-2, atol=2e-2)
+
+
+def test_triton_sparse_mla_rank_chunk_caps_long_sequence_workspace():
+    from veomni.ops.kernels.deepseek_v4.triton_sparse_mla_bwd import (
+        _MAX_RANK_CHUNK_WORKSPACE_BYTES,
+        _rank_chunk_workspace_bytes,
+        _select_rank_chunk,
+    )
+
+    short_chunk = _select_rank_chunk(total_tokens=4096, num_heads=64, d_qk=576, topk=640)
+    assert short_chunk == 256
+
+    for total_tokens in (32768, 131072):
+        chunk = _select_rank_chunk(total_tokens, num_heads=64, d_qk=576, topk=640)
+        assert chunk > 0 and chunk & (chunk - 1) == 0
+        assert _rank_chunk_workspace_bytes(total_tokens, 64, 576, chunk) <= _MAX_RANK_CHUNK_WORKSPACE_BYTES
+
+
+def test_triton_sparse_attention_forward_backward_with_invalid_indices():
+    if torch.version.hip is None or not IS_CUDA_AVAILABLE:
+        pytest.skip("DeepSeek V4 Triton sparse attention requires an AMD ROCm GPU")
+    from veomni.ops.kernels.deepseek_v4 import sparse_attn_triton
+
+    torch.manual_seed(1)
+    batch, seqlen, heads, dim, kv_len, topk = 1, 32, 8, 512, 48, 65
+    q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    sinks = torch.randn(heads, device=DEVICE, requires_grad=True)
+    indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
+    indices[..., -6:-3] = -1
+    indices[..., -3:] = kv_len
+    scale = dim**-0.5
+
+    actual = sparse_attn_triton(q, kv, sinks, indices, scale)
+    expected = _sparse_attention_reference(q, kv, sinks, indices, scale)
+    torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
+
+    grad = torch.randn(batch, heads, seqlen, dim, device=DEVICE, dtype=actual.dtype).transpose(1, 2)
+    assert not grad.is_contiguous()
+    expected_grads = torch.autograd.grad((expected * grad.float()).sum(), (q, kv, sinks))
+    actual.backward(grad)
+    for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad.float(), expected_grad.float(), rtol=2e-2, atol=2e-2)
+
+
 def test_linear_bf16_fp32_matches_bf16_rounded_fp32_reference():
     x = torch.randn(2, 3, 8, dtype=torch.float32, requires_grad=True)
     weight = torch.randn(5, 8, dtype=torch.float32, requires_grad=True)
@@ -490,6 +623,45 @@ def test_deepseek_v4_generated_attention_dispatch_matches_eager():
         )
         assert fp32_weights is not None
         assert fp32_output.dtype == torch.float32
+    finally:
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
+
+
+def test_deepseek_v4_generated_attention_dispatches_triton_like_eager(monkeypatch):
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("the sparse attention dispatch only runs on GPU tensors")
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    calls = []
+
+    def reference_kernel(*args):
+        calls.append(args)
+        return _sparse_attention_reference(*args)
+
+    monkeypatch.setattr(modeling, "sparse_attn_triton", reference_kernel)
+
+    torch.manual_seed(3)
+    batch, seqlen, heads, dim = 1, 32, 8, 512
+    query = torch.randn(batch, heads, seqlen, dim, device=DEVICE, dtype=torch.bfloat16)
+    key = torch.randn(batch, 1, seqlen, dim, device=DEVICE, dtype=torch.bfloat16)
+    causal_mask = torch.full((batch, 1, seqlen, seqlen), float("-inf"), device=DEVICE)
+    causal_mask = torch.triu(causal_mask, diagonal=1)
+    module = SimpleNamespace(
+        num_key_value_groups=heads,
+        sinks=torch.randn(heads, device=DEVICE),
+        training=False,
+        sliding_window=seqlen,
+        compressor=None,
+    )
+
+    try:
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
+        expected, _ = modeling.eager_attention_forward(module, query, key, key, causal_mask, dim**-0.5, dropout=0.0)
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="triton"))
+        actual, _ = modeling.eager_attention_forward(module, query, key, key, causal_mask, dim**-0.5, dropout=0.0)
+
+        assert len(calls) == 1
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
     finally:
         modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
 

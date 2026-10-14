@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DeepSeek V4 model-specific SM90+ GPU kernels adapted from radixark/miles.
+"""DeepSeek V4 model-specific GPU kernels.
 
-Imports stay inside the public wrappers because TileLang is an optional,
-GPU-only dependency. Importing VeOmni on CPU or NPU must not load it.
+The TileLang kernels are adapted from radixark/miles and the Triton sparse-MLA
+kernels from AMD-AGI/Primus. Imports stay inside the public wrappers because both
+are GPU-only (TileLang on NVIDIA SM90+, the Triton kernels on AMD ROCm). Importing
+VeOmni on CPU or NPU must not load either.
 """
 
 from typing import TYPE_CHECKING
@@ -34,6 +36,11 @@ def _require_tilelang_sm90() -> None:
         raise RuntimeError("DeepSeek V4 TileLang kernels require an SM90 or later NVIDIA CUDA GPU")
 
 
+def _require_triton_rocm() -> None:
+    if torch.version.hip is None or not IS_CUDA_AVAILABLE:
+        raise RuntimeError("DeepSeek V4 Triton sparse attention requires an AMD ROCm GPU")
+
+
 def sparse_attn_tilelang(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -46,6 +53,19 @@ def sparse_attn_tilelang(
     from .tilelang_sparse_mla import sparse_attn_tilelang as impl
 
     return impl(q, kv, attn_sink, topk_idxs, sm_scale, return_lse)
+
+
+def sparse_attn_triton(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    sm_scale: float | None = None,
+) -> torch.Tensor:
+    _require_triton_rocm()
+    from .triton_sparse_mla import sparse_attn_triton as impl
+
+    return impl(q, kv, attn_sink, topk_idxs, sm_scale)
 
 
 def sparse_mqa_target_fwd(
@@ -135,6 +155,7 @@ __all__ = [
     "fp8_weight_quant",
     "linear_bf16_fp32",
     "sparse_attn_tilelang",
+    "sparse_attn_triton",
     "sparse_mqa_target_fwd",
     "v4_lighting_indexer",
 ]
