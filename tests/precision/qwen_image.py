@@ -6,13 +6,16 @@ import io
 import json
 import math
 import os
+import random
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import MethodType
 
 import diffusers
+import numpy as np
 import torch
 import transformers
 import yaml
@@ -38,6 +41,55 @@ from veomni.utils.helper import enable_full_determinism, enable_high_precision_f
 ROOT = Path(__file__).resolve().parents[2]
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 MODEL = "Qwen/Qwen-Image"
+
+
+@contextmanager
+def preserve_numerical_state():
+    """Keep in-process diagnostics from changing subsequent training or tests."""
+    env_names = (
+        "PYTHONHASHSEED",
+        "CUBLAS_WORKSPACE_CONFIG",
+        "NCCL_DETERMINISTIC",
+        "FLASH_ATTENTION_DETERMINISTIC",
+        "CLOSE_MATMUL_K_SHIFT",
+    )
+    environment = {name: os.environ.get(name) for name in env_names}
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    cudnn = {name: getattr(torch.backends.cudnn, name) for name in ("enabled", "deterministic", "benchmark")}
+    precision = torch.get_float32_matmul_precision()
+    python_rng, numpy_rng, torch_rng = random.getstate(), np.random.get_state(), torch.get_rng_state()
+    accelerator = get_torch_device()
+    accelerator_rng = (
+        accelerator.get_rng_state_all() if get_device_type() != "cpu" and accelerator.is_available() else None
+    )
+    device_type = get_device_type()
+    backend = getattr(torch.backends, device_type) if device_type in ("cuda", "mlu") else accelerator
+    matmul = getattr(backend, "matmul", None)
+    matmul_flags = {
+        name: getattr(matmul, name)
+        for name in ("allow_tf32", "allow_bf16_reduced_precision_reduction")
+        if matmul is not None and hasattr(matmul, name)
+    }
+    try:
+        yield
+    finally:
+        for name, value in environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+        for name, value in cudnn.items():
+            setattr(torch.backends.cudnn, name, value)
+        for name, value in matmul_flags.items():
+            setattr(matmul, name, value)
+        torch.set_float32_matmul_precision(precision)
+        random.setstate(python_rng)
+        np.random.set_state(numpy_rng)
+        torch.set_rng_state(torch_rng)
+        if accelerator_rng is not None:
+            accelerator.set_rng_state_all(accelerator_rng)
 
 
 def read_json(path):
@@ -204,7 +256,8 @@ def prepare(config_path, output, *, weights=None, batch_file=None, records=None,
         raw = []
         for line in Path(records).read_text().splitlines():
             if line.strip():
-                prompt, _, images, _ = qwen_image_preprocess(json.loads(line), data_dir=str(Path(records).parent))
+                inputs, _, images, _ = qwen_image_preprocess(json.loads(line), data_dir=str(Path(records).parent))
+                prompt = next(value for modality, value in inputs if modality == "text")
                 raw.append({"prompt": prompt, "image": Path(images[0]).read_bytes()})
         if not raw:
             raise ValueError("The raw image/text records file is empty.")
@@ -270,6 +323,7 @@ class TensorRecorder:
         }
 
 
+@preserve_numerical_state()
 def capture(fixture, output, *, device="cpu", dtype="fp32", backend="veomni", steps=1, learning_rate=1e-5):
     """Run identical full inputs per DP rank; torchrun enables native FSDP2."""
     if steps < 1 or not math.isfinite(learning_rate) or learning_rate <= 0:
@@ -465,6 +519,7 @@ def capture(fixture, output, *, device="cpu", dtype="fp32", backend="veomni", st
             clear_parallel_state()
 
 
+@preserve_numerical_state()
 def encode(fixture, snapshot, output, *, training_config, device="cpu"):
     """Compare frozen encoders separately, with identical raw bytes and snapshot hashes."""
     if device != "cpu" and get_device_type() != device:
