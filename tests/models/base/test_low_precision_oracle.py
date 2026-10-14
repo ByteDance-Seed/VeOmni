@@ -29,6 +29,7 @@ source of drift next to its budget.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import gc
 import importlib.util
 import os
@@ -99,6 +100,7 @@ class Case:
     grad_atol: float = 0.0
     dtype: torch.dtype = torch.bfloat16
     config_overrides: dict = field(default_factory=dict)
+    single_image: bool = False
 
 
 def _hf(module: str, name: str) -> Callable[[], type]:
@@ -113,11 +115,50 @@ def _qwen3_5_full_attention(factory: Callable[..., PretrainedConfig]) -> Callabl
     return lambda: factory(layer_types=["full_attention", "full_attention"])
 
 
+def _production_attention(
+    factory: Callable[[], PretrainedConfig], head_dim: int, **rope_parameters
+) -> Callable[[], PretrainedConfig]:
+    """Widen the text head_dim (and its mrope split) to production so FA2/SDPA run production tiles."""
+
+    def build() -> PretrainedConfig:
+        config = factory()
+        text_config = getattr(config, "text_config", config)
+        text_config.head_dim = head_dim
+        if rope_parameters:
+            text_config.rope_parameters = {**text_config.rope_parameters, **rope_parameters}
+        return config
+
+    return build
+
+
 def _qwen3_vl_moe_loader_config() -> PretrainedConfig:
     config = tiny_qwen3_vl_moe_config()
     # A square (E, 2I, H) gate_up is ambiguous between the HF and v5 layouts.
     config.text_config.moe_intermediate_size = 16
     return config
+
+
+def _deepseek_v3_yarn_config() -> PretrainedConfig:
+    config = tiny_deepseek_v3_config()
+    config.max_position_embeddings = 163840
+    config.rope_parameters = {
+        **config.rope_parameters,
+        "rope_type": "yarn",
+        "factor": 40.0,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "mscale": 1.0,
+        "mscale_all_dim": 1.0,
+        "original_max_position_embeddings": 4096,
+    }
+    return config
+
+
+_QWEN3_ATTENTION = {"head_dim": 128}
+_QWEN3_VL_ATTENTION = {"head_dim": 128, "mrope_section": [24, 20, 20]}
+_QWEN3_5_ATTENTION = {"head_dim": 256, "mrope_section": [11, 11, 10]}
+_QWEN2_5_OMNI_ATTENTION = {"head_dim": 128, "mrope_section": [16, 24, 24]}
+_QWEN3_OMNI_ATTENTION = {"head_dim": 128, "mrope_section": [24, 20, 20]}
 
 
 _EAGER_EXPERTS = {"_experts_implementation": "eager"}
@@ -127,6 +168,8 @@ _EAGER_EXPERTS = {"_experts_implementation": "eager"}
 # Face 5.16.1 keeps them in FP32 (``get_vision_interpolation_indices_and_weights``).
 # Measured max abs at |logits| <= 0.71 is 4.9e-3 on H20 (about one BF16 ULP)
 # and 1.27e-2 on L20 (qwen3_vl_moe, 3/5120 elements, about three ULPs).
+# The budget covers the multi-image grids only: a single 2x2 image samples
+# integer grid points (weights 0/1), so each case has a bitwise ``-2x2`` twin.
 # Qwen3-Omni keeps the HF method and is bitwise.
 _QWEN3_VL_POS_EMBED = {"logits_equal": False, "atol": 2e-2}
 
@@ -136,13 +179,25 @@ _QWEN3_VL_POS_EMBED = {"logits_equal": False, "atol": 2e-2}
 _SDPA_MASKED_BACKWARD = {"grads_equal": False, "grad_atol": 1e-2}
 
 _ORACLE_CASES = [
-    Case("qwen2-fa2", "Qwen2ForCausalLM", "causal_lm", tiny_qwen2_config, _hf("qwen2", "Qwen2ForCausalLM")),
-    Case("qwen3-fa2", "Qwen3ForCausalLM", "causal_lm", tiny_qwen3_config, _hf("qwen3", "Qwen3ForCausalLM")),
+    Case(
+        "qwen2-fa2",
+        "Qwen2ForCausalLM",
+        "causal_lm",
+        _production_attention(tiny_qwen2_config, **_QWEN3_ATTENTION),
+        _hf("qwen2", "Qwen2ForCausalLM"),
+    ),
+    Case(
+        "qwen3-fa2",
+        "Qwen3ForCausalLM",
+        "causal_lm",
+        _production_attention(tiny_qwen3_config, **_QWEN3_ATTENTION),
+        _hf("qwen3", "Qwen3ForCausalLM"),
+    ),
     Case(
         "qwen3_moe-fa2",
         "Qwen3MoeForCausalLM",
         "causal_lm",
-        tiny_qwen3_moe_config,
+        _production_attention(tiny_qwen3_moe_config, **_QWEN3_ATTENTION),
         _hf("qwen3_moe", "Qwen3MoeForCausalLM"),
         config_overrides=_EAGER_EXPERTS,
     ),
@@ -160,14 +215,14 @@ _ORACLE_CASES = [
         "qwen3_5-text-fa2",
         "Qwen3_5ForCausalLM",
         "qwen3_5_text",
-        _qwen3_5_full_attention(tiny_qwen3_5_text_config),
+        _production_attention(_qwen3_5_full_attention(tiny_qwen3_5_text_config), **_QWEN3_5_ATTENTION),
         _hf("qwen3_5", "Qwen3_5ForCausalLM"),
     ),
     Case(
         "qwen3_5_moe-text-sdpa",
         "Qwen3_5MoeForCausalLM",
         "qwen3_5_text",
-        _qwen3_5_full_attention(tiny_qwen3_5_moe_text_config),
+        _production_attention(_qwen3_5_full_attention(tiny_qwen3_5_moe_text_config), **_QWEN3_5_ATTENTION),
         _hf("qwen3_5_moe", "Qwen3_5MoeForCausalLM"),
         attn_implementation="sdpa",
         **_SDPA_MASKED_BACKWARD,
@@ -190,7 +245,7 @@ _ORACLE_CASES = [
         "qwen3_vl-fa2",
         "Qwen3VLForConditionalGeneration",
         "vlm_full",
-        tiny_qwen3_vl_config,
+        _production_attention(tiny_qwen3_vl_config, **_QWEN3_VL_ATTENTION),
         _hf("qwen3_vl", "Qwen3VLForConditionalGeneration"),
         **_QWEN3_VL_POS_EMBED,
     ),
@@ -198,7 +253,7 @@ _ORACLE_CASES = [
         "qwen3_vl_moe-fa2",
         "Qwen3VLMoeForConditionalGeneration",
         "vlm_full",
-        tiny_qwen3_vl_moe_config,
+        _production_attention(tiny_qwen3_vl_moe_config, **_QWEN3_VL_ATTENTION),
         _hf("qwen3_vl_moe", "Qwen3VLMoeForConditionalGeneration"),
         config_overrides=_EAGER_EXPERTS,
         **_QWEN3_VL_POS_EMBED,
@@ -207,7 +262,7 @@ _ORACLE_CASES = [
         "qwen3_5_vl-sdpa",
         "Qwen3_5ForConditionalGeneration",
         "qwen3_5_vlm_full",
-        _qwen3_5_full_attention(tiny_qwen3_5_config),
+        _production_attention(_qwen3_5_full_attention(tiny_qwen3_5_config), **_QWEN3_5_ATTENTION),
         _hf("qwen3_5", "Qwen3_5ForConditionalGeneration"),
         attn_implementation="sdpa",
         **_QWEN3_VL_POS_EMBED,
@@ -216,7 +271,7 @@ _ORACLE_CASES = [
         "qwen3_5_moe_vl-sdpa",
         "Qwen3_5MoeForConditionalGeneration",
         "qwen3_5_vlm_full",
-        _qwen3_5_full_attention(tiny_qwen3_5_moe_config),
+        _production_attention(_qwen3_5_full_attention(tiny_qwen3_5_moe_config), **_QWEN3_5_ATTENTION),
         _hf("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
         attn_implementation="sdpa",
         **_QWEN3_VL_POS_EMBED,
@@ -225,14 +280,14 @@ _ORACLE_CASES = [
         "qwen2_5_omni-fa2",
         "Qwen2_5OmniThinkerForConditionalGeneration",
         "omni_thinker",
-        tiny_qwen2_5_omni_thinker_config,
+        _production_attention(tiny_qwen2_5_omni_thinker_config, **_QWEN2_5_OMNI_ATTENTION),
         _hf("qwen2_5_omni", "Qwen2_5OmniThinkerForConditionalGeneration"),
     ),
     Case(
         "qwen3_omni_moe-fa2",
         "Qwen3OmniMoeThinkerForConditionalGeneration",
         "omni_thinker",
-        tiny_qwen3_omni_moe_thinker_config,
+        _production_attention(tiny_qwen3_omni_moe_thinker_config, **_QWEN3_OMNI_ATTENTION),
         _hf("qwen3_omni_moe", "Qwen3OmniMoeThinkerForConditionalGeneration"),
         config_overrides=_EAGER_EXPERTS,
     ),
@@ -254,7 +309,7 @@ _LOADER_CASES = [
         "deepseek_v3-eager-loader",
         "DeepseekV3ForCausalLM",
         "causal_lm",
-        tiny_deepseek_v3_config,
+        _deepseek_v3_yarn_config,
         _hf("deepseek_v3", "DeepseekV3ForCausalLM"),
         config_overrides=_EAGER_EXPERTS,
         **_FP32_EAGER,
@@ -330,6 +385,18 @@ _LOADER_CASES = [
 ]
 
 
+def _single_2x2_image_twins(cases: list[Case]) -> list[Case]:
+    return [
+        dataclasses.replace(case, case_id=f"{case.case_id}-2x2", single_image=True, logits_equal=True, atol=0.0)
+        for case in cases
+        if case.kind not in _TEXT_KINDS and not case.logits_equal
+    ]
+
+
+_ORACLE_CASES += _single_2x2_image_twins(_ORACLE_CASES)
+_LOADER_CASES += _single_2x2_image_twins(_LOADER_CASES)
+
+
 @pytest.fixture(autouse=True)
 def _deterministic_backend_flags():
     """Scope cuDNN flags so a frozen collection cannot be assigned into."""
@@ -393,6 +460,33 @@ def _make_config(case: Case) -> PretrainedConfig:
     return config
 
 
+def _single_2x2_image_inputs(config, input_ids: torch.Tensor) -> dict:
+    """One ``merge x merge`` image (a single merged token) in the first row; the second row is text only."""
+    vision = config.vision_config
+    merge = vision.spatial_merge_size
+    grids = torch.tensor([[1, merge, merge]])
+    ids = input_ids.clone()
+    ids[0, 1] = config.image_token_id
+    if hasattr(config, "audio_config"):
+        ids[0, 0] = config.vision_start_token_id
+        ids[0, 2] = config.vision_end_token_id
+    image_mask = ids == config.image_token_id
+    feat_dim = vision.in_channels * vision.temporal_patch_size * vision.patch_size**2
+    result = {
+        "input_ids": ids,
+        "labels": ids.clone(),
+        "attention_mask": torch.ones_like(ids),
+        "pixel_values": torch.randn(int(grids.prod(dim=-1).sum()), feat_dim),
+        "image_grid_thw": grids,
+        "mm_token_type_ids": image_mask.int(),
+        "image_mask": image_mask,
+        "video_mask": torch.zeros_like(image_mask),
+    }
+    if hasattr(config, "audio_config"):
+        result["audio_mask"] = torch.zeros_like(image_mask)
+    return result
+
+
 def _make_inputs(case: Case, config, device, dtype) -> tuple[torch.Tensor, dict, dict]:
     """Return ``(input_ids, shared_kwargs, veomni_only_kwargs)``.
 
@@ -409,7 +503,7 @@ def _make_inputs(case: Case, config, device, dtype) -> tuple[torch.Tensor, dict,
             shared["cu_seq_lens_q"] = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         return input_ids, shared, {}
     input_ids = torch.randint(3, 100, (2, 20), device=device)
-    image = qwen_image_inputs(config, input_ids)
+    image = (_single_2x2_image_inputs if case.single_image else qwen_image_inputs)(config, input_ids)
     ids = image.pop("input_ids").to(device)
     image.pop("labels")
     fwd = {}
