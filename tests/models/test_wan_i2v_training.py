@@ -129,6 +129,37 @@ def test_wan_i2v_condition_matches_inference_and_updates(condition_factory, monk
         model(**{key: value for key, value in packed.items() if key != "image_latents"})
     with pytest.raises(ValueError, match="first-frame repetition"):
         model(**{**packed, "image_latents": [packed["image_latents"][0][:, :, :1]]})
+    for dimension in (2, 3, 4):
+        target = packed["training_target"][0]
+        shortened = target.narrow(dimension, 0, target.shape[dimension] - 1)
+        with pytest.raises(ValueError, match="prediction and target shapes must match"):
+            model(**{**packed, "training_target": [shortened]})
+
+
+@pytest.mark.parametrize("grid", [(3, 4, 4), (4, 3, 4), (4, 4, 3)])
+def test_wan_rejects_incomplete_patches(condition_factory, grid):
+    config = WanTransformer3DModelConfig(
+        in_channels=4,
+        out_channels=4,
+        patch_size=(2, 2, 2),
+        num_layers=1,
+        num_attention_heads=2,
+        attention_head_dim=8,
+        text_dim=8,
+        freq_dim=8,
+        ffn_dim=32,
+    )
+    config._attn_implementation = "eager"
+    model = transformer_module.WanTransformer3DModel(config)
+    latents = torch.zeros(1, 4, *grid)
+    with pytest.raises(ValueError, match="latent dimensions must be divisible by patch_size"):
+        model(
+            latents=latents,
+            hidden_states=latents,
+            timestep=torch.zeros(1),
+            encoder_hidden_states=torch.zeros(1, 3, 8),
+            training_target=latents,
+        )
 
 
 def test_wan_i2v_rejects_missing_or_repeated_conditions(condition_factory):

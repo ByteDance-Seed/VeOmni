@@ -196,6 +196,11 @@ example sets `data.mm_configs.frame_factor: 4` and `frame_factor_remainder: 1`
 to enforce this during video sampling. These settings follow A14B's VAE and
 must be checked when switching snapshots.
 
+The encoded latent's temporal and spatial dimensions must each be divisible by
+the corresponding transformer `patch_size`. Predictions and training targets
+must have identical shapes; incompatible inputs raise an error instead of
+silently discarding supervised frames or image borders.
+
 Expanded-timestep TI2V-5B clamps the first latent frame to the clean condition
 and uses zero timesteps there. Its flow target remains `noise - latents`;
 `process_condition` sets `loss_start_frame=1` for each sample so the transformer

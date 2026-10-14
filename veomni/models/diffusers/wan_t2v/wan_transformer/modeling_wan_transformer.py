@@ -346,6 +346,11 @@ def WanTransformer3DModel_forward(
         num_channels = hidden_states.shape[1]
 
     p_t, p_h, p_w = self.config.patch_size
+    if num_frames % p_t or height % p_h or width % p_w:
+        raise ValueError(
+            f"Wan latent dimensions must be divisible by patch_size {self.config.patch_size}, "
+            f"got {(num_frames, height, width)}."
+        )
     post_patch_num_frames = num_frames // p_t
     post_patch_height = height // p_h
     post_patch_width = width // p_w
@@ -545,11 +550,9 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
             predictions.append(prediction)
 
             if prediction.shape != target.shape:
-                min_t = min(prediction.shape[2], target.shape[2])
-                min_h = min(prediction.shape[3], target.shape[3])
-                min_w = min(prediction.shape[4], target.shape[4])
-                prediction = prediction[:, :, :min_t, :min_h, :min_w]
-                target = target[:, :, :min_t, :min_h, :min_w]
+                raise ValueError(
+                    f"Wan prediction and target shapes must match, got {prediction.shape} and {target.shape}."
+                )
 
             start = loss_start_frame[i]
             if not 0 <= start < prediction.shape[2]:
