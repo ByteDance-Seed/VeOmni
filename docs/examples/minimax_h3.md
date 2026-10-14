@@ -171,8 +171,9 @@ data:
   train_path: output/minimax_h3_fl2va_embedding    # output dir of Stage 1
   data_transform: dit_offline
   datasets_type: iterable
-  shuffle: false
   dataset_repeat: true
+  dataloader:
+    shuffle: false
 
 train:
   training_task: offline_training

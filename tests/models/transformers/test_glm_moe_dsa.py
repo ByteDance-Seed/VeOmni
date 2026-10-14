@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GLM-MoE-DSA registry, parallel-plan, and Hugging Face parity tests."""
+"""GLM-MoE-DSA registry, parallel-plan, MoE-monitor, and Hugging Face parity tests."""
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -32,7 +33,11 @@ from tests.models.compare import (
 )
 from tests.models.tiny_configs import tiny_glm_moe_dsa_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_RTOL
+from tests.tools.training_utils import make_eager_ops_config
+from veomni.models.auto import build_foundation_model
+from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+from veomni.utils.moe_monitor import MoERouterMonitor, attach_moe_router_monitor, set_active_monitor
 
 
 def _glm_cls(architecture: str):
@@ -368,3 +373,64 @@ def test_glm_moe_dsa_fused_rejects_gapped_position_ids():
         model(input_ids=input_ids, position_ids=position_ids, use_cache=False)
     assert attn_spy.kwargs is None
     assert indexer_spy.kwargs is None
+
+
+_TOY_CONFIG = Path(__file__).resolve().parents[2] / "toy_config" / "glm_moe_dsa_toy"
+
+
+@pytest.fixture
+def build_toy():
+    """``build_foundation_model`` installs the ops config process-wide; restore it afterwards."""
+    previous = get_ops_config()
+
+    def build(init_device):
+        return build_foundation_model(
+            config_path=str(_TOY_CONFIG),
+            weights_path=None,
+            torch_dtype="float32",
+            init_device=init_device,
+            ops_implementation=make_eager_ops_config(),
+        )
+
+    try:
+        yield build
+    finally:
+        set_ops_config(previous)
+
+
+def _sparse_layers(config):
+    return [i for i, layer_type in enumerate(config.mlp_layer_types) if layer_type == "sparse"]
+
+
+def test_glm_moe_dsa_ep_plan_owns_only_the_routed_experts_of_sparse_layers(build_toy):
+    """Dense-MLP layers have no experts to shard."""
+    model = build_toy("meta")
+    sparse_layers = _sparse_layers(model.config)
+    assert 0 < len(sparse_layers) < model.config.num_hidden_layers
+
+    owners = model.get_parallel_plan().get_extra_parallel_fsdp_no_shard_info(model, "ep")
+    assert sorted(owners) == [f"model.layers.{i}.mlp.experts" for i in sparse_layers]
+
+
+def test_glm_moe_dsa_moe_block_reports_router_indices_to_the_monitor(build_toy):
+    model = build_toy("cpu")
+    config = model.config
+    sparse_layers = _sparse_layers(config)
+
+    monitor = MoERouterMonitor(num_experts=config.n_routed_experts)
+    assert attach_moe_router_monitor(model, monitor) == len(sparse_layers)
+
+    moe = model.model.layers[sparse_layers[0]].mlp
+    generator = torch.Generator().manual_seed(0)
+    moe.load_state_dict({name: torch.randn(t.shape, generator=generator) for name, t in moe.state_dict().items()})
+
+    num_tokens = 5
+    set_active_monitor(monitor)
+    try:
+        moe(torch.randn(1, num_tokens, config.hidden_size, generator=generator))
+        counts = monitor._stack_and_reduce()
+    finally:
+        set_active_monitor(None)
+
+    assert counts.shape == (len(sparse_layers), config.n_routed_experts)
+    assert counts[0].sum().item() == num_tokens * config.num_experts_per_tok

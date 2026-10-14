@@ -23,6 +23,12 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config import (
+    PatchedDeepseekV3Experts,
+    deepseek_v3_get_parallel_plan_patched,
+    deepseek_v3_moe_forward_patched,
+    deepseek_v3_topk_router_forward_patched,
+)
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, translate_fused_dsa_mask
@@ -56,6 +62,8 @@ config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
 )
+config.add_import("veomni.models.utils.moe_utils", names=["merged_experts_act_fn_forward"])
+config.add_import("veomni.utils.moe_monitor", names=["record_router_indices"])
 config.add_import(
     "veomni.ops.kernels.dsa.mask",
     names=["copy_dsa_mask_provenance", "create_standard_causal_mask", "translate_fused_dsa_mask"],
@@ -121,6 +129,36 @@ def glm_moe_dsa_mlp_forward_patched(self, x):
             self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
         )
     return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+# GLM-MoE-DSA's routed-expert block (TopkRouter / Experts / MoE) is the
+# DeepSeek-V3 block with renamed classes, so its MoE patches are shared.
+_DEEPSEEK_V3_NAME_MAP = {"DeepseekV3": "GlmMoeDsa"}
+
+config.replace_class(
+    "GlmMoeDsaExperts",
+    replacement=PatchedDeepseekV3Experts,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Always call moe_experts VeomniOp on v5 gate_up_proj weights",
+)
+config.override_method(
+    "GlmMoeDsaTopkRouter.forward",
+    replacement=deepseek_v3_topk_router_forward_patched,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Disable autocast around fp32 router linear for VeRL actor/rollout parity",
+)
+config.override_method(
+    "GlmMoeDsaMoE.forward",
+    replacement=deepseek_v3_moe_forward_patched,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Report top-k indices to the MoE load-balance monitor",
+)
+config.override_method(
+    "GlmMoeDsaForCausalLM.get_parallel_plan",
+    replacement=deepseek_v3_get_parallel_plan_patched,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Register GlmMoeDsa expert parallel plan for v5 generated modeling",
+)
 
 
 @config.override_method(

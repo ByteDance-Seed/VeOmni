@@ -13,10 +13,14 @@ import torch
 import torch.nn.functional as F
 from transformers.cache_utils import Cache
 
-from veomni.models.transformers.glm_moe_dsa.glm_moe_dsa_gpu_patch_gen_config import (
-    config as gpu_config,
+from veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config import (
+    PatchedDeepseekV3Experts,
+    deepseek_v3_get_parallel_plan_patched,
+    deepseek_v3_moe_forward_patched,
+    deepseek_v3_topk_router_forward_patched,
 )
 from veomni.models.transformers.glm_moe_dsa.glm_moe_dsa_gpu_patch_gen_config import (
+    _DEEPSEEK_V3_NAME_MAP,
     glm_moe_dsa_attention_forward_patched,
     glm_moe_dsa_attention_init_patched,
     glm_moe_dsa_forcausallm_forward_patched,
@@ -25,6 +29,9 @@ from veomni.models.transformers.glm_moe_dsa.glm_moe_dsa_gpu_patch_gen_config imp
     glm_moe_dsa_mlp_init_patched,
     glm_moe_dsa_rmsnorm_forward_patched,
     glm_moe_dsa_rmsnorm_init_patched,
+)
+from veomni.models.transformers.glm_moe_dsa.glm_moe_dsa_gpu_patch_gen_config import (
+    config as gpu_config,
 )
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
@@ -109,6 +116,30 @@ config.override_method(
     "GlmMoeDsaMLP.forward",
     replacement=glm_moe_dsa_mlp_forward_patched,
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+)
+config.replace_class(
+    "GlmMoeDsaExperts",
+    replacement=PatchedDeepseekV3Experts,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Always call moe_experts VeomniOp on v5 gate_up_proj weights",
+)
+config.override_method(
+    "GlmMoeDsaTopkRouter.forward",
+    replacement=deepseek_v3_topk_router_forward_patched,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Disable autocast around fp32 router linear for VeRL actor/rollout parity",
+)
+config.override_method(
+    "GlmMoeDsaMoE.forward",
+    replacement=deepseek_v3_moe_forward_patched,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Report top-k indices to the MoE load-balance monitor",
+)
+config.override_method(
+    "GlmMoeDsaForCausalLM.get_parallel_plan",
+    replacement=deepseek_v3_get_parallel_plan_patched,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Register GlmMoeDsa expert parallel plan for v5 generated modeling",
 )
 config.modify_init(
     "GlmMoeDsaIndexer",

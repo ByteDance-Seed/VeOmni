@@ -17,6 +17,14 @@
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: GlmMoeDsaMLP.forward
 #      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
+#    - class_replacement: GlmMoeDsaExperts
+#      Always call moe_experts VeomniOp on v5 gate_up_proj weights
+#    - method_override: GlmMoeDsaTopkRouter.forward
+#      Disable autocast around fp32 router linear for VeRL actor/rollout parity
+#    - method_override: GlmMoeDsaMoE.forward
+#      Report top-k indices to the MoE load-balance monitor
+#    - method_override: GlmMoeDsaForCausalLM.get_parallel_plan
+#      Register GlmMoeDsa expert parallel plan for v5 generated modeling
 #    - init_modification: GlmMoeDsaIndexer
 #      Bind instance-local interleave rope VeomniOp
 #    - method_override: GlmMoeDsaIndexer.forward
@@ -45,7 +53,6 @@ from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_experts_implementation
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
@@ -59,11 +66,13 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 
 from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, create_standard_causal_mask, translate_fused_dsa_mask
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
+from veomni.utils.moe_monitor import record_router_indices
 
 
 # Additional import blocks for patches
@@ -564,6 +573,12 @@ class GlmMoeDsaMLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
+# ======================================================================
+# [MODIFIED CLASS] GlmMoeDsaTopkRouter
+# Methods patched: forward
+# ======================================================================
+
+
 class GlmMoeDsaTopkRouter(nn.Module):
     def __init__(self, config: GlmMoeDsaConfig):
         super().__init__()
@@ -579,7 +594,8 @@ class GlmMoeDsaTopkRouter(nn.Module):
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.view(-1, self.hidden_dim)
-        router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
         scores = router_logits.sigmoid()
         scores_for_choice = scores + self.e_score_correction_bias
         group_scores = (
@@ -599,13 +615,17 @@ class GlmMoeDsaTopkRouter(nn.Module):
         topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
         topk_weights = scores.gather(1, topk_indices)
         if self.norm_topk_prob:
-            denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
-            topk_weights /= denominator
+            topk_weights /= topk_weights.sum(dim=-1, keepdim=True) + 1e-20
         topk_weights = topk_weights * self.routed_scaling_factor
         return router_logits, topk_weights, topk_indices
 
 
-@use_experts_implementation
+# ======================================================================
+# [PATCHED CLASS] GlmMoeDsaExperts
+# Original class replaced with: PatchedDeepseekV3Experts
+# Reason: Always call moe_experts VeomniOp on v5 gate_up_proj weights
+# Source: veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config
+# ======================================================================
 class GlmMoeDsaExperts(nn.Module):
     """Collection of expert weights stored as 3D tensors."""
 
@@ -617,6 +637,8 @@ class GlmMoeDsaExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
+        self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
 
     def forward(
         self,
@@ -624,25 +646,35 @@ class GlmMoeDsaExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        if not self.use_swiglu_mlp:
+            return merged_experts_act_fn_forward(
+                hidden_states,
+                top_k_index,
+                top_k_weights.to(hidden_states.dtype),
+                self.gate_up_proj,
+                self.down_proj,
+                self.act_fn,
+                self.num_experts,
+            )
+        unused = self.gate_up_proj.new_empty(0)
+        # Eager keeps the fp32 router weights so it stays bitwise with HF's expert loop.
+        routing_weights = top_k_weights if self.veomni_moe.impl == "eager" else top_k_weights.to(hidden_states.dtype)
+        return self.veomni_moe(
+            hidden_states,
+            routing_weights,
+            top_k_index,
+            unused,
+            unused,
+            self.down_proj,
+            self.gate_up_proj,
+            num_experts=self.num_experts,
+        )
 
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
-        return final_hidden_states
+# ======================================================================
+# [MODIFIED CLASS] GlmMoeDsaMoE
+# Methods patched: forward
+# ======================================================================
 
 
 class GlmMoeDsaMoE(nn.Module):
@@ -659,10 +691,11 @@ class GlmMoeDsaMoE(nn.Module):
             config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states):
         residuals = hidden_states
         orig_shape = hidden_states.shape
         _, topk_weights, topk_indices = self.gate(hidden_states)
+        record_router_indices(self.gate, topk_indices)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
         hidden_states = hidden_states + self.shared_experts(residuals)
@@ -826,7 +859,7 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] GlmMoeDsaForCausalLM
-# Methods patched: __init__, forward
+# Methods patched: get_parallel_plan, __init__, forward
 # ======================================================================
 
 
@@ -904,6 +937,11 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def get_parallel_plan(self):
+        from ..parallel_plan import get_parallel_plan as _get_parallel_plan
+
+        return _get_parallel_plan()
 
 
 __all__ = [

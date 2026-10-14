@@ -494,6 +494,7 @@ TEST_CASES = [
     pytest.param("qwen3omni_toy", True, _DEFAULT_RTOL, _DEFAULT_ATOL, id="qwen3_omni_moe"),
     pytest.param("seed_oss_toy", False, _DEFAULT_RTOL, _DEFAULT_ATOL, id="seed_oss"),
     pytest.param("deepseek_v3_toy", True, _DEFAULT_RTOL, _DEFAULT_ATOL, id="deepseek_v3"),
+    pytest.param("glm_moe_dsa_toy", True, _DEFAULT_RTOL, _DEFAULT_ATOL, id="glm_moe_dsa"),
     pytest.param("deepseek_v4_toy", True, _DEFAULT_RTOL, _DEFAULT_ATOL, id="deepseek_v4"),
 ]
 
@@ -517,6 +518,18 @@ def _case_modes(case_id: str, is_moe: bool) -> tuple[list[ModelMode], list[Model
         veomni_modes = [
             ModelMode("veomni", "eager", moe_implementation=_FUSED_MOE_IMPL, use_kernels=use_kernels)
             for use_kernels in (_USE_KERNELS if IS_NPU_AVAILABLE else [False])
+        ]
+
+    if case_id == "glm_moe_dsa":
+        # Under the default ``dsa_attention_implementation=eager``, GLM-MoE-DSA folds
+        # its DSA top-k selection into the attention mask, which only ``eager`` /
+        # ``sdpa`` support; flash attention would discard it and raises. Compare HF
+        # eager against VeOmni's eager expert loop and its fused MoE path, the one
+        # expert parallelism runs on.
+        hf_modes = [ModelMode("hf", "eager")]
+        veomni_modes = [
+            ModelMode("veomni", "eager"),
+            ModelMode("veomni", "eager", moe_implementation=_FUSED_MOE_IMPL),
         ]
 
     if case_id in ("qwen3_5", "qwen3_5_moe"):
