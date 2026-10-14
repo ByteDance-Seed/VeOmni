@@ -28,6 +28,83 @@ from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type, get_torch_dev
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.parametrize("additive", [False, True])
+@pytest.mark.parametrize("four_dimensional", [False, True])
+def test_npu_attention_mask_layout_preserves_outputs_and_gradients(additive, four_dimensional):
+    generator = torch.Generator().manual_seed(19)
+    mask = torch.tensor([[True] * 7 + [False] * 2, [True] * 5 + [False] * 4])
+    if additive:
+        mask = torch.zeros_like(mask, dtype=torch.float64).masked_fill(~mask, -torch.inf)
+    reference_mask = mask[:, None, None, :]
+    source_mask = reference_mask if four_dimensional else mask
+    actual_mask = modeling._prepare_qwen_attention_mask(source_mask, query_length=7, device_type="npu", batch_size=2)
+    assert actual_mask.shape == (2, 1, 7, 9)
+    assert actual_mask.is_contiguous()
+    assert modeling._prepare_qwen_attention_mask(source_mask, 7, "cpu", 2) is source_mask
+    assert modeling._prepare_qwen_attention_mask(source_mask, 7, "cuda", 2) is source_mask
+    assert modeling._prepare_qwen_attention_mask(None, 7, "npu", 2) is None
+    assert modeling._prepare_qwen_attention_mask(actual_mask, 7, "npu", 2) is actual_mask
+    query_mask = torch.ones(7, 9, dtype=torch.bool).tril()
+    assert modeling._prepare_qwen_attention_mask(query_mask, 7, "npu", 2) is query_mask
+    torch.testing.assert_close(actual_mask, reference_mask.expand(2, 1, 7, 9), rtol=0, atol=0)
+
+    inputs = [torch.randn(2, 3, length, 8, generator=generator, dtype=torch.float64) for length in (7, 9, 9)]
+    expected_inputs = [tensor.clone().requires_grad_() for tensor in inputs]
+    actual_inputs = [tensor.clone().requires_grad_() for tensor in inputs]
+    expected = torch.nn.functional.scaled_dot_product_attention(*expected_inputs, attn_mask=reference_mask)
+    actual = torch.nn.functional.scaled_dot_product_attention(*actual_inputs, attn_mask=actual_mask)
+    torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-12)
+    expected.square().mean().backward()
+    actual.square().mean().backward()
+    for candidate, reference in zip(actual_inputs, expected_inputs):
+        torch.testing.assert_close(candidate.grad, reference.grad, rtol=1e-10, atol=1e-12)
+
+
+def test_npu_mask_prepared_once_for_all_qwen_blocks(monkeypatch, cpu_diffusers_normalization):
+    model = transformer()
+    batch = dict(
+        hidden_states=torch.randn(1, 4, 16),
+        encoder_hidden_states=torch.randn(1, 3, 32),
+        encoder_hidden_states_mask=torch.tensor([[True, True, False]]),
+        timestep=torch.tensor([0.5]),
+        img_shapes=[[(1, 2, 2)]],
+        return_dict=False,
+    )
+    with use_parallel_state(ParallelState(device_type="cpu")):
+        expected = modeling.QwenImageTransformer2DModel_forward(model, **batch)[0]
+        expected.square().mean().backward()
+        reference_grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+        model.zero_grad(set_to_none=True)
+        original_prepare = modeling._prepare_qwen_attention_mask
+        original_dispatch = modeling.dispatch_attention_fn
+        prepared_masks = []
+        dispatched_masks = []
+
+        def prepare_on_npu(mask, query_length, device_type, batch_size):
+            prepared_masks.append(original_prepare(mask, query_length, "npu", batch_size))
+            return prepared_masks[-1]
+
+        def dispatch_with_npu_contract(query, key, value, *, attn_mask, **kwargs):
+            assert attn_mask.shape == (query.shape[0], 1, query.shape[1], key.shape[1])
+            dispatched_masks.append(attn_mask)
+            return original_dispatch(query, key, value, attn_mask=attn_mask, **kwargs)
+
+        monkeypatch.setattr(modeling, "_prepare_qwen_attention_mask", prepare_on_npu)
+        monkeypatch.setattr(modeling, "dispatch_attention_fn", dispatch_with_npu_contract)
+        actual = modeling.QwenImageTransformer2DModel_forward(model, **batch)[0]
+        assert len(prepared_masks) == 1
+        assert len(dispatched_masks) == model.config.num_layers
+        assert all(mask is prepared_masks[0] for mask in dispatched_masks)
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=2e-6)
+        actual.square().mean().backward()
+        for name, parameter in model.named_parameters():
+            if name in reference_grads:
+                torch.testing.assert_close(parameter.grad, reference_grads[name], rtol=1e-5, atol=2e-6, msg=name)
+        batch["encoder_hidden_states"][:, -1] = 1000
+        perturbed = modeling.QwenImageTransformer2DModel_forward(model, **batch)[0]
+        torch.testing.assert_close(perturbed, actual, rtol=1e-5, atol=2e-6)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_real_rope_forward_and_gradients(dtype):
     generator = torch.Generator().manual_seed(17)

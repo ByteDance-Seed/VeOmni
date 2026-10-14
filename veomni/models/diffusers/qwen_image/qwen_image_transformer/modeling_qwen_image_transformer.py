@@ -65,6 +65,19 @@ def _pad_seq(x: torch.Tensor, dim: int, pad_size: int, value: float = 0) -> torc
     return torch.cat([x, pad], dim=dim)
 
 
+def _prepare_qwen_attention_mask(attention_mask, query_length, device_type, batch_size):
+    """Materialize the query dimension required by Ascend FlashAttentionScore."""
+    if attention_mask is None or device_type != "npu":
+        return attention_mask
+    # Match Diffusers' [B, K] key-padding mask convention. A [Q, K] mask
+    # already has a query dimension and must retain its row-specific values.
+    if attention_mask.ndim == 2 and attention_mask.shape[0] == batch_size:
+        attention_mask = attention_mask[:, None, None, :]
+    if attention_mask.ndim == 4 and attention_mask.shape[-2] == 1:
+        attention_mask = attention_mask.expand(*attention_mask.shape[:-2], query_length, -1).contiguous()
+    return attention_mask
+
+
 class QwenImageSPAttnProcessor:
     """Joint dual-stream attention processor with Ulysses sequence parallelism.
 
@@ -286,6 +299,16 @@ def QwenImageTransformer2DModel_forward(
     elif encoder_hidden_states_mask is not None:
         image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=hidden_states.device)
         block_attention_kwargs["attention_mask"] = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
+
+    if "attention_mask" in block_attention_kwargs:
+        joint_sequence_length = hidden_states.shape[1] + encoder_hidden_states.shape[1]
+        if sp_enabled:
+            joint_sequence_length *= sp_size
+        # Reuse one full-query mask across blocks instead of allocating one
+        # quadratic mask per layer. Include communication padding under SP.
+        block_attention_kwargs["attention_mask"] = _prepare_qwen_attention_mask(
+            block_attention_kwargs["attention_mask"], joint_sequence_length, hidden_states.device.type, batch_size
+        )
 
     for index_block, block in enumerate(self.transformer_blocks):
         if torch.is_grad_enabled() and self.gradient_checkpointing:
