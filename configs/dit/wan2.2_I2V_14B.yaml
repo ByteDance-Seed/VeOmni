@@ -30,11 +30,10 @@ model:
         enable: true
         param_dtype: bfloat16
         reduce_dtype: bfloat16
-        buffer_dtype: bfloat16
     offload_config:
       enable_activation: false
       activation_gpu_limit: 0.0
-      enable_async_activation_offload: true
+      enable_async_activation: true
 
 data:
   train_path: Tom-and-Jerry-VideoGeneration-Dataset-parquet
