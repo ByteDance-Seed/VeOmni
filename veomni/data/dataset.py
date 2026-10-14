@@ -886,7 +886,6 @@ class WeightedMultiSourceDataset(IterableDataset):
         self._just_resumed = True
 
 
-#
 class _MapStyleSamplerWrapper(IterableDataset):
     """Internal wrapper that re-creates the sampler for a map-style dataset.
 
