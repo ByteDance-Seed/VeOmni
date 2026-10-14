@@ -190,7 +190,6 @@ jobs:
           uv run --frozen pytest -v -s -x tests/ops/test_comp.py
           uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
           uv run --frozen pytest -v -s -x tests/ops/test_npu_kernels.py
-          uv run --frozen pytest -v -s -x tests/ops/test_qsa.py
       - name: Run utils tests
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py
@@ -213,3 +212,17 @@ jobs:
         # are validated on NPU here.
         run: |
           uv run --frozen pytest -v -s -x tests/lora/test_moe_lora_ep_sharded_stream_load.py
+      - name: Run QSA Triton Ascend parity
+        # Keep the optional CANN 9.0.0 compiler stack scoped to the final test:
+        # earlier uv runs must not remove it, or inherit its dependency pins.
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel=https://mirrors.huaweicloud.com/ascend/repos/pypi/triton-ascend/triton_ascend-3.2.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+          # Ascend declares psutil==6, conflicting with the storage client.
+          # The QSA hardware validation uses the storage-compatible 7.x series.
+          echo 'psutil>=7,<8' > "$RUNNER_TEMP/qsa-pip-overrides.txt"
+          uv pip install --python .venv/bin/python --overrides "$RUNNER_TEMP/qsa-pip-overrides.txt" "$wheel"
+          # Both packages own triton/: install the Ascend backend last.
+          uv pip install --python .venv/bin/python --no-deps --reinstall-package triton-ascend "$wheel"
+          TRITON_CACHE_DIR="$RUNNER_TEMP/qsa-triton-cache" .venv/bin/python -m pytest -v -s -x tests/ops/test_qsa.py

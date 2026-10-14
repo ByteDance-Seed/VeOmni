@@ -9,9 +9,10 @@ import torch
 
 from veomni.ops import kernel_registry
 from veomni.ops.kernel_registry import KERNEL_REGISTRY
+from veomni.ops.kernels.qsa import triton as qsa_triton
 from veomni.ops.kernels.qsa.eager import qsa_indexer_forward_eager
 from veomni.ops.kernels.qsa.triton import qsa_indexer_forward_triton
-from veomni.utils.device import IS_CUDA_AVAILABLE
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
 pytestmark = pytest.mark.skipif(IS_CUDA_AVAILABLE, reason="QSA Triton indexer is currently NPU-only")
@@ -178,3 +179,74 @@ def test_qsa_block_diagonal_mask_has_no_cross_segment_visibility() -> None:
     assert not mask[0, 0, :3, 3:].any()
     assert mask[0, 0, 2, 2]
     assert not mask[0, 0, 2, 3]
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Requires an Ascend NPU")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("additive_mask", [False, True], ids=["bool-mask", "additive-mask"])
+def test_qsa_npu_sparse_packed_parity(monkeypatch, dtype, additive_mask) -> None:
+    """Exercise real kernels across multiple chunks, including partial tails."""
+    assert qsa_triton.triton_is_available(), "NPU CI must install Triton Ascend to validate QSA kernels"
+    torch.manual_seed(42)
+    lengths = (131, 197)
+    total_length = sum(lengths)
+    budget, chunk_size = 32, 37
+    indexer = _QSAIndexer(256, 4, 128)
+    indexer.token_budget = budget
+    indexer.compress_ratio = 4
+    indexer.qsa_triton_query_chunk_size = chunk_size
+    indexer.index_qk_proj.to(device="npu", dtype=dtype)
+    for norm in (indexer.q_layernorm, indexer.k_layernorm):
+        norm.weight = norm.weight.to(device="npu", dtype=dtype)
+    hidden_states = torch.randn(1, total_length, 256).to(device="npu", dtype=dtype)
+    angles = torch.randn(1, total_length, 64)
+    rope = tuple(x.to(device="npu", dtype=dtype) for x in (angles.cos(), angles.sin()))
+    mask = _block_diagonal_mask(lengths, dtype if additive_mask else torch.bool).to("npu")
+    cu_seq_lens = torch.tensor([0, lengths[0], total_length], dtype=torch.int32, device="npu")
+    expected = qsa_indexer_forward_eager(indexer, hidden_states, rope, mask, None, cu_seq_lens)
+
+    def forbid_fallback(*args, **kwargs):
+        raise AssertionError("NPU parity test must not fall back to the eager reference")
+
+    calls = {}
+
+    class RecordingKernel:
+        def __init__(self, name):
+            self.kernel = getattr(qsa_triton, name)
+            self.calls = calls[name] = []
+
+        def __getitem__(self, grid):
+            launch = self.kernel[grid]
+
+            def run(*args, **kwargs):
+                self.calls.append(kwargs.copy())
+                return launch(*args, **kwargs)
+
+            return run
+
+    monkeypatch.setattr(qsa_triton, "qsa_reference_mask", forbid_fallback)
+    for name in (
+        "_fill_dense_and_tail_kernel",
+        "_compress_norm_rope_kernel",
+        "_qsa_score_kernel",
+        "_expand_sparse_topk_kernel",
+    ):
+        monkeypatch.setattr(qsa_triton, name, RecordingKernel(name))
+    actual = qsa_indexer_forward_triton(
+        indexer, hidden_states, rope, mask, None, cu_seq_lens, qsa_packed_seq_lens=lengths
+    )
+    torch.npu.synchronize()
+
+    # Check actual sparse launches, not just equality (which fallback could pass).
+    expected_chunks = [
+        (start, min(chunk_size, length - start)) for length in lengths for start in range(budget, length, chunk_size)
+    ]
+    assert len(calls["_fill_dense_and_tail_kernel"]) == len(lengths)
+    assert len(calls["_compress_norm_rope_kernel"]) == len(lengths)
+    assert [call["query_start"] for call in calls["_qsa_score_kernel"]] == [s for s, _ in expected_chunks]
+    assert [(call["query_start"], call["rows_in_chunk"]) for call in calls["_expand_sparse_topk_kernel"]] == (
+        expected_chunks
+    )
+    assert actual.dtype == expected.dtype
+    assert actual.shape == expected.shape
+    assert torch.equal(actual, expected)
