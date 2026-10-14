@@ -1352,7 +1352,7 @@ class OpsImplementationConfig:
     rms_norm_gated_implementation: str = field(
         default="fla",
         metadata={
-            "help": "Gated RMSNorm implementation (Qwen3.5 GatedDeltaNet `self.norm`). "
+            "help": "Gated RMSNorm implementation (Qwen3.5/Qwen4-Exp GatedDeltaNet `self.norm`). "
             "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'eager' uses the HuggingFace Qwen3_5RMSNormGated. "
             "'npu' uses the VeOmni NPUFusedRMSNormGated."
@@ -1361,7 +1361,7 @@ class OpsImplementationConfig:
     causal_conv1d_implementation: str = field(
         default="fla",
         metadata={
-            "help": "Varlen depthwise causal conv1d implementation (Qwen3.5 GatedDeltaNet pre-mixer). "
+            "help": "Varlen depthwise causal conv1d implementation (Qwen3.5/Qwen4-Exp GatedDeltaNet pre-mixer). "
             "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'eager' leaves causal_conv1d_fn unset; the varlen training path then raises "
             "because no torch fallback handles cu_seqlens. "
@@ -1373,7 +1373,7 @@ class OpsImplementationConfig:
     chunk_gated_delta_rule_implementation: str = field(
         default="fla",
         metadata={
-            "help": "Chunk gated delta-rule kernel for Qwen3.5 linear attention. "
+            "help": "Chunk gated delta-rule kernel for Qwen3.5/Qwen4-Exp linear attention. "
             "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'flash_qla' uses QwenLM FlashQLA (ships under the gpu extra, Hopper SM90 only — "
             "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
@@ -1383,6 +1383,17 @@ class OpsImplementationConfig:
             "'npu_ascendc' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
             "delegates heavy GDN compute to torch.ops.npu.*). "
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
+        },
+    )
+    qsa_attention_implementation: Literal["eager", "tilelang"] = field(
+        default="eager",
+        metadata={
+            "help": "Qwen4-Exp sparse attention implementation. 'eager' expands compact "
+            "global token indices to a dense mask and runs quadratic PyTorch attention "
+            "(numerical reference). 'tilelang' runs the gather-based TileLang sparse "
+            "attention kernel instead; it requires bf16 on an NVIDIA CUDA GPU, covers "
+            "training forward/backward only (no KV cache), and raises on unsupported "
+            "layouts instead of falling back to eager."
         },
     )
     dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = field(
@@ -1794,9 +1805,12 @@ class ModelArguments(BaseModelArguments):
         extra_parallel_sizes = dict(zip(self.accelerator.extra_parallel_names, self.accelerator.extra_parallel_sizes))
         ple_size = extra_parallel_sizes.get("ple", 1)
         if ple_size > 1:
-            if self.accelerator.dp_shard_size % ple_size != 0:
+            effective_fsdp_shard_size = (
+                self.accelerator.dp_shard_size * self.accelerator.ulysses_size * self.accelerator.cp_size
+            )
+            if effective_fsdp_shard_size % ple_size != 0:
                 raise ValueError(
-                    f"PLE size ({ple_size}) must divide the FSDP shard size ({self.accelerator.dp_shard_size})."
+                    f"PLE size ({ple_size}) must divide the effective FSDP shard size ({effective_fsdp_shard_size})."
                 )
             if not self.ep_sharded_stream_load:
                 raise ValueError(

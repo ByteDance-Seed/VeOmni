@@ -150,6 +150,35 @@ DeepSeek V4 selects the mHC adapters with `mhc_implementation: tilelang`; once
 selected, unsupported dtype, layout, or hardware raises instead of falling
 back to eager.
 
+### Qwen4-Exp library kernels
+
+`kernels/qwen4_exp/` contains the TileLang sparse-attention forward/backward
+kernels for Qwen4-Exp QSA, adapted from the DeepSeek-V4 sparse MLA kernels
+above. The kernels gather the compact `[B,S,K]` selected K/V rows directly and
+never materialize the quadratic score tensor, which is what makes 16K-token
+training feasible. Forward and dQ assign each CTA the query-head group of one
+KV head. The package does not import TileLang eagerly, so CPU and NPU
+installations can still import VeOmni.
+
+dK/dV use KV-owned reduction instead of floating-point atomic scatter. Backward
+sorts the existing selections and constructs reverse CSR entries containing a
+query ID and an exact 16-token mask. These are storage tiles: the masks retain
+arbitrary selections and packed-sample boundaries, without assuming neighboring
+queries selected the same blocks. Each KV tile splits its incoming queries
+across up to eight CTAs, which write disjoint FP32 partial gradients; a final
+reduction casts the sum to BF16. Only CSR allocation uses integer atomics.
+
+The tradeoff is sorting/CSR work and partial-gradient workspace in backward.
+CSR capacity is bounded by `B*S*min(K, ceil(S_kv/16))` entries, and partials
+scale with `B*S_kv*H_kv*D` times the split count, rather than storing a gradient
+for every selected query/KV pair. No new configuration field is required;
+`qsa_attention_implementation: tilelang` selects this backward automatically.
+
+Qwen4-Exp selects this path with `qsa_attention_implementation: tilelang`. It
+defaults to `eager`; once `tilelang` is selected, unsupported layouts (a
+missing compact selection, an additive attention mask, nonzero dropout, KV
+cache) raise instead of falling back to the dense reference.
+
 ---
 
 ## Recipe 1: Add a new backend to an existing op
