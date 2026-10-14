@@ -265,6 +265,12 @@ def _wan_sp_worker(rank, rendezvous):
             "gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=60)
         )
         try:
+            # The pinned Linux Gloo backend supports all_to_all_single, but not
+            # the list API. Newer local builds must exercise the same contract.
+            def reject_list_all_to_all(*args, **kwargs):
+                raise RuntimeError("Backend gloo does not support alltoall")
+
+            patch.setattr(torch.distributed, "all_to_all", reject_list_all_to_all)
             parallel_state.init_parallel_state_from_config(
                 AcceleratorConfig(ulysses_size=2, fsdp_config=FSDPConfig(fsdp_mode="ddp")), name=None
             )
@@ -282,14 +288,14 @@ def _wan_sp_worker(rank, rendezvous):
             config._attn_implementation = "eager"
             model = transformer_module.WanTransformer3DModel(config)
             reference = copy.deepcopy(model)
-            for frames in (3, 4):
+            for batch_size, frames in ((1, 3), (1, 4), (2, 3), (2, 4)):
                 # Three tokens need communication padding, four do not.
-                latents = torch.randn(1, 4, frames, 2, 2)
+                latents = torch.randn(batch_size, 4, frames, 2, 2)
                 batch = dict(
                     latents=latents,
                     hidden_states=latents,
-                    timestep=torch.arange(frames).unsqueeze(0).float(),
-                    encoder_hidden_states=torch.randn(1, 3, 8),
+                    timestep=torch.arange(frames).expand(batch_size, -1).float(),
+                    encoder_hidden_states=torch.randn(batch_size, 3, 8),
                     training_target=torch.zeros_like(latents),
                 )
                 model.zero_grad(set_to_none=True)

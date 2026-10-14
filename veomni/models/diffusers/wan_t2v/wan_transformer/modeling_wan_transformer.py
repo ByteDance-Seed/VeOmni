@@ -186,8 +186,11 @@ class WanSPAttnProcessor(WanAttnProcessor):
         padded_seq_len = None
         if use_sp:
             group = get_parallel_state().ulysses_group
+            # Put sequence/heads first to use the existing all_to_all_single
+            # path, which also works on Gloo builds without list all-to-all.
             query, key, value = (
-                gather_seq_scatter_heads(tensor, seq_dim=1, head_dim=2, group=group) for tensor in (query, key, value)
+                gather_seq_scatter_heads(tensor.movedim(0, 2), seq_dim=0, head_dim=1, group=group).movedim(2, 0)
+                for tensor in (query, key, value)
             )
             if rotary_emb is None:
                 raise ValueError("Wan sequence parallel self-attention requires full rotary position tables.")
@@ -284,8 +287,8 @@ class WanSPAttnProcessor(WanAttnProcessor):
         if use_sp:
             hidden_states_out = F.pad(hidden_states_out, (0, 0, 0, 0, 0, padded_seq_len - hidden_states_out.shape[1]))
             hidden_states_out = gather_heads_scatter_seq(
-                hidden_states_out, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
-            )
+                hidden_states_out.movedim(0, 2), head_dim=1, seq_dim=0, group=get_parallel_state().ulysses_group
+            ).movedim(2, 0)
 
         hidden_states_out = hidden_states_out.flatten(2, 3)
         hidden_states_out = hidden_states_out.type_as(query)
