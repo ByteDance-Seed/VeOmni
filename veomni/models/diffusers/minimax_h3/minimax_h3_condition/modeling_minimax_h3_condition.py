@@ -245,7 +245,6 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
           packed: list[dict]
           imgvid_cond_noise_aug: list[float]
           audio_cond_noise_aug: list[float]
-          use_gradient_checkpointing: list[bool]
           has_audio: list[bool]               — False when the silent placeholder latent is used
         """
         device = next(self._video_vae.parameters()).device
@@ -259,7 +258,6 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             "packed": [],
             "imgvid_cond_noise_aug": [],
             "audio_cond_noise_aug": [],
-            "use_gradient_checkpointing": [],
             "has_audio": [],
         }
 
@@ -356,7 +354,6 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             results["packed"].append(packed)
             results["imgvid_cond_noise_aug"].append(cfg.imgvid_cond_noise_aug)
             results["audio_cond_noise_aug"].append(cfg.audio_cond_noise_aug)
-            results["use_gradient_checkpointing"].append(True)
             results["has_audio"].append(has_audio)
 
         return results
@@ -548,8 +545,6 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         keyframe_cond_anchor: list[torch.Tensor | None] | None = None,
         imgvid_cond_noise_aug: float = 0.999,
         audio_cond_noise_aug: float = 1.0,
-        use_gradient_checkpointing: bool = True,
-        use_gradient_checkpointing_offload: bool = False,
         ref_visual_anchor: list[torch.Tensor | None] | None = None,
         ref_audio_anchor: list[torch.Tensor | None] | None = None,
         has_audio: list[bool | None] | None = None,
@@ -575,10 +570,6 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             imgvid_cond_noise_aug = imgvid_cond_noise_aug[0]
         if isinstance(audio_cond_noise_aug, list):
             audio_cond_noise_aug = audio_cond_noise_aug[0]
-        if isinstance(use_gradient_checkpointing, list):
-            use_gradient_checkpointing = use_gradient_checkpointing[0]
-        if isinstance(use_gradient_checkpointing_offload, list):
-            use_gradient_checkpointing_offload = use_gradient_checkpointing_offload[0]
         # Caches written before has_audio existed supervise audio as before.
         has_audio = True if not has_audio or has_audio[0] is None else bool(has_audio[0])
 
@@ -681,8 +672,6 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             **_packed_seq_params(pk, device),
             "skip_mask_out_condition": True,
             "cond_rows": cond_rows,
-            "use_gradient_checkpointing": use_gradient_checkpointing,
-            "use_gradient_checkpointing_offload": use_gradient_checkpointing_offload,
             "video_latent_shape": video_latent_shape,
             "audio_latent_shape": audio_latent_shape,
             "training_target": training_target,

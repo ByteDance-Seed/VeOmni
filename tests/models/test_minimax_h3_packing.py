@@ -139,7 +139,6 @@ def raw_sample(text_len=3, task="fl2va", refs=None, latent_t=2, latent_h=4, late
         audio_input_latents=torch.randn(2, 32, audio_t),
         prompt_embeds=torch.randn(text_len, 32),
         packed=pk,
-        use_gradient_checkpointing=False,
     )
     if pk["cond_rows"]:
         row[anchor_key] = torch.randn(pk["cond_rows"], 96)
@@ -639,8 +638,8 @@ def test_packed_outputs_losses_and_gradients_match_serial(task, checkpointing):
     base = tiny_model()
     packed = copy.deepcopy(base)
     raws = [raw_sample(3, task), raw_sample(7, task)]
-    for row in raws:
-        row["use_gradient_checkpointing"] = checkpointing
+    if checkpointing:
+        packed.gradient_checkpointing_enable({"use_reentrant": False})  # the run's setting, through HF
     samples = prepare(condition_model(), raws)
     expected = serial(base, samples)
     entries = {id(block): 0 for block in packed.dit.blocks}
@@ -1065,10 +1064,10 @@ def test_packed_sdpa_slices_with_host_bounds(monkeypatch, checkpointing):
 
     monkeypatch.setattr(minimax_h3_dit, "_sdpa_varlen_attention", record)
     raws = [raw_sample(3), raw_sample(7)]
-    for row in raws:
-        row["use_gradient_checkpointing"] = checkpointing
     samples = prepare(condition_model(), raws)
     model = tiny_model()
+    if checkpointing:
+        model.gradient_checkpointing_enable({"use_reentrant": False})
     reads = []
     tolist = torch.Tensor.tolist
     monkeypatch.setattr(torch.Tensor, "tolist", lambda self: reads.append(self.shape) or tolist(self))
@@ -1100,65 +1099,22 @@ def test_refiner_preserves_linear_row_counts_with_main_dit_packed(task):
     assert rows["main"] == [sum(sample["x"].shape[1] for sample in samples)]
 
 
-@pytest.mark.parametrize("offload", [True, [False, True]])
-def test_multisample_wrapper_rejects_checkpoint_offload(offload):
-    inputs = batch(prepare(condition_model(), [raw_sample(), raw_sample()]))
-    inputs["use_gradient_checkpointing_offload"] = offload
-    with pytest.raises(ValueError, match="checkpoint offload"):
-        tiny_model()(**inputs)
-
-
-@pytest.mark.parametrize("offload", [False, True])
-def test_inference_forwards_checkpoint_offload_to_core(offload):
-    from veomni.models.diffusers.minimax_h3.inference import model_fn_minimax_h3
-
-    row = raw_sample()
-    model = tiny_model()
-
-    def capture(module, args, kwargs):
-        assert kwargs["use_gradient_checkpointing_offload"] is offload
-        assert kwargs["packed_seq_params"]["cu_seqlens_host"] == tuple(row["packed"]["cu_seqlens"].tolist())
-        assert kwargs["refiner_packed_seq_params"]["cu_seqlens_host"] == (0, 3)
-        raise RuntimeError("inference offload forwarded")
-
-    handle = model.dit.register_forward_pre_hook(capture, with_kwargs=True)
-    try:
-        with pytest.raises(RuntimeError, match="inference offload forwarded"):
-            model_fn_minimax_h3(
-                model,
-                row["input_latents"],
-                row["audio_input_latents"],
-                row["packed"],
-                row["prompt_embeds"],
-                t_video=0.5,
-                t_audio=0.5,
-                keyframe_cond_anchor=row["keyframe_cond_anchor"],
-                use_gradient_checkpointing_offload=offload,
-            )
-    finally:
-        handle.remove()
-
-
-def test_condition_preserves_checkpoint_offload_for_model_validation():
+def test_a_legacy_sample_column_is_ignored():
+    """Caches written before recompute became configuration-only still load."""
     raws = [raw_sample(), raw_sample()]
     for row in raws:
+        row["use_gradient_checkpointing"] = True
         row["use_gradient_checkpointing_offload"] = True
     samples = prepare(condition_model(), raws)
-    assert all(sample["use_gradient_checkpointing_offload"] is True for sample in samples)
+    assert "use_gradient_checkpointing" not in samples[0]
+
     model = tiny_model()
-    with pytest.raises(ValueError, match="checkpoint offload"):
-        model(**batch(samples))
+    for sample in samples:  # the collated columns ride along from a stale cache
+        sample["use_gradient_checkpointing"] = True
 
-    def capture(module, args, kwargs):
-        assert kwargs["use_gradient_checkpointing_offload"] is True
-        raise RuntimeError("single-sample offload forwarded")
+    out = model(**batch(samples))
 
-    handle = model.dit.register_forward_pre_hook(capture, with_kwargs=True)
-    try:
-        with pytest.raises(RuntimeError, match="single-sample offload forwarded"):
-            model(**samples[0])
-    finally:
-        handle.remove()
+    assert set(out.loss) == {"mse_video", "mse_audio"}
 
 
 def test_invalid_precision_and_legacy_tail_fail_closed():

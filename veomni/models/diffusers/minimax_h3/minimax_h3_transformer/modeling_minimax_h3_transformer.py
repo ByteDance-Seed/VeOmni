@@ -65,7 +65,8 @@ class MiniMaxH3DiTModel(PreTrainedModel):
 
     def __init__(self, config: MiniMaxH3DiTModelConfig, **kwargs):
         super().__init__(config)
-        self.gradient_checkpointing = False  # enable HF-compatible GC attr
+        # HF's marker. The DiT declares its own, so the enable reaches its block loop too.
+        self.gradient_checkpointing = False
         self.dit = MiniMaxH3DiT(
             num_layers=config.num_layers,
             token_refiner_num_layers=config.token_refiner_num_layers,
@@ -109,8 +110,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
                 bind_minimax_attention(module, is_causal=False, impl=impl)
 
     def _forward_batch(self, samples):
-        if any(sample.get("use_gradient_checkpointing_offload", False) for sample in samples):
-            raise ValueError("H3 multi-sample packing does not support checkpoint offload.")
         self._load_packed_attention_kernel()
         negatives = [sample.get("unconditional_inputs") for sample in samples]
         negative_predictions = [None] * len(samples)
@@ -158,8 +157,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         img_pos_for_infer_output_info=None,
         packed_seq_params=None,
         refiner_packed_seq_params=None,
-        use_gradient_checkpointing=False,
-        use_gradient_checkpointing_offload=False,
         training_target=None,
         training_target_audio=None,
         video_latent_shape=None,
@@ -192,8 +189,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
                 img_pos_for_infer_output_info=img_pos_for_infer_output_info,
                 packed_seq_params=packed_seq_params,
                 refiner_packed_seq_params=refiner_packed_seq_params,
-                use_gradient_checkpointing=use_gradient_checkpointing,
-                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                 training_target=training_target,
                 training_target_audio=training_target_audio,
                 video_latent_shape=video_latent_shape,
@@ -240,8 +235,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             img_pos_for_infer_output_info=img_pos_for_infer_output_info,
             packed_seq_params=packed_seq_params,
             refiner_packed_seq_params=refiner_packed_seq_params,
-            use_gradient_checkpointing=use_gradient_checkpointing,
-            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             skip_mask_out_condition=skip_mask_out_condition,
         )
 
