@@ -122,7 +122,7 @@ config.add_post_import_block(
     # Bound at model-build time by _bind_veomni_ops() in auto.py. The three
     # linear-attention slots replace the previous import-time fla/torch
     # selection inside Qwen3_5MoeGatedDeltaNet.__init__ /forward.
-    from veomni.ops.dispatch import OpSlot
+    from veomni.ops.dispatch import OpSlot, OpsConfigSlot
     veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
@@ -130,6 +130,7 @@ config.add_post_import_block(
     veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
     veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
     veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
+    veomni_gdn_implementation = OpsConfigSlot("chunk_gated_delta_rule_implementation")
     """
 )
 
@@ -142,6 +143,7 @@ slice_input_tensor = None
 veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
 veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
 veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
+veomni_gdn_implementation = None
 
 # Mirror the GPU sentinel from qwen3_5_gpu_patch_gen_config: this config
 # registers Qwen3_5MoeVisionAttention.forward as the consumer, so the

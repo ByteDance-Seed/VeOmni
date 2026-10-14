@@ -109,7 +109,7 @@ from veomni.distributed.parallel_state import get_parallel_state
 # Bound by ``_bind_veomni_ops`` before model construction. Qwen4-Exp
 # keeps the upstream eager/SDPA QSA implementation while expert, loss,
 # and GDN paths can opt into VeOmni kernels.
-from veomni.ops.dispatch import OpSlot
+from veomni.ops.dispatch import OpsConfigSlot, OpSlot
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 from veomni.utils.seqlen_pos_transform_utils import culen2pos, pos2culen
@@ -120,6 +120,7 @@ veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
 veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
+veomni_gdn_implementation = OpsConfigSlot("chunk_gated_delta_rule_implementation")
 
 
 # ======================================================================
@@ -587,6 +588,9 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
 
         self.veomni_causal_conv1d_fn = veomni_causal_conv1d.bound_kernel()
         self.veomni_chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel()
+        self.gdn_grouped_heads = (
+            veomni_gdn_implementation.value == "flash_qla" and self.veomni_chunk_gated_delta_rule is not None
+        )
 
     @force_accelerate_hooks("conv1d")
     def forward(
@@ -644,7 +648,7 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
         value = value.reshape(batch_size, seq_len, -1, self.head_v_dim).contiguous()
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        if self.num_v_heads // self.num_k_heads > 1:
+        if self.num_v_heads // self.num_k_heads > 1 and not self.gdn_grouped_heads:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 

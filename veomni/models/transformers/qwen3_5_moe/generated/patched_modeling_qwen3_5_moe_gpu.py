@@ -119,7 +119,7 @@ from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_se
 # Bound at model-build time by _bind_veomni_ops() in auto.py. The three
 # linear-attention slots replace the previous import-time fla/torch
 # selection inside Qwen3_5MoeGatedDeltaNet.__init__ /forward.
-from veomni.ops.dispatch import OpSlot
+from veomni.ops.dispatch import OpsConfigSlot, OpSlot
 from veomni.utils import logging
 from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
@@ -134,6 +134,7 @@ veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
 veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
 veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
+veomni_gdn_implementation = OpsConfigSlot("chunk_gated_delta_rule_implementation")
 
 _VEOMNI_VISION_ATTENTION_PATCHED = True
 
@@ -763,6 +764,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self.causal_conv1d_fn = veomni_causal_conv1d.bound_kernel()
         self.causal_conv1d_update = causal_conv1d_update
         self.chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel() or torch_chunk_gated_delta_rule
+        self.gdn_grouped_heads = (
+            veomni_gdn_implementation.value == "flash_qla" and veomni_chunk_gated_delta_rule.bound_kernel() is not None
+        )
         self.recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
 
         self.in_proj_qkv = nn.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
@@ -918,7 +922,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         else:
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
-        if self.num_v_heads // self.num_k_heads > 1:
+        if self.num_v_heads // self.num_k_heads > 1 and not (
+            self.gdn_grouped_heads and not use_precomputed_states and cu_seq_lens_q is not None
+        ):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
