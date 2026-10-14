@@ -175,8 +175,8 @@ def main() -> None:
     grad_norm = veomni_clip_grad_norm(model, MAX_GRAD_NORM)
 
     torch.testing.assert_close(
-        grad_norm.item(),
-        reference_norm.item(),
+        grad_norm,
+        reference_norm,
         rtol=1e-4,
         atol=1e-6,
         msg=lambda message: f"[rank {rank}] grad norm differs from the sp=1 reference: {message}",
