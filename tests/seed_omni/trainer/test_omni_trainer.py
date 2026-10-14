@@ -144,6 +144,33 @@ def test_a_trainer_saves_model_state_only_if_some_module_has_a_checkpoint_manage
     assert trainer.saves_model_state is saves
 
 
+@pytest.mark.parametrize(
+    ("step_has_model_state", "run_saves_model_state", "match"),
+    [(False, True, "holds no model state"), (True, False, "holds model state")],
+)
+def test_a_step_from_the_other_kind_of_run_is_refused_before_any_module_loads(
+    tmp_path, step_has_model_state, run_saves_model_state, match
+):
+    """``load_path: auto`` takes the newest complete step in ``output_dir``, so a training run sharing it with an
+    ``offline_embedding`` run would otherwise adopt a cursor-only step and fail on a missing module checkpoint."""
+    from veomni.checkpoint import layout
+
+    step = str(tmp_path / "global_step_10")
+    layout.write_manifest(step, global_step=10, world_size=1, model_state=step_has_model_state)
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.args = SimpleNamespace(train=SimpleNamespace(checkpoint=SimpleNamespace(load_path=step)))
+    manager = object() if run_saves_model_state else None
+    trainer.model = MagicMock(module_runtimes={"m": SimpleNamespace(checkpoint=manager)})
+
+    with pytest.raises(ValueError, match=match):
+        trainer.load()
+    trainer.model.load.assert_not_called()
+
+    layout.write_manifest(step, global_step=10, world_size=1, model_state=run_saves_model_state)
+    trainer.load()
+    trainer.model.load.assert_called_once_with()
+
+
 def test_the_offline_cache_writer_opens_after_the_trainer_state_is_restored(monkeypatch):
     """``on_train_begin`` hands the writer its saved shard position; opening first would reject the resumed cache."""
     monkeypatch.setattr("veomni.trainer.omni.omni_trainer.synchronize", MagicMock())

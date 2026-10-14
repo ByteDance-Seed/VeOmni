@@ -61,6 +61,7 @@ from torch.utils.checkpoint import set_checkpoint_debug_enabled
 
 from ...arguments.omni_arguments_types import OmniArguments, build_omni_model_runtime_args
 from ...arguments.parser import save_args
+from ...checkpoint import layout
 from ...data import build_dataloader, build_dataset
 from ...data import seed_omni as _seed_omni_data  # noqa: F401  (registers data_type="seedomni" and its preprocessors)
 from ...data.data_transform import build_data_transform
@@ -397,7 +398,25 @@ class OmniTrainer:
 
         Today that is ``self.model`` only; a student+teacher trainer extends this
         to ``self.student.load()`` / ``self.teacher.load()``.
+
+        Raises:
+            ValueError: ``load_path`` is a step whose manifest disagrees with this
+                run on whether a step carries model state -- an ``offline_embedding``
+                step resumed by a training run, or the reverse.
         """
+        load_path = self.args.train.checkpoint.load_path
+        manifest = layout.read_manifest(load_path) if load_path else None
+        if manifest is not None and bool(manifest.get("model_state", True)) != self.saves_model_state:
+            if self.saves_model_state:
+                mismatch = (
+                    f"{load_path} holds no model state (an offline_embedding step), but this run trains modules."
+                )
+            else:
+                mismatch = f"{load_path} holds model state, but this offline_embedding run saves none."
+            raise ValueError(
+                f"{mismatch} An offline_embedding run and a training run must not share "
+                "train.checkpoint.output_dir: load_path: auto resumes the newest complete step in it."
+            )
         self.model.load()
 
     @property
@@ -479,9 +498,10 @@ class OmniTrainer:
     def forward_backward_step(self, micro_batch: Dict[str, Any], *, num_micro_steps: int = 1):
         """One gradient-accumulation micro-batch over the training DAG.
 
-        ``OmniModelRuntime.forward`` returns ``{"loss", "losses"}`` where ``loss``
-        is the summed per-node ``_loss``; a single backward then propagates across
-        every FSDP2 unit.
+        ``OmniModelRuntime.forward`` returns ``{"loss", "losses", "conversation_list"}``
+        where ``loss`` is the summed per-node ``_loss``; a single backward then
+        propagates across every FSDP2 unit. The result is dropped before the
+        backward so the item copies a root wrap's input cast made are not held through it.
 
         Each node's loss is a mean over its own micro-batch, so the backward is
         scaled by ``1 / num_micro_steps``: accumulated gradients are then the mean
@@ -496,6 +516,7 @@ class OmniTrainer:
 
         total_loss: torch.Tensor = result["loss"]
         loss_dict: Dict[str, torch.Tensor] = result.get("losses", {})
+        del result
 
         # Backward: separate offload hook stack (may differ from forward when GC is on).
         with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):

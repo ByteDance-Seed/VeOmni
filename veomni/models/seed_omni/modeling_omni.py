@@ -543,8 +543,8 @@ class OmniModel(PreTrainedModel):
 
         Returns the summed ``loss``, the per-node ``losses`` and the batch's
         ``conversation_list`` as the nodes left it. Under FSDP2 mixed precision
-        the root pre-forward casts its inputs with ``dataclasses.replace``, so
-        the nodes update copies of the caller's ``ConversationItem``\\ s: a caller
+        every wrap unit's pre-forward casts its inputs with ``dataclasses.replace``,
+        so the nodes update copies of the caller's ``ConversationItem``\\ s: a caller
         that needs what they wrote reads it from here.
         """
         del args, kwargs
