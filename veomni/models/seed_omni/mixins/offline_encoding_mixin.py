@@ -26,8 +26,13 @@ class OfflineEncodingMixin:
         online_method(x) == offline_training_method(offline_embedding_method(x))
 
     * ``offline_embedding`` — the graph calls the offline-embedding method on
-      the fully loaded module, and the trainer writes the encoded
-      conversations to ``train.offline_cache_dir``.
+      the fully loaded module, and the trainer writes the ``conversation_list``
+      the graph leaves in the batch to ``train.offline_cache_dir``. Edit the
+      items in ``pre_forward`` / ``post_forward``, which run on the batch, or
+      return ``conversation_list`` from the method: the method body receives
+      its kwargs after the module wrap's FSDP2 input cast, which under mixed
+      precision copies every ``ConversationItem``, so in-place edits there are
+      lost.
     * ``offline_training`` — every module that mixes this in is built on meta
       and never loads its weights, so the offline-training method the graph
       calls on it must read only the config.

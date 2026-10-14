@@ -88,7 +88,11 @@ so the cache looks complete and the error only shows in `offline_training`.
 weights; encoder weights always come from each module's `model_path`. A saved
 step is therefore only the cursor, and its manifest
 [says so](../../../veomni/trainer/callbacks/global_state_callback.py#L214), so
-`train.checkpoint.load_path: auto` finds it like any other step. A resume of that
+`train.checkpoint.load_path: auto` finds it like any other step. Give the
+encoding run and the training run separate `train.checkpoint.output_dir`s:
+`auto` resumes the newest complete step in the directory, and
+[`OmniTrainer.load`](../../../veomni/trainer/omni/omni_trainer.py#L393) refuses a
+step whose manifest disagrees with the run on carrying model state. A resume of that
 task restores the dataloader cursor and the cache writer's position together,
 both through `GlobalStateCallback`:
 
@@ -129,7 +133,7 @@ full, or it is built on meta.
   [frozen](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L165),
   then loaded and wrapped like any other: the run trains nothing, so no module
   gets an optimizer or a checkpoint manager, and
-  [`OmniTrainer`](../../../veomni/trainer/omni/omni_trainer.py#L275) allows the
+  [`OmniTrainer`](../../../veomni/trainer/omni/omni_trainer.py#L276) allows the
   empty optimizer. A `fsdp_mode: ddp` module is
   [loaded but left unwrapped](../../../veomni/distributed/torch_parallelize.py#L967),
   because DDP rejects a module with no parameter that requires grad.
@@ -268,7 +272,7 @@ The result:
   because `online_process` still runs every step.
 
 The pieces that complete this workflow are in place:
-[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L546)
+[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L567)
 runs the encoding run, and
 [`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L179)
 persists each conversation of the `conversation_list` that
@@ -276,10 +280,21 @@ persists each conversation of the `conversation_list` that
 returns. The training graph must only mutate `ConversationItem` fields in
 place (for example `value` and `meta`); it must not replace the list, append
 items, or drop items. Structural changes belong in the processor / collator
-stage, before the graph runs. The trainer still reads the list from the return
-value, not from the micro-batch it passed in: under `fsdp_scope: model` with
-mixed precision, FSDP2's root pre-forward casts the inputs with
-`dataclasses.replace`, so the graph updates copies of the micro-batch's items.
+stage, before the graph runs.
+
+Under mixed precision, the pre-forward of every FSDP2 wrap unit casts its inputs
+with `dataclasses.replace`, so a wrapped call sees copies of the items it was
+given. Two rules follow:
+
+- The trainer reads the list from the return value, not from the micro-batch it
+  passed in. Under `fsdp_scope: model` the root wrap already hands the graph
+  copies.
+- The offline-embedding node must put its edits where the batch sees them. The
+  [`pre_forward` / `post_forward` hooks](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L61)
+  run on the batch itself, outside the module's wrap, so edits made there land.
+  The method body gets its kwargs after the module wrap's cast, so in-place
+  edits there are lost unless it returns `conversation_list`.
+
 Ranks that share a `dp_rank` (SP, CP or
 TP peers) hold the same batch, so
 [only the first of them writes](../../../veomni/models/seed_omni/utils/offline_cache.py#L36).
@@ -296,7 +311,7 @@ generation graph names, e.g. an encoding run loads only the encoder. So
 checks it against the loaded modules
 ([`GenerationGraph.validate_modules`](../../../veomni/models/seed_omni/graphs/generation_graph.py#L312))
 at the start of
-[`OmniModel.generate`](../../../veomni/models/seed_omni/modeling_omni.py#L569).
+[`OmniModel.generate`](../../../veomni/models/seed_omni/modeling_omni.py#L579).
 A missing module or method still fails before the first request runs.
 
 ## Current scope
@@ -332,7 +347,8 @@ A missing module or method still fails before the first request runs.
   [it is frozen and never wrapped, trained or saved](../../../tests/seed_omni/runtime/test_module_runtime.py#L203),
   and [an `offline_embedding` run freezes every module](../../../tests/seed_omni/runtime/test_module_runtime.py#L236).
 - [`tests/seed_omni/runtime/test_omni_model_runtime.py`](../../../tests/seed_omni/runtime/test_omni_model_runtime.py):
-  [under `fsdp_scope: model`, cache readers stay on meta outside the composed wrap](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L339).
+  [under `fsdp_scope: model`, cache readers stay on meta outside the composed wrap](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L409), and
+  [under a module-level input cast, a node's item edits reach the batch only from its hooks or its return](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L296).
 - [`tests/seed_omni/test_offline_cache_writer.py`](../../../tests/seed_omni/test_offline_cache_writer.py):
   [the `seedomni_cached` transform](../../../tests/seed_omni/test_offline_cache_writer.py#L33), the
   [writer round trip](../../../tests/seed_omni/test_offline_cache_writer.py#L51),
@@ -343,8 +359,9 @@ A missing module or method still fails before the first request runs.
 - [`tests/seed_omni/trainer/test_omni_trainer.py`](../../../tests/seed_omni/trainer/test_omni_trainer.py):
   [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L125),
   [it saves no model state](../../../tests/seed_omni/trainer/test_omni_trainer.py#L137),
-  [the writer opens after the trainer state is restored](../../../tests/seed_omni/trainer/test_omni_trainer.py#L147), and
-  [`offline_cache_step` writes every micro-batch without autograd](../../../tests/seed_omni/trainer/test_omni_trainer.py#L170).
+  [a step from the other kind of run is refused before any module loads](../../../tests/seed_omni/trainer/test_omni_trainer.py#L151),
+  [the writer opens after the trainer state is restored](../../../tests/seed_omni/trainer/test_omni_trainer.py#L174), and
+  [`offline_cache_step` writes every micro-batch without autograd](../../../tests/seed_omni/trainer/test_omni_trainer.py#L197).
 - [`tests/checkpoints/test_checkpoint_callback.py`](../../../tests/checkpoints/test_checkpoint_callback.py):
   [the writer's position is saved and restored with the cursor, and the cursor-only step is complete](../../../tests/checkpoints/test_checkpoint_callback.py#L632).
 - [`tests/checkpoints/test_dcp_checkpointer.py`](../../../tests/checkpoints/test_dcp_checkpointer.py):
