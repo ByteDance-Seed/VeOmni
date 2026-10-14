@@ -1,26 +1,4 @@
 model:
-  model_config:
-    num_hidden_layers: 4
-    # DeepseekV4Config derives `layer_types` / `mlp_layer_types` from the
-    # checkpoint's `compress_ratios` / `num_hash_layers` inside __post_init__,
-    # then truncates them to `[:num_hidden_layers]`. That truncation only runs
-    # when `num_hidden_layers` is already 4 at construction time; the
-    # `model_config` override above is applied *after* construction, so the
-    # derived lists stay at 43 entries and `save_pretrained`'s
-    # validate_layer_type() rejects the config
-    # ("`num_hidden_layers` (4) must equal `len(layer_types)` (43)").
-    # List the first 4 entries explicitly to keep the config self-consistent.
-    # NOTE: these must be extended if `num_hidden_layers` is raised.
-    layer_types:
-      - sliding_attention
-      - sliding_attention
-      - compressed_sparse_attention
-      - heavily_compressed_attention
-    mlp_layer_types:
-      - hash_moe
-      - hash_moe
-      - hash_moe
-      - moe
   # Set this to the target DeepSeek-V4 checkpoint (HF format, v5 fused expert layout).
   # model_path: <path-or-id-to-DeepSeek-V4-checkpoint>
   ops_implementation:

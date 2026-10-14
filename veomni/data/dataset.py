@@ -153,19 +153,7 @@ class ShardedIterableDataset(IterableDataset):
         while True:
             n_before = index
             if hasattr(self._dataset, "set_epoch"):
-                inner_epoch = self._seed + self._epoch + pass_i
-                # HF stores the epoch in a shared-memory tensor and updates it in
-                # place (`self._epoch += epoch - self._epoch`). With num_workers > 1
-                # every worker runs this concurrently on the same shared tensor, so
-                # the read-modify-write races: the epoch is multiplied by the worker
-                # count and jitters run to run. The epoch seeds the shuffle
-                # permutation, so the race makes the sample stream diverge between
-                # runs and between ranks that must stay aligned (e.g. CP peers).
-                # Rebinding to a process-local int first makes the assignment
-                # idempotent.
-                if hasattr(self._dataset, "_epoch"):
-                    self._dataset._epoch = inner_epoch
-                self._dataset.set_epoch(inner_epoch)
+                self._dataset.set_epoch(self._seed + self._epoch + pass_i)
             for sample in self._dataset:
                 if index % self._dp_size == self._dp_rank and (index // self._dp_size) % num_workers == worker_id:
                     pending.append(sample)
@@ -898,6 +886,7 @@ class WeightedMultiSourceDataset(IterableDataset):
         self._just_resumed = True
 
 
+#
 class _MapStyleSamplerWrapper(IterableDataset):
     """Internal wrapper that re-creates the sampler for a map-style dataset.
 
