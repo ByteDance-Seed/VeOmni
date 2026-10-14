@@ -212,7 +212,6 @@ def test_a_cache_reading_module_is_frozen_and_never_wrapped_trained_or_saved(mon
         "setup",
         "_freeze_model_module",
         "_build_parallelized_model",
-        "_scope_recompute_to_parallel_state",
         "_build_optimizer",
         "build_checkpoint",
     ):
@@ -242,7 +241,7 @@ def test_a_cache_reading_module_is_frozen_and_never_wrapped_trained_or_saved(mon
 def test_an_offline_embedding_run_loads_and_wraps_every_module_but_freezes_it(monkeypatch):
     """It trains nothing, so the frozen module gets no optimizer and no checkpoint manager."""
     calls = []
-    for step in ("setup", "_freeze_model_module", "_build_parallelized_model", "_scope_recompute_to_parallel_state"):
+    for step in ("setup", "_freeze_model_module", "_build_parallelized_model"):
         monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, _step=step, **k: calls.append(_step))
     monkeypatch.setattr(ModuleRuntime, "_build_model_assets", lambda self: None)
     monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
@@ -261,7 +260,6 @@ def test_an_offline_embedding_run_loads_and_wraps_every_module_but_freezes_it(mo
         "setup",
         "_freeze_model_module",
         "_build_parallelized_model",
-        "_scope_recompute_to_parallel_state",
     ]
     assert not runtime.has_trainable_parameters
     assert runtime.optimizer is None

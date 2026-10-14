@@ -7,7 +7,7 @@ it declares no method.
 
 - Mixin: [`OfflineEncodingMixin`](../../../veomni/models/seed_omni/mixins/offline_encoding_mixin.py#L20)
 - Run selector: [`train.training_task`](../../../veomni/arguments/omni_arguments_types.py#L573)
-- Meta build: [`ModuleRuntime.reads_offline_cache`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L209)
+- Meta build: [`ModuleRuntime.reads_offline_cache`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L212)
 
 ## Why cache a module's encoder
 
@@ -91,7 +91,7 @@ step is therefore only the cursor, and its manifest
 `train.checkpoint.load_path: auto` finds it like any other step. Give the
 encoding run and the training run separate `train.checkpoint.output_dir`s:
 `auto` resumes the newest complete step in the directory, and
-[`OmniTrainer.load`](../../../veomni/trainer/omni/omni_trainer.py#L393) refuses a
+[`OmniTrainer.load`](../../../veomni/trainer/omni/omni_trainer.py#L394) refuses a
 step whose manifest disagrees with the run on carrying model state. A resume of that
 task restores the dataloader cursor and the cache writer's position together,
 both through `GlobalStateCallback`:
@@ -114,13 +114,13 @@ This follows the DiT trainer's condition model: either the module is loaded in
 full, or it is built on meta.
 
 - **`offline_training`.**
-  [`ModuleRuntime.reads_offline_cache`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L209)
+  [`ModuleRuntime.reads_offline_cache`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L212)
   is true when the module's class mixes in `OfflineEncodingMixin`. The class
   is resolved from the module config with `get_model_class`, because the init
   device has to be chosen before the module exists. Then
-  [`_build_model`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L283)
+  [`_build_model`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L286)
   passes `init_device="meta"`, and the
-  [training build stops](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L154)
+  [training build stops](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L156)
   right after `requires_grad_(False)`: no parallel wrap, no weight load, no
   optimizer, no checkpoint manager. The offline-training method therefore must
   read only the config, never a parameter or buffer: parameters are meta
@@ -130,7 +130,7 @@ full, or it is built on meta.
   detaches cache readers before the composed wrap so they stay on meta and are
   not materialised with the rest.
 - **`offline_embedding`.** Every module, cached or not, is built and
-  [frozen](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L165),
+  [frozen](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L167),
   then loaded and wrapped like any other: the run trains nothing, so no module
   gets an optimizer or a checkpoint manager, and
   [`OmniTrainer`](../../../veomni/trainer/omni/omni_trainer.py#L276) allows the
@@ -272,7 +272,7 @@ The result:
   because `online_process` still runs every step.
 
 The pieces that complete this workflow are in place:
-[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L567)
+[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L568)
 runs the encoding run, and
 [`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L179)
 persists each conversation of the `conversation_list` that
@@ -317,7 +317,7 @@ A missing module or method still fails before the first request runs.
 ## Current scope
 
 - **Cached modules are not checkpointed.** They are frozen in both cache tasks,
-  and [fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L560),
+  and [fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L577),
   so a checkpoint never holds a meta module.
 - **Every cacheable module is read from the cache.** `offline_training` builds
   every module that mixes in `OfflineEncodingMixin` on meta; one run cannot
@@ -342,10 +342,10 @@ A missing module or method still fails before the first request runs.
   [one epoch for `offline_embedding`](../../../tests/seed_omni/test_omni_offline_cache_args.py#L60) and
   [the `data.data_type` match](../../../tests/seed_omni/test_omni_offline_cache_args.py#L76).
 - [`tests/seed_omni/runtime/test_module_runtime.py`](../../../tests/seed_omni/runtime/test_module_runtime.py):
-  [only a cacheable module under `offline_training` is built on meta](../../../tests/seed_omni/runtime/test_module_runtime.py#L159),
-  [the class the omni registries build is the one checked](../../../tests/seed_omni/runtime/test_module_runtime.py#L184),
-  [it is frozen and never wrapped, trained or saved](../../../tests/seed_omni/runtime/test_module_runtime.py#L203),
-  and [an `offline_embedding` run freezes every module](../../../tests/seed_omni/runtime/test_module_runtime.py#L236).
+  [only a cacheable module under `offline_training` is built on meta](../../../tests/seed_omni/runtime/test_module_runtime.py#L165),
+  [the class the omni registries build is the one checked](../../../tests/seed_omni/runtime/test_module_runtime.py#L190),
+  [it is frozen and never wrapped, trained or saved](../../../tests/seed_omni/runtime/test_module_runtime.py#L209),
+  and [an `offline_embedding` run freezes every module](../../../tests/seed_omni/runtime/test_module_runtime.py#L241).
 - [`tests/seed_omni/runtime/test_omni_model_runtime.py`](../../../tests/seed_omni/runtime/test_omni_model_runtime.py):
   [under `fsdp_scope: model`, cache readers stay on meta outside the composed wrap](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L409), and
   [under a module-level input cast, a node's item edits reach the batch only from its hooks or its return](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L296).
