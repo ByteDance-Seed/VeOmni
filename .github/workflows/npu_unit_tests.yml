@@ -12,7 +12,10 @@ on:
     paths:
       - "**/*.py"
       - "!scripts/**/*.py"
+      - "configs/dit/qwen_image_edit_2511.yaml"
       - "configs/dit/qwen_image_sft.yaml"
+      - "configs/dit/wan2.2_I2V_5B.yaml"
+      - "configs/dit/wan2.2_I2V_14B.yaml"
       - .github/workflows/npu_unit_tests.yml
       - "pyproject.toml"
       - "uv.lock"
@@ -22,7 +25,10 @@ on:
     paths:
       - "**/*.py"
       - "!scripts/**/*.py"
+      - "configs/dit/qwen_image_edit_2511.yaml"
       - "configs/dit/qwen_image_sft.yaml"
+      - "configs/dit/wan2.2_I2V_5B.yaml"
+      - "configs/dit/wan2.2_I2V_14B.yaml"
       - .github/workflows/npu_unit_tests.yml
       - "pyproject.toml"
       - "uv.lock"
@@ -144,7 +150,10 @@ jobs:
           clean: true
       - name: Sync dependencies
         run: |
-          uv sync --frozen --python 3.11 --extra npu --group dev
+          # The NPU image already provides Python 3.11. Restrict discovery to
+          # that system interpreter so a stale runner-level uv managed install
+          # cannot fail first with a missing `_sysconfigdata_` file.
+          uv sync --frozen --no-managed-python --python 3.11 --extra npu --group dev
       - name: Check final pip list
         run: |
           uv pip list
