@@ -502,6 +502,7 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
         encoder_hidden_states_image: torch.Tensor | None = None,
         image_latents: torch.Tensor | list[torch.Tensor] | None = None,
         mask: torch.Tensor | list[torch.Tensor] | None = None,
+        loss_start_frame: int | list[int] = 0,
     ):
         if not isinstance(hidden_states, list):
             latents = [latents]
@@ -513,6 +514,11 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
                 image_latents = [image_latents]
             if mask is not None:
                 mask = [mask]
+
+        if not isinstance(loss_start_frame, list):
+            loss_start_frame = [loss_start_frame] * len(hidden_states)
+        if len(loss_start_frame) != len(hidden_states):
+            raise ValueError("loss_start_frame must have one value per sample.")
 
         per_sample_losses = []
         predictions = []
@@ -542,7 +548,12 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
                 prediction = prediction[:, :, :min_t, :min_h, :min_w]
                 target = target[:, :, :min_t, :min_h, :min_w]
 
-            per_sample_loss = F.mse_loss(prediction.float(), target.float(), reduction="none")
+            start = loss_start_frame[i]
+            if not 0 <= start < prediction.shape[2]:
+                raise ValueError("loss_start_frame must leave at least one target frame.")
+            per_sample_loss = F.mse_loss(
+                prediction[:, :, start:].float(), target[:, :, start:].float(), reduction="none"
+            )
             per_sample_loss = per_sample_loss.reshape(per_sample_loss.shape[0], -1).mean(dim=1)
             per_sample_losses.append(per_sample_loss)
 

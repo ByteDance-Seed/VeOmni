@@ -184,7 +184,7 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         if not self._timesteps_ready:
             self.scheduler.set_timesteps(self.config.num_train_timesteps, device=latents[0].device)
             self._timesteps_ready = True
-        packed_conditions: dict[str, list[torch.Tensor]] = {
+        packed_conditions: dict[str, list[torch.Tensor | int]] = {
             "hidden_states": [],
             "timestep": [],
             "encoder_hidden_states": [],
@@ -193,6 +193,8 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         }
         if self.config.image_conditioning:
             packed_conditions.update(image_latents=[], mask=[])
+        if self.config.expand_timesteps:
+            packed_conditions["loss_start_frame"] = []
         for index, (sample_latents, sample_context) in enumerate(zip(latents, context)):
             norm_latents = DiagonalGaussianDistribution(sample_latents).mode()
             norm_latents = self._normalize_latents(norm_latents)
@@ -248,11 +250,9 @@ class WanTransformer3DConditionModel(PreTrainedModel):
                 first_frame_mask[:, :, 0] = 0
 
                 hidden_states = (1 - first_frame_mask) * condition + first_frame_mask * noisy_latents
-                # First frame has t=0 (clean condition). The correct velocity
-                # target at t=0 is zero because the flow has not started.
-                # Setting target=0 at frame 0 prevents the model from learning
-                # spurious outputs that corrupt other frames through attention.
-                training_target[:, :, 0, :, :] = 0.0
+                if num_frames < 2:
+                    raise ValueError("Expanded-timestep Wan training requires at least one frame after the condition.")
+                packed_conditions["loss_start_frame"].append(1)
                 # Position-dependent timestep at post-patch resolution.
                 # Use integer division to match Conv3d output size exactly
                 # (avoids mismatch when latent spatial dims are odd).

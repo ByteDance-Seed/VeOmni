@@ -28,6 +28,7 @@ def test_wan_i2v_yaml_uses_declared_arguments(name, monkeypatch):
     args = parse_args(VeOmniDiTArguments)
     assert args.model.accelerator.fsdp_config.fsdp_mode == "fsdp2"
     assert args.model.accelerator.fsdp_config.mixed_precision.param_dtype == "bfloat16"
-    assert args.model.accelerator.offload_config.enable_async_activation
+    assert not args.model.accelerator.offload_config.enable_async_activation
     assert not args.model.accelerator.offload_config.enable_activation
+    assert args.model.accelerator.gradient_checkpointing.enable
     assert args.train.training_task == "online_training"

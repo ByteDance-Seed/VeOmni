@@ -125,6 +125,13 @@ With this ordering:
 - Intermediate activations are handled by `_checkpoint_hook` (GC recomputation),
   requiring zero persistent GPU memory.
 
+This ordering requires checkpointing to occur inside the selected module's
+`__call__`, as in `GradientCheckpointingLayer`. Wan instead invokes checkpointing
+outside the block call. Enabling async offload there places the offload hooks
+inside the checkpoint hooks and suppresses recomputation. The Wan I2V examples
+therefore keep gradient checkpointing enabled and async offload disabled; an
+integration around the outer checkpoint call is needed before combining them.
+
 ### Automatic Module Discovery
 
 Offload targets are automatically derived from `model._no_split_modules` — the same

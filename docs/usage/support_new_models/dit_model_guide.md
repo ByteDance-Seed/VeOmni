@@ -194,8 +194,23 @@ must be regenerated; the code rejects them rather than synthesizing a condition.
 The frame count must be `1 + k * vae.config.scale_factor_temporal`. The A14B
 example sets `data.mm_configs.frame_factor: 4` and `frame_factor_remainder: 1`
 to enforce this during video sampling. These settings follow A14B's VAE and
-must be checked when switching snapshots. T2V and expanded-timestep TI2V
-retain their existing condition fields.
+must be checked when switching snapshots.
+
+Expanded-timestep TI2V-5B clamps the first latent frame to the clean condition
+and uses zero timesteps there. Its flow target remains `noise - latents`;
+`process_condition` sets `loss_start_frame=1` for each sample so the transformer
+averages MSE over subsequent frames only. A sample must contain at least one
+latent frame after the condition. T2V and channel-concatenated A14B use the
+default `loss_start_frame=0` and supervise the full target video. Existing
+TI2V-5B encoded caches retain their format; the loss boundary is set during
+`process_condition` for both online and offline training.
+
+Both Wan I2V examples enable gradient checkpointing and disable async activation
+offload. Wan invokes checkpointing outside `block.__call__`, whereas the current
+async offload implementation wraps `block.__call__`. Combining them nests the
+offload saved-tensor hooks inside the checkpoint hooks and suppresses
+recomputation. Keep `model.accelerator.offload_config.enable_async_activation`
+disabled until Wan's outer checkpoint boundary supports that integration.
 
 ### Config Bridge — `to_diffuser_dict()` and `to_dict()`
 

@@ -34,7 +34,8 @@ model:
     offload_config:
       enable_activation: false
       activation_gpu_limit: 0.0
-      enable_async_activation: true
+      # Wan checkpoints outside block.__call__; inner async hooks suppress recomputation.
+      enable_async_activation: false
 
 data:
   train_path: /Tom-and-Jerry-VideoGeneration-Dataset-parquet

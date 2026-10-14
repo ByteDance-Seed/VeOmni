@@ -4,14 +4,17 @@ import copy
 import json
 import os
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
 from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler, WanImageToVideoPipeline
 from diffusers.models import normalization
 from diffusers.video_processor import VideoProcessor
 
+from veomni.distributed.async_offload import apply_async_activation_offload
 from veomni.models.diffusers.wan_t2v.wan_condition import modeling_wan_condition as condition_module
 from veomni.models.diffusers.wan_t2v.wan_condition.configuration_wan_condition import (
     WanTransformer3DConditionModelConfig,
@@ -150,8 +153,89 @@ def test_wan_non_concat_paths_keep_their_input_contract(condition_factory, expan
     if expanded:
         torch.testing.assert_close(packed["hidden_states"][0][:, :, 0], packed["latents"][0][:, :, 0])
         assert packed["timestep"][0].ndim == 2
+        assert packed["loss_start_frame"] == [1]
     else:
         assert packed["timestep"][0].ndim == 1
+        assert "loss_start_frame" not in packed
+
+
+def test_wan_expanded_loss_excludes_condition_frame(condition_factory, monkeypatch):
+    condition = condition_factory(expand_timesteps=True)
+    encoded = condition.get_condition(inputs=["video"], videos=[[torch.zeros(9, 3, 16, 16)]])
+    packed = condition.process_condition(**encoded)
+    config = WanTransformer3DModelConfig(
+        in_channels=4,
+        out_channels=4,
+        num_layers=1,
+        num_attention_heads=2,
+        attention_head_dim=8,
+        text_dim=8,
+        freq_dim=8,
+        ffn_dim=32,
+    )
+    config._attn_implementation = "eager"
+    model = transformer_module.WanTransformer3DModel(config)
+    result = model(**packed)
+    prediction = result.predictions[0]
+    expected = torch.nn.functional.mse_loss(prediction[:, :, 1:], packed["training_target"][0][:, :, 1:])
+    torch.testing.assert_close(result.loss["mse_loss"], expected, atol=1e-6, rtol=1e-6)
+    prediction.retain_grad()
+    result.loss["mse_loss"].backward()
+    assert torch.count_nonzero(prediction.grad[:, :, 0]) == 0
+    assert torch.count_nonzero(prediction.grad[:, :, 1:]) > 0
+    assert torch.isfinite(model.proj_out.weight.grad).all()
+
+    # Changing only a condition-frame output must not add a training objective.
+    perturbed = prediction.detach().clone()
+    perturbed[:, :, 0] += 1000
+    monkeypatch.setattr(transformer_module._WanTransformer3DModel, "forward", lambda *args, **kwargs: perturbed)
+    torch.testing.assert_close(model(**packed).loss["mse_loss"], result.loss["mse_loss"], rtol=0, atol=0)
+    full_loss = model(**{**packed, "loss_start_frame": 0}).loss["mse_loss"]
+    torch.testing.assert_close(full_loss, torch.nn.functional.mse_loss(perturbed, packed["training_target"][0]))
+    with pytest.raises(ValueError, match="leave at least one target frame"):
+        model(**{**packed, "loss_start_frame": [perturbed.shape[2]]})
+
+
+def test_wan_expanded_training_requires_target_frames(condition_factory):
+    condition = condition_factory(expand_timesteps=True)
+    encoded = condition.get_condition(inputs=["video"], videos=[[torch.zeros(1, 3, 16, 16)]])
+    with pytest.raises(ValueError, match="at least one frame after the condition"):
+        condition.process_condition(**encoded)
+
+
+@pytest.mark.parametrize("name", ["wan2.2_I2V_5B", "wan2.2_I2V_14B"])
+def test_wan_examples_preserve_checkpoint_recomputation(condition_factory, name):
+    settings = yaml.safe_load((Path(__file__).resolve().parents[2] / "configs/dit" / f"{name}.yaml").read_text())
+    accelerator = settings["model"]["accelerator"]
+    concat = name.endswith("14B")
+    condition = condition_factory(image_conditioning=concat, expand_timesteps=not concat)
+    packed = condition.process_condition(
+        **condition.get_condition(inputs=["video"], videos=[[torch.zeros(9, 3, 16, 16)]])
+    )
+    config = WanTransformer3DModelConfig(
+        in_channels=12 if concat else 4,
+        out_channels=4,
+        num_layers=1,
+        num_attention_heads=2,
+        attention_head_dim=8,
+        text_dim=8,
+        freq_dim=8,
+        ffn_dim=32,
+    )
+    config._attn_implementation = "eager"
+    model = transformer_module.WanTransformer3DModel(config)
+    calls = []
+    hook = model.blocks[0].register_forward_pre_hook(lambda *args: calls.append(1))
+    if accelerator["offload_config"]["enable_async_activation"]:
+        apply_async_activation_offload(model, activation_offload_modules=[])
+    assert accelerator["gradient_checkpointing"]["enable"]
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    try:
+        model(**packed).loss["mse_loss"].backward()
+    finally:
+        hook.remove()
+    assert len(calls) == 2, "Wan must run the block once in forward and again during backward recomputation."
+    assert torch.isfinite(model.proj_out.weight.grad).all()
 
 
 @pytest.mark.parametrize("in_channels,out_channels,expected", [(36, 16, True), (48, 48, False), (16, 16, False)])
