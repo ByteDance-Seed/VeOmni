@@ -13,8 +13,8 @@
 - [Core API](#core-api)
 - [Implementation Details](#implementation-details)
   - [SwapTensor Lifecycle](#swaptensor-lifecycle)
-  - [OffloadManager Singleton](#offloadmanager-singleton)
-  - [Class-Level **call** Patching](#class-level-call-patching)
+  - [OffloadManager Ownership](#offloadmanager-ownership)
+  - [Per-Instance Class Patching](#per-instance-class-patching)
   - [Prefetch Mechanism](#prefetch-mechanism)
 - [Limitations](#limitations)
 
@@ -39,16 +39,16 @@ significantly reduced peak GPU memory.
 ## Quick Start
 
 To enable async activation offload, set the
-`train.accelerator.offload_config.enable_async_activation_offload` parameter in your
+`model.accelerator.offload_config.enable_async_activation` parameter in your
 configuration file:
 
 ```yaml
-train:
-  gradient_checkpointing:
-    enable: true              # Required: must be enabled together
+model:
   accelerator:
+    gradient_checkpointing:
+      enable: true            # Recommended for lower activation memory
     offload_config:
-      enable_async_activation_offload: true
+      enable_async_activation: true
 
 ```
 
@@ -57,8 +57,8 @@ Or via command-line:
 
 ```shell
 bash train.sh tasks/train_text.py configs/text/qwen3-moe.yaml \
-    --train.gradient_checkpointing.enable true \
-    --train.accelerator.offload_config.enable_async_activation_offload true
+    --model.accelerator.gradient_checkpointing.enable true \
+    --model.accelerator.offload_config.enable_async_activation true
 
 ```
 
@@ -84,8 +84,8 @@ Async activation offload addresses this by:
 3. **Recomputation:** Intermediate activations within each block are recomputed by
    gradient checkpointing, so they never persist on GPU.
 
-This combination yields zero persistent GPU memory for both hidden states (offloaded to
-CPU) and intermediate activations (recomputed).
+This combination reduces persistent activation memory. The final block stays resident,
+and tensors that fail the storage or device eligibility checks are not offloaded.
 
 ### Stream-Based D2H/H2D Overlap
 
@@ -107,7 +107,7 @@ are prefetched back to GPU on the swap stream.
 
 ### Interaction with Gradient Checkpointing
 
-The `saved_tensors_hooks` stack ordering is critical. Class-level `__call__` patching
+The `saved_tensors_hooks` stack ordering is critical. Per-instance subclass `__call__` patching
 places `async_save_on_cpu` **outside** the `GradientCheckpointingLayer` checkpoint
 boundary:
 
@@ -137,21 +137,23 @@ all `Qwen3MoeDecoderLayer` instances are automatically identified as offload tar
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `train.accelerator.offload_config.enable_async_activation_offload` | bool | `False` | Enable async activation offload |
-| `train.accelerator.offload_config.enable_activation` | bool | `False` | Enable synchronous activation offload (legacy) |
-| `train.accelerator.offload_config.activation_gpu_limit` | float | `0.0` | GPU memory limit (GB) for synchronous offload |
-| `train.gradient_checkpointing.enable` | bool | `True` | Must be `True` when using async offload |
+| `model.accelerator.offload_config.enable_async_activation` | bool | `False` | Enable async activation offload |
+| `model.accelerator.offload_config.enable_activation` | bool | `False` | Enable synchronous activation offload (legacy) |
+| `model.accelerator.offload_config.activation_gpu_limit` | float | `0.0` | GPU memory limit (GB) for synchronous offload |
+| `model.accelerator.gradient_checkpointing.enable` | bool | `True` | Recommended for lower activation memory |
 
-When `enable_async_activation_offload` is `True`, it takes precedence over
-`enable_activation` (synchronous offload). The global forward/backward contexts
-become `nullcontext` since offloading is handled per-module via `saved_tensors_hooks`.
+`enable_async_activation` and `enable_activation` are mutually exclusive; enabling
+both raises a configuration error. In async mode, the global forward/backward offload
+contexts become `nullcontext` because transfers are handled per-module via
+`saved_tensors_hooks`.
 
 ## Core API
 
-### `apply_async_activation_offload(model)`
+### `apply_async_activation_offload(model, activation_offload_modules, ...)`
 
 Apply async activation offload to matched submodules. Called automatically by
-`build_parallelize_model` when `enable_async_activation_offload=True`.
+`VeOmniModelRuntime._build_parallelized_model` before sharding when the offload
+config sets `enable_async_activation=True`.
 
 ```python
 from veomni.distributed.async_offload import apply_async_activation_offload
@@ -160,24 +162,38 @@ apply_async_activation_offload(model, activation_offload_modules=[])
 ```
 
 Args:
-- `model`: The model to apply offloading to. Must have `_no_split_modules` attribute.
+- `model`: The model to apply offloading to.
+- `activation_offload_modules`: Explicit module-name patterns, or `[]` to discover
+  targets from `model._no_split_modules`. Missing or unmatched targets raise an error.
+- `host_cache_limit_bytes`: Optional idle pinned-buffer cache budget for this call.
+- `host_buffer_pool`: Optional shared `PinnedBufferPool` for multiple model roots;
+  mutually exclusive with `host_cache_limit_bytes`.
 
-### `async_save_on_cpu(block_idx, depth, custom_check_fn, prefetch)`
+### `async_save_on_cpu(block_idx, depth, manager, custom_check_fn=None, prefetch=True)`
 
 A `saved_tensors_hooks` context that intercepts saved tensors and offloads them to
-CPU. Applied per-module via class-level `__call__` patching.
+CPU. The high-level API supplies one manager per matched module sequence. Manual
+callers must create and reuse a manager for all blocks in the same sequence:
 
 ```python
-from veomni.distributed.async_offload import async_save_on_cpu
+from veomni.distributed.async_offload import OffloadManager, PinnedBufferPool, async_save_on_cpu
 
-with async_save_on_cpu(block_idx=0, depth=12, prefetch=True):
-    output = module(*args, **kwargs)
+pool = PinnedBufferPool()
+manager = OffloadManager(host_buffer_pool=pool)
+try:
+    for block_idx, block in enumerate(blocks):
+        with async_save_on_cpu(block_idx=block_idx, depth=len(blocks), manager=manager):
+            hidden_states = block(hidden_states)
+    loss_fn(hidden_states).backward()
+finally:
+    manager.reset()
 ```
 
 Args:
 
 - `block_idx`: Index of the current module in the offload sequence.
 - `depth`: Total number of modules being offloaded.
+- `manager`: Required `OffloadManager` shared by the blocks in this sequence.
 - `custom_check_fn`: Optional function to filter which tensors to offload.
 - `prefetch`: Whether to prefetch the next layer's activations during backward.
 
@@ -200,31 +216,34 @@ lifecycle across GPU and CPU:
 
 State transitions: `device` → (D2H) → `host` → (H2D) → `device`
 
-### OffloadManager Singleton
+### OffloadManager Ownership
 
-`OffloadManager` is a singleton (via `_Singleton` metaclass) that manages all
-`SwapTensor` instances. It provides:
+`OffloadManager` owns the bookkeeping and swap stream for one matched module
+sequence. It is not a singleton. Each call to `async_offload_modules` creates a
+manager and receives a `PinnedBufferPool` from its caller. Managers can share a
+pool to enforce one idle-cache budget while keeping tensor keys and scheduling
+independent.
 
-- Key-based storage: tensors are keyed as `"{block_idx}_{tensor_idx}"`
-- Prefetch coordination: `prefetch_get` launches H2D for the previous layer's tensors
-- Reference counting via `OffloadItem`
-- Global `GetCnt` tracker for consistent key assignment across forward passes
+- Tensors are keyed as `"{block_idx}_{tensor_idx}"`.
+- Each manager owns its `GetCnt` tracker and weak references to live `SwapTensor` objects.
+- Prefetch launches H2D for the previous block in the same sequence.
+- `reset_async_activation_offload(model)` resets all managers attached to that root
+  after a completed or failed step; the trainer invokes it at step boundaries.
+  Callers with several model roots must reset each root.
 
-### Class-Level **call** Patching
+### Per-Instance Class Patching
 
-Module `__call__` is patched at the **class level** (not instance level) because
-Python's dunder-method dispatch bypasses instance-level assignments: `module(args)`
-always resolves to `type(module).__call__`.
-
-Each unique class is patched only once (guarded by `_veomni_async_offload_patched`).
-Instances not in the offload plan (lacking `_veomni_offload_layer_idx`) fall through
-to the original `__call__` transparently.
+Python resolves `module(args)` through `type(module).__call__`. Each selected
+module is therefore rebound to a private subclass that wraps `__call__`, leaving
+its original class and unselected instances unchanged. Reapplying offload reuses
+that subclass (guarded by `_veomni_async_offload_instance_class`).
 
 Per-instance attributes set by `async_offload_modules`:
 - `_veomni_offload_layer_idx`: Index in the offload sequence
 - `_veomni_offload_depth`: Total number of offloaded modules
 - `_veomni_offload_hidden_states_idx`: Position of hidden_states in args
 - `_veomni_offload_prefetch`: Whether to enable prefetch
+- `_veomni_offload_manager`: Manager for this matched sequence
 
 ### Prefetch Mechanism
 
@@ -235,10 +254,10 @@ activations to be available on GPU.
 
 ## Limitations
 
-- **Requires gradient checkpointing:** Async activation offload must be used together
-  with gradient checkpointing (`train.gradient_checkpointing.enable=True`). Without
-  recomputation, intermediate activations would consume GPU memory, negating the
-  benefit of offloading hidden states.
+- **Gradient checkpointing is recommended:** Set
+  `model.accelerator.gradient_checkpointing.enable=True` to recompute intermediate activations.
+  Without it, async offload still works but intermediates remain on the accelerator,
+  reducing the memory savings.
 - **Pinned CPU memory:** Requires sufficient CPU pinned memory to hold all offloaded
   activations. For very large models with many layers, this can be substantial.
 - **Single-stream architecture:** Currently uses a single swap stream for both D2H and
