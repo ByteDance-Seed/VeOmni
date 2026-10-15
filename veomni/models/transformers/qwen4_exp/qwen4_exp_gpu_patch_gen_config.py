@@ -64,9 +64,13 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
 )
 from veomni.ops.kernels.attention.ulysses import prepare_ulysses_qkv, restore_ulysses_output
 from veomni.patchgen.patch_spec import PatchConfig
+from veomni.utils import logging
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 from veomni.utils.seqlen_pos_transform_utils import pos2culen
+
+
+logger = logging.get_logger(__name__)
 
 
 config = PatchConfig(
@@ -116,6 +120,11 @@ config.add_post_import_block(
     """
 )
 config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = True")
+config.add_import("veomni.utils", names=["logging"])
+config.add_post_import_block("""
+from veomni.utils import logging
+logger = logging.get_logger(__name__)
+""")
 
 
 # OpSlots are declared in the generated module's post-import block.
@@ -922,6 +931,10 @@ def qwen4_exp_eager_attention_forward_patched(
             )
         if dropout == 0:
             return qsa_attn_tilelang(query, key, value, selected_indices, scaling), None
+        logger.warning_once(
+            f"qsa_attention_implementation='tilelang' has no dropout path; attention_dropout={dropout} "
+            "falls back to the dense eager QSA reference, which materializes the [B, H, S, S] score tensor."
+        )
     # --- Patch.1 ---
     # --- Patch.2 Preserve the Transformers eager contract for every non-QSA caller. ---
     kv_heads, kv_len, kv_head_dim = key.shape[1:]

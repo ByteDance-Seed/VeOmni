@@ -311,6 +311,34 @@ def _bind_qsa_implementation(modeling, implementation):
     modeling.veomni_qsa_attention_implementation.bind(SimpleNamespace(qsa_attention_implementation=implementation))
 
 
+def test_qwen4_exp_tilelang_dropout_falls_back_to_eager_with_warning(monkeypatch):
+    _require_cuda()
+    from veomni.models.transformers.qwen4_exp.generated import patched_modeling_qwen4_exp_gpu as modeling
+
+    warnings = []
+    monkeypatch.setattr(modeling.logger, "warning_once", lambda message, *args, **kwargs: warnings.append(message))
+    torch.manual_seed(0)
+    # fp32 inputs would be rejected by the TileLang kernel, so a matching result
+    # also proves that the dropout branch never reached it.
+    q = torch.randn(1, 4, 8, 16, device=DEVICE)
+    k = torch.randn(1, 2, 8, 16, device=DEVICE)
+    v = torch.randn(1, 2, 8, 16, device=DEVICE)
+    indices = torch.arange(8, device=DEVICE, dtype=torch.int32).expand(1, 8, 8).clone()
+    indices = torch.where(indices <= torch.arange(8, device=DEVICE)[:, None], indices, -1)
+    module = SimpleNamespace(training=False)
+    try:
+        _bind_qsa_implementation(modeling, "tilelang")
+        actual, _ = modeling.eager_attention_forward(
+            module, q, k, v, None, scaling=0.25, dropout=0.1, selected_indices=indices
+        )
+    finally:
+        _bind_qsa_implementation(modeling, "eager")
+    expected = _qsa_reference(q, k, v, indices, 0.25)
+
+    torch.testing.assert_close(actual, expected)
+    assert len(warnings) == 1 and "no dropout path" in warnings[0]
+
+
 def test_qwen4_exp_attention_layer_tilelang_matches_fp32_reference():
     """Full attention-layer integration: indexer -> compact selection -> TileLang kernel.
 

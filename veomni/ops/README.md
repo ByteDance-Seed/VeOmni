@@ -175,9 +175,11 @@ for every selected query/KV pair. No new configuration field is required;
 `qsa_attention_implementation: tilelang` selects this backward automatically.
 
 Qwen4-Exp selects this path with `qsa_attention_implementation: tilelang`. It
-defaults to `eager`; once `tilelang` is selected, unsupported layouts (a
-missing compact selection, an additive attention mask, nonzero dropout, KV
-cache) raise instead of falling back to the dense reference.
+defaults to `eager`; once `tilelang` is selected, an additive attention mask or
+a KV cache raises instead of falling back to the dense reference. Nonzero
+attention dropout falls back to the dense eager reference with a one-time
+warning, because the kernel has no dropout path. Callers that pass no compact
+selection keep the standard Transformers eager attention.
 
 ---
 

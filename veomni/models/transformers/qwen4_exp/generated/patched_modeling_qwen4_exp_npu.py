@@ -125,6 +125,7 @@ from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_se
 from veomni.ops.dispatch import OpsConfigSlot, OpSlot
 from veomni.ops.kernels.attention.ulysses import prepare_ulysses_qkv, restore_ulysses_output
 from veomni.ops.kernels.qwen4_exp import qsa_attn_tilelang
+from veomni.utils import logging
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 from veomni.utils.seqlen_pos_transform_utils import pos2culen
@@ -139,6 +140,8 @@ veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
 veomni_qsa_attention_implementation = OpsConfigSlot("qsa_attention_implementation")
 
 _VEOMNI_VISION_ATTENTION_PATCHED = True
+
+logger = logging.get_logger(__name__)
 
 
 # ======================================================================
@@ -1296,6 +1299,10 @@ def eager_attention_forward(
             )
         if dropout == 0:
             return qsa_attn_tilelang(query, key, value, selected_indices, scaling), None
+        logger.warning_once(
+            f"qsa_attention_implementation='tilelang' has no dropout path; attention_dropout={dropout} "
+            "falls back to the dense eager QSA reference, which materializes the [B, H, S, S] score tensor."
+        )
     # --- Patch.1 ---
     # --- Patch.2 Preserve the Transformers eager contract for every non-QSA caller. ---
     kv_heads, kv_len, kv_head_dim = key.shape[1:]
