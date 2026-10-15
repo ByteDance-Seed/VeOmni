@@ -236,6 +236,19 @@ class QwenImageConditionModel(PreTrainedModel):
             "img_shapes": img_shapes_list,
         }
 
+    def rng_state_dict(self) -> dict[str, torch.Tensor]:
+        """Snapshot the noise/timestep generator for the job-level checkpoint.
+
+        ``process_condition`` draws both the noise and the timestep ids from
+        ``self.generator``, so a resumed run that does not restore it replays the
+        stream from the construction-time seed instead of continuing it.
+        """
+        return {"generator": self.generator.get_state()}
+
+    def load_rng_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        """Restore a snapshot produced by :meth:`rng_state_dict`."""
+        self.generator.set_state(state["generator"])
+
     def process_condition(
         self,
         latents=None,

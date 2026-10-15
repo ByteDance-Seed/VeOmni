@@ -29,7 +29,7 @@ Two blobs, two owners:
   :class:`~veomni.trainer.callbacks.global_state_callback.GlobalStateCallback`.
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch.distributed as dist
 
@@ -76,14 +76,10 @@ class ModelCheckpointManager:
     :class:`~veomni.trainer.callbacks.global_state_callback.GlobalStateCallback`,
     which also writes the step's ``checkpoint_manifest.json``.
 
-    A subclass managing one module of a multi-module model sets
-    :attr:`module_name`; every path below then nests one level deeper, and
-    nothing else changes. Paths are never built here — they all come from
+    Paths are never built here — they all come from
     :mod:`veomni.checkpoint.layout`, so a save and the load that follows it
     cannot drift apart.
     """
-
-    module_name: str = ""
 
     def __init__(self, runtime: "VeOmniModelRuntime"):
         self.runtime = runtime
@@ -129,80 +125,105 @@ class ModelCheckpointManager:
 
     def save_dir(self, state: "TrainerState") -> str:
         """Where this step's model state lives: weights, optimizer, scheduler."""
-        return layout.model_dir(self.step_dir(state), self.module_name)
+        return layout.model_dir(self.step_dir(state))
+
+    def weights_dir(self, state: "TrainerState") -> str:
+        """DCP directory holding this step's weights alone."""
+        return layout.weights_dir(self.step_dir(state))
 
     def hf_export_dir(self, state: "TrainerState") -> str:
         """Where this step's full-model safetensors export lives."""
-        return layout.hf_export_dir(self.step_dir(state), self.module_name)
+        return layout.hf_export_dir(self.step_dir(state))
 
     def lora_export_dir(self, state: "TrainerState") -> str:
         """Where this step's PEFT adapter export lives."""
-        return layout.lora_export_dir(self.step_dir(state), self.module_name)
+        return layout.lora_export_dir(self.step_dir(state))
 
     def assets_dir(self) -> str:
         """Where this model's config/tokenizer/processor sidecars live.
 
-        Once per run, at the output root — not inside a step. Nested under
-        :attr:`module_name` so two modules cannot overwrite each other's
-        ``config.json``.
+        Once per run, at the output root — not inside a step.
         """
-        return layout.assets_dir(self.config.model_assets_dir, self.module_name)
+        return layout.assets_dir(self.config.model_assets_dir)
 
     def load_dir(self) -> Optional[str]:
-        """Step directory to resume from.
-
-        The module is not folded in here: the checkpointer takes it separately
-        and resolves ``model/<module>/`` itself, so one path serves the whole job.
-        """
+        """Step directory to resume from."""
         return self.config.load_path
+
+    def _checkpointer_kwargs(self) -> Dict[str, Any]:
+        """Keyword arguments shared by ``checkpointer.save`` and ``checkpointer.load``."""
+        return {
+            "trainable_only": self.trainable_only,
+            "parallel_state": self.parallel_state,
+        }
 
     def wait_for_pending_save(self) -> None:
         """Block until the in-flight async save is on disk, if there is one."""
         self.checkpointer.wait_for_pending_save()
 
+    def _extra_state(self, state: "TrainerState") -> Dict[str, Any]:
+        """Model-bound state to store beside the weights.
+
+        The lr scheduler plus whatever the runtime contributes via
+        ``extra_state()`` (e.g. the DiT condition model's generator).
+        """
+        lr_scheduler = self.runtime.lr_scheduler
+        extra_state = {
+            "lr_scheduler": None if lr_scheduler is None else lr_scheduler.state_dict(),
+        }
+        extra_state.update(self.runtime.extra_state())
+        return extra_state
+
+    def _load_extra_state(self, extra_state: Dict[str, Any]) -> None:
+        lr_state = extra_state.get("lr_scheduler")
+        lr_scheduler = self.runtime.lr_scheduler
+        if lr_state is not None and lr_scheduler is not None:
+            lr_scheduler.load_state_dict(lr_state)
+
+        self.runtime.load_extra_state(extra_state)
+
     def load(self) -> None:
-        """Restore model, optimizer and lr_scheduler from ``load_path``."""
+        """Restore model, optimizer and model-bound extra state from ``load_path``."""
         load_dir = self.load_dir()
         if load_dir is None:
             return
 
         self.wait_for_pending_save()
+        state: Dict[str, Any] = {
+            "model": self.runtime.model,
+            "optimizer": self.runtime.optimizer,
+            "extra_state": {},
+        }
         self.checkpointer.load(
             load_dir,
-            {
-                "model": self.runtime.model,
-                "optimizer": self.runtime.optimizer,
-                "lr_scheduler": self.runtime.lr_scheduler,
-            },
-            module=self.module_name,
-            trainable_only=self.trainable_only,
-            parallel_state=self.parallel_state,
+            state,
+            **self._checkpointer_kwargs(),
         )
+        self._load_extra_state(state["extra_state"])
         dist.barrier()
         logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")
 
     def save_dcp(self, state: "TrainerState") -> None:
-        """Write model, optimizer and lr_scheduler for ``state.global_step``.
+        """Write model, optimizer and model-bound extra state for ``state.global_step``.
 
         Only model-bound state goes in here. Job-level state — where the
         dataloader is, the rng — has its own writer.
         """
+        extra_state = self._extra_state(state)
         helper.empty_cache()
         self.checkpointer.save(
             self.config.save_path,
             {
                 "model": self.runtime.model,
                 "optimizer": self.runtime.optimizer,
-                "lr_scheduler": self.runtime.lr_scheduler,
+                "extra_state": extra_state,
             },
             global_steps=state.global_step,
-            module=self.module_name,
             save_async=self.config.save_async,
-            trainable_only=self.trainable_only,
             save_to_lowest_rank=self.config.dcp_save_to_lowest_rank,
-            parallel_state=self.parallel_state,
             stage_dir=self.config.stage_dir,
             save_timeout_seconds=self.config.save_timeout_seconds,
+            **self._checkpointer_kwargs(),
         )
         helper.empty_cache()
         dist.barrier()
@@ -230,7 +251,7 @@ class ModelCheckpointManager:
             self.runtime.optimizer = None
             self.runtime.lr_scheduler = None
 
-        return layout.weights_dir(self.step_dir(state), self.module_name)
+        return self.weights_dir(state)
 
     def save_hf(self, state: "TrainerState", stage: str = "step_end") -> None:
         from ..utils.save_safetensor_utils import save_hf_safetensor

@@ -114,10 +114,11 @@ class DiTDataCollator(DataCollator):
     def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
         batch = defaultdict(list)
 
-        # batching features
+        # Fill keys missing from a sample with None so every column stays aligned with its samples.
+        keys = dict.fromkeys(key for feature in features for key in feature)
         for feature in features:
-            for key in feature.keys():
-                batch[key].append(feature[key])
+            for key in keys:
+                batch[key].append(feature.get(key))
 
         return batch
 
@@ -144,10 +145,6 @@ class DiTDataArguments(DataArguments):
     offline_embedding_save_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Path to save offline embeddings."},
-    )
-    shuffle: bool = field(
-        default=True,
-        metadata={"help": "Whether or not to shuffle the dataset."},
     )
     data_transform: Optional[str] = field(
         default="dit_online",
@@ -239,6 +236,33 @@ class DiTModelRuntime(VeOmniModelRuntime):
 
         if self.train_args.training_task != "offline_embedding":
             super()._freeze_model_module()
+
+    def extra_state(self) -> dict[str, Any]:
+        """Model-bound state: the condition model's noise/timestep generator."""
+        rng_state_dict = getattr(self.condition_model, "rng_state_dict", None)
+        if (
+            self.condition_model is not None
+            and rng_state_dict is None
+            and getattr(self.condition_model, "generator", None) is not None
+        ):
+            logger.warning_rank0(
+                "Condition model owns a ``generator`` but exposes no ``rng_state_dict``; "
+                "its noise/timestep stream will not be restored across a resume."
+            )
+        return {} if rng_state_dict is None else {"condition_model_rng_state": rng_state_dict()}
+
+    def load_extra_state(self, extra_state: dict[str, Any]) -> None:
+        condition_model_rng_state = extra_state.get("condition_model_rng_state")
+        if condition_model_rng_state is None:
+            return
+        loader = getattr(self.condition_model, "load_rng_state_dict", None)
+        if loader is None:
+            logger.warning_rank0(
+                "Checkpoint carries condition-model RNG state but the model cannot restore it; "
+                "the resumed run may replay its initial noise stream."
+            )
+        else:
+            loader(condition_model_rng_state)
 
     def _build_parallelized_model(self) -> None:
         """``offline_embedding`` builds no DiT, so there is nothing to wrap."""
@@ -333,7 +357,6 @@ class DiTTrainer:
         # registers ParallelState("base") before seed
         self.base.device = self.base._setup(args)
         args.train.dyn_bsz = False
-        args.train.micro_batch_size = 1
         # dataloader_batch_size was computed in __post_init__ when dyn_bsz was still True
         # (default), so it was set to 1. Recompute now that dyn_bsz=False.
         args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
@@ -344,17 +367,16 @@ class DiTTrainer:
             else:
                 self.offline_embedding_save_dir = args.data.offline_embedding_save_dir
 
-            args.data.drop_last = False
-            args.data.shuffle = False
+            args.data.dataloader.drop_last = False
+            args.data.dataloader.shuffle = False
             args.train.checkpoint.save_epochs = 0
             args.train.checkpoint.save_hf_weights = False
-            # No gradient accumulation needed; process one sample per step to
-            # avoid broadcast_object_list serialising all micro-batches at once
-            # which can OOM CPU memory with large video data.
-            args.train.global_batch_size = get_parallel_state().dp_size
-            args.train.dataloader_batch_size = 1
+            # Keep one microbatch per step to limit video broadcast memory; embedding needs no accumulation.
+            args.train.global_batch_size = args.train.micro_batch_size * get_parallel_state().dp_size
+            args.train.dataloader_batch_size = args.train.micro_batch_size
+            args.train.gradient_accumulation_steps = 1
             logger.info_rank0(
-                f"Task offline_embedding. Drop last: {args.data.drop_last}, shuffle: {args.data.shuffle}"
+                f"Task offline_embedding. Drop last: {args.data.dataloader.drop_last}, shuffle: {args.data.dataloader.shuffle}"
             )
             args.train.num_train_epochs = 1
 
@@ -394,7 +416,8 @@ class DiTTrainer:
                     math.ceil(self.base.train_dataset.data_len / args.train.global_batch_size)
                     * args.train.global_batch_size
                 )
-                self.base.train_dataset.data_len = padded_len
+                # Keep the source length intact for MappingDataset's repeated-index mapping.
+                self.base.train_dataset = torch.utils.data.Subset(self.base.train_dataset, range(padded_len))
                 args._train_steps = padded_len // dp_size // args.train.dataloader_batch_size
                 self.base.train_steps = args.train_steps
             else:
@@ -440,6 +463,7 @@ class DiTTrainer:
                 persistent_workers=args.data.dataloader.persistent_workers,
                 in_order=args.data.dataloader.in_order,
                 seed=args.train.seed,
+                shuffle=args.data.dataloader.shuffle,
                 collate_fn=DiTDataCollator(),
                 save_steps=args.train.checkpoint.save_steps,
             )
