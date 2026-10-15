@@ -145,6 +145,27 @@ def test_gemma4_training_loss_matches_capped_logits(monkeypatch, tmp_path, text_
         assert output.logits is None
 
 
+@pytest.mark.parametrize("text_only", [False, True], ids=["multimodal", "text"])
+def test_gemma4_softcapping_rejects_uncapped_log_probs(monkeypatch, tmp_path, text_only):
+    """The fused log-probs path cannot silently bypass logit softcapping."""
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    config = _toy_config()
+    config.text_config.final_logit_softcapping = 30.0
+    if text_only:
+        config = config.text_config
+    config.save_pretrained(tmp_path)
+    model = build_foundation_model(
+        tmp_path,
+        torch_dtype="float32",
+        init_device="cpu",
+        ops_implementation=_eager_ops_config("eager"),
+    )
+    input_ids = torch.tensor([[3, 4, 5, 6]])
+
+    with pytest.raises(ValueError, match="softcapping.*return_log_probs"):
+        model(input_ids=input_ids, labels=input_ids.clone(), return_log_probs=True, use_cache=False)
+
+
 @pytest.mark.parametrize("has_features,has_mask", [(False, False), (True, False), (False, True)])
 def test_gemma4_incomplete_audio_inputs_return_no_audio_states(monkeypatch, has_features, has_mask):
     """Audio states are absent when either encoder input is missing."""

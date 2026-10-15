@@ -14,3 +14,8 @@ inside that loss would discard the cap. This fallback materializes the logits;
 uncapped models retain the selected loss implementation. CPU tests compare
 losses and gradients against an explicit softcapped-logit reference, using the
 hardware-independent `chunk_loss` backend to exercise non-eager dispatch.
+
+`return_log_probs=True` (including its top-k distillation path) is not supported
+when logit softcapping is enabled: those fused helpers reproject uncapped logits.
+The model raises a clear error for this combination rather than returning
+incorrect auxiliary log-probabilities.

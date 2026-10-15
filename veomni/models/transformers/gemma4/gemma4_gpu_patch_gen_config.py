@@ -445,6 +445,8 @@ def _gemma4_loss(
     logits = None
     fused_linear_aux = None
     if labels is not None:
+        if final_logit_softcapping is not None and kwargs.get("return_log_probs", False):
+            raise ValueError("Gemma 4 logit softcapping does not support return_log_probs=True.")
         if veomni_causal_lm_loss.use_non_eager_impl and final_logit_softcapping is None:
             loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                 logits=None,
