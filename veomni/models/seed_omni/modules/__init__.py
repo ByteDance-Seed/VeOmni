@@ -16,6 +16,14 @@ These modules are **not** registered with HuggingFace ``AutoConfig`` /
 ``AutoModel`` — always resolve the class via ``OMNI_*_REGISTRY`` first,
 then call ``from_pretrained`` on that class.
 
+``OMNI_ACCELERATED_MODEL_REGISTRY`` maps the same ``model_type`` to the
+VeOmni-side subclass (``modules/<family>/<sub>/accelerated/``) that mixes the
+graph hooks (:class:`BaseMixin`, :class:`TrainingModuleMixin`,
+:class:`InferenceModuleMixin`) onto the HF-native class.
+:func:`veomni.models.loader.get_model_class` builds that subclass when one is
+registered, so a :class:`ModuleRuntime` gets a graph participant while bare
+``OmniModel.from_pretrained`` keeps the plain HF class.
+
 Factory functions registered on ``OMNI_*_REGISTRY`` lazy-import the
 concrete config / model / processor classes on first call — importing this
 package only wires up the registry table, it does not load modeling code.
@@ -45,6 +53,7 @@ from .module_processing_base import MODULE_ASSET_ATTRS, ModulePreprocessorBase, 
 OMNI_CONFIG_REGISTRY = Registry("OmniConfig")
 OMNI_MODEL_REGISTRY = Registry("OmniModel")
 OMNI_PROCESSOR_REGISTRY = Registry("OmniProcessor")
+OMNI_ACCELERATED_MODEL_REGISTRY = Registry("OmniAcceleratedModel")
 
 
 def read_hf_model_type(model_path: str) -> str:
@@ -78,7 +87,7 @@ def read_model_type(model_path: str) -> str:
     Shared helper for any caller that needs to dispatch from a
     split-checkpoint subfolder to the matching module class —
     today that's :class:`OmniInferencer` (eager ``from_pretrained``) and
-    :meth:`OmniTrainer._build_model` (meta-init via
+    :meth:`OmniTrainer._build_model_runtime` (meta-init via
     :func:`build_foundation_model`).  Centralised here so both paths use
     the same registration gate and emit identical error messages.
 
@@ -110,6 +119,7 @@ from . import fake_model  # noqa: F401  E402
 
 __all__ = [
     "MODULE_ASSET_ATTRS",
+    "OMNI_ACCELERATED_MODEL_REGISTRY",
     "OMNI_CONFIG_REGISTRY",
     "OMNI_MODEL_REGISTRY",
     "OMNI_PROCESSOR_REGISTRY",

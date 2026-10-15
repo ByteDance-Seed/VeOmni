@@ -315,7 +315,7 @@ class TestModelCheckpointManagerSaveContract:
 
     def test_the_logged_destination_is_the_one_save_writes(self, mock_helper, mock_dist, mock_build_ckpt):
         """The manager names the model directory for its log, and ``save`` rebuilds
-        the same one from ``path``, ``global_steps`` and ``module``."""
+        the same one from ``path`` and ``global_steps``."""
         from veomni.checkpoint.layout import model_dir, step_dir
 
         runtime = _make_mock_runtime(save_path="/remote/run")
@@ -326,21 +326,16 @@ class TestModelCheckpointManagerSaveContract:
         manager.save_dcp(state)
 
         call = manager.checkpointer.save.call_args
-        rebuilt = model_dir(step_dir(call.args[0], call.kwargs["global_steps"]), call.kwargs["module"])
+        assert "module" not in call.kwargs
+        rebuilt = model_dir(step_dir(call.args[0], call.kwargs["global_steps"]))
         assert rebuilt == "/remote/run/global_step_10/model"
         assert rebuilt == manager.save_dir(state)
 
-    def test_model_assets_nest_under_the_module_name(self, mock_helper, mock_dist, mock_build_ckpt):
+    def test_model_assets_sit_at_the_assets_root(self, mock_helper, mock_dist, mock_build_ckpt):
         runtime = _make_mock_runtime()
         mock_build_ckpt.return_value = MagicMock()
         manager = ModelCheckpointManager(runtime)
         assert manager.assets_dir() == runtime.train_args.checkpoint.model_assets_dir
-
-        class Named(ModelCheckpointManager):
-            module_name = "vision_encoder"
-
-        named = Named(runtime)
-        assert named.assets_dir() == f"{runtime.train_args.checkpoint.model_assets_dir}/vision_encoder"
 
     def test_save_forwards_extra_state_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
         runtime = _make_mock_runtime()
