@@ -19,6 +19,10 @@ Default per-model backends:
     - ``npu``: ``torch_npu.npu_rms_norm`` via ``veomni.ops.kernels.rms_norm.npu``
 Models can register a ``triton`` backend via ``extra_backends`` in their
 ``device_patch.py`` (e.g. DeepSeek V3 batch-invariant kernel).
+
+Opt-in GPU backend:
+    - ``nabla``: single-kernel Triton fwd+bwd (grad_weight accumulated in one
+      fp32 buffer via atomics), validated on H100 against liger v0.7.0.
 """
 
 from ...config.registry import BackendSpec, OpScope, OpSpec, register_op
@@ -37,12 +41,36 @@ register_op(
                 entry="liger_kernel.transformers.rms_norm:LigerRMSNorm",
                 requires=("liger_kernel",),
             ),
+            "nabla": BackendSpec(
+                entry="veomni.ops.kernels.rms_norm.nabla:NablaRMSNorm",
+                requires=("triton",),
+            ),
             "npu": BackendSpec(
                 entry="veomni.ops.kernels.rms_norm.npu:rms_norm_forward_npu",
                 requires=("torch_npu",),
                 replace_forward=True,
             ),
         },
+    )
+)
+
+
+def _nabla_rms_norm_factory():
+    """Return the functional Nabla fused RMSNorm kernel (standard formulation)."""
+
+    from .nabla import rms_norm
+
+    return rms_norm
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="nabla",
+        op_name="rms_norm",
+        variant="standard",
+        factory=_nabla_rms_norm_factory,
+        hardware=HardwareRequirement(device_type="gpu"),
+        description="Nabla fused RMSNorm (single-kernel Triton fwd+bwd)",
     )
 )
 
