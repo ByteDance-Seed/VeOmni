@@ -14,7 +14,9 @@
 
 from pathlib import Path
 
+import pytest
 import torch
+import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config
 from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration as HFGemma4
@@ -97,6 +99,50 @@ def test_gemma4_text_eager_training_ignores_logits_to_keep_with_labels(monkeypat
     assert output.logits.shape == (1, 8, config.vocab_size)
     assert torch.isfinite(output.loss)
     assert torch.isfinite(model.model.layers[0].self_attn.q_proj.weight.grad).all()
+
+
+@pytest.mark.parametrize("text_only", [False, True], ids=["multimodal", "text"])
+@pytest.mark.parametrize("loss_implementation", ["eager", "chunk_loss"])
+@pytest.mark.parametrize("softcap", [None, 30.0], ids=["uncapped", "softcapped"])
+def test_gemma4_training_loss_matches_capped_logits(monkeypatch, tmp_path, text_only, loss_implementation, softcap):
+    """A non-eager loss selection must preserve softcapped loss and gradients."""
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    torch.manual_seed(23)
+    config = _toy_config()
+    config.text_config.final_logit_softcapping = softcap
+    if text_only:
+        config = config.text_config
+    config.save_pretrained(tmp_path)
+    ops_config = _eager_ops_config("eager")
+    # chunk_loss exercises real non-eager dispatch on CPU without CUDA mocks.
+    ops_config.cross_entropy_loss_implementation = loss_implementation
+    model = build_foundation_model(tmp_path, torch_dtype="float32", init_device="cpu", ops_implementation=ops_config)
+    with torch.no_grad():
+        model.lm_head.weight.mul_(100)
+    input_ids = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 10]])
+    labels = input_ids.clone()
+    labels[:, 3] = -100
+    backbone = model.model if text_only else model.model.language_model
+    hidden_states = model.model(input_ids=input_ids, use_cache=False).last_hidden_state
+    raw_logits = model.lm_head(hidden_states)
+    expected_logits = raw_logits if softcap is None else torch.tanh(raw_logits / softcap) * softcap
+    expected_loss = F.cross_entropy(
+        expected_logits[:, :-1].reshape(-1, expected_logits.shape[-1]), labels[:, 1:].reshape(-1)
+    )
+    parameters = (model.lm_head.weight, backbone.layers[0].self_attn.q_proj.weight)
+    expected_gradients = torch.autograd.grad(expected_loss, parameters)
+
+    output = model(input_ids=input_ids, labels=labels, use_cache=False)
+    output.loss.backward()
+
+    torch.testing.assert_close(output.loss, expected_loss)
+    for parameter, expected_gradient in zip(parameters, expected_gradients):
+        torch.testing.assert_close(parameter.grad, expected_gradient, atol=1e-5, rtol=1e-4)
+    if softcap is not None:
+        assert not torch.allclose(expected_logits, raw_logits)
+        torch.testing.assert_close(output.logits, expected_logits)
+    elif loss_implementation == "chunk_loss":
+        assert output.logits is None
 
 
 def test_gemma4_builds_pack_aware_full_and_sliding_masks(monkeypatch):

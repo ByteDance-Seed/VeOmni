@@ -47,7 +47,7 @@
 
  import math
  from collections import UserDict
-@@ -25,48 +33,107 @@
+@@ -25,48 +33,105 @@
  from functools import cached_property
 
  import torch
@@ -123,6 +123,7 @@
 +
 +# Additional import blocks for patches
 +from veomni.ops.dispatch import OpSlot
++from veomni.ops.kernels.cross_entropy import ForCausalLMLoss
 +from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 +
 +
@@ -146,12 +147,7 @@
 +    logits = None
 +    fused_linear_aux = None
 +    if labels is not None:
-+        if veomni_causal_lm_loss.use_non_eager_impl:
-+            if final_logit_softcapping is not None:
-+                raise ValueError(
-+                    "Gemma 4 fused-linear loss does not support final_logit_softcapping; "
-+                    "use cross_entropy_loss_implementation='eager'."
-+                )
++        if veomni_causal_lm_loss.use_non_eager_impl and final_logit_softcapping is None:
 +            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
 +                logits=None,
 +                labels=labels,
@@ -164,7 +160,9 @@
 +            logits = model.lm_head(hidden_states)
 +            if final_logit_softcapping is not None:
 +                logits = torch.tanh(logits / final_logit_softcapping) * final_logit_softcapping
-+            loss, _, fused_linear_aux = model.loss_function(
++            # A fused-linear loss would reproject hidden states and discard softcapping.
++            loss_function = ForCausalLMLoss if final_logit_softcapping is not None else model.loss_function
++            loss, _, fused_linear_aux = loss_function(
 +                logits=logits,
 +                labels=labels,
 +                vocab_size=vocab_size,
@@ -182,7 +180,7 @@
 
 
  @auto_docstring(
-@@ -138,6 +205,36 @@
+@@ -138,6 +203,36 @@
      audio_hidden_states: torch.FloatTensor | None = None
 
      shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None
@@ -219,7 +217,7 @@
 
 
  @dataclass
-@@ -1569,6 +1666,12 @@
+@@ -1569,6 +1664,12 @@
              self.set_per_layer_input_embeddings(new_embeddings_per_layer)
 
 
@@ -232,7 +230,7 @@
  @auto_docstring(custom_intro="The base Gemma 4 language model without a language modeling head.")
  class Gemma4TextModel(Gemma4PreTrainedModel):
      config: Gemma4TextConfig
-@@ -1643,11 +1746,7 @@
+@@ -1643,11 +1744,7 @@
      ) -> Gemma4TextModelOutputWithPast:
          r"""
          per_layer_inputs (`torch.Tensor`, *optional*):
@@ -245,7 +243,7 @@
          """
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-@@ -1671,37 +1770,29 @@
+@@ -1671,37 +1768,29 @@
              position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
              position_ids = position_ids.unsqueeze(0)
 
@@ -289,7 +287,7 @@
              hidden_states = decoder_layer(
                  hidden_states,
                  per_layer_input,
-@@ -1714,7 +1805,6 @@
+@@ -1714,7 +1803,6 @@
              )
 
          hidden_states = self.norm(hidden_states)
@@ -297,7 +295,7 @@
          return Gemma4TextModelOutputWithPast(
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
-@@ -1722,24 +1812,12 @@
+@@ -1722,24 +1810,12 @@
          )
 
      def get_per_layer_inputs(self, input_ids: torch.Tensor | None, inputs_embeds: torch.Tensor | None) -> torch.Tensor:
@@ -322,7 +320,7 @@
          if input_ids is None:
              with torch.no_grad():
                  input_ids = (
-@@ -1754,10 +1832,10 @@
+@@ -1754,10 +1830,10 @@
                      input_ids = input_ids.view(inputs_embeds.shape[:2])
                  except RuntimeError:
                      raise RuntimeError(
@@ -337,7 +335,7 @@
 
          return self.embed_tokens_per_layer(input_ids).reshape(
              *input_ids.shape,
-@@ -1799,6 +1877,12 @@
+@@ -1799,6 +1875,12 @@
              return per_layer_projection
 
          return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
@@ -350,7 +348,7 @@
 
 
  @auto_docstring(custom_intro="The base Gemma 4 language model with a language modeling head.")
-@@ -1833,32 +1917,11 @@
+@@ -1833,32 +1915,11 @@
          logits_to_keep: int | torch.Tensor = 0,
          per_layer_inputs: torch.Tensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -386,7 +384,7 @@
          outputs: Gemma4TextModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -1871,21 +1934,21 @@
+@@ -1871,21 +1932,21 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -421,7 +419,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -2090,37 +2153,38 @@
+@@ -2090,37 +2151,38 @@
          return self.embedding_projection(embs_normed)
 
 
@@ -473,7 +471,7 @@
          layer_idx=0,
      )
      if early_exit:
-@@ -2130,15 +2194,11 @@
+@@ -2130,15 +2192,11 @@
              block_sequence_ids, attention_mask, kv_length, kv_offset
          )
 
@@ -489,7 +487,7 @@
      return {
          "full_attention": full_mask,
          "sliding_attention": sliding_mask,
-@@ -2155,6 +2215,12 @@
+@@ -2155,6 +2213,12 @@
      vision_group_ids = torch.cumsum(new_vision_starts.int(), dim=1) - 1
      block_sequence_ids = torch.where(is_vision, vision_group_ids, -1)
      return block_sequence_ids
@@ -502,7 +500,7 @@
 
 
  @auto_docstring(
-@@ -2169,13 +2235,11 @@
+@@ -2169,13 +2233,11 @@
 
      def __init__(self, config: Gemma4Config):
          super().__init__(config)
@@ -519,7 +517,7 @@
          self.embed_vision = (
              Gemma4MultimodalEmbedder(config.vision_config, config.text_config)
              if config.vision_config is not None
-@@ -2286,16 +2350,10 @@
+@@ -2286,16 +2348,10 @@
              The attention mask for the input audio.
          image_position_ids (`torch.LongTensor` of shape `(batch_size, max_patches, 2)`, *optional*):
              2D patch position coordinates from the image processor, with `(-1, -1)` indicating padding.
@@ -537,7 +535,7 @@
          """
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-@@ -2306,7 +2364,6 @@
+@@ -2306,7 +2362,6 @@
          image_mask, video_mask, audio_mask = self.get_placeholder_mask(input_ids, inputs_embeds)
          multimodal_mask = image_mask | video_mask | audio_mask
 
@@ -545,7 +543,7 @@
          llm_input_ids = None
          if inputs_embeds is None:
              llm_input_ids = input_ids.clone()
-@@ -2319,12 +2376,9 @@
+@@ -2319,12 +2374,9 @@
              llm_inputs_embeds = torch.where(multimodal_mask[..., None], pad_embedding.view(1, 1, -1), inputs_embeds)
              per_layer_inputs = self.language_model.get_per_layer_inputs(llm_input_ids, llm_inputs_embeds)
 
@@ -558,7 +556,7 @@
              n_image_tokens = image_mask.sum()
              image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
              torch_compilable_check(
-@@ -2332,7 +2386,6 @@
+@@ -2332,7 +2384,6 @@
                  f"Image features and image tokens do not match, tokens: {n_image_tokens}, features:"
                  f" {image_features.shape[0]}",
              )
@@ -566,7 +564,7 @@
              inputs_embeds = inputs_embeds.masked_scatter(
                  image_mask.to(inputs_embeds.device), image_features.to(inputs_embeds.device)
              )
-@@ -2342,8 +2395,6 @@
+@@ -2342,8 +2393,6 @@
                  pixel_values_videos, video_position_ids, return_dict=True
              ).pooler_output
              video_features = torch.cat(video_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
@@ -575,7 +573,7 @@
              n_video_tokens = video_mask.sum()
              video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
              torch_compilable_check(
-@@ -2351,22 +2402,15 @@
+@@ -2351,22 +2400,15 @@
                  f"Video features and video tokens do not match, tokens: {n_video_tokens}, features:"
                  f" {video_features.shape[0]}",
              )
@@ -599,7 +597,7 @@
              n_audio_tokens = audio_mask.sum()
              audio_mask = audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
              torch_compilable_check(
-@@ -2374,12 +2418,10 @@
+@@ -2374,12 +2416,10 @@
                  f"Audio features and audio tokens do not match, tokens: {n_audio_tokens}, features:"
                  f" {audio_features.shape[0] * audio_features.shape[1]}",
              )
@@ -612,7 +610,7 @@
          if position_ids is None:
              past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
              position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
-@@ -2393,20 +2435,21 @@
+@@ -2393,20 +2433,21 @@
                  "past_key_values": past_key_values,
                  "position_ids": position_ids,
              }
@@ -639,7 +637,7 @@
 
          outputs = self.language_model(
              per_layer_inputs=per_layer_inputs,
-@@ -2489,6 +2532,12 @@
+@@ -2489,6 +2530,12 @@
 
          vision_outputs.pooler_output = torch.split(pooler_output, split_sizes)
          return vision_outputs
@@ -652,7 +650,7 @@
 
 
  @auto_docstring(
-@@ -2543,22 +2592,16 @@
+@@ -2543,22 +2590,16 @@
          logits_to_keep: int | torch.Tensor = 0,
          per_layer_inputs: torch.Tensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -677,7 +675,7 @@
          """
          outputs = self.model(
              input_ids=input_ids,
-@@ -2572,7 +2615,6 @@
+@@ -2572,7 +2613,6 @@
              mm_token_type_ids=mm_token_type_ids,
              inputs_embeds=inputs_embeds,
              per_layer_inputs=per_layer_inputs,
@@ -685,7 +683,7 @@
              use_cache=use_cache,
              image_position_ids=image_position_ids,
              video_position_ids=video_position_ids,
-@@ -2581,21 +2623,22 @@
+@@ -2581,21 +2621,22 @@
          )
 
          hidden_states = outputs.last_hidden_state

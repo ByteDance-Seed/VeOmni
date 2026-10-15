@@ -78,6 +78,7 @@ from veomni.models.transformers.masking_utils import create_causal_mask, create_
 
 # Additional import blocks for patches
 from veomni.ops.dispatch import OpSlot
+from veomni.ops.kernels.cross_entropy import ForCausalLMLoss
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 
 
@@ -101,12 +102,7 @@ def _gemma4_loss(
     logits = None
     fused_linear_aux = None
     if labels is not None:
-        if veomni_causal_lm_loss.use_non_eager_impl:
-            if final_logit_softcapping is not None:
-                raise ValueError(
-                    "Gemma 4 fused-linear loss does not support final_logit_softcapping; "
-                    "use cross_entropy_loss_implementation='eager'."
-                )
+        if veomni_causal_lm_loss.use_non_eager_impl and final_logit_softcapping is None:
             loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                 logits=None,
                 labels=labels,
@@ -119,7 +115,9 @@ def _gemma4_loss(
             logits = model.lm_head(hidden_states)
             if final_logit_softcapping is not None:
                 logits = torch.tanh(logits / final_logit_softcapping) * final_logit_softcapping
-            loss, _, fused_linear_aux = model.loss_function(
+            # A fused-linear loss would reproject hidden states and discard softcapping.
+            loss_function = ForCausalLMLoss if final_logit_softcapping is not None else model.loss_function
+            loss, _, fused_linear_aux = loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=vocab_size,
