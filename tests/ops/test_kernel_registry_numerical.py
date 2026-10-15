@@ -21,7 +21,9 @@ KernelRegistry silently routing the wrong implementation into an OpSlot
 (e.g. a standard-variant kernel into a qwen3_5 slot).
 """
 
+import importlib
 import importlib.util
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -170,6 +172,111 @@ def test_chunk_gated_delta_rule_flash_qla_matches_fla():
     # a single bf16 rounding. 5e-2 was the smallest margin that held for two
     # independent kernels of this shape across seeds.
     assert torch.allclose(out_fla, out_flash_qla, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(
+    get_gpu_compute_capability() != 90 or importlib.util.find_spec("flash_qla") is None,
+    reason="FlashQLA grouped-head numerics require Hopper SM90 and flash_qla.",
+)
+@pytest.mark.parametrize("group_size", [1, 2, 4])
+def test_flash_qla_grouped_qk_matches_repeated_qk_forward_and_backward(group_size):
+    kernel = _fresh_slot("chunk_gated_delta_rule", "standard", "flash_qla")
+    torch.manual_seed(0)
+    batch, sequence, key_heads, dimension = 1, 129, 2, 128
+    value_heads = key_heads * group_size
+    inputs = (
+        torch.randn(batch, sequence, key_heads, dimension, device=DEVICE, dtype=torch.bfloat16),
+        torch.randn(batch, sequence, key_heads, dimension, device=DEVICE, dtype=torch.bfloat16),
+        torch.randn(batch, sequence, value_heads, dimension, device=DEVICE, dtype=torch.bfloat16),
+        -torch.rand(batch, sequence, value_heads, device=DEVICE, dtype=torch.float32) * 0.5,
+        torch.rand(batch, sequence, value_heads, device=DEVICE, dtype=torch.bfloat16),
+    )
+    cu_seqlens = torch.tensor([0, 31, 64, 129], device=DEVICE, dtype=torch.int32)
+    output_gradient = torch.randn_like(inputs[2])
+
+    def run(repeat_qk):
+        query, key, value, gate, beta = (tensor.detach().clone().requires_grad_() for tensor in inputs)
+        kernel_query = query.repeat_interleave(group_size, dim=2) if repeat_qk else query
+        kernel_key = key.repeat_interleave(group_size, dim=2) if repeat_qk else key
+        output, final_state = kernel(
+            kernel_query,
+            kernel_key,
+            value,
+            g=gate,
+            beta=beta,
+            cu_seqlens=cu_seqlens,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        gradients = torch.autograd.grad(output, (query, key, value, gate, beta), output_gradient)
+        return output.detach(), final_state.detach(), *(gradient.detach() for gradient in gradients)
+
+    grouped = run(False)
+    repeated = run(True)
+    for actual, expected in zip(grouped, repeated):
+        assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
+        torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(
+    get_gpu_compute_capability() != 90 or importlib.util.find_spec("flash_qla") is None,
+    reason="FlashQLA grouped-head numerics require Hopper SM90 and flash_qla.",
+)
+@pytest.mark.parametrize("model_name", ["qwen3_5", "qwen3_5_moe", "qwen4_exp"])
+@pytest.mark.parametrize("group_size", [1, 2, 4])
+def test_gdn_layer_grouped_qk_matches_repeated_qk_forward_and_backward(monkeypatch, model_name, group_size):
+    modeling = importlib.import_module(
+        f"veomni.models.transformers.{model_name}.generated.patched_modeling_{model_name}_gpu"
+    )
+    class_name = {
+        "qwen3_5": "Qwen3_5GatedDeltaNet",
+        "qwen3_5_moe": "Qwen3_5MoeGatedDeltaNet",
+        "qwen4_exp": "Qwen4ExpTextGatedDeltaNet",
+    }[model_name]
+    modeling.veomni_causal_conv1d.bind("fla")
+    modeling.veomni_chunk_gated_delta_rule.bind("flash_qla")
+    modeling.veomni_gdn_implementation.bind(SimpleNamespace(chunk_gated_delta_rule_implementation="flash_qla"))
+    if model_name != "qwen4_exp":
+        modeling.veomni_rms_norm_gated.bind("eager")
+    monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(ulysses_enabled=False))
+    config = SimpleNamespace(
+        hidden_size=256,
+        linear_num_value_heads=2 * group_size,
+        linear_num_key_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        hidden_act="silu",
+        output_gate_type=None,
+        rms_norm_eps=1e-6,
+        layer_types=["linear_attention"],
+    )
+    torch.manual_seed(13)
+    with torch.device(DEVICE):
+        layer = getattr(modeling, class_name)(config, layer_idx=0)
+    layer.to(dtype=torch.bfloat16)
+    hidden = torch.randn(1, 129, 256, device=DEVICE, dtype=torch.bfloat16)
+    output_gradient = torch.randn_like(hidden)
+    boundaries = torch.tensor([0, 31, 64, 129], device=DEVICE, dtype=torch.int32)
+    metadata = {"linear_attn_cu_seq_lens_q" if model_name == "qwen4_exp" else "cu_seq_lens_q": boundaries}
+
+    def run(grouped_heads):
+        layer.gdn_grouped_heads = grouped_heads
+        layer.zero_grad(set_to_none=True)
+        hidden_input = hidden.detach().clone().requires_grad_()
+        output = layer(hidden_input, **metadata)
+        output.backward(output_gradient)
+        return (
+            output.detach(),
+            hidden_input.grad.detach(),
+            *(parameter.grad.detach().clone() for parameter in layer.parameters()),
+        )
+
+    repeated = run(False)
+    grouped = run(True)
+    for actual, expected in zip(grouped, repeated, strict=True):
+        assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
+        torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
 
 
 def test_load_balancing_loss_triton_matches_eager():

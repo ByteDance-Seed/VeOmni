@@ -295,6 +295,14 @@ model:
     chunk_gated_delta_rule_implementation: flash_qla
 ```
 
+For packed training on Hopper SM90, FlashQLA uses grouped value heads directly:
+Q/K retain their original head count instead of being copied to match the value
+heads. This applies to dense and MoE Qwen3.5, including supported Ulysses layouts.
+Each layer caches its backend choice alongside its kernel, so constructing another
+model does not change the first layer's Q/K layout. Other backends and calls without
+packed metadata keep the existing replication. Defaults, hardware checks, and the
+unsupported cached-decode path are unchanged; no new flag or dependency is required.
+
 On NPU the default `fla` raises, so all three fields must be set explicitly — see
 [Kernel backends](#kernel-backends) under *Start training on NPU*.
 

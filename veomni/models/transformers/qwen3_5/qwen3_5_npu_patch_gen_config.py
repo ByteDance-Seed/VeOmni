@@ -118,7 +118,7 @@ config.add_post_import_block(
     """
     # ── OpSlot declarations ──────────────────────────────────────────────────
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
-    from veomni.ops.dispatch import OpSlot
+    from veomni.ops.dispatch import OpSlot, OpsConfigSlot
     veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
     veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
     veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
@@ -127,6 +127,7 @@ config.add_post_import_block(
     veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
     veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
     veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
+    veomni_gdn_implementation = OpsConfigSlot("chunk_gated_delta_rule_implementation")
     """
 )
 
@@ -142,6 +143,7 @@ sp_pad_and_slice = None
 veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
 veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
 veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
+veomni_gdn_implementation = None
 # Names referenced by the patched Qwen3_5TextModel.forward; resolved at
 # codegen time from the imports already present in the generated modeling file.
 DynamicCache = None

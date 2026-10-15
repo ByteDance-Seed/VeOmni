@@ -76,12 +76,13 @@ config.add_post_import_block(
     # Bound by ``_bind_veomni_ops`` before model construction. Qwen4-Exp
     # keeps the upstream eager/SDPA QSA implementation while expert, loss,
     # and GDN paths can opt into VeOmni kernels.
-    from veomni.ops.dispatch import OpSlot
+    from veomni.ops.dispatch import OpSlot, OpsConfigSlot
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
     veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
     veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
+    veomni_gdn_implementation = OpsConfigSlot("chunk_gated_delta_rule_implementation")
     """
 )
 
@@ -89,6 +90,7 @@ config.add_post_import_block(
 # OpSlots are declared in the generated module's post-import block.
 veomni_causal_conv1d = None
 veomni_chunk_gated_delta_rule = None
+veomni_gdn_implementation = None
 all_to_all = None
 
 
@@ -216,6 +218,9 @@ def qwen4_exp_gated_deltanet_init_patched(self, config, layer_idx):
 
     self.veomni_causal_conv1d_fn = veomni_causal_conv1d.bound_kernel()
     self.veomni_chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel()
+    self.gdn_grouped_heads = (
+        veomni_gdn_implementation.value == "flash_qla" and self.veomni_chunk_gated_delta_rule is not None
+    )
 
 
 @config.override_method(
@@ -277,7 +282,7 @@ def qwen4_exp_gated_deltanet_forward_patched(
     value = value.reshape(batch_size, seq_len, -1, self.head_v_dim).contiguous()
     beta = b.sigmoid()
     g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-    if self.num_v_heads // self.num_k_heads > 1:
+    if self.num_v_heads // self.num_k_heads > 1 and not self.gdn_grouped_heads:
         query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 

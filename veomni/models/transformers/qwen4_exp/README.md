@@ -48,6 +48,19 @@ Known limitations:
   semantics are validated without materializing the 95 GiB table. A real
   multi-node load-and-train smoke run remains the final deployment gate.
 
+## Grouped GDN Q/K heads
+
+For packed single-device GDN training on Hopper SM90, set
+`model.ops_implementation.chunk_gated_delta_rule_implementation=flash_qla`.
+FlashQLA accepts fewer Q/K heads than value heads, so the layer avoids copying
+Q/K with `repeat_interleave`. The backend choice is cached with the bound kernel
+on each layer. Other backends and the eager fallback keep the original layout;
+missing packed metadata and recurrent cache state are still rejected.
+
+This does not enable Qwen4-Exp Ulysses or change its existing model-level limits.
+The output and gradient regression is in
+`tests/ops/test_kernel_registry_numerical.py`.
+
 ## Two-device pipeline regression
 
 Run the daily toy regression with:
