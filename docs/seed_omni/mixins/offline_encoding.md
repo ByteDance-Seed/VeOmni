@@ -6,8 +6,8 @@ afterwards. It is a marker: mixing it in is what makes a module cacheable, and
 it declares no method.
 
 - Mixin: [`OfflineEncodingMixin`](../../../veomni/models/seed_omni/mixins/offline_encoding_mixin.py#L20)
-- Run selector: [`train.training_task`](../../../veomni/arguments/omni_arguments_types.py#L573)
-- Meta build: [`ModuleRuntime.reads_offline_cache`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L212)
+- Run selector: [`train.training_task`](../../../veomni/arguments/omni_arguments_types.py#L670)
+- Meta build: [`ModuleRuntime.reads_offline_cache`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L216)
 
 ## Why cache a module's encoder
 
@@ -70,7 +70,7 @@ tasks:
 | `offline_embedding` | Reads raw `seedomni` data once (`train.num_train_epochs: 1`), runs the graph without autograd and writes each encoded conversation to `train.offline_cache_dir`, which it requires. Every module is frozen: no optimizer, no lr scheduler, no checkpoint manager. | Full load, frozen; the graph calls its offline-embedding method. |
 | `offline_training` | Trains from the cache, read back with `data.data_type: seedomni_cached`. | Built on meta, never loaded, and frozen; the graph calls its offline-training method. |
 
-`OmniArguments` ([`_validate_training_task_data`](../../../veomni/arguments/omni_arguments_types.py#L694)) rejects
+`OmniArguments` ([`_validate_training_task_data`](../../../veomni/arguments/omni_arguments_types.py#L791)) rejects
 a run whose `data.data_type` does not match: only `offline_training` reads
 `seedomni_cached`.
 
@@ -120,23 +120,23 @@ This follows the DiT trainer's condition model: either the module is loaded in
 full, or it is built on meta.
 
 - **`offline_training`.**
-  [`ModuleRuntime.reads_offline_cache`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L212)
+  [`ModuleRuntime.reads_offline_cache`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L216)
   is true when the module's class mixes in `OfflineEncodingMixin`. The class
   is resolved from the module config with `get_model_class`, because the init
   device has to be chosen before the module exists. Then
-  [`_build_model`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L286)
+  [`_build_model`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L318)
   passes `init_device="meta"`, and the
-  [training build stops](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L156)
+  [training build stops](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L160)
   right after `requires_grad_(False)`: no parallel wrap, no weight load, no
   optimizer, no checkpoint manager. The offline-training method therefore must
   read only the config, never a parameter or buffer: parameters are meta
   tensors, and buffers keep the values the constructor gave them, not the
   checkpoint's. Under `fsdp_scope: model`,
-  [`_parallelize_composed_model`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L232)
+  [`_parallelize_composed_model`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L241)
   detaches cache readers before the composed wrap so they stay on meta and are
   not materialised with the rest.
 - **`offline_embedding`.** Every module, cached or not, is built and
-  [frozen](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L167),
+  [frozen](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L171),
   then loaded and wrapped like any other: the run trains nothing, so no module
   gets an optimizer or a checkpoint manager, and
   [`OmniTrainer`](../../../veomni/trainer/omni/omni_trainer.py#L276) allows the
@@ -282,7 +282,7 @@ The pieces that complete this workflow are in place:
 runs the encoding run, and
 [`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L181)
 persists each conversation of the `conversation_list` that
-[`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L460)
+[`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L529)
 returns. The training graph must only mutate `ConversationItem` fields in
 place (for example `value` and `meta`); it must not replace the list, append
 items, or drop items. Structural changes belong in the processor / collator
@@ -317,13 +317,13 @@ generation graph names, e.g. an encoding run loads only the encoder. So
 checks it against the loaded modules
 ([`GenerationGraph.validate_modules`](../../../veomni/models/seed_omni/graphs/generation_graph.py#L312))
 at the start of
-[`OmniModel.generate`](../../../veomni/models/seed_omni/modeling_omni.py#L579).
+[`OmniModel.generate`](../../../veomni/models/seed_omni/modeling_omni.py#L648).
 A missing module or method still fails before the first request runs.
 
 ## Current scope
 
 - **Cached modules are not checkpointed.** They are frozen in both cache tasks,
-  and [fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L577),
+  and [fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L624),
   so a checkpoint never holds a meta module.
 - **Every cacheable module is read from the cache.** `offline_training` builds
   every module that mixes in `OfflineEncodingMixin` on meta; one run cannot

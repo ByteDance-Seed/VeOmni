@@ -94,6 +94,97 @@ def _try_load_omni_checkpoint_config(path: Optional[str]):
 DEFAULT_SCENARIO = "default"
 
 
+def _resolve_hf_checkpoint_view(model_runtime: OmniModelRuntimeArguments) -> str:
+    """Set ``seed_omni_model_path`` to the weight-free split view when ``model_path`` is upstream HF.
+
+    ``model.model_path`` is never rewritten: loggers and saved launch args keep
+    the user-facing path. Downstream (module configs, assets, the collator's
+    preprocessors, inference) reads :attr:`OmniModelRuntimeArguments.seed_omni_model_path`,
+    while module weights still come from the HF checkpoint the view records.
+    A split root sets ``seed_omni_model_path`` equal to ``model_path``.
+    """
+    from ..models.seed_omni.utils.hf_layout import read_hf_source, resolve_omni_checkpoint_root
+
+    model_path = model_runtime.model_path
+    view = resolve_omni_checkpoint_root(model_path)
+    if view != model_path:
+        source = read_hf_source(view)
+        logger.info_rank0(
+            f"OmniModel: `model.model_path` is a HuggingFace `{source.model_type}` checkpoint; "
+            f"loading its modules through the {source.model_type} HF layout "
+            f"(seed_omni_model_path: {view})."
+        )
+    model_runtime.seed_omni_model_path = view
+    return view
+
+
+def _check_hf_source_exportable(model_path: str) -> None:
+    """Fail at startup, not at the first HF save, when the source cannot be written back."""
+    from ..models.seed_omni.utils.hf_layout import read_hf_source, source_tensor_specs, source_weight_files
+
+    source = read_hf_source(model_path)
+    if source is None:
+        return
+    try:
+        weight_files = source_weight_files(source.path)
+    except FileNotFoundError as e:
+        raise ValueError(
+            f"`train.checkpoint.save_hf_weights` exports in the source layout, which needs safetensors weights: {e} "
+            "Convert the checkpoint to safetensors, or disable save_hf_weights."
+        ) from e
+    try:
+        source_tensor_specs(source.path, weight_files)
+    except ValueError as e:
+        raise ValueError(f"`train.checkpoint.save_hf_weights` cannot write this source back: {e}") from e
+
+
+def _validate_hf_view_modules(
+    model_path: str,
+    modules: dict[str, OmniModuleRuntimeArguments],
+    *,
+    ep_sharded_stream_load: bool = False,
+) -> None:
+    """Under an HF ``model_path`` every module is one the family layout cuts from that checkpoint.
+
+    ``ep_sharded_stream_load`` is the top-level flag, which the composed wrap
+    (``fsdp_scope: model``) reads instead of the per-module ones.
+    """
+    from ..models.seed_omni.utils.hf_layout import read_hf_source
+
+    source = read_hf_source(model_path)
+    if source is None:
+        return
+    layout_modules = set(source.layout.modules)
+    for name, module_args in modules.items():
+        if name not in layout_modules:
+            raise ValueError(
+                f"Module {name!r} is not part of the `{source.model_type}` HF layout "
+                f"(modules: {sorted(layout_modules)}); an HF `model.model_path` only loads the family's own modules. "
+                "Convert the checkpoint to compose other modules."
+            )
+        if os.path.normpath(str(module_args.model_path)) != os.path.normpath(os.path.join(model_path, name)):
+            raise ValueError(
+                f"Module {name!r} sets its own model_path ({module_args.model_path!r}), but `model.model_path` is a "
+                f"HuggingFace `{source.model_type}` checkpoint every module loads from. Drop the per-module "
+                "model_path, or convert the checkpoint to compose modules from several sources."
+            )
+    streaming = sorted(name for name, args in modules.items() if args.ep_sharded_stream_load)
+    if ep_sharded_stream_load or streaming:
+        raise ValueError(
+            f"ep_sharded_stream_load (model: {ep_sharded_stream_load}, modules: {streaming}) does not apply the "
+            f"`{source.model_type}` HF layout's key renames. Disable it, or convert the checkpoint to a split one."
+        )
+    overrides = {
+        name: sorted(keys) for name, args in modules.items() if (keys := hf_module_model_config(args.model_config))
+    }
+    if overrides:
+        logger.warning_rank0(
+            f"Per-module model_config overrides {overrides} apply to this run, but an HF export of the "
+            f"`{source.model_type}` checkpoint keeps its source config.json; an override that changes the "
+            "architecture will not be reflected there."
+        )
+
+
 def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool = False) -> OmniModelRuntimeArguments:
     """Resolve ``args.model`` launcher fields into a fully populated :class:`OmniModelRuntimeArguments`.
 
@@ -105,10 +196,12 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         raise ValueError("`model.model_path` (split-checkpoint root) is required for OmniModel.")
 
     # ``model_path`` is already local: ``BaseModelArguments.__post_init__`` localizes
-    # it, so per-module subfolders join against a path that exists on disk and
-    # ``_try_load_omni_checkpoint_config`` below can open its ``config.json``.
-    model_path = model_runtime.model_path
-    omni_cfg = _try_load_omni_checkpoint_config(model_path)
+    # it. ``seed_omni_model_path`` is the root configs / assets / graphs are read
+    # from (a weight-free view when ``model_path`` is an upstream HF checkpoint).
+    seed_omni_model_path = _resolve_hf_checkpoint_view(model_runtime)
+    if not for_inference and args.train.checkpoint.save_hf_weights:
+        _check_hf_source_exportable(seed_omni_model_path)
+    omni_cfg = _try_load_omni_checkpoint_config(seed_omni_model_path)
 
     train_modules = model_runtime.launcher_config("modules")
     if train_modules is None and omni_cfg is not None:
@@ -117,7 +210,7 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         # being re-derived as ``<root>/<name>``.
         train_modules = {}
         for name in omni_cfg.module_names:
-            module_override: dict[str, Any] = {"model_path": omni_cfg.resolve_module_path(model_path, name)}
+            module_override: dict[str, Any] = {"model_path": omni_cfg.resolve_module_path(seed_omni_model_path, name)}
             if overrides := omni_cfg._module_entries[name].get("model_config"):
                 module_override["model_config"] = overrides
             train_modules[name] = module_override
@@ -157,9 +250,12 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
 
     modules = build_omni_module_runtime_args(
         _to_module_global_args(model_runtime),
-        model_path,
+        seed_omni_model_path,
         train_modules,
         for_inference=for_inference,
+    )
+    _validate_hf_view_modules(
+        seed_omni_model_path, modules, ep_sharded_stream_load=model_runtime.ep_sharded_stream_load
     )
     for module_args in modules.values():
         _validate_omni_accelerator(module_args.accelerator)
@@ -177,6 +273,7 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
     model_kwargs = {name: getattr(model_runtime, name) for name in shared_fields}
     return OmniModelRuntimeArguments(
         **model_kwargs,
+        seed_omni_model_path=seed_omni_model_path,
         modules=modules,
         training_graphs=training_graphs,
         generation_graphs=generation_graphs,
