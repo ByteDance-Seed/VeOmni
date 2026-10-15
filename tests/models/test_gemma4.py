@@ -145,6 +145,30 @@ def test_gemma4_training_loss_matches_capped_logits(monkeypatch, tmp_path, text_
         assert output.logits is None
 
 
+@pytest.mark.parametrize("has_features,has_mask", [(False, False), (True, False), (False, True)])
+def test_gemma4_incomplete_audio_inputs_return_no_audio_states(monkeypatch, has_features, has_mask):
+    """Audio states are absent when either encoder input is missing."""
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    model = build_foundation_model(
+        _TOY_CONFIG,
+        torch_dtype="float32",
+        init_device="cpu",
+        ops_implementation=_eager_ops_config("eager"),
+    ).eval()
+    input_ids = torch.tensor([[3, 4, 5, 6]])
+    with torch.no_grad():
+        expected = model(input_ids=input_ids, use_cache=False)
+        output = model(
+            input_ids=input_ids,
+            input_features=torch.randn(1, 16, 128) if has_features else None,
+            input_features_mask=torch.ones(1, 16, dtype=torch.bool) if has_mask else None,
+            use_cache=False,
+        )
+
+    assert output.audio_hidden_states is None
+    torch.testing.assert_close(output.logits, expected.logits)
+
+
 def test_gemma4_builds_pack_aware_full_and_sliding_masks(monkeypatch):
     captured = []
 

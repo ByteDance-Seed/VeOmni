@@ -306,7 +306,7 @@ def gemma4_model_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         image_hidden_states=image_features if pixel_values is not None else None,
-        audio_hidden_states=audio_features if input_features is not None else None,
+        audio_hidden_states=audio_features if input_features is not None and input_features_mask is not None else None,
         shared_kv_states=outputs.shared_kv_states,
     )
 

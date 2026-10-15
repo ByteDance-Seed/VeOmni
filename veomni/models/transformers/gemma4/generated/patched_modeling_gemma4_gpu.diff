@@ -637,7 +637,18 @@
 
          outputs = self.language_model(
              per_layer_inputs=per_layer_inputs,
-@@ -2489,6 +2530,12 @@
+@@ -2425,7 +2466,9 @@
+             hidden_states=outputs.hidden_states,
+             attentions=outputs.attentions,
+             image_hidden_states=image_features if pixel_values is not None else None,
+-            audio_hidden_states=audio_features if input_features is not None else None,
++            audio_hidden_states=audio_features
++            if input_features is not None and input_features_mask is not None
++            else None,
+             shared_kv_states=outputs.shared_kv_states,
+         )
+
+@@ -2489,6 +2532,12 @@
 
          vision_outputs.pooler_output = torch.split(pooler_output, split_sizes)
          return vision_outputs
@@ -650,7 +661,7 @@
 
 
  @auto_docstring(
-@@ -2543,22 +2590,16 @@
+@@ -2543,22 +2592,16 @@
          logits_to_keep: int | torch.Tensor = 0,
          per_layer_inputs: torch.Tensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -675,7 +686,7 @@
          """
          outputs = self.model(
              input_ids=input_ids,
-@@ -2572,7 +2613,6 @@
+@@ -2572,7 +2615,6 @@
              mm_token_type_ids=mm_token_type_ids,
              inputs_embeds=inputs_embeds,
              per_layer_inputs=per_layer_inputs,
@@ -683,7 +694,7 @@
              use_cache=use_cache,
              image_position_ids=image_position_ids,
              video_position_ids=video_position_ids,
-@@ -2581,21 +2621,22 @@
+@@ -2581,21 +2623,22 @@
          )
 
          hidden_states = outputs.last_hidden_state
