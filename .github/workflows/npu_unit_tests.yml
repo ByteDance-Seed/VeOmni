@@ -142,7 +142,10 @@ jobs:
           clean: true
       - name: Sync dependencies
         run: |
-          uv sync --frozen --python 3.11 --extra npu --group dev
+          uv sync --frozen --python "$(command -v python3)" --extra npu --group dev
+          uv pip install --python .venv/bin/python ninja
+          uv run --frozen ninja --version
+          uv run --frozen python -c "import cann_ops_transformer"
       - name: Check final pip list
         run: |
           uv pip list
@@ -203,6 +206,10 @@ jobs:
           uv run --frozen pytest -v -s -x tests/ops/test_comp.py
           uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
           uv run --frozen pytest -v -s -x tests/ops/test_npu_kernels.py
+          # This numerical gate must execute on NPU; fail instead of silently skipping
+          # when the vendor extension is missing from the CI image.
+          uv run --frozen python -c "import cann_ops_transformer"
+          uv run --frozen pytest -v -s -x tests/ops/test_mhc_tile_kernels.py::test_npu_mhc_pre_forward_backward_matches_eager
       - name: Run utils tests
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py
