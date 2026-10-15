@@ -26,7 +26,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from veomni.models.loss_utils import load_balancing_loss
 from veomni.ops import VeomniOp
-from veomni.utils.device import IS_CUDA_AVAILABLE
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device, synchronize
 
 
 # (num_experts, top_k, num_layers, batch_size, seq_len)
@@ -127,11 +127,12 @@ def test_eager_helper_matches_hf_with_mask_and_layer_grads():
 
 
 def _peak_bytes(fn) -> int:
-    baseline = torch.cuda.memory_allocated()
-    torch.cuda.reset_peak_memory_stats()
+    device = get_torch_device()
+    baseline = device.memory_allocated()
+    device.reset_peak_memory_stats()
     fn()
-    torch.cuda.synchronize()
-    return torch.cuda.max_memory_allocated() - baseline
+    synchronize()
+    return device.max_memory_allocated() - baseline
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs a GPU")
@@ -147,7 +148,8 @@ def test_triton_helper_training_forward_uses_less_peak_memory_than_hf(
     pytest.importorskip("triton")
     torch.manual_seed(0)
     layers = tuple(
-        torch.randn(batch_size * seq_len, num_experts, device="cuda", requires_grad=True) for _ in range(num_layers)
+        torch.randn(batch_size * seq_len, num_experts, device=get_device_type(), requires_grad=True)
+        for _ in range(num_layers)
     )
     triton = VeomniOp("load_balancing_loss", "standard", "triton")
 
@@ -159,7 +161,7 @@ def test_triton_helper_training_forward_uses_less_peak_memory_than_hf(
 
     run_hf()
     run_triton()
-    torch.cuda.synchronize()
+    synchronize()
 
     hf_peak = _peak_bytes(run_hf)
     triton_peak = _peak_bytes(run_triton)
