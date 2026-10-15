@@ -38,6 +38,7 @@ from .....utils import logging, recompute_utils
 from .....utils.checkpoint_utils import should_skip_hf_weight_load
 from .....utils.device import get_device_type
 from ....model_runtime import VeOmniModelRuntime
+from ...mixins.offline_encoding_mixin import OfflineEncodingMixin
 from ...utils.checkpoint import OmniModuleCheckpointManager
 from ..utils.dispatch import unwrap_module_chain
 
@@ -97,6 +98,11 @@ class ModuleRuntime(VeOmniModelRuntime):
     genuinely different topologies ("freeze the ViT, EP-shard the LLM, DDP the
     VAE") while sharing one build sequence.
 
+    ``train_args`` is the job-wide ``train:`` section (:class:`OmniTrainingArguments`),
+    shared by every module and ``None`` for inference builds. It is config, not a
+    train/infer switch (``for_inference`` is): the runtime reads ``training_task``
+    and the checkpoint paths from it.
+
     Job-wide concerns (process-group init, data pipeline, trace metering, the
     train loop) are **never** run here — :class:`OmniTrainer` owns them once, and
     cascades its ``on_{train,epoch,step}_*`` hooks into each module so every
@@ -119,7 +125,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         *,
         module_config: "OmniModuleConfig",
         global_accelerator: "AcceleratorConfig",
-        train: Optional["OmniTrainingArguments"] = None,
+        train_args: Optional["OmniTrainingArguments"] = None,
         for_inference: bool = False,
         hf_source: Optional["HFSource"] = None,
     ):
@@ -127,7 +133,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         self.model_name = module_name
         self.module_config = module_config
         self.hf_source = hf_source
-        self.train_args = train
+        self.train_args = train_args
         self.optimizer = None
         self.lr_scheduler = None
         self._global_accelerator = global_accelerator
@@ -151,7 +157,20 @@ class ModuleRuntime(VeOmniModelRuntime):
             with self._scoped():
                 self._build_model()
                 self._build_model_assets()
+                if self.reads_offline_cache:
+                    # Stay on meta. ``OmniModelRuntime._parallelize_composed_model``
+                    # detaches this module before the composed wrap so it is not
+                    # materialised with the rest under ``fsdp_scope='model'``.
+                    logger.info_rank0(
+                        f"ModuleRuntime '{self.module_name}': mixes in OfflineEncodingMixin, so "
+                        "offline_training reads it from the cache; left on meta, frozen and unwrapped."
+                    )
+                    self.model.requires_grad_(False)
+                    return
                 self._freeze_model_module()
+                if self.train_args is not None and self.train_args.training_task == "offline_embedding":
+                    # Trains nothing, so no module gets an optimizer or a checkpoint manager.
+                    self.model.requires_grad_(False)
                 self._build_parallelized_model()
                 if not self.wrap_omni_model:
                     # Parallel-state scoping for recompute rides in the policy; the
@@ -192,6 +211,23 @@ class ModuleRuntime(VeOmniModelRuntime):
         if self.wrap_omni_model:
             return self._global_accelerator
         return self.args.accelerator
+
+    @property
+    def reads_offline_cache(self) -> bool:
+        """Whether this module runs on cached data, built on meta.
+
+        True under ``train.training_task='offline_training'`` for a module whose
+        class mixes in :class:`OfflineEncodingMixin`: that task reads every
+        cacheable module from the cache, so the module loads no weights and has
+        nothing to train or save. The class is resolved from the config because
+        this decides the init device before the module exists.
+        """
+        if self.train_args is None or self.train_args.training_task != "offline_training":
+            return False
+        from .....models.loader import get_model_class
+
+        model_cls = get_model_class(self.module_config)
+        return isinstance(model_cls, type) and issubclass(model_cls, OfflineEncodingMixin)
 
     @property
     def weights_path(self) -> Optional[str]:
@@ -296,7 +332,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         from .....models import build_foundation_model
 
         acc = self.mesh_accelerator
-        init_device = acc.init_device
+        init_device = "meta" if self.reads_offline_cache else acc.init_device
         self.model = build_foundation_model(
             config_path=self.module_config,
             weights_path=args.model_path if self.hf_source is None else None,
@@ -500,8 +536,8 @@ class ModuleRuntime(VeOmniModelRuntime):
         if not should_skip_hf_weight_load(load_path, self.args.lora_config):
             return False
 
-        # A parameterless module has no persistent state for HF or DCP to restore
-        # (e.g. a process-only stage), so there is nothing to materialize.
+        # A parameterless module has no persistent state for HF or DCP to restore,
+        # so there is nothing to materialize.
         if not self.model.state_dict():
             return True
 
@@ -662,7 +698,7 @@ def build_omni_module_runtime(
     *,
     module_config: "OmniModuleConfig",
     global_accelerator: "AcceleratorConfig",
-    train: Optional["OmniTrainingArguments"] = None,
+    train_args: Optional["OmniTrainingArguments"] = None,
     for_inference: bool = False,
     hf_source: Optional["HFSource"] = None,
 ) -> ModuleRuntime:
@@ -672,7 +708,7 @@ def build_omni_module_runtime(
         module_name=module_name,
         module_config=module_config,
         global_accelerator=global_accelerator,
-        train=train,
+        train_args=train_args,
         for_inference=for_inference,
         hf_source=hf_source,
     )

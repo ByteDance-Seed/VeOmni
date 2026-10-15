@@ -450,3 +450,39 @@ def test_a_training_export_needs_safetensors_in_the_source(tmp_path):
 
     with pytest.raises(ValueError, match="needs safetensors weights"):
         _check_hf_source_exportable(view)
+
+
+def test_an_offline_embedding_run_skips_the_export_check(tmp_path, monkeypatch):
+    from veomni.arguments import omni_arguments_types
+    from veomni.arguments.omni_arguments_types import (
+        OmniArguments,
+        OmniDataArguments,
+        OmniInferArguments,
+        OmniModelRuntimeArguments,
+        build_omni_model_runtime_args,
+    )
+
+    root = tmp_path / "fake-hf"
+    _write_hf_checkpoint(root, sharded=False)
+    checked = []
+    monkeypatch.setattr(omni_arguments_types, "_check_hf_source_exportable", checked.append)
+    args = OmniArguments(
+        model=OmniModelRuntimeArguments(
+            model_path=str(root),
+            model_config={
+                "modules": str(FAKE_CONFIGS / "train" / "modules_train.yaml"),
+                "train_graph": str(FAKE_CONFIGS / "train" / "graph_train.yaml"),
+            },
+        ),
+        data=OmniDataArguments(train_path=""),
+        infer=OmniInferArguments(),
+    )
+    assert args.train.checkpoint.save_hf_weights
+
+    args.train.training_task = "offline_embedding"
+    build_omni_model_runtime_args(args)
+    assert checked == []
+
+    args.train.training_task = "online_training"
+    build_omni_model_runtime_args(args)
+    assert len(checked) == 1
