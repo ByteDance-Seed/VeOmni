@@ -78,6 +78,12 @@ def _storage_nbytes(tensor: Tensor) -> int:
     return tensor.untyped_storage().nbytes()
 
 
+# Effectively unlimited budget: used when free device memory cannot be
+# determined or when streams are disabled (CPU tests), so all states are
+# swapped in a single batch.
+_INFINITE_BUDGET = 1 << 62
+
+
 class SwapAdamW(Optimizer):
     """AdamW with host-resident moment states streamed to device in batches.
 
@@ -198,9 +204,19 @@ class SwapAdamW(Optimizer):
                     local_shard.untyped_storage().resize_(0)
 
                 if "step" not in self.state[p]:
-                    self.state[p]["step"] = torch.tensor(0.0)
+                    self.state[p]["step"] = 0
                 self._host_states[p] = host_state
                 self._device_states[p] = device_state
+
+        # Precompute per-step invariants: the param-to-group mapping and
+        # per-param state sizes never change during training.
+        self._group_by_param: Dict[Tensor, Dict[str, Any]] = {}
+        self._param_bytes: Dict[Tensor, int] = {}
+        for group in self.param_groups:
+            for p in group["params"]:
+                self._group_by_param[p] = group
+                local_shard = _to_local(p)
+                self._param_bytes[p] = sum(local_shard.numel() * local_shard.element_size() for _ in self._state_keys)
 
     # -------------------------------------------------------------- checkpoint
 
@@ -235,9 +251,18 @@ class SwapAdamW(Optimizer):
                     self.state[p][key] = host_tensor
 
     def state_dict(self):
-        """Optimizer state with all values read from host memory (see ``_bind_host_states``)."""
+        """Optimizer state with all values read from host memory (see ``_bind_host_states``).
+
+        ``step`` is stored internally as a Python int but exported as a CPU
+        tensor so DCP checkpoints stay compatible with stock AdamW (which also
+        stores step as a tensor).
+        """
         self._bind_host_states()
-        return super().state_dict()
+        state_dict = super().state_dict()
+        for param_state in state_dict["state"].values():
+            if "step" in param_state:
+                param_state["step"] = torch.tensor(float(param_state["step"]))
+        return state_dict
 
     def load_state_dict(self, state_dict) -> None:
         """Load values into the host buffers without materializing them on device.
@@ -270,16 +295,9 @@ class SwapAdamW(Optimizer):
             return
         for key, loaded in value.items():
             if key == "step":
-                # Own the value rather than aliasing the checkpoint's tensor:
-                # ``_bump_step`` mutates it in place, so an alias would corrupt it.
                 if isinstance(loaded, DTensor):
                     loaded = _to_local(loaded)
-                scalar = loaded.item() if isinstance(loaded, torch.Tensor) else loaded
-                step = self.state[p]["step"]
-                if isinstance(step, torch.Tensor):
-                    step.fill_(scalar)
-                else:
-                    self.state[p]["step"] = scalar
+                self.state[p]["step"] = int(loaded.item()) if isinstance(loaded, torch.Tensor) else int(loaded)
             elif key in host_state and loaded is not None:
                 source = _to_local(loaded) if isinstance(loaded, DTensor) else loaded
                 host_state[key].copy_(source.to(host_state[key].device))
@@ -307,33 +325,29 @@ class SwapAdamW(Optimizer):
 
     # ------------------------------------------------------------- step pieces
 
-    def _param_state_bytes(self, p: Tensor) -> int:
-        local_shard = _to_local(p)
-        return sum(local_shard.numel() * local_shard.element_size() for _ in self._state_keys)
-
     def _device_free_bytes(self) -> int:
         """Bytes this process can still allocate on the device.
 
         ``total - allocated`` includes cached-but-unused allocator blocks that
-        ``mem_get_info`` under-reports (freed states return to the pool, not the
-        device), which would collapse the swap batch after the first big swap-in.
+        ``mem_get_info`` under-reports (freed states return to the pool, not to
+        the device), which would collapse the swap batch after the first big swap-in.
         """
         device = get_torch_device()
         try:
             total = int(device.get_device_properties(get_device_id()).total_memory)
             return total - int(device.memory_allocated())
-        except Exception:
+        except (AttributeError, RuntimeError, NotImplementedError):
             try:
                 free, _total = device.mem_get_info()
                 return int(free)
             except (AttributeError, RuntimeError):
                 pass
         logger.warning_once("SwapAdamW could not determine free device memory; swapping states in one batch.")
-        return 1 << 62  # pragma: no cover
+        return _INFINITE_BUDGET  # pragma: no cover
 
     def _batch_budget_bytes(self) -> int:
         if not self._use_streams:
-            return 1 << 62
+            return _INFINITE_BUDGET
         return max(int(self._device_free_bytes() * self.mem_fraction_static), 0)
 
     def _release_pending_storages(self) -> None:
@@ -396,7 +410,7 @@ class SwapAdamW(Optimizer):
         budget = self._batch_budget_bytes()
         with stream_context:
             while index < len(params):
-                param_bytes = self._param_state_bytes(params[index])
+                param_bytes = self._param_bytes[params[index]]
                 if bytes_moved != 0 and bytes_moved + param_bytes > budget:
                     break
                 self._swap_in_param(params[index])
@@ -413,11 +427,7 @@ class SwapAdamW(Optimizer):
         return index
 
     def _bump_step(self, p: Tensor) -> int:
-        step = self.state[p]["step"]
-        if isinstance(step, torch.Tensor):
-            step = step.add_(1)
-            return int(step.item())
-        step = int(step) + 1
+        step = int(self.state[p]["step"]) + 1
         self.state[p]["step"] = step
         return step
 
@@ -511,15 +521,12 @@ class SwapAdamW(Optimizer):
                 loss = closure()
 
         active: List[Tensor] = []
-        group_by_param: Dict[Tensor, Dict[str, Any]] = {}
-        for group in self.param_groups:
-            for param in group["params"]:
-                group_by_param[param] = group
-                if not param.requires_grad or param.grad is None:
-                    continue
-                if param.grad.is_sparse:
-                    raise RuntimeError("SwapAdamW does not support sparse gradients")
-                active.append(param)
+        for param in self._group_by_param:
+            if not param.requires_grad or param.grad is None:
+                continue
+            if param.grad.is_sparse:
+                raise RuntimeError("SwapAdamW does not support sparse gradients")
+            active.append(param)
 
         index = 0
         num_params = len(active)
@@ -531,16 +538,16 @@ class SwapAdamW(Optimizer):
                 # chunk never crosses a group boundary. Within a group it is split
                 # into ``chunk_bytes``-sized stages so the swap-out of one chunk
                 # overlaps the swap-in of the next (and the compute in between).
-                group = group_by_param[active[group_start]]
+                group = self._group_by_param[active[group_start]]
                 group_end = group_start + 1
-                while group_end < batch_end and group_by_param[active[group_end]] is group:
+                while group_end < batch_end and self._group_by_param[active[group_end]] is group:
                     group_end += 1
                 chunk_start = group_start
                 while chunk_start < group_end:
                     chunk_end = chunk_start
                     acc_bytes = 0
                     while chunk_end < group_end:
-                        param_bytes = self._param_state_bytes(active[chunk_end])
+                        param_bytes = self._param_bytes[active[chunk_end]]
                         if chunk_end > chunk_start and acc_bytes + param_bytes > self.chunk_bytes:
                             break
                         acc_bytes += param_bytes

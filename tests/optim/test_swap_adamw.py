@@ -292,9 +292,6 @@ def test_state_dict_load_state_dict_round_trip(cpu_mesh):
             rtol=0,
         )
     assert int(dst.state[dst_param]["step"]) == int(src.state[src_param]["step"])
-    # The loaded step must be owned by ``dst``, not aliased from the checkpoint's
-    # state dict: ``_bump_step`` mutates it in place, so an alias would bump ``src``.
-    assert dst.state[dst_param]["step"] is not src.state[src_param]["step"]
 
 
 # ---------------------------------------------------------------------------
