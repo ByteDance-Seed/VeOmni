@@ -100,7 +100,7 @@ both through `GlobalStateCallback`:
   [flushes the writer](../../../veomni/models/seed_omni/utils/offline_cache.py#L90),
   so every row the cursor covers is on disk.
 - On resume the writer
-  [reopens at the saved shard position](../../../veomni/models/seed_omni/utils/offline_cache.py#L130)
+  [reopens at the saved shard position](../../../veomni/models/seed_omni/utils/offline_cache.py#L132)
   and deletes this rank's shards written after it. The restored cursor replays
   those steps, so keeping them would cache those samples twice.
 - Resume fails if the cache was already finalized, because it would rewrite
@@ -110,7 +110,9 @@ both through `GlobalStateCallback`:
   so shard numbers can have gaps; the cached dataset reads every shard in the
   directory.
 - A run without a saved writer position still
-  [refuses a directory that holds shards](../../../veomni/models/seed_omni/utils/offline_cache.py#L108).
+  [refuses a directory that holds shards](../../../veomni/models/seed_omni/utils/offline_cache.py#L108)
+  or a leftover completion marker, which would otherwise make a later resume
+  of the new run refuse the cache as already finalized.
 
 ## How a run builds a cached module
 
@@ -278,7 +280,7 @@ The result:
 The pieces that complete this workflow are in place:
 [`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L568)
 runs the encoding run, and
-[`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L179)
+[`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L181)
 persists each conversation of the `conversation_list` that
 [`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L460)
 returns. The training graph must only mutate `ConversationItem` fields in
@@ -356,10 +358,10 @@ A missing module or method still fails before the first request runs.
 - [`tests/seed_omni/test_offline_cache_writer.py`](../../../tests/seed_omni/test_offline_cache_writer.py):
   [the `seedomni_cached` transform](../../../tests/seed_omni/test_offline_cache_writer.py#L33), the
   [writer round trip](../../../tests/seed_omni/test_offline_cache_writer.py#L51),
-  [one writer per `dp_rank`](../../../tests/seed_omni/test_offline_cache_writer.py#L218),
-  [a resumed writer keeps every row its cursor covers and drops the replayed ones](../../../tests/seed_omni/test_offline_cache_writer.py#L133),
-  [a finalized cache](../../../tests/seed_omni/test_offline_cache_writer.py#L161) or [another dp size](../../../tests/seed_omni/test_offline_cache_writer.py#L174) cannot be resumed into, and
-  [a shard only one rank sees fails every rank](../../../tests/seed_omni/test_offline_cache_writer.py#L304).
+  [one writer per `dp_rank`](../../../tests/seed_omni/test_offline_cache_writer.py#L225),
+  [a resumed writer keeps every row its cursor covers and drops the replayed ones](../../../tests/seed_omni/test_offline_cache_writer.py#L132),
+  [a finalized cache](../../../tests/seed_omni/test_offline_cache_writer.py#L160) or [another dp size](../../../tests/seed_omni/test_offline_cache_writer.py#L173) cannot be resumed into, and
+  [a shard only one rank sees fails every rank](../../../tests/seed_omni/test_offline_cache_writer.py#L311).
 - [`tests/seed_omni/trainer/test_omni_trainer.py`](../../../tests/seed_omni/trainer/test_omni_trainer.py):
   [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L125),
   [it saves no model state](../../../tests/seed_omni/trainer/test_omni_trainer.py#L137),

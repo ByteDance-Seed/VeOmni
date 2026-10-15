@@ -112,18 +112,20 @@ class SeedOmniOfflineCacheWriter:
         run over the same directory overwrites the low shards and leaves the
         high ones behind, and the cached dataset, which reads every shard in
         the directory, would quietly include the leftovers of the earlier run.
+        A completion marker left without shards would make a later resume of
+        this run refuse the cache as already finalized.
 
         Every rank checks the directory, then the results are all-gathered so a
         non-empty directory fails on every rank together. A barrier after a
         clean check keeps a fast rank from flushing its first shard while a
         slow rank is still checking.
         """
-        if _any_rank(bool(self._shard_names())):
+        if _any_rank(bool(self._shard_names()) or os.path.exists(os.path.join(self.save_path, _COMPLETE_MARKER))):
             raise FileExistsError(
                 f"SeedOmni offline cache directory '{self.save_path}' already contains "
-                f"shard parquet file(s). Writing here would overwrite some and silently "
-                f"keep the rest. Point `save_path` at a new directory, delete the existing "
-                f"shards first, or resume the run that wrote them from its checkpoint."
+                f"shard parquet file(s) or a `{_COMPLETE_MARKER}` marker from an earlier run. "
+                f"Point `save_path` at a new directory, delete both first, or resume the run "
+                f"that wrote them from its checkpoint."
             )
         _barrier()
 
