@@ -83,19 +83,18 @@ def test_offline_cache_writer_preserves_dummy_and_encoded_cache(tmp_path) -> Non
     assert restored[2].meta == {"cache": "test_cache"}
 
 
-def test_offline_cache_writer_finalize_compacts_shard_numbers(tmp_path) -> None:
+def test_finalize_keeps_the_shard_names_resume_reads_ownership_from(tmp_path) -> None:
+    """Renaming in finalize could leave names that resume attributes to the wrong rank if it were interrupted."""
     writer = SeedOmniOfflineCacheWriter(str(tmp_path), max_rows_per_shard=1)
     writer.open()
     writer.rank = 7
     writer.world_size = 8
 
     writer.save_conversation_list([[ConversationItem(type="text", value="prompt", role="user")]])
-    assert (tmp_path / "shard_000007.parquet").exists()
-
     writer.finalize()
 
-    assert not (tmp_path / "shard_000007.parquet").exists()
-    assert (tmp_path / "shard_000000.parquet").exists()
+    assert sorted(path.name for path in tmp_path.glob("shard_*.parquet")) == ["shard_000007.parquet"]
+    assert (tmp_path / ".offline_cache_complete").exists()
 
 
 @pytest.mark.parametrize(

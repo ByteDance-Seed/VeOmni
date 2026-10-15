@@ -110,9 +110,8 @@ class SeedOmniOfflineCacheWriter:
 
         Shard names are a pure function of rank and write order, so a second
         run over the same directory overwrites the low shards and leaves the
-        high ones behind. :meth:`_compact_shard_names` then renumbers whatever
-        it finds into one contiguous range, quietly presenting the leftovers of
-        the earlier run as part of this cache.
+        high ones behind, and the cached dataset, which reads every shard in
+        the directory, would quietly include the leftovers of the earlier run.
 
         Every rank checks the directory, then the results are all-gathered so a
         non-empty directory fails on every rank together. A barrier after a
@@ -132,14 +131,15 @@ class SeedOmniOfflineCacheWriter:
         """Reopen at the saved shard position and drop this rank's shards written after it.
 
         Those shards hold steps the restored cursor replays, so keeping them
-        would cache those samples twice. Shard names are only meaningful before
-        :meth:`finalize` renumbers them and only for the dp size that wrote
-        them, so either mismatch fails on every rank.
+        would cache those samples twice. A shard name identifies its rank and
+        position only under the dp size that wrote it, so resuming under
+        another dp size fails on every rank, as does resuming into a cache
+        :meth:`finalize` already marked complete.
         """
         if _any_rank(os.path.exists(os.path.join(self.save_path, _COMPLETE_MARKER))):
             raise FileExistsError(
                 f"SeedOmni offline cache directory '{self.save_path}' was already finalized; "
-                f"its shards were renumbered and cannot be resumed into."
+                f"resuming would rewrite part of a complete cache. Point `save_path` at a new directory."
             )
         if _any_rank(state["world_size"] != self.world_size):
             raise ValueError(
@@ -210,19 +210,11 @@ class SeedOmniOfflineCacheWriter:
             dist.barrier()
 
         if not distributed or dist.get_rank() == 0:
-            self._compact_shard_names()
             with open(os.path.join(self.save_path, _COMPLETE_MARKER), "w"):
                 pass
 
         if distributed:
             dist.barrier()
-
-    def _compact_shard_names(self) -> None:
-        for next_index, name in enumerate(self._shard_names()):
-            target_name = f"shard_{next_index:06d}.parquet"
-            if name == target_name:
-                continue
-            os.replace(os.path.join(self.save_path, name), os.path.join(self.save_path, target_name))
 
 
 __all__ = ["SeedOmniOfflineCacheWriter"]

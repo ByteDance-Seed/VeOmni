@@ -100,11 +100,15 @@ both through `GlobalStateCallback`:
   [flushes the writer](../../../veomni/models/seed_omni/utils/offline_cache.py#L90),
   so every row the cursor covers is on disk.
 - On resume the writer
-  [reopens at the saved shard position](../../../veomni/models/seed_omni/utils/offline_cache.py#L131)
+  [reopens at the saved shard position](../../../veomni/models/seed_omni/utils/offline_cache.py#L130)
   and deletes this rank's shards written after it. The restored cursor replays
   those steps, so keeping them would cache those samples twice.
-- Resume fails if the cache was already finalized, because finalizing renumbers
-  the shards. It also fails if the data-parallel size changed.
+- Resume fails if the cache was already finalized, because it would rewrite
+  part of a complete cache. It also fails if the data-parallel size changed:
+  a shard's name says which rank wrote it, and at which position, only under
+  the data-parallel size that wrote it. Finalizing therefore keeps those names,
+  so shard numbers can have gaps; the cached dataset reads every shard in the
+  directory.
 - A run without a saved writer position still
   [refuses a directory that holds shards](../../../veomni/models/seed_omni/utils/offline_cache.py#L108).
 
