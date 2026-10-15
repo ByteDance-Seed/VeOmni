@@ -111,7 +111,7 @@ class ModelCheckpointManager:
         question the filesystem cannot: whether *this* run wrote the step. A
         complete checkpoint left at the same step by an earlier run looks
         identical from the outside but holds different weights, so
-        :meth:`_prepare_export` overwrites rather than trusting what it finds.
+        :meth:`prepare_export` overwrites rather than trusting what it finds.
         """
         return self._last_saved_step
 
@@ -230,7 +230,7 @@ class ModelCheckpointManager:
         self._last_saved_step = state.global_step
         logger.info_rank0(f"Distributed checkpoint saved at {self.save_dir(state)} successfully!")
 
-    def _prepare_export(self, state: "TrainerState", stage: str) -> str:
+    def prepare_export(self, state: "TrainerState", stage: str) -> str:
         """Make sure this step's DCP exists, then return its weights directory.
 
         Returns the weights directory rather than ``save_dir`` because that is
@@ -256,7 +256,7 @@ class ModelCheckpointManager:
     def save_hf(self, state: "TrainerState", stage: str = "step_end") -> None:
         from ..utils.save_safetensor_utils import save_hf_safetensor
 
-        weights_path = self._prepare_export(state, stage)
+        weights_path = self.prepare_export(state, stage)
 
         save_hf_safetensor(
             save_hf_safetensor_path=self.hf_export_dir(state),
@@ -275,7 +275,7 @@ class ModelCheckpointManager:
     def save_lora(self, state: "TrainerState", stage: str = "step_end", adapter_name: str = "default") -> None:
         from ..utils.save_safetensor_utils import save_lora_adapter_with_dcp
 
-        self._prepare_export(state, stage)
+        self.prepare_export(state, stage)
         save_lora_adapter_with_dcp(
             model=self.runtime.model,
             save_path=self.lora_export_dir(state),
