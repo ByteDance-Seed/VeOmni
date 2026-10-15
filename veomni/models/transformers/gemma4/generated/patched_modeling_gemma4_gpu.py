@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Gemma4AudioModel.forward
+#      Build boolean local audio masks independently of the language-model attention backend
 #    - function_replacement: create_masks_for_vision_model
 #      Compose Gemma 4 bidirectional vision masks with packed-sequence boundaries
 #    - method_override: Gemma4Model.__init__
@@ -1972,6 +1974,12 @@ def sliding_window_mask_function(sliding_window: tuple[int, int]) -> Callable:
     return inner_mask
 
 
+# ======================================================================
+# [MODIFIED CLASS] Gemma4AudioModel
+# Methods patched: forward
+# ======================================================================
+
+
 class Gemma4AudioModel(Gemma4PreTrainedModel):
     """An audio encoder based on the [Universal Speech Model](https://huggingface.co/papers/2303.01037) architecture."""
 
@@ -2031,20 +2039,19 @@ class Gemma4AudioModel(Gemma4PreTrainedModel):
         input_features: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, torch.BoolTensor]:
+    ) -> Gemma4AudioModelOutput:
         hidden_states, output_mask = self.subsample_conv_projection(input_features, attention_mask)
         position_embeddings = self.rel_pos_enc(hidden_states)
-
-        attention_mask = create_bidirectional_mask(
-            config=self.config,
-            inputs_embeds=hidden_states,
-            attention_mask=output_mask,
-            and_mask_function=sliding_window_mask_function(
-                (self.config.attention_context_left - 1, self.config.attention_context_right)
-            ),
+        positions = torch.arange(hidden_states.shape[1], device=hidden_states.device)
+        window = sliding_window_mask_function(
+            (self.config.attention_context_left - 1, self.config.attention_context_right)
         )
-        if attention_mask is not None:
-            attention_mask = self._convert_4d_mask_to_blocked_5d(attention_mask)
+        # The audio attention consumes True=visible, regardless of the LM backend.
+        visibility = window(0, 0, positions[:, None], positions[None, :])
+        visibility = visibility[None, None].expand(hidden_states.shape[0], 1, -1, -1)
+        if output_mask is not None:
+            visibility = visibility & output_mask[:, None, None, :].to(device=hidden_states.device, dtype=torch.bool)
+        attention_mask = self._convert_4d_mask_to_blocked_5d(visibility)
 
         for encoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states = encoder_layer(
@@ -2053,7 +2060,6 @@ class Gemma4AudioModel(Gemma4PreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-
         hidden_states = self.output_proj(hidden_states)
         return Gemma4AudioModelOutput(last_hidden_state=hidden_states, attention_mask=output_mask)
 

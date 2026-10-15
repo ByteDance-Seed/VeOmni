@@ -21,6 +21,7 @@ import torch
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.gemma4.modeling_gemma4 import (
     Gemma4AudioModel,
+    Gemma4AudioModelOutput,
     Gemma4CausalLMOutputWithPast,
     Gemma4Config,
     Gemma4ModelOutputWithPast,
@@ -60,6 +61,40 @@ config.add_post_import_block(
 )
 
 veomni_causal_lm_loss = None
+
+
+@config.override_method(
+    "Gemma4AudioModel.forward",
+    description="Build boolean local audio masks independently of the language-model attention backend",
+)
+def gemma4_audio_forward_patched(
+    self,
+    input_features: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> Gemma4AudioModelOutput:
+    hidden_states, output_mask = self.subsample_conv_projection(input_features, attention_mask)
+    position_embeddings = self.rel_pos_enc(hidden_states)
+    positions = torch.arange(hidden_states.shape[1], device=hidden_states.device)
+    window = sliding_window_mask_function(
+        (self.config.attention_context_left - 1, self.config.attention_context_right)
+    )
+    # The audio attention consumes True=visible, regardless of the LM backend.
+    visibility = window(0, 0, positions[:, None], positions[None, :])
+    visibility = visibility[None, None].expand(hidden_states.shape[0], 1, -1, -1)
+    if output_mask is not None:
+        visibility = visibility & output_mask[:, None, None, :].to(device=hidden_states.device, dtype=torch.bool)
+    attention_mask = self._convert_4d_mask_to_blocked_5d(visibility)
+
+    for encoder_layer in self.layers[: self.config.num_hidden_layers]:
+        hidden_states = encoder_layer(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+    hidden_states = self.output_proj(hidden_states)
+    return Gemma4AudioModelOutput(last_hidden_state=hidden_states, attention_mask=output_mask)
 
 
 @config.add_helper_after("Gemma4CausalLMOutputWithPast")

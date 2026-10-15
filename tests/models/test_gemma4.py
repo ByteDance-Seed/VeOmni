@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config
+from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel as HFGemma4Audio
 from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration as HFGemma4
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
@@ -48,6 +50,48 @@ def _eager_ops_config(attn_implementation: str) -> OpsImplementationConfig:
 
 def _toy_config() -> Gemma4Config:
     return Gemma4Config.from_pretrained(_TOY_CONFIG)
+
+
+@pytest.mark.parametrize("backend", ["eager", "sdpa", _FLEX_IMPLEMENTATION])
+def test_gemma4_audio_matches_boolean_mask_reference(backend):
+    """Audio mask visibility, outputs and gradients must not depend on the LM backend."""
+    torch.manual_seed(31)
+    config = _toy_config()
+    config.audio_config.attention_context_left = 4
+    config.audio_config.attention_context_right = 2
+    model = VeOmniGemma4._from_config(config, attn_implementation=backend)
+    audio = model.model.audio_tower
+    reference = HFGemma4Audio._from_config(deepcopy(config.audio_config), attn_implementation="sdpa")
+    reference.load_state_dict(audio.state_dict())
+    masks = []
+    reference_masks = []
+
+    def record_mask(module, args, kwargs):
+        masks.append(kwargs["attention_mask"])
+
+    def record_reference_mask(module, args, kwargs):
+        reference_masks.append(kwargs["attention_mask"])
+
+    audio.layers[0].self_attn.register_forward_pre_hook(record_mask, with_kwargs=True)
+    reference.layers[0].self_attn.register_forward_pre_hook(record_reference_mask, with_kwargs=True)
+    features = torch.randn(1, 20, config.audio_config.subsampling_conv_channels[0], requires_grad=True)
+    reference_features = features.detach().clone().requires_grad_()
+    feature_mask = torch.ones(1, 20, dtype=torch.bool)
+    feature_mask[:, -4:] = False
+
+    output = audio(features, attention_mask=feature_mask)
+    expected = reference(reference_features, attention_mask=feature_mask)
+
+    assert masks[0].dtype == torch.bool
+    torch.testing.assert_close(masks[0], reference_masks[0])
+    torch.testing.assert_close(output.attention_mask, expected.attention_mask)
+    torch.testing.assert_close(output.last_hidden_state, expected.last_hidden_state)
+    output.last_hidden_state[output.attention_mask].square().sum().backward()
+    expected.last_hidden_state[expected.attention_mask].square().sum().backward()
+    torch.testing.assert_close(features.grad, reference_features.grad)
+    torch.testing.assert_close(
+        audio.layers[0].self_attn.q_proj.linear.weight.grad, reference.layers[0].self_attn.q_proj.linear.weight.grad
+    )
 
 
 def test_gemma4_state_dict_matches_huggingface():
