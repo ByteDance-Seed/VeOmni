@@ -28,6 +28,17 @@ Consequences that cut both ways:
   and `-x` fail-fast. Every new file pays process startup plus model build, and a
   new flaky file blocks the whole suite for everyone.
 
+## What the NPU job can actually run
+
+Both NPU workflows build their own venv with `uv sync --extra npu`, so the
+packages baked into the image's build-time venv are not on the test path. Only
+`torch_npu` ships that way; `triton-ascend` is installed by an explicit workflow
+step (`uv sync` prunes anything outside the lockfile, `uv run --frozen` does
+not), and `fla_npu` is not installed at all. So Ascend Triton kernels are
+testable, `npu_ascendc` is not, and `fla` never works on Ascend regardless of
+what its `HardwareRequirement` lists. The runners are 910B (A2, non-arch35), so
+kernels gated behind `is_arch35()` stay unreachable.
+
 Check whether a file is wired — by name, and by the directory it sits in:
 
 ```bash
