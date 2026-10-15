@@ -25,11 +25,12 @@ import torch.distributed as dist
 from transformers import AutoConfig
 
 from tests.tools.launch_utils import torchrun
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
 
 
 pytestmark = [pytest.mark.qwen4_exp_ulysses]
 
-if not torch.cuda.is_available():
+if not IS_CUDA_AVAILABLE:
     pytest.skip("Qwen4-Exp Ulysses tests require CUDA", allow_module_level=True)
 
 _PATCHED_MODULE = "veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu"
@@ -57,8 +58,8 @@ def _set_deterministic(seed: int = 42) -> None:
     torch.backends.cudnn.deterministic = True
     torch.use_deterministic_algorithms(True)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    get_torch_device().manual_seed(seed)
+    get_torch_device().manual_seed_all(seed)
 
 
 def _use_full_float32_matmuls() -> None:
@@ -166,7 +167,7 @@ def _run_ple_halo_equivalence(packed: bool = False) -> None:
         _init_parallel_state(
             dp_size=1,
             ulysses_size=world_size,
-            device_type="cuda",
+            device_type=get_device_type(),
             extra_parallel_names=("ple",),
             extra_parallel_sizes=(1,),
             extra_parallel_placement_innermost=(False,),
@@ -174,7 +175,7 @@ def _run_ple_halo_equivalence(packed: bool = False) -> None:
         )
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
         torch.manual_seed(17)
-        device = torch.device("cuda", rank)
+        device = torch.device(get_device_type(), rank)
         ple = qwen4_exp.Qwen4ExpTextPLELayer(config, layer_idx=0, ple_layer_index=0).float().to(device)
         with torch.no_grad():
             ple.conv1d.weight.normal_(mean=0.0, std=0.2)
@@ -265,10 +266,10 @@ def _run_qsa_equivalence(
         _init_parallel_state(
             dp_size=1,
             ulysses_size=world_size,
-            device_type="cuda",
+            device_type=get_device_type(),
             name=None,
         )
-        device = torch.device("cuda", rank)
+        device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
         config.num_attention_heads = num_attention_heads
         config.num_key_value_heads = num_key_value_heads
@@ -403,7 +404,7 @@ def test_qwen4_exp_depthwise_conv1d_slicing_matches_full(
     key_dim = num_k_heads * head_k_dim
     value_dim = num_v_heads * head_v_dim
     conv_dim = key_dim * 2 + value_dim
-    device = "cuda"
+    device = get_device_type()
     mixed_qkv_full = torch.randn(bsz, conv_dim, seq_len, device=device)
     weight_full = torch.randn(conv_dim, kernel_size, device=device)
 
@@ -467,10 +468,10 @@ def _run_gated_deltanet_equivalence(
         _init_parallel_state(
             dp_size=1,
             ulysses_size=world_size,
-            device_type="cuda",
+            device_type=get_device_type(),
             name=None,
         )
-        device = torch.device("cuda", rank)
+        device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
         if num_k_heads is not None:
             config.linear_num_key_heads = num_k_heads
@@ -587,12 +588,12 @@ def _run_gated_deltanet_determinism(bsz: int, seq_len: int) -> None:
         _init_parallel_state(
             dp_size=1,
             ulysses_size=world_size,
-            device_type="cuda",
+            device_type=get_device_type(),
             name=None,
         )
         _bind_qwen4_exp_op_slots()
         _set_deterministic()
-        device = torch.device("cuda", rank)
+        device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
         layer = qwen4_exp.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).float().to(device)
         _broadcast_module(layer)
@@ -623,7 +624,7 @@ def test_qwen4_exp_gated_deltanet_forward_deterministic_no_sp(bsz: int, seq_len:
 
     _bind_qwen4_exp_op_slots()
     _set_deterministic()
-    device = torch.device("cuda")
+    device = torch.device(get_device_type())
     config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
     layer = qwen4_exp.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).float().to(device)
     inputs = torch.randn(bsz, seq_len, config.hidden_size, device=device)
@@ -650,13 +651,13 @@ def _run_text_model_equivalence() -> None:
         _init_parallel_state(
             dp_size=1,
             ulysses_size=world_size,
-            device_type="cuda",
+            device_type=get_device_type(),
             extra_parallel_names=("ple",),
             extra_parallel_sizes=(1,),
             extra_parallel_placement_innermost=(False,),
             name=None,
         )
-        device = torch.device("cuda", rank)
+        device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
         config._attn_implementation = "eager"
         torch.manual_seed(59)
@@ -752,13 +753,13 @@ def _run_router_aux_loss_equivalence() -> None:
         _init_parallel_state(
             dp_size=1,
             ulysses_size=world_size,
-            device_type="cuda",
+            device_type=get_device_type(),
             extra_parallel_names=("ple",),
             extra_parallel_sizes=(1,),
             extra_parallel_placement_innermost=(False,),
             name=None,
         )
-        device = torch.device("cuda", rank)
+        device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG)
         config.text_config._attn_implementation = "eager"
         torch.manual_seed(67)
@@ -880,13 +881,13 @@ def _run_vlm_placeholder_equivalence() -> None:
         _init_parallel_state(
             dp_size=1,
             ulysses_size=world_size,
-            device_type="cuda",
+            device_type=get_device_type(),
             extra_parallel_names=("ple",),
             extra_parallel_sizes=(1,),
             extra_parallel_placement_innermost=(False,),
             name=None,
         )
-        device = torch.device("cuda", rank)
+        device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG)
         config.text_config._attn_implementation = "eager"
         config.vision_config._attn_implementation = "veomni_flash_attention_2_with_sp"
