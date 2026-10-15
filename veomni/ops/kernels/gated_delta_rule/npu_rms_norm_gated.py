@@ -21,17 +21,28 @@
 import torch
 import torch.nn as nn
 import torch_npu
+from transformers.activations import ACT2FN
+
+
+# ``npu_swiglu`` hard-codes a SiLU gate, so it can only stand in for the gate
+# activation when the model asks for SiLU. Qwen3.5 does (``hidden_act``), but
+# Qwen4-Exp sets ``output_gate_type="sigmoid"`` — fusing there would silently
+# compute the wrong thing.
+_FUSED_GATE_ACTIVATIONS = frozenset({"silu", "swish"})
 
 
 class NPUFusedRMSNormGated(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6, **kwargs):
+    def __init__(self, hidden_size, eps=1e-6, activation: str = "silu", **kwargs):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self.activation = activation
 
     def forward(self, hidden_states, gate=None):
-        hidden_states = torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
-        hidden_states = torch.cat([gate, hidden_states], dim=-1)
-        hidden_states = torch_npu.npu_swiglu(hidden_states, dim=-1)
+        normed = torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
+        if self.activation in _FUSED_GATE_ACTIVATIONS:
+            return torch_npu.npu_swiglu(torch.cat([gate, normed], dim=-1), dim=-1)
 
-        return hidden_states
+        # Still fuses the norm; only the gate falls back to the eager formula
+        # (float32 activation, then cast back) that the reference modules use.
+        return (normed * ACT2FN[self.activation](gate.to(torch.float32))).to(hidden_states.dtype)

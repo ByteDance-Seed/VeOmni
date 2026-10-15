@@ -101,6 +101,16 @@ def _eager_rms_norm_gated(hidden_states, weight, eps, gate):
     return torch.nn.functional.silu(fused_input[..., :half]) * fused_input[..., half:]
 
 
+def _eager_rms_norm_sigmoid_gated(hidden_states, weight, eps, gate):
+    """Eager reference for a sigmoid gate (Qwen4-Exp ``output_gate_type``)."""
+    dtype = hidden_states.dtype
+    x_f = hidden_states.to(torch.float32)
+    variance = x_f.pow(2).mean(-1, keepdim=True)
+    x_f = x_f * torch.rsqrt(variance + eps)
+    normed = (weight * x_f.to(dtype)).to(dtype)
+    return (normed * torch.sigmoid(gate.to(torch.float32))).to(dtype)
+
+
 def _eager_clamped_swiglu(x, limit):
     gate, up = x.chunk(2, dim=-1)
     gate = gate.clamp(max=limit)
@@ -334,6 +344,30 @@ class TestNPURmsNormGated:
         out_eager = _eager_rms_norm_gated(hidden_states, fused_module.weight, fused_module.variance_epsilon, gate)
         # Compound op: RMSNorm + concat + SiLU gate — multiple bf16 roundings.
         # 1e-2 atol+rtol covers 1-2 bf16 ULPs at typical normalized values.
+        assert torch.allclose(out_fused.float(), out_eager.float(), atol=1e-2, rtol=1e-2)
+
+    def test_sigmoid_gate_matches_eager_bf16(self):
+        """A non-SiLU gate must not take the SiLU-only ``npu_swiglu`` path.
+
+        Qwen4-Exp sets ``output_gate_type="sigmoid"``; fusing it would compute
+        ``silu(gate) * normed`` and mis-train without raising.
+        """
+        batch, seq, hidden = 2, 16, 128
+        slot = OpSlot("rms_norm_gated", "standard")
+        slot.bind("npu")
+        fused_module = slot.bound_kernel()(hidden_size=hidden, eps=1e-6, activation="sigmoid").to(
+            device=DEVICE, dtype=torch.bfloat16
+        )
+
+        hidden_states = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
+        # Unlike the SiLU path, the gate is applied elementwise, so it carries
+        # the same width as the normalized hidden states.
+        gate = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
+
+        out_fused = fused_module(hidden_states, gate=gate)
+        out_eager = _eager_rms_norm_sigmoid_gated(
+            hidden_states, fused_module.weight, fused_module.variance_epsilon, gate
+        )
         assert torch.allclose(out_fused.float(), out_eager.float(), atol=1e-2, rtol=1e-2)
 
 
