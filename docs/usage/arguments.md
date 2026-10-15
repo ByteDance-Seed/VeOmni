@@ -440,7 +440,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| type | `Literal["adamw", "anyprecision_adamw", "muon", "adamw_swap"]` | `"adamw"` | Optimizer type. `muon` builds Muon and AdamW parameter groups; `adamw_swap` keeps moment states on host (NPU + FSDP2 only). |
+| type | `Literal["adamw", "anyprecision_adamw", "muon", "adamw_swap"]` | `"adamw"` | Optimizer type. `muon` builds Muon and AdamW parameter groups; `adamw_swap` keeps moment states on host and streams them to the device in batches. |
 | lr | `float` | `5e-5` | Maximum / default learning rate. |
 | lr_min | `float` | `1e-7` | Minimum learning rate. |
 | lr_start | `float` | `0.0` | Starting learning rate for warmup. |

@@ -26,15 +26,11 @@ once per step.
 
 Scope (v1)
 ----------
-* Ascend NPU only, FSDP2 only. Dense models and MoE with ExtraParallel (e.g.
-  expert parallelism) are supported: under ExtraParallel the factory builds one
-  ``SwapAdamW`` per parameter group inside a ``MultiOptimizer``. The factory
-  (``veomni.optim.optimizer.build_optimizer``) enforces the device/mode scope.
-* Checkpoint save/load reads and writes the host buffers directly: the state
-  holders keep their DTensor sharding metadata (mesh, placements, global shape)
-  but their local storage is pointed at the live host buffer, so DCP never
-  materializes optimizer states on the accelerator. See ``state_dict`` /
-  ``load_state_dict``.
+* Dense models and MoE with ExtraParallel (e.g. expert parallelism) are
+  supported: under ExtraParallel the factory builds one ``SwapAdamW`` per
+  parameter group inside a ``MultiOptimizer``. Validated on Ascend NPU + FSDP2.
+* Checkpoint save/load reads and writes the host buffers directly (see
+  ``state_dict`` / ``load_state_dict``).
 * The update kernel is ``torch._fused_adamw_`` on the accelerator (Ascend NPU
   registers it), applied per param group within each swapped-in batch. On CPU
   (unit tests) it falls back to plain elementwise AdamW math, which is
@@ -76,6 +72,12 @@ def _to_local(tensor: Tensor) -> Tensor:
 
 def _storage_nbytes(tensor: Tensor) -> int:
     return tensor.untyped_storage().nbytes()
+
+
+# Effectively unlimited budget: used when free device memory cannot be
+# determined or when streams are disabled (CPU tests), so all states are
+# swapped in a single batch.
+_INFINITE_BUDGET = 1 << 62
 
 
 class SwapAdamW(Optimizer):
@@ -129,22 +131,12 @@ class SwapAdamW(Optimizer):
             raise ValueError(f"chunk_bytes must be >= 1, got {chunk_bytes}")
 
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, amsgrad=amsgrad)
-        super().__init__(params, defaults)
 
         self.mem_fraction_static = float(mem_fraction_static)
         self.pin_memory = bool(pin_memory)
-        # Upper bound on the state bytes updated (and swapped out) per pipeline
-        # chunk. Smaller chunks let the swap-out of one overlap the swap-in of the
-        # next; a byte budget rather than a param count keeps a chunk from
-        # becoming one huge parameter on large models, or hundreds of tiny ones
-        # (launch overhead) on models with many small parameters.
         self.chunk_bytes = int(chunk_bytes)
 
-        # Each optimizer owns two copy streams: H2D states on ``_in_stream`` and D2H
-        # on ``_out_stream``. The two directions then overlap instead of serializing
-        # on a single stream. Leaves of an EP MultiOptimizer step one after another
-        # (serial host loop, every leaf drains its streams at the end of its own
-        # ``step``), so there is no cross-leaf copy to share.
+        # Two copy streams so H2D and D2H overlap instead of serializing on one stream.
         self._device_type = get_device_type()
         self._use_streams = self._device_type != "cpu"
         if self._use_streams:
@@ -162,11 +154,16 @@ class SwapAdamW(Optimizer):
         self._host_states: Dict[Tensor, Dict[str, Tensor]] = {}
         self._device_states: Dict[Tensor, Dict[str, Tensor]] = {}
         self._swap_in_events: Dict[Tensor, Any] = {}
-        # Storages whose device->host copy is still in flight on ``_out_stream``.
-        # They must not be released until that stream has drained, or the caching
-        # allocator could hand the block out while the copy is still reading it.
+        # Storages with an in-flight D2H on ``_out_stream``; freed only after the stream drains.
         self._pending_free: List[Tensor] = []
 
+        # ``Optimizer.__init__`` routes every group through ``add_param_group``, which
+        # builds the state, so the attributes above must exist before it runs.
+        super().__init__(params, defaults)
+        self._init_states()
+
+    def add_param_group(self, param_group: dict) -> None:  # type: ignore[override]
+        super().add_param_group(param_group)
         self._init_states()
 
     # ------------------------------------------------------------------ build
@@ -198,27 +195,27 @@ class SwapAdamW(Optimizer):
                     local_shard.untyped_storage().resize_(0)
 
                 if "step" not in self.state[p]:
-                    self.state[p]["step"] = torch.tensor(0.0)
+                    self.state[p]["step"] = 0
                 self._host_states[p] = host_state
                 self._device_states[p] = device_state
+
+        # Precompute per-step invariants: the param-to-group mapping and
+        # per-param state sizes never change during training.
+        self._group_by_param: Dict[Tensor, Dict[str, Any]] = {}
+        self._param_bytes: Dict[Tensor, int] = {}
+        for group in self.param_groups:
+            for p in group["params"]:
+                self._group_by_param[p] = group
+                local_shard = _to_local(p)
+                self._param_bytes[p] = sum(local_shard.numel() * local_shard.element_size() for _ in self._state_keys)
 
     # -------------------------------------------------------------- checkpoint
 
     def _bind_host_states(self) -> None:
-        """Rebind every state holder to its host buffer for DCP to read.
+        """Rebind every state holder to its live host buffer for DCP to read.
 
-        The DTensor shells in ``self.state`` keep their mesh/placements but their
-        local is the live host buffer, so DCP reads state off the accelerator. The
-        live buffer is bound, not copied - the base (device) optimizer hands DCP
-        live state too, so a snapshot would only add a full extra host copy.
-
-        Async saves are still safe: torch's ``FileSystemWriter`` is a
-        ``BlockingAsyncStager``, so ``dcp.async_save`` deep-copies the state dict
-        synchronously on the calling thread before the background write starts -
-        steps taken after the call cannot tear the checkpoint. That staging copy
-        transiently doubles host optimizer-state memory; sync saves read the live
-        buffers directly with no copy. Pinned by
-        ``test_async_save_snapshots_state_before_later_steps``.
+        The DTensor shells keep their mesh/placements; their local becomes the
+        host buffer, so DCP never materializes state on the accelerator.
         """
         for p, host_state in self._host_states.items():
             for key, host_tensor in host_state.items():
@@ -235,9 +232,18 @@ class SwapAdamW(Optimizer):
                     self.state[p][key] = host_tensor
 
     def state_dict(self):
-        """Optimizer state with all values read from host memory (see ``_bind_host_states``)."""
+        """Optimizer state with all values read from host memory (see ``_bind_host_states``).
+
+        ``step`` is stored internally as a Python int but exported as a CPU
+        tensor so DCP checkpoints stay compatible with stock AdamW (which also
+        stores step as a tensor).
+        """
         self._bind_host_states()
-        return super().state_dict()
+        state_dict = super().state_dict()
+        for param_state in state_dict["state"].values():
+            if "step" in param_state:
+                param_state["step"] = torch.tensor(float(param_state["step"]))
+        return state_dict
 
     def load_state_dict(self, state_dict) -> None:
         """Load values into the host buffers without materializing them on device.
@@ -270,16 +276,9 @@ class SwapAdamW(Optimizer):
             return
         for key, loaded in value.items():
             if key == "step":
-                # Own the value rather than aliasing the checkpoint's tensor:
-                # ``_bump_step`` mutates it in place, so an alias would corrupt it.
                 if isinstance(loaded, DTensor):
                     loaded = _to_local(loaded)
-                scalar = loaded.item() if isinstance(loaded, torch.Tensor) else loaded
-                step = self.state[p]["step"]
-                if isinstance(step, torch.Tensor):
-                    step.fill_(scalar)
-                else:
-                    self.state[p]["step"] = scalar
+                self.state[p]["step"] = int(loaded.item()) if isinstance(loaded, torch.Tensor) else int(loaded)
             elif key in host_state and loaded is not None:
                 source = _to_local(loaded) if isinstance(loaded, DTensor) else loaded
                 host_state[key].copy_(source.to(host_state[key].device))
@@ -307,33 +306,29 @@ class SwapAdamW(Optimizer):
 
     # ------------------------------------------------------------- step pieces
 
-    def _param_state_bytes(self, p: Tensor) -> int:
-        local_shard = _to_local(p)
-        return sum(local_shard.numel() * local_shard.element_size() for _ in self._state_keys)
-
     def _device_free_bytes(self) -> int:
         """Bytes this process can still allocate on the device.
 
-        ``total - allocated`` includes cached-but-unused allocator blocks that
-        ``mem_get_info`` under-reports (freed states return to the pool, not the
-        device), which would collapse the swap batch after the first big swap-in.
+        Driver-level free (``mem_get_info``) plus the allocator's cached-but-unused
+        blocks (``reserved - allocated``).
         """
         device = get_torch_device()
         try:
-            total = int(device.get_device_properties(get_device_id()).total_memory)
-            return total - int(device.memory_allocated())
-        except Exception:
+            free, _total = device.mem_get_info()
+            cached = int(device.memory_reserved()) - int(device.memory_allocated())
+            return int(free) + max(cached, 0)
+        except (AttributeError, RuntimeError, NotImplementedError):
             try:
-                free, _total = device.mem_get_info()
-                return int(free)
-            except (AttributeError, RuntimeError):
+                total = int(device.get_device_properties(get_device_id()).total_memory)
+                return total - int(device.memory_allocated())
+            except (AttributeError, RuntimeError, NotImplementedError):
                 pass
         logger.warning_once("SwapAdamW could not determine free device memory; swapping states in one batch.")
-        return 1 << 62  # pragma: no cover
+        return _INFINITE_BUDGET  # pragma: no cover
 
     def _batch_budget_bytes(self) -> int:
         if not self._use_streams:
-            return 1 << 62
+            return _INFINITE_BUDGET
         return max(int(self._device_free_bytes() * self.mem_fraction_static), 0)
 
     def _release_pending_storages(self) -> None:
@@ -396,15 +391,14 @@ class SwapAdamW(Optimizer):
         budget = self._batch_budget_bytes()
         with stream_context:
             while index < len(params):
-                param_bytes = self._param_state_bytes(params[index])
+                param_bytes = self._param_bytes[params[index]]
                 if bytes_moved != 0 and bytes_moved + param_bytes > budget:
                     break
                 self._swap_in_param(params[index])
                 bytes_moved += param_bytes
                 index += 1
-        # Progress is measured by index, not bytes: a rank whose active params all
-        # have empty local shards (uneven EP/FSDP sharding) moves zero bytes yet
-        # still advances, and must not trip the "could not fit" guard.
+        # Progress is measured by index: empty shards (uneven EP/FSDP sharding)
+        # move zero bytes yet must still advance past the "could not fit" guard.
         if index == start_index:
             raise RuntimeError(
                 "SwapAdamW could not fit any optimizer state on device. "
@@ -413,11 +407,7 @@ class SwapAdamW(Optimizer):
         return index
 
     def _bump_step(self, p: Tensor) -> int:
-        step = self.state[p]["step"]
-        if isinstance(step, torch.Tensor):
-            step = step.add_(1)
-            return int(step.item())
-        step = int(step) + 1
+        step = int(self.state[p]["step"]) + 1
         self.state[p]["step"] = step
         return step
 
@@ -455,12 +445,7 @@ class SwapAdamW(Optimizer):
         local_p.addcdiv_(exp_avg, denom, value=-lr / bias_correction1)
 
     def _update_group_fused(self, params: Sequence[Tensor], group: Dict[str, Any]) -> None:
-        """Update a chunk of parameters that share one param group in a single fused call.
-
-        ``torch._fused_adamw_`` takes one scalar hyperparameter set per call, so a
-        batch spanning several groups is split into one call per group. Batching
-        the call (instead of one call per parameter) amortizes the kernel launch.
-        """
+        """Update a chunk of parameters that share one param group in a single fused call."""
         if not params:
             return
         amsgrad = bool(group["amsgrad"])
@@ -489,12 +474,7 @@ class SwapAdamW(Optimizer):
         )
 
     def _update_chunk(self, params: Sequence[Tensor], group: Dict[str, Any]) -> None:
-        """Update one chunk of parameters that share ``group``.
-
-        Uses the native fused kernel when available, else the elementwise path
-        (CPU tests). Callers keep a chunk within a single param group because a
-        fused call takes one set of hyperparameters.
-        """
+        """Update one chunk of parameters that share ``group``."""
         if self._use_fused:
             self._update_group_fused(params, group)
         else:
@@ -511,15 +491,12 @@ class SwapAdamW(Optimizer):
                 loss = closure()
 
         active: List[Tensor] = []
-        group_by_param: Dict[Tensor, Dict[str, Any]] = {}
-        for group in self.param_groups:
-            for param in group["params"]:
-                group_by_param[param] = group
-                if not param.requires_grad or param.grad is None:
-                    continue
-                if param.grad.is_sparse:
-                    raise RuntimeError("SwapAdamW does not support sparse gradients")
-                active.append(param)
+        for param in self._group_by_param:
+            if not param.requires_grad or param.grad is None:
+                continue
+            if param.grad.is_sparse:
+                raise RuntimeError("SwapAdamW does not support sparse gradients")
+            active.append(param)
 
         index = 0
         num_params = len(active)
@@ -531,16 +508,16 @@ class SwapAdamW(Optimizer):
                 # chunk never crosses a group boundary. Within a group it is split
                 # into ``chunk_bytes``-sized stages so the swap-out of one chunk
                 # overlaps the swap-in of the next (and the compute in between).
-                group = group_by_param[active[group_start]]
+                group = self._group_by_param[active[group_start]]
                 group_end = group_start + 1
-                while group_end < batch_end and group_by_param[active[group_end]] is group:
+                while group_end < batch_end and self._group_by_param[active[group_end]] is group:
                     group_end += 1
                 chunk_start = group_start
                 while chunk_start < group_end:
                     chunk_end = chunk_start
                     acc_bytes = 0
                     while chunk_end < group_end:
-                        param_bytes = self._param_state_bytes(active[chunk_end])
+                        param_bytes = self._param_bytes[active[chunk_end]]
                         if chunk_end > chunk_start and acc_bytes + param_bytes > self.chunk_bytes:
                             break
                         acc_bytes += param_bytes

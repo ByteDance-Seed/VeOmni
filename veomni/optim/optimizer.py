@@ -389,28 +389,6 @@ def _should_build_extra_parallel_aware(model: "nn.Module") -> bool:
     return False
 
 
-def _validate_swap_adamw_environment() -> None:
-    """Fail fast when ``optimizer.type='adamw_swap'`` runs outside its v1 scope.
-
-    Supported configuration: Ascend NPU + FSDP2, with or without ExtraParallel
-    (e.g. MoE expert parallelism). ExtraParallel routes the swap optimizer
-    through ``build_extra_parallel_fsdp2_optimizer``, which builds one
-    ``SwapAdamW`` per parameter group.
-    """
-    from ..utils.device import get_device_type
-    from ..utils.import_utils import is_torch_npu_available
-
-    if not is_torch_npu_available():
-        raise ValueError(
-            "optimizer.type='adamw_swap' is only supported on Ascend NPU in this version; "
-            f"detected device type {get_device_type()!r}."
-        )
-
-    parallel_state = get_parallel_state()
-    if parallel_state.dp_mode != "fsdp2":
-        raise ValueError(f"optimizer.type='adamw_swap' requires fsdp_mode='fsdp2', got {parallel_state.dp_mode!r}.")
-
-
 def _make_param_groups_for_subset(
     model: "nn.Module",
     params: Iterable[torch.nn.Parameter],
@@ -523,9 +501,6 @@ def build_optimizer(
             no_decay_params=no_decay_params,
             muon_kwargs=muon_kwargs,
         )
-
-    if optimizer_type == "adamw_swap":
-        _validate_swap_adamw_environment()
 
     if param_groups is not None:
         param_groups = filter_empty_param_groups(param_groups)

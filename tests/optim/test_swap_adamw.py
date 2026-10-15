@@ -227,6 +227,34 @@ def test_param_groups_and_missing_grad(cpu_mesh):
     torch.testing.assert_close(par_c.to_local(), ref_c.detach(), atol=1e-6, rtol=1e-6)
 
 
+def test_add_param_group_matches_eager_groups(cpu_mesh):
+    torch.manual_seed(10)
+    init_a, init_b = torch.randn(4, 3), torch.randn(2, 3)
+
+    ref_a, ref_b = nn.Parameter(init_a.clone()), nn.Parameter(init_b.clone())
+    par_a, par_b = _swap_param(init_a, cpu_mesh), _swap_param(init_b, cpu_mesh)
+
+    ref_opt = torch.optim.AdamW(
+        [{"params": [ref_a], "weight_decay": 0.1}, {"params": [ref_b], "weight_decay": 0.0}],
+        lr=1e-2,
+        foreach=False,
+    )
+    swap_opt = SwapAdamW([{"params": [par_a], "weight_decay": 0.1}], lr=1e-2, pin_memory=False)
+    swap_opt.add_param_group({"params": [par_b], "weight_decay": 0.0})
+
+    grad_a, grad_b = torch.randn(4, 3), torch.randn(2, 3)
+    ref_a.grad, ref_b.grad = grad_a.clone(), grad_b.clone()
+    par_a.grad = _partition(grad_a.clone(), cpu_mesh)
+    par_b.grad = _partition(grad_b.clone(), cpu_mesh)
+
+    ref_opt.step()
+    swap_opt.step()
+
+    torch.testing.assert_close(par_a.to_local(), ref_a.detach(), atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(par_b.to_local(), ref_b.detach(), atol=1e-6, rtol=1e-6)
+    assert int(swap_opt.state[par_b]["step"]) == 1
+
+
 def test_multi_optimizer_steps_and_frees_storages(cpu_mesh):
     from veomni.optim.optimizer import MultiOptimizer
 
@@ -292,9 +320,54 @@ def test_state_dict_load_state_dict_round_trip(cpu_mesh):
             rtol=0,
         )
     assert int(dst.state[dst_param]["step"]) == int(src.state[src_param]["step"])
-    # The loaded step must be owned by ``dst``, not aliased from the checkpoint's
-    # state dict: ``_bump_step`` mutates it in place, so an alias would bump ``src``.
-    assert dst.state[dst_param]["step"] is not src.state[src_param]["step"]
+
+
+def test_device_free_bytes_driver_free_plus_pool_cache(monkeypatch):
+    from veomni.optim import swap_adamw
+
+    class _FakeDevice:
+        @staticmethod
+        def mem_get_info():
+            return 10 << 30, 64 << 30
+
+        @staticmethod
+        def memory_reserved():
+            return 12 << 30
+
+        @staticmethod
+        def memory_allocated():
+            return 8 << 30
+
+    monkeypatch.setattr(swap_adamw, "get_torch_device", lambda: _FakeDevice)
+    param = nn.Parameter(torch.randn(4, 3))
+    opt = SwapAdamW([param], pin_memory=False)
+    assert opt._device_free_bytes() == 14 << 30
+
+
+def test_device_free_bytes_falls_back_to_total_minus_allocated(monkeypatch):
+    from veomni.optim import swap_adamw
+
+    class _Props:
+        total_memory = 64 << 30
+
+    class _FakeDevice:
+        @staticmethod
+        def mem_get_info():
+            raise AttributeError("mem_get_info unavailable")
+
+        @staticmethod
+        def get_device_properties(_device_id):
+            return _Props()
+
+        @staticmethod
+        def memory_allocated():
+            return 8 << 30
+
+    monkeypatch.setattr(swap_adamw, "get_torch_device", lambda: _FakeDevice)
+    monkeypatch.setattr(swap_adamw, "get_device_id", lambda: 0)
+    param = nn.Parameter(torch.randn(4, 3))
+    opt = SwapAdamW([param], pin_memory=False)
+    assert opt._device_free_bytes() == 56 << 30
 
 
 # ---------------------------------------------------------------------------
