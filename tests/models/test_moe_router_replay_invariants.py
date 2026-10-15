@@ -17,8 +17,9 @@
 These tests are a layer up from the hook-API unit tests in
 ``tests/utils/test_moe_router_replay.py``. They instantiate the actually
 patched ``SparseMoeBlock`` of each wired family (``Qwen3MoeSparseMoeBlock``,
-``Qwen3_5MoeSparseMoeBlock``) from the generated ``patched_modeling_*.py``
-modules, run real forward passes (with VeOmni's Liger fused MoE experts in
+``Qwen3_5MoeSparseMoeBlock``, ``Qwen4ExpTextSparseMoeBlock``) from the
+generated ``patched_modeling_*.py`` modules, run real forward passes (with
+VeOmni's Liger fused MoE experts in
 the loop for Test A), and verify the two RR guarantees that the API alone
 cannot:
 
@@ -31,8 +32,9 @@ B. **REPLAY-with-native-indices reproduces the native ``(idx, w)`` pair
    as the oracle.** Combined with a small plumbing assertion that REPLAY
    with alt indices actually substitutes, this verifies the recompute
    path (``softmax → gather → renorm → cast`` for qwen3_moe; ``gather →
-   renorm → cast`` for qwen3_5_moe) is bytewise equivalent to the native
-   router's internal post-topk math, independent of the indices chosen.
+   renorm → cast`` for qwen3_5_moe and qwen4_exp) is bytewise equivalent
+   to the native router's internal post-topk math, independent of the
+   indices chosen.
 
 The capture-experts pattern in Test B replaces ``block.experts`` with a
 sink that records ``(idx, w)`` and returns zeros. This isolates the
@@ -123,8 +125,8 @@ def _capture_experts_inputs():
     """Return a (sink, captured) pair.
 
     ``sink`` is an ``nn.Module`` whose ``forward`` matches the
-    ``self.experts(h, idx, w)`` call signature used by both qwen3_moe and
-    qwen3_5_moe SparseMoeBlock. Install via attribute swap
+    ``self.experts(h, idx, w)`` call signature used by qwen3_moe,
+    qwen3_5_moe, and qwen4_exp SparseMoeBlock. Install via attribute swap
     (``block.experts = sink``); the original experts module is never
     invoked. ``sink`` MUST be an ``nn.Module`` rather than a plain
     function: ``nn.Module.__setattr__`` rejects assignment of a non-Module
@@ -195,6 +197,15 @@ def _make_qwen3_5_moe_config():
     )
 
 
+def _make_qwen4_exp_config(norm_topk_prob: bool):
+    """Load the repository's toy Qwen4-Exp config and select router normalization."""
+    from transformers import Qwen4ExpConfig
+
+    config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").text_config
+    config.norm_topk_prob = norm_topk_prob
+    return config
+
+
 # ----------------------------------------------------------------- weight init
 
 
@@ -217,11 +228,12 @@ def _init_block_deterministic(block: nn.Module, seed: int = 0) -> None:
 
 
 def _build_patched_qwen3_moe_block(config, device=_DEVICE, dtype=torch.bfloat16):
-    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import (
-        Qwen3MoeSparseMoeBlock as PatchedQwen3MoeSparseMoeBlock,
-    )
+    from veomni.models.transformers.qwen3_moe.generated import patched_modeling_qwen3_moe_gpu as modeling
 
-    block = PatchedQwen3MoeSparseMoeBlock(config).to(device=device, dtype=dtype)
+    modeling.veomni_moe_experts_forward.bind("triton")
+    assert modeling.veomni_moe_experts_forward.use_non_eager_impl
+
+    block = modeling.Qwen3MoeSparseMoeBlock(config).to(device=device, dtype=dtype)
     _init_block_deterministic(block, seed=0)
     return block
 
@@ -243,11 +255,14 @@ def _build_vanilla_qwen3_moe_block(config, device=_DEVICE, dtype=torch.bfloat16)
 
 
 def _build_patched_qwen3_5_moe_block(config, device=_DEVICE, dtype=torch.bfloat16):
-    from veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_gpu import (
-        Qwen3_5MoeSparseMoeBlock as PatchedQwen3_5MoeSparseMoeBlock,
+    from veomni.models.transformers.qwen3_5_moe.generated import (
+        patched_modeling_qwen3_5_moe_gpu as modeling,
     )
 
-    block = PatchedQwen3_5MoeSparseMoeBlock(config).to(device=device, dtype=dtype)
+    modeling.veomni_moe_experts_forward.bind("triton")
+    assert modeling.veomni_moe_experts_forward.use_non_eager_impl
+
+    block = modeling.Qwen3_5MoeSparseMoeBlock(config).to(device=device, dtype=dtype)
     _init_block_deterministic(block, seed=0)
     return block
 
@@ -260,6 +275,28 @@ def _build_vanilla_qwen3_5_moe_block(config, device=_DEVICE, dtype=torch.bfloat1
     )
 
     block = VanillaQwen3_5MoeSparseMoeBlock(config).to(device=device, dtype=dtype)
+    _init_block_deterministic(block, seed=0)
+    return block
+
+
+def _build_patched_qwen4_exp_block(config, device=_DEVICE, dtype=torch.bfloat16):
+    from veomni.models.transformers.qwen4_exp.generated import patched_modeling_qwen4_exp_gpu as modeling
+
+    modeling.veomni_moe_experts_forward.bind("triton")
+    assert modeling.veomni_moe_experts_forward.use_non_eager_impl
+
+    block = modeling.Qwen4ExpTextSparseMoeBlock(config).to(device=device, dtype=dtype)
+    _init_block_deterministic(block, seed=0)
+    return block
+
+
+def _build_vanilla_qwen4_exp_block(config, device=_DEVICE, dtype=torch.bfloat16):
+    """Build pristine HF Qwen4-Exp SparseMoeBlock as the router oracle."""
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import (
+        Qwen4ExpTextSparseMoeBlock as VanillaQwen4ExpTextSparseMoeBlock,
+    )
+
+    block = VanillaQwen4ExpTextSparseMoeBlock(config).to(device=device, dtype=dtype)
     _init_block_deterministic(block, seed=0)
     return block
 
@@ -326,6 +363,29 @@ def test_qwen3_5_moe_record_mode_is_bitwise_baseline_with_liger_experts():
 
     assert torch.equal(out_baseline, out_record), (
         "RECORD mode perturbed the forward output — RR is supposed to be a passive observer, not a transform."
+    )
+    assert ctrl.recorded is not None
+    expected_shape = (h.shape[0] * h.shape[1], config.num_experts_per_tok)
+    assert tuple(ctrl.recorded.shape) == expected_shape
+
+
+@pytest.mark.parametrize("norm_topk_prob", [False, True])
+def test_qwen4_exp_record_mode_is_bitwise_baseline_with_liger_experts(
+    norm_topk_prob,
+):
+    config = _make_qwen4_exp_config(norm_topk_prob)
+    block = _build_patched_qwen4_exp_block(config)
+    h = _make_hidden_states(config)
+
+    out_baseline = block(h).clone()
+
+    ctrl = _IndexController()
+    set_active_replay(ctrl)
+    out_record = block(h).clone()
+    set_active_replay(None)
+
+    assert torch.equal(out_baseline, out_record), (
+        f"Qwen4-Exp RECORD mode perturbed the forward output for norm_topk_prob={norm_topk_prob}."
     )
     assert ctrl.recorded is not None
     expected_shape = (h.shape[0] * h.shape[1], config.num_experts_per_tok)
@@ -458,3 +518,48 @@ def test_qwen3_5_moe_replay_native_matches_vanilla_hf_at_expert_input():
     idx_alt, _ = _capture_block_experts_inputs(patched, h)
     set_active_replay(None)
     assert torch.equal(idx_alt, alt)
+
+
+@pytest.mark.parametrize("norm_topk_prob", [False, True])
+@pytest.mark.parametrize(("batch", "seq"), [(2, 16), (1, 7), (3, 5)])
+def test_qwen4_exp_replay_native_matches_vanilla_hf_at_expert_input(
+    norm_topk_prob,
+    batch,
+    seq,
+):
+    config = _make_qwen4_exp_config(norm_topk_prob)
+    patched = _build_patched_qwen4_exp_block(config)
+    vanilla = _build_vanilla_qwen4_exp_block(config)
+    _sync_gate_weight(patched, vanilla)
+    h = _make_hidden_states(config, batch=batch, seq=seq)
+
+    idx_vanilla, w_vanilla_native_dtype = _capture_block_experts_inputs(vanilla, h)
+    idx_patched_off, w_patched_off = _capture_block_experts_inputs(patched, h)
+    w_vanilla = w_vanilla_native_dtype.to(w_patched_off.dtype)
+    assert torch.equal(idx_patched_off, idx_vanilla)
+    assert torch.equal(w_patched_off, w_vanilla)
+
+    ctrl = _IndexController()
+    ctrl.replay_target = idx_vanilla.clone()
+    set_active_replay(ctrl)
+    idx_replay, w_replay = _capture_block_experts_inputs(patched, h)
+    set_active_replay(None)
+
+    assert torch.equal(idx_replay, idx_vanilla)
+    assert torch.equal(w_replay, w_vanilla), (
+        f"Qwen4-Exp replay weight recomputation diverged from the native router for norm_topk_prob={norm_topk_prob}."
+    )
+
+    alt = (idx_vanilla + 1) % config.num_experts
+    ctrl.replay_target = alt
+    set_active_replay(ctrl)
+    idx_alt, w_alt = _capture_block_experts_inputs(patched, h)
+    set_active_replay(None)
+    assert torch.equal(idx_alt, alt)
+
+    routing_logits = patched.gate(h.view(-1, config.hidden_size))[0]
+    expected_weights = torch.softmax(routing_logits, dtype=torch.float, dim=-1).gather(1, alt)
+    if norm_topk_prob:
+        expected_weights = expected_weights / expected_weights.sum(-1, keepdim=True)
+    expected_weights = expected_weights.to(w_alt.dtype)
+    assert torch.equal(w_alt, expected_weights)
