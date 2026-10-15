@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 import torch
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.gemma4.modeling_gemma4 import (
     Gemma4AudioModel,
     Gemma4AudioModelOutput,
@@ -54,6 +55,7 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin"],
 )
 config.add_import("veomni.ops.kernels.cross_entropy", names=["ForCausalLMLoss"])
+config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_post_import_block(
     """
     from veomni.ops.dispatch import OpSlot
@@ -62,6 +64,42 @@ config.add_post_import_block(
 )
 
 veomni_causal_lm_loss = None
+
+
+@config.override_method(
+    "Gemma4VisionModel.forward",
+    description="Reject unsupported vision Ulysses layouts before entering sharded vision modules",
+)
+def gemma4_vision_forward_patched(
+    self,
+    pixel_values: torch.FloatTensor,
+    pixel_position_ids: torch.LongTensor,
+    **kwargs: Unpack[TransformersKwargs],
+) -> BaseModelOutputWithPast:
+    if get_parallel_state().ulysses_enabled:
+        raise NotImplementedError("Gemma 4 vision does not support Ulysses sequence parallelism; use ulysses_size=1.")
+
+    pooling_kernel_size = self.config.pooling_kernel_size
+    output_length = pixel_values.shape[-2] // (pooling_kernel_size * pooling_kernel_size)
+    padding_positions = (pixel_position_ids == -1).all(dim=-1)
+    inputs_embeds = self.patch_embedder(pixel_values, pixel_position_ids, padding_positions)
+    output = self.encoder(
+        inputs_embeds=inputs_embeds,
+        attention_mask=~padding_positions,
+        pixel_position_ids=pixel_position_ids,
+        **kwargs,
+    )
+    hidden_states, pooler_mask = self.pooler(
+        hidden_states=output.last_hidden_state,
+        pixel_position_ids=pixel_position_ids,
+        padding_positions=padding_positions,
+        output_length=output_length,
+    )
+    hidden_states = hidden_states[pooler_mask]
+    if self.config.standardize:
+        hidden_states = (hidden_states - self.std_bias.float()) * self.std_scale.float()
+    hidden_states = hidden_states.to(inputs_embeds.dtype)
+    return BaseModelOutputWithPast(last_hidden_state=hidden_states)
 
 
 @config.override_method(

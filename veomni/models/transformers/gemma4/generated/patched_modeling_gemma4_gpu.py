@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Gemma4VisionModel.forward
+#      Reject unsupported vision Ulysses layouts before entering sharded vision modules
 #    - method_override: Gemma4AudioModel.forward
 #      Build boolean local audio masks independently of the language-model attention backend
 #    - function_replacement: create_masks_for_vision_model
@@ -78,6 +80,8 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
+
+from veomni.distributed.parallel_state import get_parallel_state
 
 # Additional imports for patches
 from veomni.models.transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -2068,6 +2072,12 @@ class Gemma4AudioModel(Gemma4PreTrainedModel):
         return Gemma4AudioModelOutput(last_hidden_state=hidden_states, attention_mask=output_mask)
 
 
+# ======================================================================
+# [MODIFIED CLASS] Gemma4VisionModel
+# Methods patched: forward
+# ======================================================================
+
+
 class Gemma4VisionModel(Gemma4PreTrainedModel):
     """The Gemma 4 Vision Encoder."""
 
@@ -2098,41 +2108,31 @@ class Gemma4VisionModel(Gemma4PreTrainedModel):
         pixel_position_ids: torch.LongTensor,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
-        r"""
-        pixel_values (`torch.FloatTensor` or `list[torch.FloatTensor]`):
-            The images to encode. Either a single `[batch, channels, height, width]` tensor
-            (all images same size) or a list of `[1, channels, height, width]` tensors (different sizes).
-        pixel_position_ids (`torch.LongTensor` of shape `(batch_size, max_patches, 2)`):
-            The patch positions as (x, y) coordinates in the image. Padding patches are indicated by (-1, -1).
-        """
+        if get_parallel_state().ulysses_enabled:
+            raise NotImplementedError(
+                "Gemma 4 vision does not support Ulysses sequence parallelism; use ulysses_size=1."
+            )
+
         pooling_kernel_size = self.config.pooling_kernel_size
         output_length = pixel_values.shape[-2] // (pooling_kernel_size * pooling_kernel_size)
-
         padding_positions = (pixel_position_ids == -1).all(dim=-1)
         inputs_embeds = self.patch_embedder(pixel_values, pixel_position_ids, padding_positions)
         output = self.encoder(
             inputs_embeds=inputs_embeds,
-            attention_mask=~padding_positions,  # encoder expects True=valid, padding_positions is True=padding
+            attention_mask=~padding_positions,
             pixel_position_ids=pixel_position_ids,
             **kwargs,
         )
-
         hidden_states, pooler_mask = self.pooler(
             hidden_states=output.last_hidden_state,
             pixel_position_ids=pixel_position_ids,
             padding_positions=padding_positions,
             output_length=output_length,
         )
-
-        # Strip padding tokens. pooler_mask is True = valid, False = padding.
         hidden_states = hidden_states[pooler_mask]
-
-        # The pooler returns float32-scaled features. Standardize in float32 (the std_bias
-        # subtraction cancels large values) and cast back to the working dtype.
         if self.config.standardize:
             hidden_states = (hidden_states - self.std_bias.float()) * self.std_scale.float()
         hidden_states = hidden_states.to(inputs_embeds.dtype)
-
         return BaseModelOutputWithPast(last_hidden_state=hidden_states)
 
 

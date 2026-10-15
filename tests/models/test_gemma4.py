@@ -14,6 +14,7 @@
 
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -25,6 +26,7 @@ from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGener
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models.auto import build_foundation_model
+from veomni.models.transformers.gemma4.generated import patched_modeling_gemma4_gpu as gemma4_modeling
 from veomni.models.transformers.gemma4.generated.patched_modeling_gemma4_gpu import (
     Gemma4ForConditionalGeneration as VeOmniGemma4,
 )
@@ -93,6 +95,28 @@ def test_gemma4_audio_matches_boolean_mask_reference(backend):
     torch.testing.assert_close(
         audio.layers[0].self_attn.q_proj.linear.weight.grad, reference.layers[0].self_attn.q_proj.linear.weight.grad
     )
+
+
+@pytest.mark.parametrize("entry", ["image", "video", "tower"])
+def test_gemma4_vision_rejects_ulysses_before_tower_computation(monkeypatch, entry):
+    """Unadapted vision layouts fail explicitly before any FSDP-sharded vision block."""
+    model = VeOmniGemma4._from_config(_toy_config(), attn_implementation="eager")
+    monkeypatch.setattr(
+        gemma4_modeling, "get_parallel_state", lambda: SimpleNamespace(ulysses_enabled=True), raising=False
+    )
+    calls = []
+    model.model.vision_tower.patch_embedder.register_forward_pre_hook(lambda *args: calls.append("patch_embedder"))
+    positions = torch.cartesian_prod(torch.arange(4), torch.arange(4)).unsqueeze(0)
+    pixels = torch.randn(1, 16, 48)
+
+    with pytest.raises(NotImplementedError, match="Gemma 4 vision.*Ulysses"):
+        if entry == "image":
+            model.get_image_features(pixels, positions)
+        elif entry == "video":
+            model.model.get_video_features(pixels.unsqueeze(1), positions.unsqueeze(1))
+        else:
+            model.model.vision_tower(pixel_values=pixels, pixel_position_ids=positions)
+    assert calls == []
 
 
 def test_gemma4_state_dict_matches_huggingface():
