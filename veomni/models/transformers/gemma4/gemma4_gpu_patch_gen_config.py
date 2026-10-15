@@ -67,6 +67,36 @@ veomni_causal_lm_loss = None
 
 
 @config.override_method(
+    "Gemma4VisionModel.dummy_forward",
+    description="Execute a minimal vision forward using live projection dtype for FSDP participation",
+)
+def gemma4_vision_dummy_forward_patched(self):
+    """Run one poolable image without caching inputs across mixed-precision calls."""
+    weight = self.patch_embedder.input_proj.weight
+    side = self.config.pooling_kernel_size
+    positions = torch.cartesian_prod(
+        torch.arange(side, device=weight.device), torch.arange(side, device=weight.device)
+    ).unsqueeze(0)
+    pixels = torch.zeros(1, side**2, 3 * self.config.patch_size**2, dtype=weight.dtype, device=weight.device)
+    return self(pixel_values=pixels, pixel_position_ids=positions)
+
+
+@config.override_method(
+    "Gemma4AudioModel.dummy_forward",
+    description="Execute a minimal audio forward using live convolution dtype for FSDP participation",
+)
+def gemma4_audio_dummy_forward_patched(self):
+    """Run one subsampled audio chunk without caching mixed-precision inputs."""
+    weight = self.subsample_conv_projection.layer0.conv.weight
+    length = 4 * self.config.attention_chunk_size
+    features = torch.zeros(
+        1, length, self.config.subsampling_conv_channels[0], dtype=weight.dtype, device=weight.device
+    )
+    mask = torch.ones(1, length, dtype=torch.bool, device=weight.device)
+    return self(input_features=features, attention_mask=mask)
+
+
+@config.override_method(
     "Gemma4VisionModel.forward",
     description="Reject unsupported vision Ulysses layouts before entering sharded vision modules",
 )
@@ -267,6 +297,10 @@ def gemma4_model_forward_patched(
     per_layer_inputs (`torch.Tensor`, *optional*):
         Pre-computed Gemma 4 per-layer embeddings.
     """
+    # All ranks reject this layout, including text-only ranks that would otherwise
+    # enter language collectives while a peer fails inside the vision tower.
+    if self.vision_tower is not None and get_parallel_state().ulysses_enabled:
+        raise NotImplementedError("Gemma 4 vision does not support Ulysses sequence parallelism; use ulysses_size=1.")
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -301,6 +335,9 @@ def gemma4_model_forward_patched(
         inputs_embeds = inputs_embeds.masked_scatter(
             image_mask.to(inputs_embeds.device), image_features.to(inputs_embeds.device)
         )
+    elif self.vision_tower is not None and get_parallel_state().fsdp_enabled:
+        dummy_features = self.embed_vision(self.vision_tower.dummy_forward().last_hidden_state)
+        inputs_embeds = inputs_embeds + dummy_features.sum().to(inputs_embeds) * 0.0
 
     if pixel_values_videos is not None:
         video_features = self.get_video_features(
@@ -317,6 +354,9 @@ def gemma4_model_forward_patched(
         inputs_embeds = inputs_embeds.masked_scatter(
             video_mask.to(inputs_embeds.device), video_features.to(inputs_embeds.device)
         )
+    elif self.vision_tower is not None and get_parallel_state().fsdp_enabled:
+        dummy_features = self.embed_vision(self.vision_tower.dummy_forward().last_hidden_state)
+        inputs_embeds = inputs_embeds + dummy_features.sum().to(inputs_embeds) * 0.0
 
     if input_features is not None and input_features_mask is not None:
         audio_output = self.get_audio_features(input_features, input_features_mask, return_dict=True)
@@ -333,6 +373,9 @@ def gemma4_model_forward_patched(
         inputs_embeds = inputs_embeds.masked_scatter(
             audio_mask.to(inputs_embeds.device), audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
         )
+    elif self.audio_tower is not None and get_parallel_state().fsdp_enabled:
+        dummy_features = self.embed_audio(self.audio_tower.dummy_forward().last_hidden_state)
+        inputs_embeds = inputs_embeds + dummy_features.sum().to(inputs_embeds) * 0.0
 
     if position_ids is None:
         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0

@@ -33,6 +33,8 @@ from veomni.models.transformers.gemma4.generated.patched_modeling_gemma4_gpu imp
 from veomni.ops.kernels import attention as veomni_attention
 from veomni.trainer.callbacks.channel_loss_callback import ChannelLossComputer
 
+from ..tools.gemma4_utils import make_gemma4_batch
+
 
 _TOY_CONFIG = Path(__file__).parents[1] / "toy_config" / "gemma4_toy"
 _FLEX_IMPLEMENTATION = "veomni_flex_attention_with_sp"
@@ -116,6 +118,86 @@ def test_gemma4_vision_rejects_ulysses_before_tower_computation(monkeypatch, ent
             model.model.get_video_features(pixels.unsqueeze(1), positions.unsqueeze(1))
         else:
             model.model.vision_tower(pixel_values=pixels, pixel_position_ids=positions)
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "modalities",
+    [
+        (),
+        ("image",),
+        ("video",),
+        ("audio",),
+        ("image", "video"),
+        ("image", "audio"),
+        ("video", "audio"),
+        ("image", "video", "audio"),
+    ],
+)
+def test_gemma4_fsdp_dummy_paths_preserve_outputs_and_gradients(monkeypatch, modalities):
+    """Every modality combination visits the same tower order and retains zero-grad dependencies."""
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    model = build_foundation_model(
+        _TOY_CONFIG, torch_dtype="float32", init_device="cpu", ops_implementation=_eager_ops_config("eager")
+    )
+    batch = make_gemma4_batch(model.config, modalities)
+    with torch.no_grad():
+        expected = model(**batch)
+    calls = []
+    model.model.vision_tower.register_forward_pre_hook(lambda *args: calls.append("vision"))
+    model.model.audio_tower.register_forward_pre_hook(lambda *args: calls.append("audio"))
+    monkeypatch.setattr(
+        gemma4_modeling,
+        "get_parallel_state",
+        lambda: SimpleNamespace(fsdp_enabled=True, ulysses_enabled=False),
+    )
+
+    output = model(**batch)
+    output.loss.backward()
+
+    assert calls == ["vision", "vision", "audio"]
+    torch.testing.assert_close(output.logits, expected.logits)
+    torch.testing.assert_close(output.loss, expected.loss)
+    for prefix, active in (
+        ("vision_tower", "image" in modalities or "video" in modalities),
+        ("audio_tower", "audio" in modalities),
+        ("embed_vision", "image" in modalities or "video" in modalities),
+        ("embed_audio", "audio" in modalities),
+    ):
+        for name, parameter in getattr(model.model, prefix).named_parameters():
+            assert parameter.grad is not None, f"Missing gradient for {prefix}.{name}"
+            assert torch.isfinite(parameter.grad).all(), f"Nonfinite gradient for {prefix}.{name}"
+            if not active:
+                assert torch.count_nonzero(parameter.grad) == 0, f"Nonzero dummy gradient for {prefix}.{name}"
+
+
+@pytest.mark.parametrize("tower_name", ["vision_tower", "audio_tower"])
+def test_gemma4_dummy_inputs_follow_live_parameter_dtype(tower_name):
+    """Repeated dummy calls follow compute-weight casts instead of cached input dtype."""
+    model = VeOmniGemma4._from_config(_toy_config(), attn_implementation="eager")
+    tower = getattr(model.model, tower_name)
+    with torch.no_grad():
+        for dtype in (torch.float32, torch.bfloat16, torch.float32):
+            tower.to(dtype=dtype)
+            output = tower.dummy_forward()
+            assert output.last_hidden_state.dtype == dtype
+            assert torch.isfinite(output.last_hidden_state).all()
+
+
+@pytest.mark.parametrize("fsdp_enabled", [False, True])
+def test_gemma4_conditional_ulysses_rejection_is_rank_symmetric(monkeypatch, fsdp_enabled):
+    """A text-only peer rejects unsupported vision SP before entering language collectives."""
+    model = VeOmniGemma4._from_config(_toy_config(), attn_implementation="eager")
+    monkeypatch.setattr(
+        gemma4_modeling,
+        "get_parallel_state",
+        lambda: SimpleNamespace(fsdp_enabled=fsdp_enabled, ulysses_enabled=True),
+    )
+    calls = []
+    for name in ("vision_tower", "audio_tower", "language_model"):
+        getattr(model.model, name).register_forward_pre_hook(lambda *args: calls.append("tower"))
+    with pytest.raises(NotImplementedError, match="Gemma 4 vision.*Ulysses"):
+        model(input_ids=torch.tensor([[3, 4, 5, 6]]), use_cache=False)
     assert calls == []
 
 

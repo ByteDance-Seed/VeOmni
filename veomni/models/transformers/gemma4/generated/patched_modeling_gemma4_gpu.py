@@ -9,6 +9,10 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Gemma4VisionModel.dummy_forward
+#      Execute a minimal vision forward using live projection dtype for FSDP participation
+#    - method_override: Gemma4AudioModel.dummy_forward
+#      Execute a minimal audio forward using live convolution dtype for FSDP participation
 #    - method_override: Gemma4VisionModel.forward
 #      Reject unsupported vision Ulysses layouts before entering sharded vision modules
 #    - method_override: Gemma4AudioModel.forward
@@ -1984,7 +1988,7 @@ def sliding_window_mask_function(sliding_window: tuple[int, int]) -> Callable:
 
 # ======================================================================
 # [MODIFIED CLASS] Gemma4AudioModel
-# Methods patched: forward
+# Methods patched: dummy_forward, forward
 # ======================================================================
 
 
@@ -2071,10 +2075,20 @@ class Gemma4AudioModel(Gemma4PreTrainedModel):
         hidden_states = self.output_proj(hidden_states)
         return Gemma4AudioModelOutput(last_hidden_state=hidden_states, attention_mask=output_mask)
 
+    def dummy_forward(self):
+        """Run one subsampled audio chunk without caching mixed-precision inputs."""
+        weight = self.subsample_conv_projection.layer0.conv.weight
+        length = 4 * self.config.attention_chunk_size
+        features = torch.zeros(
+            1, length, self.config.subsampling_conv_channels[0], dtype=weight.dtype, device=weight.device
+        )
+        mask = torch.ones(1, length, dtype=torch.bool, device=weight.device)
+        return self(input_features=features, attention_mask=mask)
+
 
 # ======================================================================
 # [MODIFIED CLASS] Gemma4VisionModel
-# Methods patched: forward
+# Methods patched: dummy_forward, forward
 # ======================================================================
 
 
@@ -2134,6 +2148,16 @@ class Gemma4VisionModel(Gemma4PreTrainedModel):
             hidden_states = (hidden_states - self.std_bias.float()) * self.std_scale.float()
         hidden_states = hidden_states.to(inputs_embeds.dtype)
         return BaseModelOutputWithPast(last_hidden_state=hidden_states)
+
+    def dummy_forward(self):
+        """Run one poolable image without caching inputs across mixed-precision calls."""
+        weight = self.patch_embedder.input_proj.weight
+        side = self.config.pooling_kernel_size
+        positions = torch.cartesian_prod(
+            torch.arange(side, device=weight.device), torch.arange(side, device=weight.device)
+        ).unsqueeze(0)
+        pixels = torch.zeros(1, side**2, 3 * self.config.patch_size**2, dtype=weight.dtype, device=weight.device)
+        return self(pixel_values=pixels, pixel_position_ids=positions)
 
 
 class Gemma4MultimodalEmbedder(nn.Module):
@@ -2365,6 +2389,12 @@ class Gemma4Model(Gemma4PreTrainedModel):
         per_layer_inputs (`torch.Tensor`, *optional*):
             Pre-computed Gemma 4 per-layer embeddings.
         """
+        # All ranks reject this layout, including text-only ranks that would otherwise
+        # enter language collectives while a peer fails inside the vision tower.
+        if self.vision_tower is not None and get_parallel_state().ulysses_enabled:
+            raise NotImplementedError(
+                "Gemma 4 vision does not support Ulysses sequence parallelism; use ulysses_size=1."
+            )
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -2399,6 +2429,9 @@ class Gemma4Model(Gemma4PreTrainedModel):
             inputs_embeds = inputs_embeds.masked_scatter(
                 image_mask.to(inputs_embeds.device), image_features.to(inputs_embeds.device)
             )
+        elif self.vision_tower is not None and get_parallel_state().fsdp_enabled:
+            dummy_features = self.embed_vision(self.vision_tower.dummy_forward().last_hidden_state)
+            inputs_embeds = inputs_embeds + dummy_features.sum().to(inputs_embeds) * 0.0
 
         if pixel_values_videos is not None:
             video_features = self.get_video_features(
@@ -2415,6 +2448,9 @@ class Gemma4Model(Gemma4PreTrainedModel):
             inputs_embeds = inputs_embeds.masked_scatter(
                 video_mask.to(inputs_embeds.device), video_features.to(inputs_embeds.device)
             )
+        elif self.vision_tower is not None and get_parallel_state().fsdp_enabled:
+            dummy_features = self.embed_vision(self.vision_tower.dummy_forward().last_hidden_state)
+            inputs_embeds = inputs_embeds + dummy_features.sum().to(inputs_embeds) * 0.0
 
         if input_features is not None and input_features_mask is not None:
             audio_output = self.get_audio_features(input_features, input_features_mask, return_dict=True)
@@ -2431,6 +2467,9 @@ class Gemma4Model(Gemma4PreTrainedModel):
             inputs_embeds = inputs_embeds.masked_scatter(
                 audio_mask.to(inputs_embeds.device), audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
             )
+        elif self.audio_tower is not None and get_parallel_state().fsdp_enabled:
+            dummy_features = self.embed_audio(self.audio_tower.dummy_forward().last_hidden_state)
+            inputs_embeds = inputs_embeds + dummy_features.sum().to(inputs_embeds) * 0.0
 
         if position_ids is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
