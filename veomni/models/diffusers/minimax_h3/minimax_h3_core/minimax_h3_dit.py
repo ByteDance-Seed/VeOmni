@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import math
+import os
+from contextlib import nullcontext
 from typing import NamedTuple
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
 from veomni.distributed.sequence_parallel.ulysses import (
@@ -88,7 +91,17 @@ class _PackedBounds(NamedTuple):
     host: tuple[int, ...]
 
 
-def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale, compatibility_mode=False):
+def _sdpa_backend_context(q, use_cudnn):
+    """Limit an opted-in DiT/refiner call to cuDNN and restore backend flags on exit."""
+    if not use_cudnn:
+        return nullcontext()
+    if q.device.type != "cuda" or q.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("H3 torch_cudnn attention requires CUDA FP16 or BF16 inputs.")
+    return sdpa_kernel(SDPBackend.CUDNN_ATTENTION)
+
+
+def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale, compatibility_mode=False, *, use_cudnn=False):
+    """Apply SDPA independently to packed segments, optionally selecting cuDNN."""
     # Zero uncovered SP rows so discarded outputs cannot poison parameter gradients.
     out = torch.zeros_like(q)
     # Host-side segment bounds: the DiT / token-refiner entries convert the
@@ -101,7 +114,8 @@ def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale, compatibility_mod
         seg_q = q[start:stop].transpose(0, 1).unsqueeze(0)
         seg_k = k[start:stop].transpose(0, 1).unsqueeze(0)
         seg_v = v[start:stop].transpose(0, 1).unsqueeze(0)
-        seg_out = nn.functional.scaled_dot_product_attention(seg_q, seg_k, seg_v, scale=softmax_scale)
+        with _sdpa_backend_context(seg_q, use_cudnn):
+            seg_out = nn.functional.scaled_dot_product_attention(seg_q, seg_k, seg_v, scale=softmax_scale)
         out[start:stop] = seg_out.squeeze(0).transpose(0, 1)
     return out
 
@@ -146,7 +160,9 @@ class MiniMaxH3TimeEmbedder(nn.Module):
 
 class MiniMaxH3Attention(nn.Module):
     def __init__(self, hidden_size, num_attention_heads, attention_head_dim, qk_norm_eps, config=None):
+        """Bind instance-owned attention ops and capture the optional cuDNN SDPA setting."""
         super().__init__()
+        self._use_cudnn_sdpa = os.environ.get("MINIMAX_H3_ATTENTION_IMPLEMENTATION", "").lower() == "torch_cudnn"
         self.num_heads = num_attention_heads
         self.head_dim = attention_head_dim
         inner_dim = self.num_heads * self.head_dim
@@ -212,6 +228,7 @@ class MiniMaxH3Attention(nn.Module):
                 cu_seqlens=cu_seqlens,
                 softmax_scale=self.softmax_scale,
                 compatibility_mode=compatibility_mode,
+                use_cudnn=self._use_cudnn_sdpa,
             )
         bounds = tuple(cu_seqlens.tolist()) if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
         # Zero uncovered SP rows so discarded outputs cannot poison parameter gradients.
