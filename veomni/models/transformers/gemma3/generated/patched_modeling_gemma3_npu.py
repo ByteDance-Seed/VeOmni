@@ -42,7 +42,7 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.configuration_utils import PreTrainedConfig
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernelized_func
+from transformers.integrations import use_kernel_forward_from_hub, use_kernelized_func
 from transformers.masking_utils import (
     _preprocess_mask_arguments,
     blockwise_overlay,
@@ -364,6 +364,7 @@ def rotate_half(x):
 # Reason: OpSlot guard for NPU fused RoPE
 # Source: veomni.models.transformers.gemma3.gemma3_npu_patch_gen_config
 # ======================================================================
+@use_kernel_forward_from_hub("rotary_pos_emb")
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,

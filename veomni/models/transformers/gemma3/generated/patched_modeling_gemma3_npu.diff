@@ -69,7 +69,7 @@
 +from transformers.cache_utils import Cache, DynamicCache
 +from transformers.configuration_utils import PreTrainedConfig
 +from transformers.generation import GenerationMixin
-+from transformers.integrations import use_kernelized_func
++from transformers.integrations import use_kernel_forward_from_hub, use_kernelized_func
 +from transformers.masking_utils import (
      _preprocess_mask_arguments,
      blockwise_overlay,
@@ -253,11 +253,16 @@
          output = output * (1.0 + self.weight.float())
          return output.type_as(x)
 
-@@ -232,25 +359,21 @@
+@@ -232,25 +359,22 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
--@use_kernel_forward_from_hub("rotary_pos_emb")
++# ======================================================================
++# [PATCHED FUNCTION] apply_rotary_pos_emb
++# Reason: OpSlot guard for NPU fused RoPE
++# Source: veomni.models.transformers.gemma3.gemma3_npu_patch_gen_config
++# ======================================================================
+ @use_kernel_forward_from_hub("rotary_pos_emb")
 -def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 -    """Applies Rotary Position Embedding to the query and key tensors.
 -
@@ -276,11 +281,6 @@
 -    Returns:
 -        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
 -    """
-+# ======================================================================
-+# [PATCHED FUNCTION] apply_rotary_pos_emb
-+# Reason: OpSlot guard for NPU fused RoPE
-+# Source: veomni.models.transformers.gemma3.gemma3_npu_patch_gen_config
-+# ======================================================================
 +def apply_rotary_pos_emb(
 +    q: torch.Tensor,
 +    k: torch.Tensor,
@@ -294,7 +294,7 @@
      cos = cos.unsqueeze(unsqueeze_dim)
      sin = sin.unsqueeze(unsqueeze_dim)
      q_embed = (q * cos) + (rotate_half(q) * sin)
-@@ -481,6 +604,12 @@
+@@ -481,6 +605,12 @@
      return inner_mask
 
 
@@ -307,7 +307,7 @@
  @auto_docstring
  class Gemma3TextModel(Gemma3PreTrainedModel):
      config: Gemma3TextConfig
-@@ -541,6 +670,7 @@
+@@ -541,6 +671,7 @@
                  "attention_mask": attention_mask,
                  "past_key_values": past_key_values,
                  "position_ids": position_ids,
@@ -315,7 +315,7 @@
              }
              sliding_mask_kwargs = mask_kwargs.copy()
 
-@@ -576,6 +706,12 @@
+@@ -576,6 +707,12 @@
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
          )
@@ -328,7 +328,7 @@
 
 
  @auto_docstring
-@@ -609,24 +745,6 @@
+@@ -609,24 +746,6 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> CausalLMOutputWithPast:
@@ -353,7 +353,7 @@
          outputs: BaseModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -638,21 +756,53 @@
+@@ -638,21 +757,53 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -416,7 +416,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -758,6 +908,12 @@
+@@ -758,6 +909,12 @@
      }
 
 
@@ -429,7 +429,7 @@
  @auto_docstring(
      custom_intro="""
      The Base Gemma3 model which consists of a vision backbone and a language model without language modeling head.,
-@@ -767,14 +923,14 @@
+@@ -767,14 +924,14 @@
      # we are filtering the logits/labels so we shouldn't divide the loss based on num_items_in_batch
      accepts_loss_kwargs = False
 
@@ -447,7 +447,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -827,39 +983,9 @@
+@@ -827,39 +984,9 @@
          use_cache: bool | None = None,
          **lm_kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Gemma3ModelOutputWithPast:
@@ -487,7 +487,7 @@
          if input_ids is not None and self.config.image_token_id >= self.vocab_size:
              special_image_mask = input_ids == self.config.image_token_id
              llm_input_ids = input_ids.clone()
-@@ -870,7 +996,6 @@
+@@ -870,7 +997,6 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(llm_input_ids)
 
@@ -495,7 +495,7 @@
          if pixel_values is not None:
              image_features = self.get_image_features(pixel_values, return_dict=True).pooler_output
              image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
-@@ -879,24 +1004,16 @@
+@@ -879,24 +1005,16 @@
              )
              inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
 
@@ -529,7 +529,7 @@
 
          outputs = self.language_model(
              attention_mask=causal_mask_mapping,
-@@ -917,6 +1034,12 @@
+@@ -917,6 +1035,12 @@
          )
 
 
@@ -542,7 +542,7 @@
  @auto_docstring(
      custom_intro="""
      The Base Gemma3 model which consists of a vision backbone and a language model without language modeling head.,
-@@ -928,10 +1051,18 @@
+@@ -928,10 +1052,18 @@
      # Fix: https://github.com/huggingface/transformers/issues/40564
      accepts_loss_kwargs = False
 
@@ -562,7 +562,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -953,52 +1084,7 @@
+@@ -953,52 +1085,7 @@
          use_cache: bool | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **lm_kwargs: Unpack[TransformersKwargs],
@@ -616,7 +616,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1014,35 +1100,56 @@
+@@ -1014,35 +1101,56 @@
          )
 
          hidden_states = outputs[0]
@@ -695,7 +695,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1086,6 +1193,17 @@
+@@ -1086,6 +1194,17 @@
              )
 
          return create_masks_for_generate(**mask_kwargs)
