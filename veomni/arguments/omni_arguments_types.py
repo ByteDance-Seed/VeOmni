@@ -199,7 +199,8 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
     # it. ``seed_omni_model_path`` is the root configs / assets / graphs are read
     # from (a weight-free view when ``model_path`` is an upstream HF checkpoint).
     seed_omni_model_path = _resolve_hf_checkpoint_view(model_runtime)
-    if not for_inference and args.train.checkpoint.save_hf_weights:
+    # An ``offline_embedding`` run trains nothing, so it never exports HF weights.
+    if not for_inference and args.train.checkpoint.save_hf_weights and args.train.training_task != "offline_embedding":
         _check_hf_source_exportable(seed_omni_model_path)
     omni_cfg = _try_load_omni_checkpoint_config(seed_omni_model_path)
 
