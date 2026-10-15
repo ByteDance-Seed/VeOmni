@@ -36,15 +36,15 @@ from ...platform import (
 from ...registry import register_op
 from .causal_conv1d.standard import eager as conv_eager
 from .causal_conv1d.standard import fla as conv_fla
-from .causal_conv1d.standard import npu as conv_npu
+from .causal_conv1d.standard import triton as conv_triton
 from .chunk_gated_delta_rule.standard import eager as chunk_eager
 from .chunk_gated_delta_rule.standard import fla as chunk_fla
+from .chunk_gated_delta_rule.standard import fla_npu as chunk_fla_npu
 from .chunk_gated_delta_rule.standard import flash_qla as chunk_flash_qla
-from .chunk_gated_delta_rule.standard import npu as chunk_npu
-from .chunk_gated_delta_rule.standard import npu_ascendc as chunk_ascendc
+from .chunk_gated_delta_rule.standard import triton as chunk_triton
 from .rms_norm_gated.standard import eager as rms_eager
 from .rms_norm_gated.standard import fla as rms_fla
-from .rms_norm_gated.standard import npu as rms_npu
+from .rms_norm_gated.standard import torch_npu as rms_torch_npu
 
 
 _GPU = GpuKernelRequirement()
@@ -92,9 +92,9 @@ register_op(
 register_op(
     "rms_norm_gated",
     "standard",
-    "npu",
+    "torch_npu",
     description="Fused RMSNorm with a SiLU gate using torch_npu",
-    wrapper=rms_npu.wrapper,
+    wrapper=rms_torch_npu.wrapper,
     requirement=NpuKernelRequirement(),
 )
 
@@ -139,9 +139,9 @@ register_op(
 register_op(
     "causal_conv1d",
     "standard",
-    "npu",
-    conv_npu.forward,
-    conv_npu.backward,
+    "triton",
+    conv_triton.forward,
+    conv_triton.backward,
     description="Vendored Triton depthwise causal convolution with variable-length support",
     requirement=NpuKernelRequirement(),
     requires=("triton",),
@@ -198,9 +198,9 @@ register_op(
 register_op(
     "chunk_gated_delta_rule",
     "standard",
-    "npu",
-    chunk_npu.forward,
-    chunk_npu.backward,
+    "triton",
+    chunk_triton.forward,
+    chunk_triton.backward,
     description="Vendored Triton chunked gated delta rule with variable-length support",
     requirement=NpuKernelRequirement(),
     requires=("triton",),
@@ -209,9 +209,9 @@ register_op(
 register_op(
     "chunk_gated_delta_rule",
     "standard",
-    "npu_ascendc",
-    chunk_ascendc.forward,
-    chunk_ascendc.backward,
+    "fla_npu",
+    chunk_fla_npu.forward,
+    chunk_fla_npu.backward,
     description="AscendC chunked gated delta rule with variable-length support",
     requirement=NpuKernelRequirement(),
     requires=("fla_npu", "triton"),

@@ -65,7 +65,10 @@ def test_resolve_op_impl_reads_ops_config():
 
 
 def test_resolve_op_impl_applies_variant_scoped_aliases():
+    with ops_config_scope(SimpleNamespace(rms_norm_implementation="torch_npu")):
+        assert resolve_op_impl("rms_norm_implementation") == "torch_npu"
+        assert resolve_op_impl("rms_norm_implementation", variant="standard") == "torch_npu"
+        assert resolve_op_impl("rms_norm_implementation", variant="unweighted") == "eager"
+    # The deprecated field-level name still reaches a consumer that bypasses config parsing.
     with ops_config_scope(SimpleNamespace(rms_norm_implementation="npu")):
-        assert resolve_op_impl("rms_norm_implementation") == "npu"
-        assert resolve_op_impl("rms_norm_implementation", variant="standard") == "npu"
         assert resolve_op_impl("rms_norm_implementation", variant="unweighted") == "eager"

@@ -1285,9 +1285,9 @@ class TrainingArguments:
 # names alone do not capture per-model compatibility. Unset fields take their
 # host default before this allow-list validation.
 _NPU_ALLOWED: Dict[str, frozenset] = {
-    "rms_norm_implementation": frozenset({"npu"}),
-    "rotary_pos_emb_implementation": frozenset({"npu"}),
-    "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
+    "rms_norm_implementation": frozenset({"torch_npu"}),
+    "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
+    "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
     "swiglu_mlp_implementation": frozenset(),
     "load_balancing_loss_implementation": frozenset(),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss"}),
@@ -1295,9 +1295,9 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
 }
 
 _NPU_REQUIRED: Dict[str, frozenset] = {
-    "rms_norm_implementation": frozenset({"npu"}),
-    "rotary_pos_emb_implementation": frozenset({"npu"}),
-    "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
+    "rms_norm_implementation": frozenset({"torch_npu"}),
+    "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
+    "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
     "moe_implementation": frozenset({"fused_npu"}),
 }
 
@@ -1323,10 +1323,10 @@ _GPU_DEFAULT_IMPLEMENTATIONS: Dict[str, str] = {
 _NPU_DEFAULT_IMPLEMENTATIONS: Dict[str, str] = {
     "moe_implementation": "fused_npu",
     "cross_entropy_loss_implementation": "chunk_loss",
-    "rms_norm_implementation": "npu",
+    "rms_norm_implementation": "torch_npu",
     "swiglu_mlp_implementation": "eager",
-    "rotary_pos_emb_implementation": "npu",
-    "rotary_pos_emb_vision_implementation": "npu",
+    "rotary_pos_emb_implementation": "torch_npu",
+    "rotary_pos_emb_vision_implementation": "torch_npu",
     "load_balancing_loss_implementation": "eager",
 }
 
@@ -1357,22 +1357,29 @@ _DEPRECATED_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, str]] = {
         )
     },
     "moe_implementation": {"fused_mlu_triton": "fused_triton"},
-    # ``npu`` names a third-party NPU kernel; the old CE ``npu`` was ``chunk_loss``.
+    # ``npu`` named the hardware rather than the kernel behind it. Each row now
+    # says which third-party kernel it calls; the old CE ``npu`` was ``chunk_loss``.
     "cross_entropy_loss_implementation": {"npu": "chunk_loss"},
+    "rms_norm_implementation": {"npu": "torch_npu"},
+    "rotary_pos_emb_implementation": {"npu": "torch_npu"},
+    "rotary_pos_emb_vision_implementation": {"npu": "torch_npu"},
+    "rms_norm_gated_implementation": {"npu": "torch_npu"},
+    "causal_conv1d_implementation": {"npu": "triton"},
+    "chunk_gated_delta_rule_implementation": {"npu": "triton", "npu_ascendc": "fla_npu"},
 }
 
 # Variant-scoped aliases for fields shared by several variants, applied by
 # ``resolve_op_impl(field, variant=...)``. The value stays valid for the other
-# variants. These old ``npu`` rows were PyTorch math, not third-party kernels.
+# variants. These variants have no Ascend kernel, only PyTorch math.
 _DEPRECATED_VARIANT_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, Dict[str, str]]] = {
-    "rms_norm_implementation": {"unweighted": {"npu": "eager"}},
+    "rms_norm_implementation": {"unweighted": {"torch_npu": "eager", "npu": "eager"}},
 }
 
 # Values that were never implementation names and have no implementation equivalent.
 _REJECTED_IMPLEMENTATION_VALUES: Dict[str, Dict[str, str]] = {
     "rms_norm_implementation": {
         "qwen3_5": "'qwen3_5' was the Qwen3.5 RMSNorm variant name (now 'offset'), not an implementation; "
-        "use one of 'liger_kernel', 'npu', 'triton', or 'eager'.",
+        "use one of 'liger_kernel', 'torch_npu', 'triton', or 'eager'.",
     },
 }
 
@@ -1399,14 +1406,14 @@ class OpsImplementationConfig:
       model-specific ops such as ``rms_norm_gated``, ``causal_conv1d``, and
       ``chunk_gated_delta_rule``. Keeping this compatibility check at the
       consuming model avoids forcing unrelated models to configure them.
-      All three ship both a GPU (``fla``) and an NPU (``npu``) backend; the
+      All three ship both a GPU (``fla``) and an NPU backend; the
       kernel's ``HardwareRequirement`` raises only when the requested value has
       no backend for the current hardware. The varlen (``dyn_bsz=True``) caveat
       is documented in the field metadata.
 
     Backends: ``"eager"`` (HF reference, always available),
-    ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"npu"`` (Ascend),
-    ``"triton"`` (CUDA ``triton``). Load-balancing loss has a CUDA Triton
+    ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"torch_npu"`` (Ascend),
+    ``"triton"`` (CUDA ``triton``, or Triton-Ascend on NPU). Load-balancing loss has a CUDA Triton
     backend; its NPU default is ``"eager"``.
     """
 
@@ -1458,17 +1465,16 @@ class OpsImplementationConfig:
             "requires VeOmni-patched modeling that passes hidden_states=/weights= to "
             "self.loss_function; unpatched HF models raise) | 'chunk_loss' (chunked "
             "F.linear+CE, hardware-agnostic) | 'eager' (PyTorch F.cross_entropy). "
-            "'npu' is a deprecated alias for 'chunk_loss'. "
             "Unset: 'liger_kernel' on GPU, 'chunk_loss' on NPU, 'eager' on MLU."
         },
     )
     rms_norm_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "RMSNorm. 'liger_kernel' (GPU) | 'npu' (torch_npu; the unweighted "
-            "variant has no NPU kernel and uses 'eager') | "
+            "help": "RMSNorm. 'liger_kernel' (GPU) | 'torch_npu' (Ascend; the unweighted "
+            "variant has no Ascend kernel and uses 'eager') | "
             "'triton' (DeepSeek-V3 batch-invariant; GPU only) | 'eager'. "
-            "Unset: 'liger_kernel' on GPU, 'npu' on NPU, 'eager' on MLU."
+            "Unset: 'liger_kernel' on GPU, 'torch_npu' on NPU, 'eager' on MLU."
         },
     )
     swiglu_mlp_implementation: Optional[str] = field(
@@ -1482,17 +1488,17 @@ class OpsImplementationConfig:
         default=None,
         metadata={
             "help": "Rotary positional embedding. 'liger_kernel' (GPU) | "
-            "'npu' | 'triton' (per-model: DeepSeek-V3 deterministic, "
+            "'torch_npu' (Ascend) | 'triton' (per-model: DeepSeek-V3 deterministic, "
             "DeepSeek-V4 fused partial-interleaved, Wan; GPU only) | 'eager'. "
-            "Unset: 'liger_kernel' on GPU, 'npu' on NPU, 'eager' on MLU."
+            "Unset: 'liger_kernel' on GPU, 'torch_npu' on NPU, 'eager' on MLU."
         },
     )
     rotary_pos_emb_vision_implementation: Optional[str] = field(
         default=None,
         metadata={
             "help": "Rank-3 vision layout for full rotary positional embedding. "
-            "Uses the same 'rope' op with an independent implementation choice: 'npu' | 'eager'. "
-            "Unset: 'npu' on NPU, 'eager' elsewhere."
+            "Uses the same 'rope' op with an independent implementation choice: 'torch_npu' | 'eager'. "
+            "Unset: 'torch_npu' on NPU, 'eager' elsewhere."
         },
     )
     load_balancing_loss_implementation: Optional[str] = field(
@@ -1508,7 +1514,7 @@ class OpsImplementationConfig:
             "help": "Gated RMSNorm implementation (Qwen3.5 GatedDeltaNet `self.norm`). "
             "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'eager' uses the HuggingFace Qwen3_5RMSNormGated. "
-            "'npu' uses the VeOmni NPUFusedRMSNormGated."
+            "'torch_npu' uses the VeOmni NPUFusedRMSNormGated."
         },
     )
     causal_conv1d_implementation: str = field(
@@ -1518,7 +1524,7 @@ class OpsImplementationConfig:
             "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'eager' leaves causal_conv1d_fn unset; the varlen training path then raises "
             "because no torch fallback handles cu_seqlens. "
-            "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
+            "'triton' uses the vendored Triton-Ascend kernel (requires triton-ascend, NPU). "
             "Only affects varlen (dyn_bsz) training; a non-eager value on hardware without a "
             "matching backend raises when the model resolves its kernel."
         },
@@ -1532,8 +1538,8 @@ class OpsImplementationConfig:
             "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
             "cu_seqlens; varlen training therefore raises at runtime. "
-            "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
-            "'npu_ascendc' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
+            "'triton' uses the vendored Triton-Ascend kernel (requires triton-ascend, NPU). "
+            "'fla_npu' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
             "delegates heavy GDN compute to torch.ops.npu.*). "
             "A non-eager value on hardware without a matching backend raises when the model resolves its kernel."
         },

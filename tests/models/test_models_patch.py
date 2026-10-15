@@ -160,10 +160,10 @@ def _kernel_ops(model_type: str) -> dict[str, str]:
     """The ops a kernel mode selects for ``model_type`` on this device."""
     if IS_NPU_AVAILABLE:
         ops = {
-            "rms_norm_implementation": "npu",
+            "rms_norm_implementation": "torch_npu",
             "swiglu_mlp_implementation": "eager",
-            "rotary_pos_emb_implementation": "npu",
-            "rotary_pos_emb_vision_implementation": "npu",
+            "rotary_pos_emb_implementation": "torch_npu",
+            "rotary_pos_emb_vision_implementation": "torch_npu",
             "cross_entropy_loss_implementation": "chunk_loss",
         }
         if model_type == "deepseek_v4":

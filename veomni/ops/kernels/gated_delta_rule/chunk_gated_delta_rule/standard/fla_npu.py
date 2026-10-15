@@ -243,10 +243,10 @@ def _ensure_fla_npu_registered() -> None:
         if error.name != "fla_npu":
             raise
         raise RuntimeError(
-            "chunk_gated_delta_rule 'npu_ascendc' backend requires the 'fla_npu' package, "
+            "chunk_gated_delta_rule 'fla_npu' backend requires the 'fla_npu' package, "
             "which is not installed. Install fla_npu manually on NPU "
             "(https://github.com/flashserve/flash-linear-attention-npu), or set "
-            "chunk_gated_delta_rule_implementation to 'npu' (vendored Triton) or 'eager'."
+            "chunk_gated_delta_rule_implementation to 'triton' (vendored Triton-Ascend) or 'eager'."
         ) from error
 
 
@@ -528,7 +528,7 @@ def forward(
             f"v current type is {value_h.dtype}; they should be equal"
         )
     if query_h.dtype == torch.float32:
-        raise ValueError("chunk_gated_delta_rule npu_ascendc does not support float32. Please use float16/bfloat16.")
+        raise ValueError("chunk_gated_delta_rule fla_npu does not support float32. Please use float16/bfloat16.")
     if beta.ndim != 3 or g.ndim != 3:
         raise ValueError("g and beta must be rank-3 tensors with shape [B, T, H].")
     if query_h.ndim != 4 or key_h.ndim != 4 or value_h.ndim != 4:
@@ -547,16 +547,16 @@ def forward(
     initial_opt = optional_tensor(initial_state)
     if initial_opt is not None and initial_opt.requires_grad:
         raise NotImplementedError(
-            "npu_ascendc chunk_gated_delta_rule cannot differentiate initial_state "
+            "fla_npu chunk_gated_delta_rule cannot differentiate initial_state "
             "(the AscendC backward returns no dh0, same as MindSpeed-MM). Detach "
-            "initial_state, or use the 'npu' (Triton) backend if you need that gradient."
+            "initial_state, or use the 'triton' backend if you need that gradient."
         )
     inputs_need_grad = any(tensor.requires_grad for tensor in (query, key, value, g, beta))
     if output_final_state and inputs_need_grad:
         raise NotImplementedError(
-            "npu_ascendc chunk_gated_delta_rule cannot differentiate the final state "
+            "fla_npu chunk_gated_delta_rule cannot differentiate the final state "
             "(the AscendC backward drops dht). Set output_final_state=False, or use "
-            "the 'npu' (Triton) backend if you need a final-state loss."
+            "the 'triton' backend if you need a final-state loss."
         )
 
     cu_opt = optional_tensor(cu_seqlens)

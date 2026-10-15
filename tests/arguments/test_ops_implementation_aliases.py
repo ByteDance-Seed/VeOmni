@@ -76,6 +76,27 @@ def test_npu_cross_entropy_resolves_to_chunk_loss(on_npu: bool, warnings: list[s
     assert len(warnings) == 1 and "chunk_loss" in warnings[0]
 
 
+@pytest.mark.parametrize(
+    ("field_name", "old", "new"),
+    [
+        ("rms_norm_implementation", "npu", "torch_npu"),
+        ("rotary_pos_emb_implementation", "npu", "torch_npu"),
+        ("rotary_pos_emb_vision_implementation", "npu", "torch_npu"),
+        ("rms_norm_gated_implementation", "npu", "torch_npu"),
+        ("causal_conv1d_implementation", "npu", "triton"),
+        ("chunk_gated_delta_rule_implementation", "npu", "triton"),
+        ("chunk_gated_delta_rule_implementation", "npu_ascendc", "fla_npu"),
+    ],
+)
+def test_device_named_values_resolve_to_the_implementation_they_call(
+    field_name: str, old: str, new: str, warnings: list[str], monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(import_utils, "is_torch_npu_available", lambda: True)
+    config = OpsImplementationConfig(**{field_name: old})
+    assert getattr(config, field_name) == new
+    assert len(warnings) == 1 and old in warnings[0] and new in warnings[0]
+
+
 def test_qwen3_5_rms_norm_value_is_rejected_at_parse_time(warnings: list[str]):
     with pytest.raises(ValueError, match="variant name .*'offset'"):
         OpsImplementationConfig(rms_norm_implementation="qwen3_5")

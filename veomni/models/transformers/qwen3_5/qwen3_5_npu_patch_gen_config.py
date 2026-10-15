@@ -540,7 +540,7 @@ def qwen3_5_text_model_forward_patched(
     # Modification: precompute varlen metadata once for all GDN layers to avoid per-layer tolist overhead.
     cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
     if cu_seq_lens_q is not None and "cu_seqlens_list_q" not in kwargs:
-        from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.npu_ascendc import (
+        from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.fla_npu import (
             precompute_varlen_metadata,
         )
 

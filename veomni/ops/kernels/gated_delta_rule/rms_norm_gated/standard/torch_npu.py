@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""standard rms_norm_gated npu adapter."""
+"""standard rms_norm_gated torch_npu adapter."""
 
 from __future__ import annotations
 

@@ -48,7 +48,7 @@ def resolve_op_impl(field: str, *, variant: str | None = None, eager_as: str | N
     """Return the impl name on the installed ops config, or ``eager``.
 
     ``variant`` applies the variant-scoped deprecated aliases for fields shared
-    by several variants, such as ``rms_norm_implementation='npu'`` on the
+    by several variants, such as ``rms_norm_implementation='torch_npu'`` on the
     ``unweighted`` variant. ``eager_as`` remaps ``eager`` for modeling without a
     local ``eager_attention_forward``, which the ``attention/standard/eager``
     row requires. Missing config is eager so unit tests can construct a module

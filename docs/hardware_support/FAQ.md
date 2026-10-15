@@ -58,8 +58,8 @@ Configure the operators in your YAML configuration file:
 model:
   ops_implementation:
     # Use these only when replacing explicit GPU-only overrides.
-    rms_norm_implementation: "npu"
-    rotary_pos_emb_implementation: "npu"
+    rms_norm_implementation: "torch_npu"
+    rotary_pos_emb_implementation: "torch_npu"
     swiglu_mlp_implementation: "eager"
     moe_implementation: "fused_npu"
 ```
@@ -70,14 +70,15 @@ model:
 General operator settings left unset resolve to NPU-compatible implementations on NPU:
 
 - `npu_group_gemm`: [MoE GroupGEMM kernel](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/moe_experts/standard/npu.py)
-- `npu_rms_norm`: [RMS normalization kernel](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/rms_norm/standard/npu.py)
-- `npu_rotary_mul`: [RoPE positional encoding kernel](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/rope/full/npu.py)
+- `npu_rms_norm`: [RMS normalization kernel](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/rms_norm/standard/torch_npu.py)
+- `npu_rotary_mul`: [RoPE positional encoding kernel](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/rope/full/torch_npu.py)
 
 **Note**: Only unset fields take the NPU default. Explicit values are preserved and rejected
 if unsupported, so remove or replace GPU-only values such as `liger_kernel` and `fused_triton`
 when reusing a GPU YAML. Attention continues to use
 the configured HuggingFace attention backend. Qwen3.5's `rms_norm_gated`, `causal_conv1d`,
-and `chunk_gated_delta_rule` fields are model-specific and must be set to `npu` explicitly.
+and `chunk_gated_delta_rule` fields are model-specific and must be set to their Ascend values
+(`torch_npu`, `triton`, or `fla_npu`) explicitly.
 
 ## Q: How to resolve "'global batch size' should be a multiple of 8/16/32" error?
 

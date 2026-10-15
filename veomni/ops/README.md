@@ -44,22 +44,26 @@ when the selected implementation runs.
 |---|---|---|
 | `attention` | `standard` | `eager`, `sdpa`, and FlashAttention/FlexAttention/MagiAttention/SageAttention names |
 | `async_ulysses_qkv`, `async_ulysses_o` | `standard`, `dit` | `eager` orchestration |
-| `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `offset` | `eager`, `liger_kernel`, `npu`, and `triton` where supported; all accept optional `group_size` (fused weighted rows delegate grouped calls to eager) |
+| `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `offset` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; all accept optional `group_size` (fused weighted rows delegate grouped calls to eager) |
 | `layer_norm` | `standard` | `eager`, `apex` (`fused_layer_norm_cuda`); nested by async Ulysses QKV when `norm_type="layernorm"` |
-| `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
+| `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
 | `swiglu_mlp` | `standard`, `geglu` | `eager`, `liger_kernel` |
 | `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `fused_npu`, `fused_mlu` as supported by the variant |
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
-| `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `npu`, `npu_ascendc` as supported by the family |
-| `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `cudnn`, or `flashmla_cudnn` by variant |
-| `mhc` | `pre`, `post`, `head` | `eager`, `tilelang` |
+| `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `torch_npu`, `triton` (Triton-Ascend), `fla_npu` as supported by the family |
+| `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
+| `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 
-DeepSeek-V4 `dsa_attention` treats `topk_idxs` as candidate slots. Repeated
-valid indices participate once per occurrence, matching the TileLang kernel;
-invalid sentinel entries contribute no attention mass. With `return_lse=True`,
-both implementations return a detached base-2 log-sum-exp tensor.
+DeepSeek-V4 `dsa_attention` takes the full-resolution and compressed KV
+separately, plus `position_ids` and the compressor's `CompressedCandidates`,
+and derives visibility itself rather than reading a dense mask. Each row
+expands that contract its own way: `eager` and `tilelang` build explicit
+candidate slots, where repeated valid indices participate once per occurrence
+and sentinel entries contribute no attention mass, while `cann` passes mask
+modes to the kernel. With `return_lse=True`, `eager` and `tilelang` return a
+detached base-2 log-sum-exp tensor.
 
 The registry is the source of truth for the exact rows available in a given
 revision:
@@ -127,11 +131,12 @@ the hardware requirement, while optional import packages belong in `requires`,
 so availability metadata cannot drift into the description.
 
 Implementation names identify the implementation source, not the device it
-runs on. An `npu` row must call a third-party Ascend implementation such as
-`torch_npu`, vendored MindSpeed Triton, or `fla_npu`. PyTorch math that only
-runs on NPU is `eager`. MoE keeps the `fused_npu` name to match the other
-`fused_*` group-gemm backends. A library that runs on several devices, such as
-`fla`, registers one row per device under its library name.
+runs on, so no row is named for the `npu` device alone. An Ascend row is named
+after what it calls: `torch_npu`, `triton` for vendored Triton-Ascend, `cann`
+for `cann_ops_transformer`, or `fla_npu`. PyTorch math that only runs on NPU is
+`eager`. MoE keeps the `fused_npu` name to match the other `fused_*`
+group-gemm backends. A library that runs on several devices, such as `fla`,
+registers one row per device under its library name.
 
 For a raw pair, `forward` returns `(output, SavedState)`, and `backward`
 returns one gradient entry for every positional tensor passed to the generated
@@ -180,9 +185,9 @@ retarget handles that already exist.
 
 A config field such as `rms_norm_implementation` is shared by every variant
 of its op. Consumers of a variant with variant-scoped deprecated aliases pass
-`resolve_op_impl(field, variant=...)`. For example, the former `npu` name of
-the `unweighted` RMSNorm was PyTorch math, so `npu` resolves to `eager` there
-while the weighted variants keep their `torch_npu` rows.
+`resolve_op_impl(field, variant=...)`. For example, the `unweighted` RMSNorm
+has no Ascend kernel, so `torch_npu` resolves to `eager` there while the
+weighted variants keep their `torch_npu` rows.
 
 The registry wrapper is the canonical tensor contract for an op variant;
 it is not a collection of model-specific adapters. Transformations that vary

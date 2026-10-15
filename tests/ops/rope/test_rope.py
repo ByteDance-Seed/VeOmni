@@ -324,10 +324,10 @@ def test_partial_rope_accepts_positional_unsqueeze_dim():
 def test_fused_rope_rows_fall_back_for_trainable_tables_before_vendor_import(implementation, layout):
     from veomni.ops.kernels.rope.full import eager as full_eager
     from veomni.ops.kernels.rope.full import liger_kernel as full_liger
-    from veomni.ops.kernels.rope.full import npu as full_npu
+    from veomni.ops.kernels.rope.full import torch_npu as full_npu
     from veomni.ops.kernels.rope.partial import eager as partial_eager
     from veomni.ops.kernels.rope.partial import liger_kernel as partial_liger
-    from veomni.ops.kernels.rope.partial import npu as partial_npu
+    from veomni.ops.kernels.rope.partial import torch_npu as partial_npu
 
     modules = {
         "full_liger": full_liger,
@@ -487,7 +487,7 @@ def test_partial_liger_matches_eager(
 @pytest.mark.parametrize("variant", ["full", "partial"])
 def test_rope_npu_matches_eager(variant: str):
     eager = resolve_op("rope", variant, "eager").wrapper
-    other = resolve_op("rope", variant, "npu").wrapper
+    other = resolve_op("rope", variant, "torch_npu").wrapper
     torch.manual_seed(0)
     head_dim = 64 if variant == "full" else 128
     rotary_dim = 64
@@ -517,7 +517,7 @@ def test_rope_npu_matches_eager(variant: str):
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU vision RoPE needs NPU")
 def test_vision_npu_matches_eager():
     eager = resolve_op("rope", "full", "eager").wrapper
-    other = resolve_op("rope", "full", "npu").wrapper
+    other = resolve_op("rope", "full", "torch_npu").wrapper
     torch.manual_seed(0)
     q = torch.randn(16, 8, 64, device="npu", dtype=torch.bfloat16)
     k = torch.randn(16, 8, 64, device="npu", dtype=torch.bfloat16)
@@ -547,7 +547,7 @@ def test_vision_npu_matches_eager():
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_full_npu_production_shape(batch: int, heads: int, seqlen: int, head_dim: int, dtype: torch.dtype):
     eager = resolve_op("rope", "full", "eager").wrapper
-    other = resolve_op("rope", "full", "npu").wrapper
+    other = resolve_op("rope", "full", "torch_npu").wrapper
     torch.manual_seed(3)
     q = torch.randn(batch, heads, seqlen, head_dim, device="npu", dtype=dtype)
     k = torch.randn(batch, heads, seqlen, head_dim, device="npu", dtype=dtype)
@@ -570,7 +570,7 @@ def test_full_npu_production_shape(batch: int, heads: int, seqlen: int, head_dim
 @pytest.mark.parametrize("head_dim, rotary_dim", [(128, 64), (256, 128)])
 def test_partial_npu_production_shape(head_dim: int, rotary_dim: int):
     eager = resolve_op("rope", "partial", "eager").wrapper
-    other = resolve_op("rope", "partial", "npu").wrapper
+    other = resolve_op("rope", "partial", "torch_npu").wrapper
     torch.manual_seed(5)
     q = torch.randn(2, 4, 16, head_dim, device="npu", dtype=torch.bfloat16)
     k = torch.randn(2, 4, 16, head_dim, device="npu", dtype=torch.bfloat16)
@@ -590,7 +590,7 @@ def test_partial_npu_production_shape(head_dim: int, rotary_dim: int):
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RoPE needs NPU")
 def test_partial_npu_pass_through_preserved():
-    other = resolve_op("rope", "partial", "npu").wrapper
+    other = resolve_op("rope", "partial", "torch_npu").wrapper
     torch.manual_seed(6)
     rotary_dim = 32
     q = torch.randn(1, 2, 4, 64, device="npu", dtype=torch.bfloat16)
@@ -904,7 +904,7 @@ def test_wan_triton_matches_eager(seqlen: int, head_dim: int):
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU Wan RoPE needs NPU")
 def test_wan_npu_matches_eager():
     eager = resolve_op("rope", "wan", "eager").wrapper
-    other = resolve_op("rope", "wan", "npu").wrapper
+    other = resolve_op("rope", "wan", "torch_npu").wrapper
     torch.manual_seed(0)
     head_dim = 64
     x = torch.randn(2, 16, 4 * head_dim, device="npu", dtype=torch.bfloat16)

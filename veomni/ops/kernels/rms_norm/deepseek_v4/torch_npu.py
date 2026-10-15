@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""standard RMSNorm npu adapter."""
+"""DeepSeek-V4 RMSNorm torch_npu adapter."""
 
 from __future__ import annotations
 

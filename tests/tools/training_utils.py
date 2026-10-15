@@ -25,9 +25,9 @@ _NPU_OPS_DEFAULTS: Dict[str, str] = {
     "attn_implementation": "flash_attention_2",
     "moe_implementation": "fused_npu",
     "cross_entropy_loss_implementation": "chunk_loss",
-    "rms_norm_implementation": "npu",
-    "rotary_pos_emb_implementation": "npu",
-    "rotary_pos_emb_vision_implementation": "npu",
+    "rms_norm_implementation": "torch_npu",
+    "rotary_pos_emb_implementation": "torch_npu",
+    "rotary_pos_emb_vision_implementation": "torch_npu",
     "swiglu_mlp_implementation": "eager",  # no NPU backend
     # The Triton load-balancing-loss row is CUDA-only, so NPU resolution rejects
     # it even when ``triton-ascend`` is installed. Pin to eager.
@@ -43,7 +43,7 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "deepseek_v4": {
         # DeepSeek-V4 attention, RMSNorm, and partial RoPE remain eager-only on NPU.
         # The generic NPU rotary backend is incompatible with V4's partial layout.
-        # Routed experts keep npu; its clamp-aware activation uses Ascend
+        # Routed experts keep fused_npu; its clamp-aware activation uses Ascend
         # Triton when available and preserves the eager training fallback otherwise.
         "attn_implementation": "eager",
         "rms_norm_implementation": "eager",

@@ -45,10 +45,10 @@ _EXPECTED_DEFAULTS: dict[str, dict[str, str]] = {
     "npu": {
         "moe_implementation": "fused_npu",
         "cross_entropy_loss_implementation": "chunk_loss",
-        "rms_norm_implementation": "npu",
+        "rms_norm_implementation": "torch_npu",
         "swiglu_mlp_implementation": "eager",
-        "rotary_pos_emb_implementation": "npu",
-        "rotary_pos_emb_vision_implementation": "npu",
+        "rotary_pos_emb_implementation": "torch_npu",
+        "rotary_pos_emb_vision_implementation": "torch_npu",
         "load_balancing_loss_implementation": "eager",
     },
     "mlu": {
@@ -96,9 +96,9 @@ def test_explicit_eager_is_kept_on_npu(field_name: str, monkeypatch: pytest.Monk
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [
-        ("rms_norm_implementation", "npu"),
-        ("rotary_pos_emb_implementation", "npu"),
-        ("rotary_pos_emb_vision_implementation", "npu"),
+        ("rms_norm_implementation", "torch_npu"),
+        ("rotary_pos_emb_implementation", "torch_npu"),
+        ("rotary_pos_emb_vision_implementation", "torch_npu"),
         ("moe_implementation", "fused_npu"),
         ("cross_entropy_loss_implementation", "chunk_loss"),
     ],
@@ -131,8 +131,8 @@ def test_explicit_gpu_default_raises_on_npu(field_name: str, value: str, monkeyp
 )
 def test_explicit_npu_value_raises_off_npu(field_name: str, monkeypatch: pytest.MonkeyPatch):
     _set_host(monkeypatch, "gpu")
-    with pytest.raises(ValueError, match=f"{field_name}='npu' requires Ascend NPU"):
-        OpsImplementationConfig(**{field_name: "npu"})
+    with pytest.raises(ValueError, match=f"{field_name}='torch_npu' requires Ascend NPU"):
+        OpsImplementationConfig(**{field_name: "torch_npu"})
 
 
 def test_explicit_gpu_value_is_kept_on_mlu(monkeypatch: pytest.MonkeyPatch):

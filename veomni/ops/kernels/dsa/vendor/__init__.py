@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TileLang sparse MQA / indexer and FlashMLA cuDNN sources."""
+"""TileLang sparse MQA / indexer, FlashMLA cuDNN, and Ascend CANN sparse FlashMLA sources."""

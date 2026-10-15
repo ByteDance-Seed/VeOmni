@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""standard causal_conv1d NPU vendored-Triton pair."""
+"""standard causal_conv1d vendored Triton-Ascend pair."""
 
 from __future__ import annotations
 
