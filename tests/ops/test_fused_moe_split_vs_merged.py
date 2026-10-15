@@ -6,7 +6,10 @@ from veomni.distributed.moe.moe_layer import EPGroupGemm, EPMergedFc1GroupGemm
 from veomni.ops.kernels import moe as fused_moe
 from veomni.ops.kernels.moe import fused_moe_forward
 from veomni.ops.kernels.moe._kernels.kernel.moe import expert_histogram, moe_gather, moe_scatter
-from veomni.ops.kernels.moe.group_gemm import group_gemm_fused_moe_forward
+from veomni.ops.kernels.moe.group_gemm import (
+    MergedFc1TritonFusedMoeExpertFunction,
+    group_gemm_fused_moe_forward,
+)
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device, is_sm90_or_above
 from veomni.utils.import_utils import is_fused_moe_available, is_quack_gemm_available
 
@@ -133,6 +136,7 @@ def test_fused_moe_split_vs_merged(
         fc2_weight=fc2_merged,
         fc1_1_2_weight=fc1_merged,
     )
+    assert len(out_merged.grad_fn.saved_tensors) == 11
     get_torch_device().synchronize(device)
     peak_merged = get_torch_device().max_memory_allocated(device) - mem_before_merged
     out_merged.sum().backward()
@@ -181,6 +185,42 @@ def test_fused_moe_split_vs_merged(
         f"\n  merged peak: {peak_merged / (1024 * 1024):.1f} MiB"
         f"\n  diff (split - merged): {peak_diff_mb:+.1f} MiB"
     )
+
+
+@pytest.mark.parametrize("fc1_trainable,fc2_trainable", [(False, True), (True, False), (False, False)])
+def test_merged_fc1_backward_with_frozen_expert_weights(fc1_trainable: bool, fc2_trainable: bool):
+    """Skipping an expert wgrad must not change input or routing gradients."""
+    _skip_if_unsupported()
+
+    torch.manual_seed(7)
+    device = torch.device(get_device_type())
+    num_tokens, num_experts, hidden_dim, ffn_dim, topk = 32, 4, 64, 128, 2
+    hidden_states = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.bfloat16)
+    gate_weights = torch.rand(num_tokens, topk, device=device, dtype=torch.bfloat16)
+    expert_index = torch.randint(num_experts, (num_tokens, topk), device=device)
+    fc1_weight = 0.1 * torch.randn(num_experts, 2 * ffn_dim, hidden_dim, device=device, dtype=torch.bfloat16)
+    fc2_weight = 0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=torch.bfloat16)
+
+    def run(train_fc1: bool, train_fc2: bool):
+        routed = gate_weights.detach().clone().requires_grad_(True)
+        hidden = hidden_states.detach().clone().requires_grad_(True)
+        fc1 = fc1_weight.detach().clone().requires_grad_(train_fc1)
+        fc2 = fc2_weight.detach().clone().requires_grad_(train_fc2)
+        output = MergedFc1TritonFusedMoeExpertFunction.apply(
+            num_experts, routed, expert_index, hidden, fc1, fc2, None, False
+        )
+        output.sum().backward()
+        return routed.grad, hidden.grad, fc1.grad, fc2.grad
+
+    reference = run(True, True)
+    candidate = run(fc1_trainable, fc2_trainable)
+    for actual, expected in zip(candidate[:2], reference[:2], strict=True):
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    for actual, expected, trainable in zip(candidate[2:], reference[2:], (fc1_trainable, fc2_trainable), strict=True):
+        if trainable:
+            torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+        else:
+            assert actual is None
 
 
 @pytest.mark.parametrize("swiglu_limit", [7.0, 10.0])
@@ -234,6 +274,7 @@ def test_fused_moe_swiglu_limit_split_vs_merged_and_eager(swiglu_limit: float, m
         fc1_1_2_weight=fc1_merged,
         swiglu_limit=swiglu_limit,
     )
+    assert len(out_merged.grad_fn.saved_tensors) == 11
     out_merged.sum().backward()
 
     hs_eager = hidden_states.clone().detach().requires_grad_(True)
