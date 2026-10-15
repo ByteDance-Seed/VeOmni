@@ -189,6 +189,14 @@ def test_a_fresh_writer_refuses_a_directory_with_shards(tmp_path) -> None:
         SeedOmniOfflineCacheWriter(str(tmp_path)).open()
 
 
+def test_a_fresh_writer_refuses_a_leftover_completion_marker(tmp_path) -> None:
+    """With only the shards deleted, this run would later refuse its own resume as already finalized."""
+    (tmp_path / ".offline_cache_complete").touch()
+
+    with pytest.raises(FileExistsError, match="already contains"):
+        SeedOmniOfflineCacheWriter(str(tmp_path)).open()
+
+
 def test_nothing_is_written_before_the_directory_check(tmp_path) -> None:
     writer = SeedOmniOfflineCacheWriter(str(tmp_path), max_rows_per_shard=1)
 
