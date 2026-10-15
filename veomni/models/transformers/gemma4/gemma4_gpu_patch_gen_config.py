@@ -26,6 +26,7 @@ from transformers.models.gemma4.modeling_gemma4 import (
     Gemma4Config,
     Gemma4ModelOutputWithPast,
     Gemma4MultimodalEmbedder,
+    Gemma4TextConfig,
     Gemma4TextModel,
     Gemma4TextModelOutputWithPast,
     Gemma4VisionModel,
@@ -496,13 +497,13 @@ def _gemma4_loss(
             if final_logit_softcapping is not None:
                 logits = torch.tanh(logits / final_logit_softcapping) * final_logit_softcapping
             # A fused-linear loss would reproject hidden states and discard softcapping.
-            loss_function = ForCausalLMLoss if final_logit_softcapping is not None else model.loss_function
-            loss, _, fused_linear_aux = loss_function(
+            loss, _, fused_linear_aux = model.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=vocab_size,
-                hidden_states=hidden_states,
-                weights=model.lm_head.weight,
+                # Channel-loss logging must also consume the capped logits.
+                hidden_states=hidden_states if final_logit_softcapping is None else None,
+                weights=model.lm_head.weight if final_logit_softcapping is None else None,
                 **kwargs,
             )
             if fused_linear_aux is not None:
@@ -512,6 +513,33 @@ def _gemma4_loss(
         if final_logit_softcapping is not None:
             logits = torch.tanh(logits / final_logit_softcapping) * final_logit_softcapping
     return loss, logits, fused_linear_aux
+
+
+@config.override_method(
+    "Gemma4ForCausalLM.__init__",
+    description="Pin capped text-model loss to an observable instance-level eager wrapper",
+)
+def gemma4_causal_lm_init_patched(self, config: Gemma4TextConfig):
+    super().__init__(config)
+    self.model = Gemma4TextModel(config)
+    self.vocab_size = config.vocab_size
+    self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    if config.final_logit_softcapping is not None:
+        self.loss_function = ForCausalLMLoss
+    self.post_init()
+
+
+@config.override_method(
+    "Gemma4ForConditionalGeneration.__init__",
+    description="Pin capped multimodal loss to an observable instance-level eager wrapper",
+)
+def gemma4_conditional_generation_init_patched(self, config: Gemma4Config):
+    super().__init__(config)
+    self.model = Gemma4Model(config)
+    self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+    if config.text_config.final_logit_softcapping is not None:
+        self.loss_function = ForCausalLMLoss
+    self.post_init()
 
 
 @config.override_method(

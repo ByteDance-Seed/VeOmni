@@ -29,6 +29,7 @@ from veomni.models.transformers.gemma4.generated.patched_modeling_gemma4_gpu imp
     Gemma4ForConditionalGeneration as VeOmniGemma4,
 )
 from veomni.ops.kernels import attention as veomni_attention
+from veomni.trainer.callbacks.channel_loss_callback import ChannelLossComputer
 
 
 _TOY_CONFIG = Path(__file__).parents[1] / "toy_config" / "gemma4_toy"
@@ -187,6 +188,49 @@ def test_gemma4_training_loss_matches_capped_logits(monkeypatch, tmp_path, text_
         torch.testing.assert_close(output.logits, expected_logits)
     elif loss_implementation == "chunk_loss":
         assert output.logits is None
+
+
+@pytest.mark.parametrize("text_only", [False, True], ids=["multimodal", "text"])
+@pytest.mark.parametrize("loss_implementation", ["eager", "chunk_loss"])
+def test_gemma4_softcapping_preserves_channel_loss(monkeypatch, tmp_path, text_only, loss_implementation):
+    """Channel totals observe the same capped logits as the training loss."""
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    config = _toy_config()
+    config.text_config.final_logit_softcapping = 30.0
+    if text_only:
+        config = config.text_config
+    config.save_pretrained(tmp_path)
+    ops = _eager_ops_config("eager")
+    ops.cross_entropy_loss_implementation = loss_implementation
+    model = build_foundation_model(tmp_path, torch_dtype="float32", init_device="cpu", ops_implementation=ops)
+    with torch.no_grad():
+        model.lm_head.weight.mul_(100)
+    input_ids = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 10]])
+    labels = input_ids.clone()
+    labels[:, 3] = -100
+    reference = model(input_ids=input_ids, labels=labels, use_cache=False)
+    reference_gradient = torch.autograd.grad(reference.loss, model.lm_head.weight)[0]
+    computer = ChannelLossComputer()
+    computer.install(model)
+    computer.begin_step([[42]], [torch.arange(8).unsqueeze(0)], [torch.ones_like(input_ids)])
+    computer.before_micro_step()
+    try:
+        with computer.capture():
+            output = model(input_ids=input_ids, labels=labels, use_cache=False)
+        computer.after_micro_step()
+        output.loss.backward()
+
+        assert 42 in computer.step_totals
+        loss_sum, token_count = computer.step_totals[42]
+        expected_sum = F.cross_entropy(
+            output.logits[:, :-1].reshape(-1, output.logits.shape[-1]), labels[:, 1:].reshape(-1), reduction="sum"
+        )
+        assert token_count.item() == 6
+        torch.testing.assert_close(loss_sum, expected_sum)
+        torch.testing.assert_close(output.loss, reference.loss)
+        torch.testing.assert_close(model.lm_head.weight.grad, reference_gradient)
+    finally:
+        computer.uninstall()
 
 
 @pytest.mark.parametrize("text_only", [False, True], ids=["multimodal", "text"])

@@ -21,6 +21,10 @@
 #      Pass packed-sequence boundaries into VeOmni causal and sliding-window masks
 #    - method_override: Gemma4TextModel.get_per_layer_inputs
 #      Preserve Gemma 4 PLE lookup while keeping generated code lint-clean
+#    - method_override: Gemma4ForCausalLM.__init__
+#      Pin capped text-model loss to an observable instance-level eager wrapper
+#    - method_override: Gemma4ForConditionalGeneration.__init__
+#      Pin capped multimodal loss to an observable instance-level eager wrapper
 #    - method_override: Gemma4ForCausalLM.forward
 #      Adapt Gemma 4 text causal-LM loss to VeOmni's fused-loss output contract
 #    - method_override: Gemma4ForConditionalGeneration.forward
@@ -120,13 +124,13 @@ def _gemma4_loss(
             if final_logit_softcapping is not None:
                 logits = torch.tanh(logits / final_logit_softcapping) * final_logit_softcapping
             # A fused-linear loss would reproject hidden states and discard softcapping.
-            loss_function = ForCausalLMLoss if final_logit_softcapping is not None else model.loss_function
-            loss, _, fused_linear_aux = loss_function(
+            loss, _, fused_linear_aux = model.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=vocab_size,
-                hidden_states=hidden_states,
-                weights=model.lm_head.weight,
+                # Channel-loss logging must also consume the capped logits.
+                hidden_states=hidden_states if final_logit_softcapping is None else None,
+                weights=model.lm_head.weight if final_logit_softcapping is None else None,
                 **kwargs,
             )
             if fused_linear_aux is not None:
@@ -1883,7 +1887,7 @@ class Gemma4TextModel(Gemma4PreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] Gemma4ForCausalLM
-# Methods patched: forward
+# Methods patched: __init__, forward
 # ======================================================================
 
 
@@ -1901,8 +1905,8 @@ class Gemma4ForCausalLM(Gemma4PreTrainedModel, GenerationMixin):
         self.model = Gemma4TextModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
+        if config.final_logit_softcapping is not None:
+            self.loss_function = ForCausalLMLoss
         self.post_init()
 
     @can_return_tuple
@@ -2544,7 +2548,7 @@ class Gemma4Model(Gemma4PreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] Gemma4ForConditionalGeneration
-# Methods patched: forward
+# Methods patched: __init__, forward
 # ======================================================================
 
 
@@ -2563,6 +2567,8 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Gemma4Model(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+        if config.text_config.final_logit_softcapping is not None:
+            self.loss_function = ForCausalLMLoss
         self.post_init()
 
     @auto_docstring
