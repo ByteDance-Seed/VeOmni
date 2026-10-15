@@ -131,7 +131,10 @@ jobs:
           clean: true
       - name: Sync dependencies
         run: |
-          uv sync --frozen --python 3.11 --extra npu --group dev
+          uv sync --frozen --python "$(command -v python3)" --extra npu --group dev
+          uv pip install --python .venv/bin/python ninja
+          uv run --frozen ninja --version
+          uv run --frozen python -c "import cann_ops_transformer"
       - name: Check final pip list
         run: |
           uv pip list
@@ -170,7 +173,10 @@ jobs:
         run: |
           # diffusers ships under the `npu` extra (rolled in from the dropped
           # `dit` extra), so no additional extra is needed here.
-          uv sync --frozen --python 3.11 --extra npu --group dev
+          uv sync --frozen --python "$(command -v python3)" --extra npu --group dev
+          uv pip install --python .venv/bin/python ninja
+          uv run --frozen ninja --version
+          uv run --frozen python -c "import cann_ops_transformer"
       - name: Run diffusers tests
         run: |
           uv run --frozen pytest -v -s -x tests/e2e/test_e2e_parallel.py::test_wan_dit_parallel_align
