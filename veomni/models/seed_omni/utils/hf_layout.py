@@ -438,11 +438,15 @@ class HFSourceKeyConverter:
             return None
         return maybe_convert_checkpoint_tensor(target, tensor, self.inner)
 
+    def generated_tensors(self) -> list[ConvertedCheckpointTensor]:
+        """The module tensors the checkpoint does not store, under module keys."""
+        if self.generated is None:
+            return []
+        return [ConvertedCheckpointTensor(name, tensor) for name, tensor in self.generated().items()]
+
     def finalize(self) -> list[ConvertedCheckpointTensor]:
         results = list(self.inner.finalize()) if self.inner is not None else []
-        if self.generated is not None:
-            results.extend(ConvertedCheckpointTensor(name, tensor) for name, tensor in self.generated().items())
-        return results
+        return results + self.generated_tensors()
 
     def is_dim0_zero_pad(self, name: str) -> bool:
         target = self.module_key(name)
@@ -465,9 +469,9 @@ class HFSourceKeyConverter:
 def attach_hf_source_converter(model: torch.nn.Module, source: HFSource, module_name: str) -> None:
     """Make the VeOmni weight loaders read ``model`` (module ``module_name``) from ``source``.
 
-    Covers ``load_model_weights`` and ``rank0_load_and_broadcast_weights``;
-    ``ep_sharded_stream_load`` does not apply the renames and is rejected for
-    an HF ``model_path`` up front.
+    Covers ``load_model_weights``, ``rank0_load_and_broadcast_weights`` and
+    ``load_model_weights_ep_sharded``, which renames with
+    :meth:`HFSourceKeyConverter.module_key` itself.
 
     Installed on the instance, ahead of the class's own converter factory,
     which then sees the module's key names exactly as it would reading a split

@@ -479,14 +479,6 @@ def test_hf_view_modules_must_all_come_from_the_layout(hf_root):
         _validate_hf_view_modules(view, {**ok, "other_module": OmniModuleRuntimeArguments(model_path="/x")})
     with pytest.raises(ValueError, match="sets its own model_path"):
         _validate_hf_view_modules(view, {**ok, FAKE_B: OmniModuleRuntimeArguments(model_path="/elsewhere/b")})
-    streaming = OmniModuleRuntimeArguments(
-        model_path=os.path.join(view, FAKE_B), ep_sharded_stream_load=True, broadcast_model_weights_from_rank0=False
-    )
-    with pytest.raises(ValueError, match="ep_sharded_stream_load"):
-        _validate_hf_view_modules(view, {**ok, FAKE_B: streaming})
-    # The composed wrap reads the top-level flag, which a module may override to false.
-    with pytest.raises(ValueError, match="ep_sharded_stream_load"):
-        _validate_hf_view_modules(view, ok, ep_sharded_stream_load=True)
 
 
 def test_from_pretrained_rejects_a_module_read_from_elsewhere(hf_root, tmp_path):

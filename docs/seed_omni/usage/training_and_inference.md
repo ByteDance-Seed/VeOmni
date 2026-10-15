@@ -89,8 +89,10 @@ with a registered layout loads through it, and any other type is an error.
   Module weights are read from the upstream checkpoint at weight-load time:
   each HF key is renamed onto the module that owns it, and keys owned by other
   modules are skipped without being read. This works for training (FSDP2, DDP,
-  rank-0 broadcast, `fsdp_scope: model`) and for eager and distributed
-  inference.
+  rank-0 broadcast, expert-parallel streaming load, `fsdp_scope: model`) and
+  for eager and distributed inference; under `ep_sharded_stream_load` each rank
+  reads only its own experts, also when the upstream checkpoint stores them
+  one per key.
 - **Save.** The HF export (`save_hf_weights`) is one checkpoint in the upstream
   layout under `global_step_N/hf_ckpt/`: the same keys, dtypes, shard files and
   non-weight files as the source, so it loads wherever the source does
@@ -102,14 +104,13 @@ with a registered layout loads through it, and any other type is an error.
   model composed from several sources, like Qwen3 text + the Qwen3-VL ViT,
   still needs split checkpoints. Per-module `model_config` overrides apply to
   the run but not to the exported `config.json`, which is the source's (a
-  warning lists them). Expert-parallel streaming load
-  (`ep_sharded_stream_load`) does not apply the renames and is rejected at
-  startup. A module whose checkpoint tensor converter renames or reshapes
-  tensors, or that adds a parameter with no upstream counterpart (a freshly
-  initialized projector or head), loads from the upstream root but cannot
-  export to it: the HF export raises rather than write the stale source copy
-  or drop the new weight. Export such a run from a split checkpoint, or
-  disable `save_hf_weights`. Each HF export reads every source tensor no
+  warning lists them). A module whose checkpoint tensor converter renames or
+  reshapes tensors, and whose layout declares no `export_state` to undo it, or
+  that adds a parameter with no upstream counterpart (a freshly initialized
+  projector or head), loads from the upstream root but cannot export to it:
+  the HF export raises rather than write the stale source copy or drop the new
+  weight. Export such a run from a split checkpoint, or disable
+  `save_hf_weights`. Each HF export reads every source tensor no
   trained module produces (frozen modules, unclaimed keys) into rank 0's host
   memory, so a small trained module beside a large frozen one costs the frozen
   one's size in rank-0 RAM per export. Eager loads take `device_map` as
@@ -256,8 +257,11 @@ bash train.sh tasks/omni/infer_omni.py \
 ### Inferring from a trained checkpoint
 
 Training writes each module's HF weights under
-`<output_dir>/checkpoints/global_step_N/hf_ckpt/<module>/`. Link each module's
-folder into a flat root and pass it as `--model.model_path`:
+`<output_dir>/checkpoints/global_step_N/hf_ckpt/<module>/`. A module whose
+row-sharded embedding tables are too large for one file (DeepSeek-V4.1's n-gram)
+leaves them unmerged; run `python scripts/merge_hf_export.py "$STEP/hf_ckpt"` first
+([details](../../usage/checkpoint_conversion.md#finishing-an-hf-export-with-unmerged-tables)).
+Link each module's folder into a flat root and pass it as `--model.model_path`:
 
 ```bash
 STEP=outputs/janus_1.3b_omni_sft/checkpoints/global_step_20
