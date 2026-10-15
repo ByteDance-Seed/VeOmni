@@ -35,6 +35,7 @@ _FIELD_TO_OP = {
     "load_balancing_loss_implementation": "load_balancing_loss",
     "mhc_implementation": "mhc",
     "moe_implementation": "moe_experts",
+    "qsa_attention_implementation": "qsa_attention",
     "rms_norm_gated_implementation": "rms_norm_gated",
     "rms_norm_implementation": "rms_norm",
     "rotary_pos_emb_implementation": "rope",

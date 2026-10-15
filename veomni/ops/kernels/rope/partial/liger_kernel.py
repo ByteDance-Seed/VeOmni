@@ -83,7 +83,12 @@ def forward(
 
     from liger_kernel.ops.rope import rope_forward
 
-    q_in, k_in = _to_liger_layout(q[..., :rotary_dim].contiguous(), k[..., :rotary_dim].contiguous(), unsqueeze_dim)
+    # Liger rotates in place, and single-tensor callers pass one tensor as q and k.
+    q_in, k_in = _to_liger_layout(
+        q[..., :rotary_dim].clone(memory_format=torch.contiguous_format),
+        k[..., :rotary_dim].clone(memory_format=torch.contiguous_format),
+        unsqueeze_dim,
+    )
     q_out, k_out, saved_cos, saved_sin = rope_forward(q_in, k_in, cos, sin)
     q_out, k_out = _from_liger_layout(q_out, k_out, unsqueeze_dim)
     return (

@@ -1048,6 +1048,60 @@ class TestDeepseekV4ConverterConvert:
         ]
 
 
+class TestDeepseekV4ConverterExpertStreaming:
+    @pytest.mark.parametrize(
+        ("name", "target"),
+        [
+            ("layers.2.ffn.experts.5.w1.weight", ("model.layers.2.mlp.experts.gate_up_proj", 5)),
+            ("layers.2.ffn.experts.5.w3.scale", ("model.layers.2.mlp.experts.gate_up_proj", 5)),
+            ("layers.2.ffn.experts.5.w2.weight", ("model.layers.2.mlp.experts.down_proj", 5)),
+            ("model.layers.2.mlp.experts.1.up_proj.weight", ("model.layers.2.mlp.experts.gate_up_proj", 1)),
+            ("layers.2.ffn.shared_experts.w1.weight", None),
+            ("layers.2.attn.wq_a.scale", None),
+            ("mtp.0.ffn.experts.3.w1.weight", None),
+        ],
+    )
+    def test_fused_expert_target_covers_weights_and_scales(self, name, target):
+        converter = DeepseekV4CheckpointTensorConverter(num_experts=8)
+        assert converter.fused_expert_target(name) == target
+        if target is not None:
+            assert checkpoint_converter_fused_expert_target(converter, name) == target
+
+    def test_for_expert_range_stacks_only_its_fp8_experts(self):
+        fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+        if fp8_dtype is None:
+            pytest.skip("torch.float8_e4m3fn is unavailable")
+        local = DeepseekV4CheckpointTensorConverter(num_experts=4, target_model_prefix="").for_expert_range(2, 2)
+        assert (local.num_experts, local.expert_offset, local.target_model_prefix) == (2, 2, "")
+
+        emitted = {}
+        for expert_id in (2, 3):
+            for proj in ("w1", "w3", "w2"):
+                stem = f"layers.0.ffn.experts.{expert_id}.{proj}"
+                weight = _to_fp8(_make_deepseek_v4_expert_tensor(proj, expert_id))
+                assert maybe_convert_checkpoint_tensor(f"{stem}.weight", weight, local) is None
+                result = maybe_convert_checkpoint_tensor(f"{stem}.scale", torch.tensor([[2.0]]), local)
+                if result is not None:
+                    emitted[result.name] = result.tensor
+        assert local.finalize() == []
+
+        down = emitted["layers.0.mlp.experts.down_proj"]
+        assert down.shape == (2, HIDDEN_DIM, INTERMEDIATE_DIM)
+        for row, expert_id in enumerate((2, 3)):
+            want = _to_fp8(_make_deepseek_v4_expert_tensor("w2", expert_id)).float() * 2.0
+            assert torch.equal(down[row], want)
+        assert emitted["layers.0.mlp.experts.gate_up_proj"].shape == (2, 2 * INTERMEDIATE_DIM, HIDDEN_DIM)
+
+    def test_a_range_converter_rejects_other_experts(self):
+        local = DeepseekV4CheckpointTensorConverter(num_experts=4).for_expert_range(2, 2)
+        with pytest.raises(ValueError, match=r"expert 1 is outside this converter's range \[2, 4\)"):
+            local.convert("layers.0.ffn.experts.1.w1.weight", torch.zeros(INTERMEDIATE_DIM, HIDDEN_DIM))
+
+    def test_for_expert_range_rejects_an_out_of_bounds_range(self):
+        with pytest.raises(ValueError, match="outside this converter's 4 experts"):
+            DeepseekV4CheckpointTensorConverter(num_experts=4).for_expert_range(3, 2)
+
+
 class TestDeepseekV4ConverterFactoryAndMapping:
     def test_factory_creates_converter(self):
         model = SimpleNamespace(

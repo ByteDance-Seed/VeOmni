@@ -76,7 +76,9 @@ Two authoritative sources:
 - **HF ships per-expert keys under other names** (e.g. DeepSeek-V4's `w1/w2/w3`)
   → template = `veomni/models/transformers/deepseek_v4/checkpoint_tensor_converter.py`.
   A custom converter must implement `fused_expert_target` + `for_expert_range`
-  itself, or the streaming loader refuses the checkpoint.
+  itself, or the streaming loader refuses the checkpoint. Map every source key of
+  an expert (including a quantization scale) to that expert's fused target, so it
+  lands in the same rank's range-restricted converter.
 - **HF ships fused expert keys with same names as v5** (`*.mlp.experts.{gate_up_proj|down_proj}`
   at the module level, not per-expert) → template =
   `veomni/models/transformers/qwen3_vl_moe/checkpoint_tensor_converter.py`.

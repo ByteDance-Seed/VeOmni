@@ -17,8 +17,10 @@
 Three independent families share this package. They are not a compound
 kernel and are not ``rms_norm`` variants.
 
-``rms_norm_gated`` is ``weight * rms_norm(x) * silu(gate)``. Functional extra
-is *weight*. FLA's unused norm bias and ``activation`` are accepted.
+``rms_norm_gated`` is ``weight * rms_norm(x) * act(gate)``, where ``act`` is
+SiLU (``silu`` / ``swish`` / ``None``) or ``sigmoid`` as Qwen4-Exp selects
+through ``output_gate_type``. Functional extra is *weight*. FLA's unused norm
+bias is accepted.
 ``causal_conv1d`` is depthwise causal conv on ``[B, S, D]``. ``None`` or empty
 bias / ``cu_seqlens`` are unused. FLA ``seq_idx`` / ``backend`` are accepted.
 Eager has no varlen path.

@@ -483,6 +483,27 @@ def test_partial_liger_matches_eager(
     assert torch.allclose(k_e.grad, k_o.grad, atol=ROPE_NPU_PROD_BF16_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
 
 
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RoPE needs a GPU")
+def test_partial_liger_full_width_aliased_query_and_key_match_eager():
+    """The Qwen4-Exp QSA indexer rotates one tensor by passing it as both q and k."""
+    pytest.importorskip("liger_kernel")
+    eager = resolve_op("rope", "partial", "eager").wrapper
+    other = resolve_op("rope", "partial", "liger_kernel").wrapper
+    torch.manual_seed(5)
+    x = torch.randn(2, 16, 1, 64, device="cuda", dtype=torch.bfloat16)
+    original = x.clone()
+    cos_half = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
+    sin_half = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
+    cos = torch.cat((cos_half, cos_half), dim=-1)
+    sin = torch.cat((sin_half, sin_half), dim=-1)
+
+    expected, _ = eager(x, x, cos, sin, unsqueeze_dim=2)
+    actual, _ = other(x, x, cos, sin, unsqueeze_dim=2)
+
+    torch.testing.assert_close(actual, expected, atol=ROPE_NPU_PROD_BF16_ATOL, rtol=ROPE_FUSED_RTOL)
+    torch.testing.assert_close(x, original, atol=0.0, rtol=0.0)
+
+
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RoPE needs NPU")
 @pytest.mark.parametrize("variant", ["full", "partial"])
 def test_rope_npu_matches_eager(variant: str):

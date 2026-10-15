@@ -194,16 +194,27 @@ class DeepseekV4CheckpointTensorConverter:
     Buffers per-expert tensors as they stream from safetensor files, and emits
     merged tensors once all experts for a given (layer, projection) are collected.
 
+    Implements ``fused_expert_target`` / ``for_expert_range`` so
+    ``ep_sharded_stream_load`` can read only this rank's experts (including their
+    FP4/FP8 scale companions) and stack the local ``[E/ep, ...]`` slice.
+
     Args:
-        num_experts: Number of routed experts per MoE layer
-            (``config.n_routed_experts`` — equal to ``config.num_local_experts``
-            via ``DeepseekV4Config.attribute_map``).
+        num_experts: Number of routed experts this converter stacks
+            (``config.n_routed_experts`` for a full-rank converter — equal to
+            ``config.num_local_experts`` via ``DeepseekV4Config.attribute_map``;
+            ``E/ep`` after :meth:`for_expert_range`).
+        expert_offset: Checkpoint index of the first expert it stacks; experts
+            ``[expert_offset, expert_offset + num_experts)`` become rows
+            ``0..num_experts-1``.
+        target_model_prefix: Prefix prepended by :func:`convert_deepseek_v4_checkpoint_key`
+            (``"model."`` for CausalLM, ``""`` for the bare Model).
     """
 
-    def __init__(self, num_experts: int, *, target_model_prefix: str = "model."):
+    def __init__(self, num_experts: int, *, expert_offset: int = 0, target_model_prefix: str = "model."):
         self.num_experts = num_experts
+        self.expert_offset = expert_offset
         self.target_model_prefix = target_model_prefix
-        # {(prefix, proj_name): {expert_id: tensor}}
+        # {(prefix, proj_name): {local_expert_id: tensor}}
         self._expert_buffer: dict[tuple[str, str], dict[int, torch.Tensor]] = {}
         # {prefix: {proj_name: stacked_tensor}} for gate/up merge waiting
         self._stacked_buffer: dict[str, dict[str, torch.Tensor]] = {}
@@ -225,6 +236,31 @@ class DeepseekV4CheckpointTensorConverter:
             return False
         converted_name = convert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
         return self.can_handle(name) or (converted_name.endswith(".weight") and _is_quantized_weight(tensor))
+
+    def fused_expert_target(self, name: str) -> tuple[str, int] | None:
+        """Map a per-expert weight or its scale to ``(fused_param, expert_index)``."""
+        if _is_mtp_checkpoint_key(name):
+            return None
+        converted_name = convert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
+        weight_name = _weight_name_from_scale_name(converted_name) or converted_name
+        match = _EXPERT_PATTERN.match(weight_name)
+        if not match:
+            return None
+        prefix, expert_id_str, proj_name = match.groups()
+        proj_name = _PROJ_NAME_ALIASES.get(proj_name, proj_name)
+        fused_proj = "down_proj" if proj_name == "down_proj" else "gate_up_proj"
+        return f"{prefix}.experts.{fused_proj}", int(expert_id_str)
+
+    def for_expert_range(self, start: int, num_local: int) -> DeepseekV4CheckpointTensorConverter:
+        if start < 0 or num_local <= 0 or start + num_local > self.num_experts:
+            raise ValueError(
+                f"Expert range [{start}, {start + num_local}) is outside this converter's {self.num_experts} experts."
+            )
+        return DeepseekV4CheckpointTensorConverter(
+            num_experts=num_local,
+            expert_offset=self.expert_offset + start,
+            target_model_prefix=self.target_model_prefix,
+        )
 
     def convert(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
         if _is_mtp_checkpoint_key(name):
@@ -277,7 +313,12 @@ class DeepseekV4CheckpointTensorConverter:
 
         prefix, expert_id_str, proj_name = match.groups()
         proj_name = _PROJ_NAME_ALIASES.get(proj_name, proj_name)
-        expert_id = int(expert_id_str)
+        expert_id = int(expert_id_str) - self.expert_offset
+        if not 0 <= expert_id < self.num_experts:
+            raise ValueError(
+                f"{name}: expert {int(expert_id_str)} is outside this converter's range "
+                f"[{self.expert_offset}, {self.expert_offset + self.num_experts})."
+            )
         buf_key = (prefix, proj_name)
 
         if buf_key not in self._expert_buffer:

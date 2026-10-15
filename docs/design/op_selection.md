@@ -1,7 +1,7 @@
 # Op Selection in VeOmni
 
 VeOmni selects implementations for attention, RMSNorm, RoPE, SwiGLU, MoE,
-cross-entropy, load-balancing loss, GatedDeltaNet ops, DSA, and mHC through
+cross-entropy, load-balancing loss, GatedDeltaNet ops, DSA, mHC, and Qwen4-Exp QSA through
 `OpsImplementationConfig`. Modeling constructs instance-local `VeomniOp`
 handles. There is no process-global bind and no silent eager fallback after
 an optimized row is selected.
@@ -21,10 +21,11 @@ If a field is not in this table, it is not an op-selection knob.
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+), `cann` (DeepSeek-V4, Ascend) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
+| QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU), `"npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU), `"npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `torch_npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `torch_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `triton` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
@@ -281,9 +282,9 @@ Liger-only: they also accept `torch_npu` and model-specific `triton` registry ro
 ```yaml
 model:
   ops_implementation:
-    rms_norm_implementation: liger_kernel       # default; pin to "npu" / "eager" on NPU
+    rms_norm_implementation: liger_kernel       # default; pin to "torch_npu" / "eager" on NPU
     swiglu_mlp_implementation: liger_kernel     # default; pin to "eager" on NPU (no NPU backend)
-    rotary_pos_emb_implementation: liger_kernel # default; pin to "npu" / "eager" on NPU
+    rotary_pos_emb_implementation: liger_kernel # default; pin to "torch_npu" / "eager" on NPU
 ```
 
 ### Available implementations

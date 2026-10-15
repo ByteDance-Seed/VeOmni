@@ -27,6 +27,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated, torch_chunk_gated_delta_rule
+from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRMSNormGated
 
 from tests.ops.tol import (
     EAGER_ATOL,
@@ -105,8 +106,44 @@ def test_rms_norm_gated_eager_matches_hf():
     assert torch.allclose(w_e.grad, module.weight.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+def test_rms_norm_gated_eager_sigmoid_matches_hf():
+    """Qwen4-Exp selects a sigmoid output gate through ``output_gate_type``."""
+    torch.manual_seed(0)
+    hidden = 64
+    eps = 1e-6
+    x = torch.randn(2, 16, hidden, dtype=torch.float32)
+    gate = torch.randn(2, 16, hidden, dtype=torch.float32)
+    weight = torch.randn(hidden, dtype=torch.float32)
+
+    module = Qwen4ExpTextRMSNormGated(hidden, eps=eps, activation="sigmoid")
+    with torch.no_grad():
+        module.weight.copy_(weight)
+
+    x_h, g_h = make_grad_leaves(x, gate)
+    out_h = module(x_h, g_h)
+
+    x_e, g_e, w_e = make_grad_leaves(x, gate, weight)
+    out_e = resolve_op("rms_norm_gated", "standard", "eager").wrapper(x_e, g_e, w_e, eps=eps, activation="sigmoid")
+    assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    go = torch.randn_like(out_e)
+    out_h.backward(go)
+    out_e.backward(go)
+    assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(g_e.grad, g_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(w_e.grad, module.weight.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+def test_rms_norm_gated_rejects_an_unknown_activation():
+    eager = resolve_op("rms_norm_gated", "standard", "eager").wrapper
+    x = torch.randn(2, 4, 8)
+    with pytest.raises(ValueError, match="unsupported rms_norm_gated activation"):
+        eager(x, torch.randn_like(x), torch.randn(8), activation="gelu")
+
+
 @pytest.mark.parametrize("device", _FLA_DEVICE_CASES)
-def test_rms_norm_gated_fla_matches_eager(device):
+@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
+def test_rms_norm_gated_fla_matches_eager(device, activation):
     pytest.importorskip("fla")
     eager = resolve_op("rms_norm_gated", "standard", "eager").wrapper
     other = resolve_op("rms_norm_gated", "standard", "fla").wrapper
@@ -118,8 +155,8 @@ def test_rms_norm_gated_fla_matches_eager(device):
 
     x_e, g_e, w_e = make_grad_leaves(x, gate, weight)
     x_o, g_o, w_o = make_grad_leaves(x, gate, weight)
-    out_e = eager(x_e, g_e, w_e, eps=1e-6)
-    out_o = other(x_o, g_o, w_o, eps=1e-6)
+    out_e = eager(x_e, g_e, w_e, eps=1e-6, activation=activation)
+    out_o = other(x_o, g_o, w_o, eps=1e-6, activation=activation)
     assert torch.allclose(out_e, out_o, atol=GDN_FUSED_ATOL, rtol=GDN_FUSED_RTOL)
 
     go = torch.randn_like(out_e)

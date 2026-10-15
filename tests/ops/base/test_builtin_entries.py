@@ -30,6 +30,7 @@ _ANY = None
 _GPU = ("gpu", (("nvidia", None, None), ("rocm", None, None)))
 _GPU_SM70 = ("gpu", (("nvidia", 70, None), ("rocm", None, None)))
 _GPU_SM80 = ("gpu", (("nvidia", 80, None), ("rocm", None, None)))
+_GPU_NVIDIA = ("gpu", (("nvidia", None, None),))
 _GPU_NVIDIA_SM80 = ("gpu", (("nvidia", 80, None),))
 _GPU_NVIDIA_SM90 = ("gpu", (("nvidia", 90, None),))
 _GPU_NVIDIA_SM90_TO_SM100 = ("gpu", (("nvidia", 90, 100),))
@@ -133,6 +134,8 @@ _BUILTIN_ENTRIES = (
     ("mhc", "head", "eager", "any", _ANY, ()),
     ("mhc", "head", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tile_kernels",)),
     ("mhc", "head", "cann", "npu", _NPU, ()),
+    ("qsa_attention", "standard", "eager", "any", _ANY, ()),
+    ("qsa_attention", "standard", "tilelang", "cuda", _GPU_NVIDIA, ("tilelang",)),
     ("moe_experts", "standard", "eager", "any", _ANY, ()),
     ("moe_experts", "standard", "fused_triton", "cuda", _GPU_SM70, ("triton",)),
     ("moe_experts", "standard", "fused_triton", "mlu", _MLU, ("triton",)),

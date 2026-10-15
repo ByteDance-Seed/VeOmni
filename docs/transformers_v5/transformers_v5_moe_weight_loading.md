@@ -123,9 +123,18 @@ It reports each per-expert key's fused target and expert index
 own `E/ep` experts' tensors and stacks them straight into its local
 `[E/ep, ...]` slice. Per-expert keys of modules the model does not build, such
 as the Qwen3-Omni-MoE talker or the DeepSeek-V3 and GLM-5 MTP layers, are
-skipped without being read. A converter that does not implement both methods,
-for example DeepSeek-V4's, still makes the streaming loader raise
-`NotImplementedError`.
+skipped without being read. A converter that does not implement both methods
+still makes the streaming loader raise `NotImplementedError`.
+
+DeepSeek-V4's converter implements both methods for its `w1/w2/w3` expert keys,
+including the FP4 / FP8 `.scale` companion of each expert weight: a scale maps to
+the same expert as its weight, so each rank reads, dequantizes and stacks only
+its own experts. A converter that streams experts may also claim keys that are
+not ExtraParallel, such as DeepSeek-V4's renamed dense weights and its FP8
+attention weight + scale pairs. Every rank reads those whole and runs them
+through the converter before dispatch, as the whole-tensor loader does. A
+converter that emits an ExtraParallel parameter from such a key, rather than
+through `fused_expert_target`, raises `NotImplementedError`.
 
 ### Saving (VeOmni modeling -> checkpoint)
 

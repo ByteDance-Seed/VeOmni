@@ -193,7 +193,7 @@ cd torch_custom/fla_npu/ && bash build.sh
 pip list | grep fla_npu   # verify it is installed
 ```
 
-If `fla_npu` is absent when `npu_ascendc` is selected, the backend raises an actionable error when
+If the `fla_npu` package is missing when `chunk_gated_delta_rule_implementation: fla_npu` is selected, the backend raises an actionable error when
 the model constructs its `VeomniOp` handle (pointing back to the install step or to `triton` / `eager`).
 
 ### Qwen3.5-9B VL Training
@@ -220,7 +220,7 @@ Drop `chunk_gated_delta_rule_implementation` to `npu` if `fla_npu` is not instal
 
 ### Qwen3.5 MoE 35B VL Training
 
-A ready-to-run MoE-VL config wired for `npu_ascendc` (plus `fused_npu` MoE, NPU RMSNorm/RoPE and
+A ready-to-run MoE-VL config wired for `fla_npu` (plus `fused_npu` MoE, NPU RMSNorm/RoPE and
 Ulysses SP) is provided at
 [`configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml`](../../configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml):
 
@@ -313,3 +313,7 @@ Qwen3.5 is a hybrid model alternating between softmax and linear attention layer
 
 For detailed implementation notes, see the
 [Ulysses documentation](../key_features/ulysses.md#-linear-attention-ulysses-gateddeltanet).
+For Ascend 910B4 Triton code generation, export TRITON_ASCEND_ARCH=Ascend910B4
+before the first Triton import. The NPU CI regression step sets this variable
+explicitly; on a non-910B4 runner the regression test skips after checking the
+runtime device name.
