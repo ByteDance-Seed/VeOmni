@@ -48,14 +48,27 @@ def test_gate_is_inert_when_no_parallel_state_was_installed(monkeypatch):
     check_context_parallel_supported(build_config("tests/toy_config/qwen3_toy"))
 
 
-def test_gate_rejects_context_parallel_on_npu(monkeypatch):
+def test_gate_admits_deepseek_v4_on_every_backend(monkeypatch):
     monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(
         auto_module,
         "get_parallel_state",
         lambda: SimpleNamespace(cp_enabled=True),
     )
-    monkeypatch.setattr(auto_module, "is_torch_npu_available", lambda: True)
 
-    with pytest.raises(NotImplementedError, match="GPU-only"):
-        check_context_parallel_supported(SimpleNamespace(model_type="deepseek_v4"))
+    # The allow-list is the whole gate. Nothing in it is device-dependent, so a
+    # DeepSeek-V4 run with ``cp_size > 1`` is admitted on Ascend/NPU exactly as
+    # on CUDA -- the NPU compressor patches are what make that true.
+    check_context_parallel_supported(SimpleNamespace(model_type="deepseek_v4"))
+
+
+def test_gate_rejects_a_model_type_outside_the_allow_list(monkeypatch):
+    monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(
+        auto_module,
+        "get_parallel_state",
+        lambda: SimpleNamespace(cp_enabled=True),
+    )
+
+    with pytest.raises(NotImplementedError, match="not implemented for model type 'qwen3'"):
+        check_context_parallel_supported(SimpleNamespace(model_type="qwen3"))

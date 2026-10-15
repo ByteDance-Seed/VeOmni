@@ -271,8 +271,9 @@ def _indexer_loss_enabled(module) -> bool:
     rather than here. These stay because this predicate also covers the paths that
     never pass through ``build_foundation_model`` -- a model constructed straight from
     ``_from_config`` -- and because the parallel-state refusals below have no earlier
-    home: the state is installed by then, but a model-agnostic gate cannot know that
-    *this* model has no context-parallel indexer path.
+    home: the state is installed by then, but a model-agnostic gate cannot know which
+    sequence-parallel modes this model's forward supports, nor which of its
+    collectives this objective makes reachable in backward.
     """
     if not getattr(module.config, "dsa_indexer_loss", False):
         return False
@@ -296,9 +297,10 @@ def _indexer_loss_enabled(module) -> bool:
         )
     if state.cp_size > 1:
         raise ValueError(
-            f"dsa_indexer_loss requires cp_size=1, got cp_size={state.cp_size}: DeepSeek-V4's forward "
-            "has no context-parallel path, so each rank would treat its sequence shard as a whole "
-            "sequence and the teacher would be built from the resulting attention."
+            f"dsa_indexer_loss requires cp_size=1, got cp_size={state.cp_size}: under context "
+            "parallelism the per-rank KL means are not comparable, and the indexer's own halo "
+            "exchange and compressed-row gather, which this objective is what makes reachable from "
+            "the loss, have no backward on any rank -- a deadlock rather than a wrong number."
         )
     return True
 
@@ -814,10 +816,11 @@ class DeepseekV4HCACompressor(nn.Module):
     # NPU-only: packed compressed-attention gradient-participation anchor
     # ================================================================
     # A packed micro-batch where every sequence is shorter than compress_rate
-    # produces zero compression windows; ``compress_packed_windows`` then returns a
-    # fresh zero tensor detached from the autograd graph, so ``kv_proj`` /
-    # ``gate_proj`` / ``position_bias`` / ``kv_norm`` would receive no gradient in
-    # that case while ranks with at least one full window do. FSDP2 sizes a
+    # produces zero compression windows; ``compress_packed_windows`` then returns
+    # ``empty_compressed_rows``, which is attached to ``kv_proj``'s and
+    # ``gate_proj``'s outputs but touches neither ``position_bias`` nor
+    # ``kv_norm``. Those two would receive no gradient on such a rank while ranks
+    # with at least one full window do. FSDP2 sizes a
     # bucket's gradient reduce-scatter by the set of params that actually received
     # grads, so the two kinds of ranks would issue different-sized collectives for
     # the same layer bucket — HCCL validates this and raises, so this is scoped as
@@ -826,6 +829,12 @@ class DeepseekV4HCACompressor(nn.Module):
     # graph regardless of whether a full window was formed, so gradient
     # participation for these four params stays uniform across data-dependent
     # micro-batch contents.
+    #
+    # Under context parallelism the anchor sits after the compressed-row all-gather,
+    # which makes its trigger global: ``compressed.shape[1] == 0`` there means *no*
+    # rank owns a window, so either every rank anchors or none does. That keeps
+    # ``position_bias`` / ``kv_norm`` participation rank-uniform the same way the
+    # data-parallel case needs, and keeps every rank's line of execution identical.
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -852,8 +861,47 @@ class DeepseekV4HCACompressor(nn.Module):
         kv = self.kv_proj(hidden_states)
         gate = self.gate_proj(hidden_states)
 
+        # Context parallelism shards the token sequence and replicates the compressed
+        # rows: this rank compresses only the windows whose first token it owns, then
+        # all-gathers them back into global window order. Identical to the GPU
+        # sibling's HCA compressor -- see it for the full rationale; the collectives
+        # here are plain ``torch.distributed`` and reach HCCL unchanged.
+        parallel_state = get_parallel_state()
+        # The attention forward refuses a KV cache under CP before reaching a
+        # compressor, so the decode path below is never the context-parallel one.
+        cp_enabled = parallel_state.cp_enabled and cache_layer is None
+        if cp_enabled:
+            cp_group = parallel_state.cp_group
+            cp_rank = parallel_state.cp_rank
+            local_seq_len = hidden_states.shape[1]
+            rate = self.compress_rate
+            # Shared with the CSA compressor and the Lightning Indexer. It carries
+            # the narrow-shard refusal and communicates nothing.
+            shard = plan_compressor_shard(
+                role="DeepSeek V4 HCA compressor",
+                rate=rate,
+                local_seq_len=local_seq_len,
+                cp_rank=cp_rank,
+                cp_size=parallel_state.cp_size,
+                packed_compression_metadata=packed_compression_metadata,
+                device=kv.device,
+            )
+            # Every guard is above this line. A rank must not enter a collective
+            # while its peers are still deciding whether to raise, or a clear error
+            # becomes an HCCL watchdog timeout.
+            kv, gate = exchange_compressor_halos(kv, gate, rate, cp_group)
+
         if cache_layer is None and packed_sequence_slices is not None and packed_compression_metadata is not None:
             rate_metadata = packed_compression_metadata[self.compress_rate]
+            if cp_enabled:
+                rate_metadata = shard_packed_compression_metadata(
+                    rate_metadata,
+                    window_begin=shard.begin,
+                    window_end=shard.end,
+                    local_seq_len=local_seq_len,
+                    cp_rank=cp_rank,
+                    halo=rate,
+                )
             compressed = compress_packed_windows(
                 kv,
                 gate,
@@ -868,7 +916,14 @@ class DeepseekV4HCACompressor(nn.Module):
                 overlap=False,
                 apply_rope=apply_rotary_pos_emb,
             )
+            if cp_enabled:
+                compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
             compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
+            # Also the CP anchor: ``all_gather_compressed_rows`` returns a detached
+            # tensor when *no* rank owns a window, and the anchor is what keeps this
+            # rank's ``kv_proj`` / ``gate_proj`` / ``position_bias`` / ``kv_norm`` on
+            # the graph then. Every rank runs this line together, so the halo
+            # all-gathers above keep all their backward participants.
             if compressed.shape[1] == 0:
                 anchor = (self.kv_norm(kv[..., : self.head_dim]).sum() + gate.sum() + self.position_bias.sum()) * 0.0
                 compressed = compressed + anchor.to(compressed.dtype)
@@ -876,7 +931,14 @@ class DeepseekV4HCACompressor(nn.Module):
             result = (compressed.unsqueeze(1), block_bias)
             return (*result, None) if return_topk_indices else result
 
-        if cache_layer is None:
+        if cp_enabled:
+            # This rank's own windows, out of the haloed buffer in window order.
+            window_indices, first_window_position = local_window_token_indices(
+                shard, rate=rate, local_seq_len=local_seq_len, cp_rank=cp_rank, device=kv.device
+            )
+            flat_indices = window_indices.reshape(-1)
+            chunk_kv, chunk_gate = kv[:, flat_indices], gate[:, flat_indices]
+        elif cache_layer is None:
             usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
             chunk_kv, chunk_gate, first_window_position = kv[:, :usable], gate[:, :usable], 0
         else:
@@ -896,11 +958,15 @@ class DeepseekV4HCACompressor(nn.Module):
             cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
             compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
         else:
-            compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
+            # A CP rank can own no window; ``new_zeros`` would be detached and take
+            # this rank out of the compressed-row all-gather's backward.
+            compressed = empty_compressed_rows(chunk_kv, chunk_gate, self.head_dim)
 
         compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
         if cache_layer is not None:
             compressed = cache_layer.update_compressor_states("compressor", compressed)
+        if cp_enabled:
+            compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
         compressed_kv = compressed.unsqueeze(1)
 
         compressed_len = compressed_kv.shape[2]
@@ -1406,8 +1472,42 @@ class DeepseekV4CSACompressor(nn.Module):
         kv = self.kv_proj(hidden_states)
         gate = self.gate_proj(hidden_states)
 
+        # Same context-parallel treatment as the HCA compressor, plus the left halo:
+        # every CSA window's overlap half is the previous window, which for this
+        # rank's first owned window lives on the left neighbour. It feeds the very
+        # slots the decode path fills from the cache, so the compression below needs
+        # no new branch.
+        parallel_state = get_parallel_state()
+        cp_enabled = parallel_state.cp_enabled and cache_layer is None
+        if cp_enabled:
+            cp_group = parallel_state.cp_group
+            cp_rank = parallel_state.cp_rank
+            local_seq_len = hidden_states.shape[1]
+            rate = self.compress_rate
+            shard = plan_compressor_shard(
+                role="DeepSeek V4 CSA compressor",
+                rate=rate,
+                local_seq_len=local_seq_len,
+                cp_rank=cp_rank,
+                cp_size=parallel_state.cp_size,
+                packed_compression_metadata=packed_compression_metadata,
+                device=kv.device,
+            )
+            # Every guard is above this line, so no rank enters a collective while
+            # its peers are still deciding whether to raise.
+            kv, gate = exchange_compressor_halos(kv, gate, rate, cp_group)
+
         if cache_layer is None and packed_sequence_slices is not None and packed_compression_metadata is not None:
             rate_metadata = packed_compression_metadata[self.compress_rate]
+            if cp_enabled:
+                rate_metadata = shard_packed_compression_metadata(
+                    rate_metadata,
+                    window_begin=shard.begin,
+                    window_end=shard.end,
+                    local_seq_len=local_seq_len,
+                    cp_rank=cp_rank,
+                    halo=rate,
+                )
             compressed = compress_packed_windows(
                 kv,
                 gate,
@@ -1422,11 +1522,14 @@ class DeepseekV4CSACompressor(nn.Module):
                 overlap=True,
                 apply_rope=apply_rotary_pos_emb,
             )
+            if cp_enabled:
+                compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
             compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
             # The indexer submodule is intentionally NOT anchored here: its outputs
             # are non-differentiable top-k indices, so its params already receive no
             # gradient on every rank uniformly, and anchoring them would create the
-            # very asymmetry this patch removes.
+            # very asymmetry this patch removes. The compressed rows still need the
+            # anchor -- see the HCA compressor.
             if compressed.shape[1] == 0:
                 anchor = (self.kv_norm(kv[..., : self.head_dim]).sum() + gate.sum() + self.position_bias.sum()) * 0.0
                 compressed = compressed + anchor.to(compressed.dtype)
@@ -1452,7 +1555,24 @@ class DeepseekV4CSACompressor(nn.Module):
             result = (compressed_kv, block_bias)
             return (*result, top_k_indices) if return_topk_indices else result
 
-        if cache_layer is None:
+        prior_kv = prior_gate = None
+        if cp_enabled:
+            # This rank's own windows, out of the haloed buffer in window order.
+            window_indices, first_window_position = local_window_token_indices(
+                shard, rate=rate, local_seq_len=local_seq_len, cp_rank=cp_rank, device=kv.device
+            )
+            flat_indices = window_indices.reshape(-1)
+            chunk_kv, chunk_gate = kv[:, flat_indices], gate[:, flat_indices]
+            if first_window_position >= rate:
+                # The window before the first owned one, read out of the left halo.
+                # Global window 0 has no predecessor, so rank 0 leaves the slot at
+                # zero-kv / -inf-gate and never reads the halo's zeros.
+                previous_indices = window_indices[0] - rate
+                prior_kv = kv[:, previous_indices, : self.head_dim]
+                prior_gate = gate[:, previous_indices, : self.head_dim] + self.position_bias[:, : self.head_dim].to(
+                    gate.dtype
+                )
+        elif cache_layer is None:
             usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
             chunk_kv, chunk_gate, first_window_position = kv[:, :usable], gate[:, :usable], 0
         else:
@@ -1474,9 +1594,11 @@ class DeepseekV4CSACompressor(nn.Module):
                 prior_kv, prior_gate = cache_layer.update_overlap_state(
                     "compressor", chunk_kv, chunk_gate, self.head_dim
                 )
-                if prior_kv is not None:
-                    new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
-                    new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
+            # ``prior_kv`` is set by the cache on the decode path and by the left halo
+            # under context parallelism; both fill the same slots.
+            if prior_kv is not None:
+                new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
+                new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
             compressed = self.kv_norm(
                 (new_kv * new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype)).sum(dim=2)
             )
@@ -1486,11 +1608,15 @@ class DeepseekV4CSACompressor(nn.Module):
             cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
             compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
         else:
-            compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
+            # A CP rank can own no window; ``new_zeros`` would be detached and take
+            # this rank out of the compressed-row all-gather's backward.
+            compressed = empty_compressed_rows(chunk_kv, chunk_gate, self.head_dim)
 
         compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
         if cache_layer is not None:
             compressed = cache_layer.update_compressor_states("compressor", compressed)
+        if cp_enabled:
+            compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
         compressed_kv = compressed.unsqueeze(1)
         top_k_indices = self.indexer(hidden_states, q_residual, position_ids, past_key_values, layer_idx)
         if build_block_bias:

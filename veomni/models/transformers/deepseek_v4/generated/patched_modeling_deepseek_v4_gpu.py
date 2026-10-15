@@ -181,8 +181,9 @@ def _indexer_loss_enabled(module) -> bool:
     rather than here. These stay because this predicate also covers the paths that
     never pass through ``build_foundation_model`` -- a model constructed straight from
     ``_from_config`` -- and because the parallel-state refusals below have no earlier
-    home: the state is installed by then, but a model-agnostic gate cannot know that
-    *this* model has no context-parallel indexer path.
+    home: the state is installed by then, but a model-agnostic gate cannot know which
+    sequence-parallel modes this model's forward supports, nor which of its
+    collectives this objective makes reachable in backward.
     """
     if not getattr(module.config, "dsa_indexer_loss", False):
         return False
@@ -206,9 +207,10 @@ def _indexer_loss_enabled(module) -> bool:
         )
     if state.cp_size > 1:
         raise ValueError(
-            f"dsa_indexer_loss requires cp_size=1, got cp_size={state.cp_size}: DeepSeek-V4's forward "
-            "has no context-parallel path, so each rank would treat its sequence shard as a whole "
-            "sequence and the teacher would be built from the resulting attention."
+            f"dsa_indexer_loss requires cp_size=1, got cp_size={state.cp_size}: under context "
+            "parallelism the per-rank KL means are not comparable, and the indexer's own halo "
+            "exchange and compressed-row gather, which this objective is what makes reachable from "
+            "the loss, have no backward on any rank -- a deadlock rather than a wrong number."
         )
     return True
 

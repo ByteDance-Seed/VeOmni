@@ -47,11 +47,19 @@ model:
     gradient_checkpointing:
       enable: true
     init_device: meta
-    # DeepSeek-V4's Ulysses SP path (Q head all-to-all + sequence all-gather
-    # around compressors / sparse attention) is backend-agnostic but has not
-    # been validated on NPU with this model yet — keep ulysses_size at 1
-    # until it has been.
+    # DeepSeek-V4 sequence parallelism. Ulysses (Q head all-to-all + sequence
+    # all-gather around compressors / sparse attention) is backend-agnostic but
+    # has not been validated on NPU with this model yet — keep ulysses_size at 1
+    # until it has been. Context parallelism, the model's other
+    # sequence-parallel mode, *is* supported on NPU: its full-resolution KV,
+    # compressed rows and compressor halos are all-gathered through plain
+    # torch.distributed collectives, which reach HCCL unchanged, and the NPU
+    # compressor patches carry the same CP branches as the GPU ones. The two
+    # modes are mutually exclusive. The widest compression rate caps cp_size —
+    # the packed sequence length has to be at least cp_size * max(compress_rates)
+    # — see docs/design/deepseek_v4_context_parallel.md.
     ulysses_size: 1
+    cp_size: 2
     ep_size: 8
     fsdp_config:
       fsdp_mode: fsdp2

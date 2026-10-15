@@ -789,10 +789,11 @@ class TestIndexerLossGate:
 
         Under Ulysses a rank holds a head shard, so the head sum inside the teacher
         would cover only that shard: a *wrong* teacher, and one that still produces a
-        decreasing curve. Under context parallelism the sharding is of the sequence
-        and DeepSeek-V4's forward has no context-parallel path at all, so each rank
-        would treat its shard as a whole sequence and the teacher would be built from
-        the resulting attention.
+        decreasing curve. Under context parallelism the sharding is of the sequence,
+        which the forward does handle, but the per-rank KL means are not comparable
+        without a token-weighted global reduction, and the indexer's own collectives
+        -- reachable from the loss only because of this objective -- have no backward,
+        so the failure mode is a hang rather than a wrong number.
 
         The match pins each message's two actionable halves: the size observed, and
         the one size that is supported.
