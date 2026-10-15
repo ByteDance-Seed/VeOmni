@@ -58,11 +58,13 @@ _DEEPSEEK_V4_TILELANG_TRAINING_ARGS = [
 
 _QWEN4_EXP_CONFIG = "./tests/toy_config/qwen4_exp_toy/config.json"
 _ACCELERATOR = get_torch_device()
+# GatedDeltaNet under Ulysses SP rejects eager; flash-linear-attention ships only in the gpu extra.
+_QWEN4_EXP_GDN_IMPL = "fla" if IS_CUDA_AVAILABLE else "npu"
 _QWEN4_EXP_TRAINING_ARGS = [
     "--model.ops_implementation.attn_implementation=flash_attention_2",
     f"--model.ops_implementation.qsa_attention_implementation={'tilelang' if IS_CUDA_AVAILABLE else 'eager'}",
-    "--model.ops_implementation.causal_conv1d_implementation=fla",
-    "--model.ops_implementation.chunk_gated_delta_rule_implementation=fla",
+    f"--model.ops_implementation.causal_conv1d_implementation={_QWEN4_EXP_GDN_IMPL}",
+    f"--model.ops_implementation.chunk_gated_delta_rule_implementation={_QWEN4_EXP_GDN_IMPL}",
     "--model.accelerator.extra_parallel_names=ple",
     "--model.accelerator.extra_parallel_sizes=2",
     "--model.accelerator.extra_parallel_placement_innermost=false",
