@@ -131,10 +131,11 @@ jobs:
           clean: true
       - name: Sync dependencies
         run: |
-          # The NPU image already provides Python 3.11. Restrict discovery to
-          # that system interpreter so a stale runner-level uv managed install
-          # cannot fail first with a missing `_sysconfigdata_` file.
-          uv sync --frozen --no-managed-python --python 3.11 --extra npu --group dev
+          # The image builds and verifies this venv in its Dockerfile. Its base
+          # Python is not discoverable as a system interpreter at job runtime,
+          # so use the known-good image interpreter to create the project venv.
+          /app/.venv/bin/python --version
+          uv sync --frozen --python /app/.venv/bin/python --extra npu --group dev
       - name: Check final pip list
         run: |
           uv pip list
@@ -173,7 +174,7 @@ jobs:
         run: |
           # diffusers ships under the `npu` extra (rolled in from the dropped
           # `dit` extra), so no additional extra is needed here.
-          uv sync --frozen --no-managed-python --python 3.11 --extra npu --group dev
+          uv sync --frozen --python /app/.venv/bin/python --extra npu --group dev
       - name: Run diffusers tests
         run: |
           uv run --frozen pytest -v -s -x tests/e2e/test_e2e_parallel.py::test_wan_dit_parallel_align
