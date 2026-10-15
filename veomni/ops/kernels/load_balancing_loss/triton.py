@@ -19,6 +19,17 @@ eliminating the large ``[N, top_k, num_experts]`` one-hot intermediate tensor.
 
 The forward kernel uses a two-pass tiled reduction to avoid ``atomic_add``,
 ensuring deterministic results across runs.
+
+H100 optimization: the original forward hardcoded ``BLOCK_N = 256`` rows per
+program (constexpr-unrolled). In the short-sequence / small-batch regime
+(seqlen 100-200), the total row count ``N = layers * B * S`` is only a few
+thousand, so ``cdiv(N, 256)`` launched **14-48 blocks on a 132-SM H100** —
+severe under-occupancy that left forward time flat (~590us) regardless of N.
+We now size the grid to fill the machine: ``ROWS_PER_BLOCK`` is chosen so the
+number of blocks targets several waves over all SMs, and the per-block row loop
+is a **runtime** loop (not a 256-way unroll). Determinism is preserved: each
+block still owns its own partial-sum row and the cross-block reduction is a
+deterministic ``torch.sum``.
 """
 
 from typing import Optional, Union
@@ -43,14 +54,14 @@ def _lb_loss_fwd_kernel(
     stride_count_row,  # stride of expert_count along dim-0
     stride_prob_row,  # stride of router_prob_sum along dim-0
     N,
+    ROWS_PER_BLOCK,  # runtime: number of rows this block streams over
     E: tl.constexpr,
     TOP_K: tl.constexpr,
     BLOCK_E: tl.constexpr,
-    BLOCK_N: tl.constexpr,
     HAS_MASK: tl.constexpr,
 ):
     block_idx = tl.program_id(0)
-    row_start = block_idx * BLOCK_N
+    row_start = block_idx * ROWS_PER_BLOCK
     expert_offs = tl.arange(0, BLOCK_E)
     emask = expert_offs < E
 
@@ -58,7 +69,7 @@ def _lb_loss_fwd_kernel(
     local_count = tl.zeros([BLOCK_E], dtype=tl.float32)
     local_prob_sum = tl.zeros([BLOCK_E], dtype=tl.float32)
 
-    for row_offset in range(BLOCK_N):
+    for row_offset in range(ROWS_PER_BLOCK):
         row_idx = row_start + row_offset
         if row_idx < N:
             # Optional per-token mask weight
@@ -164,7 +175,28 @@ def _lb_loss_bwd_kernel(
 # Autograd Function
 # ---------------------------------------------------------------------------
 
-BLOCK_N = 256
+# Target several waves across the H100's SMs for the forward reduction so small
+# token counts (short sequences) still fill the machine. Overridable for tuning.
+import os as _os
+
+_SM_COUNT = None
+
+
+def _sm_count(device) -> int:
+    global _SM_COUNT
+    if _SM_COUNT is None:
+        _SM_COUNT = torch.cuda.get_device_properties(device).multi_processor_count
+    return _SM_COUNT
+
+
+def _pick_rows_per_block(N: int, device) -> int:
+    """Choose rows-per-block so the grid targets ~8 waves over all SMs."""
+    override = _os.environ.get("VEOMNI_LB_ROWS_PER_BLOCK")
+    if override:
+        return max(1, int(override))
+    target_blocks = 8 * _sm_count(device)
+    rpb = triton.cdiv(N, target_blocks)
+    return max(1, rpb)
 
 
 class _FusedLoadBalancingLoss(torch.autograd.Function):
@@ -194,7 +226,8 @@ class _FusedLoadBalancingLoss(torch.autograd.Function):
         N, E = concatenated_gate_logits.shape
         device = concatenated_gate_logits.device
 
-        num_blocks = triton.cdiv(N, BLOCK_N)
+        rows_per_block = _pick_rows_per_block(N, device)
+        num_blocks = triton.cdiv(N, rows_per_block)
         BLOCK_E = triton.next_power_of_2(E)
         has_mask = mask_weights is not None
 
@@ -214,10 +247,10 @@ class _FusedLoadBalancingLoss(torch.autograd.Function):
             partial_expert_count.stride(0),
             partial_router_prob_sum.stride(0),
             N,
+            rows_per_block,
             E=E,
             TOP_K=top_k,
             BLOCK_E=BLOCK_E,
-            BLOCK_N=BLOCK_N,
             HAS_MASK=has_mask,
         )
 
