@@ -142,7 +142,7 @@ jobs:
           clean: true
       - name: Sync dependencies
         run: |
-          uv sync --frozen --python 3.11 --extra npu --group dev
+          uv sync --frozen --python "$(command -v python3)" --extra npu --group dev
           uv pip install --python .venv/bin/python ninja
           uv run --frozen ninja --version
           uv run --frozen python -c "import cann_ops_transformer"
