@@ -168,12 +168,11 @@ class OmniModel(PreTrainedModel):
 
         # Convert may split modules before any DAG/FSM exists. Build each graph
         # only when the config has one; :meth:`forward` / :meth:`generate` report
-        # the absence at train / infer time. A present graph checks endpoints
-        # against these modules during its own construction.
+        # the absence at train / infer time. The training graph checks its
+        # endpoints against these modules here; the generation graph only before
+        # a request (:meth:`GenerationGraph.validate_modules`).
         self.training_graph = TrainingGraph(config.training_graph, modules=modules) if config.training_graph else None
-        self.generation_graph = (
-            GenerationGraph(config.generation_graph, modules=modules) if config.generation_graphs else None
-        )
+        self.generation_graph = GenerationGraph(config.generation_graph) if config.generation_graphs else None
 
         self._last_printed_state: str | None = None
         self._generated: list[dict[str, Any]] = []
@@ -546,6 +545,12 @@ class OmniModel(PreTrainedModel):
         collection and return value stay here. A runtime that wraps the modules
         passes one to unwrap them and scope each node to its module's mesh;
         without one each node runs as :meth:`_run_train_node`.
+
+        Returns the summed ``loss``, the per-node ``losses`` and the batch's
+        ``conversation_list`` as the nodes left it. Under FSDP2 mixed precision
+        every wrap unit's pre-forward casts its inputs with ``dataclasses.replace``,
+        so the nodes update copies of the caller's ``ConversationItem``\\ s: a caller
+        that needs what they wrote reads it from here.
         """
         del args, kwargs
         run_node = node_runner if node_runner is not None else self._run_train_node
@@ -563,7 +568,11 @@ class OmniModel(PreTrainedModel):
             loss = batch.pop(LOSS_KEY, None)
             if loss is not None:
                 self._losses[node.name] = loss
-        return {"loss": _sum_losses(self._losses), "losses": dict(self._losses)}
+        return {
+            "loss": _sum_losses(self._losses),
+            "losses": dict(self._losses),
+            "conversation_list": batch.get("conversation_list"),
+        }
 
     def reset(self) -> None:
         """Clear per-request inference runtime state."""
@@ -665,6 +674,7 @@ class OmniModel(PreTrainedModel):
                 "OmniModel.generate: this model has no generation graph. Pass `generation_graphs` "
                 f"(or place `{DEFAULT_GENERATION_GRAPH_FILE}` next to the checkpoint) to run inference."
             )
+        self.generation_graph.validate_modules({name: self.get_module(name) for name in self._module_names})
         ctx: dict[str, Any] = request
         generation_kwargs = self.resolve_generation_kwargs(generation_kwargs)
 
