@@ -142,7 +142,10 @@ jobs:
           clean: true
       - name: Sync dependencies
         run: |
-          uv sync --frozen --python 3.11 --extra npu --group dev
+          uv sync --frozen --python "$(command -v python3)" --extra npu --group dev
+          uv pip install --python .venv/bin/python ninja
+          uv run --frozen ninja --version
+          uv run --frozen python -c "import cann_ops_transformer"
       - name: Install triton-ascend
         # The Ascend Triton kernels (vendored GatedDeltaNet, MoE clamped SwiGLU)
         # need triton-ascend, which is deliberately not in the lockfile. The image
@@ -157,8 +160,9 @@ jobs:
         # parallel uv transaction does not guarantee it) and verify the patch
         # stuck. Mirrors docker/ascend/Dockerfile.ascend_9.1.0_*_910b.x86.
         run: |
-          uv pip install triton==3.2.0
-          uv pip install triton-ascend==3.2.1 --index=https://mirrors.huaweicloud.com/ascend/repos/pypi
+          uv pip install --python .venv/bin/python triton==3.2.0
+          uv pip install --python .venv/bin/python triton-ascend==3.2.1 \
+            --index=https://mirrors.huaweicloud.com/ascend/repos/pypi
           uv run --frozen python -c "from triton._C.libtriton import ascend"
       - name: Check final pip list
         run: |
@@ -215,11 +219,23 @@ jobs:
       - name: Run data tests
         run: |
           uv run --frozen pytest -v -s -x tests/data
+      - name: Run Ascend 910B4 GDR padding-mask regression (best-effort)
+        # The generic 910b-8 runner label does not guarantee a 910B4 device.
+        # The test self-skips on another chip; a green job is not proof that
+        # this numerical gate ran unless the runner reports Ascend910B4.
+        env:
+          TRITON_ASCEND_ARCH: Ascend910B4
+        run: |
+          uv run --frozen pytest -v -s -x tests/ops/test_gdr_ascend_padding_mask.py
       - name: Run ops tests
         run: |
           uv run --frozen pytest -v -s -x tests/ops/test_comp.py
           uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
           uv run --frozen pytest -v -s -x tests/ops/test_npu_kernels.py
+          # This numerical gate must execute on NPU; fail instead of silently skipping
+          # when the vendor extension is missing from the CI image.
+          uv run --frozen python -c "import cann_ops_transformer"
+          uv run --frozen pytest -v -s -x tests/ops/test_mhc_tile_kernels.py::test_npu_mhc_pre_forward_backward_matches_eager
       - name: Run utils tests
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py

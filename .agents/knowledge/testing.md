@@ -31,13 +31,17 @@ Consequences that cut both ways:
 ## What the NPU job can actually run
 
 Both NPU workflows build their own venv with `uv sync --extra npu`, so the
-packages baked into the image's build-time venv are not on the test path. Only
-`torch_npu` ships that way; `triton-ascend` is installed by an explicit workflow
-step (`uv sync` prunes anything outside the lockfile, `uv run --frozen` does
-not), and `fla_npu` is not installed at all. So Ascend Triton kernels are
-testable, `npu_ascendc` is not, and `fla` never works on Ascend regardless of
-what its `HardwareRequirement` lists. The runners are 910B (A2, non-arch35), so
-kernels gated behind `is_arch35()` stay unreachable.
+packages baked into the image's build-time venv are not on the test path. Three
+kernel dependencies land differently, and each decides what a test can reach:
+
+| Package | Where it is | What it gates |
+|---------|-------------|---------------|
+| `triton-ascend` | installed by an explicit workflow step after the sync (`uv sync` prunes anything outside the lockfile, `uv run --frozen` does not) | the vendored Ascend Triton kernels — the `npu` GatedDeltaNet backends, MoE clamped SwiGLU |
+| `fla_npu` | image venv only; the workspace venv does not inherit it | `chunk_gated_delta_rule_implementation=npu_ascendc`, so that backend is untestable |
+| `flash-linear-attention` | `gpu` extra only, so absent from both | the `fla` backends. Its `HardwareRequirement` lists `npu`, but the GatedDeltaNet docs say it raises on Ascend even when installed — treat `fla` as GPU-only |
+
+The runners are 910B (A2, non-arch35), so kernels gated behind `is_arch35()`
+stay unreachable whatever is installed.
 
 Check whether a file is wired — by name, and by the directory it sits in:
 

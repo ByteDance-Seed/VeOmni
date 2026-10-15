@@ -131,7 +131,10 @@ jobs:
           clean: true
       - name: Sync dependencies
         run: |
-          uv sync --frozen --python 3.11 --extra npu --group dev
+          uv sync --frozen --python "$(command -v python3)" --extra npu --group dev
+          uv pip install --python .venv/bin/python ninja
+          uv run --frozen ninja --version
+          uv run --frozen python -c "import cann_ops_transformer"
       - name: Install triton-ascend
         # The Ascend Triton kernels (vendored GatedDeltaNet, MoE clamped SwiGLU)
         # need triton-ascend, which is deliberately not in the lockfile. The image
@@ -140,7 +143,7 @@ jobs:
         # absent from the lockfile; `uv run --frozen` does not, so this survives
         # the test steps below — but the later `Sync dependencies [diffusers]`
         # step does prune it again, which is fine since the Wan DiT test after it
-        # uses no Triton kernel.
+        # uses no Triton kernel (unlike ninja, which that step reinstalls).
         #
         # Community triton and triton-ascend both ship triton/_C/libtriton.so and
         # only triton-ascend's carries the Ascend backend, so whoever writes that
@@ -148,8 +151,9 @@ jobs:
         # parallel uv transaction does not guarantee it) and verify the patch
         # stuck. Mirrors docker/ascend/Dockerfile.ascend_9.1.0_*_910b.x86.
         run: |
-          uv pip install triton==3.2.0
-          uv pip install triton-ascend==3.2.1 --index=https://mirrors.huaweicloud.com/ascend/repos/pypi
+          uv pip install --python .venv/bin/python triton==3.2.0
+          uv pip install --python .venv/bin/python triton-ascend==3.2.1 \
+            --index=https://mirrors.huaweicloud.com/ascend/repos/pypi
           uv run --frozen python -c "from triton._C.libtriton import ascend"
       - name: Check final pip list
         run: |
@@ -189,7 +193,10 @@ jobs:
         run: |
           # diffusers ships under the `npu` extra (rolled in from the dropped
           # `dit` extra), so no additional extra is needed here.
-          uv sync --frozen --python 3.11 --extra npu --group dev
+          uv sync --frozen --python "$(command -v python3)" --extra npu --group dev
+          uv pip install --python .venv/bin/python ninja
+          uv run --frozen ninja --version
+          uv run --frozen python -c "import cann_ops_transformer"
       - name: Run diffusers tests
         run: |
           uv run --frozen pytest -v -s -x tests/e2e/test_e2e_parallel.py::test_wan_dit_parallel_align
