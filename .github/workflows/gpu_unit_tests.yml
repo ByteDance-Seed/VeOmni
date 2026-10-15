@@ -127,7 +127,9 @@ jobs:
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_slice_input_tensor.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_wan_ulysses_padding.py
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_flux_joint_attn_ulysses.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_ltx2_ulysses.py
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_qwen4_exp_ulysses.py
           uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
           uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
           uv run --frozen pytest -s -x tests/parallel/test_ddp_sp_grad_sync.py
@@ -151,6 +153,7 @@ jobs:
           uv run --frozen pytest -s -x tests/models/test_models_logits_equal_v5.py
           uv run --frozen pytest -s -x tests/models/test_model_forward_no_implicit_sync.py
           uv run --frozen pytest -s -x tests/models/test_checkpoint_tensor_converter.py
+          uv run --frozen pytest -s -x tests/models/test_glm_moe_dsa.py
           uv run --frozen pytest -s -x tests/models/test_return_log_probs_e2e.py
       - name: Run SeedOmni unit tests
         run: |

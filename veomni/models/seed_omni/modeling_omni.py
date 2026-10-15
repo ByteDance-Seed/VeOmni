@@ -326,6 +326,11 @@ class OmniModel(PreTrainedModel):
             # After the ops config above was installed.
             bind_ops_to_modeling(mod_cls)
             if load_weights and config._hf_source is not None:
+                if os.path.normpath(module_path) != os.path.normpath(os.path.join(str(checkpoint_root), name)):
+                    raise ValueError(
+                        f"Module {name!r} reads from {module_path!r}, but {checkpoint_root} is a view of the "
+                        f"HuggingFace `{config._hf_source.model_type}` checkpoint every module loads from."
+                    )
                 modules[name] = cls._load_module_from_hf_source(
                     mod_cls, name, module_config, module_path, config._hf_source, module_kwargs
                 )

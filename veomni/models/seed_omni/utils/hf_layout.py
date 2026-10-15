@@ -85,8 +85,19 @@ _SAFE_WEIGHTS_NAME = "model.safetensors"
 # Per-rank files ``HuggingFaceStorageWriter`` stages before consolidating into the save root.
 _DCP_STAGING_DIRNAME = "sharded"
 _SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
-_WEIGHT_FILE_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".ckpt")
-_WEIGHT_INDEX_SUFFIXES = (".safetensors.index.json", ".bin.index.json")
+_WEIGHT_FILE_SUFFIXES = (
+    ".safetensors",
+    ".bin",
+    ".pt",
+    ".pth",
+    ".ckpt",
+    ".h5",
+    ".msgpack",
+    ".onnx",
+    ".gguf",
+    ".npz",
+)
+_WEIGHT_INDEX_SUFFIXES = (".safetensors.index.json", ".bin.index.json", ".h5.index.json", ".msgpack.index.json")
 
 
 @dataclass(frozen=True)
@@ -390,7 +401,11 @@ class HFSourceKeyConverter:
 
 
 def attach_hf_source_converter(model: torch.nn.Module, source: HFSource, module_name: str) -> None:
-    """Make every VeOmni weight loader read ``model`` (module ``module_name``) from ``source``.
+    """Make the VeOmni weight loaders read ``model`` (module ``module_name``) from ``source``.
+
+    Covers ``load_model_weights`` and ``rank0_load_and_broadcast_weights``;
+    ``ep_sharded_stream_load`` does not apply the renames and is rejected for
+    an HF ``model_path`` up front.
 
     Installed on the instance, ahead of the class's own converter factory,
     which then sees the module's key names exactly as it would reading a split
@@ -574,18 +589,25 @@ def source_weight_files(source_path: str) -> dict[str, str]:
     raise FileNotFoundError(f"{source_path} has neither {_SAFE_WEIGHTS_INDEX_NAME} nor {_SAFE_WEIGHTS_NAME}.")
 
 
-def _source_dtypes(source_path: str, weight_files: Mapping[str, str]) -> dict[str, torch.dtype]:
+def source_tensor_specs(source_path: str, weight_files: Mapping[str, str]) -> dict[str, tuple[torch.dtype, tuple]]:
+    """``{key: (dtype, shape)}`` of every source tensor, read from the safetensors headers only."""
     from safetensors import safe_open
 
-    dtypes: dict[str, torch.dtype] = {}
+    specs: dict[str, tuple[torch.dtype, tuple]] = {}
     by_file: dict[str, list[str]] = {}
     for key, filename in weight_files.items():
         by_file.setdefault(filename, []).append(key)
     for filename, keys in by_file.items():
         with safe_open(os.path.join(source_path, filename), framework="pt", device="cpu") as f:
             for key in keys:
-                dtypes[key] = f.get_slice(key).get_dtype()
-    return {key: _SAFETENSORS_DTYPES[value] for key, value in dtypes.items()}
+                tensor_slice = f.get_slice(key)
+                dtype = tensor_slice.get_dtype()
+                if dtype not in _SAFETENSORS_DTYPES:
+                    raise ValueError(
+                        f"{filename}: tensor {key!r} has safetensors dtype {dtype}, which is not supported."
+                    )
+                specs[key] = (_SAFETENSORS_DTYPES[dtype], tuple(tensor_slice.get_shape()))
+    return specs
 
 
 _SAFETENSORS_DTYPES = {
@@ -599,8 +621,12 @@ _SAFETENSORS_DTYPES = {
     "I32": torch.int32,
     "I16": torch.int16,
     "I8": torch.int8,
+    "U64": torch.uint64,
+    "U32": torch.uint32,
+    "U16": torch.uint16,
     "U8": torch.uint8,
     "BOOL": torch.bool,
+    **({"F8_E8M0": torch.float8_e8m0fnu} if hasattr(torch, "float8_e8m0fnu") else {}),
 }
 
 
@@ -630,6 +656,19 @@ def copy_source_non_weight_files(source_path: str, save_path: str) -> None:
         shutil.copyfile(src, os.path.join(save_path, entry))
 
 
+def _tied_parameter_names(model: torch.nn.Module) -> dict[str, tuple[str, ...]]:
+    """``{name: other names of the same parameter}`` for every tied parameter of ``model``."""
+    names: dict[int, list[str]] = {}
+    for name, param in model.named_parameters(remove_duplicate=False):
+        names.setdefault(id(param), []).append(name)
+    return {
+        name: tuple(other for other in group if other != name)
+        for group in names.values()
+        if len(group) > 1
+        for name in group
+    }
+
+
 @torch.no_grad()
 def save_hf_source_checkpoint(
     source: HFSource,
@@ -639,42 +678,56 @@ def save_hf_source_checkpoint(
     """Write ``modules``' live weights back as one checkpoint in ``source``'s own layout.
 
     ``modules`` maps a layout module name to ``(model, parallel_state)``; all
-    ranks must call this. Each module's flat state dict has its own weight
-    conversions reverted, is renamed back to source keys, and is cast to the
-    source dtype. Source keys no live module produced — modules that stayed
+    ranks must call this. Each module's flat state dict is renamed back to
+    source keys through the layout's prefixes and cast to the source dtype.
+    Every live key must land on a source key of the same shape, except a tied
+    alias the source does not store: a module whose checkpoint tensor converter
+    renames or reshapes tensors, or that adds a parameter the source lacks,
+    loads from the source but cannot be written back to it, so that raises
+    instead of exporting the stale source copy. Source keys no live module produced — modules that stayed
     frozen, a sibling built on meta, or weights no module claims — are copied
     from the source verbatim, except a declared tied duplicate
     (:attr:`OmniHFLayout.tied_source_keys`), which takes its original's value.
-    Keys the source does not hold are dropped. The result keeps the source's shard files
-    and non-weight files, so it loads wherever the source does.
+    The result keeps the source's shard files and non-weight files, so it
+    loads wherever the source does.
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
     from ....checkpoint.dcp_checkpointer import ModelState
     from ....checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
-    from ....utils.save_safetensor_utils import _revert_model_weight_conversions_for_hf
 
     apply_dcp_consolidation_patch()
     layout = source.layout
     weight_files = source_weight_files(source.path)
-    source_dtypes = _source_dtypes(source.path, weight_files)
+    source_specs = source_tensor_specs(source.path, weight_files)
 
     save_state: dict[str, torch.Tensor] = {}
     for name, (model, parallel_state) in modules.items():
         module_state = ModelState(model, parallel_state=parallel_state).state_dict()
-        module_state = _revert_model_weight_conversions_for_hf(model, module_state)
-        dropped = []
+        tied = _tied_parameter_names(model)
+        unmapped, reshaped = [], []
         for key, tensor in module_state.items():
             source_key = layout.source_key(name, key)
             if source_key is None or source_key not in weight_files:
-                dropped.append(key)
+                # A tied alias the source does not store (``tie_word_embeddings``
+                # checkpoints omit ``lm_head.weight``) is written through its original.
+                if not any(layout.source_key(name, alias) in weight_files for alias in tied.get(key, ())):
+                    unmapped.append(key)
                 continue
             if source_key in save_state:
                 raise ValueError(f"Source key {source_key!r} is produced by more than one module.")
-            dtype = source_dtypes[source_key]
+            dtype, shape = source_specs[source_key]
+            if tuple(tensor.shape) != shape:
+                reshaped.append(f"{key} {tuple(tensor.shape)} vs {source_key} {shape}")
+                continue
             save_state[source_key] = tensor if tensor.dtype == dtype else tensor.to(dtype)
-        if dropped:
-            logger.info_rank0(f"save_hf_source_checkpoint: module '{name}' keys not in the source, dropped: {dropped}")
+        if unmapped or reshaped:
+            raise ValueError(
+                f"save_hf_source_checkpoint: module '{name}' cannot be written back in the `{source.model_type}` "
+                f"source layout. Keys with no source key: {unmapped}; keys whose shape differs from the source: "
+                f"{reshaped}. A module whose checkpoint tensor converter renames or reshapes tensors cannot export "
+                "to its upstream layout; disable train.checkpoint.save_hf_weights, or train from a split checkpoint."
+            )
 
     for key, original in layout.tied_source_keys.items():
         if key in weight_files and key not in save_state and original in save_state:
@@ -748,5 +801,6 @@ __all__ = [
     "read_hf_source",
     "resolve_omni_checkpoint_root",
     "save_hf_source_checkpoint",
+    "source_tensor_specs",
     "source_weight_files",
 ]

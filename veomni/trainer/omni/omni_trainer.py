@@ -294,6 +294,7 @@ class OmniTrainer:
             dataset_name=args.data.dataset_name,
             transform=self.data_transform,
             seed=args.train.seed,
+            shuffle=args.data.dataloader.shuffle,
             **asdict(args.data),
         )
         dataset_length = None if not hasattr(self.train_dataset, "__len__") else len(self.train_dataset)
@@ -304,10 +305,7 @@ class OmniTrainer:
 
     def _build_collate_fn(self) -> None:
         args: OmniArguments = self.args
-        processor = OmniProcessor.from_config(
-            self.model.config,
-            checkpoint_root=args.model.resolved_model_path,
-        )
+        processor = OmniProcessor.from_config(self.model.config, checkpoint_root=args.model.resolved_model_path)
         # FSDP-anchor dummy tensors are only exercised by the training (inference=False)
         # branch. The model runtime is already built, so every module's own
         # resolved `ModuleRuntime.model_config` is sitting in memory — hand that

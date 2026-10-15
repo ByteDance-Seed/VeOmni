@@ -201,7 +201,7 @@ also the recommended NPU value (see [NPU-friendly operator
 configurations](../hardware_support/typical_usage.md)), and `rms_norm`, `rotary_pos_emb`,
 `swiglu_mlp` and `cross_entropy_loss` are left at their dataclass defaults there, so VeOmni
 normalizes them to NPU-compatible values automatically
-([`_NPU_DEFAULT_FALLBACK`](../../veomni/arguments/arguments_types.py#L1216)). The three
+([`_NPU_DEFAULT_FALLBACK`](../../veomni/arguments/arguments_types.py#L1298)). The three
 GatedDeltaNet ops are deliberately **not** in that table, which is why they must be explicit:
 
 ```shell
@@ -311,3 +311,7 @@ Qwen3.5 is a hybrid model alternating between softmax and linear attention layer
 
 For detailed implementation notes, see the
 [Ulysses documentation](../key_features/ulysses.md#-linear-attention-ulysses-gateddeltanet).
+For Ascend 910B4 Triton code generation, export TRITON_ASCEND_ARCH=Ascend910B4
+before the first Triton import. The NPU CI regression step sets this variable
+explicitly; on a non-910B4 runner the regression test skips after checking the
+runtime device name.

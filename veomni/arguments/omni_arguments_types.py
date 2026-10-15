@@ -120,22 +120,35 @@ def _resolve_hf_checkpoint_view(model_runtime: OmniModelRuntimeArguments) -> str
 
 def _check_hf_source_exportable(model_path: str) -> None:
     """Fail at startup, not at the first HF save, when the source cannot be written back."""
-    from ..models.seed_omni.utils.hf_layout import read_hf_source, source_weight_files
+    from ..models.seed_omni.utils.hf_layout import read_hf_source, source_tensor_specs, source_weight_files
 
     source = read_hf_source(model_path)
     if source is None:
         return
     try:
-        source_weight_files(source.path)
+        weight_files = source_weight_files(source.path)
     except FileNotFoundError as e:
         raise ValueError(
             f"`train.checkpoint.save_hf_weights` exports in the source layout, which needs safetensors weights: {e} "
             "Convert the checkpoint to safetensors, or disable save_hf_weights."
         ) from e
+    try:
+        source_tensor_specs(source.path, weight_files)
+    except ValueError as e:
+        raise ValueError(f"`train.checkpoint.save_hf_weights` cannot write this source back: {e}") from e
 
 
-def _validate_hf_view_modules(model_path: str, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
-    """Under an HF ``model_path`` every module is one the family layout cuts from that checkpoint."""
+def _validate_hf_view_modules(
+    model_path: str,
+    modules: dict[str, OmniModuleRuntimeArguments],
+    *,
+    ep_sharded_stream_load: bool = False,
+) -> None:
+    """Under an HF ``model_path`` every module is one the family layout cuts from that checkpoint.
+
+    ``ep_sharded_stream_load`` is the top-level flag, which the composed wrap
+    (``fsdp_scope: model``) reads instead of the per-module ones.
+    """
     from ..models.seed_omni.utils.hf_layout import read_hf_source
 
     source = read_hf_source(model_path)
@@ -155,6 +168,12 @@ def _validate_hf_view_modules(model_path: str, modules: dict[str, OmniModuleRunt
                 f"HuggingFace `{source.model_type}` checkpoint every module loads from. Drop the per-module "
                 "model_path, or convert the checkpoint to compose modules from several sources."
             )
+    streaming = sorted(name for name, args in modules.items() if args.ep_sharded_stream_load)
+    if ep_sharded_stream_load or streaming:
+        raise ValueError(
+            f"ep_sharded_stream_load (model: {ep_sharded_stream_load}, modules: {streaming}) does not apply the "
+            f"`{source.model_type}` HF layout's key renames. Disable it, or convert the checkpoint to a split one."
+        )
     overrides = {
         name: sorted(keys) for name, args in modules.items() if (keys := hf_module_model_config(args.model_config))
     }
@@ -180,7 +199,8 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
     # it. ``seed_omni_model_path`` is the root configs / assets / graphs are read
     # from (a weight-free view when ``model_path`` is an upstream HF checkpoint).
     seed_omni_model_path = _resolve_hf_checkpoint_view(model_runtime)
-    if not for_inference and args.train.checkpoint.save_hf_weights:
+    # An ``offline_embedding`` run trains nothing, so it never exports HF weights.
+    if not for_inference and args.train.checkpoint.save_hf_weights and args.train.training_task != "offline_embedding":
         _check_hf_source_exportable(seed_omni_model_path)
     omni_cfg = _try_load_omni_checkpoint_config(seed_omni_model_path)
 
@@ -244,7 +264,9 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         for_inference=for_inference,
         checkpoint_modules=ckpt_modules,
     )
-    _validate_hf_view_modules(seed_omni_model_path, modules)
+    _validate_hf_view_modules(
+        seed_omni_model_path, modules, ep_sharded_stream_load=model_runtime.ep_sharded_stream_load
+    )
     for module_args in modules.values():
         _validate_omni_accelerator(module_args.accelerator)
     _validate_composed_wrap(model_runtime.accelerator, modules)

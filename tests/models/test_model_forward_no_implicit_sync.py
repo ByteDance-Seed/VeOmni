@@ -857,10 +857,11 @@ def test_no_implicit_sync_in_minimax_h3_forward_backward(monkeypatch, mode, atte
     config = tiny_model().config
     config._attn_implementation = attention
     model = type(tiny_model())(config).to(device=device, dtype=dtype)
+    # Recompute the blocks through the run's own entry point, so the replayed forward is under test too.
+    model.gradient_checkpointing_enable({"use_reentrant": False})
     make_sample = cfg_raw if cfg_mode == "per_sample" else raw_sample
     raws = [make_sample(3, "fl2va"), make_sample(5, "ref2va")][: 1 if mode == "single" else 2]
     for row in raws:
-        row["use_gradient_checkpointing"] = True
         for key in ("input_latents", "audio_input_latents", "prompt_embeds"):
             row[key] = row[key].to(dtype)
     condition = condition_model() if cfg_mode == "off" else cfg_condition()

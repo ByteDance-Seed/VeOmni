@@ -53,7 +53,7 @@ class OmniModelRuntimeArguments(ModelArguments):
     generation_kwargs: dict[str, Any] = field(default_factory=dict)
     # Filled by ``build_omni_model_runtime_args``: the weight-free split view when
     # ``model_path`` is an upstream HF checkpoint, otherwise equal to ``model_path``.
-    # Never a launcher YAML field — ``model_path`` itself is never rewritten.
+    # A launcher value is overwritten; ``model_path`` itself is never rewritten.
     seed_omni_model_path: Optional[str] = None
 
     def launcher_config(self, key: str, default: Any = None) -> Any:
