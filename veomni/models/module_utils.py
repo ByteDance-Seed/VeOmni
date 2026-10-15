@@ -51,6 +51,7 @@ from .checkpoint_tensor_loading import (
     checkpoint_converter_is_dim0_zero_pad,
     checkpoint_converter_record_skip_without_loading,
     checkpoint_converter_should_skip_without_loading,
+    checkpoint_converter_supports_expert_streaming,
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
@@ -651,7 +652,7 @@ def load_model_weights_ep_sharded(
 
     Raises ``NotImplementedError`` when the checkpoint/model is unsupported: no
     ExtraParallel ``get_parallel_plan``, or a checkpoint-tensor converter whose
-    transform needs the whole tensor set. Two converter transforms stay streamable:
+    transform needs the whole tensor set. Three converter transforms stay streamable:
 
       * a pure dim-0 zero-pad -- each rank reads its real-row slice and zero-fills
         the tail -- opted into via ``CheckpointTensorConverter.is_dim0_zero_pad``;
@@ -661,7 +662,15 @@ def load_model_weights_ep_sharded(
         its local ``[E/ep, ...]`` slice; other ranks' experts are never read. Every
         rank raises ``RuntimeError`` if a built fused target that has per-expert keys
         does not have them for exactly experts ``0..E-1``, each with the same number
-        of source keys (e.g. both ``gate_proj`` and ``up_proj``).
+        of source keys (e.g. both ``gate_proj`` and ``up_proj``);
+      * for a converter with the per-expert capabilities only, whole-tensor converts
+        of non-ExtraParallel keys (e.g. DeepSeek-V4's renames and FP8 weight+scale
+        pairs): every rank reads them whole and dispatches the converter's outputs,
+        including its ``finalize`` outputs, as :func:`load_model_weights` does. Such
+        an output landing on an ExtraParallel parameter raises. The expert-range
+        converter's ``finalize`` outputs (e.g. orphan expert scales) are rank-local,
+        so they are only logged as unexpected keys; one naming a model parameter or
+        buffer raises.
 
     PEFT is supported. Base-checkpoint keys are remapped to their PEFT
     ``base_layer`` FQNs (:func:`build_lora_key_overrides`) and streamed exactly
@@ -680,9 +689,10 @@ def load_model_weights_ep_sharded(
     adapter_path = kwargs.get("adapter_path", None)
 
     # A checkpoint-tensor converter generally needs the whole tensor set, which
-    # streaming can't provide. The streamable exceptions (dim-0 zero-pad, and
-    # per-expert stacking restricted to this rank's experts) are decided per key
-    # below. Under PEFT the converter lives on the *base* model (the wrapper has none).
+    # streaming can't provide. The streamable exceptions (dim-0 zero-pad, per-expert
+    # stacking restricted to this rank's experts, and non-ExtraParallel converts for a
+    # converter that stacks experts) are decided per key below. Under PEFT the
+    # converter lives on the *base* model (the wrapper has none).
     converter = get_checkpoint_tensor_converter(model)
     if converter is None and is_peft_model:
         converter = get_checkpoint_tensor_converter(model.get_base_model())
@@ -741,6 +751,14 @@ def load_model_weights_ep_sharded(
         _, para_rank, expected_full0 = _ep_dim0_slice_meta(parallel_state, shard_group, target0)
         return para_rank * target0, target0, expected_full0
 
+    def _converter_transforms(bare_name: str) -> bool:
+        """Whether the converter claims ``bare_name`` for more than a dim-0 zero-pad."""
+        return (
+            converter is not None
+            and converter.can_handle(bare_name)
+            and not checkpoint_converter_is_dim0_zero_pad(converter, bare_name)
+        )
+
     # Up-front scan of the *raw checkpoint keys* for a converter's non-dim0-zero-pad
     # transforms. It must run over raw keys rather than in the per-destination main loop:
     # a per-expert key (e.g. ``model.layers.0.mlp.experts.3.gate_proj.weight``) has no
@@ -750,11 +768,15 @@ def load_model_weights_ep_sharded(
     # Per-expert -> fused stacking streams when the converter can name each key's fused
     # target and expert row (``fused_expert_target``) and build a converter restricted to
     # this rank's ``Shard(0)`` row range (``for_expert_range``): the rank then reads only
-    # its own experts and stacks exactly its local slice. Any other transform (reshape,
-    # dtype change, a converter without those capabilities) needs the whole tensor set,
-    # so raise before materialising anything.
+    # its own experts and stacks exactly its local slice.
+    #
+    # Converters that already advertise those capabilities may also claim non-expert keys
+    # (renames, FP8/FP4 weight+scale pairs). Those are streamed as whole tensors in the
+    # main loop. A converter that claims a key but lacks expert-streaming capabilities
+    # still needs the whole tensor set for every transform, so raise before materialising.
     expert_converter = None
     expert_range: Optional[Tuple[int, int]] = None
+    supports_expert_streaming = checkpoint_converter_supports_expert_streaming(converter)
     # Per-expert keys whose fused target the model does not build (e.g. a checkpoint's MTP
     # experts when MTP is off): unexpected keys, skipped without reading.
     unbuilt_expert_keys = set()
@@ -769,10 +791,13 @@ def load_model_weights_ep_sharded(
             bare_name = _convert_weight_key(raw_name, model)
             if checkpoint_converter_should_skip_without_loading(converter, bare_name):
                 continue
-            if not converter.can_handle(bare_name) or checkpoint_converter_is_dim0_zero_pad(converter, bare_name):
+            if not _converter_transforms(bare_name):
                 continue
             target = checkpoint_converter_fused_expert_target(converter, bare_name)
             if target is None:
+                if supports_expert_streaming:
+                    # Non-expert convert (rename / dequant); handled in the main loop.
+                    continue
                 raise NotImplementedError(
                     f"ep_sharded_stream_load: checkpoint-tensor converter "
                     f"{type(converter).__name__} needs a non-dim0-zero-pad transform for key "
@@ -826,6 +851,26 @@ def load_model_weights_ep_sharded(
         keys_by_file.setdefault(fname, []).append(key)
 
     n_ep = n_dense = n_buf = n_skipped = n_expert_reads = n_remote_experts = 0
+
+    def _dispatch_whole_converted(converted, source: str) -> None:
+        """Dispatch a whole-tensor converter output like :func:`load_model_weights` does."""
+        nonlocal n_dense, n_buf
+        dest = _apply_peft_override(converted.name)
+        if parallel_plan._get_shard_parameter_groupname(dest) is not None:
+            raise NotImplementedError(
+                f"ep_sharded_stream_load: converter emitted ExtraParallel key '{dest}' from non-expert "
+                f"source '{source}'. Per-expert keys must go through fused_expert_target / for_expert_range."
+            )
+        if dest in buffer_dict:
+            buffer_dict[dest] = converted.tensor.clone()
+            n_buf += 1
+        elif dest in parameter_names_to_load:
+            _dispatch_parameter(model, dest, converted.tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
+            parameter_names_to_load.discard(dest)
+            n_dense += 1
+        else:
+            logger.info_rank0(f"Unexpected key in state dict: {dest}.")
+
     for fname in tqdm(
         sorted(keys_by_file),
         desc="Streaming EP-sharded checkpoint",
@@ -874,6 +919,16 @@ def load_model_weights_ep_sharded(
                         parameter_names_to_load.discard(fused_name)
                         n_ep += 1
                     continue
+                # Whole-tensor converter path: renames and quantized weight+scale pairs that
+                # are not ExtraParallel. Must run before the unexpected-key skip so companion
+                # scale keys (absent from the model) are still fed to the converter. Converters
+                # without expert-streaming capabilities never get here: the up-front scan
+                # refused them.
+                if _converter_transforms(bare_name):
+                    converted = maybe_convert_checkpoint_tensor(bare_name, f.get_tensor(raw_name), converter)
+                    if converted is not None:
+                        _dispatch_whole_converted(converted, bare_name)
+                    continue
                 if name in buffer_dict:  # persistent buffers: read whole
                     buffer_dict[name] = f.get_tensor(raw_name).clone()
                     n_buf += 1
@@ -892,7 +947,7 @@ def load_model_weights_ep_sharded(
                     # overlap and zero-fill the tail. Otherwise the checkpoint must
                     # match the model exactly.
                     zero_pad = checkpoint_converter_is_dim0_zero_pad(converter, bare_name)
-                    if converter is not None and converter.can_handle(bare_name) and not zero_pad:
+                    if _converter_transforms(bare_name):
                         # A converter that fuses/reshapes this key can't be streamed.
                         raise NotImplementedError(
                             f"ep_sharded_stream_load: converter applies a non-dim0-zero-pad "
@@ -940,29 +995,51 @@ def load_model_weights_ep_sharded(
                     n_ep += 1
                 else:
                     if converter is not None and converter.can_handle(bare_name):
-                        # A streamable (dim-0 zero-pad) converter must only touch
-                        # ExtraParallel tables; a dense key would need its conversion
-                        # applied here, which this path does not do -> bail.
+                        # Only a dim-0 zero-pad key gets here (other claimed keys took
+                        # the whole-tensor converter path); it must be an ExtraParallel table.
                         raise NotImplementedError(
                             f"ep_sharded_stream_load: converter handles non-ExtraParallel key '{name}'."
                         )
                     tensor = f.get_tensor(raw_name)
-                    _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
-                    n_dense += 1
+                    # ``can_handle_tensor`` catches quantized dense weights whose names
+                    # do not change (e.g. DeepSeek-V4 FP8 attention): dequant needs the
+                    # tensor dtype, so the by-name path above cannot see them.
+                    converted = maybe_convert_checkpoint_tensor(bare_name, tensor, converter)
+                    if converted is not None:
+                        _dispatch_whole_converted(converted, bare_name)
+                    continue
                 parameter_names_to_load.discard(name)
         empty_cache()
+
+    if converter is not None:
+        finalized = converter.finalize()
+        if finalized and not supports_expert_streaming:
+            raise NotImplementedError(
+                "ep_sharded_stream_load cannot dispatch converter outputs produced only at finalize time."
+            )
+        # E.g. DeepSeek-V4's orphan block scales: whole tensors, dispatched as the
+        # whole-tensor loader does (typically logged as unexpected keys).
+        for result in finalized:
+            _dispatch_whole_converted(result, result.name)
+    if expert_converter is not None:
+        # E.g. DeepSeek-V4 ``.scale`` keys left beside BF16 expert weights. These come
+        # from this rank's experts only, so they may not be dispatched into the model
+        # (other ranks would not do the same); unexpected keys are logged, as the
+        # whole-tensor loader does.
+        for result in expert_converter.finalize():
+            dest = _apply_peft_override(result.name)
+            if dest in parameter_names_to_load or dest in buffer_dict:
+                raise NotImplementedError(
+                    f"ep_sharded_stream_load: expert-range converter emitted '{dest}' at finalize time; "
+                    f"rank-local finalize outputs cannot be dispatched."
+                )
+            logger.info_rank0(f"Unexpected key in state dict: {dest}.")
 
     logger.info_rank0(
         f"ep_sharded_stream_load: read {n_ep} ExtraParallel-sliced, {n_dense} dense, {n_buf} buffer tensors/rank; "
         f"skipped {n_skipped} converter-declared tensors without reading; stacked {n_expert_reads} local "
         f"per-expert tensors and skipped {n_remote_experts} other ranks' without reading."
     )
-
-    for active_converter in (converter, expert_converter):
-        if active_converter is not None and active_converter.finalize():
-            raise NotImplementedError(
-                "ep_sharded_stream_load cannot dispatch converter outputs produced only at finalize time."
-            )
 
     if is_peft_model and adapter_path:
         # Stream the LoRA adapter the same per-rank way as the base: independent MoE
