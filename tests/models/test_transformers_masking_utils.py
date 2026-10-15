@@ -73,7 +73,8 @@ def test_packed_sequence_ids_allow_empty_segments():
         ("create_sliding_window_causal_mask", "_hf_create_sliding_window_causal_mask"),
     ],
 )
-def test_flex_mask_wrapper_adds_packed_sequence_predicate(monkeypatch, wrapper_name, delegate_name):
+@pytest.mark.parametrize("implementation", [_FLEX_IMPLEMENTATION, "sdpa", "eager"])
+def test_mask_wrapper_adds_packed_sequence_predicate(monkeypatch, wrapper_name, delegate_name, implementation):
     captured = {}
     sentinel = object()
 
@@ -86,7 +87,7 @@ def test_flex_mask_wrapper_adds_packed_sequence_predicate(monkeypatch, wrapper_n
     attention_mask = torch.ones(1, 5)
 
     result = getattr(masking_utils, wrapper_name)(
-        config=SimpleNamespace(_attn_implementation=_FLEX_IMPLEMENTATION),
+        config=SimpleNamespace(_attn_implementation=implementation),
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
         past_key_values=None,
@@ -129,7 +130,7 @@ def test_flex_mask_wrapper_without_packing_preserves_original_predicate(monkeypa
     assert captured["and_mask_function"] is original_mask_function
 
 
-def test_non_flex_mask_wrapper_does_not_consume_packing_metadata(monkeypatch):
+def test_flash_attention_mask_wrapper_does_not_consume_packing_metadata(monkeypatch):
     captured = {}
 
     def original_mask_function(_batch_idx, _head_idx, _q_idx, _kv_idx):
