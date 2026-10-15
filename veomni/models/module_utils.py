@@ -894,6 +894,14 @@ def load_model_weights_ep_sharded(
             target = checkpoint_converter_fused_expert_target(converter, bare_name)
             if target is None:
                 if supports_expert_streaming:
+                    if parallel_plan._get_shard_parameter_groupname(_apply_peft_override(bare_name)) is not None:
+                        # The main loop would read it whole and refuse it there; refuse before any read.
+                        raise NotImplementedError(
+                            f"ep_sharded_stream_load: checkpoint-tensor converter {type(converter).__name__} "
+                            f"transforms ExtraParallel key '{bare_name}' as a whole tensor (e.g. renames it), "
+                            f"so its rank slice cannot be planned. Disable model.ep_sharded_stream_load to "
+                            f"use the whole-tensor loader."
+                        )
                     # Non-expert convert (rename / dequant); handled in the main loop.
                     continue
                 raise NotImplementedError(
