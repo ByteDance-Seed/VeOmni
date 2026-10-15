@@ -53,13 +53,12 @@ class TestLoadBalancingLossEager:
     """
 
     def test_uniform_distribution_well_conditioned(self):
-        """With uniform random gate logits, the loss is in (0, top_k + 1)."""
+        """With fixed random gate logits, the loss is reproducible."""
         num_experts, top_k, num_layers, N = 8, 2, 3, 1024
-        torch.manual_seed(0)
+        torch.manual_seed(42)
         gate_logits = tuple(torch.randn(N, num_experts, dtype=torch.float32) for _ in range(num_layers))
         loss = load_balancing_loss_pytorch(gate_logits, num_experts, top_k, None)
-        assert loss.item() > 0
-        assert loss.item() < 5.0
+        assert torch.allclose(loss, torch.tensor(2.000870943069458), atol=1e-6)
 
     def test_perfectly_balanced_gives_top_k(self):
         """All-equal gate logits -> uniform routing -> loss = top_k.
