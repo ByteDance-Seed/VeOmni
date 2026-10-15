@@ -267,11 +267,19 @@ def test_deepseek_v4_eager_matches_hf_aux_loss():
     torch.testing.assert_close(ours_out.loss, hf_out.loss, atol=1e-6, rtol=1e-6)
 
 
-class _FusedDsv4AttentionSpy:
-    impl = "tilelang"
+class _StopForward(Exception):
+    pass
+
+
+class _Dsv4AttentionRequestSpy:
+    """Stand-in ``dsa_attention`` op that records the request and stops the forward."""
+
+    def __init__(self) -> None:
+        self.kwargs: dict | None = None
 
     def __call__(self, *args, **kwargs):
-        raise AssertionError("fused DeepSeek-V4 attention should have raised before the kernel call")
+        self.kwargs = kwargs
+        raise _StopForward
 
 
 def test_deepseek_v4_eager_dropout_train_eval_seed_and_grads():
@@ -303,6 +311,28 @@ def test_deepseek_v4_eager_dropout_train_eval_seed_and_grads():
     assert any(grad is not None and grad.abs().sum() > 0 for grad in grads)
 
 
+def test_deepseek_v4_cached_decode_matches_hf():
+    # A decode query sits past the cached rows, so this is what pins the
+    # attention's ``query_offset`` and the compressors' decode candidates. The
+    # prefill is longer than the sliding window and every compression rate.
+    torch.manual_seed(0)
+    config = _tiny_config()
+    hf = HFDeepseekV4ForCausalLM(config).eval()
+    ours = _build_ours(config).eval()
+    ours.load_state_dict(hf.state_dict())
+    input_ids = torch.randint(3, config.vocab_size, (2, 22))
+    prefill, steps = input_ids[:, :19], input_ids[:, 19:]
+    with torch.no_grad():
+        hf_cache = hf(input_ids=prefill, use_cache=True).past_key_values
+        ours_cache = ours(input_ids=prefill, use_cache=True).past_key_values
+        for step in range(steps.shape[1]):
+            token = steps[:, step : step + 1]
+            hf_out = hf(input_ids=token, past_key_values=hf_cache, use_cache=True)
+            ours_out = ours(input_ids=token, past_key_values=ours_cache, use_cache=True)
+            torch.testing.assert_close(ours_out.logits, hf_out.logits, atol=1e-5, rtol=1e-5)
+            hf_cache, ours_cache = hf_out.past_key_values, ours_out.past_key_values
+
+
 def test_deepseek_v4_eager_output_attentions_matches_hf():
     torch.manual_seed(0)
     config = _tiny_config()
@@ -320,12 +350,16 @@ def test_deepseek_v4_eager_output_attentions_matches_hf():
         torch.testing.assert_close(ours_weights, hf_weights, atol=1e-4, rtol=1e-4)
 
 
-def test_deepseek_v4_fused_rejects_output_attentions():
+def test_deepseek_v4_output_attentions_reaches_the_op():
+    # Each implementation decides whether it can return weights; modeling only
+    # has to pass the request through.
     config = _tiny_config()
     model = _build_ours(config)
-    model.model.layers[0].self_attn.veomni_dsa_attention = _FusedDsv4AttentionSpy()
-    with pytest.raises(ValueError, match="output_attentions=True"):
+    spy = _Dsv4AttentionRequestSpy()
+    model.model.layers[0].self_attn.veomni_dsa_attention = spy
+    with pytest.raises(_StopForward):
         model(input_ids=torch.randint(3, config.vocab_size, (2, 8)), use_cache=False, output_attentions=True)
+    assert spy.kwargs["return_attn_weights"] is True
 
 
 def test_deepseek_v4_packed_public_entry_validates_cu_seqlens():

@@ -16,7 +16,7 @@
 
 Adapted from HuggingFace ``eager_attention_forward`` (transformers v5.9.0):
 matmul scores, add mask, concat per-head sink, shift by max, softmax, drop
-the sink column, then ``scores @ V``. Top-k indices become the additive
+the sink column, then ``scores @ V``. The candidate list becomes the additive
 mask. KV is MQA (one shared head).
 
 https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/deepseek_v4/modeling_deepseek_v4.py
@@ -29,6 +29,8 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+
+from ...sparse_indices import CompressedCandidates, build_sparse_attention_indices
 
 
 def _topk_to_additive_mask(topk_idxs: Tensor, kv_len: int, dtype: torch.dtype) -> Tensor:
@@ -47,9 +49,17 @@ def _topk_to_additive_mask(topk_idxs: Tensor, kv_len: int, dtype: torch.dtype) -
 
 def wrapper(
     q: Tensor,
-    kv: Tensor,
+    ori_kv: Tensor,
+    cmp_kv: Tensor | None,
     attn_sink: Tensor,
-    topk_idxs: Tensor,
+    position_ids: Tensor,
+    *,
+    sliding_window: int,
+    compress_ratio: int,
+    candidates: CompressedCandidates | None = None,
+    packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
+    query_offset: int = 0,
+    attention_mask: Tensor | None = None,
     sm_scale: float | None = None,
     return_lse: bool = False,
     dropout: float = 0.0,
@@ -57,13 +67,22 @@ def wrapper(
 ) -> Tensor | tuple[Tensor, ...]:
     """Sparse MQA with HF sink-softmax math.
 
-    ``q`` is ``[B, S, H, D]``, ``kv`` is ``[B, S_kv, D]``, ``attn_sink`` is
-    ``[H]``, and ``topk_idxs`` is ``[B, S, K]``. ``K`` is the selected
-    candidate width and need not equal the indexer's requested ``topk``.
-    Repeated valid indices retain their per-slot softmax multiplicity, matching
-    the TileLang row. When requested, LSE is detached and returned in base-2
-    units.
+    Takes the ``dsa_attention`` / ``deepseek_v4`` structured contract and expands
+    it into the dense mask HF's attention applies. Repeated valid candidates
+    retain their per-slot softmax multiplicity, matching the TileLang row. When
+    requested, LSE is detached and returned in base-2 units.
     """
+    del compress_ratio, packed_sequence_slices
+    kv = ori_kv if cmp_kv is None else torch.cat((ori_kv, cmp_kv), dim=1)
+    topk_idxs = build_sparse_attention_indices(
+        position_ids=position_ids,
+        sliding_window=sliding_window,
+        kv_len=ori_kv.shape[1],
+        compressed_len=0 if cmp_kv is None else cmp_kv.shape[1],
+        candidates=candidates,
+        query_offset=query_offset,
+        attention_mask=attention_mask,
+    )
     scale = q.shape[-1] ** -0.5 if sm_scale is None else sm_scale
     query = q.transpose(1, 2).contiguous()
     key_states = kv.unsqueeze(1).expand(-1, q.shape[2], -1, -1).contiguous()

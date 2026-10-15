@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DeepSeek-V4 lighting indexer (``eager``, ``tilelang``)."""
+"""DeepSeek-V4 lighting indexer (``eager``, ``tilelang``, ``cann``)."""

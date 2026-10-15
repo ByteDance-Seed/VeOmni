@@ -61,6 +61,7 @@ from veomni.ops.kernels.dsa.mask import (
     mark_standard_causal_mask,
     translate_fused_dsa_mask,
 )
+from veomni.ops.kernels.dsa.sparse_indices import CompressedCandidates
 from veomni.ops.kernels.dsa.topk import mask_unselectable_topk_indices
 from veomni.utils.device import IS_CUDA_AVAILABLE
 
@@ -87,6 +88,26 @@ class _HFAttentionModule(nn.Module):
         super().__init__()
         self.sinks = sinks
         self.num_key_value_groups = num_key_value_groups
+
+
+def _dsv4_attention_over(op, q: Tensor, kv: Tensor, sink: Tensor, indices: Tensor, **kwargs):
+    """Call a DeepSeek-V4 attention row with ``indices`` as its whole candidate list.
+
+    An empty full-resolution buffer leaves no sliding window, so every slot is an
+    explicit compressed selection that addresses ``kv`` directly.
+    """
+    position_ids = torch.zeros(indices.shape[:2], dtype=torch.long, device=indices.device)
+    return op(
+        q,
+        kv[:, :0],
+        kv,
+        sink,
+        position_ids,
+        sliding_window=1,
+        compress_ratio=1,
+        candidates=CompressedCandidates(topk_indices=indices),
+        **kwargs,
+    )
 
 
 def _official_topk_additive_mask(topk_idxs: Tensor, kv_len: int, dtype: torch.dtype) -> Tensor:
@@ -424,10 +445,11 @@ def test_deepseek_v4_fused_attention_rejects_dropout_and_output_attentions_befor
     vendor_module = "veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla"
     monkeypatch.delitem(sys.modules, vendor_module, raising=False)
     tensor = torch.empty(0)
+    contract = {"sliding_window": 1, "compress_ratio": 1}
     with pytest.raises(ValueError, match="dropout=0"):
-        deepseek_v4_fused_attention.wrapper(tensor, tensor, tensor, tensor, dropout=0.5)
+        deepseek_v4_fused_attention.wrapper(tensor, tensor, None, tensor, tensor, **contract, dropout=0.5)
     with pytest.raises(ValueError, match="output_attentions=True"):
-        deepseek_v4_fused_attention.wrapper(tensor, tensor, tensor, tensor, return_attn_weights=True)
+        deepseek_v4_fused_attention.wrapper(tensor, tensor, None, tensor, tensor, **contract, return_attn_weights=True)
     assert vendor_module not in sys.modules
 
 
@@ -440,7 +462,6 @@ def _fake_vendor(monkeypatch, module_name: str, symbol: str, return_value: objec
 
 
 def test_deepseek_v4_tilelang_attention_adapter_delegates_to_dsa_vendor(monkeypatch):
-    tensor = torch.empty(0)
     sentinel = object()
     vendor = _fake_vendor(
         monkeypatch,
@@ -448,11 +469,34 @@ def test_deepseek_v4_tilelang_attention_adapter_delegates_to_dsa_vendor(monkeypa
         "sparse_attn_tilelang",
         sentinel,
     )
+    q = torch.randn(1, 3, 2, 4)
+    ori_kv = torch.randn(1, 3, 4)
+    cmp_kv = torch.randn(1, 1, 4)
+    sink = torch.randn(2, dtype=torch.bfloat16)
+    topk = torch.tensor([[[-1], [-1], [0]]], dtype=torch.int32)
 
-    actual = deepseek_v4_fused_attention.wrapper(tensor, tensor, tensor, tensor, 0.25, True)
+    actual = deepseek_v4_fused_attention.wrapper(
+        q,
+        ori_kv,
+        cmp_kv,
+        sink,
+        torch.arange(3).view(1, 3),
+        sliding_window=2,
+        compress_ratio=4,
+        candidates=CompressedCandidates(topk_indices=topk),
+        sm_scale=0.25,
+        return_lse=True,
+    )
 
     assert actual is sentinel
-    vendor.assert_called_once_with(tensor, tensor, tensor, tensor, 0.25, True)
+    (vendor_q, vendor_kv, vendor_sink, vendor_indices, scale, return_lse), _ = vendor.call_args
+    torch.testing.assert_close(vendor_q, q)
+    torch.testing.assert_close(vendor_kv, torch.cat((ori_kv, cmp_kv), dim=1))
+    assert vendor_sink.dtype == torch.float32
+    # Two sliding slots per query, then the compressed selection lifted past the
+    # three full-resolution rows.
+    assert vendor_indices.tolist() == [[[-1, 0, -1], [0, 1, -1], [1, 2, 3]]]
+    assert (scale, return_lse) == (0.25, True)
 
 
 def test_glm_flashmla_cudnn_attention_adapter_delegates_to_dsa_vendor(monkeypatch):
@@ -547,7 +591,8 @@ def test_dsa_attention_deepseek_v4_eager_matches_hf():
     )
 
     q_e, kv_e, sink_e = make_grad_leaves(q, kv, sink)
-    ours = resolve_op("dsa_attention", "deepseek_v4", "eager").wrapper(q_e, kv_e, sink_e, indices, sm_scale=scale)
+    eager = resolve_op("dsa_attention", "deepseek_v4", "eager").wrapper
+    ours = _dsv4_attention_over(eager, q_e, kv_e, sink_e, indices, sm_scale=scale)
     assert torch.allclose(ours, hf_out, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     go = torch.randn_like(ours)
@@ -569,7 +614,10 @@ def test_dsa_attention_deepseek_v4_eager_dropout_seed_and_eval_and_grads():
             q, kv, sink = (tensor.requires_grad_(True) for tensor in (q, kv, sink))
         return q, kv, sink, indices
 
-    eager = resolve_op("dsa_attention", "deepseek_v4", "eager").wrapper
+    def eager(q, kv, sink, indices, **kwargs):
+        op = resolve_op("dsa_attention", "deepseek_v4", "eager").wrapper
+        return _dsv4_attention_over(op, q, kv, sink, indices, **kwargs)
+
     q, kv, sink, indices = _inputs(False)
     torch.manual_seed(1)
     train_a = eager(q, kv, sink, indices, sm_scale=0.5, dropout=0.5)
@@ -619,8 +667,14 @@ def test_dsa_attention_deepseek_v4_eager_preserves_repeated_candidate_slots():
     expected_lse = torch.logsumexp(combined_logits, dim=-1) / math.log(2)
 
     q_eager, kv_eager, sink_eager = make_grad_leaves(q, kv, sink)
-    actual, actual_lse = resolve_op("dsa_attention", "deepseek_v4", "eager").wrapper(
-        q_eager, kv_eager, sink_eager, indices, sm_scale=1.0, return_lse=True
+    actual, actual_lse = _dsv4_attention_over(
+        resolve_op("dsa_attention", "deepseek_v4", "eager").wrapper,
+        q_eager,
+        kv_eager,
+        sink_eager,
+        indices,
+        sm_scale=1.0,
+        return_lse=True,
     )
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(actual_lse, expected_lse)
@@ -633,10 +687,10 @@ def test_dsa_attention_deepseek_v4_eager_preserves_repeated_candidate_slots():
 
 
 def test_dsa_attention_deepseek_v4_eager_matches_official_hf_sliding_mask():
-    """Modeling mask→topk must match official HF additive sliding-window attention.
+    """The structured sliding window must match official HF sliding-window attention.
 
-    Query 0 only keeps key 0. The conversion fills the rest with ``-1``, which
-    is the overwrite case the eager mask helper has to survive.
+    Query 0 only keeps key 0, so its window is mostly ``-1``: the overwrite case
+    the eager mask helper has to survive.
     """
     from transformers.masking_utils import create_sliding_window_causal_mask
     from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
@@ -650,6 +704,7 @@ def test_dsa_attention_deepseek_v4_eager_matches_official_hf_sliding_mask():
         num_attention_heads=heads,
         num_key_value_heads=1,
         head_dim=dim,
+        sliding_window=3,
         attn_implementation="eager",
     )
     embeds = torch.randn(batch, seq_len, config.hidden_size)
@@ -675,18 +730,14 @@ def test_dsa_attention_deepseek_v4_eager_matches_official_hf_sliding_mask():
         dropout=0.0,
     )
 
-    allowed = mask[:, 0] if mask.dtype == torch.bool else mask[:, 0] >= 0
-    _, topk_indices = allowed.to(torch.int8).topk(seq_len, dim=-1, sorted=False)
-    selected_valid = allowed.gather(-1, topk_indices)
-    topk_indices = topk_indices.to(torch.int32).masked_fill(~selected_valid, -1).contiguous()
-    assert (topk_indices[0, 0] == 0).any()
-    assert (topk_indices[0, 0] == -1).any()
-
     ours = resolve_op("dsa_attention", "deepseek_v4", "eager").wrapper(
-        q.transpose(1, 2).contiguous(),
-        kv[:, 0].contiguous(),
+        q.transpose(1, 2),
+        kv[:, 0],
+        None,
         sinks,
-        topk_indices,
+        position_ids,
+        sliding_window=config.sliding_window,
+        compress_ratio=1,
         sm_scale=scale,
     )
     torch.testing.assert_close(ours, hf_out, atol=EAGER_ATOL, rtol=EAGER_RTOL)
@@ -1166,8 +1217,8 @@ def test_dsa_attention_tilelang_matches_eager():
     q_t, kv_t, sink_t = make_grad_leaves(q, kv, sink)
     eager = resolve_op("dsa_attention", "deepseek_v4", "eager").wrapper
     fused = resolve_op("dsa_attention", "deepseek_v4", "tilelang").wrapper
-    expected = eager(q_e, kv_e, sink_e, indices, sm_scale=scale)
-    actual = fused(q_t, kv_t, sink_t, indices, sm_scale=scale)
+    expected = _dsv4_attention_over(eager, q_e, kv_e, sink_e, indices, sm_scale=scale)
+    actual = _dsv4_attention_over(fused, q_t, kv_t, sink_t, indices, sm_scale=scale)
     torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
     grad = torch.randn_like(actual)
     expected.backward(grad)

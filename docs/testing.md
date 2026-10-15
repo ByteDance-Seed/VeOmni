@@ -28,7 +28,7 @@ tests/
 │   ├── async_ulysses/                       # Async QKV/O registry and parity
 │   ├── dsa/                                 # DeepSeek/GLM sparse-attention ops
 │   ├── loss/                                # Cross-entropy and load-balancing ops
-│   ├── mhc/                                 # mHC eager/TileKernels parity
+│   ├── mhc/                                 # mHC eager/TileKernels/CANN parity
 │   ├── moe_experts/                         # Eager/Triton/Quack/NPU/MLU expert ops
 │   └── gated_delta_rule/                    # GatedDeltaNet op family
 │
@@ -197,8 +197,9 @@ Optimized operator numerics live under
 `tests/ops/`.
 
 DeepSeek-V4- and GLM-MoE-DSA-specific DSA checks live under `tests/ops/dsa/`; optimized numerical
-tests require TileLang on an SM90+ NVIDIA GPU. Its mHC kernel parity is covered
-by `tests/ops/mhc/test_mhc.py` and requires TileKernels on an SM90+ NVIDIA GPU.
+tests require TileLang on an SM90+ NVIDIA GPU, and the `cann` parity tests require an Ascend NPU
+with `cann_ops_transformer`. Its mHC kernel parity is covered by `tests/ops/mhc/test_mhc.py` and
+requires TileKernels on an SM90+ NVIDIA GPU or CANN on an Ascend NPU.
 
 ---
 

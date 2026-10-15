@@ -54,14 +54,19 @@ def wrapper(
     topk_indices: Tensor | None = None,
     cu_seqlen_ks: Tensor | None = None,
     cu_seqlen_ke: Tensor | None = None,
+    packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Compute HF-aligned index scores and selected compressed-KV indices.
 
     ``index_q`` is ``[S, B, H, D]``, ``index_k`` is ``[S_kv, B, D]``,
-    ``weights`` is ``[S, B, H]``. Returns scores and indices with shape
-    ``[B, S, K]``. ``K`` is the supplied ``topk_indices`` width when present;
-    otherwise it is ``min(topk, S_kv)``.
+    ``weights`` is ``[S, B, H]``, in any strides. Returns scores and indices
+    with shape ``[B, S, K]``. ``K`` is the supplied ``topk_indices`` width when
+    present; otherwise it is ``min(topk, S_kv)``. Without ``cu_seqlen_ks`` /
+    ``cu_seqlen_ke``, query row ``t`` sees compressed entries
+    ``[0, (t + 1) // compress_ratio)``. ``packed_sequence_slices`` names the
+    query segments those ranges came from and is unused here.
     """
+    del packed_sequence_slices
     if (cu_seqlen_ks is None) != (cu_seqlen_ke is None):
         raise ValueError("cu_seqlen_ks and cu_seqlen_ke must be provided together")
 

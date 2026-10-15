@@ -17,14 +17,19 @@
 from __future__ import annotations
 
 import types
+from pathlib import Path
 
 import pytest
 import torch
+import yaml
 from transformers import AutoConfig
 
 from tests.models.compare import eager_ops_config, ops_config_scope
 from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as npu_modeling
+from veomni.ops import resolve_op
+from veomni.ops.kernels.dsa.indexer.deepseek_v4 import cann as cann_indexer
+from veomni.ops.kernels.dsa.sparse_indices import CompressedCandidates, build_sparse_attention_indices
 
 
 _TOY_CONFIG = "tests/toy_config/deepseek_v4_toy"
@@ -54,16 +59,46 @@ def _eager_compressors(config):
     return compressors
 
 
-class _TileLangSparseAttentionSpy:
-    impl = "tilelang"
+class _SparseAttentionSpy:
+    """Stand-in ``dsa_attention`` op that records what each layer is asked to attend to."""
 
-    def __init__(self, captured: list[torch.Tensor]):
-        self.captured = captured
+    def __init__(self) -> None:
+        self.attention_masks: list[torch.Tensor | None] = []
+        self.candidate_slots: list[torch.Tensor] = []
+        self.packed_slices: list[tuple[tuple[int, int], ...] | None] = []
+        self.compressed: list[tuple[int, int, CompressedCandidates | None]] = []
 
-    def __call__(self, query, key, sinks, topk_indices, **kwargs):
-        del key, sinks, kwargs
-        self.captured.append(topk_indices)
-        return torch.zeros_like(query)
+    def __call__(self, q, ori_kv, cmp_kv, sinks, position_ids, **kwargs):
+        del sinks
+        self.attention_masks.append(kwargs["attention_mask"])
+        self.packed_slices.append(kwargs["packed_sequence_slices"])
+        if cmp_kv is not None:
+            self.compressed.append((kwargs["compress_ratio"], cmp_kv.shape[1], kwargs["candidates"]))
+        self.candidate_slots.append(
+            build_sparse_attention_indices(
+                position_ids=position_ids,
+                sliding_window=kwargs["sliding_window"],
+                kv_len=ori_kv.shape[1],
+                compressed_len=0 if cmp_kv is None else cmp_kv.shape[1],
+                candidates=kwargs["candidates"],
+                query_offset=kwargs["query_offset"],
+                attention_mask=kwargs["attention_mask"],
+            )
+        )
+        return torch.zeros_like(q)
+
+
+def _visible_compressed(candidates: CompressedCandidates, seq_len: int, compressed_len: int) -> torch.Tensor:
+    """``[S, C]`` bool: which compressed rows each query of a batch-1 call may read."""
+    if candidates.topk_indices is not None:
+        indices = candidates.topk_indices[0].long()
+        visible = torch.zeros(seq_len, compressed_len + 1, dtype=torch.bool)
+        visible.scatter_(-1, torch.where(indices >= 0, indices, compressed_len), True)
+        return visible[:, :compressed_len]
+    entries = torch.arange(compressed_len)
+    starts = candidates.range_starts.reshape(-1, 1)
+    ends = candidates.range_ends.reshape(-1, 1)
+    return (entries >= starts) & (entries < ends)
 
 
 def test_deepseek_v4_stateless_forward_does_not_create_decode_cache():
@@ -93,11 +128,7 @@ def test_deepseek_v4_stateless_forward_does_not_create_decode_cache():
 
 
 def test_deepseek_v4_packed_compressors_match_independent_sequences():
-    from veomni.models.transformers.deepseek_v4.packed_utils import (
-        build_packed_compression_metadata,
-        build_sparse_attention_indices,
-        mask_sparse_attention_indices,
-    )
+    from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
     torch.manual_seed(5)
     config = _toy_config()
@@ -108,15 +139,11 @@ def test_deepseek_v4_packed_compressors_match_independent_sequences():
     position_ids = torch.cat([torch.arange(length) for length in segment_lengths]).unsqueeze(0)
     sequence_slices = ((0, segment_lengths[0]), (segment_lengths[0], total_len))
     packed_metadata = build_packed_compression_metadata(
-        hidden_states,
-        position_ids,
-        sequence_slices,
-        tuple(config.compress_rates.values()),
-        block_bias_rates=(config.compress_rates["heavily_compressed_attention"],),
+        hidden_states, position_ids, sequence_slices, tuple(config.compress_rates.values())
     )
 
     for compressor in _eager_compressors(config):
-        packed_kv, packed_bias = compressor(
+        packed_kv, packed_candidates = compressor(
             hidden_states,
             q_residual,
             position_ids,
@@ -125,54 +152,17 @@ def test_deepseek_v4_packed_compressors_match_independent_sequences():
             packed_sequence_slices=sequence_slices,
             packed_compression_metadata=packed_metadata,
         )
-        compact_kv, compact_bias, compact_candidates = compressor(
-            hidden_states,
-            q_residual,
-            position_ids,
-            None,
-            0,
-            packed_sequence_slices=sequence_slices,
-            packed_compression_metadata=packed_metadata,
-            return_topk_indices=True,
-        )
-        torch.testing.assert_close(compact_kv, packed_kv)
-        torch.testing.assert_close(compact_bias, packed_bias)
         if isinstance(compressor, modeling.DeepseekV4CSACompressor):
-            compact_indices = compact_candidates.topk_indices
-            assert compact_indices is not None
-            valid = compact_indices >= 0
-            safe_indices = compact_indices.clamp_min(0).unsqueeze(1)
-            selected_bias = packed_bias.gather(-1, safe_indices)
-            assert (selected_bias[valid.unsqueeze(1)] == 0).all()
-
-            sliding_bias = hidden_states.new_full((1, 1, total_len, total_len), float("-inf"))
-            for start, end in sequence_slices:
-                for query_idx in range(start, end):
-                    window_start = max(start, query_idx - config.sliding_window + 1)
-                    sliding_bias[:, :, query_idx, window_start : query_idx + 1] = 0
-            full_bias = torch.cat((sliding_bias, packed_bias), dim=-1)
-            candidates = build_sparse_attention_indices(
-                batch_size=1,
-                seq_len=total_len,
-                sliding_window=config.sliding_window,
-                compressed_len=packed_kv.shape[2],
-                compressed_indices=compact_indices,
-                device=hidden_states.device,
-            )
-            filtered_indices = mask_sparse_attention_indices(full_bias, candidates)
-            for query_idx in range(total_len):
-                actual_indices = filtered_indices[0, query_idx]
-                actual_indices = actual_indices[actual_indices >= 0].sort().values
-                expected_indices = torch.where(full_bias[0, 0, query_idx] == 0)[0].to(torch.int32)
-                torch.testing.assert_close(actual_indices, expected_indices)
+            assert packed_candidates.topk_indices is not None
         else:
-            assert compact_candidates.topk_indices is None
-            assert compact_candidates.range_starts is not None
+            assert packed_candidates.topk_indices is None
+            assert packed_candidates.range_starts is not None
+        packed_visible = _visible_compressed(packed_candidates, total_len, packed_kv.shape[2])
 
         segment_outputs = []
-        segment_biases = []
+        kv_offset = 0
         for start, end in sequence_slices:
-            segment_kv, segment_bias = compressor(
+            segment_kv, segment_candidates = compressor(
                 hidden_states[:, start:end],
                 q_residual[:, start:end],
                 position_ids[:, start:end],
@@ -180,26 +170,129 @@ def test_deepseek_v4_packed_compressors_match_independent_sequences():
                 0,
             )
             segment_outputs.append(segment_kv)
-            segment_biases.append(segment_bias)
-
-        torch.testing.assert_close(packed_kv, torch.cat(segment_outputs, dim=2))
-        kv_offset = 0
-        for (start, end), segment_kv, segment_bias in zip(
-            sequence_slices, segment_outputs, segment_biases, strict=True
-        ):
             kv_end = kv_offset + segment_kv.shape[2]
-            torch.testing.assert_close(packed_bias[:, :, start:end, kv_offset:kv_end], segment_bias)
-            assert torch.isneginf(packed_bias[:, :, start:end, :kv_offset]).all()
-            assert torch.isneginf(packed_bias[:, :, start:end, kv_end:]).all()
+            segment_visible = _visible_compressed(segment_candidates, end - start, segment_kv.shape[2])
+            torch.testing.assert_close(packed_visible[start:end, kv_offset:kv_end], segment_visible)
+            assert not packed_visible[start:end, :kv_offset].any()
+            assert not packed_visible[start:end, kv_end:].any()
             kv_offset = kv_end
 
+        torch.testing.assert_close(packed_kv, torch.cat(segment_outputs, dim=2))
 
-def test_deepseek_v4_compact_sparse_indices_match_attention_mask():
-    from veomni.models.transformers.deepseek_v4.packed_utils import (
-        build_sparse_attention_indices,
-        mask_sparse_attention_indices,
+
+class _IndexerSpy:
+    impl = "eager"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple, dict]] = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return resolve_op("dsa_indexer", "deepseek_v4", "eager").wrapper(*args, **kwargs)
+
+
+class _FakeCannOps:
+    @staticmethod
+    def lightning_indexer_metadata(*args, **kwargs):
+        return torch.empty(1, dtype=torch.int32)
+
+    @staticmethod
+    def lightning_indexer(q, k, weights, top_k, **kwargs):
+        shape = (q.shape[0], 1, top_k)
+        return torch.zeros(shape, dtype=torch.int32), torch.zeros(shape)
+
+
+@pytest.mark.parametrize("module", [modeling, npu_modeling], ids=["gpu", "npu"])
+def test_deepseek_v4_packed_indexer_op_receives_segments_cann_accepts(module, monkeypatch):
+    """The packed CSA path hands the indexer op segment boundaries whose ranges CANN can mask."""
+    from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+
+    torch.manual_seed(13)
+    config = _toy_config()
+    segment_lengths = (37, 64, 27)
+    total_len = sum(segment_lengths)
+    bounds = torch.tensor((0, *segment_lengths)).cumsum(0).tolist()
+    sequence_slices = tuple(zip(bounds[:-1], bounds[1:]))
+    hidden_states = torch.randn(1, total_len, config.hidden_size)
+    q_residual = torch.randn(1, total_len, config.q_lora_rank)
+    position_ids = torch.cat([torch.arange(length) for length in segment_lengths]).unsqueeze(0)
+    packed_metadata = build_packed_compression_metadata(
+        hidden_states, position_ids, sequence_slices, tuple(config.compress_rates.values())
+    )
+    with ops_config_scope(eager_ops_config()):
+        compressor = module.DeepseekV4CSACompressor(config)
+    with torch.no_grad():
+        torch.nn.init.zeros_(compressor.position_bias)
+        torch.nn.init.zeros_(compressor.indexer.position_bias)
+    spy = _IndexerSpy()
+    compressor.indexer.veomni_dsa_indexer = spy
+
+    compressor(
+        hidden_states,
+        q_residual,
+        position_ids,
+        None,
+        0,
+        packed_sequence_slices=sequence_slices,
+        packed_compression_metadata=packed_metadata,
     )
 
+    ((args, kwargs),) = spy.calls
+    assert kwargs["packed_sequence_slices"] == sequence_slices
+    assert args[0].shape[:2] == (total_len, 1)
+    monkeypatch.setattr(cann_indexer, "_ops", lambda: _FakeCannOps)
+    cann_indexer._packed_plan.cache_clear()
+    try:
+        scores, indices = cann_indexer.wrapper(*args, **kwargs)
+    finally:
+        cann_indexer._packed_plan.cache_clear()
+    assert indices.shape == scores.shape == (1, total_len, min(config.index_topk, args[1].shape[0]))
+
+
+def test_deepseek_v4_npu_config_collator_preserves_packed_segments_for_model():
+    from veomni.data.data_collator import PackingCollator
+
+    npu_config = yaml.safe_load(Path("configs/text/deepseek_v4_npu.yaml").read_text())
+    assert npu_config["train"].get("dyn_bsz", True) is True
+    assert npu_config["train"]["micro_batch_size"] == 1
+
+    lengths = (5, 3)
+    features = [
+        {
+            "input_ids": torch.arange(length),
+            "labels": torch.arange(length),
+            "attention_mask": torch.ones(length, dtype=torch.long),
+            "position_ids": torch.arange(length),
+        }
+        for length in lengths
+    ]
+    batch = PackingCollator()(features)
+    seq_len = sum(lengths)
+    assert batch["cu_seq_lens_q"].tolist() == [0, lengths[0], seq_len]
+
+    with ops_config_scope(eager_ops_config()):
+        model = npu_modeling.DeepseekV4Model(_toy_config())
+    seen_slices = []
+    for layer in model.layers:
+
+        def passthrough(self, hidden_states, **kwargs):
+            seen_slices.append(kwargs.get("packed_sequence_slices"))
+            return hidden_states
+
+        layer.forward = types.MethodType(passthrough, layer)
+
+    model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        position_ids=batch["position_ids"],
+        cu_seq_lens_q=batch["cu_seq_lens_q"],
+        use_cache=False,
+    )
+    assert seen_slices
+    assert all(slices == ((0, lengths[0]), (lengths[0], seq_len)) for slices in seen_slices)
+
+
+def test_deepseek_v4_sparse_indices_match_attention_mask():
     seq_len, compressed_len, sliding_window = 6, 3, 3
     attention_mask = torch.full((1, 1, seq_len, seq_len + compressed_len), float("-inf"))
     segment_starts = (0, 0, 0, 3, 3, 3)
@@ -211,15 +304,16 @@ def test_deepseek_v4_compact_sparse_indices_match_attention_mask():
         attention_mask[0, 0, query_idx, window_start : query_idx + 1] = 0
         attention_mask[0, 0, query_idx, seq_len + compressed_start : seq_len + compressed_end] = 0
 
-    candidates = build_sparse_attention_indices(
-        batch_size=1,
-        seq_len=seq_len,
+    actual = build_sparse_attention_indices(
+        position_ids=torch.tensor([[0, 1, 2, 0, 1, 2]]),
         sliding_window=sliding_window,
+        kv_len=seq_len,
         compressed_len=compressed_len,
-        compressed_indices=None,
-        device=attention_mask.device,
+        candidates=CompressedCandidates(
+            range_starts=torch.tensor([start for start, _ in compressed_ranges], dtype=torch.int32),
+            range_ends=torch.tensor([end for _, end in compressed_ranges], dtype=torch.int32),
+        ),
     )
-    actual = mask_sparse_attention_indices(attention_mask, candidates)
 
     for query_idx in range(seq_len):
         actual_indices = actual[0, query_idx]
@@ -229,15 +323,12 @@ def test_deepseek_v4_compact_sparse_indices_match_attention_mask():
 
 
 def test_deepseek_v4_mask_free_sparse_indices_match_dense_mask_path():
-    """Candidates built from packed metadata must equal what the dense mask allows."""
+    """The dense mask the model skips on packed input must not narrow any candidate."""
     from transformers.masking_utils import create_sliding_window_causal_mask
 
     from veomni.models.transformers.deepseek_v4.packed_utils import (
         build_packed_compression_metadata,
-        build_packed_sparse_attention_indices,
-        build_sparse_attention_indices,
         isolate_packed_causal_mask_,
-        mask_sparse_attention_indices,
     )
 
     torch.manual_seed(7)
@@ -260,87 +351,75 @@ def test_deepseek_v4_mask_free_sparse_indices_match_dense_mask_path():
     sliding_mask = isolate_packed_causal_mask_(sliding_mask, sequence_slices)
 
     packed_metadata = build_packed_compression_metadata(
-        hidden_states,
-        position_ids,
-        sequence_slices,
-        tuple(config.compress_rates.values()),
-        block_bias_rates=(config.compress_rates["heavily_compressed_attention"],),
+        hidden_states, position_ids, sequence_slices, tuple(config.compress_rates.values())
     )
 
     for compressor in _eager_compressors(config):
-        packed_kwargs = {
-            "packed_sequence_slices": sequence_slices,
-            "packed_compression_metadata": packed_metadata,
-            "return_topk_indices": True,
+        compressed_kv, candidates = compressor(
+            hidden_states,
+            q_residual,
+            position_ids,
+            None,
+            0,
+            packed_sequence_slices=sequence_slices,
+            packed_compression_metadata=packed_metadata,
+        )
+        contract = {
+            "position_ids": position_ids,
+            "sliding_window": config.sliding_window,
+            "kv_len": total_len,
+            "compressed_len": compressed_kv.shape[2],
+            "candidates": candidates,
         }
-        dense_kv, dense_bias, _ = compressor(hidden_states, q_residual, position_ids, None, 0, **packed_kwargs)
-        free_kv, free_bias, candidates = compressor(
-            hidden_states, q_residual, position_ids, None, 0, build_block_bias=False, **packed_kwargs
-        )
-        assert free_bias is None
-        torch.testing.assert_close(free_kv, dense_kv)
-
-        compressed_len = dense_kv.shape[2]
-        expected = mask_sparse_attention_indices(
-            torch.cat((sliding_mask, dense_bias), dim=-1),
-            build_sparse_attention_indices(
-                batch_size=1,
-                seq_len=total_len,
-                sliding_window=config.sliding_window,
-                compressed_len=compressed_len,
-                compressed_indices=candidates.topk_indices,
-                device=hidden_states.device,
-            ),
-        )
-        actual = build_packed_sparse_attention_indices(
-            position_ids=position_ids,
-            sliding_window=config.sliding_window,
-            compressed_len=compressed_len,
-            candidates=candidates,
-        )
+        expected = build_sparse_attention_indices(**contract, attention_mask=sliding_mask)
+        actual = build_sparse_attention_indices(**contract)
         # Width is load-bearing: the TileLang kernel specializes on the last dim,
         # so a narrower "compacted" list would trigger endless recompilation.
         assert actual.shape == expected.shape
         torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="mask-free sparse dispatch requires bf16 CUDA tensors")
-def test_deepseek_v4_packed_model_forward_skips_dense_mask(monkeypatch):
-    """Packed TileLang forwards must never materialize an O(S^2) mask."""
+def _packed_model_inputs(config, segment_lengths: tuple[int, ...]) -> dict[str, torch.Tensor]:
+    total_len = sum(segment_lengths)
+    cu_seq_lens = torch.tensor((0, *segment_lengths), dtype=torch.int32).cumsum(0).to(torch.int32)
+    return {
+        "input_ids": torch.randint(0, config.vocab_size, (1, total_len)),
+        "position_ids": torch.cat([torch.arange(length) for length in segment_lengths]).unsqueeze(0),
+        "cu_seq_lens_q": cu_seq_lens,
+        "cu_seq_lens_k": cu_seq_lens,
+    }
+
+
+@pytest.mark.parametrize("module", [modeling, npu_modeling], ids=["gpu", "npu"])
+def test_deepseek_v4_packed_model_forward_skips_dense_mask(module, monkeypatch):
+    """Packed forwards hand the op segments and per-sample candidates, never an O(S^2) mask."""
     torch.manual_seed(11)
-    device = torch.device(get_device_type())
     config = _toy_config()
     segment_lengths = (24, 40)
     total_len = sum(segment_lengths)
     with ops_config_scope(eager_ops_config()):
-        model = modeling.DeepseekV4Model(config).to(device=device, dtype=torch.bfloat16).eval()
+        model = module.DeepseekV4Model(config).eval()
 
     def fail_on_dense_mask(*args, **kwargs):
-        raise AssertionError("packed TileLang forward must not build a dense causal mask")
+        raise AssertionError("packed forward must not build a dense causal mask")
 
-    monkeypatch.setattr(modeling, "create_sliding_window_causal_mask", fail_on_dense_mask)
+    monkeypatch.setattr(module, "create_sliding_window_causal_mask", fail_on_dense_mask)
 
-    captured: list[torch.Tensor] = []
+    spy = _SparseAttentionSpy()
     for layer in model.layers:
-        layer.self_attn.veomni_dsa_attention = _TileLangSparseAttentionSpy(captured)
+        layer.self_attn.veomni_dsa_attention = spy
 
-    position_ids = torch.cat([torch.arange(length) for length in segment_lengths]).unsqueeze(0).to(device)
-    cu_seq_lens = torch.tensor([0, segment_lengths[0], total_len], dtype=torch.int32, device=device)
-    # The bound handles decide; an eager global config must not bring the mask back.
-    with ops_config_scope(eager_ops_config()), torch.no_grad():
-        model(
-            input_ids=torch.randint(0, config.vocab_size, (1, total_len), device=device),
-            position_ids=position_ids,
-            use_cache=False,
-            cu_seq_lens_q=cu_seq_lens,
-            cu_seq_lens_k=cu_seq_lens,
-        )
+    inputs = _packed_model_inputs(config, segment_lengths)
+    with torch.no_grad():
+        model(**inputs, use_cache=False)
 
-    assert len(captured) == config.num_hidden_layers
+    assert len(spy.candidate_slots) == config.num_hidden_layers
+    assert all(mask is None for mask in spy.attention_masks)
+    position_ids = inputs["position_ids"]
     # position_ids restart per sample, so this is each query's own segment start.
-    segment_starts = (torch.arange(total_len, device=device) - position_ids[0]).to(torch.int32)
-    queries = torch.arange(total_len, device=device, dtype=torch.int32)
-    for topk_indices in captured:
+    segment_starts = (torch.arange(total_len) - position_ids[0]).to(torch.int32)
+    queries = torch.arange(total_len, dtype=torch.int32)
+    for topk_indices in spy.candidate_slots:
         sliding = topk_indices[0, :, :]
         is_sliding = (sliding >= 0) & (sliding < total_len)
         assert is_sliding.any(), "no sliding candidate survived"
@@ -349,40 +428,40 @@ def test_deepseek_v4_packed_model_forward_skips_dense_mask(monkeypatch):
         assert (within_sample | ~is_sliding).all(), "sliding candidate crossed a packed boundary"
         assert (causal | ~is_sliding).all(), "sliding candidate is not causal"
 
+    assert spy.packed_slices == [((0, 24), (24, total_len))] * config.num_hidden_layers
+    assert {ratio for ratio, _, _ in spy.compressed} == set(config.compress_rates.values())
+    query_sample = torch.arange(total_len) >= segment_lengths[0]
+    for ratio, compressed_len, candidates in spy.compressed:
+        assert candidates is not None
+        assert (candidates.topk_indices is not None) == (ratio == config.compress_rates["compressed_sparse_attention"])
+        visible = _visible_compressed(candidates, total_len, compressed_len)
+        entry_sample = torch.arange(compressed_len) >= segment_lengths[0] // ratio
+        crossed = visible & (query_sample[:, None] != entry_sample[None, :])
+        assert not crossed.any(), f"ratio-{ratio} compressed candidate crossed a packed boundary"
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="mask-free sparse dispatch requires bf16 CUDA tensors")
-def test_deepseek_v4_packed_forward_keeps_mask_for_eager_bound_attention(monkeypatch):
-    """A TileLang global config must not drop the mask that eager-bound attention needs."""
-    device = torch.device(get_device_type())
+
+def test_deepseek_v4_mask_free_packed_eager_forward_matches_samples_run_alone(monkeypatch):
+    """Without the dense mask, eager attention still keeps every packed sample to itself."""
+    torch.manual_seed(12)
     config = _toy_config()
     segment_lengths = (24, 40)
-    total_len = sum(segment_lengths)
     with ops_config_scope(eager_ops_config()):
-        model = modeling.DeepseekV4Model(config).to(device=device, dtype=torch.bfloat16).eval()
+        model = modeling.DeepseekV4Model(config).eval()
 
-    built: list[bool] = []
-    create_mask = modeling.create_sliding_window_causal_mask
+    inputs = _packed_model_inputs(config, segment_lengths)
+    expected = []
+    with torch.no_grad():
+        for start, end in zip(inputs["cu_seq_lens_q"][:-1].tolist(), inputs["cu_seq_lens_q"][1:].tolist()):
+            alone = model(input_ids=inputs["input_ids"][:, start:end], use_cache=False)
+            expected.append(alone.last_hidden_state)
 
-    def record_dense_mask(*args, **kwargs):
-        built.append(True)
-        return create_mask(*args, **kwargs)
+        def fail_on_dense_mask(*args, **kwargs):
+            raise AssertionError("packed forward must not build a dense causal mask")
 
-    monkeypatch.setattr(modeling, "create_sliding_window_causal_mask", record_dense_mask)
+        monkeypatch.setattr(modeling, "create_sliding_window_causal_mask", fail_on_dense_mask)
+        packed = model(**inputs, use_cache=False).last_hidden_state
 
-    position_ids = torch.cat([torch.arange(length) for length in segment_lengths]).unsqueeze(0).to(device)
-    cu_seq_lens = torch.tensor([0, segment_lengths[0], total_len], dtype=torch.int32, device=device)
-    tilelang_ops = eager_ops_config()
-    tilelang_ops.dsa_attention_implementation = "tilelang"
-    with ops_config_scope(tilelang_ops), torch.no_grad():
-        model(
-            input_ids=torch.randint(0, config.vocab_size, (1, total_len), device=device),
-            position_ids=position_ids,
-            use_cache=False,
-            cu_seq_lens_q=cu_seq_lens,
-            cu_seq_lens_k=cu_seq_lens,
-        )
-
-    assert built, "eager-bound attention needs the dense causal mask"
+    torch.testing.assert_close(packed, torch.cat(expected, dim=1), atol=1e-5, rtol=1e-5)
 
 
 def test_deepseek_v4_packed_causal_mask_blocks_previous_samples():

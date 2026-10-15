@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DeepSeek-V4 sparse MQA attention (``eager``, ``tilelang``)."""
+"""DeepSeek-V4 sparse MQA attention (``eager``, ``tilelang``, ``cann``)."""

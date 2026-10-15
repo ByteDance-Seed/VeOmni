@@ -18,19 +18,25 @@ Three independent variants share this package. They are not a compound
 kernel. Eager is the modeling math (regular autograd). ``tilelang`` is
 TileKernels on SM90+. ``post`` / ``tilelang`` is a raw pair; ``pre`` and
 ``head`` keep an opaque wrapper because TileKernels owns that autograd.
+``cann`` is the Ascend CANN fused pre and post. CANN has no head kernel,
+so ``head`` / ``cann`` runs the eager math and lets one
+``mhc_implementation`` name cover all three variants.
 """
 
-from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement
+from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
 from .head import eager as head_eager
 from .head import tilelang as head_tilelang
+from .post import cann as post_cann
 from .post import eager as post_eager
 from .post import tilelang as post_tilelang
+from .pre import cann as pre_cann
 from .pre import eager as pre_eager
 from .pre import tilelang as pre_tilelang
 
 
 _TILELANG = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+_CANN = NpuKernelRequirement()
 
 register_op(
     "mhc",
@@ -48,6 +54,16 @@ register_op(
     wrapper=pre_tilelang.wrapper,
     requirement=_TILELANG,
     requires=("tile_kernels",),
+)
+
+register_op(
+    "mhc",
+    "pre",
+    "cann",
+    description="Ascend CANN DeepSeek-V4 mHC pre transform with Sinkhorn normalization and collapse",
+    wrapper=pre_cann.wrapper,
+    requirement=_CANN,
+    requires=("cann_ops_transformer",),
 )
 
 register_op(
@@ -71,6 +87,16 @@ register_op(
 
 register_op(
     "mhc",
+    "post",
+    "cann",
+    description="Ascend CANN DeepSeek-V4 mHC residual post-mix",
+    wrapper=post_cann.wrapper,
+    requirement=_CANN,
+    requires=("cann_ops_transformer",),
+)
+
+register_op(
+    "mhc",
     "head",
     "eager",
     description="PyTorch DeepSeek-V4 final mHC collapse",
@@ -85,4 +111,13 @@ register_op(
     wrapper=head_tilelang.wrapper,
     requirement=_TILELANG,
     requires=("tile_kernels",),
+)
+
+register_op(
+    "mhc",
+    "head",
+    "cann",
+    description="PyTorch DeepSeek-V4 final mHC collapse for CANN builds (no CANN head kernel)",
+    wrapper=head_eager.wrapper,
+    requirement=_CANN,
 )

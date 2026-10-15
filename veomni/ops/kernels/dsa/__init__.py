@@ -16,15 +16,18 @@
 
 ``dsa_attention`` / ``dsa_indexer`` each have ``deepseek_v4`` and ``glm``
 rows. Fused impls are opaque wrappers around TileLang or FlashMLA
-``Function.apply``.
+``Function.apply``. The ``deepseek_v4`` ``cann`` rows call the Ascend CANN
+Lightning Indexer and sparse FlashMLA.
 """
 
-from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement
+from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
+from .attention.deepseek_v4 import cann as dsv4_attn_cann
 from .attention.deepseek_v4 import eager as dsv4_attn_eager
 from .attention.deepseek_v4 import tilelang as dsv4_attn_tilelang
 from .attention.glm import eager as glm_attn_eager
 from .attention.glm import flashmla_cudnn as glm_attn_flashmla
+from .indexer.deepseek_v4 import cann as dsv4_indexer_cann
 from .indexer.deepseek_v4 import eager as dsv4_indexer_eager
 from .indexer.deepseek_v4 import tilelang as dsv4_indexer_tilelang
 from .indexer.glm import cudnn as glm_indexer_cudnn
@@ -51,6 +54,17 @@ register_op(
     requirement=_TILELANG,
     requires=("tilelang",),
 )
+
+register_op(
+    "dsa_attention",
+    "deepseek_v4",
+    "cann",
+    description="Ascend CANN DeepSeek-V4 sparse attention",
+    wrapper=dsv4_attn_cann.wrapper,
+    requirement=NpuKernelRequirement(),
+    requires=("cann_ops_transformer",),
+)
+
 register_op(
     "dsa_attention",
     "glm",
@@ -86,6 +100,17 @@ register_op(
     requirement=_TILELANG,
     requires=("tilelang",),
 )
+
+register_op(
+    "dsa_indexer",
+    "deepseek_v4",
+    "cann",
+    description="Ascend CANN DeepSeek-V4 sparse-attention indexer",
+    wrapper=dsv4_indexer_cann.wrapper,
+    requirement=NpuKernelRequirement(),
+    requires=("cann_ops_transformer",),
+)
+
 register_op(
     "dsa_indexer",
     "glm",
