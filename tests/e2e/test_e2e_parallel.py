@@ -60,11 +60,13 @@ _QWEN4_EXP_CONFIG = "./tests/toy_config/qwen4_exp_toy/config.json"
 _ACCELERATOR = get_torch_device()
 # GatedDeltaNet under Ulysses SP rejects eager, and the only varlen kernels need flash-linear-attention
 # (gpu extra) or triton-ascend (not in the npu extra), so off CUDA the smoke runs SP=1 with eager GDN.
+# The npu rms_norm_gated kernel hard-codes a SiLU gate, but Qwen4-Exp uses output_gate_type="sigmoid".
 _QWEN4_EXP_SP_SIZE = 2 if IS_CUDA_AVAILABLE else 1
 _QWEN4_EXP_GDN_IMPL = "fla" if IS_CUDA_AVAILABLE else "eager"
 _QWEN4_EXP_TRAINING_ARGS = [
     "--model.ops_implementation.attn_implementation=flash_attention_2",
     f"--model.ops_implementation.qsa_attention_implementation={'tilelang' if IS_CUDA_AVAILABLE else 'eager'}",
+    f"--model.ops_implementation.rms_norm_gated_implementation={_QWEN4_EXP_GDN_IMPL}",
     f"--model.ops_implementation.causal_conv1d_implementation={_QWEN4_EXP_GDN_IMPL}",
     f"--model.ops_implementation.chunk_gated_delta_rule_implementation={_QWEN4_EXP_GDN_IMPL}",
     "--model.accelerator.extra_parallel_names=ple",
