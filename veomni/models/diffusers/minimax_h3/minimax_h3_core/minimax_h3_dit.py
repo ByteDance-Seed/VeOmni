@@ -15,7 +15,7 @@ from veomni.distributed.sequence_parallel.ulysses import (
 )
 from veomni.utils.device import IS_NPU_AVAILABLE
 
-from .core import attention_forward, gradient_checkpoint_forward
+from .core import attention_forward
 
 
 if IS_NPU_AVAILABLE:
@@ -187,6 +187,7 @@ class MiniMaxH3Attention(nn.Module):
             out_blocks = []
             o_wait, o_prev = None, None
             for i, b in enumerate(blocks):
+                w_next = None
                 if i + 1 < nb:  # launch block i+1: transfers while block i computes
                     w_next = _all_to_all_single(blocks[i + 1], 1, 0, sp_group, async_op=True)
                 full = _AsyncA2A.apply(w, b, 1, 0, sp_group)  # [SEQ, 1, 3, d]: this rank's head of block i
@@ -437,6 +438,10 @@ class MiniMaxH3DiT(nn.Module):
     ):
         super().__init__()
         self._block_offload_enabled = False
+        # HF's marker: ``gradient_checkpointing_enable()`` walks ``modules()`` and writes both
+        # this flag and ``_gradient_checkpointing_func`` here, so the block loop below reads the
+        # run's setting and the policy's per-block decisions without owning a strategy itself.
+        self.gradient_checkpointing = False
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_channels_latents = latents_dim
@@ -559,8 +564,6 @@ class MiniMaxH3DiT(nn.Module):
         img_pos_for_infer_output_info,
         packed_seq_params,
         refiner_packed_seq_params,
-        use_gradient_checkpointing=False,
-        use_gradient_checkpointing_offload=False,
         update_audio_mask=None,
         skip_mask_out_condition=False,
         packed_batch=False,
@@ -582,8 +585,8 @@ class MiniMaxH3DiT(nn.Module):
         sp_group = get_ulysses_sequence_parallel_group()
         sp_world = dist.get_world_size(sp_group) if sp_group is not None else 1
         sp_rank = dist.get_rank(sp_group) if sp_group is not None else 0
-        if packed_batch and (sp_world != 1 or self._block_offload_enabled or use_gradient_checkpointing_offload):
-            raise ValueError("H3 multi-sample packing does not support sequence parallelism or offload.")
+        if packed_batch and (sp_world != 1 or self._block_offload_enabled):
+            raise ValueError("H3 multi-sample packing does not support sequence parallelism or block offload.")
 
         cu_seqlens = packed_seq_params["cu_seqlens_q"].to(torch.int32)
         max_seqlen = int(packed_seq_params["max_seqlen_q"])
@@ -654,6 +657,17 @@ class MiniMaxH3DiT(nn.Module):
         # dropped by the index_select below.
         cu_bounds = _PackedBounds(cu_seqlens.to(device), cu_host) if packed_batch else cu_host
         block_swap = self._block_swap if self._block_offload_enabled else 0
+        # Every block takes the same arguments; only the recompute decision differs, and
+        # the bound policy folds that into ``self._gradient_checkpointing_func``.
+        block_kwargs = {
+            "t_emb": t_emb,
+            "combined_indices": combined_indices,
+            "rope_cos": rope_cos,
+            "rope_sin": rope_sin,
+            "cu_seqlens": cu_bounds,
+            "max_seqlen": max_seqlen,
+            "use_ulysses": sp_world > 1,
+        }
         for i, block in enumerate(self.blocks):
             if self._block_offload_enabled:
                 if i == 0:
@@ -664,19 +678,10 @@ class MiniMaxH3DiT(nn.Module):
                         b.to("cpu")
                     for b in self.blocks[block_swap:]:
                         b.to(device)
-            hidden = gradient_checkpoint_forward(
-                block,
-                use_gradient_checkpointing,
-                use_gradient_checkpointing_offload,
-                hidden,
-                t_emb=t_emb,
-                combined_indices=combined_indices,
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
-                cu_seqlens=cu_bounds,
-                max_seqlen=max_seqlen,
-                use_ulysses=sp_world > 1,
-            )
+            if self.gradient_checkpointing:
+                hidden = self._gradient_checkpointing_func(block, hidden, **block_kwargs)
+            else:
+                hidden = block(hidden, **block_kwargs)
 
         if self._block_offload_enabled:
             for b in self.blocks[block_swap:]:
@@ -687,11 +692,14 @@ class MiniMaxH3DiT(nn.Module):
         if sp_group is not None:
             # Rebuild the full packed sequence so the output position
             # index_select / update_mask below see the original layout. The
-            # backward splits without all-reduce (grad_scale=False,
-            # sum_grad=False): the downstream loss is replicated across the SP
-            # ranks, so a sum would multiply the gradient by the SP world size.
-            video_logits = _Gather.apply(sp_group, video_logits, 0, False, False)
-            audio_logits = _Gather.apply(sp_group, audio_logits, 0, False, False)
+            # downstream loss is replicated across the SP ranks, so the
+            # backward keeps this rank's slice of the full gradient without an
+            # all-reduce (sum_grad=False). The data-parallel gradient reduction
+            # (FSDP2 over dp_shard_sp, DDP over dp_sp) also averages over the
+            # SP ranks, so the slice is scaled by the SP world size
+            # (grad_scale=True) to compensate.
+            video_logits = _Gather.apply(sp_group, video_logits, 0, True, False)
+            audio_logits = _Gather.apply(sp_group, audio_logits, 0, True, False)
 
         video_logits = video_logits.index_select(0, infer_out_pos.to(device))
         audio_logits = audio_logits.index_select(0, audio_pos.to(device))

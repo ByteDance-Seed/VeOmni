@@ -5,6 +5,12 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
+from veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config import (
+    PatchedDeepseekV3Experts,
+    deepseek_v3_get_parallel_plan_patched,
+    deepseek_v3_moe_forward_patched,
+    deepseek_v3_topk_router_forward_patched,
+)
 from veomni.patchgen.patch_spec import PatchConfig
 
 
@@ -14,6 +20,9 @@ config = PatchConfig(
     description="GLM-5 with GPU replacements",
 )
 
+config.add_import("veomni.ops", names=["fused_moe_forward"])
+config.add_import("veomni.utils.moe_monitor", names=["record_router_indices"])
+
 # Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` can
 # return per-token log-probs in the unified output dataclass.
 config.add_import(
@@ -21,18 +30,74 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 
-# The NPU sibling config is much smaller than this one — it only patches
-# `GlmMoeDsaForCausalLM.forward` and shares no patch bodies with this module, so
-# the indexer / attention ports here do not propagate to it.
+# The NPU sibling config shares only the routed-expert block and parallel-plan
+# patches with this module; the indexer / attention ports here do not propagate
+# to it.
 config.add_post_import_block(
     """
     # ── OpSlot declarations ──────────────────────────────────────────────────
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot, OpsConfigSlot
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
     veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
     """
+)
+
+# GLM-MoE-DSA's routed-expert block (TopkRouter / Experts / MoE) is the
+# DeepSeek-V3 block with renamed classes, so its MoE patches are shared.
+_DEEPSEEK_V3_NAME_MAP = {"DeepseekV3": "GlmMoeDsa"}
+
+
+# ================================================================
+# Patch: GlmMoeDsaExperts
+# 1. Drop upstream ``@use_experts_implementation`` — it dispatches to
+#    ``grouped_mm`` / HF fused paths and bypasses VeOmni's fused MoE.
+# 2. OpSlot guard: when ``veomni_moe_experts_forward`` is bound to a non-eager
+#    kernel, call ``fused_moe_forward``, which also handles the EP-sharded
+#    ``[E/ep, ...]`` expert slices. The eager loop indexes experts by global id
+#    and therefore only works without EP.
+# ================================================================
+config.replace_class(
+    "GlmMoeDsaExperts",
+    replacement=PatchedDeepseekV3Experts,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path",
+)
+
+# ================================================================
+# Patch: GlmMoeDsaTopkRouter.forward
+# 1. Disable autocast around the fp32 router ``F.linear``; an outer autocast
+#    would otherwise override the explicit ``.type(torch.float32)``.
+# ================================================================
+config.override_method(
+    "GlmMoeDsaTopkRouter.forward",
+    replacement=deepseek_v3_topk_router_forward_patched,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Disable autocast around fp32 router linear for VeRL actor/rollout parity",
+)
+
+# ================================================================
+# Patch: GlmMoeDsaMoE.forward
+# 1. Report the router's top-k indices to the MoE load-balance monitor.
+# ================================================================
+config.override_method(
+    "GlmMoeDsaMoE.forward",
+    replacement=deepseek_v3_moe_forward_patched,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Report top-k indices to the MoE load-balance monitor",
+)
+
+# ================================================================
+# Patch: GlmMoeDsaForCausalLM.get_parallel_plan
+# 1. Register the VeOmni expert-parallel plan (``parallel_plan.py``).
+# ================================================================
+config.override_method(
+    "GlmMoeDsaForCausalLM.get_parallel_plan",
+    replacement=deepseek_v3_get_parallel_plan_patched,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Register GlmMoeDsa expert parallel plan for v5 generated modeling",
 )
 
 
