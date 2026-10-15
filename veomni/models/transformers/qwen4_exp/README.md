@@ -39,8 +39,9 @@ Known limitations:
 
 - Ulysses/context sequence parallelism is rejected because PLE n-gram context
   and QSA global token indices need dedicated distributed semantics.
-- The production QSA kernel is not integrated. Upstream eager/SDPA QSA builds
-  dense masks and is suitable only for short correctness validation.
+- CUDA runs the selector-index QSA Triton kernel when the attention inputs meet
+  its training contract. CPU, NPU, cached decoding, attention-weight requests,
+  and nonzero training dropout retain the upstream eager/SDPA QSA path.
 - Distributed PLE training expects pretrained or DCP weights. Initializing from
   scratch after PLE parameters become DTensors is not supported by the upstream
   Hugging Face initializer.
