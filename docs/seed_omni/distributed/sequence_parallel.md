@@ -6,20 +6,24 @@ inside its own `pre_forward`, runs one forward, and all-gathers the result in it
 own `post_forward`. This page describes that contract and why it gives the same
 gradients and metrics as a non-SP run. General Ulysses background is in
 [Ulysses](../../key_features/ulysses.md).
+Everything else a module may choose for itself (FSDP2, DDP, extra parallel
+groups) is in [Per-Module Parallelism](per_module_parallelism.md).
 
 ## 1. Enabling SP
 
 Set the SP size on the global accelerator:
 
 ```bash
-bash train.sh tasks/omni/train_omni.py configs/seed_omni/fake_model/train/base.yaml \
+bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
   --model.accelerator.ulysses_size 4
 ```
 
 Every module inherits `ulysses_size` through the accelerator deep-merge in
-`build_omni_module_runtime_args`. There is no dedicated SP config file. The
-framework does **not** validate that all modules agree, so do not set a
-per-module `ulysses_size` in the `modules` YAML; the next section explains why.
+`build_omni_module_runtime_args` (see
+[How a module's arguments are resolved](../usage/training_and_inference.md#how-a-modules-arguments-are-resolved)).
+There is no dedicated SP config file. The framework does **not** validate that
+all modules agree, so do not set a per-module `ulysses_size` in the `modules`
+YAML; the next section explains why.
 
 With SP size `S` on `W` ranks the data-parallel size is `W / S`. On a small
 machine this can reach `dp = 1`; compensate with gradient accumulation (a larger
@@ -84,7 +88,8 @@ for node in training_graph:
 - **Slice in `pre_forward`.** A module with SP support branches on
   `get_parallel_state().sp_size > 1` and slices its replicated input to `1/S`
   with `sp_pad` + `slice_input_tensor` or `sp_pad_and_slice`. Sequence modules
-  slice tokens; per-item encoders slice along the batch of items.
+  slice tokens; per-item encoders (SigLIP, VQVAE) slice along the batch of
+  images.
 - **Gather in `post_forward`.** The matching branch all-gathers with
   `gather_outputs` and strips the padding, so everything downstream of
   `post_forward` (writing hidden states back onto the conversation list,
