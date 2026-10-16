@@ -311,19 +311,10 @@ def build_omni_module_runtime_args(
     # it off alongside `fsdp_mode: eager` keeps the single-process eager-inference
     # default from inheriting a rank0-broadcast load policy that cannot run
     # without a wrap.
-    #
-    # Mixed precision is off for the same reason it is on when training: it
-    # exists to keep fp32 master weights for an optimizer, and inference has no
-    # optimizer. Left on, it builds every module at float32 and calls
-    # `model.float()`, which upcasts whatever the checkpoint stored -- including
-    # a quantized model's fp8 weights and scales, since those are floating point
-    # too. DeepSeek-V4.1's backbone grew to 40 GiB of replicated fp32 that way,
-    # and its fp8 GEMMs would have been handed fp32 operands. These are defaults,
-    # so a config that wants fp32 inference can still ask for it.
     inference_default = (
         {
             "broadcast_model_weights_from_rank0": False,
-            "accelerator": {"fsdp_config": {"fsdp_mode": "eager", "mixed_precision": {"enable": False}}},
+            "accelerator": {"fsdp_config": {"fsdp_mode": "eager"}},
         }
         if for_inference
         else {}
@@ -512,19 +503,6 @@ class OmniInferArguments:
     )
     output_dir: str = field(default="output", metadata={"help": "Root output directory."})
     seed: int = field(default=42, metadata={"help": "Random seed."})
-    enable_full_determinism: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Opt into bitwise-reproducible generation (NCCL_DETERMINISTIC, "
-                "torch.use_deterministic_algorithms, cuDNN off). Off by default, "
-                "same as training and as vLLM serving: the rank-0 token broadcast "
-                "already keeps a multi-rank FSM from deadlocking on a last-bit "
-                "MoE scatter_add race. Turn this on only when a seeded prompt "
-                "must give the same answer twice; it is a large latency tax."
-            )
-        },
-    )
 
 
 @dataclass

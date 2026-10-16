@@ -205,18 +205,7 @@ def _skip_without_loading_fn(
     return skip_key
 
 
-def _refuse_unmerged_export(weights_path: str) -> None:
-    from ..checkpoint.layout import HF_PENDING_MERGE_FILENAME
-
-    if os.path.isfile(os.path.join(weights_path, HF_PENDING_MERGE_FILENAME)):
-        raise RuntimeError(
-            f"{weights_path} is an HF export whose row-sharded tables are still split by rank "
-            f"(see {HF_PENDING_MERGE_FILENAME}). Run `python scripts/merge_hf_export.py {weights_path}` first."
-        )
-
-
 def _resolve_state_dict_iterators(weights_path: str, **kwargs) -> List["StateDictIterator"]:
-    _refuse_unmerged_export(weights_path)
     cache_kwargs = {"_raise_exceptions_for_missing_entries": False, **kwargs}
     resolved_weight_file = cached_file(weights_path, SAFE_WEIGHTS_NAME, **cache_kwargs)
     if resolved_weight_file:
@@ -518,7 +507,6 @@ def _resolve_safetensors_shards(weights_path: str, **kwargs) -> Tuple[Dict[str, 
     (``model.safetensors.index.json`` + ``model-0000x-of-0000y.safetensors``)
     and single-file (``model.safetensors``) layouts.
     """
-    _refuse_unmerged_export(weights_path)
     cache_kwargs = {"_raise_exceptions_for_missing_entries": False, **kwargs}
     resolved_index = cached_file(weights_path, SAFE_WEIGHTS_INDEX_NAME, **cache_kwargs)
     if resolved_index:
@@ -549,29 +537,6 @@ def _ep_dim0_slice_meta(parallel_state: Any, shard_group: str, target0: int) -> 
     return para_size, para_rank, target0 * para_size
 
 
-def _companion_row_transform(
-    converter: "CheckpointTensorConverter", name: str, companion_path: str, companion_raw_name: str
-) -> Callable[["torch.Tensor", int, int], "torch.Tensor"]:
-    """A ``row_transform`` that reads the same rows of ``name``'s row-wise companion."""
-
-    def row_transform(rows: "torch.Tensor", start: int, end: int) -> "torch.Tensor":
-        with safe_open(companion_path, framework="pt", device="cpu") as companion_file:
-            companion_rows = companion_file.get_slice(companion_raw_name)[start:end]
-        return converter.convert_rows(name, rows, companion_rows)
-
-    return row_transform
-
-
-def _refuse_unconverted_tensor(converter: Optional["CheckpointTensorConverter"], name: str, tensor: "torch.Tensor"):
-    """A tensor the converter claims by content (e.g. a quantized weight) must not load raw."""
-    can_handle_tensor = getattr(converter, "can_handle_tensor", None)
-    if callable(can_handle_tensor) and can_handle_tensor(name, tensor):
-        raise NotImplementedError(
-            f"ep_sharded_stream_load: converter {type(converter).__name__} needs the whole-tensor "
-            f"conversion for '{name}' ({tensor.dtype}); disable model.ep_sharded_stream_load."
-        )
-
-
 def _read_ep_dim0_slice(
     sl: Any,
     *,
@@ -581,7 +546,6 @@ def _read_ep_dim0_slice(
     expected_full0: int,
     zero_pad: bool = False,
     strict_mismatch_message: Optional[str] = None,
-    row_transform: Optional[Callable[["torch.Tensor", int, int], "torch.Tensor"]] = None,
 ) -> "torch.Tensor":
     """Read this rank's dim-0 EP slice from a safetensors ``get_slice`` handle.
 
@@ -592,8 +556,6 @@ def _read_ep_dim0_slice(
       ``expected_full0``; used for independent MoE-LoRA adapters.
     * ``zero_pad=True``: allow ``real0 < expected_full0`` and zero-fill the
       trailing rows (dim-0 zero-pad converters on the base path).
-    * ``row_transform(rows, start, end)`` is applied to the real rows read,
-      ``[start, end)`` in checkpoint row numbers, before any zero fill.
     """
     real0 = sl.get_shape()[0]
     if real0 > expected_full0:
@@ -608,8 +570,7 @@ def _read_ep_dim0_slice(
     start = para_rank * target0
     end = start + target0
     if not zero_pad:
-        tensor = sl[start:end]
-        return row_transform(tensor, start, end) if row_transform is not None else tensor
+        return sl[start:end]
     # Clamp both ends to real0 so a rank lying entirely in the zero-pad region
     # (start >= real0) reads an in-bounds empty slice (sl[real0:real0]) instead of
     # relying on out-of-bounds ``get_slice`` semantics, which vary by safetensors
@@ -617,8 +578,6 @@ def _read_ep_dim0_slice(
     read_start = min(start, real0)
     read_end = min(end, real0)
     tensor = sl[read_start:read_end]
-    if row_transform is not None:
-        tensor = row_transform(tensor, read_start, read_end)
     if tensor.shape[0] < target0:
         pad = torch.zeros((target0 - tensor.shape[0], *tuple(tensor.shape[1:])), dtype=tensor.dtype)
         tensor = torch.cat([tensor, pad], dim=0)
@@ -834,12 +793,11 @@ def load_model_weights_ep_sharded(
         return para_rank * target0, target0, expected_full0
 
     def _converter_transforms(bare_name: str) -> bool:
-        """Whether the converter claims ``bare_name`` for more than a dim-0 zero-pad or a row-wise convert."""
+        """Whether the converter claims ``bare_name`` for more than a dim-0 zero-pad."""
         return (
             converter is not None
             and converter.can_handle(bare_name)
             and not checkpoint_converter_is_dim0_zero_pad(converter, bare_name)
-            and _rowwise_companion(bare_name) is None
         )
 
     # Up-front scan of the *raw checkpoint keys* for a converter's non-dim0-zero-pad
@@ -1052,27 +1010,14 @@ def load_model_weights_ep_sharded(
                     # overlap and zero-fill the tail. Otherwise the checkpoint must
                     # match the model exactly.
                     zero_pad = checkpoint_converter_is_dim0_zero_pad(converter, bare_name)
-                    companion = _rowwise_companion(bare_name)
                     if _converter_transforms(bare_name):
                         # A converter that fuses/reshapes this key can't be streamed.
                         raise NotImplementedError(
                             f"ep_sharded_stream_load: converter applies a non-dim0-zero-pad "
                             f"transform to ExtraParallel key '{name}'."
                         )
-                    row_transform = None
-                    if companion is not None:
-                        companion_raw = bare_to_raw[companion]
-                        row_transform = _companion_row_transform(
-                            converter, bare_name, file_to_path[key_to_file[companion_raw]], companion_raw
-                        )
-
                     spec_info = getattr(model, "_fqn2spec_info", {}).get(name)
                     if spec_info is not None and spec_info.persistent_fsdp_shard_dim is not None:
-                        if row_transform is not None:
-                            raise NotImplementedError(
-                                f"ep_sharded_stream_load: row-wise conversion of persistent ExtraParallel "
-                                f"parameter '{name}' is not supported."
-                            )
                         parameter = params_by_name[name]
                         if not isinstance(parameter, DTensor):
                             raise RuntimeError(
@@ -1104,31 +1049,14 @@ def load_model_weights_ep_sharded(
                         target0=target0,
                         para_rank=para_rank,
                         expected_full0=expected_full0,
-                        zero_pad=zero_pad or companion is not None,
-                        row_transform=row_transform,
+                        zero_pad=zero_pad,
                     )
-                    if row_transform is None:
-                        _refuse_unconverted_tensor(converter, bare_name, tensor)
                     # Already the local slice -> parallel_plan=None (do not slice
                     # again); dtensor_factory then shards over the ep_fsdp sub-mesh
                     # exactly as the whole-tensor path's post-shard_tensor half.
                     _dispatch_parameter(model, name, tensor, dtensor_factory, None, dtensor_to_cpu)
                     n_ep += 1
                 else:
-                    companion = _rowwise_companion(bare_name)
-                    if companion is not None:
-                        # Not sharded, so the rows are all of them: convert the whole
-                        # tensor with its whole companion.
-                        companion_raw = bare_to_raw[companion]
-                        with safe_open(
-                            file_to_path[key_to_file[companion_raw]], framework="pt", device="cpu"
-                        ) as companion_file:
-                            companion_tensor = companion_file.get_tensor(companion_raw)
-                        tensor = converter.convert_rows(bare_name, f.get_tensor(raw_name), companion_tensor)
-                        _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
-                        n_dense += 1
-                        parameter_names_to_load.discard(name)
-                        continue
                     if converter is not None and converter.can_handle(bare_name):
                         # Only a dim-0 zero-pad key gets here (other claimed keys took
                         # the whole-tensor converter path); it must be an ExtraParallel table.

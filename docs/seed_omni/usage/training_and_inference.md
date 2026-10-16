@@ -257,11 +257,8 @@ bash train.sh tasks/omni/infer_omni.py \
 ### Inferring from a trained checkpoint
 
 Training writes each module's HF weights under
-`<output_dir>/checkpoints/global_step_N/hf_ckpt/<module>/`. A module whose
-row-sharded embedding tables are too large for one file (DeepSeek-V4.1's n-gram)
-leaves them unmerged; run `python scripts/merge_hf_export.py "$STEP/hf_ckpt"` first
-([details](../../usage/checkpoint_conversion.md#finishing-an-hf-export-with-unmerged-tables)).
-Link each module's folder into a flat root and pass it as `--model.model_path`:
+`<output_dir>/checkpoints/global_step_N/hf_ckpt/<module>/`. Link each module's
+folder into a flat root and pass it as `--model.model_path`:
 
 ```bash
 STEP=outputs/janus_1.3b_omni_sft/checkpoints/global_step_20
