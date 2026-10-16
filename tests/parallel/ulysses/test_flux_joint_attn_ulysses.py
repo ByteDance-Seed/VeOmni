@@ -22,7 +22,7 @@ if get_device_type() == "cpu" or not c10d.is_available() or not c10d.is_backend_
 
 from torch.testing._internal.common_utils import run_tests
 
-from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+from veomni.distributed.parallel_state import use_parallel_state
 from veomni.models.transformers.flux.modeling_flux import FluxJointAttention
 
 from .utils import SequenceParallelTest
@@ -66,19 +66,15 @@ class FluxJointAttentionUlyssesTest(SequenceParallelTest):
         mask[..., 0, txt_len + img_len // 2 :] = float("-inf")
         mask[..., txt_len + img_len // 2 :, 0] = float("-inf")
 
-        try:
-            _init_parallel_state(dp_size=self.world_size, ulysses_size=1, device_type=get_device_type(), name=None)
-            with torch.no_grad():
-                refs = {name: attn(image, text, rotary, m) for name, m in [("no_mask", None), ("mask", mask)]}
-            clear_parallel_state()
+        with use_parallel_state(self.dp_state), torch.no_grad():
+            refs = {name: attn(image, text, rotary, m) for name, m in [("no_mask", None), ("mask", mask)]}
 
-            _init_parallel_state(dp_size=1, ulysses_size=self.world_size, device_type=get_device_type(), name=None)
-            t_chunk, i_chunk = txt_len // self.world_size, img_len // self.world_size
-            text_local = text[:, self.rank * t_chunk : (self.rank + 1) * t_chunk]
-            image_local = image[:, self.rank * i_chunk : (self.rank + 1) * i_chunk]
+        t_chunk, i_chunk = txt_len // self.world_size, img_len // self.world_size
+        text_local = text[:, self.rank * t_chunk : (self.rank + 1) * t_chunk]
+        image_local = image[:, self.rank * i_chunk : (self.rank + 1) * i_chunk]
+        with use_parallel_state(self.sp_state), torch.no_grad():
             for name, m in [("no_mask", None), ("mask", mask)]:
-                with torch.no_grad():
-                    out_image, out_text = attn(image_local, text_local, rotary, m)
+                out_image, out_text = attn(image_local, text_local, rotary, m)
                 ref_image, ref_text = refs[name]
                 torch.testing.assert_close(
                     _gather(out_image, group, self.world_size), ref_image, atol=1e-5, rtol=1e-4, msg=f"{name}: image"
@@ -86,8 +82,6 @@ class FluxJointAttentionUlyssesTest(SequenceParallelTest):
                 torch.testing.assert_close(
                     _gather(out_text, group, self.world_size), ref_text, atol=1e-5, rtol=1e-4, msg=f"{name}: text"
                 )
-        finally:
-            clear_parallel_state()
 
 
 if __name__ == "__main__":

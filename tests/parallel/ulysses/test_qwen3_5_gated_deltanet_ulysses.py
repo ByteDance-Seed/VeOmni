@@ -12,7 +12,6 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -35,8 +34,6 @@ except Exception:
     causal_conv1d_fn = None
 
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-
-_PATCHED_MODULE = "veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu"
 
 
 def _install_fla_kernel_config() -> None:
@@ -242,12 +239,13 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str, bsz
         world_size=world_size,
     )
 
-    from veomni.distributed.parallel_state import _init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
     from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
         Qwen3_5GatedDeltaNet,
     )
 
-    _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
+    sp_state = _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type, name="sp")
+    dp_state = _init_parallel_state(dp_size=world_size, ulysses_size=1, device_type=device_type, name="dp")
     # Spawned workers do not inherit the process-global config installed by the
     # parent fixture, so install the same FLA selections in each child.
     _install_fla_kernel_config()
@@ -269,12 +267,11 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str, bsz
         shard_len = seq_len // world_size
         local_input = full_input[:, rank * shard_len : (rank + 1) * shard_len].contiguous()
 
-        # Baseline forward/backward on rank 0 with SP disabled
+        # Baseline forward/backward on rank 0 with Ulysses disabled.
         baseline_out = None
         baseline_param_grads = None
         if rank == 0:
-            no_sp_state = SimpleNamespace(ulysses_enabled=False)
-            with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+            with use_parallel_state(dp_state):
                 baseline_out = layer(full_input, attention_mask=None, cu_seq_lens_q=None)
                 baseline_loss = baseline_out.mean()
                 baseline_loss.backward()
@@ -287,11 +284,11 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str, bsz
 
         dist.barrier()
 
-        # SP forward/backward
-        sp_out_local = layer(local_input, attention_mask=None, cu_seq_lens_q=None)
-        total_numel = bsz * seq_len * sp_out_local.shape[-1]
-        sp_loss = sp_out_local.sum() / total_numel
-        sp_loss.backward()
+        with use_parallel_state(sp_state):
+            sp_out_local = layer(local_input, attention_mask=None, cu_seq_lens_q=None)
+            total_numel = bsz * seq_len * sp_out_local.shape[-1]
+            sp_loss = sp_out_local.sum() / total_numel
+            sp_loss.backward()
 
         for param in layer.parameters():
             if param.grad is not None:
@@ -328,6 +325,7 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str, bsz
             torch.testing.assert_close(sp_out_full, baseline_out, rtol=0, atol=5e-3)
 
         dist.barrier()
+        clear_parallel_state()
         dist.destroy_process_group()
 
 
@@ -368,7 +366,7 @@ def _run_gated_deltanet_sp_determinism(rank: int, world_size: int, init_file: st
         world_size=world_size,
     )
 
-    from veomni.distributed.parallel_state import _init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
     from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
         Qwen3_5GatedDeltaNet,
     )
@@ -396,6 +394,7 @@ def _run_gated_deltanet_sp_determinism(rank: int, world_size: int, init_file: st
         _assert_forward_deterministic(layer, local_input, repeats=100)
 
         dist.barrier()
+        clear_parallel_state()
         dist.destroy_process_group()
 
 
@@ -450,7 +449,4 @@ def test_qwen3_5_gated_deltanet_forward_deterministic_no_sp(bsz, seq_len):
     layer.train()
 
     inputs = torch.randn(bsz, seq_len, config.hidden_size, device=device_type)
-
-    no_sp_state = SimpleNamespace(ulysses_enabled=False)
-    with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
-        _assert_forward_deterministic(layer, inputs, repeats=100)
+    _assert_forward_deterministic(layer, inputs, repeats=100)
