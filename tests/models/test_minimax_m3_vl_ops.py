@@ -270,6 +270,60 @@ def test_minimax_m3_vl_vision_forward_threads_global_sp_metadata(
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
+def test_minimax_m3_vl_placeholder_mask_fallback_gathers_input_ids_under_sp(module_name, monkeypatch):
+    """Without precomputed masks, SP must derive them from the full sequence, not this rank's slice."""
+    from veomni.models.loader import get_model_config
+
+    modeling = importlib.import_module(module_name)
+    config = get_model_config("./tests/toy_config/minimax_m3_vl_toy")
+    model = modeling.MiniMaxM3SparseForConditionalGeneration(config).model.eval()
+    sp_size, local_len = 2, 4
+    full_ids = torch.randint(0, 100, (1, sp_size * local_len))
+    full_ids[0, [1, 6]] = config.image_token_id
+    local_ids = full_ids[:, :local_len]
+
+    def fake_all_gather(tensor_list, tensor, group):
+        for rank, chunk in enumerate(full_ids.split(local_len, dim=1)):
+            tensor_list[rank].copy_(chunk)
+
+    monkeypatch.setattr(
+        modeling,
+        "get_parallel_state",
+        lambda: SimpleNamespace(sp_enabled=True, sp_size=sp_size, sp_group=None, fsdp_enabled=False),
+    )
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    monkeypatch.setattr(
+        modeling, "gather_outputs", lambda x, gather_dim, group: model.get_input_embeddings()(full_ids)
+    )
+    monkeypatch.setattr(modeling, "slice_input_tensor", lambda x, dim, group: x.narrow(dim, 0, local_len))
+    seen = {}
+    original_mask = model.get_placeholder_mask
+
+    def spy_mask(input_ids, inputs_embeds, **kwargs):
+        seen["input_ids"] = input_ids
+        return original_mask(input_ids, inputs_embeds, **kwargs)
+
+    monkeypatch.setattr(model, "get_placeholder_mask", spy_mask)
+
+    embed_tokens = model.get_input_embeddings()
+
+    class _LanguageModelStub(torch.nn.Module):
+        def get_input_embeddings(self):
+            return embed_tokens
+
+        def forward(self, inputs_embeds, **kwargs):
+            seen["inputs_embeds"] = inputs_embeds
+            return SimpleNamespace(last_hidden_state=inputs_embeds, past_key_values=None)
+
+    model.language_model = _LanguageModelStub()
+    with torch.no_grad():
+        model(input_ids=local_ids)
+
+    assert torch.equal(seen["input_ids"], full_ids)
+    assert seen["inputs_embeds"].shape[1] == local_len
+
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
 def test_minimax_m3_vl_parallel_plan_targets_the_expert_parameters(module_name):
     """Every EP plan pattern must match the stacked expert weights of the multimodal model."""
     import fnmatch

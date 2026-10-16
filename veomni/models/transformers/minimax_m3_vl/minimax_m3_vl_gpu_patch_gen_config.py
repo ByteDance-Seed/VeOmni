@@ -30,6 +30,7 @@ patchgen veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_co
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import initialization as init
@@ -59,6 +60,7 @@ config = PatchConfig(
     target_file="patched_modeling_minimax_m3_vl_gpu.py",
     description="MiniMax M3 VL with VeOmni parallel-plan hooks",
 )
+config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import("veomni.ops.dispatch", names=["OpSlot"])
 config.add_import(
@@ -561,6 +563,8 @@ class PatchedMiniMaxM3VLExperts(nn.Module):
 # 3. run a zero-valued dummy vision/projector path when FSDP has no visual
 #    input for a modality on this rank, keeping image/video call counts equal
 #    across ranks and preventing asymmetric collectives from hanging
+# 4. when no precomputed image/video masks are passed under SP, gather the
+#    sharded input_ids before deriving the placeholder masks
 # ================================================================
 @config.override_method(
     "MiniMaxM3VLModel.forward",
@@ -648,6 +652,13 @@ def minimax_m3_vl_model_forward_patched(
     # --- Patch.3 ---
 
     if image_mask is None or video_mask is None:
+        # Fallback for callers that pass no precomputed masks. Under SP,
+        # ``inputs_embeds`` is already gathered to the full sequence while
+        # ``input_ids`` is still this rank's slice; gather it like Qwen-VL does.
+        if input_ids is not None and parallel_state.sp_enabled:
+            input_ids_list = [torch.zeros_like(input_ids) for _ in range(parallel_state.sp_size)]
+            dist.all_gather(input_ids_list, input_ids, group=parallel_state.sp_group)
+            input_ids = torch.cat(input_ids_list, dim=1)
         image_mask, video_mask = self.get_placeholder_mask(
             input_ids, inputs_embeds, image_features=image_features, video_features=video_features
         )

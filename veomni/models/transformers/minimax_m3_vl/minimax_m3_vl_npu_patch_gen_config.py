@@ -50,6 +50,7 @@ config = PatchConfig(
     description="MiniMax M3 VL with VeOmni parallel-plan hooks for NPU runtime selection",
 )
 
+config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import("veomni.ops.dispatch", names=["OpSlot"])
 config.add_import(

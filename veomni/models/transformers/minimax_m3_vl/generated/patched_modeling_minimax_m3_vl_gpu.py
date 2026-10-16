@@ -42,6 +42,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
+
+# Additional imports for patches
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import initialization as init
@@ -65,7 +68,6 @@ from transformers.utils.import_utils import is_torchdynamo_compiling
 from transformers.utils.output_capturing import capture_outputs
 from transformers.vision_utils import get_vision_position_ids
 
-# Additional imports for patches
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
 from veomni.models.transformers.attention_utils import VARLEN_ATTENTION_TYPES
@@ -1576,6 +1578,8 @@ class MiniMaxM3VLModel(MiniMaxM3VLPreTrainedModel):
     # 3. run a zero-valued dummy vision/projector path when FSDP has no visual
     #    input for a modality on this rank, keeping image/video call counts equal
     #    across ranks and preventing asymmetric collectives from hanging
+    # 4. when no precomputed image/video masks are passed under SP, gather the
+    #    sharded input_ids before deriving the placeholder masks
     # ================================================================
     @can_return_tuple
     @auto_docstring
@@ -1661,6 +1665,13 @@ class MiniMaxM3VLModel(MiniMaxM3VLPreTrainedModel):
         # --- Patch.3 ---
 
         if image_mask is None or video_mask is None:
+            # Fallback for callers that pass no precomputed masks. Under SP,
+            # ``inputs_embeds`` is already gathered to the full sequence while
+            # ``input_ids`` is still this rank's slice; gather it like Qwen-VL does.
+            if input_ids is not None and parallel_state.sp_enabled:
+                input_ids_list = [torch.zeros_like(input_ids) for _ in range(parallel_state.sp_size)]
+                dist.all_gather(input_ids_list, input_ids, group=parallel_state.sp_group)
+                input_ids = torch.cat(input_ids_list, dim=1)
             image_mask, video_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds, image_features=image_features, video_features=video_features
             )
