@@ -151,6 +151,19 @@ def test_wan_t2v_flash2_kernel_passes_full_sequence_varlen_kwargs(available_nvid
     assert captured["cu_seq_lens_k"].tolist() == [0, 8, 16]
 
 
+def test_wan_t2v_eager_falls_back_to_veomni_sdpa():
+    """Default eager has no local Wan forward, so the processor uses the SDPA row."""
+    model = _build_ours(_tiny_config(), eager_ops_config()).to(dtype=torch.bfloat16)
+    attn = model.blocks[0].attn1
+    processor = attn.processor
+    assert processor.veomni_attn.impl == "veomni_sdpa"
+    assert not processor._use_flash2
+
+    hidden = torch.randn(2, 8, attn.to_q.in_features, dtype=torch.bfloat16)
+    output = processor(attn, hidden, encoder_hidden_states=None, attention_mask=None, rotary_emb=None)
+    assert output.shape == hidden.shape
+
+
 def test_wan_t2v_sdpa_skips_full_sequence_varlen_kwargs():
     model = _build_ours(_tiny_config()).to(dtype=torch.bfloat16)
     attn = model.blocks[0].attn1

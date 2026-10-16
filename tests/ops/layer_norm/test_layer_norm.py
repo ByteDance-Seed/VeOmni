@@ -98,7 +98,10 @@ def test_apex_matches_eager(dtype: torch.dtype) -> None:
     x_a, w_a, b_a = make_grad_leaves(x, weight, bias)
     out_e = eager(x_e, w_e, b_e, normalized_shape=hidden, eps=eps)
     out_a = apex(x_a, w_a, b_a, normalized_shape=hidden, eps=eps)
-    torch.testing.assert_close(out_a.float(), out_e.float(), atol=2e-3, rtol=2e-3)
+    # bf16 Apex and eager each round a fp32 reduction. On this shape the outputs
+    # differ by up to about 0.03 (std ~1.4). fp32 stays at 2e-3.
+    forward_tol = 4e-2 if dtype == torch.bfloat16 else 2e-3
+    torch.testing.assert_close(out_a.float(), out_e.float(), atol=forward_tol, rtol=forward_tol)
 
     grad_output = torch.randn_like(out_e)
     out_e.backward(grad_output)
