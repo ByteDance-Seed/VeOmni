@@ -152,6 +152,8 @@ class ConversationItem:
 - Training carries a **batch**: `list[list[ConversationItem]]`.
 - Inference carries **one request**: `list[ConversationItem]`.
 
+The training graph must keep the list structure fixed: mutate `ConversationItem` fields in place, and do not replace the list, append items, or drop items. Structural changes (dummy rows, packing layout) belong in the processor / collator stage before the graph runs. Under `fsdp_scope: model`, FSDP2's root pre-forward may rebuild the outer dicts and lists but keeps the same item objects, so in-place field writes still reach the trainer.
+
 `value` has a lifecycle; modules overwrite it as data flows downstream:
 
 ```mermaid

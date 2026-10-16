@@ -58,17 +58,17 @@ _DEEPSEEK_V4_TILELANG_TRAINING_ARGS = [
 
 _QWEN4_EXP_CONFIG = "./tests/toy_config/qwen4_exp_toy/config.json"
 _ACCELERATOR = get_torch_device()
+# GatedDeltaNet under Ulysses SP rejects eager, and the only varlen kernels need flash-linear-attention
+# (gpu extra) or triton-ascend (not in the npu extra), so off CUDA the smoke runs SP=1 with eager GDN.
+# The npu rms_norm_gated kernel hard-codes a SiLU gate, but Qwen4-Exp uses output_gate_type="sigmoid".
+_QWEN4_EXP_SP_SIZE = 2 if IS_CUDA_AVAILABLE else 1
+_QWEN4_EXP_GDN_IMPL = "fla" if IS_CUDA_AVAILABLE else "eager"
 _QWEN4_EXP_TRAINING_ARGS = [
-    "--model.ops_implementation.attn_implementation=eager",
-    "--model.ops_implementation.cross_entropy_loss_implementation=eager",
-    "--model.ops_implementation.rms_norm_implementation=eager",
-    "--model.ops_implementation.swiglu_mlp_implementation=eager",
-    "--model.ops_implementation.rotary_pos_emb_implementation=eager",
-    "--model.ops_implementation.rotary_pos_emb_vision_implementation=eager",
-    "--model.ops_implementation.load_balancing_loss_implementation=eager",
-    "--model.ops_implementation.rms_norm_gated_implementation=eager",
-    "--model.ops_implementation.causal_conv1d_implementation=eager",
-    "--model.ops_implementation.chunk_gated_delta_rule_implementation=eager",
+    "--model.ops_implementation.attn_implementation=flash_attention_2",
+    f"--model.ops_implementation.qsa_attention_implementation={'tilelang' if IS_CUDA_AVAILABLE else 'eager'}",
+    f"--model.ops_implementation.rms_norm_gated_implementation={_QWEN4_EXP_GDN_IMPL}",
+    f"--model.ops_implementation.causal_conv1d_implementation={_QWEN4_EXP_GDN_IMPL}",
+    f"--model.ops_implementation.chunk_gated_delta_rule_implementation={_QWEN4_EXP_GDN_IMPL}",
     "--model.accelerator.extra_parallel_names=ple",
     "--model.accelerator.extra_parallel_sizes=2",
     "--model.accelerator.extra_parallel_placement_innermost=false",
@@ -208,6 +208,15 @@ text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        None,  # max_ep_size
+    ),
+    pytest.param(
+        "glm_moe_dsa",
+        "./tests/toy_config/glm_moe_dsa_toy",
+        True,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        1,  # max_sp_size: the DSA attention / indexer has no sequence-parallel path
         None,  # max_ep_size
     ),
 ]
@@ -606,7 +615,7 @@ def test_qwen3vl_lora_smoke(dummy_qwen3vl_dataset, tmp_path):
     reason="Qwen4-Exp VLM SFT pipeline smoke requires two CUDA or NPU devices",
 )
 def test_qwen4_exp_training_smoke(tmp_path):
-    """Exercise toy Qwen4-Exp VLM SFT with PLE=2, EP=2, and SP=1."""
+    """Exercise toy Qwen4-Exp VLM SFT with PLE=2, EP=2, and SP=2 (SP=1 off CUDA)."""
     model_path = tmp_path / "model"
     output_dir = tmp_path / "output"
     _materialize_weights_dir(_QWEN4_EXP_CONFIG, str(model_path), save_original_format=False)
@@ -624,12 +633,11 @@ def test_qwen4_exp_training_smoke(tmp_path):
             model_path=str(model_path),
             train_path=dummy_dataset.save_path,
             output_dir=str(output_dir),
-            parallel_config=ParallelConfig(sp_size=1, ep_size=2, fsdp_mode="fsdp2"),
+            parallel_config=ParallelConfig(sp_size=_QWEN4_EXP_SP_SIZE, ep_size=2, fsdp_mode="fsdp2"),
             nproc=2,
             extra_args=[
                 *_QWEN4_EXP_TRAINING_ARGS,
                 "--data.max_seq_len=64",
-                "--data.dataloader.num_workers=0",
                 "--train.global_batch_size=4",
                 "--model.accelerator.gradient_checkpointing.enable=false",
                 "--model.optimizer.lr=0.01",

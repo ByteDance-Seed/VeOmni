@@ -120,18 +120,22 @@ def _resolve_hf_checkpoint_view(model_runtime: OmniModelRuntimeArguments) -> str
 
 def _check_hf_source_exportable(model_path: str) -> None:
     """Fail at startup, not at the first HF save, when the source cannot be written back."""
-    from ..models.seed_omni.utils.hf_layout import read_hf_source, source_weight_files
+    from ..models.seed_omni.utils.hf_layout import read_hf_source, source_tensor_specs, source_weight_files
 
     source = read_hf_source(model_path)
     if source is None:
         return
     try:
-        source_weight_files(source.path)
+        weight_files = source_weight_files(source.path)
     except FileNotFoundError as e:
         raise ValueError(
             f"`train.checkpoint.save_hf_weights` exports in the source layout, which needs safetensors weights: {e} "
             "Convert the checkpoint to safetensors, or disable save_hf_weights."
         ) from e
+    try:
+        source_tensor_specs(source.path, weight_files)
+    except ValueError as e:
+        raise ValueError(f"`train.checkpoint.save_hf_weights` cannot write this source back: {e}") from e
 
 
 def _validate_hf_view_modules(model_path: str, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
@@ -180,7 +184,8 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
     # it. ``seed_omni_model_path`` is the root configs / assets / graphs are read
     # from (a weight-free view when ``model_path`` is an upstream HF checkpoint).
     seed_omni_model_path = _resolve_hf_checkpoint_view(model_runtime)
-    if not for_inference and args.train.checkpoint.save_hf_weights:
+    # An ``offline_embedding`` run trains nothing, so it never exports HF weights.
+    if not for_inference and args.train.checkpoint.save_hf_weights and args.train.training_task != "offline_embedding":
         _check_hf_source_exportable(seed_omni_model_path)
     omni_cfg = _try_load_omni_checkpoint_config(seed_omni_model_path)
 
@@ -702,8 +707,8 @@ class OmniTrainingArguments:
         default="online_training",
         metadata={
             "help": "Training task. online_training: encode raw data online. offline_embedding: run the "
-            "graph's offline_encode nodes and write the cache. offline_training: train from the cache; a "
-            "module the training graph calls only through online_process is built on meta."
+            "training graph with every module frozen and write the cache. offline_training: train from the "
+            "cache; every module that mixes in OfflineEncodingMixin is built on meta."
         },
     )
     offline_cache_dir: Optional[str] = field(
@@ -740,13 +745,6 @@ class OmniTrainingArguments:
         self.global_rank = int(os.getenv("RANK", 0))
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
         self._resolve_checkpoint_paths()
-        if self.training_task == "offline_embedding" and self.checkpoint.load_path:
-            raise ValueError(
-                "`train.checkpoint.load_path` is not supported with `train.training_task='offline_embedding'`: "
-                "its frozen modules have no checkpoint manager, so the weights would not be restored while the "
-                "dataloader position would. Point the encoder's `model_path` at an HF checkpoint instead; "
-                f"got load_path={self.checkpoint.load_path!r}."
-            )
         self._resolve_profile()
 
     def _derive_batch_config(self, accelerator: AcceleratorConfig) -> None:

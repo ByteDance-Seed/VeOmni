@@ -203,7 +203,7 @@ surfaced (and fixed) a few omni-specific interactions:
   `build_foundation_model`'s `_bind_veomni_ops` finds them); the EP-aware kernel
   reads `get_parallel_state().ep_group`, resolved per-node via `module_context`.
 - **Gradient checkpointing** recompute is re-scoped to the module's `ParallelState`
-  (`ModuleRuntime._scope_recompute_to_parallel_state`) so EP stays enabled
+  (`ModuleRuntime._recompute_context`, carried by the recompute policy) so EP stays enabled
   during backward recompute.
 - **FSDP inference** routes the backbone forward through `self(...)` (not
   `self.forward(...)`) so the FSDP root `__call__` runs lazy_init + unshards

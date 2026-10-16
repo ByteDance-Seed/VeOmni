@@ -318,8 +318,8 @@ def test_omni_model_forward_runs_fake_module_chain():
     assert out == {"loss": None, "losses": {}, "conversation_list": None}
 
 
-class _ListReplacingModule(PretrainedOmniModule):
-    """Training stand-in whose ``forward`` returns a new ``conversation_list`` instead of mutating it."""
+class _ItemEncodingModule(PretrainedOmniModule):
+    """Training stand-in that encodes each ``ConversationItem`` in place, as the offline-cache contract asks."""
 
     config_class = _StubConfig
 
@@ -328,23 +328,38 @@ class _ListReplacingModule(PretrainedOmniModule):
 
     def forward(self, conversation_list=None, **kwargs):
         del kwargs
-        return {"conversation_list": [*conversation_list, "encoded"]}
+        for sample in conversation_list:
+            for item in sample:
+                item.value = item.value * 2
+        return {}
 
 
-def test_omni_model_forward_returns_the_conversation_list_the_graph_wrote():
-    """FSDP2's root pre-forward may copy the batch, so callers read the final list from the return value."""
+def test_omni_model_forward_returns_the_items_the_graph_encoded_under_an_input_cast():
+    """FSDP2 mixed precision casts the root's inputs with ``dataclasses.replace``, so the graph encodes copies."""
+    from torch.distributed.utils import _apply_to_tensors
+
+    from veomni.models.seed_omni.utils.conversation import ConversationItem
+
     config = OmniConfig(
         _module_entries={"module_A": {"model_path": "module_A"}},
         training_graphs={"default": [{"from": "module_A", "to": "end"}]},
         generation_graphs=_minimal_generation_graphs(module="module_A"),
     )
-    model = OmniModel(config, {"module_A": _ListReplacingModule()})
-    original = ["raw"]
+    model = OmniModel(config, {"module_A": _ItemEncodingModule()})
 
-    out = model(dict(conversation_list=original))
+    def cast_inputs(module, args, kwargs):
+        to_bf16 = lambda t: t.to(torch.bfloat16)  # noqa: E731
+        return _apply_to_tensors(to_bf16, args), _apply_to_tensors(to_bf16, kwargs)
 
-    assert out["conversation_list"] == ["raw", "encoded"]
-    assert original == ["raw"]
+    model.register_forward_pre_hook(cast_inputs, with_kwargs=True)
+    original = ConversationItem(type="image", value=torch.ones(2), role="user", meta={})
+
+    out = model({"conversation_list": [[original]]})
+
+    assert torch.equal(original.value, torch.ones(2))
+    encoded = out["conversation_list"][0][0]
+    assert encoded is not original
+    assert torch.equal(encoded.value, torch.full((2,), 2.0, dtype=torch.bfloat16))
 
 
 class _ArtefactModule(PretrainedOmniModule):

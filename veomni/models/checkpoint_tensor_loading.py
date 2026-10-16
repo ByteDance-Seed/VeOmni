@@ -230,6 +230,17 @@ def checkpoint_converter_record_skip_without_loading(
         fn(name)
 
 
+def checkpoint_converter_supports_expert_streaming(
+    converter: Optional["CheckpointTensorConverter"],
+) -> bool:
+    """Whether *converter* implements both per-expert streaming capabilities."""
+    if converter is None:
+        return False
+    return callable(getattr(converter, "fused_expert_target", None)) and callable(
+        getattr(converter, "for_expert_range", None)
+    )
+
+
 def checkpoint_converter_fused_expert_target(
     converter: Optional["CheckpointTensorConverter"],
     name: str,
@@ -239,12 +250,13 @@ def checkpoint_converter_fused_expert_target(
     ``None`` unless *converter* claims ``name`` and implements both expert-streaming
     capabilities (``fused_expert_target`` and ``for_expert_range``).
     """
-    if converter is None or not converter.can_handle(name):
+    if (
+        converter is None
+        or not converter.can_handle(name)
+        or not checkpoint_converter_supports_expert_streaming(converter)
+    ):
         return None
-    fn = getattr(converter, "fused_expert_target", None)
-    if not callable(fn) or not callable(getattr(converter, "for_expert_range", None)):
-        return None
-    return fn(name)
+    return converter.fused_expert_target(name)
 
 
 def get_checkpoint_tensor_converter(

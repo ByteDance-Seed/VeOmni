@@ -328,6 +328,11 @@ class OmniModel(PreTrainedModel):
             # After the ops config above was installed.
             bind_ops_to_modeling(mod_cls)
             if load_weights and config._hf_source is not None:
+                if os.path.normpath(module_path) != os.path.normpath(os.path.join(str(checkpoint_root), name)):
+                    raise ValueError(
+                        f"Module {name!r} reads from {module_path!r}, but {checkpoint_root} is a view of the "
+                        f"HuggingFace `{config._hf_source.model_type}` checkpoint every module loads from."
+                    )
                 modules[name] = cls._load_module_from_hf_source(
                     mod_cls, name, module_config, module_path, config._hf_source, module_kwargs
                 )
@@ -544,9 +549,10 @@ class OmniModel(PreTrainedModel):
         without one each node runs as :meth:`_run_train_node`.
 
         Returns the summed ``loss``, the per-node ``losses`` and the batch's
-        final ``conversation_list``. FSDP2's root pre-forward may rebuild the
-        batch's dicts and lists, so a caller that needs what the nodes wrote
-        reads it from the return value, not from the batch it passed in.
+        ``conversation_list`` as the nodes left it. Under FSDP2 mixed precision
+        every wrap unit's pre-forward casts its inputs with ``dataclasses.replace``,
+        so the nodes update copies of the caller's ``ConversationItem``\\ s: a caller
+        that needs what they wrote reads it from here.
         """
         del args, kwargs
         run_node = node_runner if node_runner is not None else self._run_train_node

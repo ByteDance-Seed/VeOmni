@@ -147,6 +147,7 @@ def write_manifest(
     step_root: str,
     global_step: int,
     world_size: int,
+    model_state: bool = True,
 ) -> str:
     """Record that the step's trainer-level state is down. Rank 0 only, and last.
 
@@ -157,12 +158,15 @@ def write_manifest(
     nothing ever overlaps the write.
 
     The manifest does not list modules. Resume discovery finds them under
-    ``model/``; see :func:`discover_modules`.
+    ``model/``; see :func:`discover_modules`. ``model_state=False`` records a
+    step that carries no model state at all (e.g. ``offline_embedding``, whose
+    modules are all frozen): only the cursor files make it complete.
     """
     payload = {
         "format_version": MANIFEST_FORMAT_VERSION,
         "global_step": global_step,
         "world_size": world_size,
+        "model_state": model_state,
     }
     path = manifest_path(step_root)
     os.makedirs(step_root, exist_ok=True)
@@ -248,7 +252,9 @@ def checkpoint_is_complete(step_root: str) -> bool:
     markers alone would accept one that has no cursor to resume from.
 
     Modules are whatever ``model/`` contains, not a field on the manifest: the
-    job cursor does not know the model graph.
+    job cursor does not know the model graph. A manifest written with
+    ``model_state=False`` has no model half to wait for. One without the field
+    predates it and carries model state.
 
     Local filesystem calls: the writers are POSIX-only, so a step in this layout
     cannot be anywhere this cannot read.
@@ -256,6 +262,8 @@ def checkpoint_is_complete(step_root: str) -> bool:
     manifest = read_manifest(step_root)
     if manifest is None:
         return False
+    if not manifest.get("model_state", True):
+        return True
     return all(os.path.exists(path) for path in dcp_markers(step_root, discover_modules(step_root)))
 
 

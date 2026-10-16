@@ -262,7 +262,7 @@ def test_mot_forward_post_scatters_virtual_marker_triplet_hidden_states() -> Non
 
 
 def test_bagel_vae_online_process_runs_on_a_meta_built_model() -> None:
-    """``offline_training`` builds the VAE on meta with no weights when the graph calls only ``online_process`` on it."""
+    """``offline_training`` builds the VAE on meta with no weights, because it mixes in ``OfflineEncodingMixin``."""
     encode_model = _tiny_vae()
     process_model = _tiny_vae(meta=True)
     encoded_cache = encode_model.offline_encode(pixel_values=torch.zeros(1, 3, 8, 8))["encoded_cache"]
@@ -328,6 +328,7 @@ def test_bagel_vae_offline_cache_replay_keeps_img_tag_for_flow_connector(tmp_pat
     encoded = encode_model.post_forward("offline_encode", **out)["conversation_list"]
 
     writer = SeedOmniOfflineCacheWriter(str(tmp_path))
+    writer.open()
     writer.save_conversation_list(encoded)
     writer.flush()
     dataset = load_dataset("parquet", data_files=[str(tmp_path / "shard_000000.parquet")], split="train")

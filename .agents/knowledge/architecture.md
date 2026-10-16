@@ -90,6 +90,7 @@ veomni/
 │   ├── kernels/        Kernel implementations (one subdir per op)
 │   │   ├── deepseek_sparse_attention/  DSA indexer/top-k selection
 │   │   ├── deepseek_v4/  TileLang sparse attention/indexer + precision helpers
+│   │   ├── qwen4_exp/    TileLang QSA sparse attention fwd/bwd
 │   │   ├── attention/  Flash attention v2/3/4 + SP-aware variants
 │   │   ├── cross_entropy/  eager/liger/npu-chunk loss variants
 │   │   ├── gated_delta_rule/  Qwen3.5 linear-attention kernels
@@ -496,8 +497,8 @@ tests/
 |-----------|-------------|
 | `veomni/models/` | `pytest tests/models/` |
 | `veomni/models/seed_omni/` | `pytest tests/seed_omni/` |
-| `veomni/trainer/omni/` | `pytest tests/seed_omni/ tests/trainer/test_omni_trainer_context.py` |
-| `veomni/arguments/` (Omni) | `pytest tests/seed_omni/arguments/ tests/seed_omni/test_omni_offline_cache_args.py` |
+| `veomni/trainer/omni/` | `pytest tests/seed_omni/` |
+| `veomni/arguments/` (Omni) | `pytest tests/seed_omni/arguments/` |
 | `veomni/data/` | `pytest tests/data/` |
 | `veomni/ops/` | `pytest tests/ops/` |
 | `veomni/distributed/` | `pytest tests/parallel/ tests/distributed/` |

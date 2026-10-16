@@ -12,37 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generic offline-encoding surfaces for SeedOmni modules."""
+"""Marker for SeedOmni modules whose online encoding can be split into a cached half and a per-step half."""
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from typing import Any
 
+class OfflineEncodingMixin:
+    """Marks a module as cacheable: an ``offline_training`` run builds it on meta.
 
-class OfflineEncodingMixin(ABC):
-    """The two graph endpoints of a module that can be encoded offline.
+    The module picks its own method names; the graph YAML of each task names
+    them. The module guarantees, for every input ``x``::
 
-    Mixing this in is what makes a module cacheable; no config flag declares it.
-    The graph YAML picks which endpoint a run calls, and ``train.training_task``
-    must match it:
+        online_method(x) == offline_training_method(offline_embedding_method(x))
 
-    * ``offline_embedding`` — the graph runs :meth:`offline_encode`, and the
-      trainer writes the encoded conversations to ``train.offline_cache_dir``.
-    * ``offline_training`` — the graph runs :meth:`online_process` on the
-      cached conversations. If the graph calls nothing else on the module, it
-      is built on meta and never loads its weights, so :meth:`online_process`
-      must read only the config.
-    * ``online_training`` — neither; the module encodes through its normal endpoint.
+    * ``offline_embedding`` — the graph calls the offline-embedding method on
+      the fully loaded module, and the trainer writes the ``conversation_list``
+      the graph leaves in the batch to ``train.offline_cache_dir``. Edit the
+      items in ``pre_forward`` / ``post_forward``, which run on the batch, or
+      return ``conversation_list`` from the method: the method body receives
+      its kwargs after the module wrap's FSDP2 input cast, which under mixed
+      precision copies every ``ConversationItem``, so in-place edits there are
+      lost.
+    * ``offline_training`` — every module that mixes this in is built on meta
+      and never loads its weights, so the offline-training method the graph
+      calls on it must read only the config.
+    * ``online_training`` — the graph calls the online method as usual.
     """
-
-    @abstractmethod
-    def offline_encode(self, **kwargs: Any) -> dict[str, Any]:
-        """Produce deterministic tensor cache artifacts from tensor inputs."""
-
-    @abstractmethod
-    def online_process(self, **kwargs: Any) -> dict[str, Any]:
-        """Materialize runtime tensors from offline encoded cache tensors, without touching weights."""
 
 
 __all__ = ["OfflineEncodingMixin"]

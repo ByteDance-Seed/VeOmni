@@ -1656,6 +1656,7 @@ def build_interleave_dataset(
     namespace: Literal["train", "test"] = "train",
     transform: Optional[Callable] = None,
     seed: int = 42,
+    shuffle: bool = True,
     **kwargs,
 ):
     """
@@ -1666,6 +1667,7 @@ def build_interleave_dataset(
         namespace (Literal["train", "test"]): dataset namespace
         transform (Optional[Callable]): transform function
         seed (int): random seed
+        shuffle (bool): shuffle each iterable source with a streaming buffer
     Returns:
         InterleavedIterableDataset: interleaved iterable dataset
         or
@@ -1695,7 +1697,7 @@ def build_interleave_dataset(
 
         for idx, source in enumerate(sources):
             dataset = build_iterable_dataset(
-                source, namespace=namespace, seed=seed, split_by_node=False, dataset_repeat=False
+                source, namespace=namespace, seed=seed, split_by_node=False, shuffle=shuffle, dataset_repeat=False
             )
             ds = dataset._data
             ds = add_ds_idx_to_iterable(ds, idx, source_names[idx])
