@@ -443,7 +443,7 @@
 
          z = self.in_proj_z(hidden_states)
          z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
-@@ -454,59 +738,152 @@
+@@ -454,59 +738,158 @@
          b = self.in_proj_b(hidden_states)
          a = self.in_proj_a(hidden_states)
 
@@ -606,6 +606,12 @@
 +                    "'flash_qla'; on NPU, set it to 'fla' or 'npu'."
 +                )
 +            elif shared_prefix_plan is not None:
++                if getattr(self.chunk_gated_delta_rule, "__module__", "").endswith("npu_ascendc_gated_delta_rule"):
++                    raise NotImplementedError(
++                        "Shared-prefix training requires gradient propagation through recurrent state, "
++                        "which the 'npu_ascendc' backend does not support (it discards dht and returns dh0=None). "
++                        "Use the 'npu' (Triton) backend on NPU, or unset text_config.shared_prefix_training."
++                    )
 +                # Modification: two varlen calls; suffixes start from the prefix state at its last chunk boundary.
 +                core_attn_out = shared_prefix_plan.gated_delta_rule(
 +                    self.chunk_gated_delta_rule, query, key, value, g, beta, use_qk_l2norm_in_kernel=True
@@ -632,7 +638,7 @@
                  query,
                  key,
                  value,
-@@ -515,26 +892,17 @@
+@@ -515,26 +898,17 @@
                  initial_state=recurrent_state,
                  output_final_state=cache_params is not None,
                  use_qk_l2norm_in_kernel=True,
@@ -666,7 +672,7 @@
 
          # reshape input data into 2D tensor
          core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
-@@ -545,6 +913,20 @@
+@@ -545,6 +919,20 @@
          output = self.out_proj(core_attn_out)
          return output
 
@@ -687,7 +693,7 @@
 
  def rotate_half(x):
      """Rotates half the hidden dims of the input."""
-@@ -553,27 +935,14 @@
+@@ -553,27 +941,14 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
@@ -722,7 +728,7 @@
      cos = cos.unsqueeze(unsqueeze_dim)
      sin = sin.unsqueeze(unsqueeze_dim)
 
-@@ -629,6 +998,12 @@
+@@ -629,6 +1004,12 @@
      return attn_output, attn_weights
 
 
@@ -735,7 +741,7 @@
  class Qwen3_5Attention(nn.Module):
      """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-@@ -656,6 +1031,7 @@
+@@ -656,6 +1037,7 @@
          self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
          self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
 
@@ -743,7 +749,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -682,6 +1058,13 @@
+@@ -682,6 +1064,13 @@
          if past_key_values is not None:
              key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
@@ -757,7 +763,7 @@
          attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
              self.config._attn_implementation, eager_attention_forward
          )
-@@ -720,6 +1103,12 @@
+@@ -720,6 +1109,12 @@
          return down_proj
 
 
@@ -770,7 +776,7 @@
  class Qwen3_5RMSNorm(nn.Module):
      def __init__(self, dim: int, eps: float = 1e-6):
          super().__init__()
-@@ -729,7 +1118,16 @@
+@@ -729,7 +1124,16 @@
      def _norm(self, x):
          return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
@@ -787,7 +793,7 @@
          output = self._norm(x.float())
          # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
          # See https://github.com/huggingface/transformers/pull/29402
-@@ -738,6 +1136,12 @@
+@@ -738,6 +1142,12 @@
 
      def extra_repr(self):
          return f"{tuple(self.weight.shape)}, eps={self.eps}"
@@ -800,7 +806,7 @@
 
 
  class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
-@@ -760,19 +1164,39 @@
+@@ -760,19 +1170,39 @@
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
          past_key_values: Cache | None = None,
@@ -842,7 +848,7 @@
              )
          elif self.block_type == "full_attention":
              # Self Attention
-@@ -781,6 +1205,7 @@
+@@ -781,6 +1211,7 @@
                  attention_mask=attention_mask,
                  position_ids=position_ids,
                  past_key_values=past_key_values,
@@ -850,7 +856,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -792,8 +1217,76 @@
+@@ -792,8 +1223,76 @@
          hidden_states = self.post_attention_layernorm(hidden_states)
          hidden_states = self.mlp(hidden_states)
          hidden_states = residual + hidden_states
@@ -928,7 +934,7 @@
 
 
  class Qwen3_5PreTrainedModel(PreTrainedModel):
-@@ -879,9 +1372,16 @@
+@@ -879,9 +1378,16 @@
          return x
 
 
@@ -945,7 +951,7 @@
      orig_q_dtype = q.dtype
      orig_k_dtype = k.dtype
      q, k = q.float(), k.float()
-@@ -1006,6 +1506,12 @@
+@@ -1006,6 +1512,12 @@
          return hidden_states
 
 
@@ -958,7 +964,7 @@
  class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
      config: Qwen3_5VisionConfig
      input_modalities = ("image", "video")
-@@ -1044,30 +1550,127 @@
+@@ -1044,30 +1556,127 @@
 
          self.post_init()
 
@@ -1108,7 +1114,7 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1082,33 +1685,156 @@
+@@ -1082,33 +1691,156 @@
          Returns:
              `torch.Tensor`: hidden_states.
          """
@@ -1280,7 +1286,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -1119,6 +1845,36 @@
+@@ -1119,6 +1851,36 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -1317,7 +1323,7 @@
 
 
  @auto_docstring
-@@ -1133,6 +1889,27 @@
+@@ -1133,6 +1895,27 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -1345,7 +1351,7 @@
  class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
      config: Qwen3_5TextConfig
 
-@@ -1148,6 +1925,7 @@
+@@ -1148,6 +1931,7 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1353,7 +1359,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1159,8 +1937,14 @@
+@@ -1159,8 +1943,14 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -1369,7 +1375,7 @@
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-@@ -1177,6 +1961,17 @@
+@@ -1177,6 +1967,17 @@
              position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
          elif position_ids.ndim == 2:
              position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
@@ -1387,7 +1393,7 @@
 
          if position_ids.ndim == 3 and position_ids.shape[0] == 4:
              text_position_ids = position_ids[0]
-@@ -1199,6 +1994,27 @@
+@@ -1199,6 +2000,27 @@
                  "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
              }
 
@@ -1415,7 +1421,7 @@
          hidden_states = inputs_embeds
          position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-@@ -1213,12 +2029,36 @@
+@@ -1213,12 +2035,36 @@
                  **kwargs,
              )
 
@@ -1454,7 +1460,7 @@
 
 
  @auto_docstring
-@@ -1230,11 +2070,9 @@
+@@ -1230,11 +2076,9 @@
 
      def __init__(self, config):
          super().__init__(config)
@@ -1469,7 +1475,7 @@
          self.post_init()
 
      def get_vision_position_ids(
-@@ -1401,58 +2239,43 @@
+@@ -1401,58 +2245,43 @@
          self,
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
@@ -1557,7 +1563,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1518,37 +2341,188 @@
+@@ -1518,37 +2347,188 @@
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
          mm_token_type_ids: torch.IntTensor | None = None,
@@ -1756,7 +1762,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1558,6 +2532,18 @@
+@@ -1558,6 +2538,18 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -1775,7 +1781,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1565,13 +2551,17 @@
+@@ -1565,13 +2557,17 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1797,7 +1803,7 @@
 
 
  @auto_docstring
-@@ -1603,10 +2593,13 @@
+@@ -1603,10 +2599,13 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -1811,7 +1817,7 @@
          labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
              Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
              config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-@@ -1635,21 +2628,50 @@
+@@ -1635,21 +2634,50 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1866,7 +1872,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1672,15 +2694,60 @@
+@@ -1672,15 +2700,60 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -1928,7 +1934,7 @@
 
          self.post_init()
 
-@@ -1724,48 +2791,52 @@
+@@ -1724,48 +2797,60 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -2009,6 +2015,14 @@
 +                )
 +            from veomni.models.transformers.qwen3_5.shared_prefix import build_shared_prefix_plan
 +
++            if position_ids is None:
++                cu = kwargs["cu_seq_lens_q"].cpu().tolist()
++                pos_list = [
++                    torch.arange(cu[i + 1] - cu[i], dtype=torch.long, device=input_ids.device)
++                    for i in range(len(cu) - 1)
++                ]
++                position_ids = torch.cat(pos_list, dim=0).unsqueeze(0) if pos_list else None
++
 +            plan = build_shared_prefix_plan(
 +                input_ids,
 +                kwargs["cu_seq_lens_q"],
@@ -2021,7 +2035,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1776,28 +2847,104 @@
+@@ -1776,28 +2861,108 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -2118,11 +2132,16 @@
 +            weight = _mtp_loss_weight(self.config.text_config)  # noqa: F821 defined via add_helper
 +            loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
 +
++        output_hidden_states = outputs.hidden_states
++        if shared_prefix_plan is not None and output_hidden_states is not None:
++            output_hidden_states = tuple(shared_prefix_plan.expand(h) for h in output_hidden_states)
++
 +        output = Qwen3_5CausalLMOutputWithLogProbs(
              loss=loss,
              logits=logits,
              past_key_values=outputs.past_key_values,
-             hidden_states=outputs.hidden_states,
+-            hidden_states=outputs.hidden_states,
++            hidden_states=output_hidden_states,
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
 -        )
@@ -2134,7 +2153,7 @@
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
          # Overwritten -- requires 3D position ids
-@@ -1984,6 +3131,24 @@
+@@ -1984,6 +3149,24 @@
 
          return input_ids, model_kwargs
 

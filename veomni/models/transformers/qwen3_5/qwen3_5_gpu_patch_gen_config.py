@@ -1939,6 +1939,13 @@ def qwen3_5_forconditional_generation_forward_patched(
             )
         from veomni.models.transformers.qwen3_5.shared_prefix import build_shared_prefix_plan
 
+        if position_ids is None:
+            cu = kwargs["cu_seq_lens_q"].cpu().tolist()
+            pos_list = [
+                torch.arange(cu[i + 1] - cu[i], dtype=torch.long, device=input_ids.device) for i in range(len(cu) - 1)
+            ]
+            position_ids = torch.cat(pos_list, dim=0).unsqueeze(0) if pos_list else None
+
         plan = build_shared_prefix_plan(
             input_ids,
             kwargs["cu_seq_lens_q"],
@@ -2044,11 +2051,15 @@ def qwen3_5_forconditional_generation_forward_patched(
         weight = _mtp_loss_weight(self.config.text_config)  # noqa: F821 defined via add_helper
         loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
 
+    output_hidden_states = outputs.hidden_states
+    if shared_prefix_plan is not None and output_hidden_states is not None:
+        output_hidden_states = tuple(shared_prefix_plan.expand(h) for h in output_hidden_states)
+
     output = Qwen3_5CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
-        hidden_states=outputs.hidden_states,
+        hidden_states=output_hidden_states,
         attentions=outputs.attentions,
         rope_deltas=outputs.rope_deltas,
         fused_linear_aux=fused_linear_aux,

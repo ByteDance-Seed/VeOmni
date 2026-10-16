@@ -412,6 +412,12 @@ def qwen3_5_gated_deltanet_forward_patched(
                 "'flash_qla'; on NPU, set it to 'fla' or 'npu'."
             )
         elif shared_prefix_plan is not None:
+            if getattr(self.chunk_gated_delta_rule, "__module__", "").endswith("npu_ascendc_gated_delta_rule"):
+                raise NotImplementedError(
+                    "Shared-prefix training requires gradient propagation through recurrent state, "
+                    "which the 'npu_ascendc' backend does not support (it discards dht and returns dh0=None). "
+                    "Use the 'npu' (Triton) backend on NPU, or unset text_config.shared_prefix_training."
+                )
             # Modification: two varlen calls; suffixes start from the prefix state at its last chunk boundary.
             core_attn_out = shared_prefix_plan.gated_delta_rule(
                 self.chunk_gated_delta_rule, query, key, value, g, beta, use_qk_l2norm_in_kernel=True

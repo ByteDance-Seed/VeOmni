@@ -237,3 +237,24 @@ def test_groups_sharing_a_system_prompt_stay_separate():
     shared = sorted((len(g.starts), g.prefix_length) for g in plan.groups if not g.is_singleton)
     assert shared == [(4, 400), (4, 400)]
     assert plan.compact_length == ids.shape[1] - 2 * 3 * 400
+
+
+def test_expand_output_hidden_states():
+    """Verify that expanding captured compact hidden states restores packed length."""
+    ids, cu = _batch([100], [[10, 10]], (50,))
+    plan = build_shared_prefix_plan(ids, cu)
+    assert plan is not None
+
+    compact_h = torch.randn(1, plan.compact_length, 64)
+    packed_h = plan.expand(compact_h)
+    assert packed_h.shape == (1, ids.shape[1], 64)
+    # Prefix representations are identical across member sequences
+    starts = [g.starts for g in plan.groups if not g.is_singleton][0]
+    torch.testing.assert_close(packed_h[:, starts[0] : starts[0] + 100], packed_h[:, starts[1] : starts[1] + 100])
+
+
+def test_default_position_ids_generates_per_sequence_positions():
+    """When position_ids is None, build_shared_prefix_plan uses per-sequence positions."""
+    ids, cu = _batch([100], [[10, 10]])
+    plan = build_shared_prefix_plan(ids, cu, position_ids=None)
+    assert plan is not None

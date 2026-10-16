@@ -298,9 +298,11 @@ def build_shared_prefix_plan(
     """
     ids = input_ids.reshape(-1).cpu()
     cu = cu_seqlens.cpu().tolist()
-    pos = None
     if position_ids is not None:
         pos = position_ids.reshape(-1, position_ids.shape[-1]).cpu()
+    else:
+        pos_list = [torch.arange(cu[i + 1] - cu[i], dtype=torch.long) for i in range(len(cu) - 1)]
+        pos = torch.cat(pos_list, dim=0).unsqueeze(0) if pos_list else None
 
     buckets: dict[bytes, list[int]] = {}
     for i in range(len(cu) - 1):

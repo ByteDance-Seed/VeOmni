@@ -1933,7 +1933,7 @@
 
          self.post_init()
 
-@@ -1724,48 +2793,52 @@
+@@ -1724,48 +2793,60 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -2014,6 +2014,14 @@
 +                )
 +            from veomni.models.transformers.qwen3_5.shared_prefix import build_shared_prefix_plan
 +
++            if position_ids is None:
++                cu = kwargs["cu_seq_lens_q"].cpu().tolist()
++                pos_list = [
++                    torch.arange(cu[i + 1] - cu[i], dtype=torch.long, device=input_ids.device)
++                    for i in range(len(cu) - 1)
++                ]
++                position_ids = torch.cat(pos_list, dim=0).unsqueeze(0) if pos_list else None
++
 +            plan = build_shared_prefix_plan(
 +                input_ids,
 +                kwargs["cu_seq_lens_q"],
@@ -2026,7 +2034,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1776,28 +2849,104 @@
+@@ -1776,28 +2857,108 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -2123,11 +2131,16 @@
 +            weight = _mtp_loss_weight(self.config.text_config)  # noqa: F821 defined via add_helper
 +            loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
 +
++        output_hidden_states = outputs.hidden_states
++        if shared_prefix_plan is not None and output_hidden_states is not None:
++            output_hidden_states = tuple(shared_prefix_plan.expand(h) for h in output_hidden_states)
++
 +        output = Qwen3_5CausalLMOutputWithLogProbs(
              loss=loss,
              logits=logits,
              past_key_values=outputs.past_key_values,
-             hidden_states=outputs.hidden_states,
+-            hidden_states=outputs.hidden_states,
++            hidden_states=output_hidden_states,
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
 -        )
@@ -2139,7 +2152,7 @@
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
          # Overwritten -- requires 3D position ids
-@@ -1984,6 +3133,24 @@
+@@ -1984,6 +3145,24 @@
 
          return input_ids, model_kwargs
 

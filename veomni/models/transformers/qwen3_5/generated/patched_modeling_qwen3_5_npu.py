@@ -861,6 +861,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     "'flash_qla'; on NPU, set it to 'fla' or 'npu'."
                 )
             elif shared_prefix_plan is not None:
+                if getattr(self.chunk_gated_delta_rule, "__module__", "").endswith("npu_ascendc_gated_delta_rule"):
+                    raise NotImplementedError(
+                        "Shared-prefix training requires gradient propagation through recurrent state, "
+                        "which the 'npu_ascendc' backend does not support (it discards dht and returns dh0=None). "
+                        "Use the 'npu' (Triton) backend on NPU, or unset text_config.shared_prefix_training."
+                    )
                 # Modification: two varlen calls; suffixes start from the prefix state at its last chunk boundary.
                 core_attn_out = shared_prefix_plan.gated_delta_rule(
                     self.chunk_gated_delta_rule, query, key, value, g, beta, use_qk_l2norm_in_kernel=True
@@ -2828,6 +2834,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 )
             from veomni.models.transformers.qwen3_5.shared_prefix import build_shared_prefix_plan
 
+            if position_ids is None:
+                cu = kwargs["cu_seq_lens_q"].cpu().tolist()
+                pos_list = [
+                    torch.arange(cu[i + 1] - cu[i], dtype=torch.long, device=input_ids.device)
+                    for i in range(len(cu) - 1)
+                ]
+                position_ids = torch.cat(pos_list, dim=0).unsqueeze(0) if pos_list else None
+
             plan = build_shared_prefix_plan(
                 input_ids,
                 kwargs["cu_seq_lens_q"],
@@ -2933,11 +2947,15 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             weight = _mtp_loss_weight(self.config.text_config)  # noqa: F821 defined via add_helper
             loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
 
+        output_hidden_states = outputs.hidden_states
+        if shared_prefix_plan is not None and output_hidden_states is not None:
+            output_hidden_states = tuple(shared_prefix_plan.expand(h) for h in output_hidden_states)
+
         output = Qwen3_5CausalLMOutputWithLogProbs(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
+            hidden_states=output_hidden_states,
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
             fused_linear_aux=fused_linear_aux,
