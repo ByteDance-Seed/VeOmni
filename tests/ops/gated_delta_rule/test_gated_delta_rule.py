@@ -135,10 +135,16 @@ def test_rms_norm_gated_eager_sigmoid_matches_hf():
 
 
 def test_rms_norm_gated_rejects_an_unknown_activation():
+    from veomni.ops.kernels.gated_delta_rule.rms_norm_gated.standard.torch_npu import wrapper as npu_rms
+
     eager = resolve_op("rms_norm_gated", "standard", "eager").wrapper
     x = torch.randn(2, 4, 8)
+    gate = torch.randn_like(x)
+    weight = torch.randn(8)
     with pytest.raises(ValueError, match="unsupported rms_norm_gated activation"):
-        eager(x, torch.randn_like(x), torch.randn(8), activation="gelu")
+        eager(x, gate, weight, activation="gelu")
+    with pytest.raises(ValueError, match="unsupported rms_norm_gated activation"):
+        npu_rms(x, gate, weight, activation="gelu")
 
 
 @pytest.mark.parametrize("device", _FLA_DEVICE_CASES)
@@ -226,6 +232,21 @@ def test_rms_norm_gated_npu_uses_eps():
         outputs.append(out_o)
 
     assert all(not torch.equal(left, right) for left, right in zip(outputs[:-1], outputs[1:], strict=True))
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="rms_norm_gated npu needs torch_npu")
+def test_rms_norm_gated_npu_sigmoid_matches_eager_bf16():
+    """A sigmoid gate must not take the SiLU-only ``npu_swiglu`` path."""
+    eager = resolve_op("rms_norm_gated", "standard", "eager").wrapper
+    other = resolve_op("rms_norm_gated", "standard", "torch_npu").wrapper
+    torch.manual_seed(0)
+    x = torch.randn(2, 16, 128, device="npu", dtype=torch.bfloat16)
+    gate = torch.randn_like(x)
+    weight = torch.randn(128, device="npu", dtype=torch.bfloat16)
+
+    out_e = eager(x, gate, weight, eps=1e-6, activation="sigmoid")
+    out_o = other(x, gate, weight, eps=1e-6, activation="sigmoid")
+    torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
 
 
 def _hf_qwen3_5_prefill_causal_conv1d(x: Tensor, weight: Tensor, bias: Tensor, *, kernel_size: int) -> Tensor:
@@ -328,6 +349,28 @@ def test_causal_conv1d_npu_matches_eager_forward_and_backward():
             atol=GDN_FUSED_GRAD_ATOL,
             rtol=GDN_FUSED_GRAD_RTOL,
         )
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="causal_conv1d npu needs torch_npu")
+def test_causal_conv1d_npu_accepts_cpu_cu_seqlens():
+    """NPU fusion attention leaves ``cu_seqlens`` on CPU; the Triton adapter moves it."""
+    _require_npu_gdr_dependencies()
+    from veomni.ops.kernels.gated_delta_rule.vendor.triton.utils import is_arch35
+
+    if is_arch35():
+        pytest.skip("vendored NPU causal_conv1d does not support arch35")
+
+    fn = resolve_op("causal_conv1d", "standard", "triton").wrapper
+    batch, seq, dim, kernel = 1, 64, 256, 4
+    x = torch.randn(batch, seq, dim, device="npu", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(dim, kernel, device="npu", dtype=torch.bfloat16, requires_grad=True)
+    cu_seqlens = torch.tensor([0, 32, 64], dtype=torch.int32)
+
+    out = fn(x, weight, bias=None, activation="silu", cu_seqlens=cu_seqlens)
+    assert out.shape == (batch, seq, dim)
+    assert cu_seqlens.device.type == "cpu"
+    out.sum().backward()
+    assert x.grad is not None and weight.grad is not None
 
 
 def test_chunk_gated_delta_rule_eager_matches_hf():
@@ -647,6 +690,35 @@ def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl):
             atol=GDN_CHUNK_GRAD_ATOL,
             rtol=GDN_CHUNK_GRAD_RTOL,
         )
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="chunk_gated_delta_rule npu needs torch_npu")
+def test_chunk_gated_delta_rule_npu_accepts_cpu_cu_seqlens():
+    """The Triton chunk adapter must accept a CPU ``cu_seqlens`` without a pointer error."""
+    _require_npu_gdr_dependencies()
+    fn = resolve_op("chunk_gated_delta_rule", "standard", "triton").wrapper
+    batch, seq, heads, dim = 1, 64, 2, 64
+    query = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16, requires_grad=True)
+    key = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16, requires_grad=True)
+    value = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16, requires_grad=True)
+    g = (-torch.rand(batch, seq, heads, device="npu", dtype=torch.float32)).requires_grad_(True)
+    beta = torch.rand(batch, seq, heads, device="npu", dtype=torch.bfloat16).sigmoid().requires_grad_(True)
+    cu_seqlens = torch.tensor([0, 32, 64], dtype=torch.int32)
+
+    out, _final_state = fn(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+    )
+    assert out.shape == (batch, seq, heads, dim)
+    assert cu_seqlens.device.type == "cpu"
+    out.sum().backward()
+    assert query.grad is not None and key.grad is not None and value.grad is not None
 
 
 @pytest.mark.skipif(

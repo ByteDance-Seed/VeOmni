@@ -129,8 +129,9 @@ model:
     chunk_gated_delta_rule_implementation: triton
 ```
 
-These kernels need the `triton-ascend` package, which is not a declared VeOmni dependency —
-install it on the NPU host. VeOmni main pins PyTorch and `torch_npu` 2.10.0; the corresponding
+`rms_norm_gated` is the exception: it is a `torch_npu` op composition rather than Triton, so only
+`causal_conv1d` and `chunk_gated_delta_rule` need `triton-ascend`. That package is not a declared
+VeOmni dependency — install it on the NPU host. VeOmni main pins PyTorch and `torch_npu` 2.10.0; the corresponding
 CANN 9.0.0 stack uses v3.2.1:
 
 ```bash

@@ -53,6 +53,10 @@ def forward(
         bias = unused_like(weight)
     if cu_seqlens is None:
         cu_seqlens = unused_like(x, dtype=torch.int32)
+    elif cu_seqlens.device != x.device:
+        # ``veomni.models.auto`` leaves ``cu_seq_lens_q`` on CPU for NPU fusion
+        # attention. This kernel indexes ``cu_seqlens`` on ``x.device``.
+        cu_seqlens = cu_seqlens.to(device=x.device, non_blocking=True)
 
     if is_arch35():
         raise NotImplementedError("causal_conv1d is not supported on arch35")

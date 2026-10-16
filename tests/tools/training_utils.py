@@ -32,6 +32,14 @@ _NPU_OPS_DEFAULTS: Dict[str, str] = {
     # The Triton load-balancing-loss row is CUDA-only, so NPU resolution rejects
     # it even when ``triton-ascend`` is installed. Pin to eager.
     "load_balancing_loss_implementation": "eager",
+    # GatedDeltaNet trio (Qwen3.5, Qwen4-Exp). The dataclass default is ``fla``,
+    # whose package is GPU-only, and ``eager`` has no ``cu_seqlens`` path.
+    # ``torch_npu`` is the fused RMSNorm gate. ``triton`` is the vendored
+    # Triton-Ascend kernel and needs ``triton-ascend``, which the NPU workflows
+    # install. Models without a GatedDeltaNet never resolve these ops.
+    "rms_norm_gated_implementation": "torch_npu",
+    "causal_conv1d_implementation": "triton",
+    "chunk_gated_delta_rule_implementation": "triton",
 }
 
 _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
@@ -168,11 +176,6 @@ def make_npu_ops_config(model_name: Optional[str] = None, **overrides) -> OpsImp
     """
     merged = _npu_overrides(model_name)
     merged.update(overrides)
-    # Qwen3.5 GatedDeltaNet ops have no NPU kernel today — pin to eager so the
-    # config validates at parse time.
-    merged.setdefault("rms_norm_gated_implementation", "eager")
-    merged.setdefault("causal_conv1d_implementation", "eager")
-    merged.setdefault("chunk_gated_delta_rule_implementation", "eager")
     return OpsImplementationConfig(**merged)
 
 

@@ -1514,7 +1514,8 @@ class OpsImplementationConfig:
             "help": "Gated RMSNorm implementation (Qwen3.5/Qwen4-Exp GatedDeltaNet `self.norm`). "
             "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'eager' uses the HuggingFace Qwen3_5RMSNormGated. "
-            "'torch_npu' uses the VeOmni NPUFusedRMSNormGated."
+            "'torch_npu' uses npu_rms_norm, fuses a SiLU gate with npu_swiglu (Qwen3.5), "
+            "and keeps the eager gate multiply for sigmoid (Qwen4-Exp's output_gate_type)."
         },
     )
     causal_conv1d_implementation: str = field(

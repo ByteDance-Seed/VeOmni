@@ -95,7 +95,7 @@ register_op(
     "rms_norm_gated",
     "standard",
     "torch_npu",
-    description="Fused RMSNorm with a SiLU gate using torch_npu",
+    description="Fused RMSNorm using torch_npu; SiLU uses npu_swiglu and sigmoid uses the eager gate",
     wrapper=rms_torch_npu.wrapper,
     requirement=NpuKernelRequirement(),
 )

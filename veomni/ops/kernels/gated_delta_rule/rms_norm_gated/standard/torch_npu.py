@@ -29,19 +29,22 @@ def wrapper(
     eps: float = 1e-6,
     activation: str | None = "silu",
 ) -> Tensor:
-    """NPU ``npu_rms_norm`` plus ``npu_swiglu`` on ``cat(gate, normed)``.
+    """NPU ``npu_rms_norm`` plus a gate.
 
-    Implements functional RMSNorm followed by a SiLU gate. Lazy-imports
-    ``torch_npu``.
+    SiLU and swish use ``npu_swiglu`` on ``cat(gate, normed)``. That op
+    hard-codes SiLU, so a sigmoid gate (Qwen4-Exp ``output_gate_type``)
+    multiplies the eager activation in fp32 instead. Lazy-imports ``torch_npu``.
     """
     from ...optional import optional_tensor
 
     if optional_tensor(bias) is not None:
         raise ValueError("rms_norm_gated does not use a norm bias")
-    if activation not in {None, "silu", "swish"}:
+    if activation not in {None, "silu", "swish", "sigmoid"}:
         raise ValueError(f"unsupported rms_norm_gated activation: {activation!r}")
 
     import torch_npu
 
     normed = torch_npu.npu_rms_norm(x, weight, eps)[0]
-    return torch_npu.npu_swiglu(torch.cat([gate, normed], dim=-1), dim=-1)
+    if activation in {None, "silu", "swish"}:
+        return torch_npu.npu_swiglu(torch.cat([gate, normed], dim=-1), dim=-1)
+    return (normed * torch.sigmoid(gate.float())).to(dtype=x.dtype)
