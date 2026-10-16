@@ -42,6 +42,34 @@ def _get_exact_token_id(tokenizer: "PreTrainedTokenizer", token: str, fallback_t
     raise ValueError(f"Cannot find token ({token_names}) in tokenizer vocab.")
 
 
+def _prepare_vlm_media_inputs(
+    sample: Dict[str, Any], processor: "ProcessorMixin", **kwargs
+) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Any]:
+    """Load and tensorize image/video inputs through a model's HF processor."""
+    from .multimodal.image_utils import fetch_images
+    from .multimodal.video_utils import fetch_videos_metadata
+
+    image_inputs, video_inputs = {}, {}
+    video_metadata = None
+
+    if sample.get("images"):
+        images = fetch_images(sample["images"], **kwargs)
+        image_inputs = processor.image_processor(images=images, return_tensors="pt")
+
+    if sample.get("videos"):
+        videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], **kwargs)
+        video_inputs = processor.video_processor(
+            videos=videos,
+            video_metadata=metadata,
+            do_sample_frames=False,
+            return_tensors="pt",
+            return_metadata=True,
+        )
+        video_metadata = video_inputs.pop("video_metadata", None)
+
+    return image_inputs, video_inputs, video_metadata
+
+
 def build_data_transform(transform_name: str, **kwargs) -> Callable:
     return partial(DATA_TRANSFORM_REGISTRY[transform_name], **kwargs)
 
@@ -290,8 +318,6 @@ def _process_sample_qwen_vl_base(
     **kwargs,
 ):
     from .multimodal import conv_preprocess
-    from .multimodal.image_utils import fetch_images
-    from .multimodal.video_utils import fetch_videos_metadata
 
     source = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")
 
@@ -301,31 +327,17 @@ def _process_sample_qwen_vl_base(
         conversations = sample
     conversations = conv_preprocess(source, conversations, **kwargs)
 
-    token_num_inputs, image_inputs, video_inputs = {}, {}, {}
-    image_grid_thw, video_grid_thw = None, None
-    video_metadata = None
+    token_num_inputs = {}
+    image_inputs, video_inputs, video_metadata = _prepare_vlm_media_inputs(sample, processor, **kwargs)
+    image_grid_thw = image_inputs["image_grid_thw"] if image_inputs else None
+    video_grid_thw = video_inputs["video_grid_thw"] if video_inputs else None
 
-    if "images" in sample and sample["images"]:
-        images = fetch_images(sample["images"], **kwargs)
-        image_inputs = processor.image_processor(images=images, return_tensors="pt")
-        image_grid_thw = image_inputs["image_grid_thw"]
+    if image_grid_thw is not None:
         merge_length = processor.image_processor.merge_size**2
         image_token_num = image_grid_thw.prod(dim=-1) // merge_length
         token_num_inputs["image"] = image_token_num
 
-    if "videos" in sample and sample["videos"]:
-        videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], **kwargs)
-        # Fetch already sampled the frames. Preserve its source indices/FPS for timestamps.
-        video_inputs = processor.video_processor(
-            videos=videos,
-            video_metadata=metadata,
-            do_sample_frames=False,
-            return_tensors="pt",
-            return_metadata=True,
-        )
-        video_grid_thw = video_inputs["video_grid_thw"]
-        video_metadata = video_inputs.pop("video_metadata", None)
-
+    if video_grid_thw is not None:
         merge_length = processor.video_processor.merge_size**2
         video_token_num = video_grid_thw.prod(dim=-1) // merge_length
         token_num_inputs["video"] = video_token_num
