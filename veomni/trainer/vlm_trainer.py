@@ -55,7 +55,9 @@ def _get_vlm_visual_module(model):
 
     inner_model = getattr(model, "model", None)
     if inner_model is not None:
-        return getattr(inner_model, "visual", None) or getattr(inner_model, "vision_tower", None)
+        # Qwen-VL names the tower ``visual``; MiniMax M3 VL names it ``vision_tower``.
+        visual = getattr(inner_model, "visual", None)
+        return visual if visual is not None else getattr(inner_model, "vision_tower", None)
 
     return None
 

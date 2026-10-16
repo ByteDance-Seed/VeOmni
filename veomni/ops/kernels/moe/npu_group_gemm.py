@@ -63,11 +63,11 @@ def _apply_moe_activation(x: torch.Tensor, swiglu_limit: float | None, swiglu_al
     """Standard (optionally clamped) SwiGLU, or SwiGLU-OAI when ``swiglu_alpha`` is set."""
     if swiglu_alpha is None:
         return _swiglu(x, swiglu_limit)
-    if swiglu_limit is None:
-        raise ValueError("SwiGLU-OAI requires swiglu_limit to be set.")
     gate, up = x.chunk(2, dim=-1)
-    gate = gate.clamp(max=swiglu_limit)
-    up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    # Same contract as the Triton path: ``swiglu_limit=None`` disables the clamp.
+    if swiglu_limit is not None:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
     return swiglu_oai(gate, up, swiglu_alpha)
 
 
