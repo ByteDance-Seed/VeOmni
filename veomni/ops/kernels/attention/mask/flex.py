@@ -124,6 +124,7 @@ def flex_attention_mask_builder(
             cu_seqlens=cu_seqlens,
             cu_seqlens_k=cu_seqlens_k,
             device=device,
+            batch_size=batch_size,
         )
 
     with _eager_hf_create_block_mask():

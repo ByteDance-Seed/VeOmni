@@ -139,6 +139,7 @@ def _dense_attention_mask_builder(
             cu_seqlens=cu_seqlens,
             cu_seqlens_k=cu_seqlens_k,
             device=device,
+            batch_size=batch_size,
         )
 
     # HF checks skip hints before evaluating mask_function. They are safe only

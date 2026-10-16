@@ -497,13 +497,16 @@ def test_gate_up_addmm_matches_nonzero_reference_and_gradients(device, dtype, rt
         torch.testing.assert_close(candidate_grad, reference_grad, rtol=rtol, atol=atol)
 
 
-def test_independent_scale_cache_tracks_loaded_state():
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_scale_cache_tracks_loaded_state(mode):
     """Loading the persistent scale buffer must also update the hot-path float cache."""
+    from veomni.checkpoint.dcp_checkpointer import ModelState
+
     model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
     patterns = lora_cfg["target_parameters"]
     sample_fqn, _ = find_first_matching_module(model, experts_module_globs(patterns))
     _apply(
-        "independent",
+        mode,
         model,
         target_parameter_patterns=patterns,
         r=lora_cfg["rank"],
@@ -519,14 +522,19 @@ def test_independent_scale_cache_tracks_loaded_state():
     assert wrapper._lora_scale_value == wrapper.lora_scaling.item()
     assert wrapper._lora_scale_value != loaded_scaling.item()
 
+    wrapper._lora_scale_value = 0.0
+    ModelState(wrapper).load_state_dict(wrapper.state_dict())
+    assert wrapper._lora_scale_value == wrapper.lora_scaling.item()
 
-def test_independent_scale_cache_load_is_meta_safe():
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_scale_cache_load_is_meta_safe(mode):
     """Scale cache loading must not read from an unmaterialized destination buffer."""
     model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
     patterns = lora_cfg["target_parameters"]
     sample_fqn, _ = find_first_matching_module(model, experts_module_globs(patterns))
     _apply(
-        "independent",
+        mode,
         model,
         target_parameter_patterns=patterns,
         r=lora_cfg["rank"],

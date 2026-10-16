@@ -280,9 +280,9 @@ def test_packed_self_attention_reuses_shared_cu_seqlens(monkeypatch):
     real_validated = packed_mask._validated_cu_seqlens
     real_segment_ids = packed_mask._segment_ids
 
-    def counting_validated(cu_seqlens, length, device):
+    def counting_validated(cu_seqlens, length, device, batch_size=1):
         counts["validated"] += 1
-        return real_validated(cu_seqlens, length, device)
+        return real_validated(cu_seqlens, length, device, batch_size)
 
     def counting_segment_ids(cu_seqlens, length, device):
         counts["segment_ids"] += 1
@@ -310,6 +310,58 @@ def test_packed_self_attention_reuses_shared_cu_seqlens(monkeypatch):
     counts["validated"] = counts["segment_ids"] = 0
     packed_mask.packed_mask_function(cu_seqlens=shared, cu_seqlens_k=shared.clone(), **kwargs)
     assert counts == {"validated": 2, "segment_ids": 2}
+
+
+def _batch_visible(shaped, impl: str, batch_size: int, length: int) -> torch.Tensor:
+    if impl == "eager":
+        return shaped[:, 0] == 0
+    query_idx = torch.arange(length)
+    key_idx = torch.arange(length)
+    return torch.stack(
+        [shaped.mask_mod(batch_idx, 0, query_idx[:, None], key_idx[None, :]) for batch_idx in range(batch_size)]
+    )
+
+
+@pytest.mark.parametrize("impl", ("eager", "flex_attention"))
+def test_packed_mask_reads_batch_flattened_cu_seqlens(impl):
+    """(2, 8) packing stores [0, 8, 16]; each row keeps its own segments."""
+    shaped = packed_causal_mask(
+        8,
+        8,
+        impl=impl,
+        device="cpu",
+        cu_seqlens=torch.tensor([0, 8, 16]),
+        batch_size=2,
+    )
+    causal = torch.tril(torch.ones(8, 8, dtype=torch.bool))
+    torch.testing.assert_close(_batch_visible(shaped, impl, 2, 8), causal.expand(2, 8, 8))
+
+    mixed = packed_causal_mask(
+        8,
+        8,
+        impl=impl,
+        device="cpu",
+        cu_seqlens=torch.tensor([0, 3, 8, 16]),
+        batch_size=2,
+    )
+    mixed_visible = _batch_visible(mixed, impl, 2, 8)
+    row0 = torch.zeros(8, 8, dtype=torch.bool)
+    row0[:3, :3] = torch.tril(torch.ones(3, 3, dtype=torch.bool))
+    row0[3:, 3:] = torch.tril(torch.ones(5, 5, dtype=torch.bool))
+    torch.testing.assert_close(mixed_visible[0], row0)
+    torch.testing.assert_close(mixed_visible[1], causal)
+
+
+def test_packed_mask_rejects_flattened_segments_that_cross_rows():
+    with pytest.raises(ValueError, match="row boundary"):
+        packed_causal_mask(
+            8,
+            8,
+            impl="eager",
+            device="cpu",
+            cu_seqlens=torch.tensor([0, 12, 16]),
+            batch_size=2,
+        )
 
 
 def test_magi_packed_aligns_with_from_cu_seqlens():
