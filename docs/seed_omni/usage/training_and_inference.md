@@ -254,31 +254,25 @@ bash train.sh tasks/omni/infer_omni.py \
 
 ### Inferring from a trained checkpoint
 
-Training writes each module's HF weights under
-`<output_dir>/checkpoints/global_step_N/hf_ckpt/<module>/`. Link each module's
-folder into a flat root and pass it as `--model.model_path`:
+Training writes the root `config.json` and graph sidecars once under
+`<output_dir>/model_assets/` and each module's HF weights under
+`<output_dir>/checkpoints/global_step_N/hf_ckpt/<module>/`. Link the root files
+and each module's folder into a flat root and pass it as `--model.model_path`:
 
 ```bash
-STEP=outputs/janus_1.3b_omni_sft/checkpoints/global_step_20
-ASM=outputs/janus_1.3b_omni_sft/infer_ckpt/global_step_20
+OUT=outputs/janus_1.3b_omni_sft
+STEP="$OUT/checkpoints/global_step_20"
+ASM="$OUT/infer_ckpt/global_step_20"
 mkdir -p "$ASM"
+for f in config.json training_graph.yaml generation_graph.yaml; do
+  [ -f "$OUT/model_assets/$f" ] && ln -sfn "$(realpath "$OUT/model_assets/$f")" "$ASM/$f"
+done
 for m in janus_siglip janus_vqvae janus_text_encoder janus_llama; do
   ln -sfn "$(realpath "$STEP/hf_ckpt/$m")" "$ASM/$m"
 done
 ```
 
 ## 6. Debugging the graph
-
-### Visualize
-
-Render the training DAG and every generation FSM a launcher resolves, through the
-same config loader as training and inference:
-
-```bash
-python scripts/seed_omni/visualize_graph.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml
-# -> graphs/janus_1.3b_base/{training,infer_gen,infer_und,infer_interleave}.mmd
-# add --visualize.format html for browser-renderable output
-```
 
 ### Graph profiler
 
@@ -300,9 +294,3 @@ Inference always writes the graph path to `<output_dir>/<infer_type>/trace.txt`;
 the `enable_*` switches only add fields to the node lines. Training writes rank-0
 traces under `train.checkpoint.output_dir/graph_trace` only when a detail switch
 is enabled.
-
-### Smoke test
-
-`scripts/seed_omni/run_smoke.sh` runs a short train and inference for each
-shipped model and prints a PASS / FAIL summary; see the script header for the
-model list and environment knobs.

@@ -127,7 +127,7 @@ If the model needs a new data source, add a preprocessor as described in
 
 ## 6. Validate
 
-1. Render the graphs with `scripts/seed_omni/visualize_graph.py`
+1. Inspect the graph trace and optionally profile per-node timing / memory
    ([Debugging the graph](training_and_inference.md#6-debugging-the-graph)).
 2. Run the unit tests: `pytest tests/seed_omni/`.
 3. Run a short train and inference end to end, then add a page under

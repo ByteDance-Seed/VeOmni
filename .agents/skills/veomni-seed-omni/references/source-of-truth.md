@@ -28,12 +28,10 @@ Use this reference to decide which files to trust before editing SeedOmni.
 
 ## Live Examples
 
-- `veomni/models/seed_omni/modules/janus/`
-  - Best complete multi-module example.
-- `configs/seed_omni/Janus/janus_1.3b/`
-  - Best complete training and inference config example.
-- `veomni/models/seed_omni/modules/qwen3*/`
-  - Useful for text-only, MoE, and vision-language variants.
+- `veomni/models/seed_omni/modules/fake_model/` and `configs/seed_omni/fake_model/`
+  - In-tree minimal multi-module stand-in.
+- `veomni/models/seed_omni/modules/<family>/` and `configs/seed_omni/<Family>/<variant>/`
+  - Complete multi-module family implementations (e.g. Janus, Qwen3, Qwen3-VL, BAGEL).
 
 ## Docs
 
@@ -51,9 +49,7 @@ Use this reference to decide which files to trust before editing SeedOmni.
   - Video / audio reading and saving, plus the decided-but-unimplemented
     audio-bearing video design. Read when touching media or adding audio.
 - `docs/seed_omni/usage/`
-  - `data_format.md`, `training_and_inference.md`, `adding_a_model.md`.
-- `docs/seed_omni/models/*.md`
-  - Per-model recipes (Janus, Qwen3, Qwen3 MoE, Qwen3-VL, BAGEL).
+  - `data_format.md`, `training_and_inference.md`, `adding_a_model.md`, `hf_layout.md`.
 
 ## Skill Resources
 

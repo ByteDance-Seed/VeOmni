@@ -4,13 +4,7 @@ Use the narrowest validation that proves the changed surface, then broaden.
 
 ## Static And Graph Checks
 
-```bash
-source .venv/bin/activate
-python scripts/seed_omni/visualize_graph.py configs/seed_omni/<model>/<variant>/train/base.yaml
-python scripts/seed_omni/visualize_graph.py configs/seed_omni/<model>/<variant>/train/base.yaml --visualize.format html
-```
-
-Check:
+Inspect the resolved `TrainingGraph` and `GenerationGraph` for a launcher YAML:
 
 - Training sources are expected carrier/data entry nodes.
 - All sinks flow to `end`.

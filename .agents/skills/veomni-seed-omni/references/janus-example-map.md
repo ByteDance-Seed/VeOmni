@@ -6,32 +6,38 @@ Use current Janus files instead of synthetic module examples.
 
 | Need | File or folder |
 |---|---|
-| Vision encoder CPU preprocessing and dummy images | `veomni/models/seed_omni/modules/janus/siglip/accelerated/accelerated.py` |
-| Vision encoder modeling + `generate()` (`InferenceMixin`) | `veomni/models/seed_omni/modules/janus/siglip/modeling.py` |
-| Vision processor asset | `veomni/models/seed_omni/modules/janus/siglip/processing.py` |
-| Text encoder CPU preprocessing and FSM signals | `veomni/models/seed_omni/modules/janus/text_encoder/accelerated/accelerated.py` |
-| Text encoder chat template | `veomni/models/seed_omni/modules/janus/text_encoder/chat_template.py` |
-| Base text encoder shared behavior | `veomni/models/seed_omni/modules/base/text_encoder/` |
-| AR backbone | `veomni/models/seed_omni/modules/janus/llama/` |
-| VQ codec encode/decode | `veomni/models/seed_omni/modules/janus/vqvae/` |
-| Packed training (CPU pack + mask scatter) | `veomni/models/seed_omni/modules/janus/packing.py` + per-module `accelerated/packed.py` |
-| Split checkpoint conversion | `veomni/models/seed_omni/modules/janus/convert_model.py` |
+| Minimal stand-in module A (accelerated hooks) | `veomni/models/seed_omni/modules/fake_model/fake_module_a/accelerated/accelerated.py` |
+| Minimal stand-in module A (native modeling) | `veomni/models/seed_omni/modules/fake_model/fake_module_a/modeling.py` |
+| Minimal stand-in module B (loss sink) | `veomni/models/seed_omni/modules/fake_model/fake_module_b/accelerated/accelerated.py` |
+| Vision encoder CPU preprocessing and dummy images | `veomni/models/seed_omni/modules/<family>/siglip/accelerated/accelerated.py` |
+| Vision encoder modeling + `generate()` (`InferenceMixin`) | `veomni/models/seed_omni/modules/<family>/siglip/modeling.py` |
+| Vision processor asset | `veomni/models/seed_omni/modules/<family>/siglip/processing.py` |
+| Text encoder CPU preprocessing and FSM signals | `veomni/models/seed_omni/modules/<family>/text_encoder/accelerated/accelerated.py` |
+| Text encoder chat template | `veomni/models/seed_omni/modules/<family>/text_encoder/chat_template.py` |
+| Base text encoder shared behavior | `veomni/models/seed_omni/modules/<base>/text_encoder/` |
+| AR backbone | `veomni/models/seed_omni/modules/<family>/llama/` |
+| VQ codec encode/decode | `veomni/models/seed_omni/modules/<family>/vqvae/` |
+| Packed training (CPU pack + mask scatter) | `veomni/models/seed_omni/modules/<family>/packing.py` + per-module `accelerated/packed.py` |
+| Split checkpoint conversion | `veomni/models/seed_omni/modules/fake_model/convert_model.py` (`veomni/models/seed_omni/modules/<family>/convert_model.py`) |
 
 ## Configs
 
 | Need | File |
 |---|---|
-| Launcher shape | `configs/seed_omni/Janus/janus_1.3b/train/base.yaml` |
-| Training module overrides | `configs/seed_omni/Janus/janus_1.3b/train/modules_train.yaml` |
-| Eager inference module overrides | `configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml` |
-| Distributed inference module overrides | `configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml` |
-| Training graph | `configs/seed_omni/Janus/janus_1.3b/train/graph_train.yaml` |
-| Packed training graph | `configs/seed_omni/Janus/janus_1.3b/packed/graph_train.yaml` |
-| Packed training launcher | `configs/seed_omni/Janus/janus_1.3b/packed/base.yaml` |
-| Model-level FSDP launcher | `configs/seed_omni/Janus/janus_1.3b/train/base_model_fsdp.yaml` |
-| Text-to-image FSM | `configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_gen.yaml` |
-| Image understanding FSM | `configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_und.yaml` |
-| Interleave FSM | `configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_interleave.yaml` |
+| Minimal stand-in launcher | `configs/seed_omni/fake_model/train/base.yaml` |
+| Minimal stand-in training module overrides | `configs/seed_omni/fake_model/train/modules_train.yaml` |
+| Minimal stand-in eager inference overrides | `configs/seed_omni/fake_model/infer/modules_infer_eager.yaml` |
+| Minimal stand-in distributed inference overrides | `configs/seed_omni/fake_model/infer/modules_infer_fsdp.yaml` |
+| Minimal stand-in training graph | `configs/seed_omni/fake_model/train/graph_train.yaml` |
+| Minimal stand-in generation FSMs | `configs/seed_omni/fake_model/infer/graph_infer_gen.yaml`, `configs/seed_omni/fake_model/infer/graph_infer_und.yaml` |
+| Family launcher shape | `configs/seed_omni/<Family>/<variant>/train/base.yaml` |
+| Family training module overrides | `configs/seed_omni/<Family>/<variant>/train/modules_train.yaml` |
+| Family eager inference module overrides | `configs/seed_omni/<Family>/<variant>/infer/modules_infer_eager.yaml` |
+| Family distributed inference module overrides | `configs/seed_omni/<Family>/<variant>/infer/modules_infer_fsdp.yaml` |
+| Family training graph | `configs/seed_omni/<Family>/<variant>/train/graph_train.yaml` |
+| Family packed training graph / launcher | `configs/seed_omni/<Family>/<variant>/packed/graph_train.yaml`, `configs/seed_omni/<Family>/<variant>/packed/base.yaml` |
+| Family model-level FSDP launcher | `configs/seed_omni/<Family>/<variant>/train/base_model_fsdp.yaml` |
+| Family generation FSMs | `configs/seed_omni/<Family>/<variant>/infer/graph_infer_<scenario>.yaml` |
 
 ## How To Use
 

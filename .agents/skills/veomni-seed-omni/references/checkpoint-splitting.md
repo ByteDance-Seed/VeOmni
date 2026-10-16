@@ -7,8 +7,8 @@ Read this when updating SeedOmni split-checkpoint conversion scripts.
 Use the live model conversion scripts as examples:
 
 - `veomni/models/seed_omni/modules/fake_model/convert_model.py` (minimal template)
-- `veomni/models/seed_omni/modules/janus/convert_model.py`
-- `veomni/models/seed_omni/modules/janus/convert_janus_weight_to_hf.py`
+- `veomni/models/seed_omni/modules/<family>/convert_model.py`
+- `veomni/models/seed_omni/modules/<family>/convert_<family>_weight_to_hf.py`
 - `veomni/models/seed_omni/utils/convert_registry.py` (`convert_checkpoint`,
   `attach_module_assets`, `load_family_graphs`)
 

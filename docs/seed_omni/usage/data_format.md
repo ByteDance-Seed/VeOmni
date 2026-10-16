@@ -120,25 +120,27 @@ many chat datasets; VeOmni uses `"value"` for text instead of a type-specific
 
 ### 1. Understanding (I2T)
 
-User sends image + question; assistant replies with text.
+User sends image + question; assistant replies with text (showing the `conversations` payload and the parallel `images` column):
 
 ```json
 {
-  "messages": [
-    {
-      "role": "user",
-      "content": [
-        {"type": "text", "value": "Describe this image in detail."},
-        {"type": "image"}
-      ]
-    },
-    {
-      "role": "assistant",
-      "content": [
-        {"type": "text", "value": "A cat on a sofa."}
-      ]
-    }
-  ],
+  "conversations": {
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "value": "Describe this image in detail."},
+          {"type": "image"}
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {"type": "text", "value": "A cat on a sofa."}
+        ]
+      }
+    ]
+  },
   "images": ["<user_png_bytes>"]
 }
 ```
@@ -149,20 +151,22 @@ User sends prompt; assistant replies with an image target.
 
 ```json
 {
-  "messages": [
-    {
-      "role": "user",
-      "content": [
-        {"type": "text", "value": "A close-up photo of Sydney Opera House at night."}
-      ]
-    },
-    {
-      "role": "assistant",
-      "content": [
-        {"type": "image"}
-      ]
-    }
-  ],
+  "conversations": {
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "value": "A close-up photo of Sydney Opera House at night."}
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {"type": "image"}
+        ]
+      }
+    ]
+  },
   "images": ["<gen_png_bytes>"]
 }
 ```
@@ -174,23 +178,25 @@ Use **two messages total** (not four turns). User turn may interleave
 
 ```json
 {
-  "messages": [
-    {
-      "role": "user",
-      "content": [
-        {"type": "text", "value": "Describe this image in detail."},
-        {"type": "image"},
-        {"type": "text", "value": "A close-up photo of Sydney Opera House at night."}
-      ]
-    },
-    {
-      "role": "assistant",
-      "content": [
-        {"type": "image"},
-        {"type": "text", "value": "The image shows …"}
-      ]
-    }
-  ],
+  "conversations": {
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "value": "Describe this image in detail."},
+          {"type": "image"},
+          {"type": "text", "value": "A close-up photo of Sydney Opera House at night."}
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {"type": "image"},
+          {"type": "text", "value": "The image shows …"}
+        ]
+      }
+    ]
+  },
   "images": ["<user_png_bytes>", "<gen_png_bytes>"]
 }
 ```
@@ -205,10 +211,10 @@ assistant-side placeholder.
 
 ```python
 ConversationItem(
-    type="text" | "image",
-    value=str | torch.Tensor,  # (C, H, W) uint8 for images
+    type="text" | "image" | "video" | "audio",
+    value=str | PIL.Image.Image | VideoInputs | np.ndarray | torch.Tensor,
     role="user" | "assistant",  # no system row; fold that text into a turn
-    meta={},  # empty at the data boundary; modules fill input_ids / labels later
+    meta={},  # media items carry video_metadata / audio_metadata; modules fill input_ids / labels later
 )
 ```
 

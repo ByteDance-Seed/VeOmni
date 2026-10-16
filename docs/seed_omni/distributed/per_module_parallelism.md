@@ -80,7 +80,7 @@ norm over the groups its wrap requires:
 - DDP with SP: gradients are first averaged over `fsdp_group`, which includes
   the SP ranks (constraint 7a in `.agents/knowledge/constraints.md`).
 
-`train.optimizer.grad_clip_scope` selects `per_module` (each module clipped to
+`model.optimizer.grad_clip_scope` selects `per_module` (each module clipped to
 `max_grad_norm` on its own, the default) or `global` (one coefficient for all
 modules). See [Arguments](../../usage/arguments.md).
 

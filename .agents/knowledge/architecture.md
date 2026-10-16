@@ -266,11 +266,11 @@ from veomni.arguments.omni_arguments_types import (
 **Runtime args vs `OmniConfig`.** `build_omni_model_runtime_args()` returns an
 `OmniModelRuntimeArguments` — the launcher's whole picture: split-checkpoint root, merged
 per-module blocks with absolute paths and `accelerator`/`train` settings, and every graph.
-Nothing is discarded. Projecting onto the slim, checkpoint-shaped `OmniConfig` is a
+Nothing is discarded. Projected onto the slim, checkpoint-shaped `OmniConfig` is a
 separate explicit step, `.to_hf_config()`, taken only where an HF artefact is needed:
 `build_omni_model_runtime()` and `OmniInferencer` (because `OmniModel` is a
-`PreTrainedModel` that needs one for `save_pretrained`), and the checkpoint export script.
-Graph-only consumers such as `scripts/seed_omni/visualize_graph.py` use the runtime args
+`PreTrainedModel` that needs one for `save_pretrained`), and the checkpoint export script
+(`scripts/seed_omni/convert_model.py`). Graph-only consumers can use the runtime args
 directly and never convert.
 
 `OmniConfig` keeps two views of every module. `_module_entries[name]` is the root
@@ -309,7 +309,7 @@ All of this rests on `_deep_update` (`arguments/parser.py`), shared with `__inhe
 merging: nested mappings merge, lists and scalars replace, an explicit `None` clears, and
 an **empty mapping is a merge of nothing rather than an erasure** — which is how a layer
 says it has nothing to say about a key (`accelerator: {}`, a bare module name under
-`modules:`) without taking the layers below it down. See `tests/seed_omni/arguments/test_config_merge.py`.
+`modules:`) without taking the layers below it down. See `tests/seed_omni/arguments/test_module_args.py`.
 
 `to_hf_config()` persists the model fields only (`model_path`, `model_config`,
 `processor_config`, `ops_implementation`) — never `accelerator`, for the same reason.
@@ -380,12 +380,13 @@ YAML Config -> VeOmniArguments -> Trainer
 ```
 YAML Config -> OmniArguments
                     │
-        ┌───────────┼───────────────────────────┐
-        v           v                           v
-build_omni_model_runtime_args()  build_omni_module_runtime_args()  OmniTrainer._setup()
-        │                    (per module)                      │
-        └───────────┬────────────────┘                  ParallelState registry
-                    v                                          │
+        ┌───────────┴───────────────────────────┐
+        v                                       v
+build_omni_model_runtime_args()         OmniTrainer._setup()
+ └── build_omni_module_runtime_args()           │
+     (-> OmniModelRuntimeArguments.modules)     │
+        │                               ParallelState registry
+        v                                       │
     build_omni_model_runtime()
      ├── ModuleRuntime × N  (FSDP2 wrap, weight load, optimizer, ckpt)
      ├── MultiOptimizer / MultiLRScheduler over the trainable modules

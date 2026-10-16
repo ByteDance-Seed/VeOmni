@@ -27,7 +27,7 @@ the final `Accelerated` model class. **Class-level annotations and `...`
 method stubs** tell the IDE which attributes and modeling methods exist,
 without copying implementation into the mixin file.
 
-Live reference: `veomni/models/seed_omni/modules/bagel/flow_connector/accelerated/accelerated.py`.
+Live reference: `veomni/models/seed_omni/modules/fake_model/fake_module_a/accelerated/accelerated.py` (or `veomni/models/seed_omni/modules/<family>/<sub>/accelerated/accelerated.py`).
 
 ## File shape
 

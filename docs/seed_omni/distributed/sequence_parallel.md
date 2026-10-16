@@ -116,11 +116,10 @@ because parameters are sharded and reduced on a mesh that includes SP. The
 result matches the non-SP baseline; this is the same invariant as single-model
 Ulysses in VeOmni.
 
-**Loss.** Decode-side losses reduce with
-`reduce_sequence_parallel_loss(..., group=ps.fsdp_group)`, a token-weighted
-reduction over `dp_sp`. With replicated data the SP peers hold identical
-`(ce_sum, n_valid)` pairs, so each distinct DP shard counts once and the SP
-copies cancel.
+**Loss.** Decode-side modules must reduce their token-weighted loss with
+`reduce_sequence_parallel_loss(..., group=ps.fsdp_group)`, a reduction over
+`dp_sp`. With replicated data the SP peers hold identical `(ce_sum, n_valid)`
+pairs, so each distinct DP shard counts once and the SP copies cancel.
 
 **Metrics.** `metric_meter_set_seqlens` runs in `pre_forward` **before** the
 slice and records full sample lengths. The step meter reduces over `dp_group`,

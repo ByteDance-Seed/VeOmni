@@ -26,7 +26,7 @@ configs/seed_omni/<Model>/<variant>/
 
 Each task folder holds its launcher plus the fragments only that task uses. A
 fragment two or more tasks share moves up — to `infer/` for inference graphs and
-module overrides, or to the model root for `data.yaml`. A task whose inference
+module overrides, or to the model root for `configs/seed_omni/<Model>/<variant>/data.yaml`. A task whose inference
 graph is its own alone keeps it inside its own folder.
 
 `base.yaml` points to module and graph files. **A graph file *is* its graph** —
