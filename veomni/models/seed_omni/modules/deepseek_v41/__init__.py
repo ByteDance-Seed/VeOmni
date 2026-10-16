@@ -18,4 +18,4 @@ node, while ``wkv`` and the gate read the mHC residual stream at layers 1 and 14
 and stay inside the backbone.
 """
 
-from . import convert_model, llm, ngram, text_encoder, vision  # noqa: F401
+from . import convert_model, hf_layout, llm, ngram, text_encoder, vision  # noqa: F401

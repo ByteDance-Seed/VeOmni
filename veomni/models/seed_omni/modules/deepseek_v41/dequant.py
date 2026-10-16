@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Undo the released DeepSeek-V4.1 checkpoint's two quantizations.
+"""Undo the released DeepSeek-V4.1 checkpoint's two quantizations, and redo them for export.
 
 The checkpoint ships every dense projection as fp8 with a block scale, and the
 routed experts as fp4 packed two values to a byte with a block scale of their
@@ -34,7 +34,7 @@ element by element.
 
 from __future__ import annotations
 
-from typing import Sequence, Tuple
+from typing import Sequence
 
 import torch
 
@@ -119,6 +119,70 @@ def dequant_fp4_blockwise(
     return values.flatten(1).to(out_dtype)
 
 
+#: Largest finite magnitudes of the two element formats.
+FP8_E4M3_MAX = 448.0
+FP4_E2M1_MAX = 6.0
+
+#: Midpoints between consecutive e2m1 magnitudes. A magnitude rounds to the
+#: smaller neighbour on a tie.
+_FP4_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+
+#: Smallest block amax a scale is derived from, as in the reference, so an
+#: all-zero block gets a finite scale.
+_MIN_AMAX = 1e-4
+
+
+def _ue8m0_scale(amax: torch.Tensor, element_max: float) -> torch.Tensor:
+    """The power-of-two scale ``ue8m0`` stores: the smallest that fits ``amax`` in the element range."""
+    return torch.exp2(torch.ceil(torch.log2(amax.clamp_min(_MIN_AMAX) / element_max)))
+
+
+def quant_fp8_blockwise(
+    weight: torch.Tensor,
+    block: tuple[int, int] = (32, 32),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[out, in]`` -> fp8 e4m3 weight and its ``[out/bo, in/bi]`` ue8m0 block scale.
+
+    The inverse of :func:`dequant_fp8_blockwise` on its own output: a weight it
+    dequantized requantizes to values that dequantize to the same numbers,
+    because the requantized scale is a power of two no larger than the
+    original and dividing by it only shifts exponents. ``block`` is ``(32, 32)``
+    for the projections and ``(1, 32)`` for the engram tables.
+    """
+    if weight.ndim != 2:
+        raise ValueError(f"expected a 2-D weight, got {tuple(weight.shape)}")
+    out_block, in_block = block
+    if weight.size(0) % out_block or weight.size(1) % in_block:
+        raise ValueError(f"weight {tuple(weight.shape)} is not an integer number of {block} blocks")
+    blocked = weight.float().unflatten(0, (-1, out_block)).unflatten(-1, (-1, in_block))
+    scale = _ue8m0_scale(blocked.abs().amax(dim=(1, 3)), FP8_E4M3_MAX)
+    values = (blocked / scale[:, None, :, None]).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+    quantized = values.flatten(2, 3).flatten(0, 1).to(torch.float8_e4m3fn)
+    return quantized, scale.to(torch.float8_e8m0fnu)
+
+
+def quant_fp4_blockwise(weight: torch.Tensor, block: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[out, in]`` -> packed e2m1 ``[out, in/2]`` int8 and its ``[out, in/block]`` ue8m0 scale.
+
+    The inverse of :func:`dequant_fp4_blockwise`, with the same nibble order:
+    the lower input index is the low nibble. Each value rounds to the nearest
+    e2m1 magnitude and keeps its sign bit, so a small negative value is stored
+    as ``-0``, as the release stores it.
+    """
+    if weight.ndim != 2:
+        raise ValueError(f"expected a 2-D weight, got {tuple(weight.shape)}")
+    if weight.size(1) % block or block % 2:
+        raise ValueError(f"weight {tuple(weight.shape)} does not split into blocks of {block} columns")
+    blocked = weight.float().unflatten(-1, (-1, block))
+    scale = _ue8m0_scale(blocked.abs().amax(dim=-1), FP4_E2M1_MAX)
+    values = (blocked / scale[..., None]).flatten(1)
+    midpoints = torch.tensor(_FP4_MIDPOINTS, dtype=torch.float32, device=weight.device)
+    codes = torch.bucketize(values.abs(), midpoints).to(torch.uint8)
+    codes = codes | torch.signbit(values).to(torch.uint8) << 3
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed.view(torch.int8), scale.to(torch.float8_e8m0fnu)
+
+
 def fuse_gate_up(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """``w1`` and ``w3`` -> the ``[2I, H]`` slab ``DeepseekV4Experts`` expects.
 
@@ -138,17 +202,21 @@ def stack_experts(per_expert: Sequence[torch.Tensor]) -> torch.Tensor:
     return torch.stack(list(per_expert), dim=0)
 
 
-def split_block_shape(weight: torch.Tensor, scale: torch.Tensor) -> Tuple[int, int]:
+def split_block_shape(weight: torch.Tensor, scale: torch.Tensor) -> tuple[int, int]:
     """The ``(out, in)`` block the scale implies. Exposed for diagnostics."""
     return weight.size(0) // scale.size(0), weight.size(1) // scale.size(1)
 
 
 __all__ = [
+    "FP4_E2M1_MAX",
     "FP4_VALUES",
+    "FP8_E4M3_MAX",
     "dequant_fp4_blockwise",
     "dequant_fp8_blockwise",
     "fp4_table",
     "fuse_gate_up",
+    "quant_fp4_blockwise",
+    "quant_fp8_blockwise",
     "split_block_shape",
     "stack_experts",
 ]

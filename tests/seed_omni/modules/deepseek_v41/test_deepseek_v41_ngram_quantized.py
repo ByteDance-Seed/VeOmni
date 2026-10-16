@@ -248,8 +248,8 @@ class TestTrainableTablesDequantizeAtLoad:
         converter = NgramTableDequant([16, 16])
         assert converter.dim0_rowwise_companion("tables.1.weight") == "tables.1.weight_scale"
         assert converter.dim0_rowwise_companion("tables.1.weight_scale") is None
-        assert converter.should_skip_without_loading("tables.1.weight_scale")
-        assert not converter.should_skip_without_loading("tables.1.weight")
+        # The streaming loader skips a companion itself; the whole-tensor loader must hand it over.
+        assert not getattr(converter, "should_skip_without_loading", lambda name: False)("tables.1.weight_scale")
 
     def test_whole_tensors_pair_up_in_either_order(self):
         packed, scale = self._released_rows()

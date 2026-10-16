@@ -125,8 +125,50 @@ class TestStreamingSpendsTheScales:
     def test_a_quantized_weight_without_its_scale_is_refused(self, tmp_path, monkeypatch):
         """Read raw, fp8 would cast into the bf16 parameter unscaled."""
         _released_checkpoint(str(tmp_path), with_dense_scale=False)
-        with pytest.raises(NotImplementedError, match="whole-tensor"):
+        with pytest.raises(RuntimeError, match="unpaired weight/scale for model.layers.0.self_attn.wq_a.weight"):
             _load(tmp_path, monkeypatch, ep_size=1, ep_rank=0)
+
+
+class TestAShrunkStackIsRefusedBeforeAnyRead:
+    def test_a_renamed_expert_slab_cannot_be_planned(self, tmp_path, monkeypatch):
+        """Released layer 2 becomes layer 0: its slab would have to be read whole to be renamed."""
+        from veomni.models.seed_omni.modules.deepseek_v41.checkpoint_tensor_converter import DeepseekV41LlmConverter
+
+        state = _released_checkpoint(str(tmp_path))
+        save_file(
+            {key.replace("layers.0.", "layers.2."): tensor for key, tensor in state.items()},
+            f"{tmp_path}/model.safetensors",
+        )
+        model = _Llm(N_EXPERTS // 2)
+        model.config = SimpleNamespace(
+            num_hidden_layers=2, num_nextn_predict_layers=0, n_routed_experts=N_EXPERTS, dspark_n_routed_experts=None
+        )
+        model._create_checkpoint_tensor_converter = lambda m: DeepseekV41LlmConverter(m.config, dequantize=True)
+        monkeypatch.setattr(module_utils, "_ep_dim0_slice_meta", lambda _state, _group, target0: (2, 0, target0 * 2))
+        real_safe_open = module_utils.safe_open
+
+        class _NoReads:
+            def __init__(self, *args, **kwargs):
+                self._handle = real_safe_open(*args, **kwargs)
+
+            def __enter__(self):
+                handle = self._handle.__enter__()
+
+                class _Proxy:
+                    def get_tensor(self, key):
+                        raise AssertionError(f"read {key} before refusing")
+
+                    def __getattr__(self, attr):
+                        return getattr(handle, attr)
+
+                return _Proxy()
+
+            def __exit__(self, *exc):
+                return self._handle.__exit__(*exc)
+
+        monkeypatch.setattr(module_utils, "safe_open", _NoReads)
+        with pytest.raises(NotImplementedError, match="transforms ExtraParallel key 'model.layers.2.mlp.experts"):
+            load_model_weights_ep_sharded(model, str(tmp_path), "cpu")
 
 
 class TestConverterDeclaresTheCompanions:
@@ -134,7 +176,8 @@ class TestConverterDeclaresTheCompanions:
         converter = DeepseekV41DequantConverter()
         assert converter.dim0_rowwise_companion(EXPERTS) == f"{EXPERTS}_scale"
         assert converter.dim0_rowwise_companion(f"{EXPERTS}_scale") is None
-        assert converter.should_skip_without_loading(f"{EXPERTS}_scale")
+        # The streaming loader skips a companion itself; the whole-tensor loader must hand it over.
+        assert not converter.should_skip_without_loading(f"{EXPERTS}_scale")
         assert not converter.should_skip_without_loading(EXPERTS)
 
     def test_a_shrunk_stack_offers_no_companions(self):
