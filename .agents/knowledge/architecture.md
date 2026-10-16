@@ -16,6 +16,7 @@ veomni/
 │   ├── torch_parallelize.py  build_parallelize_model(), parallelize_model_fsdp2()
 │   ├── parallel_plan.py    ParallelPlan for ExtraParallel (EP, embedding shard)
 │   ├── async_offload.py    Async activation offload (SwapTensor, OffloadManager, async_save_on_cpu)
+│   ├── emb_parallel/   ShardedEmbedding: vocab rows over the emb group, all-to-all lookup, tied projection
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
@@ -65,6 +66,7 @@ veomni/
 │   ├── kernels/        Kernel implementations (one subdir per op)
 │   │   ├── deepseek_sparse_attention/  DSA indexer/top-k selection
 │   │   ├── deepseek_v4/  TileLang sparse attention/indexer + precision helpers
+│   │   ├── qwen4_exp/    TileLang QSA sparse attention fwd/bwd
 │   │   ├── attention/  Flash attention v2/3/4 + SP-aware variants
 │   │   ├── cross_entropy/  eager/liger/npu-chunk loss variants
 │   │   ├── gated_delta_rule/  Qwen3.5 linear-attention kernels

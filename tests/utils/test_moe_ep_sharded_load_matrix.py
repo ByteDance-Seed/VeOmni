@@ -30,10 +30,13 @@ for both checkpoint expert layouts
 Assertions:
     * merged   x {plain, rank0, ep_sharded} -> gathered experts == reference.
     * nonmerge x {plain, rank0}             -> converter fuses -> == reference.
-    * nonmerge x ep_sharded                 -> raises ``NotImplementedError``
-      up front (a fusion converter can't be streamed per-rank; the loader
+    * nonmerge x ep_sharded, with a converter lacking the expert-streaming
+      capabilities -> raises ``NotImplementedError`` up front (the loader
       must bail so the caller falls back to the whole-tensor loader). This
-      is the silent-corruption guard for Qwen3-MoE.
+      is the silent-corruption guard for per-expert keys.
+    * nonmerge x {plain, rank0, ep_sharded}, with a converter implementing
+      ``fused_expert_target`` / ``for_expert_range`` -> == reference; the
+      streaming loader stacks only each rank's experts.
 
 Run directly (2 GPUs):
     torchrun --nproc_per_node=2 --master_port=4331 \
@@ -110,6 +113,30 @@ class _PerExpertFuseConverter:
         return False  # fusion, not a pure zero-pad -> not streamable
 
 
+class _StreamablePerExpertFuseConverter(_PerExpertFuseConverter):
+    """The same fusion, plus the expert-streaming capabilities: each rank stacks
+    only experts ``[offset, offset + num_experts)``."""
+
+    def __init__(self, num_experts: int = E, offset: int = 0) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+        self.offset = offset
+
+    def convert(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
+        idx = int(name[len(self._PREFIX) :]) - self.offset
+        assert 0 <= idx < self.num_experts, f"{name} is outside [{self.offset}, {self.offset + self.num_experts})"
+        self._buf[idx] = tensor.clone()
+        if len(self._buf) < self.num_experts:
+            return None
+        return self._flush()
+
+    def fused_expert_target(self, name: str) -> tuple[str, int]:
+        return "moe.experts", int(name[len(self._PREFIX) :])
+
+    def for_expert_range(self, start: int, num_local: int) -> "_StreamablePerExpertFuseConverter":
+        return _StreamablePerExpertFuseConverter(num_local, self.offset + start)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Fake MoE model with an EP Shard(0) experts param
 # ──────────────────────────────────────────────────────────────────────
@@ -148,6 +175,12 @@ class FakeMoeModel(nn.Module):
     @staticmethod
     def _create_checkpoint_tensor_converter(model):
         return _PerExpertFuseConverter()
+
+
+class FakeStreamableMoeModel(FakeMoeModel):
+    @staticmethod
+    def _create_checkpoint_tensor_converter(model):
+        return _StreamablePerExpertFuseConverter()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -199,8 +232,8 @@ def _local_expert_shard(t: torch.Tensor) -> torch.Tensor:
 # ──────────────────────────────────────────────────────────────────────
 # Worker
 # ──────────────────────────────────────────────────────────────────────
-def _build_fresh(weights_path, *, loader: str):
-    """Build + parallelize a fresh FakeMoeModel, loading via the chosen loader."""
+def _build_fresh(weights_path, *, loader: str, model_cls=FakeMoeModel):
+    """Build + parallelize a fresh fake MoE model, loading via the chosen loader."""
     kwargs = dict(
         weights_path=weights_path,
         init_device="meta",
@@ -214,7 +247,7 @@ def _build_fresh(weights_path, *, loader: str):
     elif loader == "ep_sharded":
         kwargs["ep_sharded_stream_load"] = True
     # loader == "plain": defaults (every-rank-reads)
-    return build_parallelize_model(FakeMoeModel(), **kwargs)
+    return build_parallelize_model(model_cls(), **kwargs)
 
 
 def run_worker() -> None:
@@ -255,12 +288,16 @@ def run_worker() -> None:
             torch.testing.assert_close(got, ref[name], atol=0.0, rtol=0.0)
         results.append(f"  [OK] {tag}: experts slice + dense params bit-identical to reference")
 
-    for fmt, path in [("merged", merged_dir), ("nonmerged", per_expert_dir)]:
+    for fmt, path, model_cls in [
+        ("merged", merged_dir, FakeMoeModel),
+        ("nonmerged", per_expert_dir, FakeMoeModel),
+        ("nonmerged-streamable", per_expert_dir, FakeStreamableMoeModel),
+    ]:
         for loader in ["plain", "rank0", "ep_sharded"]:
             tag = f"{fmt} x {loader}"
             expect_bail = fmt == "nonmerged" and loader == "ep_sharded"
             try:
-                model = _build_fresh(path, loader=loader)
+                model = _build_fresh(path, loader=loader, model_cls=model_cls)
             except NotImplementedError as e:
                 if expect_bail:
                     results.append(f"  [OK] {tag}: bailed as expected ({str(e)[:60]}...)")

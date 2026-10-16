@@ -313,6 +313,13 @@ and `triton-ascend` on a mutually compatible release set.
 
 #### Ascend 910B4-1
 
+This BV64 launch profile is a candidate pending public Triton hardware
+validation. A SKU-specific unified-buffer cause has not been established
+by a recorded compile/runtime failure and matched corrected run. Mainstream
+`Ascend910B4` retains BV128; the compiler target below does not broaden
+runtime SKU selection. Do not infer this profile from private Mojo or
+Ascend-C kernel measurements.
+
 Before importing Triton on an Ascend 910B4-1 host, canonicalize the compiler
 target to the public `triton-ascend` architecture name:
 
@@ -385,3 +392,7 @@ Qwen3.5 is a hybrid model alternating between softmax and linear attention layer
 
 For detailed implementation notes, see the
 [Ulysses documentation](../key_features/ulysses.md#-linear-attention-ulysses-gateddeltanet).
+For Ascend 910B4 Triton code generation, export TRITON_ASCEND_ARCH=Ascend910B4
+before the first Triton import. The NPU CI regression step sets this variable
+explicitly; on a non-910B4 runner the regression test skips after checking the
+runtime device name.

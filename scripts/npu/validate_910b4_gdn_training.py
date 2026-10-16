@@ -24,7 +24,7 @@ from pathlib import Path
 
 
 _EXPECTED_TRITON_ARCH = "Ascend910B4"
-_SUPPORTED_DEVICE_NAMES = frozenset({"Ascend910B4", "Ascend910B4-1"})
+_SUPPORTED_DEVICE_NAMES = frozenset({"Ascend910B4-1"})
 _STRICT_ATOL = 5e-2
 _STRICT_RTOL = 5e-2
 _STRICT_MIN_TOKENS = 131072

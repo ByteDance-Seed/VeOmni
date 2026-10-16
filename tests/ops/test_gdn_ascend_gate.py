@@ -120,14 +120,24 @@ def test_gdn_registry_has_fla_and_npu(op_name):
     assert "npu" in available
 
 
-@pytest.mark.parametrize("device_name", ["Ascend910B4", "Ascend910B4-1"])
+@pytest.mark.parametrize("device_name", ["Ascend910B4-1"])
 def test_ascend_910b4_uses_bv64(device_name):
     assert select_hidden_state_block_value(device_name) == 64
 
 
 @pytest.mark.parametrize(
     "device_name",
-    ["Ascend910B1", "Ascend910B2", "Ascend910B2C", "Ascend910B3", "Ascend910_95", "Ascend950", "", "FutureAscend"],
+    [
+        "Ascend910B1",
+        "Ascend910B2",
+        "Ascend910B2C",
+        "Ascend910B3",
+        "Ascend910B4",
+        "Ascend910_95",
+        "Ascend950",
+        "",
+        "FutureAscend",
+    ],
 )
 def test_other_ascend_devices_keep_bv128(device_name):
     assert select_hidden_state_block_value(device_name) == 128

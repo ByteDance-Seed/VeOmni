@@ -18,7 +18,7 @@ from __future__ import annotations
 from functools import cache
 
 
-_ASCEND_910B4_DEVICE_NAMES = frozenset({"Ascend910B4", "Ascend910B4-1"})
+_ASCEND_910B4_DEVICE_NAMES = frozenset({"Ascend910B4-1"})
 _DEFAULT_HIDDEN_STATE_BLOCK_VALUE = 128
 _ASCEND_910B4_HIDDEN_STATE_BLOCK_VALUE = 64
 
@@ -26,10 +26,10 @@ _ASCEND_910B4_HIDDEN_STATE_BLOCK_VALUE = 64
 def select_hidden_state_block_value(device_name: str) -> int:
     """Select the GDR hidden-state value tile for a raw Ascend device name.
 
-    The recurrence kernel keeps its ``[64, BV]`` hidden-state tiles in the
-    unified buffer. ``BV=128`` exceeds the 910B4-1 limit at Qwen3.5 training
-    shapes, while ``BV=64`` partitions only the independent value dimension
-    and preserves the kernel's math.
+    This conservative candidate changes only the independent value tile on
+    the exact B4-1 SKU. It is not a measured unified-buffer diagnosis; public
+    Triton forward/backward parity still requires a matched hardware run.
+    Mainstream B4 and unmeasured devices retain the upstream default.
     """
 
     if device_name in _ASCEND_910B4_DEVICE_NAMES:

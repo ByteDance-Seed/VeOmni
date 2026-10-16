@@ -67,7 +67,8 @@ different data-parallel samples to those ranks.
 
 - General `tp_size > 1` support.
 - Tensor-parallel attention, MLP, PLE projections, or LM head.
-- PLE with Ulysses or context parallelism.
+- PLE with context parallelism; Ulysses is supported through sequence-local
+  lookup requests and cross-rank token/convolution halos.
 - HSDP replicas of the two-dimensional PLE table in the first implementation.
 - FSDP CPU offload for FSDP-ignored PLE parameters.
 - Hugging Face export of the complete 95 GiB PLE table.
@@ -514,8 +515,9 @@ PLE 2D layout: rows=8 (ple), columns=8 (ple_fsdp), local=[V/8, E/8]
 | `veomni/distributed/fsdp2/clip_grad_norm.py` | Verify two-axis norm reduction for persistent PLE shards. |
 | `veomni/models/transformers/qwen4_exp/parallel_plan.py` | Declare the persistent PLE shard and the disjoint EP expert shard. |
 | `qwen4_exp_*_patch_gen_config.py` | Implement GPU/NPU two-dimensional request/result routing. |
-| `tests/models/test_qwen4_exp.py` | Lookup, gradient, loader, shape, and padding tests. |
-| `tests/e2e/test_qwen4_exp_pipeline.py` | Optimizer and DCP resume coverage. |
+| `tests/models/test_qwen4_exp_packing.py` | Packed-boundary output and gradient parity. |
+| `tests/parallel/ulysses/test_qwen4_exp_ulysses.py` | Ulysses lookup, halo, QSA, GDN, and VLM parity. |
+| `tests/e2e/test_e2e_parallel.py` | Two-device Qwen4-Exp VLM training smoke coverage. |
 
 Generated files under `veomni/models/transformers/qwen4_exp/generated/` must
 only be changed by running patchgen.
@@ -529,7 +531,7 @@ only be changed by running patchgen.
 | 1 | 1 | 1 | 1 | Unsharded reference behavior. |
 | 2 | 2 | 1 | 1 | Row-only distributed lookup. |
 | 4 | 2 | 2 | 1 | Required two-dimensional PLE correctness case. |
-| 2 | 2 | 1 | 2 | PLE+EP fused-MoE training and DCP resume smoke. |
+| 2 | 2 | 1 | 2 | PLE+EP fused-MoE training smoke. |
 
 Every distributed case must cover:
 

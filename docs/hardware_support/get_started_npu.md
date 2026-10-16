@@ -35,7 +35,9 @@ Product Hardware Support List
 
 For Qwen3.5 on Ascend 910B4-1, set
 `TRITON_ASCEND_ARCH=Ascend910B4` before importing Triton. The GatedDeltaNet
-recurrence then selects its B4-specific BV64 launch automatically. Run the
+recurrence selects the candidate BV64 launch only for the exact raw B4-1
+device name; mainstream B4 retains BV128. Public Triton hardware validation
+is still required. Run the
 [Qwen3.5 live hardware gate](../examples/qwen3_5.md#ascend-910b4-1) before a
 long training job.
 

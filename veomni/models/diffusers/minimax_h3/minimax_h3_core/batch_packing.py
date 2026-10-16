@@ -6,8 +6,6 @@ import torch
 def pack_samples(samples):
     if not samples:
         raise ValueError("H3 requires a nonempty microbatch.")
-    first = samples[0]
-    checkpointing = first["use_gradient_checkpointing"]
     chunks = {
         key: []
         for key in (
@@ -31,8 +29,6 @@ def pack_samples(samples):
             torch.float64,
         ):
             raise ValueError("H3 packing must retain timestep/position precision; use cast_forward_inputs=false.")
-        if inp["use_gradient_checkpointing"] != checkpointing:
-            raise ValueError("H3 packing requires one gradient-checkpointing setting per microbatch.")
         if not inp["skip_mask_out_condition"]:
             raise ValueError("H3 packing requires explicit condition-row output cropping.")
         length = inp["x"].shape[1]
@@ -64,7 +60,6 @@ def pack_samples(samples):
     result.update(
         update_mask=None,
         skip_mask_out_condition=True,
-        use_gradient_checkpointing=checkpointing,
         packed_seq_params={
             "cu_seqlens_q": torch.tensor(cu, dtype=torch.int32, device=device),
             "cu_seqlens_host": tuple(cu),
