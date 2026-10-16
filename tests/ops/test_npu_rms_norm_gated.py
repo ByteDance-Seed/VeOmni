@@ -55,7 +55,7 @@ def test_zero_gate_is_half_normalized_and_silu_unchanged():
     torch.testing.assert_close(cls(128, activation="sigmoid")(x, z), x * 0.5 / (1 + 1e-6) ** 0.5)
     torch.testing.assert_close(cls(128)(x, z), torch.zeros_like(x))
     with pytest.raises(ValueError, match="activation"):
-        cls(128, activation="relu")
+        cls(128, activation="unsupported_gate")
     with pytest.raises(ValueError, match="gate"):
         cls(128, activation="sigmoid")(x)
 
@@ -106,3 +106,22 @@ def test_gate_must_match_input_shape(activation):
     for gate in [None, torch.zeros(1, 4, 64), torch.zeros(1, 1, 32)]:
         with pytest.raises(ValueError, match="gate with the input shape"):
             norm(x, gate)
+
+
+@pytest.mark.parametrize("activation", ["relu", "gelu", "tanh", "swish"])
+def test_upstream_activation_fallback_is_preserved(activation):
+    from transformers.activations import ACT2FN
+
+    torch.manual_seed(94)
+    norm = load_wrapper()(32, activation=activation)
+    x = torch.randn(2, 32, requires_grad=True)
+    z = torch.randn_like(x, requires_grad=True)
+    normalized = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + norm.variance_epsilon)
+    expected = normalized * norm.weight * ACT2FN[activation](z)
+    actual = norm(x, z)
+    torch.testing.assert_close(actual, expected)
+    for got, ref in zip(
+        torch.autograd.grad(actual.sum(), (x, z, norm.weight)),
+        torch.autograd.grad(expected.sum(), (x, z, norm.weight)),
+    ):
+        torch.testing.assert_close(got, ref)

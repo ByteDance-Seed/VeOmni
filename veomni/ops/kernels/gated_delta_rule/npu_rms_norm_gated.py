@@ -21,12 +21,13 @@
 import torch
 import torch.nn as nn
 import torch_npu
+from transformers.activations import ACT2FN
 
 
 class NPUFusedRMSNormGated(nn.Module):
     def __init__(self, hidden_size, eps=1e-6, activation="silu", device=None, dtype=None, **kwargs):
         super().__init__()
-        if activation not in {"silu", "sigmoid"}:
+        if activation not in ACT2FN:
             raise ValueError(f"Unsupported NPU gated RMSNorm activation: {activation!r}")
         self.weight = nn.Parameter(torch.ones(hidden_size, device=device, dtype=dtype))
         self.variance_epsilon = eps
@@ -45,4 +46,8 @@ class NPUFusedRMSNormGated(nn.Module):
             return (weighted * gate.float().sigmoid()).to(hidden_states.dtype)
         # Preserve the existing SiLU route for models such as Qwen3.6.
         normalized = torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
-        return torch_npu.npu_swiglu(torch.cat([gate, normalized], dim=-1), dim=-1)
+        if self.activation in {"silu", "swish"}:
+            return torch_npu.npu_swiglu(torch.cat([gate, normalized], dim=-1), dim=-1)
+        # Preserve upstream's generic activation fallback without changing the
+        # Qwen4 sigmoid cast boundary or the established SiLU fused path.
+        return (normalized * ACT2FN[self.activation](gate.float())).to(hidden_states.dtype)
