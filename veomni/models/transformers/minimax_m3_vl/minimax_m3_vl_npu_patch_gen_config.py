@@ -34,6 +34,7 @@ from veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config
     minimax_m3_vl_get_metadata_collate_func_patched,
     minimax_m3_vl_get_parallel_plan_patched,
     minimax_m3_vl_get_position_id_func_patched,
+    minimax_m3_vl_indexer_init_patched,
     minimax_m3_vl_model_forward_patched,
     minimax_m3_vl_rmsnorm_forward_patched,
     minimax_m3_vl_sparse_for_conditional_generation_forward_patched,
@@ -99,6 +100,11 @@ config.replace_class(
     description="Remove the HF experts decorator and add SwiGLU-OAI fused MoE dispatch",
 )
 
+config.override_method(
+    "MiniMaxM3VLIndexer.__init__",
+    replacement=minimax_m3_vl_indexer_init_patched,
+    description="Freeze the sparse-attention indexer, which receives no gradient",
+)
 config.override_method(
     "MiniMaxM3VLRMSNorm.forward",
     replacement=minimax_m3_vl_rmsnorm_forward_patched,

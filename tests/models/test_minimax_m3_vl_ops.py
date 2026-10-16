@@ -149,11 +149,14 @@ def test_minimax_m3_vl_text_model_runs_unpacked_single_sequence_as_one_segment(m
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_indexer_projection_stays_out_of_autograd(module_name):
-    """Top-k block selection is not differentiable, so the indexer must not build a dead autograd graph."""
+def test_minimax_m3_vl_indexer_is_frozen_and_stays_out_of_autograd(module_name):
+    """Top-k block selection is not differentiable: the indexer is frozen and builds no dead autograd graph."""
     modeling = importlib.import_module(module_name)
     model = _single_layer_sparse_text_model(modeling)
     attention = model.layers[0].self_attn
+    assert not any(param.requires_grad for param in attention.indexer.parameters())
+    assert all(param.requires_grad for name, param in model.named_parameters() if ".indexer." not in name)
+
     hidden_states = torch.randn(1, 5, model.config.hidden_size, requires_grad=True)
     position_embeddings = model.rotary_emb(hidden_states, torch.arange(5).unsqueeze(0))
 

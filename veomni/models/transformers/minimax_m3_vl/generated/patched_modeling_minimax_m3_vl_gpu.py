@@ -13,6 +13,8 @@
 #      Allow VeOmni flash-attention implementations for the config-driven vision tower
 #    - method_override: MiniMaxM3VLRMSNorm.forward
 #      Use VeOmni's Gemma-style fused RMSNorm backend when selected
+#    - method_override: MiniMaxM3VLIndexer.__init__
+#      Freeze the sparse-attention indexer, which receives no gradient
 #    - method_override: MiniMaxM3VLAttention.forward
 #      Run packed MiniMax language attention through the TND sparse attention operators
 #    - method_override: MiniMaxM3VL3DRotaryEmbedding.forward
@@ -151,12 +153,9 @@ def _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings):
     training path, block selection runs in the MiniMax sparse attention
     operator after the Ulysses exchange instead.
 
-    The indexer is not trained here: block selection is a top-k over discrete
-    block scores and no indexer loss is computed, so no gradient can reach its
-    projections. They run under ``no_grad`` to skip building that dead autograd
-    graph and keep their checkpoint values. MiniMax describes the indexer as
-    distilled from full attention with a KL objective, but has not published how
-    it is handled in post-training; add that objective here once it is known.
+    The indexer is not trained (see ``MiniMaxM3VLIndexer.__init__``), and its
+    input ``hidden_states`` still requires grad, so the projections run under
+    ``no_grad`` to skip building an autograd graph that no loss ever reaches.
     """
     batch, q_len, _ = hidden_states.shape
     with torch.no_grad():
@@ -670,6 +669,12 @@ class MiniMaxM3VLAttention(nn.Module):
         return self.o_proj(attn_output), None
 
 
+# ======================================================================
+# [MODIFIED CLASS] MiniMaxM3VLIndexer
+# Methods patched: __init__
+# ======================================================================
+
+
 class MiniMaxM3VLIndexer(nn.Module):
     r"""Lightning Indexer for MiniMax M3 sparse attention.
 
@@ -717,7 +722,7 @@ class MiniMaxM3VLIndexer(nn.Module):
     """
 
     def __init__(self, config: MiniMaxM3VLTextConfig, layer_idx: int):
-        super().__init__()
+        nn.Module.__init__(self)
         self.config = config
         self.layer_idx = layer_idx
         self.head_dim = config.index_head_dim
@@ -729,6 +734,16 @@ class MiniMaxM3VLIndexer(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, config.index_head_dim, bias=False)
         self.q_norm = MiniMaxM3VLRMSNorm(config.index_head_dim, eps=config.rms_norm_eps)
         self.k_norm = MiniMaxM3VLRMSNorm(config.index_head_dim, eps=config.rms_norm_eps)
+        # --- Patch.1 ---
+        # The indexer is not trained: block selection is a top-k over discrete block
+        # scores and no indexer loss is computed, so no gradient can reach these
+        # parameters and they keep their checkpoint values. Freezing them states that
+        # explicitly, which DDP needs (it otherwise waits forever for their gradients)
+        # and keeps them out of the optimizer. MiniMax describes the indexer as
+        # distilled from full attention with a KL objective, but has not published how
+        # it is handled in post-training; add that objective here once it is known.
+        self.requires_grad_(False)
+        # --- Patch.1 ---
 
     def forward(
         self,

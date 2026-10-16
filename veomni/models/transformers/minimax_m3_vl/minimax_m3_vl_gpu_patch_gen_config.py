@@ -208,6 +208,35 @@ def _grid_thw_to_list(grid_thw, grid_thw_list):
     return grid_thw.tolist()
 
 
+@config.override_method(
+    "MiniMaxM3VLIndexer.__init__",
+    description="Freeze the sparse-attention indexer, which receives no gradient",
+)
+def minimax_m3_vl_indexer_init_patched(self, config: MiniMaxM3VLTextConfig, layer_idx: int):
+    nn.Module.__init__(self)
+    self.config = config
+    self.layer_idx = layer_idx
+    self.head_dim = config.index_head_dim
+    self.num_heads = config.index_n_heads
+    self.block_size = config.index_block_size
+    self.topk_blocks = config.index_topk_blocks
+    self.local_blocks = config.index_local_blocks
+    self.q_proj = nn.Linear(config.hidden_size, config.index_n_heads * config.index_head_dim, bias=False)
+    self.k_proj = nn.Linear(config.hidden_size, config.index_head_dim, bias=False)
+    self.q_norm = MiniMaxM3VLRMSNorm(config.index_head_dim, eps=config.rms_norm_eps)
+    self.k_norm = MiniMaxM3VLRMSNorm(config.index_head_dim, eps=config.rms_norm_eps)
+    # --- Patch.1 ---
+    # The indexer is not trained: block selection is a top-k over discrete block
+    # scores and no indexer loss is computed, so no gradient can reach these
+    # parameters and they keep their checkpoint values. Freezing them states that
+    # explicitly, which DDP needs (it otherwise waits forever for their gradients)
+    # and keeps them out of the optimizer. MiniMax describes the indexer as
+    # distilled from full attention with a KL objective, but has not published how
+    # it is handled in post-training; add that objective here once it is known.
+    self.requires_grad_(False)
+    # --- Patch.1 ---
+
+
 @config.add_helper
 def _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings):
     """Return the indexer's normed, rotated ``[B, S, G, D]`` queries and ``[B, S, 1, D]`` keys.
@@ -216,12 +245,9 @@ def _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings):
     training path, block selection runs in the MiniMax sparse attention
     operator after the Ulysses exchange instead.
 
-    The indexer is not trained here: block selection is a top-k over discrete
-    block scores and no indexer loss is computed, so no gradient can reach its
-    projections. They run under ``no_grad`` to skip building that dead autograd
-    graph and keep their checkpoint values. MiniMax describes the indexer as
-    distilled from full attention with a KL objective, but has not published how
-    it is handled in post-training; add that objective here once it is known.
+    The indexer is not trained (see ``MiniMaxM3VLIndexer.__init__``), and its
+    input ``hidden_states`` still requires grad, so the projections run under
+    ``no_grad`` to skip building an autograd graph that no loss ever reaches.
     """
     batch, q_len, _ = hidden_states.shape
     with torch.no_grad():
