@@ -212,12 +212,12 @@ There are exactly **two** ways to build a SeedOmni model, and the trainer / infe
 `OmniModelRuntime` composes an `OmniModel` and forwards everything it does not define (`config`, `modules_dict`, `save_pretrained`, `nn.Module` reads) to it, so shared callbacks read `trainer.model` either way. Training **requires** the runtime — only it adds ParallelState scoping, graph tracing and metric metering, which it injects into `OmniModel.forward` as a `node_runner` (`TrainNodeRunner`). The graph walk itself lives in `modeling_omni.py`, which imports nothing from `accelerated/` / `distributed/` / the trainer so it can be lifted into another framework (guarded by `tests/seed_omni/model/test_graph.py::test_modeling_omni_imports_no_veomni_runtime_package`).
 
 ```
-OmniTrainer (orchestrator)           -> tasks/omni/train_omni.py
+tasks/omni/train_omni.py             -> OmniTrainer (orchestrator)
 └── self.model = OmniModelRuntime    graph loops (forward), trace, metering
     ├── ModuleRuntime × N            per sub-module (FSDP, opt, ckpt, ParallelState)
     └── OmniModel                    eager graph definition (modeling_omni.py)
 
-OmniInferencer                       -> tasks/omni/infer_omni.py
+tasks/omni/infer_omni.py             -> OmniInferencer
 └── self.model = OmniModelRuntime (any FSDP2/DDP module) | OmniModel (all eager)
 ```
 
