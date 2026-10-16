@@ -244,6 +244,38 @@ KERNEL_REGISTRY.register(
 )
 
 
+def _swiglu_oai_triton_kernel_factory():
+    from .group_gemm import group_gemm_fused_moe_forward
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        return group_gemm_fused_moe_forward(
+            num_experts=self.num_experts,
+            routing_weights=top_k_weights.to(hidden_states.dtype),
+            selected_experts=top_k_index,
+            hidden_states=hidden_states,
+            fc1_1_weight=None,
+            fc1_2_weight=None,
+            fc2_weight=self.down_proj,
+            fc1_1_2_weight=self.gate_up_proj,
+            swiglu_limit=self.swiglu_limit,
+            swiglu_alpha=self.swiglu_alpha,
+        )
+
+    return forward
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="triton",
+        op_name="moe_experts",
+        variant="swiglu_oai",
+        factory=_swiglu_oai_triton_kernel_factory,
+        hardware=HardwareRequirement(device_type="gpu", min_compute_capability=70),
+        description="Triton group-gemm fused MoE forward with SwiGLU-OAI activation",
+    )
+)
+
+
 def _quack_kernel_factory():
     from .quack_gemm import quack_gemm_fused_moe_forward
 
@@ -298,10 +330,42 @@ KERNEL_REGISTRY.register(
 )
 
 
+def _swiglu_oai_npu_kernel_factory():
+    from .npu_group_gemm import npu_fused_moe_forward
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        return npu_fused_moe_forward(
+            num_experts=self.num_experts,
+            routing_weights=top_k_weights.to(hidden_states.dtype),
+            selected_experts=top_k_index,
+            hidden_states=hidden_states,
+            fc1_1_weight=None,
+            fc1_2_weight=None,
+            fc2_weight=self.down_proj,
+            fc1_1_2_weight=self.gate_up_proj,
+            swiglu_limit=self.swiglu_limit,
+            swiglu_alpha=self.swiglu_alpha,
+        )
+
+    return forward
+
+
 def _mlu_kernel_factory():
     from .mlu_group_gemm import mlu_group_gemm_fused_moe_forward
 
     return _make_moe_experts_adapter(mlu_group_gemm_fused_moe_forward)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu",
+        op_name="moe_experts",
+        variant="swiglu_oai",
+        factory=_swiglu_oai_npu_kernel_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="NPU group-gemm fused MoE forward with SwiGLU-OAI activation",
+    )
+)
 
 
 KERNEL_REGISTRY.register(
