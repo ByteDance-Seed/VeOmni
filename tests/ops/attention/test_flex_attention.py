@@ -42,7 +42,7 @@ from tests.ops.tol import (
     ATTN_RTOL,
 )
 from veomni.ops.kernels.attention.standard import flex as flex_backend
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 
 
 _FLEX_COMPILE_AVAILABLE = importlib.util.find_spec("triton") is not None
@@ -105,6 +105,10 @@ def _causal_block_mask(sequence_length: int, device: torch.device):
 @pytest.mark.skipif(
     not _FLEX_COMPILE_AVAILABLE,
     reason="HF FlexAttention compiles through inductor, which needs triton",
+)
+@pytest.mark.skipif(
+    IS_NPU_AVAILABLE,
+    reason="Ascend inductor cannot lower CPU flex_attention: Subgraph has no dtype",
 )
 def test_flex_attention_cpu_forward_uses_block_mask_and_hf_layout():
     sequence_length = 17
