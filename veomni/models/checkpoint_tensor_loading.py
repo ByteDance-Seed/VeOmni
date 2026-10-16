@@ -116,16 +116,16 @@ class CheckpointTensorConverter(Protocol):
         without materializing its checkpoint tensor.
 
         This is intended for checkpoint-only subtrees that the live model does
-        not construct (for example an explicitly unsupported auxiliary head).
-        The regular loader still calls :meth:`convert` after reading the tensor;
-        streaming loaders may use this hook to avoid the read entirely.
-        Implementing this method is optional and a missing method means
-        ``False``.
+        not construct (for example an explicitly unsupported auxiliary head, or
+        a sibling module's weights in a shared checkpoint). Every loader then
+        calls :meth:`record_skip_without_loading` instead of reading the tensor
+        and calling :meth:`convert`. Implementing this method is optional and a
+        missing method means ``False``.
         """
         ...
 
     def record_skip_without_loading(self, name: str) -> None:
-        """Optional notification after a streaming loader skipped ``name``.
+        """Optional notification after a loader skipped ``name``.
 
         Converters can use this to retain their usual finalize-time accounting
         without forcing the tensor to be read. Implementing it is optional.
@@ -171,7 +171,7 @@ def checkpoint_converter_should_skip_without_loading(
     converter: Optional["CheckpointTensorConverter"],
     name: str,
 ) -> bool:
-    """Whether a streaming loader may discard ``name`` before reading it."""
+    """Whether a loader may discard ``name`` before reading it."""
     if converter is None or not converter.can_handle(name):
         return False
     fn = getattr(converter, "should_skip_without_loading", None)
@@ -182,12 +182,23 @@ def checkpoint_converter_record_skip_without_loading(
     converter: Optional["CheckpointTensorConverter"],
     name: str,
 ) -> None:
-    """Notify a converter that a tensor was skipped by a streaming loader."""
+    """Notify a converter that a loader skipped a tensor without reading it."""
     if converter is None:
         return
     fn = getattr(converter, "record_skip_without_loading", None)
     if callable(fn):
         fn(name)
+
+
+def checkpoint_converter_supports_expert_streaming(
+    converter: Optional["CheckpointTensorConverter"],
+) -> bool:
+    """Whether *converter* implements both per-expert streaming capabilities."""
+    if converter is None:
+        return False
+    return callable(getattr(converter, "fused_expert_target", None)) and callable(
+        getattr(converter, "for_expert_range", None)
+    )
 
 
 def checkpoint_converter_fused_expert_target(
@@ -199,12 +210,13 @@ def checkpoint_converter_fused_expert_target(
     ``None`` unless *converter* claims ``name`` and implements both expert-streaming
     capabilities (``fused_expert_target`` and ``for_expert_range``).
     """
-    if converter is None or not converter.can_handle(name):
+    if (
+        converter is None
+        or not converter.can_handle(name)
+        or not checkpoint_converter_supports_expert_streaming(converter)
+    ):
         return None
-    fn = getattr(converter, "fused_expert_target", None)
-    if not callable(fn) or not callable(getattr(converter, "for_expert_range", None)):
-        return None
-    return fn(name)
+    return converter.fused_expert_target(name)
 
 
 def get_checkpoint_tensor_converter(

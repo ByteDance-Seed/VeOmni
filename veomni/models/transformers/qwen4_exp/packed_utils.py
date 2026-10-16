@@ -95,7 +95,7 @@ def compact_qsa_select(
         raise ValueError(
             f"Qwen4-Exp compact QSA currently requires one indexer KV head; got {indexer.index_kv_heads}."
         )
-    if indexer.compress_ratio > local_seq_len:
+    if world_size > 1 and indexer.compress_ratio > local_seq_len:
         raise ValueError(
             "Qwen4-Exp compact QSA needs each Ulysses shard to be at least one compression block wide; "
             f"got local_seq_len={local_seq_len}, compress_ratio={indexer.compress_ratio}."
@@ -209,6 +209,55 @@ def compact_qsa_select(
     return selected[..., :output_width].to(torch.int32).contiguous()
 
 
+def explicit_mask_qsa_select(indexer, hidden_states, position_embeddings, attention_mask, apply_rotary_pos_emb):
+    """Match HF visible-token block grouping for explicitly masked, non-CP calls.
+
+    Explicit masks can contain holes, so their compression blocks are groups
+    of visible tokens rather than fixed contiguous windows. Keep this rare
+    compatibility path separate from the bounded packed-training fast path.
+    """
+    batch_size, seq_len, _ = hidden_states.shape
+    if attention_mask.ndim != 4 or attention_mask.shape[1] != 1:
+        raise ValueError("Explicit QSA masks require shape [B,1,Q,K] with a shared head mask")
+    mask = torch.broadcast_to(attention_mask, (batch_size, 1, seq_len, seq_len))
+    visible = mask if mask.dtype == torch.bool else mask == 0
+    qk = indexer.index_qk_proj(hidden_states)
+    q_width = indexer.index_n_heads * indexer.index_head_dim
+    q, raw_keys = torch.split(qk, [q_width, indexer.index_head_dim], dim=-1)
+    q = indexer.q_layernorm(q.reshape(batch_size, seq_len, indexer.index_n_heads, indexer.index_head_dim))
+    cos, sin = position_embeddings
+    q = apply_rotary_pos_emb(q, cos=cos[:, -seq_len:], sin=sin[:, -seq_len:], unsqueeze_dim=2)
+    selected = torch.full(
+        (batch_size, seq_len, indexer.token_budget + indexer.compress_ratio - 1),
+        -1,
+        dtype=torch.int32,
+        device=hidden_states.device,
+    )
+    for batch_idx in range(batch_size):
+        for query_idx in range(seq_len):
+            visible_indices = visible[batch_idx, 0, query_idx].nonzero(as_tuple=True)[0]
+            complete = visible_indices.numel() // indexer.compress_ratio
+            block_tokens = visible_indices[: complete * indexer.compress_ratio].reshape(
+                complete, indexer.compress_ratio
+            )
+            if complete:
+                pooled = raw_keys[batch_idx, block_tokens].float().mean(dim=1).to(raw_keys.dtype)
+                pooled = indexer.k_layernorm(pooled)
+                starts = block_tokens[:, 0]
+                keys = apply_rotary_pos_emb(
+                    pooled.unsqueeze(1), cos=cos[batch_idx, starts], sin=sin[batch_idx, starts]
+                ).squeeze(1)
+                scores = torch.matmul(q[batch_idx, query_idx].float(), keys.float().T).T
+                scores = torch.relu(scores).sum(-1) / indexer.index_head_dim**0.5
+                top = scores.topk(min(indexer.block_topk, complete)).indices
+                tokens = block_tokens[top].flatten()
+            else:
+                tokens = visible_indices[:0]
+            tokens = torch.cat((tokens, visible_indices[complete * indexer.compress_ratio :]))
+            selected[batch_idx, query_idx, : tokens.numel()] = tokens.to(torch.int32)
+    return selected
+
+
 def gather_qsa_selected_indices(local_indices: torch.Tensor, group, world_size: int) -> torch.Tensor:
     """Assemble local query selections into global query order."""
     if world_size == 1:
@@ -218,4 +267,4 @@ def gather_qsa_selected_indices(local_indices: torch.Tensor, group, world_size: 
     return torch.cat(gathered, dim=1)
 
 
-__all__ = ["compact_qsa_select", "gather_qsa_selected_indices"]
+__all__ = ["compact_qsa_select", "explicit_mask_qsa_select", "gather_qsa_selected_indices"]

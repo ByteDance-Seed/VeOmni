@@ -261,7 +261,7 @@ def _get_model_test_kernels(qwen4_exp):
     )
 
 
-def _run_ple_halo_equivalence() -> None:
+def _run_ple_halo_equivalence(packed: bool = True) -> None:
     from veomni.distributed.parallel_state import _init_parallel_state as init_parallel_state
     from veomni.distributed.parallel_state import clear_parallel_state
     from veomni.models.transformers.qwen4_exp.generated import patched_modeling_qwen4_exp_gpu as qwen4_exp
@@ -288,7 +288,8 @@ def _run_ple_halo_equivalence() -> None:
 
         local_seq_len = max(ple.short_conv_state_len, ple.ple_embedding.context_len) + 2
         seq_len = local_seq_len * world_size
-        cu_seq_lens = torch.tensor([0, local_seq_len, seq_len], dtype=torch.int32, device=device)
+        boundaries = [0, local_seq_len, seq_len] if packed else [0, seq_len]
+        cu_seq_lens = torch.tensor(boundaries, dtype=torch.int32, device=device)
         full_ids = (torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0) + 3) % config.vocab_size
         # Exercise the packed-sample reset immediately before an SP boundary.
         full_ids[:, local_seq_len - 1] = config.eos_token_id
@@ -340,8 +341,9 @@ def _run_ple_halo_equivalence() -> None:
         clear_parallel_state()
 
 
-def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence():
-    torchrun(_run_ple_halo_equivalence, world_size=2)
+@pytest.mark.parametrize("packed", [False, True])
+def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence(packed):
+    torchrun(_run_ple_halo_equivalence, world_size=2, packed=packed)
 
 
 def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence_sp4():

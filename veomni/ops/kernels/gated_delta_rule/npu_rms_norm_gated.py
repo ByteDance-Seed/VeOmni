@@ -24,14 +24,25 @@ import torch_npu
 
 
 class NPUFusedRMSNormGated(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6, **kwargs):
+    def __init__(self, hidden_size, eps=1e-6, activation="silu", device=None, dtype=None, **kwargs):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        if activation not in {"silu", "sigmoid"}:
+            raise ValueError(f"Unsupported NPU gated RMSNorm activation: {activation!r}")
+        self.weight = nn.Parameter(torch.ones(hidden_size, device=device, dtype=dtype))
         self.variance_epsilon = eps
+        self.activation = activation
 
     def forward(self, hidden_states, gate=None):
-        hidden_states = torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
-        hidden_states = torch.cat([gate, hidden_states], dim=-1)
-        hidden_states = torch_npu.npu_swiglu(hidden_states, dim=-1)
-
-        return hidden_states
+        if gate is None or gate.shape != hidden_states.shape:
+            raise ValueError("NPU gated RMSNorm requires a gate with the input shape")
+        if self.activation == "sigmoid":
+            # Match Qwen4-Exp's rounding boundary: normalize, cast to the input
+            # dtype, then apply the learned weight. Fusing the learned weight
+            # into RMSNorm would move that boundary for BF16 compute weights.
+            unit_weight = torch.ones(hidden_states.shape[-1], device=hidden_states.device, dtype=hidden_states.dtype)
+            normalized = torch_npu.npu_rms_norm(hidden_states, unit_weight, self.variance_epsilon)[0]
+            weighted = self.weight * normalized.to(hidden_states.dtype)
+            return (weighted * gate.float().sigmoid()).to(hidden_states.dtype)
+        # Preserve the existing SiLU route for models such as Qwen3.6.
+        normalized = torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
+        return torch_npu.npu_swiglu(torch.cat([gate, normalized], dim=-1), dim=-1)
