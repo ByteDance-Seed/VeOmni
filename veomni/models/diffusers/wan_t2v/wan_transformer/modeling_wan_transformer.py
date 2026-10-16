@@ -336,7 +336,10 @@ def WanTransformerBlock_forward(
         ).chunk(6, dim=1)
 
     norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-    attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb, sp_valid_length=sp_valid_length)
+    # A model loaded via ``from_pretrained`` keeps the stock diffusers processor, which
+    # rejects ``sp_valid_length``; only forward it to our SP-aware processor.
+    attn_kwargs = {"sp_valid_length": sp_valid_length} if isinstance(self.attn1.processor, WanSPAttnProcessor) else {}
+    attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb, **attn_kwargs)
     hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
 
     norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
