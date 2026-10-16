@@ -24,20 +24,6 @@ def register_minimax_m3_vl_config():
     return MiniMaxM3VLConfig
 
 
-@MODEL_CONFIG_REGISTRY.register("minimax_m3_vl_text")
-def register_minimax_m3_vl_text_config():
-    from transformers.models.minimax_m3_vl.configuration_minimax_m3_vl import MiniMaxM3VLTextConfig
-
-    return MiniMaxM3VLTextConfig
-
-
-@MODEL_CONFIG_REGISTRY.register("minimax_m3_vl_vision")
-def register_minimax_m3_vl_vision_config():
-    from transformers.models.minimax_m3_vl.configuration_minimax_m3_vl import MiniMaxM3VLVisionConfig
-
-    return MiniMaxM3VLVisionConfig
-
-
 # ``get_model_processor`` keys this registry on the class name ``AutoProcessor``
 # resolved from the checkpoint. Public MiniMax M3 checkpoints ship their own
 # ``processing_minimax.py`` (``MiniMaxVLProcessor``) alongside the upstream class
@@ -51,6 +37,9 @@ def register_minimax_m3_vl_processor():
     return MiniMaxM3VLProcessor
 
 
+# Only the multimodal ``MiniMaxM3SparseForConditionalGeneration`` is supported:
+# the checkpoint converter and parallel plan use its ``model.language_model.*``
+# parameter names.
 @MODELING_REGISTRY.register("minimax_m3_vl")
 def register_minimax_m3_vl_modeling(architecture: str):
     from .checkpoint_tensor_converter import (
@@ -59,34 +48,15 @@ def register_minimax_m3_vl_modeling(architecture: str):
     )
 
     if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_minimax_m3_vl_npu import (
-            MiniMaxM3SparseForConditionalGeneration,
-            MiniMaxM3VLForCausalLM,
-            MiniMaxM3VLModel,
-            MiniMaxM3VLTextModel,
-        )
+        from .generated.patched_modeling_minimax_m3_vl_npu import MiniMaxM3SparseForConditionalGeneration
     else:
-        from .generated.patched_modeling_minimax_m3_vl_gpu import (
-            MiniMaxM3SparseForConditionalGeneration,
-            MiniMaxM3VLForCausalLM,
-            MiniMaxM3VLModel,
-            MiniMaxM3VLTextModel,
+        from .generated.patched_modeling_minimax_m3_vl_gpu import MiniMaxM3SparseForConditionalGeneration
+
+    if "ForConditionalGeneration" not in architecture:
+        raise ValueError(
+            f"MiniMax M3 VL supports only MiniMaxM3SparseForConditionalGeneration, got architecture {architecture!r}."
         )
-
-    for model_cls in (
-        MiniMaxM3SparseForConditionalGeneration,
-        MiniMaxM3VLForCausalLM,
-        MiniMaxM3VLModel,
-        MiniMaxM3VLTextModel,
-    ):
-        model_cls._create_checkpoint_tensor_converter = staticmethod(create_minimax_m3_vl_checkpoint_tensor_converter)
-        model_cls._convert_fqn_to_index_mapping = staticmethod(convert_minimax_m3_vl_fqn_to_index_mapping)
-
-    if "ForCausalLM" in architecture and "ConditionalGeneration" not in architecture:
-        return MiniMaxM3VLForCausalLM
-    elif "TextModel" in architecture:
-        return MiniMaxM3VLTextModel
-    elif "Model" in architecture and "ForConditionalGeneration" not in architecture:
-        return MiniMaxM3VLModel
-    else:
-        return MiniMaxM3SparseForConditionalGeneration
+    model_cls = MiniMaxM3SparseForConditionalGeneration
+    model_cls._create_checkpoint_tensor_converter = staticmethod(create_minimax_m3_vl_checkpoint_tensor_converter)
+    model_cls._convert_fqn_to_index_mapping = staticmethod(convert_minimax_m3_vl_fqn_to_index_mapping)
+    return model_cls

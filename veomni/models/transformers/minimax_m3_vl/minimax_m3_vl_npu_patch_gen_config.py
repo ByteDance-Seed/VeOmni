@@ -31,14 +31,12 @@ from veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config
     collate_multimodal_metadata,
     minimax_m3_vl_3d_rotary_embedding_forward_patched,
     minimax_m3_vl_attention_forward_patched,
-    minimax_m3_vl_for_causal_lm_forward_patched,
     minimax_m3_vl_get_metadata_collate_func_patched,
     minimax_m3_vl_get_parallel_plan_patched,
     minimax_m3_vl_get_position_id_func_patched,
     minimax_m3_vl_model_forward_patched,
     minimax_m3_vl_rmsnorm_forward_patched,
     minimax_m3_vl_sparse_for_conditional_generation_forward_patched,
-    minimax_m3_vl_text_get_parallel_plan_patched,
     minimax_m3_vl_text_model_forward_patched,
     minimax_m3_vl_vision_dummy_forward_patched,
     minimax_m3_vl_vision_model_forward_patched,
@@ -50,7 +48,6 @@ config = PatchConfig(
     source_module="transformers.models.minimax_m3_vl.modeling_minimax_m3_vl",
     target_file="patched_modeling_minimax_m3_vl_npu.py",
     description="MiniMax M3 VL with VeOmni parallel-plan hooks for NPU runtime selection",
-    transformers_version="5.16.0",
 )
 
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
@@ -60,7 +57,8 @@ config.add_import(
     names=["CausalLMOutputWithLogProbs", "FusedLinearAuxOutput", "FusedLinearAuxOutputMixin"],
 )
 config.drop_import_names("MoeCausalLMOutputWithPast")
-config.exclude_from_output("load_balancing_loss_func")
+# Only the multimodal model is supported; the text-only causal LM is not generated.
+config.exclude_from_output("load_balancing_loss_func", "MiniMaxM3VLForCausalLM")
 config.add_import(
     "veomni.distributed.sequence_parallel",
     names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"],
@@ -137,11 +135,6 @@ config.override_method(
     description="Accept only packed inputs and reject padded batches, KV cache and CP",
 )
 config.override_method(
-    "MiniMaxM3VLForCausalLM.forward",
-    replacement=minimax_m3_vl_for_causal_lm_forward_patched,
-    description="Unpack VeOmni causal LM loss tuple for MiniMax text-only training",
-)
-config.override_method(
     "MiniMaxM3SparseForConditionalGeneration.forward",
     replacement=minimax_m3_vl_sparse_for_conditional_generation_forward_patched,
     description="Unpack VeOmni causal LM loss tuple and route fused loss kernels when selected",
@@ -161,11 +154,6 @@ config.override_method(
     "MiniMaxM3SparseForConditionalGeneration.get_metadata_collate_func",
     replacement=minimax_m3_vl_get_metadata_collate_func_patched,
     description="Expose MiniMax CPU-side vision grid metadata derivation to the VeOmni collator",
-)
-config.override_method(
-    "MiniMaxM3VLForCausalLM.get_parallel_plan",
-    replacement=minimax_m3_vl_text_get_parallel_plan_patched,
-    description="Register MiniMax M3 VL expert parallel plan for text-only reduced-layer smoke tests",
 )
 
 config.add_helper_after("MiniMaxM3VLCausalLMOutputWithPast", MiniMaxM3VLCausalLMOutputWithLogProbs)

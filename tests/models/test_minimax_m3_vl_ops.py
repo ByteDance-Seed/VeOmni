@@ -19,8 +19,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from veomni.ops.kernels.cross_entropy import install_loss_mapping
-
 
 _MODELING_MODULES = (
     "veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_gpu",
@@ -75,47 +73,6 @@ def _text_config(modeling, **overrides):
 def _single_layer_sparse_text_model(modeling):
     config = _text_config(modeling, index_block_size=2, index_topk_blocks=2)
     return modeling.MiniMaxM3VLTextModel(config).eval()
-
-
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_for_causal_lm_unpacks_veomni_loss_contract(module_name):
-    modeling = importlib.import_module(module_name)
-    install_loss_mapping("eager")
-    config = _text_config(modeling, layer_types=["full_attention"], mlp_layer_types=["sparse"])
-    model = modeling.MiniMaxM3VLForCausalLM(config)
-    input_ids = torch.tensor([[1, 4, 5, 2]])
-    labels = torch.tensor([[4, 5, 2, -100]])
-
-    output = model(
-        input_ids=input_ids,
-        labels=labels,
-        position_ids=torch.arange(input_ids.shape[1]).unsqueeze(0),
-        cu_seq_lens_q=torch.tensor([0, input_ids.shape[1]], dtype=torch.int32),
-        cu_seq_lens_k=torch.tensor([0, input_ids.shape[1]], dtype=torch.int32),
-        max_length_q=input_ids.shape[1],
-        max_length_k=input_ids.shape[1],
-        use_cache=False,
-    )
-
-    assert output.loss.ndim == 0
-    assert output.logits.shape == (1, input_ids.shape[1], config.vocab_size)
-    assert not hasattr(output, "aux_loss")
-    output.loss.backward()
-    assert model.lm_head.weight.grad is not None
-
-
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_rejects_incompatible_router_aux_loss(module_name):
-    modeling = importlib.import_module(module_name)
-    config = _text_config(modeling, layer_types=["full_attention"], mlp_layer_types=["sparse"])
-    model = modeling.MiniMaxM3VLForCausalLM(config)
-
-    with pytest.raises(ValueError, match="router auxiliary loss is disabled"):
-        model(
-            input_ids=torch.tensor([[1, 4, 5, 2]]),
-            output_router_logits=True,
-            use_cache=False,
-        )
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
@@ -313,24 +270,26 @@ def test_minimax_m3_vl_vision_forward_threads_global_sp_metadata(
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_model_classes_bind_their_matching_parallel_plan(module_name, monkeypatch):
+def test_minimax_m3_vl_parallel_plan_targets_the_expert_parameters(module_name):
+    """Every EP plan pattern must match the stacked expert weights of the multimodal model."""
+    import fnmatch
+
+    from veomni.models.loader import get_model_config
+
     modeling = importlib.import_module(module_name)
-    text_config = SimpleNamespace(num_local_experts=4)
-    monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=False))
+    config = get_model_config("./tests/toy_config/minimax_m3_vl_toy")
+    with torch.device("meta"):
+        model = modeling.MiniMaxM3SparseForConditionalGeneration(config)
+    parameter_names = [name for name, _ in model.named_parameters()]
 
-    text_plan = modeling.MiniMaxM3VLForCausalLM.get_parallel_plan(SimpleNamespace(config=text_config))
-    vlm_plan = modeling.MiniMaxM3SparseForConditionalGeneration.get_parallel_plan(
-        SimpleNamespace(config=SimpleNamespace(text_config=text_config))
-    )
-
-    assert set(text_plan.extra_parallel_plan["ep"]) == {
-        "model.layers.*.mlp.experts.gate_up_proj",
-        "model.layers.*.mlp.experts.down_proj",
-    }
-    assert set(vlm_plan.extra_parallel_plan["ep"]) == {
+    plan = modeling.MiniMaxM3SparseForConditionalGeneration.get_parallel_plan(model)
+    patterns = set(plan.extra_parallel_plan["ep"])
+    assert patterns == {
         "model.language_model.layers.*.mlp.experts.gate_up_proj",
         "model.language_model.layers.*.mlp.experts.down_proj",
     }
+    for pattern in patterns:
+        assert fnmatch.filter(parameter_names, pattern), pattern
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)

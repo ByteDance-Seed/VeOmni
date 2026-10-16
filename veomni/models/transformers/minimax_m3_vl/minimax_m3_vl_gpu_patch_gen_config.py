@@ -51,14 +51,13 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.device import IS_NPU_AVAILABLE
-from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
+from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 
 
 config = PatchConfig(
     source_module="transformers.models.minimax_m3_vl.modeling_minimax_m3_vl",
     target_file="patched_modeling_minimax_m3_vl_gpu.py",
     description="MiniMax M3 VL with VeOmni parallel-plan hooks",
-    transformers_version="5.16.0",
 )
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import("veomni.ops.dispatch", names=["OpSlot"])
@@ -67,7 +66,8 @@ config.add_import(
     names=["CausalLMOutputWithLogProbs", "FusedLinearAuxOutput", "FusedLinearAuxOutputMixin"],
 )
 config.drop_import_names("MoeCausalLMOutputWithPast")
-config.exclude_from_output("load_balancing_loss_func")
+# Only the multimodal model is supported; the text-only causal LM is not generated.
+config.exclude_from_output("load_balancing_loss_func", "MiniMaxM3VLForCausalLM")
 config.add_import(
     "veomni.distributed.sequence_parallel",
     names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"],
@@ -770,102 +770,6 @@ def minimax_m3_vl_text_model_forward_patched(
     )
 
 
-# ================================================================
-# Patch: MiniMaxM3VLForCausalLM.forward
-# 1. slice hidden states before the LM head so eager and fused loss paths share
-#    the same logits_to_keep behavior
-# 2. unpack VeOmni's three-value causal-loss contract and preserve the fused
-#    linear auxiliary payload on the returned ModelOutput
-# 3. reject the upstream Switch-style router auxiliary loss because it applies
-#    softmax routing without MiniMax's expert correction bias
-# ================================================================
-@config.override_method(
-    "MiniMaxM3VLForCausalLM.forward",
-    description="Unpack VeOmni causal LM loss tuple for MiniMax text-only training",
-)
-def minimax_m3_vl_for_causal_lm_forward_patched(
-    self,
-    input_ids=None,
-    attention_mask=None,
-    position_ids=None,
-    past_key_values=None,
-    inputs_embeds=None,
-    labels=None,
-    use_cache=None,
-    output_router_logits=None,
-    logits_to_keep=0,
-    **kwargs,
-):
-    r"""
-    labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-        Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-        config.vocab_size]` or -100. Tokens with indices set to -100 are ignored.
-    """
-    # --- Patch.3 ---
-    output_router_logits = (
-        output_router_logits if output_router_logits is not None else self.config.output_router_logits
-    )
-    # --- Patch.3 ---
-
-    outputs = self.model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=past_key_values,
-        inputs_embeds=inputs_embeds,
-        use_cache=use_cache,
-        # --- Patch.3 ---
-        output_router_logits=output_router_logits,
-        # --- Patch.3 ---
-        **kwargs,
-    )
-
-    # --- Patch.1 ---
-    hidden_states = outputs.last_hidden_state
-    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-    hidden_states = hidden_states[:, slice_indices, :]
-    # --- Patch.1 ---
-
-    # --- Patch.2 ---
-    loss = None
-    logits = None
-    fused_linear_aux = None
-    if labels is not None:
-        if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                logits=None,
-                labels=labels,
-                vocab_size=self.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-        else:
-            logits = self.lm_head(hidden_states)
-            loss, _, fused_linear_aux = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-            if fused_linear_aux is not None:
-                logits = None
-    else:
-        logits = self.lm_head(hidden_states)
-    # --- Patch.2 ---
-
-    return CausalLMOutputWithLogProbs(
-        loss=loss,
-        logits=logits,
-        past_key_values=outputs.past_key_values,
-        hidden_states=outputs.hidden_states,
-        attentions=outputs.attentions,
-        fused_linear_aux=fused_linear_aux,
-    )
-
-
 @config.override_method(
     "MiniMaxM3SparseForConditionalGeneration.forward",
     description="Unpack VeOmni causal LM loss tuple and route fused loss kernels when selected",
@@ -983,13 +887,3 @@ def minimax_m3_vl_get_position_id_func_patched(self):
 )
 def minimax_m3_vl_get_metadata_collate_func_patched(self):
     return collate_multimodal_metadata  # noqa: F821 defined via add_helper
-
-
-@config.override_method(
-    "MiniMaxM3VLForCausalLM.get_parallel_plan",
-    description="Register MiniMax M3 VL expert parallel plan for text-only reduced-layer smoke tests",
-)
-def minimax_m3_vl_text_get_parallel_plan_patched(self):
-    from ..parallel_plan import get_text_parallel_plan
-
-    return get_text_parallel_plan()
