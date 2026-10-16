@@ -512,4 +512,5 @@ class TestCausalConv1dShortSegmentPacked:
 
         expected_dw = w_0.grad + w_1.grad
         torch.testing.assert_close(weight.grad, expected_dw, rtol=1e-2, atol=1e-2)
-
+        expected_dh0 = torch.cat((init_0.grad, init_1.grad), dim=0)
+        torch.testing.assert_close(initial_state.grad, expected_dh0, rtol=1e-2, atol=1e-2)
