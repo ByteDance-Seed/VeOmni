@@ -14,9 +14,9 @@
 """
 Patch configuration for MiniMax M3 VL NPU code generation.
 
-This path mirrors the GPU patch set and binds MiniMax's SwiGLU-OAI experts to
-the NPU fused-MoE registry variant while retaining the upstream eager fallback
-when eager MoE is selected without expert parallelism.
+This path reuses the GPU patch set unchanged. Device-specific behavior (fused
+MoE, RMSNorm and sparse attention backends) is selected at runtime through the
+op registry, so the NPU artifact differs from the GPU one only in helper order.
 
 Regen command:
 patchgen veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_npu_patch_gen_config -o veomni/models/transformers/minimax_m3_vl/generated --diff

@@ -478,8 +478,8 @@
 +        # The indexer is not trained: block selection is a top-k over discrete block
 +        # scores and no indexer loss is computed, so no gradient can reach these
 +        # parameters and they keep their checkpoint values. Freezing them states that
-+        # explicitly, which DDP needs (it otherwise waits forever for their gradients)
-+        # and keeps them out of the optimizer. MiniMax describes the indexer as
++        # explicitly, which DDP needs (without ``find_unused_parameters`` it raises on
++        # the next iteration) and keeps them out of the optimizer. MiniMax describes the indexer as
 +        # distilled from full attention with a KL objective, but has not published how
 +        # it is handled in post-training; add that objective here once it is known.
 +        self.requires_grad_(False)
