@@ -85,6 +85,11 @@ def test_swiglu_activation_without_alpha_is_bitwise_the_standard_swiglu():
 
     activation = swiglu_activation(gate, up, None)
     grad_gate, grad_up = swiglu_activation_backward(grad, gate, up, None)
+    # The EP backward recomputes the activation once and reuses silu(gate).
+    recomputed, gate_activation = swiglu_activation(gate, up, None, return_gate_activation=True)
+    reused_grad_gate, reused_grad_up = swiglu_activation_backward(grad, gate, up, None, gate_activation)
+    assert torch.equal(recomputed, activation)
+    assert torch.equal(reused_grad_gate, grad_gate) and torch.equal(reused_grad_up, grad_up)
 
     silu_gate = torch.ops.aten.silu(gate)
     assert torch.equal(activation, silu_gate * up)

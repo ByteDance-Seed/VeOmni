@@ -496,8 +496,10 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         ) = ctx.saved_tensors
         swiglu_limit = ctx.swiglu_limit
 
-        # recompute
-        fc1_result = swiglu_activation(fc1_1_output, fc1_2_output, ctx.swiglu_alpha)
+        # recompute (silu(gate) is computed once and reused by the gate gradients)
+        fc1_result, fc1_1_activation = swiglu_activation(
+            fc1_1_output, fc1_2_output, ctx.swiglu_alpha, return_gate_activation=True
+        )
 
         # dgrad fc2
         grad_fc1_result = group_gemm_same_nk(
@@ -524,7 +526,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
 
         # gate gradients
         grad_fc1_1_output, grad_fc1_2_output = swiglu_activation_backward(
-            grad_fc1_result, fc1_1_output, fc1_2_output, ctx.swiglu_alpha
+            grad_fc1_result, fc1_1_output, fc1_2_output, ctx.swiglu_alpha, fc1_1_activation
         )
 
         if swiglu_limit is not None:

@@ -37,19 +37,44 @@ def swiglu_oai_backward(
     return grad_gate, grad_up
 
 
-def swiglu_activation(gate: torch.Tensor, up: torch.Tensor, swiglu_alpha: float | None) -> torch.Tensor:
-    """Fused-MoE gated activation: standard SwiGLU, or SwiGLU-OAI when ``swiglu_alpha`` is set."""
+def swiglu_activation(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    swiglu_alpha: float | None,
+    *,
+    return_gate_activation: bool = False,
+):
+    """Fused-MoE gated activation: standard SwiGLU, or SwiGLU-OAI when ``swiglu_alpha`` is set.
+
+    With ``return_gate_activation`` also returns ``silu(gate)`` (``None`` for
+    SwiGLU-OAI) so a caller recomputing the activation in backward can hand it to
+    :func:`swiglu_activation_backward` instead of evaluating SiLU twice.
+    """
     if swiglu_alpha is None:
-        return torch.ops.aten.silu(gate) * up
-    return swiglu_oai(gate, up, swiglu_alpha)
+        gate_activation = torch.ops.aten.silu(gate)
+        output = gate_activation * up
+    else:
+        gate_activation = None
+        output = swiglu_oai(gate, up, swiglu_alpha)
+    return (output, gate_activation) if return_gate_activation else output
 
 
 def swiglu_activation_backward(
-    grad_output: torch.Tensor, gate: torch.Tensor, up: torch.Tensor, swiglu_alpha: float | None
+    grad_output: torch.Tensor,
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    swiglu_alpha: float | None,
+    gate_activation: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gradients of :func:`swiglu_activation` w.r.t. its (post-clamp) ``gate`` and ``up``."""
+    """Gradients of :func:`swiglu_activation` w.r.t. its (post-clamp) ``gate`` and ``up``.
+
+    ``gate_activation`` is an already computed ``silu(gate)`` for the standard
+    path; it is recomputed when omitted.
+    """
     if swiglu_alpha is None:
+        if gate_activation is None:
+            gate_activation = torch.ops.aten.silu(gate)
         grad_gate = torch.ops.aten.silu_backward(grad_output * up, gate)
-        grad_up = torch.ops.aten.silu(gate) * grad_output
+        grad_up = gate_activation * grad_output
         return grad_gate, grad_up
     return swiglu_oai_backward(grad_output, gate, up, swiglu_alpha)
