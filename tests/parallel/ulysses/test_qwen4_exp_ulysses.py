@@ -157,21 +157,30 @@ def _slice_conv1d_weight(
 
 
 def _run_ple_halo_equivalence(packed: bool = False) -> None:
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     try:
-        _init_parallel_state(
+        sp_state = _init_parallel_state(
             dp_size=1,
             ulysses_size=world_size,
             device_type=get_device_type(),
             extra_parallel_names=("ple",),
             extra_parallel_sizes=(1,),
             extra_parallel_placement_innermost=(False,),
-            name=None,
+            name="sp",
+        )
+        dp_state = _init_parallel_state(
+            dp_size=world_size,
+            ulysses_size=1,
+            device_type=get_device_type(),
+            extra_parallel_names=("ple",),
+            extra_parallel_sizes=(1,),
+            extra_parallel_placement_innermost=(False,),
+            name="dp",
         )
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
         torch.manual_seed(17)
@@ -189,17 +198,11 @@ def _run_ple_halo_equivalence(packed: bool = False) -> None:
         local_slice = slice(rank * local_seq_len, (rank + 1) * local_seq_len)
         local_ids = full_ids[:, local_slice].contiguous()
 
-        no_sp_state = SimpleNamespace(
-            ulysses_enabled=False,
-            ulysses_group=None,
-            ulysses_rank=0,
-            ulysses_size=1,
-            extra_parallel_sizes={"ple": 1},
-        )
-        with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+        with use_parallel_state(dp_state):
             expected_embeddings = ple.ple_embedding(full_ids, past_key_values=None).detach()
 
-        actual_embeddings = ple.ple_embedding(local_ids, past_key_values=None).detach()
+        with use_parallel_state(sp_state):
+            actual_embeddings = ple.ple_embedding(local_ids, past_key_values=None).detach()
         torch.testing.assert_close(_gather_sequence(actual_embeddings), expected_embeddings)
 
         torch.manual_seed(29)
@@ -212,7 +215,7 @@ def _run_ple_halo_equivalence(packed: bool = False) -> None:
         )
         boundaries = [0, local_seq_len - 1, seq_len] if packed else None
         cu_seq_lens = torch.tensor(boundaries, dtype=torch.int32, device=device) if boundaries is not None else None
-        with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+        with use_parallel_state(dp_state):
             expected_output = ple._short_conv(
                 full_hidden,
                 past_key_values=None,
@@ -224,12 +227,13 @@ def _run_ple_halo_equivalence(packed: bool = False) -> None:
         ple.conv1d.weight.grad = None
 
         local_hidden = full_hidden.detach()[:, local_slice].contiguous().requires_grad_(True)
-        actual_output = ple._short_conv(
-            local_hidden,
-            past_key_values=None,
-            cu_seq_lens_q=cu_seq_lens,
-        )
-        actual_output.sum().backward()
+        with use_parallel_state(sp_state):
+            actual_output = ple._short_conv(
+                local_hidden,
+                past_key_values=None,
+                cu_seq_lens_q=cu_seq_lens,
+            )
+            actual_output.sum().backward()
         dist.all_reduce(ple.conv1d.weight.grad, op=dist.ReduceOp.SUM)
 
         torch.testing.assert_close(_gather_sequence(actual_output.detach()), expected_output.detach())
@@ -255,7 +259,7 @@ def _run_qsa_equivalence(
     num_attention_heads: int = 2,
     num_key_value_heads: int = 1,
 ) -> None:
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
 
@@ -263,11 +267,17 @@ def _run_qsa_equivalence(
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     try:
-        _init_parallel_state(
+        sp_state = _init_parallel_state(
             dp_size=1,
             ulysses_size=world_size,
             device_type=get_device_type(),
-            name=None,
+            name="sp",
+        )
+        dp_state = _init_parallel_state(
+            dp_size=world_size,
+            ulysses_size=1,
+            device_type=get_device_type(),
+            name="dp",
         )
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
@@ -298,13 +308,7 @@ def _run_qsa_equivalence(
         expected_parameter_grads = None
         if rank == 0:
             baseline_input = full_hidden.detach().clone().requires_grad_(True)
-            no_sp_state = SimpleNamespace(
-                ulysses_enabled=False,
-                ulysses_group=None,
-                ulysses_rank=0,
-                ulysses_size=1,
-            )
-            with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+            with use_parallel_state(dp_state):
                 expected_output, _ = attention(
                     baseline_input,
                     position_embeddings=position_embeddings,
@@ -324,30 +328,33 @@ def _run_qsa_equivalence(
         local_slice = slice(rank * local_seq_len, (rank + 1) * local_seq_len)
         local_hidden = full_hidden[:, local_slice].detach().contiguous().requires_grad_(True)
         local_position_embeddings = tuple(tensor[:, local_slice].contiguous() for tensor in position_embeddings)
-        selected_indices = attention.indexer(
-            local_hidden,
-            local_position_embeddings,
-            None,
-            None,
-            cu_seq_lens_q=cu_seq_lens_q,
-        )
-        valid_indices = selected_indices >= 0
-        query_positions = torch.arange(seq_len, device=device).view(1, seq_len, 1)
-        assert torch.all(selected_indices[valid_indices] <= query_positions.expand_as(selected_indices)[valid_indices])
-        before_boundary = query_positions < packed_boundary
-        assert torch.all(
-            (selected_indices < packed_boundary)[valid_indices & before_boundary.expand_as(selected_indices)]
-        )
-        assert torch.all(
-            (selected_indices >= packed_boundary)[valid_indices & ~before_boundary.expand_as(selected_indices)]
-        )
-        actual_output, _ = attention(
-            local_hidden,
-            position_embeddings=local_position_embeddings,
-            attention_mask=None,
-            cu_seq_lens_q=cu_seq_lens_q,
-        )
-        (actual_output.sum() / (seq_len * actual_output.shape[-1])).backward()
+        with use_parallel_state(sp_state):
+            selected_indices = attention.indexer(
+                local_hidden,
+                local_position_embeddings,
+                None,
+                None,
+                cu_seq_lens_q=cu_seq_lens_q,
+            )
+            valid_indices = selected_indices >= 0
+            query_positions = torch.arange(seq_len, device=device).view(1, seq_len, 1)
+            assert torch.all(
+                selected_indices[valid_indices] <= query_positions.expand_as(selected_indices)[valid_indices]
+            )
+            before_boundary = query_positions < packed_boundary
+            assert torch.all(
+                (selected_indices < packed_boundary)[valid_indices & before_boundary.expand_as(selected_indices)]
+            )
+            assert torch.all(
+                (selected_indices >= packed_boundary)[valid_indices & ~before_boundary.expand_as(selected_indices)]
+            )
+            actual_output, _ = attention(
+                local_hidden,
+                position_embeddings=local_position_embeddings,
+                attention_mask=None,
+                cu_seq_lens_q=cu_seq_lens_q,
+            )
+            (actual_output.sum() / (seq_len * actual_output.shape[-1])).backward()
         _sum_parameter_gradients(attention)
 
         actual_output = _gather_sequence(actual_output.detach())
@@ -458,18 +465,24 @@ def _run_gated_deltanet_equivalence(
     num_k_heads: int | None = None,
     num_v_heads: int | None = None,
 ) -> None:
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     try:
-        _init_parallel_state(
+        sp_state = _init_parallel_state(
             dp_size=1,
             ulysses_size=world_size,
             device_type=get_device_type(),
-            name=None,
+            name="sp",
+        )
+        dp_state = _init_parallel_state(
+            dp_size=world_size,
+            ulysses_size=1,
+            device_type=get_device_type(),
+            name="dp",
         )
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
@@ -501,13 +514,7 @@ def _run_gated_deltanet_equivalence(
         expected_parameter_grads = None
         if rank == 0:
             baseline_input = full_hidden.detach().clone().requires_grad_(True)
-            no_sp_state = SimpleNamespace(
-                ulysses_enabled=False,
-                ulysses_group=None,
-                ulysses_rank=0,
-                ulysses_size=1,
-            )
-            with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+            with use_parallel_state(dp_state):
                 expected_output = layer(
                     baseline_input,
                     cu_seq_lens_q=cu_seq_lens,
@@ -524,8 +531,9 @@ def _run_gated_deltanet_equivalence(
         dist.barrier()
         local_slice = slice(rank * local_seq_len, (rank + 1) * local_seq_len)
         local_hidden = full_hidden[:, local_slice].detach().contiguous().requires_grad_(True)
-        actual_output = layer(local_hidden, cu_seq_lens_q=cu_seq_lens)
-        (actual_output.sum() / (seq_len * actual_output.shape[-1])).backward()
+        with use_parallel_state(sp_state):
+            actual_output = layer(local_hidden, cu_seq_lens_q=cu_seq_lens)
+            (actual_output.sum() / (seq_len * actual_output.shape[-1])).backward()
         _sum_parameter_gradients(layer)
 
         actual_output = _gather_sequence(actual_output.detach())
@@ -640,7 +648,7 @@ def test_qwen4_exp_gated_deltanet_forward_deterministic_no_sp(bsz: int, seq_len:
 
 
 def _run_text_model_equivalence() -> None:
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
 
@@ -648,14 +656,23 @@ def _run_text_model_equivalence() -> None:
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     try:
-        _init_parallel_state(
+        sp_state = _init_parallel_state(
             dp_size=1,
             ulysses_size=world_size,
             device_type=get_device_type(),
             extra_parallel_names=("ple",),
             extra_parallel_sizes=(1,),
             extra_parallel_placement_innermost=(False,),
-            name=None,
+            name="sp",
+        )
+        dp_state = _init_parallel_state(
+            dp_size=world_size,
+            ulysses_size=1,
+            device_type=get_device_type(),
+            extra_parallel_names=("ple",),
+            extra_parallel_sizes=(1,),
+            extra_parallel_placement_innermost=(False,),
+            name="dp",
         )
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
@@ -685,15 +702,7 @@ def _run_text_model_equivalence() -> None:
         expected_output = None
         expected_parameter_grads = None
         if rank == 0:
-            no_sp_state = SimpleNamespace(
-                cp_enabled=False,
-                ulysses_enabled=False,
-                ulysses_group=None,
-                ulysses_rank=0,
-                ulysses_size=1,
-                extra_parallel_sizes={"ple": 1},
-            )
-            with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+            with use_parallel_state(dp_state):
                 expected_output = model(
                     input_ids=full_input_ids,
                     attention_mask=attention_mask,
@@ -710,13 +719,14 @@ def _run_text_model_equivalence() -> None:
 
         dist.barrier()
         local_slice = slice(rank * local_seq_len, (rank + 1) * local_seq_len)
-        actual_output = model(
-            input_ids=full_input_ids[:, local_slice].contiguous(),
-            attention_mask=attention_mask,
-            position_ids=full_position_ids[:, local_slice].contiguous(),
-            cu_seq_lens_q=cu_seq_lens,
-        ).last_hidden_state
-        (actual_output.sum() / (seq_len * actual_output.shape[-1])).backward()
+        with use_parallel_state(sp_state):
+            actual_output = model(
+                input_ids=full_input_ids[:, local_slice].contiguous(),
+                attention_mask=attention_mask,
+                position_ids=full_position_ids[:, local_slice].contiguous(),
+                cu_seq_lens_q=cu_seq_lens,
+            ).last_hidden_state
+            (actual_output.sum() / (seq_len * actual_output.shape[-1])).backward()
         _sum_parameter_gradients(model)
         actual_output = _gather_sequence(actual_output.detach())
 
@@ -743,21 +753,30 @@ def test_qwen4_exp_packed_text_model_matches_full_sequence():
 
 
 def _run_router_aux_loss_equivalence() -> None:
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     try:
-        _init_parallel_state(
+        sp_state = _init_parallel_state(
             dp_size=1,
             ulysses_size=world_size,
             device_type=get_device_type(),
             extra_parallel_names=("ple",),
             extra_parallel_sizes=(1,),
             extra_parallel_placement_innermost=(False,),
-            name=None,
+            name="sp",
+        )
+        dp_state = _init_parallel_state(
+            dp_size=world_size,
+            ulysses_size=1,
+            device_type=get_device_type(),
+            extra_parallel_names=("ple",),
+            extra_parallel_sizes=(1,),
+            extra_parallel_placement_innermost=(False,),
+            name="dp",
         )
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG)
@@ -781,18 +800,7 @@ def _run_router_aux_loss_equivalence() -> None:
         expected_aux_loss = None
         expected_parameter_grads = None
         if rank == 0:
-            no_sp_state = SimpleNamespace(
-                cp_enabled=False,
-                sp_enabled=False,
-                sp_size=1,
-                ulysses_enabled=False,
-                ulysses_group=None,
-                ulysses_rank=0,
-                ulysses_size=1,
-                fsdp_enabled=True,
-                extra_parallel_sizes={"ple": 1},
-            )
-            with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+            with use_parallel_state(dp_state):
                 expected = model(
                     input_ids=full_input_ids,
                     attention_mask=attention_mask,
@@ -829,18 +837,19 @@ def _run_router_aux_loss_equivalence() -> None:
 
         dist.barrier()
         local_slice = slice(rank * local_seq_len, (rank + 1) * local_seq_len)
-        actual = model(
-            input_ids=full_input_ids[:, local_slice].contiguous(),
-            attention_mask=attention_mask,
-            position_ids=full_position_ids[..., local_slice].contiguous(),
-            image_mask=empty_mask,
-            video_mask=empty_mask,
-            qwen4_exp_position_ids_layout="batch_first",
-            cu_seq_lens_q=cu_seq_lens,
-            output_router_logits=True,
-            logits_to_keep=1,
-        )
-        actual.aux_loss.backward()
+        with use_parallel_state(sp_state):
+            actual = model(
+                input_ids=full_input_ids[:, local_slice].contiguous(),
+                attention_mask=attention_mask,
+                position_ids=full_position_ids[..., local_slice].contiguous(),
+                image_mask=empty_mask,
+                video_mask=empty_mask,
+                qwen4_exp_position_ids_layout="batch_first",
+                cu_seq_lens_q=cu_seq_lens,
+                output_router_logits=True,
+                logits_to_keep=1,
+            )
+            actual.aux_loss.backward()
         actual_aux_loss = actual.aux_loss.detach().clone()
         dist.all_reduce(actual_aux_loss, op=dist.ReduceOp.SUM)
         actual_aux_loss.div_(world_size)
@@ -871,21 +880,30 @@ def test_qwen4_exp_router_aux_loss_matches_mean_of_local_shards():
 
 
 def _run_vlm_placeholder_equivalence() -> None:
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     try:
-        _init_parallel_state(
+        sp_state = _init_parallel_state(
             dp_size=1,
             ulysses_size=world_size,
             device_type=get_device_type(),
             extra_parallel_names=("ple",),
             extra_parallel_sizes=(1,),
             extra_parallel_placement_innermost=(False,),
-            name=None,
+            name="sp",
+        )
+        dp_state = _init_parallel_state(
+            dp_size=world_size,
+            ulysses_size=1,
+            device_type=get_device_type(),
+            extra_parallel_names=("ple",),
+            extra_parallel_sizes=(1,),
+            extra_parallel_placement_innermost=(False,),
+            name="dp",
         )
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG)
@@ -931,19 +949,8 @@ def _run_vlm_placeholder_equivalence() -> None:
         expected_parameter_grads = None
         if rank == 0:
             baseline_pixels = full_pixels.detach().clone().requires_grad_(True)
-            no_sp_state = SimpleNamespace(
-                cp_enabled=False,
-                sp_enabled=False,
-                sp_size=1,
-                ulysses_enabled=False,
-                ulysses_group=None,
-                ulysses_rank=0,
-                ulysses_size=1,
-                fsdp_enabled=False,
-                extra_parallel_sizes={"ple": 1},
-            )
             model.visual.config._attn_implementation = "flash_attention_2"
-            with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+            with use_parallel_state(dp_state):
                 expected_output = model(
                     input_ids=full_input_ids,
                     attention_mask=attention_mask,
@@ -966,28 +973,30 @@ def _run_vlm_placeholder_equivalence() -> None:
             model.zero_grad(set_to_none=True)
 
         dist.barrier()
+        patch_embed_rows.clear()
         local_slice = slice(rank * local_seq_len, (rank + 1) * local_seq_len)
         pixel_rows_per_rank = full_pixels.shape[0] // world_size
         pixel_slice = slice(rank * pixel_rows_per_rank, (rank + 1) * pixel_rows_per_rank)
         local_pixels = full_pixels[pixel_slice].detach().contiguous().requires_grad_(True)
-        actual_output = model(
-            input_ids=full_input_ids[:, local_slice].contiguous(),
-            attention_mask=attention_mask,
-            position_ids=full_position_ids[..., local_slice].contiguous(),
-            pixel_values=local_pixels,
-            image_grid_thw=image_grid_thw,
-            image_mask=image_mask,
-            video_mask=video_mask,
-            qwen4_exp_position_ids_layout="batch_first",
-            multimodal_metadata={
-                "image_grid_thw_list": [[1, 2, 4]],
-                "vit_image_cu_seqlens": torch.tensor([0, 8], dtype=torch.int32, device=device),
-                "vit_image_max_seqlen": 8,
-            },
-            cu_seq_lens_q=cu_seq_lens,
-        ).last_hidden_state
-        assert patch_embed_rows[-1] == local_pixels.shape[0]
-        (actual_output.sum() / (seq_len * actual_output.shape[-1])).backward()
+        with use_parallel_state(sp_state):
+            actual_output = model(
+                input_ids=full_input_ids[:, local_slice].contiguous(),
+                attention_mask=attention_mask,
+                position_ids=full_position_ids[..., local_slice].contiguous(),
+                pixel_values=local_pixels,
+                image_grid_thw=image_grid_thw,
+                image_mask=image_mask,
+                video_mask=video_mask,
+                qwen4_exp_position_ids_layout="batch_first",
+                multimodal_metadata={
+                    "image_grid_thw_list": [[1, 2, 4]],
+                    "vit_image_cu_seqlens": torch.tensor([0, 8], dtype=torch.int32, device=device),
+                    "vit_image_max_seqlen": 8,
+                },
+                cu_seq_lens_q=cu_seq_lens,
+            ).last_hidden_state
+            assert patch_embed_rows[0] == local_pixels.shape[0]
+            (actual_output.sum() / (seq_len * actual_output.shape[-1])).backward()
         _sum_parameter_gradients(model)
         actual_output = _gather_sequence(actual_output.detach())
         actual_pixel_grad = _gather_sequence(local_pixels.grad.detach().unsqueeze(0)).squeeze(0)

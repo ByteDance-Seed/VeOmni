@@ -20,10 +20,8 @@ import pytest
 import torch.distributed as dist
 from torch.testing._internal.common_utils import run_tests
 
-from veomni.distributed.sequence_parallel.comm import (
-    get_ulysses_sequence_parallel_group,
-    set_ulysses_sequence_parallel_group,
-)
+from veomni.distributed.parallel_state import use_parallel_state
+from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
@@ -92,12 +90,13 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         loss_func = self._overlapping_grad
 
         # forward & backward for sp
-        sp_rst = attn_sp(part_input, unpad_size)
-        sp_full_rst = gather_outputs(
-            sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
-        )
-        loss_sp = loss_func(sp_rst)
-        loss_sp.backward()
+        with use_parallel_state(self.sp_state):
+            sp_rst = attn_sp(part_input, unpad_size)
+            sp_full_rst = gather_outputs(
+                sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
+            )
+            loss_sp = loss_func(sp_rst)
+            loss_sp.backward()
         attn_sp_o_grad = attn_sp.proj_o.weight.grad.detach().clone()
         attn_sp_q_grad = attn_sp.q_proj.weight.grad.detach().clone()
         part_input_grad = part_input.grad.detach().clone()
@@ -107,10 +106,10 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
         # forward & backward for dp
-        set_ulysses_sequence_parallel_group(None)
-        dp_rst = attn_dp(full_input, unpad_size)
-        loss_dp = loss_func(dp_rst)
-        loss_dp.backward()
+        with use_parallel_state(self.dp_state):
+            dp_rst = attn_dp(full_input, unpad_size)
+            loss_dp = loss_func(dp_rst)
+            loss_dp.backward()
         attn_dp_o_grad = attn_dp.proj_o.weight.grad.detach().clone()
         attn_dp_q_grad = attn_dp.q_proj.weight.grad.detach().clone()
         full_input_grad = full_input.grad.detach().clone()
@@ -144,12 +143,13 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         loss_func = self._non_overlapping_grad
 
         # forward & backward for sp
-        sp_rst = attn_sp(part_input, unpad_size)
-        sp_full_rst = gather_outputs(
-            sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
-        )
-        loss_sp = loss_func(sp_rst)
-        loss_sp.backward()
+        with use_parallel_state(self.sp_state):
+            sp_rst = attn_sp(part_input, unpad_size)
+            sp_full_rst = gather_outputs(
+                sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
+            )
+            loss_sp = loss_func(sp_rst)
+            loss_sp.backward()
         attn_sp_o_grad = attn_sp.proj_o.weight.grad.detach().clone()
         attn_sp_q_grad = attn_sp.q_proj.weight.grad.detach().clone()
         part_input_grad = part_input.grad.detach().clone()
@@ -159,10 +159,10 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
         # forward & backward for dp
-        set_ulysses_sequence_parallel_group(None)
-        dp_rst = attn_dp(full_input, unpad_size)
-        loss_dp = loss_func(dp_rst)
-        loss_dp.backward()
+        with use_parallel_state(self.dp_state):
+            dp_rst = attn_dp(full_input, unpad_size)
+            loss_dp = loss_func(dp_rst)
+            loss_dp.backward()
         attn_dp_o_grad = attn_dp.proj_o.weight.grad.detach().clone()
         attn_dp_q_grad = attn_dp.q_proj.weight.grad.detach().clone()
         full_input_grad = full_input.grad.detach().clone()

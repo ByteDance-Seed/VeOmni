@@ -301,7 +301,7 @@ def chunk_gated_delta_rule_fwd_h(
 })
 @triton.autotune(
     configs=get_autotune_config(multibuffer_list=(True, False)),
-    key=['H', 'K', 'V', 'BT', 'BV', 'USE_G', 'IS_VARLEN'],
+    key=['H', 'K', 'V', 'BT'],
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
