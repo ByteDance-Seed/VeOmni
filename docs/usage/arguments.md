@@ -163,7 +163,7 @@ own `safetensor_idx_path`.
 | lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
 | ops_implementation | `OpsImplementationConfig` | — | Attention / MoE kernel configuration. |
 | broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
-| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
+| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint (for an HF per-expert MoE checkpoint, only its own experts' tensors, when the model's checkpoint converter supports it, e.g. Qwen3-MoE / Qwen3.5-MoE / DeepSeek-V3 / GLM-5 / DeepSeek-V4, including DeepSeek-V4's FP4/FP8 experts). Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule for this model. |
 | accelerator | `AcceleratorConfig` | — | Parallelism, sharding, and placement for this model. |
 
@@ -382,7 +382,8 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | prefetch_factor | `int` | `2` | Number of batches loaded in advance per worker. |
 | persistent_workers | `bool` | `False` | Keep DataLoader worker processes alive between iterator recreations. |
 | in_order | `bool` | `True` | Return worker-loaded batches in first-in, first-out order. Set `False` to avoid slow worker head-of-line blocking for uneven sample decode costs; checkpoint/resume ordering is not guaranteed in this mode. |
-| drop_last | `bool` | `True` | Whether to drop the last incomplete batch. |
+| drop_last | `bool` | `True` | Whether to drop the last incomplete batch. DiT `offline_embedding` forces `False`. |
+| shuffle | `bool` | `True` | Shuffle the training data. Mapping datasets shuffle the sampler order, reseeded from `train.seed` each epoch; iterable datasets (including iterable multisource sources) shuffle through a streaming buffer. Energon datasets ignore it. DiT `offline_embedding` forces `False`. |
 | pin_memory | `bool` | `True` | Whether to pin memory for the dataloader. |
 | worker_num_threads | `Optional[int]` | `None` | Number of PyTorch threads used by each DataLoader worker. |
 | use_background_prefetcher | `bool` | `False` | Enable background prefetching around the DataLoader. |
@@ -531,10 +532,73 @@ distinct from the first emission.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| enable | `bool` | `True` | Enable gradient checkpointing. |
+| enable | `bool` | `True` | Enable gradient checkpointing. Master switch: with it off, the fields below have no effect. |
 | debug | `bool` | `False` | Enable [checkpoint debugging](https://docs.pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.set_checkpoint_debug_enabled). |
-| enable_reentrant | `bool` | `False` | Use reentrant gradient checkpointing. |
+| enable_reentrant | `bool` | `False` | Use reentrant gradient checkpointing. torch refuses it together with SAC, and it cannot carry a recompute context. |
 | early_stop | `bool` | `True` | Stop non-reentrant checkpoint recomputation as soon as all needed tensors are computed. PyTorch ignores this option when `enable_reentrant=True`. |
+| recompute_layers | `int` | `-1` | How many blocks recompute, counted from the end of the stack: `-1` = all, `N` = the last `N`, `0` = none. See [Layer-scoped recomputation](#layer-scoped-recomputation). |
+| selective_recompute_layers | `int` | `0` | How many of those blocks run selective activation checkpointing (SAC) instead, counted from the front of the recomputed range. Needs `enable_reentrant=False`. |
+| save_ops | `List[str]` | `[]` | Operators SAC keeps instead of recomputing, on top of the attention set it always keeps. Empty means that attention set alone. |
+
+#### Layer-scoped recomputation
+
+`recompute_layers`, `selective_recompute_layers` and `save_ops` pick *which*
+blocks recompute, without touching model code. The framework finds the stack
+itself, from `model.basic_modules` plus `model._no_split_modules` — the same
+class set FSDP2 shards on, so both agree on what a block is. Every
+`nn.ModuleList` / `nn.Sequential` holding at least two matching children is a
+candidate; candidates sharing a parent are folded into one sequence in
+registration order (Flux: `blocks` + `single_blocks` = 57 blocks, the order the
+model runs them). The parent that wins is the one named by a class in
+`model.basic_modules`, else the one holding trainable parameters, else the one
+with more blocks. Candidates under another parent — a vision tower beside the
+decoder — are reported and stay outside the counts, since one "last N blocks"
+cannot speak about two independent stacks. A model declaring neither list falls
+back to the `gradient_checkpointing` marker HF puts on checkpointed blocks.
+
+Counting is always from the end, so the recomputed range is the last
+`recompute_layers` blocks, and the blocks in front of it keep their activations
+— that is the dial: fewer recomputed blocks, more activation memory. Inside the
+range the first `selective_recompute_layers` blocks run SAC, keeping the
+operators named in `save_ops` (plus the attention set every SAC run keeps) and
+recomputing the rest; the blocks after them recompute in full. A count larger
+than the stack means the whole stack, and `recompute_layers: 0` keeps every
+block's activations while checkpointing stays on.
+
+When its context cannot be carried, SAC is dropped and the blocks in its range
+recompute in full, with a warning naming the reason:
+
+- `enable_reentrant=True` — torch takes no `context_fn` under reentrant
+  checkpointing.
+- Activation offload is on — the offload owns the checkpoint boundary.
+
+A third case is not about SAC but about reaching the blocks at all: a model that
+drives `torch.utils.checkpoint` itself (ltx2_3) leaves no entry point to
+replace, and the framework reports that the blocks are not covered.
+
+`torch.compile` together with SAC is allowed, and warns that the combination is
+unverified.
+
+The plan is logged once at rank 0, per layer: `stack=blocks+single_blocks (57
+blocks, folded blocks=19, single_blocks=38); blocks 0-9 SAC, 10-56 full
+recompute`.
+
+#### The runtime recompute context
+
+A model whose blocks run under their own parallel state (SeedOmni
+`ModuleRuntime`) needs that state current in the replayed forward too, and the
+recompute runs in backward, outside the `module_context` the forward was wrapped
+in. The runtime hook `VeOmniModelRuntime._recompute_context()` supplies it: the
+base returns `None` (torch's default context), while SeedOmni returns
+`partial(use_parallel_state, self.module_name)`. What it returns is built into
+the run's recompute policy, so the model's
+`gradient_checkpointing_enable(context_fn=...)` and every block the policy binds
+recompute inside the same context.
+
+Because reentrant checkpointing cannot carry a context at all, a runtime whose
+hook returns one rejects `enable=True` together with `enable_reentrant=True`
+(`ValueError` naming `enable_reentrant`) rather than recomputing with the wrong
+parallel state current.
 
 ### AcceleratorConfig
 
@@ -757,6 +821,12 @@ implementations also differ. These timings measure collective latency, not model
 | activation_offload_modules | `List[str]` | `[]` | Optional module name patterns for async offload, overriding `_no_split_modules` auto-discovery. Supports segment-aware glob (`model.layers.*` matches direct children only) and `{*}` for sequential groups (`model.layers.{*}`). |
 | activation_offload_host_cache_limit_gb | `float` | `4.0` | Idle-cache cap of **one** host-buffer pool, in GB. The trainer applies offload once with this limit, so it is the cap for that call. Each extra `apply_async_activation_offload` given only this limit gets its own pool (caps add); pass the same `host_buffer_pool` to share one cap. Bounds the idle cache only — in-flight offloads may temporarily exceed it. Set to `0` to disable reuse. |
 
+SeedOmni (`OmniTrainer`) applies async activation offload per module, from each
+module's merged accelerator, under either `fsdp_scope`. Each module gets its own
+pool, so `activation_offload_host_cache_limit_gb` caps each module and the caps
+add. A module with no `_no_split_modules` (or none matching the patterns) fails
+closed; give it a per-module `offload_config.enable_async_activation: false`.
+
 Async activation offload is enabled for CUDA/NPU tensors only; CPU tensors pass
 through unchanged. Only private, dense, contiguous activations are swapped so
 shared-storage views are never resized. Host buffers are pooled, keyed by shape,
@@ -857,7 +927,6 @@ derived argument groups below.
 | --- | --- | --- | --- |
 | mm_configs | `Optional[Dict]` | `{}` | Multimodal input configuration. |
 | offline_embedding_save_dir | `Optional[str]` | `None` | Directory used to save offline embeddings. |
-| shuffle | `bool` | `True` | Shuffle the training dataset. |
 
 ### DiTTrainingArguments
 

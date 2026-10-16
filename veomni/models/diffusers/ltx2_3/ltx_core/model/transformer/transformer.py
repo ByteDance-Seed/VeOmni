@@ -252,6 +252,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
         self,
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
+        sp_video_length: int | None = None,
+        sp_audio_length: int | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         if video is None and audio is None:
             raise ValueError("At least one of video or audio must be provided")
@@ -278,6 +280,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 mask=video.self_attention_mask,
                 perturbation_mask=video.self_attn_perturbation_mask,
                 all_perturbed=video.self_attn_all_perturbed,
+                sp_valid_length=sp_video_length,
             )
             vx = vx + vx_msa_out * vgate_msa
             del vgate_msa, norm_vx, vx_msa_out
@@ -306,6 +309,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 mask=audio.self_attention_mask,
                 perturbation_mask=audio.self_attn_perturbation_mask,
                 all_perturbed=audio.self_attn_all_perturbed,
+                sp_valid_length=sp_audio_length,
             )
             ax = ax + ax_msa_out * agate_msa
             del agate_msa, norm_ax, ax_msa_out
@@ -357,6 +361,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                         context=a2v_ax_scaled,
                         pe=video.cross_positional_embeddings,
                         k_pe=audio.cross_positional_embeddings,
+                        sp_context_length=sp_audio_length,
                     )
                     * gate_out_a2v
                     * video.cross_attn_perturbation_mask
@@ -392,6 +397,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                         context=v2a_vx_scaled,
                         pe=audio.cross_positional_embeddings,
                         k_pe=video.cross_positional_embeddings,
+                        sp_context_length=sp_video_length,
                     )
                     * gate_out_v2a
                     * audio.cross_attn_perturbation_mask
