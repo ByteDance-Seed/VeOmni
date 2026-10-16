@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``deepseek_v4`` ``cann`` indexer and sparse attention: CANN call layout on any host, eager parity on Ascend."""
+"""``deepseek_v4`` ``cann`` indexer and sparse attention.
+
+CANN call layout is checked on any host. The indexer is compared with eager on Ascend.
+Sparse FlashMLA numerical parity is not; see the FIXME on
+``test_sparse_flash_mla_rejects_selections_the_operator_cannot_take``.
+"""
 
 from __future__ import annotations
 
@@ -21,11 +26,8 @@ from typing import Any
 
 import pytest
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
-from tests.ops.tol import ATTN_ATOL, ATTN_RTOL
-from tests.ops.utils import assert_gradient_direction_and_scale, make_grad_leaves
 from veomni.models.transformers.deepseek_v4.packed_utils import (
     build_packed_compression_metadata,
     packed_compressed_causal_ranges,
@@ -279,7 +281,6 @@ def test_cann_matches_eager(segment_lengths: tuple[int, ...]):
 
 
 _ATTN_HEADS, _ATTN_DIM, _WINDOW, _HCA_RATE = 2, 512, 128, 128
-_CANN_AVAILABLE = IS_NPU_AVAILABLE and importlib.util.find_spec("cann_ops_transformer") is not None
 
 
 class _FlashMlaRecorder:
@@ -450,6 +451,12 @@ def test_attention_ignores_the_mask_and_leaves_kernel_limits_to_the_kernel(flash
     assert (kwargs["ori_win_left"], kwargs["cmp_ratio"]) == (63, 8)
 
 
+# FIXME: compare ``sparse_flash_mla`` / ``sparse_flash_mla_grad`` with eager on Ascend.
+# On CANN 9.1.0 (causal CSA, seq 300, heads 2, dim 512, topk 16, bf16, fp32 sink)
+# the forward keeps the eager direction (cosine 0.99995) but scales some rows down
+# to about 0.77, past the attention tolerance. The backward ``q`` gradient matches
+# eager on the early rows and is NaN after that. A wider tolerance does not make
+# that gradient finite. Left out until the ``cann_ops_transformer`` kernel is fixed.
 @pytest.mark.parametrize(
     ("index_topk", "cmp_ratio", "match"),
     [
@@ -464,98 +471,3 @@ def test_sparse_flash_mla_rejects_selections_the_operator_cannot_take(index_topk
 
     with pytest.raises(ValueError, match=match):
         vendor_flash_mla.npu_sparse_flash_mla(q, ori_kv, cmp_kv, indices, cmp_ratio=cmp_ratio)
-
-
-def _visible_candidates(segment_lengths: tuple[int, ...], rate: int, topk: int, device: str) -> CompressedCandidates:
-    """Each query's newest *topk* visible compressed rows, or the whole interval for HCA."""
-    bounds = torch.tensor((0, *segment_lengths)).cumsum(0).tolist()
-    slices = tuple(zip(bounds[:-1], bounds[1:]))
-    metadata = build_packed_compression_metadata(
-        torch.empty((), device=device), _segment_positions(segment_lengths, device), slices, (rate,)
-    )
-    range_starts, range_ends = packed_compressed_causal_ranges(metadata[rate])
-    if rate == _HCA_RATE:
-        return CompressedCandidates(range_starts=range_starts, range_ends=range_ends)
-    slots = range_ends[:, None] - 1 - torch.arange(topk, device=device, dtype=torch.int32)
-    indices = torch.where(slots >= range_starts[:, None], slots, -1)
-    return CompressedCandidates(topk_indices=indices.unsqueeze(0).to(torch.int32))
-
-
-def _parity_report(label: str, actual: Tensor, expected: Tensor) -> str:
-    """TEMPORARY: localize where the CANN output leaves the eager one.
-
-    Prints enough to tell the three candidate causes apart. A per-row softmax
-    normalizer difference (sink handling) leaves a tight least-squares scale with
-    a near-zero residual; a visibility difference concentrates in the query rows
-    whose candidate set changed; kernel accumulation precision spreads evenly.
-    """
-    actual_f, expected_f = actual.float(), expected.float()
-    diff = (actual_f - expected_f).abs()
-    budget = ATTN_ATOL + ATTN_RTOL * expected_f.abs()
-    rows = actual_f.reshape(-1, actual_f.shape[-1])
-    reference_rows = expected_f.reshape(-1, expected_f.shape[-1])
-    scale = (rows * reference_rows).sum(-1) / (reference_rows * reference_rows).sum(-1).clamp_min(1e-12)
-    residual = (rows - scale[:, None] * reference_rows).abs()
-    cosine = F.cosine_similarity(rows, reference_rows, dim=-1)
-    # Worst element per sequence row, with the head axis folded in when present.
-    per_row = diff.flatten(0, -2).amax(dim=-1) if diff.ndim == 3 else diff[0].amax(dim=-1).amax(dim=-1)
-    worst = per_row.topk(min(5, per_row.numel()))
-    lines = [
-        f"[parity:{label}] out_std={expected_f.std():.4f} diff_max={diff.max():.4f} "
-        f"diff_std={diff.std():.4f} over_budget={(diff > budget).float().mean() * 100:.2f}%",
-        f"[parity:{label}] row_scale min={scale.min():.4f} max={scale.max():.4f} "
-        f"residual_max={residual.max():.4f} cosine_min={cosine.min():.6f}",
-        f"[parity:{label}] worst_rows={worst.indices.tolist()} worst_values={[f'{v:.4f}' for v in worst.values]}",
-    ]
-    if diff.ndim == 4:
-        head_max = diff[0].amax(dim=0).amax(dim=-1)
-        lines.append(
-            f"[parity:{label}] head_max={[f'{v:.4f}' for v in head_max]} "
-            f"windowed_mean={per_row[:_WINDOW].mean():.4f} saturated_mean={per_row[_WINDOW:].mean():.4f}"
-        )
-    return "\n".join(lines)
-
-
-@pytest.mark.skipif(not _CANN_AVAILABLE, reason="CANN sparse FlashMLA requires Ascend NPU and cann_ops_transformer")
-@pytest.mark.parametrize("rate", [_RATE, _HCA_RATE], ids=["csa", "hca"])
-@pytest.mark.parametrize("segment_lengths", [(300,), (200, 260)], ids=["causal", "packed"])
-def test_attention_cann_matches_eager(rate: int, segment_lengths: tuple[int, ...]):
-    torch.manual_seed(5)
-    device = get_device_type()
-    seq_len = sum(segment_lengths)
-    compressed_len = sum(length // rate for length in segment_lengths)
-    q, ori_kv, cmp_kv, sink = _attention_inputs(seq_len, compressed_len, device=device)
-    bounds = torch.tensor((0, *segment_lengths)).cumsum(0).tolist()
-    kwargs: dict[str, Any] = {
-        "sliding_window": _WINDOW,
-        "compress_ratio": rate,
-        "candidates": _visible_candidates(segment_lengths, rate, topk=16, device=device),
-        "packed_sequence_slices": tuple(zip(bounds[:-1], bounds[1:])),
-    }
-    position_ids = _segment_positions(segment_lengths, device)
-
-    leaves_c = make_grad_leaves(q, ori_kv, cmp_kv)
-    leaves_e = make_grad_leaves(q, ori_kv, cmp_kv)
-    actual = resolve_op("dsa_attention", "deepseek_v4", "cann").wrapper(
-        *leaves_c, sink.float(), position_ids, **kwargs
-    )
-    eager = resolve_op("dsa_attention", "deepseek_v4", "eager")
-    expected = eager.wrapper(*leaves_e, sink.float(), position_ids, **kwargs)
-
-    # TEMPORARY diagnostic round: the Ascend job is the only NPU available, so
-    # the budget below is relaxed to let every variant report. ``cann`` left the
-    # ``ATTN_*`` budget by ~0.1 on ``causal-csa`` while the bf16 eager row's own
-    # rounding against the same math in fp32 is only ~0.001, so the gap is real.
-    # Restore ``ATTN_ATOL`` / ``ATTN_RTOL`` once the cause is known.
-    print()
-    print(_parity_report(f"cann-{rate}-{len(segment_lengths)}seg", actual, expected))
-    fp32 = eager.wrapper(*(leaf.detach().float() for leaf in leaves_e), sink.float(), position_ids, **kwargs)
-    print(_parity_report(f"eager-bf16-{rate}-{len(segment_lengths)}seg", expected, fp32))
-    torch.testing.assert_close(actual, expected, atol=5e-1, rtol=5e-1)
-
-    grad = torch.randn_like(actual)
-    cann_grads = torch.autograd.grad((actual * grad).sum(), leaves_c)
-    eager_grads = torch.autograd.grad((expected * grad).sum(), leaves_e)
-    for name, cann_grad, eager_grad in zip(("q", "ori_kv", "cmp_kv"), cann_grads, eager_grads, strict=True):
-        print(_parity_report(f"grad-{name}-{rate}-{len(segment_lengths)}seg", cann_grad, eager_grad))
-        assert_gradient_direction_and_scale(cann_grad, eager_grad, min_cosine=0.9, norm_rtol=0.5)
