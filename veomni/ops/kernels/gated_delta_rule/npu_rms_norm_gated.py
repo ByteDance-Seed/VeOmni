@@ -32,13 +32,17 @@ _FUSED_GATE_ACTIVATIONS = frozenset({"silu", "swish"})
 
 
 class NPUFusedRMSNormGated(nn.Module):
+    """Ascend NPU RMSNorm with an activation-gated output projection."""
+
     def __init__(self, hidden_size, eps=1e-6, activation: str = "silu", **kwargs):
+        """Initialize the norm weight and gate activation."""
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
         self.activation = activation
 
     def forward(self, hidden_states, gate=None):
+        """Apply RMSNorm to ``hidden_states`` and multiply by the activated ``gate``."""
         normed = torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
         if self.activation in _FUSED_GATE_ACTIVATIONS:
             return torch_npu.npu_swiglu(torch.cat([gate, normed], dim=-1), dim=-1)

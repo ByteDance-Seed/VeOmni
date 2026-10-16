@@ -106,6 +106,8 @@ def causal_conv1d(
     cu_seqlens: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
 ):
+    if cu_seqlens is not None and cu_seqlens.device != x.device:
+        cu_seqlens = cu_seqlens.to(device=x.device, non_blocking=True)
     return CausalConv1dFunction.apply(
         x,
         weight,

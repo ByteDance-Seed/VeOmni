@@ -371,6 +371,57 @@ class TestNPURmsNormGated:
         assert torch.allclose(out_fused.float(), out_eager.float(), atol=1e-2, rtol=1e-2)
 
 
+class TestNPUGatedDeltaNetVarlen:
+    """Tests for the ``causal_conv1d`` and ``chunk_gated_delta_rule`` NPU Triton kernels."""
+
+    def test_causal_conv1d_accepts_cpu_cu_seqlens(self):
+        """``veomni.models.auto`` moves ``cu_seq_lens_q`` to CPU on NPU; the
+        Triton ``causal_conv1d`` adapter must move it to ``x.device``."""
+        slot = OpSlot("causal_conv1d", "standard")
+        slot.bind("npu")
+        fn = slot.bound_kernel()
+
+        B, T, D, W = 1, 64, 256, 4
+        x = torch.randn(B, T, D, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        weight = torch.randn(D, W, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        cu_seqlens = torch.tensor([0, 32, 64], dtype=torch.int32, device="cpu")
+
+        out = fn(x=x, weight=weight, bias=None, activation="silu", cu_seqlens=cu_seqlens)[0]
+        assert out.shape == (B, T, D)
+        out.sum().backward()
+        assert x.grad is not None and weight.grad is not None
+
+    def test_chunk_gated_delta_rule_accepts_cpu_cu_seqlens(self):
+        """``chunk_gated_delta_rule`` ``npu`` backend must also accept a CPU
+        ``cu_seqlens`` tensor without raising a Triton pointer error."""
+        slot = OpSlot("chunk_gated_delta_rule", "standard")
+        slot.bind("npu")
+        fn = slot.bound_kernel()
+
+        B, T, H, K, V = 1, 64, 2, 64, 64
+        q = torch.randn(B, T, H, K, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(B, T, H, K, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(B, T, H, V, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        g = (-torch.rand(B, T, H, device=DEVICE, dtype=torch.float32)).requires_grad_(True)
+        beta = torch.rand(B, T, H, device=DEVICE, dtype=torch.bfloat16).sigmoid().requires_grad_(True)
+        cu_seqlens = torch.tensor([0, 32, 64], dtype=torch.int32, device="cpu")
+
+        out, _ = fn(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens,
+        )
+        assert out.shape == (B, T, H, V)
+        out.sum().backward()
+        assert q.grad is not None and k.grad is not None and v.grad is not None
+
+
 # ---------------------------------------------------------------------------
 # HCCL premul_sum patch tests (mock-based, no distributed required)
 # ---------------------------------------------------------------------------
