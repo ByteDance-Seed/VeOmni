@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 
 import veomni.trainer.base as base_module
+from veomni.utils import dist_utils
 from veomni.distributed.parallel_state import clear_parallel_state
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.dit_trainer import DiTTrainer
@@ -148,10 +149,12 @@ def test_train_step_only_counts_step_after_batch_fetch_succeeds():
 
 
 @pytest.fixture
-def single_rank_group(tmp_path):
+def single_rank_group(tmp_path, monkeypatch):
     # Real `BaseTrainer.train_step` all-reduces the loss-token count, which
     # needs a live process group. File-store rendezvous under tmp_path keeps
     # this isolated from any other single-rank gloo group in the suite.
+    # Gloo cannot reduce accelerator (e.g. NPU) tensors, so keep the scalar on CPU.
+    monkeypatch.setattr(dist_utils, "get_device_type", lambda: "cpu")
     dist.init_process_group(backend="gloo", init_method=f"file://{tmp_path / 'rendezvous'}", world_size=1, rank=0)
     try:
         yield
