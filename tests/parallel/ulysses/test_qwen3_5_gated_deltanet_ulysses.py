@@ -217,11 +217,12 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str, bsz
     import importlib
 
     from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.distributed.parallel_state import _init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
     from veomni.models.auto import _bind_veomni_ops
     from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import Qwen3_5GatedDeltaNet
 
-    _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
+    sp_state = _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type, name="sp")
+    dp_state = _init_parallel_state(dp_size=world_size, ulysses_size=1, device_type=device_type, name="dp")
 
     # The module-level ``_bind_qwen3_5_op_slots`` fixture only binds OpSlots
     # in the parent test process; ``mp.spawn(start_method="spawn")`` here
@@ -251,8 +252,7 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str, bsz
     baseline_out = None
     baseline_param_grads = None
     if rank == 0:
-        no_sp_state = SimpleNamespace(ulysses_enabled=False)
-        with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+        with use_parallel_state(dp_state):
             baseline_out = layer(full_input, attention_mask=None, cu_seq_lens_q=None)
             baseline_loss = baseline_out.mean()
             baseline_loss.backward()
@@ -266,10 +266,11 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str, bsz
     dist.barrier()
 
     # SP forward/backward
-    sp_out_local = layer(local_input, attention_mask=None, cu_seq_lens_q=None)
-    total_numel = bsz * seq_len * sp_out_local.shape[-1]
-    sp_loss = sp_out_local.sum() / total_numel
-    sp_loss.backward()
+    with use_parallel_state(sp_state):
+        sp_out_local = layer(local_input, attention_mask=None, cu_seq_lens_q=None)
+        total_numel = bsz * seq_len * sp_out_local.shape[-1]
+        sp_loss = sp_out_local.sum() / total_numel
+        sp_loss.backward()
 
     for param in layer.parameters():
         if param.grad is not None:
@@ -307,6 +308,7 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str, bsz
 
     dist.barrier()
     dist.destroy_process_group()
+    clear_parallel_state()
 
 
 @pytest.mark.parametrize("world_size", [2])
