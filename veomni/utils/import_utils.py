@@ -91,6 +91,14 @@ def is_apex_mlu_available() -> bool:
     except importlib.metadata.PackageNotFoundError:
         return False
 
+def is_liger_kernel_mlu_available() -> bool:
+    if not _PACKAGE_FLAGS["liger_kernel"]:
+        return False
+    try:
+        return _is_package_available("liger_kernel.ops.rms_norm")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+
 
 def is_diffusers_available() -> bool:
     return _PACKAGE_FLAGS["diffusers"]
