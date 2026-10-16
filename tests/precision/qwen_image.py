@@ -339,8 +339,6 @@ def capture(fixture, output, *, device="cpu", dtype="fp32", backend="veomni", st
         raise ValueError("Use CPU/GPU for the upstream complex-RoPE baseline and VeOmni for NPU.")
     fixture, output = Path(fixture), Path(output)
     manifest = verify_fixture(fixture)
-    if output.exists():
-        raise FileExistsError(f"Use a fresh output directory to avoid stale traces: {output}")
     enable_full_determinism(manifest["seed"])
     enable_high_precision_for_bf16()
     torch.use_deterministic_algorithms(True)
@@ -354,10 +352,21 @@ def capture(fixture, output, *, device="cpu", dtype="fp32", backend="veomni", st
             torch.distributed.init_process_group(get_dist_comm_backend())
             owns_group = True
             init_parallel_state_from_config(accelerator, name=None)
+        output_error = [None]
         if rank == 0:
-            (output / "tensors").mkdir(parents=True)
+            try:
+                if output.exists():
+                    raise FileExistsError(f"Use a fresh output directory to avoid stale traces: {output}")
+                (output / "tensors").mkdir(parents=True)
+            except OSError as error:
+                output_error[0] = (type(error).__name__, str(error))
         if world > 1:
-            torch.distributed.barrier()
+            torch.distributed.broadcast_object_list(output_error, src=0)
+        if output_error[0] is not None:
+            error_type, message = output_error[0]
+            if error_type == "FileExistsError":
+                raise FileExistsError(message)
+            raise OSError(f"Rank 0 failed to prepare the output directory ({error_type}): {message}")
         recorder = TensorRecorder(output, rank)
         config = build_config(str(fixture / "model"))
         if backend == "veomni":
