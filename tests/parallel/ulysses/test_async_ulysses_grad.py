@@ -18,13 +18,13 @@ import veomni.distributed.sequence_parallel.async_ulysses as au
 
 
 def _mock_identity_comm(monkeypatch) -> None:
-    monkeypatch.setattr(au, "padding_tensor_for_seqeunce_parallel", lambda tensor, dim, **kwargs: tensor)
+    monkeypatch.setattr(au, "padding_tensor_for_seqeunce_parallel", lambda tensor, dim, group=None, **kwargs: tensor)
     monkeypatch.setattr(
         au,
         "unpadding_tensor_for_seqeunce_parallel",
-        lambda tensor, dim, size, **kwargs: tensor,
+        lambda tensor, dim, size, group=None, **kwargs: tensor,
     )
-    monkeypatch.setattr(au, "get_ulysses_sequence_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(au, "get_ulysses_sequence_parallel_world_size", lambda group=None: 1)
 
     def fake_all_to_all(tensor, **kwargs):
         return (lambda: tensor) if kwargs.get("async_op") else tensor
