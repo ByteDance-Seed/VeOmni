@@ -28,7 +28,8 @@ def register_minimax_m3_vl_config():
 # resolved from the checkpoint. Public MiniMax M3 checkpoints ship their own
 # ``processing_minimax.py`` (``MiniMaxVLProcessor``) alongside the upstream class
 # name, and which one wins depends on the checkpoint's ``auto_map``; register
-# both so VeOmni's processor is used either way.
+# both so VeOmni's processor is used either way. ``MiniMaxVLProcessor`` is generic,
+# so the processor refuses checkpoints whose ``model_type`` is not ``minimax_m3_vl``.
 @MODEL_PROCESSOR_REGISTRY.register("MiniMaxVLProcessor")
 @MODEL_PROCESSOR_REGISTRY.register("MiniMaxM3VLProcessor")
 def register_minimax_m3_vl_processor():

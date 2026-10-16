@@ -19,7 +19,7 @@ MiniMax M3 run always gets this class regardless of which one ``AutoProcessor``
 resolved from the checkpoint.
 """
 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PretrainedConfig
 from transformers.models.minimax_m3_vl.processing_minimax_m3_vl import (
     MiniMaxM3VLProcessor as HfMiniMaxM3VLProcessor,
 )
@@ -28,6 +28,30 @@ from ....utils import logging
 
 
 logger = logging.get_logger(__name__)
+
+
+def _require_minimax_m3_checkpoint(pretrained_model_name_or_path, kwargs) -> None:
+    """Refuse to stand in for a processor whose checkpoint is not MiniMax M3 VL.
+
+    ``MiniMaxVLProcessor`` is the generic class name in MiniMax's bundled remote
+    code, so another MiniMax VL release could resolve to the same registry key.
+    A directory without ``config.json`` (processor files only) is not checked.
+    """
+    hub_kwargs = {
+        key: kwargs[key]
+        for key in ("token", "revision", "cache_dir", "subfolder", "local_files_only")
+        if key in kwargs
+    }
+    try:
+        config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **hub_kwargs)
+    except OSError:
+        return
+    model_type = config_dict.get("model_type")
+    if model_type != "minimax_m3_vl":
+        raise ValueError(
+            f"VeOmni's MiniMax M3 VL processor only supports model_type 'minimax_m3_vl', but "
+            f"{pretrained_model_name_or_path!r} is {model_type!r}. Register a processor for that model instead."
+        )
 
 
 class MiniMaxM3VLProcessor(HfMiniMaxM3VLProcessor):
@@ -54,6 +78,7 @@ class MiniMaxM3VLProcessor(HfMiniMaxM3VLProcessor):
         # ``trust_remote_code`` only ever gated the Auto* sub-processor resolution
         # we deliberately bypass; the concrete native classes take no such flag.
         kwargs.pop("trust_remote_code", None)
+        _require_minimax_m3_checkpoint(pretrained_model_name_or_path, kwargs)
 
         from transformers import MiniMaxM3VLImageProcessor, MiniMaxM3VLVideoProcessor
 

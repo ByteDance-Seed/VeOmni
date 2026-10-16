@@ -76,6 +76,17 @@ def test_minimax_m3_vl_processor_builds_from_native_subprocessors(monkeypatch):
     }
 
 
+def test_minimax_m3_vl_processor_refuses_other_minimax_checkpoints(tmp_path):
+    # ``MiniMaxVLProcessor`` is a generic remote class name; only substitute for M3 checkpoints.
+    import json
+
+    from veomni.models.transformers.minimax_m3_vl.processing_minimax_m3_vl import MiniMaxM3VLProcessor
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "minimax_vl_other"}))
+    with pytest.raises(ValueError, match="only supports model_type 'minimax_m3_vl'"):
+        MiniMaxM3VLProcessor.from_pretrained(str(tmp_path))
+
+
 @pytest.mark.parametrize(
     "config_path, is_hf_model, load_processor, hf_registered, veomni_registered", local_test_cases
 )
