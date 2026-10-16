@@ -36,13 +36,12 @@ from safetensors.torch import load_file, save_file
 from veomni.models.seed_omni.modules.deepseek_v41.convert_model import (
     ShardWriter,
     TensorSource,
-    _llm_layer_names,
-    _mtp_layer_names,
     convert_deepseek_v41_checkpoint,
     convert_llm,
     convert_vision,
 )
 from veomni.models.seed_omni.modules.deepseek_v41.dequant import dequant_fp8_blockwise
+from veomni.models.seed_omni.modules.deepseek_v41.released_names import llm_layer_names, mtp_layer_names
 
 
 HIDDEN = 64
@@ -122,9 +121,20 @@ def fp4_pair(out_dim, in_dim, block=32):
     return packed, e8m0_scale(out_dim, in_dim // block)
 
 
-#: Released tensors that carry a block scale. Everything else is a norm gain, a
-#: bias or an embedding, which the release stores unquantized.
-QUANTIZED_SUFFIXES = ("wq_a", "wq_b", "wkv", "wo_a", "wo_b", "indexer.wq_b")
+#: Released tensors that carry a block scale, as in the release's index. Everything
+#: else is a norm gain, a bias, an embedding or a small projection (the compressor's
+#: ``wkv`` among them), which the release stores unquantized.
+QUANTIZED_SUFFIXES = (
+    "wq_a",
+    "wq_b",
+    "attn.wkv",
+    "wo_a",
+    "wo_b",
+    "indexer.wq_b",
+    "shared_experts.w1",
+    "shared_experts.w2",
+    "shared_experts.w3",
+)
 
 
 def build_released_checkpoint(path, config):
@@ -138,7 +148,6 @@ def build_released_checkpoint(path, config):
     checkpoint's shapes are checked against the module separately, from its
     safetensors headers, which needs the 510 GB file and so is not a CI test.
     """
-    from veomni.models.seed_omni.modules.deepseek_v41.convert_model import _llm_layer_names
     from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import DeepseekV41Llm
 
     torch.manual_seed(0)
@@ -147,7 +156,7 @@ def build_released_checkpoint(path, config):
     tensors = {}
 
     for layer in range(config.num_hidden_layers):
-        for released, target in _llm_layer_names(layer).items():
+        for released, target in llm_layer_names(layer).items():
             shape = module_shapes.get(target)
             if shape is None:
                 continue  # a layer without a compressor / indexer
@@ -185,7 +194,7 @@ def build_released_checkpoint(path, config):
     n_mtp = config.num_nextn_predict_layers
     n_mtp_experts = config.dspark_n_routed_experts or config.n_routed_experts
     for stage in range(n_mtp):
-        for released, target in _mtp_layer_names(stage).items():
+        for released, target in mtp_layer_names(stage).items():
             shape = module_shapes.get(target)
             if shape is None:
                 continue
@@ -386,35 +395,35 @@ class TestTensorSource:
 
 class TestNameMapping:
     def test_the_two_norms_are_renamed_to_the_hf_spelling(self):
-        names = _llm_layer_names(3)
+        names = llm_layer_names(3)
         assert names["layers.3.attn_norm.weight"] == "model.layers.3.input_layernorm.weight"
         assert names["layers.3.ffn_norm.weight"] == "model.layers.3.post_attention_layernorm.weight"
 
     def test_the_router_bias_becomes_the_correction_bias(self):
         """The release calls it `bias`; this repo's DeepSeek modules hold it as
         e_score_correction_bias, and as a buffer rather than a parameter."""
-        names = _llm_layer_names(0)
+        names = llm_layer_names(0)
         assert names["layers.0.ffn.gate.bias"] == "model.layers.0.mlp.gate.e_score_correction_bias"
         assert names["layers.0.ffn.gate.bias_vl"] == "model.layers.0.mlp.gate.e_score_correction_bias_vl"
 
     def test_the_hc_tensors_split_by_site(self):
-        names = _llm_layer_names(1)
+        names = llm_layer_names(1)
         assert names["layers.1.hc_attn_fn"] == "model.layers.1.attn_hc.fn"
         assert names["layers.1.hc_ffn_scale"] == "model.layers.1.ffn_hc.scale"
 
     def test_the_shared_expert_is_renamed_to_gate_up_down(self):
-        names = _llm_layer_names(0)
+        names = llm_layer_names(0)
         assert names["layers.0.ffn.shared_experts.w1.weight"].endswith("shared_experts.gate_proj.weight")
         assert names["layers.0.ffn.shared_experts.w2.weight"].endswith("shared_experts.down_proj.weight")
         assert names["layers.0.ffn.shared_experts.w3.weight"].endswith("shared_experts.up_proj.weight")
 
     def test_attention_keeps_its_own_names_under_self_attn(self):
-        names = _llm_layer_names(0)
+        names = llm_layer_names(0)
         assert names["layers.0.attn.wq_a.weight"] == "model.layers.0.self_attn.wq_a.weight"
         assert names["layers.0.attn.attn_sink"] == "model.layers.0.self_attn.attn_sink"
 
     def test_mtp_layers_map_under_model_mtp(self):
-        names = _mtp_layer_names(0)
+        names = mtp_layer_names(0)
         assert names["mtp.0.attn.wq_a.weight"] == "model.mtp.0.self_attn.wq_a.weight"
         assert names["mtp.0.attn_norm.weight"] == "model.mtp.0.input_layernorm.weight"
 

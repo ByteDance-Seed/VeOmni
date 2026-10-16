@@ -37,6 +37,8 @@ from veomni.models.seed_omni.modules.deepseek_v41.dequant import (
     dequant_fp4_blockwise,
     dequant_fp8_blockwise,
     fuse_gate_up,
+    quant_fp4_blockwise,
+    quant_fp8_blockwise,
     split_block_shape,
 )
 
@@ -201,3 +203,51 @@ class TestAgainstTheReferenceExpertPath:
         gate_ours, up_ours = torch.nn.functional.linear(x, fused).chunk(2, dim=-1)
         torch.testing.assert_close(gate_ours, gate_ref)
         torch.testing.assert_close(up_ours, up_ref)
+
+
+def _e8m0(shape, low=-8, high=4):
+    return torch.exp2(torch.randint(low, high, shape).float()).to(torch.float8_e8m0fnu)
+
+
+class TestRequant:
+    """Export requantizes trained bf16 back to the release formats.
+
+    The property export relies on: a weight that came out of a dequant goes
+    back in and dequantizes to the same numbers, so exporting an untouched
+    model does not drift it.
+    """
+
+    @pytest.mark.parametrize("block", [(32, 32), (1, 32)])
+    def test_fp8_requant_of_a_dequantized_weight_is_value_exact(self, block):
+        torch.manual_seed(0)
+        weight = (torch.randn(64, 96) * 100).to(torch.float8_e4m3fn)
+        scale = _e8m0((64 // block[0], 96 // block[1]))
+        values = dequant_fp8_blockwise(weight, scale, out_dtype=torch.float32)
+        quantized, requant_scale = quant_fp8_blockwise(values, block)
+        assert quantized.dtype == torch.float8_e4m3fn and requant_scale.dtype == torch.float8_e8m0fnu
+        assert requant_scale.shape == scale.shape
+        assert torch.equal(dequant_fp8_blockwise(quantized, requant_scale, out_dtype=torch.float32), values)
+
+    def test_fp4_requant_of_a_dequantized_weight_is_byte_exact(self):
+        """Including ``-0`` codes, which the release stores for small negatives."""
+        torch.manual_seed(1)
+        packed = torch.randint(-128, 128, (16, 32), dtype=torch.int8)
+        packed[:, 0] = 0x7F  # every row carries a 6.0, so the scale cannot shrink
+        scale = _e8m0((16, 2))
+        values = dequant_fp4_blockwise(packed, scale, out_dtype=torch.float32)
+        requant, requant_scale = quant_fp4_blockwise(values)
+        assert requant.dtype == torch.int8 and requant_scale.dtype == torch.float8_e8m0fnu
+        assert torch.equal(requant_scale.view(torch.uint8), scale.view(torch.uint8))
+        assert torch.equal(requant.view(torch.uint8), packed.view(torch.uint8))
+
+    def test_fp4_rounds_to_the_nearest_value_and_keeps_the_low_nibble_first(self):
+        weight = torch.tensor([[0.6, 5.9, -2.6, 0.1] + [6.0] * 28])
+        packed, scale = quant_fp4_blockwise(weight)
+        assert float(scale.float()) == 1.0
+        out = dequant_fp4_blockwise(packed, scale, out_dtype=torch.float32)
+        assert out[0, :4].tolist() == [0.5, 6.0, -3.0, 0.0]
+
+    def test_fp8_scale_fits_the_block_into_the_element_range(self):
+        weight = torch.full((32, 32), 1000.0)
+        _, scale = quant_fp8_blockwise(weight)
+        assert float(scale.float()) == 4.0  # 1000 / 448 rounds up to 2**2

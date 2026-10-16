@@ -9,6 +9,7 @@ back in the upstream layout, so it loads wherever the source does.
 - Declaration: [`OmniHFLayout`](../../../veomni/models/seed_omni/utils/hf_layout.py#L143) and [`OmniHFModuleLayout`](../../../veomni/models/seed_omni/utils/hf_layout.py#L105)
 - Registry: [`OMNI_HF_LAYOUT_REGISTRY`](../../../veomni/models/seed_omni/utils/hf_layout.py#L80), keyed by the upstream `model_type`
 - Reference family: [`QWEN3_HF_LAYOUT`](../../../veomni/models/seed_omni/modules/qwen3/hf_layout.py#L42)
+- A layout using every hook (per-layer renames sized by the source config, per-expert stacking and fp8/fp4 dequant in the converters, a tokenizer-built `generated_tensors`, a requantizing `export_state`): [`build_deepseek_v41_hf_layout`](../../../veomni/models/seed_omni/modules/deepseek_v41/hf_layout.py#L121)
 
 User-facing behavior and limits are in
 [Load an upstream checkpoint directly](training_and_inference.md#21-load-an-upstream-checkpoint-directly).
@@ -112,7 +113,7 @@ Training from an upstream root:
   [attaches the key converter](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L371);
   [`weights_path`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L235) is the upstream root.
 - The FSDP2 / DDP wrap (per module, or [composed](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L306)) loads weights:
-  - [`load_model_weights`](../../../veomni/models/module_utils.py#L417) and the [rank-0 broadcast loader](../../../veomni/models/module_utils.py#L1223) skip keys the converter declares, without reading them;
+  - [`load_model_weights`](../../../veomni/models/module_utils.py#L417) and the [rank-0 broadcast loader](../../../veomni/models/module_utils.py#L1307) skip keys the converter declares, without reading them;
   - [`load_model_weights_ep_sharded`](../../../veomni/models/module_utils.py#L697) (`ep_sharded_stream_load`) renames each source key with the converter before planning its rank's slice, so per-expert source keys are read only by the rank that owns the expert, and dispatches the layout's `generated_tensors` last;
   - [`HFSourceKeyConverter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L380) renames the module's own keys and hands them to the module's converter.
 

@@ -151,12 +151,13 @@ class DeepseekV41DequantConverter:
         return remap_shrunk_checkpoint_key(name, self._layer_map, self._engram_map, drop_mtp=self._drop_mtp)
 
     def can_handle(self, name: str) -> bool:
-        if self._rewrite(name) is None:
+        # A shrunk stack renames every key of a kept layer, unquantized ones included.
+        if self._rewrite(name) != name:
             return True
         return weight_name_from_scale_name(name) is not None
 
     def can_handle_tensor(self, name: str, tensor: torch.Tensor) -> bool:
-        if self._rewrite(name) is None:
+        if self._rewrite(name) != name:
             return True
         if weight_name_from_scale_name(name) is not None:
             return True
@@ -167,9 +168,9 @@ class DeepseekV41DequantConverter:
 
         The streaming loader asks this for every key and uses the answer only
         when the checkpoint holds the scale, so a bf16 tensor reads as is. A
-        shrunk stack renames its layers, which only the whole-tensor loader
-        applies; offering no companion there leaves its scales unclaimed, and
-        the loader refuses them.
+        shrunk stack renames its layers, so it offers no companion: every
+        renamed key is converted whole, and the streaming loader refuses one
+        that lands on an ExtraParallel parameter (a fused expert slab).
         """
         if self._layer_map is not None or self._rewrite(name) is None:
             return None
@@ -183,9 +184,7 @@ class DeepseekV41DequantConverter:
         return dequant_converted_weight(rows, companion_rows)
 
     def should_skip_without_loading(self, name: str) -> bool:
-        if self._rewrite(name) is None:
-            return True
-        return self._layer_map is None and weight_name_from_scale_name(name) is not None
+        return self._rewrite(name) is None
 
     def record_skip_without_loading(self, name: str) -> None:
         pass
@@ -220,15 +219,179 @@ class DeepseekV41DequantConverter:
         )
 
 
-def create_deepseek_v41_llm_checkpoint_tensor_converter(model) -> DeepseekV41DequantConverter | None:
-    """Installed on the bf16 training graph; skipped when the module is quantized."""
-    if quantized_storage_dtype(model.config) is not None:
-        return None
-    return DeepseekV41DequantConverter(model.config)
+#: One released expert tensor, after the HF layout's prefix rename:
+#: ``model.layers.3.mlp.experts.17.w1.weight`` / ``...w1.scale``.
+_RELEASED_EXPERT_KEY = re.compile(
+    r"^(?P<prefix>model\.(?P<kind>layers|mtp)\.\d+\.mlp\.experts)\.(?P<expert>\d+)\.(?P<proj>w[123])\.(?P<part>weight|scale)$"
+)
+_FUSED_PROJ = {"w1": "gate_up_proj", "w3": "gate_up_proj", "w2": "down_proj"}
+
+
+class DeepseekV41LlmConverter:
+    """The llm's load converter: dense dequant plus the release's per-expert stacking.
+
+    A split checkpoint already holds fused experts and only needs the dense
+    weight/scale pairing (:class:`DeepseekV41DequantConverter`, training only).
+    The release, read in place through the HF layout, holds each expert's
+    ``w1``/``w2``/``w3`` and its ``scale`` separately; this stacks them into
+    ``gate_up_proj`` (``w1`` rows then ``w3`` rows, per expert) and
+    ``down_proj``:
+
+    * ``dequantize=True`` (training): each expert is dequantized to bf16 as
+      soon as its weight and scale have both arrived, then stacked;
+    * ``dequantize=False`` (quantized inference): the packed fp4 bytes and the
+      scales are stacked separately, into ``<fused>`` and ``<fused>_scale``.
+
+    Main layers have ``n_routed_experts`` experts and DSpark stages
+    ``dspark_n_routed_experts``. :meth:`for_expert_range` restricts a copy to
+    experts ``[start, start + num_local)`` of every fused target it is given,
+    so the per-rank streaming loader reads only its own experts.
+    """
+
+    def __init__(
+        self,
+        config,
+        *,
+        dequantize: bool,
+        expert_range: tuple[int, int] | None = None,
+    ) -> None:
+        self.config = config
+        self.dequantize = dequantize
+        self.expert_range = expert_range
+        self.dense = DeepseekV41DequantConverter(config) if dequantize else None
+        # The shrunk-stack remap applies to a quantized module too, which dequantizes nothing.
+        self._remap = self.dense if self.dense is not None else DeepseekV41DequantConverter(config)
+        self._num_experts = {
+            "layers": config.n_routed_experts,
+            "mtp": getattr(config, "dspark_n_routed_experts", None) or config.n_routed_experts,
+        }
+        # {(prefix, proj, part): {local_expert: tensor}}; part is "value" once dequantized.
+        self._stacks: dict[tuple[str, str, str], dict[int, torch.Tensor]] = {}
+        # {(prefix, proj, local_expert): {"weight"|"scale": tensor}} awaiting their pair.
+        self._pairs: dict[tuple[str, str, int], dict[str, torch.Tensor]] = {}
+        # {(prefix, fused, part): {proj: stacked}} awaiting the other half of gate_up.
+        self._fused: dict[tuple[str, str, str], dict[str, torch.Tensor]] = {}
+
+    def _rewrite(self, name: str) -> str | None:
+        return self._remap._rewrite(name)
+
+    def _expert(self, name: str) -> re.Match | None:
+        live = self._rewrite(name)
+        return None if live is None else _RELEASED_EXPERT_KEY.match(live)
+
+    def _local_count(self, kind: str) -> int:
+        return self.expert_range[1] if self.expert_range is not None else self._num_experts[kind]
+
+    def can_handle(self, name: str) -> bool:
+        if self._expert(name) is not None:
+            return True
+        if self.dense is None:
+            return self._rewrite(name) != name
+        return self.dense.can_handle(name)
+
+    def can_handle_tensor(self, name: str, tensor: torch.Tensor) -> bool:
+        if self._expert(name) is not None:
+            return True
+        return self.dense is not None and self.dense.can_handle_tensor(name, tensor)
+
+    def dim0_rowwise_companion(self, name: str) -> str | None:
+        if self.dense is None or self._expert(name) is not None:
+            return None
+        return self.dense.dim0_rowwise_companion(name)
+
+    def convert_rows(self, name: str, rows: torch.Tensor, companion_rows: torch.Tensor) -> torch.Tensor:
+        return self.dense.convert_rows(name, rows, companion_rows)
+
+    def should_skip_without_loading(self, name: str) -> bool:
+        return self._rewrite(name) is None
+
+    def record_skip_without_loading(self, name: str) -> None:
+        pass
+
+    def fused_expert_target(self, name: str) -> tuple[str, int] | None:
+        match = self._expert(name)
+        if match is None:
+            return None
+        fused = f"{match['prefix']}.{_FUSED_PROJ[match['proj']]}"
+        if not self.dequantize and match["part"] == "scale":
+            fused = scale_key(fused)
+        return fused, int(match["expert"])
+
+    def for_expert_range(self, start: int, num_local: int) -> DeepseekV41LlmConverter:
+        offset = self.expert_range[0] if self.expert_range is not None else 0
+        return DeepseekV41LlmConverter(
+            self.config, dequantize=self.dequantize, expert_range=(offset + start, num_local)
+        )
+
+    def convert(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
+        match = self._expert(name)
+        if match is None:
+            if self.dense is None:
+                live = self._rewrite(name)
+                return None if live is None else ConvertedCheckpointTensor(live, tensor)
+            return self.dense.convert(name, tensor)
+
+        prefix, kind, proj, part = match["prefix"], match["kind"], match["proj"], match["part"]
+        expert = int(match["expert"])
+        start = self.expert_range[0] if self.expert_range is not None else 0
+        local = expert - start
+        if not 0 <= local < self._local_count(kind):
+            raise ValueError(
+                f"{name}: expert {expert} is outside this converter's range [{start}, {start + self._local_count(kind)})."
+            )
+        if not self.dequantize:
+            return self._stack(prefix, kind, proj, part, local, tensor)
+        pair = self._pairs.setdefault((prefix, proj, local), {})
+        pair[part] = tensor
+        if len(pair) < 2:
+            return None
+        del self._pairs[(prefix, proj, local)]
+        return self._stack(prefix, kind, proj, "value", local, dequant_converted_weight(pair["weight"], pair["scale"]))
+
+    def _stack(
+        self, prefix: str, kind: str, proj: str, part: str, local: int, tensor: torch.Tensor
+    ) -> ConvertedCheckpointTensor | None:
+        experts = self._stacks.setdefault((prefix, proj, part), {})
+        experts[local] = tensor
+        count = self._local_count(kind)
+        if len(experts) < count:
+            return None
+        del self._stacks[(prefix, proj, part)]
+        stacked = torch.stack([experts[i] for i in range(count)])
+        fused = _FUSED_PROJ[proj]
+        name = f"{prefix}.{fused}" if part != "scale" else scale_key(f"{prefix}.{fused}")
+        if fused == "down_proj":
+            return ConvertedCheckpointTensor(name, stacked)
+        halves = self._fused.setdefault((prefix, fused, part), {})
+        halves[proj] = stacked
+        if len(halves) < 2:
+            return None
+        del self._fused[(prefix, fused, part)]
+        return ConvertedCheckpointTensor(name, torch.cat([halves["w1"], halves["w3"]], dim=1))
+
+    def finalize(self) -> list[ConvertedCheckpointTensor]:
+        problems = []
+        if self._pairs:
+            problems.append(f"experts missing their weight or scale: {sorted(self._pairs)}")
+        if self._stacks:
+            problems.append(f"incomplete expert stacks: { {key: len(v) for key, v in self._stacks.items()} }")
+        if self._fused:
+            problems.append(
+                f"gate_up halves without their pair: { {key: sorted(v) for key, v in self._fused.items()} }"
+            )
+        if problems:
+            raise RuntimeError("DeepseekV41 llm converter: incomplete checkpoint, " + "; ".join(problems))
+        return self.dense.finalize() if self.dense is not None else []
+
+
+def create_deepseek_v41_llm_checkpoint_tensor_converter(model) -> DeepseekV41LlmConverter:
+    """Dequantizes for the bf16 training graph; a quantized module only stacks released experts."""
+    return DeepseekV41LlmConverter(model.config, dequantize=quantized_storage_dtype(model.config) is None)
 
 
 __all__ = [
     "DeepseekV41DequantConverter",
+    "DeepseekV41LlmConverter",
     "create_deepseek_v41_llm_checkpoint_tensor_converter",
     "dequant_converted_weight",
     "is_quantized_weight",

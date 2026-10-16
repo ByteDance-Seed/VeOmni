@@ -34,6 +34,7 @@ from veomni.models.checkpoint_tensor_loading import (
 )
 from veomni.models.seed_omni.modules.deepseek_v41.checkpoint_tensor_converter import (
     DeepseekV41DequantConverter,
+    DeepseekV41LlmConverter,
     create_deepseek_v41_llm_checkpoint_tensor_converter,
     dequant_converted_weight,
 )
@@ -1684,20 +1685,31 @@ class TestDeepseekV41DequantConverter:
         with pytest.raises(RuntimeError, match="unpaired weight/scale"):
             self.converter.finalize()
 
-    def test_factory_skips_quantized_modules(self):
-        model = SimpleNamespace(config=SimpleNamespace(weight_quantization=_V41_QUANT))
-        assert create_deepseek_v41_llm_checkpoint_tensor_converter(model) is None
+    @staticmethod
+    def _llm_config(weight_quantization):
+        return SimpleNamespace(weight_quantization=weight_quantization, n_routed_experts=4, dspark_n_routed_experts=2)
 
-    def test_factory_installs_on_bf16_modules(self):
-        model = SimpleNamespace(config=SimpleNamespace(weight_quantization=None))
+    def test_factory_only_stacks_experts_for_quantized_modules(self):
+        model = SimpleNamespace(config=self._llm_config(_V41_QUANT))
         converter = create_deepseek_v41_llm_checkpoint_tensor_converter(model)
-        assert isinstance(converter, DeepseekV41DequantConverter)
+        assert isinstance(converter, DeepseekV41LlmConverter)
+        assert not converter.dequantize
+        packed = torch.randint(0, 256, (8, 8), dtype=torch.uint8).view(torch.int8)
+        result = maybe_convert_checkpoint_tensor("model.layers.0.self_attn.wq_a.weight", packed, converter)
+        assert result.name == "model.layers.0.self_attn.wq_a.weight"
+        assert result.tensor is packed
+
+    def test_factory_dequantizes_for_bf16_modules(self):
+        model = SimpleNamespace(config=self._llm_config(None))
+        converter = create_deepseek_v41_llm_checkpoint_tensor_converter(model)
+        assert isinstance(converter, DeepseekV41LlmConverter)
+        assert converter.dequantize
 
     def test_llm_hook_is_the_factory(self):
-        model = SimpleNamespace(config=SimpleNamespace(weight_quantization=None))
+        model = SimpleNamespace(config=self._llm_config(None))
         model._create_checkpoint_tensor_converter = staticmethod(DeepseekV41Llm._create_checkpoint_tensor_converter)
         converter = get_checkpoint_tensor_converter(model)
-        assert isinstance(converter, DeepseekV41DequantConverter)
+        assert isinstance(converter, DeepseekV41LlmConverter)
 
     def test_two_layer_stack_loads_released_layers_2_and_20(self):
         from veomni.models.seed_omni.modules.deepseek_v41.checkpoint_tensor_converter import (
@@ -1745,6 +1757,35 @@ class TestDeepseekV41DequantConverter:
         result = maybe_convert_checkpoint_tensor(f"{name}_scale", scale, converter)
         assert result is not None
         assert result.name == "model.layers.0.self_attn.wq_a.weight"
+
+    @pytest.mark.parametrize("quantized", [False, True], ids=["train", "quantized"])
+    def test_two_layer_stack_renames_the_unquantized_keys_of_kept_layers(self, quantized):
+        """Norms, router gates and sinks of released layers 2 and 20 must land on layers 0 and 1."""
+        config = SimpleNamespace(
+            weight_quantization=_V41_QUANT if quantized else None,
+            num_hidden_layers=2,
+            num_nextn_predict_layers=0,
+            n_routed_experts=4,
+            dspark_n_routed_experts=None,
+        )
+        converters = [create_deepseek_v41_llm_checkpoint_tensor_converter(SimpleNamespace(config=config))]
+        if not quantized:
+            converters.append(DeepseekV41DequantConverter(config))
+        for converter in converters:
+            for released, live in (
+                ("model.layers.2.input_layernorm.weight", "model.layers.0.input_layernorm.weight"),
+                ("model.layers.20.mlp.gate.weight", "model.layers.1.mlp.gate.weight"),
+                ("model.layers.20.self_attn.attn_sink", "model.layers.1.self_attn.attn_sink"),
+            ):
+                tensor = torch.ones(4, dtype=torch.bfloat16)
+                result = maybe_convert_checkpoint_tensor(released, tensor, converter)
+                assert result is not None and result.name == live, (type(converter).__name__, released)
+            assert converter.should_skip_without_loading("model.layers.3.input_layernorm.weight")
+        if quantized:
+            packed = torch.randint(0, 256, (4, 8, 4), dtype=torch.uint8).view(torch.int8)
+            result = maybe_convert_checkpoint_tensor("model.layers.20.mlp.experts.down_proj", packed, converters[0])
+            assert result.name == "model.layers.1.mlp.experts.down_proj"
+            assert result.tensor is packed
 
     def test_two_layer_stack_keeps_mtp_when_draft_stages_exist(self):
         from veomni.models.seed_omni.modules.deepseek_v41.checkpoint_tensor_converter import (

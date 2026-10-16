@@ -12,6 +12,15 @@
 #     --model_path /mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash \
 #     --output_dir /mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash
 #
+# Or skip the split: set model_path to the release itself
+# (/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash). The four modules then
+# load through the `deepseek_v41` HF layout with the same weights, including
+# under ep_sharded_stream_load (a shrunk llm, as here, streams only from the
+# release, not from a split checkpoint). save_hf_weights then writes the
+# release's own keys, fp8/fp4 dtypes and shards, for the full 40-layer llm
+# beside frozen n-gram tables only: a shrunk llm or trained tables raise at
+# the first HF save.
+#
 model:
   model_path: /mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash
   model_config:

@@ -6,6 +6,7 @@
 #     tasks/omni/train_omni.py configs/seed_omni/DeepSeek/deepseek_v41_flash/train/full.yaml
 
 model:
+  # Or the release itself, /mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash (see base.yaml).
   model_path: /mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash
   model_config:
     modules: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/modules_train_full.yaml

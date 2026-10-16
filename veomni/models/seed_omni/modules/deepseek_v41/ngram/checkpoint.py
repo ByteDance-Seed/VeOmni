@@ -118,12 +118,6 @@ class NgramTableDequant(NgramTablePadding):
             return torch.empty(rows.shape, dtype=torch.bfloat16)
         return dequantize_rows(rows, companion_rows)
 
-    def should_skip_without_loading(self, name: str) -> bool:
-        return self.can_handle(name) and name.endswith(".weight_scale")
-
-    def record_skip_without_loading(self, name: str) -> None:
-        pass
-
     def is_dim0_zero_pad(self, name: str) -> bool:
         """Only a bf16 checkpoint's table, which has no scale to pair with."""
         return self.can_handle(name) and name.endswith(".weight")

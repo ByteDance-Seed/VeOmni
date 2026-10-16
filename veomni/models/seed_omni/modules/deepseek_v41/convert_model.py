@@ -77,19 +77,22 @@ from safetensors.torch import save_file
 
 from ...utils.convert_registry import OMNI_CONVERT_REGISTRY, load_family_graphs
 from .dequant import fuse_gate_up
+from .released_names import (
+    MODULES,
+    TEXT_ENCODER_NAMES,
+    VISION_PREFIXES,
+    engram_connection_names,
+    llm_layer_names,
+    mtp_extra_names,
+    mtp_layer_names,
+    ngram_table_names,
+    released_scale_name,
+)
 
 
 #: Flush an output shard once it reaches this many bytes. Matches the release's
 #: own shard size closely enough that the output file count is comparable.
 SHARD_BYTES = 5 * 1000**3
-
-#: The subfolders a full conversion writes, in the order it writes them.
-MODULES = (
-    "deepseek_v41_vision",
-    "deepseek_v41_text_encoder",
-    "deepseek_v41_ngram",
-    "deepseek_v41_llm",
-)
 
 
 class ShardWriter:
@@ -261,19 +264,13 @@ class TensorSource:
         in ``DeepseekV41DequantConverter``.
         """
         weight = self.get(name)
-        scale_name = _scale_name(name)
+        scale_name = released_scale_name(name)
         if scale_name not in self.weight_map:
             return weight, None
         return weight, self.get(scale_name)
 
     def close(self) -> None:
         self._handles.clear()
-
-
-def _scale_name(weight_name: str) -> str:
-    if weight_name.endswith(".weight"):
-        return weight_name[: -len(".weight")] + ".scale"
-    return weight_name + ".scale"
 
 
 class Emitter:
@@ -370,22 +367,26 @@ def convert_vision(source: TensorSource, output_dir: str, config) -> int:
     writer = ShardWriter(target_dir)
     emitter = Emitter(source, writer)
     for name in sorted(source.names()):
-        if name.startswith(("vision.", "aligner.", "image_")):
+        if name.startswith(VISION_PREFIXES):
             if name.endswith(".scale"):
                 continue
             emitter.emit(name, name)
     count = writer.finalize(config)
+    build_vision_image_processor(config).save_pretrained(target_dir)
+    return count
 
+
+def build_vision_image_processor(config):
+    """The image processor, with the resize policy copied from ``vision_config``."""
     from .vision.processing import DeepseekV41VisionImageProcessor
 
-    DeepseekV41VisionImageProcessor(
+    return DeepseekV41VisionImageProcessor(
         patch_size=config.patch_size,
         downsample_ratio=config.downsample_ratio,
         max_image_tokens=config.max_image_tokens,
         min_pixels=config.min_pixels,
         max_wh_ratio=config.max_wh_ratio,
-    ).save_pretrained(target_dir)
-    return count
+    )
 
 
 def convert_text_encoder(source: TensorSource, output_dir: str, config, model_path: str) -> int:
@@ -393,8 +394,8 @@ def convert_text_encoder(source: TensorSource, output_dir: str, config, model_pa
     target_dir = os.path.join(output_dir, "deepseek_v41_text_encoder")
     writer = ShardWriter(target_dir)
     emitter = Emitter(source, writer)
-    emitter.emit("embed_tokens.weight", "embed.weight")
-    emitter.emit("lm_head.weight", "head.weight")
+    for released, target in TEXT_ENCODER_NAMES.items():
+        emitter.emit(target, released)
     count = writer.finalize(config)
 
     from transformers import AutoTokenizer
@@ -411,6 +412,21 @@ def convert_ngram(source: TensorSource, output_dir: str, config, model_path: str
     boundary can split, since safetensors stores a tensor whole. Copied as it
     lies, with the ``[384M, 8]`` scale beside it. The n-gram module keeps the
     tables frozen in fp8 for both training and inference.
+    """
+    token_map = build_ngram_token_map(model_path, config)
+    writer = ShardWriter(os.path.join(output_dir, "deepseek_v41_ngram"))
+    emitter = Emitter(source, writer)
+    writer.add("token_map", token_map)
+    for released, target in ngram_table_names(config.layer_ids).items():
+        emitter.emit(target, released)
+        gc.collect()
+    return writer.finalize(config)
+
+
+def build_ngram_token_map(model_path: str, config) -> torch.Tensor:
+    """The ``token_map`` the n-gram module hashes through, from the tokenizer at ``model_path``.
+
+    Checked against the config's sizes, which the tables were trained under.
     """
     from transformers import AutoTokenizer
 
@@ -431,82 +447,7 @@ def convert_ngram(source: TensorSource, output_dir: str, config, model_path: str
             "no token can reach. (This is the tokenizer's size, not hash_vocab_size="
             f"{config.hash_vocab_size}, which is the base the bucket primes are drawn above.)"
         )
-
-    writer = ShardWriter(os.path.join(output_dir, "deepseek_v41_ngram"))
-    emitter = Emitter(source, writer)
-    writer.add("token_map", torch.tensor(lookup, dtype=torch.int64))
-    for table_index, layer_id in enumerate(config.layer_ids):
-        emitter.emit(f"tables.{table_index}.weight", f"layers.{layer_id}.engram.embed.weight")
-        gc.collect()
-    return writer.finalize(config)
-
-
-def _llm_attention_names(layer: int) -> dict[str, str]:
-    """Released -> module, for one layer's attention block."""
-    prefix = f"layers.{layer}.attn"
-    target = f"model.layers.{layer}.self_attn"
-    names = {
-        f"{prefix}.wq_a.weight": f"{target}.wq_a.weight",
-        f"{prefix}.wq_b.weight": f"{target}.wq_b.weight",
-        f"{prefix}.wkv.weight": f"{target}.wkv.weight",
-        f"{prefix}.wo_a.weight": f"{target}.wo_a.weight",
-        f"{prefix}.wo_b.weight": f"{target}.wo_b.weight",
-        f"{prefix}.q_norm.weight": f"{target}.q_norm.weight",
-        f"{prefix}.kv_norm.weight": f"{target}.kv_norm.weight",
-        f"{prefix}.attn_sink": f"{target}.attn_sink",
-    }
-    for suffix in (
-        "compressor.norm.weight",
-        "compressor.wkv.weight",
-        "compressor.wgate.weight",
-        "indexer.wq_b.weight",
-        "indexer.wk.weight",
-        "indexer.k_norm.weight",
-        "indexer.weights_proj.weight",
-    ):
-        names[f"{prefix}.{suffix}"] = f"{target}.{suffix}"
-    return names
-
-
-def _llm_layer_names(layer: int) -> dict[str, str]:
-    """Released -> module, for everything in one layer except the experts.
-
-    The two norms are renamed rather than passed through: the released
-    ``attn_norm`` / ``ffn_norm`` are HF's ``input_layernorm`` /
-    ``post_attention_layernorm``, which is what the decoder layer declares.
-    """
-    names = _llm_attention_names(layer)
-    names[f"layers.{layer}.attn_norm.weight"] = f"model.layers.{layer}.input_layernorm.weight"
-    names[f"layers.{layer}.ffn_norm.weight"] = f"model.layers.{layer}.post_attention_layernorm.weight"
-    names[f"layers.{layer}.ffn.gate.weight"] = f"model.layers.{layer}.mlp.gate.weight"
-    # The aux-loss-free controllers. The release calls them `bias`; every
-    # DeepSeek-family module in this repo calls them e_score_correction_bias and
-    # holds them as buffers, not parameters -- they are updated by a sign rule on
-    # expert load, not by the objective.
-    names[f"layers.{layer}.ffn.gate.bias"] = f"model.layers.{layer}.mlp.gate.e_score_correction_bias"
-    names[f"layers.{layer}.ffn.gate.bias_vl"] = f"model.layers.{layer}.mlp.gate.e_score_correction_bias_vl"
-    for site in ("attn", "ffn"):
-        for part in ("fn", "base", "scale"):
-            names[f"layers.{layer}.hc_{site}_{part}"] = f"model.layers.{layer}.{site}_hc.{part}"
-    for source_name, target in (
-        ("w1", "gate_proj"),
-        ("w2", "down_proj"),
-        ("w3", "up_proj"),
-    ):
-        names[f"layers.{layer}.ffn.shared_experts.{source_name}.weight"] = (
-            f"model.layers.{layer}.mlp.shared_experts.{target}.weight"
-        )
-    return names
-
-
-def _mtp_layer_names(stage: int) -> dict[str, str]:
-    """Released ``mtp.{stage}.*`` -> ``model.mtp.{stage}.*``, same inner mapping as a backbone layer."""
-    return {
-        released.replace(f"layers.{stage}", f"mtp.{stage}", 1): target.replace(
-            f"model.layers.{stage}", f"model.mtp.{stage}", 1
-        )
-        for released, target in _llm_layer_names(stage).items()
-    }
+    return torch.tensor(lookup, dtype=torch.int64)
 
 
 def convert_llm(source: TensorSource, output_dir: str, config, engram_layer_ids: list[int]) -> int:
@@ -515,7 +456,7 @@ def convert_llm(source: TensorSource, output_dir: str, config, engram_layer_ids:
     emitter = Emitter(source, writer)
 
     for layer in range(config.num_hidden_layers):
-        for released, target in _llm_layer_names(layer).items():
+        for released, target in llm_layer_names(layer).items():
             if released not in source:
                 continue
             emitter.emit(target, released)
@@ -525,10 +466,8 @@ def convert_llm(source: TensorSource, output_dir: str, config, engram_layer_ids:
         # The Engram connection's half: the tables went to the ngram module, the
         # gate and wkv stay here because they read the mHC residual stream.
         if layer in engram_layer_ids:
-            connection = f"model.engram.{layer}"
-            for part in ("q_weight", "k_weight"):
-                emitter.emit(f"{connection}.{part}", f"layers.{layer}.engram.{part}")
-            emitter.emit(f"{connection}.wkv.weight", f"layers.{layer}.engram.wkv.weight")
+            for released, target in engram_connection_names(layer).items():
+                emitter.emit(target, released)
 
     _convert_mtp(emitter, source, config)
     emitter.emit("model.norm.weight", "norm.weight")
@@ -541,25 +480,14 @@ def _convert_mtp(emitter: Emitter, source: TensorSource, config) -> None:
     if n_stages <= 0 or "mtp.0.attn.wq_a.weight" not in source:
         return
     n_experts = config.dspark_n_routed_experts or config.n_routed_experts
-    last = n_stages - 1
     for stage in range(n_stages):
-        for released, target in _mtp_layer_names(stage).items():
+        for released, target in mtp_layer_names(stage).items():
             if released not in source:
                 continue
             emitter.emit(target, released)
         _convert_layer_experts(emitter, stage, n_experts, source_prefix="mtp", dest_prefix="model.mtp")
 
-    if "mtp.0.main_proj.weight" in source:
-        emitter.emit("model.mtp.0.main_proj.weight", "mtp.0.main_proj.weight")
-    if "mtp.0.main_norm.weight" in source:
-        emitter.emit("model.mtp.0.main_norm.weight", "mtp.0.main_norm.weight")
-    if f"mtp.{last}.norm.weight" in source:
-        emitter.emit(f"model.mtp.{last}.norm.weight", f"mtp.{last}.norm.weight")
-    for released, target in (
-        (f"mtp.{last}.markov_head.embed.weight", f"model.mtp.{last}.markov_head.embed.weight"),
-        (f"mtp.{last}.markov_head.head.weight", f"model.mtp.{last}.markov_head.head.weight"),
-        (f"mtp.{last}.confidence_head.proj.weight", f"model.mtp.{last}.confidence_head.proj.weight"),
-    ):
+    for released, target in mtp_extra_names(n_stages).items():
         if released in source:
             emitter.emit(target, released)
 
@@ -762,4 +690,9 @@ def _register_deepseek_v41_convert():
     return convert_deepseek_v41_checkpoint
 
 
-__all__ = ["build_compressed_token_map", "convert_deepseek_v41_checkpoint"]
+__all__ = [
+    "build_compressed_token_map",
+    "build_ngram_token_map",
+    "build_vision_image_processor",
+    "convert_deepseek_v41_checkpoint",
+]

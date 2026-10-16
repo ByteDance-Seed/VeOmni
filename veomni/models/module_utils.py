@@ -877,6 +877,9 @@ def load_model_weights_ep_sharded(
         companion = checkpoint_converter_dim0_rowwise_companion(converter, bare_name)
         return companion if companion in bare_to_raw else None
 
+    # Read beside the key that names them, never on their own.
+    companions = {companion for bare in bare_to_raw if (companion := _rowwise_companion(bare)) is not None}
+
     if converter is not None:
         # Source-key count per expert of each fused target. A converter's ``finalize`` only
         # sees its own rank's range, so a gap there would fail one rank (or, for a wholly
@@ -884,7 +887,7 @@ def load_model_weights_ep_sharded(
         expert_key_counts: Dict[str, Dict[int, int]] = {}
         num_experts_by_target: Dict[str, int] = {}
         for bare_name, raw_name in bare_to_raw.items():
-            if checkpoint_converter_should_skip_without_loading(converter, bare_name):
+            if bare_name in companions or checkpoint_converter_should_skip_without_loading(converter, bare_name):
                 continue
             if not _converter_transforms(bare_name):
                 continue
@@ -981,6 +984,9 @@ def load_model_weights_ep_sharded(
                 bare_name = _bare_name(raw_name)
                 if bare_name is None:
                     source_converter.record_skip_without_loading(raw_name)
+                    n_skipped += 1
+                    continue
+                if bare_name in companions:
                     n_skipped += 1
                     continue
                 name = _apply_peft_override(bare_name)

@@ -120,8 +120,9 @@ class CheckpointTensorConverter(Protocol):
         and their per-row block scales, dequantized to bf16). Such a transform
         commutes with a ``Shard(0)`` split, so a per-rank streaming loader reads
         the same real-row slice of both keys, hands them to :meth:`convert_rows`,
-        and zero-fills any rows past the checkpoint's. The companion itself
-        should be declared in :meth:`should_skip_without_loading`.
+        and zero-fills any rows past the checkpoint's. That loader then skips
+        the companion's own key; a whole-tensor loader hands both keys to
+        :meth:`convert`, so it must pair them there too.
 
         A key outside every ExtraParallel plan is read whole, with its whole
         companion. The loader asks for every key, claimed by :meth:`can_handle`
