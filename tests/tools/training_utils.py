@@ -34,6 +34,16 @@ _NPU_OPS_DEFAULTS: Dict[str, str] = {
     # gates ``triton`` on ``is_package_available("triton")`` so the fused
     # load-balancing-loss kernel would raise on the NPU runner. Pin to eager.
     "load_balancing_loss_implementation": "eager",
+    # GatedDeltaNet trio (Qwen3.5, Qwen4-Exp). The dataclass default is ``fla``,
+    # whose package is GPU-only, and ``eager`` has no ``cu_seqlens`` path — so
+    # without these the varlen tests either fail at OpSlot.bind or have to be
+    # skipped. The ``npu`` backends are the vendored MindSpeed-MM Triton
+    # kernels; they need ``triton-ascend``, which the NPU workflows install.
+    # Models without a GatedDeltaNet never bind these slots, so the entries are
+    # inert for them.
+    "rms_norm_gated_implementation": "npu",
+    "causal_conv1d_implementation": "npu",
+    "chunk_gated_delta_rule_implementation": "npu",
 }
 
 _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
