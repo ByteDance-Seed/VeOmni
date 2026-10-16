@@ -61,7 +61,7 @@ if they implement the same variant.
 | `op_name` | Variants | Description |
 |-----------|----------|-------------|
 | `rms_norm` | `standard`, `qwen3_5` | Standard: `w * x/rms`. Qwen3.5: `(1+w) * x/rms` (weight init zeros) |
-| `rms_norm_gated` | `standard` | `rms_norm(x) * silu(gate)` |
+| `rms_norm_gated` | `standard` | `rms_norm(x) * act(gate)`; `act` is SiLU unless the model sets another gate activation (Qwen4-Exp uses sigmoid) |
 | `apply_rotary_pos_emb` | `full`, `partial` | Full: rotate all dims. Partial: rotate first `rotary_dim`, passthrough rest |
 | `swiglu_mlp` | `standard` | SwiGLU MLP (gate/up/down) |
 | `attention` | `standard` | Multi-head / GQA attention (existing `ALL_ATTENTION_FUNCTIONS` — unchanged) |

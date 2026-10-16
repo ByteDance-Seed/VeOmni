@@ -101,6 +101,16 @@ def _eager_rms_norm_gated(hidden_states, weight, eps, gate):
     return torch.nn.functional.silu(fused_input[..., :half]) * fused_input[..., half:]
 
 
+def _eager_rms_norm_sigmoid_gated(hidden_states, weight, eps, gate):
+    """Eager reference for a sigmoid gate (Qwen4-Exp ``output_gate_type``)."""
+    dtype = hidden_states.dtype
+    x_f = hidden_states.to(torch.float32)
+    variance = x_f.pow(2).mean(-1, keepdim=True)
+    x_f = x_f * torch.rsqrt(variance + eps)
+    normed = (weight * x_f.to(dtype)).to(dtype)
+    return (normed * torch.sigmoid(gate.to(torch.float32))).to(dtype)
+
+
 def _eager_clamped_swiglu(x, limit):
     gate, up = x.chunk(2, dim=-1)
     gate = gate.clamp(max=limit)
@@ -335,6 +345,81 @@ class TestNPURmsNormGated:
         # Compound op: RMSNorm + concat + SiLU gate — multiple bf16 roundings.
         # 1e-2 atol+rtol covers 1-2 bf16 ULPs at typical normalized values.
         assert torch.allclose(out_fused.float(), out_eager.float(), atol=1e-2, rtol=1e-2)
+
+    def test_sigmoid_gate_matches_eager_bf16(self):
+        """A non-SiLU gate must not take the SiLU-only ``npu_swiglu`` path.
+
+        Qwen4-Exp sets ``output_gate_type="sigmoid"``; fusing it would compute
+        ``silu(gate) * normed`` and mis-train without raising.
+        """
+        batch, seq, hidden = 2, 16, 128
+        slot = OpSlot("rms_norm_gated", "standard")
+        slot.bind("npu")
+        fused_module = slot.bound_kernel()(hidden_size=hidden, eps=1e-6, activation="sigmoid").to(
+            device=DEVICE, dtype=torch.bfloat16
+        )
+
+        hidden_states = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
+        # Unlike the SiLU path, the gate is applied elementwise, so it carries
+        # the same width as the normalized hidden states.
+        gate = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
+
+        out_fused = fused_module(hidden_states, gate=gate)
+        out_eager = _eager_rms_norm_sigmoid_gated(
+            hidden_states, fused_module.weight, fused_module.variance_epsilon, gate
+        )
+        assert torch.allclose(out_fused.float(), out_eager.float(), atol=1e-2, rtol=1e-2)
+
+
+class TestNPUGatedDeltaNetVarlen:
+    """Tests for the ``causal_conv1d`` and ``chunk_gated_delta_rule`` NPU Triton kernels."""
+
+    def test_causal_conv1d_accepts_cpu_cu_seqlens(self):
+        """``veomni.models.auto`` moves ``cu_seq_lens_q`` to CPU on NPU; the
+        Triton ``causal_conv1d`` adapter must move it to ``x.device``."""
+        slot = OpSlot("causal_conv1d", "standard")
+        slot.bind("npu")
+        fn = slot.bound_kernel()
+
+        B, T, D, W = 1, 64, 256, 4
+        x = torch.randn(B, T, D, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        weight = torch.randn(D, W, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        cu_seqlens = torch.tensor([0, 32, 64], dtype=torch.int32, device="cpu")
+
+        out = fn(x=x, weight=weight, bias=None, activation="silu", cu_seqlens=cu_seqlens)[0]
+        assert out.shape == (B, T, D)
+        out.sum().backward()
+        assert x.grad is not None and weight.grad is not None
+
+    def test_chunk_gated_delta_rule_accepts_cpu_cu_seqlens(self):
+        """``chunk_gated_delta_rule`` ``npu`` backend must also accept a CPU
+        ``cu_seqlens`` tensor without raising a Triton pointer error."""
+        slot = OpSlot("chunk_gated_delta_rule", "standard")
+        slot.bind("npu")
+        fn = slot.bound_kernel()
+
+        B, T, H, K, V = 1, 64, 2, 64, 64
+        q = torch.randn(B, T, H, K, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(B, T, H, K, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(B, T, H, V, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        g = (-torch.rand(B, T, H, device=DEVICE, dtype=torch.float32)).requires_grad_(True)
+        beta = torch.rand(B, T, H, device=DEVICE, dtype=torch.bfloat16).sigmoid().requires_grad_(True)
+        cu_seqlens = torch.tensor([0, 32, 64], dtype=torch.int32, device="cpu")
+
+        out, _ = fn(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens,
+        )
+        assert out.shape == (B, T, H, V)
+        out.sum().backward()
+        assert q.grad is not None and k.grad is not None and v.grad is not None
 
 
 # ---------------------------------------------------------------------------
