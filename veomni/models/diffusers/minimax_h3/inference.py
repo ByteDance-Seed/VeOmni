@@ -457,8 +457,6 @@ class MiniMaxH3Pipeline(BasePipeline):
         tiled: bool = True,
         tile_size: int = 256,
         tile_overlap: int = 64,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
         # Keyframe to Video
         keyframes: list[Image.Image] = None,
         keyframe_indices: list[int] = None,
@@ -500,8 +498,6 @@ class MiniMaxH3Pipeline(BasePipeline):
             "num_frames": num_frames,
             "seed": seed,
             "rand_device": rand_device,
-            "use_gradient_checkpointing": use_gradient_checkpointing,
-            "use_gradient_checkpointing_offload": use_gradient_checkpointing_offload,
             "keyframes": keyframes,
             "keyframe_indices": keyframe_indices,
             "references": references,
@@ -1177,8 +1173,6 @@ def model_fn_minimax_h3(
     ref_audio_anchor=None,
     imgvid_cond_noise_aug=0.999,
     audio_cond_noise_aug=1.0,
-    use_gradient_checkpointing=False,
-    use_gradient_checkpointing_offload=False,
     **kwargs,
 ):
     dtype, device = video_latents.dtype, video_latents.device
@@ -1248,8 +1242,6 @@ def model_fn_minimax_h3(
         cond_rows=cond_rows_count,
         video_latent_shape=(f, h // 2, w // 2),
         audio_latent_shape=(audio_channel, audio_t),
-        use_gradient_checkpointing=use_gradient_checkpointing,
-        use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
     )
 
     video_pred, audio_pred = outputs.predictions
