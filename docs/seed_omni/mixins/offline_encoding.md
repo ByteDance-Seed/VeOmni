@@ -6,7 +6,7 @@ afterwards. It is a marker: mixing it in is what makes a module cacheable, and
 it declares no method.
 
 - Mixin: [`OfflineEncodingMixin`](../../../veomni/models/seed_omni/mixins/offline_encoding_mixin.py#L20)
-- Run selector: [`train.training_task`](../../../veomni/arguments/omni_arguments_types.py#L671)
+- Run selector: [`train.training_task`](../../../veomni/arguments/omni_arguments_types.py#L701)
 - Meta build: [`ModuleRuntime.reads_offline_cache`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L216)
 
 ## Why cache a module's encoder
@@ -70,13 +70,14 @@ tasks:
 | `offline_embedding` | Reads raw `seedomni` data once (`train.num_train_epochs: 1`), runs the graph without autograd and writes each encoded conversation to `train.offline_cache_dir`, which it requires. Every module is frozen: no optimizer, no lr scheduler, no checkpoint manager. | Full load, frozen; the graph calls its offline-embedding method. |
 | `offline_training` | Trains from the cache, read back with `data.data_type: seedomni_cached`. | Built on meta, never loaded, and frozen; the graph calls its offline-training method. |
 
-`OmniArguments` ([`_validate_training_task_data`](../../../veomni/arguments/omni_arguments_types.py#L792)) rejects
+`OmniArguments` ([`_validate_training_task_data`](../../../veomni/arguments/omni_arguments_types.py#L822)) rejects
 a run whose `data.data_type` does not match: only `offline_training` reads
 `seedomni_cached`.
 
 Which modules exist and which method each graph node calls stay in the
-modules / graph YAML: each task has its own pair. `training_task` only decides
-how the trainer loops and how a cacheable module is built. Nothing checks that
+modules / graph YAML: each task has its own pair, e.g. BAGEL's `offline_cache/`
+and `with_cache/` directories. `training_task` only decides how the trainer
+loops and how a cacheable module is built. Nothing checks that
 the graph YAML was written for the task: an `offline_training` run given the
 online graph builds the cacheable module on meta and then calls its online
 method, which fails at the first step on meta parameters. The other mistake
@@ -124,7 +125,7 @@ full, or it is built on meta.
   is true when the module's class mixes in `OfflineEncodingMixin`. The class
   is resolved from the module config with `get_model_class`, because the init
   device has to be chosen before the module exists. Then
-  [`_build_model`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L318)
+  [`_build_model`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L340)
   passes `init_device="meta"`, and the
   [training build stops](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L160)
   right after `requires_grad_(False)`: no parallel wrap, no weight load, no
@@ -153,8 +154,9 @@ full.
 - **The training run.** The VAE mixes in `OfflineEncodingMixin`, so it is
   built on meta, and its graph calls `bagel_vae.online_process`. The LLM, the
   ViT, the text encoder and the flow connector do not mix it in, so they load
-  and train as usual. Its modules YAML is the online training run's; only the
-  VAE's edge changes, from `bagel_vae.encode` to `bagel_vae.online_process`.
+  and train as usual. `with_cache/modules_train.yaml` is the same file as the
+  online run's `train/modules_train.yaml`; between the two graphs only the VAE's
+  edge changes, from `bagel_vae.encode` to `bagel_vae.online_process`.
 - **A cacheable module that still needs its weights.** An `offline_training`
   graph that also called `bagel_vae.decode`, for example for a reconstruction
   loss, would fail at its first step: the VAE is on meta, and decoding reads
@@ -165,12 +167,14 @@ full.
   reports it.
 
 The data side needs no switch. The
-[`SeedOmniCollator`](../../../veomni/data/seed_omni/collator.py#L26) always runs
-every module's preprocessor, `seedomni_cached` included, so a preprocessor must
-leave items that already hold a cache artifact alone. The simplest way is to
-mark such items in the offline-embedding method's post-hook with a key in `item.meta` and
-skip marked items in the preprocessor: the meta is saved with the item, so the
-training run sees the marker.
+[`SeedOmniCollator`](../../../veomni/data/seed_omni/collator.py#L26) always runs every
+module's preprocessor, `seedomni_cached` included, so a preprocessor must leave
+items that already hold a cache artifact alone. BAGEL marks such items in
+`offline_encode`'s post-hook with
+[`BAGEL_VAE_POSTERIOR`](../../../veomni/models/seed_omni/modules/bagel/vae/processing.py#L417),
+and the VAE preprocessor
+[skips them](../../../veomni/models/seed_omni/modules/bagel/vae/processing.py#L479).
+The marker is saved with the item's meta, so the training run sees it.
 
 ## Opting in
 
@@ -209,9 +213,12 @@ class XxxAccelerated(BaseMixin, XxxOfflineMixin, TrainingModuleMixin, XxxModel):
         return {"latents": latents}  # where downstream nodes read them
 ```
 
-The HF modeling class always builds every sub-network; it holds no VeOmni run
-logic, because which method runs is decided by the graph YAML, and whether
-weights are loaded by `ModuleRuntime`.
+BAGEL's VAE does exactly this:
+[`BagelVAEOfflineMixin`](../../../veomni/models/seed_omni/modules/bagel/vae/accelerated/accelerated.py#L44)
+and
+[`VeOmniMixin`](../../../veomni/models/seed_omni/modules/bagel/vae/accelerated/accelerated.py#L305).
+The HF modeling class always builds the encoder and decoder; it holds no
+VeOmni run logic.
 
 ## The functions
 
@@ -261,8 +268,8 @@ with its own modules and graph YAML. Each method is named in the graph as
 
 1. **Encoding run.** Only `offline_encode` runs, without autograd. Its post-hook
    attaches the artifacts to the batch, and a cache writer persists them per
-   sample. Dummy items a preprocessor appends for FSDP are encoded and saved
-   too, so the training run sees the same item layout.
+   sample. For BAGEL the VAE preprocessor's per-sample dummy rows are encoded
+   too, so every cached sample carries a VAE item.
 2. **Training run.** The dataset yields the cached artifacts in place of the raw
    media for this module. The module is built on meta, and `online_process`
    turns each artifact into the tensors downstream nodes expect.
@@ -299,7 +306,8 @@ given. Two rules follow:
   [`pre_forward` / `post_forward` hooks](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L61)
   run on the batch itself, outside the module's wrap, so edits made there land.
   The method body gets its kwargs after the module wrap's cast, so in-place
-  edits there are lost unless it returns `conversation_list`.
+  edits there are lost unless it returns `conversation_list`. BAGEL's VAE
+  [edits in `post_forward` and returns the list](../../../veomni/models/seed_omni/modules/bagel/vae/accelerated/accelerated.py#L84).
 
 Ranks that share a `dp_rank` (SP, CP or
 TP peers) hold the same batch, so
@@ -307,12 +315,14 @@ TP peers) hold the same batch, so
 The training run reads the cache through the
 [`seedomni_cached`](../../../veomni/data/seed_omni/seedomni_transform.py#L246)
 data transform. It unpickles each row, so point `data.train_path` only at a
-cache you trust.
+cache you trust. See the
+[Bagel offline VAE cache](../models/bagel.md#32-offline-vae-posterior-cache-two-stages)
+for a two-stage example.
 
 ### The generation graph in a cache run
 
 A cache run's modules YAML usually lacks modules that the checkpoint's
-generation graph names, e.g. an encoding run loads only the encoder. So
+generation graph names, e.g. BAGEL's encoding run loads only `bagel_vae`. So
 `OmniModel` checks only the generation graph's structure when it is built, and
 checks it against the loaded modules
 ([`GenerationGraph.validate_modules`](../../../veomni/models/seed_omni/graphs/generation_graph.py#L312))
@@ -323,7 +333,7 @@ A missing module or method still fails before the first request runs.
 ## Current scope
 
 - **Cached modules are not checkpointed.** They are frozen in both cache tasks,
-  and [fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L624),
+  and [fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L662),
   so a checkpoint never holds a meta module.
 - **Every cacheable module is read from the cache.** `offline_training` builds
   every module that mixes in `OfflineEncodingMixin` on meta; one run cannot
@@ -343,10 +353,18 @@ A missing module or method still fails before the first request runs.
 - [`tests/seed_omni/mixins/test_offline_encoding_mixin.py`](../../../tests/seed_omni/mixins/test_offline_encoding_mixin.py):
   [the mixin is a marker that names no method](../../../tests/seed_omni/mixins/test_offline_encoding_mixin.py#L64),
   and the hook slots dispatch through `TrainingModuleMixin`.
-- [`tests/seed_omni/test_omni_offline_cache_args.py`](../../../tests/seed_omni/test_omni_offline_cache_args.py):
+- [`tests/seed_omni/arguments/test_offline_cache_args.py`](../../../tests/seed_omni/arguments/test_offline_cache_args.py):
   `train.training_task` values, the `offline_cache_dir` requirement,
-  [one epoch for `offline_embedding`](../../../tests/seed_omni/test_omni_offline_cache_args.py#L60) and
-  [the `data.data_type` match](../../../tests/seed_omni/test_omni_offline_cache_args.py#L76).
+  [one epoch for `offline_embedding`](../../../tests/seed_omni/arguments/test_offline_cache_args.py#L60),
+  [the `data.data_type` match](../../../tests/seed_omni/arguments/test_offline_cache_args.py#L76).
+- [`tests/seed_omni/mixins/test_offline_cache_writer.py`](../../../tests/seed_omni/mixins/test_offline_cache_writer.py):
+  [the writer round trip](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L51),
+  [one writer per `dp_rank`](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L225),
+  [a resumed writer keeps every row its cursor covers and drops the replayed ones](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L132),
+  [a finalized cache](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L160) or [another dp size](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L173) cannot be resumed into, and
+  [a shard only one rank sees fails every rank](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L311).
+- [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
+  [a step without an lr scheduler logs no lr](../../../tests/seed_omni/trainer/test_step_metrics_callback.py#L82).
 - [`tests/seed_omni/runtime/test_module_runtime.py`](../../../tests/seed_omni/runtime/test_module_runtime.py):
   [only a cacheable module under `offline_training` is built on meta](../../../tests/seed_omni/runtime/test_module_runtime.py#L165),
   [the class the omni registries build is the one checked](../../../tests/seed_omni/runtime/test_module_runtime.py#L190),
@@ -355,13 +373,11 @@ A missing module or method still fails before the first request runs.
 - [`tests/seed_omni/runtime/test_omni_model_runtime.py`](../../../tests/seed_omni/runtime/test_omni_model_runtime.py):
   [under `fsdp_scope: model`, cache readers stay on meta outside the composed wrap](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L409), and
   [under a module-level input cast, a node's item edits reach the batch only from its hooks or its return](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L296).
-- [`tests/seed_omni/test_offline_cache_writer.py`](../../../tests/seed_omni/test_offline_cache_writer.py):
-  [the `seedomni_cached` transform](../../../tests/seed_omni/test_offline_cache_writer.py#L33), the
-  [writer round trip](../../../tests/seed_omni/test_offline_cache_writer.py#L51),
-  [one writer per `dp_rank`](../../../tests/seed_omni/test_offline_cache_writer.py#L225),
-  [a resumed writer keeps every row its cursor covers and drops the replayed ones](../../../tests/seed_omni/test_offline_cache_writer.py#L132),
-  [a finalized cache](../../../tests/seed_omni/test_offline_cache_writer.py#L160) or [another dp size](../../../tests/seed_omni/test_offline_cache_writer.py#L173) cannot be resumed into, and
-  [a shard only one rank sees fails every rank](../../../tests/seed_omni/test_offline_cache_writer.py#L311).
+- [`tests/seed_omni/modules/bagel/test_processing.py`](../../../tests/seed_omni/modules/bagel/test_processing.py):
+  [`online_process` on a meta-built VAE](../../../tests/seed_omni/modules/bagel/test_processing.py#L264) and the
+  [offline cache round trip](../../../tests/seed_omni/modules/bagel/test_processing.py#L305).
+- [`tests/seed_omni/data/test_preprocessor.py`](../../../tests/seed_omni/data/test_preprocessor.py):
+  [the VAE preprocessor leaves cached posteriors alone](../../../tests/seed_omni/data/test_preprocessor.py#L394).
 - [`tests/seed_omni/trainer/test_omni_trainer.py`](../../../tests/seed_omni/trainer/test_omni_trainer.py):
   [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L125),
   [it saves no model state](../../../tests/seed_omni/trainer/test_omni_trainer.py#L137),
@@ -371,8 +387,6 @@ A missing module or method still fails before the first request runs.
 - [`tests/checkpoints/test_checkpoint_callback.py`](../../../tests/checkpoints/test_checkpoint_callback.py):
   [the writer's position is saved and restored with the cursor, and the cursor-only step is complete](../../../tests/checkpoints/test_checkpoint_callback.py#L632).
 - [`tests/checkpoints/test_dcp_checkpointer.py`](../../../tests/checkpoints/test_dcp_checkpointer.py):
-  [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2546).
-- [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
-  [a step without an lr scheduler logs no lr](../../../tests/seed_omni/trainer/test_step_metrics_callback.py#L82).
+  [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2552).
 - [`tests/seed_omni/model/test_graph.py`](../../../tests/seed_omni/model/test_graph.py):
   [a generation graph builds without the modules it names](../../../tests/seed_omni/model/test_graph.py#L141).

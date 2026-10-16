@@ -15,6 +15,7 @@
 
 import io
 import math
+import os
 from io import BytesIO
 from typing import ByteString, List, Union
 
@@ -89,8 +90,14 @@ def smart_resize(
 def load_image_from_path(image: str, **kwargs):
     if image.startswith("http://") or image.startswith("https://"):
         response = requests.get(image, stream=True)
+        # ``raise_for_status`` surfaces a 404 / 5xx with the URL + status code
+        # instead of letting PIL raise a downstream ``UnidentifiedImageError``
+        # on the HTML error body, which obscures the real failure.
+        response.raise_for_status()
         image_obj = Image.open(BytesIO(response.content))
     else:
+        if not os.path.exists(image):
+            raise FileNotFoundError(f"Image path does not exist: {image}")
         image_obj = Image.open(image)
     return image_obj.convert("RGB")
 
@@ -117,8 +124,11 @@ def fetch_images(images: List[ImageInput], **kwargs):
 
 
 def save_image_tensors_to_file(image_tensors: torch.Tensor, output_path: str):
-    image_tensors = image_tensors * 255.0
-    image_tensors = image_tensors.clamp(0, 255)
+    # `.round()` before `.to(torch.uint8)` is load-bearing — uint8 cast TRUNCATES
+    # toward zero (so 127.5 → 127, not 128).  Without the explicit round the
+    # saved PNG drifts ±1 LSB from the float pixel intensity, which fails
+    # bit-exact parity against numpy / PIL reference encoders downstream.
+    image_tensors = (image_tensors * 255.0).clamp(0, 255).round()
     image_tensors = image_tensors.cpu().to(torch.uint8).numpy()
     image = Image.fromarray(image_tensors)
     image.save(output_path)

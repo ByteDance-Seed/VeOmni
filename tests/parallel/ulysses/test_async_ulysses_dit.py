@@ -35,6 +35,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch.testing._internal.common_utils import run_tests
 
+from veomni.distributed.parallel_state import set_parallel_state
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
 from veomni.distributed.sequence_parallel.async_ulysses_dit import (
     async_ulysses_output_projection as async_ulysses_dit_output_projection,
@@ -42,10 +43,7 @@ from veomni.distributed.sequence_parallel.async_ulysses_dit import (
 from veomni.distributed.sequence_parallel.async_ulysses_dit import (
     async_ulysses_qkv_projection as async_ulysses_dit_qkv_projection,
 )
-from veomni.distributed.sequence_parallel.comm import (
-    get_ulysses_sequence_parallel_group,
-    set_ulysses_sequence_parallel_group,
-)
+from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
@@ -312,7 +310,7 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
         part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
         # Forward & backward for data parallel (reference)
-        set_ulysses_sequence_parallel_group(None)
+        set_parallel_state(None)
         dp_rst = attn_dp(full_input, unpad_size)
         loss_dp = loss_func(dp_rst)
         loss_dp.backward()
@@ -411,7 +409,7 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
         part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
         # Forward & backward for data parallel (reference)
-        set_ulysses_sequence_parallel_group(None)
+        set_parallel_state(None)
         dp_rst = attn_dp(full_input, unpad_size)
         loss_dp = loss_func(dp_rst)
         loss_dp.backward()

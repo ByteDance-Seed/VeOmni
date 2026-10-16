@@ -1,6 +1,6 @@
 # Qwen3.5-MoE-35B LoRA on eight Ascend NPUs with FSDP2 and expert parallelism.
 # GPU validation uses this same file with the hardware backend overrides shown
-# in docs/examples/qwen3_5_moe_lora.md.
+# in docs/examples/qwen3_5.md.
 
 model:
   model_path: Qwen/Qwen3.5-35B-A3B

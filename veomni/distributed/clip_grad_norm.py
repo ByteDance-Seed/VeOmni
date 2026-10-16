@@ -189,7 +189,7 @@ def veomni_omni_model_clip_grad_norm(
       optimizer config, so *max_grad_norm* here is only the model-level value
       they inherit from. Returns ``sqrt(sum n_i^2)`` of the per-module (pre-clip)
       norms for logging.
-    * ``global`` (not enabled yet: ``OptimizerConfig`` rejects it): measure
+    * ``global``: measure
       each module with ``max_norm=inf`` (no scale), ``total = sqrt(sum n_i^2)``,
       then if ``total > max_grad_norm`` scale **all**
       module grads by one coefficient — single-model / seedream

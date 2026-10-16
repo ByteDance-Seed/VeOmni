@@ -21,14 +21,17 @@ the wrong axis. Dividing source-frame indices by a target rate is the bug
 `PR #1165 <https://github.com/ByteDance-Seed/VeOmni/pull/1165>`_ fixed on the
 BaseTrainer path: frame 300 of a 30 fps clip is 10 s, but 300/2 reads as 150 s.
 
-So these tests pin two things, which together are what makes that bug
+So these tests pin three things, which together are what makes that bug
 unwritable here:
 
 * the source axis is what survives (``fps`` / ``total_num_frames`` /
   ``frames_indices``), and the metadata does the division itself, so no call
   site ever pairs indices with a rate;
 * it lives on the item's ``meta``, not inside the payload, because an encoder
-  overwrites the payload while the backbone reads the timeline after that.
+  overwrites the payload while the backbone reads the timeline after that;
+* nothing downstream re-picks the frames, which would leave
+  ``frames_indices`` describing a frame set the vision tower never saw — the
+  second half of #1165.
 
 The audio half is here too: sound lifted out of a clip has to land on the same
 wall clock as its frames, and the two spans have to stay comparable.
@@ -54,6 +57,7 @@ from veomni.data.seed_omni.utils.video import (
     _sample_frame_indices,
     load_video,
 )
+from veomni.models.seed_omni.modules.qwen3vl.vision.processing import _OMNI_GRID
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
@@ -216,6 +220,85 @@ def test_load_video_records_the_timeline_for_a_pre_decoded_frame_list():
     # A silent clip states no audio metadata at all, rather than an empty one a
     # consumer would have to tell apart from a real 0 Hz track.
     assert payload.audio is None and AUDIO_METADATA_KEY not in meta
+
+
+def test_qwen3vl_forwards_the_source_axis_to_the_hf_processor():
+    from veomni.models.seed_omni.modules.qwen3vl.vision.processing import _video_metadata
+
+    video_metadata = _metadata_for(total_frames=301, source_fps=30.0, requested_fps=2.0, max_frames=6)
+    item = _video_item(video_metadata, torch.zeros(6, 3, 2, 2, dtype=torch.uint8))
+
+    assert _video_metadata([item]) == [
+        {"total_num_frames": 301, "fps": 30.0, "frames_indices": video_metadata.frames_indices}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source_fps", "total_frames", "requested_fps", "max_frames"),
+    [
+        (30.0, 301, 2.0, None),  # rates line up
+        (25.0, 251, 2.0, None),  # stride rounds -> kept frames sit at 2.083 fps
+        (30.0, 301, 8.0, None),  # asked for more than the processor's own target
+        (30.0, 301, 2.0, 6),  # max_frames thins the clip
+    ],
+)
+def test_the_hf_processor_never_re_picks_the_frames_we_sampled(source_fps, total_frames, requested_fps, max_frames):
+    """The second half of #1165, against the real processor.
+
+    ``Qwen3VLVideoProcessor`` samples to its own target rate by default. A
+    second pass silently changes which frames the tower encodes, after which
+    ``frames_indices`` — and every timestamp derived from it — describes a
+    different clip. The only thing it may still do is pad the tail up to a
+    whole ``temporal_patch_size``, which ``frame_timestamps`` pads to match.
+    """
+    from transformers.models.qwen3_vl.video_processing_qwen3_vl import Qwen3VLVideoProcessor
+
+    from veomni.models.seed_omni.modules.qwen3vl.vision.processing import Qwen3VLVisionPreprocessor
+
+    video_processor = Qwen3VLVideoProcessor()
+    temporal_patch_size = video_processor.temporal_patch_size
+    video_metadata = _metadata_for(total_frames, source_fps, requested_fps, max_frames)
+    kept = len(video_metadata.frames_indices)
+    item = _video_item(video_metadata, torch.zeros(kept, 3, 32, 32, dtype=torch.uint8))
+
+    Qwen3VLVisionPreprocessor(image_processor=None, video_processor=video_processor).preprocess_conversations(
+        [[item]], inference=True
+    )
+
+    encoded_frames = item.meta[_OMNI_GRID][0] * temporal_patch_size
+    assert encoded_frames - kept == (-kept) % temporal_patch_size, (
+        f"processor returned {encoded_frames} frames for the {kept} it was handed: more than tail padding, "
+        "so it re-sampled and frames_indices is now stale"
+    )
+    # Padded or not, the patch times still land inside the source clip.
+    patch_times = video_metadata.frame_timestamps(temporal_patch_size)
+    assert len(patch_times) == item.meta[_OMNI_GRID][0]
+    assert 0.0 <= patch_times[0] and patch_times[-1] <= video_metadata.duration
+
+
+def test_a_tower_that_cannot_hear_encodes_a_clip_with_sound_from_its_frames():
+    """Qwen3-VL has no audio modality, so a sound track is not an error for it.
+
+    It takes ``VideoInputs.video`` and skips the track: the clip encodes exactly
+    as its silent twin does, and ``meta`` still says the clip had sound.
+    """
+    from transformers.models.qwen3_vl.video_processing_qwen3_vl import Qwen3VLVideoProcessor
+
+    from veomni.models.seed_omni.modules.qwen3vl.vision.processing import Qwen3VLVisionPreprocessor
+
+    video_metadata = _metadata_for(total_frames=8, source_fps=4.0, requested_fps=4.0)
+    frames = torch.zeros(len(video_metadata.frames_indices), 3, 32, 32, dtype=torch.uint8)
+    audio_metadata = AudioMetadata(sampling_rate=16_000, num_samples=32_000)
+    silent = _video_item(video_metadata, frames.clone())
+    sounding = _video_item(video_metadata, frames.clone(), np.zeros(32_000, dtype=np.float32), audio_metadata)
+
+    Qwen3VLVisionPreprocessor(image_processor=None, video_processor=Qwen3VLVideoProcessor()).preprocess_conversations(
+        [[silent], [sounding]], inference=True
+    )
+
+    assert sounding.meta[_OMNI_GRID] == silent.meta[_OMNI_GRID]
+    assert torch.equal(sounding.value, silent.value)
+    assert sounding.meta[AUDIO_METADATA_KEY] is audio_metadata
 
 
 def test_the_timeline_outlives_the_payload_the_encoder_overwrites():

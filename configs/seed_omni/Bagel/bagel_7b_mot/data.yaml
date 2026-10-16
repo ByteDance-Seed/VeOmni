@@ -1,0 +1,18 @@
+sources:
+  - /mnt/hdfs/user_dir/dataset/imagenet1k_train
+  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/data
+  - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k
+  - /mnt/hdfs/user_dir/dataset/seed_edit_p23_multi_turn
+names:
+  - imagenet1k
+  - tulu-3-sft-mixture
+  - sharegpt4v_cap_100k
+  - seed_edit_p23_multi_turn
+schedule:
+  - schedule_type: const
+    weights: [0.4, 0.2, 0.2, 0.2]
+# Heterogeneous schemas (imagenet string / tulu dict / sharegpt4v list) — keep
+# them in the VeOmni weighted multisource sampler.
+level: token
+stopping_strategy: all_exhausted
+upstream_sharded: true

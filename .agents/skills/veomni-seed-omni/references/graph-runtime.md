@@ -1,0 +1,127 @@
+# Graph Runtime And YAML
+
+Read this before editing `configs/seed_omni/**` graph or module files.
+
+## File Split
+
+Typical layout:
+
+```text
+configs/seed_omni/<Model>/<variant>/
+├── data.yaml                        # only if two or more tasks share it
+├── train/                           # one folder per task; the folder name
+│   ├── base.yaml                    # absorbs the task SUFFIX only -- the
+│   ├── modules_train.yaml           # graph_train / modules_train prefixes
+│   └── graph_train.yaml             # stay, so a file still says what it is
+├── packed/                          # a second task, same three files
+│   ├── base.yaml                    # (was base_packed.yaml)
+│   ├── modules_train.yaml           # (was modules_train_packed.yaml)
+│   └── graph_train.yaml             # (was graph_train_packed.yaml)
+└── infer/                           # inference fragments shared across tasks
+    ├── modules_infer_eager.yaml
+    ├── modules_infer_fsdp.yaml
+    ├── graph_infer.yaml
+    └── graph_infer_<scenario>.yaml
+```
+
+Each task folder holds its launcher plus the fragments only that task uses. A
+fragment two or more tasks share moves up — to `infer/` for inference graphs and
+module overrides, or to the model root for `data.yaml`. A task whose inference
+graph is its own alone keeps it inside its own folder.
+
+`base.yaml` points to module and graph files. **A graph file *is* its graph** —
+the payload sits at the file top level with no wrapper key. Do not redeclare
+unrelated launcher config in graph files.
+
+## Training Graph
+
+Training graph YAML is a flat edge list at the top level:
+
+```yaml
+- { from: vision_encoder, to: backbone }
+- { from: text_encoder.encode, to: backbone }
+- { from: backbone, to: text_encoder.decode }
+- { from: text_encoder.decode, to: end }
+```
+
+Rules:
+
+- Endpoints are `module[.method]` strings.
+- Bare module names use the framework default method.
+- Active nodes are derived from edge endpoints.
+- Every sink needs an outgoing edge to `end`.
+- Topological sort determines execution order.
+- Edges declare dependency order. Data flows through the shared carrier.
+
+## Generation Graph
+
+Generation graph YAML is an FSM, with `initial:` and `states:` at the file top
+level:
+
+- `states.<state>.body` is an ordered inline edge list.
+- State transitions use `module_signal` or `default`.
+- `default` must be the last transition.
+- Do not declare a `done` state. It is framework-injected.
+- Use module code to emit semantic signals such as `text_done` or
+  `image_complete`; do not make the FSM inspect raw token IDs.
+
+One authoring file declares one scenario. `model.model_config.infer_graph` maps every
+scenario name to its file, and `model.model_config.infer_type` picks the active one:
+
+```yaml
+model:
+  model_config:
+    infer_graph:
+      infer_gen: configs/seed_omni/<Model>/<variant>/infer/graph_infer_gen.yaml
+      infer_und: configs/seed_omni/<Model>/<variant>/infer/graph_infer_und.yaml
+    infer_type: infer_gen
+```
+
+## Generation Graphs In A Checkpoint
+
+`OmniConfig` stores **every** scenario, not just the active one, so an exported
+checkpoint is not locked to the scenario it was exported under:
+
+- `config.training_graphs` — `{train_type: dag}`, all training DAGs.
+- `config.train_type` — the active training scenario (unset means the first declared).
+- `config.training_graph` — read-only property returning the active DAG.
+- `config.generation_graphs` — `{infer_type: fsm_spec}`, all generation FSMs.
+- `config.infer_type` — the active generation scenario (unset means the first declared).
+- `config.generation_graph` — read-only property returning the active FSM.
+
+The checkpoint sidecar `<checkpoint>/generation_graph.yaml` is that map — no
+wrapping key, since the filename is the identity:
+
+```yaml
+infer_gen: {initial: ..., states: {...}}
+infer_und: {initial: ..., states: {...}}
+```
+
+The `<checkpoint>/training_graph.yaml` sidecar is the same map idea, keyed by ``train_type`` (a lone DAG
+uses the name ``default``):
+
+```yaml
+default:
+- {from: fake_module_a, to: fake_module_b}
+- {from: fake_module_b, to: end}
+```
+
+## Module Config
+
+Module files map module names to model paths and optional per-module training or
+accelerator settings. `model_type` belongs in the module checkpoint
+`config.json`, not in YAML.
+
+## Templates
+
+Use:
+
+- `templates/base.template.yaml`
+- `templates/modules_train.template.yaml`
+- `templates/modules_infer_eager.template.yaml`
+- `templates/modules_infer_fsdp.template.yaml`
+- `templates/graph_train.template.yaml`
+- `templates/graph_infer.template.yaml`
+
+After copying a template, compare against the live Janus config for exact field
+names used on the current branch.

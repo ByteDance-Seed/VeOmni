@@ -21,10 +21,8 @@ import pytest
 import torch.distributed as dist
 from torch.testing._internal.common_utils import run_tests
 
-from veomni.distributed.sequence_parallel.comm import (
-    get_ulysses_sequence_parallel_group,
-    set_ulysses_sequence_parallel_group,
-)
+from veomni.distributed.parallel_state import set_parallel_state
+from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
 from veomni.models.transformers.masking_utils import create_causal_mask
@@ -111,7 +109,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
         # forward & backward for dp
-        set_ulysses_sequence_parallel_group(None)
+        set_parallel_state(None)
         dp_rst = attn_dp(full_input, unpad_size)
         loss_dp = loss_func(dp_rst)
         loss_dp.backward()
@@ -157,7 +155,8 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         part_input_grad = sync_tensor(part_input_grad, 1)
         part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
-        set_ulysses_sequence_parallel_group(None)
+        # forward & backward for dp
+        set_parallel_state(None)
         dp_rst = attn_dp(full_input, unpad_size)
         loss_dp = self._non_overlapping_grad(dp_rst)
         loss_dp.backward()

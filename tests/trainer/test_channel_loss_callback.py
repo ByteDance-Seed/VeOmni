@@ -26,7 +26,6 @@ def _find_spec_without_torch_npu(name: str, package: str | None = None) -> Modul
 
 importlib.util.find_spec = _find_spec_without_torch_npu  # type: ignore[assignment]
 try:
-    import veomni.trainer.callbacks.base as callback_base_module
     import veomni.trainer.callbacks.channel_loss_callback as channel_loss_module
     from veomni.arguments.arguments_types import ChannelLossConfig
     from veomni.models.transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
@@ -50,36 +49,6 @@ finally:
     importlib.util.find_spec = _real_find_spec  # type: ignore[assignment]
 
 
-def _stub_parallel_state(monkeypatch, **overrides):
-    """Let a hand-built trainer run without a registered ParallelState.
-
-    ``forward_backward_step`` enters ``use_parallel_state`` and ``Callback``
-    caches ``get_parallel_state()``, both of which need a real registry these
-    single-process tests never populate.
-    """
-    state = SimpleNamespace(sp_enabled=False, sp_group=None, sp_size=1, dp_size=1, dp_group=None, **overrides)
-    import veomni.trainer.base as base_trainer_module
-    import veomni.trainer.text_dpo_trainer as dpo_trainer_module
-
-    # Each trainer imports the context manager into its own namespace.
-    for module in (base_trainer_module, dpo_trainer_module):
-        monkeypatch.setattr(module, "use_parallel_state", lambda _: nullcontext())
-    monkeypatch.setattr(callback_base_module, "get_parallel_state", lambda: state)
-    return state
-
-
-def _sp_state(monkeypatch, *, sp_size, sp_rank=0):
-    """Stand-in for the ParallelState the SP collectives read.
-
-    ``sp_group`` is an opaque sentinel: the computer only forwards it to the
-    collectives, which these tests fake out, and reads ``None`` as "SP off".
-    """
-    group = object() if sp_size > 1 else None
-    if group is not None:
-        monkeypatch.setattr(channel_loss_module.dist, "get_rank", lambda _group=None: sp_rank)
-    return SimpleNamespace(sp_enabled=sp_size > 1, sp_group=group, sp_size=sp_size)
-
-
 class _DummyOpSlot:
     def __init__(self, kernel):
         self._kernel = kernel
@@ -97,6 +66,30 @@ class _TinyLossModel(torch.nn.Module):
 
     def forward(self, x, use_cache=False):
         return SimpleNamespace(loss=(self.weight * x).sum())
+
+
+def _sp_state(monkeypatch, *, sp_size: int = 1, sp_rank: int = 0):
+    """Stand-in ParallelState for the SP aggregation helpers.
+
+    The computer takes its SP group from the ParallelState it is handed (there are
+    no module-level group getters — constraint 7f), so ``sp_rank`` is injected by
+    patching the rank lookup for the fake group.
+    """
+    group = object() if sp_size > 1 else None
+    if group is not None:
+        monkeypatch.setattr(channel_loss_module.dist, "get_rank", lambda g=None: sp_rank)
+    return SimpleNamespace(sp_group=group, sp_size=sp_size, sp_enabled=sp_size > 1)
+
+
+def _bypass_base_state_scope(monkeypatch, *modules):
+    """Neutralize ``use_parallel_state("base")`` in hand-built trainer tests.
+
+    The ``"base"`` registry entry is created by ``BaseTrainer._setup`` (constraint
+    7f), which these tests skip — they build the trainer with ``object.__new__``
+    and drive one production method directly.
+    """
+    for module in modules:
+        monkeypatch.setattr(module, "use_parallel_state", lambda _: nullcontext())
 
 
 def _expected_segment(logits, labels, start, end):
@@ -431,12 +424,11 @@ def test_channel_loss_sp_reduce_preserves_batch_order_for_multiple_sources(monke
             gathered[1].copy_(torch.tensor([[1, 0, 0], [1, 0, 0]], dtype=torch.int64))
         gather_inputs.append((local_values.dtype, tuple(local_values.shape)))
 
-    sp_state = _sp_state(monkeypatch, sp_size=2)
+    parallel_state = _sp_state(monkeypatch, sp_size=2)
     monkeypatch.setattr(channel_loss_module.dist, "all_gather_object", fake_all_gather_object)
     monkeypatch.setattr(channel_loss_module.dist, "all_gather", fake_all_gather)
 
     result = ChannelLossComputer._aggregate_sp(
-        parallel_state=sp_state,
         per_token_loss=torch.tensor([1.0, 2.0, 10.0, 20.0]),
         labels_flat=torch.tensor([1, 1, 1, 1]),
         attention_mask_flat=None,
@@ -444,6 +436,7 @@ def test_channel_loss_sp_reduce_preserves_batch_order_for_multiple_sources(monke
         positions=torch.tensor([[0, 1], [0, 1]]),
         seq_len=4,
         ignore_index=IGNORE_INDEX,
+        parallel_state=parallel_state,
         strict=True,
     )
 
@@ -469,15 +462,15 @@ def test_channel_loss_sp_reduce_handles_empty_local_rank(monkeypatch):
         else:
             gathered[1].copy_(torch.tensor([[2, 0, 0]], dtype=torch.int64))
 
-    sp_state = _sp_state(monkeypatch, sp_size=2)
+    parallel_state = _sp_state(monkeypatch, sp_size=2)
     monkeypatch.setattr(channel_loss_module.dist, "all_gather_object", fake_all_gather_object)
     monkeypatch.setattr(channel_loss_module.dist, "all_gather", fake_all_gather)
 
     result = ChannelLossComputer._reduce_sp(
-        parallel_state=sp_state,
         local_segments=[],
         source_ids=["remote"],
         device=torch.device("cpu"),
+        parallel_state=parallel_state,
         strict=True,
     )
 
@@ -502,12 +495,11 @@ def test_channel_loss_sp_reduce_filters_uneven_remote_padding_segments(monkeypat
         else:
             gathered[1].copy_(torch.tensor([[0, 1, 1], [0, 1, 1]], dtype=torch.int64))
 
-    sp_state = _sp_state(monkeypatch, sp_size=2)
+    parallel_state = _sp_state(monkeypatch, sp_size=2)
     monkeypatch.setattr(channel_loss_module.dist, "all_gather_object", fake_all_gather_object)
     monkeypatch.setattr(channel_loss_module.dist, "all_gather", fake_all_gather)
 
     result = ChannelLossComputer._aggregate_sp(
-        parallel_state=sp_state,
         per_token_loss=torch.tensor([1.0, 2.0]),
         labels_flat=torch.tensor([1, 1]),
         attention_mask_flat=torch.ones(2, dtype=torch.long),
@@ -515,6 +507,7 @@ def test_channel_loss_sp_reduce_filters_uneven_remote_padding_segments(monkeypat
         positions=torch.tensor([[0, 1]]),
         seq_len=2,
         ignore_index=IGNORE_INDEX,
+        parallel_state=parallel_state,
         strict=True,
     )
 
@@ -522,7 +515,7 @@ def test_channel_loss_sp_reduce_filters_uneven_remote_padding_segments(monkeypat
 
 
 def test_channel_loss_sp_aggregation_does_not_extract_segment_scalars(monkeypatch):
-    sp_state = _sp_state(monkeypatch, sp_size=1)
+    parallel_state = _sp_state(monkeypatch)
 
     def fail_item(tensor):
         raise AssertionError(f"SP segment aggregation extracted a scalar with shape={tuple(tensor.shape)}")
@@ -530,7 +523,6 @@ def test_channel_loss_sp_aggregation_does_not_extract_segment_scalars(monkeypatc
     with monkeypatch.context() as context:
         context.setattr(torch.Tensor, "item", fail_item)
         result = ChannelLossComputer._aggregate_sp(
-            parallel_state=sp_state,
             per_token_loss=torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
             labels_flat=torch.ones(6, dtype=torch.long),
             attention_mask_flat=torch.ones(6, dtype=torch.long),
@@ -538,6 +530,7 @@ def test_channel_loss_sp_aggregation_does_not_extract_segment_scalars(monkeypatc
             positions=torch.tensor([[0, 1, 0, 1, 0, 1]]),
             seq_len=6,
             ignore_index=IGNORE_INDEX,
+            parallel_state=parallel_state,
             strict=True,
         )
 
@@ -613,7 +606,7 @@ def test_channel_loss_preserves_zero_supervision_tail_when_later_row_has_padding
 
 
 def test_channel_loss_compute_uses_position_aligned_mask_for_padding_evidence(monkeypatch):
-    computer = ChannelLossComputer(parallel_state=_sp_state(monkeypatch, sp_size=1))
+    computer = ChannelLossComputer(parallel_state=_sp_state(monkeypatch))
     computer.strict = True
     computer._source_ids = ["row0_normal", "row0_zero", "row1_normal"]
     computer._position_ids = torch.tensor([[0, 1, 2, 0], [0, 1, 0, 0]])
@@ -668,10 +661,7 @@ def test_channel_loss_keeps_zero_supervision_segment_before_tail_padding():
 
 
 def test_channel_loss_sp_ignores_padding_only_position_zero_segments(monkeypatch):
-    sp_state = _sp_state(monkeypatch, sp_size=1)
-
     result = ChannelLossComputer._aggregate_sp(
-        parallel_state=sp_state,
         per_token_loss=torch.tensor([1.0, 2.0, 100.0, 100.0]),
         labels_flat=torch.tensor([1, 1, IGNORE_INDEX, IGNORE_INDEX]),
         attention_mask_flat=None,
@@ -679,6 +669,7 @@ def test_channel_loss_sp_ignores_padding_only_position_zero_segments(monkeypatch
         positions=torch.tensor([[0, 1, 0, 0]]),
         seq_len=4,
         ignore_index=IGNORE_INDEX,
+        parallel_state=_sp_state(monkeypatch),
         strict=True,
     )
 
@@ -686,10 +677,7 @@ def test_channel_loss_sp_ignores_padding_only_position_zero_segments(monkeypatch
 
 
 def test_channel_loss_sp_filters_padding_tail_per_batch_row(monkeypatch):
-    sp_state = _sp_state(monkeypatch, sp_size=1)
-
     result = ChannelLossComputer._aggregate_sp(
-        parallel_state=sp_state,
         per_token_loss=torch.tensor([1.0, 2.0, 100.0, 100.0, 3.0, 4.0, 100.0, 100.0]),
         labels_flat=torch.tensor([1, 1, IGNORE_INDEX, IGNORE_INDEX, 1, 1, IGNORE_INDEX, IGNORE_INDEX]),
         attention_mask_flat=torch.tensor([1, 1, 0, 0, 1, 1, 0, 0]),
@@ -697,6 +685,7 @@ def test_channel_loss_sp_filters_padding_tail_per_batch_row(monkeypatch):
         positions=torch.tensor([[0, 1, 0, 0], [0, 1, 0, 0]]),
         seq_len=8,
         ignore_index=IGNORE_INDEX,
+        parallel_state=_sp_state(monkeypatch),
         strict=True,
     )
 
@@ -707,10 +696,7 @@ def test_channel_loss_sp_filters_padding_tail_per_batch_row(monkeypatch):
 
 
 def test_channel_loss_sp_preserves_zero_supervision_tail_when_later_row_has_padding(monkeypatch):
-    sp_state = _sp_state(monkeypatch, sp_size=1)
-
     result = ChannelLossComputer._aggregate_sp(
-        parallel_state=sp_state,
         per_token_loss=torch.tensor([1.0, 2.0, 3.0, 100.0, 3.0, 4.0, 100.0, 100.0]),
         labels_flat=torch.tensor([1, 1, 1, IGNORE_INDEX, 1, 1, IGNORE_INDEX, IGNORE_INDEX]),
         attention_mask_flat=torch.tensor([1, 1, 1, 1, 1, 1, 0, 0]),
@@ -718,6 +704,7 @@ def test_channel_loss_sp_preserves_zero_supervision_tail_when_later_row_has_padd
         positions=torch.tensor([[0, 1, 2, 0], [0, 1, 0, 0]]),
         seq_len=8,
         ignore_index=IGNORE_INDEX,
+        parallel_state=_sp_state(monkeypatch),
         strict=True,
     )
 
@@ -729,7 +716,6 @@ def test_channel_loss_sp_preserves_zero_supervision_tail_when_later_row_has_padd
 
 
 def test_channel_loss_sp_rejects_ambiguous_per_row_padding_without_mask_evidence(monkeypatch):
-    sp_state = _sp_state(monkeypatch, sp_size=1)
     kwargs = dict(
         per_token_loss=torch.tensor([1.0, 2.0, 3.0, 100.0, 3.0, 4.0, 100.0, 100.0]),
         labels_flat=torch.tensor([1, 1, 1, IGNORE_INDEX, 1, 1, IGNORE_INDEX, IGNORE_INDEX]),
@@ -738,7 +724,7 @@ def test_channel_loss_sp_rejects_ambiguous_per_row_padding_without_mask_evidence
         positions=torch.tensor([[0, 1, 2, 0], [0, 1, 0, 0]]),
         seq_len=8,
         ignore_index=IGNORE_INDEX,
-        parallel_state=sp_state,
+        parallel_state=_sp_state(monkeypatch),
     )
 
     assert ChannelLossComputer._aggregate_sp(**kwargs, strict=False) == []
@@ -747,10 +733,7 @@ def test_channel_loss_sp_rejects_ambiguous_per_row_padding_without_mask_evidence
 
 
 def test_channel_loss_sp_keeps_zero_supervision_segment_before_tail_padding(monkeypatch):
-    sp_state = _sp_state(monkeypatch, sp_size=1)
-
     result = ChannelLossComputer._aggregate_sp(
-        parallel_state=sp_state,
         per_token_loss=torch.tensor([100.0, 2.0, 100.0]),
         labels_flat=torch.tensor([IGNORE_INDEX, 1, IGNORE_INDEX]),
         attention_mask_flat=torch.ones(3, dtype=torch.long),
@@ -758,6 +741,7 @@ def test_channel_loss_sp_keeps_zero_supervision_segment_before_tail_padding(monk
         positions=torch.tensor([[0, 0, 0]]),
         seq_len=3,
         ignore_index=IGNORE_INDEX,
+        parallel_state=_sp_state(monkeypatch),
         strict=True,
     )
 
@@ -817,7 +801,9 @@ def test_channel_loss_computer_aggregates_step_results_locally():
 
 
 def test_base_forward_backward_allows_missing_channel_loss_callback(monkeypatch):
-    _stub_parallel_state(monkeypatch)
+    import veomni.trainer.base as base_trainer_module
+
+    _bypass_base_state_scope(monkeypatch, base_trainer_module)
     trainer = object.__new__(BaseTrainer)
     trainer.state = TrainerState(global_step=1)
     trainer.device = torch.device("cpu")
@@ -843,7 +829,9 @@ def test_base_forward_backward_allows_missing_channel_loss_callback(monkeypatch)
 
 
 def test_base_forward_backward_strips_channel_metadata_after_preforward(monkeypatch):
-    _stub_parallel_state(monkeypatch)
+    import veomni.trainer.base as base_trainer_module
+
+    _bypass_base_state_scope(monkeypatch, base_trainer_module)
     cfg = ChannelLossConfig(enable=True)
     trainer = object.__new__(BaseTrainer)
     trainer.state = TrainerState(global_step=1)
@@ -887,7 +875,9 @@ def test_base_forward_backward_strips_channel_metadata_after_preforward(monkeypa
 
 
 def test_dpo_forward_backward_scopes_channel_loss_to_policy_model(monkeypatch):
-    _stub_parallel_state(monkeypatch)
+    import veomni.trainer.text_dpo_trainer as text_dpo_module
+
+    _bypass_base_state_scope(monkeypatch, text_dpo_module)
     cfg = ChannelLossConfig(enable=True, interval=1)
     state = TrainerState(global_step=1)
     policy_model = SimpleNamespace(parallel_state=object())
@@ -955,7 +945,9 @@ def test_dpo_forward_backward_scopes_channel_loss_to_policy_model(monkeypatch):
 
 
 def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
-    _stub_parallel_state(monkeypatch)
+    import veomni.trainer.text_dpo_trainer as text_dpo_module
+
+    _bypass_base_state_scope(monkeypatch, text_dpo_module)
 
     class DpoLossModel(torch.nn.Module):
         def __init__(self):
@@ -1237,17 +1229,16 @@ def test_channel_loss_callback_reduces_compact_totals_and_syncs_names(monkeypatc
         step_train_metrics={},
         step_env_metrics={},
     )
-    group = object()
-    observed = {}
-
-    # Patched before construction: Callback.__init__ caches the parallel state,
-    # so the DP collectives never consult the ambient one again.
-    monkeypatch.setattr(callback_base_module, "get_parallel_state", lambda: SimpleNamespace(dp_size=2, dp_group=group))
     callback = ChannelLossCallback(trainer)
     callback._collect_step = True
     callback.computer.source_names = {0: "source/a"}
     callback.computer.step_totals = {0: (torch.tensor(6.0), torch.tensor(3))}
+    group = object()
+    observed = {}
 
+    # The callback captures its state at construction, so the DP reduce surface is
+    # set on the instance rather than through the module-level getter.
+    callback.parallel_state = SimpleNamespace(dp_size=2, dp_group=group)
     monkeypatch.setattr(channel_loss_module.dist, "is_available", lambda: True)
     monkeypatch.setattr(channel_loss_module.dist, "is_initialized", lambda: True)
 
@@ -1282,14 +1273,12 @@ def test_channel_loss_callback_strict_rejects_cross_rank_name_mismatch(monkeypat
         step_train_metrics={},
         step_env_metrics={},
     )
-    monkeypatch.setattr(
-        callback_base_module, "get_parallel_state", lambda: SimpleNamespace(dp_size=2, dp_group=object())
-    )
     callback = ChannelLossCallback(trainer)
     callback._collect_step = True
     callback.computer.source_names = {0: "source-a"}
     callback.computer.step_totals = {0: (torch.tensor(1.0), torch.tensor(1))}
 
+    callback.parallel_state = SimpleNamespace(dp_size=2, dp_group=object())
     monkeypatch.setattr(channel_loss_module.dist, "is_available", lambda: True)
     monkeypatch.setattr(channel_loss_module.dist, "is_initialized", lambda: True)
 

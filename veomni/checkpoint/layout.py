@@ -17,12 +17,12 @@
 Every writer and every reader derives its path from this module, so a save and
 the load that follows it cannot disagree. That was the failure mode this
 replaces: the checkpoint manager built its own ``save_dir`` while the
-checkpointer appended ``global_step_{N}`` itself, and the SeedOmni V2 manager
+checkpointer appended ``global_step_{N}`` itself, and the SeedOmni manager
 built a third set on top, which is how its HF export ended up sharing a
 directory with the DCP shards.
 
 The ``module`` argument is what makes one writer serve both a single-model job
-and a multi-module (SeedOmni V2) one. It is the empty string for a single model,
+and a multi-module (SeedOmni) one. It is the empty string for a single model,
 which collapses ``model/<module>/`` to ``model/``; nothing else differs between
 the two cases.
 

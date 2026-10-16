@@ -47,10 +47,16 @@ class CompileConfig:
 
 
 def _decoder_block_class_names(model: nn.Module) -> set[str]:
+    """Decoder-layer class names in ``_no_split_modules``.
+
+    An entry is either a bare class name (``LlamaDecoderLayer``) or, on a
+    SeedOmni composed model, scoped to its child (``janus_llama.LlamaDecoderLayer``).
+    """
     no_split_modules = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
     if no_split_modules is None:
         return set()
-    return {name for name in no_split_modules if isinstance(name, str) and name.endswith("DecoderLayer")}
+    class_names = {name.rpartition(".")[2] for name in no_split_modules if isinstance(name, str)}
+    return {name for name in class_names if name.endswith("DecoderLayer")}
 
 
 def _is_multimodal_model(model: nn.Module) -> bool:

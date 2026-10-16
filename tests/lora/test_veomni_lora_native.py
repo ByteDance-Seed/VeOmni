@@ -149,6 +149,24 @@ def test_model_runtime_rejects_lora_without_trainable_adapters():
         runtime._setup_lora()
 
 
+def test_model_runtime_accepts_a_model_that_wraps_its_own_lora():
+    """A model-owned ``setup_lora`` hook owns its own naming, so the runtime's
+    ``lora_A`` / ``lora_B`` probe must not abort the run."""
+
+    class CustomLoraModel(Toy):
+        def setup_lora(self, lora_config):
+            self.custom_adapter = nn.Parameter(torch.zeros(1))
+            return self
+
+    runtime = unbuilt_runtime(SimpleNamespace(lora_config={"rank": 8, "alpha": 16}))
+    runtime.model = CustomLoraModel()
+
+    runtime.setup_lora()
+
+    assert isinstance(runtime.model, CustomLoraModel)
+    assert hasattr(runtime.model, "custom_adapter")
+
+
 @pytest.mark.parametrize("is_trainable", [True, False])
 def test_model_runtime_validates_resumed_adapter(tmp_path, is_trainable):
     VeOmniLoraModel(Toy(), _base_config()).save_pretrained(str(tmp_path))

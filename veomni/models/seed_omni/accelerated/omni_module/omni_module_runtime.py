@@ -272,14 +272,34 @@ class ModuleRuntime(VeOmniModelRuntime):
             return super().__call__(*args, **kwargs)
 
     def _init_eager_inference(self) -> None:
-        """Single-process eager load via ``from_pretrained`` + ``device_map``."""
+        """Single-process eager load via ``from_pretrained`` + ``device_map``.
+
+        ``fsdp_mode='eager'`` says only that this module skips the wrapper and
+        loads through plain HF modeling with a ``device_map``. It says nothing
+        about kernels, so this path resolves ``ops_implementation`` exactly as
+        the wrapped path does through ``build_foundation_model`` — otherwise a
+        purely parallelism-level choice would silently downgrade the module's
+        ops, and in a mixed run (Janus infers with ``janus_siglip`` eager
+        beside FSDP2 modules) two modules in one process would disagree about
+        which kernels the launcher asked for.
+        """
         args = self.args
         assert self.is_eager
+        from .....ops import apply_ops_config
+        from ....auto import bind_ops_to_modeling
         from ... import OMNI_MODEL_REGISTRY
 
         model_path = args.model_path
         model_type = self.module_config.model_type
         cls = OMNI_MODEL_REGISTRY[model_type]()
+        load_kwargs = {}
+        ops = args.ops_implementation
+        if ops is not None:
+            apply_ops_config(ops)
+            if ops.attn_implementation is not None:
+                load_kwargs["attn_implementation"] = ops.attn_implementation
+        # Before construction: slots read inside ``__init__`` need the binding.
+        bind_ops_to_modeling(cls)
         if dist.is_initialized():
             device_map = {"": f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"}
         else:
@@ -298,6 +318,7 @@ class ModuleRuntime(VeOmniModelRuntime):
                 self.module_name,
                 device_map=device_map,
                 torch_dtype=torch.bfloat16,
+                attn_implementation=load_kwargs.get("attn_implementation"),
             ).eval()
             self.model_config = self.model.config
             self._build_model_assets()
@@ -311,6 +332,7 @@ class ModuleRuntime(VeOmniModelRuntime):
             config=self.module_config,
             torch_dtype=torch.bfloat16,
             device_map=device_map,
+            **load_kwargs,
         ).eval()
         self.model_config = self.model.config
         self._build_model_assets()
@@ -556,11 +578,18 @@ class ModuleRuntime(VeOmniModelRuntime):
         A distributed optimizer (Muon) reads ``get_parallel_state()`` at build
         time, so it must resolve to this module's mesh, not the orchestrator's.
         A no-op for a fully-frozen module: there is nothing to step.
+
+        A module that defines ``configure_optimizer(optimizer)`` gets the built
+        optimizer before the lr-scheduler is built and a checkpoint is loaded into
+        it, so it can adjust its param groups or register step hooks.
         """
         if not self.has_trainable_parameters:
             return
         with self._scoped():
             super()._build_optimizer(param_groups)
+            configure_optimizer = getattr(self.omni_module, "configure_optimizer", None)
+            if callable(configure_optimizer):
+                configure_optimizer(self.optimizer)
 
     def _build_lr_scheduler(self, total_steps: int) -> None:
         """Build this module's lr-scheduler over ``total_steps``.

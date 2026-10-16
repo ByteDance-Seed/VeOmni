@@ -417,12 +417,14 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
     vae.reads_offline_cache = True
     vae.model = meta_module
     vae.args = SimpleNamespace(model_path="vae", lora_config=None)
+    vae.weights_path = "vae"
     vae.build_after_omni_model_wrap = MagicMock()
 
     llm = MagicMock()
     llm.reads_offline_cache = False
     llm.model = model.module_b
     llm.args = SimpleNamespace(model_path="llm", lora_config=None)
+    llm.weights_path = "llm"
     llm.skip_hf_weight_load = False
     llm.build_after_omni_model_wrap = MagicMock()
 
