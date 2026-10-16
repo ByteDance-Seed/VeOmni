@@ -149,6 +149,34 @@ def test_minimax_m3_vl_text_model_runs_unpacked_single_sequence_as_one_segment(m
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
+def test_minimax_m3_vl_indexer_projection_stays_out_of_autograd(module_name):
+    """Top-k block selection is not differentiable, so the indexer must not build a dead autograd graph."""
+    modeling = importlib.import_module(module_name)
+    model = _single_layer_sparse_text_model(modeling)
+    attention = model.layers[0].self_attn
+    hidden_states = torch.randn(1, 5, model.config.hidden_size, requires_grad=True)
+    position_embeddings = model.rotary_emb(hidden_states, torch.arange(5).unsqueeze(0))
+
+    index_query, index_key = modeling._minimax_m3_indexer_project(
+        attention.indexer, hidden_states, position_embeddings
+    )
+    assert not index_query.requires_grad
+    assert not index_key.requires_grad
+
+    output = model(
+        inputs_embeds=hidden_states,
+        position_ids=torch.arange(5).unsqueeze(0),
+        cu_seq_lens_q=torch.tensor([0, 5], dtype=torch.int32),
+        cu_seq_lens_k=torch.tensor([0, 5], dtype=torch.int32),
+        max_length_q=5,
+        max_length_k=5,
+    ).last_hidden_state
+    output.square().sum().backward()
+    assert all(param.grad is None for param in attention.indexer.parameters())
+    assert attention.q_proj.weight.grad is not None
+
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
 @pytest.mark.parametrize(
     ("forward_kwargs", "message"),
     [

@@ -152,22 +152,24 @@ def _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings):
     operator after the Ulysses exchange instead.
 
     The indexer is not trained here: block selection is a top-k over discrete
-    block scores and no indexer loss is computed, so its projections receive no
-    gradient and keep their checkpoint values. MiniMax describes the indexer as
+    block scores and no indexer loss is computed, so no gradient can reach its
+    projections. They run under ``no_grad`` to skip building that dead autograd
+    graph and keep their checkpoint values. MiniMax describes the indexer as
     distilled from full attention with a KL objective, but has not published how
     it is handled in post-training; add that objective here once it is known.
     """
     batch, q_len, _ = hidden_states.shape
-    index_query = indexer.q_norm(indexer.q_proj(hidden_states).view(batch, q_len, -1, indexer.head_dim))
-    index_key = indexer.k_norm(indexer.k_proj(hidden_states).view(batch, q_len, 1, indexer.head_dim))
-    cos, sin = position_embeddings
-    return apply_rotary_pos_emb(
-        index_query,
-        index_key,
-        cos[..., : indexer.head_dim],
-        sin[..., : indexer.head_dim],
-        unsqueeze_dim=2,
-    )
+    with torch.no_grad():
+        index_query = indexer.q_norm(indexer.q_proj(hidden_states).view(batch, q_len, -1, indexer.head_dim))
+        index_key = indexer.k_norm(indexer.k_proj(hidden_states).view(batch, q_len, 1, indexer.head_dim))
+        cos, sin = position_embeddings
+        return apply_rotary_pos_emb(
+            index_query,
+            index_key,
+            cos[..., : indexer.head_dim],
+            sin[..., : indexer.head_dim],
+            unsqueeze_dim=2,
+        )
 
 
 class MiniMaxM3VLSparseCacheLayer(DynamicLayer):
