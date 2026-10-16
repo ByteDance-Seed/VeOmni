@@ -1624,7 +1624,7 @@ def test_channel_loss_cleanup_failure_preserves_deferred_strict_metadata_error(m
     assert "metadata failed" in computer.strict_observation_errors[0][1]
 
 
-def test_channel_loss_multiple_observations_accumulate_all_totals(monkeypatch):
+def test_channel_loss_multiple_objectives_count_primary_data_once(monkeypatch):
     computer = ChannelLossComputer(parallel_state=_test_parallel_state())
     computer._source_ids = ["source-a"]
     computer._position_ids = torch.tensor([[0, 1]])
@@ -1666,7 +1666,82 @@ def test_channel_loss_multiple_observations_accumulate_all_totals(monkeypatch):
     loss_sum, token_count = computer.step_totals["source-a"]
     sample_count, input_token_count, label_token_count = computer.step_data_totals["source-a"]
     assert (loss_sum.item(), token_count.item()) == (7.0, 3)
-    assert (sample_count.item(), input_token_count.item(), label_token_count.item()) == (2, 5, 3)
+    assert (sample_count.item(), input_token_count.item(), label_token_count.item()) == (1, 2, 1)
+
+
+@pytest.mark.parametrize("auxiliary_first", [False, True])
+@pytest.mark.parametrize("copy_primary_labels", [False, True])
+def test_channel_loss_qwen35_mtp_counts_primary_batch_once(auxiliary_first, copy_primary_labels):
+    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import compute_mtp_loss
+
+    class MTPModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(8, 3))
+
+        def loss_function(self, hidden_states, labels, weights, shift_labels=None, **kwargs):
+            logits = F.linear(hidden_states, weights)
+            targets = shift_labels if shift_labels is not None else F.pad(labels, (0, 1), value=IGNORE_INDEX)[:, 1:]
+            loss = F.cross_entropy(logits.flatten(0, 1), targets.flatten(), ignore_index=IGNORE_INDEX)
+            return loss, logits, None
+
+        def forward(self, hidden, labels, mtp_labels):
+            def primary():
+                return self.loss_function(
+                    logits=None,
+                    hidden_states=hidden,
+                    labels=labels.clone() if copy_primary_labels else labels,
+                    weights=self.weight,
+                    vocab_size=8,
+                )[0]
+
+            def auxiliary():
+                return compute_mtp_loss(self.loss_function, (hidden,), mtp_labels, self.weight, vocab_size=8)
+
+            if auxiliary_first:
+                aux, main = auxiliary(), primary()
+            else:
+                main, aux = primary(), auxiliary()
+            return main + 0.2 * aux
+
+    torch.manual_seed(719)
+    model = MTPModel()
+    hidden = torch.randn(1, 4, 3, requires_grad=True)
+    labels = torch.tensor([[1, 2, 3, 4]])
+    mtp_labels = torch.tensor([[[3, 4, IGNORE_INDEX, IGNORE_INDEX]]])
+    expected = model(hidden, labels, mtp_labels)
+    expected_grads = torch.autograd.grad(expected, (hidden, model.weight))
+    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer.strict = True
+    computer.begin_step([["source-a"]], [torch.arange(4)[None]], [None])
+    computer.before_micro_step(primary_labels=labels)
+    try:
+        computer.install(model)
+        with computer.capture():
+            actual = model(hidden, labels, mtp_labels)
+        computer.after_micro_step()
+    finally:
+        computer.uninstall()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for actual_grad, expected_grad in zip(torch.autograd.grad(actual, (hidden, model.weight)), expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+    assert computer.strict_observation_errors == []
+    assert tuple(value.item() for value in computer.step_data_totals["source-a"]) == (1, 4, 3)
+    assert computer.step_totals["source-a"][1].item() == 5  # Primary CE plus two auxiliary targets.
+
+
+def test_channel_loss_primary_data_is_reset_between_microbatches():
+    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer.strict = True
+    computer.begin_step([["same"], ["same"]], [torch.arange(4)[None]] * 2, [None, None])
+    for labels in (torch.tensor([[1, 2, 3, 4]]), torch.tensor([[1, IGNORE_INDEX, 3, IGNORE_INDEX]])):
+        computer.before_micro_step(primary_labels=labels)
+        for _ in range(2):
+            with computer.capture():
+                computer.compute_side_channel(torch.randn(1, 4, 8), labels, 8, None, None)
+        computer.after_micro_step()
+    assert computer.strict_observation_errors == []
+    assert tuple(value.item() for value in computer.step_data_totals["same"]) == (2, 8, 4)
 
 
 def test_channel_loss_strict_success_plus_failure_discards_partial_evidence(monkeypatch):
@@ -1774,6 +1849,7 @@ def test_channel_loss_computer_aggregates_step_results_locally():
         },
     ]
 
+    computer._data_result = computer._result
     computer.after_micro_step()
 
     assert set(computer.step_totals) == {"a", "b"}
@@ -1945,6 +2021,64 @@ def test_base_forward_backward_strips_channel_metadata_after_preforward(monkeypa
     assert trainer.model.weight.grad.item() == 2.0
 
 
+def test_base_forward_backward_refreshes_primary_labels_after_device_transfer(monkeypatch):
+    _install_test_parallel_state(monkeypatch)
+    trainer = object.__new__(BaseTrainer)
+    trainer.state = TrainerState(global_step=1)
+    trainer.device = torch.device("meta")  # Second-device seam; no accelerator required.
+    trainer.args = SimpleNamespace(
+        train=SimpleNamespace(
+            channel_loss=ChannelLossConfig(enable=True, interval=1),
+            enable_batch_invariant_mode=False,
+            local_rank=0,
+        )
+    )
+    trainer.model_fwd_context = nullcontext()
+    trainer.model_bwd_context = nullcontext()
+    trainer.LOG_SAMPLE = False
+    trainer.postforward = lambda outputs, batch: (outputs.loss, {"loss": outputs.loss.detach()}, {})
+    trainer.preforward = lambda batch: BaseTrainer.preforward(trainer, batch)
+
+    class DeviceTransferProbe(torch.nn.Module):
+        parallel_state = "base"
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(()))
+
+        def forward(self, labels, **kwargs):
+            computer = trainer.channel_loss_callback.computer
+            assert labels.device.type == "meta"
+            assert computer._primary_labels is labels
+            computer.compute_side_channel(None, labels, 8, None, None)
+            return SimpleNamespace(loss=self.weight * 2)
+
+    trainer.model = DeviceTransferProbe()
+    trainer.channel_loss_callback = ChannelLossCallback(trainer)
+    trainer._callbacks = [trainer.channel_loss_callback]
+    # Isolate lifecycle from CE, which cannot materialize a meta tensor.
+    monkeypatch.setattr(
+        trainer.channel_loss_callback.computer,
+        "_compute_channel_loss",
+        lambda **kwargs: [
+            {
+                "source_id": 3,
+                "loss_sum": torch.tensor(2.0),
+                "token_count": torch.tensor(2),
+                "sample_count": torch.tensor(1),
+                "input_token_count": torch.tensor(3),
+            }
+        ],
+    )
+    batch = {"labels": torch.tensor([[1, 2, 3]]), "position_ids": torch.arange(3)[None], "ds_idx": torch.tensor([3])}
+    trainer.channel_loss_callback.on_step_begin(trainer.state, micro_batches=[batch])
+    loss, _, _ = BaseTrainer.forward_backward_step(trainer, batch)
+    computer = trainer.channel_loss_callback.computer
+    assert loss.item() == 2
+    assert computer.strict_observation_errors == []
+    assert tuple(value.item() for value in computer.step_data_totals[3]) == (1, 3, 2)
+
+
 def test_dpo_forward_backward_scopes_channel_loss_to_policy_model(monkeypatch):
     _install_test_parallel_state(monkeypatch)
     cfg = ChannelLossConfig(enable=True, interval=1)
@@ -1972,7 +2106,7 @@ def test_dpo_forward_backward_scopes_channel_loss_to_policy_model(monkeypatch):
 
     def preforward(micro_batch):
         preforward_seen["metadata"] = "ds_idx" in micro_batch and "source_name" in micro_batch
-        return micro_batch
+        return {**micro_batch, "labels": micro_batch["labels"].to("meta")}
 
     base.preforward = preforward
     trainer = object.__new__(TextDPOTrainer)
@@ -1982,6 +2116,9 @@ def test_dpo_forward_backward_scopes_channel_loss_to_policy_model(monkeypatch):
     forward_calls = []
 
     def concatenated_forward(model, micro_batch):
+        if model is policy_model:
+            assert base.channel_loss_callback.computer._primary_labels is micro_batch["labels"]
+            assert micro_batch["labels"].device.type == "meta"
         forward_calls.append(
             {
                 "model": model,
@@ -2771,6 +2908,7 @@ def _gloo_sp_preflight_worker(rank, world_size, init_file, result_queue):
             "missing",
             "generic",
             "count",
+            "primary_mismatch",
             "metadata",
             "malformed",
             "descriptor_resolution_failure",
@@ -2803,6 +2941,8 @@ def _gloo_sp_preflight_worker(rank, world_size, init_file, result_queue):
             computer.strict = True
             computer._source_ids = ["source-a"]
             computer._position_ids = torch.tensor([[0, 1]]) if rank == 0 else torch.tensor([[2, 3]])
+            if scenario == "primary_mismatch" and rank == 1:
+                computer._primary_labels = torch.tensor([[3, 4]])
             prepare_descriptor = ChannelLossComputer.__dict__["_prepare_sp_observation_payload"]
 
             if scenario == "source" and rank == 1:

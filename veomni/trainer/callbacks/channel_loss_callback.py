@@ -226,6 +226,9 @@ class ChannelLossComputer:
         self._packed_global_physical_seq_len: int | None = None
         self._tail_padding_length: Any | None = None
         self._result: list[dict[str, Any]] | None = None
+        self._primary_labels: torch.Tensor | None = None
+        self._data_result: list[dict[str, Any]] | None = None
+        self._pending_data_observation_index: int | None = None
         self._pending_observations: list[_PendingSPObservation | list[dict[str, Any]]] = []
         self._observation_attempt_count = 0
         self._capture_errors: list[tuple[str, str]] = []
@@ -435,6 +438,7 @@ class ChannelLossComputer:
 
     def _reset_capture_state(self) -> None:
         self._pending_observations = []
+        self._pending_data_observation_index = None
         self._observation_attempt_count = 0
         self._capture_errors = []
         self._observer_devices = []
@@ -479,6 +483,7 @@ class ChannelLossComputer:
                             exc_info=True,
                         )
             self._pending_observations = []
+            self._pending_data_observation_index = None
             self._capture_errors = []
             self._observer_devices = []
             self._capture_sp_descriptor = None
@@ -663,6 +668,7 @@ class ChannelLossComputer:
             "has_source": bool(self._source_ids),
             "observation_count": self._observation_attempt_count,
             "successful_count": len(self._pending_observations),
+            "data_observation_index": self._pending_data_observation_index,
             "source_ids": _source_id_signature(self._source_ids),
             "observation_source_ids": [_source_id_signature(observation.source_ids) for observation in pending_sp],
             "sp_payload_count": len(pending_sp),
@@ -740,6 +746,7 @@ class ChannelLossComputer:
         successful_counts = [int(status.get("successful_count", -1)) for status in statuses]
         payload_counts = [int(status.get("sp_payload_count", -1)) for status in statuses]
         source_ids = [status.get("source_ids") for status in statuses]
+        data_indices = [status.get("data_observation_index") for status in statuses]
         errors = [status.get("errors") or [] for status in statuses]
         observation_sources = [status.get("observation_source_ids") or [] for status in statuses]
         payload_specs = [status.get("payload_specs") or [] for status in statuses]
@@ -778,6 +785,8 @@ class ChannelLossComputer:
             and expected_observation_count > 0
             and successful_counts == observation_counts
             and payload_counts == observation_counts
+            and all(index == data_indices[0] for index in data_indices)
+            and all(index is None or 0 <= index < expected_observation_count for index in data_indices)
             and all(source_id == source_ids[0] for source_id in source_ids)
             and all(payload_spec == payload_specs[0] for payload_spec in payload_specs)
             and all(alignment_mode == alignment_modes[0] for alignment_mode in alignment_modes)
@@ -797,7 +806,7 @@ class ChannelLossComputer:
             "Channel loss: SP preflight rejected observation payload before conditional collectives "
             f"(has_source={has_source}, observation_counts={observation_counts}, "
             f"successful_counts={successful_counts}, payload_counts={payload_counts}, "
-            f"source_ids={source_ids}, payload_specs={payload_specs}, "
+            f"source_ids={source_ids}, data_indices={data_indices}, payload_specs={payload_specs}, "
             f"segment_counts={segment_counts}, alignment_modes={alignment_modes}, "
             f"descriptor_specs={descriptor_specs}, errors={errors})."
         )
@@ -809,6 +818,10 @@ class ChannelLossComputer:
             self._result = []
         for observation in observations:
             self._result.extend(observation)
+        # Losses may include auxiliary objectives. Physical samples/tokens and
+        # supervised-token counts describe the primary batch exactly once.
+        if self._data_result is None and self._pending_data_observation_index is not None:
+            self._data_result = observations[self._pending_data_observation_index]
         self._micro_step_observation_count += len(observations)
 
     def _record_capture_failure(self, message: str) -> None:
@@ -817,6 +830,7 @@ class ChannelLossComputer:
             # invalidates successful observations from the same micro-step.
             self._micro_step_failed = True
             self._result = None
+            self._data_result = None
             self._micro_step_observation_count = 0
             self.strict_observation_errors.append((self._micro_step, message))
             logger.warning_rank0(
@@ -900,7 +914,7 @@ class ChannelLossComputer:
         self.step_totals = {}
         self.step_data_totals = {}
 
-    def before_micro_step(self) -> None:
+    def before_micro_step(self, primary_labels: torch.Tensor | None = None) -> None:
         step = self._micro_step
         if step < len(self._per_mb_source_ids):
             self._source_ids = self._per_mb_source_ids[step]
@@ -919,11 +933,15 @@ class ChannelLossComputer:
             self._packed_global_physical_seq_len = None
             self._tail_padding_length = None
         self._result = None
+        self._primary_labels = primary_labels
+        self._data_result = None
         self._micro_step_observation_count = 0
         self._micro_step_failed = False
         self._reset_capture_state()
 
     def after_micro_step(self) -> None:
+        if self._result and self._data_result is None:
+            self._record_capture_failure("no observed causal-LM loss matched the primary micro-batch labels")
         if self.strict and self._source_ids and self._micro_step_observation_count == 0:
             self.missing_observation_micro_steps.append(self._micro_step)
         if self._result:
@@ -937,6 +955,10 @@ class ChannelLossComputer:
                 else:
                     self.step_totals[source_id] = (previous[0] + loss_sum, previous[1] + token_count)
 
+        if self._data_result:
+            for item in self._data_result:
+                source_id = item["source_id"]
+                token_count = item["token_count"].detach()
                 sample_count = item.get("sample_count", token_count.new_ones(()).to(dtype=torch.int64)).detach()
                 input_token_count = item.get("input_token_count", token_count).detach()
                 data_previous = self.step_data_totals.get(source_id)
@@ -956,6 +978,8 @@ class ChannelLossComputer:
         self._packed_global_physical_seq_len = None
         self._tail_padding_length = None
         self._result = None
+        self._primary_labels = None
+        self._data_result = None
         self._reset_capture_state()
         self._micro_step += 1
 
@@ -1033,6 +1057,20 @@ class ChannelLossComputer:
                 reused_per_token_loss=reused_per_token_loss,
             )
             if result:
+                if self._data_result is None and self._pending_data_observation_index is None:
+                    primary = self._primary_labels
+                    # Identity is the usual trainer path. Equal copied labels
+                    # also support models that make a contiguous/view copy.
+                    if (
+                        primary is None
+                        or labels is primary
+                        or (
+                            labels.shape == primary.shape
+                            and labels.device == primary.device
+                            and torch.equal(labels, primary)
+                        )
+                    ):
+                        self._pending_data_observation_index = len(self._pending_observations)
                 self._pending_observations.append(result)
             else:
                 self._capture_errors.append(
@@ -2043,11 +2081,15 @@ class ChannelLossCallback(Callback):
     ) -> None:
         if not self._collect_step:
             return
-        self.computer.before_micro_step()
+        self.computer.before_micro_step(primary_labels=micro_batch.get("labels"))
 
     def strip_model_inputs(self, micro_batch: dict[str, Any]) -> None:
         if not self.enabled or not isinstance(micro_batch, dict):
             return
+        if self._collect_step:
+            # BaseTrainer and DPO enter the micro-step before preforward moves
+            # tensors. Refresh the labels here from the actual model inputs.
+            self.computer._primary_labels = micro_batch.get("labels")
         for key in self._strip_keys:
             micro_batch.pop(key, None)
 
