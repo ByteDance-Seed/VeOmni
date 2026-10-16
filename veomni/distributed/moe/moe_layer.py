@@ -314,12 +314,14 @@ class EPGroupGemm(torch.autograd.Function):
         )
 
         ctx.swiglu_limit = swiglu_limit
+        # Save parameter references so FSDP can release unsharded storage.
+        # Retaining compute-dtype copies here would pin them until backward.
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
-            fc1_1_weight_compute,
-            fc1_2_weight_compute,
-            fc2_weight_compute,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
             fc1_1_output,
             fc1_2_output,
             mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=permute_tokens.device),
@@ -342,6 +344,10 @@ class EPGroupGemm(torch.autograd.Function):
             mask_fc1_1,
             mask_fc1_2,
         ) = ctx.saved_tensors
+        # FSDP has unsharded the original parameters before this backward.
+        fc1_1_weight = _compute_weight(fc1_1_weight, permute_tokens.dtype)
+        fc1_2_weight = _compute_weight(fc1_2_weight, permute_tokens.dtype)
+        fc2_weight = _compute_weight(fc2_weight, permute_tokens.dtype)
         swiglu_limit = ctx.swiglu_limit
         # permute_tokens: [tokens, hidden_dim]
         # cumsum: [local_experts]
@@ -503,11 +509,13 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         )
 
         ctx.swiglu_limit = swiglu_limit
+        # Save parameter references so FSDP can release unsharded storage.
+        # Retaining compute-dtype copies here would pin them until backward.
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
-            fc1_1_2_weight_compute,
-            fc2_weight_compute,
+            fc1_1_2_weight,
+            fc2_weight,
             fc1_1_output,
             fc1_2_output,
             mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=permute_tokens.device),
@@ -528,6 +536,9 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             mask_fc1_1,
             mask_fc1_2,
         ) = ctx.saved_tensors
+        # FSDP has unsharded the original parameters before this backward.
+        fc1_1_2_weight = _compute_weight(fc1_1_2_weight, permute_tokens.dtype)
+        fc2_weight = _compute_weight(fc2_weight, permute_tokens.dtype)
         swiglu_limit = ctx.swiglu_limit
 
         # recompute

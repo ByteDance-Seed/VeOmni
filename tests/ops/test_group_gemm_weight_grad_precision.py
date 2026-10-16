@@ -245,3 +245,54 @@ def test_fused_moe_keeps_fp32_weight_gradients_for_fp32_weights():
     eps = torch.finfo(torch.bfloat16).eps
     for fp32_grad, bf16_grad in ((gate_up_grad_fp32, gate_up_grad_bf16), (down_grad_fp32, down_grad_bf16)):
         torch.testing.assert_close(fp32_grad, bf16_grad.float(), rtol=4 * eps, atol=4 * eps)
+
+
+@pytest.mark.parametrize("merged", [False, True], ids=["split", "merged"])
+@pytest.mark.parametrize("ep", [False, True], ids=["non_ep", "ep"])
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("trainable", [False, True], ids=["frozen", "trainable"])
+def test_fused_moe_saves_original_weights(merged, ep, weight_dtype, trainable):
+    """Saving cast copies would retain full weights after FSDP forward resharding."""
+    _skip_if_unsupported()
+    from veomni.distributed.moe.moe_layer import EPGroupGemm, EPMergedFc1GroupGemm
+    from veomni.ops.kernels.moe.group_gemm import (
+        MergedFc1TritonFusedMoeExpertFunction,
+        TritonFusedMoeExpertFunction,
+    )
+
+    device = torch.device(get_device_type())
+    torch.manual_seed(19)
+    hidden = (0.1 * torch.randn(64, 32, device=device, dtype=torch.bfloat16)).requires_grad_()
+    gate = 0.1 * torch.randn(2, 48, 32, device=device, dtype=weight_dtype)
+    up = torch.randn_like(gate) * 0.1
+    down = 0.1 * torch.randn(2, 32, 48, device=device, dtype=weight_dtype)
+    weights = [torch.cat([gate, up], dim=1), down] if merged else [gate, up, down]
+    for weight in weights:
+        weight.requires_grad_(trainable)
+
+    if ep:
+        function = EPMergedFc1GroupGemm if merged else EPGroupGemm
+        output = function.apply(hidden, torch.tensor([32, 64], device=device), *weights, None)
+    else:
+        function = MergedFc1TritonFusedMoeExpertFunction if merged else TritonFusedMoeExpertFunction
+        selected = (torch.arange(64, device=device) // 32).unsqueeze(1)
+        routing = torch.ones(64, 1, device=device, dtype=hidden.dtype)
+        output = function.apply(2, routing, selected, hidden, *weights, None)
+
+    # Only the weights are 3-D in this fixture. Each saved weight must alias
+    # its input parameter, including frozen parameters needed for dgrad.
+    saved_weights = [tensor for tensor in output.grad_fn.saved_tensors if tensor.ndim == 3]
+    assert len(saved_weights) == len(weights)
+    for saved, weight in zip(saved_weights, weights):
+        assert saved.dtype == weight.dtype
+        assert saved.shape == weight.shape
+        assert saved.data_ptr() == weight.data_ptr()
+
+    output.float().square().sum().backward()
+    assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+    for weight in weights:
+        if trainable:
+            assert weight.grad is not None and weight.grad.dtype == weight_dtype
+            assert torch.isfinite(weight.grad).all()
+        else:
+            assert weight.grad is None

@@ -197,11 +197,13 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         ctx.num_experts = num_experts
         ctx.swiglu_limit = swiglu_limit
+        # Save parameter references so FSDP can release unsharded storage.
+        # Retaining compute-dtype copies here would pin them until backward.
         ctx.save_for_backward(
             gate_weights,
-            fc1_1_weight_compute,
-            fc1_2_weight_compute,
-            fc2_weight_compute,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
             hidden_states,
             scatter_index,
             scatter_output,
@@ -236,6 +238,10 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             mask_fc1_1,
             mask_fc1_2,
         ) = ctx.saved_tensors
+        # FSDP has unsharded the original parameters before this backward.
+        fc1_1_weight = compute_weight(fc1_1_weight, hidden_states.dtype)
+        fc1_2_weight = compute_weight(fc1_2_weight, hidden_states.dtype)
+        fc2_weight = compute_weight(fc2_weight, hidden_states.dtype)
         swiglu_limit = ctx.swiglu_limit
         hidden_dim = grad_output.shape[-1]
         grad_output = grad_output.view(-1, hidden_dim)
@@ -449,10 +455,12 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         ctx.num_experts = num_experts
         ctx.swiglu_limit = swiglu_limit
+        # Save parameter references so FSDP can release unsharded storage.
+        # Retaining compute-dtype copies here would pin them until backward.
         ctx.save_for_backward(
             gate_weights,
-            fc1_1_2_weight_compute,
-            fc2_weight_compute,
+            fc1_1_2_weight,
+            fc2_weight,
             hidden_states,
             scatter_index,
             scatter_output,
@@ -486,6 +494,9 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             mask_fc1_1,
             mask_fc1_2,
         ) = ctx.saved_tensors
+        # FSDP has unsharded the original parameters before this backward.
+        fc1_1_2_weight = compute_weight(fc1_1_2_weight, hidden_states.dtype)
+        fc2_weight = compute_weight(fc2_weight, hidden_states.dtype)
         swiglu_limit = ctx.swiglu_limit
         hidden_dim = grad_output.shape[-1]
         grad_output = grad_output.view(-1, hidden_dim)
