@@ -112,7 +112,7 @@ Training from an upstream root:
   [attaches the key converter](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L371);
   [`weights_path`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L233) is the upstream root.
 - The FSDP2 / DDP wrap (per module, or [composed](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L306)) loads weights:
-  - [`load_model_weights`](../../../veomni/models/module_utils.py#L405) and the [rank-0 broadcast loader](../../../veomni/models/module_utils.py#L1299) skip keys the converter declares, without reading them;
+  - [`load_model_weights`](../../../veomni/models/module_utils.py#L405) and the [rank-0 broadcast loader](../../../veomni/models/module_utils.py#L1223) skip keys the converter declares, without reading them;
   - [`load_model_weights_ep_sharded`](../../../veomni/models/module_utils.py#L655) (`ep_sharded_stream_load`) renames each source key with the converter before planning its rank's slice, so per-expert source keys are read only by the rank that owns the expert, and dispatches the layout's `generated_tensors` last;
   - [`HFSourceKeyConverter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L380) renames the module's own keys and hands them to the module's converter.
 
