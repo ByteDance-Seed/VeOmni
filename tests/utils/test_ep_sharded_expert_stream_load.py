@@ -22,6 +22,7 @@ The all-per-expert trunk case covers the Qwen3-MoE, DeepSeek-V3 and
 Qwen3-Omni-MoE checkpoint layouts.
 """
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,6 +36,7 @@ from torch.distributed.tensor import Shard
 import veomni.models.module_utils as module_utils
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.models.transformers.deepseek_v3.checkpoint_tensor_converter import DeepseekV3CheckpointTensorConverter
+from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import DeepseekV4CheckpointTensorConverter
 from veomni.models.transformers.glm_moe_dsa.checkpoint_tensor_converter import GlmMoeDsaCheckpointTensorConverter
 from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import Qwen3MoeCheckpointTensorConverter
 from veomni.models.transformers.qwen3_omni_moe.checkpoint_tensor_converter import (
@@ -361,3 +363,215 @@ def test_per_expert_keys_of_an_unbuilt_module_are_skipped_unread(monkeypatch, tm
         atol=0,
         rtol=0,
     )
+
+
+class _DeepseekV4StreamModel(nn.Module):
+    """One DSV4-named MoE layer plus dense ``q_a_proj`` / ``lm_head``.
+
+    The checkpoint uses DeepSeek's inference names (``layers.0.ffn.experts.{j}.w{1,2,3}``,
+    ``layers.0.attn.wq_a``, ``head``), so every key goes through the converter's rename.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = nn.Module()
+        layer = _layer(NUM_EXPERTS // EP_SIZE)
+        layer.self_attn = nn.Module()
+        layer.self_attn.q_a_proj = nn.Linear(HIDDEN, Q_A_DIM, bias=False)
+        self.model.layers = nn.ModuleList([layer])
+        self.lm_head = nn.Linear(HIDDEN, 5, bias=False)
+        self.config = SimpleNamespace(tie_word_embeddings=False)
+
+    def get_parallel_plan(self) -> ParallelPlan:
+        return ParallelPlan(
+            extra_parallel_plan={
+                "ep": {f"model.layers.*.mlp.experts.{proj}": Shard(0) for proj in ("gate_up_proj", "down_proj")}
+            }
+        )
+
+    @staticmethod
+    def _create_checkpoint_tensor_converter(model):
+        return DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+
+
+Q_A_DIM = 4
+_DSV4_EXPERT_SHAPES = (("w1", (INTERMEDIATE, HIDDEN)), ("w3", (INTERMEDIATE, HIDDEN)), ("w2", (HIDDEN, INTERMEDIATE)))
+
+
+def _dsv4_local_experts(ep_rank: int) -> range:
+    num_local = NUM_EXPERTS // EP_SIZE
+    return range(ep_rank * num_local, (ep_rank + 1) * num_local)
+
+
+@pytest.mark.parametrize("ep_rank", range(EP_SIZE))
+def test_deepseek_v4_w_keys_stream_into_the_local_fused_slice(monkeypatch, tmp_path, ep_rank):
+    """BF16 ``w1/w2/w3`` experts stream per rank; renamed dense keys are read whole."""
+    generator = torch.Generator().manual_seed(0)
+    state = {
+        "head.weight": torch.randn(5, HIDDEN, generator=generator),
+        "layers.0.attn.wq_a.weight": torch.randn(Q_A_DIM, HIDDEN, generator=generator),
+    }
+    for expert in range(NUM_EXPERTS):
+        for proj, shape in _DSV4_EXPERT_SHAPES:
+            state[f"layers.0.ffn.experts.{expert}.{proj}.weight"] = torch.randn(*shape, generator=generator)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    save_file(state, str(tmp_path / "model.safetensors"))
+
+    with torch.device("meta"):
+        model = _DeepseekV4StreamModel()
+    read_keys = _load_as_rank(monkeypatch, tmp_path, ep_rank, model)
+
+    local = _dsv4_local_experts(ep_rank)
+    expert = "layers.0.ffn.experts.{}.{}.weight"
+    want_gate_up = torch.stack(
+        [torch.cat([state[expert.format(e, "w1")], state[expert.format(e, "w3")]]) for e in local]
+    )
+    want_down = torch.stack([state[expert.format(e, "w2")] for e in local])
+    layer = model.model.layers[0]
+    torch.testing.assert_close(layer.mlp.experts.gate_up_proj.data, want_gate_up, atol=0, rtol=0)
+    torch.testing.assert_close(layer.mlp.experts.down_proj.data, want_down, atol=0, rtol=0)
+    torch.testing.assert_close(
+        layer.self_attn.q_a_proj.weight.data, state["layers.0.attn.wq_a.weight"], atol=0, rtol=0
+    )
+    torch.testing.assert_close(model.lm_head.weight.data, state["head.weight"], atol=0, rtol=0)
+    assert {int(k.split(".experts.")[1].split(".")[0]) for k in read_keys if ".ffn.experts." in k} == set(local)
+
+
+@pytest.mark.parametrize("ep_rank", range(EP_SIZE))
+def test_deepseek_v4_fp8_weights_and_scales_stream_with_their_owner(monkeypatch, tmp_path, ep_rank):
+    """Each rank pairs and dequantizes weight+scale for its own experts only; the dense
+    FP8 ``wq_a`` pair is dequantized on every rank."""
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if fp8_dtype is None:
+        pytest.skip("torch.float8_e4m3fn is unavailable")
+
+    scales = {"w1": 2.0, "w2": 3.0, "w3": 4.0}
+    state = {
+        "head.weight": torch.full((5, HIDDEN), 0.25),
+        "layers.0.attn.wq_a.weight": torch.full((Q_A_DIM, HIDDEN), 1.5).to(fp8_dtype),
+        "layers.0.attn.wq_a.scale": torch.tensor([[5.0]]),
+    }
+    for expert in range(NUM_EXPERTS):
+        for proj, shape in _DSV4_EXPERT_SHAPES:
+            stem = f"layers.0.ffn.experts.{expert}.{proj}"
+            state[f"{stem}.weight"] = torch.full(shape, float(expert + 1)).to(fp8_dtype)
+            state[f"{stem}.scale"] = torch.tensor([[scales[proj]]])
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    save_file(state, str(tmp_path / "model.safetensors"))
+
+    with torch.device("meta"):
+        model = _DeepseekV4StreamModel()
+    read_keys = _load_as_rank(monkeypatch, tmp_path, ep_rank, model)
+
+    local = _dsv4_local_experts(ep_rank)
+    experts = model.model.layers[0].mlp.experts
+    for row, e in enumerate(local):
+        want = {proj: torch.full(shape, float(e + 1)) * scales[proj] for proj, shape in _DSV4_EXPERT_SHAPES}
+        torch.testing.assert_close(experts.gate_up_proj.data[row], torch.cat([want["w1"], want["w3"]]), atol=0, rtol=0)
+        torch.testing.assert_close(experts.down_proj.data[row], want["w2"], atol=0, rtol=0)
+    q_a = model.model.layers[0].self_attn.q_a_proj.weight.data
+    torch.testing.assert_close(q_a, torch.full((Q_A_DIM, HIDDEN), 7.5), atol=0, rtol=0)
+
+    assert {k for k in read_keys if ".ffn.experts." in k} == {
+        f"layers.0.ffn.experts.{e}.{proj}.{part}" for e in local for proj in scales for part in ("weight", "scale")
+    }
+
+
+def _save_split_by_suffix(path: Path, state: dict, scales_first: bool) -> None:
+    """Write ``.scale`` tensors and everything else to two shards, scales in the first one or the last one."""
+    scales = {k: v for k, v in state.items() if k.endswith(".scale")}
+    rest = {k: v for k, v in state.items() if not k.endswith(".scale")}
+    first, second = (scales, rest) if scales_first else (rest, scales)
+    path.mkdir(parents=True, exist_ok=True)
+    weight_map = {}
+    for i, shard in enumerate((first, second), start=1):
+        fname = f"model-0000{i}-of-00002.safetensors"
+        save_file(shard, str(path / fname))
+        weight_map.update(dict.fromkeys(shard, fname))
+    (path / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}))
+
+
+@pytest.mark.parametrize("ep_rank", range(EP_SIZE))
+@pytest.mark.parametrize("scales_first", (True, False), ids=("scales_first", "scales_last"))
+@pytest.mark.parametrize(
+    "q_a_stem", ("layers.0.attn.wq_a", "model.layers.0.self_attn.q_a_proj"), ids=("raw_dense", "hf_named_dense")
+)
+def test_deepseek_v4_fp8_pairs_split_across_shards(monkeypatch, tmp_path, ep_rank, scales_first, q_a_stem):
+    """Weight and scale may sit in different shards, in either order. An HF-named FP8
+    dense weight is claimed only by dtype (``can_handle_tensor``), not by name."""
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if fp8_dtype is None:
+        pytest.skip("torch.float8_e4m3fn is unavailable")
+
+    state = {
+        "head.weight": torch.full((5, HIDDEN), 0.25),
+        f"{q_a_stem}.weight": torch.full((Q_A_DIM, HIDDEN), 1.5).to(fp8_dtype),
+        f"{q_a_stem}.scale": torch.tensor([[5.0]]),
+    }
+    for expert in range(NUM_EXPERTS):
+        for proj, shape in _DSV4_EXPERT_SHAPES:
+            stem = f"layers.0.ffn.experts.{expert}.{proj}"
+            state[f"{stem}.weight"] = torch.full(shape, float(expert + 1)).to(fp8_dtype)
+            state[f"{stem}.scale"] = torch.tensor([[2.0]])
+    _save_split_by_suffix(tmp_path, state, scales_first)
+
+    with torch.device("meta"):
+        model = _DeepseekV4StreamModel()
+    _load_as_rank(monkeypatch, tmp_path, ep_rank, model)
+
+    experts = model.model.layers[0].mlp.experts
+    for row, e in enumerate(_dsv4_local_experts(ep_rank)):
+        torch.testing.assert_close(experts.down_proj.data[row], torch.full((HIDDEN, INTERMEDIATE), 2.0 * (e + 1)))
+    q_a = model.model.layers[0].self_attn.q_a_proj.weight.data
+    torch.testing.assert_close(q_a, torch.full((Q_A_DIM, HIDDEN), 7.5), atol=0, rtol=0)
+
+
+def test_deepseek_v4_orphan_scale_loads_like_the_whole_tensor_loader(monkeypatch, tmp_path):
+    """A dequantized BF16 weight whose ``.scale`` stayed behind: the converter returns the
+    scale at ``finalize``, which is dropped as unexpected rather than failing the load."""
+    q_a = torch.full((Q_A_DIM, HIDDEN), 1.5)
+    state = {
+        "head.weight": torch.full((5, HIDDEN), 0.25),
+        "layers.0.attn.wq_a.weight": q_a,
+        "layers.0.attn.wq_a.scale": torch.tensor([[5.0]]),
+    }
+    for expert in range(NUM_EXPERTS):
+        for proj, shape in _DSV4_EXPERT_SHAPES:
+            state[f"layers.0.ffn.experts.{expert}.{proj}.weight"] = torch.zeros(shape)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    save_file(state, str(tmp_path / "model.safetensors"))
+
+    with torch.device("meta"):
+        model = _DeepseekV4StreamModel()
+    _load_as_rank(monkeypatch, tmp_path, 0, model)
+
+    torch.testing.assert_close(model.model.layers[0].self_attn.q_a_proj.weight.data, q_a, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("ep_rank", range(EP_SIZE))
+def test_deepseek_v4_orphan_expert_scales_beside_bf16_experts_are_dropped(monkeypatch, tmp_path, ep_rank):
+    """Expert ``.scale`` keys left beside dequantized BF16 expert weights: each rank's
+    expert-range converter returns its orphan scales at ``finalize``, which are dropped
+    as unexpected (as on the whole-tensor loader) instead of failing the load."""
+    generator = torch.Generator().manual_seed(0)
+    state = {
+        "head.weight": torch.randn(5, HIDDEN, generator=generator),
+        "layers.0.attn.wq_a.weight": torch.randn(Q_A_DIM, HIDDEN, generator=generator),
+    }
+    for expert in range(NUM_EXPERTS):
+        for proj, shape in _DSV4_EXPERT_SHAPES:
+            stem = f"layers.0.ffn.experts.{expert}.{proj}"
+            state[f"{stem}.weight"] = torch.randn(*shape, generator=generator)
+            state[f"{stem}.scale"] = torch.tensor([[2.0]])
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    save_file(state, str(tmp_path / "model.safetensors"))
+
+    with torch.device("meta"):
+        model = _DeepseekV4StreamModel()
+    read_keys = _load_as_rank(monkeypatch, tmp_path, ep_rank, model)
+
+    local = _dsv4_local_experts(ep_rank)
+    expert = "layers.0.ffn.experts.{}.{}.weight"
+    want_down = torch.stack([state[expert.format(e, "w2")] for e in local])
+    torch.testing.assert_close(model.model.layers[0].mlp.experts.down_proj.data, want_down, atol=0, rtol=0)
+    assert {int(k.split(".experts.")[1].split(".")[0]) for k in read_keys if ".ffn.experts." in k} == set(local)

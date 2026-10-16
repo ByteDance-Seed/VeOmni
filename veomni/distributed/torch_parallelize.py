@@ -905,7 +905,8 @@ def parallelize_model_ddp(
     does either — ``build_model`` returns an empty model and ``BaseTrainer`` has
     no load step of its own — so the wrap used to reach DDP's constructor with
     meta parameters and die there on ``Tensor.item()``. A model that arrives with
-    real weights already loaded must not be touched here.
+    real weights already loaded must not be touched here. A model with no
+    parameter that requires grad is loaded but returned unwrapped.
     """
     parallel_state = get_parallel_state()
 
@@ -955,6 +956,13 @@ def parallelize_model_ddp(
                 f"DDP received unmaterialized parameters after loading from {weights_path!r}: "
                 f"{unmaterialized[:5]}{'...' if len(unmaterialized) > 5 else ''}"
             )
+
+    # DDP's constructor rejects a module with no parameter that requires grad,
+    # and a frozen replica (e.g. every encoder of an ``offline_embedding`` run)
+    # has no gradient to all-reduce. Its weights are loaded above; skip the wrap.
+    if not any(param.requires_grad for param in model.parameters()):
+        logger.info_rank0("No parameter requires grad: loaded the weights without a DDP wrap.")
+        return model
 
     # ``broadcast_buffers=False`` because FSDP2 syncs no buffers at all, and a
     # module's buffer semantics must not change with the ``fsdp_mode`` a config

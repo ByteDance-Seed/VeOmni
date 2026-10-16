@@ -944,7 +944,7 @@ def test_from_pretrained_rejects_missing_endpoint_method(tmp_path):
 
 
 def test_omni_model_rejects_missing_default_generate():
-    """Bare generation endpoints resolve to ``generate``; that method must exist when the FSM is built."""
+    """Bare generation endpoints resolve to ``generate``; that method must exist when a request runs."""
 
     class NoGenerate(FakeModuleA):
         generate = None
@@ -954,5 +954,6 @@ def test_omni_model_rejects_missing_default_generate():
         training_graphs={"default": [{"from": FAKE_A, "to": "end"}]},
         generation_graphs=_minimal_generation_graphs(module=FAKE_A),
     )
+    model = OmniModel(config, {FAKE_A: NoGenerate(FakeModuleAConfig())})
     with pytest.raises(ValueError, match=r"NoGenerate\.generate"):
-        OmniModel(config, {FAKE_A: NoGenerate(FakeModuleAConfig())})
+        model.generate({})
