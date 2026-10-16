@@ -328,7 +328,8 @@ def test_causal_conv1d_npu_matches_eager_forward_and_backward():
     eager = resolve_op("causal_conv1d", "standard", "eager").wrapper
     other = resolve_op("causal_conv1d", "standard", "triton").wrapper
     torch.manual_seed(13)
-    batch, seq, dim, kernel = 2, 64, 128, 4
+    # Forward tiles the channel axis at 256 when there is no initial state.
+    batch, seq, dim, kernel = 2, 64, 256, 4
     x = torch.randn(batch, seq, dim, device="npu", dtype=torch.bfloat16)
     weight = torch.randn(dim, kernel, device="npu", dtype=torch.bfloat16)
     bias = torch.randn(dim, device="npu", dtype=torch.bfloat16)
