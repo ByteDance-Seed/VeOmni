@@ -183,7 +183,17 @@ def chunk_loss_function(
         for i in range(len(chunk_labels))
     ]
 
-    chunk_loss = ChunkLoss.apply(hidden_states, weights, None, ce_loss_func, loss_kwargs_chunks, chunk_size)
+    if torch.is_grad_enabled():
+        chunk_loss = ChunkLoss.apply(hidden_states, weights, None, ce_loss_func, loss_kwargs_chunks, chunk_size)
+    else:
+        # Evaluation needs only the scalar CE. Inference mode cannot build the
+        # chunk-local graph used to precompute training gradients, even inside
+        # enable_grad(). Keep the same chunk projection and normalization.
+        chunk_loss = hidden_states.new_zeros((), dtype=torch.float32)
+        for hidden_chunk, loss_kwargs in zip(torch.split(hidden_states, chunk_size, dim=1), loss_kwargs_chunks):
+            loss, chunk_aux = ce_loss_func(hidden_chunk, weights, None, **loss_kwargs)
+            chunk_loss.add_(loss)
+            del loss, chunk_aux
 
     # Keep this cleanup after ``apply`` rather than inside ``ChunkLoss.forward``:
     # saved-tensor pack hooks run as the custom Function finishes applying.

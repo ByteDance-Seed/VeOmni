@@ -111,3 +111,30 @@ def test_dispatch_loss_and_gradients_match_dense(monkeypatch, device):
                 refs = dense.detach(), xr.grad, wr.grad
             for result, ref in zip((loss, x.grad, weight.grad), refs):
                 torch.testing.assert_close(result, ref, atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize("mode", [torch.no_grad, torch.inference_mode], ids=["no_grad", "inference_mode"])
+@pytest.mark.parametrize("sp_enabled", [False, True])
+@pytest.mark.parametrize("chunk_size", [1, 3, 16])
+def test_evaluation_chunk_loss_matches_dense_without_backward(monkeypatch, mode, sp_enabled, chunk_size):
+    monkeypatch.setattr(chunk_loss_module, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=sp_enabled))
+    monkeypatch.setattr(chunk_loss_module, "reduce_sequence_parallel_loss", lambda loss, count: loss)
+    monkeypatch.setattr(
+        chunk_loss_module.ChunkLoss,
+        "apply",
+        lambda *a, **kw: pytest.fail("evaluation must not precompute backward gradients"),
+    )
+    torch.manual_seed(219)
+    # Two samples exercise non-contiguous chunk views; one chunk is fully masked.
+    hidden_states = torch.randn(2, 7, 4, requires_grad=True)
+    weights = torch.randn(11, 4, requires_grad=True)
+    labels = torch.tensor([[1, -100, -100, 4, 5, 6, 7], [2, -100, -100, -100, 6, 7, 8]])
+    with mode():
+        actual, _ = chunk_loss_module.chunk_loss_function(hidden_states, weights, labels, chunk_size=chunk_size)
+        logits = F.linear(hidden_states if sp_enabled else hidden_states[:, :-1], weights).float()
+        targets = labels if sp_enabled else labels[:, 1:]
+        expected = F.cross_entropy(logits.reshape(-1, 11), targets.reshape(-1))
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+    assert not actual.requires_grad
+    assert hidden_states.grad is None
+    assert weights.grad is None
