@@ -206,7 +206,8 @@ def _init_cp_attention(
     from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
-    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
+    dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
@@ -234,7 +235,7 @@ def _init_cp_attention(
     rotary = dsv4.DeepseekV4RotaryEmbedding(config).to(device=device_type)
     _broadcast_module(rotary)
 
-    return dsv4, layer, _make_forward(layer, rotary), full_hidden, full_position_ids, full_mask
+    return dsv4, layer, _make_forward(layer, rotary), full_hidden, full_position_ids, full_mask, cp_state, dp_state
 
 
 def _run_attention_cp(
@@ -247,16 +248,13 @@ def _run_attention_cp(
     batch_size: int = 1,
     sample_slices=None,
 ) -> None:
-    from veomni.distributed.parallel_state import clear_parallel_state
+    from veomni.distributed.parallel_state import clear_parallel_state, use_parallel_state
 
-    _, layer, _forward, full_hidden, full_position_ids, full_mask = _init_cp_attention(
+    _, layer, _forward, full_hidden, full_position_ids, full_mask, cp_state, dp_state = _init_cp_attention(
         rank, world_size, init_file, seq_len, with_compressor, layer_idx, batch_size, sample_slices
     )
 
-    # Baseline: whole sequence with the parallel state stubbed out. Re-initialising
-    # the state here would contradict the world size the process group was built for.
-    no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
-    with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+    with use_parallel_state(dp_state):
         baseline_input = full_hidden.detach().clone().requires_grad_(True)
         baseline = _forward(baseline_input, full_position_ids, full_mask)
         baseline.sum().backward()
@@ -271,8 +269,9 @@ def _run_attention_cp(
     local_len = seq_len // world_size
     begin = rank * local_len
     local_input = full_hidden[:, begin : begin + local_len].detach().clone().requires_grad_(True)
-    local_output = _forward(local_input, full_position_ids[:, begin : begin + local_len], full_mask)
-    local_output.sum().backward()
+    with use_parallel_state(cp_state):
+        local_output = _forward(local_input, full_position_ids[:, begin : begin + local_len], full_mask)
+        local_output.sum().backward()
 
     summed_grads = {}
     for name, param in layer.named_parameters():
@@ -327,9 +326,9 @@ def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str,
     the builder not at all. The assertion is unaffected -- candidates are integer
     indices, compared exactly.
     """
-    from veomni.distributed.parallel_state import clear_parallel_state
+    from veomni.distributed.parallel_state import clear_parallel_state, use_parallel_state
 
-    dsv4, _, _forward, full_hidden, full_position_ids, full_mask = _init_cp_attention(
+    dsv4, _, _forward, full_hidden, full_position_ids, full_mask, cp_state, dp_state = _init_cp_attention(
         rank, world_size, init_file, seq_len, with_compressor=False, dtype=torch.bfloat16
     )
     dsv4.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
@@ -349,18 +348,18 @@ def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str,
         patch(f"{_PATCHED_MODULE}.build_sparse_attention_indices", _record),
         patch(f"{_PATCHED_MODULE}.sparse_attn_tilelang", _stub_sparse_attn_tilelang),
     ):
-        no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
-        with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+        with use_parallel_state(dp_state):
             _forward(full_hidden, full_position_ids, full_mask)
         # Unpacking asserts the forward built exactly one candidate list.
         (baseline_indices,) = built
         built.clear()
 
-        _forward(
-            full_hidden[:, begin : begin + local_len],
-            full_position_ids[:, begin : begin + local_len],
-            full_mask,
-        )
+        with use_parallel_state(cp_state):
+            _forward(
+                full_hidden[:, begin : begin + local_len],
+                full_position_ids[:, begin : begin + local_len],
+                full_mask,
+            )
         (local_indices,) = built
 
     torch.testing.assert_close(local_indices, baseline_indices[:, begin : begin + local_len], rtol=0, atol=0)
@@ -453,7 +452,7 @@ def _run_compressor_cp(
     row all-gather, and running it is the only way to drive them. Its selection
     is then observable through ``block_bias``, which is scattered from it.
     """
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -470,7 +469,8 @@ def _run_compressor_cp(
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
-    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
+    dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
@@ -524,8 +524,7 @@ def _run_compressor_cp(
             **packed_kwargs,
         )
 
-    no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
-    with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+    with use_parallel_state(dp_state):
         baseline_input = full_hidden.detach().clone().requires_grad_(True)
         baseline_kv, baseline_bias = _forward(baseline_input, full_position_ids, q_residual)
         baseline_kv.sum().backward()
@@ -538,14 +537,15 @@ def _run_compressor_cp(
     local_len = seq_len // world_size
     begin = rank * local_len
     local_input = full_hidden[:, begin : begin + local_len].detach().clone().requires_grad_(True)
-    local_kv, local_bias = _forward(
-        local_input,
-        full_position_ids[:, begin : begin + local_len],
-        q_residual[:, begin : begin + local_len],
-    )
+    with use_parallel_state(cp_state):
+        local_kv, local_bias = _forward(
+            local_input,
+            full_position_ids[:, begin : begin + local_len],
+            q_residual[:, begin : begin + local_len],
+        )
 
-    owned = (_window_starts(rate, seq_len, sample_slices) // local_len) == rank
-    local_kv[:, :, owned.to(local_kv.device)].sum().backward()
+        owned = (_window_starts(rate, seq_len, sample_slices) // local_len) == rank
+        local_kv[:, :, owned.to(local_kv.device)].sum().backward()
     # A rank that owns no window never touches ``position_bias`` or ``kv_norm`` and
     # so has no gradient for them, while its peers do. Reducing a zero stand-in
     # instead of skipping keeps every rank in the same collectives.
@@ -599,7 +599,7 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
     local. The packed layout is what forces it to shard the compression metadata
     it is handed, which is global.
     """
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -616,7 +616,8 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
-    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
+    dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
     # The TileLang kernel is the production scorer and the only one with a query
     # partitioning of its own; the eager scorer is covered by the CSA layer test.
     dsv4.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
@@ -667,18 +668,18 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
 
         kernel_runs.clear()
         with patch(f"{_PATCHED_MODULE}.v4_lighting_indexer", _counting_kernel):
-            no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
-            with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+            with use_parallel_state(dp_state):
                 baseline = indexer(hidden, q_residual, position_ids, None, 0, **packed_kwargs)
 
-            local = indexer(
-                hidden[:, begin : begin + local_len],
-                q_residual[:, begin : begin + local_len],
-                position_ids[:, begin : begin + local_len],
-                None,
-                0,
-                **packed_kwargs,
-            )
+            with use_parallel_state(cp_state):
+                local = indexer(
+                    hidden[:, begin : begin + local_len],
+                    q_residual[:, begin : begin + local_len],
+                    position_ids[:, begin : begin + local_len],
+                    None,
+                    0,
+                    **packed_kwargs,
+                )
         compared.append((local, baseline[:, begin : begin + local_len], len(kernel_runs)))
 
     # Both layouts run their collectives before anything is asserted, so a
@@ -1214,7 +1215,7 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
     ``test_deepseek_v4_cp_collator_shards_contiguously_by_cp_rank`` pins that the
     collator really produces these three things.
     """
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -1230,7 +1231,8 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
 
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
-    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
+    dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
     if tilelang:
         # The model forward withholds the dense mask only for bf16 CUDA tensors
         # with the TileLang attention selected, so this is the arm that reaches
@@ -1278,9 +1280,7 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
         patch(f"{_PATCHED_MODULE}.sparse_attn_tilelang", _counted("sparse_attn_tilelang")),
         patch(f"{_PATCHED_MODULE}.v4_lighting_indexer", _counted("v4_lighting_indexer")),
     ):
-        # Baseline: the whole packed batch with the parallel state stubbed out.
-        no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
-        with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+        with use_parallel_state(dp_state):
             baseline = _forward(input_ids, position_ids)
             baseline.sum().backward()
             baseline_grads = {name: _grad_or_zeros(param) for name, param in model.named_parameters()}
@@ -1289,8 +1289,9 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
 
         # Context-parallel: this rank's contiguous shard beside the full-sequence
         # cu-seqlens, which is what the collator hands the model.
-        local = _forward(input_ids[:, begin : begin + local_len], position_ids[:, begin : begin + local_len])
-        local.sum().backward()
+        with use_parallel_state(cp_state):
+            local = _forward(input_ids[:, begin : begin + local_len], position_ids[:, begin : begin + local_len])
+            local.sum().backward()
 
     summed_grads = {}
     for name, param in model.named_parameters():
