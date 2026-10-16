@@ -785,6 +785,12 @@ def minimax_m3_vl_text_model_forward_patched(
             max_length_q=sequence_length,
             max_length_k=sequence_length,
         )
+    elif inputs_embeds.shape[0] != 1:
+        # The sparse attention operators consume one packed [T, H, D] row.
+        raise ValueError(
+            "MiniMax M3 VL packed inputs (cu_seq_lens_q/max_length_q) must have batch size 1, "
+            f"got {inputs_embeds.shape[0]}."
+        )
     # --- Patch.2 ---
 
     hidden_states = inputs_embeds

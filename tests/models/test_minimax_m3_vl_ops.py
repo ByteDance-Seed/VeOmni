@@ -185,8 +185,18 @@ def test_minimax_m3_vl_indexer_is_frozen_and_stays_out_of_autograd(module_name):
     [
         ({"inputs_embeds": torch.randn(2, 4, 8)}, "padded batches are not supported"),
         ({"inputs_embeds": torch.randn(1, 4, 8), "past_key_values": object()}, "does not support KV cache"),
+        (
+            {
+                "inputs_embeds": torch.randn(2, 4, 8),
+                "cu_seq_lens_q": torch.tensor([0, 4, 8], dtype=torch.int32),
+                "cu_seq_lens_k": torch.tensor([0, 4, 8], dtype=torch.int32),
+                "max_length_q": 4,
+                "max_length_k": 4,
+            },
+            "must have batch size 1",
+        ),
     ],
-    ids=["padded_batch", "kv_cache"],
+    ids=["padded_batch", "kv_cache", "packed_batch_gt_1"],
 )
 def test_minimax_m3_vl_text_model_rejects_inputs_it_cannot_pack(module_name, forward_kwargs, message):
     modeling = importlib.import_module(module_name)
