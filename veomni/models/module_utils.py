@@ -47,7 +47,6 @@ from ..utils.device import get_device_type, synchronize
 from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
 from ..utils.import_utils import is_diffusers_available
 from .checkpoint_tensor_loading import (
-    checkpoint_converter_dim0_rowwise_companion,
     checkpoint_converter_fused_expert_target,
     checkpoint_converter_is_dim0_zero_pad,
     checkpoint_converter_record_skip_without_loading,
@@ -829,23 +828,15 @@ def load_model_weights_ep_sharded(
         bare_name = _convert_weight_key(raw_name, model)
         return bare_name if source_converter is None else source_converter.module_key(bare_name)
 
-    bare_to_raw = {bare: raw for raw in key_to_file if (bare := _bare_name(raw)) is not None}
-
-    def _rowwise_companion(bare_name: str) -> Optional[str]:
-        companion = checkpoint_converter_dim0_rowwise_companion(converter, bare_name)
-        return companion if companion in bare_to_raw else None
-
-    # Read beside the key that names them, never on their own.
-    companions = {companion for bare in bare_to_raw if (companion := _rowwise_companion(bare)) is not None}
-
     if converter is not None:
         # Source-key count per expert of each fused target. A converter's ``finalize`` only
         # sees its own rank's range, so a gap there would fail one rank (or, for a wholly
         # absent range, none); checking here makes every rank reject the checkpoint.
         expert_key_counts: Dict[str, Dict[int, int]] = {}
         num_experts_by_target: Dict[str, int] = {}
-        for bare_name, raw_name in bare_to_raw.items():
-            if bare_name in companions or checkpoint_converter_should_skip_without_loading(converter, bare_name):
+        for raw_name in key_to_file:
+            bare_name = _bare_name(raw_name)
+            if bare_name is None or checkpoint_converter_should_skip_without_loading(converter, bare_name):
                 continue
             if not _converter_transforms(bare_name):
                 continue
@@ -942,9 +933,6 @@ def load_model_weights_ep_sharded(
                 bare_name = _bare_name(raw_name)
                 if bare_name is None:
                     source_converter.record_skip_without_loading(raw_name)
-                    n_skipped += 1
-                    continue
-                if bare_name in companions:
                     n_skipped += 1
                     continue
                 name = _apply_peft_override(bare_name)

@@ -824,7 +824,7 @@ def save_hf_source_checkpoint(
         if export_state is not None:
             module_state = export_state(model, module_state)
             exported_keys = _all_ranks_union(module_state)
-        unmapped, reshaped = [], []
+        unmapped, reshaped, bad_dtypes = [], [], []
         for key in exported_keys:
             source_key = layout.source_key(name, key)
             if source_key is None or source_key not in weight_files:
@@ -843,10 +843,16 @@ def save_hf_source_checkpoint(
             if tuple(tensor.shape) != shape:
                 reshaped.append(f"{key} {tuple(tensor.shape)} vs {source_key} {shape}")
                 continue
-            save_state[source_key] = _to_source_dtype(name, key, tensor, dtype)
+            try:
+                save_state[source_key] = _to_source_dtype(name, key, tensor, dtype)
+            except TypeError as exc:
+                bad_dtypes.append(str(exc))
         if export_state is not None:
             # An exported key may live on one rank only; every rank must agree to raise.
             reshaped = _all_ranks_union(reshaped)
+            bad_dtypes = _all_ranks_union(bad_dtypes)
+        if bad_dtypes:
+            raise TypeError(bad_dtypes[0])
         if unmapped or reshaped:
             raise ValueError(
                 f"save_hf_source_checkpoint: module '{name}' cannot be written back in the `{source.model_type}` "

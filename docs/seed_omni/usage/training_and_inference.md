@@ -111,9 +111,8 @@ with a registered layout loads through it, and any other type is an error.
   the HF export raises rather than write the stale source copy or drop the new
   weight. Export such a run from a split checkpoint, or disable
   `save_hf_weights`. Each HF export reads every source tensor no
-  trained module produces (frozen modules, unclaimed keys) into rank 0's host
-  memory, so a small trained module beside a large frozen one costs the frozen
-  one's size in rank-0 RAM per export. Eager loads take `device_map` as
+  trained module produces (frozen modules, unclaimed keys) into host memory,
+  spread across the ranks. Eager loads take `device_map` as
   `from_pretrained` does; a module spread over several devices (`"auto"`) is
   loaded on CPU first, so host memory must hold it once.
 

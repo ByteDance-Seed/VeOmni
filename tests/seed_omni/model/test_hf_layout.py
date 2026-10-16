@@ -276,6 +276,32 @@ def test_export_refuses_a_cast_that_would_drop_quantization(hf_root, tmp_path, m
         )
 
 
+def test_export_dtype_refusal_propagates_across_ranks(hf_root, tmp_path, monkeypatch):
+    """When another rank's ``export_state`` slice hits a forbidden cast, every rank raises together."""
+    import veomni.models.seed_omni.utils.hf_layout as hf_layout_mod
+
+    root, _ = hf_root
+    calls = []
+
+    def fake_union(items):
+        items = list(items)
+        calls.append(items)
+        if len(calls) == 1:
+            return ["proj.weight"]
+        if len(calls) == 2:
+            return items
+        return ["save_hf_source_checkpoint: peer rank hit a forbidden cast; must declare export_state."]
+
+    monkeypatch.setattr(hf_layout_mod, "_all_ranks_union", fake_union)
+    _with_module_hooks(monkeypatch, FAKE_A, export_state=lambda module, state: {})
+    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
+    with pytest.raises(TypeError, match="peer rank hit a forbidden cast"):
+        save_hf_source_checkpoint(
+            model.config._hf_source, {FAKE_A: (model.modules_dict[FAKE_A], None)}, str(tmp_path / "export")
+        )
+    assert len(calls) == 3
+
+
 def test_an_hf_root_resolves_to_a_weight_free_split_view(hf_root):
     root, _ = hf_root
     view = resolve_omni_checkpoint_root(root)
