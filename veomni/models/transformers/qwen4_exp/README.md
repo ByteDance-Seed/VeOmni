@@ -19,7 +19,12 @@ Supported in this correctness stage:
   layout, so the kernel itself carries no sequence-parallel logic.
   Explicit cu-seqlens isolate packed samples consistently for SP=1 and SP>1.
 - PLE n-gram token halos and differentiable dilated-convolution halos across
-  Ulysses shard boundaries.
+  Ulysses shard boundaries. Packed metadata is computed once per model
+  forward; n-gram histories are reset by local token offsets, and only the
+  first `(kernel_size - 1) * dilation` outputs of each sample need convolution
+  correction. Interior tokens retain the original convolution and SP halos.
+  Explicit cumulative lengths remain authoritative; rotary positions are not
+  used as token offsets. This adds no collective or model/checkpoint parameter.
 - VeOmni fused cross-entropy and fused MoE dispatch, with sequence-local router
   logits and padding masks for auxiliary load-balancing loss.
 - Concurrent PLE and MoE expert parallelism: PLE tables use the persistent
