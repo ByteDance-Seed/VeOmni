@@ -105,6 +105,12 @@ def _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings):
     This is the projection half of ``MiniMaxM3VLIndexer.forward``. On the packed
     training path, block selection runs in the MiniMax sparse attention
     operator after the Ulysses exchange instead.
+
+    The indexer is not trained here: block selection is a top-k over discrete
+    block scores and no indexer loss is computed, so its projections receive no
+    gradient and keep their checkpoint values. MiniMax describes the indexer as
+    distilled from full attention with a KL objective, but has not published how
+    it is handled in post-training; add that objective here once it is known.
     """
     batch, q_len, _ = hidden_states.shape
     index_query = indexer.q_norm(indexer.q_proj(hidden_states).view(batch, q_len, -1, indexer.head_dim))

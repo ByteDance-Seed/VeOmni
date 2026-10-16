@@ -59,7 +59,7 @@
 
  from collections.abc import Callable
  from dataclasses import dataclass
-@@ -24,30 +44,122 @@
+@@ -24,30 +44,128 @@
  import torch
  import torch.nn as nn
  import torch.nn.functional as F
@@ -190,6 +190,12 @@
 +    This is the projection half of ``MiniMaxM3VLIndexer.forward``. On the packed
 +    training path, block selection runs in the MiniMax sparse attention
 +    operator after the Ulysses exchange instead.
++
++    The indexer is not trained here: block selection is a top-k over discrete
++    block scores and no indexer loss is computed, so its projections receive no
++    gradient and keep their checkpoint values. MiniMax describes the indexer as
++    distilled from full attention with a KL objective, but has not published how
++    it is handled in post-training; add that objective here once it is known.
 +    """
 +    batch, q_len, _ = hidden_states.shape
 +    index_query = indexer.q_norm(indexer.q_proj(hidden_states).view(batch, q_len, -1, indexer.head_dim))
@@ -205,7 +211,7 @@
 
 
  class MiniMaxM3VLSparseCacheLayer(DynamicLayer):
-@@ -139,6 +251,12 @@
+@@ -139,6 +257,12 @@
              self.idx_keys = self.idx_keys.index_select(0, beam_idx.to(self.idx_keys.device))
 
 
@@ -218,7 +224,7 @@
  class MiniMaxM3VLRMSNorm(nn.Module):
      """Gemma-style RMSNorm: normalizes in fp32 and scales by `weight + 1`."""
 
-@@ -151,9 +269,14 @@
+@@ -151,9 +275,14 @@
          return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
      def forward(self, x):
@@ -235,7 +241,7 @@
          output = output * (1.0 + self.weight.float())
          return output.type_as(x)
 
-@@ -179,11 +302,16 @@
+@@ -179,11 +308,16 @@
          return self.down_proj((up + 1.0) * glu)
 
 
@@ -256,7 +262,7 @@
          super().__init__()
          self.num_experts = config.num_local_experts
          self.hidden_dim = config.hidden_size
-@@ -194,25 +322,23 @@
+@@ -194,25 +328,23 @@
          self.swiglu_alpha = config.swiglu_alpha
          self.swiglu_limit = config.swiglu_limit
 
@@ -287,7 +293,7 @@
          gate, up = gate_up.chunk(2, dim=-1)
          gate = gate.clamp(max=self.swiglu_limit)
          up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-@@ -405,6 +531,12 @@
+@@ -405,6 +537,12 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
@@ -300,7 +306,7 @@
  class MiniMaxM3VLAttention(nn.Module):
      """
      M3 attention: per-head Gemma QK-norm + partial RoPE, optionally sparse indexer selection which require position IDs.
-@@ -429,14 +561,27 @@
+@@ -429,14 +567,27 @@
              MiniMaxM3VLIndexer(config, layer_idx) if config.layer_types[layer_idx] == "minimax_m3_sparse" else None
          )
 
@@ -334,7 +340,7 @@
          input_shape = hidden_states.shape[:-1]
          hidden_shape = (*input_shape, -1, self.head_dim)
 
-@@ -444,49 +589,75 @@
+@@ -444,49 +595,75 @@
          key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
          value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
@@ -446,7 +452,7 @@
 
 
  class MiniMaxM3VLIndexer(nn.Module):
-@@ -677,26 +848,38 @@
+@@ -677,26 +854,38 @@
          return hidden_states
 
 
@@ -489,7 +495,7 @@
 
      @torch.no_grad()
      def _init_weights(self, module):
-@@ -712,6 +895,12 @@
+@@ -712,6 +901,12 @@
              init.zeros_(module.weight)
 
 
@@ -502,7 +508,7 @@
  @auto_docstring
  class MiniMaxM3VLTextModel(MiniMaxM3VLPreTrainedModel):
      config: MiniMaxM3VLTextConfig
-@@ -730,6 +919,17 @@
+@@ -730,6 +925,17 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -520,7 +526,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -738,48 +938,69 @@
+@@ -738,48 +944,69 @@
          input_ids: torch.LongTensor | None = None,
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
@@ -617,7 +623,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -789,180 +1010,6 @@
+@@ -789,180 +1016,6 @@
          return MoeModelOutputWithPast(
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
@@ -798,7 +804,7 @@
          )
 
 
-@@ -990,6 +1037,12 @@
+@@ -990,6 +1043,12 @@
          )
          hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
          return hidden_states
@@ -811,7 +817,7 @@
 
 
  class MiniMaxM3VL3DRotaryEmbedding(nn.Module):
-@@ -1019,13 +1072,17 @@
+@@ -1019,13 +1078,17 @@
          self.spatial_merge_size = spatial_merge_size
          self.theta = theta
 
@@ -836,7 +842,7 @@
          coords = get_vision_position_ids(grid_thw, self.spatial_merge_size, include_temporal=True, kwargs=kwargs)
          coords = coords.to(device=device, dtype=torch.float32)
          inv_freq = 1.0 / (
-@@ -1156,6 +1213,12 @@
+@@ -1156,6 +1219,12 @@
          return hidden_states
 
 
@@ -849,7 +855,7 @@
  @auto_docstring
  class MiniMaxM3VLVisionModel(MiniMaxM3VLPreTrainedModel):
      """CLIP-like vision tower with Conv3d patch embed + 3D RoPE."""
-@@ -1178,23 +1241,151 @@
+@@ -1178,23 +1247,151 @@
          )
          self.post_init()
 
@@ -1007,7 +1013,7 @@
 
 
  class MiniMaxM3VLMultiModalProjector(nn.Module):
-@@ -1278,6 +1469,26 @@
+@@ -1278,6 +1475,26 @@
      image_hidden_states: torch.FloatTensor | None = None
 
      video_hidden_states: torch.FloatTensor | None = None
@@ -1034,7 +1040,7 @@
 
 
  @auto_docstring(custom_intro="MiniMax M3 VL backbone (vision + projector + text), without LM head.")
-@@ -1350,46 +1561,114 @@
+@@ -1350,46 +1567,114 @@
              )
          return special_image_mask, special_video_mask
 
@@ -1166,7 +1172,7 @@
 
          outputs = self.language_model(
              attention_mask=attention_mask,
-@@ -1426,6 +1705,12 @@
+@@ -1426,6 +1711,12 @@
          return vision_outputs
 
 
@@ -1179,7 +1185,7 @@
  @auto_docstring(custom_intro="MiniMax M3 VL full model with LM head (text + vision).")
  class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3VLPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
-@@ -1448,48 +1733,25 @@
+@@ -1448,48 +1739,25 @@
      @auto_docstring
      def forward(
          self,
@@ -1246,7 +1252,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1504,15 +1766,42 @@
+@@ -1504,15 +1772,42 @@
          )
          hidden_states = outputs.last_hidden_state
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1294,7 +1300,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1524,9 +1813,19 @@
+@@ -1524,9 +1819,19 @@
      def get_video_features(self, pixel_values_videos, video_grid_thw, **kwargs):
          return self.model.get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
 
