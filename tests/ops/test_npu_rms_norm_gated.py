@@ -97,3 +97,12 @@ def test_native_npu_reference_and_gradients(dtype, activation, autocast_enabled)
     for a, b in zip((actual, *got), (expected, *ref), strict=True):
         assert torch.isfinite(a).all()
         torch.testing.assert_close(a, b, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("activation", ["sigmoid", "silu"])
+def test_gate_must_match_input_shape(activation):
+    norm = load_wrapper()(32, activation=activation)
+    x = torch.ones(1, 4, 32)
+    for gate in [None, torch.zeros(1, 4, 64), torch.zeros(1, 1, 32)]:
+        with pytest.raises(ValueError, match="gate with the input shape"):
+            norm(x, gate)

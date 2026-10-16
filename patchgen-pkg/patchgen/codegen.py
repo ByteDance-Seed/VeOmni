@@ -763,7 +763,7 @@ class ModelingCodeGenerator:
                 replacement_source = strip_patch_decorators(replacement_source)
 
                 # Rename the class (simple text replacement for class definition line)
-                old_name = patch.replacement.__name__
+                old_name = _apply_name_map(patch.replacement.__name__, patch.name_map)
                 if old_name != original_class.name:
                     # Replace "class OldName" with "class NewName"
                     replacement_source = replacement_source.replace(
@@ -890,6 +890,13 @@ class ModelingCodeGenerator:
                 replacement_source = textwrap.dedent(replacement_source)
                 replacement_source = _apply_name_map(replacement_source, patch.name_map)
                 replacement_source = strip_patch_decorators(replacement_source)
+
+                # Keep source decorators such as HF kernel registrations referenced by classes.
+                if original_func.decorator_list:
+                    decorator_start = get_node_start_line(original_func) - 1
+                    original_decorators = self.source_lines[decorator_start : original_func.lineno - 1]
+                    leading_lines, definition = _split_leading_comments(replacement_source)
+                    replacement_source = "\n".join([*leading_lines, *original_decorators, definition])
 
                 # Rename the function if necessary (simple text replacement)
                 old_name = patch.replacement.__name__

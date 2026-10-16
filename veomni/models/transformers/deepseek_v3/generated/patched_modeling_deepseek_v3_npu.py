@@ -243,12 +243,8 @@ class DeepseekV3TopkRouter(nn.Module):
 # 2. OpSlot guard for fused-MoE: when ``veomni_moe_experts_forward`` is bound
 #    to a non-eager kernel (the ``moe_implementation`` ops-config field is
 #    not ``"eager"``), call ``fused_moe_forward`` with stacked ``gate_up_proj``.
-#    Otherwise fall through to the eager loop. This is the same dispatch
-#    qwen3_moe / qwen3_omni_moe / v4 deepseek_v3 use; an earlier draft of this
-#    patch keyed on a ``config._moe_implementation`` attribute that was never
-#    wired up by the framework, so EP runs always took the eager branch and
-#    crashed on EP-sharded ``gate_up_proj[expert_idx]`` lookups for global
-#    expert ids.
+#    Otherwise fall through to the eager loop, which indexes experts by
+#    global id and therefore fails on EP-sharded ``[E/ep, ...]`` weights.
 # Layout matches v5 upstream (direct, no transpose):
 #   gate_up_proj [E, 2*I, H],  down_proj [E, H, I]
 # ================================================================
@@ -420,6 +416,7 @@ def rotate_half(x):
 # Patch: apply_rotary_pos_emb
 # 1. Use NPU fused rotary embedding kernel.
 # ================================================================
+@use_kernel_forward_from_hub("rotary_pos_emb")
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     from veomni.ops.kernels.rotary.npu import apply_rotary_pos_emb_npu as _apply_rotary_pos_emb_npu
 

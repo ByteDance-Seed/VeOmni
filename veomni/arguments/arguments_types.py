@@ -413,7 +413,12 @@ class GradientCheckpointingConfig:
 
     enable: bool = field(
         default=True,
-        metadata={"help": "Enable gradient checkpointing."},
+        metadata={
+            "help": (
+                "Enable gradient checkpointing. Master switch: with it off recompute_layers, "
+                "selective_recompute_layers and save_ops have no effect."
+            )
+        },
     )
     debug: bool = field(
         default=False,
@@ -423,7 +428,15 @@ class GradientCheckpointingConfig:
     )
     enable_reentrant: bool = field(
         default=False,
-        metadata={"help": "Use reentrant gradient checkpointing."},
+        metadata={
+            "help": (
+                "Use reentrant gradient checkpointing. Kept off by default, and not usable "
+                "on a model whose block loop passes its block arguments by keyword "
+                "(MiniMax-H3): reentrant checkpointing saves positional tensors only, so "
+                "the first recomputed block raises. torch also refuses "
+                "enable_reentrant=True together with SAC."
+            )
+        },
     )
     early_stop: bool = field(
         default=True,
@@ -434,6 +447,75 @@ class GradientCheckpointingConfig:
             )
         },
     )
+    recompute_layers: int = field(
+        default=-1,
+        metadata={
+            "help": (
+                "How many layers run recomputation while checkpointing is on, counted from the "
+                "last block: -1 (default) = every layer, N = the last N layers, 0 = "
+                "none. A value above the model depth means every layer. The layers in "
+                "front of that range keep their activations, so memory grows. Applies "
+                "to every model: the framework finds the block stack itself "
+                "(_no_split_modules / basic_modules) and folds sibling stacks into one "
+                "sequence. A model with several stacks (a VLM tower beside the decoder) "
+                "counts the trainable one, the one with more blocks if both train; list "
+                "a class in model.basic_modules to count that one instead. A model "
+                "calling torch.utils.checkpoint directly does not honour it and is "
+                "reported. Ignored when enable=False."
+            )
+        },
+    )
+    selective_recompute_layers: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "How many of those layers run selective activation checkpointing (SAC) — "
+                "keep the operators named in save_ops and recompute the rest — counted "
+                "from the front of the recomputed range, the rest of the range "
+                "recomputing in full. 0 (default) = SAC off, N = the first N, a value "
+                "above the length of that range means the whole range. Ignored when "
+                "enable=False, and needs enable_reentrant=False."
+            )
+        },
+    )
+    save_ops: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Operators SAC keeps (MUST_SAVE) instead of recomputing, on top of the "
+                "attention set it always keeps. Empty (default) or 'attn' = that "
+                "attention set. Any other entry is read as a literal operator string, "
+                "e.g. 'aten._scaled_dot_product_attention.default'. Only applies while "
+                "SAC is on."
+            )
+        },
+    )
+
+    def __post_init__(self) -> None:
+        # YAML values reach the dataclass untyped (the parser casts CLI args only),
+        # so a quoted count would otherwise fail much later, inside the policy build.
+        for name, minimum, expected in (
+            ("recompute_layers", -1, "a non-negative integer or -1"),
+            ("selective_recompute_layers", 0, "a non-negative integer"),
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(
+                    f"model.accelerator.gradient_checkpointing.{name} must be {expected}, "
+                    f"got {value!r} ({type(value).__name__})"
+                )
+        # A bare operator string would be iterated character by character by the op
+        # resolver (one warning per letter), so normalise it and reject anything
+        # that is not a sequence of names.
+        if self.save_ops is None:
+            self.save_ops = []
+        elif isinstance(self.save_ops, str):
+            self.save_ops = [self.save_ops]
+        elif not isinstance(self.save_ops, list):
+            raise ValueError(
+                "model.accelerator.gradient_checkpointing.save_ops must be a list of names, "
+                f"got {self.save_ops!r} ({type(self.save_ops).__name__})"
+            )
 
 
 @dataclass
@@ -503,6 +585,38 @@ class MixedPrecisionConfig:
         _check_dtype(self.output_dtype)
 
 
+def validate_low_precision_reduce_scatter_comm(
+    enabled: bool,
+    mixed_precision: MixedPrecisionConfig,
+    *,
+    fsdp_mode: str = "fsdp2",
+) -> bool:
+    """Validate the opt-in flag and precision settings; return whether a custom path is needed."""
+    if not isinstance(enabled, bool):
+        raise ValueError("low_precision_reduce_scatter_comm must be a boolean (true or false).")
+    if not enabled:
+        return False
+    if (
+        mixed_precision.param_dtype in ("bfloat16", "float16", "float32")
+        and mixed_precision.param_dtype == mixed_precision.reduce_dtype
+    ):
+        return False
+    if fsdp_mode != "fsdp2":
+        raise ValueError("low_precision_reduce_scatter_comm requires fsdp_mode='fsdp2'.")
+    if (
+        not mixed_precision.enable
+        or mixed_precision.reduce_dtype != "float32"
+        or mixed_precision.param_dtype not in ("bfloat16", "float16")
+    ):
+        raise ValueError(
+            "low_precision_reduce_scatter_comm requires enabled mixed-precision FSDP2 with "
+            "param_dtype='bfloat16' or 'float16' and reduce_dtype='float32'. "
+            "Communication precision is inferred from param_dtype. Disable the option or use equal "
+            "parameter and reduction dtypes for the native path."
+        )
+    return True
+
+
 @dataclass
 class FSDPConfig:
     """model.accelerator.fsdp_config.* — FSDP sharding configuration."""
@@ -511,9 +625,25 @@ class FSDPConfig:
         default="fsdp2",
         metadata={
             "help": (
-                "Data parallel mode. 'eager' is reserved for a future single-process "
-                "from_pretrained(device_map=...) inference path that skips every wrapper, "
-                "and currently raises."
+                "Data parallel mode. 'eager' skips every wrapper for the single-process "
+                "inference path an omni module takes via ModuleRuntime._init_eager_inference."
+            )
+        },
+    )
+    fsdp_scope: Literal["module", "model"] = field(
+        default="module",
+        metadata={
+            "help": (
+                "Where to apply the FSDP2/DDP wrap for a SeedOmni composed model. "
+                "'module' (default) wraps each omni module independently. 'model' wraps "
+                "the composed OmniModel once, so one FSDP tree spans every sub-module. "
+                "Wrap targets are each child's _no_split_modules scoped as "
+                "'{child}.{ClassName}'; leftover params unshard on OmniModel.forward. "
+                "Under 'model', per-module fsdp_mode / extra_parallel / init_device and "
+                "SP-CP-TP-PP overlays stay as written but no longer decide mesh, init or "
+                "wrap — the top-level accelerator does, and only its fsdp_scope counts. "
+                "Every module must defer to that one wrap, so a module on inference "
+                "fsdp_mode='eager' is rejected under 'model'."
             )
         },
     )
@@ -543,6 +673,20 @@ class FSDPConfig:
             )
         },
     )
+    low_precision_reduce_scatter_comm: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use mixed_precision.param_dtype for node-local FSDP2 ReduceScatter communication, while "
+                "keeping FP32 reduction buffers and accumulation. Disabled by default. Equal parameter and "
+                "reduction dtypes retain native communication. The custom path requires enabled mixed precision, "
+                "bfloat16 or float16 parameters, and float32 reduction. "
+                "Cross-node or unknown-placement shard groups fall back to native communication; "
+                "HSDP replica-linked groups make a consistent choice. FP32 modules excluded from mixed "
+                "precision keep native communication."
+            )
+        },
+    )
     max_load_broadcast_size: float = field(
         default=20.0,
         metadata={
@@ -558,13 +702,11 @@ class FSDPConfig:
                 "switch to fsdp_mode='fsdp2' (with model.accelerator.init_device='meta'), "
                 "'ddp', or 'eager'."
             )
-        if self.fsdp_mode == "eager":
-            # Reserved rather than live: the parallelize path has no unwrapped branch,
-            # so accepting this silently would hand the model to DDP instead.
-            raise NotImplementedError(
-                "model.accelerator.fsdp_config.fsdp_mode='eager' is reserved for the "
-                "single-process inference path and is not wired up yet."
-            )
+        if self.fsdp_scope not in ("module", "model"):
+            raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
+        validate_low_precision_reduce_scatter_comm(
+            self.low_precision_reduce_scatter_comm, self.mixed_precision, fsdp_mode=self.fsdp_mode
+        )
 
 
 @dataclass
@@ -1225,7 +1367,9 @@ class OpsImplementationConfig:
             "eager",
             "sdpa",
             "flash_attention_2",
+            "flash_attention_2_hub",
             "flash_attention_3",
+            "flash_attention_3_hub",
             "flash_attention_4",
             "flex_attention",
             "magi_attention",
@@ -1290,7 +1434,7 @@ class OpsImplementationConfig:
     rms_norm_gated_implementation: str = field(
         default="fla",
         metadata={
-            "help": "Gated RMSNorm implementation (Qwen3.5 GatedDeltaNet `self.norm`). "
+            "help": "Gated RMSNorm implementation (Qwen3.5/Qwen4-Exp GatedDeltaNet `self.norm`). "
             "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'eager' uses the HuggingFace Qwen3_5RMSNormGated. "
             "'npu' uses the VeOmni NPUFusedRMSNormGated."
@@ -1299,7 +1443,7 @@ class OpsImplementationConfig:
     causal_conv1d_implementation: str = field(
         default="fla",
         metadata={
-            "help": "Varlen depthwise causal conv1d implementation (Qwen3.5 GatedDeltaNet pre-mixer). "
+            "help": "Varlen depthwise causal conv1d implementation (Qwen3.5/Qwen4-Exp GatedDeltaNet pre-mixer). "
             "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'eager' leaves causal_conv1d_fn unset; the varlen training path then raises "
             "because no torch fallback handles cu_seqlens. "
@@ -1311,7 +1455,7 @@ class OpsImplementationConfig:
     chunk_gated_delta_rule_implementation: str = field(
         default="fla",
         metadata={
-            "help": "Chunk gated delta-rule kernel for Qwen3.5 linear attention. "
+            "help": "Chunk gated delta-rule kernel for Qwen3.5/Qwen4-Exp linear attention. "
             "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'flash_qla' uses QwenLM FlashQLA (ships under the gpu extra, Hopper SM90 only — "
             "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
@@ -1323,19 +1467,36 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
-    dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = field(
+    qsa_attention_implementation: Literal["eager", "tilelang"] = field(
         default="eager",
-        metadata={"help": "DeepSeek sparse attention top-k indexer implementation: 'eager', 'cudnn', or 'tilelang'."},
+        metadata={
+            "help": "Qwen4-Exp sparse attention implementation. 'eager' expands compact "
+            "global token indices to a dense mask and runs quadratic PyTorch attention "
+            "(numerical reference). 'tilelang' runs the gather-based TileLang sparse "
+            "attention kernel instead; it requires bf16 on an NVIDIA CUDA GPU, covers "
+            "training forward/backward only (no KV cache), and raises on an additive "
+            "attention mask. Nonzero attention dropout falls back to eager with a warning."
+        },
     )
-    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "tilelang"] = field(
+    dsa_indexer_implementation: Literal["eager", "cudnn", "cann", "tilelang"] = field(
         default="eager",
-        metadata={"help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', or 'tilelang'."},
+        metadata={
+            "help": "DeepSeek sparse attention top-k indexer implementation: 'eager', 'cudnn', 'cann', or 'tilelang'."
+        },
     )
-    mhc_implementation: Literal["eager", "tilelang"] = field(
+    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "cann", "tilelang"] = field(
+        default="eager",
+        metadata={
+            "help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', 'cann', or 'tilelang'."
+        },
+    )
+    mhc_implementation: Literal["eager", "cann", "tilelang"] = field(
         default="eager",
         metadata={
             "help": "Manifold-constrained Hyper-Connection implementation. 'tilelang' enables the "
-            "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'eager' uses PyTorch."
+            "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'cann' enables the "
+            "Ascend CANN fused pre/post path with a PyTorch final-head collapse (requires NPU BF16 "
+            "and cann_ops_transformer); 'eager' uses PyTorch."
         },
     )
     qat_implementation: Literal["none", "fp8_blockwise"] = field(
@@ -1353,7 +1514,38 @@ class OpsImplementationConfig:
         },
     )
 
+    @staticmethod
+    def validate_hub_attention_backend(implementation: Optional[str]) -> None:
+        """Reject unsupported Hub attention requests before HF kernel preloading."""
+        if implementation not in (
+            "flash_attention_2_hub",
+            "flash_attention_3_hub",
+            "veomni_flash_attention_2_hub_with_sp",
+            "veomni_flash_attention_3_hub_with_sp",
+        ):
+            return
+
+        from ..utils.import_utils import is_torch_npu_available
+
+        if is_torch_npu_available():
+            raise ValueError(
+                f"{implementation} is not supported on Ascend NPU; "
+                "select a supported non-Hub attention backend instead."
+            )
+        if get_env("MODELING_BACKEND") != "veomni":
+            raise ValueError(f"{implementation} requires MODELING_BACKEND=veomni.")
+
+    @staticmethod
+    def normalize_hub_attention_backend(implementation: Optional[str]) -> Optional[str]:
+        """Validate Hub requests and resolve their registered VeOmni names."""
+        OpsImplementationConfig.validate_hub_attention_backend(implementation)
+        return {
+            "flash_attention_2_hub": "veomni_flash_attention_2_hub_with_sp",
+            "flash_attention_3_hub": "veomni_flash_attention_3_hub_with_sp",
+        }.get(implementation, implementation)
+
     def __post_init__(self):
+        self.attn_implementation = self.normalize_hub_attention_backend(self.attn_implementation)
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",
@@ -1701,9 +1893,12 @@ class ModelArguments(BaseModelArguments):
         extra_parallel_sizes = dict(zip(self.accelerator.extra_parallel_names, self.accelerator.extra_parallel_sizes))
         ple_size = extra_parallel_sizes.get("ple", 1)
         if ple_size > 1:
-            if self.accelerator.dp_shard_size % ple_size != 0:
+            effective_fsdp_shard_size = (
+                self.accelerator.dp_shard_size * self.accelerator.ulysses_size * self.accelerator.cp_size
+            )
+            if effective_fsdp_shard_size % ple_size != 0:
                 raise ValueError(
-                    f"PLE size ({ple_size}) must divide the FSDP shard size ({self.accelerator.dp_shard_size})."
+                    f"PLE size ({ple_size}) must divide the effective FSDP shard size ({effective_fsdp_shard_size})."
                 )
             if not self.ep_sharded_stream_load:
                 raise ValueError(
@@ -1751,6 +1946,13 @@ class DataloaderConfig:
     drop_last: bool = field(
         default=True,
         metadata={"help": "Whether to drop the last incomplete batch."},
+    )
+    shuffle: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to shuffle the training data: the sampler order of mapping datasets "
+            "(reseeded each epoch) and the streaming shuffle buffer of iterable datasets."
+        },
     )
     pin_memory: bool = field(
         default=True,

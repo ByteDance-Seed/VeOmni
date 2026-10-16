@@ -28,6 +28,21 @@ Consequences that cut both ways:
   and `-x` fail-fast. Every new file pays process startup plus model build, and a
   new flaky file blocks the whole suite for everyone.
 
+## What the NPU job can actually run
+
+Both NPU workflows build their own venv with `uv sync --extra npu`, so the
+packages baked into the image's build-time venv are not on the test path. Three
+kernel dependencies land differently, and each decides what a test can reach:
+
+| Package | Where it is | What it gates |
+|---------|-------------|---------------|
+| `triton-ascend` | installed by an explicit workflow step after the sync (`uv sync` prunes anything outside the lockfile, `uv run --frozen` does not) | the vendored Ascend Triton kernels — the `npu` GatedDeltaNet backends, MoE clamped SwiGLU |
+| `fla_npu` | image venv only; the workspace venv does not inherit it | `chunk_gated_delta_rule_implementation=npu_ascendc`, so that backend is untestable |
+| `flash-linear-attention` | `gpu` extra only, so absent from both | the `fla` backends. Its `HardwareRequirement` lists `npu`, but the GatedDeltaNet docs say it raises on Ascend even when installed — treat `fla` as GPU-only |
+
+The runners are 910B (A2, non-arch35), so kernels gated behind `is_arch35()`
+stay unreachable whatever is installed.
+
 Check whether a file is wired — by name, and by the directory it sits in:
 
 ```bash
@@ -53,6 +68,7 @@ by a `pytest.param` table, so a new case is a few lines:
 | MoE checkpoint conversion | `tests/models/test_checkpoint_tensor_converter.py` |
 | VLM / Omni dummy forward | `tests/distributed/test_dummy_forward.py` (`_vlm_cases` / `_omni_cases`) |
 | `torch.compile` support | `tests/distributed/test_torch_compile.py` |
+| Gradient checkpointing / selective recompute (SAC) | `tests/distributed/test_gradient_checkpointing.py` |
 | Ulysses SP behaviour | `tests/parallel/ulysses/test_ulysses.py` and siblings |
 | Checkpoint callback / DCP round-trip | `tests/checkpoints/test_checkpoint_callback.py`, `test_trainer_saveload.py` |
 | DiT resume / noise-stream equivalence | `tests/checkpoints/test_dit_resume_align.py` |

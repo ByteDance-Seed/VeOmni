@@ -175,6 +175,30 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
     return bool(bound)
 
 
+def bind_ops_to_modeling(model_cls: Optional[type]) -> bool:
+    """Resolve ``model_cls``'s OpSlots against the ops config now in force.
+
+    Every load path needs this same step and none of them holds the modeling
+    *module* that :func:`_bind_veomni_ops` wants — they hold the model class.
+    Keeping the lookup here means the callers (this file's
+    :func:`build_foundation_model` and ``OmniModel._load_modules``) stay one
+    line each, and slot binding has a single site to delete once every op
+    resolves at call time.
+
+    Callers are responsible for installing the intended config first; this
+    reads whatever ``apply_ops_config`` last put in place.
+    """
+    from ..ops.config.singleton import get_ops_config
+
+    if model_cls is None:
+        return False
+    modeling_module = sys.modules.get(model_cls.__module__)
+    ops_config = get_ops_config()
+    if modeling_module is None or ops_config is None:
+        return False
+    return _bind_veomni_ops(modeling_module, ops_config)
+
+
 def _validate_attention_parallelism(attn_implementation: Optional[str]) -> None:
     if attn_implementation not in ("magi_attention", "veomni_magi_attention_with_sp"):
         return
@@ -199,14 +223,18 @@ def build_foundation_model(
             "eager",
             "sdpa",
             "flash_attention_2",
+            "flash_attention_2_hub",
             "flash_attention_3",
+            "flash_attention_3_hub",
             "flash_attention_4",
             "flex_attention",
             "magi_attention",
             "veomni_flex_attention_with_sp",
             "veomni_magi_attention_with_sp",
             "veomni_flash_attention_2_with_sp",
+            "veomni_flash_attention_2_hub_with_sp",
             "veomni_flash_attention_3_with_sp",
+            "veomni_flash_attention_3_hub_with_sp",
             "veomni_flash_attention_4_with_sp",
             "native-sparse",
         ]
@@ -235,7 +263,9 @@ def build_foundation_model(
     from ..ops.config.singleton import get_ops_config
 
     if ops_implementation is not None:
-        attn_implementation = ops_implementation.attn_implementation
+        attn_implementation = OpsImplementationConfig.normalize_hub_attention_backend(
+            ops_implementation.attn_implementation
+        )
         _validate_attention_parallelism(attn_implementation)
         apply_ops_config(ops_implementation)
     else:
@@ -255,6 +285,7 @@ def build_foundation_model(
         # variant the user selected.
         if attn_implementation is None:
             attn_implementation = installed.attn_implementation
+        attn_implementation = OpsImplementationConfig.normalize_hub_attention_backend(attn_implementation)
         _validate_attention_parallelism(attn_implementation)
 
     if config_kwargs is None:
@@ -303,10 +334,8 @@ def build_foundation_model(
     # the timing uniform. Assumes ``loader.model_cls`` is final at this point —
     # i.e. no loader rewrites it between here and ``loader.load_model()`` below.
     model_cls = getattr(loader, "model_cls", None) if loader is not None else None
-    modeling_module = sys.modules.get(model_cls.__module__) if model_cls is not None else None
-    if modeling_module is not None:
-        if _bind_veomni_ops(modeling_module, get_ops_config()):
-            logger.info_rank0("OpSlot-based kernel dispatch active.")
+    if bind_ops_to_modeling(model_cls):
+        logger.info_rank0("OpSlot-based kernel dispatch active.")
 
     init_kwargs = {
         "config": config,
@@ -319,7 +348,9 @@ def build_foundation_model(
         "veomni_flex_attention_with_sp",
         "veomni_magi_attention_with_sp",
         "veomni_flash_attention_2_with_sp",
+        "veomni_flash_attention_2_hub_with_sp",
         "veomni_flash_attention_3_with_sp",
+        "veomni_flash_attention_3_hub_with_sp",
         "veomni_flash_attention_4_with_sp",
     ):
         logger.warning_rank0(
