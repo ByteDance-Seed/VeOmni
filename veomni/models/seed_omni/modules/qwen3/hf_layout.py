@@ -61,7 +61,7 @@ QWEN3_HF_LAYOUT = OmniHFLayout(
 
 
 @OMNI_HF_LAYOUT_REGISTRY.register("qwen3")
-def _register_qwen3_hf_layout() -> OmniHFLayout:
+def _register_qwen3_hf_layout(source_path: str | None = None) -> OmniHFLayout:
     return QWEN3_HF_LAYOUT
 
 

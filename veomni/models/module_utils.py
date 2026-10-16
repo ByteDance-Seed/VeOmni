@@ -730,6 +730,12 @@ def load_model_weights_ep_sharded(
     converter = get_checkpoint_tensor_converter(model)
     if converter is None and is_peft_model:
         converter = get_checkpoint_tensor_converter(model.get_base_model())
+    # A key-renaming source converter (a SeedOmni module read from its upstream HF
+    # checkpoint) claims every key. What to slice is decided by the destination
+    # parameter, so rename to module keys up front and convert with its ``inner``.
+    source_converter = converter if callable(getattr(converter, "module_key", None)) else None
+    if source_converter is not None:
+        converter = source_converter.inner
 
     # Runtime plan: PEFT-prefixes every pattern with ``base_model.model.`` and
     # registers the MoE-LoRA wrapper FQNs -- base experts under ``base_layer.weight``
@@ -808,28 +814,43 @@ def load_model_weights_ep_sharded(
     # (renames, FP8/FP4 weight+scale pairs). Those are streamed as whole tensors in the
     # main loop. A converter that claims a key but lacks expert-streaming capabilities
     # still needs the whole tensor set for every transform, so raise before materialising.
-    expert_converter = None
-    expert_range: Optional[Tuple[int, int]] = None
+    # One range-restricted converter per distinct local expert range: fused targets
+    # with different expert counts (e.g. main layers and draft stages) shard differently.
+    expert_converters: Dict[Tuple[int, int], Any] = {}
+    range_by_target: Dict[str, Tuple[int, int]] = {}
     supports_expert_streaming = checkpoint_converter_supports_expert_streaming(converter)
     # Per-expert keys whose fused target the model does not build (e.g. a checkpoint's MTP
     # experts when MTP is off): unexpected keys, skipped without reading.
     unbuilt_expert_keys = set()
+
+    def _bare_name(raw_name: str) -> Optional[str]:
+        """The base-model FQN ``raw_name`` loads into; ``None`` when a source converter does not read it."""
+        bare_name = _convert_weight_key(raw_name, model)
+        return bare_name if source_converter is None else source_converter.module_key(bare_name)
+
     if converter is not None:
-        expert_ranges: Dict[Tuple[int, int], str] = {}
         # Source-key count per expert of each fused target. A converter's ``finalize`` only
         # sees its own rank's range, so a gap there would fail one rank (or, for a wholly
         # absent range, none); checking here makes every rank reject the checkpoint.
         expert_key_counts: Dict[str, Dict[int, int]] = {}
         num_experts_by_target: Dict[str, int] = {}
         for raw_name in key_to_file:
-            bare_name = _convert_weight_key(raw_name, model)
-            if checkpoint_converter_should_skip_without_loading(converter, bare_name):
+            bare_name = _bare_name(raw_name)
+            if bare_name is None or checkpoint_converter_should_skip_without_loading(converter, bare_name):
                 continue
             if not _converter_transforms(bare_name):
                 continue
             target = checkpoint_converter_fused_expert_target(converter, bare_name)
             if target is None:
                 if supports_expert_streaming:
+                    if parallel_plan._get_shard_parameter_groupname(_apply_peft_override(bare_name)) is not None:
+                        # The main loop would read it whole and refuse it there; refuse before any read.
+                        raise NotImplementedError(
+                            f"ep_sharded_stream_load: checkpoint-tensor converter {type(converter).__name__} "
+                            f"transforms ExtraParallel key '{bare_name}' as a whole tensor (e.g. renames it), "
+                            f"so its rank slice cannot be planned. Disable model.ep_sharded_stream_load to "
+                            f"use the whole-tensor loader."
+                        )
                     # Non-expert convert (rename / dequant); handled in the main loop.
                     continue
                 raise NotImplementedError(
@@ -847,7 +868,7 @@ def load_model_weights_ep_sharded(
                 continue
             if fused_name not in num_experts_by_target:
                 start, num_local, num_experts_by_target[fused_name] = _local_expert_range(fused_name)
-                expert_ranges.setdefault((start, num_local), fused_name)
+                range_by_target[fused_name] = (start, num_local)
             counts = expert_key_counts.setdefault(fused_name, {})
             counts[target[1]] = counts.get(target[1], 0) + 1
         for fused_name, counts in expert_key_counts.items():
@@ -868,14 +889,8 @@ def load_model_weights_ep_sharded(
                     f"ep_sharded_stream_load: incomplete checkpoint detected for '{fused_name}' "
                     f"({len(expected)} experts): " + "; ".join(problems) + "."
                 )
-        if len(expert_ranges) > 1:
-            raise NotImplementedError(
-                f"ep_sharded_stream_load: per-expert checkpoint keys map to fused experts with different "
-                f"local expert ranges {expert_ranges}; one converter range per rank is supported."
-            )
-        if expert_ranges:
-            expert_range = next(iter(expert_ranges))
-            expert_converter = converter.for_expert_range(*expert_range)
+        for expert_range in sorted(set(range_by_target.values())):
+            expert_converters[expert_range] = converter.for_expert_range(*expert_range)
 
     model.to_empty(device=init_device)
     dtensor_to_cpu = init_device == "cpu"
@@ -915,7 +930,11 @@ def load_model_weights_ep_sharded(
                 # ``bare_name`` is the base-model FQN the converter is keyed on;
                 # ``name`` is the live model destination (PEFT ``base_layer`` FQN
                 # under PEFT, else identical to ``bare_name``).
-                bare_name = _convert_weight_key(raw_name, model)
+                bare_name = _bare_name(raw_name)
+                if bare_name is None:
+                    source_converter.record_skip_without_loading(raw_name)
+                    n_skipped += 1
+                    continue
                 name = _apply_peft_override(bare_name)
                 if checkpoint_converter_should_skip_without_loading(converter, bare_name):
                     checkpoint_converter_record_skip_without_loading(converter, bare_name)
@@ -925,16 +944,14 @@ def load_model_weights_ep_sharded(
                     logger.info_rank0(f"Unexpected key in state dict: {name}.")
                     continue
                 expert_target = (
-                    checkpoint_converter_fused_expert_target(converter, bare_name)
-                    if expert_converter is not None
-                    else None
+                    checkpoint_converter_fused_expert_target(converter, bare_name) if expert_converters else None
                 )
                 if expert_target is not None:
-                    start, num_local = expert_range
+                    start, num_local = range_by_target[_apply_peft_override(expert_target[0])]
                     if not start <= expert_target[1] < start + num_local:
                         n_remote_experts += 1
                         continue
-                    converted = expert_converter.convert(bare_name, f.get_tensor(raw_name))
+                    converted = expert_converters[start, num_local].convert(bare_name, f.get_tensor(raw_name))
                     n_expert_reads += 1
                     if converted is not None:
                         fused_name = _apply_peft_override(converted.name)
@@ -1055,11 +1072,15 @@ def load_model_weights_ep_sharded(
         # whole-tensor loader does (typically logged as unexpected keys).
         for result in finalized:
             _dispatch_whole_converted(result, result.name)
-    if expert_converter is not None:
-        # E.g. DeepSeek-V4 ``.scale`` keys left beside BF16 expert weights. These come
-        # from this rank's experts only, so they may not be dispatched into the model
-        # (other ranks would not do the same); unexpected keys are logged, as the
-        # whole-tensor loader does.
+    if source_converter is not None:
+        # Whole tensors the source does not store, built on every rank.
+        for result in source_converter.generated_tensors():
+            _dispatch_whole_converted(result, result.name)
+    # E.g. DeepSeek-V4 ``.scale`` keys left beside BF16 expert weights. These come
+    # from this rank's experts only, so they may not be dispatched into the model
+    # (other ranks would not do the same); unexpected keys are logged, as the
+    # whole-tensor loader does.
+    for expert_converter in expert_converters.values():
         for result in expert_converter.finalize():
             dest = _apply_peft_override(result.name)
             if dest in parameter_names_to_load or dest in buffer_dict:
