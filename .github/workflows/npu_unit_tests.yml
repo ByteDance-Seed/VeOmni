@@ -213,6 +213,7 @@ jobs:
         run: |
           uv run --frozen pytest -v -s -x tests/ops/test_comp.py
           uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
+          uv run --frozen pytest -v -s -x tests/ops/test_minimax_sparse_attention.py
           uv run --frozen pytest -v -s -x tests/ops/test_npu_kernels.py
           # This numerical gate must execute on NPU; fail instead of silently skipping
           # when the vendor extension is missing from the CI image.
