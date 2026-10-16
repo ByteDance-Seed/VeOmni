@@ -409,7 +409,7 @@ def causal_conv1d_bwd_kernel(
                     b_dw = tl.sum(b_dy_shift * b_x, 0)
 
                     if USE_INITIAL_STATE:
-                        mask_head_rows = o_t < i_w
+                        mask_head_rows = (o_t < i_w) & (o_t < T_len)
 
                         b_dy_head = tl.load(
                             dy + bos * D + o_t[:, None] * D + o_d,
@@ -452,11 +452,12 @@ def causal_conv1d_bwd_kernel(
                     b_dh0_s = tl.zeros((BD,), dtype=tl.float32)
                     for i_t2 in tl.static_range(0, W - 1):
                         if i_t2 < i_w:
-                            dy0_row = tl.load(dy + bos * D + (i_t * BT + i_t2) * D + o_d, mask=m_d, other=0.0).to(
+                            m_dy0 = m_d & ((i_t * BT + i_t2) < T_len)
+                            dy0_row = tl.load(dy + bos * D + (i_t * BT + i_t2) * D + o_d, mask=m_dy0, other=0.0).to(
                                 tl.float32
                             )
                             if ACTIVATION == "swish" or ACTIVATION == "silu":  # pylint: disable=consider-using-in
-                                y0_row = tl.load(y + bos * D + (i_t * BT + i_t2) * D + o_d, mask=m_d, other=0.0).to(
+                                y0_row = tl.load(y + bos * D + (i_t * BT + i_t2) * D + o_d, mask=m_dy0, other=0.0).to(
                                     tl.float32
                                 )
                                 y0_s = tl.sigmoid(y0_row)
