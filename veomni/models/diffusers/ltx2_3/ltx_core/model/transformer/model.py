@@ -1,4 +1,5 @@
 from enum import Enum
+from functools import partial
 
 import torch
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
@@ -321,6 +322,8 @@ class LTXModel(torch.nn.Module):
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
         perturbations: BatchedPerturbationConfig | None,
+        sp_video_length: int | None = None,
+        sp_audio_length: int | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         if perturbations is None:
             batch_size = (video or audio).x.shape[0]
@@ -346,13 +349,15 @@ class LTXModel(torch.nn.Module):
 
             if self.gradient_checkpointing and self.training:
                 video, audio = torch.utils.checkpoint.checkpoint(
-                    block,
+                    partial(block, sp_video_length=sp_video_length, sp_audio_length=sp_audio_length),
                     video,
                     audio,
                     use_reentrant=False,
                 )
             else:
-                video, audio = block(video=video, audio=audio)
+                video, audio = block(
+                    video=video, audio=audio, sp_video_length=sp_video_length, sp_audio_length=sp_audio_length
+                )
 
         return video, audio
 

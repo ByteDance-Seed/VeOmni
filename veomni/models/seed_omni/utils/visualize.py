@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 import os
-import re
 from typing import TYPE_CHECKING
 
+from ..configuration_omni import check_infer_type_names
 from ..graphs.generation_graph import GenerationGraph
 from ..graphs.training_graph import TrainingGraph
 
 
 if TYPE_CHECKING:
     from ..configuration_omni import OmniConfig
-
-
-_SAFE_INFER_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 def _write_mermaid(path: str, body: str) -> None:
@@ -51,12 +48,8 @@ def save_graph_mermaid_diagrams(
         _write_mermaid(training_path, TrainingGraph(config.training_graph).to_mermaid(title=training_title))
         paths.append(training_path)
 
+    check_infer_type_names(config.infer_types)
     for infer_type in config.infer_types:
-        if not _SAFE_INFER_TYPE.fullmatch(infer_type):
-            raise ValueError(
-                f"Invalid infer_type {infer_type!r}: scenario names must match {_SAFE_INFER_TYPE.pattern} "
-                "so they can be used as diagram filenames."
-            )
         generation_path = os.path.join(vis_dir, f"generation_{infer_type}.mmd")
         _write_mermaid(
             generation_path,

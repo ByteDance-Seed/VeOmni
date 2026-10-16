@@ -16,6 +16,8 @@ import torch
 
 from veomni.checkpoint import layout
 from veomni.models.checkpoint_manager import ModelCheckpointManager
+from veomni.models.seed_omni.utils.conversation import ConversationItem
+from veomni.models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import (
     CheckpointCallback,
@@ -61,6 +63,7 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
     trainer.environ_meter = MagicMock()
     trainer.channel_loss_callback = MagicMock()
     trainer.channel_loss_callback.state_dict.return_value = {}
+    trainer.offline_cache_writer = None
     trainer.model_assets = []
     trainer.state = TrainerState()
     trainer.start_epoch = 0
@@ -315,7 +318,7 @@ class TestModelCheckpointManagerSaveContract:
 
     def test_the_logged_destination_is_the_one_save_writes(self, mock_helper, mock_dist, mock_build_ckpt):
         """The manager names the model directory for its log, and ``save`` rebuilds
-        the same one from ``path``, ``global_steps`` and ``module``."""
+        the same one from ``path`` and ``global_steps``."""
         from veomni.checkpoint.layout import model_dir, step_dir
 
         runtime = _make_mock_runtime(save_path="/remote/run")
@@ -326,21 +329,16 @@ class TestModelCheckpointManagerSaveContract:
         manager.save_dcp(state)
 
         call = manager.checkpointer.save.call_args
-        rebuilt = model_dir(step_dir(call.args[0], call.kwargs["global_steps"]), call.kwargs["module"])
+        assert "module" not in call.kwargs
+        rebuilt = model_dir(step_dir(call.args[0], call.kwargs["global_steps"]))
         assert rebuilt == "/remote/run/global_step_10/model"
         assert rebuilt == manager.save_dir(state)
 
-    def test_model_assets_nest_under_the_module_name(self, mock_helper, mock_dist, mock_build_ckpt):
+    def test_model_assets_sit_at_the_assets_root(self, mock_helper, mock_dist, mock_build_ckpt):
         runtime = _make_mock_runtime()
         mock_build_ckpt.return_value = MagicMock()
         manager = ModelCheckpointManager(runtime)
         assert manager.assets_dir() == runtime.train_args.checkpoint.model_assets_dir
-
-        class Named(ModelCheckpointManager):
-            module_name = "vision_encoder"
-
-        named = Named(runtime)
-        assert named.assets_dir() == f"{runtime.train_args.checkpoint.model_assets_dir}/vision_encoder"
 
     def test_save_forwards_extra_state_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
         runtime = _make_mock_runtime()
@@ -484,7 +482,7 @@ class TestGlobalStateCallbackJobState:
 
     def test_train_end_writes_the_cursor_for_the_export_that_follows(self, mock_dist, tmp_path):
         """A run ending off the cadence still exports, and that export writes the
-        step's DCP (``ModelCheckpointManager._prepare_export``). Model state at a
+        step's DCP (``ModelCheckpointManager.prepare_export``). Model state at a
         step with no cursor beside it is a step nothing can resume from, so the
         cursor follows the export."""
         mock_dist.is_initialized.return_value = False
@@ -630,6 +628,40 @@ class TestGlobalStateCallbackJobState:
 
         trainer.channel_loss_callback.load_state_dict.assert_called_once_with(callback_state)
         assert trainer.state.global_step == 7
+
+    def test_the_offline_cache_writer_resumes_with_the_cursor(self, mock_dist, tmp_path):
+        """The cursor is saved only after the writer flushed, and the position comes back with it.
+
+        The run saves no model state, so the cursor alone makes the step complete for ``load_path: auto``.
+        """
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer(save_path=str(tmp_path / "ckpt"))
+        trainer.train_dataloader = None
+        trainer.data_iterator = None
+        trainer.environ_meter.state_dict.return_value = {}
+        trainer.saves_model_state = False
+        writer = SeedOmniOfflineCacheWriter(str(tmp_path / "cache"), max_rows_per_shard=10)
+        writer.open()
+        writer.save_conversation_list([[ConversationItem(type="text", value="s0", role="user")]])
+        trainer.offline_cache_writer = writer
+
+        GlobalStateCallback(trainer).save_global_state(TrainerState(global_step=10))
+
+        assert writer.buffer == []
+        assert (tmp_path / "cache" / "shard_000000.parquet").exists()
+        step_root = str(tmp_path / "ckpt" / "global_step_10")
+        assert not os.path.exists(os.path.join(step_root, layout.MODEL_DIRNAME))
+        assert layout.checkpoint_is_complete(step_root)
+
+        resumed = _make_mock_trainer()
+        resumed.args.train.checkpoint.load_path = str(tmp_path / "ckpt" / "global_step_10")
+        resumed.train_dataloader = None
+        resumed.offline_cache_writer = MagicMock()
+        GlobalStateCallback(resumed).load_global_state()
+
+        resumed.offline_cache_writer.load_state_dict.assert_called_once_with(
+            {"shard_index": 1, "rows_written": 1, "world_size": 1}
+        )
 
     @patch("veomni.trainer.callbacks.global_state_callback.get_device_type", return_value="cpu")
     def test_load_skips_when_any_rank_is_missing_state(self, mock_device, mock_dist, tmp_path):

@@ -114,10 +114,11 @@ class DiTDataCollator(DataCollator):
     def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
         batch = defaultdict(list)
 
-        # batching features
+        # Fill keys missing from a sample with None so every column stays aligned with its samples.
+        keys = dict.fromkeys(key for feature in features for key in feature)
         for feature in features:
-            for key in feature.keys():
-                batch[key].append(feature[key])
+            for key in keys:
+                batch[key].append(feature.get(key))
 
         return batch
 
@@ -144,10 +145,6 @@ class DiTDataArguments(DataArguments):
     offline_embedding_save_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Path to save offline embeddings."},
-    )
-    shuffle: bool = field(
-        default=True,
-        metadata={"help": "Whether or not to shuffle the dataset."},
     )
     data_transform: Optional[str] = field(
         default="dit_online",
@@ -370,8 +367,8 @@ class DiTTrainer:
             else:
                 self.offline_embedding_save_dir = args.data.offline_embedding_save_dir
 
-            args.data.drop_last = False
-            args.data.shuffle = False
+            args.data.dataloader.drop_last = False
+            args.data.dataloader.shuffle = False
             args.train.checkpoint.save_epochs = 0
             args.train.checkpoint.save_hf_weights = False
             # Keep one microbatch per step to limit video broadcast memory; embedding needs no accumulation.
@@ -379,7 +376,7 @@ class DiTTrainer:
             args.train.dataloader_batch_size = args.train.micro_batch_size
             args.train.gradient_accumulation_steps = 1
             logger.info_rank0(
-                f"Task offline_embedding. Drop last: {args.data.drop_last}, shuffle: {args.data.shuffle}"
+                f"Task offline_embedding. Drop last: {args.data.dataloader.drop_last}, shuffle: {args.data.dataloader.shuffle}"
             )
             args.train.num_train_epochs = 1
 
@@ -466,7 +463,7 @@ class DiTTrainer:
                 persistent_workers=args.data.dataloader.persistent_workers,
                 in_order=args.data.dataloader.in_order,
                 seed=args.train.seed,
-                shuffle=args.data.shuffle,
+                shuffle=args.data.dataloader.shuffle,
                 collate_fn=DiTDataCollator(),
                 save_steps=args.train.checkpoint.save_steps,
             )

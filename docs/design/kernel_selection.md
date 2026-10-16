@@ -14,7 +14,7 @@ selection knob.
 
 | Kernel | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
-| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
+| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_2_hub`, `flash_attention_3_hub`, `flash_attention_4`, `flex_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+) | `"eager"` | Model build via three `OpSlot`s (`pre`, `post`, `head`) |
@@ -26,6 +26,7 @@ selection knob.
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
+| QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` | `"eager"` | Qwen4-Exp `OpsConfigSlot` dispatch in generated modeling |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | `apply_ops_config()` (before model build) |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused_triton"` (GPU) | `build_foundation_model` |
 | QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Read by the patched modeling helpers (`veomni/ops/qat/`) |
@@ -124,9 +125,17 @@ model:
 | `sdpa` | `F.scaled_dot_product_attention` | No | — |
 | `flash_attention_2` | Flash Attention v2 | Yes | `flash-attn` |
 | `flash_attention_3` | Flash Attention v3 | Yes | `flash-attn-interface` |
+| `flash_attention_2_hub` | Hub Flash Attention v2 | Yes | `kernels==0.16.0`, compatible `kernels-community/flash-attn2` version 1 artifact; VeOmni backend only, not Ascend NPU |
+| `flash_attention_3_hub` | Hub Flash Attention v3 | Yes | `kernels==0.16.0`, compatible `kernels-community/flash-attn3` version 1 artifact; VeOmni backend only, not Ascend NPU |
 | `flash_attention_4` | Flash Attention v4 | Yes | `flash-attn.cute` |
 | `flex_attention` | PyTorch FlexAttention | Yes | Native `BlockMask`; CUDA for compiled training |
 | `native-sparse` | Sparse attention | No | — |
+
+Hub backends are explicit opt-ins; local FA2/FA3 remain the defaults. Config parsing
+and `build_foundation_model()` normalize Hub short names to
+`veomni_flash_attention_{2,3}_hub_with_sp`. Both forms are rejected on Ascend NPU
+before HF preloading can silently select built-in NPU attention. Missing dependencies
+or artifact download failures raise instead of falling back to another kernel.
 
 When `MODELING_BACKEND=veomni` (the default), `__post_init__` automatically
 rewrites `flash_attention_2/3/4` and `flex_attention` to VeOmni SP-aware
@@ -320,6 +329,32 @@ kernel) and `npu_ascendc` (an AscendC fused `torch.ops.npu.*` path), the latter
 requiring a manual `fla_npu` install. Registrations live in
 `veomni/ops/kernels/gated_delta_rule/__init__.py`; field defaults and allowed
 values are documented by `OpsImplementationConfig`.
+
+---
+
+### Qwen4-Exp QSA
+
+Qwen4-Exp exposes `qsa_attention_implementation` independently from the normal
+attention backend. Both values consume compact `[B,S,K]` global token indices
+from distributed local-query/global-block selection:
+
+- `eager` (default) follows the native Transformers Qwen4-Exp path: it expands
+  the indices to an `[B,1,S,S]` mask and runs ordinary dense GQA, materializing
+  the full `[B,H,S,S]` score tensor. This is a portable numerical reference
+  rather than a memory-efficient sparse or fused throughput kernel.
+- `tilelang` runs the gather-based TileLang sparse-attention kernel in
+  `veomni/ops/kernels/qwen4_exp/` (training forward/backward, bf16, NVIDIA
+  CUDA). It never materializes the dense score tensor, which is what makes
+  16K-token training feasible. A nonzero attention dropout falls back to the
+  eager reference with a one-time warning because the kernel has no dropout
+  path; this materializes the
+  quadratic score tensor. The dispatch still fails closed for an additive
+  `attention_mask` or a KV cache.
+
+The QSA selection lives in the model patch because it owns packed-block and
+Ulysses semantics. Its model-specific dense eager implementation lives in
+`veomni/models/transformers/qwen4_exp/qwen4_exp_gpu_patch_gen_config.py` and is
+emitted into both generated GPU and NPU modeling files by patchgen.
 
 ---
 

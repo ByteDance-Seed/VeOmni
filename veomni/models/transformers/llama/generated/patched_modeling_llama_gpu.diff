@@ -123,11 +123,17 @@
          input_dtype = hidden_states.dtype
          hidden_states = hidden_states.to(torch.float32)
          variance = hidden_states.pow(2).mean(-1, keepdim=True)
-@@ -134,30 +166,34 @@
+@@ -134,30 +166,35 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
--@use_kernel_forward_from_hub("rotary_pos_emb")
++# ======================================================================
++# [PATCHED FUNCTION] apply_rotary_pos_emb
++# Reason: OpSlot guard for Liger fused RoPE
++# Source: veomni.models.transformers.llama.llama_gpu_patch_gen_config
++# ======================================================================
++# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
+ @use_kernel_forward_from_hub("rotary_pos_emb")
 -def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 -    """Applies Rotary Position Embedding to the query and key tensors.
 -
@@ -146,12 +152,6 @@
 -    Returns:
 -        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
 -    """
-+# ======================================================================
-+# [PATCHED FUNCTION] apply_rotary_pos_emb
-+# Reason: OpSlot guard for Liger fused RoPE
-+# Source: veomni.models.transformers.llama.llama_gpu_patch_gen_config
-+# ======================================================================
-+# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
 +def apply_rotary_pos_emb(
 +    q: torch.Tensor,
 +    k: torch.Tensor,
@@ -177,7 +177,7 @@
 
 
  class LlamaMLP(nn.Module):
-@@ -171,7 +207,12 @@
+@@ -171,7 +208,12 @@
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
 
@@ -190,7 +190,7 @@
          down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
          return down_proj
 
-@@ -417,6 +458,12 @@
+@@ -417,6 +459,12 @@
          )
 
 
@@ -203,7 +203,7 @@
  @auto_docstring
  class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -433,6 +480,7 @@
+@@ -433,6 +481,7 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -211,7 +211,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -444,55 +492,130 @@
+@@ -444,55 +493,130 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
