@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from veomni.utils.device import IS_CUDA_AVAILABLE
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
 from veomni.utils.import_utils import is_fused_moe_available
 
 
@@ -47,7 +47,7 @@ def test_triton_swiglu_oai_moe_matches_eager_forward_backward(monkeypatch):
 
     monkeypatch.setattr(group_gemm, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=False))
     torch.manual_seed(0)
-    device = torch.device("cuda")
+    device = torch.device(get_device_type())
     dtype = torch.bfloat16
     num_tokens, num_experts, hidden_dim, intermediate_dim, top_k = 12, 4, 16, 8, 2
     limit, alpha = 0.7, 1.702
@@ -125,13 +125,13 @@ def _ep_forward_backward_worker():
     init_parallel_state(
         dp_size=world_size,
         dp_shard_size=world_size,
-        device_type="cuda",
+        device_type=get_device_type(),
         extra_parallel_sizes=(world_size,),
         extra_parallel_names=("ep",),
         extra_parallel_placement_innermost=(False,),
     )
     try:
-        device = torch.device("cuda", rank)
+        device = torch.device(get_device_type(), rank)
         dtype = torch.bfloat16
         num_tokens, num_experts, hidden_dim, intermediate_dim, top_k = 8, 4, 16, 8, 2
         local_experts = num_experts // world_size
@@ -208,7 +208,7 @@ def _ep_forward_backward_worker():
 
 def test_triton_swiglu_oai_ep2_matches_eager_forward_backward():
     _skip_if_unsupported()
-    if torch.cuda.device_count() < 2:
+    if get_torch_device().device_count() < 2:
         pytest.skip("SwiGLU-OAI EP parity requires two CUDA devices.")
 
     from ..tools.launch_utils import torchrun
