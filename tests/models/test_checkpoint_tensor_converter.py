@@ -1674,3 +1674,35 @@ class TestMiniMaxM3VLConverter:
         assert converted["model.language_model.layers.0.mlp.gate_up_proj.weight"] == 2
         assert converted["model.language_model.layers.0.mlp.down_proj.weight"] == 4
         assert converted["model.multi_modal_projector.merge_linear_2.weight"] == 8
+
+    def test_public_checkpoint_index_maps_onto_every_model_parameter(self):
+        """Every key of the public MiniMaxAI/MiniMax-M3 index must reach a model key, and vice versa.
+
+        A model key that no converted name reaches is silently randomly
+        initialised by the loader, so the mapping is checked against the real
+        checkpoint layout: ``index_key_templates.json`` is the public
+        ``model.safetensors.index.json`` with layer / expert ids folded into
+        ``{layer}`` / ``{expert}`` placeholders.
+        """
+        import json
+
+        from veomni.models.loader import get_model_class, get_model_config
+
+        fixture = Path(__file__).resolve().parents[1] / "toy_config" / "minimax_m3_vl_public_layout"
+        layout = json.loads((fixture / "index_key_templates.json").read_text())
+        public_keys = []
+        for template, layer_ranges in layout["templates"].items():
+            layers = (
+                [layer for start, end in layer_ranges for layer in range(start, end + 1)] if layer_ranges else [None]
+            )
+            experts = range(layout["num_experts"]) if "{expert}" in template else [None]
+            public_keys.extend(template.format(layer=layer, expert=expert) for layer in layers for expert in experts)
+
+        config = get_model_config(str(fixture))
+        with torch.device("meta"):
+            model = get_model_class(config)._from_config(config)
+
+        converted = set(convert_minimax_m3_vl_fqn_to_index_mapping(dict.fromkeys(public_keys, 0)))
+        model_keys = set(model.state_dict())
+        assert sorted(model_keys - converted) == []
+        assert sorted(converted - model_keys) == []
