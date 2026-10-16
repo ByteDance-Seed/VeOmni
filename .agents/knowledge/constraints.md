@@ -115,6 +115,11 @@ Core entry points:
 8c. **Differentiable SP collectives must remain in every rank's autograd graph**
    - Rank-local packed boundaries can make a gathered halo unused on some ranks. Preserve a zero-valued dependency on the gathered tensor so every rank executes the same backward collective sequence; otherwise a later all-reduce can be matched against another rank's gather backward and fail with inconsistent collective counts.
 
+8d. **A shared MoE load-balancing loss is valid only when it matches the model's router semantics**
+   - Do not attach the Switch-style `load_balancing_loss_func` merely because a model exposes raw router logits. That loss applies `softmax(router_logits)` and performs its own top-k selection.
+   - Routers such as MiniMax M3 instead select experts from `sigmoid(router_logits) + e_score_correction_bias`, then derive expert weights from the unbiased sigmoid scores. A softmax-based auxiliary loss can therefore optimize a different expert assignment from the one executed by the model.
+   - For these models, leave router-logit capture and the generic auxiliary loss disabled until a model-specific balancing algorithm, statistics scope, and distributed update rule are verified against the model's training recipe.
+
 ## Data Pipeline
 
 Core files:

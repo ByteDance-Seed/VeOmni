@@ -129,6 +129,7 @@ MODEL_TO_DATASET = {
     "qwen4_exp": "qwen4exp",
     "qwen2_5_omni": "qwen2omni",
     "qwen3_omni_moe": "qwen3omni",
+    "minimax_m3_vl": "minimax_m3_vl",
 }
 
 UNSQUEECE_KEYS = ["input_ids", "attention_mask", "labels", "position_ids", "image_mask", "video_mask", "audio_mask"]

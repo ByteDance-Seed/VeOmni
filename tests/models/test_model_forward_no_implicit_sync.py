@@ -97,6 +97,7 @@ import pytest
 import torch
 
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device, synchronize
+from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 from .test_models_logits_equal_v5 import (
     _DTYPE_MAP,
@@ -209,6 +210,16 @@ CASES = [
     # qwen2_5_omni — forward on ``model.thinker``; shares the window-attention
     # ViT layout with qwen2_5_vl.
     _logits_case("qwen2_5_omni-fa2"),
+    # MiniMax M3 VL — full multimodal path with collator-precomputed vision
+    # grid lists. The model is available starting in transformers 5.16.
+    Case(
+        "minimax_m3_vl-fa2",
+        _toy("minimax_m3_vl_toy"),
+        "MiniMaxM3SparseForConditionalGeneration",
+        "vlm_full",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+    ),
 ]
 
 # Acknowledged sync sites in generated/. Keyed by ``Case.case_id``;
@@ -369,6 +380,9 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     # on-device (no sync) and the omni `get_rope_index` is VeOmni-patched and
     # host-side, so no syncs remain on the production path.
     "qwen2_5_omni-fa2": {},
+    # MiniMax's collator hook supplies image/video grid lists, so the patched
+    # 3D RoPE path does not call ``grid_thw.tolist()`` on the accelerator.
+    "minimax_m3_vl-fa2": {},
 }
 
 # Cases that are *declared* in CASES but skipped at runtime because they
@@ -395,6 +409,7 @@ _MM_METADATA_WIRED_CASES: set[str] = {
     "qwen2_vl-fa2",
     "qwen2_5_vl-fa2",
     "qwen2_5_omni-fa2",
+    "minimax_m3_vl-fa2",
 }
 
 
@@ -591,8 +606,6 @@ def _build_veomni_model(case, config):
 @pytest.mark.parametrize("case", CASES, ids=[c.case_id for c in CASES])
 def test_no_implicit_sync_in_generated_forward(case):
     """No implicit CUDA sync should originate from generated/ during forward."""
-    from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
-
     if not is_transformers_version_greater_or_equal_to("5.2.0"):
         pytest.skip("Scope is transformers v5 model definition only (v5 stack pins >= 5.2.0).")
     if not IS_CUDA_AVAILABLE:
@@ -739,8 +752,6 @@ def test_multimodal_metadata_path_matches_fallback(case):
     *that* the fast path is sync-free, not that it is *correct*; this test
     closes that gap.
     """
-    from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
-
     if not is_transformers_version_greater_or_equal_to("5.2.0"):
         pytest.skip("Scope is transformers v5 model definition only (v5 stack pins >= 5.2.0).")
     if not IS_CUDA_AVAILABLE:
