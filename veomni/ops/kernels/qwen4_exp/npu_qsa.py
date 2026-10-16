@@ -86,6 +86,8 @@ class _CompactFusedAttention(torch.autograd.Function):
             result, maximum, denominator, *_ = _forward(
                 q, key[:, :, lo:hi].contiguous(), value[:, :, lo:hi].contiguous(), blocked, scale
             )
+            valid_rows = (indices[:, section] >= 0).any(-1)[:, None, :, None]
+            result.masked_fill_(~valid_rows, 0)
             output[:, :, section].copy_(result)
             statistics.extend((maximum, denominator))
         ctx.save_for_backward(query, key, value, indices, output, *statistics)
@@ -106,17 +108,24 @@ class _CompactFusedAttention(torch.autograd.Function):
             section = slice(start, start + ctx.chunk_size)
             lo, hi = ctx.ranges[block]
             blocked = _blocked_mask(indices[:, section] - lo, hi - lo)
+            valid_rows = (indices[:, section] >= 0).any(-1)[:, None, :, None]
             dq, dk, dv = _backward(
                 query[:, :, section].contiguous(),
                 key[:, :, lo:hi].contiguous(),
                 value[:, :, lo:hi].contiguous(),
-                grad_output[:, :, section].contiguous(),
+                grad_output[:, :, section].masked_fill(~valid_rows, 0).contiguous(),
                 blocked,
                 output[:, :, section].contiguous(),
                 statistics[2 * block],
                 statistics[2 * block + 1],
                 ctx.scale,
             )
+            # CANN may return subnormals for fully masked rows. Their output
+            # is constant zero, so its derivative must also be exactly zero.
+            dq.masked_fill_(~valid_rows, 0)
+            empty_batch = ~valid_rows.any(-2, keepdim=True)
+            dk.masked_fill_(empty_batch, 0)
+            dv.masked_fill_(empty_batch, 0)
             grad_query[:, :, section].copy_(dq)
             grad_key[:, :, lo:hi].add_(dk)
             grad_value[:, :, lo:hi].add_(dv)

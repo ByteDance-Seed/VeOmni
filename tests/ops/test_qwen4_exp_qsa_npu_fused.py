@@ -90,6 +90,37 @@ def test_ranges_cover_every_selected_index_with_partial_last_block():
         assert torch.all((valid >= lo) & (valid < hi))
 
 
+def test_masked_rows_are_constant_zero_even_with_backend_residue(monkeypatch):
+    torch.manual_seed(83)
+
+    def forward(*args):
+        output, maximum, denominator = _reference_forward(*args)
+        # A fused backend may leave subnormal values on fully masked rows.
+        output = output.masked_fill(args[3].all(-1, keepdim=True), 1e-38)
+        return output, maximum, denominator
+
+    def backward(*args):
+        dq, dk, dv = _reference_backward(*args)
+        dq = dq.masked_fill(args[4].all(-1, keepdim=True), 1e-38)
+        empty = args[4].all((-1, -2), keepdim=True)
+        return dq, dk.masked_fill(empty, 1e-38), dv.masked_fill(empty, 1e-38)
+
+    monkeypatch.setattr(npu_qsa, "_forward", forward)
+    monkeypatch.setattr(npu_qsa, "_backward", backward)
+    q = torch.randn(2, 4, 4, 8, requires_grad=True)
+    k = torch.randn(2, 2, 128, 8, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    indices = torch.tensor([[[0, 2], [-1, -1], [-1, -1], [-1, -1]]] * 2)
+    output = npu_qsa._CompactFusedAttention.apply(q, k, v, indices, 0.31, 2)
+    # Only masked rows contribute to this objective. Every gradient is zero.
+    grad = torch.ones_like(output)
+    grad[:, :, 0] = 0
+    gradients = torch.autograd.grad(output, (q, k, v), grad)
+    assert torch.count_nonzero(output[:, :, 1:]) == 0
+    for gradient in gradients:
+        assert torch.count_nonzero(gradient) == 0
+
+
 def test_int8_scatter_mask_matches_boolean_reference_exactly():
     # Non-contiguous indices, duplicates, padding and an entirely masked row.
     indices = torch.tensor([[[0, 0, -1, 6], [-1, -1, -1, -1], [5, 2, 5, -1]]])
