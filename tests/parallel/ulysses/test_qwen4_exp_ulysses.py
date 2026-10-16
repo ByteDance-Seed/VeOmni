@@ -194,6 +194,10 @@ def _run_ple_halo_equivalence(packed: bool = False) -> None:
             ulysses_group=None,
             ulysses_rank=0,
             ulysses_size=1,
+            sp_enabled=False,
+            sp_rank=0,
+            sp_size=1,
+            sp_group=None,
             extra_parallel_sizes={"ple": 1},
         )
         with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
@@ -691,6 +695,10 @@ def _run_text_model_equivalence() -> None:
                 ulysses_group=None,
                 ulysses_rank=0,
                 ulysses_size=1,
+                sp_enabled=False,
+                sp_rank=0,
+                sp_size=1,
+                sp_group=None,
                 extra_parallel_sizes={"ple": 1},
             )
             with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
