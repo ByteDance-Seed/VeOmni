@@ -1939,8 +1939,12 @@ def qwen3_5_forconditional_generation_forward_patched(
             )
         from veomni.models.transformers.qwen3_5.shared_prefix import build_shared_prefix_plan
 
+        cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
+        if cu_seq_lens_q is None:
+            raise ValueError("Shared-prefix training requires packed-sequence metadata (`cu_seq_lens_q`).")
+
         if position_ids is None:
-            cu = kwargs["cu_seq_lens_q"].cpu().tolist()
+            cu = cu_seq_lens_q.cpu().tolist()
             pos_list = [
                 torch.arange(cu[i + 1] - cu[i], dtype=torch.long, device=input_ids.device) for i in range(len(cu) - 1)
             ]
@@ -1948,7 +1952,7 @@ def qwen3_5_forconditional_generation_forward_patched(
 
         plan = build_shared_prefix_plan(
             input_ids,
-            kwargs["cu_seq_lens_q"],
+            cu_seq_lens_q,
             position_ids=position_ids,
             conv_kernel_size=self.config.text_config.linear_conv_kernel_dim,
         )

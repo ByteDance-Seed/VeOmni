@@ -1933,7 +1933,7 @@
 
          self.post_init()
 
-@@ -1724,48 +2793,60 @@
+@@ -1724,48 +2793,64 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -2014,8 +2014,12 @@
 +                )
 +            from veomni.models.transformers.qwen3_5.shared_prefix import build_shared_prefix_plan
 +
++            cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
++            if cu_seq_lens_q is None:
++                raise ValueError("Shared-prefix training requires packed-sequence metadata (`cu_seq_lens_q`).")
++
 +            if position_ids is None:
-+                cu = kwargs["cu_seq_lens_q"].cpu().tolist()
++                cu = cu_seq_lens_q.cpu().tolist()
 +                pos_list = [
 +                    torch.arange(cu[i + 1] - cu[i], dtype=torch.long, device=input_ids.device)
 +                    for i in range(len(cu) - 1)
@@ -2024,7 +2028,7 @@
 +
 +            plan = build_shared_prefix_plan(
 +                input_ids,
-+                kwargs["cu_seq_lens_q"],
++                cu_seq_lens_q,
 +                position_ids=position_ids,
 +                conv_kernel_size=self.config.text_config.linear_conv_kernel_dim,
 +            )
@@ -2034,7 +2038,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1776,28 +2857,108 @@
+@@ -1776,28 +2861,108 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -2152,7 +2156,7 @@
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
          # Overwritten -- requires 3D position ids
-@@ -1984,6 +3145,24 @@
+@@ -1984,6 +3149,24 @@
 
          return input_ids, model_kwargs
 

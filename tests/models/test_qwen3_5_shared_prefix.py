@@ -258,3 +258,45 @@ def test_default_position_ids_generates_per_sequence_positions():
     ids, cu = _batch([100], [[10, 10]])
     plan = build_shared_prefix_plan(ids, cu, position_ids=None)
     assert plan is not None
+
+
+def test_forward_missing_cu_seq_lens_q_raises_value_error():
+    """Shared-prefix training without cu_seq_lens_q must raise a clear ValueError."""
+    from unittest.mock import MagicMock
+
+    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+        Qwen3_5ForConditionalGeneration,
+    )
+
+    mock_self = MagicMock()
+    mock_self.mtp = None
+    mock_self.config.text_config.shared_prefix_training = True
+    mock_self.config.text_config._attn_implementation = "flash_attention_2"
+    input_ids = torch.tensor([[1, 2, 3]])
+
+    with pytest.raises(ValueError, match="Shared-prefix training requires packed-sequence metadata"):
+        Qwen3_5ForConditionalGeneration.forward(
+            mock_self,
+            input_ids=input_ids,
+        )
+
+
+def test_forward_incompatible_attn_impl_raises_not_implemented():
+    """Shared-prefix training with non-flash attention backend must raise NotImplementedError."""
+    from unittest.mock import MagicMock
+
+    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+        Qwen3_5ForConditionalGeneration,
+    )
+
+    mock_self = MagicMock()
+    mock_self.mtp = None
+    mock_self.config.text_config.shared_prefix_training = True
+    mock_self.config.text_config._attn_implementation = "eager"
+    input_ids = torch.tensor([[1, 2, 3]])
+
+    with pytest.raises(NotImplementedError, match="Shared-prefix training needs a varlen attention backend"):
+        Qwen3_5ForConditionalGeneration.forward(
+            mock_self,
+            input_ids=input_ids,
+        )
