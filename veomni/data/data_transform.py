@@ -435,7 +435,10 @@ def process_sample_minimax_m3_vl(
     from .multimodal import conv_preprocess
 
     source = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")
-    conversations = sample.get("conversations") or sample
+    if "conversations" in sample and sample["conversations"] is not None and len(sample["conversations"]) > 0:
+        conversations = sample["conversations"]
+    else:
+        conversations = sample
     conversations = conv_preprocess(source, conversations, **kwargs)
 
     image_inputs, video_inputs, video_metadata = _prepare_vlm_media_inputs(sample, processor, **kwargs)
