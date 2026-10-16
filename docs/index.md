@@ -99,6 +99,7 @@ key_features/mtp.md
 :caption: SeedOmni
 
 seed_omni/usage/hf_layout.md
+seed_omni/distributed/sequence_parallel.md
 seed_omni/mixins/metric_meter.md
 seed_omni/mixins/offline_encoding.md
 ```
