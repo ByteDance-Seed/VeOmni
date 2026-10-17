@@ -97,18 +97,20 @@ owed on every commit.
 
 Skills follow the [Agent Skills](https://agentskills.io) open standard. Each skill is a folder in `.agents/skills/<name>/` containing a `SKILL.md` with YAML frontmatter (`name`, `description`). Agents that implement the standard auto-discover them from the `description`; they can also be invoked manually with `/skill-name` in chat.
 
-| Task | Skill |
-|------|-------|
-| Feature / refactoring | `/veomni-develop` |
-| Bug fix / debugging | `/veomni-debug` |
-| Code review (before opening a PR) | `/veomni-review` |
-| Add new model | `/veomni-new-model` |
-| Write or refresh a model's patchgen modeling | `/veomni-patchgen-model` |
-| Add new op/kernel | `/veomni-new-op` |
-| Update dependencies (uv) | `/veomni-uv-update` |
-| Performance profiling | `/veomni-profile` |
-| Documentation audit / correction | `/veomni-fix-docs` |
-| Create or update a pull request | `/create-pr` |
+| Task                                           | Skill                     |
+|------------------------------------------------|---------------------------|
+| Feature / refactoring                          | `/veomni-develop`         |
+| Bug fix / debugging                            | `/veomni-debug`           |
+| Code review (before opening a PR)              | `/veomni-review`          |
+| Add new model                                  | `/veomni-new-model`       |
+| Write or refresh a model's patchgen modeling   | `/veomni-patchgen-model`  |
+| Add new op/kernel                              | `/veomni-new-op`          |
+| Generate NPU tests and CI for a module/feature | `/veomni-npu-ci-generate` |
+| Migrate existing GPU CI coverage to NPU        | `/veomni-gpu-ci-migrate`  |
+| Update dependencies (uv)                       | `/veomni-uv-update`       |
+| Performance profiling                          | `/veomni-profile`         |
+| Documentation audit / correction               | `/veomni-fix-docs`        |
+| Create or update a pull request                | `/create-pr`              |
 
 ### Quick Decision Guide
 
@@ -117,6 +119,8 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 - **"Add a new kernel / fused op"** → `/veomni-new-op`
 - **"Fix this error" / "training hangs" / "wrong results"** → `/veomni-debug`
 - **"Add a new capability" / "refactor" / "clean up"** → `/veomni-develop`
+- **"Generate NPU tests / CI for this module"** → `/veomni-npu-ci-generate`
+- **"Migrate this GPU workflow / test scope to NPU"** → `/veomni-gpu-ci-migrate`
 - **"Update package X" / "bump uv" / "upgrade torch"** → `/veomni-uv-update`
 - **"Analyze this trace" / "why is training slow" / "profile" / "MFU"** → `/veomni-profile`
 - **"Scan docs" / "fix documentation" / "broken link"** → `/veomni-fix-docs`
