@@ -416,19 +416,18 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         ctx.num_experts = num_experts
         ctx.swiglu_limit = swiglu_limit
+        # These intermediates are cheap to recompute in backward and do not
+        # need to remain live for the entire forward-to-backward interval.
         ctx.save_for_backward(
             gate_weights,
             fc1_1_2_weight,
             fc2_weight,
             hidden_states,
             scatter_index,
-            scatter_output,
             cumsum_t,
             fc1_1_output,
             fc1_2_output,
-            fc1_activation,
             scattered_gate_weight,
-            fc1_weighted_output,
             mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=hidden_states.device),
             mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=hidden_states.device),
         )
@@ -443,19 +442,19 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc2_weight,
             hidden_states,
             scatter_index,
-            scatter_output,
             cumsum_t,
             fc1_1_output,
             fc1_2_output,
-            fc1_activation,
             scattered_gate_weight,
-            fc1_weighted_output,
             mask_fc1_1,
             mask_fc1_2,
         ) = ctx.saved_tensors
         swiglu_limit = ctx.swiglu_limit
         hidden_dim = grad_output.shape[-1]
         grad_output = grad_output.view(-1, hidden_dim)
+
+        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        fc1_activation = fc1_1_activation * fc1_2_output
 
         # MOE Step 10
         grad_fc2_output = moe_scatter(grad_output, scatter_index)
@@ -476,6 +475,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         # MOE Step 9 - wgrad
         grad_fc2_weight = None
         if fc2_weight.requires_grad:
+            fc1_weighted_output = fc1_activation * scattered_gate_weight
             grad_fc2_weight = torch.empty_like(fc2_weight)
             group_gemm_same_mn(
                 a=grad_fc2_output,
@@ -486,6 +486,8 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
                 transpose_a=True,
                 transpose_b=False,
             )
+            del fc1_weighted_output
+        del grad_fc2_output
 
         # MOE Step 8-2
         grad_fc1_activation = grad_fc1_weighted_output * scattered_gate_weight
@@ -494,9 +496,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         grad_scattered_gate_weight = torch.sum(fc1_activation * grad_fc1_weighted_output, dim=-1)
         grad_gate_weight = grad_scattered_gate_weight[scatter_index.flatten()]
         grad_gate_weight = grad_gate_weight.reshape(gate_weights.shape)
-
-        # recompute during backward
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        del fc1_activation, grad_fc1_weighted_output, grad_scattered_gate_weight
 
         # MOE Step 7
         grad_fc1_1_activation = grad_fc1_activation * fc1_2_output
@@ -504,6 +504,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         # MOE Step 5
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+        del fc1_1_activation, grad_fc1_activation, grad_fc1_1_activation
 
         # Step 5a (backward): zero out gradients in saturated SwiGLU clamp regions.
         if swiglu_limit is not None:
@@ -512,6 +513,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         # Merge grad_fc1_1_output and grad_fc1_2_output back to [T, 2I]
         grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)
+        del grad_fc1_1_output, grad_fc1_2_output
 
         # MOE Step 4 - single dgrad for merged fc1
         grad_scatter_output = group_gemm_same_nk(
@@ -525,6 +527,8 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         # MOE Step 4 - single wgrad for merged fc1
         grad_fc1_1_2_weight = None
         if fc1_1_2_weight.requires_grad:
+            # Reconstruct the routed input only when FC1 wgrad consumes it.
+            scatter_output = moe_scatter(hidden_states, scatter_index)
             grad_fc1_1_2_weight = torch.empty_like(fc1_1_2_weight)
             group_gemm_same_mn(
                 a=grad_fc1_output,
@@ -535,6 +539,8 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
                 transpose_a=True,
                 transpose_b=False,
             )
+            del scatter_output
+        del grad_fc1_output
 
         # MOE Step 3
         grad_hidden_states = moe_gather(grad_scatter_output, scatter_index)
