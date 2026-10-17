@@ -395,7 +395,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         if drop_visual:
             keyframe_images, ref_blocks = None, None
         elif pk.get("task") == "ref2va":
-            if keyframe_images or (pk["cond_rows"] > 0 and not ref_blocks):
+            if keyframe_images or ((pk["cond_rows"] > 0 or pk.get("audio_cond_rows", 0) > 0) and not ref_blocks):
                 raise ValueError("Ref2VA paired caches require their original prepared ref_blocks.")
         elif ref_blocks or (pk["cond_rows"] > 0 and not keyframe_images):
             raise ValueError("FL2VA paired caches require their original resized keyframe_images.")
@@ -403,10 +403,6 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             raise ValueError("Load the condition model's Qwen encoder and processor before generating embeddings.")
         if not isinstance(negative_prompt, str) or not negative_prompt:
             raise ValueError('Use a nonempty negative_prompt; the native default is " " (one space).')
-        if ref_blocks and any(
-            block["kind"] not in ("image", "video") or int(block.get("ref_audio_t", 0)) > 0 for block in ref_blocks
-        ):
-            raise NotImplementedError("Ref2VA training supports visual references only.")
         parameter = next(self._text_encoder.parameters())
         encoded = encode_prompt(
             self._text_encoder,
@@ -545,7 +541,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         packed: list[dict],
         keyframe_cond_anchor: list[torch.Tensor | None] | None = None,
         imgvid_cond_noise_aug: float = 0.999,
-        audio_cond_noise_aug: float = 1.0,
+        audio_cond_noise_aug: float | None = None,
         ref_visual_anchor: list[torch.Tensor | None] | None = None,
         ref_audio_anchor: list[torch.Tensor | None] | None = None,
         has_audio: list[bool | None] | None = None,
@@ -571,11 +567,11 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             imgvid_cond_noise_aug = imgvid_cond_noise_aug[0]
         if isinstance(audio_cond_noise_aug, list):
             audio_cond_noise_aug = audio_cond_noise_aug[0]
+        if audio_cond_noise_aug is None:
+            audio_cond_noise_aug = self.config.audio_cond_noise_aug
         # Caches written before has_audio existed supervise audio as before.
         has_audio = True if not has_audio or has_audio[0] is None else bool(has_audio[0])
 
-        if ref_audio_anchor is not None and any(anchor is not None for anchor in ref_audio_anchor):
-            raise NotImplementedError("Ref2VA audio references are not supported.")
         clean_video = input_latents[0]
         clean_audio = audio_input_latents[0]
         prompt = prompt_embeds[0]
@@ -585,11 +581,23 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             if cond_anchor is not None:
                 raise ValueError("Specify either keyframe or reference visual anchors, not both.")
             cond_anchor = ref_visual_anchor[0]
-        if pk.get("task") == "ref2va":
+        audio_anchor = ref_audio_anchor[0] if ref_audio_anchor else None
+        audio_cond_rows = pk.get("audio_cond_rows", 0)
+        if (
+            audio_cond_rows < 0
+            or len(pk["audio_pos"]) != audio_cond_rows + clean_audio.shape[0] * clean_audio.shape[-1]
+        ):
+            raise ValueError("H3 audio reference/target rows must match the packed layout.")
+        if audio_cond_rows:
+            if not 0.0 <= float(audio_cond_noise_aug) <= 1.0:
+                raise ValueError("audio_cond_noise_aug must be finite and in [0, 1].")
+            if audio_anchor is None or audio_anchor.shape != (audio_cond_rows, clean_audio.shape[1]):
+                raise ValueError("H3 audio anchor rows must match the packed reference layout.")
+        elif audio_anchor is not None:
+            raise ValueError("An audio anchor requires packed audio reference rows.")
+        if pk.get("task") == "ref2va" and pk["cond_rows"]:
             if cond_anchor is None or cond_anchor.shape != (pk["cond_rows"], clean_video.shape[1] * 4):
                 raise ValueError("Ref2VA visual anchor rows must match the packed reference layout.")
-            if len(pk["audio_pos"]) != clean_audio.shape[0] * clean_audio.shape[-1]:
-                raise NotImplementedError("Ref2VA audio reference rows are not supported.")
 
         device = clean_video.device
         dtype = clean_video.dtype
@@ -640,11 +648,15 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             x[0, img_pos[:cond_rows]] = cond_anchor.to(dtype)
 
         audio_x = torch.zeros(1, seq_len, audio_rows.shape[-1], device=device, dtype=dtype)
-        audio_x[0, audio_pos] = audio_rows.to(dtype)
+        audio_x[0, audio_pos[audio_cond_rows:]] = audio_rows.to(dtype)
+        if audio_anchor is not None:
+            audio_x[0, audio_pos[:audio_cond_rows]] = audio_anchor.to(device=device, dtype=dtype)
 
         # 4. Per-token timesteps (t = 1 - sigma format)
         timesteps = torch.full((seq_len,), t_video, dtype=torch.float32, device=device)
         timesteps[audio_pos] = t_audio
+        if audio_cond_rows:
+            timesteps[audio_pos[:audio_cond_rows]] = max(float(t_audio), float(audio_cond_noise_aug))
         if cond_rows > 0:
             # Condition tokens: always near-clean (t ≈ 1.0, sigma ≈ 0)
             timesteps[img_pos[:cond_rows]] = max(float(t_video), float(cfg.imgvid_cond_noise_aug))
@@ -673,6 +685,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             **_packed_seq_params(pk, device),
             "skip_mask_out_condition": True,
             "cond_rows": cond_rows,
+            "audio_cond_rows": audio_cond_rows,
             "video_latent_shape": video_latent_shape,
             "audio_latent_shape": audio_latent_shape,
             "training_target": training_target,

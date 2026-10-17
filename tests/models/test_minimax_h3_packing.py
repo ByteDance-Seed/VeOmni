@@ -142,6 +142,8 @@ def raw_sample(text_len=3, task="fl2va", refs=None, latent_t=2, latent_h=4, late
     )
     if pk["cond_rows"]:
         row[anchor_key] = torch.randn(pk["cond_rows"], 96)
+    if pk.get("audio_cond_rows", 0):
+        row["ref_audio_anchor"] = torch.randn(pk["audio_cond_rows"], 32)
     return row
 
 
@@ -369,7 +371,8 @@ def test_paired_cache_rejects_missing_visual_sources(task):
         condition_model().add_unconditional_cache(raw_sample(task=task))
 
 
-def test_ref_prompt_preserves_reference_order_and_video_timestamps(monkeypatch):
+@pytest.mark.parametrize("with_audio", [False, True])
+def test_ref_prompt_preserves_reference_order_and_video_timestamps(monkeypatch, with_audio):
     import numpy as np
 
     from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_text_encoder as text
@@ -394,10 +397,15 @@ def test_ref_prompt_preserves_reference_order_and_video_timestamps(monkeypatch):
         {"kind": "video", "prepared_frames": [np.zeros((2, 2, 3)) for _ in range(24)], "ref_audio_t": 0},
         {"kind": "image", "prepared_image": object()},
     ]
+    if with_audio:
+        refs[0].update(kind="video_audio", ref_audio_t=40)
+        refs.append({"kind": "audio", "ref_audio_t": 10})
     text.prepare_ref_prompt(None, None, " ", refs)
     assert observed == {
         "prompt": " ",
-        "labels": [("video", 1), ("image", 1)],
+        "labels": [("audio", 1), ("video", 1), ("image", 1), ("audio", 2)]
+        if with_audio
+        else [("video", 1), ("image", 1)],
         "images": [3],
         "videos": [[2]],
         "timestamps": [[0.25]],
@@ -808,24 +816,30 @@ def test_ref2va_variable_reference_layouts_and_target_only_loss():
     assert [p.shape for p in actual.predictions[1]] == [(2, 32, 3)] * 2
 
 
-def test_audio_refs_fail_closed():
+def test_audio_refs_reject_missing_or_mismatched_anchors():
     cond = condition_model()
     row = raw_sample(task="ref2va")
     row["ref_audio_anchor"] = torch.ones(2, 32)
-    with pytest.raises(NotImplementedError, match="audio"):
+    with pytest.raises(ValueError, match="audio"):
         prepare(cond, [row])
-    with pytest.raises(NotImplementedError, match="audio"):
-        raw_sample(task="ref2va", refs=[{"kind": "audio", "ref_audio_t": 2}])
+    with pytest.raises(ValueError, match="audio"):
+        row = raw_sample(task="ref2va", refs=[{"kind": "audio", "ref_audio_t": 2}])
+        row.pop("ref_audio_anchor")
+        prepare(cond, [row])
 
 
 @pytest.mark.parametrize("audio_channel", [1, 2])
-def test_visual_ref_layout_matches_native_inference(audio_channel):
+@pytest.mark.parametrize("audio_refs", [False, True])
+def test_visual_ref_layout_matches_native_inference(audio_channel, audio_refs):
     from veomni.models.diffusers.minimax_h3.inference import MiniMaxH3Unit_PackedSequenceBuilder
 
     refs = [
         {"kind": "image", "latent_t": 1, "latent_h": 2, "latent_w": 4},
         {"kind": "video", "latent_t": 3, "latent_h": 6, "latent_w": 4},
     ]
+    if audio_refs:
+        refs[1].update(kind="video_audio", ref_audio_t=4)
+        refs += [{"kind": "audio", "ref_audio_t": 2}]
     kwargs = dict(
         text_len=7, latent_t=2, latent_h=4, latent_w=6, audio_t=3, ref_blocks=refs, audio_channel=audio_channel
     )
@@ -947,6 +961,14 @@ def test_sequence_parallel_gradients_match_single_rank_after_sp_average(tmp_path
         loss.backward()
         grads = {name: param.grad.clone() for name, param in model.named_parameters()}
         cases.append((f"{task} heads={heads}", heads, model.state_dict(), sample, loss.detach(), grads))
+    for audio_only in (False, True):
+        torch.manual_seed(5)
+        model = tiny_model()
+        sample = prepare(cfg_condition(), [audio_ref_raw(paired=True, audio_only=audio_only)])[0]
+        loss = sum(model(**sample).loss.values())
+        loss.backward()
+        grads = {name: param.grad.clone() for name, param in model.named_parameters()}
+        cases.append((f"audio-reference audio_only={audio_only}", 2, model.state_dict(), sample, loss.detach(), grads))
     mp.spawn(_check_sequence_parallel_gradients, args=((tmp_path / "rendezvous").as_uri(), cases), nprocs=2)
 
 
@@ -1143,3 +1165,180 @@ def test_invalid_precision_and_legacy_tail_fail_closed():
         prepare(condition_model(), [row])
     with pytest.raises(ValueError, match="nonempty"):
         model(x=[])
+
+
+AUDIO_REFS = [
+    {"kind": "image", "latent_t": 1, "latent_h": 2, "latent_w": 4},
+    {"kind": "video_audio", "latent_t": 3, "latent_h": 6, "latent_w": 4, "ref_audio_t": 4},
+    {"kind": "audio", "ref_audio_t": 2},
+]
+
+
+def audio_ref_raw(text_len=3, *, paired=False, audio_only=False):
+    refs = AUDIO_REFS[-1:] if audio_only else AUDIO_REFS
+    row = raw_sample(text_len, "ref2va", refs)
+    if paired:
+        negative = raw_sample(2, "ref2va", refs)
+        row["unconditional_packed"] = negative["packed"]
+        row["unconditional_prompt_embeds"] = negative["prompt_embeds"]
+    return row
+
+
+@pytest.mark.parametrize("cfg", [False, True])
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_audio_reference_packing_matches_serial_loss_and_gradients(cfg, checkpointing):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.cfg_conditioning import validate_unconditional
+
+    torch.manual_seed(77)
+    raws = [audio_ref_raw(paired=cfg), audio_ref_raw(5, paired=cfg, audio_only=True)]
+    # Missing target audio must not remove the reference audio from attention.
+    raws[1]["has_audio"] = False
+    for row in raws:
+        row["audio_cond_noise_aug"] = 0.98
+        if cfg:
+            validate_unconditional(
+                row["packed"], row["unconditional_packed"], row["unconditional_prompt_embeds"], row["prompt_embeds"]
+            )
+    samples = prepare(cfg_condition() if cfg else condition_model(), raws)
+    for row, sample in zip(raws, samples):
+        n = row["packed"]["audio_cond_rows"]
+        positions = sample["audio_pos_info"]["position_ids"][:n]
+        torch.testing.assert_close(sample["audio_x"][0, positions], row["ref_audio_anchor"])
+        times = sample["unique_timesteps"][sample["inverse_indices"]][positions]
+        torch.testing.assert_close(times, torch.full_like(times, max(sample["t_audio"], 0.98)))
+        if cfg:
+            negative = sample["unconditional_inputs"]
+            assert negative["audio_cond_rows"] == n
+            torch.testing.assert_close(
+                negative["audio_x"][0, negative["audio_pos_info"]["position_ids"][:n]], row["ref_audio_anchor"]
+            )
+    first, packed_model = tiny_model(), tiny_model()
+    packed_model.load_state_dict(first.state_dict())
+    if checkpointing:
+        packed_model.gradient_checkpointing_enable({"use_reentrant": False})
+    expected = serial(first, samples)
+    entries = {id(block): 0 for block in packed_model.dit.blocks}
+
+    def record(module, inputs):
+        if torch.is_grad_enabled():
+            entries[id(module)] += 1
+
+    handles = [block.register_forward_pre_hook(record) for block in packed_model.dit.blocks]
+    actual = packed_model(**batch(samples))
+    assert set(entries.values()) == {1}
+    assert expected[1].loss["mse_audio"].item() == 0
+    for i, out in enumerate(expected):
+        for modality in (0, 1):
+            torch.testing.assert_close(
+                actual.predictions[modality][i], out.predictions[modality], rtol=2e-5, atol=2e-5
+            )
+    torch.testing.assert_close(
+        actual.loss, {key: torch.stack([out.loss[key] for out in expected]).mean() for key in actual.loss}
+    )
+    sum(sum(out.loss.values()) for out in expected).div(len(samples)).backward()
+    sum(actual.loss.values()).backward()
+    assert set(entries.values()) == {2 if checkpointing else 1}
+    for handle in handles:
+        handle.remove()
+    for (name, a), (_, b) in zip(first.named_parameters(), packed_model.named_parameters()):
+        torch.testing.assert_close(a.grad, b.grad, rtol=2e-4, atol=2e-5, msg=name)
+
+
+def test_reference_output_rows_are_excluded_from_supervision():
+    video = torch.randn(5, 96, requires_grad=True)
+    audio = torch.randn(8, 32, requires_grad=True)
+    output = MiniMaxH3DiTModel._finish_outputs(
+        video,
+        audio,
+        cond_rows=1,
+        audio_cond_rows=2,
+        video_latent_shape=(1, 2, 2),
+        audio_latent_shape=(2, 3),
+        training_target=torch.randn(1, 24, 1, 4, 4),
+        training_target_audio=torch.randn(2, 32, 3),
+    )
+    sum(output.loss.values()).backward()
+    assert torch.count_nonzero(video.grad[:1]) == 0
+    assert torch.count_nonzero(audio.grad[:2]) == 0
+    assert torch.count_nonzero(video.grad[1:]) > 0
+    assert torch.count_nonzero(audio.grad[2:]) > 0
+
+
+def test_audio_reference_coordinates_match_native_convention():
+    # Explicit oracle, independent of the train/inference shared builder.
+    pk = packed_sequence.build_packed_ref2va(
+        2,
+        1,
+        2,
+        4,
+        3,
+        [
+            {"kind": "image", "latent_t": 1, "latent_h": 2, "latent_w": 2},
+            {"kind": "video_audio", "latent_t": 2, "latent_h": 2, "latent_w": 2, "ref_audio_t": 2},
+            {"kind": "audio", "ref_audio_t": 1},
+        ],
+    )
+    assert pk["img_pos"].tolist() == [2, 7, 8, 17, 18]
+    assert pk["audio_pos"].tolist() == [3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15, 16]
+    assert (pk["cond_rows"], pk["audio_cond_rows"]) == (3, 6)
+    grid = pk["img_position_ids"][0]
+    torch.testing.assert_close(grid[[3, 4, 5, 6], 0], torch.tensor([3.0, 4.0, 3.0, 4.0], dtype=torch.float64))
+    torch.testing.assert_close(grid[[7, 8], 0], torch.tensor([3.0, 3.0 + 5 / 3], dtype=torch.float64))
+    # Square reference uses W=0; standalone audio uses target spatial extent.
+    torch.testing.assert_close(grid[[3, 4, 5, 6], 2], torch.zeros(4, dtype=torch.float64))
+    w = packed_sequence._axis_from_sqrt_area(4, 2, (2 * 4) ** 0.5)
+    torch.testing.assert_close(grid[[9, 10], 2], w)
+    torch.testing.assert_close(grid[[11, 17], 0], torch.full((2,), 3 + 25 / 3 + 1, dtype=torch.float64))
+
+
+def test_inference_accepts_audio_references_and_returns_only_targets():
+    from veomni.models.diffusers.minimax_h3.inference import model_fn_minimax_h3
+
+    row = audio_ref_raw()
+    predictions = model_fn_minimax_h3(
+        tiny_model(),
+        row["input_latents"],
+        row["audio_input_latents"],
+        row["packed"],
+        row["prompt_embeds"],
+        t_video=0.5,
+        t_audio=0.4,
+        ref_visual_anchor=row["ref_visual_anchor"],
+        ref_audio_anchor=row["ref_audio_anchor"],
+    )
+    assert predictions[0].shape == row["input_latents"].shape
+    assert predictions[1].shape == row["audio_input_latents"].shape
+    assert all(torch.isfinite(prediction).all() for prediction in predictions)
+
+
+def test_audio_only_paired_cache_preserves_audio_sources(monkeypatch):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_text_encoder as text
+
+    row = audio_ref_raw(audio_only=True)
+    refs = [{"kind": "audio", "ref_audio_t": 2}]
+
+    def encode(*args, ref_blocks, **kwargs):
+        assert ref_blocks is refs
+        return {"prompt_embeds": torch.ones(2, 32), "text_token_tags": torch.ones(2, dtype=torch.long)}
+
+    monkeypatch.setattr(text, "encode_prompt", encode)
+    cond = cfg_condition()
+    cond._text_encoder = torch.nn.Linear(1, 1)
+    cond._tokenizer = object()
+    with pytest.raises(ValueError, match="original prepared ref_blocks"):
+        cond.add_unconditional_cache(row)
+    paired = cond.add_unconditional_cache(row, ref_blocks=refs)
+    assert paired["ref_audio_anchor"] is row["ref_audio_anchor"]
+    output = tiny_model()(**prepare(cond, [paired])[0])
+    assert all(torch.isfinite(value) for value in output.loss.values())
+
+
+def test_audio_condition_augmentation_defaults_to_config():
+    row = audio_ref_raw(audio_only=True)
+    sample = prepare(
+        MiniMaxH3ConditionModel(MiniMaxH3ConditionModelConfig(skip_encoder_load=True, audio_cond_noise_aug=0.95)),
+        [row],
+    )[0]
+    pk = row["packed"]
+    actual = sample["unique_timesteps"][sample["inverse_indices"]][pk["audio_pos"][: pk["audio_cond_rows"]]]
+    torch.testing.assert_close(actual, torch.full_like(actual, max(sample["t_audio"], 0.95)))
