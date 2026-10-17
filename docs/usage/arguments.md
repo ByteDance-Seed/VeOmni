@@ -440,7 +440,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| type | `Literal["adamw", "anyprecision_adamw", "muon"]` | `"adamw"` | Optimizer type. `muon` builds Muon and AdamW parameter groups. |
+| type | `Literal["adamw", "anyprecision_adamw", "muon", "adamw_swap"]` | `"adamw"` | Optimizer type. `muon` builds Muon and AdamW parameter groups; `adamw_swap` keeps moment states on host (NPU + FSDP2 only). |
 | lr | `float` | `5e-5` | Maximum / default learning rate. |
 | lr_min | `float` | `1e-7` | Minimum learning rate. |
 | lr_start | `float` | `0.0` | Starting learning rate for warmup. |
@@ -466,6 +466,8 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | muon_expert_zero_comm | `bool` | `False` | Use whole-expert `Shard(0)` when the FSDP+ExtraParallel topology permits zero-communication expert Muon updates. |
 | muon_ns_implementation | `Literal["std", "gram", "gram_quack"]` | `"gram_quack"` | Newton–Schulz backend: standard, pure-PyTorch Gram-NS, or Gram-NS with quack kernels (default; falls back to `gram` if unavailable). |
 | muon_gram_ns_reset_iterations | `List[int]` | `[2]` | Restart indices for Gram Newton–Schulz (ignored by `std`). |
+| swap_mem_fraction_static | `float` | `0.8` | With `type="adamw_swap"`, fraction of currently free device memory used to size one batch of optimizer states streamed from host to device. |
+| swap_pin_memory | `bool` | `True` | With `type="adamw_swap"`, pin the host-side optimizer state buffers. Disable if page-locked memory is scarce. |
 
 ### WandbConfig
 

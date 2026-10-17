@@ -83,11 +83,20 @@ class OptimizerConfig:
     ``type="muon"`` builds a Muon + AdamW multi-optimizer: 2D hidden weights
     and 3D MoE expert stacks use Muon, while embeddings, lm_head, biases and
     norms use AdamW.
+
+    ``type="adamw_swap"`` builds an AdamW whose moment states live on host memory
+    and are streamed to the device in batches; see ``veomni.optim.swap_adamw``.
     """
 
-    type: Literal["adamw", "anyprecision_adamw", "muon"] = field(
+    type: Literal["adamw", "anyprecision_adamw", "muon", "adamw_swap"] = field(
         default="adamw",
-        metadata={"help": "Optimizer type. Default to adamw."},
+        metadata={
+            "help": (
+                "Optimizer type. Default to adamw. 'adamw_swap' keeps the AdamW moment states "
+                "on host memory and streams them to the device in batches to lower peak device "
+                "memory; it is NPU + FSDP2 only."
+            )
+        },
     )
     lr: float = field(
         default=5e-5,
@@ -144,6 +153,25 @@ class OptimizerConfig:
     betas: Tuple[float, float] = field(
         default=(0.9, 0.95),
         metadata={"help": "AdamW betas (beta1, beta2). Default (0.9, 0.95)."},
+    )
+    # ---- adamw_swap-specific (only consulted when type == "adamw_swap") ----
+    swap_mem_fraction_static: float = field(
+        default=0.8,
+        metadata={
+            "help": (
+                "With optimizer.type='adamw_swap', the fraction of currently free device memory "
+                "used to size one batch of optimizer states streamed from host to device."
+            )
+        },
+    )
+    swap_pin_memory: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "With optimizer.type='adamw_swap', pin the host-side optimizer state buffers. "
+                "Disable if page-locked memory is scarce."
+            )
+        },
     )
     # ---- Muon-specific (only consulted when type == "muon") ---------------
     muon_lr: Optional[float] = field(
