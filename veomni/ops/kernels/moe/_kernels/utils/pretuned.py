@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import torch
 import triton
 
 from ......utils import logging
@@ -57,7 +58,10 @@ class Pretuned(triton.KernelInterface):
     def run(self, *args, **kwargs):
         algo_key = self.algo_key_maker(**kwargs)
         if algo_key not in self.configs:
-            if not envvars.is_untuned_warning_suppressed():
+            # Logging introspects the nested Triton kernel and is not tensor
+            # computation. Keep it outside Dynamo's fullgraph trace without
+            # changing which pre-tuned/fallback configuration is selected.
+            if not torch.compiler.is_compiling() and not envvars.is_untuned_warning_suppressed():
                 logger.debug(
                     f"Untuned case (using algo-key [{algo_key}]) is seen when invoking "
                     f"kernel [{qualified_name(self)}], performance may suffer."

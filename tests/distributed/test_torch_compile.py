@@ -393,6 +393,154 @@ def test_compile_decoder_blocks_no_decoder_layers_returns_zero(monkeypatch):
     assert compile_decoder_blocks(NoDecoderModel(), CompileConfig()) == 0
 
 
+def _build_deepseek_v4_fused_toy(seed=0):
+    from veomni.models import build_foundation_model
+
+    from ..tools.training_utils import make_eager_ops_config
+
+    torch.manual_seed(seed)
+    model = build_foundation_model(
+        config_path="tests/toy_config/deepseek_v4_toy",
+        weights_path=None,
+        torch_dtype="bfloat16",
+        init_device=get_device_type(),
+        ops_implementation=make_eager_ops_config(moe_implementation="fused_triton"),
+    ).train()
+    with torch.no_grad():
+        for module in model.modules():
+            if hasattr(module, "tid2eid"):
+                table = module.tid2eid
+                tokens = torch.arange(table.shape[0], device=table.device).view(-1, 1)
+                slots = torch.arange(table.shape[1], device=table.device).view(1, -1)
+                table.copy_((tokens + slots) % module.num_experts)
+    return model
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="V4 fused MoE requires CUDA")
+@pytest.mark.parametrize("backend", ["eager"])
+def test_deepseek_v4_fused_decoder_fullgraph_forward_backward_matches_eager(backend):
+    from veomni.distributed.parallel_state import ParallelState
+
+    model = _build_deepseek_v4_fused_toy()
+    inputs = torch.arange(64, device=get_device_type()).view(1, 64)
+    with use_parallel_state(ParallelState()):
+        eager_loss = model(input_ids=inputs, labels=inputs, use_cache=False).loss
+        eager_loss.backward()
+        eager_grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+        model.zero_grad(set_to_none=True)
+        assert compile_decoder_blocks(model, CompileConfig(enable=True, backend=backend, fullgraph=True)) == 4
+        compiled_loss = model(input_ids=inputs, labels=inputs, use_cache=False).loss
+        compiled_loss.backward()
+
+    assert torch.isfinite(compiled_loss)
+    torch.testing.assert_close(compiled_loss, eager_loss, rtol=0, atol=0)
+    compiled_grads = {name: p.grad for name, p in model.named_parameters() if p.grad is not None}
+    assert compiled_grads.keys() == eager_grads.keys()
+    for name, grad in compiled_grads.items():
+        assert torch.isfinite(grad).all(), name
+        torch.testing.assert_close(grad, eager_grads[name], rtol=0, atol=0, msg=name)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="V4 fused MoE requires CUDA")
+def test_deepseek_v4_inductor_fullgraph_executes_finite_optimizer_step():
+    """Execution/coverage gate, not an eager-BF16 gradient numerical oracle."""
+    from veomni.distributed.parallel_state import ParallelState
+
+    model = _build_deepseek_v4_fused_toy()
+    inputs = torch.arange(64, device=get_device_type()).view(1, 64)
+    with use_parallel_state(ParallelState()):
+        eager_loss = model(input_ids=inputs, labels=inputs, use_cache=False).loss
+        eager_loss.backward()
+        used_parameters = {name for name, p in model.named_parameters() if p.grad is not None}
+        model.zero_grad(set_to_none=True)
+        assert compile_decoder_blocks(model, CompileConfig(enable=True, backend="inductor", fullgraph=True)) == 4
+        loss = model(input_ids=inputs, labels=inputs, use_cache=False).loss
+        loss.backward()
+        assert torch.isfinite(loss)
+        torch.testing.assert_close(loss, eager_loss, rtol=1e-3, atol=1e-3)
+        gradients = {name: p.grad for name, p in model.named_parameters() if p.grad is not None}
+        assert gradients.keys() == used_parameters
+        for name, gradient in gradients.items():
+            assert torch.isfinite(gradient).all(), name
+        before = model.model.embed_tokens.weight.detach().clone()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        optimizer.step()
+        assert len(optimizer.state) == len(used_parameters)
+        assert not torch.equal(before, model.model.embed_tokens.weight)
+        for name, parameter in model.named_parameters():
+            assert torch.isfinite(parameter).all(), name
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="V4 fused MoE requires CUDA")
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_deepseek_v4_inductor_fixed_route_expert_vjp_matches_fp32_reference(seed):
+    """Held-out fixed-route VJP against promoted BF16 weights and FP32 math.
+
+    Budget: relative L2 <= two BF16 epsilons; peak error <= four epsilons
+    of the reference peak. This checks each tensor, not pointwise relative
+    errors on near-zero coordinates or whole-model training convergence.
+    """
+    from veomni.distributed.parallel_state import ParallelState
+
+    from ..models.test_deepseek_v4_fused_moe import _deepseek_v4_experts_reference
+
+    model = _build_deepseek_v4_fused_toy(seed)
+    experts = model.model.layers[3].mlp.experts
+    captured = {}
+
+    def capture(module, args, output):
+        captured["inputs"] = tuple(item.detach().clone() for item in args)
+        output.register_hook(lambda gradient: captured.update(cotangent=gradient.detach().clone()))
+
+    handle = experts.register_forward_hook(capture)
+    inputs = torch.arange(64, device=get_device_type()).roll(seed).view(1, 64)
+    with use_parallel_state(ParallelState()):
+        model(input_ids=inputs, labels=inputs, use_cache=False).loss.backward()
+    handle.remove()
+    hidden, indices, routing = captured["inputs"]
+    routing = routing.to(torch.bfloat16)
+    instance = copy.deepcopy(experts)
+    instance.zero_grad(set_to_none=True)
+    x = hidden.detach().clone().requires_grad_()
+    route = routing.detach().clone().requires_grad_()
+    with use_parallel_state(ParallelState()):
+        actual = torch.compile(instance, backend="inductor", fullgraph=True)(x, indices, route)
+        actual.backward(captured["cotangent"].clone())
+    reference = copy.deepcopy(experts).float()
+    reference.zero_grad(set_to_none=True)
+    reference_x = hidden.float().detach().clone().requires_grad_()
+    reference_route = routing.float().detach().clone().requires_grad_()
+    precision = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision("highest")
+        expected = _deepseek_v4_experts_reference(
+            num_experts=experts.num_experts,
+            routing_weights=reference_route,
+            selected_experts=indices,
+            hidden_states=reference_x,
+            gate_up_proj=reference.gate_up_proj,
+            down_proj=reference.down_proj,
+            swiglu_limit=experts.limit,
+        )
+        expected.backward(captured["cotangent"].float().clone())
+    finally:
+        torch.set_float32_matmul_precision(precision)
+    pairs = {
+        "output": (actual, expected),
+        "hidden_grad": (x.grad, reference_x.grad),
+        "route_grad": (route.grad, reference_route.grad),
+    }
+    for name, parameter in instance.named_parameters():
+        pairs[name] = parameter.grad, dict(reference.named_parameters())[name].grad
+    epsilon = torch.finfo(torch.bfloat16).eps
+    for name, (value, oracle) in pairs.items():
+        assert value is not None and oracle is not None, name
+        assert torch.isfinite(value).all() and torch.isfinite(oracle).all(), name
+        delta = value.double() - oracle.double()
+        assert delta.norm() <= 2 * epsilon * oracle.double().norm().clamp_min(1e-30), name
+        assert delta.abs().max() <= 4 * epsilon * oracle.double().abs().max().clamp_min(1e-30), name
+
+
 def test_mark_compile_step_begin_calls_torch_compiler_api(monkeypatch):
     calls = []
 
@@ -685,3 +833,90 @@ def test_enable_compile_accepts_text_data_argument_subclass():
     )
 
     assert args.train.pad_to_length == 16
+
+
+def _decoder_gradient_relative_l2(actual, reference):
+    """Whole-decoder relative L2 over the union of the trained parameters."""
+    assert actual.keys() == reference.keys(), actual.keys() ^ reference.keys()
+    error_squared = reference_squared = 0.0
+    for name, expected in reference.items():
+        value = actual[name]
+        assert value.shape == expected.shape, name
+        error_squared += (value.double() - expected.double()).square().sum().item()
+        reference_squared += expected.double().square().sum().item()
+    return (error_squared / reference_squared) ** 0.5
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="V4 fused MoE requires CUDA")
+@pytest.mark.parametrize("seed", [1, 2])
+def test_deepseek_v4_compiled_decoder_gradients_track_the_fp32_oracle(seed):
+    """Compiled BF16 must not be numerically further from FP32 than eager BF16.
+
+    Both modes start from one set of BF16-rounded weights, so a pairwise
+    eager/Inductor comparison cannot tell "different rounding" from "less
+    accurate". An eager FP32 forward/backward over the same BF16 values can: it
+    is the shared reference both modes are measured against.
+
+    The FP32 reference runs the eager MoE implementation, while both BF16 modes
+    run the Triton grouped GEMM, so a distance to it also contains that
+    implementation difference; the eager-versus-Inductor comparison, which shares
+    the fused path, is the one that isolates compilation. Budget: each mode
+    within 5% relative L2 of the reference (measured 1.70% eager, 1.48%
+    Inductor; mutual difference 2.08%). That both stay inside the budget is the
+    claim under test; the ordering between them is not asserted, because it is a
+    rounding coincidence rather than a contract. Costs about 65s of GPU wall time
+    for two seeds on an L20.
+    """
+    from veomni.distributed.parallel_state import ParallelState
+    from veomni.models import build_foundation_model
+    from veomni.utils.device import empty_cache
+
+    from ..tools.training_utils import make_eager_ops_config
+
+    def trainable_gradients(model):
+        model.zero_grad(set_to_none=True)
+        with use_parallel_state(ParallelState()):
+            model(input_ids=inputs, labels=inputs, use_cache=False).loss.backward()
+        return {
+            name: parameter.grad.detach().float()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+
+    fused = _build_deepseek_v4_fused_toy(seed)
+    # ``tid2eid`` is a persistent buffer, so its filled-in tables travel with the
+    # state dict; no separate re-fill is needed.
+    state = {name: tensor.detach().clone() for name, tensor in fused.state_dict().items()}
+    del fused
+    empty_cache()
+    inputs = torch.arange(64, device=get_device_type()).view(1, 64)
+
+    precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        oracle = build_foundation_model(
+            config_path="tests/toy_config/deepseek_v4_toy",
+            weights_path=None,
+            torch_dtype="float32",
+            init_device=get_device_type(),
+            ops_implementation=make_eager_ops_config(),
+        ).train()
+        oracle.load_state_dict(state)
+        oracle_gradients = trainable_gradients(oracle)
+    finally:
+        torch.set_float32_matmul_precision(precision)
+    del oracle
+    empty_cache()
+
+    distances = {}
+    for backend in ("eager", "inductor"):
+        model = _build_deepseek_v4_fused_toy(seed)
+        model.load_state_dict(state)
+        if backend == "inductor":
+            assert compile_decoder_blocks(model, CompileConfig(enable=True, backend=backend, fullgraph=True)) == 4
+        distances[backend] = _decoder_gradient_relative_l2(trainable_gradients(model), oracle_gradients)
+        del model
+        empty_cache()
+
+    assert distances["eager"] < 0.05, distances
+    assert distances["inductor"] < 0.05, distances

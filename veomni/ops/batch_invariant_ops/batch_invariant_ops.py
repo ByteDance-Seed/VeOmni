@@ -100,7 +100,8 @@ def matmul_kernel_persistent(
 
             a = tl.load(a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0)
             b = tl.load(b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0)
-            accumulator = tl.dot(a, b, accumulator)
+            # FP32 projections must not silently truncate their operands to TF32.
+            accumulator = tl.dot(a, b, accumulator, input_precision="ieee")
 
         tile_id_c += NUM_SMS
         pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
