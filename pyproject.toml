@@ -383,6 +383,7 @@ select = ["B", "C", "E", "F", "I", "W"]
 "veomni/models/transformers/**/generated/*.py" = ["E402", "B007"]
 "veomni/models/transformers/**/*_patch_gen_config.py" = ["F821"]
 "veomni/ops/kernels/gated_delta_rule/_ascend/**" = ["I001", "W291", "W292", "W293", "F401", "F811", "F841", "B028"]
+"tests/models/test_qwen_image_precision.py" = ["F401", "F811"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2

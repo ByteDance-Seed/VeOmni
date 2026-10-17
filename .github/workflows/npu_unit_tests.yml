@@ -12,6 +12,10 @@ on:
     paths:
       - "**/*.py"
       - "!scripts/**/*.py"
+      - "configs/dit/qwen_image_edit_2511.yaml"
+      - "configs/dit/qwen_image_sft.yaml"
+      - "configs/dit/wan2.2_I2V_5B.yaml"
+      - "configs/dit/wan2.2_I2V_14B.yaml"
       - .github/workflows/npu_unit_tests.yml
       - "pyproject.toml"
       - "uv.lock"
@@ -21,6 +25,10 @@ on:
     paths:
       - "**/*.py"
       - "!scripts/**/*.py"
+      - "configs/dit/qwen_image_edit_2511.yaml"
+      - "configs/dit/qwen_image_sft.yaml"
+      - "configs/dit/wan2.2_I2V_5B.yaml"
+      - "configs/dit/wan2.2_I2V_14B.yaml"
       - .github/workflows/npu_unit_tests.yml
       - "pyproject.toml"
       - "uv.lock"
@@ -183,6 +191,8 @@ jobs:
           uv run --frozen pytest -v -s -x tests/models/test_runtime_chat_template.py
           uv run --frozen pytest -v -s -x tests/models/test_generated_modeling_imports.py
           uv run --frozen pytest -v -s -x tests/models/test_transformers_upgrade_compat.py
+          uv run --frozen pytest -v -s -x tests/models/test_qwen_image_training.py tests/models/test_qwen_image_precision.py
+          uv run --frozen pytest -v -s -x tests/models/test_wan_i2v_training.py
           uv run --frozen pytest -v -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -v -s -x tests/models/test_qwen3_5_moe_mtp.py
           uv run --frozen pytest -v -s -x tests/models/test_padded_packed_loss.py
