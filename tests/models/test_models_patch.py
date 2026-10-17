@@ -444,6 +444,13 @@ TEST_CASES = [
         _DEFAULT_ATOL,
         id="deepseek_v4",
     ),
+    pytest.param(
+        "./tests/toy_config/minimax_m3_vl_toy/config.json",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="minimax_m3_vl",
+    ),
 ]
 
 
@@ -492,6 +499,15 @@ def test_models_patch_fwd_bwd(
             ModelMode("veomni", "eager"),
             ModelMode("veomni", "eager", moe_implementation=moe_impl),
         ]
+
+    # Upstream MiniMax M3 VL supports neither Flash Attention
+    # (``_supports_flash_attn = False``) nor packed sequences, so the HF
+    # reference runs eager attention. VeOmni's language attention always goes
+    # through the packed MiniMax sparse attention operators regardless of
+    # ``attn_implementation`` (which only selects the ViT backend), so the
+    # default VeOmni mode grid still applies.
+    if case_id == "minimax_m3_vl":
+        hf_model_modes = [ModelMode("hf", "eager")]
 
     # Qwen3.5 compatibility:
     # - HF backend doesn't support the test's position_ids test cases.
@@ -555,8 +571,10 @@ def test_models_patch_fwd_bwd(
     # Comparing it with VeOmni's boundary-aware packed path on two concatenated
     # samples would therefore compare different attention semantics. Keep this
     # HF↔VeOmni patch-alignment case to one sequence; multi-sample packed V4 is
-    # covered by ``test_deepseek_v4_tilelang_dyn_bsz_smoke``.
-    num_samples = 1 if case_id == "deepseek_v4" else 2
+    # covered by ``test_deepseek_v4_tilelang_dyn_bsz_smoke``. Upstream MiniMax
+    # M3 VL likewise ignores packed boundaries; VeOmni's per-sample isolation is
+    # covered by ``test_minimax_m3_vl_packed_attention_matches_separate_samples``.
+    num_samples = 1 if case_id in ("deepseek_v4", "minimax_m3_vl") else 2
     dummy_data_loader = prepare_data(case_id, max_seq_len=1024, model_config=model_config, num_samples=num_samples)
 
     res = {}

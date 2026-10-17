@@ -1,7 +1,9 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from veomni.models.loader import get_model_class, get_model_config, get_model_processor
+from veomni.models.loader import MODEL_PROCESSOR_REGISTRY, get_model_class, get_model_config, get_model_processor
 from veomni.utils.helper import get_cache_dir
 
 
@@ -22,6 +24,67 @@ local_test_cases = [
     pytest.param("./tests/toy_config/movqgan_toy", False, True, [], ["config", "model", "processor"]),
     pytest.param("./tests/toy_config/gpt_oss_toy", True, False, ["config", "model"], ["model"]),
 ]
+
+
+# Public MiniMax M3 checkpoints ship their own processing_minimax.py, so which
+# class name AutoProcessor resolves depends on the checkpoint's auto_map. Both
+# must route to VeOmni's processor.
+@pytest.mark.parametrize("processor_class_name", ["MiniMaxM3VLProcessor", "MiniMaxVLProcessor"])
+def test_minimax_m3_vl_processor_registry_resolves_to_veomni_class(processor_class_name):
+    from veomni.models.transformers.minimax_m3_vl.processing_minimax_m3_vl import MiniMaxM3VLProcessor
+
+    assert MODEL_PROCESSOR_REGISTRY[processor_class_name]() is MiniMaxM3VLProcessor
+
+
+def test_minimax_m3_vl_processor_builds_from_native_subprocessors(monkeypatch):
+    # The checkpoint's bundled processor is unusable, so from_pretrained must
+    # build the native tokenizer / image / video processors by concrete class
+    # with trust_remote_code=False, and take the chat template from the tokenizer.
+    import transformers
+
+    from veomni.models.transformers.minimax_m3_vl import processing_minimax_m3_vl as mod
+
+    calls = {}
+
+    def _record(name, result):
+        def _factory(path, **kwargs):
+            calls[name] = kwargs
+            return result
+
+        return _factory
+
+    fake_tokenizer = SimpleNamespace(chat_template="{{ tokenizer_template }}")
+    monkeypatch.setattr(mod.AutoTokenizer, "from_pretrained", staticmethod(_record("tokenizer", fake_tokenizer)))
+    monkeypatch.setattr(
+        transformers.MiniMaxM3VLImageProcessor, "from_pretrained", staticmethod(_record("image", "<image>"))
+    )
+    monkeypatch.setattr(
+        transformers.MiniMaxM3VLVideoProcessor, "from_pretrained", staticmethod(_record("video", "<video>"))
+    )
+    constructed = {}
+    monkeypatch.setattr(mod.MiniMaxM3VLProcessor, "__init__", lambda self, **kwargs: constructed.update(kwargs))
+
+    mod.MiniMaxM3VLProcessor.from_pretrained("some/path", trust_remote_code=True, max_pixels=123)
+
+    assert all(kwargs.get("trust_remote_code") is False for kwargs in calls.values())
+    assert calls["image"].get("max_pixels") == 123
+    assert constructed == {
+        "image_processor": "<image>",
+        "tokenizer": fake_tokenizer,
+        "video_processor": "<video>",
+        "chat_template": "{{ tokenizer_template }}",
+    }
+
+
+def test_minimax_m3_vl_processor_refuses_other_minimax_checkpoints(tmp_path):
+    # ``MiniMaxVLProcessor`` is a generic remote class name; only substitute for M3 checkpoints.
+    import json
+
+    from veomni.models.transformers.minimax_m3_vl.processing_minimax_m3_vl import MiniMaxM3VLProcessor
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "minimax_vl_other"}))
+    with pytest.raises(ValueError, match="only supports model_type 'minimax_m3_vl'"):
+        MiniMaxM3VLProcessor.from_pretrained(str(tmp_path))
 
 
 @pytest.mark.parametrize(

@@ -17,6 +17,7 @@ selection knob.
 | Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_2_hub`, `flash_attention_3_hub`, `flash_attention_4`, `flex_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
+| MiniMax sparse attention | — (no config field until a kernel backend exists) | `eager` | `"eager"` | Model build via two `OpSlot`s (`indexer`, `attention`) of op `minimax_sparse_attention`; a backend adds `minimax_sparse_attention_implementation`. The eager attention dispatches to `torch_npu.npu_fusion_attention` on NPU tensors |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+) | `"eager"` | Model build via three `OpSlot`s (`pre`, `post`, `head`) |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | `"liger_kernel"` (GPU) | `apply_ops_config()` (before model build) |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
@@ -28,7 +29,7 @@ selection knob.
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` | `"eager"` | Qwen4-Exp `OpsConfigSlot` dispatch in generated modeling |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | `apply_ops_config()` (before model build) |
-| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused_triton"` (GPU) | `build_foundation_model` |
+| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused_triton"` (GPU) | `build_foundation_model`; model variants include `standard`, `gpt_oss`, and MiniMax `swiglu_oai` |
 | QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Read by the patched modeling helpers (`veomni/ops/qat/`) |
 
 The last row is the one field that is not a kernel backend: `qat_implementation`

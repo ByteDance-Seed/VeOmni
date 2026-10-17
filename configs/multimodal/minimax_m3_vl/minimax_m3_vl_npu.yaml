@@ -1,0 +1,47 @@
+model:
+  model_path: MiniMaxAI/MiniMax-M3
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_npu
+    rms_norm_implementation: npu
+    cross_entropy_loss_implementation: eager
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
+  accelerator:
+    gradient_checkpointing:
+      enable_reentrant: false
+    init_device: meta
+    ulysses_size: 2
+    ep_size: 2
+    fsdp_config:
+      fsdp_mode: fsdp2
+  chat_template: minimax_m3_vl
+
+data:
+  train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
+  data_type: conversation
+  max_seq_len: 4096
+  train_size: 80000000
+  mm_configs:
+    image_max_pixels: 602112
+    video_max_pixels: 602112
+    video_total_pixels: 2889523
+    max_frames: 4
+    fps: 2.0
+    use_audio_in_video: false
+
+train:
+  wandb:
+    enable: false
+    project: VeOmni
+    name: MiniMax-M3-vl-sft
+  freeze_vit: false
+  num_train_epochs: 1
+  micro_batch_size: 1
+  global_batch_size: 4
+  max_steps: 500
+  checkpoint:
+    output_dir: MiniMax-M3-vl-sft
+    manager: dcp
+    save_hf_weights: false

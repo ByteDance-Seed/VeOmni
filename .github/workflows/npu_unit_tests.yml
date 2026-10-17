@@ -185,6 +185,7 @@ jobs:
           uv run --frozen pytest -v -s -x tests/models/test_transformers_upgrade_compat.py
           uv run --frozen pytest -v -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -v -s -x tests/models/test_qwen3_5_moe_mtp.py
+          uv run --frozen pytest -v -s -x tests/models/test_minimax_m3_vl_ops.py
           uv run --frozen pytest -v -s -x tests/models/test_padded_packed_loss.py
           uv run --frozen pytest -v -s -x tests/models/test_vlm_trainer.py
           uv run --frozen pytest -v -s -x tests/trainer/test_aux_metrics.py
@@ -231,11 +232,13 @@ jobs:
         run: |
           uv run --frozen pytest -v -s -x tests/ops/test_comp.py
           uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
+          uv run --frozen pytest -v -s -x tests/ops/test_minimax_sparse_attention.py
           uv run --frozen pytest -v -s -x tests/ops/test_npu_kernels.py
           # This numerical gate must execute on NPU; fail instead of silently skipping
           # when the vendor extension is missing from the CI image.
           uv run --frozen python -c "import cann_ops_transformer"
           uv run --frozen pytest -v -s -x tests/ops/test_mhc_tile_kernels.py::test_npu_mhc_pre_forward_backward_matches_eager
+          uv run --frozen pytest -v -s -x tests/ops/test_swiglu_oai_fused_moe_npu.py
       - name: Run utils tests
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py

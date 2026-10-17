@@ -24,6 +24,46 @@ from ....distributed.sequence_parallel import (
 )
 
 
+def _gather_seq_scatter_heads_bshd(tensor: torch.Tensor, *, group: ProcessGroup) -> torch.Tensor:
+    """Gather sequence and scatter heads for one tensor in ``[B, S, H, D]`` layout."""
+    if tensor.ndim == 4 and tensor.size(0) == 1:
+        tensor = gather_seq_scatter_heads(tensor.squeeze(0), seq_dim=0, head_dim=1, group=group)
+        return tensor.unsqueeze(0)
+
+    return gather_seq_scatter_heads(tensor, seq_dim=1, head_dim=2, group=group)
+
+
+def _repeat_kv_heads_for_ulysses(tensor: torch.Tensor, ulysses_size: int) -> torch.Tensor:
+    """Repeat KV heads in ``[B, S, H, D]`` layout until every Ulysses rank owns at least one."""
+    head_count = tensor.shape[2]
+    if ulysses_size > head_count:
+        assert ulysses_size % head_count == 0, (
+            f"ulysses_size ({ulysses_size}) must be divisible by num_key_value_heads ({head_count})"
+        )
+        return torch.repeat_interleave(tensor, dim=2, repeats=ulysses_size // head_count)
+
+    assert head_count % ulysses_size == 0, (
+        f"num_key_value_heads ({head_count}) must be divisible by ulysses_size ({ulysses_size})"
+    )
+    return tensor
+
+
+def gather_seq_scatter_kv_heads(
+    tensor: torch.Tensor,
+    *,
+    group: ProcessGroup,
+    ulysses_size: int,
+) -> torch.Tensor:
+    """Exchange a KV-head tensor in ``[B, S, H, D]`` layout exactly as ``prepare_ulysses_qkv`` exchanges K/V.
+
+    When ``ulysses_size`` exceeds the head count, heads are repeated first, so
+    each rank receives the KV group that serves its contiguous query-head
+    slice. Any tensor with one head per KV group (e.g. sparse-attention index
+    queries) must use this helper to stay aligned with the exchanged K/V.
+    """
+    return _gather_seq_scatter_heads_bshd(_repeat_kv_heads_for_ulysses(tensor, ulysses_size), group=group)
+
+
 def prepare_ulysses_qkv(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -34,34 +74,15 @@ def prepare_ulysses_qkv(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Gather sequence and scatter heads for Q/K/V in ``[B, S, H, D]`` layout."""
     query_head_count = query.shape[2]
-    key_value_head_count = key.shape[2]
-
     assert query_head_count % ulysses_size == 0, (
         f"num_query_heads ({query_head_count}) must be divisible by ulysses_size ({ulysses_size})"
     )
-    if ulysses_size > key_value_head_count:
-        assert ulysses_size % key_value_head_count == 0, (
-            f"ulysses_size ({ulysses_size}) must be divisible by num_key_value_heads ({key_value_head_count})"
-        )
-        repeat_count = ulysses_size // key_value_head_count
-        key = torch.repeat_interleave(key, dim=2, repeats=repeat_count)
-        value = torch.repeat_interleave(value, dim=2, repeats=repeat_count)
-    else:
-        assert key_value_head_count % ulysses_size == 0, (
-            f"num_key_value_heads ({key_value_head_count}) must be divisible by ulysses_size ({ulysses_size})"
-        )
+    key = _repeat_kv_heads_for_ulysses(key, ulysses_size)
+    value = _repeat_kv_heads_for_ulysses(value, ulysses_size)
 
-    if query.ndim == 4 and query.size(0) == 1:
-        query, key, value = query.squeeze(0), key.squeeze(0), value.squeeze(0)
-        query = gather_seq_scatter_heads(query, seq_dim=0, head_dim=1, group=group)
-        key = gather_seq_scatter_heads(key, seq_dim=0, head_dim=1, group=group)
-        value = gather_seq_scatter_heads(value, seq_dim=0, head_dim=1, group=group)
-        query, key, value = query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0)
-    else:
-        query = gather_seq_scatter_heads(query, seq_dim=1, head_dim=2, group=group)
-        key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2, group=group)
-        value = gather_seq_scatter_heads(value, seq_dim=1, head_dim=2, group=group)
-
+    query = _gather_seq_scatter_heads_bshd(query, group=group)
+    key = _gather_seq_scatter_heads_bshd(key, group=group)
+    value = _gather_seq_scatter_heads_bshd(value, group=group)
     return query, key, value, query_head_count
 
 

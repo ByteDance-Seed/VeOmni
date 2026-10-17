@@ -20,6 +20,7 @@ veomni/ops/
 │   ├── deepseek_v4/        TileLang sparse attention/indexer + precision helpers
 │   ├── load_balancing_loss/  eager + triton fused kernel
 │   ├── mhc/                TileKernels mHC pre/post/head adapters
+│   ├── minimax_sparse_attention/  MiniMax M3 TND block-sparse indexer/attention (eager)
 │   ├── rms_norm/           Liger / NPU / triton batch-invariant
 │   ├── rotary/             Liger / NPU / deterministic / Wan Triton
 │   ├── swiglu/             Liger SwiGLU MLP
@@ -53,6 +54,7 @@ depending on when and where the kernel is bound:
 | RMSNorm | `rms_norm_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
 | Rotary pos emb | `rotary_pos_emb_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
 | SwiGLU MLP | `swiglu_mlp_implementation` | PER_MODEL | `eager` | `liger_kernel` |
+| MiniMax sparse attention | `minimax_sparse_attention_implementation` (added with the first kernel backend) | build-time `OpSlot` | `eager` | `eager` (TND reference, `indexer` + `attention` variants; on NPU tensors the attention runs through `torch_npu.npu_fusion_attention`) |
 | mHC | `mhc_implementation` | build-time `OpSlot` | `eager` | `tilelang` (DeepSeek V4, SM90+; provided by `tile-kernels`) |
 | Fused MoE | `moe_implementation` | build-time | `eager` | `eager`, `fused_triton` (group-gemm, SM70+), `fused_quack` (CUTLASS/CuTe, SM90+), `fused_npu` (Ascend). Mismatches raise instead of falling back. |
 
