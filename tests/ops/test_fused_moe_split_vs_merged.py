@@ -28,14 +28,7 @@ def _eager_moe_forward(
     fc2_weight: torch.Tensor,
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
-    """Reference eager MoE implementation matching fused-kernel operator ordering.
-
-    The fused kernels multiply routing weights *before* the fc2 projection. That
-    is mathematically equivalent to applying the weights after fc2 because fc2 is
-    linear, but it is not numerically identical in bf16, especially around
-    ``swiglu_limit`` clamp boundaries. Keep this helper aligned with the fused
-    implementation so parity tests compare like-for-like.
-    """
+    """Reference eager MoE: weight each expert's down-projection output."""
     output = torch.zeros_like(hidden_states)
     expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
     expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
@@ -50,8 +43,8 @@ def _eager_moe_forward(
             gate = gate.clamp(max=swiglu_limit)
             up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
         y = F.silu(gate) * up
-        y = y * routing_weights[token_idx, top_k_pos, None]
         y = F.linear(y, fc2_weight[idx])
+        y = y * routing_weights[token_idx, top_k_pos, None]
         output.index_add_(0, token_idx, y.to(output.dtype))
 
     return output
@@ -778,3 +771,46 @@ def test_ep_merged_vs_non_ep(
     fc1_atol = 4e-3 if is_sm90_or_above() else 3.2e-2
     fc1_eager_grad = torch.cat([fc1_1_eager.grad, fc1_2_eager.grad], dim=1)
     torch.testing.assert_close(fc1_eager_grad, fc1_merged_ep.grad, rtol=0, atol=fc1_atol)
+
+
+@pytest.mark.parametrize("merged", [False, True])
+@pytest.mark.parametrize("swiglu_limit", [None, 1.0])
+@pytest.mark.parametrize("seed", [17, 29, 43])
+def test_fused_moe_routing_weights_match_ep_projection_order(merged, swiglu_limit, seed):
+    """A single-expert route must have the same BF16 output/VJP with or without EP."""
+    _skip_if_unsupported()
+    device = get_device_type()
+    generator = torch.Generator(device=device).manual_seed(seed)
+
+    def randn(*shape):
+        return torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
+
+    hidden = randn(37, 64)
+    route = torch.linspace(0, 1, 37, dtype=torch.bfloat16, device=device).unsqueeze(1)
+    selected = torch.zeros((37, 1), dtype=torch.long, device=device)
+    gate, up, down = randn(1, 96, 64) * 0.2, randn(1, 96, 64) * 0.2, randn(1, 64, 96) * 0.2
+    weights = [torch.cat((gate, up), dim=1), down] if merged else [gate, up, down]
+    cotangent = randn(37, 64)
+    results = []
+    for ep in (False, True):
+        x, r, *w = [v.detach().clone().requires_grad_() for v in (hidden, route, *weights)]
+        if ep:
+            expert = EPMergedFc1GroupGemm if merged else EPGroupGemm
+            cumsum = torch.tensor([x.shape[0]], dtype=torch.long, device=device)
+            output = expert.apply(x, cumsum, *w, swiglu_limit) * r
+        else:
+            output = group_gemm_fused_moe_forward(
+                num_experts=1,
+                routing_weights=r,
+                selected_experts=selected,
+                hidden_states=x,
+                fc1_1_weight=None if merged else w[0],
+                fc1_2_weight=None if merged else w[1],
+                fc1_1_2_weight=w[0] if merged else None,
+                fc2_weight=w[-1],
+                swiglu_limit=swiglu_limit,
+            )
+        grads = torch.autograd.grad(output, (x, r, *w), cotangent)
+        results.append((output, *grads))
+    for actual, expected in zip(*results):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

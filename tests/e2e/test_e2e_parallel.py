@@ -503,6 +503,32 @@ def test_text_parallel_smoke(
     )
 
 
+def test_deepseek_v4_expert_parallel_alignment(dummy_deepseek_v4_dense_packed_text_dataset):
+    """Compare two optimizer steps with EP=1/2 on the same four-rank FSDP2 job.
+
+    Keep SP disabled so this explicitly validates expert sharding and token
+    dispatch rather than conflating it with the existing SP-only smoke test.
+    Eager DSA/mHC work on the SM89 CI fleet; routed MoE stays fused.
+    """
+    main(
+        task_name="train_text_test",
+        model_name="deepseek_v4",
+        config_path="./tests/toy_config/deepseek_v4_toy",
+        is_moe=True,
+        rtol=_DEFAULT_RTOL,
+        atol=_DEFAULT_ATOL,
+        train_path=dummy_deepseek_v4_dense_packed_text_dataset,
+        max_sp_size=1,
+        max_ep_size=2,
+        compare_alignment=True,
+        extra_args=[
+            "--model.ops_implementation.dsa_indexer_implementation=eager",
+            "--model.ops_implementation.dsa_attention_implementation=eager",
+            "--model.ops_implementation.mhc_implementation=eager",
+        ],
+    )
+
+
 @_deepseek_v4_tilelang_skip
 @pytest.mark.parametrize("dataset_fixture, case_args", deepseek_v4_tilelang_dyn_bsz_test_cases)
 def test_deepseek_v4_tilelang_dyn_bsz_smoke(
