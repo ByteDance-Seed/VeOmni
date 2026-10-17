@@ -53,7 +53,7 @@ KERNEL_REGISTRY.register(
         op_name="rms_norm",
         variant="standard",
         factory=_liger_rms_norm_factory,
-        hardware=HardwareRequirement(device_type="gpu"),
+        hardware=HardwareRequirement(device_type=["gpu", "mlu"]),
         description="LigerKernel fused RMSNorm",
     )
 )
@@ -64,7 +64,7 @@ KERNEL_REGISTRY.register(
         op_name="rms_norm",
         variant="unweighted",
         factory=_liger_rms_norm_factory,
-        hardware=HardwareRequirement(device_type="gpu"),
+        hardware=HardwareRequirement(device_type=["gpu", "mlu"]),
         description="LigerKernel fused unweighted RMSNorm",
     )
 )
@@ -102,7 +102,7 @@ KERNEL_REGISTRY.register(
         op_name="rms_norm",
         variant="qwen3_5",
         factory=_liger_rms_norm_qwen3_5_factory,
-        hardware=HardwareRequirement(device_type="gpu"),
+        hardware=HardwareRequirement(device_type=["gpu", "mlu"]),
         description="LigerKernel fused RMSNorm for Qwen3.5 (1+weight, zeros init, gemma casting)",
     )
 )
@@ -118,7 +118,7 @@ KERNEL_REGISTRY.register(
         factory=lambda: (
             __import__("liger_kernel.transformers.rope", fromlist=["liger_rotary_pos_emb"]).liger_rotary_pos_emb
         ),
-        hardware=HardwareRequirement(device_type="gpu"),
+        hardware=HardwareRequirement(device_type=["gpu", "mlu"]),
         description="LigerKernel fused RoPE (full head_dim only)",
     )
 )
@@ -147,7 +147,7 @@ KERNEL_REGISTRY.register(
         op_name="swiglu_mlp",
         variant="standard",
         factory=_liger_swiglu_factory,
-        hardware=HardwareRequirement(device_type="gpu"),
+        hardware=HardwareRequirement(device_type=["gpu", "mlu"]),
         description="LigerKernel fused SwiGLU MLP",
     )
 )

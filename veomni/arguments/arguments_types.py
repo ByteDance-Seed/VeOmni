@@ -1314,15 +1314,19 @@ _NPU_DEFAULT_FALLBACK: Dict[str, str] = {
 
 # MLU compatibility tables for ``_validate_implementations``.
 _MLU_ALLOWED: Dict[str, frozenset] = {
+    "rms_norm_implementation": frozenset({"liger_kernel"}),
+    "rotary_pos_emb_implementation": frozenset({"liger_kernel"}),
+    "swiglu_mlp_implementation": frozenset({"liger_kernel"}),
+    "cross_entropy_loss_implementation": frozenset({"liger_kernel", "chunk_loss"}),
     "moe_implementation": frozenset({"fused_mlu", "fused_mlu_triton"}),
 }
 
 _MLU_DEFAULT_FALLBACK: Dict[str, str | frozenset] = {
-    "rms_norm_implementation": "eager",
-    "rotary_pos_emb_implementation": "eager",
-    "swiglu_mlp_implementation": "eager",
+    "rms_norm_implementation": frozenset({"eager", "liger_kernel"}),
+    "rotary_pos_emb_implementation": frozenset({"eager", "liger_kernel"}),
+    "swiglu_mlp_implementation": frozenset({"eager", "liger_kernel"}),
     "load_balancing_loss_implementation": "eager",
-    "cross_entropy_loss_implementation": "eager",
+    "cross_entropy_loss_implementation": frozenset({"eager", "liger_kernel"}),
     "moe_implementation": frozenset({"fused_mlu", "fused_mlu_triton"}),
 }
 
@@ -1620,7 +1624,7 @@ class OpsImplementationConfig:
         user overrides (non-default values) are left untouched and will be
         caught by ``_validate_implementations`` if unsupported.
         """
-        from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available
+        from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available, is_liger_kernel_mlu_available
 
         if not is_torch_mlu_available():
             return
@@ -1634,6 +1638,8 @@ class OpsImplementationConfig:
             if current == gpu_defaults[field_name]:
                 if field_name == "moe_implementation":
                     mlu_value = "fused_mlu" if is_apex_mlu_available() else "fused_mlu_triton"
+                if field_name in ["rms_norm_implementation", "rotary_pos_emb_implementation", "swiglu_mlp_implementation", "cross_entropy_loss_implementation"]:
+                    mlu_value = "liger_kernel" if is_liger_kernel_mlu_available() else "eager"
                 setattr(self, field_name, mlu_value)
                 logger.info_rank0(
                     f"{field_name}: auto-resolved GPU default {current!r} -> {mlu_value!r} on Cambricon MLU."
