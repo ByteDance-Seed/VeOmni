@@ -554,8 +554,6 @@ class DiTTrainer:
         return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        self.base.state.global_step += 1
-
         # SP broadcast of micro_batches
         with use_parallel_state(self.base.model.parallel_state):
             if get_parallel_state().sp_enabled:
@@ -573,6 +571,8 @@ class DiTTrainer:
                 micro_batches = obj_list[0]
             else:
                 micro_batches = next(data_iterator)
+
+        self.base.state.global_step += 1
 
         self.base._reset_async_activation_offload_if_enabled(self.base.model)
         self.on_step_begin(micro_batches=micro_batches)
