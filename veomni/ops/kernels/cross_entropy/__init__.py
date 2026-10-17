@@ -77,13 +77,18 @@ from ....distributed.sequence_parallel import reduce_sequence_parallel_loss
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available, is_torch_npu_available
 from ....utils.model_outputs import FusedLinearAuxOutput
+from ...config.singleton import get_ops_config
 from .chunk_logprobs import chunk_logprobs_function  # noqa: F401 re-export
-from .chunk_loss import chunk_loss_function  # noqa: F401 re-export for legacy callers
+from .chunk_loss import (  # noqa: F401 re-export for legacy callers
+    _release_accelerator_cache,
+    chunk_loss_function,
+)
 from .chunk_topk_distill import chunk_topk_distill_function  # noqa: F401 re-export
 from .eager import eager_cross_entropy
 
 
 logger = logging.get_logger(__name__)
+_CHUNK_SIZE_UNSET = object()
 
 
 def ForCausalLMLoss(
@@ -357,7 +362,7 @@ def _resolve_cross_entropy_fn(impl: str) -> Callable:
 
 
 def _chunk_loss_dispatch(
-    *args, **kwargs
+    *args, release_cache: bool | None = None, **kwargs
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, FusedLinearAuxOutput | None]:
     """3-tuple shim for the ``chunk_loss`` LOSS_MAPPING entry.
 
@@ -381,6 +386,15 @@ def _chunk_loss_dispatch(
       teacher-topk kwargs defensively so a caller that always forwards
       them doesn't trip ``chunk_loss_function``'s signature.
 
+    ``release_cache`` is resolved lazily from
+    ``OpsImplementationConfig.cross_entropy_loss_release_cache`` when left
+    as ``None``, so both the ``LOSS_MAPPING`` and OpSlot entry points observe
+    a later ``set_ops_config``. On the plain CE path the flag is forwarded
+    into ``chunk_loss_function`` (cleanup after outer saved-tensor packs).
+    On the log-probs / top-k distill paths the same cleanup runs here after
+    the chunked kernel returns, reclaiming transient vocab-sized working set
+    before the caller continues.
+
     Args/kwargs are forwarded as-is — model `forward` only ever calls this
     via keyword (``self.loss_function(logits=..., labels=..., hidden_states=...,
     weights=..., **kwargs)``), so a single ``**kwargs`` parameter is enough.
@@ -390,7 +404,11 @@ def _chunk_loss_dispatch(
     teacher_topk_ids = kwargs.pop("teacher_topk_ids", None)
     teacher_topk_log_probs = kwargs.pop("teacher_topk_log_probs", None)
     log_prob_min_clamp = kwargs.pop("log_prob_min_clamp", None)
-    chunk_size = kwargs.pop("chunk_size", 1024)
+    chunk_size = kwargs.pop("chunk_size", _CHUNK_SIZE_UNSET)
+    resolved_chunk_size = 1024 if chunk_size is _CHUNK_SIZE_UNSET else chunk_size
+    if release_cache is None:
+        ops_config = get_ops_config()
+        release_cache = bool(getattr(ops_config, "cross_entropy_loss_release_cache", False))
 
     if return_log_probs:
         hidden_states = kwargs.get("hidden_states")
@@ -410,12 +428,14 @@ def _chunk_loss_dispatch(
                 labels,
                 teacher_topk_ids,
                 teacher_topk_log_probs,
-                chunk_size=chunk_size,
+                chunk_size=resolved_chunk_size,
                 ignore_index=kwargs.get("ignore_index", -100),
                 shift_labels=kwargs.get("shift_labels"),
                 temperature=temperature,
                 log_prob_min_clamp=log_prob_min_clamp,
             )
+            if release_cache:
+                _release_accelerator_cache(hidden_states.device)
             return (
                 None,
                 None,
@@ -431,14 +451,18 @@ def _chunk_loss_dispatch(
             hidden_states,
             weights,
             labels,
-            chunk_size=chunk_size,
+            chunk_size=resolved_chunk_size,
             ignore_index=kwargs.get("ignore_index", -100),
             shift_labels=kwargs.get("shift_labels"),
             temperature=temperature,
         )
+        if release_cache:
+            _release_accelerator_cache(hidden_states.device)
         return None, None, FusedLinearAuxOutput(log_probs=log_probs, entropy=entropy)
 
-    loss, logits_out = chunk_loss_function(*args, **kwargs)
+    if chunk_size is not _CHUNK_SIZE_UNSET:
+        kwargs["chunk_size"] = chunk_size
+    loss, logits_out = chunk_loss_function(*args, release_cache=release_cache, **kwargs)
     return loss, logits_out, None
 
 
@@ -575,6 +599,11 @@ def _chunk_loss_causal_factory():
     wrapper contract requires, and to route ``return_log_probs=True``
     through ``chunk_logprobs_function``. This matches how
     ``install_loss_mapping("chunk_loss")`` populates ``LOSS_MAPPING``.
+
+    Return the bare dispatch callable (not a ``partial``) so
+    ``release_cache`` is resolved lazily from the ops config on every call,
+    matching the ``LOSS_MAPPING`` install path, and so ops startup logs keep
+    a readable kernel name instead of a ``functools.partial`` repr.
     """
     return _chunk_loss_dispatch
 
