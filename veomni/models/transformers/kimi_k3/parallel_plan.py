@@ -1,0 +1,37 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from torch.distributed._tensor import Shard
+
+from ....distributed.parallel_plan import ParallelPlan
+
+
+def get_parallel_plan(text_module_prefix="language_model.model"):
+    """Expert-parallel plan for Kimi-K3 fused expert weights.
+
+    The routed experts live at ``{prefix}.layers.*.block_sparse_moe.experts``
+    where ``prefix`` depends on the top-level wrapper:
+
+    * ``KimiK3ForConditionalGeneration`` -> ``language_model.model``
+    * ``KimiLinearForCausalLM``          -> ``model``
+    """
+    ep_plan = {
+        f"{text_module_prefix}.layers.*.block_sparse_moe.experts.gate_up_proj": Shard(0),
+        f"{text_module_prefix}.layers.*.block_sparse_moe.experts.down_proj": Shard(0),
+    }
+    parallel_plan = ParallelPlan(
+        extra_parallel_plan={
+            "ep": ep_plan,
+        }
+    )
+    return parallel_plan
