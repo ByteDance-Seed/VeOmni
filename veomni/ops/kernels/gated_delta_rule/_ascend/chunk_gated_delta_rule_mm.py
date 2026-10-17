@@ -332,6 +332,8 @@ def chunk_gated_delta_rule(
             "Please verify your input tensor format matches the expected shape [B, T, H, ...]."
         )
     if cu_seqlens is not None:
+        if cu_seqlens.device != q.device:
+            cu_seqlens = cu_seqlens.to(device=q.device, non_blocking=True)
         if q.shape[0] != 1:
             raise ValueError(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."

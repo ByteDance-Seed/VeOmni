@@ -32,7 +32,7 @@ if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backen
 
 from torch.testing._internal.common_utils import run_tests
 
-from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, get_parallel_state
+from veomni.distributed.parallel_state import get_parallel_state, use_parallel_state
 from veomni.models.transformers.wan.modeling_wan import SelfAttention, precompute_freqs_cis
 
 from .utils import SequenceParallelTest
@@ -46,63 +46,54 @@ class WanSelfAttentionUlyssesTest(SequenceParallelTest):
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_sync_path_matches_non_sp_reference(self):
         group = self._get_process_group()
-        try:
-            _init_parallel_state(
-                dp_size=1,
-                ulysses_size=self.world_size,
-                device_type=get_device_type(),
-                name=None,
-            )
-            device = get_device_type()
-            dtype = torch.float32
-            dim, num_heads, full_seq_len, batch = 64, 4, 32, 2
-            head_dim = dim // num_heads
-            assert full_seq_len % self.world_size == 0  # no tail padding -- isolates the a2a fix
+        device = get_device_type()
+        dtype = torch.float32
+        dim, num_heads, full_seq_len, batch = 64, 4, 32, 2
+        head_dim = dim // num_heads
+        assert full_seq_len % self.world_size == 0  # no tail padding -- isolates the a2a fix
 
-            config = SimpleNamespace(_attn_implementation="eager")
-            self_attn = SelfAttention(config, dim, num_heads).to(device=device, dtype=dtype)
-            self._sync_model(self_attn.state_dict(), self.rank)
-            for p in self_attn.parameters():
-                c10d.broadcast(p.data, src=0, group=group)
+        config = SimpleNamespace(_attn_implementation="eager")
+        self_attn = SelfAttention(config, dim, num_heads).to(device=device, dtype=dtype)
+        self._sync_model(self_attn.state_dict(), self.rank)
+        for p in self_attn.parameters():
+            c10d.broadcast(p.data, src=0, group=group)
 
-            torch.manual_seed(0)
-            x_full = torch.randn(batch, full_seq_len, dim, device=device, dtype=dtype)
-            c10d.broadcast(x_full, src=0, group=group)
+        torch.manual_seed(0)
+        x_full = torch.randn(batch, full_seq_len, dim, device=device, dtype=dtype)
+        c10d.broadcast(x_full, src=0, group=group)
 
-            freqs_full = precompute_freqs_cis(head_dim, end=full_seq_len).reshape(full_seq_len, 1, -1).to(device)
+        freqs_full = precompute_freqs_cis(head_dim, end=full_seq_len).reshape(full_seq_len, 1, -1).to(device)
 
-            # Reference: exact sync-path math (norm -> rope -> eager attn -> out proj),
-            # run directly on the FULL sequence with no SP redistribution at all.
-            with torch.no_grad():
-                q = self_attn.norm_q(self_attn.q(x_full))
-                k = self_attn.norm_k(self_attn.k(x_full))
-                v = self_attn.v(x_full)
-                q = rope_apply_ref(q, freqs_full, head_dim)
-                k = rope_apply_ref(k, freqs_full, head_dim)
-                attn_out = self_attn.attn(q, k, v, last_loss=None, isSelfAttn=True, attention_mask=None)
-                reference = self_attn.o(attn_out)
+        # Reference: exact sync-path math (norm -> rope -> eager attn -> out proj),
+        # run directly on the FULL sequence with no SP redistribution at all.
+        with torch.no_grad():
+            q = self_attn.norm_q(self_attn.q(x_full))
+            k = self_attn.norm_k(self_attn.k(x_full))
+            v = self_attn.v(x_full)
+            q = rope_apply_ref(q, freqs_full, head_dim)
+            k = rope_apply_ref(k, freqs_full, head_dim)
+            attn_out = self_attn.attn(q, k, v, last_loss=None, isSelfAttn=True, attention_mask=None)
+            reference = self_attn.o(attn_out)
 
-            # Actual: each rank runs the real SelfAttention.forward on its own local
-            # shard, with Ulysses SP enabled -- exercising the all-to-all fix.
-            unit = full_seq_len // self.world_size
-            x_local = x_full[:, unit * self.rank : unit * (self.rank + 1), :].contiguous()
-            freqs_local = freqs_full[unit * self.rank : unit * (self.rank + 1)].contiguous()
+        # Actual: each rank runs the real SelfAttention.forward on its own local
+        # shard, with Ulysses SP enabled -- exercising the all-to-all fix.
+        unit = full_seq_len // self.world_size
+        x_local = x_full[:, unit * self.rank : unit * (self.rank + 1), :].contiguous()
+        freqs_local = freqs_full[unit * self.rank : unit * (self.rank + 1)].contiguous()
 
+        with use_parallel_state(self.sp_state), torch.no_grad():
             assert get_parallel_state().ulysses_enabled
-            with torch.no_grad():
-                local_out = self_attn(x_local, freqs_local, cos=None, sin=None, last_loss=None, self_attn_mask=None)
+            local_out = self_attn(x_local, freqs_local, cos=None, sin=None, last_loss=None, self_attn_mask=None)
 
-            chunks = [torch.empty(batch, unit, dim, device=device, dtype=dtype) for _ in range(self.world_size)]
-            c10d.all_gather(chunks, local_out.contiguous(), group=group)
-            gathered = torch.cat(chunks, dim=1)
+        chunks = [torch.empty(batch, unit, dim, device=device, dtype=dtype) for _ in range(self.world_size)]
+        c10d.all_gather(chunks, local_out.contiguous(), group=group)
+        gathered = torch.cat(chunks, dim=1)
 
-            # GPU float32 attention/matmul reduction order differs slightly between
-            # "all heads, one process" (reference) and "subset of heads per rank,
-            # concatenated" (actual) even though they're mathematically identical --
-            # a couple ULPs of noise, not a correctness gap.
-            torch.testing.assert_close(gathered, reference, atol=2e-4, rtol=2e-3)
-        finally:
-            clear_parallel_state()
+        # GPU float32 attention/matmul reduction order differs slightly between
+        # "all heads, one process" (reference) and "subset of heads per rank,
+        # concatenated" (actual) even though they're mathematically identical --
+        # a couple ULPs of noise, not a correctness gap.
+        torch.testing.assert_close(gathered, reference, atol=2e-4, rtol=2e-3)
 
 
 def rope_apply_ref(x, freqs, head_dim):

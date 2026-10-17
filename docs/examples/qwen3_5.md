@@ -128,8 +128,9 @@ model:
     chunk_gated_delta_rule_implementation: npu
 ```
 
-These kernels need the `triton-ascend` package, which is not a declared VeOmni dependency —
-install it on the NPU host. VeOmni main pins PyTorch and `torch_npu` 2.10.0; the corresponding
+`rms_norm_gated` is the exception: it is a `torch_npu` op composition rather than Triton, so only
+`causal_conv1d` and `chunk_gated_delta_rule` need `triton-ascend`. That package is not a declared
+VeOmni dependency — install it on the NPU host. VeOmni main pins PyTorch and `torch_npu` 2.10.0; the corresponding
 CANN 9.0.0 stack uses v3.2.1:
 
 ```bash
@@ -311,3 +312,7 @@ Qwen3.5 is a hybrid model alternating between softmax and linear attention layer
 
 For detailed implementation notes, see the
 [Ulysses documentation](../key_features/ulysses.md#-linear-attention-ulysses-gateddeltanet).
+For Ascend 910B4 Triton code generation, export TRITON_ASCEND_ARCH=Ascend910B4
+before the first Triton import. The NPU CI regression step sets this variable
+explicitly; on a non-910B4 runner the regression test skips after checking the
+runtime device name.

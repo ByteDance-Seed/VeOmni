@@ -1,13 +1,12 @@
 """Multi-process regression test for the diffusers Wan T2V model under Ulysses SP.
 
-Covers three gaps in `WanTransformer3DModel_forward` / `WanSPAttnProcessor`:
+Covers `WanTransformer3DModel_forward` / `WanSPAttnProcessor` on the cases that used to break:
 
-1. A token count not divisible by the SP size crashed: `slice_input_tensor` pads the hidden
-   states, but RoPE was sliced with a floor division, and the pad was never masked or stripped.
-2. Per-token timesteps (Wan 2.2 style, `timestep.ndim == 2`) crashed: `timestep_proj` stayed
-   at the full sequence length while the hidden states were sliced.
-3. The `eager` backend never did the Ulysses all-to-all, so every rank attended only to its
-   own shard.
+1. A token count not divisible by the SP size: the communication pad must not reach
+   attention, and RoPE must line up with each token.
+2. Per-token timesteps (Wan 2.2 style, `timestep.ndim == 2`): `timestep_proj` has to be
+   sliced along with the hidden states.
+3. The `eager` backend has to see the full sequence, not just the local shard.
 
 Runs a tiny random-weight model with SP off and with Ulysses SP on and compares outputs and
 SP-reduced parameter grads, with and without gradient checkpointing.
@@ -47,8 +46,7 @@ CASES = {
 }
 
 
-# The blocks carry the SP-aware forward as a class patch, and the model forward reaches them
-# through `block(...)`; FSDP2 wraps these blocks, so that call path (and its hooks) has to hold.
+# FSDP2 wraps the blocks, so the model forward has to reach them through `block(...)` (and its hooks).
 apply_veomni_wan_transformer_patch()
 
 

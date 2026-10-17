@@ -1338,7 +1338,7 @@ def deepseek_v4_indexer_forward_patched(
     indexer_implementation = veomni_dsa_indexer_implementation.value
     if indexer_implementation not in {"eager", "tilelang"}:
         raise ValueError(
-            "DeepSeek-V4 does not support "
+            "DeepSeek-V4 GPU does not support "
             f"dsa_indexer_implementation={indexer_implementation!r}; expected 'eager' or 'tilelang'"
         )
     # A local query row ``i`` is global row ``query_offset + i``; off the context
@@ -1775,7 +1775,7 @@ def deepseek_v4_eager_attention_forward_patched(
     attention_implementation = veomni_dsa_attention_implementation.value
     if attention_implementation not in {"eager", "tilelang"}:
         raise ValueError(
-            "DeepSeek-V4 does not support "
+            "DeepSeek-V4 GPU does not support "
             f"dsa_attention_implementation={attention_implementation!r}; expected 'eager' or 'tilelang'"
         )
     # Operand dtypes are the kernel's contract and are enforced by

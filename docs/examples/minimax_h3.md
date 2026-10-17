@@ -171,8 +171,9 @@ data:
   train_path: output/minimax_h3_fl2va_embedding    # output dir of Stage 1
   data_transform: dit_offline
   datasets_type: iterable
-  shuffle: false
   dataset_repeat: true
+  dataloader:
+    shuffle: false
 
 train:
   training_task: offline_training
@@ -236,8 +237,8 @@ keep supervising audio as before.
 
 Use matching Ref2VA model weights and **precomputed** Ref2VA prompt/condition
 embeddings. The existing FL2VA embedding recipe does not become a Ref2VA encoder.
-A decoded offline sample has the usual `input_latents`, `audio_input_latents`,
-`prompt_embeds` and `use_gradient_checkpointing`, plus:
+A decoded offline sample has the usual `input_latents`, `audio_input_latents` and
+`prompt_embeds`, plus:
 
 ```python
 from veomni.models.diffusers.minimax_h3.minimax_h3_core.packed_sequence import build_packed_ref2va

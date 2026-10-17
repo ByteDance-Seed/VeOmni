@@ -23,6 +23,8 @@ on random inputs. This guards against:
 Tests are skipped on non-NPU hosts so the same test suite runs in any CI runner.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -97,6 +99,16 @@ def _eager_rms_norm_gated(hidden_states, weight, eps, gate):
     fused_input = torch.cat([gate, normed], dim=-1)
     half = fused_input.shape[-1] // 2
     return torch.nn.functional.silu(fused_input[..., :half]) * fused_input[..., half:]
+
+
+def _eager_rms_norm_sigmoid_gated(hidden_states, weight, eps, gate):
+    """Eager reference for a sigmoid gate (Qwen4-Exp ``output_gate_type``)."""
+    dtype = hidden_states.dtype
+    x_f = hidden_states.to(torch.float32)
+    variance = x_f.pow(2).mean(-1, keepdim=True)
+    x_f = x_f * torch.rsqrt(variance + eps)
+    normed = (weight * x_f.to(dtype)).to(dtype)
+    return (normed * torch.sigmoid(gate.to(torch.float32))).to(dtype)
 
 
 def _eager_clamped_swiglu(x, limit):
@@ -334,6 +346,81 @@ class TestNPURmsNormGated:
         # 1e-2 atol+rtol covers 1-2 bf16 ULPs at typical normalized values.
         assert torch.allclose(out_fused.float(), out_eager.float(), atol=1e-2, rtol=1e-2)
 
+    def test_sigmoid_gate_matches_eager_bf16(self):
+        """A non-SiLU gate must not take the SiLU-only ``npu_swiglu`` path.
+
+        Qwen4-Exp sets ``output_gate_type="sigmoid"``; fusing it would compute
+        ``silu(gate) * normed`` and mis-train without raising.
+        """
+        batch, seq, hidden = 2, 16, 128
+        slot = OpSlot("rms_norm_gated", "standard")
+        slot.bind("npu")
+        fused_module = slot.bound_kernel()(hidden_size=hidden, eps=1e-6, activation="sigmoid").to(
+            device=DEVICE, dtype=torch.bfloat16
+        )
+
+        hidden_states = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
+        # Unlike the SiLU path, the gate is applied elementwise, so it carries
+        # the same width as the normalized hidden states.
+        gate = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
+
+        out_fused = fused_module(hidden_states, gate=gate)
+        out_eager = _eager_rms_norm_sigmoid_gated(
+            hidden_states, fused_module.weight, fused_module.variance_epsilon, gate
+        )
+        assert torch.allclose(out_fused.float(), out_eager.float(), atol=1e-2, rtol=1e-2)
+
+
+class TestNPUGatedDeltaNetVarlen:
+    """Tests for the ``causal_conv1d`` and ``chunk_gated_delta_rule`` NPU Triton kernels."""
+
+    def test_causal_conv1d_accepts_cpu_cu_seqlens(self):
+        """``veomni.models.auto`` moves ``cu_seq_lens_q`` to CPU on NPU; the
+        Triton ``causal_conv1d`` adapter must move it to ``x.device``."""
+        slot = OpSlot("causal_conv1d", "standard")
+        slot.bind("npu")
+        fn = slot.bound_kernel()
+
+        B, T, D, W = 1, 64, 256, 4
+        x = torch.randn(B, T, D, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        weight = torch.randn(D, W, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        cu_seqlens = torch.tensor([0, 32, 64], dtype=torch.int32, device="cpu")
+
+        out = fn(x=x, weight=weight, bias=None, activation="silu", cu_seqlens=cu_seqlens)[0]
+        assert out.shape == (B, T, D)
+        out.sum().backward()
+        assert x.grad is not None and weight.grad is not None
+
+    def test_chunk_gated_delta_rule_accepts_cpu_cu_seqlens(self):
+        """``chunk_gated_delta_rule`` ``npu`` backend must also accept a CPU
+        ``cu_seqlens`` tensor without raising a Triton pointer error."""
+        slot = OpSlot("chunk_gated_delta_rule", "standard")
+        slot.bind("npu")
+        fn = slot.bound_kernel()
+
+        B, T, H, K, V = 1, 64, 2, 64, 64
+        q = torch.randn(B, T, H, K, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(B, T, H, K, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(B, T, H, V, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        g = (-torch.rand(B, T, H, device=DEVICE, dtype=torch.float32)).requires_grad_(True)
+        beta = torch.rand(B, T, H, device=DEVICE, dtype=torch.bfloat16).sigmoid().requires_grad_(True)
+        cu_seqlens = torch.tensor([0, 32, 64], dtype=torch.int32, device="cpu")
+
+        out, _ = fn(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens,
+        )
+        assert out.shape == (B, T, H, V)
+        out.sum().backward()
+        assert q.grad is not None and k.grad is not None and v.grad is not None
+
 
 # ---------------------------------------------------------------------------
 # HCCL premul_sum patch tests (mock-based, no distributed required)
@@ -440,6 +527,174 @@ class TestHcclPremulSum:
             dist.reduce_scatter_tensor = orig_reduce_scatter_tensor
 
 
+class TestNPULightningIndexer:
+    @pytest.mark.parametrize(("seq_len", "expected_residual"), [(17, 1), (18, 2)])
+    def test_uses_original_key_length_for_causal_compression_residual(self, monkeypatch, seq_len, expected_residual):
+        from veomni.ops.kernels.deepseek_v4 import npu_lightning_indexer as module
+
+        seen_residuals = []
+
+        class FakeOps:
+            @staticmethod
+            def lightning_indexer_metadata(*args, cmp_residual_k, **kwargs):
+                seen_residuals.append(cmp_residual_k.cpu().tolist())
+                return torch.empty(1, dtype=torch.int32, device=DEVICE)
+
+            @staticmethod
+            def lightning_indexer(q, k, w, top_k, *, cmp_residual_k, **kwargs):
+                seen_residuals.append(cmp_residual_k.cpu().tolist())
+                shape = (q.shape[0], q.shape[1], 1, top_k)
+                indices = torch.zeros(shape, dtype=torch.int32, device=q.device)
+                values = torch.zeros(shape, dtype=torch.float32, device=q.device)
+                return indices, values
+
+        monkeypatch.setattr(module, "_ops", lambda: FakeOps)
+        module.get_npu_lightning_indexer_metadata.cache_clear()
+
+        batch, num_heads, head_dim, compress_rate = 1, 32, 128, 4
+        compressed_len = seq_len // compress_rate
+        q = torch.zeros((batch, seq_len, num_heads, head_dim), dtype=torch.bfloat16, device=DEVICE)
+        compressed_kv = torch.zeros((batch, compressed_len, head_dim), dtype=torch.bfloat16, device=DEVICE)
+        weights = torch.zeros((batch, seq_len, num_heads), dtype=torch.float32, device=DEVICE)
+
+        module.npu_lightning_indexer(q, compressed_kv, weights, compressed_len, compress_rate=compress_rate)
+
+        assert compressed_len % compress_rate == 0  # The old implementation incorrectly passed zero.
+        assert seen_residuals == [[expected_residual], [expected_residual]]
+
+    def test_packed_tnd_forwards_segment_boundaries(self, monkeypatch):
+        from veomni.ops.kernels.deepseek_v4 import npu_lightning_indexer as module
+
+        calls = []
+
+        class FakeOps:
+            @staticmethod
+            def lightning_indexer_metadata(*args, **kwargs):
+                calls.append(("metadata", kwargs))
+                return torch.empty(1, dtype=torch.int32, device=DEVICE)
+
+            @staticmethod
+            def lightning_indexer(q, k, weights, top_k, **kwargs):
+                calls.append(("indexer", kwargs))
+                shape = (q.shape[0], 1, top_k)
+                return (
+                    torch.zeros(shape, dtype=torch.int32, device=q.device),
+                    torch.zeros(shape, dtype=torch.float32, device=q.device),
+                )
+
+        monkeypatch.setattr(module, "_ops", lambda: FakeOps)
+        q = torch.zeros((1, 8, 32, 128), dtype=torch.bfloat16, device=DEVICE)
+        compressed_kv = torch.zeros((1, 2, 128), dtype=torch.bfloat16, device=DEVICE)
+        weights = torch.zeros((1, 8, 32), dtype=torch.float32, device=DEVICE)
+        indices, _ = module.npu_lightning_indexer(
+            q,
+            compressed_kv,
+            weights,
+            1,
+            compress_rate=4,
+            packed_sequence_slices=((0, 4), (4, 8)),
+        )
+
+        assert indices.shape == (1, 8, 1)
+        for _, kwargs in calls:
+            assert kwargs["layout_q"] == "TND"
+            assert kwargs["layout_k"] == "TND"
+            assert kwargs["cu_seqlens_q"].tolist() == [0, 4, 8]
+            assert kwargs["cu_seqlens_k"].tolist() == [0, 1, 2]
+            assert kwargs["cmp_residual_k"].tolist() == [0, 0]
+
+
+class TestNPUAttentionDispatch:
+    @pytest.mark.parametrize(
+        ("layer_type", "has_candidates"),
+        [("compressed_sparse_attention", True), ("heavily_compressed_attention", False)],
+    )
+    def test_packed_sequence_forwards_compression_metadata(self, monkeypatch, layer_type, has_candidates):
+        from transformers import AutoConfig
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as modeling
+
+        config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+        config._attn_implementation = "eager"
+        layer_idx = config.layer_types.index(layer_type)
+        attention = modeling.DeepseekV4Attention(config, layer_idx).to(device=DEVICE, dtype=torch.bfloat16).eval()
+        seq_len = 8
+        compressed_len = max(1, seq_len // config.compress_rates[layer_type])
+        topk_indices = torch.zeros((1, seq_len, 1), dtype=torch.int32, device=DEVICE)
+        calls = {}
+
+        class FakeCompressor(torch.nn.Module):
+            compress_rate = config.compress_rates[layer_type]
+
+            def forward(self, hidden_states, *args, **kwargs):
+                calls["return_topk_indices"] = kwargs["return_topk_indices"]
+                compressed_kv = torch.zeros(
+                    (1, 1, compressed_len, config.head_dim), dtype=torch.bfloat16, device=DEVICE
+                )
+                block_bias = torch.zeros((1, 1, seq_len, compressed_len), dtype=torch.bfloat16, device=DEVICE)
+                candidates = SimpleNamespace(topk_indices=topk_indices) if has_candidates else None
+                return compressed_kv, block_bias, candidates
+
+        def fake_attention_interface(module, query, key, value, attention_mask, **kwargs):
+            calls["npu_compressed_len"] = kwargs.get("npu_compressed_len")
+            calls["npu_compressed_topk_indices"] = kwargs.get("npu_compressed_topk_indices")
+            calls["npu_packed_sequence_slices"] = kwargs.get("npu_packed_sequence_slices")
+            output = torch.zeros(
+                (query.shape[0], query.shape[-2], query.shape[1], query.shape[-1]),
+                dtype=query.dtype,
+                device=query.device,
+            )
+            return output, None
+
+        attention.compressor = FakeCompressor()
+        monkeypatch.setattr(modeling.ALL_ATTENTION_FUNCTIONS, "get_interface", lambda *args: fake_attention_interface)
+        cos = torch.ones((1, seq_len, config.qk_rope_head_dim), dtype=torch.bfloat16, device=DEVICE)
+        sin = torch.zeros_like(cos)
+        hidden_states = torch.randn((1, seq_len, config.hidden_size), dtype=torch.bfloat16, device=DEVICE)
+        position_ids = torch.arange(seq_len // 2, device=DEVICE).repeat(2).unsqueeze(0)
+        attention_mask = torch.zeros((1, 1, seq_len, seq_len), dtype=torch.bfloat16, device=DEVICE)
+
+        try:
+            modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="cann"))
+            attention(
+                hidden_states,
+                {attention.rope_layer_type: (cos, sin)},
+                position_ids,
+                attention_mask,
+                packed_sequence_slices=((0, seq_len // 2), (seq_len // 2, seq_len)),
+                packed_compression_metadata=object(),
+            )
+        finally:
+            modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
+
+        assert calls["return_topk_indices"] is True
+        assert calls["npu_compressed_len"] == compressed_len
+        assert calls["npu_compressed_topk_indices"] is (topk_indices if has_candidates else None)
+        assert calls["npu_packed_sequence_slices"] == ((0, seq_len // 2), (seq_len // 2, seq_len))
+
+
+class TestNPUSparseFlashMLA:
+    @staticmethod
+    def _inputs(index_topk):
+        q = torch.zeros((1, 1, 1, 8), dtype=torch.bfloat16, device=DEVICE)
+        ori_kv = torch.zeros((1, 1, 1, 8), dtype=torch.bfloat16, device=DEVICE)
+        cmp_kv = torch.zeros((1, 1, 1, 8), dtype=torch.bfloat16, device=DEVICE)
+        indices = torch.zeros((1, 1, index_topk), dtype=torch.int32, device=DEVICE)
+        return q, ori_kv, cmp_kv, indices
+
+    def test_rejects_sparse_indices_for_non_csa_compression_ratio(self):
+        from veomni.ops.kernels.deepseek_v4.npu_sparse_flash_mla import npu_sparse_flash_mla
+
+        with pytest.raises(ValueError, match=r"supported only when cmp_ratio=4; got cmp_ratio=128"):
+            npu_sparse_flash_mla(*self._inputs(16), cmp_ratio=128)
+
+    def test_rejects_sparse_index_width_above_operator_limit(self):
+        from veomni.ops.kernels.deepseek_v4.npu_sparse_flash_mla import npu_sparse_flash_mla
+
+        with pytest.raises(ValueError, match=r"index_topk=1025 exceeds sfmla K limit \(1024\)"):
+            npu_sparse_flash_mla(*self._inputs(1025), cmp_ratio=4)
+
+
 # ---------------------------------------------------------------------------
 # Kernel registry NPU registrations sanity checks
 # ---------------------------------------------------------------------------
@@ -466,3 +721,51 @@ class TestNPUKernelRegistry:
         assert "npu" in KERNEL_REGISTRY.list_available(op_name, variant), (
             f"Expected 'npu' kernel registered for ({op_name!r}, {variant!r})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Causal conv1d short segment packed regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestCausalConv1dShortSegmentPacked:
+    """Regression tests for short-segment packed conv1d with initial_state.
+
+    Ensures that widening BT (to keep dh0 on a single-slot path) does not let
+    mask_head_rows or dh0 load masks leak rows from subsequent sequences into
+    b_dw or dh0 for packed segments shorter than W (e.g. lengths [1, 7], W=4).
+    """
+
+    def test_short_segment_packed_dw_matches_unpacked(self):
+        from veomni.ops.kernels.gated_delta_rule._ascend.causal_conv1d import causal_conv1d
+
+        device = get_device_type()
+        W = 4
+        D = 256  # divisible by BD=32
+        # Packed lengths [1, 7], total T=8
+        cu_seqlens = torch.tensor([0, 1, 8], dtype=torch.int32, device=device)
+        x = torch.randn(1, 8, D, dtype=torch.bfloat16, device=device, requires_grad=True)
+        weight = torch.randn(W, D, dtype=torch.bfloat16, device=device, requires_grad=True)
+        initial_state = torch.randn(2, D, W, dtype=torch.bfloat16, device=device, requires_grad=True)
+
+        # Packed forward + backward
+        y, _ = causal_conv1d(x, weight, initial_state=initial_state, cu_seqlens=cu_seqlens)
+        y.sum().backward()
+
+        # Unpacked separate calls
+        x_0 = x[:, :1].detach().clone().requires_grad_()
+        init_0 = initial_state[:1].detach().clone().requires_grad_()
+        w_0 = weight.detach().clone().requires_grad_()
+        y_0, _ = causal_conv1d(x_0, w_0, initial_state=init_0)
+        y_0.sum().backward()
+
+        x_1 = x[:, 1:].detach().clone().requires_grad_()
+        init_1 = initial_state[1:].detach().clone().requires_grad_()
+        w_1 = weight.detach().clone().requires_grad_()
+        y_1, _ = causal_conv1d(x_1, w_1, initial_state=init_1)
+        y_1.sum().backward()
+
+        expected_dw = w_0.grad + w_1.grad
+        torch.testing.assert_close(weight.grad, expected_dw, rtol=1e-2, atol=1e-2)
+        expected_dh0 = torch.cat((init_0.grad, init_1.grad), dim=0)
+        torch.testing.assert_close(initial_state.grad, expected_dh0, rtol=1e-2, atol=1e-2)

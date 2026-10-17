@@ -288,7 +288,7 @@ def chunk_bwd_kernel_dv_local(
     'USE_G_GAMMA': lambda args: args['g_gamma'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
 })
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'N'])
 def chunk_fwd_kernel_o(
     q,
     k,
@@ -302,7 +302,7 @@ def chunk_fwd_kernel_o(
     scale,
     T,
     H: tl.constexpr,
-    N: tl.constexpr,
+    N,
     Hg: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,

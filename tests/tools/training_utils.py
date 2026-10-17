@@ -34,6 +34,16 @@ _NPU_OPS_DEFAULTS: Dict[str, str] = {
     # gates ``triton`` on ``is_package_available("triton")`` so the fused
     # load-balancing-loss kernel would raise on the NPU runner. Pin to eager.
     "load_balancing_loss_implementation": "eager",
+    # GatedDeltaNet trio (Qwen3.5, Qwen4-Exp). The dataclass default is ``fla``,
+    # whose package is GPU-only, and ``eager`` has no ``cu_seqlens`` path — so
+    # without these the varlen tests either fail at OpSlot.bind or have to be
+    # skipped. The ``npu`` backends are the vendored MindSpeed-MM Triton
+    # kernels; they need ``triton-ascend``, which the NPU workflows install.
+    # Models without a GatedDeltaNet never bind these slots, so the entries are
+    # inert for them.
+    "rms_norm_gated_implementation": "npu",
+    "causal_conv1d_implementation": "npu",
+    "chunk_gated_delta_rule_implementation": "npu",
 }
 
 _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
@@ -51,6 +61,9 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },
+    # GLM-MoE-DSA folds its DSA top-k selection into the attention mask, which
+    # flash attention cannot consume; the NPU build has no sparse DSA kernel.
+    "glm_moe_dsa": {"attn_implementation": "eager"},
     # Multimodal RoPE has no NPU backend in the Qwen-VL family.
     "qwen2vl": {"rotary_pos_emb_implementation": "eager"},
     "qwen25vl": {"rotary_pos_emb_implementation": "eager"},
@@ -100,6 +113,10 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # L20 runners where another job is still holding part of the card.
     "qwen3_5": {"cross_entropy_loss_implementation": "chunk_loss"},
     "qwen3_5_moe": {"cross_entropy_loss_implementation": "chunk_loss"},
+    # Under the default dsa_attention_implementation=eager, GLM-MoE-DSA folds its
+    # DSA top-k selection into the attention mask, which flash attention cannot
+    # consume. The flashmla_cudnn kernel needs SM90+ and GLM-5-sized heads.
+    "glm_moe_dsa": {"attn_implementation": "eager"},
     # GPT-OSS intentionally does not register a Triton MoE backend because its
     # native interleaved gate/up training layout needs either eager reference
     # math or the dedicated SM90-only Quack path. Keep the shared helper on the

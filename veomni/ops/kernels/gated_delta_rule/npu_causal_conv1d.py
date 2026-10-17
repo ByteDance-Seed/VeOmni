@@ -51,6 +51,12 @@ def causal_conv1d(
 ):
     from ._ascend.causal_conv1d import causal_conv1d as _ascend_causal_conv1d
 
+    # ``veomni.models.auto`` moves ``cu_seq_lens_q`` to CPU on NPU for
+    # ``npu_fusion_attention``, whereas the Triton kernel indexes ``cu_seqlens``
+    # on device. Match ``flash_gated_delta_rule`` and place it on ``x.device``.
+    if cu_seqlens is not None and cu_seqlens.device != x.device:
+        cu_seqlens = cu_seqlens.to(device=x.device, non_blocking=True)
+
     # weight arrives as [D, W] (conv1d.weight.squeeze(1)); the kernel wants [W, D].
     return _ascend_causal_conv1d(
         x=x,

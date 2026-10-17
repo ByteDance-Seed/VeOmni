@@ -11,7 +11,6 @@ from diffusers import WanTransformer3DModel as _WanTransformer3DModel
 from diffusers.models.transformers.transformer_wan import (
     WanAttention,
     WanAttnProcessor,
-    WanTransformerBlock,
     _get_added_kv_projections,
     _get_qkv_projections,
 )
@@ -27,18 +26,19 @@ from .....distributed.sequence_parallel import (
     slice_input_tensor,
 )
 from .....utils import logging
+from .....utils.device import IS_NPU_AVAILABLE, get_device_type
 from .configuration_wan_transformer import WanTransformer3DModelConfig
+
+
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
 
 
 logger = logging.get_logger(__name__)
 
 
-# ================================================================
-# Eager attention forward for WanTransformer (SDPA fallback).
-# Inputs/output follow the ALL_ATTENTION_FUNCTIONS convention:
-#   input : (B, heads, seq, head_dim)
-#   output: (B, seq,   heads, head_dim), None
-# ================================================================
 def wan_eager_attention_forward(
     module,
     query: torch.Tensor,
@@ -47,25 +47,17 @@ def wan_eager_attention_forward(
     attention_mask=None,
     scaling: float | None = None,
     dropout: float = 0.0,
-    skip_ulysses: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
-    use_ulysses = get_parallel_state().ulysses_enabled and not skip_ulysses
-    if use_ulysses:
-        query = gather_seq_scatter_heads(query, seq_dim=2, head_dim=1)
-        key = gather_seq_scatter_heads(key, seq_dim=2, head_dim=1)
-        value = gather_seq_scatter_heads(value, seq_dim=2, head_dim=1)
     attn_output = F.scaled_dot_product_attention(
         query, key, value, attn_mask=attention_mask, dropout_p=dropout, scale=scaling, is_causal=False
     )
-    if use_ulysses:
-        attn_output = gather_heads_scatter_seq(attn_output, seq_dim=2, head_dim=1)
     return attn_output.transpose(1, 2), None
 
 
 class WanAttentionKernelModule:
     def __init__(self, config: SimpleNamespace, attn: WanAttention):
-        target_dtype = attn.to_q.weight.dtype
+        target_dtype = _get_weight_dtype(attn.to_q)
         if target_dtype == torch.float32:
             target_dtype = torch.bfloat16
         self.config = SimpleNamespace(
@@ -87,9 +79,6 @@ def _get_wan_full_sequence_varlen_kwargs(
     query_length: int | None = None,
     key_length: int | None = None,
 ) -> dict[str, torch.Tensor | int]:
-    # Wan DiT batches are already full per-sample sequences, not packed
-    # text-style ragged inputs. Still pass explicit varlen metadata so FA2 uses
-    # the same unpadded kernel path without inventing a padding mask.
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         raise ValueError("Wan flash-attention expects Q/K/V tensors with shape (batch, seq, heads, head_dim).")
     if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
@@ -101,18 +90,20 @@ def _get_wan_full_sequence_varlen_kwargs(
     batch_size = query.shape[0]
     query_length = query.shape[1] if query_length is None else query_length
     key_length = key.shape[1] if key_length is None else key_length
+    _q_device = "cpu" if get_device_type() == "npu" else query.device
+    _k_device = "cpu" if get_device_type() == "npu" else key.device
     cu_seq_lens_q = torch.arange(
         0,
         (batch_size + 1) * query_length,
         query_length,
-        device=query.device,
+        device=_q_device,
         dtype=torch.int32,
     )
     cu_seq_lens_k = torch.arange(
         0,
         (batch_size + 1) * key_length,
         key_length,
-        device=key.device,
+        device=_k_device,
         dtype=torch.int32,
     )
     return {
@@ -123,23 +114,29 @@ def _get_wan_full_sequence_varlen_kwargs(
     }
 
 
+def _get_weight_dtype(module):
+    if hasattr(module, "weight"):
+        return module.weight.dtype
+    if hasattr(module, "base_layer"):
+        return module.base_layer.weight.dtype
+    raise AttributeError(f"Cannot determine weight dtype for {type(module)}")
+
+
 def _assert_wan_flash_attention_bf16(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     attn: WanAttention,
 ) -> None:
-    # Wan's production FA2 coverage is bf16 mixed precision. Falling back to
-    # eager for fp32 would hide the path this PR is meant to validate.
     tensor_dtypes = {
         "query": query.dtype,
         "key": key.dtype,
         "value": value.dtype,
     }
     weight_dtypes = {
-        "to_q.weight": attn.to_q.weight.dtype,
-        "to_k.weight": attn.to_k.weight.dtype,
-        "to_v.weight": attn.to_v.weight.dtype,
+        "to_q.weight": _get_weight_dtype(attn.to_q),
+        "to_k.weight": _get_weight_dtype(attn.to_k),
+        "to_v.weight": _get_weight_dtype(attn.to_v),
     }
     assert all(dtype == torch.bfloat16 for dtype in tensor_dtypes.values()), (
         f"Wan flash-attention expects bf16 Q/K/V tensors, got {tensor_dtypes}."
@@ -152,14 +149,8 @@ def _assert_wan_flash_attention_bf16(
 class WanSPAttnProcessor(WanAttnProcessor):
     def __init__(self, attn_implementation: str):
         self.attn_implementation = attn_implementation
-        # build config for veomni_flash_attention_forward
         self.config = SimpleNamespace(_attn_implementation=attn_implementation)
         super().__init__()
-
-    @staticmethod
-    def sp_padded_length(length: int) -> int:
-        ulysses_size = get_parallel_state().ulysses_size
-        return length + (ulysses_size - length % ulysses_size) % ulysses_size
 
     def __call__(
         self,
@@ -168,7 +159,6 @@ class WanSPAttnProcessor(WanAttnProcessor):
         encoder_hidden_states: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
-        sp_valid_length: int | None = None,
         **kwargs,
     ) -> torch.Tensor:
         is_cross_attention = encoder_hidden_states is not None
@@ -181,14 +171,33 @@ class WanSPAttnProcessor(WanAttnProcessor):
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
         query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
 
-        query = attn.norm_q(query)
-        key = attn.norm_k(key)
+        if IS_NPU_AVAILABLE and torch_npu is not None and query.device.type == "npu":
+            query = torch_npu.npu_rms_norm(query, attn.norm_q.weight, epsilon=attn.norm_q.eps)[0]
+            key = torch_npu.npu_rms_norm(key, attn.norm_k.weight, epsilon=attn.norm_k.eps)[0]
+        else:
+            query = attn.norm_q(query)
+            key = attn.norm_k(key)
 
         query = query.unflatten(2, (attn.heads, -1))
         key = key.unflatten(2, (attn.heads, -1))
         value = value.unflatten(2, (attn.heads, -1))
 
         use_sp = get_parallel_state().sp_enabled and not is_cross_attention
+        padded_seq_len = None
+        if use_sp:
+            group = get_parallel_state().ulysses_group
+            # Put sequence/heads first to use the existing all_to_all_single
+            # path, which also works on Gloo builds without list all-to-all.
+            query, key, value = (
+                gather_seq_scatter_heads(tensor.movedim(0, 2), seq_dim=0, head_dim=1, group=group).movedim(2, 0)
+                for tensor in (query, key, value)
+            )
+            if rotary_emb is None:
+                raise ValueError("Wan sequence parallel self-attention requires full rotary position tables.")
+            sequence_length = rotary_emb[0].shape[1]
+            padded_seq_len = query.shape[1]
+            # Padding is only for communication; it must not enter softmax.
+            query, key, value = (tensor[:, :sequence_length] for tensor in (query, key, value))
 
         if rotary_emb is not None:
 
@@ -205,12 +214,25 @@ class WanSPAttnProcessor(WanAttnProcessor):
                 out[..., 1::2] = x1 * sin + x2 * cos
                 return out.type_as(hidden_states)
 
-            query = apply_rotary_emb(query, *rotary_emb)
-            key = apply_rotary_emb(key, *rotary_emb)
+            def apply_rotary_emb_npu(
+                hidden_states: torch.Tensor,
+                freqs_cos: torch.Tensor,
+                freqs_sin: torch.Tensor,
+            ):
+                cos = freqs_cos[..., 0::2].to(torch.float32).repeat_interleave(2, dim=-1).contiguous()
+                sin = freqs_sin[..., 1::2].to(torch.float32).repeat_interleave(2, dim=-1).contiguous()
+                x_float = hidden_states.to(torch.float32)
+                x_out = torch_npu.npu_rotary_mul(x_float, cos, sin, rotary_mode="interleave")
+                return x_out.to(hidden_states.dtype)
 
-        # DiT trainer feeds full per-sample sequences. Passing explicit sequence
-        # boundaries selects HF's varlen FA2 path without changing attention
-        # semantics or relying on a synthetic padding mask.
+            _apply_rope = (
+                apply_rotary_emb_npu
+                if IS_NPU_AVAILABLE and torch_npu is not None and query.device.type == "npu"
+                else apply_rotary_emb
+            )
+            query = _apply_rope(query, *rotary_emb)
+            key = _apply_rope(key, *rotary_emb)
+
         attention_interface: Callable = wan_eager_attention_forward
         use_flash_attention = self.attn_implementation in {"flash_attention_2", "veomni_flash_attention_2_with_sp"}
         if use_flash_attention:
@@ -249,33 +271,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
             )[0]
             hidden_states_img = hidden_states_img.flatten(2, 3).type_as(query)
 
-        query_length = query.shape[1]
-        key_length = key.shape[1]
-        skip_ulysses = is_cross_attention
-        valid_length = None
-        if use_sp:
-            ulysses_size = get_parallel_state().ulysses_size
-            if sp_valid_length is not None and sp_valid_length < query_length * ulysses_size:
-                # Ulysses tail padding: gather here, drop the pad rows so no backend attends to
-                # them, and scatter back below. Kernels then see the plain full sequence.
-                valid_length = sp_valid_length
-                query, key, value = (
-                    gather_seq_scatter_heads(x, seq_dim=1, head_dim=2)[:, :valid_length] for x in (query, key, value)
-                )
-                query_length = key_length = valid_length
-                skip_ulysses = True
-            else:
-                # Wan forward slices hidden_states/rotary_emb before the blocks.
-                # The shared VeOmni FA wrapper gathers those local slices back to
-                # the full sequence before calling FA2, so cu_seqlens must describe
-                # the post-gather length rather than this rank's local length.
-                query_length *= ulysses_size
-                key_length *= ulysses_size
-        attention_kwargs = (
-            _get_wan_full_sequence_varlen_kwargs(query, key, value, query_length=query_length, key_length=key_length)
-            if use_flash_attention
-            else {}
-        )
+        attention_kwargs = _get_wan_full_sequence_varlen_kwargs(query, key, value) if use_flash_attention else {}
         hidden_states_out = attention_interface(
             kernel_module,
             query.transpose(1, 2),
@@ -284,88 +280,84 @@ class WanSPAttnProcessor(WanAttnProcessor):
             attention_mask=attention_mask,
             dropout=0.0,
             is_causal=False,
-            skip_ulysses=skip_ulysses,
+            skip_ulysses=True,
             **attention_kwargs,
         )[0]
-        if valid_length is not None:
-            pad = self.sp_padded_length(valid_length) - valid_length
-            hidden_states_out = F.pad(hidden_states_out, (0, 0, 0, 0, 0, pad))
-            hidden_states_out = gather_heads_scatter_seq(hidden_states_out, seq_dim=1, head_dim=2)
+
+        if use_sp:
+            hidden_states_out = F.pad(hidden_states_out, (0, 0, 0, 0, 0, padded_seq_len - hidden_states_out.shape[1]))
+            hidden_states_out = gather_heads_scatter_seq(
+                hidden_states_out.movedim(0, 2), head_dim=1, seq_dim=0, group=get_parallel_state().ulysses_group
+            ).movedim(2, 0)
 
         hidden_states_out = hidden_states_out.flatten(2, 3)
-        hidden_states = hidden_states.type_as(query)
+        hidden_states_out = hidden_states_out.type_as(query)
 
         if hidden_states_img is not None:
             hidden_states_out = hidden_states_out + hidden_states_img
 
-        hidden_states_out = hidden_states_out.type_as(attn.to_out[0].weight)
+        hidden_states_out = hidden_states_out.to(_get_weight_dtype(attn.to_out[0]))
         hidden_states_out = attn.to_out[0](hidden_states_out)
         hidden_states_out = attn.to_out[1](hidden_states_out)
         return hidden_states_out
 
 
-def WanTransformerBlock_forward(
-    self,
-    hidden_states: torch.Tensor,
-    encoder_hidden_states: torch.Tensor,
-    temb: torch.Tensor,
-    rotary_emb: torch.Tensor,
-    sp_valid_length: int | None = None,
-) -> torch.Tensor:
-    """Patch for ``WanTransformerBlock.forward``.
+def _wan_block_ckpt_wrapper(block):
+    """Return a callable compatible with VeOmni's gradient checkpointing.
 
-    Identical to the diffusers block forward, plus the ``sp_valid_length`` that the
-    self-attention processor needs to strip the Ulysses tail pad. Patched onto the class
-    rather than called as a helper so the block is still entered through ``__call__`` and
-    keeps its forward hooks (FSDP2 wraps these blocks and unshards parameters in its
-    pre-forward hook).
+    VeOmni's ``_gradient_checkpointing_func`` passes an ``early_stop`` kwarg that
+    diffusers' ``WanTransformerBlock.forward()`` does not accept; this wrapper
+    absorbs and ignores it.
     """
-    if temb.ndim == 4:
-        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-            self.scale_shift_table.unsqueeze(0) + temb.float()
-        ).chunk(6, dim=2)
-        shift_msa = shift_msa.squeeze(2)
-        scale_msa = scale_msa.squeeze(2)
-        gate_msa = gate_msa.squeeze(2)
-        c_shift_msa = c_shift_msa.squeeze(2)
-        c_scale_msa = c_scale_msa.squeeze(2)
-        c_gate_msa = c_gate_msa.squeeze(2)
-    else:
-        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-            self.scale_shift_table + temb.float()
-        ).chunk(6, dim=1)
 
-    norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-    # A model loaded via ``from_pretrained`` keeps the stock diffusers processor, which
-    # rejects ``sp_valid_length``; only forward it to our SP-aware processor.
-    attn_kwargs = {"sp_valid_length": sp_valid_length} if isinstance(self.attn1.processor, WanSPAttnProcessor) else {}
-    attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb, **attn_kwargs)
-    hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
+    def custom_forward(*args, early_stop=None, **kwargs):
+        return block(*args, **kwargs)
 
-    norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
-    attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, None, None)
-    hidden_states = hidden_states + attn_output
-
-    norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(hidden_states)
-    ff_output = self.ffn(norm_hidden_states)
-    return (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
+    return custom_forward
 
 
-# ================================================================
-# Patch: WanTransformer3DModel.forward
-# 1. Slice the patchified sequence across Ulysses SP ranks before the
-#    transformer blocks, and gather it back before the output head.
-# ================================================================
 def WanTransformer3DModel_forward(
     self: _WanTransformer3DModel,
     hidden_states: torch.Tensor,
     timestep: torch.Tensor,
     encoder_hidden_states: torch.Tensor,
     encoder_hidden_states_image: torch.Tensor | None = None,
+    image_latents: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
     **kwargs,
 ):
+    parallel_state = get_parallel_state()
+    if parallel_state.cp_enabled:
+        raise NotImplementedError(
+            "WanTransformer3DModel supports Ulysses sequence parallelism, but not context parallelism; "
+            "set model.accelerator.cp_size=1."
+        )
+
     batch_size, num_channels, num_frames, height, width = hidden_states.shape
+
+    if num_channels != self.config.in_channels:
+        mask_channels = self.config.in_channels - 2 * num_channels
+        if num_channels != self.config.out_channels or mask_channels <= 0:
+            raise ValueError("Wan noisy latent channels do not match the transformer configuration.")
+        if image_latents is None or mask is None:
+            raise ValueError("Wan I2V requires full image_latents and mask from the condition model.")
+        if image_latents.shape != hidden_states.shape:
+            raise ValueError(
+                "Wan I2V image_latents must match the full noisy video shape; first-frame repetition is invalid."
+            )
+        expected_mask = (batch_size, mask_channels, num_frames, height, width)
+        if tuple(mask.shape) != expected_mask:
+            raise ValueError(f"Wan I2V mask shape must be {expected_mask}, got {tuple(mask.shape)}.")
+        # Match WanImageToVideoPipeline: noisy latents, temporal mask, VAE condition.
+        hidden_states = torch.cat([hidden_states, mask.to(hidden_states), image_latents.to(hidden_states)], dim=1)
+        num_channels = hidden_states.shape[1]
+
     p_t, p_h, p_w = self.config.patch_size
+    if num_frames % p_t or height % p_h or width % p_w:
+        raise ValueError(
+            f"Wan latent dimensions must be divisible by patch_size {self.config.patch_size}, "
+            f"got {(num_frames, height, width)}."
+        )
     post_patch_num_frames = num_frames // p_t
     post_patch_height = height // p_h
     post_patch_width = width // p_w
@@ -374,7 +366,12 @@ def WanTransformer3DModel_forward(
     rotary_emb = self.rope(hidden_states)
     # 2. Patch embedding: (B, C, F, H, W) → (B, seq, inner_dim)
     hidden_states = self.patch_embedding(hidden_states)
-    hidden_states = hidden_states.flatten(2).transpose(1, 2)
+    if IS_NPU_AVAILABLE and torch_npu is not None and hidden_states.device.type == "npu":
+        B, C = hidden_states.shape[:2]
+        S = hidden_states.shape[2:].numel()
+        hidden_states = torch_npu.npu_confusion_transpose(hidden_states, [0, 2, 1], [B, C, S], transpose_first=False)
+    else:
+        hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
     # 3. Condition embedding
     if timestep.ndim == 2:
@@ -394,32 +391,49 @@ def WanTransformer3DModel_forward(
     if encoder_hidden_states_image is not None:
         encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
-    use_sp = get_parallel_state().sp_enabled
-    seq_len = hidden_states.shape[1]
+    if parallel_state.sp_enabled:
+        hidden_states = slice_input_tensor(hidden_states, dim=1, group=parallel_state.sp_group)
 
-    if use_sp:
-        # slice_input_tensor pads to a multiple of the SP size; slice RoPE and per-token
-        # timesteps the same way so every rank's positions line up with its tokens.
-        sp_group = get_parallel_state().sp_group
-        hidden_states = slice_input_tensor(hidden_states, dim=1, group=sp_group)
-        rotary_emb = tuple(slice_input_tensor(freqs, dim=1, group=sp_group) for freqs in rotary_emb)
         if ts_seq_len is not None:
-            timestep_proj = slice_input_tensor(timestep_proj, dim=1, group=sp_group)
+            timestep_proj = slice_input_tensor(timestep_proj, dim=1, group=parallel_state.sp_group)
+
+        # Keep full positions: self-attention gathers the sequence and discards
+        # communication padding before applying RoPE and computing attention.
+
+    # Cast rotary_emb to compute dtype for checkpoint dtype consistency.
+    # WanRotaryPosEmbed stores frequencies in float64/float32, but FSDP2
+    # cast_forward_inputs casts checkpoint args to param_dtype during the
+    # first forward while recomputation uses the original high-precision
+    # tensors, causing CheckpointError with use_reentrant=False.
+    rotary_emb = tuple(f.to(hidden_states.dtype) for f in rotary_emb)
+
     # 4. Transformer blocks
-    sp_valid_length = seq_len if use_sp else None
     if torch.is_grad_enabled() and self.gradient_checkpointing:
         for block in self.blocks:
+            # Wrap the block to absorb VeOmni's `early_stop` kwarg that
+            # _gradient_checkpointing_func injects but diffusers blocks
+            # do not accept.
             hidden_states = self._gradient_checkpointing_func(
-                block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, sp_valid_length
+                _wan_block_ckpt_wrapper(block),
+                hidden_states,
+                encoder_hidden_states,
+                timestep_proj,
+                rotary_emb,
             )
     else:
         for block in self.blocks:
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, sp_valid_length)
+            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
 
     # SP: gather before output head – every rank holds the full sequence so
     # that the loss is identical across SP ranks.
-    if use_sp:
-        hidden_states = gather_outputs(hidden_states, gather_dim=1, padding_dim=1, unpad_dim_size=seq_len)
+    if parallel_state.sp_enabled:
+        hidden_states = gather_outputs(
+            hidden_states,
+            gather_dim=1,
+            padding_dim=1,
+            unpad_dim_size=post_patch_num_frames * post_patch_height * post_patch_width,
+            group=parallel_state.sp_group,
+        )
 
     # 5. Output: norm → projection → unpatchify
     if temb.ndim == 3:
@@ -468,6 +482,7 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
     config_class = WanTransformer3DModelConfig
     supports_gradient_checkpointing = True
     _supports_flash_attn = True
+    _no_split_modules = ["WanTransformerBlock"]
 
     def __init__(self, config: WanTransformer3DModelConfig, **kwargs):
         PreTrainedModel.__init__(self, config, **kwargs)
@@ -494,24 +509,68 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
 
     def forward(
         self,
-        latents: torch.Tensor,
-        hidden_states: torch.Tensor,
-        timestep: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        training_target: torch.Tensor,
+        latents: torch.Tensor | list[torch.Tensor],
+        hidden_states: torch.Tensor | list[torch.Tensor],
+        timestep: torch.Tensor | list[torch.Tensor],
+        encoder_hidden_states: torch.Tensor | list[torch.Tensor],
+        training_target: torch.Tensor | list[torch.Tensor],
+        encoder_hidden_states_image: torch.Tensor | None = None,
+        image_latents: torch.Tensor | list[torch.Tensor] | None = None,
+        mask: torch.Tensor | list[torch.Tensor] | None = None,
+        loss_start_frame: int | list[int] = 0,
     ):
+        if not isinstance(hidden_states, list):
+            latents = [latents]
+            hidden_states = [hidden_states]
+            timestep = [timestep]
+            encoder_hidden_states = [encoder_hidden_states]
+            training_target = [training_target]
+            if image_latents is not None:
+                image_latents = [image_latents]
+            if mask is not None:
+                mask = [mask]
+
+        if not isinstance(loss_start_frame, list):
+            loss_start_frame = [loss_start_frame] * len(hidden_states)
+        if len(loss_start_frame) != len(hidden_states):
+            raise ValueError("loss_start_frame must have one value per sample.")
+
         per_sample_losses = []
         predictions = []
-        for hidden_state, ts, enc_hs, target in zip(hidden_states, timestep, encoder_hidden_states, training_target):
+        for i, (hs, ts, enc_hs, target) in enumerate(
+            zip(hidden_states, timestep, encoder_hidden_states, training_target)
+        ):
+            # Per-sample I2V kwargs
+            img_lat = image_latents[i] if image_latents is not None else None
+            msk = mask[i] if mask is not None else None
+
             # Call the SP-patched diffusers forward for each sample.
             prediction = _WanTransformer3DModel.forward(
-                self, hidden_states=hidden_state, timestep=ts, encoder_hidden_states=enc_hs
+                self,
+                hidden_states=hs,
+                timestep=ts,
+                encoder_hidden_states=enc_hs,
+                encoder_hidden_states_image=encoder_hidden_states_image,
+                image_latents=img_lat,
+                mask=msk,
             )
             predictions.append(prediction)
-            per_sample_loss = F.mse_loss(prediction.float(), target.float(), reduction="none")
-            per_sample_loss = per_sample_loss.view(per_sample_loss.shape[0], -1).mean(dim=1)
+
+            if prediction.shape != target.shape:
+                raise ValueError(
+                    f"Wan prediction and target shapes must match, got {prediction.shape} and {target.shape}."
+                )
+
+            start = loss_start_frame[i]
+            if not 0 <= start < prediction.shape[2]:
+                raise ValueError("loss_start_frame must leave at least one target frame.")
+            per_sample_loss = F.mse_loss(
+                prediction[:, :, start:].float(), target[:, :, start:].float(), reduction="none"
+            )
+            per_sample_loss = per_sample_loss.reshape(per_sample_loss.shape[0], -1).mean(dim=1)
             per_sample_losses.append(per_sample_loss)
-        loss = torch.stack(per_sample_losses).mean()
+
+        loss = torch.cat(per_sample_losses).mean()
         return WanModelOutput(loss={"mse_loss": loss}, predictions=predictions)
 
     def save_pretrained(self, path, **kwargs):
@@ -542,13 +601,6 @@ def apply_veomni_wan_transformer_patch() -> None:
     would be absent, making sequence slicing incorrect.
     """
     _WanTransformer3DModel.forward = WanTransformer3DModel_forward
-    WanTransformerBlock.forward = WanTransformerBlock_forward
-    # Newer diffusers (resolved under transformers v5) gate FA2 with a strict
-    # ``_supports_flash_attn_2 = False`` on WanTransformer3DModel and raise on
-    # init when callers request the FA2 attention path. VeOmni's training
-    # already exercises FA2 (via our SP-aware attention processor) and goes
-    # through the WanAttention forward we control — opt in to FA2 here so the
-    # diffusers gate doesn't refuse on our behalf.
     _WanTransformer3DModel._supports_flash_attn = True
     _WanTransformer3DModel._supports_flash_attn_2 = True
     logger.info_rank0("Applied VeOmni SP patch to WanTransformer3DModel.forward.")

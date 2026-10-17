@@ -1,4 +1,6 @@
-from typing import Optional
+import json
+import os
+from typing import Optional, Tuple
 
 from transformers import PretrainedConfig
 
@@ -27,6 +29,9 @@ class WanTransformer3DConditionModelConfig(PretrainedConfig):
         cfg_negative_prob: float = 0.1,
         video_max_size: int = 480,
         seed: Optional[int] = 42,
+        expand_timesteps: bool = False,
+        image_conditioning: bool = False,
+        patch_size: Tuple[int, ...] = (1, 2, 2),
         **kwargs,
     ):
         self.base_model_path = base_model_path
@@ -42,6 +47,11 @@ class WanTransformer3DConditionModelConfig(PretrainedConfig):
         self.cfg_negative_prob = cfg_negative_prob
         self.video_max_size = video_max_size
         self.seed = seed
+        self.expand_timesteps = expand_timesteps
+        self.image_conditioning = image_conditioning
+        if image_conditioning and expand_timesteps:
+            raise ValueError("Wan channel-concatenated image conditioning cannot use expanded timesteps.")
+        self.patch_size = patch_size
         super().__init__(**kwargs)
 
     @classmethod
@@ -52,4 +62,23 @@ class WanTransformer3DConditionModelConfig(PretrainedConfig):
     ):
         config_dict, kwargs = super().get_config_dict(pretrained_model_name_or_path, **kwargs)
         config_dict["base_model_path"] = pretrained_model_name_or_path
+
+        model_index_path = os.path.join(pretrained_model_name_or_path, "model_index.json")
+        if os.path.isfile(model_index_path):
+            with open(model_index_path, "r", encoding="utf-8") as f:
+                model_index = json.load(f)
+            if "expand_timesteps" in model_index and "expand_timesteps" not in config_dict:
+                config_dict["expand_timesteps"] = model_index["expand_timesteps"]
+
+        transformer_config_path = os.path.join(pretrained_model_name_or_path, "transformer", "config.json")
+        if os.path.isfile(transformer_config_path):
+            with open(transformer_config_path, "r", encoding="utf-8") as f:
+                transformer_config = json.load(f)
+            if "patch_size" in transformer_config:
+                config_dict.setdefault("patch_size", transformer_config["patch_size"])
+            if "in_channels" in transformer_config and "out_channels" in transformer_config:
+                config_dict.setdefault(
+                    "image_conditioning", transformer_config["in_channels"] != transformer_config["out_channels"]
+                )
+
         return config_dict, kwargs

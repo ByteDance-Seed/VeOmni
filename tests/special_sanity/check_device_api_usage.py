@@ -57,6 +57,12 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # ``veomni.utils.device`` equivalent; the test is gated on
     # ``IS_CUDA_AVAILABLE`` so it skips on non-CUDA hosts.
     "tests/models/test_model_forward_no_implicit_sync.py",
+    # Precision and async-offload tests explicitly select CUDA/NPU devices by
+    # name to exercise accelerator-specific code paths; the literal "cuda" is
+    # a test fixture, not a production device-API call.
+    "tests/distributed/test_async_activation_offload.py",
+    "tests/models/test_qwen_image_precision.py",
+    "tests/precision/qwen_image.py",
     # Vendored Ascend Triton kernels for Qwen3.5 gated delta-rule (FLA + Huawei
     # port) are kept byte-identical to upstream; the FLA-origin code references
     # ``.cuda`` in fallback/util paths. Excluded wholesale, matching the ruff
