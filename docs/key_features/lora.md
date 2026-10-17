@@ -628,6 +628,8 @@ sets `ep_size: 8` and additionally LoRA-wraps DeepSeek's MLA projections
 
 For a Qwen3.5-MoE LoRA configuration, see
 [`configs/text/qwen3_5_moe_lora.yaml`](../../configs/text/qwen3_5_moe_lora.yaml).
+For the Qwen3.5-MoE-35B Ascend NPU and H200 commands, backend matrix, validation
+method, and measured results, see [Qwen3.5](../examples/qwen3_5.md).
 
 ---
 
