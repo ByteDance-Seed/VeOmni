@@ -32,7 +32,7 @@ from transformers.masking_utils import (
 )
 
 
-_FLEX_ATTENTION_IMPLEMENTATION = "veomni_flex_attention_with_sp"
+_PACKED_MASK_IMPLEMENTATIONS = {"eager", "sdpa", "veomni_flex_attention_with_sp"}
 
 
 def _packed_sequence_ids_from_cu_seq_lens(
@@ -70,18 +70,18 @@ def _add_packed_sequence_mask(
     and_mask_function: Callable | None,
     cu_seq_lens_q: torch.Tensor | None,
 ) -> Callable | None:
-    """Add packed self-attention boundaries to the FlexAttention mask predicate."""
+    """Add packed self-attention boundaries when the backend accepts mask predicates."""
     if (
         cu_seq_lens_q is None
-        or config._attn_implementation != _FLEX_ATTENTION_IMPLEMENTATION
+        or config._attn_implementation not in _PACKED_MASK_IMPLEMENTATIONS
         or cu_seq_lens_q.numel() == 2
     ):
         return and_mask_function
 
     if past_key_values is not None:
-        raise ValueError("Packed FlexAttention does not support past_key_values.")
+        raise ValueError("Packed attention does not support past_key_values.")
     if attention_mask is not None and attention_mask.ndim != 2:
-        raise ValueError("Packed FlexAttention requires a 2D attention mask.")
+        raise ValueError("Packed attention requires a 2D attention mask.")
 
     sequence_length = attention_mask.shape[-1] if attention_mask is not None else inputs_embeds.shape[1]
     sequence_ids = _packed_sequence_ids_from_cu_seq_lens(
