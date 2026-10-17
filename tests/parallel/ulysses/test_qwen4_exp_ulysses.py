@@ -254,6 +254,8 @@ def test_qwen4_exp_packed_ple_hidden_halos_match_full_sequence():
 def _run_qsa_equivalence(
     num_attention_heads: int = 2,
     num_key_value_heads: int = 1,
+    parallel_mode: str = "ulysses",
+    qsa_implementation: str = "eager",
 ) -> None:
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 
@@ -265,31 +267,39 @@ def _run_qsa_equivalence(
     try:
         _init_parallel_state(
             dp_size=1,
-            ulysses_size=world_size,
+            cp_size=world_size if parallel_mode == "cp" else 1,
+            ulysses_size=world_size if parallel_mode == "ulysses" else 1,
             device_type=get_device_type(),
             name=None,
         )
+        qwen4_exp.veomni_qsa_attention_implementation.bind(
+            SimpleNamespace(qsa_attention_implementation=qsa_implementation)
+        )
         device = torch.device(get_device_type(), rank)
+        dtype = torch.bfloat16 if qsa_implementation == "tilelang" else torch.float32
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
         config.num_attention_heads = num_attention_heads
         config.num_key_value_heads = num_key_value_heads
+        if qsa_implementation == "tilelang":
+            config.head_dim = 64
+            config.indexer_head_dim = 32
         torch.manual_seed(31)
-        attention = qwen4_exp.Qwen4ExpTextAttention(config, layer_idx=1).float().to(device)
+        attention = qwen4_exp.Qwen4ExpTextAttention(config, layer_idx=1).to(device=device, dtype=dtype)
         _broadcast_module(attention)
 
         local_seq_len = 4
         seq_len = local_seq_len * world_size
         if rank == 0:
-            full_hidden = torch.randn(1, seq_len, config.hidden_size, device=device)
+            full_hidden = torch.randn(1, seq_len, config.hidden_size, device=device, dtype=dtype)
         else:
-            full_hidden = torch.empty(1, seq_len, config.hidden_size, device=device)
+            full_hidden = torch.empty(1, seq_len, config.hidden_size, device=device, dtype=dtype)
         dist.broadcast(full_hidden, src=0)
         rotary_dim = int(config.head_dim * config.partial_rotary_factor)
         rotary_angles = torch.arange(seq_len, device=device).view(1, seq_len, 1) * 0.17
         rotary_angles = rotary_angles + torch.arange(rotary_dim, device=device).view(1, 1, rotary_dim) * 0.03
         position_embeddings = (
-            rotary_angles.cos(),
-            rotary_angles.sin(),
+            rotary_angles.cos().to(dtype=dtype),
+            rotary_angles.sin().to(dtype=dtype),
         )
         packed_boundary = local_seq_len - 1
         cu_seq_lens_q = torch.tensor([0, packed_boundary, seq_len], dtype=torch.int32, device=device)
@@ -299,6 +309,7 @@ def _run_qsa_equivalence(
         if rank == 0:
             baseline_input = full_hidden.detach().clone().requires_grad_(True)
             no_sp_state = SimpleNamespace(
+                cp_enabled=False,
                 ulysses_enabled=False,
                 ulysses_group=None,
                 ulysses_rank=0,
@@ -331,8 +342,13 @@ def _run_qsa_equivalence(
             None,
             cu_seq_lens_q=cu_seq_lens_q,
         )
+        assert selected_indices.shape[:2] == (1, local_seq_len)
         valid_indices = selected_indices >= 0
-        query_positions = torch.arange(seq_len, device=device).view(1, seq_len, 1)
+        query_positions = torch.arange(
+            rank * local_seq_len,
+            (rank + 1) * local_seq_len,
+            device=device,
+        ).view(1, local_seq_len, 1)
         assert torch.all(selected_indices[valid_indices] <= query_positions.expand_as(selected_indices)[valid_indices])
         before_boundary = query_positions < packed_boundary
         assert torch.all(
@@ -352,9 +368,11 @@ def _run_qsa_equivalence(
 
         actual_output = _gather_sequence(actual_output.detach())
         actual_input_grad = _gather_sequence(local_hidden.grad.detach())
+        rtol = 1e-2 if dtype == torch.bfloat16 else 2e-5
+        atol = 1e-2 if dtype == torch.bfloat16 else 2e-5
         if rank == 0:
-            torch.testing.assert_close(actual_output, expected_output, rtol=1e-5, atol=1e-5)
-            torch.testing.assert_close(actual_input_grad, expected_input_grad, rtol=2e-5, atol=2e-5)
+            torch.testing.assert_close(actual_output, expected_output, rtol=rtol, atol=atol)
+            torch.testing.assert_close(actual_input_grad, expected_input_grad, rtol=rtol, atol=atol)
             for name, parameter in attention.named_parameters():
                 expected_grad = expected_parameter_grads[name]
                 if expected_grad is None:
@@ -363,11 +381,12 @@ def _run_qsa_equivalence(
                     torch.testing.assert_close(
                         parameter.grad,
                         expected_grad,
-                        rtol=2e-5,
-                        atol=2e-5,
+                        rtol=rtol,
+                        atol=atol,
                         msg=lambda msg, parameter_name=name: f"{msg}\nGradient mismatch for {parameter_name}",
                     )
     finally:
+        qwen4_exp.veomni_qsa_attention_implementation.bind(SimpleNamespace(qsa_attention_implementation="eager"))
         clear_parallel_state()
 
 
@@ -381,6 +400,15 @@ def test_qwen4_exp_compact_qsa_mqa_matches_full_sequence_sp4():
 
 def test_qwen4_exp_compact_qsa_gqa_matches_full_sequence():
     torchrun(_run_qsa_equivalence, 2, 4, 2)
+
+
+def test_qwen4_exp_compact_qsa_cp_nondivisible_heads_matches_full_sequence():
+    torchrun(_run_qsa_equivalence, 2, 3, 1, "cp", "eager")
+
+
+def test_qwen4_exp_compact_qsa_cp_tilelang_matches_full_sequence():
+    pytest.importorskip("tilelang")
+    torchrun(_run_qsa_equivalence, 2, 4, 1, "cp", "tilelang")
 
 
 @pytest.mark.parametrize("bsz", [1, 4])
@@ -870,7 +898,7 @@ def test_qwen4_exp_router_aux_loss_matches_mean_of_local_shards():
     torchrun(_run_router_aux_loss_equivalence, world_size=2)
 
 
-def _run_vlm_placeholder_equivalence() -> None:
+def _run_vlm_placeholder_equivalence(parallel_mode: str = "ulysses") -> None:
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
@@ -880,7 +908,8 @@ def _run_vlm_placeholder_equivalence() -> None:
     try:
         _init_parallel_state(
             dp_size=1,
-            ulysses_size=world_size,
+            cp_size=world_size if parallel_mode == "cp" else 1,
+            ulysses_size=world_size if parallel_mode == "ulysses" else 1,
             device_type=get_device_type(),
             extra_parallel_names=("ple",),
             extra_parallel_sizes=(1,),
@@ -1013,3 +1042,7 @@ def _run_vlm_placeholder_equivalence() -> None:
 
 def test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence():
     torchrun(_run_vlm_placeholder_equivalence, world_size=2)
+
+
+def test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence_cp():
+    torchrun(_run_vlm_placeholder_equivalence, 2, "cp")

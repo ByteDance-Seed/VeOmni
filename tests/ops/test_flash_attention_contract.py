@@ -248,9 +248,14 @@ def test_ulysses_head_auxiliary_slices_global_vector_by_rank(monkeypatch):
     torch.testing.assert_close(sliced, torch.tensor([2, 3]))
 
 
-def test_flash_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
+@pytest.mark.parametrize("mode", ["ulysses", "sp"])
+def test_flash_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch, mode):
     group = object()
-    state = SimpleNamespace(ulysses_enabled=True, ulysses_group=group, ulysses_size=2)
+    state = (
+        SimpleNamespace(ulysses_enabled=True, ulysses_group=group, ulysses_size=2)
+        if mode == "ulysses"
+        else SimpleNamespace(sp_enabled=True, sp_group=group, sp_size=2)
+    )
     calls = []
 
     def fake_prepare(query, key, value, *, group, ulysses_size):

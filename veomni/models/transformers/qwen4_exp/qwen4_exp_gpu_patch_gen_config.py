@@ -52,7 +52,7 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import (
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
-from veomni.distributed.context_parallel.dsa_cp import all_gather_compressed_rows
+from veomni.distributed.context_parallel.dsa_cp import all_gather_compressed_rows, all_gather_kv
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
@@ -62,7 +62,6 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_vision_model_forward,
     qwen3_5_vision_model_rot_pos_emb,
 )
-from veomni.ops.kernels.attention.ulysses import prepare_ulysses_qkv, restore_ulysses_output
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils import logging
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -85,7 +84,10 @@ config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.moe.comm", names=["all_to_all"])
-config.add_import("veomni.distributed.context_parallel.dsa_cp", names=["all_gather_compressed_rows"])
+config.add_import(
+    "veomni.distributed.context_parallel.dsa_cp",
+    names=["all_gather_compressed_rows", "all_gather_kv"],
+)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import(
     "veomni.distributed.sequence_parallel",
@@ -94,10 +96,6 @@ config.add_import(
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_heads_scatter_seq", "gather_seq_scatter_heads"],
-)
-config.add_import(
-    "veomni.ops.kernels.attention.ulysses",
-    names=["prepare_ulysses_qkv", "restore_ulysses_output"],
 )
 config.add_import("veomni.ops.kernels.qwen4_exp", names=["qsa_attn_tilelang"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
@@ -175,6 +173,31 @@ def qwen4_exp_model_init_patched(self, config):
     # --- Patch.2 ---
     self.rope_deltas = None
     self.post_init()
+
+
+@config.add_helper
+def _qwen4_exp_sequence_parallel_state(parallel_state):
+    """Resolve the active sequence-parallel group, rank, and world size.
+
+    Supports both Ulysses sequence parallelism and context parallelism while
+    preserving compatibility with unit-test stubs that define only the
+    ``ulysses_*`` or ``cp_*`` attributes.
+    """
+    if getattr(parallel_state, "cp_enabled", False):
+        return (
+            True,
+            getattr(parallel_state, "cp_group", None),
+            getattr(parallel_state, "cp_rank", 0),
+            getattr(parallel_state, "cp_size", 1),
+        )
+    if getattr(parallel_state, "ulysses_enabled", False):
+        return (
+            True,
+            getattr(parallel_state, "ulysses_group", None),
+            getattr(parallel_state, "ulysses_rank", 0),
+            getattr(parallel_state, "ulysses_size", 1),
+        )
+    return False, None, 0, 1
 
 
 @config.add_helper
@@ -275,7 +298,7 @@ def qwen4_exp_gated_deltanet_forward_patched(
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
     batch_size, seq_len, _ = hidden_states.shape
     parallel_state = get_parallel_state()
-    ulysses_enabled = parallel_state.ulysses_enabled
+    sp_enabled, sp_group, sp_rank, sp_size = _qwen4_exp_sequence_parallel_state(parallel_state)
     # --- Patch.2: Reuse host-side packed lengths threaded through kwargs. ---
     # The trainer moves cu_seq_lens_q onto the device, so deriving the lengths
     # here would sync GPU->CPU once per layer; the model forward exports the
@@ -283,13 +306,13 @@ def qwen4_exp_gated_deltanet_forward_patched(
     if cu_seq_lens_q is None:
         packed_seq_lens = None
     else:
-        sequence_length = seq_len * parallel_state.ulysses_size if ulysses_enabled else seq_len
+        sequence_length = seq_len * sp_size if sp_enabled else seq_len
         if packed_seq_lens is None:
             packed_seq_lens = cu_seq_lens_q.diff().tolist()
         packed_seq_lens = _qwen4_exp_validate_packed_seq_lens(packed_seq_lens, batch_size, sequence_length)
     # --- Patch.2 ---
 
-    if ulysses_enabled and cache_params is not None:
+    if sp_enabled and cache_params is not None:
         raise NotImplementedError("Qwen4-Exp GatedDeltaNet does not support KV/recurrent cache state under Ulysses.")
 
     use_precomputed_states = cache_params is not None and cache_params.has_previous_state(self.layer_idx, state_idx=0)
@@ -298,11 +321,10 @@ def qwen4_exp_gated_deltanet_forward_patched(
     b = self.in_proj_b(hidden_states)
     a = self.in_proj_a(hidden_states)
 
-    if ulysses_enabled:
-        ulysses_size = parallel_state.ulysses_size
-        if self.num_k_heads % ulysses_size != 0 or self.num_v_heads % ulysses_size != 0:
+    if sp_enabled:
+        if self.num_k_heads % sp_size != 0 or self.num_v_heads % sp_size != 0:
             raise ValueError(
-                f"ulysses_size ({ulysses_size}) must divide Qwen4-Exp GatedDeltaNet key heads "
+                f"ulysses_size ({sp_size}) must divide Qwen4-Exp GatedDeltaNet key heads "
                 f"({self.num_k_heads}) and value heads ({self.num_v_heads})."
             )
         if self.veomni_causal_conv1d_fn is None or self.veomni_chunk_gated_delta_rule is None:
@@ -311,10 +333,8 @@ def qwen4_exp_gated_deltanet_forward_patched(
                 "chunk_gated_delta_rule implementations."
             )
 
-        ulysses_group = parallel_state.ulysses_group
-        ulysses_rank = parallel_state.ulysses_rank
-        local_num_k_heads = self.num_k_heads // ulysses_size
-        local_num_v_heads = self.num_v_heads // ulysses_size
+        local_num_k_heads = self.num_k_heads // sp_size
+        local_num_v_heads = self.num_v_heads // sp_size
         local_key_dim = local_num_k_heads * self.head_k_dim
         local_value_dim = local_num_v_heads * self.head_v_dim
 
@@ -323,22 +343,22 @@ def qwen4_exp_gated_deltanet_forward_patched(
             q_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim),
             seq_dim=1,
             head_dim=2,
-            group=ulysses_group,
+            group=sp_group,
         )
         k_proj = gather_seq_scatter_heads(
             k_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim),
             seq_dim=1,
             head_dim=2,
-            group=ulysses_group,
+            group=sp_group,
         )
         v_proj = gather_seq_scatter_heads(
             v_proj.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim),
             seq_dim=1,
             head_dim=2,
-            group=ulysses_group,
+            group=sp_group,
         )
-        b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
-        a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
+        b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=sp_group)
+        a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=sp_group)
         mixed_qkv = torch.cat(
             (
                 q_proj.flatten(2),
@@ -349,8 +369,8 @@ def qwen4_exp_gated_deltanet_forward_patched(
         )
 
         full_weight = self.conv1d.weight.squeeze(1)
-        key_offset = ulysses_rank * local_key_dim
-        value_offset = ulysses_rank * local_value_dim
+        key_offset = sp_rank * local_key_dim
+        value_offset = sp_rank * local_value_dim
         conv_weight = torch.cat(
             (
                 full_weight[key_offset : key_offset + local_key_dim],
@@ -432,8 +452,8 @@ def qwen4_exp_gated_deltanet_forward_patched(
     value = value.reshape(batch_size, -1, local_num_v_heads, self.head_v_dim).contiguous()
     beta = b.sigmoid()
 
-    if ulysses_enabled:
-        value_head_start = parallel_state.ulysses_rank * local_num_v_heads
+    if sp_enabled:
+        value_head_start = sp_rank * local_num_v_heads
         value_head_slice = slice(value_head_start, value_head_start + local_num_v_heads)
         g = -self.A_log[value_head_slice].float().exp() * F.softplus(a.float() + self.dt_bias[value_head_slice])
     else:
@@ -444,7 +464,7 @@ def qwen4_exp_gated_deltanet_forward_patched(
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
     recurrent_state = cache_params.layers[self.layer_idx].recurrent_states[0] if use_precomputed_states else None
-    if ulysses_enabled:
+    if sp_enabled:
         core_attn_out, last_recurrent_state = self.veomni_chunk_gated_delta_rule(
             query,
             key,
@@ -522,12 +542,12 @@ def qwen4_exp_gated_deltanet_forward_patched(
     if cache_params is not None:
         cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
 
-    if ulysses_enabled:
+    if sp_enabled:
         core_attn_out = gather_heads_scatter_seq(
             core_attn_out,
             head_dim=2,
             seq_dim=1,
-            group=parallel_state.ulysses_group,
+            group=sp_group,
         )
 
     core_attn_out = self.norm(core_attn_out.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
@@ -538,7 +558,7 @@ def qwen4_exp_gated_deltanet_forward_patched(
 
 @config.override_method(
     "Qwen4ExpTextQSAIndexer.forward",
-    description="Select compact global QSA token indices under Ulysses",
+    description="Select compact global QSA token indices for local queries under SP/CP",
 )
 def qwen4_exp_qsa_indexer_forward_patched(
     self,
@@ -549,17 +569,15 @@ def qwen4_exp_qsa_indexer_forward_patched(
     cu_seq_lens_q: torch.Tensor | None = None,
     packed_seq_lens: list[int] | tuple[int, ...] | None = None,
 ) -> torch.Tensor:
-    # --- Patch.1: Select compact global QSA token indices under Ulysses. ---
+    # --- Patch.1: Select compact global QSA token indices under SP/CP. ---
     # Using sequence-local RoPE inputs and gathering only the compressed keys
-    # and final selections required by the attention backend.
+    # required to score this rank's local queries against global KV blocks.
     del attention_mask
     parallel_state = get_parallel_state()
     if past_key_values is not None:
         raise NotImplementedError("Qwen4-Exp compact QSA does not support a KV/indexer cache.")
 
-    group = parallel_state.ulysses_group
-    rank = parallel_state.ulysses_rank if parallel_state.ulysses_enabled else 0
-    world_size = parallel_state.ulysses_size
+    _, group, rank, world_size = _qwen4_exp_sequence_parallel_state(parallel_state)
     batch_size, local_seq_len, _ = hidden_states.shape
     global_seq_len = local_seq_len * world_size
     if self.index_kv_heads != 1:
@@ -674,12 +692,6 @@ def qwen4_exp_qsa_indexer_forward_patched(
     extended_keys = torch.cat((raw_keys, right_halo), dim=1)
 
     if owned_blocks:
-        local_batch_ids = torch.tensor(
-            [batch_idx for _, batch_idx, _ in owned_blocks], dtype=torch.long, device=hidden_states.device
-        )
-        local_block_starts = torch.tensor(
-            [start for _, _, start in owned_blocks], dtype=torch.long, device=hidden_states.device
-        )
         local_offsets = local_block_starts - local_start
         window_indices = local_offsets[:, None] + torch.arange(self.compress_ratio, device=hidden_states.device)[None]
         pooled_keys = extended_keys[local_batch_ids[:, None], window_indices].float().mean(dim=1).to(raw_keys.dtype)
@@ -753,19 +765,13 @@ def qwen4_exp_qsa_indexer_forward_patched(
             (0, output_width - selected_local.shape[-1]),
             value=-1,
         )
-    selected_local = selected_local[..., :output_width].to(torch.int32).contiguous()
-
-    if world_size == 1:
-        return selected_local
-    gathered = [torch.empty_like(selected_local) for _ in range(world_size)]
-    dist.all_gather(gathered, selected_local, group=group)
-    return torch.cat(gathered, dim=1)
+    return selected_local[..., :output_width].to(torch.int32).contiguous()
     # --- Patch.1 ---
 
 
 @config.override_method(
     "Qwen4ExpTextAttention.forward",
-    description="Run dense-mask eager QSA with global selection and Ulysses QKV exchange",
+    description="Run QSA with local queries and all-gathered KV under SP/CP",
 )
 def qwen4_exp_text_attention_forward_patched(
     self,
@@ -775,23 +781,11 @@ def qwen4_exp_text_attention_forward_patched(
     past_key_values: Cache | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    # --- Patch.1 ---
+    # --- Patch.1: Validate KV cache and resolve SP/CP state. ---
     parallel_state = get_parallel_state()
-    if parallel_state.ulysses_enabled:
-        if past_key_values is not None:
-            raise NotImplementedError("Qwen4-Exp QSA does not support a KV cache under Ulysses.")
-        ulysses_size = parallel_state.ulysses_size
-        query_head_count = self.q_proj.out_features // (2 * self.head_dim)
-        key_value_head_count = self.k_proj.out_features // self.head_dim
-        if query_head_count % ulysses_size != 0:
-            raise ValueError(
-                f"Qwen4-Exp QSA query heads ({query_head_count}) must be divisible by ulysses_size ({ulysses_size})."
-            )
-        if key_value_head_count % ulysses_size != 0 and ulysses_size % key_value_head_count != 0:
-            raise ValueError(
-                f"Qwen4-Exp QSA KV heads ({key_value_head_count}) and ulysses_size ({ulysses_size}) "
-                "must divide one another."
-            )
+    sp_enabled, sp_group, sp_rank, sp_size = _qwen4_exp_sequence_parallel_state(parallel_state)
+    if sp_enabled and past_key_values is not None:
+        raise NotImplementedError("Qwen4-Exp QSA does not support a KV cache under Ulysses or context parallelism.")
     # --- Patch.1 ---
 
     # --- Patch.4: Forward the host-side packed lengths so the indexer never
@@ -817,8 +811,8 @@ def qwen4_exp_text_attention_forward_patched(
     key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
     value_states = self.v_proj(hidden_states).view(hidden_shape)
 
-    # --- Patch.2: Apply local RoPE before the Ulysses QKV exchange. ---
-    # Under Ulysses these embeddings already belong to this rank's sequence
+    # --- Patch.2: Apply local RoPE before all-gathering KV. ---
+    # Under SP/CP these embeddings already belong to this rank's sequence
     # shard. The trailing slice preserves the non-SP cache continuation path.
     cos, sin = (tensor[:, -hidden_states.shape[1] :, :] for tensor in position_embeddings)
     query_states, key_states = apply_rotary_pos_emb(
@@ -837,17 +831,14 @@ def qwen4_exp_text_attention_forward_patched(
             self.layer_idx,
         )
         query_states = query_states.transpose(1, 2)
-    elif parallel_state.ulysses_enabled:
-        query_states, key_states, value_states, _ = prepare_ulysses_qkv(
-            query_states,
-            key_states,
-            value_states,
-            group=parallel_state.ulysses_group,
-            ulysses_size=parallel_state.ulysses_size,
-        )
+    elif sp_enabled:
+        local_seq_len = hidden_states.shape[1]
+        kv_full_len = local_seq_len * sp_size
+        if isinstance(attention_mask, torch.Tensor) and attention_mask.shape[-2] == kv_full_len:
+            attention_mask = attention_mask.narrow(-2, sp_rank * local_seq_len, local_seq_len)
         query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
+        key_states = all_gather_kv(key_states.transpose(1, 2), sp_group)
+        value_states = all_gather_kv(value_states.transpose(1, 2), sp_group)
     else:
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
@@ -865,9 +856,6 @@ def qwen4_exp_text_attention_forward_patched(
         dropout=0.0 if not self.training else self.attention_dropout,
         selected_indices=selection,
     )
-
-    if parallel_state.ulysses_enabled:
-        attn_output = restore_ulysses_output(attn_output, group=parallel_state.ulysses_group)
     # --- Patch.3 ---
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output * torch.sigmoid(gate))
@@ -895,12 +883,14 @@ def qwen4_exp_eager_attention_forward_patched(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run standard eager attention, optionally constrained by compact QSA indices.
 
-    Q/K/V use ``[B, H, S, D]`` and indices use ``[B, S, K]``. Invalid slots
-    are ``-1``. Query heads may be a multiple of KV heads (GQA/MQA).
+    Query uses ``[B, H_q, S_local, D]``, K/V use ``[B, H_kv, S_global, D]``,
+    and indices use ``[B, S_local, K]``. Invalid slots are ``-1``. Query heads
+    may be a multiple of KV heads (GQA/MQA).
 
     Like the native Transformers Qwen4-Exp eager path, this implementation
-    materializes the full ``[B, H, S, S]`` score tensor. It is an intentionally
-    simple numerical reference, not a memory-efficient sparse backend.
+    materializes the full ``[B, H_q, S_local, S_global]`` score tensor. It is an
+    intentionally simple numerical reference, not a memory-efficient sparse
+    backend.
     """
 
     selected_indices = kwargs.pop("selected_indices", None)
@@ -933,7 +923,7 @@ def qwen4_exp_eager_attention_forward_patched(
             return qsa_attn_tilelang(query, key, value, selected_indices, scaling), None
         logger.warning_once(
             f"qsa_attention_implementation='tilelang' has no dropout path; attention_dropout={dropout} "
-            "falls back to the dense eager QSA reference, which materializes the [B, H, S, S] score tensor."
+            "falls back to the dense eager QSA reference, which materializes the [B, H_q, S_local, S_global] score tensor."
         )
     # --- Patch.1 ---
     # --- Patch.2 Preserve the Transformers eager contract for every non-QSA caller. ---
@@ -1260,13 +1250,14 @@ class PatchedQwen4ExpTextNGramEmbedding(nn.Module):
     ) -> torch.Tensor:
         input_ids = input_ids.long()
         parallel_state = get_parallel_state()
+        sp_enabled, sp_group, sp_rank, sp_size = _qwen4_exp_sequence_parallel_state(parallel_state)
         full_input_ids = input_ids
         # --- Patch.6: Reuse host-side packed lengths threaded through kwargs. ---
         if cu_seq_lens_q is None:
             packed_seq_lens = None
-        elif parallel_state.ulysses_enabled:
-            gathered_input_ids = [torch.empty_like(input_ids) for _ in range(parallel_state.ulysses_size)]
-            dist.all_gather(gathered_input_ids, input_ids, group=parallel_state.ulysses_group)
+        elif sp_enabled:
+            gathered_input_ids = [torch.empty_like(input_ids) for _ in range(sp_size)]
+            dist.all_gather(gathered_input_ids, input_ids, group=sp_group)
             full_input_ids = torch.cat(gathered_input_ids, dim=1)
             if packed_seq_lens is None:
                 packed_seq_lens = cu_seq_lens_q.diff().tolist()
@@ -1282,23 +1273,23 @@ class PatchedQwen4ExpTextNGramEmbedding(nn.Module):
             if past_key_values is not None:
                 raise ValueError("Qwen4-Exp packed PLE n-gram history does not support cache state.")
         # --- Patch.6 ---
-        if parallel_state.ulysses_enabled and past_key_values is not None:
+        if sp_enabled and past_key_values is not None:
             raise NotImplementedError("Qwen4-Exp PLE n-gram history does not support cache state under Ulysses.")
         if packed_seq_lens is not None:
             previous_context = input_ids[:, :0]
-        elif parallel_state.ulysses_enabled and self.context_len > 0:
+        elif sp_enabled and self.context_len > 0:
             if input_ids.shape[1] < self.context_len:
                 raise ValueError(
                     f"The local Ulysses sequence length ({input_ids.shape[1]}) must be at least the PLE "
                     f"n-gram halo ({self.context_len})."
                 )
             local_tail = input_ids[:, -self.context_len :].contiguous()
-            gathered_tails = [torch.empty_like(local_tail) for _ in range(parallel_state.ulysses_size)]
-            dist.all_gather(gathered_tails, local_tail, group=parallel_state.ulysses_group)
+            gathered_tails = [torch.empty_like(local_tail) for _ in range(sp_size)]
+            dist.all_gather(gathered_tails, local_tail, group=sp_group)
             previous_context = (
                 input_ids.new_full((input_ids.shape[0], self.context_len), self.eos_token_id)
-                if parallel_state.ulysses_rank == 0
-                else gathered_tails[parallel_state.ulysses_rank - 1]
+                if sp_rank == 0
+                else gathered_tails[sp_rank - 1]
             )
         elif past_key_values is not None and past_key_values.has_previous_state(self.layer_idx, state_idx=2):
             previous_context = past_key_values.layers[self.layer_idx].conv_states[2].clone()
@@ -1341,8 +1332,8 @@ class PatchedQwen4ExpTextNGramEmbedding(nn.Module):
         ngram_ids = torch.cat(blocks, dim=-1)
         if packed_seq_lens is None:
             ngram_ids = ngram_ids[:, -input_ids.shape[1] :]
-        elif parallel_state.ulysses_enabled:
-            local_start = parallel_state.ulysses_rank * input_ids.shape[1]
+        elif sp_enabled:
+            local_start = sp_rank * input_ids.shape[1]
             ngram_ids = ngram_ids[:, local_start : local_start + input_ids.shape[1]]
         original_shape = ngram_ids.shape
         flat_ids = ngram_ids.reshape(-1)
@@ -1366,7 +1357,8 @@ def qwen4_exp_text_ple_layer_short_conv_patched(
     packed_seq_lens: list[int] | tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     parallel_state = get_parallel_state()
-    if not parallel_state.ulysses_enabled:
+    sp_enabled, sp_group, sp_rank, sp_size = _qwen4_exp_sequence_parallel_state(parallel_state)
+    if not sp_enabled:
         if cu_seq_lens_q is not None:
             # --- Patch.3: Reuse host-side packed lengths threaded through kwargs. ---
             if packed_seq_lens is None:
@@ -1408,12 +1400,12 @@ def qwen4_exp_text_ple_layer_short_conv_patched(
     gathered_tails = gather_outputs(
         local_tail,
         gather_dim=1,
-        group=parallel_state.ulysses_group,
+        group=sp_group,
     )
     # --- Patch.1 ---
     if cu_seq_lens_q is not None:
         local_seq_len = hidden_states.shape[1]
-        global_seq_len = local_seq_len * parallel_state.ulysses_size
+        global_seq_len = local_seq_len * sp_size
         # --- Patch.3: Reuse host-side packed lengths threaded through kwargs. ---
         if packed_seq_lens is None:
             packed_seq_lens = cu_seq_lens_q.diff().tolist()
@@ -1422,7 +1414,7 @@ def qwen4_exp_text_ple_layer_short_conv_patched(
         boundaries = [0]
         for length in packed_seq_lens:
             boundaries.append(boundaries[-1] + length)
-        local_start = parallel_state.ulysses_rank * local_seq_len
+        local_start = sp_rank * local_seq_len
         local_end = local_start + local_seq_len
         outputs = []
         for segment_start, segment_end in zip(boundaries[:-1], boundaries[1:], strict=True):
@@ -1434,10 +1426,10 @@ def qwen4_exp_text_ple_layer_short_conv_patched(
             local_segment = hidden_states[:, local_offset : overlap_end - local_start]
             available_context = min(halo_length, overlap_start - segment_start)
             if available_context:
-                previous_rank_tail_start = parallel_state.ulysses_rank * halo_length - available_context
+                previous_rank_tail_start = sp_rank * halo_length - available_context
                 context = gathered_tails[
                     :,
-                    previous_rank_tail_start : parallel_state.ulysses_rank * halo_length,
+                    previous_rank_tail_start : sp_rank * halo_length,
                 ]
             else:
                 context = hidden_states[:, :0]
@@ -1450,10 +1442,10 @@ def qwen4_exp_text_ple_layer_short_conv_patched(
         # Otherwise ranks enter different collectives during backward.
         return torch.cat(outputs, dim=1) + gathered_tails.sum() * 0
     # --- Patch.2: Keep the original cache/padding path unchanged when Ulysses is disabled. ---
-    if parallel_state.ulysses_rank == 0:
+    if sp_rank == 0:
         left_halo = gathered_tails[:, :halo_length, :] * 0
     else:
-        start = (parallel_state.ulysses_rank - 1) * halo_length
+        start = (sp_rank - 1) * halo_length
         left_halo = gathered_tails[:, start : start + halo_length, :]
     # --- Patch.2 ---
     conv_input = torch.cat((left_halo, hidden_states), dim=1).transpose(1, 2)
@@ -1600,13 +1592,10 @@ def qwen4_exp_text_model_forward_patched(
 
     # --- Patch.1: Prepare VeOmni inputs and sequence-parallel metadata. ---
     # Defer the quadratic QSA mask to the attention backend while retaining
-    # sequence-local M-RoPE embeddings under Ulysses.
+    # sequence-local M-RoPE embeddings under SP/CP.
     parallel_state = get_parallel_state()
-    if parallel_state.cp_enabled:
-        raise NotImplementedError(
-            "Qwen4-Exp supports Ulysses sequence parallelism only; context parallelism is disabled."
-        )
-    if parallel_state.ulysses_enabled and (use_cache or past_key_values is not None):
+    sp_enabled, sp_group, _sp_rank, sp_size = _qwen4_exp_sequence_parallel_state(parallel_state)
+    if sp_enabled and (use_cache or past_key_values is not None):
         raise NotImplementedError("Qwen4-Exp does not support cache prefill or decode under Ulysses.")
     # --- Patch.1 ---
     # --- Patch.5: Export host-side packed lengths once per forward. ---
@@ -1617,11 +1606,7 @@ def qwen4_exp_text_model_forward_patched(
     packed_seq_lens = kwargs.pop("packed_seq_lens", None)
     cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
     if cu_seq_lens_q is not None and packed_seq_lens is None:
-        sequence_length = (
-            inputs_embeds.shape[1] * parallel_state.ulysses_size
-            if parallel_state.ulysses_enabled
-            else inputs_embeds.shape[1]
-        )
+        sequence_length = inputs_embeds.shape[1] * sp_size if sp_enabled else inputs_embeds.shape[1]
         packed_seq_lens = _qwen4_exp_validate_packed_seq_lens(
             cu_seq_lens_q.diff().tolist(), inputs_embeds.shape[0], sequence_length
         )
@@ -1636,7 +1621,7 @@ def qwen4_exp_text_model_forward_patched(
 
     if position_ids is None:
         # --- Patch.2: Pass the VeOmni attention mask contract to decoder layers. ---
-        if parallel_state.ulysses_enabled:
+        if sp_enabled:
             raise ValueError("Qwen4-Exp Ulysses requires collator-provided sequence-local position_ids.")
         # --- Patch.2 ---
         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -1662,8 +1647,8 @@ def qwen4_exp_text_model_forward_patched(
 
     # --- Patch.3: Preserve the VeOmni sequence-parallel decoder layout. ---
     if not isinstance(causal_mask_mapping := attention_mask, dict):
-        if parallel_state.ulysses_enabled:
-            mask_seq_len = inputs_embeds.shape[1] * parallel_state.ulysses_size
+        if sp_enabled:
+            mask_seq_len = inputs_embeds.shape[1] * sp_size
             mask_inputs = inputs_embeds.new_empty((inputs_embeds.shape[0], mask_seq_len, 1))
         else:
             mask_inputs = inputs_embeds
@@ -1683,13 +1668,13 @@ def qwen4_exp_text_model_forward_patched(
 
     conv_mask = causal_mask_mapping.get("linear_attention")
     # --- Patch.4: Run the patched decoder layers and restore the output layout. ---
-    if parallel_state.ulysses_enabled:
+    if sp_enabled:
         if conv_mask is not None:
             conv_mask = slice_input_tensor(
                 conv_mask,
                 dim=-1,
                 padding=False,
-                group=parallel_state.ulysses_group,
+                group=sp_group,
             )
     # --- Patch.4 ---
 
@@ -1920,11 +1905,8 @@ def qwen4_exp_model_forward_patched(
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen4ExpModelOutputWithPast:
     parallel_state = get_parallel_state()
-    if parallel_state.cp_enabled:
-        raise NotImplementedError(
-            "Qwen4-Exp supports Ulysses sequence parallelism only; context parallelism is disabled."
-        )
-    if parallel_state.ulysses_enabled and past_key_values is not None:
+    sp_enabled, sp_group, _sp_rank, sp_size = _qwen4_exp_sequence_parallel_state(parallel_state)
+    if sp_enabled and past_key_values is not None:
         raise NotImplementedError("Qwen4-Exp does not support cache prefill or decode under Ulysses.")
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1971,20 +1953,20 @@ def qwen4_exp_model_forward_patched(
     if position_ids_layout not in (None, "batch_first"):
         raise ValueError(f"Unsupported Qwen4-Exp position_ids layout: {position_ids_layout!r}")
 
-    if parallel_state.ulysses_enabled:
+    if sp_enabled:
         inputs_embeds = gather_outputs(
             inputs_embeds,
             gather_dim=1,
-            group=parallel_state.ulysses_group,
+            group=sp_group,
         )
     # if None, calculate mask
     if image_mask is None or video_mask is None:
         mask_input_ids = input_ids
-        if parallel_state.ulysses_enabled and input_ids is not None:
+        if sp_enabled and input_ids is not None:
             mask_input_ids = gather_outputs(
                 input_ids,
                 gather_dim=1,
-                group=parallel_state.ulysses_group,
+                group=sp_group,
             )
         fallback_image_mask, fallback_video_mask = self.get_placeholder_mask(mask_input_ids, inputs_embeds)
         image_mask = fallback_image_mask.squeeze(-1) if image_mask is None else image_mask
@@ -2001,11 +1983,11 @@ def qwen4_exp_model_forward_patched(
             **image_vit_kwargs,
         )
         image_embeds = image_outputs.pooler_output
-        if parallel_state.ulysses_enabled:
+        if sp_enabled:
             image_embeds = gather_outputs(
                 image_embeds,
                 gather_dim=0,
-                group=parallel_state.ulysses_group,
+                group=sp_group,
             )
         image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(image_mask.unsqueeze(-1), image_embeds)
@@ -2025,11 +2007,11 @@ def qwen4_exp_model_forward_patched(
             **video_vit_kwargs,
         )
         video_embeds = video_outputs.pooler_output
-        if parallel_state.ulysses_enabled:
+        if sp_enabled:
             video_embeds = gather_outputs(
                 video_embeds,
                 gather_dim=0,
-                group=parallel_state.ulysses_group,
+                group=sp_group,
             )
         video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(video_mask.unsqueeze(-1), video_embeds)
@@ -2040,24 +2022,24 @@ def qwen4_exp_model_forward_patched(
         inputs_embeds = inputs_embeds + fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         # --- Patch.3 ---
 
-    if parallel_state.ulysses_enabled:
+    if sp_enabled:
         inputs_embeds = slice_input_tensor(
             inputs_embeds,
             dim=1,
             padding=False,
-            group=parallel_state.ulysses_group,
+            group=sp_group,
         )
         image_mask = slice_input_tensor(
             image_mask,
             dim=1,
             padding=False,
-            group=parallel_state.ulysses_group,
+            group=sp_group,
         )
         video_mask = slice_input_tensor(
             video_mask,
             dim=1,
             padding=False,
-            group=parallel_state.ulysses_group,
+            group=sp_group,
         )
 
     ple_input_ids = None
@@ -2069,7 +2051,7 @@ def qwen4_exp_model_forward_patched(
         ple_input_ids.masked_fill_(video_mask, self.config.video_token_id)
 
     if position_ids is None:
-        if parallel_state.ulysses_enabled:
+        if sp_enabled:
             raise ValueError("Qwen4-Exp Ulysses requires precomputed position_ids from the data collator.")
         tensor_attention_mask = (
             attention_mask.get("full_attention") if isinstance(attention_mask, dict) else attention_mask
@@ -2098,11 +2080,11 @@ def qwen4_exp_model_forward_patched(
 
     cu_seq_lens_q = lm_kwargs.get("cu_seq_lens_q")
     if cu_seq_lens_q is None:
-        if parallel_state.ulysses_enabled:
+        if sp_enabled:
             raise ValueError("Qwen4-Exp Ulysses requires precomputed cu_seq_lens_q from the data collator.")
         cu_seq_lens_q = pos2culen(position_ids[0])
         lm_kwargs["cu_seq_lens_q"] = cu_seq_lens_q
-    global_sequence_length = inputs_embeds.shape[1] * parallel_state.ulysses_size
+    global_sequence_length = inputs_embeds.shape[1] * sp_size if sp_enabled else inputs_embeds.shape[1]
     # --- Patch.7: Export host-side packed lengths once per forward. ---
     # Every GDN/QSA/PLE layer needs the same segment boundaries. The trainer
     # moves cu_seq_lens_q onto the device, so deriving lengths per layer would
@@ -2123,12 +2105,12 @@ def qwen4_exp_model_forward_patched(
             .to(dtype=position_ids.dtype)
         )
         # --- Patch.7 ---
-        if parallel_state.ulysses_enabled:
+        if sp_enabled:
             text_position_ids = slice_input_tensor(
                 text_position_ids,
                 dim=-1,
                 padding=False,
-                group=parallel_state.ulysses_group,
+                group=sp_group,
             )
         if tuple(text_position_ids.shape) != tuple(position_ids.shape[1:]):
             raise ValueError(
@@ -2241,8 +2223,9 @@ def qwen4_exp_for_conditional_generation_forward_patched(
     if kwargs.get("output_router_logits", False):
         router_attention_mask = attention_mask
         parallel_state = get_parallel_state()
+        sp_enabled, sp_group, _sp_rank, _sp_size = _qwen4_exp_sequence_parallel_state(parallel_state)
         if (
-            parallel_state.ulysses_enabled
+            sp_enabled
             and router_attention_mask is not None
             and router_attention_mask.shape[-1] != outputs.last_hidden_state.shape[1]
         ):
@@ -2250,7 +2233,7 @@ def qwen4_exp_for_conditional_generation_forward_patched(
                 router_attention_mask,
                 dim=-1,
                 padding=False,
-                group=parallel_state.ulysses_group,
+                group=sp_group,
             )
         if veomni_load_balancing_loss.use_non_eager_impl:
             aux_loss = veomni_load_balancing_loss(

@@ -335,24 +335,27 @@ values are documented by `OpsImplementationConfig`.
 ### Qwen4-Exp QSA
 
 Qwen4-Exp exposes `qsa_attention_implementation` independently from the normal
-attention backend. Both values consume compact `[B,S,K]` global token indices
-from distributed local-query/global-block selection:
+attention backend. Both values consume local queries (`[B,H_q,S_local,D]`),
+all-gathered KV (`[B,H_kv,S_global,D]`), and compact `[B,S_local,K]` global
+token indices from distributed local-query/global-block selection:
 
 - `eager` (default) follows the native Transformers Qwen4-Exp path: it expands
-  the indices to an `[B,1,S,S]` mask and runs ordinary dense GQA, materializing
-  the full `[B,H,S,S]` score tensor. This is a portable numerical reference
-  rather than a memory-efficient sparse or fused throughput kernel.
+  the indices to an `[B,1,S_local,S_global]` mask and runs ordinary dense GQA,
+  materializing the `[B,H_q,S_local,S_global]` score tensor. This is a portable
+  numerical reference rather than a memory-efficient sparse or fused throughput
+  kernel.
 - `tilelang` runs the gather-based TileLang sparse-attention kernel in
   `veomni/ops/kernels/qwen4_exp/` (training forward/backward, bf16, NVIDIA
   CUDA). It never materializes the dense score tensor, which is what makes
   16K-token training feasible. A nonzero attention dropout falls back to the
   eager reference with a one-time warning because the kernel has no dropout
   path; this materializes the
-  quadratic score tensor. The dispatch still fails closed for an additive
-  `attention_mask` or a KV cache.
+  `[B,H_q,S_local,S_global]` score tensor. The dispatch still fails closed for
+  an additive `attention_mask` or a KV cache.
 
-The QSA selection lives in the model patch because it owns packed-block and
-Ulysses semantics. Its model-specific dense eager implementation lives in
+The QSA selection lives in the model patch because it owns packed-block,
+Ulysses, and Context Parallel semantics. Its model-specific dense eager
+implementation lives in
 `veomni/models/transformers/qwen4_exp/qwen4_exp_gpu_patch_gen_config.py` and is
 emitted into both generated GPU and NPU modeling files by patchgen.
 

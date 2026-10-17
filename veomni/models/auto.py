@@ -47,7 +47,7 @@ logger = logging.get_logger(__name__)
 # false — so the shards are never gathered, each rank attends only within its own
 # 1/cp_size of the sequence, and the run trains to a plausible loss curve while
 # being silently wrong.
-CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
+CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4", "qwen4_exp"})
 
 
 def check_model_build_prerequisites(config: PretrainedConfig) -> None:

@@ -263,17 +263,19 @@ def flash_attention_forward(
     if is_causal is None:
         is_causal = module.is_causal
 
-    # Ulysses patch
-    ulysses_enabled = get_parallel_state().ulysses_enabled
-    if ulysses_enabled and not skip_ulysses:
-        ulysses_group = get_parallel_state().ulysses_group
-        ulysses_size = get_parallel_state().ulysses_size
+    # Ulysses / SP patch
+    parallel_state = get_parallel_state()
+    ulysses_enabled = getattr(parallel_state, "ulysses_enabled", False)
+    sp_enabled = ulysses_enabled or getattr(parallel_state, "sp_enabled", False)
+    if sp_enabled and not skip_ulysses:
+        sp_group = parallel_state.ulysses_group if ulysses_enabled else parallel_state.sp_group
+        sp_size = parallel_state.ulysses_size if ulysses_enabled else parallel_state.sp_size
         query, key, value, query_head_count = prepare_ulysses_qkv(
             query,
             key,
             value,
-            group=ulysses_group,
-            ulysses_size=ulysses_size,
+            group=sp_group,
+            ulysses_size=sp_size,
         )
 
         # Only after all_to_all we got the full seq_len
@@ -283,7 +285,7 @@ def flash_attention_forward(
                 kwargs["s_aux"],
                 query_head_count=query_head_count,
                 local_query_head_count=query.shape[2],
-                group=ulysses_group,
+                group=sp_group,
             )
 
     # Resolve the token that will be passed to Transformers' lazy_import_flash_attention.
@@ -352,9 +354,8 @@ def flash_attention_forward(
     if v_head_dim < head_dim:
         attn_output = attn_output[..., :v_head_dim]
 
-    # Ulysses patch
-    if ulysses_enabled and not skip_ulysses:
-        ulysses_group = get_parallel_state().ulysses_group
-        attn_output = restore_ulysses_output(attn_output, group=ulysses_group)
+    # Ulysses / SP patch
+    if sp_enabled and not skip_ulysses:
+        attn_output = restore_ulysses_output(attn_output, group=sp_group)
 
     return attn_output, None
