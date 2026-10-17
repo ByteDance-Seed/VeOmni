@@ -1,4 +1,5 @@
 import contextlib
+import functools
 
 import torch
 from torch.distributed.fsdp._common_utils import _get_module_fsdp_state_if_fully_sharded_module, _module_handle
@@ -57,11 +58,18 @@ class CheckpointFunction(torch.autograd.Function):
             outputs = run_function(*args)
 
         # patch code, remove the extra allgather with use_reentrant + ckpt
-        if not isinstance(ctx.run_function, torch.nn.Module):
-            ctx.patch_module = ctx.run_function.__self__
+        run_function = ctx.run_function
+        while isinstance(run_function, functools.partial):
+            run_function = run_function.func
+        if isinstance(run_function, torch.nn.Module):
+            ctx.patch_module = run_function
         else:
-            ctx.patch_module = ctx.run_function
-        state = _get_module_fsdp_state_if_fully_sharded_module(ctx.patch_module)
+            ctx.patch_module = getattr(run_function, "__self__", None)
+        state = (
+            _get_module_fsdp_state_if_fully_sharded_module(ctx.patch_module)
+            if ctx.patch_module is not None
+            else None
+        )
         if state:
             handle = _module_handle(state, ctx.patch_module)
             if handle:
