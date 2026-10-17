@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import inspect
 import os
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 # ── Attention backend detection ──────────────────────────────────────
@@ -55,7 +57,8 @@ except Exception:
 
 def _initialize_attention_priority() -> str:
     env_val = os.environ.get("MINIMAX_H3_ATTENTION_IMPLEMENTATION")
-    if env_val is not None:
+    # cuDNN is a DiT/refiner override; VAEs retain automatic backend selection.
+    if env_val is not None and env_val.lower() != "torch_cudnn":
         return env_val.lower()
     if FLASH_ATTN_3_AVAILABLE:
         return "flash_attention_3"
@@ -69,6 +72,9 @@ def _initialize_attention_priority() -> str:
 
 
 ATTENTION_IMPLEMENTATION = _initialize_attention_priority()
+DIT_ATTENTION_IMPLEMENTATION = (
+    "torch_cudnn" if os.environ.get("MINIMAX_H3_ATTENTION_IMPLEMENTATION", "").lower() == "torch_cudnn" else None
+)
 
 
 # ── Rearrange helpers (einops) ───────────────────────────────────────
@@ -233,23 +239,32 @@ def attention_forward(
     is_causal: bool = False,
     compatibility_mode: bool = False,
     window_size: int | None = None,
+    *,
+    backend: str | None = None,
 ) -> torch.Tensor:
-    """Dispatch attention to available backend."""
-    if compatibility_mode or (attn_mask is not None) or ATTENTION_IMPLEMENTATION == "torch":
-        return _torch_sdpa(
-            q,
-            k,
-            v,
-            q_pattern,
-            k_pattern,
-            v_pattern,
-            out_pattern,
-            dims,
-            attn_mask=attn_mask,
-            scale=scale,
-            is_causal=is_causal,
-        )
-    if ATTENTION_IMPLEMENTATION == "flash_attention_3":
+    """Dispatch attention, optionally overriding the shared backend for this call."""
+    implementation = ATTENTION_IMPLEMENTATION if backend is None else backend
+    if compatibility_mode or (attn_mask is not None) or implementation in ("torch", "torch_cudnn"):
+        context = nullcontext()
+        if implementation == "torch_cudnn":
+            if q.device.type != "cuda" or q.dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError("H3 torch_cudnn attention requires CUDA FP16 or BF16 inputs.")
+            context = sdpa_kernel(SDPBackend.CUDNN_ATTENTION)
+        with context:
+            return _torch_sdpa(
+                q,
+                k,
+                v,
+                q_pattern,
+                k_pattern,
+                v_pattern,
+                out_pattern,
+                dims,
+                attn_mask=attn_mask,
+                scale=scale,
+                is_causal=is_causal,
+            )
+    if implementation == "flash_attention_3":
         return _flash_attn_3_forward(
             q,
             k,
@@ -263,7 +278,7 @@ def attention_forward(
             is_causal=is_causal,
             window_size=window_size,
         )
-    if ATTENTION_IMPLEMENTATION == "flash_attention_2":
+    if implementation == "flash_attention_2":
         return _flash_attn_2_forward(
             q,
             k,
@@ -277,7 +292,7 @@ def attention_forward(
             is_causal=is_causal,
             window_size=window_size,
         )
-    if ATTENTION_IMPLEMENTATION == "sage_attention":
+    if implementation == "sage_attention":
         if window_size is not None or is_causal:
             return attention_forward(
                 q,
@@ -292,9 +307,10 @@ def attention_forward(
                 scale,
                 is_causal,
                 compatibility_mode=True,
+                backend=implementation,
             )
         return _sage_attn_forward(q, k, v, q_pattern, k_pattern, v_pattern, out_pattern, dims, scale=scale)
-    if ATTENTION_IMPLEMENTATION == "xformers":
+    if implementation == "xformers":
         if window_size is not None or is_causal:
             return attention_forward(
                 q,
@@ -309,6 +325,7 @@ def attention_forward(
                 scale,
                 is_causal,
                 compatibility_mode=True,
+                backend=implementation,
             )
         return _xformers_forward(q, k, v, q_pattern, k_pattern, v_pattern, out_pattern, dims, scale=scale)
-    raise NotImplementedError(f"No available attention implementation (current: {ATTENTION_IMPLEMENTATION}).")
+    raise NotImplementedError(f"No available attention implementation (current: {implementation}).")

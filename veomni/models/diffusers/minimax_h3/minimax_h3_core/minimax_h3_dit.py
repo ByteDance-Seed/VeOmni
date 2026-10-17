@@ -15,6 +15,7 @@ from veomni.distributed.sequence_parallel.ulysses import (
 )
 from veomni.utils.device import IS_NPU_AVAILABLE
 
+from . import core
 from .core import attention_forward
 
 
@@ -110,7 +111,14 @@ def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale, compatibility_mod
         seg_q = q[start:stop].transpose(0, 1).unsqueeze(0)
         seg_k = k[start:stop].transpose(0, 1).unsqueeze(0)
         seg_v = v[start:stop].transpose(0, 1).unsqueeze(0)
-        seg_out = attention_forward(seg_q, seg_k, seg_v, scale=softmax_scale, compatibility_mode=compatibility_mode)
+        seg_out = attention_forward(
+            seg_q,
+            seg_k,
+            seg_v,
+            scale=softmax_scale,
+            compatibility_mode=compatibility_mode,
+            backend=core.DIT_ATTENTION_IMPLEMENTATION,
+        )
         out[start:stop] = seg_out.squeeze(0).transpose(0, 1)
     return out
 

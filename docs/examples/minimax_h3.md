@@ -311,6 +311,25 @@ varlen layout; kernel correctness itself is covered by
 No end-to-end speedup or convergence is claimed. Benchmark against an equivalent,
 tuned non-packed baseline before claiming a performance improvement.
 
+For CUDA FP16/BF16, H3 can explicitly select cuDNN for its DiT/refiner SDPA calls:
+
+```shell
+export MINIMAX_H3_ATTENTION_IMPLEMENTATION=torch_cudnn
+export TORCH_BLAS_PREFER_CUBLASLT=1
+```
+
+Use this with `eager` or `sdpa` attention. The cuDNN option applies to H3's
+text refiner and main-transformer SDPA calls, restores the caller's backend
+settings afterwards, and leaves the default dispatch unchanged. It does not
+force cuDNN on the audio/video VAEs: they retain automatic backend selection
+when this option is set. Other existing environment-variable values keep their
+shared dispatch behavior. This avoids forcing cuDNN on the audio VAE's
+256-dimensional heads, which are unsupported on some GPU/runtime combinations.
+The option does not override explicitly configured packed FA2/FA3 varlen kernels.
+Unsupported devices or dtypes fail explicitly. The separate cuBLASLt setting reduces
+GEMM shape-dependent rounding differences when using sequence parallelism.
+Keep FP32 gradient reduction and `cast_forward_inputs=false`.
+
 ## 5. Inference
 
 ```shell

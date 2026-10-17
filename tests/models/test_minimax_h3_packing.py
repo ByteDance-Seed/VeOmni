@@ -1,6 +1,7 @@
 """Native H3 model-owned packing, without pretrained weights or encoders."""
 
 import copy
+import runpy
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -25,7 +26,138 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_
     MiniMaxH3DiTOutput,
 )
 from veomni.trainer.dit_trainer import DiTDataCollator
+from veomni.utils.device import IS_CUDA_AVAILABLE
 from veomni.utils.import_utils import is_torch_npu_available
+
+
+@pytest.mark.parametrize("modality", ["audio", "video"])
+def test_cudnn_env_keeps_vae_dispatch_independent(monkeypatch, modality):
+    """The DiT cuDNN option must leave both VAE attention paths usable on CPU."""
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_audio_vae import CausalAttention
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_video_vae import Attention
+
+    # Exercise the fallback available without optional attention packages.
+    for name in ("FLASH_ATTN_3_AVAILABLE", "FLASH_ATTN_2_AVAILABLE", "SAGE_ATTN_AVAILABLE", "XFORMERS_AVAILABLE"):
+        monkeypatch.setattr(core, name, False)
+    if modality == "audio":
+        # Official audio VAE projection: 2048 channels / 8 heads = head_dim 256.
+        layer = CausalAttention(2048, 32, 8)
+        for bias in (layer.q_bias, layer.zero_k_bias, layer.v_bias):
+            torch.nn.init.zeros_(bias.weight)
+        x = torch.randn(1, 4, 2048)
+    else:
+        layer = Attention(heads=2, dim_head=64)
+        x = torch.randn(1, 4, 128)
+    monkeypatch.setattr(core, "ATTENTION_IMPLEMENTATION", "torch")
+    with torch.no_grad():
+        expected = layer(x)
+    monkeypatch.setenv("MINIMAX_H3_ATTENTION_IMPLEMENTATION", "torch_cudnn")
+    monkeypatch.setattr(core, "ATTENTION_IMPLEMENTATION", core._initialize_attention_priority())
+    with torch.no_grad():
+        actual = layer(x)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.parametrize("compatibility_mode", [False, True])
+def test_explicit_cudnn_attention_rejects_cpu(monkeypatch, compatibility_mode):
+    q = torch.randn(1, 2, 8, 16)
+    with pytest.raises(ValueError, match="requires CUDA FP16 or BF16"):
+        core.attention_forward(q, q, q, compatibility_mode=compatibility_mode, backend="torch_cudnn")
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_explicit_cudnn_attention_restores_backend_flags(monkeypatch, raises):
+    # Dispatch metadata only; the complete CUDA operator is covered by GPU validation.
+    q = SimpleNamespace(device=torch.device("cuda"), dtype=torch.bfloat16)
+
+    def flags():
+        return (
+            torch.backends.cuda.flash_sdp_enabled(),
+            torch.backends.cuda.mem_efficient_sdp_enabled(),
+            torch.backends.cuda.math_sdp_enabled(),
+            torch.backends.cuda.cudnn_sdp_enabled(),
+        )
+
+    before = flags()
+
+    def sdpa(*args, **kwargs):
+        assert flags() == (False, False, False, True)
+        if raises:
+            raise RuntimeError("attention failure")
+        return q
+
+    monkeypatch.setattr(core, "_torch_sdpa", sdpa)
+    if raises:
+        with pytest.raises(RuntimeError, match="attention failure"):
+            core.attention_forward(q, q, q, backend="torch_cudnn")
+    else:
+        assert core.attention_forward(q, q, q, backend="torch_cudnn") is q
+    assert flags() == before
+
+
+@pytest.mark.parametrize("selected", [None, "torch", "flash_attention_2", "TORCH_CUDNN"])
+def test_attention_env_scopes_only_cudnn_to_dit(monkeypatch, selected):
+    """Import-time configuration preserves existing backends and separates cuDNN."""
+    monkeypatch.delenv("MINIMAX_H3_ATTENTION_IMPLEMENTATION", raising=False)
+    default = runpy.run_path(core.__file__)["ATTENTION_IMPLEMENTATION"]
+    if selected is not None:
+        monkeypatch.setenv("MINIMAX_H3_ATTENTION_IMPLEMENTATION", selected)
+    configured = runpy.run_path(core.__file__)
+    cudnn = selected == "TORCH_CUDNN"
+    assert configured["ATTENTION_IMPLEMENTATION"] == (default if selected is None or cudnn else selected)
+    assert configured["DIT_ATTENTION_IMPLEMENTATION"] == ("torch_cudnn" if cudnn else None)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_dit_and_refiner_receive_explicit_cudnn_backend(monkeypatch, packed):
+    """Both transformer stages forward the override, including packed SDPA."""
+    monkeypatch.setattr(core, "DIT_ATTENTION_IMPLEMENTATION", "torch_cudnn")
+    calls = []
+
+    def attention(q, k, v, *, scale, compatibility_mode, backend):
+        calls.append((backend, compatibility_mode))
+        return core._torch_sdpa(q, k, v, scale=scale)
+
+    monkeypatch.setattr(minimax_h3_dit, "attention_forward", attention)
+    model = tiny_model()
+    samples = prepare(condition_model(), [raw_sample(), raw_sample()])
+    out = model(**(batch(samples) if packed else samples[0]))
+    sum(out.loss.values()).backward()
+    # One token-refiner layer and two DiT layers, once per packed segment.
+    assert len(calls) == 3 * (2 if packed else 1)
+    assert all(backend == "torch_cudnn" for backend, _ in calls)
+    assert all(mode == packed for _, mode in calls)
+
+
+@pytest.mark.parametrize("backend", ["sage_attention", "xformers"])
+def test_attention_override_preserved_in_causal_fallback(monkeypatch, backend):
+    """A per-call fallback must not inherit an unrelated global backend."""
+    monkeypatch.setattr(core, "ATTENTION_IMPLEMENTATION", "torch_cudnn")
+    q = torch.randn(1, 2, 4, 16)
+    expected = F.scaled_dot_product_attention(q, q, q, is_causal=True)
+    actual = core.attention_forward(q, q, q, is_causal=True, backend=backend)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Requires CUDA cuDNN SDPA")
+def test_cudnn_dit_and_audio_vae_head_dim_256_on_cuda(monkeypatch):
+    """Exercise real BF16 cuDNN attention and the audio VAE's d256 attention."""
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_audio_vae import CausalAttention
+
+    device = torch.device("cuda")
+    monkeypatch.setattr(core, "ATTENTION_IMPLEMENTATION", "torch")
+    monkeypatch.setattr(core, "DIT_ATTENTION_IMPLEMENTATION", "torch_cudnn")
+    q = torch.randn(128, 2, 128, device=device, dtype=torch.bfloat16, requires_grad=True)
+    out = minimax_h3_dit._sdpa_varlen_attention(q, q, q, (0, 128), 128**-0.5)
+    out.float().square().mean().backward()
+    assert torch.isfinite(out).all() and torch.isfinite(q.grad).all()
+    layer = CausalAttention(2048, 32, 8).to(device=device, dtype=torch.bfloat16)
+    for bias in (layer.q_bias, layer.zero_k_bias, layer.v_bias):
+        torch.nn.init.zeros_(bias.weight)
+    with torch.no_grad():
+        encoded = layer(torch.randn(1, 128, 2048, device=device, dtype=torch.bfloat16))
+    assert encoded.shape == (1, 128, 32) and torch.isfinite(encoded).all()
 
 
 def tiny_model(num_attention_heads=2):
@@ -576,6 +708,7 @@ def serial(model, samples):
 def cpu_attention(monkeypatch):
     monkeypatch.setattr(minimax_h3_dit, "IS_NPU_AVAILABLE", False)
     monkeypatch.setattr(core, "ATTENTION_IMPLEMENTATION", "torch")
+    monkeypatch.setattr(core, "DIT_ATTENTION_IMPLEMENTATION", None)
     monkeypatch.setattr(minimax_h3_dit, "get_ulysses_sequence_parallel_group", lambda: None)
 
 
