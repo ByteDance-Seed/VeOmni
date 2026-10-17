@@ -12,6 +12,10 @@ on:
     paths:
       - "**/*.py"
       - "!scripts/**/*.py"
+      - "configs/dit/qwen_image_edit_2511.yaml"
+      - "configs/dit/qwen_image_sft.yaml"
+      - "configs/dit/wan2.2_I2V_5B.yaml"
+      - "configs/dit/wan2.2_I2V_14B.yaml"
       - .github/workflows/npu_unit_tests.yml
       - "pyproject.toml"
       - "uv.lock"
@@ -21,6 +25,10 @@ on:
     paths:
       - "**/*.py"
       - "!scripts/**/*.py"
+      - "configs/dit/qwen_image_edit_2511.yaml"
+      - "configs/dit/qwen_image_sft.yaml"
+      - "configs/dit/wan2.2_I2V_5B.yaml"
+      - "configs/dit/wan2.2_I2V_14B.yaml"
       - .github/workflows/npu_unit_tests.yml
       - "pyproject.toml"
       - "uv.lock"
