@@ -232,6 +232,9 @@ jobs:
           uv run --frozen pytest -v -s -x tests/ops/test_comp.py
           uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
           uv run --frozen pytest -v -s -x tests/ops/test_npu_kernels.py
+          # A missing native runtime/device must fail Ascend CI, not skip the parity gate.
+          uv run --frozen python -c "import torch; import torch_npu; assert torch.npu.is_available(), 'Ascend parity gate requires a live NPU'"
+          uv run --frozen pytest -v -s -x tests/ops/test_npu_rms_norm_gated.py
           # This numerical gate must execute on NPU; fail instead of silently skipping
           # when the vendor extension is missing from the CI image.
           uv run --frozen python -c "import cann_ops_transformer"

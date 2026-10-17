@@ -24,29 +24,30 @@ import torch_npu
 from transformers.activations import ACT2FN
 
 
-# ``npu_swiglu`` hard-codes a SiLU gate, so it can only stand in for the gate
-# activation when the model asks for SiLU. Qwen3.5 does (``hidden_act``), but
-# Qwen4-Exp sets ``output_gate_type="sigmoid"`` — fusing there would silently
-# compute the wrong thing.
-_FUSED_GATE_ACTIVATIONS = frozenset({"silu", "swish"})
-
-
 class NPUFusedRMSNormGated(nn.Module):
-    """Ascend NPU RMSNorm with an activation-gated output projection."""
-
-    def __init__(self, hidden_size, eps=1e-6, activation: str = "silu", **kwargs):
-        """Initialize the norm weight and gate activation."""
+    def __init__(self, hidden_size, eps=1e-6, activation="silu", device=None, dtype=None, **kwargs):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        if activation not in ACT2FN:
+            raise ValueError(f"Unsupported NPU gated RMSNorm activation: {activation!r}")
+        self.weight = nn.Parameter(torch.ones(hidden_size, device=device, dtype=dtype))
         self.variance_epsilon = eps
         self.activation = activation
 
     def forward(self, hidden_states, gate=None):
-        """Apply RMSNorm to ``hidden_states`` and multiply by the activated ``gate``."""
-        normed = torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
-        if self.activation in _FUSED_GATE_ACTIVATIONS:
-            return torch_npu.npu_swiglu(torch.cat([gate, normed], dim=-1), dim=-1)
-
-        # Still fuses the norm; only the gate falls back to the eager formula
-        # (float32 activation, then cast back) that the reference modules use.
-        return (normed * ACT2FN[self.activation](gate.to(torch.float32))).to(hidden_states.dtype)
+        if gate is None or gate.shape != hidden_states.shape:
+            raise ValueError("NPU gated RMSNorm requires a gate with the input shape")
+        if self.activation == "sigmoid":
+            # Match Qwen4-Exp's rounding boundary: normalize, cast to the input
+            # dtype, then apply the learned weight. Fusing the learned weight
+            # into RMSNorm would move that boundary for BF16 compute weights.
+            unit_weight = torch.ones(hidden_states.shape[-1], device=hidden_states.device, dtype=hidden_states.dtype)
+            normalized = torch_npu.npu_rms_norm(hidden_states, unit_weight, self.variance_epsilon)[0]
+            weighted = self.weight * normalized.to(hidden_states.dtype)
+            return (weighted * gate.float().sigmoid()).to(hidden_states.dtype)
+        # Preserve the existing SiLU route for models such as Qwen3.6.
+        normalized = torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
+        if self.activation in {"silu", "swish"}:
+            return torch_npu.npu_swiglu(torch.cat([gate, normalized], dim=-1), dim=-1)
+        # Preserve upstream's generic activation fallback without changing the
+        # Qwen4 sigmoid cast boundary or the established SiLU fused path.
+        return (normalized * ACT2FN[self.activation](gate.float())).to(hidden_states.dtype)

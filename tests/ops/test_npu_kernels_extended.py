@@ -267,34 +267,27 @@ class TestNPURotaryPosEmbExtended:
 class TestNPURmsNormGatedExtended:
     """Coverage for the NPU FusedRMSNormGated module beyond PR #818."""
 
-    @pytest.mark.parametrize("ffn_dim_factor", [2, 4])
-    def test_gating_output_shape_and_dtype(self, ffn_dim_factor):
-        """Output shape is (B, S, (ffn_dim + hidden) // 2).
-
-        NPUFusedRMSNormGated concatenates [gate, rms_norm(hidden)]
-        along the last dim (so the concat length is ffn_dim +
-        hidden), then npu_swiglu splits in half via SiLU(x[:h])
-        * x[h:].  The result is shape (B, S, (ffn_dim + hidden) / 2).
-        """
+    @pytest.mark.parametrize("hidden", [32, 128])
+    def test_gating_output_shape_and_dtype(self, hidden):
+        """Elementwise gating preserves the hidden-state shape and dtype."""
         from veomni.ops.kernels.gated_delta_rule.npu_rms_norm_gated import NPUFusedRMSNormGated
 
-        batch, seq, hidden, ffn_dim = 1, 4, 32, 32 * ffn_dim_factor
-        expected_dim = (ffn_dim + hidden) // 2
+        batch, seq = 1, 4
         fused_module = NPUFusedRMSNormGated(hidden_size=hidden, eps=1e-6).to(device=DEVICE, dtype=torch.bfloat16)
         hidden_states = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
-        gate = torch.randn(batch, seq, ffn_dim, device=DEVICE, dtype=torch.bfloat16)
+        gate = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
         out = fused_module(hidden_states, gate=gate)
-        assert out.shape == (batch, seq, expected_dim)
+        assert out.shape == (batch, seq, hidden)
         assert out.dtype == torch.bfloat16
 
     def test_gating_zero_gate_zeros_output(self):
         """When gate is zero, the output is 0 * normed = 0."""
         from veomni.ops.kernels.gated_delta_rule.npu_rms_norm_gated import NPUFusedRMSNormGated
 
-        batch, seq, hidden, ffn_dim = 1, 4, 32, 64
+        batch, seq, hidden = 1, 4, 32
         fused_module = NPUFusedRMSNormGated(hidden_size=hidden, eps=1e-6).to(device=DEVICE, dtype=torch.bfloat16)
         hidden_states = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
-        gate = torch.zeros(batch, seq, ffn_dim, device=DEVICE, dtype=torch.bfloat16)
+        gate = torch.zeros(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
         out = fused_module(hidden_states, gate=gate)
         # SiLU(0) * normed -> 0, so the output is bit-exact zero.
         assert out.abs().max().item() == 0.0, f"Output should be exactly zero, got max abs {out.abs().max().item()}"
@@ -303,10 +296,10 @@ class TestNPURmsNormGatedExtended:
     def test_gating_eps_parameter_used(self, eps):
         from veomni.ops.kernels.gated_delta_rule.npu_rms_norm_gated import NPUFusedRMSNormGated
 
-        batch, seq, hidden, ffn_dim = 1, 4, 32, 64
+        batch, seq, hidden = 1, 4, 32
         fused_module = NPUFusedRMSNormGated(hidden_size=hidden, eps=eps).to(device=DEVICE, dtype=torch.bfloat16)
         hidden_states = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
-        gate = torch.randn(batch, seq, ffn_dim, device=DEVICE, dtype=torch.bfloat16)
+        gate = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
         out_fused = fused_module(hidden_states, gate=gate)
         out_eager = _eager_rms_norm_gated(hidden_states, fused_module.weight, eps, gate)
         # Compound op (RMSNorm + concat + SiLU gate) with bf16 rounding.
