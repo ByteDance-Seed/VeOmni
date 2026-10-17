@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -23,12 +24,17 @@ def _packed_segments(
     batch_size: int,
     seq_len: int,
     cu_seq_lens_q: torch.Tensor | None,
+    packed_seq_lens: tuple[int, ...] | None = None,
 ) -> list[tuple[int, int, int]]:
     """Return ``(batch, start, end)`` ranges in batch-local coordinates."""
-    if cu_seq_lens_q is None:
+    if packed_seq_lens is not None:
+        boundaries = [0]
+        for length in packed_seq_lens:
+            boundaries.append(boundaries[-1] + int(length))
+    elif cu_seq_lens_q is None:
         return [(batch_idx, 0, seq_len) for batch_idx in range(batch_size)]
-
-    boundaries = [int(value) for value in cu_seq_lens_q.tolist()]
+    else:
+        boundaries = [int(value) for value in cu_seq_lens_q.tolist()]
     if not boundaries or boundaries[0] != 0 or boundaries[-1] != batch_size * seq_len:
         raise ValueError(
             "Qwen4-Exp compact QSA requires cu_seq_lens_q to cover the complete padded batch; "
@@ -59,6 +65,111 @@ def _segment_ids_and_starts(
     return segment_ids, segment_starts
 
 
+@dataclass(frozen=True)
+class PackedQSALayout:
+    """Integer-only selection metadata; never holds projected keys or autograd state."""
+
+    counts: tuple[int, ...]
+    local_batch_ids: torch.Tensor
+    local_block_starts: torch.Tensor
+    window_indices: torch.Tensor
+    block_segment_ids: torch.Tensor
+    block_batch_ids: torch.Tensor
+    block_owners: torch.Tensor
+    block_starts: torch.Tensor
+    gather_keep_indices: torch.Tensor
+    query_positions: torch.Tensor
+    local_segment_ids: torch.Tensor
+    local_segment_starts: torch.Tensor
+    block_offsets: torch.Tensor
+    tails: torch.Tensor
+
+
+def build_packed_qsa_layout(segments, batch_size, global_seq_len, compress_ratio, rank, world_size, device):
+    """Build stable owner-major indices on the host, then upload each integer tensor once."""
+    local_seq_len = global_seq_len // world_size
+    starts, batches, sample_ids = [], [], []
+    for segment_id, (batch_idx, start, end) in enumerate(segments):
+        block_starts = torch.arange(
+            start, max(start, end - compress_ratio + 1), compress_ratio, dtype=torch.long, device="cpu"
+        )
+        starts.append(block_starts)
+        batches.append(torch.full_like(block_starts, batch_idx))
+        sample_ids.append(torch.full_like(block_starts, segment_id))
+    starts = torch.cat(starts)
+    batches = torch.cat(batches)
+    sample_ids = torch.cat(sample_ids)
+    owners = torch.div(starts, local_seq_len, rounding_mode="floor")
+    counts_tensor = torch.bincount(owners, minlength=world_size)
+    counts = tuple(counts_tensor.tolist())  # CPU integer metadata, no accelerator readback.
+    # Preserve segment/batch-major order within each owner, including equal starts.
+    order = torch.argsort(owners, stable=True)
+    starts, batches, sample_ids = starts[order], batches[order], sample_ids[order]
+    first = sum(counts[:rank])
+    last = first + counts[rank]
+    local_start = rank * local_seq_len
+    local_batch_ids = batches[first:last].to(device)
+    local_block_starts = starts[first:last].to(device)
+    block_offsets = torch.arange(compress_ratio, device=device)
+    window_indices = local_block_starts[:, None] - local_start + block_offsets[None]
+    n_max = max(counts, default=0)
+    rows = torch.arange(n_max, device="cpu")
+    keep = torch.arange(world_size, device="cpu")[:, None] * n_max + rows[None]
+    keep = keep[rows[None] < counts_tensor[:, None]].to(device)
+    segment_ids, segment_starts = _segment_ids_and_starts(batch_size, global_seq_len, segments, device)
+    local_segment_ids = segment_ids[:, local_start : local_start + local_seq_len].clone()
+    local_segment_starts = segment_starts[:, local_start : local_start + local_seq_len].clone()
+    query_positions = local_start + torch.arange(local_seq_len, device=device)
+    visible_count = query_positions[None] - local_segment_starts + 1
+    tail_count = torch.remainder(visible_count, compress_ratio)
+    tail_start = (
+        local_segment_starts + torch.div(visible_count, compress_ratio, rounding_mode="floor") * compress_ratio
+    )
+    tail_offsets = torch.arange(compress_ratio - 1, device=device)
+    tails = tail_start[..., None] + tail_offsets
+    tails = tails.masked_fill(tail_offsets[None, None] >= tail_count[..., None], -1)
+    return PackedQSALayout(
+        counts,
+        local_batch_ids,
+        local_block_starts,
+        window_indices,
+        sample_ids.to(device),
+        batches.to(device),
+        owners[order].to(device),
+        starts.to(device),
+        keep,
+        query_positions,
+        local_segment_ids,
+        local_segment_starts,
+        block_offsets,
+        tails,
+    )
+
+
+def get_packed_qsa_layout(
+    batch_size,
+    global_seq_len,
+    cu_seq_lens_q,
+    compress_ratio,
+    rank,
+    world_size,
+    device,
+    *,
+    packed_seq_lens=None,
+    layout_cache=None,
+):
+    """A content-keyed, per-forward cache; callers must pass validated host lengths."""
+    segments = _packed_segments(batch_size, global_seq_len, cu_seq_lens_q, packed_seq_lens)
+    device = torch.device(device)
+    key = (tuple(segments), batch_size, global_seq_len, compress_ratio, rank, world_size, device)
+    if layout_cache is not None and key in layout_cache:
+        return layout_cache[key]
+    layout = build_packed_qsa_layout(segments, batch_size, global_seq_len, compress_ratio, rank, world_size, device)
+    if layout_cache is not None:
+        layout_cache[key] = layout
+    return layout
+
+
 def _right_halo(raw_keys: torch.Tensor, halo: int, group, rank: int, world_size: int) -> torch.Tensor:
     """Gather short prefixes and return the next rank's differentiable halo."""
     if halo == 0 or world_size == 1:
@@ -80,6 +191,8 @@ def compact_qsa_select(
     rank: int,
     world_size: int,
     apply_rotary_pos_emb: Callable,
+    packed_seq_lens: tuple[int, ...] | None = None,
+    layout_cache: dict | None = None,
 ) -> torch.Tensor:
     """Return local-query/global-token QSA selections as ``[B, L, K]`` int32."""
     batch_size, local_seq_len, _ = hidden_states.shape
@@ -104,33 +217,24 @@ def compact_qsa_select(
     local_sin = full_sin[:, local_start : local_start + local_seq_len]
     q = apply_rotary_pos_emb(q, cos=local_cos, sin=local_sin, unsqueeze_dim=2)
 
-    segments = _packed_segments(batch_size, global_seq_len, cu_seq_lens_q)
-    segment_ids, segment_starts = _segment_ids_and_starts(batch_size, global_seq_len, segments, hidden_states.device)
-    blocks = [
-        (segment_id, batch_idx, start)
-        for segment_id, (batch_idx, segment_start, segment_end) in enumerate(segments)
-        for start in range(segment_start, segment_end - indexer.compress_ratio + 1, indexer.compress_ratio)
-    ]
-    owned_blocks = [block for block in blocks if block[2] // local_seq_len == rank]
-    counts = torch.tensor(
-        [sum(block_start // local_seq_len == owner for _, _, block_start in blocks) for owner in range(world_size)],
-        dtype=torch.long,
-        device=hidden_states.device,
+    layout = get_packed_qsa_layout(
+        batch_size,
+        global_seq_len,
+        cu_seq_lens_q,
+        indexer.compress_ratio,
+        rank,
+        world_size,
+        hidden_states.device,
+        packed_seq_lens=packed_seq_lens,
+        layout_cache=layout_cache,
     )
 
     halo = indexer.compress_ratio - 1
     extended_keys = torch.cat((raw_keys, _right_halo(raw_keys, halo, group, rank, world_size)), dim=1)
-    if owned_blocks:
-        local_batch_ids = torch.tensor(
-            [batch_idx for _, batch_idx, _ in owned_blocks], dtype=torch.long, device=hidden_states.device
-        )
-        local_block_starts = torch.tensor(
-            [start for _, _, start in owned_blocks], dtype=torch.long, device=hidden_states.device
-        )
-        local_offsets = local_block_starts - local_start
-        window_indices = (
-            local_offsets[:, None] + torch.arange(indexer.compress_ratio, device=hidden_states.device)[None]
-        )
+    if layout.counts[rank]:
+        local_batch_ids = layout.local_batch_ids
+        local_block_starts = layout.local_block_starts
+        window_indices = layout.window_indices
         pooled_keys = extended_keys[local_batch_ids[:, None], window_indices].float().mean(dim=1).to(raw_keys.dtype)
         pooled_keys = indexer.k_layernorm(pooled_keys)
         pooled_keys = apply_rotary_pos_emb(
@@ -145,23 +249,20 @@ def compact_qsa_select(
         pooled_keys = indexer.k_layernorm(extended_keys[:, :0]).reshape(1, 0, indexer.index_head_dim)
 
     if world_size > 1:
-        pooled_keys = all_gather_compressed_rows(pooled_keys, counts, group)
-    gathered_blocks = [block for owner in range(world_size) for block in blocks if block[2] // local_seq_len == owner]
+        pooled_keys = all_gather_compressed_rows(
+            pooled_keys, layout.counts, group, keep_indices=layout.gather_keep_indices
+        )
+    block_count = layout.block_starts.numel()
     output_width = indexer.token_budget + indexer.compress_ratio - 1
-    query_positions = local_start + torch.arange(local_seq_len, device=hidden_states.device)
-    local_segment_ids = segment_ids[:, local_start : local_start + local_seq_len]
-    local_segment_starts = segment_starts[:, local_start : local_start + local_seq_len]
+    query_positions = layout.query_positions
+    local_segment_ids = layout.local_segment_ids
 
-    if gathered_blocks:
-        block_segment_ids = torch.tensor(
-            [segment_id for segment_id, _, _ in gathered_blocks], dtype=torch.long, device=hidden_states.device
-        )
-        block_starts = torch.tensor(
-            [start for _, _, start in gathered_blocks], dtype=torch.long, device=hidden_states.device
-        )
-        top_count = min(indexer.block_topk, len(gathered_blocks))
-        block_offsets = torch.arange(indexer.compress_ratio, device=hidden_states.device)
-        elements_per_query = max(1, batch_size * len(gathered_blocks) * indexer.index_n_heads)
+    if block_count:
+        block_segment_ids = layout.block_segment_ids
+        block_starts = layout.block_starts
+        top_count = min(indexer.block_topk, block_count)
+        block_offsets = layout.block_offsets
+        elements_per_query = max(1, batch_size * block_count * indexer.index_n_heads)
         query_chunk_size = max(1, min(local_seq_len, _MAX_SCORE_ELEMENTS // elements_per_query))
         selected_chunks = []
         for query_start in range(0, local_seq_len, query_chunk_size):
@@ -186,15 +287,7 @@ def compact_qsa_select(
     else:
         selected_blocks = torch.empty(batch_size, local_seq_len, 0, dtype=torch.long, device=hidden_states.device)
 
-    visible_count = query_positions[None] - local_segment_starts + 1
-    tail_count = torch.remainder(visible_count, indexer.compress_ratio)
-    tail_start = (
-        local_segment_starts
-        + torch.div(visible_count, indexer.compress_ratio, rounding_mode="floor") * indexer.compress_ratio
-    )
-    tail_offsets = torch.arange(indexer.compress_ratio - 1, device=hidden_states.device)
-    tails = tail_start[..., None] + tail_offsets
-    tails = tails.masked_fill(tail_offsets[None, None] >= tail_count[..., None], -1)
+    tails = layout.tails
 
     selected = torch.cat((selected_blocks, tails), dim=-1)
     if selected.shape[-1] < output_width:

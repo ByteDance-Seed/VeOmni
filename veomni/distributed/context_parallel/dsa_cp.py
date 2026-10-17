@@ -35,8 +35,10 @@ def all_gather_kv(kv: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
 
 def all_gather_compressed_rows(
     local_rows: torch.Tensor,
-    counts: torch.Tensor,
+    counts: torch.Tensor | tuple[int, ...],
     group: dist.ProcessGroup,
+    *,
+    keep_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Assemble per-rank compressed rows into global window order.
 
@@ -52,17 +54,18 @@ def all_gather_compressed_rows(
     back to one broadcast per rank when they differ, which is ``cp_size``
     launches per compressor per layer.
 
-    Concatenating each rank's valid rows in rank order is already global window
-    order, because windows sort by start token and shards sort by rank.
+    Results are owner-major, preserving each owner's local row order. For a
+    single sequence this is global window order; packed multi-batch callers
+    must keep matching owner-major metadata rather than sorting by token start.
+    Optional integer ``keep_indices`` reuse a precomputed padding crop.
     """
-    # One device-to-host sync for every count at once. Reading ``counts.max()``
-    # and then ``counts[rank]`` inside the loop below drains the device queue
-    # ``cp_size + 1`` times per call, and there is one call per compressor and
-    # per indexer per layer.
-    per_rank = counts.tolist()
+    # Host counts let repeated QSA layers avoid draining the accelerator queue.
+    # Tensor counts retain the existing fallback for other CP models.
+    per_rank = counts.tolist() if isinstance(counts, torch.Tensor) else counts
     n_max = max(per_rank, default=0)
     if n_max == 0:
-        return local_rows.new_zeros(local_rows.shape[0], 0, local_rows.shape[-1])
+        # Preserve a zero-gradient edge on ranks with no compressed rows.
+        return local_rows[:, :0]
 
     n_local = local_rows.shape[1]
     if n_local < n_max:
@@ -70,13 +73,14 @@ def all_gather_compressed_rows(
         local_rows = torch.cat([local_rows, pad], dim=1)
 
     gathered = gather_outputs(local_rows, gather_dim=1, group=group)
-    keep = torch.cat(
-        [
-            torch.arange(rank * n_max, rank * n_max + count, device=gathered.device)
-            for rank, count in enumerate(per_rank)
-        ]
-    )
-    return gathered.index_select(1, keep)
+    if keep_indices is None:
+        keep_indices = torch.cat(
+            [
+                torch.arange(rank * n_max, rank * n_max + count, device=gathered.device)
+                for rank, count in enumerate(per_rank)
+            ]
+        )
+    return gathered.index_select(1, keep_indices)
 
 
 def exchange_compressor_halos(

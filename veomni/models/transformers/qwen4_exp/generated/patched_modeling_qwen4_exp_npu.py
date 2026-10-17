@@ -175,7 +175,11 @@ def _qwen4_exp_validate_packed_seq_lens(
     if batch_size != 1:
         raise ValueError("Qwen4-Exp packed sequence metadata currently requires batch_size=1.")
 
-    lengths = tuple(int(length) for length in packed_seq_lens)
+    lengths = (
+        packed_seq_lens
+        if isinstance(packed_seq_lens, tuple) and all(type(length) is int for length in packed_seq_lens)
+        else tuple(int(length) for length in packed_seq_lens)
+    )
     if not lengths or any(length <= 0 for length in lengths) or sum(lengths) != sequence_length:
         raise ValueError(
             "Qwen4-Exp packed sequence lengths must be positive and cover the complete sequence; "
@@ -184,12 +188,69 @@ def _qwen4_exp_validate_packed_seq_lens(
     return lengths
 
 
+def qwen4_exp_prepare_packed_lengths(kwargs, batch_size, global_seq_len, *, refresh=False):
+    """Resolve host lengths once; linear mixers may use independent boundaries."""
+    main_cu = kwargs.get("cu_seq_lens_q")
+    if main_cu is None:
+        return
+    linear_cu = kwargs.get("linear_attn_cu_seq_lens_q")
+    if linear_cu is None:
+        linear_cu = main_cu
+        kwargs["linear_attn_cu_seq_lens_q"] = linear_cu
+    # Only reuse metadata prepared for these exact, unmodified boundary tensors.
+    # Caller-provided tuples alone cannot establish the current sample boundaries.
+    try:
+        versions = (main_cu._version, linear_cu._version)
+    except RuntimeError:  # Inference tensors do not expose version counters.
+        versions = None
+    context = kwargs.get("_qwen4_exp_packed_lengths_context")
+    reusable = (
+        not refresh
+        and versions is not None
+        and isinstance(context, tuple)
+        and len(context) == 7
+        and context[0] is main_cu
+        and context[1] is linear_cu
+        and context[2] == versions
+        and context[3] == batch_size
+        and context[4] == global_seq_len
+    )
+    if reusable:
+        main_lengths, linear_lengths = context[5:]
+    else:
+
+        def resolve(cu):
+            if cu.ndim != 1 or cu.numel() < 2:
+                raise ValueError("Packed cumulative lengths must be a one-dimensional boundary tensor.")
+            boundaries = cu.tolist()
+            if boundaries[0] != 0 or boundaries[-1] != global_seq_len:
+                raise ValueError("Packed cumulative lengths must start at zero and cover the global sequence.")
+            return _qwen4_exp_validate_packed_seq_lens(
+                tuple(end - start for start, end in zip(boundaries, boundaries[1:])), batch_size, global_seq_len
+            )
+
+        main_lengths = resolve(main_cu)
+        linear_lengths = main_lengths if linear_cu is main_cu else resolve(linear_cu)
+    kwargs["packed_seq_lens"] = main_lengths
+    kwargs["linear_attn_packed_seq_lens"] = linear_lengths
+    kwargs["_qwen4_exp_packed_lengths_context"] = (
+        main_cu,
+        linear_cu,
+        versions,
+        batch_size,
+        global_seq_len,
+        main_lengths,
+        linear_lengths,
+    )
+
+
 def qwen4_exp_gdn_non_sp_forward(
     self,
     hidden_states: torch.Tensor,
     cache_params: Cache | None = None,
     attention_mask: torch.Tensor | None = None,
     linear_attn_cu_seq_lens_q: torch.Tensor | None = None,
+    packed_seq_lens: tuple[int, ...] | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ):
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
@@ -198,7 +259,7 @@ def qwen4_exp_gdn_non_sp_forward(
     if linear_attn_cu_seq_lens_q is None:
         raise ValueError("Qwen4-Exp GDN requires linear_attn_cu_seq_lens_q for VeOmni varlen training.")
     packed_seq_lens = _qwen4_exp_validate_packed_seq_lens(
-        linear_attn_cu_seq_lens_q.diff().tolist(), batch_size, seq_len
+        linear_attn_cu_seq_lens_q.diff().tolist() if packed_seq_lens is None else packed_seq_lens, batch_size, seq_len
     )
     if cache_params is not None:
         raise ValueError("Qwen4-Exp varlen GDN training does not support recurrent cache state.")
@@ -797,11 +858,19 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
         cache_params: Cache | None = None,
         attention_mask: torch.Tensor | None = None,
         linear_attn_cu_seq_lens_q: torch.Tensor | None = None,
+        packed_seq_lens: tuple[int, ...] | None = None,
+        linear_attn_packed_seq_lens: tuple[int, ...] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ):
         parallel_state = get_parallel_state()
+        main_cu = kwargs.pop("cu_seq_lens_q", None)
         if linear_attn_cu_seq_lens_q is None:
-            linear_attn_cu_seq_lens_q = kwargs.pop("cu_seq_lens_q", None)
+            linear_attn_cu_seq_lens_q = main_cu
+        if linear_attn_packed_seq_lens is not None:
+            packed_seq_lens = linear_attn_packed_seq_lens
+        elif main_cu is not None and linear_attn_cu_seq_lens_q is not main_cu:
+            # A main-attention host tuple must not mask different GDN boundaries.
+            packed_seq_lens = None
         if not parallel_state.sp_enabled:
             return qwen4_exp_gdn_non_sp_forward(
                 self,
@@ -809,6 +878,7 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
                 cache_params=cache_params,
                 attention_mask=attention_mask,
                 linear_attn_cu_seq_lens_q=linear_attn_cu_seq_lens_q,
+                packed_seq_lens=packed_seq_lens,
                 **kwargs,
             )
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
@@ -816,7 +886,9 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
         if linear_attn_cu_seq_lens_q is None:
             raise ValueError("Qwen4-Exp GDN requires global packed boundaries under SP.")
         _qwen4_exp_validate_packed_seq_lens(
-            linear_attn_cu_seq_lens_q.diff().tolist(), batch_size, seq_len * parallel_state.sp_size
+            linear_attn_cu_seq_lens_q.diff().tolist() if packed_seq_lens is None else packed_seq_lens,
+            batch_size,
+            seq_len * parallel_state.sp_size,
         )
         ulysses_enabled = parallel_state.sp_enabled
 
@@ -1107,6 +1179,8 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None,
         cu_seq_lens_q: torch.Tensor | None = None,
+        packed_seq_lens: tuple[int, ...] | None = None,
+        qsa_layout_cache: dict | None = None,
     ) -> torch.Tensor:
         parallel_state = get_parallel_state()
         if past_key_values is not None:
@@ -1129,6 +1203,8 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
             rank=parallel_state.sp_rank if parallel_state.sp_enabled else 0,
             world_size=parallel_state.sp_size,
             apply_rotary_pos_emb=apply_rotary_pos_emb,
+            packed_seq_lens=packed_seq_lens,
+            layout_cache=qsa_layout_cache,
         )
         return gather_qsa_selected_indices(
             selected_local,
@@ -1379,6 +1455,8 @@ class Qwen4ExpTextAttention(nn.Module):
             attention_mask,
             past_key_values,
             cu_seq_lens_q=kwargs.get("cu_seq_lens_q"),
+            packed_seq_lens=kwargs.get("packed_seq_lens"),
+            qsa_layout_cache=kwargs.get("qsa_layout_cache"),
         )
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -2363,6 +2441,11 @@ class Qwen4ExpTextModel(Qwen4ExpPreTrainedModel):
             eos_token_id = eos_token_id[0] if isinstance(eos_token_id, list) else eos_token_id
             ple_input_ids = torch.where(conv_mask.bool(), ple_input_ids, eos_token_id)
 
+        qwen4_exp_prepare_packed_lengths(
+            kwargs, inputs_embeds.shape[0], inputs_embeds.shape[1] * parallel_state.sp_size
+        )
+        # A new forward owns its integer layout cache; checkpointed layers share it.
+        kwargs["qsa_layout_cache"] = {}
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         hidden_states = hidden_states.repeat(1, 1, self.config.hc_count)
@@ -3437,9 +3520,8 @@ class Qwen4ExpModel(Qwen4ExpPreTrainedModel):
                 raise ValueError("Qwen4-Exp SP requires collator-provided global cu_seq_lens_q.")
             cu_seq_lens_q = pos2culen(position_ids[0])
             kwargs["cu_seq_lens_q"] = cu_seq_lens_q
-        kwargs.setdefault("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
-        _qwen4_exp_validate_packed_seq_lens(
-            cu_seq_lens_q.diff().tolist(), inputs_embeds.shape[0], inputs_embeds.shape[1] * parallel_state.sp_size
+        qwen4_exp_prepare_packed_lengths(
+            kwargs, inputs_embeds.shape[0], inputs_embeds.shape[1] * parallel_state.sp_size, refresh=True
         )
         if position_ids.shape[0] == 3:
             text_position_ids = culen2pos(cu_seq_lens_q).to(device=position_ids.device, dtype=position_ids.dtype)

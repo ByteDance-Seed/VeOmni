@@ -239,6 +239,10 @@ def main():
         dict(linear_attn_cu_seq_lens_q=bounds),
         "GDN packed recurrence",
     )
+    # Two QSA layers must share the per-forward integer layout, including
+    # backward recomputation; neither may share differentiable activations.
+    config.layer_types = ["linear_attention", "full_attention"] * 2
+    config.num_hidden_layers = len(config.layer_types)
     model = model_code.Qwen4ExpTextModel(config).float()
     for layer in model.layers:
         if hasattr(layer, "linear_attn"):
@@ -259,16 +263,24 @@ def main():
     )
     model.zero_grad(set_to_none=True)
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    compare(
-        model,
-        ids.clone(),
-        ids[:, sl].clone(),
-        dict(position_ids=positions, attention_mask=mask, cu_seq_lens_q=bounds, linear_attn_cu_seq_lens_q=bounds),
-        dict(
-            position_ids=positions[:, sl], attention_mask=mask, cu_seq_lens_q=bounds, linear_attn_cu_seq_lens_q=bounds
-        ),
-        "packed text model with non-reentrant gradient checkpointing",
-    )
+    from veomni.models.transformers.qwen4_exp import packed_utils
+
+    build_layout = packed_utils.build_packed_qsa_layout
+    with patch.object(packed_utils, "build_packed_qsa_layout", wraps=build_layout) as builds:
+        compare(
+            model,
+            ids.clone(),
+            ids[:, sl].clone(),
+            dict(position_ids=positions, attention_mask=mask, cu_seq_lens_q=bounds, linear_attn_cu_seq_lens_q=bounds),
+            dict(
+                position_ids=positions[:, sl],
+                attention_mask=mask,
+                cu_seq_lens_q=bounds,
+                linear_attn_cu_seq_lens_q=bounds,
+            ),
+            "packed text model with non-reentrant gradient checkpointing",
+        )
+        assert builds.call_count == 2, builds.call_count
     clear_parallel_state()
     dist.destroy_process_group()
 

@@ -27,3 +27,32 @@ PLE halos, GDN, the complete toy text model, checkpoint recomputation, and
 all input/parameter gradients against the non-SP reference. GDN device
 kernels use CPU references in this gate; it does not qualify native kernels.
 The fused NPU QSA implementation matches #1231, including INT8 mask scatter.
+
+## Packed metadata reuse
+
+Each model forward resolves validated host sequence lengths once. Main QSA/PLE
+boundaries and independently supplied GDN boundaries retain separate length
+tuples. Boundary tensor identity and version checks prevent stale tuples from
+being reused; inference tensors without version counters are resolved again.
+
+QSA builds an integer-only layout once per distinct packed boundary content,
+compression ratio, batch/sequence shape, SP rank/size and device within a
+forward. The layout is shared across attention layers and their checkpoint
+recomputation. A new model forward creates a new cache. It contains no projected
+keys or differentiable activations, and the score, TopK and attention arithmetic
+remain unchanged. Stable owner-major order preserves within-owner sample and
+block ordering, including multi-batch inputs and empty owners.
+
+Host row counts and a cached padding-crop index let compressed-row gathering
+avoid repeated device-to-host count conversions. Existing tensor-count callers
+retain their original interface. These changes reduce metadata construction and
+host synchronization; they do not reduce the attention's arithmetic complexity
+or guarantee any particular end-to-end speedup.
+
+`tests/parallel/context_parallel/test_qwen4_exp_packed_layout.py` checks layout
+ordering, cache invalidation, independent GDN boundaries and empty-row gradients.
+The Gloo model gate uses two QSA layers and checks that layout reuse survives
+non-reentrant checkpoint recomputation. An optional 32-NPU replay is provided in
+`tests/parallel/context_parallel/qwen4_exp_packed_layout_native_probe.py`; it
+requires the #1275 NPU-safe TopK follow-up in both baseline and candidate. It
+measures selector timing and numerical agreement, not full-training throughput.
