@@ -519,9 +519,11 @@ they do not trigger another detached CE attempt. Non-strict mode skips invalid
 observations, while strict mode reports failures at the globally synchronized
 step end. Errors in the main training forward or loss still propagate normally. A failed
 forward discards pending observations without entering observer collectives.
-The default `chunk_loss` backend reuses the main loss projection, but the detached
-per-token CE still needs a chunk-sized full-vocabulary workspace. Other fused-loss
-backends may recompute the LM-head projection on sampled steps, so the default
+When `cross_entropy_loss_implementation` is `chunk_loss` (or its `npu` alias),
+the observer reuses the main loss projection, but the detached per-token CE
+still needs a chunk-sized full-vocabulary workspace. Other fused-loss backends,
+including the GPU default `liger_kernel`, may recompute the LM-head projection
+on sampled steps, so the default
 interval is 10 steps; set `interval=1` for per-step metrics. On memory-constrained
 profiles, `release_cache=true` synchronizes and releases the detached CE
 workspace after each sampled forward and before training backward. This does
