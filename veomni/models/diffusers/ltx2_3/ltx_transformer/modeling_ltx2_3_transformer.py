@@ -59,6 +59,7 @@ def LTXSPAttention_forward(
     sp_valid_length: int | None = None,
     sp_context_length: int | None = None,
 ) -> torch.Tensor:
+    """Apply LTX attention with sequence collectives only for explicitly sharded DiT inputs."""
     is_cross_attention = context is not None
 
     # Audio<->video cross-attention attends to the other modality, which is sliced across SP
@@ -80,7 +81,9 @@ def LTXSPAttention_forward(
         k = self.to_k(context)
         q, k = self.preattention_function(q, k, self, mask, pe, k_pe)
 
-        sp_enabled = get_parallel_state().sp_enabled and not is_cross_attention
+        # Only DiT self-attention receives sequence shards and their original length.
+        # Text connectors share this patch but keep full, replicated sequences.
+        sp_enabled = get_parallel_state().sp_enabled and not is_cross_attention and sp_valid_length is not None
 
         if sp_enabled:
             heads = self.heads
@@ -230,6 +233,7 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
     }
 
     def __init__(self, config: LTXVideoTransformerModelConfig, **kwargs):
+        """Initialize the shared transformer from its Hugging Face configuration."""
         PreTrainedModel.__init__(self, config, **kwargs)
         del self._internal_dict
         kwargs.pop("attn_implementation", None)
@@ -280,13 +284,18 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
             caption_projection=caption_projection,
             audio_caption_projection=audio_caption_projection,
             cross_attention_adaln=config.cross_attention_adaln,
+            ff_bias=config.ff_bias,
+            audio_ff_bias=config.audio_ff_bias,
+            use_keyframes_abs_pos_embedding=config.use_keyframes_abs_pos_embedding,
         )
         self.config: LTXVideoTransformerModelConfig = config
         self.config.tie_word_embeddings = False
         self.gradient_checkpointing = False
 
     def _init_weights(self, module: torch.nn.Module) -> None:
+        """Initialize linear, normalization and keyframe parameters for newly created models."""
         for attr in (
+            "keyframes_abs_pos_embedding",
             "scale_shift_table",
             "audio_scale_shift_table",
             "scale_shift_table_a2v_ca_audio",
@@ -333,6 +342,7 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
         audio_loss_mask: list[torch.Tensor] | None = None,
         ref_seq_len: list[int] | None = None,
     ):
+        """Prepare per-sample audio-video modalities and return predictions with optional training loss."""
         video_patchifier = VideoLatentPatchifier(patch_size=1)
         audio_patchifier = AudioPatchifier(patch_size=1) if self.config.with_audio else None
         predictions = []
@@ -397,12 +407,21 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
             if sample_ctx_mask is not None:
                 sample_ctx_mask = sample_ctx_mask.to(device=model_device)
 
+            keyframes_mask = None
+            if self.config.use_keyframes_abs_pos_embedding:
+                if sample_ref_seq_len:
+                    raise ValueError("LTX-2.5 IC-LoRA reference conditioning is not supported by this recipe.")
+                # The first generated latent frame is a keyframe in T2AV as well as I2AV.
+                keyframes_mask = latent_tokens.new_zeros((*latent_tokens.shape[:2], 1))
+                keyframes_mask[:, : latent_shape.height * latent_shape.width] = 1
+
             video_modality = Modality(
                 latent=latent_tokens,
                 sigma=sigma,
                 timesteps=timesteps,
                 positions=positions,
                 context=enc_hs,
+                keyframes_mask=keyframes_mask,
                 context_mask=sample_ctx_mask,
             )
 

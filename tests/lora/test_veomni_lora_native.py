@@ -73,6 +73,36 @@ def _randomize_lora_b(model: VeOmniLoraModel) -> None:
                     lin.weight.normal_(0.0, 0.02)
 
 
+def test_offloaded_adapter_broadcast_uses_accelerator(monkeypatch):
+    """CPU offload must not send even the adapter-count scalar over NCCL on CPU."""
+    from veomni.lora import weight_loading
+    from veomni.models import module_utils
+
+    monkeypatch.setattr(weight_loading.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(weight_loading.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(weight_loading, "get_parallel_state", lambda: SimpleNamespace(global_rank=0))
+    monkeypatch.setattr(module_utils, "get_device_type", lambda: "cuda")
+    monkeypatch.setattr(weight_loading, "load_adapter_state_dict", lambda *args, **kwargs: {})
+    tensor_factory = torch.tensor
+    requested_devices = []
+
+    def allocate_count(*args, **kwargs):
+        """Record the requested communication device while allocating on CPU."""
+        requested_devices.append(torch.device(kwargs.pop("device")))
+        # Exercise the transport decision without requiring CUDA in this suite.
+        return tensor_factory(*args, device="cpu", **kwargs)
+
+    def broadcast_count(tensor, src):
+        """Verify the adapter-count collective uses the root rank and expected value."""
+        assert requested_devices[-1].type == "cuda", "NCCL cannot broadcast CPU tensors"
+        assert src == 0 and tensor.item() == 0
+
+    monkeypatch.setattr(weight_loading.torch, "tensor", allocate_count)
+    monkeypatch.setattr(weight_loading.dist, "broadcast", broadcast_count)
+    weight_loading.rank0_load_and_broadcast_lora_weights(nn.Identity(), "unused", init_device="cpu")
+    assert len(requested_devices) == 1
+
+
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------

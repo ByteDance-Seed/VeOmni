@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import torch
@@ -98,7 +99,9 @@ class TransformerArgsPreprocessor:
         rope_type: LTXRopeType,
         caption_projection: torch.nn.Module | None = None,
         prompt_adaln: AdaLayerNormSingle | None = None,
+        keyframes_embedding_provider: Callable[[], torch.Tensor | None] | None = None,
     ) -> None:
+        """Store modality projections and positional settings, including an optional keyframe provider."""
         self.patchify_proj = patchify_proj
         self.adaln = adaln
         self.inner_dim = inner_dim
@@ -111,6 +114,7 @@ class TransformerArgsPreprocessor:
         self.rope_type = rope_type
         self.caption_projection = caption_projection
         self.prompt_adaln = prompt_adaln
+        self.keyframes_embedding_provider = keyframes_embedding_provider
 
     def _prepare_timestep(
         self, timestep: torch.Tensor, adaln: AdaLayerNormSingle, batch_size: int, hidden_dtype: torch.dtype
@@ -209,7 +213,12 @@ class TransformerArgsPreprocessor:
         modality: Modality,
         cross_modality: Modality | None = None,  # noqa: ARG002
     ) -> TransformerArgs:
+        """Project modality tokens and assemble masks, timesteps and positional embeddings."""
         x = self.patchify_proj(modality.latent)
+        if self.keyframes_embedding_provider is not None and modality.keyframes_mask is not None:
+            embedding = self.keyframes_embedding_provider()
+            if embedding is not None:
+                x = x + (modality.keyframes_mask > 0).to(x.dtype) * embedding.to(x.dtype)
         batch_size = x.shape[0]
         timestep, embedded_timestep = self._prepare_timestep(
             modality.timesteps, self.adaln, batch_size, modality.latent.dtype
@@ -266,7 +275,9 @@ class MultiModalTransformerArgsPreprocessor:
         av_ca_timestep_scale_multiplier: int,
         caption_projection: torch.nn.Module | None = None,
         prompt_adaln: AdaLayerNormSingle | None = None,
+        keyframes_embedding_provider: Callable[[], torch.Tensor | None] | None = None,
     ) -> None:
+        """Initialize single-modality preprocessing and audio-video cross-attention conditioning."""
         self.simple_preprocessor = TransformerArgsPreprocessor(
             patchify_proj=patchify_proj,
             adaln=adaln,
@@ -280,6 +291,7 @@ class MultiModalTransformerArgsPreprocessor:
             rope_type=rope_type,
             caption_projection=caption_projection,
             prompt_adaln=prompt_adaln,
+            keyframes_embedding_provider=keyframes_embedding_provider,
         )
         self.cross_scale_shift_adaln = cross_scale_shift_adaln
         self.cross_gate_adaln = cross_gate_adaln
