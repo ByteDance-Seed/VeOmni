@@ -2,7 +2,7 @@ model:
   model_path: Wan-AI/Wan2.1-I2V-14B-480P
   config_path: ./configs/model_configs/wan/wani2v_14b.json
   ops_implementation:
-    attn_implementation: flash_attention_2
+    attn_implementation: veomni_flash_attention_2_with_sp
     # Wan's RoPE has a non-standard signature (rope_apply takes a single
     # tensor plus freqs/head_dim kwargs) so the framework's default
     # liger_kernel RoPE cannot drop in. Pin to eager explicitly until a
