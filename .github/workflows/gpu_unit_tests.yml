@@ -184,6 +184,7 @@ jobs:
         run: |
           uv run --frozen pytest -s -x tests/distributed/test_async_offload_unit.py
           uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
+          uv run --frozen pytest -s -x tests/models/test_qwen4_exp_vision_dummy.py
           uv run --frozen pytest -s -x tests/distributed/test_emb_parallel.py
           uv run --frozen pytest -s -x tests/distributed/test_parallel_plan.py
           uv run --frozen pytest -s -x tests/distributed/test_reduce_scatter_fp32_accumulation.py

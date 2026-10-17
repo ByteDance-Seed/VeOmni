@@ -1972,7 +1972,7 @@
  @auto_docstring
  class Qwen4ExpVisionModel(Qwen4ExpPreTrainedModel):
      config: Qwen4ExpVisionConfig
-@@ -1960,6 +2916,50 @@
+@@ -1960,6 +2916,42 @@
              pooler_output=merged_hidden_states,
          )
 
@@ -1982,13 +1982,9 @@
 +    # 2. Derive shapes and dtype from the live model instead of hardcoding them.
 +    # ================================================================
 +    def dummy_forward(self):
-+        # --- Patch.1: Reuse VeOmni's SP-aware vision helpers. ---
-+        # 1. Touch the vision tower on text-only FSDP ranks.
-+        # 2. Derive shapes and dtype from the live model instead of hardcoding them.
-+        # 3. Under SP, describe the global grid while supplying only this rank's
-+        #    local patch rows, and avoid runtime metadata synchronization.
-+        # 4. Use local varlen boundaries when the selected vision attention does not
-+        #    perform the Ulysses sequence exchange.
++        # Qwen4-Exp gathers real image patches before its unsharded vision tower.
++        # Its Transformers vision helpers produce global positions, so the dummy
++        # input must also contain every patch in grid_thw, including under U/CP.
 +        merge_size = self.spatial_merge_size
 +        parallel_state = get_parallel_state()
 +        t = 1
@@ -1998,14 +1994,10 @@
 +        flattened_patch_size = config.in_channels * config.temporal_patch_size * config.patch_size**2
 +        dtype = self.patch_embed.proj.weight.dtype
 +        device = self.patch_embed.proj.weight.device
-+        local_patch_count = t * h * w // parallel_state.sp_size
-+        pixel_values = torch.zeros((local_patch_count, flattened_patch_size), dtype=dtype, device=device)
++        patch_count = t * h * w
++        pixel_values = torch.zeros((patch_count, flattened_patch_size), dtype=dtype, device=device)
 +        grid_thw = torch.tensor([[t, h, w]], dtype=torch.long, device=device)
-+        attention_seq_len = (
-+            t * h * w
-+            if not parallel_state.sp_enabled or self.config._attn_implementation.endswith("_with_sp")
-+            else local_patch_count
-+        )
++        attention_seq_len = patch_count
 +        vit_metadata = {
 +            "grid_thw_list": [[t, h, w]],
 +            "cu_seqlens": torch.tensor([0, attention_seq_len], dtype=torch.int32, device="cpu"),
@@ -2023,7 +2015,7 @@
 
  @auto_docstring
  class Qwen4ExpModel(Qwen4ExpPreTrainedModel):
-@@ -1968,13 +2968,23 @@
+@@ -1968,13 +2960,23 @@
      accepts_loss_kwargs = False
      _no_split_modules = ["Qwen4ExpDecoderLayer", "Qwen4ExpVisionBlock"]
 
@@ -2052,7 +2044,7 @@
          self.post_init()
 
      def get_vision_position_ids(
-@@ -2244,6 +3254,14 @@
+@@ -2244,6 +3246,14 @@
              position_ids = None
          return position_ids
 
@@ -2067,7 +2059,7 @@
      @auto_docstring
      @can_return_tuple
      def forward(
-@@ -2260,53 +3278,185 @@
+@@ -2260,53 +3270,185 @@
          mm_token_type_ids: torch.IntTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen4ExpModelOutputWithPast:
@@ -2274,7 +2266,7 @@
          outputs = self.language_model(
              input_ids=None,
              position_ids=position_ids,
-@@ -2316,11 +3466,7 @@
+@@ -2316,11 +3458,7 @@
              ple_input_ids=ple_input_ids,
              **kwargs,
          )
@@ -2287,7 +2279,7 @@
 
 
  @auto_docstring
-@@ -2335,6 +3481,27 @@
+@@ -2335,6 +3473,27 @@
      rope_deltas: torch.LongTensor | None = None
      router_logits: tuple[torch.FloatTensor] | None = None
      aux_loss: torch.FloatTensor | None = None
@@ -2315,7 +2307,7 @@
 
 
  @auto_docstring
-@@ -2379,6 +3546,12 @@
+@@ -2379,6 +3538,12 @@
          """
          return self.model.get_image_features(pixel_values, image_grid_thw, **kwargs)
 
@@ -2328,7 +2320,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -2396,47 +3569,10 @@
+@@ -2396,47 +3561,10 @@
          mm_token_type_ids: torch.IntTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -2380,7 +2372,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -2448,33 +3584,74 @@
+@@ -2448,33 +3576,74 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -2472,7 +2464,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -2483,6 +3660,7 @@
+@@ -2483,6 +3652,7 @@
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
              router_logits=outputs.router_logits,
@@ -2480,7 +2472,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -2696,6 +3874,46 @@
+@@ -2696,6 +3866,46 @@
          }
          return causal_mask_mapping
 
