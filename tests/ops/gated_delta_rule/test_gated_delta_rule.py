@@ -374,6 +374,61 @@ def test_causal_conv1d_npu_accepts_cpu_cu_seqlens():
     assert x.grad is not None and weight.grad is not None
 
 
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="causal_conv1d npu needs torch_npu")
+def test_causal_conv1d_npu_short_segment_packed_matches_unpacked():
+    """A packed segment shorter than the window must not leak into ``dw`` or ``dh0``.
+
+    The registry wrapper always passes ``initial_state=None``. This case calls the
+    vendored impl, which still accepts ``initial_state`` and expects ``weight`` as ``[W, D]``.
+    """
+    _require_npu_gdr_dependencies()
+    from veomni.ops.kernels.gated_delta_rule.vendor.triton.convolution import (
+        causal_conv1d_bwd_impl,
+        causal_conv1d_fwd_impl,
+    )
+    from veomni.ops.kernels.gated_delta_rule.vendor.triton.utils import is_arch35
+
+    if is_arch35():
+        pytest.skip("vendored NPU causal_conv1d does not support arch35")
+
+    def run(x, weight, initial_state, cu_seqlens=None):
+        y, _ = causal_conv1d_fwd_impl(
+            x=x,
+            weight=weight,
+            bias=None,
+            residual=None,
+            initial_state=initial_state,
+            activation=None,
+            cu_seqlens=cu_seqlens,
+        )
+        _, grad_weight, _, _, grad_initial_state = causal_conv1d_bwd_impl(
+            x=x,
+            dy=torch.ones_like(y),
+            dht=None,
+            weight=weight,
+            bias=None,
+            residual=None,
+            initial_state=initial_state,
+            activation=None,
+            cu_seqlens=cu_seqlens,
+        )
+        return grad_weight, grad_initial_state
+
+    torch.manual_seed(17)
+    window, dim = 4, 256
+    cu_seqlens = torch.tensor([0, 1, 8], dtype=torch.int32, device="npu")
+    x = torch.randn(1, 8, dim, dtype=torch.bfloat16, device="npu")
+    weight = torch.randn(window, dim, dtype=torch.bfloat16, device="npu")
+    initial_state = torch.randn(2, dim, window, dtype=torch.bfloat16, device="npu")
+
+    packed_dw, packed_dh0 = run(x, weight, initial_state, cu_seqlens)
+    dw_0, dh0_0 = run(x[:, :1].contiguous(), weight, initial_state[:1].contiguous())
+    dw_1, dh0_1 = run(x[:, 1:].contiguous(), weight, initial_state[1:].contiguous())
+
+    torch.testing.assert_close(packed_dw, dw_0 + dw_1, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(packed_dh0, torch.cat((dh0_0, dh0_1), dim=0), rtol=1e-2, atol=1e-2)
+
+
 def test_chunk_gated_delta_rule_eager_matches_hf():
     torch.manual_seed(2)
     batch, seq, heads, dim = 1, 32, 2, 16
