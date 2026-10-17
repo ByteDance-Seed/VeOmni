@@ -206,6 +206,9 @@ jobs:
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_moe_ep_sharded_load_matrix.py
           uv run --frozen pytest -v -s -x tests/utils/test_ep_sharded_expert_stream_load.py
+      - name: Run Qwen4 training compatibility regressions
+        run: |
+          uv run --frozen pytest -v -s -x tests/optim/test_master_fp32_adamw.py tests/optim/test_cpu_offload_adamw.py
       - name: Run checkpoint tests
         run: |
           uv run --frozen pytest -v -s -x tests/checkpoints/
@@ -259,3 +262,7 @@ jobs:
         # are validated on NPU here.
         run: |
           uv run --frozen pytest -v -s -x tests/lora/test_moe_lora_ep_sharded_stream_load.py
+
+      - name: Test FP32 master and logical-slice Muon optimizers
+        run: |
+          uv run --frozen pytest -v -s -x tests/optim/test_master_fp32_adamw.py tests/optim/test_cpu_offload_adamw.py tests/optim/test_qwen38_muon.py
