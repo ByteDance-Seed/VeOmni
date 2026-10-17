@@ -829,6 +829,7 @@ class AcceleratorConfig:
         default=1,
         metadata={"help": "Context parallel size."},
     )
+    allow_hybrid_cp: bool = field(default=False, metadata={"help": "Opt in to model-specific Ulysses with CP."})
     init_device: Literal["cuda", "meta", "npu", "mlu"] = field(
         default="meta",
         metadata={
@@ -876,7 +877,7 @@ class AcceleratorConfig:
             )
         assert self.tp_size == 1, "Tensor parallel size not supported yet."
         assert self.pp_size == 1, "Pipeline parallel size not supported yet."
-        if self.cp_size > 1 and self.ulysses_size > 1:
+        if self.cp_size > 1 and self.ulysses_size > 1 and not self.allow_hybrid_cp:
             raise NotImplementedError(
                 "Context parallelism cannot be combined with Ulysses yet; "
                 f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
@@ -1469,10 +1470,11 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
-    qsa_attention_implementation: Literal["eager", "tilelang"] = field(
+    qwen4_gdn_cp_implementation: Literal["headwise"] = field(default="headwise")
+    qsa_attention_implementation: Literal["eager", "npu_fused", "tilelang"] = field(
         default="eager",
         metadata={
-            "help": "Qwen4-Exp sparse attention implementation. 'eager' expands compact "
+            "help": "Qwen4-Exp sparse attention implementation. 'npu_fused' uses bounded Ascend fusion; 'eager' expands compact "
             "global token indices to a dense mask and runs quadratic PyTorch attention "
             "(numerical reference). 'tilelang' runs the gather-based TileLang sparse "
             "attention kernel instead; it requires bf16 on an NVIDIA CUDA GPU, covers "
