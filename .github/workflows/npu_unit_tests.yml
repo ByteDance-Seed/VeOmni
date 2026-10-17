@@ -232,6 +232,7 @@ jobs:
           uv run --frozen pytest -v -s -x tests/ops/test_comp.py
           uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
           uv run --frozen pytest -v -s -x tests/ops/test_npu_kernels.py
+          uv run --frozen pytest -v -s -x tests/ops/test_qwen4_exp_qsa_npu_fused.py
           # This numerical gate must execute on NPU; fail instead of silently skipping
           # when the vendor extension is missing from the CI image.
           uv run --frozen python -c "import cann_ops_transformer"

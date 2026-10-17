@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen4-Exp model-specific NVIDIA CUDA kernels.
+"""Qwen4-Exp model-specific CUDA and Ascend kernels.
 
 Imports stay inside the public wrappers because TileLang is an optional,
 GPU-only dependency. Importing VeOmni on CPU or NPU must not load it.
@@ -21,6 +21,7 @@ GPU-only dependency. Importing VeOmni on CPU or NPU must not load it.
 import torch
 
 from ....utils.device import IS_CUDA_AVAILABLE
+from ....utils.import_utils import is_torch_npu_available
 
 
 def qsa_attn_tilelang(
@@ -38,4 +39,12 @@ def qsa_attn_tilelang(
     return impl(query, key, value, selected_indices, sm_scale)
 
 
-__all__ = ["qsa_attn_tilelang"]
+def qsa_attn_npu_fused(query, key, value, selected_indices, sm_scale=None, query_chunk_size=2048):
+    if query.device.type != "npu" or not is_torch_npu_available():
+        raise RuntimeError("QSA npu_fused requires Ascend NPU and torch_npu")
+    from .npu_qsa import qsa_attn_npu_fused as impl
+
+    return impl(query, key, value, selected_indices, sm_scale, query_chunk_size)
+
+
+__all__ = ["qsa_attn_tilelang", "qsa_attn_npu_fused"]
