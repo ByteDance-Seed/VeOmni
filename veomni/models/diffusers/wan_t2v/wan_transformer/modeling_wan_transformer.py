@@ -195,7 +195,15 @@ class WanSPAttnProcessor(WanAttnProcessor):
         # boundaries selects HF's varlen FA2 path without changing attention
         # semantics or relying on a synthetic padding mask.
         attention_interface: Callable = wan_eager_attention_forward
-        use_flash_attention = self.attn_implementation in {"flash_attention_2", "veomni_flash_attention_2_with_sp"}
+        # Deliberately narrower than ``VARLEN_ATTENTION_TYPES``, which also lists the FA3 and
+        # FA4 names: this set gates the bf16 precondition assert below, and only the backends
+        # Wan has actually been validated against belong in it. Add a name here once it has
+        # been exercised end to end, rather than importing the shared tuple.
+        use_flash_attention = self.attn_implementation in {
+            "flash_attention_2",
+            "veomni_flash_attention_2_with_sp",
+            "veomni_flash_attention_aiter_with_sp",
+        }
         if use_flash_attention:
             _assert_wan_flash_attention_bf16(query, key, value, attn)
         if self.attn_implementation != "eager":
