@@ -2922,13 +2922,9 @@ class Qwen4ExpVisionModel(Qwen4ExpPreTrainedModel):
     # 2. Derive shapes and dtype from the live model instead of hardcoding them.
     # ================================================================
     def dummy_forward(self):
-        # --- Patch.1: Reuse VeOmni's SP-aware vision helpers. ---
-        # 1. Touch the vision tower on text-only FSDP ranks.
-        # 2. Derive shapes and dtype from the live model instead of hardcoding them.
-        # 3. Under SP, describe the global grid while supplying only this rank's
-        #    local patch rows, and avoid runtime metadata synchronization.
-        # 4. Use local varlen boundaries when the selected vision attention does not
-        #    perform the Ulysses sequence exchange.
+        # Qwen4-Exp gathers real image patches before its unsharded vision tower.
+        # Its Transformers vision helpers produce global positions, so the dummy
+        # input must also contain every patch in grid_thw, including under U/CP.
         merge_size = self.spatial_merge_size
         parallel_state = get_parallel_state()
         t = 1
@@ -2938,14 +2934,10 @@ class Qwen4ExpVisionModel(Qwen4ExpPreTrainedModel):
         flattened_patch_size = config.in_channels * config.temporal_patch_size * config.patch_size**2
         dtype = self.patch_embed.proj.weight.dtype
         device = self.patch_embed.proj.weight.device
-        local_patch_count = t * h * w // parallel_state.sp_size
-        pixel_values = torch.zeros((local_patch_count, flattened_patch_size), dtype=dtype, device=device)
+        patch_count = t * h * w
+        pixel_values = torch.zeros((patch_count, flattened_patch_size), dtype=dtype, device=device)
         grid_thw = torch.tensor([[t, h, w]], dtype=torch.long, device=device)
-        attention_seq_len = (
-            t * h * w
-            if not parallel_state.sp_enabled or self.config._attn_implementation.endswith("_with_sp")
-            else local_patch_count
-        )
+        attention_seq_len = patch_count
         vit_metadata = {
             "grid_thw_list": [[t, h, w]],
             "cu_seqlens": torch.tensor([0, attention_seq_len], dtype=torch.int32, device="cpu"),
