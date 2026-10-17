@@ -721,3 +721,51 @@ class TestNPUKernelRegistry:
         assert "npu" in KERNEL_REGISTRY.list_available(op_name, variant), (
             f"Expected 'npu' kernel registered for ({op_name!r}, {variant!r})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Causal conv1d short segment packed regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestCausalConv1dShortSegmentPacked:
+    """Regression tests for short-segment packed conv1d with initial_state.
+
+    Ensures that widening BT (to keep dh0 on a single-slot path) does not let
+    mask_head_rows or dh0 load masks leak rows from subsequent sequences into
+    b_dw or dh0 for packed segments shorter than W (e.g. lengths [1, 7], W=4).
+    """
+
+    def test_short_segment_packed_dw_matches_unpacked(self):
+        from veomni.ops.kernels.gated_delta_rule._ascend.causal_conv1d import causal_conv1d
+
+        device = get_device_type()
+        W = 4
+        D = 256  # divisible by BD=32
+        # Packed lengths [1, 7], total T=8
+        cu_seqlens = torch.tensor([0, 1, 8], dtype=torch.int32, device=device)
+        x = torch.randn(1, 8, D, dtype=torch.bfloat16, device=device, requires_grad=True)
+        weight = torch.randn(W, D, dtype=torch.bfloat16, device=device, requires_grad=True)
+        initial_state = torch.randn(2, D, W, dtype=torch.bfloat16, device=device, requires_grad=True)
+
+        # Packed forward + backward
+        y, _ = causal_conv1d(x, weight, initial_state=initial_state, cu_seqlens=cu_seqlens)
+        y.sum().backward()
+
+        # Unpacked separate calls
+        x_0 = x[:, :1].detach().clone().requires_grad_()
+        init_0 = initial_state[:1].detach().clone().requires_grad_()
+        w_0 = weight.detach().clone().requires_grad_()
+        y_0, _ = causal_conv1d(x_0, w_0, initial_state=init_0)
+        y_0.sum().backward()
+
+        x_1 = x[:, 1:].detach().clone().requires_grad_()
+        init_1 = initial_state[1:].detach().clone().requires_grad_()
+        w_1 = weight.detach().clone().requires_grad_()
+        y_1, _ = causal_conv1d(x_1, w_1, initial_state=init_1)
+        y_1.sum().backward()
+
+        expected_dw = w_0.grad + w_1.grad
+        torch.testing.assert_close(weight.grad, expected_dw, rtol=1e-2, atol=1e-2)
+        expected_dh0 = torch.cat((init_0.grad, init_1.grad), dim=0)
+        torch.testing.assert_close(initial_state.grad, expected_dh0, rtol=1e-2, atol=1e-2)
