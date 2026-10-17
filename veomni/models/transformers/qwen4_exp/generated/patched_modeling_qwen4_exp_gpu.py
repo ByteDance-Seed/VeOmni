@@ -1282,14 +1282,14 @@ def eager_attention_forward(
         attention_weights = F.dropout(attention_weights, p=dropout, training=module.training)
         return torch.matmul(attention_weights, value_states).transpose(1, 2).contiguous(), attention_weights
 
-    # --- Patch.1: Dispatch QSA to eager or TileLang attention. ---
+    # --- Patch.1: Dispatch QSA to eager, SDPA, or TileLang attention. ---
     # Dispatch QSA calls to the TileLang sparse-attention kernel when
     # `qsa_attention_implementation='tilelang'`.
     # If dropout != 0, fall back to the eager path;
     qsa_implementation = veomni_qsa_attention_implementation.value
-    if qsa_implementation not in {"eager", "tilelang"}:
+    if qsa_implementation not in {"eager", "sdpa", "tilelang"}:
         raise ValueError(
-            f"Unknown qsa_attention_implementation={qsa_implementation!r}; expected 'eager' or 'tilelang'."
+            f"Unknown qsa_attention_implementation={qsa_implementation!r}; expected 'eager', 'sdpa', or 'tilelang'."
         )
     if qsa_implementation == "tilelang":
         if attention_mask is not None:
@@ -1304,7 +1304,7 @@ def eager_attention_forward(
             "falls back to the dense eager QSA reference, which materializes the [B, H, S, S] score tensor."
         )
     # --- Patch.1 ---
-    # --- Patch.2 Preserve the Transformers eager contract for every non-QSA caller. ---
+    # --- Patch.2: Expand compact QSA indices to a 4D mask and dispatch SDPA or eager. ---
     kv_heads, kv_len, kv_head_dim = key.shape[1:]
     batch_size, query_heads, query_len, head_dim = query.shape
     selected_token_mask = torch.zeros(
@@ -1315,12 +1315,57 @@ def eager_attention_forward(
     scatter_indices = torch.where(selected_indices >= 0, selected_indices, kv_len)
     allowed = selected_token_mask.scatter_(-1, scatter_indices.long(), True)[..., :kv_len][:, None]
     repeats = query_heads // kv_heads
+    config_attn_implementation = getattr(getattr(module, "config", None), "_attn_implementation", None)
+    use_sdpa = qsa_implementation == "sdpa" or (
+        qsa_implementation == "eager" and config_attn_implementation in {"sdpa", "paged|sdpa"}
+    )
+    if use_sdpa:
+        if attention_mask is not None:
+            if attention_mask.is_floating_point():
+                qsa_attention_mask = attention_mask.masked_fill(~allowed, torch.finfo(attention_mask.dtype).min)
+                allowed = allowed & (attention_mask > torch.finfo(attention_mask.dtype).min / 2)
+            else:
+                allowed = allowed & attention_mask
+                qsa_attention_mask = allowed
+        else:
+            qsa_attention_mask = allowed
+        has_selection_mask = allowed.any(dim=-1, keepdim=True)
+        if qsa_attention_mask.is_floating_point():
+            qsa_attention_mask = torch.where(
+                has_selection_mask, qsa_attention_mask, torch.zeros_like(qsa_attention_mask)
+            )
+        else:
+            qsa_attention_mask = torch.where(has_selection_mask, qsa_attention_mask, True)
+        sdpa_interface = ALL_ATTENTION_FUNCTIONS["sdpa"]
+        has_num_kv_groups = hasattr(module, "num_key_value_groups")
+        original_num_kv_groups = getattr(module, "num_key_value_groups", None)
+        module.num_key_value_groups = repeats
+        try:
+            attn_output, attn_weights = sdpa_interface(
+                module,
+                query,
+                key,
+                value,
+                qsa_attention_mask,
+                dropout=dropout,
+                scaling=scaling,
+                **kwargs,
+            )
+        finally:
+            if has_num_kv_groups:
+                module.num_key_value_groups = original_num_kv_groups
+            else:
+                delattr(module, "num_key_value_groups")
+        has_selection = has_selection_mask.transpose(1, 2)
+        attn_output = torch.where(has_selection, attn_output, torch.zeros_like(attn_output))
+        return attn_output, attn_weights
     key_states = repeat_kv(key, repeats)
     value_states = repeat_kv(value, repeats)
     attention_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
         if attention_mask.is_floating_point():
             attention_weights = attention_weights + attention_mask
+            allowed = allowed & (attention_mask > torch.finfo(attention_mask.dtype).min / 2)
         else:
             allowed = allowed & attention_mask
     attention_weights = attention_weights.masked_fill(~allowed, torch.finfo(attention_weights.dtype).min)
@@ -1453,8 +1498,9 @@ class Qwen4ExpTextAttention(nn.Module):
             key_states = key_states.transpose(1, 2)
             value_states = value_states.transpose(1, 2)
         # --- Patch.3 ---
-        # Compact QSA indices are understood only by this module's patched eager
-        # function, so bypass the global registry for this QSA-specific call.
+        # Compact QSA indices are understood only by this module's patched attention
+        # dispatcher, which routes 'tilelang' to the sparse kernel and expands the
+        # 4D QSA mask for 'sdpa' (via ALL_ATTENTION_FUNCTIONS) or 'eager'.
         attn_output, attn_weights = eager_attention_forward(
             self,
             query_states,
@@ -1464,6 +1510,7 @@ class Qwen4ExpTextAttention(nn.Module):
             scaling=self.scaling,
             dropout=0.0 if not self.training else self.attention_dropout,
             selected_indices=selection,
+            **kwargs,
         )
 
         if parallel_state.ulysses_enabled:

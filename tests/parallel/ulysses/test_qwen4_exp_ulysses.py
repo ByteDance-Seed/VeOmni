@@ -271,6 +271,7 @@ def _run_qsa_equivalence(
         )
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
+        config._attn_implementation = "eager"
         config.num_attention_heads = num_attention_heads
         config.num_key_value_heads = num_key_value_heads
         torch.manual_seed(31)
@@ -322,7 +323,7 @@ def _run_qsa_equivalence(
 
         dist.barrier()
         local_slice = slice(rank * local_seq_len, (rank + 1) * local_seq_len)
-        local_hidden = full_hidden[:, local_slice].detach().contiguous().requires_grad_(True)
+        local_hidden = full_hidden[:, local_slice].detach().contiguous()
         local_position_embeddings = tuple(tensor[:, local_slice].contiguous() for tensor in position_embeddings)
         selected_indices = attention.indexer(
             local_hidden,
@@ -341,32 +342,39 @@ def _run_qsa_equivalence(
         assert torch.all(
             (selected_indices >= packed_boundary)[valid_indices & ~before_boundary.expand_as(selected_indices)]
         )
-        actual_output, _ = attention(
-            local_hidden,
-            position_embeddings=local_position_embeddings,
-            attention_mask=None,
-            cu_seq_lens_q=cu_seq_lens_q,
-        )
-        (actual_output.sum() / (seq_len * actual_output.shape[-1])).backward()
-        _sum_parameter_gradients(attention)
+        for attn_implementation in ("eager", "sdpa"):
+            attention.config._attn_implementation = attn_implementation
+            attention.zero_grad(set_to_none=True)
+            local_input = local_hidden.detach().clone().requires_grad_(True)
+            actual_output, _ = attention(
+                local_input,
+                position_embeddings=local_position_embeddings,
+                attention_mask=None,
+                cu_seq_lens_q=cu_seq_lens_q,
+            )
+            (actual_output.sum() / (seq_len * actual_output.shape[-1])).backward()
+            _sum_parameter_gradients(attention)
 
-        actual_output = _gather_sequence(actual_output.detach())
-        actual_input_grad = _gather_sequence(local_hidden.grad.detach())
-        if rank == 0:
-            torch.testing.assert_close(actual_output, expected_output, rtol=1e-5, atol=1e-5)
-            torch.testing.assert_close(actual_input_grad, expected_input_grad, rtol=2e-5, atol=2e-5)
-            for name, parameter in attention.named_parameters():
-                expected_grad = expected_parameter_grads[name]
-                if expected_grad is None:
-                    assert parameter.grad is None, f"Unexpected gradient for {name}"
-                else:
-                    torch.testing.assert_close(
-                        parameter.grad,
-                        expected_grad,
-                        rtol=2e-5,
-                        atol=2e-5,
-                        msg=lambda msg, parameter_name=name: f"{msg}\nGradient mismatch for {parameter_name}",
-                    )
+            actual_output = _gather_sequence(actual_output.detach())
+            actual_input_grad = _gather_sequence(local_input.grad.detach())
+            if rank == 0:
+                torch.testing.assert_close(actual_output, expected_output, rtol=1e-5, atol=1e-5)
+                torch.testing.assert_close(actual_input_grad, expected_input_grad, rtol=2e-5, atol=2e-5)
+                for name, parameter in attention.named_parameters():
+                    expected_grad = expected_parameter_grads[name]
+                    if expected_grad is None:
+                        assert parameter.grad is None, f"Unexpected gradient for {name} ({attn_implementation})"
+                    else:
+                        torch.testing.assert_close(
+                            parameter.grad,
+                            expected_grad,
+                            rtol=2e-5,
+                            atol=2e-5,
+                            msg=lambda msg, parameter_name=name, impl=attn_implementation: (
+                                f"{msg}\nGradient mismatch for {parameter_name} ({impl})"
+                            ),
+                        )
+            dist.barrier()
     finally:
         clear_parallel_state()
 

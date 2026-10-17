@@ -1469,15 +1469,18 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
-    qsa_attention_implementation: Literal["eager", "tilelang"] = field(
+    qsa_attention_implementation: Literal["eager", "sdpa", "tilelang"] = field(
         default="eager",
         metadata={
             "help": "Qwen4-Exp sparse attention implementation. 'eager' expands compact "
             "global token indices to a dense mask and runs quadratic PyTorch attention "
-            "(numerical reference). 'tilelang' runs the gather-based TileLang sparse "
-            "attention kernel instead; it requires bf16 on an NVIDIA CUDA GPU, covers "
-            "training forward/backward only (no KV cache), and raises on an additive "
-            "attention mask. Nonzero attention dropout falls back to eager with a warning."
+            "(numerical reference), or dispatches to SDPA when the text config's "
+            "_attn_implementation is 'sdpa'. 'sdpa' expands compact global token indices "
+            "to a 4D mask and runs PyTorch SDPA via ALL_ATTENTION_FUNCTIONS['sdpa']. "
+            "'tilelang' runs the gather-based TileLang sparse attention kernel instead; "
+            "it requires bf16 on an NVIDIA CUDA GPU, covers training forward/backward "
+            "only (no KV cache), and raises on an additive attention mask. Nonzero "
+            "attention dropout falls back to eager with a warning."
         },
     )
     dsa_indexer_implementation: Literal["eager", "cudnn", "cann", "tilelang"] = field(

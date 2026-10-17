@@ -399,3 +399,152 @@ def test_qwen4_exp_attention_layer_tilelang_matches_fp32_reference():
         assert _cosine_similarity(actual_input.grad, reference_input.grad) > 0.95
     finally:
         _bind_qsa_implementation(modeling, "eager")
+
+
+def test_qwen4_exp_sdpa_qsa_matches_eager_reference_and_handles_empty_rows():
+    from veomni.models.transformers.qwen4_exp.generated import patched_modeling_qwen4_exp_gpu as modeling
+
+    test_cases = [("cpu", torch.float32, 16, 32, 1e-5, 1e-5)]
+    if IS_CUDA_AVAILABLE:
+        # seq_len=64, dim=256 in bfloat16 exercises cuDNN SDPA on CUDA.
+        # Looser tolerances cover known bf16 SDPA vs dense-softmax drift.
+        test_cases.append(("cuda", torch.bfloat16, 64, 256, 8e-2, 8e-2))
+
+    for device, dtype, seq_len, dim, rtol, atol in test_cases:
+        torch.manual_seed(19)
+        batch, heads, kv_heads, topk = 1, 8, 2, 8
+        q = torch.randn(batch, heads, seq_len, dim, device=device, dtype=dtype, requires_grad=True)
+        k = torch.randn(batch, kv_heads, seq_len, dim, device=device, dtype=dtype, requires_grad=True)
+        v = torch.randn(batch, kv_heads, seq_len, dim, device=device, dtype=dtype, requires_grad=True)
+        indices = torch.full((batch, seq_len, topk), -1, device=device, dtype=torch.int32)
+        for s in range(seq_len):
+            if s == 5:
+                continue
+            width = min(s + 1, topk)
+            indices[:, s, :width] = torch.arange(width, device=device, dtype=torch.int32)
+        scale = dim**-0.5
+
+        # Also mask out query row 7 via a floating-point attention_mask to verify float mask parity.
+        float_mask = torch.zeros((batch, 1, seq_len, seq_len), device=device, dtype=dtype)
+        float_mask[:, :, 7, :] = torch.finfo(dtype).min
+
+        module = SimpleNamespace(training=False, num_key_value_groups=heads // kv_heads, is_causal=True)
+        for attention_mask in (None, float_mask):
+            q_ref = q.detach().clone().requires_grad_(True)
+            k_ref = k.detach().clone().requires_grad_(True)
+            v_ref = v.detach().clone().requires_grad_(True)
+            _bind_qsa_implementation(modeling, "eager")
+            expected, _ = modeling.eager_attention_forward(
+                module,
+                q_ref,
+                k_ref,
+                v_ref,
+                attention_mask=attention_mask,
+                scaling=scale,
+                dropout=0.0,
+                selected_indices=indices,
+            )
+            grad_output = torch.randn_like(expected)
+            expected_grads = torch.autograd.grad(expected, (q_ref, k_ref, v_ref), grad_output)
+
+            q_sdpa = q.detach().clone().requires_grad_(True)
+            k_sdpa = k.detach().clone().requires_grad_(True)
+            v_sdpa = v.detach().clone().requires_grad_(True)
+            try:
+                _bind_qsa_implementation(modeling, "sdpa")
+                actual, attn_weights = modeling.eager_attention_forward(
+                    module,
+                    q_sdpa,
+                    k_sdpa,
+                    v_sdpa,
+                    attention_mask=attention_mask,
+                    scaling=scale,
+                    dropout=0.0,
+                    selected_indices=indices,
+                )
+            finally:
+                _bind_qsa_implementation(modeling, "eager")
+
+            assert attn_weights is None
+            assert module.num_key_value_groups == heads // kv_heads
+            assert torch.all(actual[:, 5] == 0)
+            if attention_mask is not None:
+                assert torch.all(actual[:, 7] == 0)
+            torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+
+            actual_grads = torch.autograd.grad(actual, (q_sdpa, k_sdpa, v_sdpa), grad_output)
+            assert not torch.isnan(actual_grads[0]).any()
+            assert torch.all(actual_grads[0][:, :, 5] == 0)
+            if attention_mask is not None:
+                assert torch.all(actual_grads[0][:, :, 7] == 0)
+            for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+                torch.testing.assert_close(actual_grad, expected_grad, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize(
+    "config_attn_impl,qsa_impl",
+    [
+        ("sdpa", "eager"),
+        ("veomni_flash_attention_2_with_sp", "sdpa"),
+    ],
+)
+def test_qwen4_exp_attention_layer_sdpa_matches_eager_reference(config_attn_impl, qsa_impl):
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.qwen4_exp.generated import patched_modeling_qwen4_exp_gpu as modeling
+
+    config = AutoConfig.from_pretrained("tests/toy_config/qwen4_exp_toy").text_config
+    config._attn_implementation = "eager"
+    config.num_attention_heads = 4
+    config.num_key_value_heads = 2
+    torch.manual_seed(41)
+    reference = modeling.Qwen4ExpTextAttention(config, layer_idx=1).float()
+    attention = copy.deepcopy(reference)
+    attention.config._attn_implementation = config_attn_impl
+
+    seq_len = 16
+    packed_boundary = 7
+    rotary_dim = int(config.head_dim * config.partial_rotary_factor)
+    position_embeddings = (
+        torch.ones(1, seq_len, rotary_dim),
+        torch.zeros(1, seq_len, rotary_dim),
+    )
+    cu_seq_lens_q = torch.tensor([0, packed_boundary, seq_len], dtype=torch.int32)
+    hidden = torch.randn(1, seq_len, config.hidden_size)
+
+    try:
+        _bind_qsa_implementation(modeling, "eager")
+        reference_input = hidden.clone().requires_grad_(True)
+        expected, _ = reference(
+            reference_input,
+            position_embeddings=position_embeddings,
+            attention_mask=None,
+            cu_seq_lens_q=cu_seq_lens_q,
+        )
+        (expected.sum() / expected.numel()).backward()
+
+        _bind_qsa_implementation(modeling, qsa_impl)
+        actual_input = hidden.clone().requires_grad_(True)
+        actual, attn_weights = attention(
+            actual_input,
+            position_embeddings=position_embeddings,
+            attention_mask=None,
+            cu_seq_lens_q=cu_seq_lens_q,
+        )
+        (actual.sum() / actual.numel()).backward()
+
+        assert attn_weights is None
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(actual_input.grad, reference_input.grad, rtol=1e-5, atol=1e-5)
+        for (name, actual_param), (_, expected_param) in zip(
+            attention.named_parameters(), reference.named_parameters(), strict=True
+        ):
+            torch.testing.assert_close(
+                actual_param.grad,
+                expected_param.grad,
+                rtol=1e-5,
+                atol=1e-5,
+                msg=lambda msg, param_name=name: f"{msg}\nGradient mismatch for {param_name}",
+            )
+    finally:
+        _bind_qsa_implementation(modeling, "eager")

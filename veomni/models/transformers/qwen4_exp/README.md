@@ -11,13 +11,14 @@ Supported in this correctness stage:
   sequence/head exchange, and only the merged features are gathered for the
   global placeholder scatter.
 - Global QSA selection plus main-attention Q/K/V Ulysses exchange. The
-  `qsa_attention_implementation=eager` path uses local block pooling, compact
-  global token indices, and a Transformers-compatible dense PyTorch attention
-  reference after the Ulysses exchange. `qsa_attention_implementation=tilelang`
-  instead runs the gather-based TileLang sparse-attention kernel
-  (`veomni/ops/kernels/qwen4_exp/`, bf16, NVIDIA CUDA) on the same post-exchange
-  layout, so the kernel itself carries no sequence-parallel logic.
-  Explicit cu-seqlens isolate packed samples consistently for SP=1 and SP>1.
+  `qsa_attention_implementation=eager` and `sdpa` paths use local block pooling,
+  compact global token indices, and a Transformers-compatible 4D QSA mask after
+  the Ulysses exchange (`sdpa` dispatches through `ALL_ATTENTION_FUNCTIONS["sdpa"]`,
+  including when `text_config._attn_implementation="sdpa"`).
+  `qsa_attention_implementation=tilelang` instead runs the gather-based TileLang
+  sparse-attention kernel (`veomni/ops/kernels/qwen4_exp/`, bf16, NVIDIA CUDA) on
+  the same post-exchange layout, so the kernel itself carries no sequence-parallel
+  logic. Explicit cu-seqlens isolate packed samples consistently for SP=1 and SP>1.
 - PLE n-gram token halos and differentiable dilated-convolution halos across
   Ulysses shard boundaries.
 - VeOmni fused cross-entropy and fused MoE dispatch, with sequence-local router

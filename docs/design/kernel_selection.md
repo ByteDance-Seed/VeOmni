@@ -26,7 +26,7 @@ selection knob.
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
-| QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` | `"eager"` | Qwen4-Exp `OpsConfigSlot` dispatch in generated modeling |
+| QSA attention | `qsa_attention_implementation` | `eager`, `sdpa`, `tilelang` | `"eager"` | Qwen4-Exp `OpsConfigSlot` dispatch in generated modeling |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | `apply_ops_config()` (before model build) |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused_triton"` (GPU) | `build_foundation_model` |
 | QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Read by the patched modeling helpers (`veomni/ops/qat/`) |
@@ -335,13 +335,17 @@ values are documented by `OpsImplementationConfig`.
 ### Qwen4-Exp QSA
 
 Qwen4-Exp exposes `qsa_attention_implementation` independently from the normal
-attention backend. Both values consume compact `[B,S,K]` global token indices
+attention backend. All three values consume compact `[B,S,K]` global token indices
 from distributed local-query/global-block selection:
 
 - `eager` (default) follows the native Transformers Qwen4-Exp path: it expands
   the indices to an `[B,1,S,S]` mask and runs ordinary dense GQA, materializing
-  the full `[B,H,S,S]` score tensor. This is a portable numerical reference
-  rather than a memory-efficient sparse or fused throughput kernel.
+  the full `[B,H,S,S]` score tensor (or dispatches to SDPA when the text
+  config's `_attn_implementation` is `"sdpa"`). This is a portable numerical
+  reference rather than a memory-efficient sparse or fused throughput kernel.
+- `sdpa` expands the compact indices to an `[B,1,S,S]` boolean mask and
+  dispatches through `ALL_ATTENTION_FUNCTIONS["sdpa"]` (`F.scaled_dot_product_attention`),
+  preserving zero output and zero query gradients on empty selection rows.
 - `tilelang` runs the gather-based TileLang sparse-attention kernel in
   `veomni/ops/kernels/qwen4_exp/` (training forward/backward, bf16, NVIDIA
   CUDA). It never materializes the dense score tensor, which is what makes
