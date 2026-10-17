@@ -19,7 +19,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 from torch import nn
-from torch.nn.attention.flex_attention import BlockMask
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 from transformers import PreTrainedConfig
 from transformers.integrations.flex_attention import flex_attention_forward as hf_flex_attention_forward
 from transformers.masking_utils import (
@@ -236,6 +236,43 @@ def test_register_veomni_flex_attention_mask_builder_uses_sp_aware_wrapper(monke
     assert isinstance(causal_mask, BlockMask)
     assert isinstance(sliding_window_mask, BlockMask)
     assert causal_mask.shape == sliding_window_mask.shape == (1, 1, 8, 8)
+
+
+@pytest.mark.parametrize("explicit_num_stages,expected_num_stages", [(None, 1), (2, 2)])
+def test_flex_attention_limits_pipeline_depth_for_wide_heads(monkeypatch, explicit_num_stages, expected_num_stages):
+    captured = {}
+
+    def fake_flex_forward(module, query, key, value, attention_mask, **kwargs):
+        captured.update(kwargs)
+        return query.transpose(1, 2), None
+
+    monkeypatch.setattr(
+        flex_backend,
+        "get_parallel_state",
+        lambda: SimpleNamespace(ulysses_enabled=False),
+    )
+    monkeypatch.setattr(flex_backend, "_flex_attention_forward", fake_flex_forward)
+    block_mask = create_block_mask(
+        lambda batch, head, query, key: query >= key,
+        B=1,
+        H=None,
+        Q_LEN=2,
+        KV_LEN=2,
+        device="cpu",
+    )
+    kernel_options = {} if explicit_num_stages is None else {"num_stages": explicit_num_stages}
+
+    flex_backend.flex_attention_forward(
+        SimpleNamespace(training=True),
+        torch.zeros(1, 8, 2, 256),
+        torch.zeros(1, 1, 2, 256),
+        torch.zeros(1, 1, 2, 256),
+        block_mask,
+        kernel_options=kernel_options,
+    )
+
+    assert captured["kernel_options"]["BACKEND"] == "TRITON"
+    assert captured["kernel_options"]["num_stages"] == expected_num_stages
 
 
 def test_register_veomni_magi_attention_mask_builder_uses_range_builder(monkeypatch):
