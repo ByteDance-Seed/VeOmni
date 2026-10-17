@@ -23,7 +23,7 @@ from safetensors.torch import save_file
 from transformers import PretrainedConfig
 
 from veomni.arguments.omni_arguments_types import OmniModuleRuntimeArguments, _validate_hf_view_modules
-from veomni.models.module_utils import _load_state_dict
+from veomni.models.checkpoint.weights import _load_state_dict
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.fake_model.fake_module_a.configuration import FakeModuleAConfig

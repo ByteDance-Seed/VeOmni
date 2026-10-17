@@ -379,7 +379,7 @@ def test_omni_transform_uses_effective_fps(omni_processor, monkeypatch, duration
     from types import SimpleNamespace
 
     from veomni.data.data_transform import process_sample_qwen_omni
-    from veomni.models.loader import MODELING_REGISTRY
+    from veomni.models.registry import MODELING_REGISTRY
     from veomni.utils.constants import AUDIO_INPUT_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 
     is_qwen2_5 = type(omni_processor).__name__ == "Qwen2_5OmniProcessor"
