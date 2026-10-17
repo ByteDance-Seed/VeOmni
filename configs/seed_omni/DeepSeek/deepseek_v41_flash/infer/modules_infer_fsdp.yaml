@@ -43,6 +43,8 @@ deepseek_v41_text_encoder:
 
 deepseek_v41_ngram:
   model_path: deepseek_v41_ngram
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
   model_config:
     # Also drives `freeze_model`; without it the tables would be built with
     # grads for 196.6 B rows that are never stepped.
@@ -67,6 +69,8 @@ deepseek_v41_ngram:
 
 deepseek_v41_llm:
   model_path: deepseek_v41_llm
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
   accelerator:
     # The routed experts are 269 of the module's 275.7 GiB, so this is the
     # sharding that matters: 33.6 GiB a rank. Tokens are dispatched to the rank

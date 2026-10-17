@@ -737,19 +737,68 @@ def _all_ranks_union(names: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(key for keys in gathered for key in keys or ()))
 
 
-def _read_source_tensors(
-    source_path: str, weight_files: Mapping[str, str], keys: list[str]
-) -> dict[str, torch.Tensor]:
-    from safetensors import safe_open
+_SHARDED_CARRY_BYTES = 64 << 20
 
-    tensors: dict[str, torch.Tensor] = {}
-    by_file: dict[str, list[str]] = {}
+
+def _read_carried_tensors(
+    source_path: str,
+    weight_files: Mapping[str, str],
+    source_specs: Mapping[str, tuple[torch.dtype, tuple[int, ...]]],
+    keys: list[str],
+) -> dict[str, torch.Tensor]:
+    """Read ``keys`` from ``source_path``, splitting large tensors along dim 0 across ranks.
+
+    Small tensors go whole to one rank each, round-robin; a tensor at or above
+    ``_SHARDED_CARRY_BYTES`` (e.g. a 91.6 GiB frozen n-gram table) is sliced
+    into a ``Shard(0)`` :class:`DTensor` so no single process reads, holds, or
+    stages it whole during ``dcp.save``.
+    """
+    from safetensors import safe_open
+    from torch.distributed.tensor import DeviceMesh, DTensor, Shard
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+    sharded: list[str] = []
+    whole: list[str] = []
     for key in keys:
-        by_file.setdefault(weight_files[key], []).append(key)
-    for filename, file_keys in by_file.items():
+        dtype, shape = source_specs[key]
+        meta = torch.empty(shape, dtype=dtype, device="meta")
+        if (
+            world_size > 1
+            and shape
+            and shape[0] >= world_size
+            and meta.numel() * meta.element_size() >= _SHARDED_CARRY_BYTES
+        ):
+            sharded.append(key)
+        else:
+            whole.append(key)
+
+    mine_whole = whole[rank::world_size]
+    by_file: dict[str, list[tuple[str, bool]]] = {}
+    for key in mine_whole:
+        by_file.setdefault(weight_files[key], []).append((key, False))
+    for key in sharded:
+        by_file.setdefault(weight_files[key], []).append((key, True))
+
+    mesh = DeviceMesh("cpu", list(range(world_size)), _init_backend=False) if sharded else None
+    tensors: dict[str, torch.Tensor] = {}
+    for filename, entries in by_file.items():
         with safe_open(os.path.join(source_path, filename), framework="pt", device="cpu") as f:
-            for key in file_keys:
-                tensors[key] = f.get_tensor(key)
+            for key, is_sharded in entries:
+                if not is_sharded:
+                    tensors[key] = f.get_tensor(key)
+                    continue
+                dtype, shape = source_specs[key]
+                rows = shape[0]
+                chunk = (rows + world_size - 1) // world_size
+                start = min(rank * chunk, rows)
+                end = min((rank + 1) * chunk, rows)
+                local = f.get_slice(key)[start:end]
+                stride = torch.empty(shape, dtype=dtype, device="meta").stride()
+                tensors[key] = DTensor.from_local(
+                    local, mesh, [Shard(0)], run_check=False, shape=torch.Size(shape), stride=stride
+                )
     return tensors
 
 
@@ -803,9 +852,14 @@ def save_hf_source_checkpoint(
     loads wherever the source does.
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
+    from torch.distributed.checkpoint._consolidate_hf_safetensors import (
+        consolidate_safetensors_files,
+        consolidate_safetensors_files_on_every_rank,
+    )
 
     from ....checkpoint.dcp_checkpointer import ModelState
     from ....checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
+    from ....utils.save_safetensor_utils import _consolidation_process_group
 
     apply_dcp_consolidation_patch()
     layout = source.layout
@@ -874,37 +928,48 @@ def save_hf_source_checkpoint(
         )
         # Spread the copy over the ranks: a frozen sibling module's weights can
         # be most of the checkpoint, more than one process should hold.
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        mine = carried[rank::world_size]
-        save_state.update(_read_source_tensors(source.path, weight_files, mine))
+        save_state.update(_read_carried_tensors(source.path, weight_files, source_specs, carried))
 
     single_file = set(weight_files.values()) == {_SAFE_WEIGHTS_NAME}
     fqn_to_index_mapping = {
         key: 1 if single_file else shard_index_from_filename(filename) for key, filename in weight_files.items()
     }
+    sharded_path = os.path.join(save_path, _DCP_STAGING_DIRNAME)
     storage_writer = HuggingFaceStorageWriter(
-        path=save_path,
+        path=sharded_path,
         save_distributed=True,
         fqn_to_index_mapping=fqn_to_index_mapping,
-        enable_consolidation=True,
-        thread_count_consolidation=5,
+        enable_consolidation=False,
     )
     if dist.is_initialized():
         dist.barrier()
     start = time.time()
-    dcp.save(state_dict=save_state, storage_writer=storage_writer)
+    group = _consolidation_process_group() if dist.is_initialized() else None
+    dcp.save(state_dict=save_state, storage_writer=storage_writer, process_group=group)
     del save_state
     if dist.is_initialized():
-        dist.barrier()
+        dist.barrier(group=group)
+        consolidate_safetensors_files_on_every_rank(
+            input_dir=sharded_path,
+            output_dir=save_path,
+            fqn_to_index_mapping=fqn_to_index_mapping,
+            process_group=group,
+        )
+    else:
+        consolidate_safetensors_files(
+            input_dir=sharded_path,
+            output_dir=save_path,
+            fqn_to_index_mapping=fqn_to_index_mapping,
+            num_threads=5,
+        )
 
     if not dist.is_initialized() or dist.get_rank() == 0:
-        shutil.rmtree(os.path.join(save_path, _DCP_STAGING_DIRNAME), ignore_errors=True)
+        shutil.rmtree(sharded_path, ignore_errors=True)
         if single_file:
             _restore_single_file_name(save_path)
         copy_source_non_weight_files(source.path, save_path)
     if dist.is_initialized():
-        dist.barrier()
+        dist.barrier(group=group)
     helper.empty_cache()
     logger.info_rank0(
         f"save_hf_source_checkpoint: `{source.model_type}` checkpoint saved at {save_path} "
