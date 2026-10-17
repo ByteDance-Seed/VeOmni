@@ -80,6 +80,7 @@ Our guiding principles when building VeOmni are:
 | [Qwen2-3 Omni](https://huggingface.co/Qwen)              | 7B/30BA3B                     | [qwen25_omni.yaml](configs/multimodal/qwen25_omni/qwen25_omni.yaml)   |
 | [Wan](https://huggingface.co/Wan-AI)                     | Wan2.1-I2V-14B-480P           | [wan_sft.yaml](configs/dit/wan_sft.yaml)                              |
 | [MiniMax H3](docs/examples/minimax_h3.md)                | Checkpoint-dependent          | [FL2VA](configs/dit/minimax_h3_fl2va_offline.yaml); [Ref2VA](configs/dit/minimax_h3_ref2va_cfg_offline.yaml) |
+| [HunyuanVideo 1.5](docs/examples/hunyuanvideo15.md) | 480p T2V (experimental; CPU and NPU backbone checks) | [hunyuanvideo15_t2v.yaml](configs/dit/hunyuanvideo15_t2v.yaml) |
 | [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3)     | Checkpoint-dependent          | [ltx2_av_lora.yaml](configs/dit/ltx2_av_lora.yaml); [training guide](docs/examples/ltx-2.3.md) |
 
 Support new models to VeOmni see [Support New Models](https://veomni.readthedocs.io/en/latest/usage/support_new_models/guide_and_checklist.html)

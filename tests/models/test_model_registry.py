@@ -92,3 +92,18 @@ def test_remote_model_registry(monkeypatch, config_path, hf_registered, veomni_r
         "veomni." if "processor" in veomni_registered else "transformers."
     )
     veomni_processor.save_pretrained(save_path)
+
+
+def test_hunyuanvideo15_registry(tmp_path, monkeypatch):
+    from veomni.models.diffusers.hunyuanvideo15.configuration_hunyuanvideo15 import HunyuanVideo15Config
+    from veomni.models.diffusers.hunyuanvideo15.modeling_hunyuanvideo15 import HunyuanVideo15Model
+    from veomni.models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    HunyuanVideo15Config().save_pretrained(tmp_path)
+    config = get_model_config(str(tmp_path))
+    assert isinstance(config, HunyuanVideo15Config)
+    assert get_model_class(config) is HunyuanVideo15Model
+    condition_config = MODEL_CONFIG_REGISTRY[config.condition_model_type]()
+    condition_model = MODELING_REGISTRY[config.condition_model_type]()
+    assert condition_model.config_class is condition_config

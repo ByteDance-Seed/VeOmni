@@ -1,0 +1,30 @@
+HunyuanVideo 1.5 native components
+
+Source repository: https://github.com/Tencent-Hunyuan/HunyuanVideo-1.5
+Source revision: 60783e704160023913bee78f0b470036d393d4dfa
+License: TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT; see LICENSE.txt.
+Original license headers are retained in source-derived files.
+
+Source path -> local path:
+hyvideo/models/transformers/hunyuanvideo_1_5_transformer.py -> native/transformer.py
+hyvideo/models/transformers/modules/{activation,norm,embed,posemb,mlp,modulate}_layers.py -> native/modules/
+hyvideo/models/transformers/modules/token_refiner.py -> native/modules/token_refiner.py
+hyvideo/models/text_encoders/__init__.py -> native/text_encoder.py
+hyvideo/models/text_encoders/byT5/__init__.py -> native/{byt5,glyph_encoder}.py
+hyvideo/models/autoencoders/hunyuanvideo_15_vae.py -> native/vae.py
+
+Changes:
+- Core native transformer uses nn.Module; VeOmni's outer PreTrainedModel owns HF metadata.
+- Official parameter hierarchy is retained without a wrapper prefix.
+- CUDA/SP source runtime and source LoRA/save/load wrappers are omitted from the backbone.
+- Dense attention is expressed with PyTorch SDPA and identical boolean masks.
+- Blocks use the Transformers GradientCheckpointingLayer contract.
+- Standard tuple utilities replace hyvideo.commons imports.
+- Frozen loading is local-only; glyph torch.load uses weights_only=True.
+- VAE parallel-state import points to VeOmni; tile parallelism is not enabled.
+- Formatting and unused imports are normalized to repository style.
+- Adapter, condition orchestration, preprocessing, tests and dataset converter are new.
+
+The source reference test executes pinned upstream bodies, with import/launch
+dependencies isolated, and compares random-weight fp32 results and the full meta
+parameter schema. Real pretrained checks and accelerator training remain pending.
