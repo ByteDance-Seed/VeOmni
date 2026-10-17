@@ -39,7 +39,7 @@ def test_environ_meter_passes_supported_lora_config(monkeypatch):
     )
     fake_memory = SimpleNamespace(used=0, available=0, percent=0)
     monkeypatch.setattr(helper, "VeomniFlopsCounter", FakeFlopsCounter)
-    monkeypatch.setattr(helper.dist, "get_world_size", lambda: 1)
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda group=None: 1)
     monkeypatch.setattr(helper, "all_reduce", lambda values, **kwargs: values)
     monkeypatch.setattr(helper, "get_torch_device", lambda: fake_device)
     monkeypatch.setattr(helper.psutil, "virtual_memory", lambda: fake_memory)

@@ -151,6 +151,24 @@ VeOmni includes several built-in callbacks:
 - **[GlobalStateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/global_state_callback.py)**: Saves the job cursor per rank — the dataloader position as `loader/rank_{N}.pt`, the step counter, rng and meters as `extra_state/rank_{N}.pt` — separate from the model's `model/lr_scheduler.pt`. Runs last, and writes the step's `checkpoint_manifest.json`.
 - **[EvaluateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/evaluate_callback.py)**: Runs evaluation on the validation set.
 
+`EnvironMeterCallback` also reports topology-invariant packed-token metrics
+under `token_accounting/*`. The counters are captured before sequence-parallel
+slicing and reduced only across data-parallel ranks:
+
+- `physical_window_tokens`: padded window capacity.
+- `aligned_compute_tokens`: compute tokens after alignment, excluding known tail padding.
+- `source_input_tokens`: input document tokens before alignment and padding.
+- `loss_tokens`: labels that are not `IGNORE_INDEX`.
+- `source_fill`, `aligned_compute_fill`, and the corresponding
+  `*_tokens_per_second(M)` metrics.
+
+This distinction is important when a sequence-parallel attention backend uses
+rank-local `cu_seq_lens_q`; kernel-local boundaries are not a valid source-token
+throughput counter. When only rank-local `cu_seq_lens_q` is available under
+CP/Ulysses, the legacy FLOPs meter leaves those boundaries unchanged; it does
+not multiply each document by the SP degree. The collator counters above remain
+the authoritative global token totals.
+
 On-disk layout for weights, optimizer, scheduler and job cursor, and how a checkpoint from an earlier layout is still resumed: [Checkpoint layout](checkpoint.md).
 
 ### Custom Callbacks
