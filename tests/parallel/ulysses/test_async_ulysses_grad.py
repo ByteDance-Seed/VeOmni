@@ -17,23 +17,34 @@ import torch
 import veomni.distributed.sequence_parallel.async_ulysses as au
 
 
-def _mock_identity_comm(monkeypatch) -> None:
-    monkeypatch.setattr(au, "padding_tensor_for_seqeunce_parallel", lambda tensor, dim, group=None, **kwargs: tensor)
-    monkeypatch.setattr(
-        au,
-        "unpadding_tensor_for_seqeunce_parallel",
-        lambda tensor, dim, size, group=None, **kwargs: tensor,
-    )
-    monkeypatch.setattr(au, "get_ulysses_sequence_parallel_world_size", lambda group=None: 1)
+def _mock_identity_comm(monkeypatch, expected_group) -> None:
+    # Every collective and pad/unpad helper must get the group passed to the projection,
+    # not fall back to the ambient one.
+    def identity_padding(tensor, dim, group=None, **kwargs):
+        assert group is expected_group
+        return tensor
+
+    def identity_unpadding(tensor, dim, size, group=None, **kwargs):
+        assert group is expected_group
+        return tensor
+
+    def identity_world_size(group=None):
+        assert group is expected_group
+        return 1
 
     def fake_all_to_all(tensor, **kwargs):
+        assert kwargs.get("group") is expected_group
         return (lambda: tensor) if kwargs.get("async_op") else tensor
 
+    monkeypatch.setattr(au, "padding_tensor_for_seqeunce_parallel", identity_padding)
+    monkeypatch.setattr(au, "unpadding_tensor_for_seqeunce_parallel", identity_unpadding)
+    monkeypatch.setattr(au, "get_ulysses_sequence_parallel_world_size", identity_world_size)
     monkeypatch.setattr(au, "all_to_all_tensor", fake_all_to_all)
 
 
 def test_output_projection_weight_bias_grad_shapes(monkeypatch) -> None:
-    _mock_identity_comm(monkeypatch)
+    group = object()
+    _mock_identity_comm(monkeypatch, group)
 
     batch, seq, heads, head_dim = 2, 3, 4, 5
     out_dim = 7
@@ -42,7 +53,7 @@ def test_output_projection_weight_bias_grad_shapes(monkeypatch) -> None:
     proj_weight = torch.randn(out_dim, heads * head_dim, requires_grad=True)
     proj_bias = torch.randn(out_dim, requires_grad=True)
 
-    output = au.AsyncUlyssesOutputProjection.apply(hidden_states, 1, 2, proj_weight, proj_bias, seq, object())
+    output = au.AsyncUlyssesOutputProjection.apply(hidden_states, 1, 2, proj_weight, proj_bias, seq, group)
     output.sum().backward()
 
     assert proj_weight.grad is not None
@@ -52,7 +63,8 @@ def test_output_projection_weight_bias_grad_shapes(monkeypatch) -> None:
 
 
 def test_output_projection_bias_grad_when_weight_frozen(monkeypatch) -> None:
-    _mock_identity_comm(monkeypatch)
+    group = object()
+    _mock_identity_comm(monkeypatch, group)
 
     batch, seq, heads, head_dim = 2, 3, 4, 5
     out_dim = 7
@@ -60,7 +72,7 @@ def test_output_projection_bias_grad_when_weight_frozen(monkeypatch) -> None:
     proj_weight = torch.randn(out_dim, heads * head_dim)
     proj_bias = torch.randn(out_dim, requires_grad=True)
 
-    output = au.AsyncUlyssesOutputProjection.apply(hidden_states, 1, 2, proj_weight, proj_bias, seq, object())
+    output = au.AsyncUlyssesOutputProjection.apply(hidden_states, 1, 2, proj_weight, proj_bias, seq, group)
     output.sum().backward()
 
     # needs_input_grad must be read at the bias index (4), not the weight index (3).
@@ -69,7 +81,8 @@ def test_output_projection_bias_grad_when_weight_frozen(monkeypatch) -> None:
 
 
 def test_qkv_projection_bias_grad_when_weights_frozen(monkeypatch) -> None:
-    _mock_identity_comm(monkeypatch)
+    group = object()
+    _mock_identity_comm(monkeypatch, group)
 
     batch, seq, hidden_size = 2, 3, 20
     head_dim = 5
@@ -102,7 +115,7 @@ def test_qkv_projection_bias_grad_when_weights_frozen(monkeypatch) -> None:
         None,
         seq,
         head_dim,
-        object(),
+        group,
     )
     (query.sum() + key.sum() + value.sum()).backward()
 
