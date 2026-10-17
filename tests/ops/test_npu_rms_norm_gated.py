@@ -1,6 +1,7 @@
 """CPU contract checks and native Ascend forward/backward parity."""
 
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -65,7 +66,12 @@ def test_zero_gate_is_half_normalized_and_silu_unchanged():
 @pytest.mark.parametrize("autocast_enabled", [False, True])
 def test_native_npu_reference_and_gradients(dtype, activation, autocast_enabled):
     # Load the real wrapper without the CPU tests' torch_npu substitution.
-    pytest.importorskip("torch_npu")
+    if os.environ.get("VEOMNI_REQUIRE_NPU") == "1":
+        import torch_npu  # noqa: F401
+
+        assert torch.npu.is_available(), "Ascend parity gate requires a live NPU"
+    else:
+        pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("Native Ascend device is required")
     path = Path(__file__).parents[2] / "veomni/ops/kernels/gated_delta_rule/npu_rms_norm_gated.py"
