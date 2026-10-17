@@ -559,6 +559,8 @@ class Qwen3_5MoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Moe
         ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
 
+    mtp_loss: torch.Tensor | None = None
+
 
 @config.add_helper_after("Qwen3_5MoeModelOutputWithPast")
 @dataclass
@@ -1137,6 +1139,10 @@ def qwen3_5_moe_forconditional_generation_init_patched(self, config):
     self.post_init()
 
 
+# Patch: Qwen3_5MoeForConditionalGeneration.forward
+# 1. Schedule MTP independently of the policy labels and module.training flag.
+# 2. Fused policy log-probs bypass the dense vocabulary projection.
+# 3. Expose raw MTP CE, isolate optional encoder gradients, and preserve SFT loss.
 @config.override_method(
     "Qwen3_5MoeForConditionalGeneration.forward",
     description="Support fused cross entropy path in Qwen3_5MoeForConditionalGeneration.forward",
@@ -1157,15 +1163,22 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
     cache_position: torch.LongTensor | None = None,
     logits_to_keep: int | torch.Tensor = 0,
     mtp_labels: torch.LongTensor | None = None,
+    compute_mtp: bool | None = None,
+    mtp_detach_encoder: bool = False,
     **kwargs: Unpack[TransformersKwargs],
 ) -> Qwen3_5MoeCausalLMOutputWithLogProbs:
     """Run MoE conditional generation and combine foundation, MTP, and router losses."""
     output_router_logits = (
         output_router_logits if output_router_logits is not None else self.config.text_config.output_router_logits
     )
-    requires_mtp_context = self.mtp is not None and labels is not None
-    if requires_mtp_context and mtp_labels is None:
-        raise ValueError("Qwen3.5 MoE MTP loss requires `mtp_labels` when `labels` are provided.")
+    # --- Patch.1 ---
+    requires_mtp_context = (self.mtp is not None and labels is not None) if compute_mtp is None else compute_mtp
+    if requires_mtp_context:
+        if self.mtp is None or mtp_labels is None:
+            raise ValueError("Qwen3.5 MoE MTP requires an enabled head and explicit `mtp_labels`.")
+        if past_key_values is not None or kwargs.get("use_cache", False):
+            raise ValueError("MTP training requires full sequences with use_cache=False.")
+    # --- Patch.1 ---
 
     model_kwargs = dict(kwargs)
     model_kwargs["return_mtp_context"] = requires_mtp_context
@@ -1204,7 +1217,9 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
                 **kwargs,
             )
         else:
-            logits = self.lm_head(hidden_states)
+            # --- Patch.2 ---
+            logits = None if kwargs.get("return_log_probs", False) else self.lm_head(hidden_states)
+            # --- Patch.2 ---
             # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
             # returns (loss, logits, fused_linear_aux); unpack to match the
             # OpSlot branch above.
@@ -1223,15 +1238,19 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
     else:
         logits = self.lm_head(hidden_states)
 
+    # --- Patch.3 ---
     loss_dict = None
+    mtp_loss = None
     mtp_router_logits = None
     if requires_mtp_context:
         mtp_context = getattr(outputs, "mtp_context", None)
         if mtp_context is None:
             raise RuntimeError("Qwen3.5 MoE MTP context was requested but the language model did not return it.")
         mtp_hidden_states, mtp_router_logits = self.mtp(
-            hidden_states=outputs[0],
-            inputs_embeds=mtp_context["inputs_embeds"],
+            hidden_states=outputs[0].detach() if mtp_detach_encoder else outputs[0],
+            inputs_embeds=(
+                mtp_context["inputs_embeds"].detach() if mtp_detach_encoder else mtp_context["inputs_embeds"]
+            ),
             position_embeddings=mtp_context["position_embeddings"],
             attention_mask=mtp_context["attention_mask"],
             position_ids=mtp_context["position_ids"],
@@ -1246,12 +1265,13 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
             mtp_loss_fn,
             mtp_hidden_states,
             mtp_labels,
-            weights=self.lm_head.weight,
+            weights=self.lm_head.weight.detach() if mtp_detach_encoder else self.lm_head.weight,
             vocab_size=self.config.text_config.vocab_size,
             **kwargs,
         )
         weight = _mtp_loss_weight(self.config.text_config)  # noqa: F821
-        loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
+        if loss is not None:
+            loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
 
     router_logits = outputs.router_logits
     aux_loss = None
@@ -1276,7 +1296,7 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
                 self.config.text_config.num_experts_per_tok,
                 attention_mask,
             )
-        if labels is not None and isinstance(aux_loss, torch.Tensor):
+        if loss is not None and isinstance(aux_loss, torch.Tensor):
             loss = loss + self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
             if loss_dict is not None:
                 loss_dict["foundation_loss"] = loss
@@ -1291,9 +1311,11 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
         router_logits=router_logits,
         rope_deltas=outputs.rope_deltas,
         fused_linear_aux=fused_linear_aux,
+        mtp_loss=mtp_loss,
     )
     if loss_dict is not None:
         output.loss = loss_dict
+    # --- Patch.3 ---
     return output
 
 

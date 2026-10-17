@@ -904,6 +904,8 @@ class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Causal
         ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
 
+    mtp_loss: torch.Tensor | None = None
+
 
 config.add_import("transformers.utils", names=["logging"])
 config.add_post_import_block("""

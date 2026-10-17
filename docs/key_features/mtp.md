@@ -30,8 +30,9 @@ MTP head relative to the trunk.
 
 Currently supported through `tasks/train_text.py` and `tasks/train_vlm.py`:
 **Qwen3.5 dense** (`Qwen3_5ForConditionalGeneration`) and **Qwen3.5 MoE**
-(`Qwen3_5MoeForConditionalGeneration`) on GPU and Ascend NPU. DPO and RL trainers
-do not support MTP. The NPU path uses FLA's Ascend dispatch for the GatedDeltaNet
+(`Qwen3_5MoeForConditionalGeneration`) on GPU and Ascend NPU. External RL engines
+can use the explicit MTP forward API described below; the built-in DPO trainer
+does not construct MTP labels. The NPU path uses FLA's Ascend dispatch for the GatedDeltaNet
 kernels.
 
 ## 🚀 Quick Start
@@ -64,9 +65,10 @@ Its three GatedDeltaNet implementation fields select FLA's native Ascend dispatc
 MTP is disabled when `mtp_loss_weight` is unset, `null`, or non-positive, or when
 `mtp_num_hidden_layers` is unset, `null`, or non-positive. In all of these cases,
 the module is never constructed, no `mtp.*` parameters exist, and load / DCP /
-export behave exactly as they did before MTP support existed. There is deliberately
-no second boolean flag: `mtp_num_hidden_layers` describes the checkpoint architecture,
-and MTP is enabled only when both the layer count and loss weight are positive.
+export behave exactly as they did before MTP support existed. This remains the
+default SFT behavior. External engines can explicitly set `text_config.mtp_enabled`
+to separate head construction from loss weighting: `True` constructs the head even
+at weight zero; `False` disables it. A positive `mtp_num_hidden_layers` is still required.
 
 The weight is applied inside the model, so **`training/mtp_loss` in the logs is the
 weighted contribution**. `BaseTrainer.postforward` sums the loss dict, so whatever is
@@ -157,13 +159,36 @@ tokenizer/config path.
 
 ### Loss dictionary contract
 
-Per-head losses are returned in `output.loss` as a dictionary with
+For a conventional labeled SFT objective, per-head losses are returned in `output.loss` as a dictionary with
 `foundation_loss` and `mtp_loss` entries. The model assigns this dictionary
 after constructing the output object, and the trainer's loss utilities preserve
 the keys for token-normalized reduction and logging.
 
 The individual tensors remain reachable through the regular `ModelOutput` pytree,
 which is required by FSDP2's pre-backward unshard hook.
+
+### 外部 RL 引擎接口
+
+Qwen3.5 dense/MoE 的 forward 额外支持：
+
+- `compute_mtp=None`：保留 SFT 默认行为，有 head 且提供主分支 `labels` 时计算 MTP。
+- `compute_mtp=True`：显式执行 MTP，要求存在 head 和 `[B,D,L]` 的 `mtp_labels`；主分支允许 `labels=None`，供 non-fused PPO 使用。
+- `compute_mtp=False`：即使 fused policy 传了 `labels`，也跳过 MTP，适用于 old/ref log-prob 和 load-only 场景。
+- `mtp_detach_encoder=True`：只将 MTP 分支读取的 trunk hidden、已注入视觉特征的 embedding、共享 lm_head weight detach；主分支训练不受影响。
+
+独立的 `output.mtp_loss` 是未加权、按当前 forward 有效目标数求平均的 CE 标量。
+该字段在 ModelOutput dataclass 中显式声明，使 FSDP2 能追踪其 backward 图。
+SFT 的 `output.loss["mtp_loss"]` 仍然是加权项；外部引擎使用 raw 字段时应只乘一次权重。
+fused policy 的 `loss=None` 不影响 MTP 标量返回。
+
+MTP CE 不继承 policy 的 `return_log_probs`、temperature、teacher top-K 或主 loss
+分母。外部引擎负责全 DP batch / micro-batch 的归一化；不能假设所有 CE kernel
+都使用调用方给出的全局分母。全 mask 时通过安全目标算出连接计算图的零 loss。
+MTP 只接受完整序列，必须 `use_cache=False` 且不传 `past_key_values`。
+
+verl 接入会按样本从 response mask 构造 MTP labels，再 packing，避免跨样本目标；
+其 `use_fused_kernels=True/False` 均显式控制 `compute_mtp`。
+此次 RL API 与接入仅做静态检查，没有运行训练或数值验证。
 
 ### `mtp_context`
 
@@ -175,9 +200,9 @@ out through an added `mtp_context` field (`Qwen3_5MTPContextOutput`).
 
 Recomputing them one level up would re-embed `input_ids` *without* the scattered
 vision features — silently wrong for multimodal batches. `mtp_context` is populated
-only when an enabled MTP head is asked to compute a labeled objective, including
-both training and evaluation. Label-free inference and MTP-off runs allocate
-nothing extra.
+only when the MTP objective is requested, including explicit `compute_mtp=True`
+with no foundation labels. Ordinary label-free inference and `compute_mtp=False`
+runs allocate nothing extra.
 
 ## 💾 Checkpoints
 
@@ -222,7 +247,9 @@ MTP per step (median, +3.9%). Peak memory increased from 43.95GB to 44.89GB (+2.
   train the head on 1-shifted labels behind nothing louder than a `warning_once`.
 - **Training only.** Speculative decoding runs in the inference engine; the forward
   asserts `past_key_values is None`.
-- **SFT only.** Text and Qwen3.5 VLM trainers construct MTP labels; DPO and RL do not.
+- **Built-in SFT / external RL API.** Text and Qwen3.5 VLM trainers construct MTP
+  labels; external engines such as verl must supply their own per-sample masked
+  labels and loss normalization. Built-in DPO remains unsupported.
 - **Multimodal shift semantics differ slightly from vLLM.** vLLM rotates `input_ids`
   then embeds; training shifts the already-scattered `inputs_embeds`. Equivalent for
   text, and only different at multimodal placeholder boundaries.
