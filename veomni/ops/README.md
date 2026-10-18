@@ -211,6 +211,12 @@ for variants with explicit-value aliases. In particular, an explicit
 `rms_norm_implementation='torch_npu'` (or the deprecated `npu`) still maps to
 `eager` for `unweighted`, while weighted variants retain `torch_npu`.
 
+Full RoPE's eager and Liger implementations store fixed cos/sin tables in the
+query dtype for backward. Forward computation still receives the original
+tables. This keeps saved metadata stable when FSDP2 casts vision tables on the
+first forward but non-reentrant checkpoint recomputation sees FP32 tables.
+Trainable tables continue through the eager path with table gradients.
+
 The registry wrapper is the canonical tensor contract for an op variant;
 it is not a collection of model-specific adapters. Transformations that vary
 by consumer stay with that consumer. For example:

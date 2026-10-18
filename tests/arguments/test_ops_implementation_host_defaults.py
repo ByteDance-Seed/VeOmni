@@ -27,6 +27,7 @@ from tests.models.compare import ops_config_scope
 from veomni.arguments import OpsImplementationConfig
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.platform import GpuKernelRequirement
 
 
 _HOST_FIELDS = (
@@ -86,7 +87,9 @@ def _set_host(monkeypatch: pytest.MonkeyPatch, host: str, *, apex_mlu: bool = Fa
     monkeypatch.setattr(device, "IS_NPU_AVAILABLE", host == "npu")
     monkeypatch.setattr(import_utils, "is_torch_mlu_available", lambda: host == "mlu")
     monkeypatch.setattr(import_utils, "is_apex_mlu_available", lambda: apex_mlu)
-    monkeypatch.setattr(registry_mod, "get_device_type", lambda: "cuda" if host == "gpu" else host)
+    monkeypatch.setattr(
+        registry_mod, "get_device_type", lambda: GpuKernelRequirement.device if host == "gpu" else host
+    )
     monkeypatch.setattr(gpu_mod, "IS_CUDA_AVAILABLE", host == "gpu")
     monkeypatch.setattr(requirement_mod, "IS_NPU_AVAILABLE", host == "npu")
     monkeypatch.setattr(requirement_mod, "IS_MLU_AVAILABLE", host == "mlu")

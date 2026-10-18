@@ -83,7 +83,8 @@ def forward(
     out. The fused path requires full-width Llama-style ``cos`` and ``sin``
     tables whose second half duplicates the first; Liger reads only the first
     half. Any other ``unsqueeze_dim``, empty input, or trainable rotary table
-    falls back to the eager pair.
+    falls back to the eager pair. Fixed tables are saved in ``q.dtype`` for
+    stable checkpoint metadata, without changing the forward compute tables.
     """
     vision_layout = _eager._is_vision_layout(q, k, cos, sin)
     if (
@@ -113,13 +114,13 @@ def forward(
         q_in, k_in = _vision_to_liger(q, k)
         q_out, k_out, saved_cos, saved_sin = rope_forward(q_in, k_in, cos.unsqueeze(0), sin.unsqueeze(0))
         return _vision_from_liger(q_out, k_out), SavedState(
-            (saved_cos, saved_sin), _Meta(False, -2, vision_layout=True)
+            _eager._tables_for_saved_state(q, saved_cos, saved_sin), _Meta(False, -2, vision_layout=True)
         )
 
     q_in, k_in = _clone_for_liger(*_to_liger_layout(q, k, unsqueeze_dim))
     q_out, k_out, saved_cos, saved_sin = rope_forward(q_in, k_in, cos, sin)
     return _from_liger_layout(q_out, k_out, unsqueeze_dim), SavedState(
-        (saved_cos, saved_sin), _Meta(False, unsqueeze_dim)
+        _eager._tables_for_saved_state(q, saved_cos, saved_sin), _Meta(False, unsqueeze_dim)
     )
 
 

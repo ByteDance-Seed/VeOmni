@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 import torch
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import apply_rotary_pos_emb_interleave as hf_interleave_rope
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import apply_rotary_pos_emb as hf_dsv4_rope
 from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb as hf_mrope
@@ -396,7 +397,8 @@ def test_fused_rope_rows_fall_back_for_trainable_tables_before_vendor_import(imp
         )
 
 
-def test_full_liger_routes_vision_layout_through_liger(monkeypatch):
+@pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float32])
+def test_full_liger_routes_vision_layout_through_liger(monkeypatch, table_dtype):
     """Rank-3 vision is reshaped into Liger's 4D layout instead of falling back."""
     liger_rope = pytest.importorskip("liger_kernel.ops.rope")
     from veomni.ops.kernels.rope.full import liger_kernel as full_liger
@@ -408,22 +410,26 @@ def test_full_liger_routes_vision_layout_through_liger(monkeypatch):
         seen["k_shape"] = tuple(k.shape)
         seen["cos_shape"] = tuple(cos.shape)
         seen["sin_shape"] = tuple(sin.shape)
+        seen["cos_dtype"] = cos.dtype
+        seen["sin_dtype"] = sin.dtype
         seen["q_ptr"] = q.data_ptr()
         seen["k_ptr"] = k.data_ptr()
         return q, k, cos, sin
 
     monkeypatch.setattr(liger_rope, "rope_forward", fake_forward)
-    q = torch.randn(4, 3, 8)
-    k = torch.randn(4, 2, 8)
+    q = torch.randn(4, 3, 8, dtype=torch.bfloat16)
+    k = torch.randn(4, 2, 8, dtype=torch.bfloat16)
     original_q = q.clone()
-    cos = torch.randn(4, 8)
-    sin = torch.randn(4, 8)
+    cos = torch.randn(4, 8, dtype=table_dtype)
+    sin = torch.randn(4, 8, dtype=table_dtype)
     actual, saved = full_liger.forward(q, k, cos, sin)
 
     assert seen["q_shape"] == (1, 3, 4, 8)
     assert seen["k_shape"] == (1, 2, 4, 8)
     assert seen["cos_shape"] == (1, 4, 8)
     assert seen["sin_shape"] == (1, 4, 8)
+    assert seen["cos_dtype"] == table_dtype
+    assert seen["sin_dtype"] == table_dtype
     assert seen["q_ptr"] != q.data_ptr()
     assert seen["k_ptr"] != k.data_ptr()
     assert torch.equal(q, original_q)
@@ -431,6 +437,45 @@ def test_full_liger_routes_vision_layout_through_liger(monkeypatch):
     assert actual[1].shape == k.shape
     assert saved.metadata.vision_layout is True
     assert saved.metadata.use_eager is False
+    assert all(tensor.dtype == q.dtype for tensor in saved.tensors)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Liger RoPE checkpoint needs GPU")
+@pytest.mark.parametrize("layout", ["vision", "full"])
+@pytest.mark.parametrize("first_dtype", [torch.bfloat16, torch.float32])
+def test_liger_rope_checkpoint_accepts_recomputed_table_dtype_change(layout, first_dtype):
+    """FSDP can cast fixed tables only on the first pass of a checkpointed block."""
+    pytest.importorskip("liger_kernel.ops.rope")
+    op = resolve_op("rope", "full", "liger_kernel").wrapper
+    torch.manual_seed(37)
+    shape = (160, 2, 80) if layout == "vision" else (1, 2, 160, 80)
+    q = torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn_like(q, requires_grad=True)
+    # Keep table values identical across dtypes to isolate saved-state metadata.
+    angle = torch.randn(160, 40, device="cuda")
+    cos = torch.cat((angle.cos(), angle.cos()), dim=-1).to(torch.bfloat16)
+    sin = torch.cat((angle.sin(), angle.sin()), dim=-1).to(torch.bfloat16)
+    if layout == "full":
+        cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
+    second_dtype = torch.float32 if first_dtype == torch.bfloat16 else torch.bfloat16
+    table_dtypes = iter((first_dtype, second_dtype))
+
+    def run(query, key):
+        dtype = next(table_dtypes)
+        return op(query, key, cos.to(dtype), sin.to(dtype))
+
+    expected_q = q.detach().clone().requires_grad_()
+    expected_k = k.detach().clone().requires_grad_()
+    expected = op(expected_q, expected_k, cos.to(first_dtype), sin.to(first_dtype))
+    actual = checkpoint(run, q, k, use_reentrant=False)
+    grad_outputs = tuple(torch.randn_like(output) for output in expected)
+    # Liger's text backward consumes its gradient buffers in place.
+    torch.autograd.backward(expected, tuple(grad.clone() for grad in grad_outputs))
+    torch.autograd.backward(actual, tuple(grad.clone() for grad in grad_outputs))
+    for lhs, rhs in zip(actual, expected):
+        torch.testing.assert_close(lhs, rhs, rtol=0, atol=0)
+    torch.testing.assert_close(q.grad, expected_q.grad, rtol=0, atol=0)
+    torch.testing.assert_close(k.grad, expected_k.grad, rtol=0, atol=0)
 
 
 def test_full_liger_clones_aliased_text_inputs(monkeypatch):
