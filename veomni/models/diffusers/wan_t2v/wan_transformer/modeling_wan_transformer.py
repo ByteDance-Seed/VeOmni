@@ -23,7 +23,9 @@ from veomni.ops.config import resolve_op_impl
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
+    gather_heads_scatter_seq,
     gather_outputs,
+    gather_seq_scatter_heads,
     slice_input_tensor,
 )
 from .....utils import logging
@@ -205,6 +207,21 @@ class WanSPAttnProcessor(WanAttnProcessor):
         value = value.unflatten(2, (attn.heads, -1))
 
         use_sp = get_parallel_state().sp_enabled and not is_cross_attention
+        padded_seq_len = None
+        if use_sp:
+            group = get_parallel_state().ulysses_group
+            # Put sequence/heads first to use the existing all_to_all_single
+            # path, which also works on Gloo builds without list all-to-all.
+            query, key, value = (
+                gather_seq_scatter_heads(tensor.movedim(0, 2), seq_dim=0, head_dim=1, group=group).movedim(2, 0)
+                for tensor in (query, key, value)
+            )
+            if rotary_emb is None:
+                raise ValueError("Wan sequence parallel self-attention requires full rotary position tables.")
+            sequence_length = rotary_emb[0].shape[1]
+            padded_seq_len = query.shape[1]
+            # Padding is only for communication; it must not enter softmax.
+            query, key, value = (tensor[:, :sequence_length] for tensor in (query, key, value))
 
         if rotary_emb is not None:
 
@@ -268,24 +285,21 @@ class WanSPAttnProcessor(WanAttnProcessor):
                 .type_as(query)
             )
 
-        query_length = query.shape[1]
-        key_length = key.shape[1]
-        if use_sp:
-            # Outer forward already sliced tokens. The FA wrapper gathers before
-            # FA2, so cu_seqlens must describe the post-gather length.
-            query_length *= get_parallel_state().ulysses_size
-            key_length *= get_parallel_state().ulysses_size
         hidden_states_out = self._run_attention(
             kernel_module,
             query,
             key,
             value,
             attention_mask=attention_mask,
-            skip_ulysses=is_cross_attention,
-            query_length=query_length,
-            key_length=key_length,
-        ).flatten(2, 3)
-        hidden_states = hidden_states.type_as(query)
+            skip_ulysses=True,
+        )
+        if use_sp:
+            hidden_states_out = F.pad(hidden_states_out, (0, 0, 0, 0, 0, padded_seq_len - hidden_states_out.shape[1]))
+            hidden_states_out = gather_heads_scatter_seq(
+                hidden_states_out.movedim(0, 2), head_dim=1, seq_dim=0, group=get_parallel_state().ulysses_group
+            ).movedim(2, 0)
+        hidden_states_out = hidden_states_out.flatten(2, 3)
+        hidden_states_out = hidden_states_out.type_as(query)
 
         if hidden_states_img is not None:
             hidden_states_out = hidden_states_out + hidden_states_img
