@@ -50,8 +50,9 @@ class AdaZeroCallable(Protocol):
 
 class PytorchAdaZeroFunction(AdaZeroCallable):
     def __init__(self) -> None:
-        impl = resolve_op_impl("rms_norm_implementation", variant="unweighted")
-        self.veomni_rms_norm = VeomniOp("rms_norm", "unweighted", impl)
+        self.veomni_rms_norm = VeomniOp(
+            "rms_norm", "unweighted", resolve_op_impl("rms_norm_implementation", variant="unweighted")
+        )
 
     def __call__(
         self,

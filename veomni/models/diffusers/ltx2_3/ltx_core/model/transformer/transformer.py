@@ -99,8 +99,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         if ops is None:
             ops = TransformerOpsConfig()
-        impl = resolve_op_impl("rms_norm_implementation", variant="unweighted")
-        self.veomni_rms_norm_unweighted = VeomniOp("rms_norm", "unweighted", impl)
+        self.veomni_rms_norm_unweighted = VeomniOp(
+            "rms_norm", "unweighted", resolve_op_impl("rms_norm_implementation", variant="unweighted")
+        )
         self.ada_zero_function = ops.ada_zero_function
         self.post_sa_function = ops.post_sa_function
         if video is not None:

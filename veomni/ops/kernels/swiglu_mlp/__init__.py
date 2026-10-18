@@ -59,6 +59,7 @@ register_op(
     description="Liger Kernel SwiGLU MLP with optional activation clamping",
     requirement=_GPU,
     requires=("liger_kernel",),
+    default=True,
 )
 
 register_op(
@@ -79,4 +80,5 @@ register_op(
     description="Liger Kernel GeGLU MLP with tanh-approximate GELU",
     requirement=_GPU,
     requires=("liger_kernel",),
+    default=True,
 )

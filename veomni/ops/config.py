@@ -44,12 +44,14 @@ def get_ops_config() -> Any:
     return _ops_config
 
 
-def resolve_op_impl(field: str, *, variant: str | None = None, eager_as: str | None = None) -> str:
-    """Return the impl name on the installed ops config, or ``eager``.
+def resolve_op_impl(field: str, *, variant: str | None = None, eager_as: str | None = None) -> str | None:
+    """Return the impl name on the installed ops config, or ``eager`` when no config is installed.
 
-    ``variant`` applies the variant-scoped deprecated aliases for fields shared
-    by several variants, such as ``rms_norm_implementation='torch_npu'`` on the
-    ``unweighted`` variant. ``eager_as`` remaps ``eager`` for modeling without a
+    Unset fields on ``OpsImplementationConfig`` are ``None`` and resolve to
+    their ``(op, variant)`` host default in ``resolve_op`` / ``VeomniOp``.
+    ``variant`` preserves compatibility aliases for explicit values shared by
+    several variants, such as ``torch_npu`` on unweighted RMSNorm.
+    ``eager_as`` remaps ``eager`` for modeling without a
     local ``eager_attention_forward``, which the ``attention/standard/eager``
     row requires. Missing config is eager so unit tests can construct a module
     without ``set_ops_config``.

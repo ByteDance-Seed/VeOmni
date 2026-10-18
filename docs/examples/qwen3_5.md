@@ -203,9 +203,9 @@ There is no dedicated dense NPU config; reuse the GPU one and set the GatedDelta
 command line. Nothing else needs overriding: the YAML's `attn_implementation: flash_attention_2` is
 also the recommended NPU value (see [NPU-friendly operator
 configurations](../hardware_support/typical_usage.md)), and `rms_norm`, `rotary_pos_emb`,
-`swiglu_mlp` and `cross_entropy_loss` are left unset there, so they take the NPU defaults
-([`_NPU_DEFAULT_IMPLEMENTATIONS`](../../veomni/arguments/arguments_types.py)). The three
-GatedDeltaNet ops are deliberately **not** in that table, which is why they must be explicit:
+`swiglu_mlp` and `cross_entropy_loss` are left unset there, so `VeomniOp` resolves them to the NPU defaults
+from `OP_REGISTRY.default_impl`. The three
+GatedDeltaNet ops default to `"fla"` instead, which is why they must be explicit:
 
 ```shell
 bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5/qwen3_5_vl.yaml \

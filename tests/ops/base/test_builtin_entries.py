@@ -125,6 +125,7 @@ _BUILTIN_ENTRIES = (
     ("cross_entropy_loss", "standard", "eager", "any", _ANY, ()),
     ("cross_entropy_loss", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("cross_entropy_loss", "standard", "chunk_loss", "any", _ANY, ()),
+    ("cross_entropy_loss", "standard", "chunk_loss", "npu", _NPU, ()),
     ("mhc", "pre", "eager", "any", _ANY, ()),
     ("mhc", "pre", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tile_kernels",)),
     ("mhc", "pre", "cann", "npu", _NPU, ("cann_ops_transformer",)),
@@ -214,3 +215,33 @@ def test_builtin_entry_catalog_is_exact():
 
     assert len(expected) == len(_BUILTIN_ENTRIES)
     assert actual == expected
+
+
+_BUILTIN_DEFAULT_ENTRIES = {
+    ("cross_entropy_loss", "standard", "liger_kernel", "cuda"),
+    ("cross_entropy_loss", "standard", "chunk_loss", "npu"),
+    ("load_balancing_loss", "standard", "triton", "cuda"),
+    ("moe_experts", "standard", "fused_triton", "cuda"),
+    ("moe_experts", "standard", "fused_mlu", "mlu"),
+    ("moe_experts", "standard", "fused_triton", "mlu"),
+    ("moe_experts", "standard", "fused_npu", "npu"),
+    ("rms_norm", "standard", "liger_kernel", "cuda"),
+    ("rms_norm", "standard", "torch_npu", "npu"),
+    ("rms_norm", "deepseek_v4", "liger_kernel", "cuda"),
+    ("rms_norm", "deepseek_v4", "torch_npu", "npu"),
+    ("rms_norm", "offset", "liger_kernel", "cuda"),
+    ("rms_norm", "offset", "torch_npu", "npu"),
+    ("rms_norm", "unweighted", "liger_kernel", "cuda"),
+    ("rope", "full", "liger_kernel", "cuda"),
+    ("rope", "full", "torch_npu", "npu"),
+    ("rope", "partial", "liger_kernel", "cuda"),
+    ("rope", "partial", "torch_npu", "npu"),
+    ("swiglu_mlp", "standard", "liger_kernel", "cuda"),
+    ("swiglu_mlp", "geglu", "liger_kernel", "cuda"),
+}
+
+
+def test_builtin_default_entries_are_exact():
+    """Only the intended device rows set default=True."""
+    actual = {key for key, entry in OP_REGISTRY._entries.items() if entry.default}
+    assert actual == _BUILTIN_DEFAULT_ENTRIES

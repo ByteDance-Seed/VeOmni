@@ -189,17 +189,27 @@ self.veomni_rms_norm = VeomniOp(
 hidden_states = self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 ```
 
-`VeomniOp` resolves its row at construction, is interned by the public
+`VeomniOp` resolves its row at construction, is interned by the resolved
 triple, and always calls the row's wrapper. `models.build_foundation_model`
 installs the `OpsImplementationConfig` object in `ops/config.py` before
 constructing the model. Changing the installed config later does not
 retarget handles that already exist.
 
-A config field such as `rms_norm_implementation` is shared by every variant
-of its op. Consumers of a variant with variant-scoped deprecated aliases pass
-`resolve_op_impl(field, variant=...)`. For example, the `unweighted` RMSNorm
-has no Ascend kernel, so `torch_npu` resolves to `eager` there while the
-weighted variants keep their `torch_npu` rows.
+Unset fields on `OpsImplementationConfig` remain `None`, and
+`resolve_op(op, variant, None)` / `VeomniOp(op, variant, None)` selects the
+host default for that `(op, variant)` from `OP_REGISTRY.default_impl`: the
+first `default=True` row on the active device whose hardware and software
+requirements are satisfied, or explicitly `eager` when no default candidate
+is available. Registration order only determines priority among available
+default candidates. An explicit implementation never falls back when its
+requirements are unmet. For example, `rms_norm/unweighted` has no Ascend kernel,
+so an unset `rms_norm_implementation` resolves `rms_norm/standard` to
+`torch_npu` and `rms_norm/unweighted` to `eager` on NPU.
+
+For compatibility, consumers pass `resolve_op_impl(field, variant=...)`
+for variants with explicit-value aliases. In particular, an explicit
+`rms_norm_implementation='torch_npu'` (or the deprecated `npu`) still maps to
+`eager` for `unweighted`, while weighted variants retain `torch_npu`.
 
 The registry wrapper is the canonical tensor contract for an op variant;
 it is not a collection of model-specific adapters. Transformations that vary

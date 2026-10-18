@@ -224,8 +224,9 @@ def deepseek_v4_rms_norm_forward_patched(self, hidden_states: torch.Tensor) -> t
 def deepseek_v4_unweighted_rmsnorm_init_patched(self, eps: float = 1.0e-6) -> None:
     nn.Module.__init__(self)
     self.eps = eps
-    impl = resolve_op_impl("rms_norm_implementation", variant="unweighted")
-    self.veomni_unweighted_rms_norm = VeomniOp("rms_norm", "unweighted", impl)
+    self.veomni_unweighted_rms_norm = VeomniOp(
+        "rms_norm", "unweighted", resolve_op_impl("rms_norm_implementation", variant="unweighted")
+    )
 
 
 @config.override_method(

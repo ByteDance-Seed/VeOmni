@@ -224,8 +224,9 @@ class DeepseekV4UnweightedRMSNorm(nn.Module):
     def __init__(self, eps: float = 1.0e-6) -> None:
         nn.Module.__init__(self)
         self.eps = eps
-        impl = resolve_op_impl("rms_norm_implementation", variant="unweighted")
-        self.veomni_unweighted_rms_norm = VeomniOp("rms_norm", "unweighted", impl)
+        self.veomni_unweighted_rms_norm = VeomniOp(
+            "rms_norm", "unweighted", resolve_op_impl("rms_norm_implementation", variant="unweighted")
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.veomni_unweighted_rms_norm(x, eps=self.eps)

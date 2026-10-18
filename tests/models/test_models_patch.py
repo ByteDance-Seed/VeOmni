@@ -56,7 +56,7 @@ from veomni.data.data_collator import MainCollator
 from veomni.data.dummy_dataset import build_dummy_dataset
 from veomni.distributed.parallel_state import clear_parallel_state
 from veomni.models.model_runtime import VeOmniModelRuntime
-from veomni.ops import VeomniOp, apply_ops_patch
+from veomni.ops import OP_REGISTRY, VeomniOp, apply_ops_patch
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, is_sm90_or_above
 from veomni.utils.env import get_env
@@ -157,25 +157,12 @@ _VEOMNI_ATTN = ("veomni_flash_attention_2", "veomni_flash_attention_3")
 
 
 def _kernel_ops(model_type: str) -> dict[str, str]:
-    """The ops a kernel mode selects for ``model_type`` on this device."""
-    if IS_NPU_AVAILABLE:
-        ops = {
-            "rms_norm_implementation": "torch_npu",
-            "swiglu_mlp_implementation": "eager",
-            "rotary_pos_emb_implementation": "torch_npu",
-            "rotary_pos_emb_vision_implementation": "torch_npu",
-            "cross_entropy_loss_implementation": "chunk_loss",
-        }
-        if model_type == "deepseek_v4":
-            # rope/deepseek_v4 has no torch_npu row.
-            ops["rotary_pos_emb_implementation"] = "eager"
-        return ops
-    ops = dict.fromkeys(_KERNEL_FIELDS, "liger_kernel")
-    if model_type in ("qwen3_5", "qwen3_5_moe"):
+    """Config overrides for ``model_type`` when ``use_kernels=True`` (unset fields use ``OP_REGISTRY.default_impl``)."""
+    if not IS_NPU_AVAILABLE and model_type in ("qwen3_5", "qwen3_5_moe"):
         # Liger CE materializes the full-vocab logits of these toys (~5 GiB);
         # chunk_loss keeps the step within shared CI cards.
-        ops["cross_entropy_loss_implementation"] = "chunk_loss"
-    return ops
+        return {"cross_entropy_loss_implementation": "chunk_loss"}
+    return {}
 
 
 def _ops_config_for_mode(mode: ModelMode, model_type: str) -> OpsImplementationConfig:
@@ -219,14 +206,6 @@ _KERNEL_OP_FIELDS = {
 }
 
 
-def _has_row(op: str, variant: str, impl: str) -> bool:
-    try:
-        VeomniOp(op, variant, impl)
-    except (KeyError, RuntimeError):
-        return False
-    return True
-
-
 def _op_handles(model: torch.nn.Module) -> dict[str, list[VeomniOp]]:
     handles: dict[str, list[VeomniOp]] = defaultdict(list)
     for module in model.modules():
@@ -247,16 +226,14 @@ def _verify_selected_ops(model: torch.nn.Module, mode: ModelMode, config: OpsImp
         if not handles[op]:
             continue
         impls = sorted({handle.impl for handle in handles[op]})
-        selected = {getattr(config, name) for name in field_names} - {"eager"}
         if not mode.use_kernels:
             assert impls == ["eager"], f"[{mode}] {op} should be eager with kernels off, got {impls}"
             continue
-        # Variants without a row for the selected kernel (e.g. interleaved or multimodal RoPE) stay eager.
-        eligible = [h for h in handles[op] if any(_has_row(op, h.variant, impl) for impl in selected)]
-        if eligible:
-            eligible_impls = sorted({h.impl for h in eligible})
-            assert selected & set(eligible_impls), (
-                f"[{mode}] no {op} handle uses {sorted(selected)}, got {eligible_impls}"
+        configured = [getattr(config, name) for name in field_names if getattr(config, name) is not None]
+        for handle in handles[op]:
+            expected = set(configured) if configured else {OP_REGISTRY.default_impl(op, handle.variant)}
+            assert handle.impl in expected, (
+                f"[{mode}] {op}/{handle.variant} should use {sorted(expected)}, got {handle.impl!r}"
             )
 
     moe_impls = sorted({handle.impl for handle in handles["moe_experts"]})

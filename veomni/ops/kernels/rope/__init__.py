@@ -60,6 +60,7 @@ register_op(
     description="Liger Kernel rotary embedding over every channel, including rank-3 vision layout",
     requirement=_GPU,
     requires=("liger_kernel",),
+    default=True,
 )
 
 register_op(
@@ -70,6 +71,7 @@ register_op(
     full_npu.backward,
     description="torch_npu rotary embedding over every channel, including rank-3 vision layout",
     requirement=NpuKernelRequirement(),
+    default=True,
 )
 
 register_op(
@@ -90,6 +92,7 @@ register_op(
     description="Liger Kernel rotary embedding over a channel prefix with eager fallback",
     requirement=_GPU,
     requires=("liger_kernel",),
+    default=True,
 )
 
 register_op(
@@ -100,6 +103,7 @@ register_op(
     partial_npu.backward,
     description="torch_npu rotary embedding over a channel prefix",
     requirement=NpuKernelRequirement(),
+    default=True,
 )
 
 register_op(

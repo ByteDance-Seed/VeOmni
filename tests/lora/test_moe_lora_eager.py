@@ -351,7 +351,7 @@ def test_wrapper_constructs_on_mocked_mlu_with_default_ops_config(monkeypatch, m
     monkeypatch.setattr(VeomniOp, "_intern", {})
 
     ops = OpsImplementationConfig()
-    assert ops.moe_implementation == "fused_triton"
+    assert ops.moe_implementation is None
     assert "fused_triton" not in OP_REGISTRY.list_available("moe_experts_lora", mode)
     with pytest.raises(RuntimeError, match="not registered for device 'mlu'"):
         VeomniOp("moe_experts_lora", mode, "fused_triton")

@@ -8,7 +8,7 @@ model:
     # Must be eager on both GPU and NPU.
     attn_implementation: eager
     # Unset moe_implementation already resolves to fused_npu on NPU
-    # (veomni/arguments/arguments_types.py _NPU_DEFAULT_IMPLEMENTATIONS). Set
+    # via OP_REGISTRY.default_impl (see veomni/arguments/arguments_types.py). Set
     # fused_npu here so the NPU backend choice is visible in the config.
     moe_implementation: fused_npu
     # Fused-CE 'liger_kernel' is GPU-only; use the NPU chunk_loss gate

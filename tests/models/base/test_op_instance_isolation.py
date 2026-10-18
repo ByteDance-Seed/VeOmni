@@ -24,6 +24,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tests.models.compare import eager_ops_config, ops_config_scope, qwen_image_inputs, stamp_attn_implementation
@@ -42,6 +43,34 @@ from tests.models.tiny_configs import (
     tiny_wan_config,
 )
 from veomni.ops import VeomniOp
+
+
+@pytest.mark.parametrize("impl", ["torch_npu", "npu"])
+@pytest.mark.parametrize("family", ["flux", "ltx2_3", "deepseek_v4"])
+def test_unweighted_rms_norm_preserves_explicit_npu_compatibility(family, impl):
+    cfg = eager_ops_config()
+    cfg.rms_norm_implementation = impl
+    with ops_config_scope(cfg):
+        if family == "flux":
+            from veomni.models.transformers.flux.modeling_flux import RMSNorm
+
+            handle = RMSNorm(8, eps=1e-6, elementwise_affine=False).veomni_rms_norm
+        elif family == "ltx2_3":
+            from veomni.models.diffusers.ltx2_3.ltx_core.model.transformer.ops import PytorchAdaZeroFunction
+
+            handle = PytorchAdaZeroFunction().veomni_rms_norm
+        else:
+            from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+                DeepseekV4UnweightedRMSNorm,
+            )
+
+            handle = DeepseekV4UnweightedRMSNorm().veomni_unweighted_rms_norm
+        assert cfg.rms_norm_implementation == impl
+        assert handle.variant == "unweighted"
+        assert handle.impl == "eager"
+        hidden = torch.randn(2, 8)
+        expected = hidden * torch.rsqrt(hidden.square().mean(-1, keepdim=True) + 1e-6)
+        torch.testing.assert_close(handle(hidden, eps=1e-6), expected)
 
 
 def _output_tensor(result):

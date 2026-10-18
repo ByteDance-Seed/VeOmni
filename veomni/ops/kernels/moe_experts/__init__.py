@@ -57,6 +57,18 @@ register_op(
     wrapper=standard_triton.wrapper,
     requirement=_GPU_SM70_OR_ROCM,
     requires=("triton",),
+    default=True,
+)
+
+register_op(
+    "moe_experts",
+    "standard",
+    "fused_mlu",
+    description="Apex grouped-GEMM routed SwiGLU MoE experts",
+    wrapper=standard_mlu.wrapper,
+    requirement=MluKernelRequirement(),
+    requires=("apex",),
+    default=True,
 )
 
 register_op(
@@ -67,6 +79,7 @@ register_op(
     wrapper=standard_triton.wrapper,
     requirement=MluKernelRequirement(),
     requires=("triton",),
+    default=True,
 )
 
 register_op(
@@ -86,16 +99,7 @@ register_op(
     description="torch_npu grouped-GEMM routed SwiGLU MoE experts",
     wrapper=standard_npu.wrapper,
     requirement=NpuKernelRequirement(),
-)
-
-register_op(
-    "moe_experts",
-    "standard",
-    "fused_mlu",
-    description="Apex grouped-GEMM routed SwiGLU MoE experts",
-    wrapper=standard_mlu.wrapper,
-    requirement=MluKernelRequirement(),
-    requires=("apex",),
+    default=True,
 )
 
 register_op(

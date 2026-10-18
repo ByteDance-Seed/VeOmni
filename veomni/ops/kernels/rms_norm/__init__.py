@@ -58,6 +58,7 @@ register_op(
     description="Liger Kernel standard RMSNorm with Llama-style casting",
     requirement=_GPU,
     requires=("liger_kernel",),
+    default=True,
 )
 
 register_op(
@@ -68,6 +69,7 @@ register_op(
     standard_npu.backward,
     description="torch_npu standard RMSNorm with Llama-style casting",
     requirement=NpuKernelRequirement(),
+    default=True,
 )
 
 register_op(
@@ -99,6 +101,7 @@ register_op(
     description="Liger Kernel DeepSeek-V4 RMSNorm with offset 0 and Gemma-style scaling",
     requirement=_GPU,
     requires=("liger_kernel",),
+    default=True,
 )
 
 register_op(
@@ -109,6 +112,7 @@ register_op(
     deepseek_v4_npu.backward,
     description="torch_npu DeepSeek-V4 RMSNorm with offset 0",
     requirement=NpuKernelRequirement(),
+    default=True,
 )
 
 register_op(
@@ -129,6 +133,7 @@ register_op(
     description="Liger Kernel RMSNorm with offset-1 weights and Gemma-style scaling",
     requirement=_GPU,
     requires=("liger_kernel",),
+    default=True,
 )
 
 register_op(
@@ -139,6 +144,7 @@ register_op(
     offset_npu.backward,
     description="torch_npu RMSNorm with offset-1 weights and Gemma-style scaling",
     requirement=NpuKernelRequirement(),
+    default=True,
 )
 
 register_op(
@@ -159,4 +165,5 @@ register_op(
     description="Liger Kernel RMSNorm without an affine weight",
     requirement=_GPU,
     requires=("liger_kernel",),
+    default=True,
 )
