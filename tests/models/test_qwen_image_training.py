@@ -384,7 +384,8 @@ def test_preprocessor_contract(tmp_path):
         qwen_image_preprocess({"prompt": ["one"], "image": "sample.png"})
 
 
-def test_backbone_reference_forward_and_gradients(snapshot, encoded):
+@pytest.mark.parametrize("cpu_safe_diffusers_rms_norm", [False, True], indirect=True, ids=["native", "ascend-cpu"])
+def test_backbone_reference_forward_and_gradients(snapshot, encoded, cpu_safe_diffusers_rms_norm):
     inputs = condition_model(snapshot, offline=True).process_condition(**encoded)
     model = transformer()
     reference = DiffusersQwenImageTransformer(**model.config.to_diffuser_dict())

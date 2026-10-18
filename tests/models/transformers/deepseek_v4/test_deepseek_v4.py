@@ -20,6 +20,7 @@ Direct-import the generated class. Compare a toy CausalLM against Hugging Face.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -160,7 +161,8 @@ def test_deepseek_v4_attention_preserves_q_norm_and_rope_dtype_modes():
     assert not torch.equal(captured["query"], wrong_fp32_multiply)
 
 
-def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit():
+@pytest.mark.parametrize("impl", ["eager", "fused_triton"])
+def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
     config = _tiny_config()
     model = _build_ours(config)
     experts = model.model.layers[3].mlp.experts
@@ -177,13 +179,14 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit():
         captured["kwargs"] = kwargs
         return torch.zeros_like(hidden_states)
 
-    experts.veomni_moe = record
+    experts.veomni_moe = Mock(impl=impl, side_effect=record)
     actual = experts(hidden_states, selected_experts, top_k_weights)
     args = captured["args"]
     kwargs = captured["kwargs"]
 
     assert args[0] is hidden_states
-    torch.testing.assert_close(args[1], top_k_weights.to(hidden_states.dtype), rtol=0, atol=0)
+    expected_weights = top_k_weights if impl == "eager" else top_k_weights.to(hidden_states.dtype)
+    torch.testing.assert_close(args[1], expected_weights, rtol=0, atol=0)
     assert args[2] is selected_experts
     assert args[3].numel() == 0
     assert args[4].numel() == 0

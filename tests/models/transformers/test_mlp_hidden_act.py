@@ -43,6 +43,10 @@ class _CallCounter:
         self.inner = inner
         self.calls = 0
 
+    @property
+    def impl(self):
+        return self.inner.impl
+
     def __call__(self, *args, **kwargs):
         self.calls += 1
         return self.inner(*args, **kwargs)

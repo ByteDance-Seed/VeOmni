@@ -108,6 +108,15 @@ needed" without a reason is what the reviewer is looking for.
 
 ## Guidance
 
+- A test double wrapping a `VeomniOp` must expose the handle attributes its
+  consumer reads, including `impl`. DeepSeek-V4 keeps eager routing weights in
+  their incoming dtype and casts them for fused MoE; a recording double must
+  identify which path it represents and assert the corresponding dtype.
+- CPU substitutes for Diffusers RMSNorm on Ascend hosts must preserve the
+  pinned upstream CPU math and dtype promotion. `F.rms_norm` is not a drop-in
+  replacement for BF16 inputs with FP32 weights: its BF16 output cannot feed
+  an FP32 Linear without autocast. Exercise the Ascend-host CPU fixture path
+  on non-Ascend CI through indirect fixture parametrization.
 - A standalone Transformers layer can allocate parameters with `torch.empty`
   that only the enclosing `PreTrainedModel.post_init()` initializes. Initialize
   these in the fixture before any rank broadcast; setting a seed does not
