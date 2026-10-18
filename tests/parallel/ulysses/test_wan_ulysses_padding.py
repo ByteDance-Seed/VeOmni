@@ -11,7 +11,6 @@ if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backen
     sys.exit(0)
 
 import pytest
-from torch.testing._internal.common_utils import run_tests
 
 from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor_scale_grad
@@ -93,4 +92,6 @@ class WanUlyssesUnpatchifyPaddingTest(SequenceParallelTest):
 
 
 if __name__ == "__main__":
+    from torch.testing._internal.common_utils import run_tests
+
     run_tests()

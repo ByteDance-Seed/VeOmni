@@ -302,46 +302,41 @@ class OmniModel(PreTrainedModel):
         """
 
         from ...arguments import OpsImplementationConfig
-        from ...ops import apply_ops_config
-        from ...ops.config.singleton import get_ops_config
-        from ..auto import bind_ops_to_modeling
+        from ...ops.config import get_ops_config, set_ops_config
 
         base_ops = get_ops_config()
         modules: dict[str, PretrainedOmniModule] = {}
-        for name in config.module_names:
-            entry = config._module_entries[name]
-            module_path = OmniModuleConfig.resolve_path(checkpoint_root, name, entry.get("model_path"))
-            module_config = config._module_configs[name]
-            mod_cls = OMNI_MODEL_REGISTRY[module_config.model_type]()
-            module_ops = OpsImplementationConfig(**dict(module_config.ops_implementation or {}))
-            # Copy per module: HF pops keys such as ``torch_dtype`` out of the dict it is given.
-            # TODO: make it per module kwargs
-            module_kwargs = dict(kwargs)
+        try:
+            for name in config.module_names:
+                entry = config._module_entries[name]
+                module_path = OmniModuleConfig.resolve_path(checkpoint_root, name, entry.get("model_path"))
+                module_config = config._module_configs[name]
+                mod_cls = OMNI_MODEL_REGISTRY[module_config.model_type]()
+                module_ops = OpsImplementationConfig(**dict(module_config.ops_implementation or {}))
+                # Copy per module: HF pops keys such as ``torch_dtype`` out of the dict it is given.
+                # TODO: make it per module kwargs
+                module_kwargs = dict(kwargs)
 
-            # Install this module's kernels for the duration of its own load, so
-            # a module's kernels do not depend on its position in
-            # ``config.module_names``.
-            apply_ops_config(module_ops)
-
-            # After the ops config above was installed.
-            bind_ops_to_modeling(mod_cls)
-            if load_weights and config._hf_source is not None:
-                if os.path.normpath(module_path) != os.path.normpath(os.path.join(str(checkpoint_root), name)):
-                    raise ValueError(
-                        f"Module {name!r} reads from {module_path!r}, but {checkpoint_root} is a view of the "
-                        f"HuggingFace `{config._hf_source.model_type}` checkpoint every module loads from."
+                # Install this module's kernels for the duration of its own load, so
+                # a module's kernels do not depend on its position in
+                # ``config.module_names``.
+                set_ops_config(module_ops)
+                if load_weights and config._hf_source is not None:
+                    if os.path.normpath(module_path) != os.path.normpath(os.path.join(str(checkpoint_root), name)):
+                        raise ValueError(
+                            f"Module {name!r} reads from {module_path!r}, but {checkpoint_root} is a view of the "
+                            f"HuggingFace `{config._hf_source.model_type}` checkpoint every module loads from."
+                        )
+                    modules[name] = cls._load_module_from_hf_source(
+                        mod_cls, name, module_config, module_path, config._hf_source, module_kwargs
                     )
-                modules[name] = cls._load_module_from_hf_source(
-                    mod_cls, name, module_config, module_path, config._hf_source, module_kwargs
-                )
-            elif load_weights:
-                modules[name] = mod_cls.from_pretrained(module_path, config=module_config, **module_kwargs)
-            else:
-                modules[name] = mod_cls._from_config(module_config, **cls._init_only_load_kwargs(module_kwargs))
-
-        # Don't leave the caller's config holding the last module's override.
-        if base_ops is not None:
-            apply_ops_config(base_ops)
+                elif load_weights:
+                    modules[name] = mod_cls.from_pretrained(module_path, config=module_config, **module_kwargs)
+                else:
+                    modules[name] = mod_cls._from_config(module_config, **cls._init_only_load_kwargs(module_kwargs))
+        finally:
+            # Don't leave the caller's config holding the last module's override.
+            set_ops_config(base_ops)
         return modules
 
     @staticmethod

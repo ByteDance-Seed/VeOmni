@@ -65,14 +65,14 @@ class WanTransformer3DConditionModelConfig(PretrainedConfig):
 
         model_index_path = os.path.join(pretrained_model_name_or_path, "model_index.json")
         if os.path.isfile(model_index_path):
-            with open(model_index_path, "r", encoding="utf-8") as f:
+            with open(model_index_path, encoding="utf-8") as f:
                 model_index = json.load(f)
             if "expand_timesteps" in model_index and "expand_timesteps" not in config_dict:
                 config_dict["expand_timesteps"] = model_index["expand_timesteps"]
 
         transformer_config_path = os.path.join(pretrained_model_name_or_path, "transformer", "config.json")
         if os.path.isfile(transformer_config_path):
-            with open(transformer_config_path, "r", encoding="utf-8") as f:
+            with open(transformer_config_path, encoding="utf-8") as f:
                 transformer_config = json.load(f)
             if "patch_size" in transformer_config:
                 config_dict.setdefault("patch_size", transformer_config["patch_size"])

@@ -38,19 +38,37 @@ _TOY_CONFIG = "tests/toy_config/qwen4_exp_toy"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 try:
-    from fla.modules.convolution import causal_conv1d as causal_conv1d_fn
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as chunk_gated_delta_rule_fn
+    from fla.modules.convolution import causal_conv1d as _causal_conv1d_fn  # noqa: F401
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _chunk_gated_delta_rule_fn  # noqa: F401
     from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func  # noqa: F401
 except ImportError:
     pytest.skip("Qwen4-Exp Ulysses tests require FLA and FlashAttention kernels", allow_module_level=True)
 
 
-def _bind_qwen4_exp_op_slots() -> None:
-    """Bind the generated module's OpSlots for direct layer construction."""
-    from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.models.auto import _bind_veomni_ops
+def _install_qwen4_exp_ops_config() -> None:
+    """Install FLA GatedDeltaNet selections; every other op stays eager."""
+    from veomni.ops.config import set_ops_config
 
-    _bind_veomni_ops(importlib.import_module(_PATCHED_MODULE), OpsImplementationConfig())
+    set_ops_config(
+        SimpleNamespace(
+            rms_norm_gated_implementation="fla",
+            causal_conv1d_implementation="fla",
+            chunk_gated_delta_rule_implementation="fla",
+        )
+    )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _configured_qwen4_exp_kernels():
+    """Scope the default selections to this module's in-process tests."""
+    from veomni.ops.config import get_ops_config, set_ops_config
+
+    previous = get_ops_config()
+    _install_qwen4_exp_ops_config()
+    try:
+        yield
+    finally:
+        set_ops_config(previous)
 
 
 def _set_deterministic(seed: int = 42) -> None:
@@ -407,7 +425,7 @@ def test_qwen4_exp_depthwise_conv1d_slicing_matches_full(
     """Local channels and weights reproduce the matching full-conv channels."""
     Qwen4ExpTextGatedDeltaNet = importlib.import_module(_PATCHED_MODULE).Qwen4ExpTextGatedDeltaNet
 
-    _bind_qwen4_exp_op_slots()
+    _install_qwen4_exp_ops_config()
     key_dim = num_k_heads * head_k_dim
     value_dim = num_v_heads * head_v_dim
     conv_dim = key_dim * 2 + value_dim
@@ -493,10 +511,8 @@ def _run_gated_deltanet_equivalence(
         if num_v_heads is not None:
             config.linear_num_value_heads = num_v_heads
         torch.manual_seed(43)
-        _bind_qwen4_exp_op_slots()
+        _install_qwen4_exp_ops_config()
         layer = qwen4_exp.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).float().to(device)
-        layer.veomni_causal_conv1d_fn = causal_conv1d_fn
-        layer.veomni_chunk_gated_delta_rule = chunk_gated_delta_rule_fn
         _broadcast_module(layer)
 
         local_seq_len = 4
@@ -599,7 +615,7 @@ def _run_gated_deltanet_determinism(bsz: int, seq_len: int) -> None:
             device_type=get_device_type(),
             name=None,
         )
-        _bind_qwen4_exp_op_slots()
+        _install_qwen4_exp_ops_config()
         _set_deterministic()
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
@@ -630,7 +646,7 @@ def test_qwen4_exp_gated_deltanet_forward_deterministic_sp(bsz: int, seq_len: in
 def test_qwen4_exp_gated_deltanet_forward_deterministic_no_sp(bsz: int, seq_len: int) -> None:
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
 
-    _bind_qwen4_exp_op_slots()
+    _install_qwen4_exp_ops_config()
     _set_deterministic()
     device = torch.device(get_device_type())
     config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
@@ -677,12 +693,9 @@ def _run_text_model_equivalence() -> None:
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
         config._attn_implementation = "eager"
+        _install_qwen4_exp_ops_config()
         torch.manual_seed(59)
         model = qwen4_exp.Qwen4ExpTextModel(config).float().to(device)
-        for decoder_layer in model.layers:
-            if hasattr(decoder_layer, "linear_attn"):
-                decoder_layer.linear_attn.veomni_causal_conv1d_fn = causal_conv1d_fn
-                decoder_layer.linear_attn.veomni_chunk_gated_delta_rule = chunk_gated_delta_rule_fn
         _broadcast_module(model)
 
         local_seq_len = 4
@@ -781,12 +794,9 @@ def _run_router_aux_loss_equivalence() -> None:
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG)
         config.text_config._attn_implementation = "eager"
+        _install_qwen4_exp_ops_config()
         torch.manual_seed(67)
         model = qwen4_exp.Qwen4ExpForConditionalGeneration(config).float().to(device)
-        for decoder_layer in model.model.language_model.layers:
-            if hasattr(decoder_layer, "linear_attn"):
-                decoder_layer.linear_attn.veomni_causal_conv1d_fn = causal_conv1d_fn
-                decoder_layer.linear_attn.veomni_chunk_gated_delta_rule = chunk_gated_delta_rule_fn
         _broadcast_module(model)
 
         local_seq_len = 4
@@ -908,13 +918,10 @@ def _run_vlm_placeholder_equivalence() -> None:
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG)
         config.text_config._attn_implementation = "eager"
-        config.vision_config._attn_implementation = "veomni_flash_attention_2_with_sp"
+        config.vision_config._attn_implementation = "veomni_flash_attention_2"
+        _install_qwen4_exp_ops_config()
         torch.manual_seed(71)
         model = qwen4_exp.Qwen4ExpModel(config).to(device=device, dtype=torch.bfloat16)
-        for decoder_layer in model.language_model.layers:
-            if hasattr(decoder_layer, "linear_attn"):
-                decoder_layer.linear_attn.veomni_causal_conv1d_fn = causal_conv1d_fn
-                decoder_layer.linear_attn.veomni_chunk_gated_delta_rule = chunk_gated_delta_rule_fn
         _broadcast_module(model)
         patch_embed_rows = []
         model.visual.patch_embed.register_forward_pre_hook(
@@ -949,7 +956,6 @@ def _run_vlm_placeholder_equivalence() -> None:
         expected_parameter_grads = None
         if rank == 0:
             baseline_pixels = full_pixels.detach().clone().requires_grad_(True)
-            model.visual.config._attn_implementation = "flash_attention_2"
             with use_parallel_state(dp_state):
                 expected_output = model(
                     input_ids=full_input_ids,
@@ -963,7 +969,6 @@ def _run_vlm_placeholder_equivalence() -> None:
                     cu_seq_lens_q=cu_seq_lens,
                 ).last_hidden_state
                 (expected_output.sum() / expected_output.numel()).backward()
-            model.visual.config._attn_implementation = "veomni_flash_attention_2_with_sp"
             expected_pixel_grad = baseline_pixels.grad.detach().clone()
             expected_parameter_grads = {
                 name: parameter.grad.detach().clone() if parameter.grad is not None else None

@@ -152,7 +152,7 @@ Training from an upstream root:
   [attaches the key converter](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L347);
   [`weights_path`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L233) is the upstream root.
 - The FSDP2 / DDP wrap (per module, or [composed](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L296)) loads weights:
-  - [`load_model_weights`](../../../veomni/models/module_utils.py#L404) and the [rank-0 broadcast loader](../../../veomni/models/module_utils.py#L1125) skip keys the converter declares, without reading them;
+  - [`load_model_weights`](../../../veomni/models/checkpoint/weights.py#L410) and the [rank-0 broadcast loader](../../../veomni/models/checkpoint/weights.py#L1207) skip keys the converter declares, without reading them;
   - [`HFSourceKeyConverter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L331) renames the module's own keys and hands them to the module's converter.
 
 HF export (`CheckpointCallback` → [`OmniModelRuntime.save_hf_or_lora`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L611)):
@@ -163,7 +163,7 @@ HF export (`CheckpointCallback` → [`OmniModelRuntime.save_hf_or_lora`](../../.
 Bare `OmniModel.from_pretrained` and eager inference:
 
 - [`OmniModel.from_pretrained`](../../../veomni/models/seed_omni/modeling_omni.py#L203) resolves the root first;
-- [`_load_module_from_hf_source`](../../../veomni/models/seed_omni/modeling_omni.py#L348) loads each module with [`load_module_from_hf_source`](../../../veomni/models/seed_omni/utils/hf_layout.py#L483) and binds its assets from the view;
+- [`_load_module_from_hf_source`](../../../veomni/models/seed_omni/modeling_omni.py#L343) loads each module with [`load_module_from_hf_source`](../../../veomni/models/seed_omni/utils/hf_layout.py#L483) and binds its assets from the view;
 - [`resolve_hf_source_device_map`](../../../veomni/models/seed_omni/utils/hf_layout.py#L449) gives `device_map` its `from_pretrained` meaning (`"auto"` is planned by accelerate over `_no_split_modules`). A multi-device map loads on CPU, then `accelerate.dispatch_model` places the module.
 
 Offline convert: a family with a layout and no converter splits through
