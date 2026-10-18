@@ -1197,10 +1197,16 @@ class DeepseekV4Indexer(nn.Module):
         packed_npu_supported = packed_sequence_slices is None or (
             batch == 1 and packed_sequence_slices[0][0] == 0 and packed_sequence_slices[-1][1] == seq_len
         )
+        # SequenceParallelCollator pads position_ids with zeros. The padding is an
+        # isolated final packed segment whose labels are ignored, so it need not be
+        # renumbered; real data segments must still use canonical local positions.
         packed_positions_are_canonical = packed_sequence_slices is None or all(
-            torch.equal(
-                position_ids[0, start:end],
-                torch.arange(end - start, device=position_ids.device),
+            (
+                torch.equal(
+                    position_ids[0, start:end],
+                    torch.arange(end - start, device=position_ids.device),
+                )
+                or (end == seq_len and torch.count_nonzero(position_ids[0, start:end]) == 0)
             )
             for start, end in packed_sequence_slices
         )
@@ -1209,7 +1215,6 @@ class DeepseekV4Indexer(nn.Module):
             and hidden_states.device.type == "npu"
             and cache_layer is None
             and not cp_enabled
-            and not parallel_state.ulysses_enabled
             and packed_npu_supported
             and compressed_len > 0
             and (
@@ -1221,7 +1226,7 @@ class DeepseekV4Indexer(nn.Module):
         if indexer_implementation == "cann" and not use_npu and compressed_len > 0:
             raise ValueError(
                 "dsa_indexer_implementation='cann' was requested outside the fused Lightning Indexer "
-                "contract (training/prefill, canonical packed positions, no SP/CP)"
+                "contract (training/prefill, canonical packed positions, no CP)"
             )
         if use_npu:
             from veomni.ops.kernels.deepseek_v4.npu_lightning_indexer import npu_lightning_indexer
@@ -1903,7 +1908,6 @@ class DeepseekV4Attention(nn.Module):
             and past_key_values is None
             and q.device.type == "npu"
             and q.dtype == torch.bfloat16
-            and not ulysses_enabled
             and not cp_enabled
             and packed_npu_supported
         )
