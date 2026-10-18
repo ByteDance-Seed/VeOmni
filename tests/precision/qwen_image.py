@@ -26,14 +26,13 @@ from safetensors.torch import load_file, save_file
 from veomni.arguments.arguments_types import AcceleratorConfig, MixedPrecisionConfig, OpsImplementationConfig
 from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state_from_config
 from veomni.distributed.torch_parallelize import build_parallelize_model
-from veomni.models import build_foundation_model
+from veomni.models import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY, build_foundation_model
 from veomni.models.auto import build_config
+from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
 from veomni.models.diffusers.qwen_image.qwen_image_transformer.modeling_qwen_image_transformer import (
     QWEN_IMAGE_ORIGINAL_FORWARD,
     QwenImageTransformer2DModel,
 )
-from veomni.models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
-from veomni.models.module_utils import init_empty_weights, load_model_weights
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device, set_device
 from veomni.utils.helper import enable_full_determinism, enable_high_precision_for_bf16
 
