@@ -1607,9 +1607,9 @@ class OpsImplementationConfig:
         ):
             return
 
-        from ..utils.import_utils import is_torch_npu_available
+        from ..utils.device import IS_NPU_AVAILABLE
 
-        if is_torch_npu_available():
+        if IS_NPU_AVAILABLE:
             raise ValueError(
                 f"{implementation} is not supported on Ascend NPU; "
                 "select a supported non-Hub attention backend instead."
@@ -1661,9 +1661,10 @@ class OpsImplementationConfig:
                 setattr(self, field_name, aliases[value])
 
         if self.moe_implementation == "fused":
-            from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available, is_torch_npu_available
+            from ..utils.device import IS_NPU_AVAILABLE
+            from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available
 
-            if is_torch_npu_available():
+            if IS_NPU_AVAILABLE:
                 resolved = "fused_npu"
             elif is_torch_mlu_available():
                 resolved = "fused_mlu" if is_apex_mlu_available() else "fused_triton"
@@ -1681,9 +1682,10 @@ class OpsImplementationConfig:
 
     def _apply_host_defaults(self) -> None:
         """Fill the kernel fields left unset (``None``) with this host's defaults."""
-        from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available, is_torch_npu_available
+        from ..utils.device import IS_NPU_AVAILABLE
+        from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available
 
-        if is_torch_npu_available():
+        if IS_NPU_AVAILABLE:
             defaults = _NPU_DEFAULT_IMPLEMENTATIONS
         elif is_torch_mlu_available():
             defaults = dict(_MLU_DEFAULT_IMPLEMENTATIONS)
@@ -1703,13 +1705,13 @@ class OpsImplementationConfig:
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
+        from ..utils.device import IS_NPU_AVAILABLE
         from ..utils.import_utils import (
             is_apex_mlu_available,
             is_torch_mlu_available,
-            is_torch_npu_available,
         )
 
-        on_npu = is_torch_npu_available()
+        on_npu = IS_NPU_AVAILABLE
         on_mlu = is_torch_mlu_available()
 
         for field_name, npu_ok in _NPU_ALLOWED.items():

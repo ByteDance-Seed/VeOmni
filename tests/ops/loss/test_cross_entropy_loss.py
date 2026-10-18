@@ -614,6 +614,32 @@ def test_liger_matches_eager(
             assert other_input.grad is None
 
 
+def test_for_causal_lm_loss_forwards_chunk_size_only_to_chunk_loss():
+    from veomni.models.loss_utils.cross_entropy_loss import ForCausalLMLoss
+
+    seen: dict[str, object] = {}
+
+    def token_op(hidden, labels, weight, *, ignore_index, num_items_in_batch=None, chunk_size=1024):
+        seen["chunk_size"] = chunk_size
+        seen["keys"] = "chunk_size"
+        return hidden.sum() * 0
+
+    token_op.impl = "chunk_loss"
+    hidden = torch.randn(2, 4, 8)
+    labels = torch.zeros(2, 4, dtype=torch.long)
+    weight = torch.randn(6, 8)
+    ForCausalLMLoss(hidden_states=hidden, labels=labels, weights=weight, op=token_op, chunk_size=3)
+    assert seen["chunk_size"] == 3
+
+    def eager_op(hidden, labels, weight, *, ignore_index, num_items_in_batch=None):
+        seen["eager"] = True
+        return hidden.sum() * 0
+
+    eager_op.impl = "eager"
+    ForCausalLMLoss(hidden_states=hidden, labels=labels, weights=weight, op=eager_op, chunk_size=3)
+    assert seen["eager"] is True
+
+
 @pytest.mark.parametrize(
     ("impl", "device"),
     (

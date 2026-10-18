@@ -1653,9 +1653,11 @@ class PatchedDeepseekV4Experts(nn.Module):
                 swiglu_limit=self.limit,
             )
         unused = gate_up_proj.new_empty(0)
+        # Eager keeps the fp32 router weights so it stays bitwise with HF's expert loop.
+        routing_weights = top_k_weights if self.veomni_moe.impl == "eager" else top_k_weights.to(hidden_states.dtype)
         return self.veomni_moe(
             hidden_states,
-            top_k_weights.to(hidden_states.dtype),
+            routing_weights,
             top_k_index,
             unused,
             unused,

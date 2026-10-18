@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import pytest
 
+import veomni.utils.device as device
 import veomni.utils.import_utils as import_utils
 from veomni.arguments import OpsImplementationConfig
 
@@ -65,7 +66,7 @@ _EXPECTED_DEFAULTS: dict[str, dict[str, str]] = {
 
 def _set_host(monkeypatch: pytest.MonkeyPatch, host: str, *, apex_mlu: bool = False) -> None:
     monkeypatch.delenv("MODELING_BACKEND", raising=False)
-    monkeypatch.setattr(import_utils, "is_torch_npu_available", lambda: host == "npu")
+    monkeypatch.setattr(device, "IS_NPU_AVAILABLE", host == "npu")
     monkeypatch.setattr(import_utils, "is_torch_mlu_available", lambda: host == "mlu")
     monkeypatch.setattr(import_utils, "is_apex_mlu_available", lambda: apex_mlu)
 
@@ -139,3 +140,12 @@ def test_explicit_gpu_value_is_kept_on_mlu(monkeypatch: pytest.MonkeyPatch):
     _set_host(monkeypatch, "mlu")
     config = OpsImplementationConfig(rms_norm_implementation="liger_kernel")
     assert config.rms_norm_implementation == "liger_kernel"
+
+
+def test_installed_torch_npu_without_runtime_keeps_gpu_defaults(monkeypatch: pytest.MonkeyPatch):
+    """A packaged ``torch_npu`` with autoload off is not an NPU host."""
+    monkeypatch.delenv("MODELING_BACKEND", raising=False)
+    monkeypatch.setattr(import_utils, "is_torch_npu_available", lambda: True)
+    monkeypatch.setattr(device, "IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr(import_utils, "is_torch_mlu_available", lambda: False)
+    assert OpsImplementationConfig().moe_implementation == "fused_triton"

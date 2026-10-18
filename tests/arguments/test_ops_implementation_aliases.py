@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import pytest
 
+import veomni.utils.device as device
 import veomni.utils.import_utils as import_utils
 from veomni.arguments import OpsImplementationConfig, arguments_types
 
@@ -28,7 +29,7 @@ def warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     monkeypatch.setattr(arguments_types.logger, "warning_rank0", lambda msg, *a, **k: messages.append(msg))
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
     # Ascend NPU rejects Hub attention and re-resolves GPU defaults, which these name tests do not cover.
-    monkeypatch.setattr(import_utils, "is_torch_npu_available", lambda: False)
+    monkeypatch.setattr(device, "IS_NPU_AVAILABLE", False)
     return messages
 
 
@@ -70,7 +71,7 @@ def test_legacy_fused_moe_resolves_per_host(
 
 @pytest.mark.parametrize("on_npu", [False, True], ids=["gpu", "npu"])
 def test_npu_cross_entropy_resolves_to_chunk_loss(on_npu: bool, warnings: list[str], monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(import_utils, "is_torch_npu_available", lambda: on_npu)
+    monkeypatch.setattr(device, "IS_NPU_AVAILABLE", on_npu)
     config = OpsImplementationConfig(cross_entropy_loss_implementation="npu")
     assert config.cross_entropy_loss_implementation == "chunk_loss"
     assert len(warnings) == 1 and "chunk_loss" in warnings[0]
@@ -91,7 +92,7 @@ def test_npu_cross_entropy_resolves_to_chunk_loss(on_npu: bool, warnings: list[s
 def test_device_named_values_resolve_to_the_implementation_they_call(
     field_name: str, old: str, new: str, warnings: list[str], monkeypatch: pytest.MonkeyPatch
 ):
-    monkeypatch.setattr(import_utils, "is_torch_npu_available", lambda: True)
+    monkeypatch.setattr(device, "IS_NPU_AVAILABLE", True)
     config = OpsImplementationConfig(**{field_name: old})
     assert getattr(config, field_name) == new
     assert len(warnings) == 1 and old in warnings[0] and new in warnings[0]

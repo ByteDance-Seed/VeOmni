@@ -192,12 +192,16 @@ def ForCausalLMLoss(
     target = target.to(device)
 
     hidden, weight, out_logits = _select_hidden_weight(logits, hidden_states, weights)
+    token_kwargs: dict[str, Any] = {}
+    if getattr(token_op, "impl", None) == "chunk_loss":
+        token_kwargs["chunk_size"] = chunk_size
     loss = token_op(
         hidden,
         target,
         weight,
         ignore_index=ignore_index,
         num_items_in_batch=num_items_in_batch,
+        **token_kwargs,
     )
     loss = _maybe_reduce_loss(
         loss,

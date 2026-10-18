@@ -57,7 +57,7 @@ register_op(
     "liger_kernel",
     full_liger.forward,
     full_liger.backward,
-    description="Liger Kernel rotary embedding over every channel with eager vision fallback",
+    description="Liger Kernel rotary embedding over every channel, including rank-3 vision layout",
     requirement=_GPU,
     requires=("liger_kernel",),
 )

@@ -1679,7 +1679,7 @@
          super().__init__()
          self.num_experts = config.num_local_experts
          self.hidden_dim = config.hidden_size
-@@ -992,33 +1745,64 @@
+@@ -992,33 +1745,66 @@
          self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
          self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
          self.act_fn = ACT2FN[config.hidden_act]
@@ -1746,9 +1746,11 @@
 +                swiglu_limit=self.limit,
 +            )
 +        unused = gate_up_proj.new_empty(0)
++        # Eager keeps the fp32 router weights so it stays bitwise with HF's expert loop.
++        routing_weights = top_k_weights if self.veomni_moe.impl == "eager" else top_k_weights.to(hidden_states.dtype)
 +        return self.veomni_moe(
 +            hidden_states,
-+            top_k_weights.to(hidden_states.dtype),
++            routing_weights,
 +            top_k_index,
 +            unused,
 +            unused,
@@ -1767,7 +1769,7 @@
 
 
  class DeepseekV4TopKRouter(nn.Module):
-@@ -1032,14 +1816,28 @@
+@@ -1032,14 +1818,28 @@
          self.routed_scaling_factor = config.routed_scaling_factor
          self.e_score_correction_bias = nn.Buffer(torch.zeros(self.num_experts))
 
@@ -1799,7 +1801,7 @@
 
 
  class DeepseekV4HashRouter(nn.Module):
-@@ -1062,23 +1860,54 @@
+@@ -1062,23 +1862,54 @@
          self.tid2eid = nn.Buffer(torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), persistent=True)
 
      def forward(
@@ -1858,7 +1860,7 @@
          self.shared_experts = DeepseekV4MLP(config)
 
      def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None) -> torch.Tensor:
-@@ -1093,6 +1922,12 @@
+@@ -1093,6 +1924,12 @@
          return routed + self.shared_experts(residual)
 
 
@@ -1871,7 +1873,7 @@
  class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
      r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
      two places:
-@@ -1107,7 +1942,7 @@
+@@ -1107,7 +1944,7 @@
 
      """
 
@@ -1880,7 +1882,7 @@
          super().__init__()
          self.layer_idx = layer_idx
          self.self_attn = DeepseekV4Attention(config, layer_idx)
-@@ -1116,32 +1951,42 @@
+@@ -1116,32 +1953,42 @@
          self.post_attention_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
          self.attn_hc = DeepseekV4HyperConnection(config)
          self.ffn_hc = DeepseekV4HyperConnection(config)
@@ -1939,7 +1941,7 @@
 
 
  @auto_docstring
-@@ -1252,6 +2097,12 @@
+@@ -1252,6 +2099,12 @@
                  init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
@@ -1952,7 +1954,7 @@
  @auto_docstring
  class DeepseekV4Model(DeepseekV4PreTrainedModel):
      def __init__(self, config: DeepseekV4Config):
-@@ -1271,6 +2122,17 @@
+@@ -1271,6 +2124,17 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1970,7 +1972,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1283,38 +2145,141 @@
+@@ -1283,38 +2147,141 @@
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -2122,7 +2124,7 @@
                  hidden_states,
                  position_embeddings=position_embeddings,
                  position_ids=position_ids,
-@@ -1323,9 +2288,50 @@
+@@ -1323,9 +2290,50 @@
                  past_key_values=past_key_values,
                  **kwargs,
              )
@@ -2174,7 +2176,7 @@
 
 
  def load_balancing_loss_func(
-@@ -1397,6 +2403,12 @@
+@@ -1397,6 +2405,12 @@
      return overall_loss * num_experts
 
 
@@ -2187,7 +2189,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1404,6 +2416,9 @@
+@@ -1404,6 +2418,9 @@
      _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
      _fsdp_plan = {"lm_head": "keep_full_weight"}
 
@@ -2197,7 +2199,7 @@
      def __init__(self, config):
          super().__init__(config)
          self.model = DeepseekV4Model(config)
-@@ -1412,54 +2427,37 @@
+@@ -1412,54 +2429,37 @@
          self.router_aux_loss_coef = config.router_aux_loss_coef
          self.num_experts = config.num_local_experts
          self.num_experts_per_tok = config.num_experts_per_tok
@@ -2271,7 +2273,7 @@
              input_ids=input_ids,
              attention_mask=attention_mask,
              position_ids=position_ids,
-@@ -1471,26 +2469,68 @@
+@@ -1471,26 +2471,68 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -2347,7 +2349,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1498,7 +2538,22 @@
+@@ -1498,7 +2540,22 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

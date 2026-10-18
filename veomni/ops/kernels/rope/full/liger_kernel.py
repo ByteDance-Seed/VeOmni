@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
 from torch import Tensor
 
 from ....registry import SavedState
@@ -33,6 +34,7 @@ class _Meta:
     eager_empty: bool = False
     eager_table_gradients: bool = False
     eager_compute_in_fp32: bool = False
+    vision_layout: bool = False
 
 
 def _to_liger_layout(q: Tensor, k: Tensor, unsqueeze_dim: int) -> tuple[Tensor, Tensor]:
@@ -49,6 +51,21 @@ def _from_liger_layout(q: Tensor, k: Tensor, unsqueeze_dim: int) -> tuple[Tensor
     return q.transpose(1, 2), k.transpose(1, 2)
 
 
+def _clone_for_liger(q: Tensor, k: Tensor) -> tuple[Tensor, Tensor]:
+    """``rope_forward`` writes its inputs. Aliased ``(q, q)`` must not rotate twice."""
+    return q.clone(memory_format=torch.contiguous_format), k.clone(memory_format=torch.contiguous_format)
+
+
+def _vision_to_liger(q: Tensor, k: Tensor) -> tuple[Tensor, Tensor]:
+    """``[S, H, D]`` to Liger ``[1, H, S, D]``."""
+    return _clone_for_liger(q.unsqueeze(0).transpose(1, 2), k.unsqueeze(0).transpose(1, 2))
+
+
+def _vision_from_liger(q: Tensor, k: Tensor) -> tuple[Tensor, Tensor]:
+    """Liger ``[1, H, S, D]`` back to ``[S, H, D]``."""
+    return q.squeeze(0).transpose(0, 1).contiguous(), k.squeeze(0).transpose(0, 1).contiguous()
+
+
 def forward(
     q: Tensor,
     k: Tensor,
@@ -61,17 +78,18 @@ def forward(
 
     ``unsqueeze_dim`` is the HF broadcast axis and therefore the q/k layout:
     ``1`` is ``[B, H, S, D]``, ``2`` is ``[B, S, H, D]``. Liger only speaks
-    ``[B, H, S, D]``, so ``2`` is transposed in and out. Its fused path also
-    requires full-width Llama-style ``cos`` and ``sin`` tables whose second
-    half duplicates the first; Liger reads only the first half. Any other
-    ``unsqueeze_dim``, rank-3 vision input, empty input, or trainable rotary
-    table falls back to the eager pair.
+    ``[B, H, S, D]``, so ``2`` is transposed in and out. Rank-3 vision
+    ``[S, H, D]`` is wrapped as batch 1 on the way in and restored on the way
+    out. The fused path requires full-width Llama-style ``cos`` and ``sin``
+    tables whose second half duplicates the first; Liger reads only the first
+    half. Any other ``unsqueeze_dim``, empty input, or trainable rotary table
+    falls back to the eager pair.
     """
+    vision_layout = _eager._is_vision_layout(q, k, cos, sin)
     if (
-        _eager._is_vision_layout(q, k, cos, sin)
-        or q.numel() == 0
+        q.numel() == 0
         or k.numel() == 0
-        or unsqueeze_dim not in (1, 2)
+        or (not vision_layout and unsqueeze_dim not in (1, 2))
         or cos.requires_grad
         or sin.requires_grad
     ):
@@ -91,7 +109,14 @@ def forward(
 
     from liger_kernel.ops.rope import rope_forward
 
-    q_in, k_in = _to_liger_layout(q, k, unsqueeze_dim)
+    if vision_layout:
+        q_in, k_in = _vision_to_liger(q, k)
+        q_out, k_out, saved_cos, saved_sin = rope_forward(q_in, k_in, cos.unsqueeze(0), sin.unsqueeze(0))
+        return _vision_from_liger(q_out, k_out), SavedState(
+            (saved_cos, saved_sin), _Meta(False, -2, vision_layout=True)
+        )
+
+    q_in, k_in = _clone_for_liger(*_to_liger_layout(q, k, unsqueeze_dim))
     q_out, k_out, saved_cos, saved_sin = rope_forward(q_in, k_in, cos, sin)
     return _from_liger_layout(q_out, k_out, unsqueeze_dim), SavedState(
         (saved_cos, saved_sin), _Meta(False, unsqueeze_dim)
@@ -104,6 +129,15 @@ def backward(
     """Return q/k, optional table, and compatibility-argument gradients."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
+    if meta.vision_layout:
+        from liger_kernel.ops.rope import rope_backward
+
+        grad_q, grad_k = _vision_to_liger(*grad_output)
+        cos, sin = saved.tensors
+        dq, dk = rope_backward(grad_q, grad_k, cos, sin)
+        dq, dk = _vision_from_liger(dq, dk)
+        return dq, dk, None, None, None, None
+
     if meta.use_eager:
         return _eager.backward(
             grad_output,

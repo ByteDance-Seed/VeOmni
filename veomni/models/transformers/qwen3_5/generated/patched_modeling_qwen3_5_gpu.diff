@@ -1934,7 +1934,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1672,15 +2553,70 @@
+@@ -1672,15 +2553,71 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -1996,7 +1996,8 @@
 +            parallel_state = get_parallel_state()
 +            assert not parallel_state.sp_enabled, (
 +                "Qwen3.5 MTP does not support Ulysses/context sequence parallel yet: the MTP embedding "
-+                "shift crosses rank boundaries, and ForCausalLMLoss ignores shift_labels when SP is on. "
++                "shift crosses rank boundaries. ForCausalLMLoss uses shift_labels when they are provided, "
++                "including when SP is on. "
 +                "Set train.accelerator.ulysses_size=1 and cp_size=1, or unset text_config.mtp_loss_weight."
 +            )
 +            self.mtp = Qwen3_5MTP(config.text_config)  # noqa: F821 defined via add_helper_after
@@ -2006,7 +2007,7 @@
 
          self.post_init()
 
-@@ -1724,48 +2660,18 @@
+@@ -1724,48 +2661,18 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -2065,7 +2066,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1776,28 +2682,69 @@
+@@ -1776,28 +2683,69 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -2143,7 +2144,7 @@
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
          # Overwritten -- requires 3D position ids
-@@ -1984,6 +2931,24 @@
+@@ -1984,6 +2932,24 @@
 
          return input_ids, model_kwargs
 

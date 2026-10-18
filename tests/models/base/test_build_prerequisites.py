@@ -57,9 +57,9 @@ def _stub_loader(monkeypatch: pytest.MonkeyPatch) -> Mock:
 
 def _host(monkeypatch: pytest.MonkeyPatch, *, on_npu: bool, modeling_backend: str) -> None:
     monkeypatch.setenv("MODELING_BACKEND", modeling_backend)
-    monkeypatch.setattr("veomni.utils.import_utils.is_torch_npu_available", lambda: on_npu)
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", on_npu)
     monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
-    monkeypatch.setattr(auto, "is_torch_npu_available", lambda: on_npu)
+    monkeypatch.setattr(auto, "IS_NPU_AVAILABLE", on_npu)
 
 
 # --- MagiAttention context parallelism ---------------------------------------------

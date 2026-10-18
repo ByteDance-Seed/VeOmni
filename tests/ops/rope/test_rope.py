@@ -396,17 +396,64 @@ def test_fused_rope_rows_fall_back_for_trainable_tables_before_vendor_import(imp
         )
 
 
-def test_full_liger_falls_back_for_vision_layout_before_vendor_import():
-    from veomni.ops.kernels.rope.full import eager as full_eager
+def test_full_liger_routes_vision_layout_through_liger(monkeypatch):
+    """Rank-3 vision is reshaped into Liger's 4D layout instead of falling back."""
+    liger_rope = pytest.importorskip("liger_kernel.ops.rope")
     from veomni.ops.kernels.rope.full import liger_kernel as full_liger
 
+    seen: dict[str, object] = {}
+
+    def fake_forward(q, k, cos, sin):
+        seen["q_shape"] = tuple(q.shape)
+        seen["k_shape"] = tuple(k.shape)
+        seen["cos_shape"] = tuple(cos.shape)
+        seen["sin_shape"] = tuple(sin.shape)
+        seen["q_ptr"] = q.data_ptr()
+        seen["k_ptr"] = k.data_ptr()
+        return q, k, cos, sin
+
+    monkeypatch.setattr(liger_rope, "rope_forward", fake_forward)
     q = torch.randn(4, 3, 8)
     k = torch.randn(4, 2, 8)
+    original_q = q.clone()
     cos = torch.randn(4, 8)
     sin = torch.randn(4, 8)
-    expected, _ = full_eager.forward(q, k, cos, sin)
-    actual, _ = full_liger.forward(q, k, cos, sin)
-    _assert_pair(actual, expected, atol=0.0, rtol=0.0)
+    actual, saved = full_liger.forward(q, k, cos, sin)
+
+    assert seen["q_shape"] == (1, 3, 4, 8)
+    assert seen["k_shape"] == (1, 2, 4, 8)
+    assert seen["cos_shape"] == (1, 4, 8)
+    assert seen["sin_shape"] == (1, 4, 8)
+    assert seen["q_ptr"] != q.data_ptr()
+    assert seen["k_ptr"] != k.data_ptr()
+    assert torch.equal(q, original_q)
+    assert actual[0].shape == q.shape
+    assert actual[1].shape == k.shape
+    assert saved.metadata.vision_layout is True
+    assert saved.metadata.use_eager is False
+
+
+def test_full_liger_clones_aliased_text_inputs(monkeypatch):
+    liger_rope = pytest.importorskip("liger_kernel.ops.rope")
+    from veomni.ops.kernels.rope.full import liger_kernel as full_liger
+
+    seen: dict[str, object] = {}
+
+    def fake_forward(q, k, cos, sin):
+        seen["aliased"] = q.data_ptr() == k.data_ptr()
+        q.add_(1)
+        k.add_(1)
+        return q, k, cos, sin
+
+    monkeypatch.setattr(liger_rope, "rope_forward", fake_forward)
+    x = torch.randn(2, 4, 8, 16)
+    original = x.clone()
+    cos = torch.randn(2, 8, 16)
+    sin = torch.randn(2, 8, 16)
+    full_liger.forward(x, x, cos, sin, unsqueeze_dim=1)
+
+    assert seen["aliased"] is False
+    torch.testing.assert_close(x, original)
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RoPE needs a GPU")

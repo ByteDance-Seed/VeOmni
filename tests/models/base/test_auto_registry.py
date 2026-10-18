@@ -771,7 +771,7 @@ def test_context_parallel_is_refused_on_npu(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True))
-    monkeypatch.setattr(auto, "is_torch_npu_available", lambda: True)
+    monkeypatch.setattr(auto, "IS_NPU_AVAILABLE", True)
     with pytest.raises(NotImplementedError, match="GPU-only"):
         check_context_parallel_supported(_tiny_qwen3_config())
 

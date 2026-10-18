@@ -2610,7 +2610,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             parallel_state = get_parallel_state()
             assert not parallel_state.sp_enabled, (
                 "Qwen3.5 MTP does not support Ulysses/context sequence parallel yet: the MTP embedding "
-                "shift crosses rank boundaries, and ForCausalLMLoss ignores shift_labels when SP is on. "
+                "shift crosses rank boundaries. ForCausalLMLoss uses shift_labels when they are provided, "
+                "including when SP is on. "
                 "Set train.accelerator.ulysses_size=1 and cp_size=1, or unset text_config.mtp_loss_weight."
             )
             self.mtp = Qwen3_5MTP(config.text_config)  # noqa: F821 defined via add_helper_after

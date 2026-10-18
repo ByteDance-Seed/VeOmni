@@ -98,6 +98,36 @@ def _expected_segment(logits, labels, start, end):
     return losses[start : end + 1][valid].sum().item(), valid.sum().item()
 
 
+def test_channel_loss_uses_shift_labels_when_sequence_parallel_is_on():
+    torch.manual_seed(2)
+    logits = torch.randn(1, 3, 8)
+    labels = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    shift_labels = torch.tensor([[4, 5, 6]], dtype=torch.long)
+
+    def run(sp_enabled: bool, shift: torch.Tensor | None):
+        computer = ChannelLossComputer(parallel_state=SimpleNamespace(sp_enabled=sp_enabled))
+        computer._source_ids = [0]
+        computer._position_ids = None
+        result = computer._compute_channel_loss(
+            logits=logits,
+            labels=labels,
+            vocab_size=8,
+            hidden_states=None,
+            weights=None,
+            attention_mask=None,
+            shift_labels=shift,
+            ignore_index=IGNORE_INDEX,
+        )
+        return result[0]["loss_sum"], result[0]["token_count"]
+
+    with_shift = run(True, shift_labels)
+    without_sp = run(False, shift_labels)
+    without_shift = run(True, None)
+    torch.testing.assert_close(with_shift[0], without_sp[0])
+    assert with_shift[1] == without_sp[1] == 3
+    assert not torch.allclose(with_shift[0], without_shift[0])
+
+
 def test_channel_loss_computer_aggregates_packed_logits_by_source():
     torch.manual_seed(0)
     vocab_size = 32
