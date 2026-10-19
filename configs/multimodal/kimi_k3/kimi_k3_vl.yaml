@@ -15,7 +15,7 @@ model:
     # situ_and_mul) are NPU-only; on GPU they fall back to the pure-PyTorch
     # eager paths, and SituGLU experts always run the eager expert loop
     # (moe_implementation therefore has no effect for this model on GPU).
-    attn_implementation: veomni_flash_attention_2_with_sp
+    attn_implementation: veomni_flash_attention_2
     rms_norm_implementation: liger_kernel
     cross_entropy_loss_implementation: chunk_loss
     chunk_kda_implementation: eager

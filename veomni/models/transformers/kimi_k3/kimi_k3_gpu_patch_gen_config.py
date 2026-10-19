@@ -481,11 +481,12 @@ def kimi_linear_model_init_patched(self, config):
 @config.override_method(
     "KimiK3ForConditionalGeneration.__init__",
     description="Propagate the top-level `_attn_implementation` to text_config and "
-    "vision_config before construction (the MoonViT3d tower registers only "
-    "'eager'/'flash_attention_2' in VL_VISION_ATTENTION_FUNCTIONS -- HF K3 has "
-    "no vision 'sdpa', so an 'sdpa' request falls back to 'eager' for vision); "
-    "also override _no_split_modules to keep vision/projector in the root FSDP2 "
-    "unit (asymmetric multimodal batches deadlock otherwise)",
+    "vision_config before construction (the MoonViT3d tower registers "
+    "'eager'/'flash_attention_2'/'veomni_flash_attention_2' in "
+    "VL_VISION_ATTENTION_FUNCTIONS -- HF K3 has no vision 'sdpa', so an "
+    "'sdpa' request falls back to 'eager' for vision); also override "
+    "_no_split_modules to keep vision/projector in the root FSDP2 unit "
+    "(asymmetric multimodal batches deadlock otherwise)",
 )
 def kimi_k3_for_conditional_generation_init_patched(self, config):
     # Modification: propagate the attention implementation to the sub-configs

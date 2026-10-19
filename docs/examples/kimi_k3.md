@@ -132,7 +132,7 @@ Drop the `model_config` block for the full layout (multi-node), or set
 | | `model_config.text_config`: `num_hidden_layers: 10`, `num_experts: 16` | single-node reduction; see [Scale up](#scale-up) |
 | | `model_path: null` | random init (to_empty-safe re-init is patched) |
 | | `tokenizer_path` | HF-format tokenizer + AutoProcessor (auto_map) |
-| model.ops_implementation | six knobs | `attn: veomni_flash_attention_2_with_sp`, `rms_norm: npu`, `ce: chunk_loss`, `moe: fused_npu`, `chunk_kda: ascendc`, `situ: npu` |
+| model.ops_implementation | six knobs | `attn: veomni_flash_attention_2`, `rms_norm: torch_npu`, `ce: chunk_loss`, `moe: fused_npu`, `chunk_kda: ascendc`, `situ: triton` |
 | model.accelerator | `ulysses_size: 2`, `ep_size: 2`, fsdp2, `init_device: meta` | SP=2 (text-sharded) + EP=2 + FSDP2 |
 | data | `train_path` (manifest), `conversation`, `max_seq_len: 1024` | dynamic batching budgets **expanded** vision tokens (see below) |
 | train | `max_steps: 30`, micro 1, global 8 | smoke scale; lr 1e-3 cosine |

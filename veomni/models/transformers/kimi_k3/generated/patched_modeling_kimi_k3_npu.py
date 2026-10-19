@@ -525,15 +525,15 @@ class KimiMLAAttention(nn.Module):
         # the end. Every SP rank redundantly computes the full sequence.
         #
         # SP head sharding (MLA): when the attention
-        # implementation is a veomni_*_with_sp wrapper, skip the gather/narrow
-        # entirely -- the wrapper performs the ulysses all-to-all internally
-        # (scatter heads, gather sequence), so each rank computes H/sp heads
-        # over the full sequence instead of all heads redundantly. MLA is
-        # rope-free (use_nope), so the local shard needs no position handling.
+        # implementation is a veomni_* adapter (Ulysses SP is built into
+        # the registered adapters, gated by the parallel state), skip the
+        # gather/narrow entirely -- the adapter performs the ulysses
+        # all-to-all internally (scatter heads, gather sequence), so each
+        # rank computes H/sp heads over the full sequence instead of all
+        # heads redundantly. MLA is rope-free (use_nope), so the local
+        # shard needs no position handling.
         _attn_impl = getattr(self.config, "_attn_implementation", "eager")
-        sp_ulysses_attn = (
-            get_parallel_state().sp_enabled and _attn_impl.startswith("veomni_") and _attn_impl.endswith("_with_sp")
-        )
+        sp_ulysses_attn = get_parallel_state().sp_enabled and _attn_impl.startswith("veomni_")
         if get_parallel_state().sp_enabled and not sp_ulysses_attn:
             hidden_states = gather_outputs(hidden_states, gather_dim=1, group=get_parallel_state().sp_group)
             if attention_mask is not None and attention_mask.shape[-2] != hidden_states.shape[1]:
@@ -611,8 +611,8 @@ class KimiMLAAttention(nn.Module):
             attn_output = attn_output * g
         attn_output = self.o_proj(attn_output)
         if get_parallel_state().sp_enabled and not sp_ulysses_attn:
-            # With the veomni_*_with_sp wrapper the output is
-            # already in the local-shard layout -- no narrowing needed.
+            # With the veomni_* adapter the output is already in
+            # the local-shard layout -- no narrowing needed.
             attn_output = slice_input_tensor(attn_output, dim=1, group=get_parallel_state().sp_group)
         return attn_output
 
@@ -1879,7 +1879,7 @@ def npu_fusion_vision_attention(
 VL_VISION_ATTENTION_FUNCTIONS = {
     "flash_attention_2": multihead_attention,
     "eager": eager_attention,
-    "veomni_flash_attention_2_with_sp": npu_fusion_vision_attention,
+    "veomni_flash_attention_2": npu_fusion_vision_attention,
 }
 
 
