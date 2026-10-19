@@ -90,7 +90,21 @@ release index (never the pruned nightly index):
 - `docker/rocm/Dockerfile.ROCm7.14`: the flash-attn and aiter commits it
   source-builds against that torch
 
-**Steps:**
+**ROCm steps:**
+1. Select the matching release wheels from
+   https://repo.amd.com/rocm/whl-multi-arch/.
+2. Update every ROCm location listed above, including the Dockerfile's
+   flash-attn and aiter commits when the torch ABI changes.
+3. Regenerate the lockfile and validate the ROCm fork explicitly:
+
+```bash
+uv lock
+uv sync --extra rocm --dev
+```
+
+4. Rebuild `docker/rocm/Dockerfile.ROCm7.14` and rerun the affected ROCm tests.
+
+**CUDA steps:**
 1. Identify the target torch version and matching wheel URLs from https://download.pytorch.org/whl/
 2. Update all pinned versions in `pyproject.toml` (extras, overrides, sources)
 3. Check attention-kernel compatibility. Three groups behave differently —
