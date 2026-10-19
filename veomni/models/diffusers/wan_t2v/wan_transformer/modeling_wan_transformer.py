@@ -1,7 +1,8 @@
+"""Adapted from https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_wan.py"""
+
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -16,7 +17,9 @@ from diffusers.models.transformers.transformer_wan import (
 )
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
@@ -37,22 +40,6 @@ except ImportError:
 
 
 logger = logging.get_logger(__name__)
-
-
-def wan_eager_attention_forward(
-    module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask=None,
-    scaling: float | None = None,
-    dropout: float = 0.0,
-    **kwargs,
-) -> tuple[torch.Tensor, None]:
-    attn_output = F.scaled_dot_product_attention(
-        query, key, value, attn_mask=attention_mask, dropout_p=dropout, scale=scaling, is_causal=False
-    )
-    return attn_output.transpose(1, 2), None
 
 
 class WanAttentionKernelModule:
@@ -114,6 +101,9 @@ def _get_wan_full_sequence_varlen_kwargs(
     }
 
 
+_WAN_FLASH2_IMPLS = frozenset({"flash_attention_2", "veomni_flash_attention_2"})
+
+
 def _get_weight_dtype(module):
     if hasattr(module, "weight"):
         return module.weight.dtype
@@ -147,10 +137,43 @@ def _assert_wan_flash_attention_bf16(
 
 
 class WanSPAttnProcessor(WanAttnProcessor):
-    def __init__(self, attn_implementation: str):
-        self.attn_implementation = attn_implementation
-        self.config = SimpleNamespace(_attn_implementation=attn_implementation)
+    """Video self-attn / text cross-attn through the interned ``attention`` kernel."""
+
+    def __init__(self):
+        impl = resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
+        self.veomni_attn = VeomniOp("attention", "standard", impl)
+        self._use_flash2 = impl in _WAN_FLASH2_IMPLS
+        self.config = SimpleNamespace(_attn_implementation=impl)
         super().__init__()
+
+    def _run_attention(
+        self,
+        module: WanAttentionKernelModule,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        skip_ulysses: bool,
+        query_length: int | None = None,
+        key_length: int | None = None,
+    ) -> torch.Tensor:
+        kwargs = {}
+        if self._use_flash2:
+            kwargs = _get_wan_full_sequence_varlen_kwargs(
+                query, key, value, query_length=query_length, key_length=key_length
+            )
+        return self.veomni_attn(
+            module,
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            attention_mask=attention_mask,
+            dropout=0.0,
+            is_causal=False,
+            skip_ulysses=skip_ulysses,
+            **kwargs,
+        )[0]
 
     def __call__(
         self,
@@ -161,6 +184,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        """Project, rope, then run the interned kernel. Cross-attn and image tokens skip Ulysses."""
         is_cross_attention = encoder_hidden_states is not None
 
         # I2V: the first part of encoder_hidden_states holds image context.
@@ -233,63 +257,47 @@ class WanSPAttnProcessor(WanAttnProcessor):
             query = _apply_rope(query, *rotary_emb)
             key = _apply_rope(key, *rotary_emb)
 
-        attention_interface: Callable = wan_eager_attention_forward
-        use_flash_attention = self.attn_implementation in {"flash_attention_2", "veomni_flash_attention_2_with_sp"}
-        if use_flash_attention:
+        if self._use_flash2:
             _assert_wan_flash_attention_bf16(query, key, value, attn)
-        if self.attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.attn_implementation]
 
         kernel_module = WanAttentionKernelModule(self.config, attn)
 
-        # I2V: additional cross-attention over image tokens (no Ulysses SP needed).
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
             key_img, value_img = _get_added_kv_projections(attn, encoder_hidden_states_img)
             key_img = attn.norm_added_k(key_img)
-
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
-            if use_flash_attention:
+            if self._use_flash2:
                 assert key_img.dtype == torch.bfloat16 and value_img.dtype == torch.bfloat16, (
                     "Wan image flash-attention expects bf16 added K/V tensors, "
                     f"got key={key_img.dtype}, value={value_img.dtype}."
                 )
-            image_attention_kwargs = (
-                _get_wan_full_sequence_varlen_kwargs(query, key_img, value_img) if use_flash_attention else {}
+            hidden_states_img = (
+                self._run_attention(
+                    kernel_module,
+                    query,
+                    key_img,
+                    value_img,
+                    skip_ulysses=True,
+                )
+                .flatten(2, 3)
+                .type_as(query)
             )
-            hidden_states_img = attention_interface(
-                kernel_module,
-                query.transpose(1, 2),
-                key_img.transpose(1, 2),
-                value_img.transpose(1, 2),
-                attention_mask=None,
-                dropout=0.0,
-                is_causal=False,
-                skip_ulysses=True,
-                **image_attention_kwargs,
-            )[0]
-            hidden_states_img = hidden_states_img.flatten(2, 3).type_as(query)
 
-        attention_kwargs = _get_wan_full_sequence_varlen_kwargs(query, key, value) if use_flash_attention else {}
-        hidden_states_out = attention_interface(
+        hidden_states_out = self._run_attention(
             kernel_module,
-            query.transpose(1, 2),
-            key.transpose(1, 2),
-            value.transpose(1, 2),
+            query,
+            key,
+            value,
             attention_mask=attention_mask,
-            dropout=0.0,
-            is_causal=False,
             skip_ulysses=True,
-            **attention_kwargs,
-        )[0]
-
+        )
         if use_sp:
             hidden_states_out = F.pad(hidden_states_out, (0, 0, 0, 0, 0, padded_seq_len - hidden_states_out.shape[1]))
             hidden_states_out = gather_heads_scatter_seq(
                 hidden_states_out.movedim(0, 2), head_dim=1, seq_dim=0, group=get_parallel_state().ulysses_group
             ).movedim(2, 0)
-
         hidden_states_out = hidden_states_out.flatten(2, 3)
         hidden_states_out = hidden_states_out.type_as(query)
 
@@ -494,7 +502,7 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
         self.config: WanTransformer3DModelConfig = config
         self.config.tie_word_embeddings = False
 
-        sp_processor = WanSPAttnProcessor(attn_implementation=config._attn_implementation)
+        sp_processor = WanSPAttnProcessor()
         for block in self.blocks:
             block.attn1.set_processor(sp_processor)
             block.attn2.set_processor(sp_processor)
@@ -595,16 +603,10 @@ def apply_veomni_wan_transformer_patch() -> None:
     2. **Sequence gather** before the output head – all ranks see the full output
        so that the loss is identical across SP ranks.
 
-    Slicing only takes effect when BOTH ``ulysses_enabled`` is True AND an SP-aware
-    attention implementation (``veomni_flash_attention_*_with_sp``) is configured.
-    Without the SP attention processor the required AllToAll in self-attention
-    would be absent, making sequence slicing incorrect.
+    Slicing only takes effect when ``sp_enabled``. Self-attn gathers inside the
+    interned attention kernel. Cross-attn and image tokens pass ``skip_ulysses``.
     """
     _WanTransformer3DModel.forward = WanTransformer3DModel_forward
     _WanTransformer3DModel._supports_flash_attn = True
     _WanTransformer3DModel._supports_flash_attn_2 = True
     logger.info_rank0("Applied VeOmni SP patch to WanTransformer3DModel.forward.")
-
-    from veomni.models.transformers.wan.device_patch import apply_veomni_wan_device_patch
-
-    apply_veomni_wan_device_patch()

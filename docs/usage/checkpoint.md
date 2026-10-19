@@ -39,7 +39,7 @@ nothing else. The two exports are inference artifacts that resume never reads.
 
 **Model assets** is whatever that model's runtime `model_assets` list carries, in type terms
 `Union[PretrainedConfig, GenerationConfig, PreTrainedTokenizer, ProcessorMixin]`
-(`veomni/models/module_utils.py`). Each is written by calling its own
+(`veomni/models/checkpoint/weights.py`). Each is written by calling its own
 `save_pretrained`, so the files that appear are whatever those objects emit —
 `config.json`, `generation_config.json`, then tokenizer files, processor files,
 or both. Do not read a fixed file list into these directories. Two modules
