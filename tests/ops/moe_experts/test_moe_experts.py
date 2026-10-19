@@ -618,15 +618,30 @@ def test_triton_split_and_merged_match_eager(swiglu_limit: float | None):
     )
 
 
-@pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
-    reason="triton fused MoE needs a GPU + triton",
+@pytest.mark.parametrize(
+    "device_type",
+    [
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+                reason="triton fused MoE needs a GPU + triton",
+            ),
+        ),
+        pytest.param(
+            "mlu",
+            marks=pytest.mark.skipif(
+                not IS_MLU_AVAILABLE or not is_fused_moe_available(),
+                reason="MLU Triton fused MoE needs torch_mlu + triton",
+            ),
+        ),
+    ],
 )
 @pytest.mark.parametrize("fc1_trainable,fc2_trainable", [(False, True), (True, False), (False, False)])
-def test_merged_fc1_backward_with_frozen_expert_weights(fc1_trainable: bool, fc2_trainable: bool):
+def test_merged_fc1_backward_with_frozen_expert_weights(fc1_trainable: bool, fc2_trainable: bool, device_type: str):
     """Skipping an expert wgrad must not change input or routing gradients."""
     torch.manual_seed(7)
-    device = torch.device("cuda")
+    device = torch.device(device_type)
     num_tokens, num_experts, hidden_dim, ffn_dim, topk = 32, 4, 64, 128, 2
     hidden_states = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.bfloat16)
     gate_weights = torch.rand(num_tokens, topk, device=device, dtype=torch.bfloat16)
