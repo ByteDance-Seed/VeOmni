@@ -346,6 +346,68 @@ def test_extra_parallel_fsdp_state_resume_restores_parameter_mesh(tmp_path, hsdp
     )
 
 
+def _restore_fsdp_only_extra_parallel_worker(rank, world, rendezvous):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    from veomni.checkpoint.dcp_checkpointer import restore_extra_parallel_dim
+
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world)
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("ep_fsdp", "ep"))
+        fsdp_rank, ep_rank = mesh.get_coordinate()
+        fsdp_mesh = mesh["ep_fsdp"]
+        # The EP extent is even globally, but each FSDP-only DTensor exposes
+        # only its EP-local extent, so the original shape cannot be inferred.
+        full = torch.arange(6 * 8, dtype=torch.float32).reshape(6, 8)
+        ep_local = torch.tensor_split(full, 2, dim=0)[ep_rank]
+        local = torch.tensor_split(ep_local, 2, dim=1)[fsdp_rank].clone()
+        fsdp_only = DTensor.from_local(
+            local,
+            fsdp_mesh,
+            [Shard(1)],
+            run_check=False,
+            shape=ep_local.shape,
+            stride=(ep_local.shape[1], 1),
+        )
+
+        with pytest.raises(RuntimeError, match="pass the original global_shape"):
+            restore_extra_parallel_dim(fsdp_only, mesh, fsdp_mesh)
+
+        restored = restore_extra_parallel_dim(fsdp_only, mesh, fsdp_mesh, global_shape=full.shape)
+        assert restored.device_mesh == mesh
+        assert tuple(restored.placements) == (Shard(1), Shard(0))
+        assert restored.shape == full.shape
+        torch.testing.assert_close(restored.to_local(), local, rtol=0, atol=0)
+
+        full_layout = DTensor.from_local(
+            local,
+            mesh,
+            [Shard(1), Shard(0)],
+            run_check=False,
+            shape=full.shape,
+            stride=(full.shape[1], 1),
+        )
+        restored_full = restore_extra_parallel_dim(full_layout, mesh, fsdp_mesh, global_shape=full.shape)
+        assert restored_full.shape == full.shape
+        torch.testing.assert_close(restored_full.to_local(), local, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_restore_fsdp_only_extra_parallel_uses_original_global_shape(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.start_processes(
+        _restore_fsdp_only_extra_parallel_worker,
+        args=(4, str(tmp_path / "rdzv")),
+        nprocs=4,
+        join=True,
+        start_method="fork",
+    )
+
+
 def _extra_parallel_dcp_resume_worker(rank, world, rendezvous, checkpoint, hsdp, optimizer_kind, same_dim=False):
     import torch.distributed as dist
     from torch.distributed.device_mesh import init_device_mesh

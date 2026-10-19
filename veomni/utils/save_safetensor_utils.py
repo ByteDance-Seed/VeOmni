@@ -320,6 +320,7 @@ def save_lora_adapter_with_dcp(
                     lora_state[name],
                     spec.para_fsdp_mesh,
                     spec.para_fsdp_mesh[f"{spec.para_name}_fsdp"],
+                    global_shape=spec.global_shape,
                 )
 
     # ckpt_to_state_dict's DCP conversion path only recognizes keys starting with "model.".

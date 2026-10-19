@@ -390,7 +390,12 @@ def _apply_extra_parallel_dim(
             tensor = drop_extra_parallel_dim(tensor, fsdp_submesh, fsdp_shard_dim)
         else:
             tensor = restore_extra_parallel_dim(
-                tensor, spec_info.para_fsdp_mesh, fsdp_submesh, ep_shard_dim, fsdp_shard_dim
+                tensor,
+                spec_info.para_fsdp_mesh,
+                fsdp_submesh,
+                ep_shard_dim,
+                fsdp_shard_dim,
+                global_shape=spec_info.global_shape,
             )
         state_dict[name] = tensor
 
@@ -693,6 +698,7 @@ def restore_extra_parallel_dim(
     extra_parallel_fsdp_mesh: DeviceMesh,
     ep_shard_dim: int = 0,
     fsdp_shard_dim: int = 1,
+    global_shape: Optional[tuple[int, ...]] = None,
 ):
     """
     Restore ExtraParallel dim so that DCP can be aware about ExtraParallel ranks
@@ -711,6 +717,11 @@ def restore_extra_parallel_dim(
             dim excluded), used for the pure-ExtraParallel (no FSDP) path.
         ep_shard_dim (int): Tensor dim the ExtraParallel dim shards along.
         fsdp_shard_dim (int): Tensor dim FSDP shards along.
+        global_shape (tuple[int, ...], optional): The model parameter's shape
+            before ExtraParallel and FSDP sharding. This is required for an
+            FSDP-only DTensor whose local storage is already one ExtraParallel
+            slice and the ExtraParallel shard is uneven; without it the helper
+            can only infer an evenly divisible extent and otherwise fails.
 
     Note:
         When ``ep_shard_dim == fsdp_shard_dim`` (e.g. the Muon zero-comm layout
@@ -733,12 +744,32 @@ def restore_extra_parallel_dim(
             placements = [Replicate(), Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
         else:
             placements = [Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
+        if global_shape is None:
+            shape = list(orgin_tensor.shape)
+            if len(orgin_tensor.placements) < fsdp_mesh.ndim:
+                ep_size = fsdp_mesh.size(fsdp_mesh.ndim - 1)
+                if shape[ep_shard_dim] % ep_size:
+                    raise RuntimeError(
+                        "Cannot infer the full ExtraParallel tensor shape from an FSDP-only DTensor with an "
+                        f"uneven {ep_shard_dim=} extent {shape[ep_shard_dim]} over {ep_size} ranks; "
+                        "pass the original global_shape."
+                    )
+                shape[ep_shard_dim] *= ep_size
+            global_shape = tuple(shape)
+        elif len(global_shape) != orgin_tensor.ndim:
+            raise RuntimeError(
+                f"ExtraParallel global shape {global_shape} does not match tensor rank {orgin_tensor.ndim}."
+            )
+        shape = tuple(global_shape)
+        stride = [1] * len(shape)
+        for index in range(len(shape) - 2, -1, -1):
+            stride[index] = stride[index + 1] * shape[index + 1]
         dtensor = _from_local_preserve_device(
             orgin_tensor._local_tensor,
             device_mesh=fsdp_mesh,
             placements=placements,
-            shape=orgin_tensor.shape,
-            stride=orgin_tensor.stride(),
+            shape=shape,
+            stride=tuple(stride),
         )
     elif torch.is_tensor(orgin_tensor):
         # If there is no FSDP but only ExtraParallel
