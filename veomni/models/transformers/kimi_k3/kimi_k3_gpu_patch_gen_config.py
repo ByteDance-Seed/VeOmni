@@ -22,7 +22,7 @@ Source module: the vendored, HF-compatible modeling at
 (transformers 5.16.1 ships no ``kimi_k3``, so the upstream modeling files are
 vendored verbatim under ``source/`` and patched on top).
 
-Patches (stage-2 skeleton):
+Patches (skeleton):
 1.  ``KimiRMSNorm.forward``  --OpSlot guard for fused RMSNorm.
 2.  ``KimiMoEGate.forward``  --drop the inference-only ``assert not self.training``.
 3.  ``KimiBlockSparseMLP``   --replaced by ``PatchedKimiK3Experts``: fused
@@ -690,7 +690,7 @@ def kimi_k3_for_conditional_generation_forward_patched(
     )
     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-    # Modification (stage 5, SP): ulysses sequence parallel -- the sequence
+    # Modification (SP): ulysses sequence parallel -- the sequence
     # shards arrive per rank; gather them back into the full sequence so the
     # multimodal merge (and the vision tower) run on the full sequence, then
     # slice the merged embeds back to the local shard afterwards. The
@@ -759,7 +759,7 @@ def kimi_k3_for_conditional_generation_forward_patched(
             attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
             position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
 
-    # Modification (stage 5, SP): slice the merged embeds / labels back to
+    # Modification (SP): slice the merged embeds / labels back to
     # the local shard and hand the LM a full-sequence cache_position so
     # position ids and causal masks are built at full length (matching the
     # gathered sequences inside the attention layers).
@@ -768,7 +768,7 @@ def kimi_k3_for_conditional_generation_forward_patched(
         full_seq_len = inputs_embeds.shape[1]
         inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=sp_group)
         if labels is not None:
-            # Modification (fix #18): VeOmni's ForCausalLMLoss skips its internal
+            # Modification: VeOmni's ForCausalLMLoss skips its internal
             # causal shift when sp_enabled (it expects dataloader-side pre-shift).
             # K3 expands labels inside the merge, so the shift must happen here,
             # on the full post-expansion labels, before slicing to shards.
@@ -994,8 +994,8 @@ def kimi_k3_get_extra_collate_infos_patched(self):
     "KimiK3ForConditionalGeneration.get_dyn_bsz_length_fn",
     description="Dynamic-batching length hook: K3 expands one media_pad placeholder per image "
     "to grid_t*h*w/(mh*mw) merged features inside the model (occupation table), so the "
-    "packer's attention_mask-only budget must add the expanded vision length (matches the "
-    "stage-7 len_post budgeting). Closes over merge ints only -- picklable for "
+    "packer's attention_mask-only budget must add the expanded vision length. "
+    "Closes over merge ints only -- picklable for "
     "worker-side dynamic batching.",
 )
 def kimi_k3_get_dyn_bsz_length_fn_patched(self):

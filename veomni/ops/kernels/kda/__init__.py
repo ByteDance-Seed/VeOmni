@@ -22,16 +22,15 @@ Backends:
       in turn derives from flash-linear-attention, MIT). Supports the full
       Kimi-K3 training contract (varlen cu_seqlens, use_gate_in_kernel,
       beta-sigmoid) with initial_state=None / output_final_state=False --
-      the training path after source fix #16. Only small l2norm triton
+      the training path. Only small l2norm triton
       kernels remain on the triton runtime.
 The eager fallback lives in the Kimi-K3 modeling itself
 (``source/kda_fallback.py`` ``chunk_kda_naive``).
 
-History: the standalone ``npu`` (triton fused) entry was removed on
-2026-10-10 -- EP>1 NaN race with the MoE alltoall (stage-6/7 finding, deep
-cause in HCCL/kernel concurrency) plus an 8-card OOM in the vision conv
-backward before the first step; the ascendc path covers production with no
-upstream dependency.
+History: the standalone ``npu`` (triton fused) entry was removed due to an
+EP>1 NaN race with the MoE alltoall (deep cause in HCCL/kernel concurrency)
+plus an 8-card OOM in the vision conv backward before the first step; the
+ascendc path covers production with no upstream dependency.
 """
 
 from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec

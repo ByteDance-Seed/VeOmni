@@ -4,7 +4,7 @@
 # (COCO val2017 captions, 25014 samples; fields: image / width / height / caption.)
 # Replace the source path below with your own output path. See docs/examples/kimi_k3.md.
 sources:
-- /home/w00991160/k3_workspace/data/k3_coco_val2017.jsonl
+- /path/to/k3_coco_val2017.jsonl
 names:
 - kimi_k3_coco
 schedule:

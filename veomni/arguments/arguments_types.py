@@ -1323,7 +1323,7 @@ class OpsImplementationConfig:
             "'eager' uses the modeling's own chunk_kda_naive (pure PyTorch, slow). "
             "'ascendc' uses the fused AscendC kernel from the flash-linear-attention-npu "
             "package via the vendored wrapper (NPU; production default). "
-            "The 'npu' (triton fused) option was removed 2026-10-10: EP>1 NaN race "
+            "The 'npu' (triton fused) option was removed: EP>1 NaN race "
             "with the MoE alltoall plus 8-card OOM."
         },
     )

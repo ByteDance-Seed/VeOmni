@@ -544,12 +544,12 @@ class KimiMLAAttention(nn.Module):
         past_key_values: Cache | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
-        # NPU/SP (stage 5): ulysses sequence parallel -- gather the local
+        # NPU/SP (Ulysses sequence parallel): gather the local
         # sequence shard into the full sequence before the attention (MLA is
         # full-sequence); the output is narrowed back to the local shard at
         # the end. Every SP rank redundantly computes the full sequence.
         #
-        # SP phase 2 (MLA head sharding, 2026-10-08): when the attention
+        # SP head sharding (MLA): when the attention
         # implementation is a veomni_*_with_sp wrapper, skip the gather/narrow
         # entirely -- the wrapper performs the ulysses all-to-all internally
         # (scatter heads, gather sequence), so each rank computes H/sp heads
@@ -636,7 +636,7 @@ class KimiMLAAttention(nn.Module):
             attn_output = attn_output * g
         attn_output = self.o_proj(attn_output)
         if get_parallel_state().sp_enabled and not sp_ulysses_attn:
-            # (SP phase 2) with the veomni_*_with_sp wrapper the output is
+            # With the veomni_*_with_sp wrapper the output is
             # already in the local-shard layout -- no narrowing needed.
             attn_output = slice_input_tensor(attn_output, dim=1, group=get_parallel_state().sp_group)
         return attn_output
@@ -708,11 +708,11 @@ class KimiDeltaAttention(nn.Module):
         attention_mask: torch.Tensor | None,
         **kwargs,
     ):
-        """(SP phase 3) Head-sharded training forward under sequence parallel.
+        """Head-sharded training forward under sequence parallel.
 
         Linear attention (short conv, gated chunked recurrence, per-head
-        gates) is independent across heads, so instead of the phase-1
-        full-sequence gather -- where every SP rank redundantly computed the
+        gates) is independent across heads, so instead of the
+        full-sequence gather -- where every SP rank redundantly computes the
         whole layer over all tokens -- the ranks exchange
         [sequence shard, all heads] <-> [full sequence, head shard] with
         ulysses-style all-to-alls, mirroring the flash wrapper's SP hooks
@@ -883,13 +883,17 @@ class KimiDeltaAttention(nn.Module):
                     "attention_mask must be a 0-1 matrix of shape [batch_size, seq_len] "
                     "(0 = padding). 3D masks are not supported here.",
                 )
-        if get_parallel_state().sp_enabled and cache_params is None and os.environ.get("K3_KDA_SP3", "1") == "1":
-            # (SP phase 3) training under SP: head-sharded KDA via
+        if (
+            get_parallel_state().sp_enabled
+            and cache_params is None
+            and os.environ.get("K3_KDA_HEAD_SHARD", "1") == "1"
+        ):
+            # Training under SP: head-sharded KDA via
             # ulysses-style all-to-all -- see _forward_sp_head_shard. The
             # legacy full-sequence gather path below stays for the cache /
             # inference case.
             return self._forward_sp_head_shard(hidden_states, attention_mask, **kwargs)
-        # NPU/SP (stage 5): ulysses sequence parallel -- linear attention is
+        # NPU/SP (Ulysses sequence parallel): linear attention is
         # sequential across tokens, so gather the local shard into the full
         # sequence before the causal convs / projections and narrow the output
         # back afterwards. Every SP rank redundantly computes the full
@@ -1266,11 +1270,11 @@ class KimiDecoderLayer(GradientCheckpointingLayer):
         )
 
     def _attn_selective_recompute(self) -> bool:
-        # NPU/EP (stage 6, MindSpeed-style selective recompute): under EP
+        # NPU/EP (MindSpeed-style selective recompute): under EP
         # the MoE block contains alltoall dispatch/combine collectives.
         # Non-reentrant whole-layer gradient checkpointing replays them
         # inside backward at rank-skewed moments, desynchronizing the
-        # collectives (all-NaN grads after a few training steps, stage 6).
+        # collectives (all-NaN grads after a few training steps, observed during EP bring-up).
         # When EP is on we therefore skip whole-layer checkpointing and
         # checkpoint ONLY the attention stack (collective-free); the MoE
         # block keeps its activations so it is never replayed.
@@ -1312,7 +1316,7 @@ class KimiDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        # NPU/EP (stage 6, selective recompute): checkpoint the attention
+        # NPU/EP (selective recompute): checkpoint the attention
         # stack only; the MoE block below keeps its activations so the EP
         # alltoall collectives are never replayed inside backward.
         if self._attn_selective_recompute():
@@ -1379,7 +1383,7 @@ class KimiDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        # NPU/EP (stage 6, selective recompute): checkpoint the attention
+        # NPU/EP (selective recompute): checkpoint the attention
         # stack only; the MoE block below keeps its activations so the EP
         # alltoall collectives are never replayed inside backward.
         if self._attn_selective_recompute():
@@ -1867,7 +1871,7 @@ def npu_fusion_vision_attention(
     head_dim), non-causal within each image segment, no padding inside
     segments; returns (tot_seqlens, num_heads * head_dim). CANN's varlen
     score takes cumulative-END positions (no leading zero), hence
-    ``cu_seqlens[1:]`` (stage-6b validated: fp32 max diff 4.77e-07 vs eager).
+    ``cu_seqlens[1:]`` (validated: fp32 max diff 4.77e-07 vs eager).
     Non-NPU devices fall back to the flash-attn varlen path.
     """
     if q_cu_seqlens is None or k_cu_seqlens is None:
@@ -2927,7 +2931,7 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # Modification (stage 5, SP): ulysses sequence parallel -- the sequence
+        # Modification (SP): ulysses sequence parallel -- the sequence
         # shards arrive per rank; gather them back into the full sequence so the
         # multimodal merge (and the vision tower) run on the full sequence, then
         # slice the merged embeds back to the local shard afterwards. The
@@ -2996,7 +3000,7 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
                 attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
                 position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
 
-        # Modification (stage 5, SP): slice the merged embeds / labels back to
+        # Modification (SP): slice the merged embeds / labels back to
         # the local shard and hand the LM a full-sequence cache_position so
         # position ids and causal masks are built at full length (matching the
         # gathered sequences inside the attention layers).
@@ -3005,7 +3009,7 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
             full_seq_len = inputs_embeds.shape[1]
             inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=sp_group)
             if labels is not None:
-                # Modification (fix #18): VeOmni's ForCausalLMLoss skips its internal
+                # Modification: VeOmni's ForCausalLMLoss skips its internal
                 # causal shift when sp_enabled (it expects dataloader-side pre-shift).
                 # K3 expands labels inside the merge, so the shift must happen here,
                 # on the full post-expansion labels, before slicing to shards.

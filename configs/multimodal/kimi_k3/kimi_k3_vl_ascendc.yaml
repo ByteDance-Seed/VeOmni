@@ -1,7 +1,14 @@
 model:
-  config_path: tests/toy_config/kimi_k3_stage6
+  config_path: configs/model_configs/kimi_k3/kimi_k3.json
+  # Single-node reduction of the native layout (93 layers / 896 experts):
+  # depth 93 -> 10, experts 896 -> 16. Drop this block for the full layout.
+  model_config:
+    text_config:
+      num_hidden_layers: 10
+      num_experts: 16
   model_path: null
-  tokenizer_path: /home/w00991160/k3_workspace/kimi_k3_hf
+  # Kimi K3 tokenizer: HF-format dir or hub repo id
+  tokenizer_path: /path/to/kimi_k3_hf
   ops_implementation:
     attn_implementation: veomni_flash_attention_2_with_sp
     rms_norm_implementation: npu
@@ -33,6 +40,6 @@ train:
   global_batch_size: 8
   max_steps: 30
   checkpoint:
-    output_dir: k3_stage6_trainer_smoke
+    output_dir: kimi_k3_sft
     manager: dcp
     save_hf_weights: false

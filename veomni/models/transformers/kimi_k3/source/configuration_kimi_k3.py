@@ -125,8 +125,25 @@ class KimiLinearConfig(PretrainedConfig):
         self.topk_method = topk_method
 
         if linear_attn_config is not None:
-            assert linear_attn_config["kda_layers"] is not None
-            assert linear_attn_config["full_attn_layers"] is not None
+            kda_layers = linear_attn_config.get("kda_layers")
+            full_attn_layers = linear_attn_config.get("full_attn_layers")
+            if (
+                kda_layers is None
+                or full_attn_layers is None
+                or sorted(list(kda_layers) + list(full_attn_layers)) != list(range(1, num_hidden_layers + 1))
+            ):
+                # Depth override (e.g. model_config.text_config.num_hidden_layers): rebuild the
+                # native layer pattern for the new depth -- full attention on every 4th layer
+                # plus the final layer, KDA everywhere else (the released 93-layer layout).
+                full_attn_layers = [i for i in range(1, num_hidden_layers + 1) if i % 4 == 0]
+                if num_hidden_layers % 4 != 0:
+                    full_attn_layers.append(num_hidden_layers)
+                kda_layers = [i for i in range(1, num_hidden_layers + 1) if i not in set(full_attn_layers)]
+                linear_attn_config = {
+                    **linear_attn_config,
+                    "kda_layers": kda_layers,
+                    "full_attn_layers": full_attn_layers,
+                }
         self.linear_attn_config = linear_attn_config
 
         super().__init__(

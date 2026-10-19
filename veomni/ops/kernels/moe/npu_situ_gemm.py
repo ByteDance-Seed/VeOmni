@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NPU situ fused MoE forward (Kimi-K3 SituGLU experts, stage 5).
+"""NPU situ fused MoE forward (Kimi-K3 SituGLU experts).
 
 A sibling of ``npu_group_gemm.py``'s swiglu fused MoE where the activation
 between the two group gemms is Kimi-K3's SituGLU

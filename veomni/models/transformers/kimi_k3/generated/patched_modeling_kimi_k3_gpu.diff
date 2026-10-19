@@ -57,7 +57,7 @@
 +#    - method_override: KimiK3ForConditionalGeneration.get_extra_collate_infos
 +#      K3 SP contract: text tokens are seq-sharded (ulysses) but the vision tower runs redundantly on every SP rank -- pixel_values/grid_thws stay full (no sp-slice). grid_thws (num_images, 3) cats along dim 0 like image_grid_thw. Tuple form; MainCollator expands it to DataCollateInfo.
 +#    - method_override: KimiK3ForConditionalGeneration.get_dyn_bsz_length_fn
-+#      Dynamic-batching length hook: K3 expands one media_pad placeholder per image to grid_t*h*w/(mh*mw) merged features inside the model (occupation table), so the packer's attention_mask-only budget must add the expanded vision length (matches the stage-7 len_post budgeting). Closes over merge ints only -- picklable for worker-side dynamic batching.
++#      Dynamic-batching length hook: K3 expands one media_pad placeholder per image to grid_t*h*w/(mh*mw) merged features inside the model (occupation table), so the packer's attention_mask-only budget must add the expanded vision length. Closes over merge ints only -- picklable for worker-side dynamic batching.
 +#    - method_override: KimiLinearForCausalLM.get_parallel_plan
 +#      Register KimiLinear expert parallel plan for v5 generated modeling
 +#    - method_override: KimiK3ForConditionalGeneration.get_parallel_plan
@@ -111,7 +111,7 @@
 -# Linear-attention kernels: always use the vendored eager implementations from
 -# `.kda_fallback` (pure PyTorch, MindSpeed-derived; `fla` is GPU-only and absent
 -# from the NPU image). patchgen hoists conditional imports to the module top
--# level, so a try/except fla import cannot survive codegen. Stage-4 NPU kernels
+-# level, so a try/except fla import cannot survive codegen. NPU kernels
 -# will replace these via OpSlot dispatch instead.
 -from .kda_fallback import (
 +from veomni.models.transformers.kimi_k3.source.configuration_kimi_k3 import KimiK3Config, KimiLinearConfig
@@ -334,7 +334,20 @@
 
          _timing = os.environ.get("K3_KDA_SP_TIMING") == "1"
          if _timing:
-@@ -889,6 +1003,12 @@
+@@ -769,7 +883,11 @@
+                     "attention_mask must be a 0-1 matrix of shape [batch_size, seq_len] "
+                     "(0 = padding). 3D masks are not supported here.",
+                 )
+-        if get_parallel_state().sp_enabled and cache_params is None and os.environ.get("K3_KDA_HEAD_SHARD", "1") == "1":
++        if (
++            get_parallel_state().sp_enabled
++            and cache_params is None
++            and os.environ.get("K3_KDA_HEAD_SHARD", "1") == "1"
++        ):
+             # Training under SP: head-sharded KDA via
+             # ulysses-style all-to-all -- see _forward_sp_head_shard. The
+             # legacy full-sequence gather path below stays for the cache /
+@@ -889,6 +1007,12 @@
          return o
 
 
@@ -347,7 +360,7 @@
  class KimiMoEGate(nn.Module):
      """
      MoEGate adapted from Deepseek-V3.
-@@ -922,10 +1042,9 @@
+@@ -922,10 +1046,9 @@
          self.reset_parameters()
 
      def reset_parameters(self) -> None:
@@ -359,7 +372,7 @@
      def forward(self, hidden_states):
          bsz, seq_len, h = hidden_states.shape
          # compute gating score
-@@ -945,7 +1064,7 @@
+@@ -945,7 +1068,7 @@
              )
 
          # select top-k experts
@@ -368,7 +381,7 @@
          scores = scores.view(bsz * seq_len, -1)
          scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
          if self.num_expert_group > 1 and self.num_expert_group > self.topk_group:
-@@ -990,13 +1109,29 @@
+@@ -990,13 +1113,29 @@
          return topk_idx, topk_weight
 
 
@@ -403,7 +416,7 @@
          super().__init__()
          self.config = config
          self.hidden_dim = config.hidden_size
-@@ -1008,20 +1143,16 @@
+@@ -1008,20 +1147,16 @@
          self.moe_hidden_size = config.routed_expert_hidden_size if self.use_latent_moe else config.hidden_size
          self.latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
 
@@ -432,7 +445,7 @@
          if config.num_shared_experts is not None:
              intermediate_size = config.moe_intermediate_size * config.num_shared_experts
              self.shared_experts = KimiMLP(
-@@ -1055,10 +1186,9 @@
+@@ -1055,10 +1190,9 @@
          if self.use_latent_moe:
              hidden_states = self.routed_expert_down_proj(hidden_states)
 
@@ -446,7 +459,7 @@
 
          if self.use_latent_moe:
              if self.latent_moe_use_norm:
-@@ -1070,41 +1200,6 @@
+@@ -1070,41 +1204,6 @@
          if self.config.num_shared_experts is not None:
              y = y + self.shared_experts(identity)
          return y
@@ -488,7 +501,7 @@
 
 
  class KimiDecoderLayer(GradientCheckpointingLayer):
-@@ -1336,6 +1431,12 @@
+@@ -1336,6 +1435,12 @@
          return prefix_sum, block_residual
 
 
@@ -501,7 +514,7 @@
  class KimiPreTrainedModel(PreTrainedModel):
      config_class = KimiLinearConfig
      base_model_prefix = "model"
-@@ -1350,8 +1451,47 @@
+@@ -1350,8 +1455,47 @@
      }
      _is_stateful = True
 
@@ -549,7 +562,7 @@
          if isinstance(module, nn.Linear):
              module.weight.data.normal_(mean=0.0, std=std)
              if module.bias is not None:
-@@ -1378,8 +1518,15 @@
+@@ -1378,8 +1522,15 @@
      return hidden_states.to(v.dtype)
 
 
@@ -566,7 +579,7 @@
          super().__init__(config)
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
-@@ -1395,14 +1542,12 @@
+@@ -1395,14 +1546,12 @@
              self.output_attn_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
              self.output_attn_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
 
@@ -586,7 +599,7 @@
          self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
          self.gradient_checkpointing = False
          # Initialize weights and apply final processing
-@@ -1516,6 +1661,12 @@
+@@ -1516,6 +1665,12 @@
          ).view(batch_size, seq_len, hidden_size)
 
 
@@ -599,7 +612,7 @@
  class KimiLinearForCausalLM(KimiPreTrainedModel, GenerationMixin):
      @classmethod
      def _supports_default_dynamic_cache(cls) -> bool:
-@@ -1532,32 +1683,25 @@
+@@ -1532,32 +1687,25 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -647,7 +660,7 @@
          output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
          output_hidden_states = (
              output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-@@ -1577,22 +1721,59 @@
+@@ -1577,22 +1725,59 @@
              cache_position=cache_position,
          )
 
@@ -715,7 +728,7 @@
 
 
  def multihead_attention(
-@@ -2368,6 +2549,12 @@
+@@ -2368,6 +2553,12 @@
          return x
 
 
@@ -728,7 +741,7 @@
  class KimiK3PreTrainedModel(PreTrainedModel):
      config_class = KimiK3Config
      base_model_prefix = "model"
-@@ -2385,13 +2572,48 @@
+@@ -2385,13 +2576,48 @@
 
      def _init_weights(self, module):
          # important: this ported version of Llava isn't meant for training from scratch - only
@@ -778,7 +791,7 @@
 
          if hasattr(module, "class_embedding"):
              module.class_embedding.data.normal_(mean=0.0, std=std)
-@@ -2442,13 +2664,37 @@
+@@ -2442,13 +2668,37 @@
          self.projector_ln_eps = config.projector_ln_eps
 
 
@@ -817,7 +830,7 @@
          super().__init__(config)
 
          vt_config = VisionTowerConfig(config.vision_config)
-@@ -2469,6 +2715,19 @@
+@@ -2469,6 +2719,19 @@
          self.language_model = KimiLinearForCausalLM(config.text_config)
          self.post_init()
 
@@ -837,7 +850,7 @@
          if hasattr(self.language_model, "dtype"):
              target_dtype = self.language_model.dtype
              self.vision_tower = self.vision_tower.to(dtype=target_dtype)
-@@ -2492,8 +2751,14 @@
+@@ -2492,8 +2755,14 @@
      def get_decoder(self):
          return self.language_model.get_decoder()
 
@@ -854,7 +867,7 @@
 
      def resize_token_embeddings(self, new_num_tokens: int | None = None, pad_to_multiple_of=None) -> nn.Embedding:
          model_embeds = self.language_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
-@@ -2638,35 +2903,46 @@
+@@ -2638,35 +2907,46 @@
          image_features = self.vision_tower(pixel_values, grid_thws)
          return image_features
 
@@ -903,7 +916,7 @@
          )
          return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 +
-+        # Modification (stage 5, SP): ulysses sequence parallel -- the sequence
++        # Modification (SP): ulysses sequence parallel -- the sequence
 +        # shards arrive per rank; gather them back into the full sequence so the
 +        # multimodal merge (and the vision tower) run on the full sequence, then
 +        # slice the merged embeds back to the local shard afterwards. The
@@ -922,11 +935,11 @@
 
          if inputs_embeds is None:
              # 1. Extra the input embeddings
-@@ -2678,15 +2954,7 @@
+@@ -2678,15 +2958,7 @@
                  if self.mm_projector:
                      image_features = self.mm_projector(image_features)
 
--                # NPU/FSDP2 mixed-precision fix (stage 5): align the fused
+-                # NPU/FSDP2 mixed-precision fix: align the fused
 -                # embeds to the *text embedding* dtype instead of the vision
 -                # dtype. Under FSDP2 mp the text parameters are bf16, and a
 -                # fp32 vision path would leak fp32 activations into the first
@@ -939,12 +952,12 @@
                  inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
                      image_features,
                      inputs_embeds,
-@@ -2728,46 +2996,86 @@
+@@ -2728,46 +3000,86 @@
                  attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
                  position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
 
 -        outputs = self.language_model(
-+        # Modification (stage 5, SP): slice the merged embeds / labels back to
++        # Modification (SP): slice the merged embeds / labels back to
 +        # the local shard and hand the LM a full-sequence cache_position so
 +        # position ids and causal masks are built at full length (matching the
 +        # gathered sequences inside the attention layers).
@@ -953,7 +966,7 @@
 +            full_seq_len = inputs_embeds.shape[1]
 +            inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=sp_group)
 +            if labels is not None:
-+                # Modification (fix #18): VeOmni's ForCausalLMLoss skips its internal
++                # Modification: VeOmni's ForCausalLMLoss skips its internal
 +                # causal shift when sp_enabled (it expects dataloader-side pre-shift).
 +                # K3 expands labels inside the merge, so the shift must happen here,
 +                # on the full post-expansion labels, before slicing to shards.
@@ -1050,7 +1063,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2833,3 +3141,34 @@
+@@ -2833,3 +3145,34 @@
 
      def _reorder_cache(self, *args, **kwargs):
          return self.language_model._reorder_cache(*args, **kwargs)

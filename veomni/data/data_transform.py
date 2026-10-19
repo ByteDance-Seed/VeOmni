@@ -585,7 +585,7 @@ def process_sample_kimi_k3(
     position_id_func: "Callable",
     **kwargs,
 ):
-    """Kimi K3 multimodal processing (single image + caption), stage-7 faithful.
+    """Kimi K3 multimodal processing (single image + caption), faithful to the reference implementation.
 
     One ``<|media_pad|>`` placeholder per image -- the modeling expands it to
     the merged patch grid from ``grid_thws``. Labels supervise only the caption

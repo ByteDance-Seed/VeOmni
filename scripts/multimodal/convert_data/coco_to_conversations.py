@@ -11,6 +11,7 @@ shape: it renders the single-placeholder media template
 supervises only the caption (+EOS), and preprocesses the image through the
 KimiK3Processor. See docs/examples/kimi_k3.md for the full recipe.
 """
+
 import argparse
 import json
 import os

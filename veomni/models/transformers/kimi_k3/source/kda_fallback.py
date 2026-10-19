@@ -449,9 +449,9 @@ chunk_kda = chunk_kda_naive
 
 
 # ==============================================================================
-# (SP phase 3 diagnostics) phase timers for the head-sharded KDA forward.
+# Optional timing instrumentation for the head-sharded KDA forward.
 # Enabled via K3_KDA_SP_TIMING=1; event pairs are resolved at interpreter exit
-# (no per-phase device sync while training) and dumped per rank. Imported by
+# (no device sync while training) and dumped per rank. Imported by
 # the generated modeling files (gpu + npu) alongside the kernels above.
 # ==============================================================================
 _KDA_TIMING_EVENTS: list = []
