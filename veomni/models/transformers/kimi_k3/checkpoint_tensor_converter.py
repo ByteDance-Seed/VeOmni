@@ -37,7 +37,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from ....utils import logging
-from ...checkpoint_tensor_loading import ConvertedCheckpointTensor
+from ...checkpoint import ConvertedCheckpointTensor
 
 
 logger = logging.get_logger(__name__)
