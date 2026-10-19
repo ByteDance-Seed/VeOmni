@@ -20,7 +20,7 @@ patchgen veomni.models.transformers.kimi_k3.kimi_k3_npu_patch_gen_config -o veom
 Re-registers every patch from the GPU config against an NPU-target file so the
 NPU modeling is generated from the same source (the eager fallbacks in the
 vendored source module — kda_fallback, eager MLA attention — are NPU-safe, and
-the OpSlot guards keep fused kernels opt-in per ops config).
+the VeomniOp handles resolve per ops config).
 """
 
 from veomni.models.transformers.kimi_k3.kimi_k3_gpu_patch_gen_config import (
@@ -35,12 +35,15 @@ from veomni.models.transformers.kimi_k3.kimi_k3_gpu_patch_gen_config import (
     kimi_k3_pretrained_init_weights_patched,
     kimi_k3_tie_weights_patched,
     kimi_linear_for_causal_lm_forward_patched,
+    kimi_linear_for_causal_lm_init_patched,
     kimi_linear_get_parallel_plan_patched,
     kimi_linear_model_init_patched,
     kimi_moe_gate_forward_patched,
     kimi_pretrained_init_weights_patched,
     kimi_rmsnorm_forward_patched,
+    kimi_rmsnorm_init_patched,
     situ_and_mul_forward_patched,
+    situ_and_mul_init_patched,
 )
 from veomni.models.transformers.kimi_k3.kimi_k3_gpu_patch_gen_config import (
     config as gpu_config,
@@ -55,7 +58,7 @@ config = PatchConfig(
 )
 
 # Mirror additional imports + post-import helpers from the GPU config so the
-# generated file is self-contained (same OpSlot declarations, same dropped
+# generated file is self-contained (same VeomniOp imports, same dropped
 # imports).
 config.additional_imports.extend(gpu_config.additional_imports)
 config.post_import_blocks.extend(gpu_config.post_import_blocks)
@@ -66,18 +69,32 @@ config.drop_imported_names.update(gpu_config.drop_imported_names)
 
 
 config.override_method(
+    "KimiRMSNorm.__init__",
+    replacement=kimi_rmsnorm_init_patched,
+    description="Construct a local rms_norm VeomniOp",
+)
+
+
+config.override_method(
     "KimiRMSNorm.forward",
     replacement=kimi_rmsnorm_forward_patched,
-    description="OpSlot guard for NPU fused RMSNorm (standard formulation)",
+    description="Always call the local rms_norm VeomniOp",
 )
 
 # ── SituGLU (fused Triton kernel) ────────────────────────────────────────────
 
 
 config.override_method(
+    "SituAndMul.__init__",
+    replacement=situ_and_mul_init_patched,
+    description="Construct a local situ_and_mul VeomniOp",
+)
+
+
+config.override_method(
     "SituAndMul.forward",
     replacement=situ_and_mul_forward_patched,
-    description="OpSlot guard: route SituGLU to the fused NPU Triton kernel (situ_and_mul op, kimi_k3 variant)",
+    description="Always call the local situ_and_mul VeomniOp",
 )
 
 
@@ -97,8 +114,8 @@ config.replace_class(
     "KimiBlockSparseMLP",
     replacement=PatchedKimiK3Experts,
     description=(
-        "Use v5 gate_up_proj expert weights ([E, 2I, H] F.linear layout) and the VeOmni fused "
-        "MoE path. SituGLU activations always run the eager expert loop."
+        "Use v5 gate_up_proj expert weights ([E, 2I, H] F.linear layout) and the "
+        "instance-local moe_experts VeomniOp (kimi_k3 variant for SituGLU, standard otherwise)."
     ),
 )
 
@@ -139,9 +156,16 @@ config.override_method(
 
 
 config.override_method(
+    "KimiLinearForCausalLM.__init__",
+    replacement=kimi_linear_for_causal_lm_init_patched,
+    description="Bind ForCausalLMLoss VeomniOp on KimiLinearForCausalLM",
+)
+
+
+config.override_method(
     "KimiLinearForCausalLM.forward",
     replacement=kimi_linear_for_causal_lm_forward_patched,
-    description="Fused cross-entropy path via veomni_causal_lm_loss / patched loss_function",
+    description="Fused cross-entropy path via the VeomniOp-bound loss_function",
 )
 
 

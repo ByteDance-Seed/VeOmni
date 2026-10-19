@@ -23,14 +23,13 @@ Source module: the vendored, HF-compatible modeling at
 vendored verbatim under ``source/`` and patched on top).
 
 Patches (skeleton):
-1.  ``KimiRMSNorm.forward``  --OpSlot guard for fused RMSNorm.
+1.  ``KimiRMSNorm``  --instance-local ``VeomniOp`` for fused RMSNorm.
 2.  ``KimiMoEGate.forward``  --drop the inference-only ``assert not self.training``.
 3.  ``KimiBlockSparseMLP``   --replaced by ``PatchedKimiK3Experts``: fused
-    ``[E, 2I, H]`` / ``[E, H, I]`` expert weights plus the VeOmni fused-MoE
-    OpSlot dispatch. SituGLU experts dispatch to the situ fused-MoE kernel
-    (``moe_experts`` op, ``kimi_k3`` variant: NPU group-gemm + SituGLU, EP
-    alltoall-aware); other activations may take the standard fused path once
-    an OpSlot is bound.
+    ``[E, 2I, H]`` / ``[E, H, I]`` expert weights plus an instance-local
+    ``moe_experts`` ``VeomniOp``. SituGLU experts bind the ``kimi_k3``
+    variant (NPU group-gemm + SituGLU, EP alltoall-aware); other activations
+    bind the ``standard`` variant.
 4.  ``KimiSparseMoeBlock``   --replaced by ``PatchedKimiK3SparseMoeBlock``:
     training-mode forward (latent-MoE down/up projections + optional norm +
     shared experts), dropping the inference-only ``moe_infer`` path.
@@ -42,8 +41,8 @@ Patches (skeleton):
     ``__init__`` override; sdpa falls back to eager for the vision tower) and
     keep the linear-attention decoder layers in the root FSDP2 unit by
     clearing the aggregated ``_no_split_modules`` after ``post_init``.
-7.  ``KimiLinearForCausalLM.forward`` --fused CE path via
-    ``veomni_causal_lm_loss`` / the patched ``loss_function``; returns
+7.  ``KimiLinearForCausalLM.forward`` --fused CE path via the
+    ``VeomniOp``-bound ``loss_function``; returns
     ``CausalLMOutputWithLogProbs`` so ``fused_linear_aux`` is a constructor
     field (FSDP2 pre-backward unshard safety).
 8.  ``KimiK3ForConditionalGeneration.forward`` --fused CE path. Calls
@@ -57,13 +56,12 @@ Patches (skeleton):
     weights are already initialized at construction).
 10. ``get_parallel_plan`` on ``KimiLinearForCausalLM`` /
     ``KimiK3ForConditionalGeneration`` --EP plan for the fused expert weights.
-11. ``SituAndMul.forward`` --OpSlot guard for the fused NPU Triton SituGLU
+11. ``SituAndMul`` --instance-local ``VeomniOp`` for the fused Triton SituGLU
     kernel (``situ_and_mul`` op, ``kimi_k3`` variant).
-12. ``chunk_kda`` --name hijack (drop-import + post-import redefinition) with
-    an OpSlot guard: routes the KDA chunked linear attention to the fused
-    Triton kernel from the triton-ascend-kernels package (``chunk_kda`` op,
-    ``kimi_k3`` variant) when bound; eager ``chunk_kda_naive`` stays as the
-    fallback.
+12. ``chunk_kda`` --name hijack (drop-import + post-import redefinition)
+    dispatching through a lazily-resolved ``chunk_kda`` ``VeomniOp``
+    (``kimi_k3`` variant): the fused AscendC kernel when configured, the
+    modeling reference otherwise.
 13. ``KimiK3ForConditionalGeneration.forward`` --ulysses sequence-parallel
     data flow: gather the per-rank sequence shards (input_ids / mask /
     labels / position_ids) to the full sequence before the multimodal merge
@@ -71,19 +69,24 @@ Patches (skeleton):
     labels back to the local shard, and hand the LM a full-sequence
     ``cache_position`` so causal masks / position ids match the gathered
     sequences inside the attention layers.
-14. ``KimiDeltaAttention.forward`` / ``KimiMLAAttention.forward`` (source
-    fixes #13/#14) --SP gather at entry / narrow at exit: linear attention
+14. ``KimiDeltaAttention.forward`` / ``KimiMLAAttention.forward`` --SP
+    gather at entry / narrow at exit: linear attention
     is sequential across tokens and MLA is full-sequence, so both run on the
     full (gathered) sequence on every SP rank and narrow the output back to
     the local shard. The MLA shard-sized causal mask is dropped (all-ones
     training packs); the KDA cu_seqlens derive from the full-sequence mask.
 """
 
+from functools import partial
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (
     CausalLMOutputWithLogProbs,
@@ -110,89 +113,80 @@ config.add_import(
 config.drop_import_names("CausalLMOutputWithPast")
 config.drop_import_names("LlavaCausalLMOutputWithPast")
 
-config.add_post_import_block(
-    """
-    # OpSlot declarations
-    # These are bound at model-build time by _bind_veomni_ops() in auto.py.
-    from veomni.ops.dispatch import OpSlot
-    veomni_rms_norm = OpSlot("rms_norm", "standard")
-    veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
-    veomni_moe_experts_situ = OpSlot("moe_experts", "kimi_k3")
-    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-    veomni_situ_and_mul = OpSlot("situ_and_mul", "kimi_k3")
-    veomni_chunk_kda = OpSlot("chunk_kda", "kimi_k3")
-    """
+config.add_import("functools", names=["partial"])
+config.add_import("veomni.models.loss_utils", names=["ForCausalLMLoss"])
+config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import("veomni.ops.config", names=["resolve_op_impl"])
+
+
+# SituGLU (instance-local VeomniOp, fused Triton kernel)
+
+
+@config.override_method(
+    "SituAndMul.__init__",
+    description="Construct a local situ_and_mul VeomniOp",
 )
-
-
-# SituGLU (OpSlot guard, fused Triton kernel)
+def situ_and_mul_init_patched(self, beta: float = 1.0, linear_beta: float | None = None):
+    nn.Module.__init__(self)
+    self.beta = beta
+    self.linear_beta = linear_beta
+    self.veomni_situ_and_mul = VeomniOp("situ_and_mul", "kimi_k3", resolve_op_impl("situ_and_mul_implementation"))
 
 
 @config.override_method(
     "SituAndMul.forward",
-    description="OpSlot guard: route SituGLU to the fused NPU Triton kernel "
-    "(situ_and_mul op, kimi_k3 variant) when bound",
+    description="Always call the local situ_and_mul VeomniOp",
 )
 def situ_and_mul_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
-    # Modification: OpSlot guard --use the fused Triton kernel when bound.
-    # Signature matches the eager SituAndMul: x is [..., 2d] with gate on the
-    # left half and up on the right half.
-    if veomni_situ_and_mul.use_non_eager_impl:
-        return veomni_situ_and_mul(x, beta=self.beta, linear_beta=self.linear_beta)
-    # Original HF code below, unchanged.
-    d = x.shape[-1] // 2
-    gate = x[..., :d].to(torch.float32)
-    up = x[..., d:].to(torch.float32)
-    situ_a = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
-    if self.linear_beta is not None:
-        up = self.linear_beta * torch.tanh(up / self.linear_beta)
-    return (situ_a * up).to(x.dtype)
+    return self.veomni_situ_and_mul(x, beta=self.beta, linear_beta=self.linear_beta)
 
 
-# KDA chunked linear attention (OpSlot guard, fused triton-ascend-kernels kernel)
+# KDA chunked linear attention (lazily-resolved VeomniOp, fused AscendC kernel)
 
 # Patch 12: hijack the ``chunk_kda`` name. ``chunk_kda`` is *imported* from
 # ``kda_fallback`` (not defined in the source module), so FUNCTION_REPLACEMENT
 # cannot touch it. Drop the import and re-define the name in a post-import
-# block: the guard dispatches to the fused triton-ascend-kernels chunk_kda
-# when the ``veomni_chunk_kda`` OpSlot is bound, and falls back to the eager
-# ``chunk_kda_naive`` otherwise. Signatures are kwarg-compatible; extra K3
+# block that dispatches through a ``chunk_kda`` ``VeomniOp`` (``kimi_k3``
+# variant), resolved lazily on first call so the row follows the ops config
+# installed at model-build time. Signatures are kwarg-compatible; extra K3
 # args (``A_log``/``dt_bias``/``transpose_state_layout``) pass through.
 
 config.drop_import_names("chunk_kda")
 config.add_post_import_block(
     """
-    # --- Patch 12: chunk_kda OpSlot guard (KDA fused Triton kernel) ---
-    from veomni.models.transformers.kimi_k3.source.kda_fallback import (
-        chunk_kda as _kda_chunk_kda_eager,
-    )
+    # --- Patch 12: chunk_kda dispatch through a lazily-resolved VeomniOp ---
+    _k3_chunk_kda_op = None
+
 
     def chunk_kda(q, k, v, g, beta, **kwargs):
-        # OpSlot guard: use the fused triton-ascend-kernels implementation
-        # when bound; otherwise the eager naive implementation above.
-        if veomni_chunk_kda.use_non_eager_impl:
-            return veomni_chunk_kda(q=q, k=k, v=v, g=g, beta=beta, **kwargs)
-        return _kda_chunk_kda_eager(q=q, k=k, v=v, g=g, beta=beta, **kwargs)
+        global _k3_chunk_kda_op
+        if _k3_chunk_kda_op is None:
+            _k3_chunk_kda_op = VeomniOp("chunk_kda", "kimi_k3", resolve_op_impl("chunk_kda_implementation"))
+        return _k3_chunk_kda_op(q=q, k=k, v=v, g=g, beta=beta, **kwargs)
     """
 )
 
 
-# RMSNorm (OpSlot guard, functional fused kernel)
+# RMSNorm (instance-local VeomniOp, functional fused kernel)
+
+
+@config.override_method(
+    "KimiRMSNorm.__init__",
+    description="Construct a local rms_norm VeomniOp",
+)
+def kimi_rmsnorm_init_patched(self, hidden_size, eps=1e-6):
+    nn.Module.__init__(self)
+    self.weight = nn.Parameter(torch.ones(hidden_size))
+    self.variance_epsilon = eps
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
 
 
 @config.override_method(
     "KimiRMSNorm.forward",
-    description="OpSlot guard for fused RMSNorm (standard formulation)",
+    description="Always call the local rms_norm VeomniOp",
 )
 def kimi_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    # Modification: OpSlot guard --use fused RMSNorm kernel when bound.
-    if veomni_rms_norm.use_non_eager_impl:
-        return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
-    # Original HF code below, unchanged.
-    dtype = hidden_states.dtype
-    x = hidden_states.float()
-    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
-    return self.weight * x.to(dtype)
+    return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 
 
 # MoE gate (training-mode routing)
@@ -273,9 +267,9 @@ def kimi_moe_gate_forward_patched(self, hidden_states):
     "KimiBlockSparseMLP",
     description=(
         "Use v5 gate_up_proj expert weights ([E, 2I, H] F.linear layout) and the VeOmni fused "
-        "MoE path. SituGLU experts dispatch through the situ OpSlot (kimi_k3 variant, NPU "
-        "group-gemm + SituGLU activation, EP-aware); other activations dispatch through the "
-        "standard OpSlot when bound."
+        "MoE path. SituGLU experts bind the kimi_k3 moe_experts VeomniOp variant (NPU "
+        "group-gemm + SituGLU activation, EP-aware); other activations bind the standard "
+        "variant."
     ),
 )
 class PatchedKimiK3Experts(nn.Module):
@@ -307,6 +301,11 @@ class PatchedKimiK3Experts(nn.Module):
             self.act_fn = SituAndMul(beta=beta, linear_beta=linear_beta)
         else:
             self.act_fn = ACT2FN[config.hidden_act]
+        self.veomni_moe = VeomniOp(
+            "moe_experts",
+            "kimi_k3" if self.is_situ else "standard",
+            resolve_op_impl("moe_implementation"),
+        )
 
     def forward(
         self,
@@ -314,42 +313,33 @@ class PatchedKimiK3Experts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        final_hidden_states = torch.zeros_like(hidden_states)
-        # Modification: OpSlot guards for the fused MoE kernels. SituGLU
-        # experts dispatch to the situ variant (``moe_experts`` op,
-        # ``kimi_k3`` variant: NPU group-gemm with the SituGLU activation and
-        # alltoall dispatch/combine under EP); other activations take the
-        # standard fused path. Eager expert loop stays the fallback.
+        # Modification: always dispatch through the instance-local
+        # moe_experts VeomniOp (eager is a registered row). SituGLU experts
+        # bind the kimi_k3 variant (NPU group-gemm with the SituGLU
+        # activation and alltoall dispatch/combine under EP); other
+        # activations bind the standard fused path.
         if self.is_situ:
-            if veomni_moe_experts_situ.use_non_eager_impl:
-                return veomni_moe_experts_situ(self, hidden_states, top_k_index, top_k_weights)
-        elif veomni_moe_experts_forward.use_non_eager_impl:
-            return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
-
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            gate_up = torch.nn.functional.linear(current_state, self.gate_up_proj[expert_idx])
-            if self.is_situ:
-                # SituAndMul splits the trailing dim in half itself:
-                # situ(beta * tanh(gate/beta) * sigmoid(gate) * up).
-                current_hidden_states = self.act_fn(gate_up)
-            else:
-                gate, up = gate_up.chunk(2, dim=-1)
-                current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = torch.nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-
-        return final_hidden_states
+            return self.veomni_moe(
+                hidden_states,
+                top_k_weights,
+                top_k_index,
+                self.gate_up_proj,
+                self.down_proj,
+                num_experts=self.num_experts,
+                beta=self.act_fn.beta,
+                linear_beta=self.act_fn.linear_beta,
+            )
+        unused = self.gate_up_proj.new_empty(0)
+        return self.veomni_moe(
+            hidden_states,
+            top_k_weights,
+            top_k_index,
+            unused,
+            unused,
+            self.down_proj,
+            self.gate_up_proj,
+            num_experts=self.num_experts,
+        )
 
 
 # Sparse MoE block (training-mode forward)
@@ -530,6 +520,9 @@ def kimi_k3_for_conditional_generation_init_patched(self, config):
         raise ValueError(f"Unsupported mm_projector_type: {proj_config.mm_projector_type}")
 
     self.language_model = KimiLinearForCausalLM(config.text_config)
+    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
 
     # Modification (VeOmni FSDP2 wrap): keep the vision tower / projector
@@ -565,12 +558,30 @@ def kimi_k3_tie_weights_patched(self, missing_keys=None, recompute_mapping=True)
     )
 
 
+# KimiLinearForCausalLM.__init__ (bind the CE VeomniOp)
+
+
+@config.override_method(
+    "KimiLinearForCausalLM.__init__",
+    description="Bind ForCausalLMLoss VeomniOp on KimiLinearForCausalLM",
+)
+def kimi_linear_for_causal_lm_init_patched(self, config):
+    super().__init__(config)
+    self.model = KimiLinearModel(config)
+    self.vocab_size = config.vocab_size
+    self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+    self.post_init()
+
+
 # KimiLinearForCausalLM.forward (fused CE)
 
 
 @config.override_method(
     "KimiLinearForCausalLM.forward",
-    description="Fused cross-entropy path via veomni_causal_lm_loss / patched loss_function",
+    description="Fused cross-entropy path via the VeomniOp-bound loss_function",
 )
 def kimi_linear_for_causal_lm_forward_patched(
     self,
@@ -616,33 +627,17 @@ def kimi_linear_for_causal_lm_forward_patched(
     logits = None
     fused_linear_aux = None
     if labels is not None:
-        # Modification: OpSlot guard for cross-entropy loss.
-        if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-        else:
-            logits = self.lm_head(hidden_states)
-            # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-            # returns (loss, logits, fused_linear_aux); unpack to match the
-            # OpSlot branch above.
-            loss, _, fused_linear_aux = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-            if fused_linear_aux is not None:
-                # fused_linear_aux path empties loss/logits slots; clear the local 3D
-                # logits so output mirrors the OpSlot branch's contract.
-                logits = None
+        # Modification: fused cross-entropy via the VeomniOp-bound helper
+        # (fused rows consume hidden_states + weights; the eager row does
+        # the projection inside the op and returns the logits).
+        loss, logits, fused_linear_aux = self.loss_function(
+            logits=logits,
+            labels=labels,
+            vocab_size=self.vocab_size,
+            hidden_states=hidden_states,
+            weights=self.lm_head.weight,
+            **kwargs,
+        )
     else:
         logits = self.lm_head(hidden_states)
 
@@ -800,31 +795,17 @@ def kimi_k3_for_conditional_generation_forward_patched(
     logits = None
     fused_linear_aux = None
     if labels is not None:
-        # Modification: OpSlot guard for cross-entropy loss.
-        if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.text_config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.language_model.lm_head.weight,
-                **kwargs,
-            )
-        else:
-            logits = self.language_model.lm_head(hidden_states)
-            # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-            # returns (loss, logits, fused_linear_aux); unpack to match the
-            # OpSlot branch above.
-            loss, _, fused_linear_aux = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.text_config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.language_model.lm_head.weight,
-                **kwargs,
-            )
-            if fused_linear_aux is not None:
-                logits = None
+        # Modification: fused cross-entropy via the VeomniOp-bound helper
+        # (fused rows consume hidden_states + weights; the eager row does
+        # the projection inside the op and returns the logits).
+        loss, logits, fused_linear_aux = self.loss_function(
+            logits=logits,
+            labels=labels,
+            vocab_size=self.config.text_config.vocab_size,
+            hidden_states=hidden_states,
+            weights=self.language_model.lm_head.weight,
+            **kwargs,
+        )
     else:
         logits = self.language_model.lm_head(hidden_states)
 
@@ -1047,3 +1028,4 @@ KimiRMSNorm = None  # noqa: E305
 KimiDecoderLayer = None  # noqa: E305
 KimiBlockSparseMLP = None  # noqa: E305
 KimiDeltaAttention = None  # noqa: E305
+KimiLinearModel = None  # noqa: E305
