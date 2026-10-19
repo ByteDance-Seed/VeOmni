@@ -784,6 +784,10 @@ def test_flex_thd_matches_bhsd_outputs_lse_and_gradients_on_cpu(monkeypatch, cro
 
 
 @pytest.mark.skipif(not _FLEX_COMPILE_AVAILABLE, reason="HF FlexAttention needs triton for compilation")
+@pytest.mark.skipif(
+    IS_NPU_AVAILABLE,
+    reason="Ascend inductor cannot lower CPU flex_attention: Subgraph has no dtype",
+)
 def test_flex_thd_cpu_forward_matches_math_for_different_qk_lengths():
     query, key, value = (torch.randn(length, heads, 8) for length, heads in ((17, 4), (23, 2), (23, 2)))
     mask = create_block_mask(lambda b, h, q, k: q >= k, B=None, H=None, Q_LEN=17, KV_LEN=23, device="cpu")
