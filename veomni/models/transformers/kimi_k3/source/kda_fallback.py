@@ -489,7 +489,6 @@ def _kda_timing_dump():
         f.write("phase\ttotal_ms\tcalls\tus_per_call\n")
         for phase, (t, c) in sorted(totals.items(), key=lambda kv: -kv[1][0]):
             f.write(f"{phase}\t{t / 1000.0:.1f}\t{c}\t{t / max(c, 1):.0f}\n")
-    print(f"[kda-timing] rank={rank} dumped {len(totals)} phases", flush=True)
 
 
 def _kda_timing_maybe_register():
