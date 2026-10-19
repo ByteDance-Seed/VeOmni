@@ -17,6 +17,8 @@ import gc
 import hashlib
 import os
 import shutil
+import threading
+import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -66,6 +68,37 @@ _EXTRA_STATE_KEY = "extra_state"
 _EXTRA_STATE_DIRNAME = "extra_state"
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 _ZERO_OPTIMIZER_STATE_MARKER = "__veomni_zero_optimizer_state__"
+_EXTRA_PARALLEL_FIRST_MESHES = weakref.WeakKeyDictionary()
+_EXTRA_PARALLEL_FIRST_MESH_LOCK = threading.Lock()
+
+
+def _extra_parallel_first_mesh(mesh: DeviceMesh) -> DeviceMesh:
+    """Return a view with the ExtraParallel dim outside the FSDP dim.
+
+    The runtime mesh is ``(para_fsdp, para)`` (or
+    ``(para_replicate, para_fsdp, para)`` for HSDP). When both placements
+    shard the same tensor dim, PyTorch composes mesh dims outer-to-inner.
+    Keeping the runtime order would therefore describe FSDP-outer /
+    ExtraParallel-inner shards, while the optimizer stores the inverse layout.
+    Swapping only those two mesh dims preserves rank-local storage and makes
+    DTensor/DCP publish the real EP-outer / FSDP-inner global offsets.
+    """
+    with _EXTRA_PARALLEL_FIRST_MESH_LOCK:
+        cached = _EXTRA_PARALLEL_FIRST_MESHES.get(mesh)
+        if cached is not None:
+            return cached
+
+        names = mesh.mesh_dim_names
+        if names is None or len(names) != mesh.ndim or mesh.ndim not in (2, 3):
+            raise RuntimeError("ExtraParallel checkpoint mesh must have 2 or 3 named dimensions")
+        order = tuple(range(mesh.ndim - 2)) + (mesh.ndim - 1, mesh.ndim - 2)
+        reordered = DeviceMesh(
+            mesh.device_type,
+            mesh.mesh.permute(order),
+            mesh_dim_names=tuple(names[index] for index in order),
+        )
+        _EXTRA_PARALLEL_FIRST_MESHES[mesh] = reordered
+        return reordered
 
 
 def _mark_zero_optimizer_state_resume(optimizer) -> None:
@@ -387,7 +420,12 @@ def _apply_extra_parallel_dim(
         ep_shard_dim = spec_info.placement.dim
         fsdp_shard_dim = spec_info.fsdp_shard_dim
         if action == "drop":
-            tensor = drop_extra_parallel_dim(tensor, fsdp_submesh, fsdp_shard_dim)
+            tensor = drop_extra_parallel_dim(
+                tensor,
+                fsdp_submesh,
+                fsdp_shard_dim,
+                extra_parallel_name=spec_info.para_name,
+            )
         else:
             tensor = restore_extra_parallel_dim(
                 tensor,
@@ -616,18 +654,40 @@ def _from_local_preserve_device(local_tensor, device_mesh, placements, *, shape=
     )
 
 
-def _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim):
+def _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim, extra_parallel_name=None):
     """Global shape/stride of one ExtraParallel slice on the FSDP sub-mesh."""
     shape = list(loaded_tensor.shape)
     if ep_shard_dim == fsdp_shard_dim:
-        mesh_dim_names = loaded_tensor.device_mesh.mesh_dim_names
-        fsdp_size = loaded_tensor.device_mesh.size(len(mesh_dim_names) - 2)
-        ep_size = loaded_tensor.device_mesh.size(len(mesh_dim_names) - 1)
-        fsdp_rank, ep_rank = loaded_tensor.device_mesh.get_coordinate()[-2:]
+        mesh = loaded_tensor.device_mesh
+        mesh_dim_names = mesh.mesh_dim_names
+        if mesh_dim_names is None or len(mesh_dim_names) != mesh.ndim:
+            raise RuntimeError("ExtraParallel checkpoint mesh must have named dimensions")
+        last_two = mesh_dim_names[-2:]
+        if extra_parallel_name is not None and extra_parallel_name in last_two:
+            ep_dim = len(mesh_dim_names) - 2 if last_two[0] == extra_parallel_name else len(mesh_dim_names) - 1
+            fsdp_dim = len(mesh_dim_names) - 2 if ep_dim == len(mesh_dim_names) - 1 else len(mesh_dim_names) - 1
+        elif last_two[-1] == f"{last_two[0]}_fsdp":
+            ep_dim, fsdp_dim = len(mesh_dim_names) - 2, len(mesh_dim_names) - 1
+        elif last_two[0] == f"{last_two[-1]}_fsdp":
+            fsdp_dim, ep_dim = len(mesh_dim_names) - 2, len(mesh_dim_names) - 1
+        else:
+            raise RuntimeError(
+                f"Cannot determine ExtraParallel/FSDP mesh order from mesh dimensions {mesh_dim_names}."
+            )
+        ep_size = mesh.size(ep_dim)
+        fsdp_size = mesh.size(fsdp_dim)
+        coordinate = mesh.get_coordinate()
+        ep_rank, fsdp_rank = coordinate[ep_dim], coordinate[fsdp_dim]
         size, remainder = divmod(shape[ep_shard_dim], fsdp_size * ep_size)
         chunks = [size + 1] * remainder + [size] * (fsdp_size * ep_size - remainder)
-        shape[ep_shard_dim] = sum(chunks[ep_rank::ep_size])
-        if chunks[fsdp_rank * ep_size + ep_rank] != loaded_tensor.to_local().shape[ep_shard_dim]:
+        if ep_dim < fsdp_dim:
+            ep_local_indices = range(ep_rank * fsdp_size, (ep_rank + 1) * fsdp_size)
+            local_index = ep_rank * fsdp_size + fsdp_rank
+        else:
+            ep_local_indices = range(ep_rank, fsdp_size * ep_size, ep_size)
+            local_index = fsdp_rank * ep_size + ep_rank
+        shape[ep_shard_dim] = sum(chunks[index] for index in ep_local_indices)
+        if chunks[local_index] != loaded_tensor.to_local().shape[ep_shard_dim]:
             raise RuntimeError("Unsupported uneven ExtraParallel/FSDP shard layout")
     else:
         shape[ep_shard_dim] = loaded_tensor.to_local().shape[ep_shard_dim]
@@ -637,7 +697,13 @@ def _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim):
     return tuple(shape), tuple(stride)
 
 
-def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh, fsdp_shard_dim: int = 1):
+def drop_extra_parallel_dim(
+    loaded_tensor: torch.Tensor,
+    device_mesh: DeviceMesh,
+    fsdp_shard_dim: int = 1,
+    *,
+    extra_parallel_name: Optional[str] = None,
+):
     """
     Drop ExtraParallel dims after loading from DCP so that ExtraParallel-FSDP would not be confused.
 
@@ -662,7 +728,7 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
         if not isinstance(ep_placement, Shard):
             raise RuntimeError(f"ExtraParallel placement must be Shard, got {ep_placement}")
         ep_shard_dim = ep_placement.dim
-        shape, stride = _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim)
+        shape, stride = _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim, extra_parallel_name)
         tensor_to_put = _from_local_preserve_device(
             loaded_tensor._local_tensor,
             device_mesh=device_mesh,
@@ -675,7 +741,7 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
         if not isinstance(ep_placement, Shard):
             raise RuntimeError(f"ExtraParallel placement must be Shard, got {ep_placement}")
         ep_shard_dim = ep_placement.dim
-        shape, stride = _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim)
+        shape, stride = _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim, extra_parallel_name)
         tensor_to_put = _from_local_preserve_device(
             loaded_tensor._local_tensor,
             device_mesh=device_mesh,
@@ -726,13 +792,9 @@ def restore_extra_parallel_dim(
     Note:
         When ``ep_shard_dim == fsdp_shard_dim`` (e.g. the Muon zero-comm layout
         shards experts on dim 0 just like EP), both mesh dims split the SAME
-        tensor dim. The mesh order ``(ep_fsdp, ep)`` then composes ``ep_fsdp``
-        OUTER of ``ep``, whereas the physical layout is EP-outer / FSDP-inner,
-        so the reconstructed GLOBAL tensor is block-transposed along that dim.
-        Save->load into the SAME parallel config still round-trips correctly
-        (drop is the exact inverse); only resharding / external reads of such a
-        checkpoint see the permuted layout. Fixing this needs the EP mesh dims
-        reordered so ``ep`` precedes ``ep_fsdp`` (a parallel_state change).
+        tensor dim. The temporary checkpoint DTensor uses an EP-outer /
+        FSDP-inner mesh view so DCP metadata matches the optimizer's physical
+        local shards and global offsets instead of block-transposing the dim.
     """
     assert fsdp_mesh.ndim in (2, 3), f"global_mesh.ndim must be 2 or 3, got {fsdp_mesh.ndim}"
 
@@ -740,10 +802,18 @@ def restore_extra_parallel_dim(
         # ExtraParallel+FSDP2. mesh order is (ep_fsdp, ep) or, for HSDP,
         # (ep_replicate, ep_fsdp, ep): ep_fsdp -> Shard(fsdp_shard_dim),
         # ep -> Shard(ep_shard_dim), ep_replicate -> Replicate().
-        if fsdp_mesh.ndim == 3:
-            placements = [Replicate(), Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
+        if ep_shard_dim == fsdp_shard_dim:
+            checkpoint_mesh = _extra_parallel_first_mesh(fsdp_mesh)
+            if checkpoint_mesh.ndim == 3:
+                placements = [Replicate(), Shard(ep_shard_dim), Shard(fsdp_shard_dim)]
+            else:
+                placements = [Shard(ep_shard_dim), Shard(fsdp_shard_dim)]
         else:
-            placements = [Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
+            checkpoint_mesh = fsdp_mesh
+            if fsdp_mesh.ndim == 3:
+                placements = [Replicate(), Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
+            else:
+                placements = [Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
         if global_shape is None:
             shape = list(orgin_tensor.shape)
             if len(orgin_tensor.placements) < fsdp_mesh.ndim:
@@ -766,7 +836,7 @@ def restore_extra_parallel_dim(
             stride[index] = stride[index + 1] * shape[index + 1]
         dtensor = _from_local_preserve_device(
             orgin_tensor._local_tensor,
-            device_mesh=fsdp_mesh,
+            device_mesh=checkpoint_mesh,
             placements=placements,
             shape=shape,
             stride=tuple(stride),

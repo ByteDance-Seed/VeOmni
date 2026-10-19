@@ -392,6 +392,33 @@ def _restore_fsdp_only_extra_parallel_worker(rank, world, rendezvous):
         restored_full = restore_extra_parallel_dim(full_layout, mesh, fsdp_mesh, global_shape=full.shape)
         assert restored_full.shape == full.shape
         torch.testing.assert_close(restored_full.to_local(), local, rtol=0, atol=0)
+
+        # When EP and FSDP shard the same tensor dim, global checkpoint metadata
+        # must follow EP-outer / FSDP-inner physical storage. A same-config
+        # round-trip alone can miss a block-transposed global layout, so rebuild
+        # the complete tensor and compare its values.
+        same_dim_full = torch.arange(6, dtype=torch.float32)
+        same_dim_ep_local = torch.tensor_split(same_dim_full, 2, dim=0)[ep_rank]
+        same_dim_local = torch.tensor_split(same_dim_ep_local, 2, dim=0)[fsdp_rank].clone()
+        same_dim_fsdp_only = DTensor.from_local(
+            same_dim_local,
+            fsdp_mesh,
+            [Shard(0)],
+            run_check=False,
+            shape=same_dim_ep_local.shape,
+            stride=(1,),
+        )
+        same_dim_restored = restore_extra_parallel_dim(
+            same_dim_fsdp_only,
+            mesh,
+            fsdp_mesh,
+            ep_shard_dim=0,
+            fsdp_shard_dim=0,
+            global_shape=same_dim_full.shape,
+        )
+        assert same_dim_restored.device_mesh.mesh_dim_names == ("ep", "ep_fsdp")
+        torch.testing.assert_close(same_dim_restored.to_local(), same_dim_local, rtol=0, atol=0)
+        torch.testing.assert_close(same_dim_restored.full_tensor(), same_dim_full, rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
 
