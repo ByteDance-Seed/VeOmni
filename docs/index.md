@@ -68,9 +68,11 @@ examples/qwen3.md
 examples/qwen3_5.md
 examples/qwen3_moe.md
 examples/qwen3_vl.md
+examples/qwen_image_edit.md
 examples/qwen3_omni_moe.md
 examples/qwen3_omni_offline_av.md
 examples/minimax_h3.md
+examples/minimax_h3_smoke_test.md
 examples/wan2.1.md
 examples/wan2.1_I2V_1.3B.md
 examples/ltx-2.3.md
@@ -86,7 +88,9 @@ examples/seed_oss.md
 key_features/model_loader.md
 key_features/preprocessor_registry.md
 key_features/ep_fsdp2.md
+key_features/async_activate_offload.md
 key_features/extra_parallel.md
+key_features/sharded_embedding.md
 key_features/ulysses.md
 key_features/lora.md
 key_features/mtp.md
@@ -95,14 +99,29 @@ key_features/mtp.md
 
 ```{toctree}
 :maxdepth: 1
+:caption: SeedOmni
+
+seed_omni/design/architecture.md
+seed_omni/design/media.md
+seed_omni/usage/training_and_inference.md
+seed_omni/usage/data_format.md
+seed_omni/usage/adding_a_model.md
+seed_omni/usage/hf_layout.md
+seed_omni/distributed/per_module_parallelism.md
+seed_omni/distributed/sequence_parallel.md
+seed_omni/mixins/metric_meter.md
+seed_omni/mixins/offline_encoding.md
+```
+
+```{toctree}
+:maxdepth: 1
 :caption: Design
 
-design/kernel_selection.md
-design/fused_moe_kernels.md
+design/op_selection.md
+design/fused_moe_ops.md
 design/local_parallel_state.md
 design/patchgen.md
 design/qwen4_exp_ple_2d_parallelism.md
-design/unified_kernel_registry.md
 design/verl_topk_distill_integration.md
 design/deepseek_v4_context_parallel.md
 design/deepseek_v4_indexer_loss.md

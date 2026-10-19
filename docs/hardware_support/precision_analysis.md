@@ -89,7 +89,7 @@ if __name__ == "__main__":
     main()
 ```
 
-3. **Fixed Data Order**: Ensure DataLoader has `shuffle=False` and `num_workers=0` (or fix worker initialization seeds) to guarantee identical batch data reading on both NPU and GPU.
+3. **Fixed Data Order**: Ensure DataLoader has `shuffle=False` (`data.dataloader.shuffle: false` in VeOmni configs) and `num_workers=0` (or fix worker initialization seeds) to guarantee identical batch data reading on both NPU and GPU.
 
 4. **Fixed Random Noise**: For generative models, ensure Noise Tensors generated on NPU and GPU are identical (you can generate and save them on GPU first as .pt files, then load them directly on NPU).
 
