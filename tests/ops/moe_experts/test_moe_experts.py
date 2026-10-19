@@ -517,6 +517,8 @@ def _run_fused_three_way(
     hidden_e, routing_e, fc1_1_e, fc1_2_e, fc2_e = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
     out_s = fused(hidden_s, routing_s, selected, fc1_1_s, fc1_2_s, fc2_s, empty, **kwargs)
     out_m = fused(hidden_m, routing_m, selected, empty, empty, fc2_m, fc1_12_m, **kwargs)
+    if impl == "fused_triton":
+        assert len(out_m.grad_fn.saved_tensors) == 11
     out_e = standard_fused_reference(hidden_e, routing_e, selected, fc1_1_e, fc1_2_e, fc2_e, **kwargs)
     torch.testing.assert_close(out_s, out_m, rtol=0, atol=0)
 
@@ -614,6 +616,60 @@ def test_triton_split_and_merged_match_eager(swiglu_limit: float | None):
         data_scale=0.4,
         require_active_clamp=swiglu_limit is not None,
     )
+
+
+@pytest.mark.parametrize(
+    "device_type",
+    [
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+                reason="triton fused MoE needs a GPU + triton",
+            ),
+        ),
+        pytest.param(
+            "mlu",
+            marks=pytest.mark.skipif(
+                not IS_MLU_AVAILABLE or not is_fused_moe_available(),
+                reason="MLU Triton fused MoE needs torch_mlu + triton",
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("fc1_trainable,fc2_trainable", [(False, True), (True, False), (False, False)])
+def test_merged_fc1_backward_with_frozen_expert_weights(fc1_trainable: bool, fc2_trainable: bool, device_type: str):
+    """Skipping an expert wgrad must not change input or routing gradients."""
+    torch.manual_seed(7)
+    device = torch.device(device_type)
+    num_tokens, num_experts, hidden_dim, ffn_dim, topk = 32, 4, 64, 128, 2
+    hidden_states = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.bfloat16)
+    gate_weights = torch.rand(num_tokens, topk, device=device, dtype=torch.bfloat16)
+    expert_index = torch.randint(num_experts, (num_tokens, topk), device=device)
+    fc1_weight = 0.1 * torch.randn(num_experts, 2 * ffn_dim, hidden_dim, device=device, dtype=torch.bfloat16)
+    fc2_weight = 0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=torch.bfloat16)
+    empty = _empty(device, torch.bfloat16)
+    fused = resolve_op("moe_experts", "standard", "fused_triton").wrapper
+
+    def run(train_fc1: bool, train_fc2: bool):
+        """Execute the registered merged path with the selected trainable weights."""
+        routed = gate_weights.detach().clone().requires_grad_(True)
+        hidden = hidden_states.detach().clone().requires_grad_(True)
+        fc1 = fc1_weight.detach().clone().requires_grad_(train_fc1)
+        fc2 = fc2_weight.detach().clone().requires_grad_(train_fc2)
+        output = fused(hidden, routed, expert_index, empty, empty, fc2, fc1, num_experts=num_experts)
+        output.sum().backward()
+        return routed.grad, hidden.grad, fc1.grad, fc2.grad
+
+    reference = run(True, True)
+    candidate = run(fc1_trainable, fc2_trainable)
+    for actual, expected in zip(candidate[:2], reference[:2], strict=True):
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    for actual, expected, trainable in zip(candidate[2:], reference[2:], (fc1_trainable, fc2_trainable), strict=True):
+        if trainable:
+            torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+        else:
+            assert actual is None
 
 
 @pytest.mark.skipif(
