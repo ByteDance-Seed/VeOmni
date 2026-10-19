@@ -122,6 +122,8 @@ _BUILTIN_ENTRIES = (
     ("chunk_gated_delta_rule", "standard", "fla_npu", "npu", _NPU, ("fla_npu", "triton")),
     ("load_balancing_loss", "standard", "eager", "any", _ANY, ()),
     ("load_balancing_loss", "standard", "triton", "cuda", _GPU, ("triton",)),
+    ("chunk_kda", "kimi_k3", "eager", "any", _ANY, ()),
+    ("chunk_kda", "kimi_k3", "ascendc", "npu", _NPU, ()),
     ("cross_entropy_loss", "standard", "eager", "any", _ANY, ()),
     ("cross_entropy_loss", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("cross_entropy_loss", "standard", "chunk_loss", "any", _ANY, ()),
@@ -145,6 +147,8 @@ _BUILTIN_ENTRIES = (
     ("moe_experts", "standard", "fused_mlu", "mlu", _MLU, ("apex",)),
     ("moe_experts", "gpt_oss", "eager", "any", _ANY, ()),
     ("moe_experts", "gpt_oss", "fused_quack", "cuda", _GPU_NVIDIA_SM90, ("quack",)),
+    ("moe_experts", "kimi_k3", "eager", "any", _ANY, ()),
+    ("moe_experts", "kimi_k3", "fused_npu", "npu", _NPU, ()),
     ("moe_experts_lora", "shared", "eager", "any", _ANY, ()),
     ("moe_experts_lora", "shared", "fused_triton", "cuda", _GPU_SM70, ("triton",)),
     ("moe_experts_lora", "shared", "fused_npu", "npu", _NPU, ()),
@@ -173,6 +177,8 @@ _BUILTIN_ENTRIES = (
     ("rope", "partial", "torch_npu", "npu", _NPU, ()),
     ("rope", "interleave", "eager", "any", _ANY, ()),
     ("rope", "mrope", "eager", "any", _ANY, ()),
+    ("situ_and_mul", "kimi_k3", "eager", "any", _ANY, ()),
+    ("situ_and_mul", "kimi_k3", "triton", "npu", _NPU, ("triton",)),
     ("rope", "deepseek_v4", "eager", "any", _ANY, ()),
     ("rope", "deepseek_v4", "triton", "cuda", _GPU, ("triton",)),
     ("rope", "wan", "eager", "any", _ANY, ()),
@@ -218,9 +224,11 @@ def test_builtin_entry_catalog_is_exact():
 
 
 _BUILTIN_DEFAULT_ENTRIES = {
+    ("chunk_kda", "kimi_k3", "ascendc", "npu"),
     ("cross_entropy_loss", "standard", "liger_kernel", "cuda"),
     ("cross_entropy_loss", "standard", "chunk_loss", "npu"),
     ("load_balancing_loss", "standard", "triton", "cuda"),
+    ("moe_experts", "kimi_k3", "fused_npu", "npu"),
     ("moe_experts", "standard", "fused_triton", "cuda"),
     ("moe_experts", "standard", "fused_mlu", "mlu"),
     ("moe_experts", "standard", "fused_triton", "mlu"),
@@ -236,6 +244,7 @@ _BUILTIN_DEFAULT_ENTRIES = {
     ("rope", "full", "torch_npu", "npu"),
     ("rope", "partial", "liger_kernel", "cuda"),
     ("rope", "partial", "torch_npu", "npu"),
+    ("situ_and_mul", "kimi_k3", "triton", "npu"),
     ("swiglu_mlp", "standard", "liger_kernel", "cuda"),
     ("swiglu_mlp", "geglu", "liger_kernel", "cuda"),
 }

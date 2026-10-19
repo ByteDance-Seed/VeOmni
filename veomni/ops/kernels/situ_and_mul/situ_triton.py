@@ -235,8 +235,11 @@ def _launch_bwd(x, dout, beta, linear_beta):
 
 
 class _SituAndMulFunc(torch.autograd.Function):
+    """Autograd wrapper around the SituAndMul triton-ascend kernels."""
+
     @staticmethod
     def forward(ctx, x, beta, linear_beta):
+        """Launch the fused SituAndMul forward kernel."""
         y = _launch_fwd(x, beta, linear_beta)
         if x.requires_grad:
             ctx.save_for_backward(x)
@@ -246,6 +249,7 @@ class _SituAndMulFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout):
+        """Launch the fused SituAndMul backward kernel."""
         (x,) = ctx.saved_tensors
         dx = _launch_bwd(x, dout, ctx.beta, ctx.linear_beta)
         return dx, None, None

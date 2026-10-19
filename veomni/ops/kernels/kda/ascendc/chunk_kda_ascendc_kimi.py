@@ -6,6 +6,7 @@
 # the following copyright notice:
 # Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
 
+"""Chunked KDA AscendC kernel for Kimi K3 (fla-npu OPP + fused beta-sigmoid gating)."""
 
 import warnings
 
@@ -57,10 +58,12 @@ _fla_npu_compat_canonical_chunk_indices_none()
 
 
 def fused_beta_sigmoid_fwd(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """Forward of the fused beta sigmoid: ``scale * sigmoid(x)`` in fp32."""
     return (torch.sigmoid(x.float()) * scale).to(x.dtype)
 
 
 def fused_beta_sigmoid_bwd(x: torch.Tensor, dy: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """Backward of the fused beta sigmoid: ``scale * s * (1 - s) * dy``."""
     x = x.float()
     s = torch.sigmoid(x)
     return (dy.float() * scale * s * (1.0 - s)).to(x.dtype)
@@ -283,6 +286,8 @@ def _can_use_fused_kda_bwd(
 
 
 class ChunkKDAFunction(torch.autograd.Function):
+    """Autograd wrapper around the AscendC chunked-KDA forward/backward kernels."""
+
     @staticmethod
     @input_guard
     @autocast_custom_fwd
@@ -313,6 +318,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         transpose_state_layout: bool = False,
     ):
         # Apply l2norm
+        """Run the AscendC chunked-KDA forward, saving tensors for the backward."""
         q_rstd, k_rstd = None, None
         if use_qk_l2norm_in_kernel:
             q, q_rstd = l2norm_fwd(q)
@@ -510,6 +516,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         do: torch.Tensor,
         dht: torch.Tensor,
     ):
+        """Run the AscendC chunked-KDA backward to produce the input gradients."""
         (
             q,
             q_rstd,
@@ -699,6 +706,7 @@ def chunk_kda_ascendc(
     cu_seqlens_cpu: torch.LongTensor | None = None,
     **kwargs,
 ):
+    """Chunked-KDA entry point binding the fused beta-sigmoid gating to AscendC."""
     if "transpose_state_layout" in kwargs:
         if state_v_first:
             raise ValueError("Cannot pass both `state_v_first` and the deprecated `transpose_state_layout`.")

@@ -12,3 +12,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""AscendC chunked-KDA kernels for Kimi K3 (the ``chunk_kda`` op, ``kimi_k3`` variant)."""
+
