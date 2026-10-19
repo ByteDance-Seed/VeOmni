@@ -14,10 +14,13 @@ from transformers.modeling_outputs import ModelOutput
 
 import veomni.data.data_loader as loader_module
 import veomni.models.model_runtime as runtime_module
+import veomni.trainer.base as base_module
 import veomni.trainer.dit_trainer as dit_module
 from veomni.data.dataset import MappingDataset
+from veomni.trainer.base import BaseTrainer
 from veomni.trainer.dit_trainer import (
     DiTDataArguments,
+    DiTDataCollator,
     DiTModelArguments,
     DiTModelRuntime,
     DiTTrainer,
@@ -27,7 +30,7 @@ from veomni.trainer.dit_trainer import (
 )
 
 
-def _trainer(monkeypatch, task, micro_batch_size, dp_size=1, dp_rank=0):
+def _trainer(monkeypatch, task, micro_batch_size, dp_size=1, dp_rank=0, shuffle=True):
     monkeypatch.setenv("WORLD_SIZE", str(dp_size))
     state = SimpleNamespace(dp_size=dp_size, dp_rank=dp_rank, sp_size=1, sp_enabled=False)
     monkeypatch.setattr("veomni.distributed.parallel_state.get_parallel_state", lambda: state)
@@ -47,6 +50,7 @@ def _trainer(monkeypatch, task, micro_batch_size, dp_size=1, dp_rank=0):
     args.data.dataloader.num_workers = 0
     args.data.dataloader.prefetch_factor = None
     args.data.dataloader.pin_memory = False
+    args.data.dataloader.shuffle = shuffle
     args._train_steps = 1
     trainer = DiTTrainer.__new__(DiTTrainer)
     trainer.base = SimpleNamespace(args=args, _setup=Mock(return_value=torch.device("cpu")), LOG_SAMPLE=False)
@@ -76,6 +80,46 @@ def test_setup_and_loader_honor_fixed_microbatches(monkeypatch, task, micro_batc
     assert len(batches) == 4 // micro_batch_size
     assert all(len(batch["value"]) == micro_batch_size for batch in batches)
     assert all(isinstance(batch["value"], list) for batch in batches)
+
+
+@pytest.mark.parametrize("task", ["offline_training", "online_training", "offline_embedding"])
+@pytest.mark.parametrize("shuffle", [True, False])
+def test_dataloader_shuffle_reaches_sampler(monkeypatch, task, shuffle):
+    trainer = _trainer(monkeypatch, task, micro_batch_size=1, shuffle=shuffle)
+    expected = shuffle and task != "offline_embedding"
+    assert trainer.base.args.data.dataloader.shuffle is expected
+    _load(trainer, [{"value": torch.ones(1)} for _ in range(4)])
+    assert trainer.base.train_dataloader.sampler.shuffle is expected
+
+
+@pytest.mark.parametrize("task", ["offline_training", "online_training", "offline_embedding"])
+def test_offline_embedding_keeps_the_last_batch(monkeypatch, task):
+    trainer = _trainer(monkeypatch, task, micro_batch_size=1)
+    expected = task != "offline_embedding"
+    assert trainer.base.args.data.dataloader.drop_last is expected
+    assert not hasattr(trainer.base.args.data, "drop_last")
+    _load(trainer, [{"value": torch.ones(1)} for _ in range(4)])
+    assert trainer.base.train_dataloader.drop_last is expected
+
+
+@pytest.mark.parametrize("shuffle", [True, False])
+def test_dataloader_shuffle_reaches_base_trainer_builders(monkeypatch, shuffle):
+    trainer = _trainer(monkeypatch, "offline_training", micro_batch_size=1, shuffle=shuffle)
+    built = {}
+
+    def build_dataset(**kwargs):
+        built.update(kwargs)
+        return list(range(4))
+
+    monkeypatch.setattr(base_module, "build_dataset", build_dataset)
+    base = SimpleNamespace(args=trainer.base.args, data_transform=None)
+    BaseTrainer._build_dataset(base)
+    assert built["shuffle"] is shuffle
+
+    base.train_dataset = [({"value": torch.ones(1)},) for _ in range(4)]
+    base.collate_fn = DiTDataCollator()
+    BaseTrainer._build_dataloader(base)
+    assert base.train_dataloader.sampler.shuffle is shuffle
 
 
 class _Condition:
@@ -208,3 +252,10 @@ def test_embedding_tail_padding_saves_original_samples_exactly_once(monkeypatch,
         rows = Dataset.from_parquet(str(tmp_path / f"rank_{rank}_shard_0.parquet"))
         saved_ids.extend(int(pickle.loads(row["value"]).item()) - 1 for row in rows)
     assert sorted(saved_ids) == list(range(5))
+
+
+def test_collator_aligns_missing_keys_with_none():
+    single = DiTDataCollator()([{"a": 1, "b": 2}])
+    assert dict(single) == {"a": [1], "b": [2]}
+    mixed = DiTDataCollator()([{"a": 1, "x": "fl2va"}, {"a": 2, "y": "ref2va"}, {"a": 3}])
+    assert dict(mixed) == {"a": [1, 2, 3], "x": ["fl2va", None, None], "y": [None, "ref2va", None]}

@@ -1,4 +1,5 @@
 from enum import Enum
+from functools import partial
 
 import torch
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
@@ -6,7 +7,6 @@ from ltx_core.model.transformer.adaln import AdaLayerNormSingle, adaln_embedding
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.transformer import (
-    DEFAULT_TRANSFORMER_OPS,
     BasicAVTransformerBlock,
     TransformerConfig,
     TransformerOpsConfig,
@@ -44,7 +44,7 @@ class LTXModel(torch.nn.Module):
         num_layers: int = 48,
         cross_attention_dim: int = 4096,
         norm_eps: float = 1e-06,
-        ops: TransformerOpsConfig = DEFAULT_TRANSFORMER_OPS,
+        ops: TransformerOpsConfig | None = None,
         positional_embedding_theta: float = 10000.0,
         positional_embedding_max_pos: list[int] | None = None,
         timestep_scale_multiplier: int = 1000,
@@ -64,6 +64,8 @@ class LTXModel(torch.nn.Module):
         cross_attention_adaln: bool = False,
     ):
         super().__init__()
+        if ops is None:
+            ops = TransformerOpsConfig()
         self.gradient_checkpointing = False
         self.cross_attention_adaln = cross_attention_adaln
         self.use_middle_indices_grid = use_middle_indices_grid
@@ -321,6 +323,8 @@ class LTXModel(torch.nn.Module):
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
         perturbations: BatchedPerturbationConfig | None,
+        sp_video_length: int | None = None,
+        sp_audio_length: int | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         if perturbations is None:
             batch_size = (video or audio).x.shape[0]
@@ -346,13 +350,15 @@ class LTXModel(torch.nn.Module):
 
             if self.gradient_checkpointing and self.training:
                 video, audio = torch.utils.checkpoint.checkpoint(
-                    block,
+                    partial(block, sp_video_length=sp_video_length, sp_audio_length=sp_audio_length),
                     video,
                     audio,
                     use_reentrant=False,
                 )
             else:
-                video, audio = block(video=video, audio=audio)
+                video, audio = block(
+                    video=video, audio=audio, sp_video_length=sp_video_length, sp_audio_length=sp_audio_length
+                )
 
         return video, audio
 

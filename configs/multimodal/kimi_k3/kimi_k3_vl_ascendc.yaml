@@ -11,11 +11,11 @@ model:
   tokenizer_path: /path/to/kimi_k3_hf
   ops_implementation:
     attn_implementation: veomni_flash_attention_2_with_sp
-    rms_norm_implementation: npu
+    rms_norm_implementation: torch_npu
     cross_entropy_loss_implementation: chunk_loss
     moe_implementation: fused_npu
     chunk_kda_implementation: ascendc
-    situ_and_mul_implementation: npu
+    situ_and_mul_implementation: triton
   optimizer:
     lr: 1.0e-3
     lr_decay_style: cosine

@@ -127,7 +127,7 @@ The same recipe runs on GPU and NPU clusters: the ops registry resolves each ker
 | Model | Model size | Example config |
 | --- | --- | --- |
 | [DeepSeek2.5/3/R1](https://huggingface.co/deepseek-ai) | 236B/671B | [deepseek.yaml](configs/text/deepseek.yaml) |
-| [DeepSeek-V4](https://huggingface.co/deepseek-ai) | Checkpoint-dependent | [deepseek.yaml](configs/text/deepseek.yaml); DSA/mHC default to eager, with optional [SM90+ TileLang/TileKernels backends](docs/design/kernel_selection.md#deepseek-v4-dsa-and-mhc) |
+| [DeepSeek-V4](https://huggingface.co/deepseek-ai) | Checkpoint-dependent | [deepseek.yaml](configs/text/deepseek.yaml); DSA/mHC default to eager, with optional [SM90+ TileLang/TileKernels backends](docs/design/op_selection.md#deepseek-v4-dsa-and-mhc) |
 | [Llama3-3.3](https://huggingface.co/meta-llama) | 1B/3B/8B/70B | [llama3.yaml](configs/text/llama3.yaml) |
 | [Qwen2-3](https://huggingface.co/Qwen) | 0.5B-72B | [qwen2_5.yaml](configs/text/qwen2_5.yaml) |
 | [Qwen2-3 VL/QVQ](https://huggingface.co/Qwen) | 2B-72B | [qwen3_vl_dense.yaml](configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml) |
@@ -137,6 +137,7 @@ The same recipe runs on GPU and NPU clusters: the ops registry resolves each ker
 | [Qwen2-3 Omni](https://huggingface.co/Qwen) | 7B/30BA3B | [qwen25_omni.yaml](configs/multimodal/qwen25_omni/qwen25_omni.yaml) |
 | Kimi K3 (multimodal MoE) | Checkpoint-dependent | [kimi_k3_vl_ascendc.yaml](configs/multimodal/kimi_k3/kimi_k3_vl_ascendc.yaml); [training guide](docs/examples/kimi_k3.md) |
 | [Wan](https://huggingface.co/Wan-AI) | Wan2.1-I2V-14B-480P | [wan_sft.yaml](configs/dit/wan_sft.yaml) |
+| [MiniMax H3](docs/examples/minimax_h3.md) | Checkpoint-dependent | [FL2VA](configs/dit/minimax_h3_fl2va_offline.yaml); [Ref2VA](configs/dit/minimax_h3_ref2va_cfg_offline.yaml) |
 | [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) | Checkpoint-dependent | [ltx2_av_lora.yaml](configs/dit/ltx2_av_lora.yaml); [training guide](docs/examples/ltx-2.3.md) |
 
 To support a new model, see [Support New Models](https://veomni.readthedocs.io/en/latest/usage/support_new_models/guide_and_checklist.html).

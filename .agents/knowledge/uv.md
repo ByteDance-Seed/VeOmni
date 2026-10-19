@@ -109,11 +109,17 @@ forced into a specific 5.x patch.
 |---|---|---|
 | `flash-attn` (FA2) | cp311 wheel (v0.0.3) + cp312 wheel (v0.0.5), Luosuu cu130/torch2.11/sm80-100 | x86_64 only; omitted on aarch64 |
 | `flash-attn-3` (Hopper) | cp310-abi3 Luosuu wheel on x86_64; cp39-abi3 PyTorch cu130 wheel on aarch64 | abi3 covers supported Python versions; aarch64 requires glibc 2.34+ |
+| `kernels` | PyPI `0.16.0` | Optional `flash_attention_{2,3}_hub` runtimes load pinned version 1 of `kernels-community/flash-attn{2,3}`; local FA2/FA3 remain the defaults. Its Sigstore verification stack adds crypto/TUF dependencies and resolves Pydantic 2.13.x in the Linux GPU environment. |
 | `flash-mla` | cp311/cp312 Luosuu cu130/torch2.11/sm90a+sm100f wheels | architecture-specific x86_64/aarch64 wheels |
 | `flash-attn-4` (cute) | PyPI `4.0.0b16` | pure-Python wheel |
-| `flash-qla` | PyPI `0.1.2` | pure-Python wheel that publishes usable metadata (it declares only `apache-tvm-ffi`), so no source build and no `dependency-metadata` override |
+| `flash-qla` | PyPI `0.1.2` | pure-Python wheel with usable metadata; requires TileLang 0.1.9; full forward/backward support on SM90 and SM100 |
 | `tile-kernels` | PyPI `1.0.0` | DeepSeek V4 mHC forward/backward; requires TileLang 0.1.9 and SM90+ |
 | `magi-attention` + `create-block-mask-cuda`, `flash-attn-cute`, `magi-to-hstu-cuda` | git revs | optional `--extra magi`; SM90/SM100 source builds, omitted by the default GPU CI install |
+
+FlashQLA 0.1.2 supports full forward/backward execution on NVIDIA SM90 and
+SM100. Its SM120 path is forward-only, so VeOmni's full op registration is
+limited to the SM90-SM100 range. The GPU extra also installs
+`tile-kernels==1.0.0`, which requires `tilelang>=0.1.9`.
 
 `flash-qla` and `tile-kernels` must agree on one TileLang version, so
 `[tool.uv].override-dependencies` pins the shared GPU environment to
