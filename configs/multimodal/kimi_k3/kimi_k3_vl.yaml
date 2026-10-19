@@ -1,0 +1,49 @@
+model:
+  config_path: configs/model_configs/kimi_k3/kimi_k3.json
+  # Single-node reduction of the native layout (93 layers / 896 experts):
+  # depth 93 -> 10, experts 896 -> 16. Drop this block for the full layout.
+  model_config:
+    text_config:
+      num_hidden_layers: 10
+      num_experts: 16
+  model_path: null
+  # Kimi K3 tokenizer: HF-format dir or hub repo id
+  tokenizer_path: /path/to/kimi_k3_hf
+  ops_implementation:
+    # GPU stack: flash-attn SP wrapper, liger rms norm, chunked CE.
+    # The Kimi-specific fused kernels (chunk_kda AscendC, situ fused MoE,
+    # situ_and_mul) are NPU-only; on GPU they fall back to the pure-PyTorch
+    # eager paths, and SituGLU experts always run the eager expert loop
+    # (moe_implementation therefore has no effect for this model on GPU).
+    attn_implementation: veomni_flash_attention_2_with_sp
+    rms_norm_implementation: liger_kernel
+    cross_entropy_loss_implementation: chunk_loss
+    chunk_kda_implementation: eager
+    situ_and_mul_implementation: eager
+  optimizer:
+    lr: 1.0e-3
+    lr_decay_style: cosine
+  accelerator:
+    gradient_checkpointing:
+      enable_reentrant: false
+    init_device: meta
+    ulysses_size: 2
+    ep_size: 2
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+data:
+  train_path: configs/multimodal/data/k3_coco.yaml
+  data_type: conversation
+  max_seq_len: 1024
+  mm_configs: {}
+
+train:
+  num_train_epochs: 1
+  micro_batch_size: 1
+  global_batch_size: 8
+  max_steps: 30
+  checkpoint:
+    output_dir: kimi_k3_sft_gpu
+    manager: dcp
+    save_hf_weights: false
