@@ -325,7 +325,7 @@ This interface consumes model-provided masks and transports attention tensors.
 It does not define model-specific masking, data preprocessing, trainer
 scheduling, or FSDP policy.
 
-#### FLASH eligibility and broadcast layouts
+### FLASH eligibility and broadcast layouts
 
 Automatic FLASH selection retains Triton for unsupported sparse Q/V dimensions,
 BlockMasks without full-block tables, and trainable `position_bias`. The general sparse training path on SM90/SM100/SM110
