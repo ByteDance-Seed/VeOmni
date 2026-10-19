@@ -228,8 +228,8 @@ def qwen3_5_gated_deltanet_forward_patched(
     shared_prefix_plan=None,
 ):
     """Run GatedDeltaNet with precomputed varlen metadata on Ascend NPU."""
-    if shared_prefix_plan is not None and get_parallel_state().ulysses_enabled:
-        raise NotImplementedError("Shared-prefix training does not support Ulysses sequence parallelism yet.")
+    if shared_prefix_plan is not None and get_parallel_state().sp_enabled:
+        raise NotImplementedError("Shared-prefix training does not support sequence parallelism yet.")
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
     # Set up dimensions for reshapes later
@@ -369,6 +369,11 @@ def qwen3_5_gated_deltanet_forward_patched(
 
     if not use_precomputed_states:
         if shared_prefix_plan is not None:
+            if self.veomni_chunk_gated_delta_rule.impl == "eager":
+                raise RuntimeError(
+                    "Shared-prefix training requires a varlen-capable chunk_gated_delta_rule backend. "
+                    "On GPU, set the implementation to 'fla' or 'flash_qla'; on NPU, set it to 'fla' or 'triton'."
+                )
             if self.veomni_chunk_gated_delta_rule.impl == "fla_npu":
                 raise NotImplementedError(
                     "Shared-prefix training requires gradient propagation through recurrent state, "
@@ -554,10 +559,13 @@ def qwen3_5_text_model_forward_patched(
     # every shared prefix appears once; the final hidden states are expanded back below.
     shared_prefix_plan = kwargs.get("shared_prefix_plan", None)
     if shared_prefix_plan is not None:
-        if return_mtp_context or use_cache:
+        if get_parallel_state().sp_enabled:
+            raise NotImplementedError("Shared-prefix training does not support sequence parallelism yet.")
+        if return_mtp_context or use_cache or past_key_values is not None:
             raise NotImplementedError("Shared-prefix training supports neither MTP nor KV cache.")
         inputs_embeds = shared_prefix_plan.compact(inputs_embeds)
         position_ids = shared_prefix_plan.compact(position_ids, dim=-1)
+        attention_mask = None
         for key in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"):
             kwargs.pop(key, None)
 

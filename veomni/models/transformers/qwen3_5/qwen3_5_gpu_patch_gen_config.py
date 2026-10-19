@@ -315,8 +315,8 @@ def qwen3_5_gated_deltanet_forward_patched(
     # Modification: shared-prefix plan; the conv and the delta rule run on its compact row.
     shared_prefix_plan=None,
 ):
-    if shared_prefix_plan is not None and get_parallel_state().ulysses_enabled:
-        raise NotImplementedError("Shared-prefix training does not support Ulysses sequence parallelism yet.")
+    if shared_prefix_plan is not None and get_parallel_state().sp_enabled:
+        raise NotImplementedError("Shared-prefix training does not support sequence parallelism yet.")
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
     # Set up dimensions for reshapes later
@@ -566,10 +566,13 @@ def qwen3_5_text_model_forward_patched(
     # every shared prefix appears once; the final hidden states are expanded back below.
     shared_prefix_plan = kwargs.get("shared_prefix_plan", None)
     if shared_prefix_plan is not None:
-        if return_mtp_context or use_cache:
+        if get_parallel_state().sp_enabled:
+            raise NotImplementedError("Shared-prefix training does not support sequence parallelism yet.")
+        if return_mtp_context or use_cache or past_key_values is not None:
             raise NotImplementedError("Shared-prefix training supports neither MTP nor KV cache.")
         inputs_embeds = shared_prefix_plan.compact(inputs_embeds)
         position_ids = shared_prefix_plan.compact(position_ids, dim=-1)
+        attention_mask = None
         for key in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"):
             kwargs.pop(key, None)
 
@@ -1866,6 +1869,8 @@ def qwen3_5_forconditional_generation_forward_patched(
         and pixel_values is None
         and pixel_values_videos is None
     ):
+        if get_parallel_state().sp_enabled:
+            raise NotImplementedError("Shared-prefix training does not support sequence parallelism yet.")
         # The plan hands attention more keys than it has compact queries and relies on
         # cu_seq_lens_q / cu_seq_lens_k to describe that. Backends that build their own
         # mask instead — eager, sdpa, flex, magi — would silently mask against the
@@ -1919,12 +1924,19 @@ def qwen3_5_forconditional_generation_forward_patched(
     hidden_states = outputs[0]
     # Modification: under shared prefix the backbone returns the compact row. For per-token log-probs,
     # score each distinct (row, label) pair once and expand the results; otherwise expand the hidden states.
+    orig_shift_labels = kwargs.get("shift_labels")
+    if orig_shift_labels is None and labels is not None:
+        orig_shift_labels = F.pad(labels[..., 1:], (0, 1), value=IGNORE_INDEX)  # noqa: F821
+
     lm_inverse = None
     if shared_prefix_plan is not None:
-        if labels is not None and kwargs.get("return_log_probs") and kwargs.get("teacher_topk_ids") is None:
-            shift_labels = kwargs.pop("shift_labels", None)
-            if shift_labels is None:
-                shift_labels = F.pad(labels[..., 1:], (0, 1), value=IGNORE_INDEX)  # noqa: F821
+        if (
+            labels is not None
+            and kwargs.get("return_log_probs")
+            and kwargs.get("teacher_topk_ids") is None
+            and not (isinstance(logits_to_keep, int) and logits_to_keep > 0)
+        ):
+            shift_labels = kwargs.pop("shift_labels", orig_shift_labels)
             lm_rows, labels, lm_inverse = shared_prefix_plan.lm_rows(shift_labels)
             hidden_states = hidden_states.index_select(1, lm_rows)
             labels = labels[None]
@@ -1932,8 +1944,9 @@ def qwen3_5_forconditional_generation_forward_patched(
         else:
             hidden_states = shared_prefix_plan.expand(hidden_states)
     # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-    hidden_states = hidden_states[:, slice_indices, :]
+    if lm_inverse is None:
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        hidden_states = hidden_states[:, slice_indices, :]
 
     loss = None
     logits = None
@@ -1953,6 +1966,12 @@ def qwen3_5_forconditional_generation_forward_patched(
     if lm_inverse is not None:
         fused_linear_aux.log_probs = fused_linear_aux.log_probs.reshape(-1).index_select(0, lm_inverse)[None]
         fused_linear_aux.entropy = fused_linear_aux.entropy.reshape(-1).index_select(0, lm_inverse)[None]
+        if loss is not None and orig_shift_labels is not None:
+            valid_mask = orig_shift_labels != IGNORE_INDEX  # noqa: F821
+            if valid_mask.any():
+                loss = -fused_linear_aux.log_probs[valid_mask].sum() / valid_mask.sum().clamp_min(1)
+            else:
+                loss = fused_linear_aux.log_probs.new_tensor(0.0)
 
     loss_dict = None
     if requires_mtp_context:

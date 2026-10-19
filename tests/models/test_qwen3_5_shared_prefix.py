@@ -300,3 +300,99 @@ def test_forward_incompatible_attn_impl_raises_not_implemented():
             mock_self,
             input_ids=input_ids,
         )
+
+
+def test_forward_sp_enabled_raises_not_implemented(monkeypatch):
+    """Shared-prefix training with sequence parallelism enabled must raise NotImplementedError."""
+    from unittest.mock import MagicMock
+
+    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+        Qwen3_5ForConditionalGeneration,
+    )
+
+    monkeypatch.setattr(
+        "veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu.get_parallel_state",
+        lambda: MagicMock(sp_enabled=True),
+    )
+    mock_self = MagicMock()
+    mock_self.config.text_config.shared_prefix_training = True
+    mock_self.config.text_config._attn_implementation = "flash_attention_2"
+    input_ids = torch.tensor([[1, 2, 3]])
+
+    with pytest.raises(NotImplementedError, match="Shared-prefix training does not support sequence parallelism yet."):
+        Qwen3_5ForConditionalGeneration.forward(
+            mock_self,
+            input_ids=input_ids,
+            cu_seq_lens_q=torch.tensor([0, 3], dtype=torch.int32),
+        )
+
+
+def test_text_model_past_key_values_raises_not_implemented(monkeypatch):
+    """Shared-prefix training in TextModel must raise NotImplementedError if past_key_values is passed."""
+    from unittest.mock import MagicMock
+
+    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+        Qwen3_5TextModel,
+    )
+
+    monkeypatch.setattr(
+        "veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu.get_parallel_state",
+        lambda: MagicMock(sp_enabled=False),
+    )
+    mock_self = MagicMock()
+    mock_self.config.vision_feature_select_strategy = "default"
+    mock_self.config.use_cache = False
+    mock_self.gradient_checkpointing = False
+    mock_self.embed_tokens = MagicMock(return_value=torch.randn(1, 4, 16))
+    mock_plan = MagicMock()
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+
+    with pytest.raises(NotImplementedError, match="Shared-prefix training supports neither MTP nor KV cache."):
+        Qwen3_5TextModel.forward(
+            mock_self,
+            input_ids=input_ids,
+            past_key_values=MagicMock(),
+            shared_prefix_plan=mock_plan,
+        )
+
+
+def test_npu_gated_delta_rule_eager_raises_runtime_error():
+    """NPU GatedDeltaNet with eager implementation must raise RuntimeError under shared-prefix training."""
+    from unittest.mock import MagicMock
+
+    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_npu import (
+        Qwen3_5GatedDeltaNet,
+    )
+
+    mock_self = MagicMock()
+    mock_self.layer_idx = 0
+    mock_self.head_v_dim = 16
+    mock_self.head_k_dim = 16
+    mock_self.num_k_heads = 2
+    mock_self.num_v_heads = 2
+    mock_self.key_dim = 32
+    mock_self.value_dim = 32
+    mock_self.activation = "silu"
+    mock_self.conv_kernel_size = 4
+    mock_self.conv1d.weight = torch.randn(32 * 2 + 32, 1, 4)
+    mock_self.conv1d.bias = torch.zeros(32 * 2 + 32)
+    mock_self.in_proj_qkv = lambda x: torch.randn(1, 4, 32 * 2 + 32)
+    mock_self.in_proj_z = lambda x: torch.randn(1, 4, 32)
+    mock_self.in_proj_b = lambda x: torch.randn(1, 4, 2)
+    mock_self.in_proj_a = lambda x: torch.randn(1, 4, 2)
+    mock_self.A_log = torch.zeros(2)
+    mock_self.dt_bias = torch.zeros(2)
+    mock_self.veomni_causal_conv1d = MagicMock()
+    mock_self.veomni_chunk_gated_delta_rule = MagicMock()
+    mock_self.veomni_chunk_gated_delta_rule.impl = "eager"
+
+    mock_plan = MagicMock()
+    mock_plan.causal_conv1d = MagicMock(return_value=torch.randn(1, 4, 32 * 2 + 32))
+    hidden_states = torch.randn(1, 4, 64)
+
+    with pytest.raises(RuntimeError, match="Shared-prefix training requires a varlen-capable chunk_gated_delta_rule"):
+        Qwen3_5GatedDeltaNet.forward(
+            mock_self,
+            hidden_states=hidden_states,
+            shared_prefix_plan=mock_plan,
+        )
