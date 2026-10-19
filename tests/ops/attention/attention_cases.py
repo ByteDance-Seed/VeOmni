@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
+from veomni.ops.kernels.attention.mask.flex import _flex_block_size
 from veomni.ops.mask import MagiAttentionMask
 
 
@@ -108,7 +109,7 @@ def flex_2d_mask(sequence_length: int, device: torch.device | str) -> BlockMask:
         Q_LEN=sequence_length,
         KV_LEN=sequence_length,
         device=device,
-        BLOCK_SIZE=128,
+        BLOCK_SIZE=_flex_block_size(device),
     )
 
 
@@ -148,7 +149,7 @@ def flex_mask(mask_case: str, sequence_length: int, device: torch.device | str) 
             Q_LEN=sequence_length,
             KV_LEN=sequence_length,
             device=device,
-            BLOCK_SIZE=128,
+            BLOCK_SIZE=_flex_block_size(device),
         )
     if mask_case == "2d_mask":
         return flex_2d_mask(sequence_length, device)

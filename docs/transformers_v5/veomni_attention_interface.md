@@ -134,7 +134,8 @@ PyTorch's FLASH backend (CuteDSL wrapping FA4) on SM90 and newer when FA4 is
 installed. SM80 stays on Triton; unsupported FA4 dtypes and head dimensions
 also fall back to Triton. The registered mask builder uses 128×128 blocks
 through SM90 and 256×128 on SM100+, as required by the SM100 FA4 backend.
-Callers supplying their own `BlockMask` must use the matching tile size.
+Caller-provided `BlockMask` tiles must match these sizes for automatic FLASH
+selection; mismatched tiles stay on Triton without changing the mask.
 An explicit `kernel_options["BACKEND"]` wins. FLASH does not request LSE
 because that backend's backward rejects dLSE. Attention sinks (`s_aux`) need
 LSE renormalization, so they stay on Triton unless FLASH was forced, which

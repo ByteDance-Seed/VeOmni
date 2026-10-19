@@ -38,6 +38,7 @@ from tests.ops.tol import (
     ATTN_LSE_RTOL,
     ATTN_RTOL,
 )
+from veomni.ops.kernels.attention.mask import flex as flex_mask_backend
 from veomni.ops.kernels.attention.mask.flex import _flex_block_size
 from veomni.ops.kernels.attention.standard import flex as flex_backend
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
@@ -138,7 +139,9 @@ def cleanup_compiled_cuda_state():
     torch.cuda.empty_cache()
 
 
-def _causal_block_mask(sequence_length: int, device: torch.device, block_size: int | tuple[int, int] = 128):
+def _causal_block_mask(
+    sequence_length: int, device: torch.device | str, block_size: int | tuple[int, int] | None = None
+):
     return create_block_mask(
         lambda batch_idx, head_idx, query_idx, key_idx: query_idx >= key_idx,
         B=None,
@@ -146,7 +149,7 @@ def _causal_block_mask(sequence_length: int, device: torch.device, block_size: i
         Q_LEN=sequence_length,
         KV_LEN=sequence_length,
         device=device,
-        BLOCK_SIZE=block_size,
+        BLOCK_SIZE=_flex_block_size(device) if block_size is None else block_size,
     )
 
 
@@ -938,6 +941,45 @@ def test_flex_fa4_sparse_shape_eligibility(monkeypatch, capability, q_dim, v_dim
     monkeypatch.setattr(flex_backend._fa4, "_flash_attn_cute_available", lambda: True)
     selected = flex_backend.resolve_flex_attention(torch.device("cuda"), {}, head_dim=q_dim, value_head_dim=v_dim)
     assert (selected is flex_backend._flex_attention_fa4) is expected_flash
+
+
+@pytest.mark.parametrize(
+    ("capability", "block_size", "expected_flash"),
+    [
+        (90, 128, True),
+        (90, (128, 128), True),
+        (90, (256, 128), False),
+        (100, 128, False),
+        (100, (128, 128), False),
+        (100, (256, 128), True),
+        (100, (256, 64), False),
+        (110, (128, 128), False),
+        (110, (256, 128), True),
+    ],
+)
+@pytest.mark.parametrize("backend", [None, "FLASH", "TRITON"])
+def test_flex_fa4_block_size_eligibility(monkeypatch, capability, block_size, expected_flash, backend):
+    """Automatic routing checks tiles; explicit backend choice retains native validation."""
+    monkeypatch.setattr(flex_backend, "get_gpu_compute_capability", lambda device: capability)
+    monkeypatch.setattr(flex_mask_backend, "get_gpu_compute_capability", lambda device: capability)
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(flex_backend._fa4, "_flash_attn_cute_available", lambda: True)
+    mask = _causal_block_mask(389, "cpu", block_size=block_size)
+    # Exercise scalar and tuple representations independently of PyTorch normalization.
+    mask.BLOCK_SIZE = block_size
+    kernel_options = {} if backend is None else {"BACKEND": backend}
+    selected = flex_backend.resolve_flex_attention(
+        torch.device("cuda"),
+        kernel_options,
+        query_dtype=torch.bfloat16,
+        head_dim=128,
+        value_head_dim=128,
+        attention_mask=mask,
+    )
+    expected_flash = backend == "FLASH" if backend is not None else expected_flash
+    expected = flex_backend.FLEX_BACKEND_FLASH if expected_flash else flex_backend.FLEX_BACKEND_TRITON
+    assert (selected is flex_backend._flex_attention_fa4) is expected_flash
+    assert kernel_options["BACKEND"] == expected
 
 
 def test_flex_fa4_incomplete_block_tables_retain_triton(monkeypatch):

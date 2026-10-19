@@ -31,7 +31,7 @@ from transformers.masking_utils import (
     sliding_window_overlay,
 )
 
-from .....utils.device import get_gpu_compute_capability
+from .....utils.device import get_gpu_compute_capability, is_nvidia_cuda_device
 from ..ulysses import should_apply_ulysses, ulysses_mask_lengths
 from .packed import packed_mask_function
 
@@ -42,7 +42,7 @@ _DEFAULT_BLOCK_SIZE = 128
 
 def _flex_block_size(device: torch.device | str | int | None) -> int | tuple[int, int]:
     """Use FA4's SM100 Q tile, and retain the default size elsewhere."""
-    if device is not None and torch.device(device).type == "cuda" and torch.version.hip is None:
+    if is_nvidia_cuda_device(device):
         if get_gpu_compute_capability(device) >= 100:
             return _SM100_BLOCK_SIZE
     return _DEFAULT_BLOCK_SIZE

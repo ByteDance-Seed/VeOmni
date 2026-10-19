@@ -22,7 +22,8 @@ from torch.nn.attention.flex_attention import BlockMask
 from transformers.integrations.flex_attention import flex_attention_forward as _flex_attention_triton
 
 from ......distributed.parallel_state import get_parallel_state
-from ......utils.device import get_gpu_compute_capability
+from ......utils.device import get_gpu_compute_capability, is_nvidia_cuda_device
+from ...mask.flex import _flex_block_size
 from ...ulysses import (
     prepare_ulysses_qkv,
     restore_ulysses_output,
@@ -37,6 +38,11 @@ from ._inputs import _maybe_recast_qkv_for_fa4, _normalize_flex_qkv
 FLEX_BACKEND_FLASH = "FLASH"
 FLEX_BACKEND_TRITON = "TRITON"
 _HOPPER_MIN_CC = 90
+
+
+def _normalized_block_size(block_size: int | tuple[int, int]) -> tuple[int, int]:
+    """Normalize scalar and rectangular BlockMask tile sizes for backend selection."""
+    return (block_size, block_size) if isinstance(block_size, int) else block_size
 
 
 def resolve_flex_attention(
@@ -58,8 +64,9 @@ def resolve_flex_attention(
     Attention sinks need LSE renormalization, and FLASH backward rejects dLSE,
     so sinks fall back to Triton unless FLASH was forced. FA4 also rejects
     fp32, so a remaining fp32 query stays on Triton unless FLASH was forced.
-    Unsupported sparse head dimensions, incomplete BlockMask tables, and
-    trainable position bias also retain the Triton path.
+    Unsupported sparse head dimensions, incomplete BlockMask tables,
+    architecture-mismatched mask tiles, and trainable position bias also
+    retain the Triton path.
     """
     backend = kernel_options.get("BACKEND")
     if backend is not None and str(backend).upper() == FLEX_BACKEND_FLASH and trainable_position_bias:
@@ -72,7 +79,7 @@ def resolve_flex_attention(
                 "(s_aux). FLASH backward rejects dLSE, and sinks need LSE "
                 "renormalization. Omit BACKEND to fall back to Triton, or drop s_aux."
             )
-    elif attention_sinks or trainable_position_bias or device.type != "cuda":
+    elif attention_sinks or trainable_position_bias or not is_nvidia_cuda_device(device):
         backend = FLEX_BACKEND_TRITON
     elif query_dtype is not None and not _fa4._dtype_supports_flex_fa4(query_dtype):
         backend = FLEX_BACKEND_TRITON
@@ -81,6 +88,10 @@ def resolve_flex_attention(
     elif attention_mask is not None and any(
         getattr(attention_mask, name) is None
         for name in ("full_kv_num_blocks", "full_kv_indices", "full_q_num_blocks", "full_q_indices")
+    ):
+        backend = FLEX_BACKEND_TRITON
+    elif attention_mask is not None and _normalized_block_size(attention_mask.BLOCK_SIZE) != _normalized_block_size(
+        _flex_block_size(device)
     ):
         backend = FLEX_BACKEND_TRITON
     elif not _fa4._sparse_head_dims_support_flex_fa4(get_gpu_compute_capability(device), head_dim, value_head_dim):

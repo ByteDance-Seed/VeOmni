@@ -185,8 +185,8 @@ def test_fa4_tail_bounds_preserve_asymmetric_forward_and_gradients(
 
     from veomni.ops.kernels.attention.standard import flex
 
-    if flex.get_gpu_compute_capability(torch.device("cuda")) < 90 or not flex._fa4._flash_attn_cute_available():
-        pytest.skip("requires H20-compatible FA4 backend")
+    if flex.get_gpu_compute_capability(torch.device("cuda")) != 90 or not flex._fa4._flash_attn_cute_available():
+        pytest.skip("requires NVIDIA SM90 and FA4 for the SM90 compatibility tests")
     q_groups = torch.arange(q_length, device="cuda", dtype=torch.int32) % 5
     k_groups = torch.arange(k_length, device="cuda", dtype=torch.int32) % 5
 
