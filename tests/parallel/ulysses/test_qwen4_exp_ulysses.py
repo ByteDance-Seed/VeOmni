@@ -45,8 +45,8 @@ except ImportError:
     pytest.skip("Qwen4-Exp Ulysses tests require FLA and FlashAttention kernels", allow_module_level=True)
 
 
-def _install_qwen4_exp_ops_config() -> None:
-    """Install FLA GatedDeltaNet selections; every other op stays eager."""
+def _install_qwen4_exp_ops_config(qsa_attention_implementation: str = "eager") -> None:
+    """Install FLA GatedDeltaNet selections; every other op stays eager unless specified."""
     from veomni.ops.config import set_ops_config
 
     set_ops_config(
@@ -54,6 +54,7 @@ def _install_qwen4_exp_ops_config() -> None:
             rms_norm_gated_implementation="fla",
             causal_conv1d_implementation="fla",
             chunk_gated_delta_rule_implementation="fla",
+            qsa_attention_implementation=qsa_attention_implementation,
         )
     )
 
@@ -276,6 +277,8 @@ def test_qwen4_exp_packed_ple_hidden_halos_match_full_sequence():
 def _run_qsa_equivalence(
     num_attention_heads: int = 2,
     num_key_value_heads: int = 1,
+    parallel_mode: str = "ulysses",
+    qsa_implementation: str = "eager",
 ) -> None:
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
@@ -287,37 +290,44 @@ def _run_qsa_equivalence(
     try:
         sp_state = _init_parallel_state(
             dp_size=1,
-            ulysses_size=world_size,
+            cp_size=world_size if parallel_mode == "cp" else 1,
+            ulysses_size=world_size if parallel_mode == "ulysses" else 1,
             device_type=get_device_type(),
             name="sp",
         )
         dp_state = _init_parallel_state(
             dp_size=world_size,
+            cp_size=1,
             ulysses_size=1,
             device_type=get_device_type(),
             name="dp",
         )
+        _install_qwen4_exp_ops_config(qsa_attention_implementation=qsa_implementation)
         device = torch.device(get_device_type(), rank)
+        dtype = torch.bfloat16 if qsa_implementation == "tilelang" else torch.float32
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
         config.num_attention_heads = num_attention_heads
         config.num_key_value_heads = num_key_value_heads
+        if qsa_implementation == "tilelang":
+            config.head_dim = 64
+            config.indexer_head_dim = 32
         torch.manual_seed(31)
-        attention = qwen4_exp.Qwen4ExpTextAttention(config, layer_idx=1).float().to(device)
+        attention = qwen4_exp.Qwen4ExpTextAttention(config, layer_idx=1).to(device=device, dtype=dtype)
         _broadcast_module(attention)
 
         local_seq_len = 4
         seq_len = local_seq_len * world_size
         if rank == 0:
-            full_hidden = torch.randn(1, seq_len, config.hidden_size, device=device)
+            full_hidden = torch.randn(1, seq_len, config.hidden_size, device=device, dtype=dtype)
         else:
-            full_hidden = torch.empty(1, seq_len, config.hidden_size, device=device)
+            full_hidden = torch.empty(1, seq_len, config.hidden_size, device=device, dtype=dtype)
         dist.broadcast(full_hidden, src=0)
         rotary_dim = int(config.head_dim * config.partial_rotary_factor)
         rotary_angles = torch.arange(seq_len, device=device).view(1, seq_len, 1) * 0.17
         rotary_angles = rotary_angles + torch.arange(rotary_dim, device=device).view(1, 1, rotary_dim) * 0.03
         position_embeddings = (
-            rotary_angles.cos(),
-            rotary_angles.sin(),
+            rotary_angles.cos().to(dtype=dtype),
+            rotary_angles.sin().to(dtype=dtype),
         )
         packed_boundary = local_seq_len - 1
         cu_seq_lens_q = torch.tensor([0, packed_boundary, seq_len], dtype=torch.int32, device=device)
@@ -354,8 +364,13 @@ def _run_qsa_equivalence(
                 None,
                 cu_seq_lens_q=cu_seq_lens_q,
             )
+            assert selected_indices.shape[:2] == (1, local_seq_len)
             valid_indices = selected_indices >= 0
-            query_positions = torch.arange(seq_len, device=device).view(1, seq_len, 1)
+            query_positions = torch.arange(
+                rank * local_seq_len,
+                (rank + 1) * local_seq_len,
+                device=device,
+            ).view(1, local_seq_len, 1)
             assert torch.all(
                 selected_indices[valid_indices] <= query_positions.expand_as(selected_indices)[valid_indices]
             )
@@ -377,9 +392,11 @@ def _run_qsa_equivalence(
 
         actual_output = _gather_sequence(actual_output.detach())
         actual_input_grad = _gather_sequence(local_hidden.grad.detach())
+        rtol = 1e-2 if dtype == torch.bfloat16 else 2e-5
+        atol = 1e-2 if dtype == torch.bfloat16 else 2e-5
         if rank == 0:
-            torch.testing.assert_close(actual_output, expected_output, rtol=1e-5, atol=1e-5)
-            torch.testing.assert_close(actual_input_grad, expected_input_grad, rtol=2e-5, atol=2e-5)
+            torch.testing.assert_close(actual_output, expected_output, rtol=rtol, atol=atol)
+            torch.testing.assert_close(actual_input_grad, expected_input_grad, rtol=rtol, atol=atol)
             for name, parameter in attention.named_parameters():
                 expected_grad = expected_parameter_grads[name]
                 if expected_grad is None:
@@ -388,11 +405,12 @@ def _run_qsa_equivalence(
                     torch.testing.assert_close(
                         parameter.grad,
                         expected_grad,
-                        rtol=2e-5,
-                        atol=2e-5,
+                        rtol=rtol,
+                        atol=atol,
                         msg=lambda msg, parameter_name=name: f"{msg}\nGradient mismatch for {parameter_name}",
                     )
     finally:
+        _install_qwen4_exp_ops_config()
         clear_parallel_state()
 
 
@@ -406,6 +424,15 @@ def test_qwen4_exp_compact_qsa_mqa_matches_full_sequence_sp4():
 
 def test_qwen4_exp_compact_qsa_gqa_matches_full_sequence():
     torchrun(_run_qsa_equivalence, 2, 4, 2)
+
+
+def test_qwen4_exp_compact_qsa_cp_nondivisible_heads_matches_full_sequence():
+    torchrun(_run_qsa_equivalence, 2, 3, 1, "cp", "eager")
+
+
+def test_qwen4_exp_compact_qsa_cp_tilelang_matches_full_sequence():
+    pytest.importorskip("tilelang")
+    torchrun(_run_qsa_equivalence, 2, 4, 1, "cp", "tilelang")
 
 
 @pytest.mark.parametrize("bsz", [1, 4])
@@ -889,7 +916,7 @@ def test_qwen4_exp_router_aux_loss_matches_mean_of_local_shards():
     torchrun(_run_router_aux_loss_equivalence, world_size=2)
 
 
-def _run_vlm_placeholder_equivalence() -> None:
+def _run_vlm_placeholder_equivalence(parallel_mode: str = "ulysses") -> None:
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
@@ -899,7 +926,8 @@ def _run_vlm_placeholder_equivalence() -> None:
     try:
         sp_state = _init_parallel_state(
             dp_size=1,
-            ulysses_size=world_size,
+            cp_size=world_size if parallel_mode == "cp" else 1,
+            ulysses_size=world_size if parallel_mode == "ulysses" else 1,
             device_type=get_device_type(),
             extra_parallel_names=("ple",),
             extra_parallel_sizes=(1,),
@@ -908,6 +936,7 @@ def _run_vlm_placeholder_equivalence() -> None:
         )
         dp_state = _init_parallel_state(
             dp_size=world_size,
+            cp_size=1,
             ulysses_size=1,
             device_type=get_device_type(),
             extra_parallel_names=("ple",),
@@ -1027,3 +1056,141 @@ def _run_vlm_placeholder_equivalence() -> None:
 
 def test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence():
     torchrun(_run_vlm_placeholder_equivalence, world_size=2)
+
+
+def test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence_cp():
+    torchrun(_run_vlm_placeholder_equivalence, 2, "cp")
+
+
+@pytest.mark.parametrize(
+    ("attn_impl", "expected_seq_len"),
+    [
+        ("eager", 4),
+        ("veomni_sdpa", 4),
+        ("veomni_flash_attention_2", 8),
+    ],
+)
+def test_qwen4_exp_vision_dummy_forward_uses_local_cu_seqlens_for_non_fa_under_sp(
+    attn_impl: str, expected_seq_len: int
+) -> None:
+    qwen4_exp = importlib.import_module(_PATCHED_MODULE)
+    config = AutoConfig.from_pretrained(_TOY_CONFIG).vision_config
+    config._attn_implementation = attn_impl
+    _install_qwen4_exp_ops_config()
+    vision = qwen4_exp.Qwen4ExpVisionModel(config)
+    sp_state = SimpleNamespace(sp_enabled=True, sp_size=2)
+    captured = {}
+
+    def fake_forward(hidden_states, grid_thw, vit_metadata=None, **kwargs):
+        captured["hidden_shape"] = tuple(hidden_states.shape)
+        captured["grid_thw"] = grid_thw.tolist()
+        captured["vit_metadata"] = vit_metadata
+        return "dummy-out"
+
+    with (
+        patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=sp_state),
+        patch.object(qwen4_exp.Qwen4ExpVisionModel, "forward", side_effect=fake_forward),
+    ):
+        assert vision.dummy_forward() == "dummy-out"
+
+    assert captured["hidden_shape"][0] == 4
+    assert captured["grid_thw"] == [[1, 4, 2]]
+    assert captured["vit_metadata"]["cu_seqlens"].tolist() == [0, expected_seq_len]
+    assert captured["vit_metadata"]["max_seqlen"] == expected_seq_len
+
+
+@pytest.mark.parametrize(
+    "bad_mask",
+    [
+        torch.ones(1, 8, dtype=torch.bool),
+        torch.ones(1, 1, 6, 8, dtype=torch.bool),
+    ],
+)
+def test_qwen4_exp_text_attention_rejects_invalid_sp_attention_mask_before_collective(
+    bad_mask: torch.Tensor,
+) -> None:
+    qwen4_exp = importlib.import_module(_PATCHED_MODULE)
+    config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
+    config._attn_implementation = "eager"
+    _install_qwen4_exp_ops_config()
+    attn = qwen4_exp.Qwen4ExpTextAttention(config, layer_idx=1).float()
+    hidden_states = torch.randn(1, 4, config.hidden_size)
+    cos = torch.ones(1, 4, attn.head_dim)
+    sin = torch.zeros(1, 4, attn.head_dim)
+    cp_state = SimpleNamespace(
+        cp_enabled=True,
+        cp_group=object(),
+        cp_rank=0,
+        cp_size=2,
+        ulysses_enabled=False,
+    )
+
+    with (
+        patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=cp_state),
+        patch.object(attn.indexer, "forward", return_value=torch.zeros(1, 4, 2, dtype=torch.long)),
+        patch(f"{_PATCHED_MODULE}.all_gather_kv", side_effect=AssertionError("all_gather_kv must not run")),
+        pytest.raises(ValueError, match="Qwen4-Exp sequence parallelism expects a 3D/4D attention_mask"),
+    ):
+        attn(hidden_states, (cos, sin), attention_mask=bad_mask)
+
+
+def test_qwen4_exp_vision_attention_projects_cp_state_to_ulysses_parallel_state() -> None:
+    from veomni.distributed.parallel_state import ParallelState, get_parallel_state, use_parallel_state
+
+    qwen4_exp = importlib.import_module(_PATCHED_MODULE)
+    config = AutoConfig.from_pretrained(_TOY_CONFIG).vision_config
+    config._attn_implementation = "veomni_flash_attention_2"
+    _install_qwen4_exp_ops_config()
+    attn = qwen4_exp.Qwen4ExpVisionAttention(config).float()
+    hidden_states = torch.randn(4, config.hidden_size)
+    head_dim = config.hidden_size // config.num_heads
+    cos = torch.ones(4, head_dim)
+    sin = torch.zeros(4, head_dim)
+    cu_seqlens = torch.tensor([0, 8], dtype=torch.int32)
+    sp_group = object()
+    fake_mesh = SimpleNamespace(
+        mesh_dim_names=("dp_shard", "cp"),
+        get_group=lambda dim_name: sp_group if dim_name in ("cp", "sp") else None,
+        get_local_rank=lambda dim_name: 1 if dim_name in ("cp", "sp") else 0,
+    )
+    captured = {}
+
+    def fake_veomni_attn(_module, query_states, *_args, **_kwargs):
+        active_state = get_parallel_state()
+        captured["is_parallel_state"] = isinstance(active_state, ParallelState)
+        captured["ulysses_enabled"] = active_state.ulysses_enabled
+        captured["ulysses_group"] = active_state.ulysses_group
+        captured["ulysses_rank"] = active_state.ulysses_rank
+        captured["ulysses_size"] = active_state.ulysses_size
+        captured["cp_enabled"] = active_state.cp_enabled
+        captured["cp_group"] = active_state.cp_group
+        captured["cp_rank"] = active_state.cp_rank
+        captured["cp_size"] = active_state.cp_size
+        captured["fsdp_enabled"] = active_state.fsdp_enabled
+        return query_states, None
+
+    attn.veomni_attn = fake_veomni_attn
+    with patch.object(ParallelState, "world_size", 2):
+        cp_state = ParallelState(dp_size=1, cp_size=2, ulysses_size=1, device_mesh=fake_mesh)
+        with use_parallel_state(cp_state):
+            output = attn(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=(cos, sin),
+                vision_max_seqlen=8,
+            )
+            assert get_parallel_state() is cp_state
+
+    assert output.shape == hidden_states.shape
+    assert captured == {
+        "is_parallel_state": True,
+        "ulysses_enabled": True,
+        "ulysses_group": sp_group,
+        "ulysses_rank": 1,
+        "ulysses_size": 2,
+        "cp_enabled": False,
+        "cp_group": None,
+        "cp_rank": -1,
+        "cp_size": 1,
+        "fsdp_enabled": True,
+    }

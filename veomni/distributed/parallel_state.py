@@ -433,14 +433,16 @@ class ParallelState:
     @property
     def ulysses_group(self) -> Optional["ProcessGroup"]:
         if self.device_mesh is not None and self.ulysses_enabled:
-            return self.device_mesh.get_group("ulysses")
+            dim_name = "ulysses" if "ulysses" in self.device_mesh.mesh_dim_names else "sp"
+            return self.device_mesh.get_group(dim_name)
 
         return None
 
     @property
     def ulysses_rank(self) -> int:
         if self.device_mesh is not None and self.ulysses_enabled:
-            return self.device_mesh.get_local_rank("ulysses")
+            dim_name = "ulysses" if "ulysses" in self.device_mesh.mesh_dim_names else "sp"
+            return self.device_mesh.get_local_rank(dim_name)
 
         return -1
 
