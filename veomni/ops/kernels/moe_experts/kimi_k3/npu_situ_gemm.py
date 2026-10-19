@@ -29,9 +29,9 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
-from ....distributed.parallel_state import get_parallel_state
-from ..glu.situ_triton import situ_and_mul
-from .npu_group_gemm import (
+from .....distributed.parallel_state import get_parallel_state
+from ...situ_and_mul.situ_triton import situ_and_mul
+from ..standard.npu import (
     alltoall_combine,
     alltoall_dispatch,
     dispatch_preprocess,
