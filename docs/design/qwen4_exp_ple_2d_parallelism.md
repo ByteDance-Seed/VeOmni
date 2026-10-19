@@ -67,8 +67,8 @@ different data-parallel samples to those ranks.
 
 - General `tp_size > 1` support.
 - Tensor-parallel attention, MLP, PLE projections, or LM head.
-- PLE with context parallelism; Ulysses is supported through sequence-local
-  lookup requests and cross-rank token/convolution halos.
+- Simultaneous hybrid context parallelism and Ulysses. Each run may use either
+  sequence-parallel mode, not both at once.
 - HSDP replicas of the two-dimensional PLE table in the first implementation.
 - FSDP CPU offload for FSDP-ignored PLE parameters.
 - Hugging Face export of the complete 95 GiB PLE table.
@@ -107,10 +107,17 @@ P > 1
 tp_size == 1
 pp_size == 1
 dp_replicate_size == 1
-ulysses_size == 1
-cp_size == 1
 ep_size divides world_size
 ```
+
+PLE is compatible with the active Ulysses or context-parallel sequence group:
+lookup requests stay sequence-local and token/convolution halos cross the
+active shard boundaries. Hybrid CP × Ulysses remains unsupported by the shared
+`ParallelState`.
+
+The CP halo equivalence suite covers the sequence-local lookup and convolution
+path with `ple_size == 1`. End-to-end persistent two-dimensional PLE with
+`ple_size > 1` under CP remains a qualification gate.
 
 Each rank has a coordinate `(col_rank, row_rank)` in the `[F, P]` mesh.
 Code must derive group-local ranks and destination ranks from `DeviceMesh`; it
@@ -488,6 +495,7 @@ model:
   accelerator:
     tp_size: 1
     ep_size: 4
+    # Set either ulysses_size or cp_size above 1 to enable sequence parallelism.
     ulysses_size: 1
     cp_size: 1
     extra_parallel_names: [ple]

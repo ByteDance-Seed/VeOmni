@@ -175,7 +175,7 @@ def _slice_conv1d_weight(
     return torch.cat((query, key, value), dim=0)
 
 
-def _run_ple_halo_equivalence(packed: bool = False) -> None:
+def _run_ple_halo_equivalence(packed: bool = False, parallel_mode: str = "ulysses") -> None:
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
@@ -185,7 +185,8 @@ def _run_ple_halo_equivalence(packed: bool = False) -> None:
     try:
         sp_state = _init_parallel_state(
             dp_size=1,
-            ulysses_size=world_size,
+            cp_size=world_size if parallel_mode == "cp" else 1,
+            ulysses_size=world_size if parallel_mode == "ulysses" else 1,
             device_type=get_device_type(),
             extra_parallel_names=("ple",),
             extra_parallel_sizes=(1,),
@@ -268,6 +269,10 @@ def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence():
 
 def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence_sp4():
     torchrun(_run_ple_halo_equivalence, world_size=4)
+
+
+def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence_cp():
+    torchrun(_run_ple_halo_equivalence, world_size=2, parallel_mode="cp")
 
 
 def test_qwen4_exp_packed_ple_hidden_halos_match_full_sequence():
@@ -1085,6 +1090,7 @@ def test_qwen4_exp_vision_dummy_forward_uses_local_cu_seqlens_for_non_fa_under_s
         captured["hidden_shape"] = tuple(hidden_states.shape)
         captured["grid_thw"] = grid_thw.tolist()
         captured["vit_metadata"] = vit_metadata
+        captured["vision_dummy"] = kwargs.get("vision_dummy")
         return "dummy-out"
 
     with (
@@ -1097,6 +1103,7 @@ def test_qwen4_exp_vision_dummy_forward_uses_local_cu_seqlens_for_non_fa_under_s
     assert captured["grid_thw"] == [[1, 4, 2]]
     assert captured["vit_metadata"]["cu_seqlens"].tolist() == [0, expected_seq_len]
     assert captured["vit_metadata"]["max_seqlen"] == expected_seq_len
+    assert captured["vision_dummy"] is True
 
 
 @pytest.mark.parametrize(
@@ -1127,11 +1134,107 @@ def test_qwen4_exp_text_attention_rejects_invalid_sp_attention_mask_before_colle
 
     with (
         patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=cp_state),
-        patch.object(attn.indexer, "forward", return_value=torch.zeros(1, 4, 2, dtype=torch.long)),
+        patch(
+            f"{_PATCHED_MODULE}.all_gather_compressed_rows",
+            side_effect=AssertionError("all_gather_compressed_rows must not run"),
+        ),
+        patch(f"{_PATCHED_MODULE}.gather_outputs", side_effect=AssertionError("gather_outputs must not run")),
         patch(f"{_PATCHED_MODULE}.all_gather_kv", side_effect=AssertionError("all_gather_kv must not run")),
         pytest.raises(ValueError, match="Qwen4-Exp sequence parallelism expects a 3D/4D attention_mask"),
     ):
         attn(hidden_states, (cos, sin), attention_mask=bad_mask)
+
+
+def test_qwen4_exp_sequence_parallel_state_reads_cp_without_sp_alias() -> None:
+    from veomni.distributed.parallel_state import ParallelState
+
+    qwen4_exp = importlib.import_module(_PATCHED_MODULE)
+    cp_group = object()
+
+    class _CpOnlyMesh:
+        mesh_dim_names = ("dp_shard", "cp")
+
+        def get_group(self, dim_name):
+            if dim_name == "cp":
+                return cp_group
+            raise KeyError(f"unexpected mesh dimension for group lookup: {dim_name}")
+
+        def get_local_rank(self, dim_name):
+            if dim_name == "cp":
+                return 1
+            raise KeyError(f"unexpected mesh dimension for rank lookup: {dim_name}")
+
+    with patch.object(ParallelState, "world_size", 2):
+        cp_state = ParallelState(dp_size=1, cp_size=2, ulysses_size=1, device_mesh=_CpOnlyMesh())
+
+    assert qwen4_exp._qwen4_exp_sequence_parallel_state(cp_state) == (True, cp_group, 1, 2)
+
+
+def test_qwen4_exp_vision_real_image_cp_rejects_non_flash_attention() -> None:
+    from veomni.distributed.parallel_state import ParallelState, use_parallel_state
+
+    qwen4_exp = importlib.import_module(_PATCHED_MODULE)
+    config = AutoConfig.from_pretrained(_TOY_CONFIG).vision_config
+    config._attn_implementation = "veomni_sdpa"
+    _install_qwen4_exp_ops_config()
+    vision = qwen4_exp.Qwen4ExpVisionModel(config).float()
+    flattened_patch_size = config.in_channels * config.temporal_patch_size * config.patch_size**2
+    local_pixel_values = torch.zeros(4, flattened_patch_size)
+    image_grid_thw = torch.tensor([[1, 2, 4]], dtype=torch.long)
+    cp_group = object()
+    fake_mesh = SimpleNamespace(
+        mesh_dim_names=("dp_shard", "cp", "sp"),
+        get_group=lambda dim_name: cp_group if dim_name in ("cp", "sp") else None,
+        get_local_rank=lambda dim_name: 1 if dim_name in ("cp", "sp") else 0,
+    )
+
+    with patch.object(ParallelState, "world_size", 2):
+        cp_state = ParallelState(dp_size=1, cp_size=2, ulysses_size=1, device_mesh=fake_mesh)
+        with (
+            use_parallel_state(cp_state),
+            pytest.raises(NotImplementedError, match="vision sequence parallelism requires FlashAttention"),
+        ):
+            vision(hidden_states=local_pixel_values, grid_thw=image_grid_thw)
+
+
+def test_qwen4_exp_vision_dummy_attention_allows_non_flash_attention_under_cp() -> None:
+    from veomni.distributed.parallel_state import ParallelState, use_parallel_state
+
+    qwen4_exp = importlib.import_module(_PATCHED_MODULE)
+    config = AutoConfig.from_pretrained(_TOY_CONFIG).vision_config
+    config._attn_implementation = "veomni_sdpa"
+    _install_qwen4_exp_ops_config()
+    attn = qwen4_exp.Qwen4ExpVisionAttention(config).float()
+    hidden_states = torch.randn(4, config.hidden_size)
+    head_dim = config.hidden_size // config.num_heads
+    cos = torch.ones(4, head_dim)
+    sin = torch.zeros(4, head_dim)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+    cp_group = object()
+    fake_mesh = SimpleNamespace(
+        mesh_dim_names=("dp_shard", "cp", "sp"),
+        get_group=lambda dim_name: cp_group if dim_name in ("cp", "sp") else None,
+        get_local_rank=lambda dim_name: 1 if dim_name in ("cp", "sp") else 0,
+    )
+    captured = {}
+
+    def fake_veomni_attn(_module, query_states, *_args, **_kwargs):
+        captured["query_shape"] = tuple(query_states.shape)
+        return query_states, None
+
+    attn.veomni_attn = fake_veomni_attn
+    with patch.object(ParallelState, "world_size", 2):
+        cp_state = ParallelState(dp_size=1, cp_size=2, ulysses_size=1, device_mesh=fake_mesh)
+        with use_parallel_state(cp_state):
+            output = attn(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=(cos, sin),
+                vision_dummy=True,
+            )
+
+    assert output.shape == hidden_states.shape
+    assert captured["query_shape"] == (1, config.num_heads, 4, head_dim)
 
 
 def test_qwen4_exp_vision_attention_projects_cp_state_to_ulysses_parallel_state() -> None:

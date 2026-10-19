@@ -56,6 +56,9 @@ Known limitations:
 
 - Cache prefill/decode, HSDP replicas of persistent PLE, NPU context
   parallelism, and hybrid CP × Ulysses remain unsupported.
+- Vision forward under Ulysses or context parallelism requires FlashAttention.
+  Eager and SDPA are rejected because they receive local visual-token Q/K/V but
+  global `cu_seqlens` and cannot segment that layout safely.
 - The default `eager` QSA backend expands compact indices to a dense mask and
   materializes the `[B, H_q, S_local, S_global]` attention-score tensor. Use
   `qsa_attention_implementation=tilelang` (NVIDIA CUDA, bf16) for the 16K

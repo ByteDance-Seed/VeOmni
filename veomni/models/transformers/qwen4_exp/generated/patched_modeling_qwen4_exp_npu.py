@@ -172,6 +172,13 @@ def _qwen4_exp_validate_packed_seq_lens(
     return lengths
 
 
+def _qwen4_exp_parallel_state_attr(parallel_state, primary: str, fallback: str, default):
+    """Read an optional active-group property without evaluating the fallback eagerly."""
+    if hasattr(parallel_state, primary):
+        return getattr(parallel_state, primary)
+    return getattr(parallel_state, fallback, default)
+
+
 def _qwen4_exp_sequence_parallel_state(parallel_state):
     """Resolve the active sequence-parallel group/rank/size across Ulysses and CP."""
     ulysses_enabled = bool(getattr(parallel_state, "ulysses_enabled", False))
@@ -183,18 +190,34 @@ def _qwen4_exp_sequence_parallel_state(parallel_state):
     if cp_enabled:
         return (
             True,
-            getattr(parallel_state, "cp_group", getattr(parallel_state, "sp_group", None)),
-            getattr(parallel_state, "cp_rank", getattr(parallel_state, "sp_rank", 0)),
-            getattr(parallel_state, "cp_size", getattr(parallel_state, "sp_size", 1)),
+            _qwen4_exp_parallel_state_attr(parallel_state, "cp_group", "sp_group", None),
+            _qwen4_exp_parallel_state_attr(parallel_state, "cp_rank", "sp_rank", 0),
+            _qwen4_exp_parallel_state_attr(parallel_state, "cp_size", "sp_size", 1),
         )
     if ulysses_enabled:
         return (
             True,
-            getattr(parallel_state, "ulysses_group", getattr(parallel_state, "sp_group", None)),
-            getattr(parallel_state, "ulysses_rank", getattr(parallel_state, "sp_rank", 0)),
-            getattr(parallel_state, "ulysses_size", getattr(parallel_state, "sp_size", 1)),
+            _qwen4_exp_parallel_state_attr(parallel_state, "ulysses_group", "sp_group", None),
+            _qwen4_exp_parallel_state_attr(parallel_state, "ulysses_rank", "sp_rank", 0),
+            _qwen4_exp_parallel_state_attr(parallel_state, "ulysses_size", "sp_size", 1),
         )
     return False, None, 0, 1
+
+
+def _qwen4_exp_validate_sp_attention_mask(attention_mask, local_seq_len: int, sp_size: int, sp_rank: int):
+    """Validate and locally slice a Qwen4-Exp text mask before any collective."""
+    if not isinstance(attention_mask, torch.Tensor):
+        return attention_mask
+    kv_full_len = local_seq_len * sp_size
+    if attention_mask.ndim < 3 or attention_mask.shape[-2] not in (1, local_seq_len, kv_full_len):
+        raise ValueError(
+            "Qwen4-Exp sequence parallelism expects a 3D/4D attention_mask whose query "
+            f"dimension (-2) is 1, the local shard length ({local_seq_len}), or the full "
+            f"sequence length ({kv_full_len}); got shape {tuple(attention_mask.shape)}."
+        )
+    if attention_mask.shape[-2] == kv_full_len:
+        return attention_mask.narrow(-2, sp_rank * local_seq_len, local_seq_len)
+    return attention_mask
 
 
 def _qwen4_exp_vision_parallel_state(parallel_state):
@@ -1308,6 +1331,15 @@ class Qwen4ExpTextAttention(nn.Module):
         sp_enabled, sp_group, sp_rank, sp_size = _qwen4_exp_sequence_parallel_state(parallel_state)
         if sp_enabled and past_key_values is not None:
             raise NotImplementedError("Qwen4-Exp QSA does not support a KV cache under Ulysses/CP.")
+        if sp_enabled:
+            # Every rank must reject an unsupported mask shape before the indexer
+            # enters its compressed-row or halo collectives.
+            attention_mask = _qwen4_exp_validate_sp_attention_mask(
+                attention_mask,
+                hidden_states.shape[1],
+                sp_size,
+                sp_rank,
+            )
         # --- Patch.1 ---
 
         # --- Patch.4: Forward the host-side packed lengths so the indexer never
@@ -1348,17 +1380,6 @@ class Qwen4ExpTextAttention(nn.Module):
             )
             query_states = query_states.transpose(1, 2)
         elif sp_enabled:
-            local_seq_len = hidden_states.shape[1]
-            kv_full_len = local_seq_len * sp_size
-            if isinstance(attention_mask, torch.Tensor):
-                if attention_mask.ndim < 3 or attention_mask.shape[-2] not in (1, local_seq_len, kv_full_len):
-                    raise ValueError(
-                        "Qwen4-Exp sequence parallelism expects a 3D/4D attention_mask whose query "
-                        f"dimension (-2) is 1, the local shard length ({local_seq_len}), or the full "
-                        f"sequence length ({kv_full_len}); got shape {tuple(attention_mask.shape)}."
-                    )
-                if attention_mask.shape[-2] == kv_full_len:
-                    attention_mask = attention_mask.narrow(-2, sp_rank * local_seq_len, local_seq_len)
             query_states = query_states.transpose(1, 2)
             key_states = all_gather_kv(key_states.transpose(1, 2), sp_group)
             value_states = all_gather_kv(value_states.transpose(1, 2), sp_group)
@@ -2725,6 +2746,14 @@ class Qwen4ExpVisionAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        parallel_state = get_parallel_state()
+        vision_dummy = bool(kwargs.pop("vision_dummy", False))
+        sp_enabled, _, _, _ = _qwen4_exp_sequence_parallel_state(parallel_state)
+        if sp_enabled and not vision_dummy and not is_flash_attention_requested(self.config):
+            raise NotImplementedError(
+                "Qwen4-Exp vision sequence parallelism requires FlashAttention; eager and SDPA "
+                "receive local visual-token Q/K/V but global cu_seqlens and cannot segment that layout safely."
+            )
         seq_length = hidden_states.shape[0]
         query_states, key_states, value_states = (
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
@@ -2736,7 +2765,7 @@ class Qwen4ExpVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        with use_parallel_state(_qwen4_exp_vision_parallel_state(get_parallel_state())):
+        with use_parallel_state(_qwen4_exp_vision_parallel_state(parallel_state)):
             if is_flash_attention_requested(self.config):
                 # Modification: prefer the int max_seqlen pre-computed once in
                 # Qwen4ExpVisionModel.forward (Patch.5). Fall back to the original
@@ -3187,7 +3216,7 @@ class Qwen4ExpVisionModel(Qwen4ExpPreTrainedModel):
             "cu_seqlens": torch.tensor([0, attention_seq_len], dtype=torch.int32, device="cpu"),
             "max_seqlen": attention_seq_len,
         }
-        return self(hidden_states=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata)
+        return self(hidden_states=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata, vision_dummy=True)
         # --- Patch.1 ---
 
 
