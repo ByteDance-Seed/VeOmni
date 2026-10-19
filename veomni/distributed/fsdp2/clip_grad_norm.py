@@ -17,9 +17,9 @@ logger = get_logger(__name__)
 def clip_grad_norm(
     model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
 ) -> torch.Tensor:
+    if getattr(model, "_extra_parallel_only", False):
+        _average_extra_parallel_only_replicated_grads(model)
     if hasattr(model, "_extra_parallel_param_groups"):
-        if getattr(model, "_extra_parallel_only", False):
-            _average_extra_parallel_only_replicated_grads(model)
         return extra_parallel_fsdp2_clip_grad_norm(
             model,
             max_norm,
@@ -65,9 +65,14 @@ def _average_extra_parallel_only_replicated_grads(model) -> None:
     ps = get_parallel_state()
     group = ps.fsdp_group
     group_size = dist.get_world_size(group) if group is not None else 1
-    if group_size == 1:
+    if group_size <= 1:
         return
-    for param in model._extra_parallel_param_groups.get("non_extra_parallel", []):
+    ep_param_groups = getattr(model, "_extra_parallel_param_groups", None)
+    if ep_param_groups is not None:
+        replicated_params = ep_param_groups.get("non_extra_parallel", [])
+    else:
+        replicated_params = [p for p in model.parameters() if p.requires_grad and not isinstance(p, DTensor)]
+    for param in replicated_params:
         if param.grad is None:
             param.grad = torch.zeros_like(param)
         dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=group)

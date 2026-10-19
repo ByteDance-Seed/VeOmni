@@ -44,7 +44,7 @@ model:
   # modules_train_full128.yaml.
   optimizer:
     type: adamw
-    lr: 1.0e-5
+    lr: 1.0e-4
     lr_min: 1.0e-7
     lr_start: 0.0
     lr_warmup_ratio: 0.03
@@ -65,10 +65,10 @@ data:
   train_sample: 1000000
   dataloader:
     type: native
-    num_workers: 4
+    num_workers: 8
     drop_last: true
     pin_memory: true
-    prefetch_factor: 2
+    prefetch_factor: 4
 
 train:
   seed: 42

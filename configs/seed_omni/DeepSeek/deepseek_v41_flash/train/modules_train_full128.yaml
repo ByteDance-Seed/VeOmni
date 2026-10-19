@@ -54,16 +54,9 @@ deepseek_v41_vision:
 deepseek_v41_text_encoder:
   model_path: deepseek_v41_text_encoder
   accelerator:
-    extra_parallel_sizes: [128]
-    extra_parallel_names: ["emb"]
-    extra_parallel_placement_innermost: [false]
     fsdp_config:
       fsdp_mode: fsdp2
-      extra_parallel_only: true
-      # No FSDP wrap, so MixedPrecisionPolicy cannot cast weights to bf16
-      # for the fused CE. Keep the module in bf16 rather than fp32 masters.
-      mixed_precision:
-        enable: false
+      reshard_after_forward: false
     gradient_checkpointing:
       enable: false
 
@@ -112,14 +105,16 @@ deepseek_v41_llm:
     qat_implementation: fp8_blockwise
   optimizer:
     type: muon
+    lr: 1.0e-4
+    muon_lr: 5.0e-4
     muon_momentum: 0.95
     muon_nesterov: true
     muon_weight_decay: 0.01
     # The setting the 256-card Muon run trained and resumed with.
     muon_expert_zero_comm: false
   accelerator:
-    # 6 experts a rank; ep_fsdp=2 shards them further for storage.
-    ep_size: 64
+    # 3 experts a rank; ep_fsdp=1 at 128 cards.
+    ep_size: 128
     ep_outside: false
     gradient_checkpointing:
       enable: true

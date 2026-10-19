@@ -644,5 +644,64 @@ def test_persistent_ple_and_ep_norm_use_independent_reduction_groups():
     assert ep_calls[0][1] == [("ep_fsdp", "ep_fsdp_group"), ("ep", "ep_group")]
 
 
+def test_omni_module_clip_grad_norm_extra_parallel_only_averages_replicated_grads_and_skips_fsdp_sum():
+    """``veomni_omni_module_clip_grad_norm`` averages replicated grads on ``fsdp_group``
+    and skips the ``fsdp`` norm reduction on ``non_extra_parallel`` when
+    ``model._extra_parallel_only`` is set."""
+    omni_cgn_mod = importlib.import_module("veomni.distributed.clip_grad_norm")
+
+    class _FakeMesh:
+        def __init__(self, group):
+            self.group = group
+
+        def get_group(self):
+            return self.group
+
+    p_non = _param_with_grad(torch.tensor([3.0, 4.0]))
+    p_emb = _param_with_grad(torch.tensor([5.0, 12.0]))
+    fake_ps = _FakeParallelState(
+        extra_parallel_names=["emb"],
+        fsdp_group="fsdp_group",
+        extra_parallel_fsdp_device_mesh={"emb": {"emb_fsdp": _FakeMesh("emb_fsdp_group")}},
+        dp_mode="fsdp2",
+    )
+    fake_ps.any_extra_parallel_enabled = True
+    fake_ps.sp_size = 1
+    fake_ps.extra_parallel_enabled = lambda _name: True
+    fake_ps.extra_parallel_group = lambda name: f"{name}_group"
+
+    model = _make_model(
+        {"non_extra_parallel": [p_non], "emb": [p_emb]},
+        replicated_ids=set(),
+    )
+    model._extra_parallel_only = True
+
+    reduce_calls = []
+    avg_calls = []
+
+    def record_reduce(params, norm_type, reduce_groups):
+        reduce_calls.append((list(params), list(reduce_groups)))
+        return cgn_mod._local_pth_sum(params, float(norm_type))
+
+    def record_avg(m):
+        avg_calls.append(m)
+
+    with (
+        mock.patch.object(omni_cgn_mod, "get_parallel_state", return_value=fake_ps),
+        mock.patch.object(omni_cgn_mod, "_fsdp2_reduce_group", side_effect=record_reduce),
+        mock.patch.object(omni_cgn_mod, "_average_extra_parallel_only_replicated_grads", side_effect=record_avg),
+    ):
+        total = omni_cgn_mod.veomni_omni_module_clip_grad_norm(model, max_norm=1e9, norm_type=2.0)
+
+    assert avg_calls == [model]
+    assert total == pytest.approx(math.sqrt(25.0 + 169.0), abs=1e-6)
+    non_ep_calls = [call for call in reduce_calls if len(call[0]) == 1 and call[0][0] is p_non]
+    emb_calls = [call for call in reduce_calls if len(call[0]) == 1 and call[0][0] is p_emb]
+    assert len(non_ep_calls) == 1
+    assert non_ep_calls[0][1] == []
+    assert len(emb_calls) == 1
+    assert emb_calls[0][1] == [("emb_fsdp", "emb_fsdp_group"), ("emb", "emb_group")]
+
+
 if __name__ == "__main__":
     main()
