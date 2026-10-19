@@ -55,7 +55,7 @@ def test_gate_rejects_context_parallel_on_npu(monkeypatch):
         "get_parallel_state",
         lambda: SimpleNamespace(cp_enabled=True),
     )
-    monkeypatch.setattr(auto_module, "is_torch_npu_available", lambda: True)
+    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", True)
 
     with pytest.raises(NotImplementedError, match="GPU-only"):
         check_context_parallel_supported(SimpleNamespace(model_type="deepseek_v4"))

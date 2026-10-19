@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 
 from transformers import PretrainedConfig
@@ -24,6 +25,9 @@ class MiniMaxH3ConditionModelConfig(PretrainedConfig):
         video_max_frames: int = 73,
         video_max_resolution: int = 848,
         text_encoder_num_retained_layers: int = 50,
+        training_cfg_scale: float = 1.0,
+        training_cfg_schedule: str = "constant",
+        training_cfg_curvature_power: float = 2.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -43,3 +47,12 @@ class MiniMaxH3ConditionModelConfig(PretrainedConfig):
         self.video_max_frames = video_max_frames
         self.video_max_resolution = video_max_resolution
         self.text_encoder_num_retained_layers = text_encoder_num_retained_layers
+        if not math.isfinite(training_cfg_scale) or training_cfg_scale < 1:
+            raise ValueError("training_cfg_scale must be finite and >= 1.")
+        if training_cfg_schedule not in ("constant", "sigma"):
+            raise ValueError("training_cfg_schedule must be constant or sigma.")
+        if not math.isfinite(training_cfg_curvature_power) or not 0 <= training_cfg_curvature_power <= 2:
+            raise ValueError("training_cfg_curvature_power must be finite and in [0, 2].")
+        self.training_cfg_scale = training_cfg_scale
+        self.training_cfg_schedule = training_cfg_schedule
+        self.training_cfg_curvature_power = training_cfg_curvature_power

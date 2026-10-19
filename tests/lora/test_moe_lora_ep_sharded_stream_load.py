@@ -22,7 +22,7 @@ weights to the reference broadcast loader.
 What ``ep_sharded_stream_load`` does for a PEFT model
 -----------------------------------------------------
 ``load_model_weights_ep_sharded`` under ``is_peft_model=True`` (wired in
-``veomni/models/module_utils.py``):
+``veomni/models/checkpoint/weights.py``):
 
   * **Base experts** — the fused ``...experts.gate_up_proj`` /
     ``down_proj`` tensors are streamed from the base checkpoint straight
@@ -69,6 +69,7 @@ from .test_moe_lora_trainer import (
     _gpu_count_or_skip,
     _writer_adapter_path,
     _yaml_for_mode,
+    toy_base_dir,  # noqa: F401  (pytest fixture, per-expert HF layout)
 )
 
 
@@ -79,9 +80,8 @@ __all__ = [
 
 
 # EP requires a fused MoE-LoRA kernel: the wrappers only implement the EP
-# dispatch on the fused path. The backend is device-specific — ``fused_triton``
-# on GPU, ``fused_npu`` on NPU (selecting the wrong one raises a hard error in
-# ``apply_veomni_fused_moe_patch``), so pick it from the active accelerator.
+# dispatch on the fused path. The backend is device-specific — ``triton``
+# on GPU, ``npu`` on NPU — so pick it from the active accelerator.
 def _fused_ops_override() -> str:
     from veomni.utils.import_utils import is_torch_npu_available
 
@@ -100,19 +100,20 @@ _SEED_STEPS = 2
 # ──────────────────────────────────────────────────────────────────────
 #
 # ``ep_sharded_stream_load`` streams each rank's dim-0 expert slice
-# straight from the checkpoint. That is only possible when the on-disk
-# expert layout *is* the model's fused layout
-# (``...experts.gate_up_proj`` / ``down_proj`` with shape ``[E, ...]``).
-# The shared ``toy_base_dir`` fixture in ``test_moe_lora_trainer`` writes
-# the standard HF **per-expert** layout (``...experts.<e>.gate_proj.weight``),
-# which needs the ``Qwen3MoeCheckpointTensorConverter`` per-expert->fused
-# fusion at load time -- a transform the stream loader explicitly refuses
-# (``NotImplementedError``; covered by the non-PEFT bail case in
-# ``tests/utils/test_moe_ep_sharded_load_matrix.py``).
+# straight from the checkpoint when the on-disk expert layout *is* the
+# model's fused layout (``...experts.gate_up_proj`` / ``down_proj`` with
+# shape ``[E, ...]``). The shared ``toy_base_dir`` fixture in
+# ``test_moe_lora_trainer`` writes the standard HF **per-expert** layout
+# (``...experts.<e>.gate_proj.weight``), which instead goes through the
+# ``Qwen3MoeCheckpointTensorConverter`` per-rank expert stacking (covered
+# by ``tests/utils/test_moe_ep_sharded_load_matrix.py`` and
+# ``tests/utils/test_ep_sharded_expert_stream_load.py``).
 #
-# So this test builds its *own* base by dumping the fused
+# This test builds its *own* base by dumping the fused
 # ``model.state_dict()`` directly (no ``save_pretrained`` re-split),
-# giving a converter-free, streamable checkpoint.
+# so it exercises the converter-free dim-0 slice path under PEFT. The
+# ``per_expert`` case loads ``toy_base_dir`` instead, so the converter's
+# per-rank expert stacking runs with experts under ``base_layer``.
 
 
 def _build_and_save_fused_toy_base(dest_dir: str) -> None:
@@ -129,8 +130,9 @@ def _build_and_save_fused_toy_base(dest_dir: str) -> None:
     from safetensors.torch import save_file
 
     from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.models import build_foundation_model
     from veomni.utils import helper as _helper
+
+    from .utils import build_lora_test_model
 
     _helper.set_seed(42)
     ops = OpsImplementationConfig(
@@ -141,7 +143,7 @@ def _build_and_save_fused_toy_base(dest_dir: str) -> None:
         swiglu_mlp_implementation="eager",
         rotary_pos_emb_implementation="eager",
     )
-    model = build_foundation_model(
+    model = build_lora_test_model(
         config_path=_TOY_CONFIG_PATH,
         weights_path=None,
         torch_dtype="bfloat16",
@@ -222,8 +224,10 @@ def _make_adapter_resume_yaml(base_yaml: str, adapter_path: str, dest: str) -> s
     return dest
 
 
-@pytest.mark.parametrize("mode", ["independent", "shared"])
-def test_peft_ep_sharded_stream_load_matches_broadcast(tmp_path, fused_toy_base_dir, mode):
+@pytest.mark.parametrize(
+    "mode, base_layout", [("independent", "fused"), ("shared", "fused"), ("independent", "per_expert")]
+)
+def test_peft_ep_sharded_stream_load_matches_broadcast(tmp_path, request, mode, base_layout):
     """Streaming a LoRA-wrapped MoE checkpoint == broadcast loader, bit-exact.
 
     Three EP=2 subprocesses on the Qwen3-MoE toy:
@@ -244,11 +248,13 @@ def test_peft_ep_sharded_stream_load_matches_broadcast(tmp_path, fused_toy_base_
     difference is *how* each rank obtained its local slice. For
     ``independent`` the adapter's per-expert LoRA is EP-streamed; for
     ``shared`` the adapter LoRA is read whole while the base experts are
-    still EP-streamed.
+    still EP-streamed. With the ``per_expert`` base the stream resumer stacks
+    each rank's experts through the checkpoint converter.
     """
     nproc = _gpu_count_or_skip(min_count=2, max_count=2)
     yaml_path = _yaml_for_mode(mode)
-    base_overrides = _fused_model_path_overrides(fused_toy_base_dir) + [
+    base_dir = request.getfixturevalue("fused_toy_base_dir" if base_layout == "fused" else "toy_base_dir")
+    base_overrides = _fused_model_path_overrides(base_dir) + [
         _fused_ops_override(),
         "--model.accelerator.ep_size=2",
     ]
@@ -289,7 +295,7 @@ def test_peft_ep_sharded_stream_load_matches_broadcast(tmp_path, fused_toy_base_
     _compare_snapshots_bit_exact(
         actual_path=os.path.join(stream_dir, SNAPSHOT_PRE),
         ref_path=os.path.join(ref_dir, SNAPSHOT_PRE),
-        label=f"{mode}/ep_sharded_stream_vs_broadcast",
+        label=f"{mode}/{base_layout}/ep_sharded_stream_vs_broadcast",
     )
 
     for d in (ref_dir, stream_dir):
