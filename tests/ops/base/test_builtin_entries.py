@@ -35,6 +35,7 @@ _GPU_NVIDIA_SM80 = ("gpu", (("nvidia", 80, None),))
 _GPU_NVIDIA_SM90 = ("gpu", (("nvidia", 90, None),))
 _GPU_NVIDIA_SM100 = ("gpu", (("nvidia", 100, None),))
 _GPU_NVIDIA_SM90_TO_SM100 = ("gpu", (("nvidia", 90, 100),))
+_GPU_ROCM = ("gpu", (("rocm", None, None),))
 _NPU = ("npu", ())
 _MLU = ("mlu", ())
 
@@ -76,6 +77,7 @@ _BUILTIN_ENTRIES = (
     ),
     ("attention", "standard", "veomni_flash_attention_3_hub", "cuda", _GPU_NVIDIA_SM90, ("kernels",)),
     ("attention", "standard", "veomni_flash_attention_4", "cuda", _GPU_NVIDIA_SM90, ("flash_attn.cute",)),
+    ("attention", "standard", "veomni_flash_attention_aiter", "cuda", _GPU_ROCM, ("aiter",)),
     ("attention", "standard", "veomni_flex_attention", "cuda", _GPU_NVIDIA, ()),
     (
         "attention",

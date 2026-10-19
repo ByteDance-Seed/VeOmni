@@ -17,7 +17,7 @@ If a field is not in this table, it is not an op-selection knob.
 
 | Op | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
-| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `magi_attention`, `sage_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` rewrite + model `__init__` via `VeomniOp("attention", "standard", config._attn_implementation)` stored on the attention module |
+| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `aiter`, `magi_attention`, `sage_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` rewrite + model `__init__` via `VeomniOp("attention", "standard", config._attn_implementation)` stored on the attention module |
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+), `cann` (DeepSeek-V4, Ascend) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
@@ -140,6 +140,7 @@ model:
 | `flash_attention_3` | Flash Attention v3 | Yes after rewrite | `flash-attn-interface` |
 | `flash_attention_4` | Flash Attention v4 | Yes after rewrite | `flash-attn.cute` |
 | `flex_attention` | PyTorch FlexAttention | Yes after rewrite | NVIDIA GPU; native `BlockMask`; SM90+ uses FA4 when available, otherwise Triton |
+| `aiter` | AMD AITER FMHA-v3 | Yes after rewrite | AMD ROCm; `aiter` |
 | `magi_attention` | MagiAttention FFA | Yes after rewrite | `--extra magi`; NVIDIA SM100+; model-provided `MagiAttentionMask` |
 | `sage_attention` | SageAttention | Yes after rewrite | `sageattention` |
 | `native-sparse` | Sparse attention | No | — |
@@ -153,6 +154,7 @@ public values to VeOmni adapters:
 | `flash_attention_3` | `veomni_flash_attention_3` |
 | `flash_attention_4` | `veomni_flash_attention_4` |
 | `flex_attention` | `veomni_flex_attention` |
+| `aiter` | `veomni_flash_attention_aiter` |
 | `magi_attention` | `veomni_magi_attention` |
 | `sage_attention` | `veomni_sage_attention` |
 | `sdpa` | `veomni_sdpa` |
@@ -163,6 +165,12 @@ builders on Transformers' `ALL_ATTENTION_FUNCTIONS` /
 `VeomniOp("attention", "standard", config._attn_implementation)` in
 `__init__` (or `modify_init`) and stores `self.veomni_attn`. `forward` calls
 that handle. The registered row looks up the same Transformers interface.
+
+The AITER adapter requires `MODELING_BACKEND=veomni`. Its row has an explicit
+ROCm-only GPU requirement and does not resolve on NVIDIA, Ascend, or MLU. Both
+`aiter` and its normalized
+`veomni_flash_attention_aiter` name are rejected on Ascend before Transformers
+can select its NPU attention path.
 
 `eager` resolves the modeling file's own `eager_attention_forward`, as in
 Transformers. Flux, Qwen-Image, LTX-2.3, and MiniMax-H3 define none, so

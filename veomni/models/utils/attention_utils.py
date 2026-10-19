@@ -31,6 +31,7 @@ VARLEN_ATTENTION_TYPES = (
     "veomni_flash_attention_3",
     "veomni_flash_attention_3_hub",
     "veomni_flash_attention_4",
+    "veomni_flash_attention_aiter",
 )
 PACKED_ATTENTION_METADATA_KEYS = frozenset(
     {
