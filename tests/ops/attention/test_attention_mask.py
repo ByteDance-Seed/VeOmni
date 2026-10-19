@@ -26,7 +26,6 @@ from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, create_caus
 
 from tests.ops.attention.attention_cases import (
     dense_2d_mask,
-    eager_create_block_mask,
     flex_2d_mask,
     flex_visible,
     magi_2d_mask,
@@ -57,27 +56,6 @@ def test_mask_builder_return_types():
     assert isinstance(magi, MagiAttentionMask)
     assert magi.q_ranges.dtype == torch.int32
     assert magi.q_ranges.shape == (1, 2)
-
-
-def test_flex_mask_builder_keeps_create_block_mask_eager(monkeypatch):
-    """Compiled ``create_block_mask`` is magi-vs-flex work, not this branch."""
-
-    def boom(*args, **kwargs):
-        raise AssertionError("flex_attention_mask_builder must not torch.compile create_block_mask")
-
-    monkeypatch.setattr(torch, "compile", boom)
-    mask = flex_attention_mask_builder(1, 4, 4, device="cpu")
-    assert isinstance(mask, BlockMask)
-    helper_mask = eager_create_block_mask(
-        lambda batch_idx, head_idx, query_idx, key_idx: query_idx >= key_idx,
-        B=None,
-        H=None,
-        Q_LEN=4,
-        KV_LEN=4,
-        device="cpu",
-    )
-    assert isinstance(helper_mask, BlockMask)
-    assert isinstance(flex_2d_mask(16, "cpu"), BlockMask)
 
 
 @pytest.mark.parametrize("allow_skip", (None, False, True))
@@ -433,3 +411,60 @@ def test_2d_masks_match_dense_visibility():
     flex = flex_2d_mask(sequence_length, device)
     torch.testing.assert_close(materialize_magi_mask(magi, sequence_length), dense)
     torch.testing.assert_close(flex_visible(flex, sequence_length, sequence_length), dense[0, 0])
+
+
+@pytest.mark.parametrize(
+    ("device", "compute_capability", "expected"),
+    [
+        (None, 0, 128),
+        ("cpu", 0, 128),
+        ("cuda", 80, 128),
+        ("cuda", 90, 128),
+        ("cuda", 100, (256, 128)),
+        ("cuda", 110, (256, 128)),
+    ],
+)
+def test_flex_mask_block_size_follows_nvidia_architecture(monkeypatch, device, compute_capability, expected):
+    monkeypatch.setattr(flex_mask.torch.version, "hip", None)
+    monkeypatch.setattr(flex_mask, "get_gpu_compute_capability", lambda selected_device: compute_capability)
+    assert flex_mask._flex_block_size(device) == expected
+
+
+def test_flex_mask_block_size_keeps_rocm_default(monkeypatch):
+    monkeypatch.setattr(flex_mask.torch.version, "hip", "test-rocm")
+    monkeypatch.setattr(flex_mask, "get_gpu_compute_capability", lambda selected_device: 100)
+    assert flex_mask._flex_block_size("cuda") == 128
+
+
+def test_flex_mask_builder_passes_sm100_block_size_to_pytorch(monkeypatch):
+    captured = []
+    real = flex_mask.create_block_mask
+
+    def spy(*args, **kwargs):
+        captured.append(kwargs["BLOCK_SIZE"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(flex_mask, "create_block_mask", spy)
+    monkeypatch.setattr(flex_mask, "_flex_block_size", lambda device: (256, 128))
+    mask = flex_attention_mask_builder(1, 256, 128, device="cpu")
+    assert isinstance(mask, BlockMask)
+    assert mask.BLOCK_SIZE == (256, 128)
+    assert captured == [(256, 128)]
+
+
+def test_flex_mask_builder_keeps_eager_construction(monkeypatch):
+    seen = []
+    original = flex_mask.create_block_mask
+
+    def create(*args, **kwargs):
+        seen.append(kwargs["_compile"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(flex_mask, "create_block_mask", create)
+    monkeypatch.setattr(
+        flex_mask.torch, "compile", lambda *args, **kwargs: pytest.fail("Mask construction must stay eager")
+    )
+    mask = flex_attention_mask_builder(1, 4, 4, device="cpu")
+    assert isinstance(mask, BlockMask)
+    assert seen == [False]
+    torch.testing.assert_close(flex_visible(mask, 4, 4), torch.ones(4, 4, dtype=torch.bool).tril())

@@ -309,7 +309,7 @@ requires TileKernels on an SM90+ NVIDIA GPU or CANN on an Ascend NPU.
 | `moe_experts/test_moe_experts.py` | Eager/Triton/Quack MoE parity, split/merged weights, and hardware guards | CPU for guards; CUDA for optimized kernels |
 | `dsa/test_dsa*.py` | DSA registry, CPU guards, and TileLang/cuDNN numerical parity | CPU for guards; matching CUDA hardware for optimized kernels |
 | `attention/flash/test_flash_attention.py` | FlashAttention contracts | CUDA |
-| `attention/magi/` | Magi mask, installer, FA4 metadata, and numerical contracts | CPU for guards; SM90/SM100 for optimized kernels |
+| `attention/magi/` | Magi mask, SM100+ guard, FA4 metadata, and numerical contracts | CPU for guards; SM100+ for optimized kernels |
 | `batch_invariant/test_batch_invariant.py` | Batch-invariant ATen patch lifecycle and math | CPU for lifecycle; CUDA for Triton kernels |
 
 Cross-entropy is covered at two layers: `tests/ops/loss/test_cross_entropy_loss.py`
