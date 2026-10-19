@@ -12,10 +12,9 @@ import re
 import time
 
 import torch
-from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
-from .master_fp32_adamw import FullFP32AdamW, _local
+from .master_fp32_adamw import FullFP32AdamW, _align_state_to_parameter, _local
 
 
 def select_cpu_offload_groups(model, groups, patterns):
@@ -119,6 +118,7 @@ class CPUOffloadAdamW(FullFP32AdamW):
                                 f"Optimizer checkpoint dtype mismatch for {name}: saved={saved[name].dtype}, "
                                 f"configured={expected_dtype}; explicit precision migration is required"
                             )
+                        saved[name] = _align_state_to_parameter(saved[name], param)
                         if tuple(saved[name].shape) != tuple(param.shape):
                             raise RuntimeError(f"Shape mismatch for optimizer state {name}")
                 restored.append((param, saved, id(param) in self._offloaded))
@@ -133,11 +133,6 @@ class CPUOffloadAdamW(FullFP32AdamW):
             state = {"step": torch.as_tensor(saved["step"]).detach().cpu().clone()}
             for name in ("master_weight", "exp_avg", "exp_avg_sq"):
                 tensor = saved[name]
-                if isinstance(param, DTensor) != isinstance(tensor, DTensor):
-                    raise RuntimeError("Optimizer checkpoint DTensor layout does not match parameter")
-                if isinstance(param, DTensor):
-                    if tensor.placements != param.placements or tensor.device_mesh != param.device_mesh:
-                        raise RuntimeError("Optimizer checkpoint DTensor mesh/placements do not match parameter")
                 # Reuse DCP's already correctly placed buffers. Cloning every
                 # resident state here would transiently double accelerator
                 # optimizer memory during resume.

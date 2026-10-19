@@ -16,6 +16,57 @@ def _local(tensor):
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
+def _align_state_to_parameter(tensor, param):
+    """Restore an ExtraParallel-dropped DTensor to the parameter's runtime mesh.
+
+    DCP stores ExtraParallel state on the temporary full ``(fsdp, extra)`` mesh,
+    then drops the extra dimension before handing it back to the optimizer. The
+    resulting local shard is correct, but its mesh and global metadata are not
+    equal to the parameter's runtime layout. Rebuild that DTensor around the
+    same local storage so a custom optimizer loader can consume a real cold
+    resume without silently changing the state layout.
+    """
+    if not isinstance(param, DTensor):
+        if isinstance(tensor, DTensor):
+            raise RuntimeError("Optimizer checkpoint DTensor layout does not match parameter")
+        return tensor
+    if not isinstance(tensor, DTensor):
+        raise RuntimeError("Optimizer checkpoint DTensor layout does not match parameter")
+    if tensor.device_mesh == param.device_mesh and tensor.placements == param.placements:
+        return tensor
+
+    # A single ExtraParallel dimension is removed on load. Keep the FSDP/HSDP
+    # prefix placements and reject every other mismatch rather than guessing.
+    if len(tensor.placements) + 1 != len(param.placements):
+        raise RuntimeError("Optimizer checkpoint DTensor mesh/placements do not match parameter")
+    if tuple(tensor.placements) != tuple(param.placements[: len(tensor.placements)]):
+        raise RuntimeError("Optimizer checkpoint DTensor mesh/placements do not match parameter")
+    local = tensor.to_local()
+    if local.shape != param.to_local().shape:
+        raise RuntimeError("Optimizer checkpoint DTensor local shape does not match parameter")
+    if tensor.device_mesh.device_type != param.device_mesh.device_type:
+        raise RuntimeError("Optimizer checkpoint DTensor device type does not match parameter")
+
+    if local.device.type == "cpu" and param.device_mesh.device_type != "cpu":
+        metadata = DTensor.from_local(
+            local.to("meta"),
+            param.device_mesh,
+            param.placements,
+            run_check=False,
+            shape=param.shape,
+            stride=param.stride(),
+        )
+        return DTensor(local, metadata._spec, requires_grad=False)
+    return DTensor.from_local(
+        local,
+        param.device_mesh,
+        param.placements,
+        run_check=False,
+        shape=param.shape,
+        stride=param.stride(),
+    )
+
+
 class MasterFP32AdamW(Optimizer):
     requires_exact_state_dtypes = True
     moment_dtype = torch.bfloat16
@@ -37,6 +88,7 @@ class MasterFP32AdamW(Optimizer):
                 for name in ("master_weight", "exp_avg", "exp_avg_sq"):
                     if name in saved:
                         expected_dtype = torch.float32 if name == "master_weight" else self.moment_dtype
+                        saved[name] = _align_state_to_parameter(saved[name], param)
                         if saved[name].dtype != expected_dtype or saved[name].shape != param.shape:
                             raise RuntimeError(f"Optimizer state {name} requires explicit precision/shape migration")
                         preserved.append((param, name, saved[name]))

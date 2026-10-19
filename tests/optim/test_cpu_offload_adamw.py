@@ -8,7 +8,13 @@ import torch
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.api import CheckpointException
 
-from veomni.checkpoint.dcp_checkpointer import OptimizerState, _ModelStrictLoadPlanner
+from veomni.checkpoint.dcp_checkpointer import (
+    _ZERO_OPTIMIZER_STATE_MARKER,
+    OptimizerState,
+    _ModelStrictLoadPlanner,
+    _requires_exact_optimizer_recipe,
+    _requires_exact_optimizer_state_dtypes,
+)
 from veomni.optim.cpu_offload_adamw import CPUOffloadAdamW
 from veomni.optim.master_fp32_adamw import FullFP32AdamW, MasterFP32AdamW
 
@@ -51,7 +57,7 @@ def test_dcp_rejects_missing_master_optimizer_state(tmp_path, missing):
         {"optimizer": {"state": {"weight": saved}}, "model": {"weight": torch.tensor([2.0])}}, checkpoint_id=tmp_path
     )
     target = {"optimizer": {"state": {"weight": copy.deepcopy(fields)}}, "model": {"weight": torch.tensor([9.0])}}
-    with pytest.raises(CheckpointException, match="missing precision-sensitive optimizer state"):
+    with pytest.raises(CheckpointException, match="precision-sensitive optimizer state"):
         dcp.load(
             target,
             checkpoint_id=tmp_path,
@@ -66,6 +72,15 @@ def test_master_optimizer_rejects_implicit_precision_migration():
     source.step()
     with pytest.raises(RuntimeError, match="migration"):
         MasterFP32AdamW([p]).load_state_dict(source.state_dict())
+
+
+def test_optimizer_state_wrapper_preserves_strict_optimizer_policy():
+    p = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+    optimizer = CPUOffloadAdamW([p], lr=0.001)
+    wrapper = SimpleNamespace(optimizer=optimizer)
+    assert _requires_exact_optimizer_state_dtypes(wrapper)
+    assert not _requires_exact_optimizer_recipe(wrapper)
+    assert _requires_exact_optimizer_recipe(SimpleNamespace(optimizer=SimpleNamespace(requires_exact_recipe=True)))
 
 
 @pytest.mark.parametrize("field", ["master_weight", "exp_avg", "exp_avg_sq"])
@@ -142,3 +157,282 @@ def test_dcp_keeps_partial_ordinary_adamw_state_supported(tmp_path):
     for key in ("step", "exp_avg", "exp_avg_sq"):
         torch.testing.assert_close(opt.state[model.weight][key], resumed.state[target.weight][key], rtol=0, atol=0)
     assert target.bias not in resumed.state
+
+
+def test_dcp_keeps_default_state_for_unstepped_parameter(tmp_path):
+    fields = {
+        "master_weight": torch.tensor([2.0]),
+        "exp_avg": torch.tensor([0.5]),
+        "exp_avg_sq": torch.tensor([0.25]),
+        "step": torch.tensor(3.0),
+    }
+    dcp.save({"optimizer": {"state": {"weight": copy.deepcopy(fields)}}}, checkpoint_id=tmp_path)
+    target_weight = copy.deepcopy(fields)
+    target_bias = {name: torch.zeros_like(tensor) for name, tensor in fields.items()}
+    target = {"optimizer": {"state": {"weight": target_weight, "bias": target_bias}}}
+
+    weight = torch.nn.Parameter(torch.zeros(1))
+    bias = torch.nn.Parameter(torch.zeros(1))
+    optimizer = SimpleNamespace(
+        requires_exact_state_dtypes=True,
+        param_groups=[{"params": [weight, bias]}],
+        state={weight: copy.deepcopy(fields), bias: copy.deepcopy(target_bias)},
+    )
+    dcp.load(
+        target,
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True, optimizer=optimizer),
+    )
+    for name in fields:
+        torch.testing.assert_close(target["optimizer"]["state"]["weight"][name], fields[name], rtol=0, atol=0)
+        torch.testing.assert_close(
+            target["optimizer"]["state"]["bias"][name], torch.zeros_like(fields[name]), rtol=0, atol=0
+        )
+
+
+def test_dcp_zero_step_sparse_multi_optimizer_restores_lazy_state(tmp_path):
+    from torch.distributed.checkpoint import FileSystemReader
+
+    from veomni.optim.optimizer import MultiOptimizer
+
+    model = torch.nn.Linear(3, 2).bfloat16()
+    child = CPUOffloadAdamW(model.parameters(), lr=0.001)
+    optimizer = MultiOptimizer(model, {"all": child}, ["all"])
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    dcp.save(
+        {"optimizer": OptimizerState(model, optimizer, parallel_state=parallel_state)},
+        checkpoint_id=tmp_path,
+    )
+    metadata = FileSystemReader(tmp_path).read_metadata()
+    assert "optimizer.__veomni_zero_optimizer_state__" in metadata.state_dict_metadata
+
+    target_model = torch.nn.Linear(3, 2).bfloat16()
+    target_child = CPUOffloadAdamW(target_model.parameters(), lr=0.001)
+    target = MultiOptimizer(target_model, {"all": target_child}, ["all"])
+    dcp.load(
+        {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True, optimizer=target),
+    )
+    assert not target_child.state
+    assert not target._veomni_resume_zero_optimizer_state
+
+
+def test_dcp_rejects_zero_state_marker_with_tensor_state_and_clears_stale_flag(tmp_path):
+    from veomni.optim.optimizer import MultiOptimizer
+
+    model = torch.nn.Linear(3, 2).bfloat16()
+    child = CPUOffloadAdamW(model.parameters(), lr=0.001)
+    optimizer = MultiOptimizer(model, {"all": child}, ["all"])
+    model.weight.grad = torch.ones_like(model.weight)
+    optimizer.step()
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    state_dict = OptimizerState(model, optimizer, parallel_state=parallel_state).state_dict()
+    assert any(key.startswith("state.") for key in state_dict)
+    state_dict[_ZERO_OPTIMIZER_STATE_MARKER] = True
+    dcp.save({"optimizer": state_dict}, checkpoint_id=tmp_path)
+
+    target_model = torch.nn.Linear(3, 2).bfloat16()
+    target_child = CPUOffloadAdamW(target_model.parameters(), lr=0.001)
+    target = MultiOptimizer(target_model, {"all": target_child}, ["all"])
+    target._veomni_resume_zero_optimizer_state = True
+    with pytest.raises(CheckpointException, match="zero-state optimizer marker conflicts"):
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True, optimizer=target),
+        )
+    assert not target._veomni_resume_zero_optimizer_state
+
+
+def test_dcp_zero_step_exact_recipe_multi_optimizer_restores_lazy_state(tmp_path):
+    from veomni.optim.optimizer import MultiOptimizer
+    from veomni.optim.qwen38_muon import Qwen38MuonAdamW, add_qwen38_plans
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.down_proj = torch.nn.Linear(4, 2, bias=False)
+
+    def make_optimizer(model):
+        groups = add_qwen38_plans(model, [{"params": [model.down_proj.weight], "cpu_offload": True}])
+        child = Qwen38MuonAdamW(groups, lr=0.001)
+        return child, MultiOptimizer(model, {"all": child}, ["all"])
+
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    model = Model().bfloat16()
+    _, optimizer = make_optimizer(model)
+    dcp.save(
+        {"optimizer": OptimizerState(model, optimizer, parallel_state=parallel_state)},
+        checkpoint_id=tmp_path,
+    )
+
+    target_model = Model().bfloat16()
+    target_child, target = make_optimizer(target_model)
+    dcp.load(
+        {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(
+            strict_model=False,
+            strict_optimizer_dtype=True,
+            strict_optimizer_recipe=True,
+            optimizer=target,
+        ),
+    )
+    assert not target_child.state
+    assert not target._veomni_resume_zero_optimizer_state
+
+
+def _extra_parallel_resume_worker(rank, world, rendezvous, hsdp=False):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Replicate, Shard
+
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world)
+    try:
+        if hsdp:
+            mesh = init_device_mesh("cpu", (2, 2, 2), mesh_dim_names=("replicate", "fsdp", "ep"))
+            replicate, fsdp, ep = mesh.get_coordinate()
+            state_mesh = mesh["replicate", "fsdp"]
+            state_placements = [Replicate(), Shard(0)]
+        else:
+            mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("fsdp", "ep"))
+            fsdp, ep = mesh.get_coordinate()
+            state_mesh = mesh["fsdp"]
+            state_placements = [Shard(0)]
+        # Deliberately uneven FSDP/EP shards exercise DTensor metadata recovery.
+        global_shape = (5, 7)
+        full = torch.arange(global_shape[0] * global_shape[1], dtype=torch.float32).reshape(global_shape)
+        local = torch.tensor_split(torch.tensor_split(full, 2, dim=0)[fsdp], 2, dim=1)[ep].clone()
+        param = torch.nn.Parameter(
+            DTensor.from_local(
+                local,
+                mesh,
+                [Replicate(), Shard(0), Shard(1)] if hsdp else [Shard(0), Shard(1)],
+                run_check=False,
+                shape=global_shape,
+                stride=(global_shape[1], 1),
+            )
+        )
+        state_tensors = {
+            name: DTensor.from_local(local.clone() + index, state_mesh, state_placements, run_check=False)
+            for index, name in enumerate(("master_weight", "exp_avg", "exp_avg_sq"), start=1)
+        }
+        optimizer = CPUOffloadAdamW([{"params": [param], "cpu_offload": True}], lr=0.001)
+        optimizer.state[param] = {"step": torch.tensor(2.0), **state_tensors}
+        saved = copy.deepcopy(optimizer.state_dict())
+
+        resumed = CPUOffloadAdamW([{"params": [param], "cpu_offload": True}], lr=0.001)
+        resumed.load_state_dict(saved)
+        for name, expected in state_tensors.items():
+            actual = resumed.state[param][name]
+            assert actual.device_mesh == param.device_mesh
+            assert actual.placements == param.placements
+            torch.testing.assert_close(actual.to_local(), expected.to_local(), rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("hsdp", [False, True])
+def test_extra_parallel_fsdp_state_resume_restores_parameter_mesh(tmp_path, hsdp):
+    import torch.multiprocessing as mp
+
+    mp.start_processes(
+        _extra_parallel_resume_worker,
+        args=(8 if hsdp else 4, str(tmp_path / "rdzv"), hsdp),
+        nprocs=8 if hsdp else 4,
+        join=True,
+        start_method="fork",
+    )
+
+
+def _extra_parallel_dcp_resume_worker(rank, world, rendezvous, checkpoint, hsdp, optimizer_kind, same_dim=False):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+
+    from veomni.distributed.parallel_plan import SpecInfo
+    from veomni.optim.master_fp32_adamw import FullFP32AdamW
+    from veomni.optim.optimizer import MultiOptimizer
+
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world)
+    try:
+        if hsdp:
+            mesh = init_device_mesh("cpu", (2, 2, 2), mesh_dim_names=("replicate", "fsdp", "ep"))
+            placements = [Replicate(), Shard(0), Shard(0)] if same_dim else [Replicate(), Shard(1), Shard(0)]
+        else:
+            mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("fsdp", "ep"))
+            placements = [Shard(0), Shard(0)] if same_dim else [Shard(1), Shard(0)]
+        torch.manual_seed(17)
+        full = torch.randn(5, 7, dtype=torch.bfloat16)
+        model = torch.nn.Module()
+        model.weight = torch.nn.Parameter(distribute_tensor(full, mesh, placements))
+        model._fqn2spec_info = {
+            "weight": SpecInfo(
+                para_name="ep",
+                placement=Shard(0),
+                fqn="weight",
+                para_fsdp_mesh=mesh,
+                fsdp_shard_dim=0 if same_dim else 1,
+            )
+        }
+        parallel_state = SimpleNamespace(
+            dp_mode="fsdp2",
+            any_extra_parallel_enabled=True,
+            extra_parallel_names=("ep",),
+            extra_parallel_fsdp_device_mesh={"ep": mesh},
+        )
+
+        def make_optimizer(model, gradient=None):
+            if optimizer_kind == "cpu_offload_adamw":
+                child = CPUOffloadAdamW([{"params": [model.weight], "cpu_offload": True}], lr=0.001)
+            else:
+                child = FullFP32AdamW([model.weight], lr=0.001)
+            optimizer = MultiOptimizer(model, {"ep": child}, ["ep"])
+            if gradient is not None:
+                model.weight.grad = distribute_tensor(gradient, mesh, placements)
+                optimizer.step()
+                model.weight.grad = None
+            return child, optimizer
+
+        source_child, source = make_optimizer(model, torch.randn_like(full))
+        dcp.save(
+            {"optimizer": OptimizerState(model, source, parallel_state=parallel_state)},
+            checkpoint_id=checkpoint,
+        )
+        dist.barrier()
+
+        target_model = torch.nn.Module()
+        target_model.weight = torch.nn.Parameter(distribute_tensor(torch.zeros_like(full), mesh, placements))
+        target_model._fqn2spec_info = model._fqn2spec_info
+        target_child, target = make_optimizer(target_model)
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+            checkpoint_id=checkpoint,
+            planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True, optimizer=target),
+        )
+        for name in ("master_weight", "exp_avg", "exp_avg_sq"):
+            expected = source_child.state[model.weight][name]
+            actual = target_child.state[target_model.weight][name]
+            assert actual.device_mesh == target_model.weight.device_mesh
+            assert actual.placements == target_model.weight.placements
+            assert actual.shape == target_model.weight.shape
+            torch.testing.assert_close(actual.to_local(), expected.to_local(), rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("optimizer_kind", ["cpu_offload_adamw", "full_fp32_adamw"])
+@pytest.mark.parametrize("hsdp", [False, True])
+@pytest.mark.parametrize("same_dim", [False, True])
+def test_extra_parallel_dcp_resume_restores_parameter_layout(tmp_path, hsdp, optimizer_kind, same_dim):
+    import torch.multiprocessing as mp
+
+    world = 8 if hsdp else 4
+    mp.start_processes(
+        _extra_parallel_dcp_resume_worker,
+        args=(world, str(tmp_path / "rdzv"), str(tmp_path / "checkpoint"), hsdp, optimizer_kind, same_dim),
+        nprocs=world,
+        join=True,
+        start_method="fork",
+    )

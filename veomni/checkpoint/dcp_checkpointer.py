@@ -65,10 +65,54 @@ logger = logging.get_logger(__name__)
 _EXTRA_STATE_KEY = "extra_state"
 _EXTRA_STATE_DIRNAME = "extra_state"
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
+_ZERO_OPTIMIZER_STATE_MARKER = "__veomni_zero_optimizer_state__"
+
+
+def _mark_zero_optimizer_state_resume(optimizer) -> None:
+    if optimizer is None:
+        raise RuntimeError("A zero-state optimizer checkpoint requires the target optimizer")
+    targets = optimizer.values() if isinstance(optimizer, dict) else (optimizer,)
+    for target in targets:
+        target._veomni_resume_zero_optimizer_state = True
+
+
+def _reset_zero_optimizer_state_resume(optimizer) -> None:
+    """Discard an unconsumed resume marker without touching optimizer state."""
+    if optimizer is None:
+        return
+    targets = optimizer.values() if isinstance(optimizer, dict) else (optimizer,)
+    for target in targets:
+        target._veomni_resume_zero_optimizer_state = False
+
+
+def _clear_optimizer_state(optimizer) -> None:
+    if isinstance(optimizer, dict):
+        for child in optimizer.values():
+            _clear_optimizer_state(child)
+        return
+    children = getattr(optimizer, "optimizers_dict", None)
+    if children is not None:
+        for child in children.values():
+            _clear_optimizer_state(child)
+        return
+    optimizer.state.clear()
+
+
+def _finish_zero_optimizer_state_resume(optimizer) -> None:
+    if optimizer is None:
+        return
+    targets = optimizer.values() if isinstance(optimizer, dict) else (optimizer,)
+    if not any(getattr(target, "_veomni_resume_zero_optimizer_state", False) for target in targets):
+        return
+    try:
+        _clear_optimizer_state(optimizer)
+    finally:
+        _reset_zero_optimizer_state_resume(optimizer)
 
 
 def _requires_exact_optimizer_state_dtypes(optimizer):
     """Opt in only precision-sensitive optimizers, including MultiOptimizer."""
+    optimizer = getattr(optimizer, "optimizer", optimizer)
     if getattr(optimizer, "requires_exact_state_dtypes", False):
         return True
     children = optimizer if isinstance(optimizer, dict) else getattr(optimizer, "optimizers_dict", {})
@@ -76,6 +120,7 @@ def _requires_exact_optimizer_state_dtypes(optimizer):
 
 
 def _requires_exact_optimizer_recipe(optimizer):
+    optimizer = getattr(optimizer, "optimizer", optimizer)
     if getattr(optimizer, "requires_exact_recipe", False):
         return True
     children = optimizer if isinstance(optimizer, dict) else getattr(optimizer, "optimizers_dict", {})
@@ -84,6 +129,7 @@ def _requires_exact_optimizer_recipe(optimizer):
 
 def _validate_exact_optimizer_state_targets(optimizer):
     """Validate parameter inventory even when PyTorch skips partial-state initialization."""
+    optimizer = getattr(optimizer, "optimizer", optimizer)
     children = optimizer if isinstance(optimizer, dict) else getattr(optimizer, "optimizers_dict", {})
     if children:
         for child in children.values():
@@ -122,10 +168,35 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         self.optimizer = optimizer
 
     def create_local_plan(self):
-        if self.strict_optimizer_recipe:
+        # The marker is an ephemeral handoff from planning to load_state_dict.
+        # Never let a failed plan leave it behind for a later checkpoint.
+        _reset_zero_optimizer_state_resume(self.optimizer)
+        metadata = self.metadata.state_dict_metadata if self.metadata is not None else {}
+        has_optimizer_state = any(key.startswith("optimizer.state.") for key in metadata)
+        has_zero_state_marker = f"optimizer.{_ZERO_OPTIMIZER_STATE_MARKER}" in metadata
+        if has_zero_state_marker and has_optimizer_state:
+            raise RuntimeError(
+                "DCP zero-state optimizer marker conflicts with saved tensor state; "
+                "refusing to discard loaded optimizer state"
+            )
+        resume_zero_optimizer_state = has_zero_state_marker and not has_optimizer_state
+
+        # A marker-only sparse MultiOptimizer checkpoint intentionally has no
+        # param-group metadata. There is no state to migrate, so recipe identity
+        # comes from the fresh target optimizer rather than the empty checkpoint.
+        if self.strict_optimizer_recipe and not resume_zero_optimizer_state:
             assert self.metadata is not None
             for key, path in self.mappings.items():
-                if path and path[0] == "optimizer" and key not in self.metadata.state_dict_metadata:
+                # Recipe identity lives in param-group metadata. Tensor state is
+                # validated below and may legitimately be absent for a parameter
+                # that never received a gradient.
+                if (
+                    path
+                    and path[0] == "optimizer"
+                    and len(path) > 1
+                    and path[1] == "param_groups"
+                    and key not in self.metadata.state_dict_metadata
+                ):
                     raise RuntimeError(
                         f"DCP optimizer recipe/state is incomplete: {key}; "
                         "AdamW-to-Muon migration must not use partial resume"
@@ -137,6 +208,7 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
             assert self.metadata is not None
             if any(path and path[0] == "optimizer" for path in self.mappings.values()):
                 _validate_exact_optimizer_state_targets(self.optimizer)
+            missing_state_fields = []
             for key, path in self.mappings.items():
                 if (
                     not path
@@ -147,10 +219,8 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
                 source = self.metadata.state_dict_metadata.get(key)
                 target = self.state_dict.get(key)
                 if source is None:
-                    raise RuntimeError(
-                        f"DCP is missing precision-sensitive optimizer state {key}; "
-                        "explicit checkpoint migration is required"
-                    )
+                    missing_state_fields.append(key)
+                    continue
                 if not torch.is_tensor(target):
                     continue
                 source_shape = getattr(source, "size", None)
@@ -165,23 +235,51 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
                         f"DCP optimizer dtype mismatch for {key}: saved={source_dtype}, configured={target.dtype}; "
                         "explicit precision migration is required"
                     )
+            if missing_state_fields:
+                lazy_bases = set()
+                for key in missing_state_fields:
+                    base, _, _ = key.rpartition(".")
+                    required = {
+                        f"{base}.step",
+                        f"{base}.master_weight",
+                        f"{base}.exp_avg",
+                        f"{base}.exp_avg_sq",
+                    }
+                    if required.intersection(metadata):
+                        raise RuntimeError(
+                            f"DCP is missing part of precision-sensitive optimizer state for {base}; "
+                            "explicit checkpoint migration is required"
+                        )
+                    lazy_bases.add(base)
+                if not has_optimizer_state and not has_zero_state_marker:
+                    raise RuntimeError(
+                        "DCP is missing every precision-sensitive optimizer state entry; "
+                        "explicit checkpoint migration is required"
+                    )
+                if lazy_bases and not resume_zero_optimizer_state:
+                    logger.info_rank0(
+                        "DCP resume keeps default lazy optimizer state for %d parameter(s) absent from the checkpoint",
+                        len(lazy_bases),
+                    )
         plan = super().create_local_plan()
-        if not self.strict_model:
-            return plan
-
-        assert self.metadata is not None
-        missing_model_keys = sorted(
-            key
-            for key, path in self.mappings.items()
-            if path and path[0] == "model" and key not in self.metadata.state_dict_metadata
-        )
-        if missing_model_keys:
-            preview = ", ".join(missing_model_keys[:10])
-            suffix = " ..." if len(missing_model_keys) > 10 else ""
-            raise RuntimeError(
-                f"DCP is missing {len(missing_model_keys)} model key(s) required for a full-model resume: "
-                f"{preview}{suffix}"
+        if self.strict_model:
+            assert self.metadata is not None
+            missing_model_keys = sorted(
+                key
+                for key, path in self.mappings.items()
+                if path and path[0] == "model" and key not in self.metadata.state_dict_metadata
             )
+            if missing_model_keys:
+                preview = ", ".join(missing_model_keys[:10])
+                suffix = " ..." if len(missing_model_keys) > 10 else ""
+                raise RuntimeError(
+                    f"DCP is missing {len(missing_model_keys)} model key(s) required for a full-model resume: "
+                    f"{preview}{suffix}"
+                )
+
+        if resume_zero_optimizer_state:
+            _mark_zero_optimizer_state_resume(self.optimizer)
+            logger.info_rank0("DCP resume restored an explicitly zero-step optimizer checkpoint")
 
         return plan
 
@@ -392,9 +490,11 @@ class OptimizerState(Stateful):
             avoiding synthetic zero state for unused parameters (e.g. unused
             MoE experts) in the checkpoint.
 
-    Precision-sensitive optimizers opt out of partial state restoration: missing
-    master, moment, or step fields require explicit migration. This also rejects
-    checkpoints with entirely absent lazy states for unused parameters.
+    Precision-sensitive optimizers opt out of partial state restoration of an
+    existing but incomplete state. A parameter with no saved state at all keeps
+    the fresh optimizer's default lazy state; unused parameters can be absent.
+    A zero-step sparse MultiOptimizer checkpoint records an explicit marker, so
+    an entirely empty optimizer state restores lazy instead of being rejected.
     """
 
     def __init__(self, model, optimizer, parallel_state=None, *, load: bool = False):
@@ -424,44 +524,53 @@ class OptimizerState(Stateful):
         if getattr(self.optimizer, "_is_multi_optimizer", False):
             if self._load:
                 return self.optimizer.state_dict()
-            return self.optimizer._sparse_state_dict()
+            sparse = self.optimizer._sparse_state_dict()
+            if not any(key.startswith("state.") for key in sparse):
+                sparse[_ZERO_OPTIMIZER_STATE_MARKER] = True
+            return sparse
 
-        return get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
+        state_dict = get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
+        if not self._load and not state_dict["state"]:
+            state_dict[_ZERO_OPTIMIZER_STATE_MARKER] = True
+        return state_dict
 
     def load_state_dict(self, state_dict):
         optim_state_from_dcp_load = state_dict
-        if self.should_extra_parallel_aware:
-            # we need to drop ExtraParallel dim before loading them into optimizers
-            optim_state_without_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
-                optim_state_from_dcp_load, "drop"
+        try:
+            if self.should_extra_parallel_aware:
+                # we need to drop ExtraParallel dim before loading them into optimizers
+                optim_state_without_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
+                    optim_state_from_dcp_load, "drop"
+                )
+                # Delegate to MultiOptimizer (it will split/filter correctly)
+                self.optimizer.load_state_dict(optim_state_without_extra_parallel_dim)
+                # MultiOptimizer sub-optimizers can also lose param-group hyperparams
+                # (betas/...) for empty groups after load; restore recurses into them.
+                restore_optimizer_param_group_defaults(self.optimizer)
+                return
+
+            if getattr(self.optimizer, "_is_multi_optimizer", False):
+                self.optimizer.load_state_dict(optim_state_from_dcp_load)
+                restore_optimizer_param_group_defaults(self.optimizer)
+                return
+
+            # Single torch optimizer.
+            # ``strict=False`` matches the DCP planner's allow_partial_load intent:
+            # params that never received a gradient (and thus have no saved Adam
+            # state) keep the default-initialized state that
+            # ``set_optimizer_state_dict`` / ``_init_optim_state`` already created.
+            # Torch 2.11+ raises under the default strict=True when any
+            # requires_grad param is missing from the checkpoint (DeepSeek-V4
+            # indexer ``position_bias`` is one such case on short toy runs).
+            set_optimizer_state_dict(
+                model=self.model,
+                optimizers=self.optimizer,
+                optim_state_dict=optim_state_from_dcp_load,
+                options=StateDictOptions(strict=False),
             )
-            # Delegate to MultiOptimizer (it will split/filter correctly)
-            self.optimizer.load_state_dict(optim_state_without_extra_parallel_dim)
-            # MultiOptimizer sub-optimizers can also lose param-group hyperparams
-            # (betas/...) for empty groups after load; restore recurses into them.
             restore_optimizer_param_group_defaults(self.optimizer)
-            return
-
-        if getattr(self.optimizer, "_is_multi_optimizer", False):
-            self.optimizer.load_state_dict(optim_state_from_dcp_load)
-            restore_optimizer_param_group_defaults(self.optimizer)
-            return
-
-        # Single torch optimizer.
-        # ``strict=False`` matches the DCP planner's allow_partial_load intent:
-        # params that never received a gradient (and thus have no saved Adam
-        # state) keep the default-initialized state that
-        # ``set_optimizer_state_dict`` / ``_init_optim_state`` already created.
-        # Torch 2.11+ raises under the default strict=True when any
-        # requires_grad param is missing from the checkpoint (DeepSeek-V4
-        # indexer ``position_bias`` is one such case on short toy runs).
-        set_optimizer_state_dict(
-            model=self.model,
-            optimizers=self.optimizer,
-            optim_state_dict=optim_state_from_dcp_load,
-            options=StateDictOptions(strict=False),
-        )
-        restore_optimizer_param_group_defaults(self.optimizer)
+        finally:
+            _finish_zero_optimizer_state_resume(self.optimizer)
 
     def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):
         return _apply_extra_parallel_dim(
@@ -473,7 +582,7 @@ class OptimizerState(Stateful):
         )
 
 
-def _from_local_preserve_device(local_tensor, device_mesh, placements):
+def _from_local_preserve_device(local_tensor, device_mesh, placements, *, shape=None, stride=None):
     """Wrap optimizer CPU state without moving it onto its accelerator mesh.
 
     DTensor.from_local implicitly copies CPU input to device_mesh.device_type.
@@ -483,9 +592,44 @@ def _from_local_preserve_device(local_tensor, device_mesh, placements):
     No collectives or accelerator allocations are needed (run_check=False).
     """
     if local_tensor.device.type == "cpu" and device_mesh.device_type != "cpu":
-        metadata = DTensor.from_local(local_tensor.to("meta"), device_mesh=device_mesh, placements=placements)
+        metadata = DTensor.from_local(
+            local_tensor.to("meta"),
+            device_mesh=device_mesh,
+            placements=placements,
+            run_check=False,
+            shape=shape,
+            stride=stride,
+        )
         return DTensor(local_tensor, metadata._spec, requires_grad=local_tensor.requires_grad)
-    return DTensor.from_local(local_tensor, device_mesh=device_mesh, placements=placements)
+    return DTensor.from_local(
+        local_tensor,
+        device_mesh=device_mesh,
+        placements=placements,
+        run_check=False,
+        shape=shape,
+        stride=stride,
+    )
+
+
+def _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim):
+    """Global shape/stride of one ExtraParallel slice on the FSDP sub-mesh."""
+    shape = list(loaded_tensor.shape)
+    if ep_shard_dim == fsdp_shard_dim:
+        mesh_dim_names = loaded_tensor.device_mesh.mesh_dim_names
+        fsdp_size = loaded_tensor.device_mesh.size(len(mesh_dim_names) - 2)
+        ep_size = loaded_tensor.device_mesh.size(len(mesh_dim_names) - 1)
+        fsdp_rank, ep_rank = loaded_tensor.device_mesh.get_coordinate()[-2:]
+        size, remainder = divmod(shape[ep_shard_dim], fsdp_size * ep_size)
+        chunks = [size + 1] * remainder + [size] * (fsdp_size * ep_size - remainder)
+        shape[ep_shard_dim] = sum(chunks[ep_rank::ep_size])
+        if chunks[fsdp_rank * ep_size + ep_rank] != loaded_tensor.to_local().shape[ep_shard_dim]:
+            raise RuntimeError("Unsupported uneven ExtraParallel/FSDP shard layout")
+    else:
+        shape[ep_shard_dim] = loaded_tensor.to_local().shape[ep_shard_dim]
+    stride = [1] * len(shape)
+    for index in range(len(shape) - 2, -1, -1):
+        stride[index] = stride[index + 1] * shape[index + 1]
+    return tuple(shape), tuple(stride)
 
 
 def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh, fsdp_shard_dim: int = 1):
@@ -509,12 +653,30 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     if num_placements == 1:
         tensor_to_put = loaded_tensor.to_local()
     elif num_placements == 2:
+        ep_placement = loaded_tensor.placements[-1]
+        if not isinstance(ep_placement, Shard):
+            raise RuntimeError(f"ExtraParallel placement must be Shard, got {ep_placement}")
+        ep_shard_dim = ep_placement.dim
+        shape, stride = _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim)
         tensor_to_put = _from_local_preserve_device(
-            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(fsdp_shard_dim)]
+            loaded_tensor._local_tensor,
+            device_mesh=device_mesh,
+            placements=[Shard(fsdp_shard_dim)],
+            shape=shape,
+            stride=stride,
         )
     elif num_placements == 3:
+        ep_placement = loaded_tensor.placements[-1]
+        if not isinstance(ep_placement, Shard):
+            raise RuntimeError(f"ExtraParallel placement must be Shard, got {ep_placement}")
+        ep_shard_dim = ep_placement.dim
+        shape, stride = _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim)
         tensor_to_put = _from_local_preserve_device(
-            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Replicate(), Shard(fsdp_shard_dim)]
+            loaded_tensor._local_tensor,
+            device_mesh=device_mesh,
+            placements=[Replicate(), Shard(fsdp_shard_dim)],
+            shape=shape,
+            stride=stride,
         )
     else:
         raise RuntimeError(
@@ -571,7 +733,13 @@ def restore_extra_parallel_dim(
             placements = [Replicate(), Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
         else:
             placements = [Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
-        dtensor = _from_local_preserve_device(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
+        dtensor = _from_local_preserve_device(
+            orgin_tensor._local_tensor,
+            device_mesh=fsdp_mesh,
+            placements=placements,
+            shape=orgin_tensor.shape,
+            stride=orgin_tensor.stride(),
+        )
     elif torch.is_tensor(orgin_tensor):
         # If there is no FSDP but only ExtraParallel
         dtensor = _from_local_preserve_device(
@@ -1133,9 +1301,29 @@ class DistributedCheckpointer(CheckpointerBase):
             load_state: Dict[str, Any] = {"model": _model_state()}
             if wants_optimizer:
                 load_state["optimizer"] = _optimizer_state()
+            try:
+                dcp.load(
+                    state_dict=load_state,
+                    storage_reader=cls._create_storage_reader(fused_dir),
+                    process_group=process_group,
+                    planner=_ModelStrictLoadPlanner(
+                        strict_model=not trainable_only,
+                        strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(state.get("optimizer")),
+                        strict_optimizer_recipe=_requires_exact_optimizer_recipe(state.get("optimizer")),
+                        optimizer=state.get("optimizer"),
+                    ),
+                )
+            finally:
+                _reset_zero_optimizer_state_resume(state.get("optimizer"))
+            cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
+            logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
+            return state
+
+        model_root = model_dir(path, module)
+        try:
             dcp.load(
-                state_dict=load_state,
-                storage_reader=cls._create_storage_reader(fused_dir),
+                state_dict={"model": _model_state()},
+                storage_reader=cls._create_storage_reader(weights_dir(path, module)),
                 process_group=process_group,
                 planner=_ModelStrictLoadPlanner(
                     strict_model=not trainable_only,
@@ -1144,36 +1332,25 @@ class DistributedCheckpointer(CheckpointerBase):
                     optimizer=state.get("optimizer"),
                 ),
             )
-            cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
-            logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
-            return state
-
-        model_root = model_dir(path, module)
-        dcp.load(
-            state_dict={"model": _model_state()},
-            storage_reader=cls._create_storage_reader(weights_dir(path, module)),
-            process_group=process_group,
-            planner=_ModelStrictLoadPlanner(
-                strict_model=not trainable_only,
-                strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(state.get("optimizer")),
-                strict_optimizer_recipe=_requires_exact_optimizer_recipe(state.get("optimizer")),
-                optimizer=state.get("optimizer"),
-            ),
-        )
+        finally:
+            _reset_zero_optimizer_state_resume(state.get("optimizer"))
         if wants_optimizer:
-            dcp.load(
-                state_dict={"optimizer": _optimizer_state()},
-                storage_reader=cls._create_storage_reader(optimizer_dir(path, module)),
-                process_group=process_group,
-                # The strict check looks for missing ``model`` keys; there are none
-                # in an optimizer-only load, so strictness has nothing to say here.
-                planner=_ModelStrictLoadPlanner(
-                    strict_model=False,
-                    strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(state.get("optimizer")),
-                    strict_optimizer_recipe=_requires_exact_optimizer_recipe(state.get("optimizer")),
-                    optimizer=state.get("optimizer"),
-                ),
-            )
+            try:
+                dcp.load(
+                    state_dict={"optimizer": _optimizer_state()},
+                    storage_reader=cls._create_storage_reader(optimizer_dir(path, module)),
+                    process_group=process_group,
+                    # The strict check looks for missing ``model`` keys; there are none
+                    # in an optimizer-only load, so strictness has nothing to say here.
+                    planner=_ModelStrictLoadPlanner(
+                        strict_model=False,
+                        strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(state.get("optimizer")),
+                        strict_optimizer_recipe=_requires_exact_optimizer_recipe(state.get("optimizer")),
+                        optimizer=state.get("optimizer"),
+                    ),
+                )
+            finally:
+                _reset_zero_optimizer_state_resume(state.get("optimizer"))
 
         cls._load_extra_state(checkpoint_dir=model_root, state=state)
 
