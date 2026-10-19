@@ -105,9 +105,9 @@ def check_context_parallel_supported(config: PretrainedConfig, attn_implementati
                 "USP zigzag CP currently supports Qwen3 / Qwen3-VL / Qwen3-VL-MoE with VeOmni FlashAttention 2 or 4 "
                 "only. Use contiguous CP for DeepSeek V4 or cp_size=1 for other models/backends."
             )
-        if config.model_type in USP_VISION_MODEL_TYPES and not is_torch_npu_available():
+        if config.model_type in USP_VISION_MODEL_TYPES and implementation != "veomni_flash_attention_2_with_sp":
             raise NotImplementedError(
-                "USP for Qwen3-VL runs the bidirectional ViT ring, which is Ascend NPU only for now."
+                "USP for Qwen3-VL runs the bidirectional ViT ring, which supports FlashAttention 2 only for now."
             )
         if is_torch_npu_available() and implementation != "veomni_flash_attention_2_with_sp":
             raise NotImplementedError("Ascend USP uses the VeOmni FlashAttention 2 adapter with torch_npu.")

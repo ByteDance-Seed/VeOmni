@@ -43,8 +43,9 @@ def test_usp_layout_is_explicit(monkeypatch):
         ("qwen3", "zigzag", "veomni_flash_attention_4_with_sp", True),
         ("qwen3", "zigzag", "veomni_flex_attention_with_sp", False),
         ("qwen3_next", "zigzag", "veomni_flash_attention_2_with_sp", False),
-        ("qwen3_vl", "zigzag", "veomni_flash_attention_2_with_sp", False),
-        ("qwen3_vl_moe", "zigzag", "veomni_flash_attention_2_with_sp", False),
+        ("qwen3_vl", "zigzag", "veomni_flash_attention_2_with_sp", True),
+        ("qwen3_vl", "zigzag", "veomni_flash_attention_4_with_sp", False),
+        ("qwen3_vl_moe", "zigzag", "veomni_flash_attention_2_with_sp", True),
     ],
 )
 def test_cp_model_and_backend_gate(monkeypatch, model_type, layout, backend, allowed):

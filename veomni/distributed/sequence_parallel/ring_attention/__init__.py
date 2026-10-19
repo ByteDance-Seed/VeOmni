@@ -23,6 +23,7 @@ from .comm import RingComm
 from .gpu import (
     FA_BACKEND,
     ring_flash_attn_func,
+    ring_flash_attn_varlen_func,
     update_out_and_lse,
     zigzag_ring_flash_attn_func,
     zigzag_ring_flash_attn_varlen_func,
@@ -61,6 +62,7 @@ __all__ = [
     "zigzag_reorder_varlen",
     "zigzag_undo",
     "ring_flash_attn_func",
+    "ring_flash_attn_varlen_func",
     "update_out_and_lse",
     "zigzag_ring_flash_attn_func",
     "zigzag_ring_flash_attn_varlen_func",

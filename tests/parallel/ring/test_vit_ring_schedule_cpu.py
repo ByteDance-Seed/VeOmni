@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU (gloo) schedule test for the NPU bidirectional (ViT) ring attention.
+"""CPU (gloo) schedule test for the bidirectional (ViT) ring attention backends.
 
-The ``torch_npu`` fusion-attention calls are replaced with a float64 torch
-reference that honours TND ``actual_seq_*len`` segments, including zero-length
-ones, so the ring schedule (per-rank offsets, softmax-stat merge, dK/dV return
-trip) runs and is checked on any machine against full bidirectional varlen
-attention. Numerical coverage on real hardware lives in ``test_usp_ring_npu.py``.
+The NPU ``torch_npu`` fusion-attention calls and the CUDA FlashAttention-2 varlen
+calls are replaced with float64 torch references that honour the packed offsets,
+including zero-length segments, so both ring schedules (per-rank offsets, partial
+result merge, dK/dV return trip) run and are checked on any machine against full
+bidirectional varlen attention. The FA2 reference reproduces FlashAttention-2's
+``lse=+inf`` for query rows whose key segment is empty, which the CUDA ring must
+neutralise before merging. Numerical coverage on real hardware lives in
+``test_usp_ring_npu.py`` / ``test_usp_ring_gpu.py``.
 """
 
 import torch
@@ -26,6 +29,7 @@ import torch.distributed as dist
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.common_utils import run_tests
 
+import veomni.distributed.sequence_parallel.ring_attention.gpu as ring_gpu
 import veomni.distributed.sequence_parallel.ring_attention.npu as ring_npu
 from veomni.distributed.sequence_parallel.ring_attention.layout import vit_cp_cu_seqlens, vit_usp_slice
 
@@ -81,6 +85,35 @@ def _fake_npu_fa_backward(
     return dq, dk, dv
 
 
+def _fake_fa2_varlen_forward(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale, causal):
+    out = torch.zeros_like(q)
+    lse = torch.full((q.shape[1], q.shape[0]), float("inf"), dtype=torch.float32)  # FA2: empty rows -> +inf
+    for (q0, q1), (k0, k1) in zip(_segments(cu_q.tolist()), _segments(cu_k.tolist())):
+        if q1 == q0 or k1 == k0:
+            continue
+        scores = torch.einsum("qnd,knd->nqk", q[q0:q1], k[k0:k1]) * softmax_scale
+        out[q0:q1] = torch.einsum("nqk,knd->qnd", torch.softmax(scores, dim=-1), v[k0:k1])
+        lse[:, q0:q1] = torch.logsumexp(scores, dim=-1).float()
+    return out, lse
+
+
+def _fake_fa2_varlen_backward(dout, q, k, v, out, lse, dq, dk, dv, cu_q, cu_k, max_q, max_k, softmax_scale, causal):
+    dq.zero_()
+    dk.zero_()
+    dv.zero_()
+    delta = (dout * out).sum(-1).transpose(0, 1)  # (N, T)
+    for (q0, q1), (k0, k1) in zip(_segments(cu_q.tolist()), _segments(cu_k.tolist())):
+        if q1 == q0 or k1 == k0:
+            continue
+        scores = torch.einsum("qnd,knd->nqk", q[q0:q1], k[k0:k1]) * softmax_scale
+        probs = torch.exp(scores - lse[:, q0:q1].to(scores.dtype).unsqueeze(-1))
+        dv[k0:k1] += torch.einsum("nqk,qnd->knd", probs, dout[q0:q1])
+        dprobs = torch.einsum("qnd,knd->nqk", dout[q0:q1], v[k0:k1])
+        dscores = probs * (dprobs - delta[:, q0:q1].to(scores.dtype).unsqueeze(-1))
+        dq[q0:q1] += torch.einsum("nqk,knd->qnd", dscores, k[k0:k1]) * softmax_scale
+        dk[k0:k1] += torch.einsum("nqk,qnd->knd", dscores, q[q0:q1]) * softmax_scale
+
+
 def _reference(q, k, v, vit_seqlens, scale):
     outs, start = [], 0
     for seqlen in vit_seqlens:
@@ -103,11 +136,16 @@ class _VitRingScheduleTest(MultiProcessTestCase):
         ring_npu._require_torch_npu = lambda: None
         ring_npu._npu_fa_forward = _fake_npu_fa_forward
         ring_npu._npu_fa_backward = _fake_npu_fa_backward
-        for vit_seqlens in _CASES:
-            self._check(vit_seqlens)
+        ring_gpu._FA_AVAILABLE = True
+        ring_gpu.FA_BACKEND = "fa2"
+        ring_gpu._fa_varlen_forward = _fake_fa2_varlen_forward
+        ring_gpu._fa_varlen_backward = _fake_fa2_varlen_backward
+        for ring_func in (ring_npu.ring_npu_flash_attn_varlen_func, ring_gpu.ring_flash_attn_varlen_func):
+            for vit_seqlens in _CASES:
+                self._check(vit_seqlens, ring_func)
         dist.destroy_process_group()
 
-    def _check(self, vit_seqlens):
+    def _check(self, vit_seqlens, ring_func):
         world, rank = self.world_size, self.rank
         total = sum(vit_seqlens)
         scale = _HEAD_DIM**-0.5
@@ -129,9 +167,7 @@ class _VitRingScheduleTest(MultiProcessTestCase):
         cu_per_rank = [vit_cp_cu_seqlens(global_cu, world, c, 1) for c in range(world)]
 
         local_q, local_k, local_v = (shard(t).requires_grad_(True) for t in (q, k, v))
-        out = ring_npu.ring_npu_flash_attn_varlen_func(
-            local_q, local_k, local_v, cu_per_rank, softmax_scale=scale, group=dist.group.WORLD
-        )
+        out = ring_func(local_q, local_k, local_v, cu_per_rank, softmax_scale=scale, group=dist.group.WORLD)
         out.backward(shard(dout))
 
         rows = shard(torch.arange(total), pad_value=-1)

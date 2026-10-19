@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import veomni.distributed.sequence_parallel.ring_attention as ring_attention_module
+import veomni.distributed.sequence_parallel.ring_attention.gpu as ring_gpu
 from veomni.utils.device import get_device_type
 
 
@@ -133,9 +134,35 @@ def test_ring_attention_bidirectional_rejects_mismatched_local_length(monkeypatc
         )
 
 
-def test_ring_attention_bidirectional_is_not_implemented_on_cuda():
+def test_ring_attention_bidirectional_routes_cuda_to_fa2_varlen(monkeypatch):
+    calls = []
+
+    def fake_ring_varlen(q, k, v, cu_seqlens_per_rank, softmax_scale=None, group=None):
+        calls.append((q.shape, cu_seqlens_per_rank, softmax_scale))
+        return q
+
+    monkeypatch.setattr(ring_gpu, "ring_flash_attn_varlen_func", fake_ring_varlen)
     query = torch.randn(1, 8, 2, 4)
-    with pytest.raises(NotImplementedError, match="only implemented for NPU"):
+    output = ring_attention_module.ring_attention(
+        query,
+        query,
+        query,
+        group=object(),
+        cp_size=2,
+        cu_seqlens=torch.tensor([0, 12]),
+        softmax_scale=0.5,
+        causal=False,
+        device_type="cuda",
+    )
+    assert output.shape == query.shape
+    assert calls == [((8, 2, 4), [[0, 8, 8], [0, 4, 8]], 0.5)]
+
+
+def test_ring_attention_bidirectional_rejects_non_fa2_backend(monkeypatch):
+    monkeypatch.setattr(ring_gpu, "_FA_AVAILABLE", True)
+    monkeypatch.setattr(ring_gpu, "FA_BACKEND", "fa4")
+    query = torch.randn(1, 8, 2, 4)
+    with pytest.raises(NotImplementedError, match="only supports FlashAttention-2"):
         ring_attention_module.ring_attention(
             query,
             query,

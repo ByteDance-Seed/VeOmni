@@ -478,7 +478,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
 | 128K    | `ulysses=8`, `cp=2..4`       | Ring extends past the head ceiling. |
 | 256K+   | `ulysses=8` (intra-node), `cp=N` (inter-node) | Ring scales horizontally. |
 
-Qwen3-VL (dense / MoE) on Ascend:
+Qwen3-VL (dense / MoE) on Ascend or CUDA (FlashAttention-2):
 
 ```shell
 bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense_usp.yaml \
@@ -493,9 +493,10 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense_usp.
   ring). Packed (varlen) sequences ARE supported — each document is zig-zag
   split independently across the `cp` group.
 - **Vision encoders under `cp_size > 1`** (first version):
-  - Only **Qwen3-VL / Qwen3-VL-MoE**, only on **Ascend NPU**. The CUDA ViT ring
-    raises `NotImplementedError`: FlashAttention returns `lse=+inf` for query
-    rows whose key segment is empty, which needs special handling.
+  - Only **Qwen3-VL / Qwen3-VL-MoE**, on **Ascend NPU** and on CUDA with
+    **FlashAttention-2** (the FA4 backend raises `NotImplementedError`). Per-rank
+    vit shards can be empty; FA2 returns `lse=+inf` for query rows whose key
+    segment is empty, so the CUDA ring rewrites those to `-inf` before merging.
   - Every bidirectional attention under `cp_size > 1` is treated with the ViT
     layout, and `SequenceParallelCollator` slices `pixel_values` /
     `pixel_values_videos` with the Qwen3-VL rule (`[h·w] × t` vit seqs from
@@ -552,7 +553,8 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense_usp.
   or `bidirectional_ring_attention` (ViT).
 - ViT ring: `layout.vit_usp_slice` (per-vit-seq shards + tail pad) and
   `layout.vit_cp_cu_seqlens` (each cp rank's local offsets from the global ones);
-  NPU kernel `npu.ring_npu_flash_attn_varlen_func`. Qwen3-VL scatters the
+  kernels `npu.ring_npu_flash_attn_varlen_func` and
+  `gpu.ring_flash_attn_varlen_func` (FA2). Qwen3-VL scatters the
   gathered ViT tokens into the zig-zag sliced text in `_usp_merge_visual_embeds`.
 - Mesh: `init_parallel_state_from_config()` builds `[ulysses, cp]` and flattens `sp`.
 

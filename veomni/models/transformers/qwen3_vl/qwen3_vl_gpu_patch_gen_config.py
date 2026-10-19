@@ -20,6 +20,7 @@ patchgen veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config -o ve
 
 import copy
 from functools import lru_cache, partial
+from itertools import accumulate
 from types import SimpleNamespace
 from typing import Callable
 
@@ -100,6 +101,7 @@ import copy
 
 import numpy as np
 from functools import lru_cache, partial
+from itertools import accumulate
 from types import SimpleNamespace
 
 import torch.distributed as dist
@@ -754,8 +756,9 @@ def qwen3_vl_vision_fast_pos_embed_interpolate_patched(self, grid_thw):
 #    path returned `(merged, deepstack_list)` as a bare tuple)
 # 7. USP cp>1: pos_embeds / cos / sin take this rank's rows with the same
 #    per-vit-seq layout the collator used for pixel_values (vit_usp_slice);
-#    cu_seqlens stay the GLOBAL offsets of the real vit seqs (no sp-pad
-#    tail) — bidirectional ring attention derives per-rank offsets from them
+#    cu_seqlens are the GLOBAL offsets of the real vit seqs (no sp-pad
+#    tail), built on the host from grid_thw_list so bidirectional ring
+#    attention derives per-rank offsets from them without a device sync
 # ================================================================
 @config.override_method(
     "Qwen3VLVisionModel.forward",
@@ -879,8 +882,17 @@ def qwen3_vl_vision_forward_patched(
             max_seqlen = max(max_seqlen, sp_pad_seq_len)
     # --- Patch.4 ---
 
+    # --- Patch.7 ---
+    if get_parallel_state().cp_enabled:
+        # Host offsets of the real vit seqs (no device sync): ring attention
+        # turns them into per-rank offsets on the host every layer.
+        cu_seqlens = torch.tensor(
+            [0, *accumulate(_vit_seqlens_from_grid(grid_thw_list))],  # noqa: F821 defined via add_helper
+            dtype=torch.int32,
+        )
+    # --- Patch.7 ---
     # --- Patch.5 ---
-    if IS_NPU_AVAILABLE:
+    elif IS_NPU_AVAILABLE:
         cu_seqlens = cu_seqlens.cpu()
     # --- Patch.5 ---
 

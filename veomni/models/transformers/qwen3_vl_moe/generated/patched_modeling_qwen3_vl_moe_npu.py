@@ -58,6 +58,7 @@ import itertools
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache, partial
+from itertools import accumulate
 from types import SimpleNamespace
 from typing import Any
 
@@ -1278,8 +1279,9 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
     #    path returned `(merged, deepstack_list)` as a bare tuple)
     # 7. USP cp>1: pos_embeds / cos / sin take this rank's rows with the same
     #    per-vit-seq layout the collator used for pixel_values (vit_usp_slice);
-    #    cu_seqlens stay the GLOBAL offsets of the real vit seqs (no sp-pad
-    #    tail) — bidirectional ring attention derives per-rank offsets from them
+    #    cu_seqlens are the GLOBAL offsets of the real vit seqs (no sp-pad
+    #    tail), built on the host from grid_thw_list so bidirectional ring
+    #    attention derives per-rank offsets from them without a device sync
     # ================================================================
     @merge_with_config_defaults
     @capture_outputs
@@ -1401,8 +1403,17 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
                 max_seqlen = max(max_seqlen, sp_pad_seq_len)
         # --- Patch.4 ---
 
+        # --- Patch.7 ---
+        if get_parallel_state().cp_enabled:
+            # Host offsets of the real vit seqs (no device sync): ring attention
+            # turns them into per-rank offsets on the host every layer.
+            cu_seqlens = torch.tensor(
+                [0, *accumulate(_vit_seqlens_from_grid(grid_thw_list))],  # noqa: F821 defined via add_helper
+                dtype=torch.int32,
+            )
+        # --- Patch.7 ---
         # --- Patch.5 ---
-        if IS_NPU_AVAILABLE:
+        elif IS_NPU_AVAILABLE:
             cu_seqlens = cu_seqlens.cpu()
         # --- Patch.5 ---
 

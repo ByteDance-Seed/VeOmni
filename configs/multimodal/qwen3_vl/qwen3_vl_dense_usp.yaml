@@ -1,11 +1,11 @@
-# Qwen3-VL dense long-context SFT with USP (Unified Sequence Parallelism) on Ascend NPU.
+# Qwen3-VL dense long-context SFT with USP (Unified Sequence Parallelism).
 #
 # USP composes Ulysses (all-to-all head/seq exchange) with Ring-Attention
 # (context parallel). The effective sequence-parallel size is
 # ``ulysses_size * cp_size``. See docs/key_features/ulysses.md (USP section).
 #
 # Constraints for the ``cp`` (ring) path with vision inputs (first version):
-#   * Ascend NPU only (the CUDA ViT ring is not implemented yet)
+#   * Ascend NPU, or CUDA with FlashAttention-2 (the FA4 ViT ring is not supported yet)
 #   * text: causal zig-zag ring; every packed document is padded to 2 * cp_size
 #   * ViT: bidirectional ring; every image / video temporal step is split into
 #     cp_size shards on spatial-merge granularity, no per-image padding needed
