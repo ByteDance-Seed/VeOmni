@@ -92,6 +92,16 @@ def test_dataloader_shuffle_reaches_sampler(monkeypatch, task, shuffle):
     assert trainer.base.train_dataloader.sampler.shuffle is expected
 
 
+@pytest.mark.parametrize("task", ["offline_training", "online_training", "offline_embedding"])
+def test_offline_embedding_keeps_the_last_batch(monkeypatch, task):
+    trainer = _trainer(monkeypatch, task, micro_batch_size=1)
+    expected = task != "offline_embedding"
+    assert trainer.base.args.data.dataloader.drop_last is expected
+    assert not hasattr(trainer.base.args.data, "drop_last")
+    _load(trainer, [{"value": torch.ones(1)} for _ in range(4)])
+    assert trainer.base.train_dataloader.drop_last is expected
+
+
 @pytest.mark.parametrize("shuffle", [True, False])
 def test_dataloader_shuffle_reaches_base_trainer_builders(monkeypatch, shuffle):
     trainer = _trainer(monkeypatch, "offline_training", micro_batch_size=1, shuffle=shuffle)

@@ -96,7 +96,10 @@ class OmniStepMetricsCallback(Callback):
             sums = all_reduce(values + counts, op="sum", group=group)
             for i, key in enumerate(node_keys):
                 step_train_metrics[f"training/{key}"] = sums[i] / sums[len(node_keys) + i]
-        step_train_metrics["training/lr"] = max(self.trainer.model.lr_scheduler.get_last_lr())
+        # None only for an offline_embedding run, which freezes every module.
+        lr_scheduler = self.trainer.model.lr_scheduler
+        if lr_scheduler is not None:
+            step_train_metrics["training/lr"] = max(lr_scheduler.get_last_lr())
 
         step_env_metrics.update(step_train_metrics)
 

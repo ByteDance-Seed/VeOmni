@@ -19,7 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from ....checkpoint import layout
-from ....models.checkpoint_manager import ModelCheckpointManager
+from ....models.checkpoint import ModelCheckpointManager
 
 
 if TYPE_CHECKING:
