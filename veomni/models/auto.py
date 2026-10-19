@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
-CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
+CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4", "qwen4_exp"})
 
 _VEOMNI_SP_ATTN = (
     "veomni_flex_attention",
