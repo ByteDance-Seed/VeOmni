@@ -1011,10 +1011,15 @@ def test_flex_trainable_position_bias_forward_and_gradients():
     from torch.nn.attention import SDPBackend, sdpa_kernel
     from torch.nn.functional import scaled_dot_product_attention
 
+    generator = torch.Generator(device="cuda").manual_seed(9051)
     query, key, value = (
-        torch.randn(1, 2, 32, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True) for _ in range(3)
+        torch.randn(1, 2, 32, 64, device="cuda", dtype=torch.bfloat16, generator=generator, requires_grad=True)
+        for _ in range(3)
     )
-    bias = torch.randn(1, 2, 32, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    bias = torch.randn(1, 2, 32, 32, device="cuda", dtype=torch.bfloat16, generator=generator, requires_grad=True)
+    # Independent leaves keep the MATH oracle separate from compiled backward buffers.
+    reference_qkvb = tuple(t.detach().clone().requires_grad_(True) for t in (query, key, value, bias))
+    reference_query, reference_key, reference_value, reference_bias = reference_qkvb
     mask = _causal_block_mask(32, query.device)
     output, _ = flex_backend.flex_attention_forward(
         _FakeAttentionModule(), query, key, value, mask, position_bias=bias, scaling=64**-0.5
@@ -1022,11 +1027,14 @@ def test_flex_trainable_position_bias_forward_and_gradients():
     with sdpa_kernel(SDPBackend.MATH):
         causal = torch.ones(32, 32, device="cuda", dtype=torch.bool).tril()
         expected = scaled_dot_product_attention(
-            query, key, value, attn_mask=bias.masked_fill(~causal, -float("inf"))
+            reference_query,
+            reference_key,
+            reference_value,
+            attn_mask=reference_bias.masked_fill(~causal, -float("inf")),
         ).transpose(1, 2)
-    gradient = torch.randn_like(output)
-    actual_grads = torch.autograd.grad(output, (query, key, value, bias), gradient, retain_graph=True)
-    expected_grads = torch.autograd.grad(expected, (query, key, value, bias), gradient)
+    gradient = torch.randn(output.shape, device=output.device, dtype=output.dtype, generator=generator)
+    actual_grads = torch.autograd.grad(output, (query, key, value, bias), gradient)
+    expected_grads = torch.autograd.grad(expected, reference_qkvb, gradient)
     torch.testing.assert_close(output, expected, atol=1e-2, rtol=2e-2)
     for actual, reference in zip(actual_grads, expected_grads, strict=True):
         torch.testing.assert_close(actual, reference, atol=1e-2, rtol=3e-2)
