@@ -110,6 +110,14 @@ SYNC_FORWARD_CASES = (
         dtype="bfloat16",
         forward_attr="thinker",
     ),
+    ForwardCase(
+        "minimax_m3_vl-fa2-fused",
+        _toy("minimax_m3_vl_toy"),
+        "MiniMaxM3SparseForConditionalGeneration",
+        "vlm_full",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+    ),
 )
 
 

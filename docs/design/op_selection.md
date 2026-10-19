@@ -22,6 +22,7 @@ If a field is not in this table, it is not an op-selection knob.
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+), `cann` (DeepSeek-V4, Ascend) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
+| MiniMax sparse attention | — (no config field until a kernel backend exists) | `eager` | `"eager"` | Model `__init__` via two instance-local `VeomniOp`s (`indexer`, `attention`) of op `minimax_sparse_attention`; the eager attention runs `torch_npu.npu_fusion_attention` on NPU tensors |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
@@ -490,6 +491,12 @@ in `__init__` and always call that handle. `eager` is a registered row, not a
 separate `ModuleList` fork. LoRA experts follow the wrapped module's
 `veomni_moe.impl` and fall back to `eager` when that `moe_experts_lora` row is
 unavailable on the device.
+
+MiniMax M3 experts use the `swiglu_oai` variant, which registers `eager`,
+`fused_triton` and `fused_npu` only. It shares the standard merged-fc1 Triton
+and NPU paths (including EP) with a `swiglu_alpha` argument that replaces SiLU
+with the clamped `(up + 1) * gate * sigmoid(alpha * gate)` activation; selecting
+an implementation without a row, such as `fused_quack`, fails at model build.
 
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
 SM90+ `tilelang` and Ascend `cann` indexer and attention implementations. Its MoE path

@@ -82,6 +82,7 @@ VeOmni supports a wide range of models on Ascend NPUs, including large language 
 | | 35B-A3B | ✅ | ✅ | ✅ | ✅ | Requires explicit GatedDeltaNet NPU kernels; generic NPU E2E coverage pending |
 | [Qwen3-VL](../examples/qwen3_vl.md) | 8B | ✅ | ✅ | | ✅ | |
 | | 30B | ✅ | ✅ | ✅ | ✅ | |
+| [MiniMax M3 VL](../examples/minimax_m3_vl.md) | Checkpoint-dependent | ✅ | ✅ | ✅ | ✅ | Language attention uses the eager MSA operators with `npu_fusion_attention` |
 | [Wan2.1](../examples/wan2.1.md) | 1.3B | ✅ | ✅ | | ✅ | Prototype |
 | [Qwen3-Omni](../examples/qwen3_omni_moe.md) | 30B | ✅ | ✅ | | ✅ | Prototype |
 

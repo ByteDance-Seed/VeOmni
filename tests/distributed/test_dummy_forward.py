@@ -218,6 +218,12 @@ _vlm_cases = [
         partial(_vlm_batch, patch_size=16),
         id="qwen3_vl_moe",
     ),
+    pytest.param(
+        "minimax_m3_vl",
+        "./tests/toy_config/minimax_m3_vl_toy",
+        partial(_vlm_batch, patch_size=14),
+        id="minimax_m3_vl",
+    ),
 ]
 
 

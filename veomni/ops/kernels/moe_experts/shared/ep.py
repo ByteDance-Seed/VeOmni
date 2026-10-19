@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import torch
 
-from .swiglu import apply_swiglu_clamp
+from .swiglu import apply_swiglu_clamp, swiglu_activation, swiglu_activation_backward
 
 
 class EPGroupGemm(torch.autograd.Function):
@@ -196,8 +196,9 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         fc1_1_2_weight,
         fc2_weight,
         swiglu_limit=None,
+        swiglu_alpha=None,
     ):
-        """Merged fc1 GEMM, SwiGLU, and fc2. No routing scale."""
+        """Merged fc1 GEMM, SwiGLU (or SwiGLU-OAI), and fc2. No routing scale."""
         from .group_gemm import group_gemm_same_nk
 
         assert fc1_1_2_weight.shape[1] % 2 == 0, (
@@ -215,8 +216,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = apply_swiglu_clamp(
             fc1_1_output, fc1_2_output, swiglu_limit
         )
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-        fc1_result = fc1_1_activation * fc1_2_output
+        fc1_result = swiglu_activation(fc1_1_output, fc1_2_output, swiglu_alpha)
         fc2_output = group_gemm_same_nk(
             a=fc1_result,
             b=fc2_weight,
@@ -227,6 +227,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         )
 
         ctx.swiglu_limit = swiglu_limit
+        ctx.swiglu_alpha = swiglu_alpha
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
@@ -256,8 +257,9 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         ) = ctx.saved_tensors
         swiglu_limit = ctx.swiglu_limit
 
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-        fc1_result = fc1_1_activation * fc1_2_output
+        fc1_result, fc1_1_activation = swiglu_activation(
+            fc1_1_output, fc1_2_output, ctx.swiglu_alpha, return_gate_activation=True
+        )
         grad_fc1_result = group_gemm_same_nk(
             a=grad_output,
             b=fc2_weight,
@@ -279,9 +281,9 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
                 transpose_b=False,
             )
 
-        grad_fc1_2_output = fc1_1_activation * grad_fc1_result
-        grad_fc1_1_activation = grad_fc1_result * fc1_2_output
-        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+        grad_fc1_1_output, grad_fc1_2_output = swiglu_activation_backward(
+            grad_fc1_result, fc1_1_output, fc1_2_output, ctx.swiglu_alpha, fc1_1_activation
+        )
         if swiglu_limit is not None:
             grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
             grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
@@ -314,4 +316,5 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             grad_fc1_1_2_weight,
             grad_fc2_weight,
             None,
+            None,  # swiglu_alpha
         )

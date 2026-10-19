@@ -15,7 +15,9 @@
 """MoE experts kernel family.
 
 ``standard`` is routed SwiGLU (split or merged fc1). ``gpt_oss`` is the
-interleaved gate/up layout with bias and ``alpha`` / ``limit``. Eager is
+interleaved gate/up layout with bias and ``alpha`` / ``limit``. ``swiglu_oai``
+is the merged gate/up layout with the clamped ``(up + 1) * gate *
+sigmoid(alpha * gate)`` activation (MiniMax M3), on the standard fused paths. Eager is
 the HF expert loop (regular autograd). Fused rows wrap the local Functions.
 """
 
@@ -35,6 +37,9 @@ from .standard import mlu as standard_mlu
 from .standard import npu as standard_npu
 from .standard import quack as standard_quack
 from .standard import triton as standard_triton
+from .swiglu_oai import eager as swiglu_oai_eager
+from .swiglu_oai import npu as swiglu_oai_npu
+from .swiglu_oai import triton as swiglu_oai_triton
 
 
 _GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
@@ -118,4 +123,33 @@ register_op(
     wrapper=gpt_oss_quack.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("quack",),
+)
+
+register_op(
+    "moe_experts",
+    "swiglu_oai",
+    "eager",
+    description="PyTorch SwiGLU-OAI MoE experts with merged gate/up weights",
+    wrapper=swiglu_oai_eager.wrapper,
+)
+
+register_op(
+    "moe_experts",
+    "swiglu_oai",
+    "fused_triton",
+    description="Triton grouped-GEMM SwiGLU-OAI MoE experts",
+    wrapper=swiglu_oai_triton.wrapper,
+    requirement=_GPU_SM70_OR_ROCM,
+    requires=("triton",),
+    default=True,
+)
+
+register_op(
+    "moe_experts",
+    "swiglu_oai",
+    "fused_npu",
+    description="torch_npu grouped-GEMM SwiGLU-OAI MoE experts",
+    wrapper=swiglu_oai_npu.wrapper,
+    requirement=NpuKernelRequirement(),
+    default=True,
 )
