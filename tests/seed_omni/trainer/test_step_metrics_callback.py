@@ -23,7 +23,7 @@ _MODULE_METRICS = [{"text": (30.0, [3, 5])}, {"text": (10.0, [2])}]
 _MICRO_BATCHES = [[{"conversation_list": [[], []]}], [{"conversation_list": [[]]}]]
 
 
-def _rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
+def _rank_main(rank: int, rendezvous: str, out_dir: str, with_lr_scheduler: bool = True) -> None:
     import veomni.trainer.callbacks.base as callback_base
     import veomni.utils.dist_utils as dist_utils
     import veomni.utils.omni_helper as omni_helper
@@ -41,7 +41,7 @@ def _rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
             ),
             train_dataloader=None,
             model=SimpleNamespace(
-                lr_scheduler=SimpleNamespace(get_last_lr=lambda: [1e-4]),
+                lr_scheduler=SimpleNamespace(get_last_lr=lambda: [1e-4]) if with_lr_scheduler else None,
                 metric_meter_collect=lambda: _MODULE_METRICS[rank],
             ),
         )
@@ -76,3 +76,13 @@ def test_ranks_reduce_the_same_step_metrics(tmp_path):
     assert env["trace/text/avg_seq_len"] == 10 / 4
     assert abs(env["flops_achieved(T)"] - 40.0 / 2.0) < 1.0
     assert env["flops_promised(T)"] == 200.0
+    assert train["training/lr"] == 1e-4
+
+
+def test_offline_cache_logs_no_lr_without_an_lr_scheduler(tmp_path):
+    """An ``offline_embedding`` run freezes every module, so the composed model has no lr scheduler."""
+    mp.spawn(_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path), False), nprocs=2, join=True)
+
+    train = json.loads((tmp_path / "rank0.json").read_text())["train"]
+    assert "training/lr" not in train
+    assert train["training/total_loss"] == 1.0

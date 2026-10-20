@@ -19,7 +19,6 @@ from .configuration_wan_condition import WanTransformer3DConditionModelConfig
 logger = logging.get_logger(__name__)
 
 
-# T2V only
 class WanTransformer3DConditionModel(PreTrainedModel):
     config_class = WanTransformer3DConditionModelConfig
     supports_gradient_checkpointing = False
@@ -84,27 +83,44 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         )
         self.negative_prompt_embeds = prompt_embeds[0].unsqueeze(0)
 
-    def _encode_video_to_latents(self, video: torch.Tensor) -> torch.Tensor:
+    def _preprocess_video(self, video: torch.Tensor) -> torch.Tensor:
         # resize video to max size
         height, width = video.shape[-2:]
-
         size = min(self.config.video_max_size, min(width, height))
         video = functional.resize(video, size, interpolation=InterpolationMode.BICUBIC).float().clamp(0, 255)
         video = self.video_processor.preprocess_video(video)
-        video = video.to(device=self.vae.device, dtype=self.vae.dtype)
+        return video.to(device=self.vae.device, dtype=self.vae.dtype)
 
-        # save mean & logvar
-        posterior: DiagonalGaussianDistribution = self.vae.encode(video).latent_dist
+    def _encode_video_to_latents(self, video: torch.Tensor) -> torch.Tensor:
+        return self.vae.encode(self._preprocess_video(video)).latent_dist.parameters
 
-        return posterior.parameters
+    def _encode_image_condition(self, video: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode the normalized first frame followed by zeros, as Wan I2V inference does."""
+        batch, _, frames, _, _ = video.shape
+        temporal_factor = self.vae.config.scale_factor_temporal
+        if (frames - 1) % temporal_factor:
+            raise ValueError(f"Wan I2V needs 1 + k * {temporal_factor} video frames; got {frames}.")
+        condition_video = torch.zeros_like(video)
+        condition_video[:, :, :1] = video[:, :, :1]
+        parameters = self.vae.encode(condition_video).latent_dist.parameters
+        latent_height, latent_width = parameters.shape[-2:]
+        mask = video.new_zeros(batch, 1, frames, latent_height, latent_width)
+        mask[:, :, :1] = 1
+        mask = torch.cat([mask[:, :, :1].repeat_interleave(temporal_factor, dim=2), mask[:, :, 1:]], dim=2)
+        mask = mask.view(batch, -1, temporal_factor, latent_height, latent_width).transpose(1, 2)
+        return parameters, mask
 
     def _normalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        latents_mean = torch.tensor(self.vae.config.latents_mean, device=latents.device, dtype=latents.dtype).view(
-            1, self.vae.config.z_dim, 1, 1, 1
-        )
-        latents_std = torch.tensor(self.vae.config.latents_std, device=latents.device, dtype=latents.dtype).view(
-            1, self.vae.config.z_dim, 1, 1, 1
-        )
+        latents_mean = torch.tensor(
+            self.vae.config.latents_mean,
+            device=latents.device,
+            dtype=latents.dtype,
+        ).view(1, self.vae.config.z_dim, 1, 1, 1)
+        latents_std = torch.tensor(
+            self.vae.config.latents_std,
+            device=latents.device,
+            dtype=latents.dtype,
+        ).view(1, self.vae.config.z_dim, 1, 1, 1)
         return (latents - latents_mean) / latents_std
 
     @torch.no_grad()
@@ -124,13 +140,20 @@ class WanTransformer3DConditionModel(PreTrainedModel):
             max_sequence_length=self.config.max_sequence_length,
         )  # bs, seqlen, dim
         context_list = [u.unsqueeze(0) for u in prompt_embeds]
-
-        latents_list: list[list[torch.Tensor]] = []
+        latents_list: list[torch.Tensor] = []
+        image_latents_list, masks = [], []
         for sample_videos in videos:
             assert len(sample_videos) == 1, "Only one video per sample is supported for T2V"
-            latents_list.append(self._encode_video_to_latents(sample_videos[0]))  # 1, c, f, h, w
-
-        return {"latents": latents_list, "context": context_list}
+            video = self._preprocess_video(sample_videos[0])
+            latents_list.append(self.vae.encode(video).latent_dist.parameters)
+            if self.config.image_conditioning:
+                image_parameters, mask = self._encode_image_condition(video)
+                image_latents_list.append(image_parameters)
+                masks.append(mask)
+        condition = {"latents": latents_list, "context": context_list}
+        if self.config.image_conditioning:
+            condition.update(image_latents=image_latents_list, mask=masks)
+        return condition
 
     def rng_state_dict(self) -> dict[str, torch.Tensor]:
         """Snapshot the noise/timestep generator for the job-level checkpoint.
@@ -145,47 +168,118 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         """Restore a snapshot produced by :meth:`rng_state_dict`."""
         self.generator.set_state(state["generator"])
 
-    def process_condition(self, latents: list[torch.Tensor], context: list[torch.Tensor]) -> dict[str, Any]:
+    def process_condition(
+        self,
+        latents: list[torch.Tensor],
+        context: list[torch.Tensor],
+        image_latents: list[torch.Tensor] | None = None,
+        mask: list[torch.Tensor] | None = None,
+    ) -> dict[str, Any]:
+        if not latents or len(latents) != len(context):
+            raise ValueError("Wan latents and context must have the same nonzero sample count.")
+        if self.config.image_conditioning and (
+            image_latents is None or mask is None or len(image_latents) != len(latents) or len(mask) != len(latents)
+        ):
+            raise ValueError("Wan I2V requires full image_latents and mask; regenerate legacy offline embeddings.")
         if not self._timesteps_ready:
             self.scheduler.set_timesteps(self.config.num_train_timesteps, device=latents[0].device)
             self._timesteps_ready = True
-
-        packed_conditions: dict[str, list[torch.Tensor]] = {
+        packed_conditions: dict[str, list[torch.Tensor | int]] = {
             "hidden_states": [],
             "timestep": [],
             "encoder_hidden_states": [],
             "training_target": [],
             "latents": [],
         }
-        for sample_latents, sample_context in zip(latents, context):
-            latents = DiagonalGaussianDistribution(sample_latents).mode()
-            latents = self._normalize_latents(latents).to(self.generator.device)
+        if self.config.image_conditioning:
+            packed_conditions.update(image_latents=[], mask=[])
+        if self.config.expand_timesteps:
+            packed_conditions["loss_start_frame"] = []
+        for index, (sample_latents, sample_context) in enumerate(zip(latents, context)):
+            norm_latents = DiagonalGaussianDistribution(sample_latents).mode()
+            norm_latents = self._normalize_latents(norm_latents)
+            if self.config.image_conditioning:
+                parameters, sample_mask = image_latents[index], mask[index]
+                expected_mask = (norm_latents.shape[0], self.vae.config.scale_factor_temporal, *norm_latents.shape[2:])
+                if parameters.shape != sample_latents.shape or tuple(sample_mask.shape) != expected_mask:
+                    raise ValueError("Wan I2V condition posterior and mask must match the full target video grid.")
+                image_condition = self._normalize_latents(DiagonalGaussianDistribution(parameters).mode())
+                packed_conditions["image_latents"].append(image_condition.to(norm_latents))
+                packed_conditions["mask"].append(sample_mask.to(norm_latents))
             noise = torch.randn(  # TODO: use randn_like(generator=self.generator) when updating to torch 2.10.0
-                latents.shape, dtype=latents.dtype, device=self.generator.device, generator=self.generator
+                norm_latents.shape, dtype=norm_latents.dtype, device=self.generator.device, generator=self.generator
             ).to(self.generator.device)
             timestep_ids = torch.randint(
                 0,
                 len(self.scheduler.timesteps),
-                (latents.shape[0],),
+                (norm_latents.shape[0],),
                 device=self.generator.device,
                 generator=self.generator,
-            ).to(latents.device)
-            timestep = self.scheduler.timesteps[timestep_ids].to(device=latents.device, dtype=latents.dtype)
-            noisy_latents = self.scheduler.scale_noise(latents, timestep, noise)
-            training_target = noise - latents
+            ).to(norm_latents.device)
+            timestep = self.scheduler.timesteps[timestep_ids].to(device=norm_latents.device, dtype=norm_latents.dtype)
+            noisy_latents = self.scheduler.scale_noise(norm_latents, timestep, noise)
+            training_target = noise - norm_latents
 
             use_negative_context = (
                 torch.rand((), device=self.generator.device, generator=self.generator) < self.config.cfg_negative_prob
             )
             if use_negative_context:
-                sample_context = self.negative_prompt_embeds.to(device=latents.device, dtype=sample_context.dtype)
+                sample_context = self.negative_prompt_embeds.to(
+                    device=sample_latents.device, dtype=sample_context.dtype
+                )
             else:
-                sample_context = sample_context.to(latents.device)
+                sample_context = sample_context.to(sample_latents.device)
 
-            packed_conditions["hidden_states"].append(noisy_latents)
+            if self.config.expand_timesteps:
+                # Wan2.2 I2V: flow-matching blend with position-dependent timesteps.
+                # First frame uses clean latent as condition (t=0);
+                # other frames use noisy latent at the sampled timestep.
+                condition = norm_latents[:, :, 0:1, :, :]
+                num_frames = norm_latents.shape[2]
+                latent_h = norm_latents.shape[3]
+                latent_w = norm_latents.shape[4]
+                first_frame_mask = torch.ones(
+                    1,
+                    1,
+                    num_frames,
+                    latent_h,
+                    latent_w,
+                    dtype=norm_latents.dtype,
+                    device=norm_latents.device,
+                )
+                first_frame_mask[:, :, 0] = 0
+
+                hidden_states = (1 - first_frame_mask) * condition + first_frame_mask * noisy_latents
+                if num_frames < 2:
+                    raise ValueError("Expanded-timestep Wan training requires at least one frame after the condition.")
+                packed_conditions["loss_start_frame"].append(1)
+                # Position-dependent timestep at post-patch resolution.
+                # Use integer division to match Conv3d output size exactly
+                # (avoids mismatch when latent spatial dims are odd).
+                p_t, p_h, p_w = self.config.patch_size
+                post_patch_f = num_frames // p_t
+                post_patch_h = latent_h // p_h
+                post_patch_w = latent_w // p_w
+                first_frame_mask_post = torch.ones(
+                    1,
+                    1,
+                    post_patch_f,
+                    post_patch_h,
+                    post_patch_w,
+                    dtype=norm_latents.dtype,
+                    device=norm_latents.device,
+                )
+                first_frame_mask_post[:, :, 0] = 0
+
+                temp_ts = (first_frame_mask_post[0, 0] * timestep).flatten()
+                timestep = temp_ts.unsqueeze(0).expand(norm_latents.shape[0], -1)
+            else:
+                hidden_states = noisy_latents
+
+            packed_conditions["hidden_states"].append(hidden_states)
             packed_conditions["timestep"].append(timestep)
             packed_conditions["encoder_hidden_states"].append(sample_context)
             packed_conditions["training_target"].append(training_target)
-            packed_conditions["latents"].append(latents)
+            packed_conditions["latents"].append(norm_latents)
 
         return packed_conditions
