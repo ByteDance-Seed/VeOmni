@@ -76,6 +76,8 @@ def test_runtime_config_keeps_the_full_launcher_view():
 
     assert isinstance(runtime_cfg, OmniModelRuntimeArguments)
     assert runtime_cfg.model_path == "/tmp/fake_omni"
+    assert runtime_cfg.seed_omni_model_path == "/tmp/fake_omni"
+    assert runtime_cfg.resolved_model_path == "/tmp/fake_omni"
     module_a = runtime_cfg.modules[MODULE_A]
     assert module_a.accelerator.fsdp_config.fsdp_mode == "ddp"
     assert module_a.model_path.startswith("/tmp/fake_omni")

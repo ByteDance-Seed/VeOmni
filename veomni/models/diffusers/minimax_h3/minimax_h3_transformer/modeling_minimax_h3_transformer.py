@@ -19,6 +19,7 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from ..minimax_h3_core.batch_packing import pack_samples
+from ..minimax_h3_core.core import bind_minimax_attention
 from ..minimax_h3_core.minimax_h3_dit import MiniMaxH3Attention, MiniMaxH3DiT, unpack_audio, unpatchify_video
 from ..minimax_h3_core.training_objectives import cfg_calibrated_mse
 from .configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
@@ -33,11 +34,25 @@ class MiniMaxH3DiTOutput(ModelOutput):
 
 
 _PACKED_FLASH_BACKENDS = (
-    "veomni_flash_attention_2_with_sp",
-    "veomni_flash_attention_2_hub_with_sp",
-    "veomni_flash_attention_3_with_sp",
-    "veomni_flash_attention_3_hub_with_sp",
+    "veomni_flash_attention_2",
+    "veomni_flash_attention_2_hub",
+    "veomni_flash_attention_3",
+    "veomni_flash_attention_3_hub",
+    "flash_attention_2",
+    "flash_attention_2_hub",
+    "flash_attention_3",
+    "flash_attention_3_hub",
 )
+
+
+def _veomni_attn_impl(attn_implementation: str | None) -> str | None:
+    if attn_implementation in (None, "eager", "sdpa", "veomni_sdpa"):
+        return None
+    if attn_implementation.startswith("flash_attention_"):
+        return f"veomni_{attn_implementation}"
+    if attn_implementation.startswith("veomni_flash_attention_"):
+        return attn_implementation
+    return None
 
 
 class MiniMaxH3DiTModel(PreTrainedModel):
@@ -50,7 +65,8 @@ class MiniMaxH3DiTModel(PreTrainedModel):
 
     def __init__(self, config: MiniMaxH3DiTModelConfig, **kwargs):
         super().__init__(config)
-        self.gradient_checkpointing = False  # enable HF-compatible GC attr
+        # HF's marker. The DiT declares its own, so the enable reaches its block loop too.
+        self.gradient_checkpointing = False
         self.dit = MiniMaxH3DiT(
             num_layers=config.num_layers,
             token_refiner_num_layers=config.token_refiner_num_layers,
@@ -76,31 +92,24 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         self._configure_packed_attention(config._attn_implementation)
 
     def _configure_packed_attention(self, attn_implementation):
-        """Record the packed backend; it is validated and loaded on the first packed forward."""
+        """Record the attention backend. Do not bind it yet: FA4/NPU/pre-SM90
+        cannot construct ``veomni_flash_attention_4``, so a flash name is
+        validated and bound on the first forward.
+        """
         self._packed_attn_implementation = attn_implementation
-        for module in self.dit.modules():
-            if isinstance(module, MiniMaxH3Attention):
-                module.packed_sdpa = attn_implementation in (None, "eager", "sdpa")
-                module.varlen_kernel = None
 
     def _load_packed_attention_kernel(self):
         implementation = self._packed_attn_implementation
-        if implementation in (None, "eager", "sdpa"):
+        if implementation in (None, "eager", "sdpa", "veomni_sdpa"):
             return
-        if implementation not in _PACKED_FLASH_BACKENDS:
+        impl = _veomni_attn_impl(implementation)
+        if impl is None or implementation not in _PACKED_FLASH_BACKENDS:
             raise ValueError(f"Unsupported H3 packing backend: {implementation}")
-        attention_modules = [module for module in self.dit.modules() if isinstance(module, MiniMaxH3Attention)]
-        if all(module.varlen_kernel is not None for module in attention_modules):
-            return
-        from .....ops.kernels.attention.flash import _load_veomni_flash_kernel
-
-        kernel = _load_veomni_flash_kernel(implementation).flash_attn_varlen_func
-        for module in attention_modules:
-            module.varlen_kernel = kernel
+        for module in self.dit.modules():
+            if isinstance(module, MiniMaxH3Attention):
+                bind_minimax_attention(module, is_causal=False, impl=impl)
 
     def _forward_batch(self, samples):
-        if any(sample.get("use_gradient_checkpointing_offload", False) for sample in samples):
-            raise ValueError("H3 multi-sample packing does not support checkpoint offload.")
         self._load_packed_attention_kernel()
         negatives = [sample.get("unconditional_inputs") for sample in samples]
         negative_predictions = [None] * len(samples)
@@ -148,8 +157,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         img_pos_for_infer_output_info=None,
         packed_seq_params=None,
         refiner_packed_seq_params=None,
-        use_gradient_checkpointing=False,
-        use_gradient_checkpointing_offload=False,
         training_target=None,
         training_target_audio=None,
         video_latent_shape=None,
@@ -182,8 +189,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
                 img_pos_for_infer_output_info=img_pos_for_infer_output_info,
                 packed_seq_params=packed_seq_params,
                 refiner_packed_seq_params=refiner_packed_seq_params,
-                use_gradient_checkpointing=use_gradient_checkpointing,
-                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                 training_target=training_target,
                 training_target_audio=training_target_audio,
                 video_latent_shape=video_latent_shape,
@@ -212,6 +217,8 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             with torch.no_grad():
                 negative_predictions = self.forward(**negative_inputs).predictions
 
+        if self._packed_attn_implementation in _PACKED_FLASH_BACKENDS:
+            self._load_packed_attention_kernel()
         # Run DiT — skip_mask_out_condition=True, update_mask=None
         video_tokens, audio_tokens = self.dit(
             x=x,
@@ -228,8 +235,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             img_pos_for_infer_output_info=img_pos_for_infer_output_info,
             packed_seq_params=packed_seq_params,
             refiner_packed_seq_params=refiner_packed_seq_params,
-            use_gradient_checkpointing=use_gradient_checkpointing,
-            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             skip_mask_out_condition=skip_mask_out_condition,
         )
 
