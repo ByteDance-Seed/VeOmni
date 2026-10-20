@@ -8,13 +8,13 @@ import torch
 import torch.distributed as dist
 
 import veomni.trainer.base as base_module
-from veomni.utils import dist_utils
 from veomni.distributed.parallel_state import clear_parallel_state
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.dit_trainer import DiTTrainer
 from veomni.trainer.text_dpo_trainer import TextDPOTrainer
 from veomni.trainer.text_trainer import TextTrainer
 from veomni.trainer.vlm_trainer import VLMTrainer
+from veomni.utils import dist_utils
 
 
 def _trainer(sync_each_train_step: bool):
