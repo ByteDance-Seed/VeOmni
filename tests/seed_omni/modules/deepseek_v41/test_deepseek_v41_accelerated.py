@@ -359,12 +359,77 @@ class TestContextParallelSlice:
         FakeState.ulysses_size = 1
         make_config().validate_build_prerequisites()
 
-    def test_every_v41_module_may_build_under_cp(self):
-        """SeedOmni checks each module against the CP allow-list under the shared mesh."""
-        from veomni.models.auto import CONTEXT_PARALLEL_MODEL_TYPES
+    def test_v41_cp_allowlist_and_vision_ulysses_split(self, monkeypatch):
+        """LLM, text encoder, and n-gram use CP; vision uses Ulysses SP instead."""
+        import veomni.models.auto as auto_module
+        from veomni.models.auto import CONTEXT_PARALLEL_MODEL_TYPES, check_context_parallel_supported
         from veomni.models.seed_omni.modules.deepseek_v41.convert_model import MODULES
+        from veomni.models.seed_omni.modules.deepseek_v41.vision.configuration import DeepseekV41VisionEncoderConfig
 
-        assert set(MODULES) <= CONTEXT_PARALLEL_MODEL_TYPES
+        cp_modules = {"deepseek_v41_llm", "deepseek_v41_ngram", "deepseek_v41_text_encoder"}
+        assert set(MODULES) == cp_modules | {"deepseek_v41_vision"}
+        assert cp_modules <= CONTEXT_PARALLEL_MODEL_TYPES
+        assert "deepseek_v41_vision" not in CONTEXT_PARALLEL_MODEL_TYPES
+
+        class FakeState:
+            cp_enabled = False
+            cp_size = 1
+            ulysses_enabled = True
+            ulysses_size = 4
+
+        monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
+        monkeypatch.setattr(auto_module, "get_parallel_state", lambda: FakeState())
+        check_context_parallel_supported(DeepseekV41VisionEncoderConfig())
+
+        FakeState.cp_enabled = True
+        FakeState.cp_size = 4
+        FakeState.ulysses_enabled = False
+        FakeState.ulysses_size = 1
+        with pytest.raises(NotImplementedError, match="deepseek_v41_vision"):
+            check_context_parallel_supported(DeepseekV41VisionEncoderConfig())
+
+    def test_vit_sp_plus_llm_cp_config_resolves_uniform_dp_size(self, monkeypatch):
+        """Top-level ``cp_size: 4`` + vision ``ulysses_size: 4, cp_size: 1`` share ``dp_size``."""
+        from pathlib import Path
+
+        import yaml
+
+        from veomni.arguments.arguments_types import AcceleratorConfig
+        from veomni.arguments.omni_arguments_types import (
+            OmniModuleRuntimeArguments,
+            _validate_omni_dp_size,
+            build_omni_module_runtime_args,
+        )
+
+        monkeypatch.setenv("WORLD_SIZE", "8")
+        modules_yaml = (
+            Path(__file__).resolve().parents[4]
+            / "configs/seed_omni/DeepSeek/deepseek_v41_flash/train/modules_train.yaml"
+        )
+        with open(modules_yaml) as f:
+            raw_modules = yaml.safe_load(f)
+        raw_modules["deepseek_v41_vision"]["accelerator"]["ulysses_size"] = 4
+        raw_modules["deepseek_v41_vision"]["accelerator"]["cp_size"] = 1
+        raw_modules["deepseek_v41_llm"]["ops_implementation"]["qat_implementation"] = "none"
+
+        global_args = OmniModuleRuntimeArguments(
+            model_path="/tmp/deepseek_v41",
+            accelerator=AcceleratorConfig(cp_size=4),
+        )
+        resolved = build_omni_module_runtime_args(global_args, "/tmp/deepseek_v41", raw_modules)
+        _validate_omni_dp_size(global_args.accelerator, resolved)
+
+        assert global_args.accelerator.dp_size == 2
+        vision_acc = resolved["deepseek_v41_vision"].accelerator
+        assert (vision_acc.ulysses_size, vision_acc.cp_size, vision_acc.dp_size) == (4, 1, 2)
+        for name in ("deepseek_v41_ngram", "deepseek_v41_text_encoder", "deepseek_v41_llm"):
+            acc = resolved[name].accelerator
+            assert (acc.ulysses_size, acc.cp_size, acc.dp_size) == (1, 4, 2)
+
+        raw_modules["deepseek_v41_vision"]["accelerator"]["ulysses_size"] = 2
+        mismatched = build_omni_module_runtime_args(global_args, "/tmp/deepseek_v41", raw_modules)
+        with pytest.raises(ValueError, match="All distributed SeedOmni modules must resolve to the same `dp_size`"):
+            _validate_omni_dp_size(global_args.accelerator, mismatched)
 
 
 class TestDummyAnchor:

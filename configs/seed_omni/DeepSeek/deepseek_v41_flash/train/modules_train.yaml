@@ -15,6 +15,12 @@ deepseek_v41_vision:
   ops_implementation:
     attn_implementation: flash_attention_2
   accelerator:
+    # ViT shards patches and scatters its 16 attention heads over Ulysses
+    # (`ulysses_size`), while the llm shards rows over `cp_size`. Keep
+    # `cp_size: 1` here and match `ulysses_size` to the top-level `cp_size` so
+    # every module resolves to the same `dp_size`.
+    ulysses_size: 1
+    cp_size: 1
     gradient_checkpointing:
       enable: false
     fsdp_config:

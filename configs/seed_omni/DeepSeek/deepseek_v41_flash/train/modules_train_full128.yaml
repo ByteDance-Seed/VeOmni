@@ -46,6 +46,8 @@ deepseek_v41_vision:
   ops_implementation:
     attn_implementation: flash_attention_2
   accelerator:
+    ulysses_size: 1
+    cp_size: 1
     gradient_checkpointing:
       enable: false
     fsdp_config:

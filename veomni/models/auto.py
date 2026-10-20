@@ -48,17 +48,18 @@ logger = logging.get_logger(__name__)
 # 1/cp_size of the sequence, and the run trains to a plausible loss curve while
 # being silently wrong.
 #
-# SeedOmni builds each module separately under the shared mesh, so every module
-# of a family is checked. The DeepSeek-V4.1 llm shards the row over cp itself;
-# its vision tower and n-gram tables run whole rows, and its text encoder slices
-# on ``sp_group``, which is the cp group when CP is on.
+# SeedOmni builds each module under its own ParallelState (sharing one dp_size).
+# The DeepSeek-V4.1 llm shards the row over cp itself, its n-gram tables run
+# whole rows, and its text encoder slices on ``sp_group`` (which is the cp group
+# when CP is on). ``deepseek_v41_vision`` instead shards patches and scatters
+# attention heads over Ulysses (``ulysses_size``, ``cp_size=1``), so it is not on
+# the CP allow-list.
 CONTEXT_PARALLEL_MODEL_TYPES = frozenset(
     {
         "deepseek_v4",
         "deepseek_v41_llm",
         "deepseek_v41_ngram",
         "deepseek_v41_text_encoder",
-        "deepseek_v41_vision",
     }
 )
 

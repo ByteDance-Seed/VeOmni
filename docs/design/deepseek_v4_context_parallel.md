@@ -242,12 +242,25 @@ window KV with the same `all_gather_kv`. Two things differ:
   halos, so it has no `cp_size <= S / max(compress_rates)` bound, at the cost
   of more traffic.
 
-All four V4.1 modules are on the allow-list because the mesh is shared: the
-vision tower and the n-gram tables run whole rows, and the text encoder slices
-on `sp_group`, which is the cp group when CP is on. `ulysses_size > 1` is refused
-by `DeepseekV41LlmConfig.validate_build_prerequisites`. The parity check is
-`tests/seed_omni/modules/deepseek_v41/test_deepseek_v41_sequence_shard.py`, on
-gloo at 2 and 4 ranks.
+Each module configures its own sequence/context parallelism while resolving to
+the same `dp_size`:
+
+- **`deepseek_v41_vision` uses Ulysses SP (`ulysses_size: S, cp_size: 1`)**:
+  patches are padded and sliced across the Ulysses group and the 16 attention
+  heads are scattered (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`).
+  `deepseek_v41_vision` is in `SEQUENCE_PARALLEL_MODEL_TYPES` (and not in
+  `CONTEXT_PARALLEL_MODEL_TYPES`), so `check_context_parallel_supported`
+  refuses `cp_size > 1` on it.
+- **`deepseek_v41_llm` uses Context Parallelism (`cp_size: S, ulysses_size: 1`)**:
+  `DeepseekV41LlmConfig.validate_build_prerequisites` refuses `ulysses_size > 1`.
+- **`deepseek_v41_text_encoder` and `deepseek_v41_ngram`**: join `deepseek_v41_llm`
+  on `CONTEXT_PARALLEL_MODEL_TYPES`; the n-gram tables run whole rows and the
+  text encoder slices on `sp_group` (which is `cp_group` when CP is on).
+
+The parity checks are
+`tests/seed_omni/modules/deepseek_v41/test_deepseek_v41_sequence_shard.py` and
+`tests/seed_omni/modules/deepseek_v41/test_deepseek_v41_vision_sp.py`, on gloo
+at 2 and 4 ranks.
 
 ## Open questions
 

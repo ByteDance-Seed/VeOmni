@@ -35,8 +35,11 @@ model:
     init_device: meta
     # Context parallelism splits each packed row across `cp_size` ranks, the
     # mesh DeepSeek-V4 uses; `deepseek_v41_llm` gathers only its single KV head
-    # (llm/sequence_shard.py) and refuses `ulysses_size > 1`. It shrinks the
-    # per-token activations, not the per-layer expert weights.
+    # (llm/sequence_shard.py) and refuses `ulysses_size > 1`. When raising
+    # `cp_size` to S > 1 here, also set `ulysses_size: S` under
+    # `deepseek_v41_vision.accelerator` in `modules_train.yaml` (where
+    # `cp_size: 1` is pinned) so the ViT runs Ulysses SP and the llm runs CP
+    # under the same `dp_size`.
     cp_size: 1
     # Per-module in modules_train.yaml. The ViT does not declare
     # `gradient_checkpointing`, so a top-level enable would trip HF's check.
