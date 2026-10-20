@@ -147,6 +147,30 @@ because that backend's backward rejects dLSE. Attention sinks (`s_aux`) need
 LSE renormalization, so they stay on Triton unless FLASH was forced, which
 is rejected.
 
+### Compiled mask construction
+
+`flex_attention_mask_builder` caches `torch.compile(create_block_mask)` and uses
+it by default, including for packed inputs with `cu_seqlens`. This compilation
+is separate from FLASH attention execution. It uses PyTorch's automatic dynamic
+generalization: an initial length specialization may be followed by a more
+general graph when lengths change. A cached callable can therefore own several
+graphs; caching the callable alone does not prove graph reuse.
+
+Packing by itself is not a reason to disable compilation. Changing document
+boundaries or segment counts changes metadata values, while the packed
+predicate consumes per-token tensors. Regression coverage exercises the public
+builder with changing lengths, segment layouts, batched flattened coordinates,
+and asymmetric Q/K, checks visibility and all sparse tables against references,
+and requires repeated inputs to reuse graphs within a limited compile budget.
+Arbitrary changes to predicate code or captured Python state can still
+specialize; these tests do not promise graph reuse for every custom predicate.
+
+Use `compile_block_mask=False` for explicit eager construction. Both paths
+suppress HF's deprecated `_compile` flag. Eager construction may materialize
+token-square intermediates, so it can cost substantially more memory on long
+sequences. Compare compilation cost, steady execution, and peak memory for the
+actual workload before selecting it as a fallback.
+
 ### Dynamic compilation
 
 FLASH calls always compile a wrapper with `dynamic=True, fullgraph=True`;

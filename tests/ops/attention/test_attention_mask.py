@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from types import SimpleNamespace
 
 import pytest
@@ -414,13 +415,16 @@ def test_2d_masks_match_dense_visibility():
 
 
 def _reset_flex_compile_cache(monkeypatch):
+    """Isolate the builder singleton so tests do not inherit a compiled callable."""
     monkeypatch.setattr(flex_mask, "_COMPILED_CREATE_BLOCK_MASK", None)
 
 
 def _spy_torch_compile(monkeypatch):
+    """Observe compile requests; this spy does not establish Dynamo graph reuse."""
     compiled = []
 
     def fake_compile(fn, *args, **kwargs):
+        """Leave execution eager while recording which builder was selected."""
         compiled.append(fn)
         return fn
 
@@ -429,6 +433,7 @@ def _spy_torch_compile(monkeypatch):
 
 
 def test_flex_mask_builder_compiles_create_block_mask_by_default(monkeypatch):
+    """The default path should cache its compile wrapper across builder calls."""
     _reset_flex_compile_cache(monkeypatch)
     compiled = _spy_torch_compile(monkeypatch)
     mask = flex_attention_mask_builder(1, 4, 4, device="cpu")
@@ -478,6 +483,7 @@ def test_flex_mask_builder_passes_sm100_block_size_to_pytorch(monkeypatch):
 
 
 def test_flex_mask_builder_compile_block_mask_false_skips_compile(monkeypatch):
+    """Explicit eager mode must also suppress HF's deprecated compile flag."""
     _reset_flex_compile_cache(monkeypatch)
     compiled = _spy_torch_compile(monkeypatch)
     captured = []
@@ -495,9 +501,86 @@ def test_flex_mask_builder_compile_block_mask_false_skips_compile(monkeypatch):
 
 
 def test_flex_mask_builder_compile_flag_preserves_causal_visibility(monkeypatch):
+    """Real compilation must preserve the causal predicate, not just mask type."""
     _reset_flex_compile_cache(monkeypatch)
     compiled = flex_attention_mask_builder(1, 4, 4, device="cpu", compile_block_mask=True)
     eager = flex_attention_mask_builder(1, 4, 4, device="cpu", compile_block_mask=False)
     torch.testing.assert_close(flex_visible(compiled, 4, 4), flex_visible(eager, 4, 4))
     expected = torch.ones(4, 4, dtype=torch.bool).tril()
     torch.testing.assert_close(flex_visible(compiled, 4, 4), expected)
+
+
+def _packed_builder_inputs(length, segments, rows, cross_attention, boundary_shift):
+    """Construct packed inputs and an independent per-document visibility oracle."""
+    q_cuts = [0] + [length * i // segments for i in range(1, segments)] + [length]
+    if segments > 1:
+        q_cuts[1] += boundary_shift
+    k_cuts = [0]
+    for i, (start, end) in enumerate(zip(q_cuts, q_cuts[1:])):
+        k_cuts.append(k_cuts[-1] + end - start + (3 * (i + 1) if cross_attention else 0))
+    kv_length = k_cuts[-1]
+    expected = torch.zeros(length, kv_length, dtype=torch.bool)
+    for (qs, qe), (ks, ke) in zip(zip(q_cuts, q_cuts[1:]), zip(k_cuts, k_cuts[1:]), strict=True):
+        # Cached Q tokens are the suffix of the paired K document.
+        expected[qs:qe, ks:ke] = torch.ones(qe - qs, ke - ks, dtype=torch.bool).tril(diagonal=(ke - ks) - (qe - qs))
+    q_flat = [0] + [row * length + end for row in range(rows) for end in q_cuts[1:]]
+    k_flat = [0] + [row * kv_length + end for row in range(rows) for end in k_cuts[1:]]
+    kwargs = {
+        "batch_size": rows,
+        "q_length": length,
+        "kv_length": kv_length,
+        "device": "cpu",
+        "skip_ulysses": True,
+        "cu_seqlens": torch.tensor(q_flat, dtype=torch.int32),
+    }
+    if cross_attention:
+        kwargs["cu_seqlens_k"] = torch.tensor(k_flat, dtype=torch.int32)
+    return kwargs, expected
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("triton") is None, reason="Compiled masks require the compiler environment"
+)
+@pytest.mark.parametrize(("rows", "cross_attention"), [(1, False), (2, False), (1, True)])
+def test_packed_flex_builder_reuses_real_graphs_and_preserves_visibility(monkeypatch, rows, cross_attention):
+    """Exercise the public cu_seqlens path; attention-only graph tests bypass it."""
+    lengths = (65, 129, 193, 259, 389, 517, 645, 773, 901, 1027, 1283, 1541)
+    cases = [(length, 3, 0) for length in lengths]
+    cases += [(389, 3, shift) for shift in (1, 3, 5, 11)]
+    if not cross_attention:
+        cases += [(389, segments, 0) for segments in (1, 2, 4, 7, 11, 17)]
+    cases += [cases[i] for i in (0, 4, 1, 0)]
+    fields = (
+        "kv_num_blocks",
+        "kv_indices",
+        "full_kv_num_blocks",
+        "full_kv_indices",
+        "q_num_blocks",
+        "q_indices",
+        "full_q_num_blocks",
+        "full_q_indices",
+    )
+    torch.compiler.reset()
+    _reset_flex_compile_cache(monkeypatch)
+    initial_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+    try:
+        # A regression must raise rather than silently fall back to eager when
+        # new inputs exhaust the graph budget. Production limits stay unchanged.
+        with torch._dynamo.config.patch(recompile_limit=4, fail_on_recompile_limit_hit=True):
+            for case_index, (length, segments, shift) in enumerate(cases):
+                if case_index == len(cases) - 4:
+                    repeat_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+                kwargs, expected = _packed_builder_inputs(length, segments, rows, cross_attention, shift)
+                compiled = flex_attention_mask_builder(**kwargs)
+                eager = flex_attention_mask_builder(**kwargs, compile_block_mask=False)
+                for field in fields:
+                    torch.testing.assert_close(getattr(compiled, field), getattr(eager, field))
+                q = torch.arange(length)[:, None]
+                k = torch.arange(kwargs["kv_length"])[None, :]
+                for batch in range(rows):
+                    torch.testing.assert_close(compiled.mask_mod(batch, 0, q, k), expected)
+            graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"] - initial_graphs
+            assert 1 <= graphs <= 4
+            assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == repeat_graphs
+    finally:
+        torch.compiler.reset()
