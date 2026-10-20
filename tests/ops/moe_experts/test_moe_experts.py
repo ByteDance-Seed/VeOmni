@@ -1012,7 +1012,7 @@ def test_triton_merged_same_nk_exact_bound(
 
 
 def test_triton_merged_stream_capture_uses_shape_bound(monkeypatch: pytest.MonkeyPatch):
-    """Direct capture uses the original bound without reading a device scalar."""
+    """Captured forward and backward reuse the shape bound without a scalar read."""
     require_nvidia_cuda("triton")
     from veomni.ops.kernels.moe_experts.shared import group_gemm as gemm_module
 
@@ -1022,9 +1022,9 @@ def test_triton_merged_stream_capture_uses_shape_bound(monkeypatch: pytest.Monke
     routes = torch.randn(tokens, experts, device=device).topk(top_k, dim=-1).indices
     assert torch.bincount(routes.flatten(), minlength=experts).max().item() < tokens
     gate = torch.full((tokens, top_k), 1 / top_k, device=device, dtype=torch.bfloat16)
-    x = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16)
-    w1 = torch.randn(experts, 2 * intermediate, hidden, device=device, dtype=torch.bfloat16)
-    w2 = torch.randn(experts, hidden, intermediate, device=device, dtype=torch.bfloat16)
+    x = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16, requires_grad=True)
+    w1 = torch.randn(experts, 2 * intermediate, hidden, device=device, dtype=torch.bfloat16, requires_grad=True)
+    w2 = torch.randn(experts, hidden, intermediate, device=device, dtype=torch.bfloat16, requires_grad=True)
     empty = _empty(device, torch.bfloat16)
     fused = resolve_op("moe_experts", "standard", "fused_triton").wrapper
     bounds = []
@@ -1044,13 +1044,18 @@ def test_triton_merged_stream_capture_uses_shape_bound(monkeypatch: pytest.Monke
     warmup_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup_stream):
         for _ in range(3):
-            forward()
+            forward().sum().backward()
     warmup_stream.synchronize()
+    x.grad = w1.grad = w2.grad = None
     bounds.clear()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = forward()
-    assert bounds == [tokens, tokens]
+        output.sum().backward()
+    assert bounds == [tokens] * 4
     graph.replay()
     torch.cuda.synchronize()
     assert torch.isfinite(output).all()
+    for tensor in (x, w1, w2):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
