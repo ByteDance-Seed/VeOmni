@@ -150,7 +150,8 @@ an obsolete hierarchy or conceal mismatches with `strict=False`.
 
 Have the model derive mapping rules from the actual implementation. Reuse an
 existing converter where suitable; otherwise write a model-specific script under
-`scripts/model_conversion/`. Keep its interface focused on source, destination,
+`scripts/model_conversion/<model_name>.py`, creating the directory if needed.
+Keep its interface focused on source, destination,
 and the actual conversion choices rather than a generic conversion framework.
 
 Account for the transformations that apply:

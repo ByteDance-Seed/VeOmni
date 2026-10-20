@@ -1,3 +1,6 @@
+# Modified by the VeOmni contributors for native HunyuanVideo 1.5 integration.
+# Changes include import/runtime adaptation and repository formatting; see veomni/models/diffusers/hunyuanvideo15/SOURCE.txt.
+
 # Licensed under the TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -695,13 +698,14 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
         self._tile_parallelism_enabled = False
 
     def tile_parallel_spatial_tiled_decode(self, z: torch.Tensor):
+        """Decode spatial tiles across SP ranks, padding ranks with no work."""
         B, C, T, H, W = z.shape
         overlap_size = int(self.tile_latent_min_size * (1 - self.tile_overlap_factor))
         blend_extent = int(self.tile_sample_min_size * self.tile_overlap_factor)
         row_limit = self.tile_sample_min_size - blend_extent
 
         rank = get_parallel_state().sp_rank
-        world_size = get_parallel_state().sp
+        world_size = get_parallel_state().sp_size
 
         num_rows = math.ceil(H / overlap_size)
         num_cols = math.ceil(W / overlap_size)
@@ -713,6 +717,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
         decoded_metas = []
         H_out_std = self.tile_sample_min_size
         W_out_std = self.tile_sample_min_size
+        output_dtype = torch.get_autocast_dtype(z.device.type) if torch.is_autocast_enabled(z.device.type) else z.dtype
         for lin_idx in my_linear_indices:
             ri = lin_idx // num_cols
             rj = lin_idx % num_cols
@@ -730,9 +735,9 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
 
         while len(decoded_tiles) < tiles_per_rank:
             zero_tile = torch.zeros(
-                [1, 3, (T - 1) * self.ffactor_temporal + 1, self.tile_sample_min_size, self.tile_sample_min_size],
-                device=dec.device,
-                dtype=dec.dtype,
+                [B, self.config.out_channels, (T - 1) * self.ffactor_temporal + 1, H_out_std, W_out_std],
+                device=z.device,
+                dtype=output_dtype,
             )
             decoded_tiles.append(zero_tile)
             meta_tensor = torch.tensor(
@@ -908,11 +913,14 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
 
     @contextmanager
     def memory_efficient_context(self):
+        """Temporarily enable slicing/tiling and restore settings on every exit."""
         original_use_slicing = self.use_slicing
         original_use_spatial_tiling = self.use_spatial_tiling
 
-        self.enable_slicing()
-        self.enable_tiling()
-        yield
-        self.use_slicing = original_use_slicing
-        self.use_spatial_tiling = original_use_spatial_tiling
+        try:
+            self.enable_slicing()
+            self.enable_tiling()
+            yield
+        finally:
+            self.use_slicing = original_use_slicing
+            self.use_spatial_tiling = original_use_spatial_tiling

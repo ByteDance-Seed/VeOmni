@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 
 def validate_attention_mode(mode):
+    """Normalize supported dense-attention labels to the native SDPA path."""
     # "flash" is the official checkpoint's dense-attention label, not a
     # requirement to import the CUDA-only flash_attn package.
     if mode not in (None, "torch", "flash", "sdpa"):
@@ -13,12 +14,13 @@ def validate_attention_mode(mode):
 
 
 def attention(q, k, v, drop_rate=0.0, attn_mask=None, causal=False, attn_mode="torch"):
+    """Attend to valid keys and zero invalid queries with linear mask storage."""
     validate_attention_mode(attn_mode)
     mask = None
     if attn_mask is not None:
         if attn_mask.dtype != torch.bool:
             raise TypeError("The attention boundary requires a boolean validity mask")
-        mask = attn_mask[:, None, :, None] & attn_mask[:, None, None, :]
+        mask = attn_mask[:, None, None, :]
     out = F.scaled_dot_product_attention(
         q.transpose(1, 2),
         k.transpose(1, 2),
@@ -27,12 +29,15 @@ def attention(q, k, v, drop_rate=0.0, attn_mask=None, causal=False, attn_mode="t
         dropout_p=drop_rate,
         is_causal=causal,
     )
+    if attn_mask is not None:
+        out = out.masked_fill(~attn_mask[:, None, :, None], 0)
     return out.transpose(1, 2).flatten(2)
 
 
 def parallel_attention(
     q, k, v, img_q_len, img_kv_len, attn_mode=None, text_mask=None, attn_param=None, block_idx=None
 ):
+    """Join image/text streams for dense self attention without SP collectives."""
     validate_attention_mode(attn_mode)
     if img_q_len != img_kv_len:
         raise ValueError("Only self attention is supported")

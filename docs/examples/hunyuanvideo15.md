@@ -1,9 +1,11 @@
 # HunyuanVideo 1.5: native 480p T2V
 
 This integration connects the native Tencent backbone and frozen conditions to
-`tasks/train_dit.py`. It has CPU structural/numerical and single-NPU random-weight backbone validation;
-**pretrained real-data training and accelerator checkpoint resume are not yet
-validated**. Config-only model downloads do not satisfy those prerequisites.
+`tasks/train_dit.py`. Validation includes CPU structural/numerical checks,
+GPU/NPU backbone tests, and a historical eight-rank, 100-step real-weight
+Tom-and-Jerry training comparison. **Pretrained source numerical equivalence,
+long-run convergence, and fresh-process checkpoint resume equivalence remain
+unverified**. Real-data training requires the complete pretrained components.
 
 ## Implementation and boundary
 
@@ -13,8 +15,9 @@ validated**. Config-only model downloads do not satisfy those prerequisites.
   54 double-stream blocks, 8,326,608,160 parameters.
 - Native parameter names/layouts are retained. The production meta-model has
   1793 matching state entries. No converter or checkpoint rename is needed
-  based on this schema comparison; actual pretrained files still require strict
-  loading and output verification.
+  based on this schema comparison. Official transformer weights have also been
+  loaded for accelerator training; pretrained source output equivalence still
+  requires separate verification.
 - Dense PyTorch SDPA replaces the source's CUDA attention imports. The native
   `flash` config label selects dense SDPA here. Sparse/SSTA and sequence
   parallelism are rejected; use `ulysses_size: 1`.
@@ -29,7 +32,8 @@ validated**. Config-only model downloads do not satisfy those prerequisites.
   official Muon optimizer trajectory. Frozen text runs in fp16, VAE in fp32,
   and trainable inputs in bf16. Model mixed precision is owned by FSDP2.
 - Native block activation checkpointing is supported. FSDP2 uses the generic
-  runtime; no ExtraParallel plan is introduced. No multi-device claim is made.
+  runtime; no ExtraParallel plan is introduced. The historical comparison used
+  eight-rank FSDP2 with sequence parallelism disabled.
 - This initial path supports online training. I2V, distillation, super-resolution,
   sparse attention, condition caches, and a generation pipeline are outside its
   validated scope. Do not use `offline_training` or `offline_embedding`.
@@ -121,8 +125,11 @@ A weight reload or a condition-generator unit test is not this trainer test.
 
 ## Verification and remaining evidence
 
-Run the focused tests without downloading model weights. NPU cases run when an
-accessible NPU is present and otherwise skip:
+Run the focused tests without downloading model weights. Accelerator cases run
+on the available CUDA GPU or NPU and otherwise skip. They cover fp32/bf16,
+activation checkpointing on/off, CPU output parity, finite nonzero gradients,
+two AdamW updates, and condition-generator RNG replay. CUDA fp32 parity disables
+TF32 in the test only to compare the same arithmetic precision:
 
 ```bash
 PYTHONPATH=. python -m pytest -q \
@@ -145,6 +152,26 @@ updates, and condition-generator RNG replay. CPU bf16 uses autocast for the
 float32 timestep embedding. Nonzero test linear weights exercise attention and
 gates; the native zero output initializer could otherwise hide numerical errors.
 Production initialization is unchanged.
+
+Review regression checks also compare broadcast key masks against pairwise
+attention masks for both outputs and gradients, including invalid queries,
+fully masked samples and causal attention. The implementation retains only a
+`[B,1,1,L]` key mask and zeroes invalid query outputs instead of allocating a
+`[B,1,L,L]` validity mask.
+
+VAE regressions cover normal, exceptional and nested slicing/tiling contexts.
+A real two-process CPU/Gloo test compares tiled decoding with serial decoding,
+including idle ranks, uneven tile assignments, a batch of two, four output
+channels, and fp32/bf16 autocast. Optional tile parallelism requires an initialized
+VeOmni SP mesh; all SP ranks must call decode, and only SP rank zero receives
+the reconstructed video.
+
+On 2026-10-20, the review-fix suite on an A100 passed 24 model tests, including
+all four CUDA precision/checkpointing cases, plus six data/registry tests.
+The source-reference and full-NPU opt-in tests were skipped. CUDA-to-CPU maximum
+output errors were 8.34e-7 in fp32 and 3.91e-3 in bf16. The CPU-only model suite
+also passed 20 tests; its accelerator and opt-in cases skipped. NPU hardware
+regressions were not rerun because the available cards were occupied.
 
 On Ascend910_9382, the full 8.33B/54-layer backbone also completed bf16 forward,
 backward and two SGD updates with activation checkpointing. Peak allocated tensor
@@ -178,9 +205,10 @@ Evidence obtained during onboarding:
 | Native tiny VAE encode/reload | Passed; random initialization only |
 | Real dataset preparation | 6092 aligned pairs; revision `fc9066b00cb690f44779c5202572b8e052b5cced2` |
 | Real video decode/preprocess | Caption preserved; [1,3,33,480,832], range [-1,1] |
-| Pretrained loading and pretrained numerical parity | Blocked: only configs/non-weight assets available |
-| Real-data trainer run and fresh-process DCP equivalence | Blocked: missing weights; backbone NPU smoke checks do not cover this trainer path |
-| Multi-device/kernel performance | Not evaluated |
+| Official pretrained transformer loading | Subsequently validated with the 8.33B/1793-tensor checkpoint on NPU; pretrained source numerical parity remains unverified |
+| Real-data trainer run | Subsequently completed a deterministic 100-step, eight-rank BF16 comparison with Tom-and-Jerry and real weights on GPU/NPU; this establishes short-run execution, not convergence |
+| Fresh-process DCP equivalence | Still pending; successful checkpoint writes and RNG-hook tests do not establish optimizer/data-cursor resume equivalence |
+| Multi-device/kernel performance | Not benchmarked |
 
 Source comparison tolerances are declared before execution: output
 `atol=2e-5, rtol=2e-5`; gradients `atol=2e-5, rtol=2e-4`.
@@ -190,3 +218,13 @@ The small random-weight comparison does not prove pretrained full-model parity.
 NPU-to-CPU output tolerances are fp32 `atol=2e-4, rtol=2e-3` and bf16
 `atol=1e-2, rtol=5e-2`. NPU gradient finiteness and updates are checked;
 full-model pretrained numerical parity and optimizer resume remain unverified.
+
+The deterministic 100-step comparison fixes input order, seed, VAE posterior
+noise, diffusion noise and timestep, with cuDNN SDPA disabled in the external
+GPU comparison harness. Loss mean/max relative errors are 0.334%/1.685%
+(Pearson 0.999976); gradient-norm mean/max relative errors are 12.55%/72.96%
+(Pearson 0.986825), using NPU values as the denominator. These are the historical
+pre-review measurements in [PR #1319](https://github.com/ByteDance-Seed/VeOmni/pull/1319),
+not a rerun of the optimized mask. They show close loss trajectories and a
+remaining gradient-norm difference; they do not establish gradient equivalence
+or long-run convergence.

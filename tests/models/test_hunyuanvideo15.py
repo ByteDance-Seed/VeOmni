@@ -1,4 +1,4 @@
-"""CPU/NPU correctness checks; full pretrained trainer acceptance is separate."""
+"""CPU/GPU/NPU correctness checks; full pretrained trainer acceptance is separate."""
 
 import os
 
@@ -94,6 +94,118 @@ def test_masked_condition_tokens_do_not_change_output():
     data["text_states"][:, -1] = 10000
     data["byt5_text_states"][:, -1] = -10000
     torch.testing.assert_close(first, model(**data).predictions, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_attention_broadcast_mask_matches_pairwise_outputs_and_gradients(monkeypatch, causal):
+    """Keep masked-query semantics and gradients without allocating a quadratic mask."""
+    from veomni.models.diffusers.hunyuanvideo15.native.modules import attention as attention_module
+
+    torch.manual_seed(42)
+    valid = torch.tensor([[True, False, True, False], [False] * 4, [True] * 4])
+    actual_inputs = [torch.randn(3, 4, 2, 8, requires_grad=True) for _ in range(3)]
+    reference_inputs = [value.detach().clone().requires_grad_() for value in actual_inputs]
+    sdpa = torch.nn.functional.scaled_dot_product_attention
+    pairwise = valid[:, None, :, None] & valid[:, None, None, :]
+    expected = (
+        sdpa(*(value.transpose(1, 2) for value in reference_inputs), attn_mask=pairwise, is_causal=causal)
+        .transpose(1, 2)
+        .flatten(2)
+    )
+    mask_shapes = []
+
+    def record_sdpa(*args, **kwargs):
+        """Record mask storage while executing the real attention operation."""
+        mask_shapes.append(kwargs["attn_mask"].shape)
+        return sdpa(*args, **kwargs)
+
+    monkeypatch.setattr(attention_module.F, "scaled_dot_product_attention", record_sdpa)
+    actual = attention_module.attention(*actual_inputs, attn_mask=valid, causal=causal)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    assert torch.count_nonzero(actual[~valid]) == 0
+    actual.square().sum().backward()
+    expected.square().sum().backward()
+    for actual_input, reference_input in zip(actual_inputs, reference_inputs):
+        torch.testing.assert_close(actual_input.grad, reference_input.grad, rtol=1e-5, atol=1e-6)
+    assert mask_shapes == [torch.Size([3, 1, 1, 4])]
+
+
+@pytest.mark.parametrize(
+    "initial_slicing,initial_tiling", [(False, False), (True, False), (False, True), (True, True)]
+)
+@pytest.mark.parametrize("raise_error", [False, True])
+def test_vae_memory_efficient_context_restores_settings(initial_slicing, initial_tiling, raise_error):
+    """Restore both settings on success, exceptions, and nested context exits."""
+    model = tiny_vae()
+    model.use_slicing, model.use_spatial_tiling = initial_slicing, initial_tiling
+    try:
+        with model.memory_efficient_context():
+            assert model.use_slicing and model.use_spatial_tiling
+            with model.memory_efficient_context():
+                assert model.use_slicing and model.use_spatial_tiling
+            assert model.use_slicing and model.use_spatial_tiling
+            if raise_error:
+                raise RuntimeError("context body failed")
+    except RuntimeError as error:
+        assert raise_error and str(error) == "context body failed"
+    assert (model.use_slicing, model.use_spatial_tiling) == (initial_slicing, initial_tiling)
+
+
+def tiny_vae(out_channels=3):
+    """Build a small real VAE for decode and setting-restoration regressions."""
+    from veomni.models.diffusers.hunyuanvideo15.native.vae import AutoencoderKLConv3D
+
+    return AutoencoderKLConv3D(
+        in_channels=3,
+        out_channels=out_channels,
+        latent_channels=2,
+        block_out_channels=(8, 16, 16),
+        layers_per_block=1,
+        ffactor_spatial=4,
+        ffactor_temporal=4,
+        sample_size=32,
+        sample_tsize=5,
+        scaling_factor=1.0,
+    ).eval()
+
+
+def _check_vae_tile_parallel_decode(rank, rendezvous):
+    """Exercise real Gloo collectives with idle ranks and non-default batches/channels."""
+    from datetime import timedelta
+
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=60)
+    )
+    try:
+        _init_parallel_state(dp_size=1, ulysses_size=2, device_type="cpu")
+        torch.manual_seed(42)
+        model = tiny_vae(out_channels=4)
+        for dtype in (torch.float32, torch.bfloat16):
+            for height, width in ((4, 4), (4, 16)):
+                latents = torch.randn(2, 2, 2, height, width)
+                with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16, enabled=dtype == torch.bfloat16):
+                    expected = model.spatial_tiled_decode(latents)
+                    actual = model.tile_parallel_spatial_tiled_decode(latents)
+                if rank == 0:
+                    assert actual.shape == expected.shape
+                    assert actual.shape[:3] == (2, 4, 5)
+                    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+                else:
+                    assert actual.numel() == 0
+    finally:
+        torch.distributed.destroy_process_group()
+        clear_parallel_state()
+
+
+@pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="requires the CPU Gloo backend")
+def test_vae_tile_parallel_decode_with_idle_rank(tmp_path):
+    """Decode one tile on two ranks, then an uneven tile distribution, without hanging."""
+    torch.multiprocessing.spawn(
+        _check_vae_tile_parallel_decode, args=(str(tmp_path / "vae_gloo"),), nprocs=2, join=True
+    )
 
 
 def test_flow_objective_and_rng_continuation():
@@ -314,13 +426,19 @@ def test_glyph_checkpoint_extraction_is_strict(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("checkpointing", [False, True])
-def test_npu_forward_backward_update_and_rng(dtype, checkpointing):
+def test_accelerator_forward_backward_update_and_rng(dtype, checkpointing, monkeypatch):
+    """Check CPU parity, finite gradients, optimizer updates, and RNG on CUDA or NPU."""
     import copy
 
     from veomni.utils.device import get_device_type, get_torch_device
 
-    if get_device_type() != "npu" or not get_torch_device().is_available():
-        pytest.skip("An accessible NPU is required")
+    device = get_device_type()
+    if device not in ("cuda", "npu") or not get_torch_device().is_available():
+        pytest.skip("An accessible CUDA GPU or NPU is required")
+    if device == "cuda" and dtype == torch.float32:
+        # Compare FP32 arithmetic against CPU instead of CUDA's optional TF32 path.
+        monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+        monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     accelerator = get_torch_device()
     accelerator.set_device(0)
     torch.manual_seed(42)
@@ -334,18 +452,18 @@ def test_npu_forward_backward_update_and_rng(dtype, checkpointing):
     reference = HunyuanVideo15Model(config)
     initialize_nonzero_linears(reference)
     reference = reference.to(dtype=dtype)
-    model = copy.deepcopy(reference).to("npu").train()
+    model = copy.deepcopy(reference).to(device).train()
     if checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     # Distinct seeds avoid a degenerate noise == latent, zero velocity target.
-    flow = FlowMatchingConditioner(314, "npu")
-    latent = torch.randn(1, 32, 2, 4, 4, dtype=dtype).to("npu")
+    flow = FlowMatchingConditioner(314, device)
+    latent = torch.randn(1, 32, 2, 4, 4, dtype=dtype).to(device)
     data = flow(latent)
     data.update(
-        text_states=torch.randn(1, 8, 32, dtype=dtype).to("npu"),
-        encoder_attention_mask=torch.tensor([[True] * 4 + [False] * 4]).to("npu"),
-        byt5_text_states=torch.randn(1, 4, 1472, dtype=dtype).to("npu"),
-        byt5_text_mask=torch.tensor([[True, True, False, False]]).to("npu"),
+        text_states=torch.randn(1, 8, 32, dtype=dtype).to(device),
+        encoder_attention_mask=torch.tensor([[True] * 4 + [False] * 4]).to(device),
+        byt5_text_states=torch.randn(1, 4, 1472, dtype=dtype).to(device),
+        byt5_text_mask=torch.tensor([[True, True, False, False]]).to(device),
     )
     assert data["training_target"].abs().max().item() > 0
     cpu_data = {k: v.cpu() for k, v in data.items()}
@@ -367,7 +485,7 @@ def test_npu_forward_backward_update_and_rng(dtype, checkpointing):
             atol, rtol = (2e-4, 2e-3) if dtype == torch.float32 else (1e-2, 5e-2)
             torch.testing.assert_close(result.predictions.cpu(), expected.predictions, atol=atol, rtol=rtol)
             print(
-                "NPU parity",
+                device + " parity",
                 dtype,
                 checkpointing,
                 "output max_abs",
@@ -383,7 +501,7 @@ def test_npu_forward_backward_update_and_rng(dtype, checkpointing):
     replay = flow(latent)
     for key in replay:
         torch.testing.assert_close(replay[key], next_condition[key], rtol=0, atol=0)
-    print("NPU losses", dtype, checkpointing, losses)
+    print(device + " losses", dtype, checkpointing, losses)
 
 
 @pytest.mark.skipif(os.environ.get("HUNYUANVIDEO15_FULL_NPU") != "1", reason="Opt-in full 8.33B NPU test")

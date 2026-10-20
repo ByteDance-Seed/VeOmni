@@ -1,3 +1,9 @@
+HunyuanVideo 1.5 distribution notice
+
+Tencent Hunyuan is licensed under the Tencent Hunyuan Community License Agreement, Copyright © 2025 Tencent. All Rights Reserved. The trademark rights of “Tencent Hunyuan” are owned by Tencent or its affiliate.
+
+Upstream third-party notices and historical HunyuanVideo attribution follow.
+
 This project is built on and with the aid of the following open source projects. Credits are given to these projects.
 
 In case you believe there have been errors in the attribution below, you may submit the concerns to us for review and correction.

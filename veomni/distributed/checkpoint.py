@@ -66,9 +66,7 @@ class CheckpointFunction(torch.autograd.Function):
         else:
             ctx.patch_module = getattr(run_function, "__self__", None)
         state = (
-            _get_module_fsdp_state_if_fully_sharded_module(ctx.patch_module)
-            if ctx.patch_module is not None
-            else None
+            _get_module_fsdp_state_if_fully_sharded_module(ctx.patch_module) if ctx.patch_module is not None else None
         )
         if state:
             handle = _module_handle(state, ctx.patch_module)
