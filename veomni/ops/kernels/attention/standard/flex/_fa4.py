@@ -68,10 +68,34 @@ def _sparse_head_dims_support_flex_fa4(capability: int, head_dim: int | None, va
     return all(0 < dim <= 128 and dim % 32 == 0 for dim in (head_dim, value_head_dim))
 
 
+def _flex_attention_with_tensor_lengths(query, key, value, *, block_mask, **kwargs):
+    """Bind mask bounds to tensor shapes without changing visibility or buffers.
+
+    FLASH accepts shape-derived symbols, but rejects dynamic Python integers
+    captured by Flex's safe-indexing mask wrapper. Reading the caller's integer
+    seq_lengths there creates such captures even for a tensor-only mask_mod.
+    The caller validates exact lengths before entering this compiled function.
+    """
+    block_mask = BlockMask(
+        seq_lengths=(query.shape[-2], key.shape[-2]),
+        kv_num_blocks=block_mask.kv_num_blocks,
+        kv_indices=block_mask.kv_indices,
+        full_kv_num_blocks=block_mask.full_kv_num_blocks,
+        full_kv_indices=block_mask.full_kv_indices,
+        q_num_blocks=block_mask.q_num_blocks,
+        q_indices=block_mask.q_indices,
+        full_q_num_blocks=block_mask.full_q_num_blocks,
+        full_q_indices=block_mask.full_q_indices,
+        BLOCK_SIZE=block_mask.BLOCK_SIZE,
+        mask_mod=block_mask.mask_mod,
+    )
+    return raw_flex_attention(query, key, value, block_mask=block_mask, **kwargs)
+
+
 @cache
 def _compiled_flex_attention_fa4():
-    """Compile fixed-shape FLASH calls; raise instead of falling back to dense eager attention."""
-    return torch.compile(raw_flex_attention, dynamic=False, fullgraph=True)
+    """Reuse variable-length FLASH graphs; raise instead of falling back to dense eager attention."""
+    return torch.compile(_flex_attention_with_tensor_lengths, dynamic=True, fullgraph=True)
 
 
 def _flex_attention_fa4(
@@ -128,7 +152,7 @@ def _flex_attention_fa4(
 
     if (query.shape[-2], key.shape[-2]) != attention_mask.seq_lengths:
         raise ValueError("Flex-FA4 requires BlockMask sequence lengths to match query/key lengths exactly.")
-    flex_fn = raw_flex_attention if is_torchdynamo_compiling() else _compiled_flex_attention_fa4()
+    flex_fn = _flex_attention_with_tensor_lengths if is_torchdynamo_compiling() else _compiled_flex_attention_fa4()
     attention_output = flex_fn(
         query,
         key,

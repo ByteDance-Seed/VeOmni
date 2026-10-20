@@ -36,6 +36,7 @@ from ..ulysses import should_apply_ulysses, ulysses_mask_lengths
 from .packed import packed_mask_function
 
 
+_COMPILED_CREATE_BLOCK_MASK = None
 _SM100_BLOCK_SIZE = (256, 128)
 _DEFAULT_BLOCK_SIZE = 128
 
@@ -48,6 +49,20 @@ def _flex_block_size(device: torch.device | str | int | None) -> int | tuple[int
     return _DEFAULT_BLOCK_SIZE
 
 
+def _compiled_create_block_mask():
+    """Return a cached ``torch.compile(create_block_mask)``."""
+    global _COMPILED_CREATE_BLOCK_MASK
+    if _COMPILED_CREATE_BLOCK_MASK is None:
+        _COMPILED_CREATE_BLOCK_MASK = torch.compile(create_block_mask)
+    return _COMPILED_CREATE_BLOCK_MASK
+
+
+def _create_block_mask(*args, **kwargs):
+    """Compiled ``create_block_mask`` with HF's deprecated ``_compile`` forced off."""
+    kwargs["_compile"] = False
+    return _compiled_create_block_mask()(*args, **kwargs)
+
+
 def _eager_create_block_mask(*args, **kwargs):
     """Eager ``create_block_mask`` with HF's deprecated ``_compile`` forced off."""
     kwargs["_compile"] = False
@@ -55,10 +70,15 @@ def _eager_create_block_mask(*args, **kwargs):
 
 
 @contextmanager
-def _patched_hf_create_block_mask(block_size: int | tuple[int, int]) -> Iterator[None]:
-    """Use the architecture-specific tile size without HF's deprecated compilation flag."""
+def _patched_hf_create_block_mask(compile_block_mask: bool, block_size: int | tuple[int, int]) -> Iterator[None]:
+    """Swap HF's ``create_block_mask`` for the compiled or eager path.
+
+    Transformers still passes ``_compile=True`` on torch>=2.6, so the eager
+    path cannot use the raw function or the flag would compile anyway.
+    """
     original = masking_utils.create_block_mask
-    masking_utils.create_block_mask = partial(_eager_create_block_mask, BLOCK_SIZE=block_size)
+    builder = _create_block_mask if compile_block_mask else _eager_create_block_mask
+    masking_utils.create_block_mask = partial(builder, BLOCK_SIZE=block_size)
     try:
         yield
     finally:
@@ -76,6 +96,7 @@ def flex_attention_mask_builder(
     skip_ulysses: bool = False,
     cu_seqlens: torch.Tensor | None = None,
     cu_seqlens_k: torch.Tensor | None = None,
+    compile_block_mask: bool = True,
     **kwargs,
 ) -> BlockMask:
     """Build a Transformers FlexAttention mask.
@@ -90,8 +111,26 @@ def flex_attention_mask_builder(
     Canonical masks can be rebuilt from global lengths; custom predicates
     require global metadata.
 
-    BlockMask construction stays eager. The builder chooses a compatible tile
-    size but does not change the caller's visibility predicate.
+    ``create_block_mask`` is compiled by default so the eager dense
+    ``[B, H, Q, KV]`` materialization can be fused. Pass
+    ``compile_block_mask=False`` to keep the uncompiled path.
+
+    Keep ``mask_function`` a fixed predicate. Put per-step geometry in
+    captured tensors (document ids, span ids, ``cu_seqlens``) and reuse the
+    same callable. Captured Python constants can specialize static FA4
+    programs or be rejected by dynamic FLASH lowering. A new closure that
+    bakes changing range endpoints as ints can retrace or fail on new layouts.
+
+    A packed prefix-plus-causal mask can keep one callable and refresh two
+    ``int32 [S]`` buffers each step::
+
+        def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+            same_document = document_ids[q_idx] == document_ids[kv_idx]
+            causal = q_idx >= kv_idx
+            same_full_span = (full_span_ids[q_idx] >= 0) & (
+                full_span_ids[q_idx] == full_span_ids[kv_idx]
+            )
+            return same_document & (causal | same_full_span)
     """
     sliding_window = kwargs.pop("sliding_window", None)
     if cu_seqlens_k is None:
@@ -141,7 +180,7 @@ def flex_attention_mask_builder(
             batch_size=batch_size,
         )
 
-    with _patched_hf_create_block_mask(_flex_block_size(device)):
+    with _patched_hf_create_block_mask(compile_block_mask, _flex_block_size(device)):
         return ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"](
             batch_size=batch_size,
             q_length=q_length,

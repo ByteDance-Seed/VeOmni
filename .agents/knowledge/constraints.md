@@ -265,11 +265,11 @@ Core files:
 
 Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__.py` owns dispatch/Ulysses, `_inputs.py` owns input handling, `_fa4.py` owns compiled execution, and `_fa4_sm90_compat.py` owns the pinned bounds shim. The mask builder remains in `attention/mask/flex.py`.
 
-30. **FLASH execution uses fixed-shape compilation**
-    - Compile FLASH with `dynamic=False, fullgraph=True`; variable lengths can require new specializations. Do not increase global cache limits or fall back to dense eager attention on cache exhaustion.
-    - Validate exact BlockMask bounds against normalized post-Ulysses Q/K lengths. Keep custom predicates compatible with the pinned FLASH lowering.
-    - BlockMask construction remains eager; compiled creation and dynamic-length graph reuse belong to a follow-up change.
-    - See [FLASH compilation](../../docs/transformers_v5/veomni_attention_interface.md#flash-compilation-and-mask-construction).
+30. **FLASH compilation uses tensor-derived bounds**
+    - Always use `dynamic=True, fullgraph=True`, with no compile-mode parameter or internal static fallback. Derive bounds from normalized, post-Ulysses Q/K shapes inside the wrapper; preserve sparse buffers and `mask_mod`, and require exact equality with the caller's original bounds.
+    - Keep cache exhaustion explicit; do not raise global cache limits to handle variable lengths. Outer whole-model dynamic compilation and additional Python scalar captures remain unsupported; dtype/head/callback guards can still specialize.
+    - Prefer indexed per-token metadata buffers. The pinned CuteDSL lowering can also fail on zero-dimensional scalar-tensor captures; converting a Python scalar to a scalar tensor alone does not establish callback compatibility.
+    - See [dynamic compilation](../../docs/transformers_v5/veomni_attention_interface.md#dynamic-compilation) for the supported compile boundary and mask predicate design.
 
 30a. **Q/K/V layouts and visibility are explicit**
     - Reject `output_attentions=True` at the shared Flex entry before Ulysses or backend selection. The second result is optional LSE, never attention weights; returning LSE from Triton does not satisfy an attention-weight request.
@@ -278,7 +278,7 @@ Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__
 
 30b. **Pinned FA4 auxiliary callbacks require bounds protection**
     - Install the version/signature-gated `4.0.0b16` compatibility forwarder before compilation. Auxiliary metadata reads must be safe for padded tile positions; validate with allocator-disabled memcheck (`PYTORCH_NO_CUDA_MEMORY_CACHING=1`).
-    - For affected auxiliary callbacks with bounds disabled, restore full native Q/K bounds. Keep this correctness baseline independent of tail-only or Q-only optimizations.
+    - Apply Q-only protection only on physically padded Q tiles (account for PackGQA). Check K completeness on every Q tile before either fast path. Q-only callback clamping requires a proven complete K tile; ragged/negative K tiles retain native full bounds. Never use the incoming false flag as proof of K bounds.
     - Use separate JIT-cache namespaces and bump them when shader semantics change. Retain old cache objects and prepare both replacement caches before publishing installation.
     - Native b16 omits broadcast strides from its forward cache key. Materialize zero-stride Q/K/V views after KV expansion, bump the cache namespace, and test mixed layouts through the same production cache. Automatic FLASH routing must retain Triton for unsupported sparse dimensions, missing full-block tables, architecture-mismatched BlockMask tiles (128×128 on SM90; 256×128 on SM100/110), and trainable score bias. Explicit backend selection retains native validation.
     - See [FA4 partial-tile compatibility](../../docs/transformers_v5/veomni_attention_interface.md#fa4-partial-tile-compatibility) for the mechanism, hardware validation scope and upgrade requirements.

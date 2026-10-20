@@ -413,6 +413,31 @@ def test_2d_masks_match_dense_visibility():
     torch.testing.assert_close(flex_visible(flex, sequence_length, sequence_length), dense[0, 0])
 
 
+def _reset_flex_compile_cache(monkeypatch):
+    monkeypatch.setattr(flex_mask, "_COMPILED_CREATE_BLOCK_MASK", None)
+
+
+def _spy_torch_compile(monkeypatch):
+    compiled = []
+
+    def fake_compile(fn, *args, **kwargs):
+        compiled.append(fn)
+        return fn
+
+    monkeypatch.setattr(flex_mask.torch, "compile", fake_compile)
+    return compiled
+
+
+def test_flex_mask_builder_compiles_create_block_mask_by_default(monkeypatch):
+    _reset_flex_compile_cache(monkeypatch)
+    compiled = _spy_torch_compile(monkeypatch)
+    mask = flex_attention_mask_builder(1, 4, 4, device="cpu")
+    assert isinstance(mask, BlockMask)
+    assert compiled == [flex_mask.create_block_mask]
+    flex_attention_mask_builder(1, 4, 4, device="cpu")
+    assert compiled == [flex_mask.create_block_mask]
+
+
 @pytest.mark.parametrize(
     ("device", "compute_capability", "expected"),
     [
@@ -446,25 +471,33 @@ def test_flex_mask_builder_passes_sm100_block_size_to_pytorch(monkeypatch):
 
     monkeypatch.setattr(flex_mask, "create_block_mask", spy)
     monkeypatch.setattr(flex_mask, "_flex_block_size", lambda device: (256, 128))
-    mask = flex_attention_mask_builder(1, 256, 128, device="cpu")
+    mask = flex_attention_mask_builder(1, 256, 128, device="cpu", compile_block_mask=False)
     assert isinstance(mask, BlockMask)
     assert mask.BLOCK_SIZE == (256, 128)
     assert captured == [(256, 128)]
 
 
-def test_flex_mask_builder_keeps_eager_construction(monkeypatch):
-    seen = []
-    original = flex_mask.create_block_mask
+def test_flex_mask_builder_compile_block_mask_false_skips_compile(monkeypatch):
+    _reset_flex_compile_cache(monkeypatch)
+    compiled = _spy_torch_compile(monkeypatch)
+    captured = []
+    real = flex_mask.create_block_mask
 
-    def create(*args, **kwargs):
-        seen.append(kwargs["_compile"])
-        return original(*args, **kwargs)
+    def spy(*args, **kwargs):
+        captured.append(kwargs.get("_compile"))
+        return real(*args, **kwargs)
 
-    monkeypatch.setattr(flex_mask, "create_block_mask", create)
-    monkeypatch.setattr(
-        flex_mask.torch, "compile", lambda *args, **kwargs: pytest.fail("Mask construction must stay eager")
-    )
-    mask = flex_attention_mask_builder(1, 4, 4, device="cpu")
+    monkeypatch.setattr(flex_mask, "create_block_mask", spy)
+    mask = flex_attention_mask_builder(1, 4, 4, device="cpu", compile_block_mask=False)
     assert isinstance(mask, BlockMask)
-    assert seen == [False]
-    torch.testing.assert_close(flex_visible(mask, 4, 4), torch.ones(4, 4, dtype=torch.bool).tril())
+    assert compiled == []
+    assert captured == [False]
+
+
+def test_flex_mask_builder_compile_flag_preserves_causal_visibility(monkeypatch):
+    _reset_flex_compile_cache(monkeypatch)
+    compiled = flex_attention_mask_builder(1, 4, 4, device="cpu", compile_block_mask=True)
+    eager = flex_attention_mask_builder(1, 4, 4, device="cpu", compile_block_mask=False)
+    torch.testing.assert_close(flex_visible(compiled, 4, 4), flex_visible(eager, 4, 4))
+    expected = torch.ones(4, 4, dtype=torch.bool).tril()
+    torch.testing.assert_close(flex_visible(compiled, 4, 4), expected)

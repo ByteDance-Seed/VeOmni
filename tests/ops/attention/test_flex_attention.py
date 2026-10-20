@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
-from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask, create_mask
 
 from tests.ops.attention.attention_cases import clone_qkv, dense_mask, flex_mask, math_sdpa_reference
 from tests.ops.attention.utils import UlyssesHelperRecorder
@@ -664,8 +664,80 @@ def test_flex_toy_layer_matches_math_sdpa(dtype, cleanup_compiled_cuda_state):
         torch.testing.assert_close(flex_gradient, math_gradient, rtol=ATTN_GRAD_RTOL, atol=gradient_atol)
 
 
+@pytest.mark.parametrize("sequence_length", [13, 129, 259])
 @pytest.mark.skipif(not _FLEX_TENSOR_BOUNDS_AVAILABLE, reason="BlockMask tensor-derived bounds require seq_lengths")
-def test_flex_rejects_mismatched_bounds_before_compile(monkeypatch):
+def test_tensor_length_wrapper_preserves_mixed_visibility_and_sparse_buffers(monkeypatch, sequence_length):
+    mask, dense = _mixed_packed_mask(sequence_length, torch.device("cpu"))
+    captured = {}
+
+    def fake_raw(query, key, value, *, block_mask):
+        captured["mask"] = block_mask
+        return query
+
+    monkeypatch.setattr(flex_backend._fa4, "raw_flex_attention", fake_raw)
+    query = torch.randn(1, 4, sequence_length, 32)
+    flex_backend._fa4._flex_attention_with_tensor_lengths(query, query, query, block_mask=mask)
+    rebuilt = captured["mask"]
+    assert rebuilt is not mask
+    assert rebuilt.seq_lengths == mask.seq_lengths == (sequence_length, sequence_length)
+    for name in (
+        "kv_num_blocks",
+        "kv_indices",
+        "full_kv_num_blocks",
+        "full_kv_indices",
+        "q_num_blocks",
+        "q_indices",
+        "full_q_num_blocks",
+        "full_q_indices",
+        "mask_mod",
+    ):
+        assert getattr(rebuilt, name) is getattr(mask, name)
+    assert rebuilt.BLOCK_SIZE == mask.BLOCK_SIZE
+    actual = create_mask(rebuilt.mask_mod, B=1, H=1, Q_LEN=sequence_length, KV_LEN=sequence_length, device="cpu")
+    torch.testing.assert_close(actual, dense)
+
+
+@pytest.mark.skipif(not _FLEX_TENSOR_BOUNDS_AVAILABLE, reason="BlockMask tensor-derived bounds require seq_lengths")
+@pytest.mark.parametrize("token_major", [False, True])
+def test_flex_flash_adapter_uses_dynamic_compile_without_option(monkeypatch, token_major):
+    calls = []
+    real_compile = torch.compile
+
+    def fake_compile(fn, **options):
+        calls.append(options)
+        assert fn is flex_backend._fa4._flex_attention_with_tensor_lengths
+        return real_compile(fn, backend="eager", **options)
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    monkeypatch.setattr(
+        flex_backend._fa4, "raw_flex_attention", lambda query, key, value, **kwargs: query + key + value
+    )
+    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda **kwargs: False)
+    torch.compiler.reset()
+    flex_backend._fa4._compiled_flex_attention_fa4.cache_clear()
+    initial_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+    try:
+        with torch._dynamo.config.patch(recompile_limit=4):
+            for length in (65, 129, 193, 259, 389, 517, 645, 773, 901, 1027, 1283, 1541, 389, 129, 773, 65):
+                mask, _ = _mixed_packed_mask(length, torch.device("cpu"))
+                query = torch.randn(length, 4, 32) if token_major else torch.randn(1, 4, length, 32)
+                output, auxiliary = flex_backend.flex_attention_forward(
+                    _FakeAttentionModule(), query, query, query, mask, kernel_options={"BACKEND": "FLASH"}
+                )
+                expected = query + query + query
+                if not token_major:
+                    expected = expected.transpose(1, 2)
+                torch.testing.assert_close(output, expected)
+                assert auxiliary is None
+        assert calls == [{"dynamic": True, "fullgraph": True}]
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] - initial_graphs <= 4
+    finally:
+        torch.compiler.reset()
+        flex_backend._fa4._compiled_flex_attention_fa4.cache_clear()
+
+
+@pytest.mark.skipif(not _FLEX_TENSOR_BOUNDS_AVAILABLE, reason="BlockMask tensor-derived bounds require seq_lengths")
+def test_dynamic_flex_rejects_mismatched_bounds_before_compile(monkeypatch):
     monkeypatch.setattr(
         flex_backend._fa4,
         "_compiled_flex_attention_fa4",
@@ -717,6 +789,113 @@ def test_flex_cache_exhaustion_raises_without_eager_fallback_on_cpu(monkeypatch)
                         softcap=None,
                         kernel_options={"BACKEND": "FLASH"},
                     )
+    finally:
+        torch.compiler.reset()
+        flex_backend._fa4._compiled_flex_attention_fa4.cache_clear()
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Flex-FA4 requires CUDA")
+@pytest.mark.parametrize(("query_heads", "kv_heads"), [(28, 4), (7, 1)])
+@pytest.mark.parametrize("token_major", [False, True])
+def test_flex_fa4_variable_lengths_reuse_graphs_and_match_math_sdpa(
+    query_heads, kv_heads, token_major, record_property
+):
+    device = torch.device(get_device_type())
+    if flex_backend.get_gpu_compute_capability(device) < 90 or not flex_backend._fa4._flash_attn_cute_available():
+        pytest.skip("Flex-FA4 requires SM90+ and flash-attn-4")
+    torch.compiler.reset()
+    flex_backend._fa4._compiled_flex_attention_fa4.cache_clear()
+    initial_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+    try:
+        with torch._dynamo.config.patch(recompile_limit=4):
+            for length in (65, 129, 193, 259, 389, 517, 645, 773, 901, 1027, 1283, 1541, 389, 129, 773, 65):
+                mask, dense = _mixed_packed_mask(length, device)
+                tensors = [
+                    torch.randn(1, heads, length, 128, device=device, dtype=torch.bfloat16, requires_grad=True)
+                    for heads in (query_heads, kv_heads, kv_heads)
+                ]
+                references = [t.detach().clone().requires_grad_() for t in tensors]
+                if token_major:
+                    tensors = [t.squeeze(0).transpose(0, 1).contiguous().detach().requires_grad_() for t in tensors]
+                expected, _ = math_sdpa_reference(*references, dense, scaling=128**-0.5)
+                actual, auxiliary = flex_backend.flex_attention_forward(
+                    _FakeAttentionModule(),
+                    *tensors,
+                    mask,
+                    scaling=128**-0.5,
+                    kernel_options={"BACKEND": "FLASH"},
+                )
+                assert auxiliary is None
+                if token_major:
+                    expected = expected.squeeze(0)
+                torch.testing.assert_close(actual, expected, atol=1e-2, rtol=2e-2)
+                gradient = torch.randn_like(actual)
+                actual_gradients = torch.autograd.grad(actual, tensors, gradient)
+                expected_gradients = torch.autograd.grad(expected, references, gradient)
+                for actual_grad, expected_grad in zip(actual_gradients, expected_gradients, strict=True):
+                    if token_major:
+                        expected_grad = expected_grad.squeeze(0).transpose(0, 1)
+                    assert torch.isfinite(actual_grad).all()
+                    assert (actual_grad.float() - expected_grad.float()).norm() <= 0.01 * expected_grad.float().norm()
+            graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"] - initial_graphs
+            record_property("unique_graphs", graphs)
+            assert graphs <= 4
+    finally:
+        torch.compiler.reset()
+        flex_backend._fa4._compiled_flex_attention_fa4.cache_clear()
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Flex-FA4 requires CUDA")
+def test_dynamic_flex_inside_static_outer_compile_matches_standalone_gradients():
+    device = torch.device(get_device_type())
+    if flex_backend.get_gpu_compute_capability(device) < 90 or not flex_backend._fa4._flash_attn_cute_available():
+        pytest.skip("Flex-FA4 requires SM90+ and flash-attn-4")
+    module = _FakeAttentionModule()
+
+    def outer(query, key, value, mask):
+        return flex_backend._flex_attention_fa4(
+            module,
+            query,
+            key,
+            value,
+            mask,
+            dropout=0.0,
+            scaling=128**-0.5,
+            softcap=None,
+            kernel_options={"BACKEND": "FLASH"},
+        )[0]
+
+    torch.compiler.reset()
+    compiled = torch.compile(outer, dynamic=False, fullgraph=True)
+    try:
+        for length in (259, 389, 517, 1027):
+            mask, _ = _mixed_packed_mask(length, device)
+            tensors = [
+                torch.randn(1, heads, length, 128, device=device, dtype=torch.bfloat16, requires_grad=True)
+                for heads in (7, 1, 1)
+            ]
+            for tensor in tensors:
+                torch._dynamo.mark_static(tensor, 1)
+                torch._dynamo.mark_static(tensor, 3)
+            refs = [t.detach().clone().requires_grad_() for t in tensors]
+            actual = compiled(*tensors, mask)
+            expected, _ = flex_backend._flex_attention_fa4(
+                module,
+                *refs,
+                mask,
+                dropout=0.0,
+                scaling=128**-0.5,
+                softcap=None,
+                kernel_options={"BACKEND": "FLASH"},
+            )
+            torch.testing.assert_close(actual, expected, atol=1e-2, rtol=2e-2)
+            gradient = torch.randn_like(actual)
+            for actual_grad, expected_grad in zip(
+                torch.autograd.grad(actual, tensors, gradient),
+                torch.autograd.grad(expected, refs, gradient),
+                strict=True,
+            ):
+                assert (actual_grad.float() - expected_grad.float()).norm() <= 0.01 * expected_grad.float().norm()
     finally:
         torch.compiler.reset()
         flex_backend._fa4._compiled_flex_attention_fa4.cache_clear()
@@ -870,7 +1049,7 @@ def test_flex_flash_bounds_follow_qkv_after_ulysses(monkeypatch, token_major, sk
     monkeypatch.setattr(
         flex_backend._fa4,
         "_compiled_flex_attention_fa4",
-        lambda: raw,
+        lambda: flex_backend._fa4._flex_attention_with_tensor_lengths,
     )
     q_length, kv_length = (10, 14) if skip_ulysses else (5, 7)
     tensors = [torch.randn(1, heads, length, 32) for heads, length in ((4, q_length), (2, kv_length), (2, kv_length))]
@@ -929,39 +1108,6 @@ def test_flex_fa4_different_qk_lengths_match_math_gradients(token_major):
             assert (actual_grad.float() - expected_grad.float()).norm() <= 0.01 * expected_grad.float().norm()
     finally:
         torch.compiler.reset()
-        flex_backend._fa4._compiled_flex_attention_fa4.cache_clear()
-
-
-@pytest.mark.parametrize("token_major", [False, True])
-def test_flex_fa4_compiles_fixed_shapes_and_reuses_callable(monkeypatch, token_major):
-    calls = []
-
-    def raw(query, key, value, **kwargs):
-        return query + key + value
-
-    def compile_fixed(fn, **options):
-        assert fn is raw
-        calls.append(options)
-        return fn
-
-    monkeypatch.setattr(flex_backend._fa4, "raw_flex_attention", raw)
-    monkeypatch.setattr(torch, "compile", compile_fixed)
-    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda **kwargs: False)
-    flex_backend._fa4._compiled_flex_attention_fa4.cache_clear()
-    try:
-        inputs = [torch.randn(1, 2, 65, 32) for _ in range(3)]
-        if token_major:
-            inputs = [t.squeeze(0).transpose(0, 1) for t in inputs]
-        mask = _causal_block_mask(65, "cpu")
-        for _ in range(3):
-            output, auxiliary = flex_backend.flex_attention_forward(
-                _FakeAttentionModule(), *inputs, mask, kernel_options={"BACKEND": "FLASH"}
-            )
-            expected = sum(inputs) if token_major else sum(inputs).transpose(1, 2)
-            torch.testing.assert_close(output, expected)
-            assert auxiliary is None
-        assert calls == [{"dynamic": False, "fullgraph": True}]
-    finally:
         flex_backend._fa4._compiled_flex_attention_fa4.cache_clear()
 
 
