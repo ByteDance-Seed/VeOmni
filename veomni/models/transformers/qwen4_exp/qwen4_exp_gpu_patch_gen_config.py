@@ -183,9 +183,6 @@ logger = logging.get_logger(__name__)
 # so the PLE replacement class can mention it while the patch config loads.
 all_to_all = None
 
-# Names resolved at codegen time from generated imports.
-get_max_seqlen = None
-
 
 @config.override_method(
     "Qwen4ExpTextModel.reverse_embedding",

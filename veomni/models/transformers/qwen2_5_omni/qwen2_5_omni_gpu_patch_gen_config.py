@@ -22,9 +22,8 @@ Covers the thinker training path (text + vision + audio, dense — no MoE):
   - Vision encoder forward with SP gather/slice (full + windowed cu_seqlens
     extended for the SP pad tail) and a new dummy_forward for FSDP rank
     asymmetry
-  - Audio encoder _prepare_attention_mask returning None on VARLEN paths,
-    forward with input_features (len, mel) permute + SP gather/strip + SP
-    slice + cu_seqlens extension, plus a new dummy_forward
+  - Audio encoder forward with input_features (len, mel) permute + SP
+    gather/strip + SP slice + cu_seqlens extension, plus a new dummy_forward
   - Thinker.get_audio_features simplified to VeOmni's flat (len, mel) inputs
     (no feature_attention_mask)
   - Thinker.get_position_id_func — multiprocessing-safe per-sample closure
@@ -75,7 +74,6 @@ from veomni.distributed.sequence_parallel import (
     unpad_tensor,
 )
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
@@ -115,7 +113,6 @@ config.add_import(
         "unpad_tensor",
     ],
 )
-config.add_import("veomni.models.utils.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
@@ -599,36 +596,6 @@ def qwen2_5_omni_pretrained_init_weights_patched(self, module):
     elif isinstance(module, Qwen2_5_VisionRotaryEmbedding):  # noqa: F821
         inv_freq = 1.0 / (module.theta ** (torch.arange(0, module.dim, 2, dtype=torch.float) / module.dim))
         init.copy_(module.inv_freq, inv_freq)  # noqa: F821
-
-
-# ================================================================
-# Patch: Qwen2_5OmniAudioEncoder._prepare_attention_mask
-# 1. Return None for any VARLEN_ATTENTION_TYPES backend (including
-#    veomni_flash_attention_*); upstream only checks the HF built-in
-#    flash-attention name via `is_flash_attention_requested`.
-# ================================================================
-@config.override_method(
-    "Qwen2_5OmniAudioEncoder._prepare_attention_mask",
-    description="Return None on all VARLEN attention backends (veomni_flash_attention_* included)",
-)
-def qwen2_5_omni_audio_prepare_attention_mask_patched(
-    self, inputs_tensor: torch.Tensor, cu_seqlens: torch.Tensor
-) -> torch.Tensor:
-    # --- Patch.1 ---
-    if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
-        return None
-    # --- Patch.1 ---
-
-    seq_length = inputs_tensor.shape[0]
-    attention_mask = torch.full(
-        [1, 1, seq_length, seq_length],
-        torch.finfo(inputs_tensor.dtype).min,
-        device=inputs_tensor.device,
-        dtype=inputs_tensor.dtype,
-    )
-    for i in range(1, len(cu_seqlens)):
-        attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = 0
-    return attention_mask
 
 
 # ================================================================

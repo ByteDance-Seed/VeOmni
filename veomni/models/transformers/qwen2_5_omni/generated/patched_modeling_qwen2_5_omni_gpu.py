@@ -25,8 +25,6 @@
 #      Per-video use_audio_in_video via audio_seqlens + None attention_mask tolerance
 #    - method_override: Qwen2_5OmniPreTrainedModel._init_weights
 #      Drop UpSample1d / DownSample1d branches since both classes are excluded from the generated file
-#    - method_override: Qwen2_5OmniAudioEncoder._prepare_attention_mask
-#      Return None on all VARLEN attention backends (veomni_flash_attention_* included)
 #    - method_override: Qwen2_5OmniAudioEncoder.forward
 #      Permute VeOmni (len, mel) input + SP gather/strip + SP slice + extend cu_seqlens
 #    - method_override: Qwen2_5OmniAudioEncoder.dummy_forward
@@ -138,7 +136,6 @@ from transformers.vision_utils import get_vision_position_ids, get_vision_window
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, pad_tensor, slice_input_tensor, unpad_tensor
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
@@ -1016,7 +1013,7 @@ def get_pool_indices(feature_lens: torch.Tensor, kwargs: dict | None = None) -> 
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen2_5OmniAudioEncoder
-# Methods patched: _prepare_attention_mask, forward, dummy_forward
+# Methods patched: forward, dummy_forward
 # ======================================================================
 
 
@@ -1247,29 +1244,6 @@ class Qwen2_5OmniAudioEncoder(Qwen2_5OmniPreTrainedModel):
             batch_mask.unsqueeze(1),
             batch_mask_after_cnn.bool(),
         )
-
-    # ================================================================
-    # Patch: Qwen2_5OmniAudioEncoder._prepare_attention_mask
-    # 1. Return None for any VARLEN_ATTENTION_TYPES backend (including
-    #    veomni_flash_attention_*); upstream only checks the HF built-in
-    #    flash-attention name via `is_flash_attention_requested`.
-    # ================================================================
-    def _prepare_attention_mask(self, inputs_tensor: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
-        # --- Patch.1 ---
-        if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
-            return None
-        # --- Patch.1 ---
-
-        seq_length = inputs_tensor.shape[0]
-        attention_mask = torch.full(
-            [1, 1, seq_length, seq_length],
-            torch.finfo(inputs_tensor.dtype).min,
-            device=inputs_tensor.device,
-            dtype=inputs_tensor.dtype,
-        )
-        for i in range(1, len(cu_seqlens)):
-            attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = 0
-        return attention_mask
 
     # ================================================================
     # Patch: Qwen2_5OmniAudioEncoder.dummy_forward (NEW method)

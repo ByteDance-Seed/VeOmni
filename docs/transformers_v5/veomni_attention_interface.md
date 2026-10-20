@@ -80,6 +80,15 @@ All registered adapters use the Transformers attention-forward convention.
 Q/K/V inputs use `[batch, heads, sequence, head_dim]`; the returned attention
 output uses `[batch, sequence, heads, head_dim]`.
 
+For `sdpa`, `veomni_sdpa`, and `eager`, unmasked (`attention_mask=None`)
+batch-size-1 calls carrying multi-segment `cu_seqlens` (`cu_seq_lens_q`/`k` or
+`cu_seqlens_q`/`k`) are automatically split per segment inside the wrapper and
+concatenated back along the sequence dimension. In `veomni_sdpa`, this split
+happens after the Ulysses sequence-gather/head-scatter exchange so global
+`cu_seqlens` match the gathered sequence length. Single-segment metadata or
+calls already isolated by a 3D/4D dense `attention_mask` strip the packed
+metadata without splitting.
+
 ## FlexAttention mask contract
 
 The Flex implementation has four responsibilities. These are independent of
