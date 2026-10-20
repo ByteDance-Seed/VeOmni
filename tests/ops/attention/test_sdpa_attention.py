@@ -68,14 +68,8 @@ def eager_attention_forward(
         key = key.repeat_interleave(module.num_key_value_groups, dim=1)
         value = value.repeat_interleave(module.num_key_value_groups, dim=1)
     scores = torch.matmul(query, key.transpose(-2, -1)) * scale
-    is_causal = kwargs.get("is_causal")
-    if is_causal is None:
-        is_causal = getattr(module, "is_causal", False)
     if attention_mask is not None:
         scores = scores + attention_mask
-    elif is_causal and query.shape[-2] > 1:
-        causal = torch.ones(query.shape[-2], key.shape[-2], dtype=torch.bool, device=query.device).tril()
-        scores = scores.masked_fill(~causal, torch.finfo(scores.dtype).min)
     weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
     weights = F.dropout(weights, p=dropout, training=module.training)
     return torch.matmul(weights, value).transpose(1, 2).contiguous(), weights
@@ -200,13 +194,29 @@ def test_sdpa_splits_unmasked_packed_cu_seqlens(entrypoint, is_causal, metadata_
     module.is_causal = is_causal
     module.num_key_value_groups = 2
     forward = _sdpa_forward(entrypoint)
+    metadata = dict.fromkeys(metadata_keys, cu_seqlens) | {"max_length_q": 4, "max_length_k": 4}
+
+    if entrypoint == "eager" and is_causal:
+        with pytest.raises(ValueError, match="does not support is_causal=True"):
+            forward(
+                module,
+                query,
+                key,
+                value,
+                None,
+                dropout=0.0,
+                scaling=scaling,
+                is_causal=True,
+                **metadata,
+            )
+        return
 
     ref_q, ref_k, ref_v = clone_qkv(query, key, value)
     q_splits = torch.split(ref_q, lengths, dim=2)
     k_splits = torch.split(ref_k, lengths, dim=2)
     v_splits = torch.split(ref_v, lengths, dim=2)
     ref_chunks = [
-        forward(
+        sdpa_backend.hf_sdpa_attention_forward(
             module,
             q_chunk,
             k_chunk,
@@ -222,7 +232,6 @@ def test_sdpa_splits_unmasked_packed_cu_seqlens(entrypoint, is_causal, metadata_
     expected_grads = torch.autograd.grad(expected, (ref_q, ref_k, ref_v), grad_out)
 
     act_q, act_k, act_v = clone_qkv(query, key, value)
-    metadata = dict.fromkeys(metadata_keys, cu_seqlens) | {"max_length_q": 4, "max_length_k": 4}
     actual, lse = forward(
         module,
         act_q,
@@ -343,83 +352,16 @@ def test_sdpa_packed_varlen_rejects_invalid_metadata(monkeypatch):
             cu_seqlens=torch.tensor([0, 2, 5], dtype=torch.int32),
         )
 
-
-def test_sdpa_lookup_splits_packed_cu_seqlens_and_accepts_block_mask(monkeypatch):
-    """``sdpa`` lookup splits unmasked multi-segment calls and preserves BlockMask calls."""
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-
-    from tests.ops.attention.attention_cases import eager_create_block_mask
-
-    recorded_chunks = []
-
-    def fake_hf_sdpa(module, query, key, value, attention_mask, **kwargs):
-        recorded_chunks.append((query.shape, attention_mask, dict(kwargs)))
-        return eager_attention_forward(module, query, key, value, None, **kwargs)
-
-    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, "sdpa", fake_hf_sdpa)
-    module = _FakeAttentionModule()
-    module.is_causal = False
-    forward = VeomniOp("attention", "standard", "sdpa")
-
-    cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
-    q1 = torch.randn(1, 2, 4, 8)
-    q2 = q1.clone()
-    q2[:, :, 2:, :] += 10.0
-
-    out1, _ = forward(
-        module,
-        q1,
-        q1,
-        q1,
-        None,
-        cu_seq_lens_q=cu_seqlens,
-        cu_seq_lens_k=cu_seqlens,
-        max_length_q=2,
-        max_length_k=2,
-        is_causal=False,
-    )
-    out2, _ = forward(
-        module,
-        q2,
-        q2,
-        q2,
-        None,
-        cu_seq_lens_q=cu_seqlens,
-        cu_seq_lens_k=cu_seqlens,
-        max_length_q=2,
-        max_length_k=2,
-        is_causal=False,
-    )
-    # Segment 1 must be completely unaffected by changes in segment 2.
-    torch.testing.assert_close(out1[:, :2], out2[:, :2], rtol=0, atol=0)
-    assert [shape for shape, _, _ in recorded_chunks[:2]] == [torch.Size([1, 2, 2, 8]), torch.Size([1, 2, 2, 8])]
-
-    # BlockMask already isolates segments and must pass through unsplit without .ndim AttributeError.
-    recorded_chunks.clear()
-    block_mask = eager_create_block_mask(
-        lambda b, h, q_idx, kv_idx: q_idx >= kv_idx,
-        B=None,
-        H=None,
-        Q_LEN=4,
-        KV_LEN=4,
-        device=q1.device,
-        BLOCK_SIZE=128,
-    )
-    forward(
-        module,
-        q1,
-        q1,
-        q1,
-        block_mask,
-        cu_seq_lens_q=cu_seqlens,
-        cu_seq_lens_k=cu_seqlens,
-        max_length_q=2,
-        max_length_k=2,
-    )
-    assert len(recorded_chunks) == 1
-    assert recorded_chunks[0][0] == torch.Size([1, 2, 4, 8])
-    assert recorded_chunks[0][1] is block_mask
-    assert "cu_seq_lens_q" not in recorded_chunks[0][2]
+    with pytest.raises(ValueError, match="position_bias"):
+        sdpa_backend.sdpa_attention_forward(
+            module,
+            query,
+            query,
+            query,
+            None,
+            cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32),
+            position_bias=torch.zeros(1, 2, 4, 4),
+        )
 
 
 def test_veomni_sdpa_pins_mask_backends_only_with_mask(monkeypatch):

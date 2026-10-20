@@ -17,31 +17,30 @@
 from collections.abc import Callable
 
 import torch
-from torch.nn.attention.flex_attention import BlockMask
 
 
 _SDPA_CU_SEQLENS_KEYS = ("cu_seqlens", "cu_seqlens_q", "cu_seqlens_k", "cu_seq_lens_q", "cu_seq_lens_k")
 _SDPA_PACKED_METADATA_KEYS = (*_SDPA_CU_SEQLENS_KEYS, "max_length_q", "max_length_k", "max_seqlen_q", "max_seqlen_k")
 
 
-def has_isolating_attention_mask(attention_mask: torch.Tensor | BlockMask | None) -> bool:
-    """Return True when ``attention_mask`` is a 3-D/4-D dense mask or ``BlockMask``."""
-    return isinstance(attention_mask, BlockMask) or (torch.is_tensor(attention_mask) and attention_mask.ndim >= 3)
+def has_isolating_attention_mask(attention_mask: torch.Tensor | None) -> bool:
+    """Return True when ``attention_mask`` is a 3-D/4-D dense mask."""
+    return torch.is_tensor(attention_mask) and attention_mask.ndim >= 3
 
 
 def strip_sdpa_packed_metadata(
     kwargs: dict,
     *,
     batch_size: int,
-    dense_mask: torch.Tensor | BlockMask | None,
+    dense_mask: torch.Tensor | None,
 ) -> dict:
     """Drop packed/varlen arguments absent from the SDPA API.
 
     The collator always emits this metadata. It is dropped when it describes
     at most one segment per batch row, or when ``dense_mask`` is a 3-D/4-D
-    mask or ``BlockMask``, which the caller built to isolate the segments.
-    Several segments in a row without such a mask would attend across samples,
-    so that raises. Dense mask contents are not inspected.
+    mask, which the caller built to isolate the segments. Several segments in
+    a row without such a mask would attend across samples, so that raises.
+    Dense mask contents are not inspected.
     """
     packed = [name for name in _SDPA_PACKED_METADATA_KEYS if kwargs.get(name) is not None]
     if not packed:
@@ -65,19 +64,19 @@ def extract_packed_varlen_cu_seqlens(
     kwargs: dict,
     *,
     batch_size: int,
-    attention_mask: torch.Tensor | BlockMask | None,
+    attention_mask: torch.Tensor | None,
 ) -> tuple[dict, tuple[torch.Tensor | None, torch.Tensor | None] | None]:
     """Extract multi-segment ``cu_seqlens`` for unmasked varlen splitting or strip packed metadata.
 
-    When ``attention_mask`` is a 3-D/4-D dense mask or ``BlockMask``,
-    ``dsa_position_ids`` is present (sparse attention handles packed sequences
-    natively), or the cumulative lengths describe at most one segment per batch
-    row, packed metadata is dropped and ``None`` is returned so the caller runs
-    a single attention forward. When ``attention_mask is None`` and
-    ``batch_size == 1`` with multiple segments, packed metadata is stripped
-    from ``kwargs`` and ``(cu_seqlens_q, cu_seqlens_k)`` is returned for
-    chunked varlen execution. Multi-segment metadata with a 2-D mask or
-    ``batch_size != 1`` is rejected via :func:`strip_sdpa_packed_metadata`.
+    When ``attention_mask`` is a 3-D/4-D dense mask, ``dsa_position_ids`` is
+    present (sparse attention handles packed sequences natively), or the
+    cumulative lengths describe at most one segment per batch row, packed
+    metadata is dropped and ``None`` is returned so the caller runs a single
+    attention forward. When ``attention_mask is None`` and ``batch_size == 1``
+    with multiple segments, packed metadata is stripped from ``kwargs`` and
+    ``(cu_seqlens_q, cu_seqlens_k)`` is returned for chunked varlen execution.
+    Multi-segment metadata with a 2-D mask or ``batch_size != 1`` is rejected
+    via :func:`strip_sdpa_packed_metadata`.
     """
     packed = [name for name in _SDPA_PACKED_METADATA_KEYS if kwargs.get(name) is not None]
     if not packed:
@@ -135,6 +134,8 @@ def packed_split_attention_forward(
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
     """Split packed ``[1, H, S, D]`` Q/K/V by ``cu_seqlens`` and run ``forward_fn`` per segment."""
+    if kwargs.get("position_bias") is not None:
+        raise ValueError("Packed varlen attention splitting does not support position_bias.")
     if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
         raise ValueError(
             "Packed varlen attention requires batch_size == 1 for query, key, and value; "

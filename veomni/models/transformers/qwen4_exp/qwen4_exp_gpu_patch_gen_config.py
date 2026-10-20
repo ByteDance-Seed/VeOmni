@@ -1768,59 +1768,36 @@ def qwen4_exp_vision_attention_forward_patched(
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
     parallel_state = get_parallel_state()
-    if is_flash_attention_requested(self.config):
-        # Modification: prefer the int max_seqlen pre-computed once in
-        # Qwen4ExpVisionModel.forward (Patch.5). Fall back to the original
-        # GPU-side reduction so this method still works when the model forward
-        # has not been patched (e.g. external callers, unit tests).
-        max_seqlen = kwargs.pop("vision_max_seqlen", None)
-        if max_seqlen is None:
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-        with use_parallel_state(_qwen4_exp_vision_parallel_state(parallel_state)):
-            attn_output, _ = self.veomni_attn(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
-                max_length_q=max_seqlen,
-                max_length_k=max_seqlen,
-                is_causal=False,
-                **kwargs,
-            )
-    else:
+    if not is_flash_attention_requested(self.config):
         sp_enabled, _, _, _ = _qwen4_exp_sequence_parallel_state(parallel_state)
         if sp_enabled or bool(getattr(parallel_state, "sp_enabled", False)):
             raise NotImplementedError(
                 "Qwen4-Exp vision sequence parallelism requires FlashAttention; eager and SDPA "
                 "receive local visual-token Q/K/V but global cu_seqlens and cannot segment that layout safely."
             )
-        # Modification: drop `vision_max_seqlen` from kwargs before falling through
-        # to the non-FA path so it doesn't reach kernels that don't expect it.
-        kwargs.pop("vision_max_seqlen", None)
-        # Other implementations: Process each chunk separately
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
-
-        attn_outputs = [
-            self.veomni_attn(
-                self,
-                q,
-                k,
-                v,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                is_causal=False,
-                **kwargs,
-            )[0]
-            for q, k, v in zip(*splits)
-        ]
-        attn_output = torch.cat(attn_outputs, dim=1)
+    # Modification: prefer the int max_seqlen pre-computed once in
+    # Qwen4ExpVisionModel.forward (Patch.5). Fall back to the original
+    # GPU-side reduction so this method still works when the model forward
+    # has not been patched (e.g. external callers, unit tests).
+    max_seqlen = kwargs.pop("vision_max_seqlen", None)
+    if max_seqlen is None:
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+    with use_parallel_state(_qwen4_exp_vision_parallel_state(parallel_state)):
+        attn_output, _ = self.veomni_attn(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask=None,
+            scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+            is_causal=False,
+            **kwargs,
+        )
 
     attn_output = attn_output.reshape(seq_length, -1).contiguous()
     attn_output = self.proj(attn_output)

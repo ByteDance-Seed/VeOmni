@@ -112,6 +112,16 @@ def lookup(impl: str) -> Callable:
             )
 
         if packed_cu_seqlens is not None:
+            if impl == "eager":
+                is_causal = kwargs.get("is_causal")
+                if is_causal is None:
+                    is_causal = bool(getattr(module, "is_causal", False))
+                if is_causal:
+                    raise ValueError(
+                        "Unmasked packed varlen 'eager' attention does not support is_causal=True because "
+                        "Transformers eager_attention_forward requires an explicit causal attention_mask. "
+                        "Build a 4D mask with packed_causal_mask or pass is_causal=False."
+                    )
             cu_seqlens_q, cu_seqlens_k = packed_cu_seqlens
             return packed_split_attention_forward(
                 forward,
