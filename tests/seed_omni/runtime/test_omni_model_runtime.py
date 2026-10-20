@@ -15,13 +15,16 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import MultiLRScheduler, OmniModelRuntime
+from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
+    MultiLRScheduler,
+    OmniModelRuntime,
+)
 from veomni.models.seed_omni.accelerated.utils import executor
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
 from veomni.models.seed_omni.mixins.inference_module_mixin import InferenceModuleMixin, post_generate, pre_generate
 from veomni.models.seed_omni.mixins.metric_meter_mixin import MetricMeterMixin
-from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleMixin
+from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.module_configuration_base import OmniModuleConfig
 from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
@@ -247,6 +250,76 @@ def test_runtime_calls_a_wrapped_module_through_its_runtime():
     assert dict(runtime.named_omni_modules())["module_a"] is model.modules_dict["module_a"]
 
 
+def _double_every_item(conversation_list):
+    for sample in conversation_list:
+        for item in sample:
+            item.value = item.value * 2
+
+
+class _EncodingModule(PretrainedOmniModule, TrainingModuleMixin):
+    """Encodes every item in its method body (in place or returned) or in ``post_forward``."""
+
+    config_class = _StubConfig
+
+    def __init__(self, edits: str):
+        super().__init__(_StubConfig())
+        self.edits = edits
+        self._carrier = None
+
+    @pre_forward("forward")
+    def forward_pre(self, conversation_list=None, **kwargs):
+        if self.edits != "post_forward":
+            return {**kwargs, "conversation_list": conversation_list}
+        self._carrier = conversation_list
+        return kwargs
+
+    def forward(self, conversation_list=None, **kwargs):
+        del kwargs
+        if self.edits == "post_forward":
+            return {}
+        _double_every_item(conversation_list)
+        return {"conversation_list": conversation_list} if self.edits == "body_returns_the_list" else {}
+
+    @post_forward("forward")
+    def forward_post(self, **outputs):
+        if self.edits != "post_forward":
+            return outputs
+        conversation, self._carrier = self._carrier, None
+        _double_every_item(conversation)
+        return {**outputs, "conversation_list": conversation}
+
+
+@pytest.mark.parametrize(
+    ("edits", "encoded"),
+    [("body_in_place", False), ("body_returns_the_list", True), ("post_forward", True)],
+)
+def test_a_node_s_item_edits_reach_the_batch_only_through_its_hooks_or_its_return(edits, encoded):
+    """Every FSDP2 wrap unit casts its inputs with ``dataclasses.replace`` under mixed precision, so a method
+    body that edits the items it was handed edits copies. The cache gets what the node leaves in the batch."""
+    from torch.distributed.utils import _apply_to_tensors
+
+    from veomni.models.seed_omni.utils.conversation import ConversationItem
+
+    module = _EncodingModule(edits)
+
+    def cast_inputs(_module, args, kwargs):
+        to_bf16 = lambda t: t.to(torch.bfloat16)  # noqa: E731
+        return _apply_to_tensors(to_bf16, args), _apply_to_tensors(to_bf16, kwargs)
+
+    module.register_forward_pre_hook(cast_inputs, with_kwargs=True)
+    config = OmniConfig(
+        _module_entries={"module_a": {"model_path": "module_a"}},
+        training_graphs={"default": [{"from": "module_a", "to": "end"}]},
+        generation_graphs={},
+    )
+    runtime = OmniModelRuntime(OmniModel(config, {"module_a": module}))
+
+    out = runtime.forward({"conversation_list": [[ConversationItem(type="image", value=torch.ones(2), role="user")]]})
+
+    value = out["conversation_list"][0][0].value.float()
+    assert torch.equal(value, torch.full((2,), 2.0 if encoded else 1.0))
+
+
 class _ClippingRuntime:
     def __init__(self, norm: float, max_grad_norm: float):
         self.norm = norm
@@ -331,3 +404,129 @@ def test_metric_meter_collect_drains_only_the_metered_modules():
 
     assert runtime.metric_meter_collect() == {"metered": (7.0, [3, 4])}
     assert runtime.metric_meter_collect() == {"metered": (0.0, [])}
+
+
+def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
+    """Under ``fsdp_scope='model'``, cache readers must not go through weight materialisation."""
+    model = _model()
+    meta_module = torch.nn.Linear(2, 2, device="meta")
+    model.module_a = meta_module
+    runtime = OmniModelRuntime(model)
+
+    vae = MagicMock()
+    vae.reads_offline_cache = True
+    vae.model = meta_module
+    vae.args = SimpleNamespace(model_path="vae", lora_config=None)
+    vae.build_after_omni_model_wrap = MagicMock()
+
+    llm = MagicMock()
+    llm.reads_offline_cache = False
+    llm.model = model.module_b
+    llm.args = SimpleNamespace(model_path="llm", lora_config=None)
+    llm.skip_hf_weight_load = False
+    llm.build_after_omni_model_wrap = MagicMock()
+
+    runtime.module_runtimes = {"module_a": vae, "module_b": llm}
+    runtime.omni_model_runtime_args = SimpleNamespace(
+        accelerator=SimpleNamespace(
+            fsdp_config=SimpleNamespace(
+                fsdp_scope="model",
+                reshard_after_forward=True,
+                mixed_precision=SimpleNamespace(enable=False),
+                forward_prefetch=False,
+                offload=False,
+                offload_pin_memory=False,
+                max_load_broadcast_size=20.0,
+            ),
+            torch_compile=SimpleNamespace(
+                enable=False,
+                backend="inductor",
+                mode=None,
+                dynamic=None,
+                fullgraph=False,
+                compile_full_model=False,
+            ),
+            gradient_checkpointing=SimpleNamespace(enable_reentrant=False, early_stop=False),
+            init_device="cpu",
+        ),
+        optimizer=None,
+        broadcast_model_weights_from_rank0=False,
+        ep_sharded_stream_load=False,
+    )
+
+    captured = {}
+
+    def fake_parallelize(model, **kwargs):
+        captured["weights_path"] = kwargs["weights_path"]
+        captured["children"] = list(dict(model.named_children()))
+        return model
+
+    monkeypatch.setattr(
+        "veomni.distributed.torch_parallelize.build_parallelize_model",
+        fake_parallelize,
+    )
+    monkeypatch.setattr(
+        "veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.use_parallel_state",
+        lambda name: nullcontext(),
+    )
+    monkeypatch.setattr(
+        "veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.composed_model_owns_wrap",
+        lambda acc: True,
+    )
+    monkeypatch.setattr(
+        "veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime._scoped_no_split_modules",
+        lambda modules: [],
+    )
+
+    runtime._parallelize_composed_model()
+
+    assert list(captured["weights_path"]) == ["module_b"]
+    assert "module_a" not in captured["children"]
+    assert runtime.model.get_module("module_a") is meta_module
+    assert all(p.is_meta for p in meta_module.parameters())
+    assert vae.model is meta_module
+    llm.build_after_omni_model_wrap.assert_called_once()
+    vae.build_after_omni_model_wrap.assert_not_called()
+
+
+def _exporting_runtime(checkpoint):
+    return SimpleNamespace(model=MagicMock(name="model"), checkpoint=checkpoint, save_hf_or_lora=MagicMock())
+
+
+def test_an_hf_source_run_exports_trained_modules_as_one_source_layout_checkpoint(monkeypatch):
+    from veomni.models.seed_omni.accelerated.omni_model import omni_model_runtime
+    from veomni.models.seed_omni.utils.hf_layout import HFSource
+
+    full = _exporting_runtime(MagicMock(trainable_only=False))
+    full.checkpoint.step_dir.return_value = "/run/checkpoints/global_step_4"
+    lora = _exporting_runtime(MagicMock(trainable_only=True))
+    frozen = _exporting_runtime(None)
+    saved = MagicMock()
+    monkeypatch.setattr(omni_model_runtime, "save_hf_source_checkpoint", saved)
+    source = HFSource(path="/hf/Qwen3", model_type="qwen3")
+    runtime = OmniModelRuntime(
+        MagicMock(), module_runtimes={"full": full, "lora": lora, "frozen": frozen}, hf_source=source
+    )
+    state = SimpleNamespace(global_step=4)
+
+    runtime.save_hf_or_lora(state, stage="train_end")
+
+    lora.checkpoint.save_lora.assert_called_once_with(state, stage="train_end")
+    full.checkpoint.prepare_export.assert_called_once_with(state, "train_end")
+    full.checkpoint.save_hf_or_lora.assert_not_called()
+    saved.assert_called_once_with(
+        source, {"full": (full.model, full.checkpoint.parallel_state)}, "/run/checkpoints/global_step_4/hf_ckpt"
+    )
+    for module in (full, lora, frozen):
+        module.save_hf_or_lora.assert_not_called()
+
+
+def test_a_split_run_exports_every_module_on_its_own():
+    modules = {name: _exporting_runtime(MagicMock()) for name in ("a", "b")}
+    runtime = OmniModelRuntime(MagicMock(), module_runtimes=modules)
+    state = SimpleNamespace(global_step=2)
+
+    runtime.save_hf_or_lora(state, stage="step_end")
+
+    for module in modules.values():
+        module.save_hf_or_lora.assert_called_once_with(state, stage="step_end")

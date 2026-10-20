@@ -12,6 +12,7 @@ Reusable skills and knowledge for AI coding agents working on VeOmni. Follows th
 │   ├── veomni-review/
 │   ├── veomni-new-model/
 │   ├── veomni-patchgen-model/
+│   ├── veomni-seed-omni/
 │   ├── veomni-new-op/
 │   ├── veomni-uv-update/
 │   ├── veomni-profile/
@@ -22,7 +23,8 @@ Reusable skills and knowledge for AI coding agents working on VeOmni. Follows th
 │   ├── cpu_only_env.md
 │   ├── multimodal_metadata.md
 │   ├── testing.md
-│   └── uv.md
+│   ├── uv.md
+│   └── veomni-seed-omni.md
 ├── setup_agent.sh       # Bootstrap script (see below)
 └── README.md
 ```
@@ -57,6 +59,7 @@ The `knowledge/` directory contains domain-specific context loaded by agents on 
 - **multimodal_metadata.md** — canonical multimodal metadata keys and ownership
 - **testing.md** — how CI selects tests; whether a change needs one and where it goes
 - **uv.md** — dependency management architecture
+- **veomni-seed-omni.md** — SeedOmni runtime architecture, config resolution, and SP/FSDP/DDP/resume constraints
 
 ## Keeping these docs honest
 

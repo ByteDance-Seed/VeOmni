@@ -33,6 +33,10 @@ class SpecInfo:
     placement: Union[Shard, Replicate]
     fqn: str
     para_fsdp_mesh: DeviceMesh
+    # Original model shape before ExtraParallel or FSDP sharding. Checkpoint
+    # restoration cannot recover an uneven ExtraParallel extent from an
+    # FSDP-only DTensor because its local storage already lost that slice.
+    global_shape: Optional[tuple[int, ...]] = None
     # Tensor dim that FSDP2 shards this param along (set in ``torch_parallelize``
     # after the ``shard_placement_fn`` is decided: 1 by default, 0 for the
     # Muon zero-comm layout). Used by the checkpointer to build the correct
@@ -149,6 +153,7 @@ class ParallelPlan:
                                 para_fsdp_mesh=para_fsdp_mesh,
                                 placement=shard,
                                 fqn=fqn,
+                                global_shape=tuple(param.shape),
                                 persistent_fsdp_shard_dim=persistent_fsdp_shard_dim,
                             )
                             if persistent_fsdp_shard_dim is not None:

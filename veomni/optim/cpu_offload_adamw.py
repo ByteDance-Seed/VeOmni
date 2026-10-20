@@ -12,10 +12,9 @@ import re
 import time
 
 import torch
-from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
-from .master_fp32_adamw import FullFP32AdamW, _local
+from .master_fp32_adamw import FullFP32AdamW, _align_state_to_parameter, _local
 
 
 def select_cpu_offload_groups(model, groups, patterns):
@@ -119,6 +118,7 @@ class CPUOffloadAdamW(FullFP32AdamW):
                                 f"Optimizer checkpoint dtype mismatch for {name}: saved={saved[name].dtype}, "
                                 f"configured={expected_dtype}; explicit precision migration is required"
                             )
+                        saved[name] = _align_state_to_parameter(saved[name], param)
                         if tuple(saved[name].shape) != tuple(param.shape):
                             raise RuntimeError(f"Shape mismatch for optimizer state {name}")
                 restored.append((param, saved, id(param) in self._offloaded))
@@ -133,11 +133,6 @@ class CPUOffloadAdamW(FullFP32AdamW):
             state = {"step": torch.as_tensor(saved["step"]).detach().cpu().clone()}
             for name in ("master_weight", "exp_avg", "exp_avg_sq"):
                 tensor = saved[name]
-                if isinstance(param, DTensor) != isinstance(tensor, DTensor):
-                    raise RuntimeError("Optimizer checkpoint DTensor layout does not match parameter")
-                if isinstance(param, DTensor):
-                    if tensor.placements != param.placements or tensor.device_mesh != param.device_mesh:
-                        raise RuntimeError("Optimizer checkpoint DTensor mesh/placements do not match parameter")
                 # Reuse DCP's already correctly placed buffers. Cloning every
                 # resident state here would transiently double accelerator
                 # optimizer memory during resume.
@@ -177,7 +172,7 @@ class CPUOffloadAdamW(FullFP32AdamW):
             ),
             local_state=list(entries.values()),
         )
-        print("AI4SE_OPTIMIZER_STATE_RECEIPT " + json.dumps(payload, sort_keys=True), flush=True)
+        print("OPTIMIZER_STATE_RECEIPT " + json.dumps(payload, sort_keys=True), flush=True)
         self._state_receipt_emitted = True
 
     def _buffer(self, tensor, size):
@@ -277,8 +272,9 @@ class CPUOffloadAdamW(FullFP32AdamW):
             self._synchronize(device)
         self.last_step_seconds = time.perf_counter() - started
         self._emit_state_receipt()
-        if self._offloaded and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
-            print(
-                f"AI4SE_CPU_OPTIMIZER_STEP global_rank0_suboptimizer_seconds={self.last_step_seconds:.6f}", flush=True
-            )
+        self._emit_step_timing()
         return loss
+
+    def _emit_step_timing(self):
+        if self._offloaded and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+            print(f"CPU_OPTIMIZER_STEP global_rank0_suboptimizer_seconds={self.last_step_seconds:.6f}", flush=True)

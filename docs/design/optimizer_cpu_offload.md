@@ -4,8 +4,10 @@ Opt in with optimizer type `master_fp32_adamw`, `full_fp32_adamw` or `cpu_offloa
 
 For CPU offload, `cpu_offload_param_patterns` selects parameters by full parameter-name regex. `cpu_offload_cpu_moment_dtype` and `cpu_offload_resident_moment_dtype` independently choose `float32` or `bfloat16`; both default to FP32. Run optimizer steps after gradient synchronization and global clipping. Parameters and gradients stay on the accelerator; selected master/moment states are stored and updated on CPU using bounded staging.
 
-DCP load preserves offloaded CPU storage instead of temporarily materializing the optimizer on the accelerator. Precision-sensitive restores reject dtype changes and incomplete optimizer fields, including wholly absent lazy states for unused parameters. Such checkpoints need an explicit migration; silent initialization from pre-load compute weights is unsafe.
+DCP load preserves offloaded CPU storage instead of temporarily materializing the optimizer on the accelerator. Precision-sensitive restores reject dtype changes and incomplete optimizer fields, including partially missing states for unused parameters. Such checkpoints need an explicit migration; silent initialization from pre-load compute weights is unsafe.
 
 CPU tests cover FP32 reference updates, cold optimizer-state restoration, missing-field rejection and precision migration rejection. Accelerator transfers, DTensor layouts and multi-rank DCP cold resume still require native qualification on each hardware profile.
 
 Resume validates saved tensor shapes and dtypes before DCP reads. Precision-sensitive optimizers must expose complete target state for every trainable parameter; use a fresh optimizer when resuming rather than one initialized for only a subset of parameters. Partial ordinary AdamW state remains supported. These checks allocate no additional master or moment tensors.
+
+Wholly absent lazy states are supported: DCP placeholders are removed on restore, and the optimizer initializes the FP32 master from the current parameter on its first real gradient. Partially missing fields or implicit precision migration remain errors.

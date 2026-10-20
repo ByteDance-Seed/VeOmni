@@ -24,7 +24,7 @@ model:
     lora_modules: 'dit\.blocks\.\d+\.(attn\.(qkv_proj|out_proj)|mlp\.(fc1|fc2))'
 
   ops_implementation:
-    attn_implementation: eager
+    attn_implementation: flash_attention_2
     rotary_pos_emb_implementation: eager
     rms_norm_implementation: eager
     swiglu_mlp_implementation: eager

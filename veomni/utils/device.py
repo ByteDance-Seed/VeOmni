@@ -26,7 +26,10 @@ logger = logging.get_logger(__name__)
 
 
 IS_CUDA_AVAILABLE = torch.cuda.is_available()
-IS_NPU_AVAILABLE = is_torch_npu_available()
+# ``is_torch_npu_available`` is a package-install check. Tests that disable
+# ``TORCH_DEVICE_BACKEND_AUTOLOAD`` still have the package, but ``torch.npu`` is
+# not registered, so treat that as NPU-unavailable rather than crashing on import.
+IS_NPU_AVAILABLE = is_torch_npu_available() and hasattr(torch, "npu")
 IS_MLU_AVAILABLE = is_torch_mlu_available()
 
 if IS_NPU_AVAILABLE:
@@ -47,6 +50,11 @@ def get_device_type() -> str:
         device = "cpu"
 
     return device
+
+
+def is_nvidia_cuda_device(device: torch.types.Device | int | None) -> bool:
+    """Return whether an explicit device uses NVIDIA CUDA rather than ROCm."""
+    return device is not None and torch.device(device).type == "cuda" and torch.version.hip is None
 
 
 def get_device_name() -> str:
@@ -181,18 +189,12 @@ def is_sm90_or_above() -> bool:
     return get_gpu_compute_capability() >= 90
 
 
-def create_stream(device: torch.device | None = None, priority: int = 0) -> Any:
+def create_stream(device=None, priority: int = 0) -> Any:
     """Create a device stream (CUDA/NPU-agnostic)."""
     device_type = get_device_type()
     device_api = get_torch_device()
-
-    # ``torch.cpu.Stream`` intentionally has a smaller constructor than the
-    # CUDA/NPU stream implementations.  Passing ``device`` or ``priority``
-    # through unconditionally makes CPU-only unit tests fail before they can
-    # exercise the device-agnostic caller.
     if device_type == "cpu":
         return device_api.Stream()
-
     kwargs = {}
     if device is not None:
         kwargs["device"] = device
@@ -205,14 +207,20 @@ def create_event(enable_timing: bool = False, blocking: bool = False) -> Any:
     """Create a device event (CUDA/NPU-agnostic)."""
     device_api = get_torch_device()
     if get_device_type() == "cpu":
-        # ``torch.cpu.Event`` is a no-argument synchronization marker.
         return device_api.Event()
     return device_api.Event(enable_timing=enable_timing, blocking=blocking)
 
 
-def get_current_stream() -> Any:
+def get_current_stream(device=None) -> Any:
     """Get the current device stream."""
-    return get_torch_device().current_stream()
+    if device is None:
+        return get_torch_device().current_stream()
+    return get_torch_device().current_stream(device=device)
+
+
+def switch_to_stream(stream: Any) -> Any:
+    """Set the given stream as the current compute stream; returns the previous stream."""
+    return get_torch_device().set_stream(stream)
 
 
 def switch_to_specified_stream(stream: Any) -> Any:
