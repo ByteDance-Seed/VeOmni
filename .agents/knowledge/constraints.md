@@ -110,11 +110,11 @@ Core entry points:
    - Qwen4-Exp's `ple` dimension is currently the only persistent ExtraParallel use. Its lookup, gradient scaling, optimizer, and checkpoint paths operate over the complete flattened PLE mesh while inputs remain sequence-sharded.
 
 8b. **Qwen4-Exp QSA indices are global full-resolution token indices**
-   - `qsa_attention_implementation` selects blocks with local queries and globally gathered pooled keys, then gathers `[B,L,K]` selections to `[B,S,K]` before the Ulysses attention call.
+   - `qsa_attention_implementation` selects blocks with local queries and globally gathered pooled keys, returning local `[B,L,K]` selections for each rank's query shard while `Qwen4ExpTextAttention` keeps `query_states` local (`[B,H_q,L,D]`) and all-gathers `key_states`/`value_states` (`[B,H_kv,S,D]`) over the active sequence- or context-parallel group.
    - Index values address global full-resolution K/V directly; `-1` is the only invalid-slot sentinel. Do not rebase them by rank or lift them past a compressed-KV segment.
-   - Packed block boundaries come exclusively from global `cu_seq_lens_q`. Blocks must never cross a packed-sample boundary or be derived from an SP shard boundary.
-   - Keep selections compact through distributed collection and Q/K/V exchange. Unsupported layouts must fail before entering collectives.
-   - The eager backend deliberately expands the compact indices to an `[B,1,S,S]` mask and runs dense GQA. It is a numerical reference with quadratic memory/runtime scaling, not evidence that a fused backend implements gather semantics.
+   - Packed block boundaries come exclusively from global `cu_seq_lens_q`. Blocks must never cross a packed-sample boundary or be derived from an SP/CP shard boundary.
+   - Keep selections compact through distributed collection and KV all-gather. Unsupported layouts must fail before entering collectives.
+   - The eager backend deliberately expands the compact indices to an `[B,1,L,S]` mask and runs dense GQA. It is a numerical reference with quadratic memory/runtime scaling, not evidence that a fused backend implements gather semantics.
 
 8c. **Differentiable SP collectives must remain in every rank's autograd graph**
    - Rank-local packed boundaries can make a gathered halo unused on some ranks. Preserve a zero-valued dependency on the gathered tensor so every rank executes the same backward collective sequence; otherwise a later all-reduce can be matched against another rank's gather backward and fail with inconsistent collective counts.
