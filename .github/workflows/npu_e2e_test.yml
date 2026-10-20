@@ -155,6 +155,9 @@ jobs:
           uv pip install --python .venv/bin/python triton-ascend==3.2.1 \
             --index=https://mirrors.huaweicloud.com/ascend/repos/pypi
           uv run --frozen python -c "from triton._C.libtriton import ascend"
+      - name: Verify workspace NPU runtime on all eight devices
+        run: |
+          uv run --frozen python tests/tools/npu_preflight.py --expected-devices 8
       - name: Check final pip list
         run: |
           uv pip list
@@ -197,6 +200,9 @@ jobs:
           uv pip install --python .venv/bin/python ninja
           uv run --frozen ninja --version
           uv run --frozen python -c "import cann_ops_transformer"
+      - name: Verify workspace NPU runtime on all eight devices
+        run: |
+          uv run --frozen python tests/tools/npu_preflight.py --expected-devices 8
       - name: Run diffusers tests
         run: |
           uv run --frozen pytest -v -s -x tests/e2e/test_e2e_parallel.py::test_wan_dit_parallel_align
