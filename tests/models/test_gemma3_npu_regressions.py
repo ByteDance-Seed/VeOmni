@@ -16,9 +16,45 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from transformers.models.gemma3.configuration_gemma3 import Gemma3TextConfig
+from transformers.models.gemma3.configuration_gemma3 import Gemma3Config, Gemma3TextConfig
+from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 
+from tests.models.compare import eager_ops_config, ops_config_scope, stamp_attn_implementation
+from tests.models.tiny_configs import tiny_gemma3_text_config
 from veomni.models.transformers.gemma3.generated import patched_modeling_gemma3_npu as gemma3_modeling
+from veomni.ops import VeomniOp
+
+
+def test_gemma3_vlm_binds_instance_local_ops_and_runs_text_loss():
+    text_config = tiny_gemma3_text_config()
+    vision_config = SiglipVisionConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        image_size=8,
+        patch_size=4,
+    )
+    config = Gemma3Config(
+        text_config=text_config,
+        vision_config=vision_config,
+        mm_tokens_per_image=4,
+        image_token_index=120,
+        tie_word_embeddings=False,
+    )
+    ops = eager_ops_config()
+    stamp_attn_implementation(config, ops.attn_implementation)
+    with ops_config_scope(ops):
+        model = gemma3_modeling.Gemma3ForConditionalGeneration(config)
+
+    assert isinstance(model.veomni_ce, VeomniOp)
+    assert model.veomni_ce.impl == "eager"
+    assert model.model.language_model.layers[0].input_layernorm.veomni_rms_norm.variant == "offset"
+    assert not hasattr(gemma3_modeling, "veomni_causal_lm_loss")
+
+    input_ids = torch.tensor([[2, 5, 6, 7]])
+    output = model(input_ids=input_ids, labels=input_ids, use_cache=False)
+    assert torch.isfinite(output.loss)
 
 
 def test_gemma3_vlm_sdpa_mask_preserves_packed_boundaries():
@@ -42,6 +78,7 @@ def test_gemma3_vlm_sdpa_mask_preserves_packed_boundaries():
         position_ids=None,
         token_type_ids=torch.tensor([[0, 1, 1, 0, 0]]),
         cu_seq_lens_q=torch.tensor([0, 3, 5], dtype=torch.int32),
+        attention_impl="sdpa",
     )
 
     for mask in masks.values():

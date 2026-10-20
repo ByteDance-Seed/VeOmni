@@ -9,18 +9,28 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Gemma3TextModel.forward
+#      Packed masks use veomni.ops.mask; non-packed uses HF cache-aware builders
+#    - method_override: Gemma3ForCausalLM.__init__
+#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
+#    - method_override: Gemma3ForCausalLM.forward
+#      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
+#    - method_override: Gemma3RMSNorm.__init__
+#      Construct a local rms_norm offset VeomniOp
 #    - method_override: Gemma3RMSNorm.forward
-#      OpSlot guard for NPU fused RMSNorm (Gemma 1.0+weight formulation)
-#    - function_replacement: apply_rotary_pos_emb
-#      OpSlot guard for NPU fused RoPE
+#      Always call the local rms_norm offset VeomniOp
+#    - init_modification: Gemma3MLP
+#      Bind instance-local geglu swiglu_mlp VeomniOp
+#    - method_override: Gemma3MLP.forward
+#      Call geglu swiglu_mlp for gelu_pytorch_tanh on plain nn.Linear projections, otherwise the projection modules
+#    - init_modification: Gemma3Attention
+#      Bind instance-local rope and attention VeomniOps
+#    - method_override: Gemma3Attention.forward
+#      Always call the local rope and attention VeomniOps
 #    - method_override: Gemma3Model.__init__
 #      Construct the generated text tower instead of the upstream AutoModel class
 #    - method_override: Gemma3Model.forward
 #      Preserve packed-sample boundaries in Gemma 3 VLM attention masks
-#    - method_override: Gemma3TextModel.forward
-#      Pass packed-sequence boundaries into VeOmni mask preparation
-#    - method_override: Gemma3ForCausalLM.forward
-#      Adapt Gemma 3 causal-LM loss to VeOmni's fused-loss output contract
 #    - method_override: Gemma3ForConditionalGeneration.__init__
 #      Map legacy Gemma 3 VLM checkpoint names to the current nested model layout
 #    - method_override: Gemma3ForConditionalGeneration.forward
@@ -35,6 +45,9 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 
+# Additional imports for patches
+from functools import partial
+
 import torch
 import torch.nn as nn
 from transformers import initialization as init
@@ -42,11 +55,12 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.configuration_utils import PreTrainedConfig
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernel_forward_from_hub, use_kernelized_func
 from transformers.masking_utils import (
     _preprocess_mask_arguments,
     blockwise_overlay,
+    create_causal_mask,
     create_masks_for_generate,
+    create_sliding_window_causal_mask,
     maybe_pad_block_sequence_ids,
     sliding_window_overlay,
 )
@@ -58,7 +72,7 @@ from transformers.modeling_outputs import (
     SequenceClassifierOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.auto import AutoModel
 from transformers.models.gemma3.configuration_gemma3 import Gemma3Config, Gemma3TextConfig
 from transformers.processing_utils import Unpack
@@ -74,25 +88,13 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.models.transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-
-# Additional import blocks for patches
-# Bound at model-build time by _bind_veomni_ops() in auto.py.
-from veomni.ops.dispatch import OpSlot
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.ops.mask import packed_causal_mask, sliding_window_mask
 from veomni.utils.constants import IGNORE_INDEX
-
-# Additional imports for patches
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
-
-
-veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-
-# Bound at model-build time by _bind_veomni_ops() in auto.py.
-from veomni.ops.dispatch import OpSlot
-
-
-veomni_rms_norm = OpSlot("rms_norm", "standard")
-veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
 
 
 # ======================================================================
@@ -117,6 +119,7 @@ def create_gemma3_masks(
     position_ids: torch.Tensor | None,
     token_type_ids: torch.Tensor | None,
     cu_seq_lens_q: torch.Tensor | None,
+    attention_impl: str,
 ) -> dict:
     """Build Gemma 3 full/sliding masks while retaining packed-sample boundaries."""
     mask_kwargs = {
@@ -125,36 +128,45 @@ def create_gemma3_masks(
         "attention_mask": attention_mask,
         "past_key_values": past_key_values,
         "position_ids": position_ids,
-        "cu_seq_lens_q": cu_seq_lens_q,
     }
 
-    if token_type_ids is None:
-        return {
-            "full_attention": create_causal_mask(**mask_kwargs),
-            "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-        }
+    if cu_seq_lens_q is None:
+        previous_impl = config._attn_implementation
+        config._attn_implementation = attention_impl
+        try:
+            if token_type_ids is None:
+                return create_masks_for_generate(**mask_kwargs)
+            block_sequence_ids = get_block_sequence_ids_for_mask(token_type_ids, device=inputs_embeds.device)
+            return create_masks_for_vision_model(block_sequence_ids=block_sequence_ids, **mask_kwargs)
+        finally:
+            config._attn_implementation = previous_impl
 
-    block_sequence_ids = get_block_sequence_ids_for_mask(token_type_ids, device=inputs_embeds.device)
-    full_mask = create_causal_mask(**mask_kwargs, block_sequence_ids=block_sequence_ids)
+    if past_key_values is not None:
+        raise ValueError("Packed Gemma 3 VLM attention does not support past_key_values.")
 
-    preprocess_kwargs = mask_kwargs.copy()
-    preprocess_kwargs.pop("cu_seq_lens_q")
-    early_exit, _, _, _, kv_length, _, kv_offset = _preprocess_mask_arguments(
-        **preprocess_kwargs,
-        layer_idx=0,
-    )
-    padded_block_sequence_ids = block_sequence_ids
-    if not early_exit:
-        padded_block_sequence_ids = maybe_pad_block_sequence_ids(
-            block_sequence_ids, attention_mask, kv_length, kv_offset
-        )
+    q_len = inputs_embeds.shape[1]
+    packed_kwargs = {
+        "impl": attention_impl,
+        "device": inputs_embeds.device,
+        "batch_size": inputs_embeds.shape[0],
+        "dtype": inputs_embeds.dtype,
+        "cu_seqlens": cu_seq_lens_q,
+    }
+    if attention_mask is not None:
+        packed_kwargs["attention_mask"] = attention_mask
+    if token_type_ids is not None:
+        block_sequence_ids = get_block_sequence_ids_for_mask(token_type_ids, device=inputs_embeds.device)
+        packed_kwargs["or_mask_function"] = blockwise_overlay(block_sequence_ids)
 
-    sliding_mask = create_causal_mask(
-        **mask_kwargs,
-        or_mask_function=blockwise_overlay(padded_block_sequence_ids),
-        and_mask_function=sliding_window_overlay(config.sliding_window),
-    )
-    return {"full_attention": full_mask, "sliding_attention": sliding_mask}
+    return {
+        "full_attention": packed_causal_mask(q_len, q_len, **packed_kwargs),
+        "sliding_attention": sliding_window_mask(
+            q_len,
+            q_len,
+            sliding_window=config.sliding_window,
+            **packed_kwargs,
+        ),
+    }
 
 
 @auto_docstring(
@@ -233,7 +245,14 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
         return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)
 
 
+# ======================================================================
+# [MODIFIED CLASS] Gemma3MLP
+# Methods patched: forward, __init__
+# ======================================================================
+
+
 class Gemma3MLP(nn.Module):
+    # [modified __init__] Bind instance-local geglu swiglu_mlp VeomniOp
     def __init__(self, config: Gemma3TextConfig):
         super().__init__()
         self.config = config
@@ -243,38 +262,43 @@ class Gemma3MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_activation]
+        # Bind instance-local geglu swiglu_mlp VeomniOp
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "geglu", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        if self.config.hidden_activation in {"gelu_pytorch_tanh", "gelu_python_tanh"} and has_plain_linear_projections(
+            self
+        ):
+            return self.veomni_swiglu_mlp(
+                x,
+                self.gate_proj.weight,
+                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+                self.up_proj.weight,
+                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+                self.down_proj.weight,
+                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+            )
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 # ======================================================================
 # [MODIFIED CLASS] Gemma3RMSNorm
-# Methods patched: forward
+# Methods patched: __init__, forward
 # ======================================================================
 
 
 class Gemma3RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        nn.Module.__init__(self)
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
+        self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    # Gemma 3 uses (1.0 + weight) scaling (weight zero-initialised), and the eps
-    # attribute is ``self.eps`` (not ``self.variance_epsilon``).  Pass ``1.0 +
-    # self.weight`` so the NPU ``npu_rms_norm`` kernel reproduces the Gemma
-    # contract exactly.
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if veomni_rms_norm.use_non_eager_impl:
-            return veomni_rms_norm(x, 1.0 + self.weight, self.eps)
-        # Original HF code below, unchanged.
-        output = self._norm(x.float())
-        output = output * (1.0 + self.weight.float())
-        return output.type_as(x)
+    def forward(self, x):
+        return self.veomni_rms_norm(x, self.weight, eps=self.eps)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
@@ -352,36 +376,6 @@ class Gemma3RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-# ======================================================================
-# [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: OpSlot guard for NPU fused RoPE
-# Source: veomni.models.transformers.gemma3.gemma3_npu_patch_gen_config
-# ======================================================================
-@use_kernel_forward_from_hub("rotary_pos_emb")
-def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
-        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
-    # Original HF code below, unchanged.
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -428,10 +422,16 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-@use_kernelized_func(apply_rotary_pos_emb)
+# ======================================================================
+# [MODIFIED CLASS] Gemma3Attention
+# Methods patched: forward, __init__
+# ======================================================================
+
+
 class Gemma3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Gemma3TextConfig, layer_idx: int):
         super().__init__()
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
@@ -461,6 +461,9 @@ class Gemma3Attention(nn.Module):
 
         self.q_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,
@@ -481,16 +484,12 @@ class Gemma3Attention(nn.Module):
         key_states = self.k_norm(key_states)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,
@@ -662,30 +661,68 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
             position_ids = position_ids.unsqueeze(0)
 
-        # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
-            # Prepare mask arguments
-            mask_kwargs = {
-                "config": self.config,
-                "inputs_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-                "cu_seq_lens_q": kwargs.get("cu_seq_lens_q"),
-            }
-            sliding_mask_kwargs = mask_kwargs.copy()
+            # Mask builders must follow this instance's attention impl. Reading the
+            # global ops config would let SDPA return None while eager attention
+            # still needs a causal triangle.
+            attn_impl = resolve_op_impl("attn_implementation")
+            for layer in self.layers[: self.config.num_hidden_layers]:
+                handle = getattr(getattr(layer, "self_attn", None), "veomni_attn", None)
+                if handle is not None:
+                    attn_impl = handle.impl
+                    break
+            cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
+            if cu_seq_lens_q is not None:
+                impl = attn_impl
+                q_len = inputs_embeds.shape[1]
+                past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+                kv_len = q_len + past_seen
+                packed_kwargs: dict = {
+                    "impl": impl,
+                    "device": inputs_embeds.device,
+                    "batch_size": inputs_embeds.shape[0],
+                    "dtype": inputs_embeds.dtype,
+                }
+                if attention_mask is not None:
+                    packed_kwargs["attention_mask"] = attention_mask
+                sliding_kwargs = dict(packed_kwargs)
+                if self.config.use_bidirectional_attention:
+                    packed_kwargs["or_mask_function"] = lambda *args: torch.tensor(True, dtype=torch.bool)
+                    sliding_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
+                causal_mask_mapping = {
+                    "full_attention": packed_causal_mask(q_len, kv_len, cu_seqlens=cu_seq_lens_q, **packed_kwargs),
+                    "sliding_attention": sliding_window_mask(
+                        q_len,
+                        kv_len,
+                        sliding_window=self.config.sliding_window,
+                        cu_seqlens=cu_seq_lens_q,
+                        **sliding_kwargs,
+                    ),
+                }
+            else:
+                mask_kwargs = {
+                    "config": self.config,
+                    "inputs_embeds": inputs_embeds,
+                    "attention_mask": attention_mask,
+                    "past_key_values": past_key_values,
+                    "position_ids": position_ids,
+                }
+                sliding_mask_kwargs = mask_kwargs.copy()
+                if self.config.use_bidirectional_attention:
+                    mask_kwargs["or_mask_function"] = lambda *args: torch.tensor(True, dtype=torch.bool)
+                    sliding_mask_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
+                # HF builders dispatch on config._attn_implementation; keep it aligned
+                # with this instance's attention impl so flex still receives a BlockMask.
+                previous_impl = self.config._attn_implementation
+                self.config._attn_implementation = attn_impl
+                try:
+                    causal_mask_mapping = {
+                        "full_attention": create_causal_mask(**mask_kwargs),
+                        "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs),
+                    }
+                finally:
+                    self.config._attn_implementation = previous_impl
 
-            if self.config.use_bidirectional_attention:
-                mask_kwargs["or_mask_function"] = lambda *args: torch.tensor(True, dtype=torch.bool)
-                sliding_mask_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
-
-            # Create the masks
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs),
-            }
-
-        # embed positions
         hidden_states = inputs_embeds
         position_embeddings = {}
         for layer_type in set(self.config.layer_types):
@@ -711,7 +748,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] Gemma3ForCausalLM
-# Methods patched: forward
+# Methods patched: __init__, forward
 # ======================================================================
 
 
@@ -723,13 +760,14 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
     _fsdp_plan = {"lm_head": "keep_full_weight"}
     config: Gemma3TextConfig
 
-    def __init__(self, config: Gemma3TextConfig):
+    def __init__(self, config):
         super().__init__(config)
         self.model = Gemma3TextModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
+        impl = resolve_op_impl("cross_entropy_loss_implementation")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
     @can_return_tuple
@@ -763,13 +801,21 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
         logits = None
         fused_linear_aux = None
         if labels is not None:
-            if veomni_causal_lm_loss.use_non_eager_impl:
-                if self.config.final_logit_softcapping is not None:
-                    raise ValueError(
-                        "Gemma 3 fused-linear loss does not support final_logit_softcapping; "
-                        "use cross_entropy_loss_implementation='eager'."
-                    )
-                loss, logits, fused_linear_aux = veomni_causal_lm_loss(
+            if self.config.final_logit_softcapping is not None:
+                logits = self.lm_head(hidden_states)
+                logits = logits / self.config.final_logit_softcapping
+                logits = torch.tanh(logits)
+                logits = logits * self.config.final_logit_softcapping
+                loss, _, fused_linear_aux = self.loss_function(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.vocab_size,
+                    **kwargs,
+                )
+                if fused_linear_aux is not None:
+                    logits = None
+            else:
+                loss, logits, fused_linear_aux = self.loss_function(
                     logits=None,
                     labels=labels,
                     vocab_size=self.vocab_size,
@@ -777,22 +823,6 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
                     weights=self.lm_head.weight,
                     **kwargs,
                 )
-            else:
-                logits = self.lm_head(hidden_states)
-                if self.config.final_logit_softcapping is not None:
-                    logits = logits / self.config.final_logit_softcapping
-                    logits = torch.tanh(logits)
-                    logits = logits * self.config.final_logit_softcapping
-                loss, _, fused_linear_aux = self.loss_function(
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
-                    **kwargs,
-                )
-                if fused_linear_aux is not None:
-                    logits = None
         else:
             logits = self.lm_head(hidden_states[:, slice_indices, :])
             if self.config.final_logit_softcapping is not None:
@@ -1014,6 +1044,7 @@ class Gemma3Model(Gemma3PreTrainedModel):
                 position_ids=position_ids,
                 token_type_ids=token_type_ids,
                 cu_seq_lens_q=lm_kwargs.get("cu_seq_lens_q"),
+                attention_impl=self.language_model.layers[0].self_attn.veomni_attn.impl,
             )
 
         outputs = self.language_model(
@@ -1052,9 +1083,8 @@ class Gemma3ForConditionalGeneration(Gemma3PreTrainedModel, GenerationMixin):
     # Fix: https://github.com/huggingface/transformers/issues/40564
     accepts_loss_kwargs = False
 
-    # Patch the multimodal (VLM) forward to use VeOmni's fused-CE OpSlot instead
-    # of the upstream ``nn.CrossEntropyLoss``.  This is the VLM-specific addition
-    # over the text-only GPU config (which only patches Gemma3ForCausalLM).
+    # Patch the multimodal forward to use the same local cross-entropy VeomniOp as
+    # the text-only GPU config.
     def __init__(self, config):
         super().__init__(config)
         self.model = Gemma3Model(config)
@@ -1064,6 +1094,9 @@ class Gemma3ForConditionalGeneration(Gemma3PreTrainedModel, GenerationMixin):
             r"^vision_tower\.vision_model\.": "model.vision_tower.",
             r"^multi_modal_projector\.": "model.multi_modal_projector.",
         }
+        impl = resolve_op_impl("cross_entropy_loss_implementation")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
     @auto_docstring
@@ -1118,24 +1151,22 @@ class Gemma3ForConditionalGeneration(Gemma3PreTrainedModel, GenerationMixin):
                     IGNORE_INDEX,
                 )
 
-            if veomni_causal_lm_loss.use_non_eager_impl:
-                if self.config.text_config.final_logit_softcapping is not None:
-                    raise ValueError(
-                        "Gemma 3 fused-linear loss does not support final_logit_softcapping; "
-                        "use cross_entropy_loss_implementation='eager'."
-                    )
-                loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                    logits=None,
-                    labels=loss_labels,
-                    vocab_size=self.config.text_config.vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
-                    **lm_kwargs,
-                )
-            else:
-                logits = self.lm_head(hidden_states).float()
+            if self.config.text_config.final_logit_softcapping is not None:
+                logits = self.lm_head(hidden_states)
+                logits = logits / self.config.text_config.final_logit_softcapping
+                logits = torch.tanh(logits)
+                logits = logits * self.config.text_config.final_logit_softcapping
                 loss, _, fused_linear_aux = self.loss_function(
                     logits=logits,
+                    labels=loss_labels,
+                    vocab_size=self.config.text_config.vocab_size,
+                    **lm_kwargs,
+                )
+                if fused_linear_aux is not None:
+                    logits = None
+            else:
+                loss, logits, fused_linear_aux = self.loss_function(
+                    logits=None,
                     labels=loss_labels,
                     vocab_size=self.config.text_config.vocab_size,
                     hidden_states=hidden_states,
@@ -1146,6 +1177,10 @@ class Gemma3ForConditionalGeneration(Gemma3PreTrainedModel, GenerationMixin):
                     logits = None
         else:
             logits = self.lm_head(hidden_states[:, slice_indices, :])
+            if self.config.text_config.final_logit_softcapping is not None:
+                logits = logits / self.config.text_config.final_logit_softcapping
+                logits = torch.tanh(logits)
+                logits = logits * self.config.text_config.final_logit_softcapping
 
         return Gemma3CausalLMOutputWithLogProbs(
             loss=loss,

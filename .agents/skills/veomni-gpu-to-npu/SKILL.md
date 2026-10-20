@@ -11,8 +11,10 @@ Read these references before changing model code:
 
 - `.agents/knowledge/constraints.md`
 - `.agents/skills/veomni-patchgen-model/SKILL.md`
+- `.agents/skills/veomni-new-op/SKILL.md`
 - `docs/design/patchgen.md`
 - `docs/design/kernel_selection.md`
+- `veomni/ops/README.md`
 - `.agents/knowledge/testing.md`
 
 Use `veomni/models/transformers/qwen3/`, `seed_oss/`, `qwen3_vl/`, and `qwen3_5/` as reference implementations. Gemma 3 under `veomni/models/transformers/gemma3/` is the dense text/VLM worked example.
@@ -40,7 +42,7 @@ ls veomni/models/transformers/<model>/generated/patched_modeling_*_gpu.py
 rg -n "cuda|triton|flash_attention|flex_attention|liger|is_cuda|\.cuda\(" \
   veomni/models/transformers/<model>
 
-rg -n "OpSlot|attn_implementation|RMSNorm|apply_rotary|cross_entropy" \
+rg -n "VeomniOp|resolve_op_impl|attn_implementation|RMSNorm|apply_rotary|cross_entropy" \
   veomni/models/transformers/<model> \
   veomni/ops/kernels
 ```
@@ -50,50 +52,48 @@ For every patched operator, verify the registered implementations and select the
 | Operation | Typical GPU backend | Typical NPU choice |
 |---|---|---|
 | attention | `flex_attention` / flash attention | `sdpa` or `eager` |
-| RMSNorm | `liger_kernel` | `npu` when the formula matches |
-| rotary embedding | `liger_kernel` | `npu` |
-| causal cross entropy | `liger_kernel` | `npu`, `chunk_loss`, or `eager` |
+| RMSNorm | `liger_kernel` | `torch_npu` when the variant matches |
+| rotary embedding | `liger_kernel` | `torch_npu` |
+| causal cross entropy | `liger_kernel` | `chunk_loss` or `eager` |
 | SwiGLU | fused GPU backend | registered NPU backend or `eager` |
 | MoE | `fused_triton` | `fused_npu` |
 | load-balancing loss | `triton` | registered NPU backend or `eager` |
 
 Check device-neutral behavior as part of the audit: allocations must derive their device from inputs or parameters, no `.cuda()` calls may remain, dtype conversions must preserve the model contract, and distributed operations must use VeOmni's current parallel-state APIs.
 
-Model-specific normalization and loss semantics are correctness-critical. Standard RMSNorm initializes weights to ones and passes `weight`; Gemma 3 initializes weights to zeros and computes with `1 + weight`, so its NPU kernel must also receive `1 + self.weight`. Likewise, verify soft-capping, ignored labels, shifted labels, and reduction behavior before replacing the upstream loss.
+Model-specific normalization and loss semantics are correctness-critical. Select the registry variant whose tensor contract matches the model: standard RMSNorm uses the `standard` variant, while Gemma 3 initializes weights to zero and uses the `offset` variant to apply `1 + weight`. Do not apply that offset again in model code. Likewise, verify soft-capping, ignored labels, shifted labels, and reduction behavior before replacing the upstream loss.
 
 ## 2. Implement The NPU Patch
 
-Prefer an NPU sibling patch spec that reuses device-neutral GPU patch bodies and changes only device-specific operators.
+Prefer an NPU sibling patch spec that reuses the complete device-neutral GPU patch. Add only NPU/VLM behavior that is absent from the GPU path.
 
 ```python
-from veomni.models.transformers.<model>.<model>_gpu_patch_gen_config import (
-    config as gpu_config,
-    <shared_patch_function>,
-)
-from veomni.patchgen.patch_spec import PatchConfig
+from copy import deepcopy
 
-config = PatchConfig(
-    source_module="transformers.models.<model>.modeling_<model>",
-    target_file="patched_modeling_<model>_npu.py",
-    description="<Model> with VeOmni NPU operator replacements",
-)
-config.additional_imports.extend(gpu_config.additional_imports)
-config.post_import_blocks.extend(gpu_config.post_import_blocks)
-config.helpers.extend(gpu_config.helpers)
-config.drop_imported_names.update(gpu_config.drop_imported_names)
+from veomni.models.transformers.<model>.<model>_gpu_patch_gen_config import config as gpu_config
+
+
+config = deepcopy(gpu_config)
+config.target_file = "patched_modeling_<model>_npu.py"
+config.description = "<Model> with VeomniOp NPU replacements"
 ```
 
-Use an `OpSlot` guard when eager fallback is needed by CPU/GPU model tests.
+Model classes must own instance-local `VeomniOp` handles. Resolve the configured implementation during construction and call the handle unconditionally; the registry's `eager` row supplies the CPU/GPU fallback.
 
 ```python
-@config.override_method("<Model>RMSNorm.forward", description="Use NPU RMSNorm through OpSlot")
-def rmsnorm_forward_npu(self, x):
-    if veomni_rms_norm.use_non_eager_impl:
-        return veomni_rms_norm(x, self.weight, self.variance_epsilon)
-    return <upstream eager implementation>
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
+
+
+self.veomni_rms_norm = VeomniOp(
+    "rms_norm",
+    "standard",
+    resolve_op_impl("rms_norm_implementation"),
+)
+hidden_states = self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 ```
 
-Use a direct NPU kernel only when the surrounding model family already follows that pattern and no eager fallback is required. Do not duplicate a GPU patch body merely to change its target file.
+Inspect `OP_REGISTRY` before adding an implementation. If the required `(op, variant, implementation)` row is missing, follow `veomni-new-op`: implement it under `veomni/ops/kernels`, register it with `register_op`, attach `NpuKernelRequirement()`, and keep model-specific argument adaptation in the PatchGen model. Never import a vendor kernel directly from generated modeling. Do not duplicate a GPU patch body merely to change its target file.
 
 Update `__init__.py` so model classes are selected at import time by device availability.
 
@@ -143,7 +143,7 @@ python -c "import veomni.models.transformers.<model>.generated.patched_modeling_
 make quality
 ```
 
-Extend an existing model test when practical. Cover generated-module import, NPU/GPU registry dispatch, fused-operator guards, eager-fallback parity, finite forward/backward outputs, gradients, checkpoint conversion, multimodal input propagation when applicable, and patchgen reproducibility.
+Extend an existing model test when practical. Cover generated-module import, local `VeomniOp` selection, eager parity, finite forward/backward outputs, gradients, checkpoint conversion, multimodal input propagation when applicable, and patchgen reproducibility. Verify that constructing another model with a different ops configuration does not retarget handles on the first model.
 
 ## Completion Checklist
 
@@ -151,6 +151,7 @@ Extend an existing model test when practical. Cover generated-module import, NPU
 - [ ] GPU-only model dependencies are classified
 - [ ] Device-neutral allocations, dtype conversions, and distributed APIs are verified
 - [ ] NPU backends are verified in the live operator registry
+- [ ] Every model-side operator is an instance-local `VeomniOp`; no module-global dispatch remains
 - [ ] Model-specific normalization and loss semantics are preserved
 - [ ] NPU patch spec reuses device-neutral GPU patch bodies
 - [ ] Text and multimodal model types are registered as applicable

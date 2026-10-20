@@ -17,47 +17,38 @@ Patch configuration for Gemma 3 VeOmni NPU modeling path (text + VLM).
 Regen command:
 patchgen veomni.models.transformers.gemma3.gemma3_npu_patch_gen_config -o veomni/models/transformers/gemma3/generated --diff
 
-This mirrors the GPU patch in
-veomni/models/transformers/gemma3/gemma3_gpu_patch_gen_config.py and adds
-OpSlot guards for NPU fused RMSNorm and RoPE kernels, plus a VLM-aware
-patch for Gemma3ForConditionalGeneration.forward that uses fused CE.
+This inherits the GPU patch in
+veomni/models/transformers/gemma3/gemma3_gpu_patch_gen_config.py. The local
+``VeomniOp`` handles select NPU kernels through the shared op registry, while
+this config adds the VLM-specific model, mask, checkpoint, and loss patches.
 
 This file itself is not runnable. It's used to generate the runnable explicitly patched modeling file
 "generated/patched_modeling_gemma3_npu.py".
 """
 
+from copy import deepcopy
 from dataclasses import dataclass
+from functools import partial
 
 import torch
+from torch import nn
 from transformers.cache_utils import Cache
 from transformers.models.gemma3.modeling_gemma3 import Gemma3CausalLMOutputWithPast, Gemma3ModelOutputWithPast
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
+from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.transformers.gemma3.gemma3_gpu_patch_gen_config import (
     config as gpu_config,
 )
-from veomni.models.transformers.gemma3.gemma3_gpu_patch_gen_config import (
-    gemma3_forcausallm_forward_patched,
-    gemma3_textmodel_forward_patched,
-)
-from veomni.patchgen.patch_spec import PatchConfig
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 
 
-config = PatchConfig(
-    source_module="transformers.models.gemma3.modeling_gemma3",
-    target_file="patched_modeling_gemma3_npu.py",
-    description="Gemma 3 (text + VLM) with VeOmni NPU fused-operator replacements",
-)
-
-# Mirror additional imports + post-import helpers + dropped names from the GPU
-# config so the generated file is self-contained (same masking-utils imports,
-# same CausalLMOutputWithLogProbs import, same veomni_causal_lm_loss OpSlot).
-config.additional_imports.extend(gpu_config.additional_imports)
-config.post_import_blocks.extend(gpu_config.post_import_blocks)
-config.helpers.extend(gpu_config.helpers)
-config.drop_imported_names.update(gpu_config.drop_imported_names)
+config = deepcopy(gpu_config)
+config.target_file = "patched_modeling_gemma3_npu.py"
+config.description = "Gemma 3 (text + VLM) with VeomniOp NPU replacements"
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import("veomni.utils.constants", names=["IGNORE_INDEX"])
 
@@ -81,6 +72,7 @@ def create_gemma3_masks(
     position_ids: torch.Tensor | None,
     token_type_ids: torch.Tensor | None,
     cu_seq_lens_q: torch.Tensor | None,
+    attention_impl: str,
 ) -> dict:
     """Build Gemma 3 full/sliding masks while retaining packed-sample boundaries."""
     mask_kwargs = {
@@ -89,48 +81,45 @@ def create_gemma3_masks(
         "attention_mask": attention_mask,
         "past_key_values": past_key_values,
         "position_ids": position_ids,
-        "cu_seq_lens_q": cu_seq_lens_q,
     }
 
-    if token_type_ids is None:
-        return {
-            "full_attention": create_causal_mask(**mask_kwargs),
-            "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-        }
+    if cu_seq_lens_q is None:
+        previous_impl = config._attn_implementation
+        config._attn_implementation = attention_impl
+        try:
+            if token_type_ids is None:
+                return create_masks_for_generate(**mask_kwargs)
+            block_sequence_ids = get_block_sequence_ids_for_mask(token_type_ids, device=inputs_embeds.device)
+            return create_masks_for_vision_model(block_sequence_ids=block_sequence_ids, **mask_kwargs)
+        finally:
+            config._attn_implementation = previous_impl
 
-    block_sequence_ids = get_block_sequence_ids_for_mask(token_type_ids, device=inputs_embeds.device)
-    full_mask = create_causal_mask(**mask_kwargs, block_sequence_ids=block_sequence_ids)
+    if past_key_values is not None:
+        raise ValueError("Packed Gemma 3 VLM attention does not support past_key_values.")
 
-    preprocess_kwargs = mask_kwargs.copy()
-    preprocess_kwargs.pop("cu_seq_lens_q")
-    early_exit, _, _, _, kv_length, _, kv_offset = _preprocess_mask_arguments(
-        **preprocess_kwargs,
-        layer_idx=0,
-    )
-    padded_block_sequence_ids = block_sequence_ids
-    if not early_exit:
-        padded_block_sequence_ids = maybe_pad_block_sequence_ids(
-            block_sequence_ids, attention_mask, kv_length, kv_offset
-        )
+    q_len = inputs_embeds.shape[1]
+    packed_kwargs = {
+        "impl": attention_impl,
+        "device": inputs_embeds.device,
+        "batch_size": inputs_embeds.shape[0],
+        "dtype": inputs_embeds.dtype,
+        "cu_seqlens": cu_seq_lens_q,
+    }
+    if attention_mask is not None:
+        packed_kwargs["attention_mask"] = attention_mask
+    if token_type_ids is not None:
+        block_sequence_ids = get_block_sequence_ids_for_mask(token_type_ids, device=inputs_embeds.device)
+        packed_kwargs["or_mask_function"] = blockwise_overlay(block_sequence_ids)
 
-    sliding_mask = create_causal_mask(
-        **mask_kwargs,
-        or_mask_function=blockwise_overlay(padded_block_sequence_ids),
-        and_mask_function=sliding_window_overlay(config.sliding_window),
-    )
-    return {"full_attention": full_mask, "sliding_attention": sliding_mask}
-
-
-# NPU-specific OpSlot declarations (RMSNorm + RoPE) on top of the GPU config's
-# cross-entropy-loss OpSlot.
-config.add_post_import_block(
-    """
-    # Bound at model-build time by _bind_veomni_ops() in auto.py.
-    from veomni.ops.dispatch import OpSlot
-    veomni_rms_norm = OpSlot("rms_norm", "standard")
-    veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
-    """
-)
+    return {
+        "full_attention": packed_causal_mask(q_len, q_len, **packed_kwargs),
+        "sliding_attention": sliding_window_mask(
+            q_len,
+            q_len,
+            sliding_window=config.sliding_window,
+            **packed_kwargs,
+        ),
+    }
 
 
 @config.add_helper_after("Gemma3CausalLMOutputWithPast")
@@ -143,46 +132,6 @@ class Gemma3CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Gemma3CausalLM
         Per-token tensors produced by the fused-linear loss path. This is
         ``None`` on the plain loss path.
     """
-
-
-# Gemma 3 uses (1.0 + weight) scaling (weight zero-initialised), and the eps
-# attribute is ``self.eps`` (not ``self.variance_epsilon``).  Pass ``1.0 +
-# self.weight`` so the NPU ``npu_rms_norm`` kernel reproduces the Gemma
-# contract exactly.
-
-
-@config.override_method(
-    "Gemma3RMSNorm.forward",
-    description="OpSlot guard for NPU fused RMSNorm (Gemma 1.0+weight formulation)",
-)
-def gemma3_rmsnorm_forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-    if veomni_rms_norm.use_non_eager_impl:
-        return veomni_rms_norm(x, 1.0 + self.weight, self.eps)
-    # Original HF code below, unchanged.
-    output = self._norm(x.float())
-    output = output * (1.0 + self.weight.float())
-    return output.type_as(x)
-
-
-@config.replace_function(
-    "apply_rotary_pos_emb",
-    description="OpSlot guard for NPU fused RoPE",
-)
-def apply_rotary_pos_emb_npu(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
-        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
-    # Original HF code below, unchanged.
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
 
 
 @config.override_method(
@@ -247,6 +196,7 @@ def gemma3_model_forward_npu(
             position_ids=position_ids,
             token_type_ids=token_type_ids,
             cu_seq_lens_q=lm_kwargs.get("cu_seq_lens_q"),
+            attention_impl=self.language_model.layers[0].self_attn.veomni_attn.impl,
         )
 
     outputs = self.language_model(
@@ -268,31 +218,8 @@ def gemma3_model_forward_npu(
     )
 
 
-# Reuse the GPU patch verbatim. The masking-utils wrappers handle both
-# FlexAttention (BlockMask) and SDPA/eager (tensor mask) backends.
-
-
-config.override_method(
-    "Gemma3TextModel.forward",
-    replacement=gemma3_textmodel_forward_patched,
-    description="Pass packed-sequence boundaries into VeOmni mask preparation",
-)
-
-
-# Reuse the GPU patch verbatim. The veomni_causal_lm_loss OpSlot dispatches to
-# the NPU chunk-loss kernel when bound.
-
-
-config.override_method(
-    "Gemma3ForCausalLM.forward",
-    replacement=gemma3_forcausallm_forward_patched,
-    description="Adapt Gemma 3 causal-LM loss to VeOmni's fused-loss output contract",
-)
-
-
-# Patch the multimodal (VLM) forward to use VeOmni's fused-CE OpSlot instead
-# of the upstream ``nn.CrossEntropyLoss``.  This is the VLM-specific addition
-# over the text-only GPU config (which only patches Gemma3ForCausalLM).
+# Patch the multimodal forward to use the same local cross-entropy VeomniOp as
+# the text-only GPU config.
 
 
 @config.override_method(
@@ -308,6 +235,9 @@ def gemma3_for_conditional_generation_init_npu(self, config):
         r"^vision_tower\.vision_model\.": "model.vision_tower.",
         r"^multi_modal_projector\.": "model.multi_modal_projector.",
     }
+    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
 
 
@@ -361,24 +291,22 @@ def gemma3_for_conditional_generation_forward_npu(
                 IGNORE_INDEX,
             )
 
-        if veomni_causal_lm_loss.use_non_eager_impl:
-            if self.config.text_config.final_logit_softcapping is not None:
-                raise ValueError(
-                    "Gemma 3 fused-linear loss does not support final_logit_softcapping; "
-                    "use cross_entropy_loss_implementation='eager'."
-                )
-            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                logits=None,
-                labels=loss_labels,
-                vocab_size=self.config.text_config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **lm_kwargs,
-            )
-        else:
-            logits = self.lm_head(hidden_states).float()
+        if self.config.text_config.final_logit_softcapping is not None:
+            logits = self.lm_head(hidden_states)
+            logits = logits / self.config.text_config.final_logit_softcapping
+            logits = torch.tanh(logits)
+            logits = logits * self.config.text_config.final_logit_softcapping
             loss, _, fused_linear_aux = self.loss_function(
                 logits=logits,
+                labels=loss_labels,
+                vocab_size=self.config.text_config.vocab_size,
+                **lm_kwargs,
+            )
+            if fused_linear_aux is not None:
+                logits = None
+        else:
+            loss, logits, fused_linear_aux = self.loss_function(
+                logits=None,
                 labels=loss_labels,
                 vocab_size=self.config.text_config.vocab_size,
                 hidden_states=hidden_states,
@@ -389,6 +317,10 @@ def gemma3_for_conditional_generation_forward_npu(
                 logits = None
     else:
         logits = self.lm_head(hidden_states[:, slice_indices, :])
+        if self.config.text_config.final_logit_softcapping is not None:
+            logits = logits / self.config.text_config.final_logit_softcapping
+            logits = torch.tanh(logits)
+            logits = logits * self.config.text_config.final_logit_softcapping
 
     return Gemma3CausalLMOutputWithLogProbs(
         loss=loss,
