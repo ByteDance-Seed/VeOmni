@@ -33,10 +33,15 @@ K3-specific operators need extra packages (inside the container):
 pip install transformers==5.16.1
 pip install -e patchgen-pkg --no-build-isolation
 pip install ruff==0.13.2 pytest expecttest rich
-# KDA AscendC kernels: build fla-npu locally, setup.py installs the OPP pack
-pip install /path/to/fla-npu --no-build-isolation
-# KDA wrapper helpers; --no-deps: pyproject pins triton-ascend==3.2.0
-pip install -e /path/to/triton-ascend-kernels --no-deps --no-build-isolation
+# KDA AscendC kernels (chunked KDA fwd/bwd): local build of fla-npu; its
+# setup.py also builds and installs the AscendC OPP custom-op pack (needs
+# the CANN env - the image above already exports it)
+git clone https://github.com/flashserve/flash-linear-attention-npu.git fla-npu
+pip install ./fla-npu --no-build-isolation
+# KDA helper ops (autocast guards, l2norm, chunk indices, triton reference
+# path); --no-deps: pyproject pins triton-ascend==3.2.0
+git clone https://gitcode.com/Ascend/triton-ascend-kernels.git
+pip install -e ./triton-ascend-kernels --no-deps --no-build-isolation
 ```
 
 Dependency check:
