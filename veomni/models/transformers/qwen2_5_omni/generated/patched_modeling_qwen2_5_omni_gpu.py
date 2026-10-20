@@ -34,7 +34,7 @@
 #    - init_modification: Qwen2_5OmniVisionAttention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen2_5OmniVisionAttention.forward
-#      Route through VARLEN_ATTENTION_TYPES so veomni_flash_attention_* with cu_seqlens works
+#      Route packed cu_seqlens through the local attention VeomniOp
 #    - method_override: Qwen2_5OmniVisionEncoder.forward
 #      SP gather/slice around window-attention reshape + extend cu_seqlens for SP pad tail
 #    - method_override: Qwen2_5OmniVisionEncoder.dummy_forward
@@ -70,7 +70,7 @@
 #    - init_modification: Qwen2_5OmniAudioAttention
 #      Bind instance-local attention VeomniOp
 #    - method_override: Qwen2_5OmniAudioAttention.forward
-#      Always call the local attention VeomniOp
+#      Route packed cu_seqlens through the local attention VeomniOp
 #    - init_modification: Qwen2_5OmniAttention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen2_5OmniAttention.forward
@@ -815,6 +815,7 @@ class Qwen2_5OmniAudioAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        max_seqlen: int | None = None,
         **kwargs,
     ) -> torch.Tensor:
         seq_length, _ = hidden_states.size()
@@ -827,45 +828,23 @@ class Qwen2_5OmniAudioAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = self.veomni_attn
-
-        if is_flash_attention_requested(self.config):
+        if max_seqlen is None:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-            attn_output, _ = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
-                max_length_q=max_seqlen,
-                max_length_k=max_seqlen,
-                is_causal=False,
-                **kwargs,
-            )
-        else:
-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            splits = [
-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-            ]
-            attn_outputs = [
-                attention_interface(
-                    self,
-                    q,
-                    k,
-                    v,
-                    attention_mask=None,
-                    scaling=self.scaling,
-                    dropout=0.0 if not self.training else self.attention_dropout,
-                    is_causal=False,
-                    **kwargs,
-                )[0]
-                for q, k, v in zip(*splits)
-            ]
-            attn_output = torch.cat(attn_outputs, dim=1)
+        attn_output, _ = self.veomni_attn(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask=None,
+            scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+            is_causal=False,
+            **kwargs,
+        )
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.out_proj(attn_output)
@@ -1361,49 +1340,24 @@ class Qwen2_5OmniVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = self.veomni_attn
-
         # --- Patch.1 ---
-        if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
-            if max_seqlen is None:
-                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-            attn_output, _ = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
-                max_length_q=max_seqlen,
-                max_length_k=max_seqlen,
-                is_causal=False,
-                **kwargs,
-            )
-        else:
-            # Other implementations: process each chunk separately.
-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            splits = [
-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-            ]
-
-            attn_outputs = [
-                attention_interface(
-                    self,
-                    q,
-                    k,
-                    v,
-                    attention_mask=None,
-                    scaling=self.scaling,
-                    dropout=0.0 if not self.training else self.attention_dropout,
-                    is_causal=False,
-                    **kwargs,
-                )[0]
-                for q, k, v in zip(*splits)
-            ]
-            attn_output = torch.cat(attn_outputs, dim=1)
+        if max_seqlen is None:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+        attn_output, _ = self.veomni_attn(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask=None,
+            scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+            is_causal=False,
+            **kwargs,
+        )
         # --- Patch.1 ---
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()

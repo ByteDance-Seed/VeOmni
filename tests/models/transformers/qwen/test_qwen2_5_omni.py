@@ -134,6 +134,62 @@ def test_qwen2_5_omni_eager_matches_hf_image_and_text():
     )
 
 
+def test_qwen2_5_omni_vision_and_audio_attention_veomni_sdpa_matches_hf():
+    from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+        Qwen2_5OmniAudioAttention as HFQwen2_5OmniAudioAttention,
+    )
+    from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+        Qwen2_5OmniVisionAttention as HFQwen2_5OmniVisionAttention,
+    )
+
+    from veomni.models.transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
+        Qwen2_5OmniAudioAttention,
+        Qwen2_5OmniVisionAttention,
+    )
+
+    torch.manual_seed(0)
+    thinker_config = _tiny_thinker_config()
+    cu_seqlens = torch.tensor([0, 3, 7], dtype=torch.int32)
+
+    vision_cfg_hf = thinker_config.vision_config
+    vision_cfg_hf._attn_implementation = "sdpa"
+    hf_vision_attn = HFQwen2_5OmniVisionAttention(vision_cfg_hf).eval()
+
+    vision_cfg_ours = _tiny_thinker_config().vision_config
+    vision_cfg_ours._attn_implementation = "veomni_sdpa"
+    with ops_config_scope(eager_ops_config()):
+        ours_vision_attn = Qwen2_5OmniVisionAttention(vision_cfg_ours).eval()
+    ours_vision_attn.load_state_dict(hf_vision_attn.state_dict())
+
+    vision_hidden = torch.randn(7, vision_cfg_hf.hidden_size)
+    head_dim = vision_cfg_hf.hidden_size // vision_cfg_hf.num_heads
+    pos_emb = torch.randn(7, head_dim // 2)
+    torch.testing.assert_close(
+        ours_vision_attn(vision_hidden, cu_seqlens=cu_seqlens, position_embeddings=pos_emb),
+        hf_vision_attn(vision_hidden, cu_seqlens=cu_seqlens, position_embeddings=pos_emb),
+        rtol=0,
+        atol=0,
+    )
+
+    audio_cfg_hf = thinker_config.audio_config
+    audio_cfg_hf._attn_implementation = "sdpa"
+    hf_audio_attn = HFQwen2_5OmniAudioAttention(audio_cfg_hf).eval()
+
+    audio_cfg_ours = _tiny_thinker_config().audio_config
+    audio_cfg_ours._attn_implementation = "veomni_sdpa"
+    with ops_config_scope(eager_ops_config()):
+        ours_audio_attn = Qwen2_5OmniAudioAttention(audio_cfg_ours).eval()
+    ours_audio_attn.load_state_dict(hf_audio_attn.state_dict())
+
+    audio_hidden = torch.randn(7, audio_cfg_hf.d_model)
+    torch.testing.assert_close(
+        ours_audio_attn(audio_hidden, cu_seqlens=cu_seqlens),
+        hf_audio_attn(audio_hidden, cu_seqlens=cu_seqlens),
+        rtol=0,
+        atol=0,
+    )
+
+
 class _StubTokenizer:
     init_kwargs: dict = {}
     image_token = "<|image|>"

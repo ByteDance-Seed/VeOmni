@@ -52,6 +52,35 @@ class _FakeAttentionModule(nn.Module):
         self.num_key_value_groups = 1
 
 
+def eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float | None = None,
+    dropout: float = 0.0,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Module-level eager attention reference resolved for ``_FakeAttentionModule``."""
+    scale = (query.shape[-1] ** -0.5) if scaling is None else scaling
+    if getattr(module, "num_key_value_groups", 1) > 1:
+        key = key.repeat_interleave(module.num_key_value_groups, dim=1)
+        value = value.repeat_interleave(module.num_key_value_groups, dim=1)
+    scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+    is_causal = kwargs.get("is_causal")
+    if is_causal is None:
+        is_causal = getattr(module, "is_causal", False)
+    if attention_mask is not None:
+        scores = scores + attention_mask
+    elif is_causal and query.shape[-2] > 1:
+        causal = torch.ones(query.shape[-2], key.shape[-2], dtype=torch.bool, device=query.device).tril()
+        scores = scores.masked_fill(~causal, torch.finfo(scores.dtype).min)
+    weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    weights = F.dropout(weights, p=dropout, training=module.training)
+    return torch.matmul(weights, value).transpose(1, 2).contiguous(), weights
+
+
 @pytest.mark.parametrize("impl", ("sdpa", "veomni_sdpa"))
 @pytest.mark.parametrize("metadata", ({}, {"cu_seq_lens_q": None, "cu_seq_lens_k": None, "max_length_q": None}))
 def test_sdpa_attention_forward_square_causal_layout(impl, metadata):
@@ -144,6 +173,175 @@ def test_sdpa_accepts_packing_isolated_by_dense_mask(entrypoint):
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
     # The first token of the second segment only sees itself.
     torch.testing.assert_close(output[0, 2], query[0, :, 2], rtol=ATTN_RTOL, atol=ATTN_ATOL)
+
+
+@pytest.mark.parametrize("entrypoint", ("sdpa", "veomni_sdpa", "adapter", "eager"))
+@pytest.mark.parametrize("is_causal", (False, True))
+@pytest.mark.parametrize(
+    "metadata_keys",
+    (
+        ("cu_seq_lens_q", "cu_seq_lens_k"),
+        ("cu_seqlens_q", "cu_seqlens_k"),
+        ("cu_seqlens",),
+    ),
+)
+def test_sdpa_splits_unmasked_packed_cu_seqlens(entrypoint, is_causal, metadata_keys):
+    """Unmasked batch-1 multi-segment calls split Q/K/V per segment and match chunked SDPA."""
+    cu_seqlens = torch.tensor([0, 3, 5, 9], dtype=torch.int32)
+    lengths = [3, 2, 4]
+    generator = torch.Generator().manual_seed(23)
+    query = torch.randn(1, 4, 9, 8, generator=generator)
+    key = torch.randn(1, 2, 9, 8, generator=generator)
+    value = torch.randn(1, 2, 9, 8, generator=generator)
+    grad_out = torch.randn(1, 9, 4, 8, generator=generator)
+    scaling = 8**-0.5
+
+    module = _FakeAttentionModule()
+    module.is_causal = is_causal
+    module.num_key_value_groups = 2
+    forward = _sdpa_forward(entrypoint)
+
+    ref_q, ref_k, ref_v = clone_qkv(query, key, value)
+    q_splits = torch.split(ref_q, lengths, dim=2)
+    k_splits = torch.split(ref_k, lengths, dim=2)
+    v_splits = torch.split(ref_v, lengths, dim=2)
+    ref_chunks = [
+        forward(
+            module,
+            q_chunk,
+            k_chunk,
+            v_chunk,
+            None,
+            dropout=0.0,
+            scaling=scaling,
+            is_causal=is_causal,
+        )[0]
+        for q_chunk, k_chunk, v_chunk in zip(q_splits, k_splits, v_splits, strict=True)
+    ]
+    expected = torch.cat(ref_chunks, dim=1)
+    expected_grads = torch.autograd.grad(expected, (ref_q, ref_k, ref_v), grad_out)
+
+    act_q, act_k, act_v = clone_qkv(query, key, value)
+    metadata = dict.fromkeys(metadata_keys, cu_seqlens) | {"max_length_q": 4, "max_length_k": 4}
+    actual, lse = forward(
+        module,
+        act_q,
+        act_k,
+        act_v,
+        None,
+        dropout=0.0,
+        scaling=scaling,
+        is_causal=is_causal,
+        **metadata,
+    )
+    actual_grads = torch.autograd.grad(actual, (act_q, act_k, act_v), grad_out)
+
+    assert lse is None
+    torch.testing.assert_close(actual, expected, rtol=EAGER_RTOL, atol=EAGER_ATOL)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=EAGER_GRAD_RTOL, atol=EAGER_GRAD_ATOL)
+
+
+def test_sdpa_splits_unmasked_packed_cu_seqlens_after_ulysses_prepare(monkeypatch):
+    """Ulysses gathers local sequence shards to global length before splitting by cu_seqlens."""
+    group = object()
+    state = SimpleNamespace(ulysses_group=group, ulysses_size=2)
+    recorder = UlyssesHelperRecorder()
+
+    def fake_prepare(query, key, value, *, group, ulysses_size):
+        recorder.calls.append(("prepare", query, key, value, group, ulysses_size))
+        return (
+            query.repeat(1, ulysses_size, 1, 1)[:, :, : query.shape[2] // ulysses_size],
+            key.repeat(1, ulysses_size, 1, 1)[:, :, : key.shape[2] // ulysses_size],
+            value.repeat(1, ulysses_size, 1, 1)[:, :, : value.shape[2] // ulysses_size],
+            query.shape[2],
+        )
+
+    def fake_backend(module, query, key, value, attention_mask, **kwargs):
+        recorder.calls.append(("backend", query.shape, key.shape, value.shape, attention_mask, kwargs))
+        return query.transpose(1, 2), None
+
+    def fake_restore(output, *, group):
+        recorder.calls.append(("restore", output.shape, group))
+        return output[:, : output.shape[1] // 2]
+
+    monkeypatch.setattr(sdpa_backend, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(sdpa_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
+    monkeypatch.setattr(sdpa_backend, "prepare_ulysses_qkv", fake_prepare)
+    monkeypatch.setattr(sdpa_backend, "hf_sdpa_attention_forward", fake_backend)
+    monkeypatch.setattr(sdpa_backend, "restore_ulysses_output", fake_restore)
+
+    # Local sequence length is 4; global sequence length after Ulysses gather is 8,
+    # split into segments of length 3 and 5.
+    query = torch.randn(1, 4, 4, 8)
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+    output, lse = sdpa_backend.sdpa_attention_forward(
+        _FakeAttentionModule(),
+        query,
+        query[:, :2],
+        query[:, :2],
+        attention_mask=None,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+        max_length_q=5,
+        max_length_k=5,
+        is_causal=False,
+    )
+
+    assert lse is None
+    assert [call[0] for call in recorder.calls] == ["prepare", "backend", "backend", "restore"]
+    assert recorder.calls[1][1:4] == (torch.Size([1, 2, 3, 8]), torch.Size([1, 1, 3, 8]), torch.Size([1, 1, 3, 8]))
+    assert recorder.calls[2][1:4] == (torch.Size([1, 2, 5, 8]), torch.Size([1, 1, 5, 8]), torch.Size([1, 1, 5, 8]))
+    assert recorder.calls[3][1:] == (torch.Size([1, 8, 2, 8]), group)
+    assert output.shape == (1, 4, 2, 8)
+
+
+def test_sdpa_packed_varlen_rejects_invalid_metadata(monkeypatch):
+    """Invalid packed varlen metadata fails closed."""
+    module = _FakeAttentionModule()
+    query = torch.randn(1, 2, 4, 8)
+
+    with pytest.raises(ValueError, match="several segments per row"):
+        batch2 = torch.randn(2, 2, 4, 8)
+        sdpa_backend.sdpa_attention_forward(
+            module,
+            batch2,
+            batch2,
+            batch2,
+            None,
+            cu_seqlens=torch.tensor([0, 2, 4, 8], dtype=torch.int32),
+        )
+
+    with pytest.raises(ValueError, match="same number of query and key segments"):
+        sdpa_backend.sdpa_attention_forward(
+            module,
+            query,
+            query,
+            query,
+            None,
+            cu_seq_lens_q=torch.tensor([0, 2, 4], dtype=torch.int32),
+            cu_seq_lens_k=torch.tensor([0, 1, 2, 4], dtype=torch.int32),
+        )
+
+    with pytest.raises(ValueError, match="segment lengths must be positive"):
+        sdpa_backend.sdpa_attention_forward(
+            module,
+            query,
+            query,
+            query,
+            None,
+            cu_seqlens=torch.tensor([0, 2, 2, 4], dtype=torch.int32),
+        )
+
+    with pytest.raises(ValueError, match="total length"):
+        sdpa_backend.sdpa_attention_forward(
+            module,
+            query,
+            query,
+            query,
+            None,
+            cu_seqlens=torch.tensor([0, 2, 5], dtype=torch.int32),
+        )
 
 
 def test_veomni_sdpa_pins_mask_backends_only_with_mask(monkeypatch):

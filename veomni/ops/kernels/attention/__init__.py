@@ -38,7 +38,10 @@ from ...platform import (
     NvidiaGpuPlatform,
 )
 from ...registry import register_op
-from .helper import strip_sdpa_packed_metadata
+from .standard.sdpa import (
+    extract_packed_varlen_cu_seqlens,
+    packed_split_attention_forward,
+)
 
 
 def _module_eager_forward(module: torch.nn.Module) -> Callable | None:
@@ -71,8 +74,13 @@ def lookup(impl: str) -> Callable:
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Dispatch one attention call through the selected Transformers interface."""
-        if impl == "sdpa":
-            kwargs = strip_sdpa_packed_metadata(kwargs, batch_size=query.shape[0], dense_mask=attention_mask)
+        packed_cu_seqlens = None
+        if impl in ("sdpa", "eager"):
+            kwargs, packed_cu_seqlens = extract_packed_varlen_cu_seqlens(
+                kwargs,
+                batch_size=query.shape[0],
+                attention_mask=attention_mask,
+            )
 
         eager_default = _module_eager_forward(module)
         forward = ALL_ATTENTION_FUNCTIONS.get_interface(impl, eager_default)
@@ -80,6 +88,23 @@ def lookup(impl: str) -> Callable:
             raise KeyError(
                 f"attention impl {impl!r} is not registered and "
                 f"{type(module).__module__} has no eager_attention_forward"
+            )
+
+        if packed_cu_seqlens is not None:
+            cu_seqlens_q, cu_seqlens_k = packed_cu_seqlens
+            return packed_split_attention_forward(
+                forward,
+                module,
+                query,
+                key,
+                value,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                dropout=dropout,
+                scaling=scaling,
+                sliding_window=sliding_window,
+                softcap=softcap,
+                **kwargs,
             )
 
         return forward(
