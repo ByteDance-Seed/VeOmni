@@ -50,20 +50,27 @@ backbone:
 - Per-module extra-parallel lists may need deduplication before mesh creation;
   check the current trainer helper before changing this area.
 
-## Sequence Parallel (Ulysses)
+## Sequence & Context Parallel (`ulysses_size` / `cp_size`)
 
-> SeedOmni uses classic single-pass Ulysses at ONE **uniform** SP size shared by
-> every module. Design, invariants and open limitations (item balancing for
-> audio/video encoders, compute-aware packing): `docs/seed_omni/distributed/sequence_parallel.md`.
+> SeedOmni requires every distributed module to share one **`dp_size`** (and
+> therefore one unified `sp_size = cp_size * ulysses_size = world_size // dp_size`),
+> while each module may independently choose Ulysses SP (`ulysses_size`), Context
+> Parallelism (`cp_size`), or hybrid `cp * sp`. Design and invariants:
+> `docs/seed_omni/distributed/sequence_parallel.md`.
 
-SP is **uniform**. Set the SP size on the global accelerator
-(`model.accelerator.ulysses_size`, CLI `--model.accelerator.ulysses_size`); every module inherits it through the per-module
-accelerator deep-merge in `build_omni_module_runtime_args`. Do NOT add per-module
-`ulysses_size` overrides — nothing validates uniformity, so an override silently
-produces a non-uniform run. The dataloader is the
-standard `BaseTrainer` build-time sharded loader: it yields `dp_size = world / sp`
-**distinct** shards and **replicates** each shard across its SP group, so every
-rank of an SP group holds the SAME sample.
+`dp_size` is **uniform across all distributed modules**. You can set a uniform
+`model.accelerator.ulysses_size` (or `cp_size`), or override `ulysses_size` and
+`cp_size` per module in `modules_train.yaml` as long as `cp_size * ulysses_size`
+is identical across all distributed modules and `model.accelerator`. Because
+`_deep_update` merges keys individually, overriding `cp_size > 1` on a module
+when the base config has `ulysses_size > 1` (or vice versa) requires setting
+`ulysses_size: 1` (or `cp_size: 1`) if pure CP (or pure SP) is intended;
+`build_omni_model_runtime_args` enforces `_validate_omni_dp_size` to verify that
+all distributed modules and `model.accelerator` resolve to the same `dp_size`.
+The dataloader is the standard `BaseTrainer` build-time sharded
+loader: it yields `dp_size = world / sp_size` **distinct** shards and
+**replicates** each shard across its `sp_group`, so every rank of an `sp_group`
+holds the SAME sample.
 
 A module with `sp_size = S > 1` runs classic single-pass Ulysses, with the SP
 slice/gather living INSIDE its own `pre_forward` / `post_forward` (no separate
