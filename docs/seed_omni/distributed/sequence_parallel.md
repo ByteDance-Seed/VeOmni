@@ -22,9 +22,12 @@ bash train.sh tasks/omni/train_omni.py configs/seed_omni/fake_model/train/base.y
   --model.accelerator.ulysses_size 4
 ```
 
-Or configure `ulysses_size` / `cp_size` per module in `modules_train.yaml` (for
+Or, keeping `--model.accelerator.ulysses_size 4` (or `model.accelerator.ulysses_size: 4`
+in `base.yaml`) so the top-level accelerator also resolves to `dp_size = W / 4`,
+configure `ulysses_size` / `cp_size` per module in `modules_train.yaml` (for
 example, Ulysses SP on the vision encoder and Context Parallelism on a
-DeepSeek-V4 LLM backbone), provided every module resolves to the same
+DeepSeek-V4 LLM backbone), provided every distributed module and
+`model.accelerator` resolve to the same
 `dp_size = world_size // (cp_size * ulysses_size)`:
 
 ```yaml
@@ -115,8 +118,10 @@ for node in training_graph:
   mechanism between modules.
 
 The SP logic lives entirely in each module's `pre_forward` / `post_forward`;
-there is no separate SP hook. Forward and backward activation peaks are both
-about `1/S` of a full sample. The node runner is
+there is no separate SP hook. Inside the module's forward and backward pass,
+local intermediate activations scale as about `1/S` of a full sample, while
+`post_forward`'s `gather_outputs` materializes the full-sequence module output
+on each SP rank before stripping padding. The node runner is
 `veomni/models/seed_omni/accelerated/utils/executor.py::execute_train_node`, and
 the primitives are in `veomni/distributed/sequence_parallel/data.py`.
 
@@ -151,15 +156,22 @@ The hard rules agents must follow are kept in
 
 ## 5. Choosing between slicing and item balancing
 
-For a **block-diagonal** encoder (each image or clip attends only within itself)
-whose slice boundaries align with items, SP slicing is exactly data balancing:
-each item is computed once on one rank and no all-to-all is needed. SP slicing
-also balances load strictly better than assigning whole items to ranks, because
-it splits by tokens: a single image is still split `S` ways, with at most `S`
-padding tokens once per batch, while whole-item assignment idles ranks when there
-are fewer items than ranks or the items differ in size. For SP-aware encoders
-(global attention, no cross-shard locality, such as a ViT), uniform SP slicing is
-therefore sufficient, and it is what every module does today.
+There are two ways to distribute encoder work across the `S` ranks of an
+`sp_group`:
+
+- **Item-aligned (batch-dim) slicing.** For a **block-diagonal** encoder where
+  each image or clip attends only within itself (such as SigLIP or VQVAE without
+  Ulysses), slicing along the batch of items assigns whole items to ranks and
+  needs no cross-rank communication inside the encoder. However, a single item
+  cannot be split across `S` ranks without communication, so ranks can idle when
+  there are fewer items than `S` or when item sizes vary.
+- **Token-level sequence slicing.** For **SP-aware** encoders whose attention
+  exchanges heads/tokens across the SP group (such as a ViT with Ulysses
+  attention), slicing the flat token or patch sequence splits even a single
+  image `S` ways (with at most `S - 1` padding tokens per batch) and balances
+  compute across all `S` ranks, at the cost of the in-attention all-to-all. Encoders
+  with local pre-attention operators (section 6) cannot split a single item by
+  tokens without halo exchange.
 
 ## 6. Limitations and future work
 

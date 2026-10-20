@@ -29,7 +29,8 @@ class TextEncoderPreprocessor(ModulePreprocessorBase):
     decodes generated text via ``self._tokenizer``.
     """
 
-    def __init__(self, chat_template: TextEncoderChatTemplate) -> None:
+    def __init__(self, chat_template: TextEncoderChatTemplate, **kwargs: Any) -> None:
+        del kwargs
         self._chat_template = chat_template
         self._tokenizer = chat_template.tokenizer
 

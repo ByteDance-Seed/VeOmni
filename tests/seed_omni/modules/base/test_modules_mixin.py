@@ -285,3 +285,25 @@ def test_text_encoder_selects_ops_from_module_config_not_global_ops_config():
 
     assert te_eager.veomni_ce.impl == "eager"
     assert te_chunk.veomni_ce.impl == "chunk_loss"
+
+
+def test_text_encoder_preprocessor_from_pretrained_forwards_and_tolerates_processor_kwargs():
+    from veomni.models.seed_omni.modules.base.text_encoder.processing import TextEncoderPreprocessor
+
+    fake_template = SimpleNamespace(tokenizer="tok")
+
+    class _BaseSub(TextEncoderPreprocessor):
+        @classmethod
+        def build_chat_template(cls, module_path: str, *, config_overrides=None):
+            return fake_template
+
+    class _CustomSub(_BaseSub):
+        def __init__(self, chat_template, *, packed_preprocess: bool = False, **kwargs):
+            super().__init__(chat_template, **kwargs)
+            self.packed_preprocess = packed_preprocess
+
+    base_proc = _BaseSub.from_pretrained("/tmp/fake", extra_unused_kwarg=True)
+    assert base_proc._tokenizer == "tok"
+
+    custom_proc = _CustomSub.from_pretrained("/tmp/fake", packed_preprocess=True, extra_unused_kwarg=1)
+    assert custom_proc.packed_preprocess is True
