@@ -19,6 +19,7 @@ import os
 import shutil
 import threading
 import weakref
+from bisect import bisect_left
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -68,10 +69,31 @@ logger = logging.get_logger(__name__)
 _EXTRA_STATE_KEY = "extra_state"
 _EXTRA_STATE_DIRNAME = "extra_state"
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
+_EXTRA_PARALLEL_LAYOUT_MARKER = "__veomni_ep_outer_layout_v1__"
 _ZERO_OPTIMIZER_STATE_MARKER = "__veomni_zero_optimizer_state__"
 _ABSENT_OPTIMIZER_STATE_ATTR = "_veomni_absent_optimizer_state_bases"
 _EXTRA_PARALLEL_FIRST_MESHES = weakref.WeakKeyDictionary()
 _EXTRA_PARALLEL_FIRST_MESH_LOCK = threading.Lock()
+
+
+def _needs_extra_parallel_layout_marker(specs) -> bool:
+    return any(
+        isinstance(spec.placement, Shard)
+        and spec.placement.dim == spec.fsdp_shard_dim
+        and getattr(spec, "persistent_fsdp_shard_dim", None) is None
+        for spec in (specs or {}).values()
+    )
+
+
+def _strip_extra_parallel_layout_marker(state_dict, required):
+    if not required:
+        return state_dict
+    state_dict = dict(state_dict)
+    if state_dict.pop(_EXTRA_PARALLEL_LAYOUT_MARKER, None) is not True:
+        raise RuntimeError(
+            "Unversioned same-dimension ExtraParallel checkpoint; explicit layout migration is required"
+        )
+    return state_dict
 
 
 def _extra_parallel_first_mesh(mesh: DeviceMesh) -> DeviceMesh:
@@ -290,6 +312,11 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         if self.optimizer is not None:
             _reset_absent_optimizer_state(self.optimizer)
         metadata = self.metadata.state_dict_metadata if self.metadata is not None else {}
+        for key, path in self.mappings.items():
+            if path and path[-1] == _EXTRA_PARALLEL_LAYOUT_MARKER and key not in metadata:
+                raise RuntimeError(
+                    "Unversioned same-dimension ExtraParallel checkpoint; explicit layout migration is required"
+                )
         has_optimizer_state = any(key.startswith("optimizer.state.") for key in metadata)
         has_zero_state_marker = f"optimizer.{_ZERO_OPTIMIZER_STATE_MARKER}" in metadata
         if has_zero_state_marker and has_optimizer_state:
@@ -355,15 +382,12 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
                     )
             if missing_state_fields:
                 lazy_bases = set()
+                saved_keys = sorted(metadata)
                 for key in missing_state_fields:
                     base, _, _ = key.rpartition(".")
-                    required = {
-                        f"{base}.step",
-                        f"{base}.master_weight",
-                        f"{base}.exp_avg",
-                        f"{base}.exp_avg_sq",
-                    }
-                    if required.intersection(metadata):
+                    prefix = base + "."
+                    saved_index = bisect_left(saved_keys, prefix)
+                    if saved_index < len(saved_keys) and saved_keys[saved_index].startswith(prefix):
                         raise RuntimeError(
                             f"DCP is missing part of precision-sensitive optimizer state for {base}; "
                             "explicit checkpoint migration is required"
@@ -563,6 +587,8 @@ class ModelState(Stateful):
             # restoring state dict should be extra parallel aware.
             model_state_dict = self.get_state_dict_with_extra_parallel_dim_preprocess(model_state_dict, "restore")
 
+        if self.should_extra_parallel_aware and _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info):
+            model_state_dict[_EXTRA_PARALLEL_LAYOUT_MARKER] = True
         return model_state_dict
 
     @torch.no_grad()
@@ -572,7 +598,11 @@ class ModelState(Stateful):
         need to drop ExtraParallel-dim when loading from DCP checkpoints
         so that ExtraParallel-FSDP would not be confused
         """
-        model_state_dict = state_dict
+        model_state_dict = _strip_extra_parallel_layout_marker(
+            state_dict,
+            self.should_extra_parallel_aware
+            and _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info),
+        )
         if self.should_extra_parallel_aware:
             model_state_dict = self.get_state_dict_with_extra_parallel_dim_preprocess(model_state_dict, "drop")
 
@@ -649,6 +679,8 @@ class OptimizerState(Stateful):
             optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
                 vanilla_optim_sd, "restore"
             )
+            if _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info):
+                optim_sd_with_extra_parallel_dim[_EXTRA_PARALLEL_LAYOUT_MARKER] = True
             return optim_sd_with_extra_parallel_dim
 
         if getattr(self.optimizer, "_is_multi_optimizer", False):
@@ -665,7 +697,11 @@ class OptimizerState(Stateful):
         return state_dict
 
     def load_state_dict(self, state_dict):
-        optim_state_from_dcp_load = state_dict
+        optim_state_from_dcp_load = _strip_extra_parallel_layout_marker(
+            state_dict,
+            self.should_extra_parallel_aware
+            and _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info),
+        )
         try:
             if self.should_extra_parallel_aware:
                 # we need to drop ExtraParallel dim before loading them into optimizers
@@ -1781,6 +1817,8 @@ def _normalize_key(key: str) -> Optional[str]:
       with ``model.`` so DCP keeps them, and we strip that here on read)
     - Other "model.*" keys -> log warning and strip "model." prefix
     """
+    if key == f"model.{_EXTRA_PARALLEL_LAYOUT_MARKER}":
+        return None
     if not key.startswith("model."):
         return None
 
