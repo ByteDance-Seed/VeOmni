@@ -45,6 +45,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.functional import scaled_dot_product_attention
 
+from veomni.distributed.parallel_state import get_parallel_state
+from veomni.distributed.sequence_parallel import (
+    gather_heads_scatter_seq,
+    gather_outputs,
+    gather_seq_scatter_heads,
+    sp_pad_and_slice,
+)
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 from veomni.utils.import_utils import is_flash_attn_2_available
 
@@ -164,6 +171,12 @@ class DeepseekV41VisionAttention(nn.Module):
         q = _apply_rotary(q, cos, sin)
         k = _apply_rotary(k, cos, sin)
 
+        if get_parallel_state().sp_enabled:
+            sp_group = get_parallel_state().sp_group
+            q = gather_seq_scatter_heads(q, seq_dim=0, head_dim=1, group=sp_group)
+            k = gather_seq_scatter_heads(k, seq_dim=0, head_dim=1, group=sp_group)
+            v = gather_seq_scatter_heads(v, seq_dim=0, head_dim=1, group=sp_group)
+
         if USE_FLASH_ATTN_VARLEN:
             out = flash_attn_varlen_func(
                 q.to(torch.bfloat16),
@@ -181,7 +194,7 @@ class DeepseekV41VisionAttention(nn.Module):
                 q.to(torch.bfloat16),
                 k.to(torch.bfloat16),
                 v.to(torch.bfloat16),
-                self.n_heads,
+                q.size(1),
                 pse=None,
                 atten_mask=None,
                 scale=1.0 / math.sqrt(self.head_dim),
@@ -192,6 +205,9 @@ class DeepseekV41VisionAttention(nn.Module):
             )[0]
         else:
             out = _sdpa_varlen_attn(q, k, v, cu_seqlens)
+
+        if get_parallel_state().sp_enabled:
+            out = gather_heads_scatter_seq(out, head_dim=1, seq_dim=0, group=sp_group)
         return self.wo(out.reshape(n, -1).to(x.dtype))
 
 
@@ -302,11 +318,19 @@ def build_deepseek_v41_vit_metadata(
         cos, sin = _vision_freqs(int(n_h), int(n_w), rope_dim, float(rope_theta))
         cos_parts.append(cos)
         sin_parts.append(sin)
+    cos = torch.cat(cos_parts, dim=0).to(device)
+    sin = torch.cat(sin_parts, dim=0).to(device)
+    if get_parallel_state().sp_enabled:
+        pad = -cu[-1] % get_parallel_state().sp_size
+        if pad:
+            cu.append(cu[-1] + pad)
+        cos = sp_pad_and_slice(cos, dim=0, pad_value=0)
+        sin = sp_pad_and_slice(sin, dim=0, pad_value=0)
     return {
         "cu_seqlens": torch.tensor(cu, dtype=torch.int32, device=device),
         "max_seqlen": max((b - a for a, b in zip(cu, cu[1:])), default=0),
-        "cos": torch.cat(cos_parts, dim=0).to(device),
-        "sin": torch.cat(sin_parts, dim=0).to(device),
+        "cos": cos,
+        "sin": sin,
     }
 
 
@@ -398,6 +422,8 @@ class DeepseekV41VisionEncoder(InferenceMixin, PretrainedOmniModule):
             vit_metadata["cu_seqlens"],
             vit_metadata["max_seqlen"],
         )
+        if get_parallel_state().sp_enabled:
+            features = gather_outputs(features, gather_dim=0, group=get_parallel_state().sp_group)
         cu = vit_metadata["cu_seqlens"]
         spans = []
         for index, (n_h, n_w) in enumerate(grids):

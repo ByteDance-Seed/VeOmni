@@ -17,17 +17,14 @@
 ``generate()`` lives on the native :class:`DeepseekV41VisionEncoder`; this file
 only carries the pre/post forward hooks that move the conversation carrier in and
 the assembled spans out.
-
-No sequence-parallel branch. The ViT's attention is per-image and images are
-already packed varlen, so an Ulysses slice would have to respect image boundaries
-that vary per sample; the tower is 0.49B against a 40-layer backbone, so it is not
-where the step time is. Revisit under G4 if a long-image workload says otherwise.
 """
 
 from typing import Any, Dict, List, Optional
 
 import torch
 
+from .......distributed.parallel_state import get_parallel_state
+from .......distributed.sequence_parallel import sp_pad_and_slice
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem, iter_desired_items
@@ -72,14 +69,17 @@ class TrainingMixin(TrainingModuleMixin):
         pixel_values, grids, token_types, slots = build_deepseek_v41_vit_batch(
             items, device=self.device, dtype=self.dtype
         )
+        vit_metadata = build_deepseek_v41_vit_metadata(
+            grids, self.config.rope_dim, self.config.rope_theta, self.device
+        )
+        if get_parallel_state().sp_size > 1:
+            pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0)
         self._visual_output_slots = slots
         return {
             "pixel_values": pixel_values,
             "grids": grids,
             "token_types": token_types,
-            "vit_metadata": build_deepseek_v41_vit_metadata(
-                grids, self.config.rope_dim, self.config.rope_theta, self.device
-            ),
+            "vit_metadata": vit_metadata,
         }
 
     @post_forward("forward")
@@ -96,13 +96,17 @@ class TrainingMixin(TrainingModuleMixin):
         grids = [[ratio, ratio]]
         from ..processing import image_token_types
 
+        pixel_values = torch.zeros(ratio * ratio, 3, patch, patch, device=self.device, dtype=self.dtype)
+        vit_metadata = build_deepseek_v41_vit_metadata(
+            grids, self.config.rope_dim, self.config.rope_theta, self.device
+        )
+        if get_parallel_state().sp_size > 1:
+            pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0)
         return {
-            "pixel_values": torch.zeros(ratio * ratio, 3, patch, patch, device=self.device, dtype=self.dtype),
+            "pixel_values": pixel_values,
             "grids": grids,
             "token_types": [image_token_types(1, 1)],
-            "vit_metadata": build_deepseek_v41_vit_metadata(
-                grids, self.config.rope_dim, self.config.rope_theta, self.device
-            ),
+            "vit_metadata": vit_metadata,
         }
 
 
