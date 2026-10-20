@@ -272,6 +272,30 @@ def test_omni_model_from_pretrained_loads_the_fake_chain(tmp_path):
     assert torch.equal(loaded.get_module(FAKE_B).proj.weight, model.get_module(FAKE_B).proj.weight)
 
 
+@pytest.mark.parametrize("caller_has_ops", [False, True], ids=["no_base_ops", "base_ops"])
+def test_module_loading_restores_the_callers_ops_config(tmp_path, monkeypatch, caller_has_ops):
+    from veomni.arguments import OpsImplementationConfig
+    from veomni.ops.config import get_ops_config, set_ops_config
+
+    _build_omni_model().save_pretrained(tmp_path)
+    caller_ops = OpsImplementationConfig() if caller_has_ops else None
+    previous = get_ops_config()
+    set_ops_config(caller_ops)
+    try:
+        OmniModel.from_pretrained(tmp_path)
+        assert get_ops_config() is caller_ops
+
+        def fail_load(*args, **kwargs):
+            raise RuntimeError("module load failed")
+
+        monkeypatch.setattr(FakeModuleB, "from_pretrained", classmethod(fail_load))
+        with pytest.raises(RuntimeError, match="module load failed"):
+            OmniModel.from_pretrained(tmp_path)
+        assert get_ops_config() is caller_ops
+    finally:
+        set_ops_config(previous)
+
+
 def test_omni_model_from_pretrained_forwards_dtype_to_modules(tmp_path):
     _build_omni_model().save_pretrained(tmp_path)
 
@@ -944,7 +968,7 @@ def test_from_pretrained_rejects_missing_endpoint_method(tmp_path):
 
 
 def test_omni_model_rejects_missing_default_generate():
-    """Bare generation endpoints resolve to ``generate``; that method must exist when the FSM is built."""
+    """Bare generation endpoints resolve to ``generate``; that method must exist when a request runs."""
 
     class NoGenerate(FakeModuleA):
         generate = None
@@ -954,5 +978,6 @@ def test_omni_model_rejects_missing_default_generate():
         training_graphs={"default": [{"from": FAKE_A, "to": "end"}]},
         generation_graphs=_minimal_generation_graphs(module=FAKE_A),
     )
+    model = OmniModel(config, {FAKE_A: NoGenerate(FakeModuleAConfig())})
     with pytest.raises(ValueError, match=r"NoGenerate\.generate"):
-        OmniModel(config, {FAKE_A: NoGenerate(FakeModuleAConfig())})
+        model.generate({})

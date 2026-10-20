@@ -21,7 +21,6 @@ under ``torch.no_grad()`` before the extra CE work runs.
 
 from __future__ import annotations
 
-import importlib
 import inspect
 import re
 from collections import defaultdict
@@ -31,7 +30,6 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from numbers import Integral
 from typing import TYPE_CHECKING, Any, Callable
-from weakref import WeakSet
 
 import torch
 import torch.distributed as dist
@@ -58,48 +56,6 @@ _LOSS_CALL_POSITIONAL_KEYS = ("logits", "labels", "vocab_size", "num_items_in_ba
 _ACTIVE_CHANNEL_LOSS_COMPUTER: ContextVar[ChannelLossComputer | None] = ContextVar(
     "veomni_active_channel_loss_computer", default=None
 )
-
-
-class _OpSlotDispatcher:
-    """Shared dispatcher for a module-global causal-loss OpSlot."""
-
-    def __init__(self, slot: Any, original_kernel: Callable[..., Any]) -> None:
-        self.slot = slot
-        self.original_kernel = original_kernel
-        self.owners: WeakSet[Any] = WeakSet()
-
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        owner = _ACTIVE_CHANNEL_LOSS_COMPUTER.get()
-        if owner is None or owner not in self.owners:
-            return self.original_kernel(*args, **kwargs)
-
-        reused_per_token_losses: list[torch.Tensor] = []
-        observation_errors: list[str] = []
-        with capture_chunk_loss_per_token(reused_per_token_losses.append, on_error=observation_errors.append):
-            result = self.original_kernel(*args, **kwargs)
-        if observation_errors:
-            # Join the same coordinated preflight as other local preparation
-            # failures. In particular, never retry detached CE after an OOM.
-            owner._observation_attempt_count += 1
-            owner._capture_errors.extend(("generic", error) for error in observation_errors)
-            return result
-        if len(reused_per_token_losses) != 1:
-            logger.warning_once(
-                "Channel loss expected exactly one reusable per-token CE capture from chunk_loss, "
-                f"but observed {len(reused_per_token_losses)}; falling back to detached CE recomputation. "
-                "This can occur with a non-chunk loss backend or a forward that invokes the causal loss "
-                "multiple times."
-            )
-        owner._observe_opslot_call(
-            self.original_kernel,
-            args,
-            kwargs,
-            reused_per_token_loss=(reused_per_token_losses[0].detach() if len(reused_per_token_losses) == 1 else None),
-        )
-        return result
-
-
-_OP_SLOT_DISPATCHERS: dict[Any, _OpSlotDispatcher] = {}
 
 
 class ChannelLossMetadataError(ValueError):
@@ -216,7 +172,6 @@ class ChannelLossComputer:
         self._original_loss_fn: Callable[..., Any] | None = None
         self._model_ref: torch.nn.Module | None = None
         self._installed = False
-        self._wrapped_opslots: list[Any] = []
 
         self._source_ids: list[ChannelKey] = []
         self._position_ids: torch.Tensor | None = None
@@ -323,8 +278,7 @@ class ChannelLossComputer:
         if host is None or not hasattr(host, "loss_function"):
             logger.warning_rank0(
                 "Channel loss: could not locate model.loss_function "
-                f"(outer_type={type(model).__name__}, inner_type={type(host).__name__ if host else None}). "
-                "Only OpSlot-based fused CE paths, if any, can be observed."
+                f"(outer_type={type(model).__name__}, inner_type={type(host).__name__ if host else None})."
             )
         else:
             self._original_loss_fn = host.loss_function
@@ -342,8 +296,7 @@ class ChannelLossComputer:
                 f"Channel loss: wrapped {type(host).__name__}.loss_function (outer={type(model).__name__})."
             )
 
-        self._wrap_causal_loss_opslots(model, host)
-        self._installed = self._original_loss_fn is not None or bool(self._wrapped_opslots)
+        self._installed = self._original_loss_fn is not None
         if not self._installed:
             logger.warning_rank0("Channel loss: no causal loss hook was installed.")
 
@@ -351,64 +304,9 @@ class ChannelLossComputer:
         if self._model_ref is not None and self._original_loss_fn is not None:
             self._model_ref.loss_function = self._original_loss_fn
 
-        for slot in reversed(self._wrapped_opslots):
-            dispatcher = _OP_SLOT_DISPATCHERS.get(slot)
-            if dispatcher is None:
-                continue
-            dispatcher.owners.discard(self)
-            if dispatcher.owners:
-                continue
-            if getattr(slot, "_kernel", None) is dispatcher:
-                slot._kernel = dispatcher.original_kernel
-            _OP_SLOT_DISPATCHERS.pop(slot, None)
-
         self._original_loss_fn = None
         self._model_ref = None
-        self._wrapped_opslots = []
         self._installed = False
-
-    def _wrap_causal_loss_opslots(
-        self,
-        model: torch.nn.Module,
-        host: torch.nn.Module | None,
-    ) -> None:
-        modules = []
-        seen = set()
-        for root in (model, host):
-            if root is None:
-                continue
-            for cls in type(root).__mro__:
-                module_name = getattr(cls, "__module__", None)
-                if not module_name or module_name in seen:
-                    continue
-                seen.add(module_name)
-                try:
-                    modules.append(importlib.import_module(module_name))
-                except Exception:
-                    continue
-
-        for module in modules:
-            slot = getattr(module, "veomni_causal_lm_loss", None)
-            if slot is None or not getattr(slot, "use_non_eager_impl", False):
-                continue
-            original_kernel = getattr(slot, "_kernel", None)
-            if original_kernel is None:
-                continue
-            dispatcher = _OP_SLOT_DISPATCHERS.get(slot)
-            if dispatcher is None:
-                dispatcher = _OpSlotDispatcher(slot, original_kernel)
-                _OP_SLOT_DISPATCHERS[slot] = dispatcher
-                slot._kernel = dispatcher
-                logger.info_rank0(f"Channel loss: installed dispatcher for {module.__name__}.veomni_causal_lm_loss.")
-            elif getattr(slot, "_kernel", None) is not dispatcher:
-                logger.warning_rank0(
-                    f"Channel loss: {module.__name__}.veomni_causal_lm_loss was rebound after interception; "
-                    "skipping this slot."
-                )
-                continue
-
-            dispatcher.owners.add(self)
-            self._wrapped_opslots.append(slot)
 
     @property
     def capture_active(self) -> bool:
@@ -839,30 +737,6 @@ class ChannelLossComputer:
             return
         logger.warning_rank0(f"Channel loss: {message} Skipping this model forward.")
 
-    def _observe_opslot_call(
-        self,
-        original_kernel: Callable[..., Any],
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-        reused_per_token_loss: torch.Tensor | None = None,
-    ) -> None:
-        call_args = _bind_loss_call_args(original_kernel, args, kwargs)
-        labels = call_args.get("labels")
-        ignore_index = call_args.get("ignore_index", IGNORE_INDEX)
-        if ignore_index is None:
-            ignore_index = IGNORE_INDEX
-        if self.capture_active and self._source_ids and labels is not None:
-            self.compute_side_channel(
-                logits=call_args.get("logits"),
-                labels=labels,
-                vocab_size=call_args.get("vocab_size"),
-                hidden_states=call_args.get("hidden_states"),
-                weights=call_args.get("weights"),
-                shift_labels=call_args.get("shift_labels"),
-                ignore_index=ignore_index,
-                reused_per_token_loss=reused_per_token_loss,
-            )
-
     def begin_step(
         self,
         per_mb_source_ids: list[list[ChannelKey]],
@@ -995,11 +869,28 @@ class ChannelLossComputer:
 
     def _wrapped_loss_fn(self, *args: Any, **kwargs: Any) -> Any:
         assert self._original_loss_fn is not None
-        main_loss = self._original_loss_fn(*args, **kwargs)
+        reused = []
+        errors = []
+        active = self.capture_active and bool(self._source_ids)
+        if active:
+            with capture_chunk_loss_per_token(reused.append, on_error=errors.append):
+                main_loss = self._original_loss_fn(*args, **kwargs)
+        else:
+            return self._original_loss_fn(*args, **kwargs)
+        if errors:
+            self._observation_attempt_count += 1
+            self._capture_errors.extend(("generic", error) for error in errors)
+            return main_loss
+        if len(reused) > 1:
+            self._observation_attempt_count += 1
+            self._capture_errors.append(("generic", "multiple chunk-loss observations in one causal loss call"))
+            return main_loss
 
         call_args = _bind_loss_call_args(self._original_loss_fn, args, kwargs)
         logits = call_args.get("logits")
         labels = call_args.get("labels")
+        if labels is None:
+            labels = call_args.get("shift_labels")
         vocab_size = call_args.get("vocab_size")
         ignore_index = call_args.get("ignore_index", IGNORE_INDEX)
         if ignore_index is None:
@@ -1013,6 +904,7 @@ class ChannelLossComputer:
                 weights=call_args.get("weights"),
                 shift_labels=call_args.get("shift_labels"),
                 ignore_index=ignore_index,
+                reused_per_token_loss=reused[0] if reused else None,
             )
 
         return main_loss
@@ -1102,12 +994,12 @@ class ChannelLossComputer:
         if descriptor is None:
             descriptor = _resolve_cached_sp_capture_descriptor(self.parallel_state)
         sp_enabled = descriptor.enabled
-        if sp_enabled:
-            effective_labels = labels
-        elif shift_labels is not None:
+        if shift_labels is not None:
             effective_labels = shift_labels
-        else:
+        elif not sp_enabled:
             effective_labels = F.pad(labels, (0, 1), value=ignore_index)[..., 1:].contiguous()
+        else:
+            effective_labels = labels
 
         if reused_per_token_loss is not None:
             reused_per_token_loss = self._align_reused_per_token_loss(
@@ -1161,8 +1053,9 @@ class ChannelLossComputer:
     ) -> torch.Tensor:
         """Align causal ``S-1`` main-loss observations with callback ``S`` labels."""
 
-        if per_token_loss.shape == effective_labels.shape:
-            return per_token_loss
+        # The registered CE consumes flattened targets selected by ForCausalLMLoss.
+        if per_token_loss.numel() == effective_labels.numel():
+            return per_token_loss.reshape_as(effective_labels)
         if (
             not sp_enabled
             and per_token_loss.dim() == effective_labels.dim()
@@ -2121,7 +2014,7 @@ class ChannelLossCallback(Callback):
         state: TrainerState,
         loss: float,
         loss_dict: dict[str, float],
-        grad_norm: float,
+        grad_norm: float | torch.Tensor,
         **kwargs: Any,
     ) -> None:
         if not self._collect_step:
