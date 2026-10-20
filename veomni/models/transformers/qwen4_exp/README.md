@@ -98,7 +98,8 @@ for example `ulysses_size=8, cp_size=2` on 32 ranks with DP=2. Other model
 families retain the combined-topology rejection. The collator's contiguous
 rank order is the flattened CP×Ulysses group order; QSA keeps local queries
 and gathers KV over that complete group. GDN exchanges sequence for heads
-over the same group, so its key/value the combined degree must still divide both key and value head counts. This is not recurrent-state context sharding for GDN.
+over the same group. The combined degree must divide both GDN key and value
+head counts. This is not recurrent-state context sharding for GDN.
 
 Vision uses FlashAttention/Ulysses over that complete sequence group, with
 local patch rows and global varlen metadata. Eager/SDPA vision remains
