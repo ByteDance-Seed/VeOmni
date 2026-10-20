@@ -89,13 +89,15 @@ the *block*, so callers passing `rotary_pos_emb=` still work (with a
 received `position_embeddings=None`.
 
 Note for VeOmni's SP and attention-op path: vision and audio attention overrides
-do not call `get_max_seqlen` or branch on `is_flash_attention_requested`. They
-use the caller-supplied `max_seqlen` when present (otherwise reducing
+do not call `get_max_seqlen` or branch on `is_flash_attention_requested` to
+split segments manually (only `Qwen4ExpVisionAttention.forward` still checks
+`is_flash_attention_requested` to guard its FlashAttention-only vision SP path).
+They use the caller-supplied `max_seqlen` when present (otherwise reducing
 `cu_seqlens` locally) and pass `cu_seq_lens_q`, `cu_seq_lens_k`, `max_length_q`,
 and `max_length_k` directly to `self.veomni_attn`. Non-FlashAttention backends
-(`sdpa`, `veomni_sdpa`, `eager`, `veomni_sage_attention`) split unmasked
-batch-size-1 multi-segment `cu_seqlens` inside the attention op wrapper, after
-any Ulysses all-to-all for the `veomni_*` rows.
+(`sdpa`, `veomni_sdpa`, non-causal `eager`, `veomni_sage_attention`) split
+unmasked batch-size-1 multi-segment `cu_seqlens` inside the attention op
+wrapper, after any Ulysses all-to-all for the `veomni_*` rows.
 
 ### `get_{image,video}_features` split `pooler_output` per item
 
