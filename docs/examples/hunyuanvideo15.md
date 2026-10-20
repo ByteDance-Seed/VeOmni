@@ -155,7 +155,9 @@ Production initialization is unchanged.
 
 Review regression checks also compare broadcast key masks against pairwise
 attention masks for both outputs and gradients, including invalid queries,
-fully masked samples and causal attention. The caller retains a `[B,1,1,L]`
+fully masked samples, using the SDPA math backend. This integration uses
+bidirectional attention; its native attention helper has no causal mode.
+The caller retains a `[B,1,1,L]`
 key mask and zeroes invalid query outputs. On NPU, CANN requires the query
 dimension, so the caller passes a `[B,1,L,L]` zero-stride `expand` view backed by
 the same `B*L` mask elements. NPU fp32/bf16 tests verify this storage property
@@ -179,11 +181,12 @@ measured 8.34e-7 in fp32 and 3.91e-3 in bf16. Both precisions on each backend
 produced decreasing losses over two AdamW updates. The CPU-only model suite
 previously passed 20 tests; its accelerator and opt-in cases skipped.
 
-After merging upstream `3089331` on 2026-10-20, the focused suite passed
-35 tests on NPU (two opt-in cases skipped) and 28 on CPU (nine accelerator
-or opt-in cases skipped). Registration now uses `veomni.models.registry`, and
+With upstream `3089331` and bidirectional attention, the focused suite passed
+34 tests on NPU (two opt-in cases skipped), 32 on an A100 (four NPU-specific
+or opt-in cases skipped), and 27 on CPU (nine accelerator or opt-in cases
+skipped). Registration now uses `veomni.models.registry`, and
 the registry check lives in `tests/models/base/test_auto_registry.py`.
-This includes a real two-rank FSDP2/BF16 checkpoint regression on NPU and CPU
+This includes real two-rank FSDP2/BF16 checkpoint regressions on GPU/NPU and CPU
 regressions for both RoPE table-dtype transitions. Rotary tables remain FP32
 through recomputation so saved tensor metadata stays stable.
 The shared registry, gradient-checkpointing, DiT microbatch and resume suites

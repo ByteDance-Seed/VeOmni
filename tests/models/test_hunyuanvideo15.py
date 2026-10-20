@@ -191,9 +191,10 @@ def test_masked_condition_tokens_do_not_change_output():
     torch.testing.assert_close(first, model(**data).predictions, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("causal", [False, True])
-def test_attention_broadcast_mask_matches_pairwise_outputs_and_gradients(monkeypatch, causal):
+def test_attention_broadcast_mask_matches_pairwise_outputs_and_gradients(monkeypatch):
     """Keep masked-query semantics and gradients without allocating a quadratic mask."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
     from veomni.models.diffusers.hunyuanvideo15.native.modules import attention as attention_module
 
     torch.manual_seed(42)
@@ -202,11 +203,11 @@ def test_attention_broadcast_mask_matches_pairwise_outputs_and_gradients(monkeyp
     reference_inputs = [value.detach().clone().requires_grad_() for value in actual_inputs]
     sdpa = torch.nn.functional.scaled_dot_product_attention
     pairwise = valid[:, None, :, None] & valid[:, None, None, :]
-    expected = (
-        sdpa(*(value.transpose(1, 2) for value in reference_inputs), attn_mask=pairwise, is_causal=causal)
-        .transpose(1, 2)
-        .flatten(2)
-    )
+    # Exercise the portable fallback instead of depending on CPU fused SDPA.
+    with sdpa_kernel(SDPBackend.MATH):
+        expected = (
+            sdpa(*(value.transpose(1, 2) for value in reference_inputs), attn_mask=pairwise).transpose(1, 2).flatten(2)
+        )
     mask_shapes = []
 
     def record_sdpa(*args, **kwargs):
@@ -215,7 +216,8 @@ def test_attention_broadcast_mask_matches_pairwise_outputs_and_gradients(monkeyp
         return sdpa(*args, **kwargs)
 
     monkeypatch.setattr(attention_module.F, "scaled_dot_product_attention", record_sdpa)
-    actual = attention_module.attention(*actual_inputs, attn_mask=valid, causal=causal)
+    with sdpa_kernel(SDPBackend.MATH):
+        actual = attention_module.attention(*actual_inputs, attn_mask=valid)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
     assert torch.count_nonzero(actual[~valid]) == 0
     actual.square().sum().backward()

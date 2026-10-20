@@ -13,7 +13,7 @@ def validate_attention_mode(mode):
     return "torch"
 
 
-def attention(q, k, v, drop_rate=0.0, attn_mask=None, causal=False, attn_mode="torch"):
+def attention(q, k, v, drop_rate=0.0, attn_mask=None, attn_mode="torch"):
     """Attend to valid keys and zero invalid queries with linear mask storage."""
     validate_attention_mode(attn_mode)
     mask = None
@@ -31,7 +31,6 @@ def attention(q, k, v, drop_rate=0.0, attn_mask=None, causal=False, attn_mode="t
         v.transpose(1, 2),
         attn_mask=mask,
         dropout_p=drop_rate,
-        is_causal=causal,
     )
     if attn_mask is not None:
         out = out.masked_fill(~attn_mask[:, None, :, None], 0)
