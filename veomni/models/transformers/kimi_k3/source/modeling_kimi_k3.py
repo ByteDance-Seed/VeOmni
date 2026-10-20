@@ -769,7 +769,11 @@ class KimiDeltaAttention(nn.Module):
                     "attention_mask must be a 0-1 matrix of shape [batch_size, seq_len] "
                     "(0 = padding). 3D masks are not supported here.",
                 )
-        if get_parallel_state().sp_enabled and cache_params is None and os.environ.get("K3_KDA_HEAD_SHARD", "1") == "1":
+        if (
+            get_parallel_state().sp_enabled
+            and cache_params is None
+            and os.environ.get("K3_KDA_HEAD_SHARD", "1") == "1"
+        ):
             # Training under SP: head-sharded KDA via
             # ulysses-style all-to-all -- see _forward_sp_head_shard. The
             # legacy full-sequence gather path below stays for the cache /
