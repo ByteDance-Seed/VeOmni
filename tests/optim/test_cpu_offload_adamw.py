@@ -229,6 +229,68 @@ def test_dcp_drops_wholly_absent_optimizer_state_after_resume(tmp_path):
     assert target_optimizer.state[target_model.weight]["step"].item() == 2
 
 
+def test_dcp_drops_wholly_absent_state_from_ddp_wrapped_model(tmp_path):
+    import torch.distributed as dist
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+    from torch.nn.parallel import DistributedDataParallel
+
+    if dist.is_initialized():
+        pytest.skip("requires ownership of the default process group")
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{tmp_path / 'ddp-init'}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        parallel_state = SimpleNamespace(dp_mode="ddp")
+        source_model = DistributedDataParallel(torch.nn.Linear(1, 1).bfloat16())
+        source_optimizer = CPUOffloadAdamW(source_model.parameters(), lr=0.001)
+        source_model.module.weight.grad = torch.ones_like(source_model.module.weight)
+        source_optimizer.step()
+        source_optimizer.zero_grad(set_to_none=True)
+        assert source_model.module.bias not in source_optimizer.state
+        dcp.save(
+            {"optimizer": OptimizerState(source_model, source_optimizer, parallel_state=parallel_state)},
+            checkpoint_id=tmp_path / "checkpoint",
+        )
+
+        target_model = DistributedDataParallel(torch.nn.Linear(1, 1).bfloat16())
+        target_optimizer = CPUOffloadAdamW(target_model.parameters(), lr=0.001)
+        get_optimizer_state_dict(target_model, target_optimizer)
+        with torch.no_grad():
+            target_model.module.bias.fill_(7.0)
+        dcp.load(
+            {
+                "optimizer": OptimizerState(
+                    target_model,
+                    target_optimizer,
+                    parallel_state=parallel_state,
+                    load=True,
+                )
+            },
+            checkpoint_id=tmp_path / "checkpoint",
+            planner=_ModelStrictLoadPlanner(
+                strict_model=False,
+                strict_optimizer_dtype=True,
+                optimizer=target_optimizer,
+            ),
+        )
+        assert target_model.module.bias not in target_optimizer.state
+        assert target_optimizer.state[target_model.module.weight]["step"].item() == 1
+
+        target_model.module.weight.grad = torch.zeros_like(target_model.module.weight)
+        target_model.module.bias.grad = torch.zeros_like(target_model.module.bias)
+        target_optimizer.step()
+        bias_state = target_optimizer.state[target_model.module.bias]
+        assert bias_state["step"].item() == 1
+        torch.testing.assert_close(bias_state["master_weight"], torch.full_like(bias_state["master_weight"], 7.0))
+        assert target_optimizer.state[target_model.module.weight]["step"].item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
 def test_dcp_rejects_adamw_multi_optimizer_as_muon(tmp_path):
     from veomni.optim.optimizer import MultiOptimizer
     from veomni.optim.qwen38_muon import Qwen38MuonAdamW, add_qwen38_plans

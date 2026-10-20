@@ -37,6 +37,7 @@ from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner, Def
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
+    _get_fqns,
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
@@ -175,6 +176,25 @@ def _iter_optimizer_leaves(optimizer):
     yield optimizer
 
 
+def _dcp_parameter_name_map(model) -> dict[str, torch.nn.Parameter]:
+    """Map DCP-canonical parameter FQNs back to their runtime parameters.
+
+    ``get_optimizer_state_dict`` strips wrapper prefixes such as DDP's
+    ``module.`` when it canonicalizes state keys. The absent-state handoff uses
+    those canonical keys, so resolving them through ``named_parameters()``
+    directly breaks every wrapped model. Reuse DCP's own FQN conversion so both
+    sides of the handoff name the same parameter.
+    """
+    names = {}
+    for runtime_name, param in model.named_parameters():
+        for fqn in _get_fqns(model, runtime_name):
+            existing = names.get(fqn)
+            if existing is not None and existing is not param:
+                raise RuntimeError(f"DCP parameter FQN collision for {fqn}")
+            names[fqn] = param
+    return names
+
+
 def _drop_absent_optimizer_state(model, optimizer) -> None:
     """Remove DCP-created placeholders for parameters with no saved state.
 
@@ -187,7 +207,7 @@ def _drop_absent_optimizer_state(model, optimizer) -> None:
     bases = getattr(optimizer, _ABSENT_OPTIMIZER_STATE_ATTR, ())
     if not bases:
         return
-    names = dict(model.named_parameters())
+    names = _dcp_parameter_name_map(model)
     fqns = {
         base.removeprefix("optimizer.state.")
         for base in bases
