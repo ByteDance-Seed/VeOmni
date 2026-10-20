@@ -89,10 +89,13 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     if not get_parallel_state().cp_enabled:
         return
 
-    if IS_NPU_AVAILABLE:
-        raise NotImplementedError("Context parallelism is GPU-only in this release; set cp_size=1 on Ascend/NPU runs.")
-
+    state = get_parallel_state()
     model_type = getattr(config, "model_type", None)
+    if getattr(state, "ulysses_size", 1) > 1 and model_type != "qwen4_exp":
+        raise NotImplementedError("Combined Ulysses/CP is currently implemented for Qwen4-Exp only.")
+    if IS_NPU_AVAILABLE and model_type != "qwen4_exp":
+        raise NotImplementedError("Context parallelism on Ascend/NPU is currently implemented for Qwen4-Exp only.")
+
     if model_type in CONTEXT_PARALLEL_MODEL_TYPES:
         return
 

@@ -67,6 +67,7 @@ class ParallelState:
     pp_size: int = 1
     cp_size: int = 1
     ulysses_size: int = 1
+    allow_hybrid_cp: bool = False
     dp_mode: Literal["ddp", "fsdp2"] = "fsdp2"
     device_type: str = get_device_type()
     include_sp_in_fsdp: bool = True
@@ -89,7 +90,7 @@ class ParallelState:
         if self.cp_size < 1:
             raise ValueError(f"cp_size must be a positive integer; got {self.cp_size}.")
 
-        if self.cp_size > 1 and self.ulysses_size > 1:
+        if self.cp_size > 1 and self.ulysses_size > 1 and not self.allow_hybrid_cp:
             raise NotImplementedError(
                 "Context parallelism cannot be combined with Ulysses yet; "
                 f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
@@ -497,6 +498,7 @@ def _init_parallel_state(
     pp_size: int = 1,
     cp_size: int = 1,
     ulysses_size: int = 1,
+    allow_hybrid_cp: bool = False,
     dp_mode: Literal["ddp", "fsdp2"] = "fsdp2",
     device_type: str = None,
     include_sp_in_fsdp: bool = True,
@@ -572,6 +574,7 @@ def _init_parallel_state(
         pp_size,
         cp_size,
         ulysses_size,
+        allow_hybrid_cp,
         dp_mode,
         device_type,
         include_sp_in_fsdp,
@@ -713,6 +716,7 @@ def _init_parallel_state(
         pp_size=pp_size,
         cp_size=cp_size,
         ulysses_size=ulysses_size,
+        allow_hybrid_cp=allow_hybrid_cp,
         dp_mode=dp_mode,
         device_type=device_type,
         include_sp_in_fsdp=include_sp_in_fsdp,
@@ -748,6 +752,7 @@ def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Opti
         pp_size=accelerator.pp_size,
         cp_size=accelerator.cp_size,
         ulysses_size=accelerator.ulysses_size,
+        allow_hybrid_cp=getattr(accelerator, "allow_hybrid_cp", False),
         extra_parallel_sizes=accelerator.extra_parallel_sizes,
         extra_parallel_placement_innermost=accelerator.extra_parallel_placement_innermost,
         extra_parallel_names=accelerator.extra_parallel_names,
