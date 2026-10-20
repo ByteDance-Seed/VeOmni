@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 from types import SimpleNamespace
 
@@ -584,3 +585,26 @@ def test_packed_flex_builder_reuses_real_graphs_and_preserves_visibility(monkeyp
             assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == repeat_graphs
     finally:
         torch.compiler.reset()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_flex_builder_restores_hf_functions_after_offset_patch(fails):
+    """Scoped builder/offset replacements must not leak into native HF calls."""
+    from transformers import masking_utils
+
+    original_builder = masking_utils.create_block_mask
+    original_offsets = masking_utils.add_offsets_to_mask_function
+
+    def predicate(batch_idx, head_idx, q_idx, kv_idx):
+        """Exercise restoration when user predicate evaluation raises."""
+        if fails:
+            raise RuntimeError("predicate failed")
+        return q_idx >= kv_idx
+
+    context = pytest.raises(RuntimeError, match="predicate failed") if fails else contextlib.nullcontext()
+    with context:
+        flex_attention_mask_builder(
+            1, 4, 6, q_offset=2, mask_function=predicate, device="cpu", compile_block_mask=False
+        )
+    assert masking_utils.create_block_mask is original_builder
+    assert masking_utils.add_offsets_to_mask_function is original_offsets

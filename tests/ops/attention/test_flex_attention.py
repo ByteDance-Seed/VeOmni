@@ -846,7 +846,9 @@ def test_flex_fa4_variable_lengths_reuse_graphs_and_match_math_sdpa(
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Flex-FA4 requires CUDA")
-def test_dynamic_flex_inside_static_outer_compile_matches_standalone_gradients():
+@pytest.mark.parametrize("framework_scalars", [False, True])
+def test_dynamic_flex_inside_static_outer_compile_matches_standalone_gradients(framework_scalars):
+    """Static outer compilation retains standalone callback values and gradients."""
     device = torch.device(get_device_type())
     if flex_backend.get_gpu_compute_capability(device) < 90 or not flex_backend._fa4._flash_attn_cute_available():
         pytest.skip("Flex-FA4 requires SM90+ and flash-attn-4")
@@ -861,7 +863,7 @@ def test_dynamic_flex_inside_static_outer_compile_matches_standalone_gradients()
             mask,
             dropout=0.0,
             scaling=128**-0.5,
-            softcap=None,
+            softcap=2.5 if framework_scalars else None,
             kernel_options={"BACKEND": "FLASH"},
         )[0]
 
@@ -869,7 +871,11 @@ def test_dynamic_flex_inside_static_outer_compile_matches_standalone_gradients()
     compiled = torch.compile(outer, dynamic=False, fullgraph=True)
     try:
         for length in (259, 389, 517, 1027):
-            mask, _ = _mixed_packed_mask(length, device)
+            mask, _ = (
+                _framework_scalar_mask_case(length, "both", 33, device)
+                if framework_scalars
+                else _mixed_packed_mask(length, device)
+            )
             tensors = [
                 torch.randn(1, heads, length, 128, device=device, dtype=torch.bfloat16, requires_grad=True)
                 for heads in (7, 1, 1)
@@ -885,7 +891,7 @@ def test_dynamic_flex_inside_static_outer_compile_matches_standalone_gradients()
                 mask,
                 dropout=0.0,
                 scaling=128**-0.5,
-                softcap=None,
+                softcap=2.5 if framework_scalars else None,
                 kernel_options={"BACKEND": "FLASH"},
             )
             torch.testing.assert_close(actual, expected, atol=1e-2, rtol=2e-2)
@@ -1244,3 +1250,213 @@ def test_flex_fa4_unvalidated_sparse_architecture_retains_triton(monkeypatch):
     monkeypatch.setattr(flex_backend, "get_gpu_compute_capability", lambda device: 120)
     monkeypatch.setattr(flex_backend._fa4, "_flash_attn_cute_available", lambda: True)
     assert flex_backend.resolve_flex_attention(torch.device("cuda"), {}) is flex_backend._flex_attention_triton
+
+
+def _framework_scalar_mask_case(length, case, window, device, *, compile_block_mask=False):
+    """Build the public mask and an independent per-document visibility oracle."""
+    packed = case in ("packed", "packed_cached", "flattened", "shared")
+    cached = case in ("cached", "packed_cached")
+    batch_size = 2 if case in ("flattened", "shared") else 1
+    kv_length = length + (18 if case == "packed_cached" else 17 if cached else 0)
+    kv_offset = 11 if cached else 0
+    q_offset = kv_offset + kv_length - length
+    expected = torch.zeros(batch_size, 1, length, kv_length, device=device, dtype=torch.bool)
+    q_flat, k_flat = [0], [0]
+    for batch in range(batch_size):
+        split = length // 3 + (batch if case == "flattened" else 0)
+        q_lengths = (split, length - split) if packed else (length,)
+        k_lengths = (
+            tuple(q + (7 if i == 0 else 11) for i, q in enumerate(q_lengths))
+            if packed and cached
+            else (q_lengths if packed else (kv_length,))
+        )
+        qs = ks = 0
+        for q_len, k_len in zip(q_lengths, k_lengths, strict=True):
+            # A cached Q document is the suffix of its corresponding K document.
+            q_pos = torch.arange(q_len, device=device)[:, None] + k_len - q_len
+            k_pos = torch.arange(k_len, device=device)[None, :]
+            visibility = k_pos <= q_pos
+            if window is not None:
+                visibility &= k_pos > q_pos - window
+            expected[batch, 0, qs : qs + q_len, ks : ks + k_len] = visibility
+            qs += q_len
+            ks += k_len
+            q_flat.append(batch * length + qs)
+            k_flat.append(batch * kv_length + ks)
+    kwargs = {}
+    if packed:
+        if case == "shared":
+            q_flat = q_flat[:3]
+        kwargs["cu_seqlens"] = torch.tensor(q_flat, device=device, dtype=torch.int32)
+        if cached:
+            kwargs["cu_seqlens_k"] = torch.tensor(k_flat, device=device, dtype=torch.int32)
+    mask = flex_mask_backend.flex_attention_mask_builder(
+        batch_size,
+        length,
+        kv_length,
+        q_offset=q_offset,
+        kv_offset=kv_offset,
+        device=device,
+        sliding_window=window,
+        skip_ulysses=True,
+        # Isolate attention graph counts from mask-construction compilation.
+        compile_block_mask=compile_block_mask,
+        **kwargs,
+    )
+    return mask, expected
+
+
+def _softcap_math_reference(query, key, value, visible, softcap):
+    """Float32 dense attention with explicit GQA, score transform, and masking."""
+    groups = query.shape[1] // key.shape[1]
+    key = key.repeat_interleave(groups, dim=1).float()
+    value = value.repeat_interleave(groups, dim=1).float()
+    scores = (query.float() @ key.transpose(-2, -1)) * query.shape[-1] ** -0.5
+    if softcap is not None:
+        scores = softcap * torch.tanh(scores / softcap)
+    scores = scores.masked_fill(~visible, -float("inf"))
+    return (scores.softmax(dim=-1) @ value).to(query.dtype).transpose(1, 2).contiguous()
+
+
+_SCALAR_CALLBACK_CASES = [
+    (case, dtype, token_major)
+    for case in ("causal", "window", "softcap", "both")
+    for dtype in (torch.bfloat16, torch.float16)
+    for token_major in (False, True)
+] + [
+    (case, torch.bfloat16, token_major)
+    for case in ("packed", "cached", "packed_cached", "flattened", "shared")
+    for token_major in (False, True)
+    if case not in ("flattened", "shared") or not token_major
+]
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Flex-FA4 requires CUDA")
+@pytest.mark.parametrize(("case", "dtype", "token_major"), _SCALAR_CALLBACK_CASES)
+def test_flex_fa4_framework_scalars_match_math_and_reuse_graphs(case, dtype, token_major, record_property):
+    """Exercise real FLASH callbacks across lengths and changing scalar values."""
+    device = torch.device(get_device_type())
+    if flex_backend.get_gpu_compute_capability(device) < 90 or not flex_backend._fa4._flash_attn_cute_available():
+        pytest.skip("Flex-FA4 requires SM90+ and flash-attn-4")
+    lengths = (65, 129, 193, 259, 389, 517, 645, 773, 901, 1027, 1283, 1541)
+    cases = []
+    for i, length in enumerate(lengths):
+        window = None if case in ("causal", "softcap") else (17, 33, 65)[i % 3]
+        softcap = None if case in ("causal", "window") else (1.25, 2.5, 5.0)[i % 3]
+        mask, visible = _framework_scalar_mask_case(length, case, window, device)
+        cases.append((mask, visible, softcap))
+    cases += [cases[i] for i in (0, 4, 1, 0)]
+    generator = torch.Generator(device=device).manual_seed(1328)
+    torch.compiler.reset()
+    flex_backend._fa4._compiled_flex_attention_fa4.cache_clear()
+    initial_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+    max_gradient_error = 0.0
+    try:
+        with torch._dynamo.config.patch(recompile_limit=4, fail_on_recompile_limit_hit=True):
+            for index, (mask, visible, softcap) in enumerate(cases):
+                if index == len(lengths):
+                    repeat_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+                batch_size, _, q_length, kv_length = visible.shape
+                tensors = [
+                    torch.randn(
+                        batch_size,
+                        heads,
+                        length,
+                        64,
+                        device=device,
+                        dtype=dtype,
+                        generator=generator,
+                        requires_grad=True,
+                    )
+                    for heads, length in ((4, q_length), (2, kv_length), (2, kv_length))
+                ]
+                refs = [tensor.detach().clone().requires_grad_() for tensor in tensors]
+                expected = _softcap_math_reference(*refs, visible, softcap)
+                if token_major:
+                    tensors = [
+                        tensor.squeeze(0).transpose(0, 1).contiguous().detach().requires_grad_() for tensor in tensors
+                    ]
+                    expected = expected.squeeze(0)
+                actual, auxiliary = flex_backend.flex_attention_forward(
+                    _FakeAttentionModule(),
+                    *tensors,
+                    mask,
+                    scaling=64**-0.5,
+                    softcap=softcap,
+                    skip_ulysses=True,
+                    kernel_options={"BACKEND": "FLASH"},
+                )
+                assert auxiliary is None
+                torch.testing.assert_close(actual, expected, atol=1e-2, rtol=2e-2)
+                gradient = torch.randn(actual.shape, device=device, dtype=dtype, generator=generator)
+                for actual_grad, expected_grad in zip(
+                    torch.autograd.grad(actual, tensors, gradient),
+                    torch.autograd.grad(expected, refs, gradient),
+                    strict=True,
+                ):
+                    if token_major:
+                        expected_grad = expected_grad.squeeze(0).transpose(0, 1)
+                    assert torch.isfinite(actual_grad).all()
+                    relative_error = (
+                        actual_grad.float() - expected_grad.float()
+                    ).norm() / expected_grad.float().norm()
+                    max_gradient_error = max(max_gradient_error, relative_error.item())
+                    assert relative_error <= 0.01
+            graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"] - initial_graphs
+            record_property("unique_graphs", graphs)
+            record_property("max_gradient_relative_error", max_gradient_error)
+            assert 1 <= graphs <= 4
+            assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == repeat_graphs
+    finally:
+        torch.compiler.reset()
+        flex_backend._fa4._compiled_flex_attention_fa4.cache_clear()
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Flex-FA4 requires CUDA")
+@pytest.mark.parametrize("case", ["both", "packed_cached", "flattened"])
+def test_flex_fa4_framework_scalars_with_compiled_mask_builder(case):
+    """Default compiled mask construction also feeds real FLASH softcap training."""
+    device = torch.device(get_device_type())
+    if flex_backend.get_gpu_compute_capability(device) < 90 or not flex_backend._fa4._flash_attn_cute_available():
+        pytest.skip("Flex-FA4 requires SM90+ and flash-attn-4")
+    torch.compiler.reset()
+    flex_backend._fa4._compiled_flex_attention_fa4.cache_clear()
+    try:
+        mask, visible = _framework_scalar_mask_case(259, case, 33, device, compile_block_mask=True)
+        batch_size, _, q_length, kv_length = visible.shape
+        generator = torch.Generator(device=device).manual_seed(432473)
+        tensors = [
+            torch.randn(
+                batch_size,
+                heads,
+                length,
+                64,
+                device=device,
+                dtype=torch.bfloat16,
+                generator=generator,
+                requires_grad=True,
+            )
+            for heads, length in ((4, q_length), (2, kv_length), (2, kv_length))
+        ]
+        refs = [tensor.detach().clone().requires_grad_() for tensor in tensors]
+        expected = _softcap_math_reference(*refs, visible, 2.5)
+        actual, _ = flex_backend.flex_attention_forward(
+            _FakeAttentionModule(),
+            *tensors,
+            mask,
+            softcap=2.5,
+            skip_ulysses=True,
+            kernel_options={"BACKEND": "FLASH"},
+        )
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=2e-2)
+        gradient = torch.randn(actual.shape, device=device, dtype=actual.dtype, generator=generator)
+        for actual_grad, expected_grad in zip(
+            torch.autograd.grad(actual, tensors, gradient),
+            torch.autograd.grad(expected, refs, gradient),
+            strict=True,
+        ):
+            assert torch.isfinite(actual_grad).all()
+            assert (actual_grad.float() - expected_grad.float()).norm() <= 0.01 * expected_grad.float().norm()
+    finally:
+        torch.compiler.reset()
+        flex_backend._fa4._compiled_flex_attention_fa4.cache_clear()

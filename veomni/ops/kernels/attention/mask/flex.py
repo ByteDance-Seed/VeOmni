@@ -28,7 +28,6 @@ from transformers.masking_utils import (
     and_masks,
     bidirectional_mask_function,
     causal_mask_function,
-    sliding_window_overlay,
 )
 
 from .....utils.device import get_gpu_compute_capability, is_nvidia_cuda_device
@@ -69,20 +68,50 @@ def _eager_create_block_mask(*args, **kwargs):
     return create_block_mask(*args, **kwargs)
 
 
+def _tensor_offset_mask(
+    mask_function: Callable, q_offset: int, kv_offset: int, *, device, q_length, kv_length
+) -> Callable:
+    """Preserve HF's absolute coordinates without capturing Python offsets."""
+    if q_offset == 0 and kv_offset == 0:
+        return mask_function
+    q_offsets = torch.tensor([q_offset], device=device, dtype=torch.int64).expand(q_length)
+    k_offsets = torch.tensor([kv_offset], device=device, dtype=torch.int64).expand(kv_length)
+
+    def offset_mask(batch_idx, head_idx, q_idx, kv_idx):
+        """Read offsets from an indexed device buffer for dynamic FLASH."""
+        return mask_function(
+            batch_idx,
+            head_idx,
+            q_idx + q_offsets[q_idx].to(q_idx.dtype),
+            kv_idx + k_offsets[kv_idx].to(kv_idx.dtype),
+        )
+
+    return offset_mask
+
+
 @contextmanager
-def _patched_hf_create_block_mask(compile_block_mask: bool, block_size: int | tuple[int, int]) -> Iterator[None]:
+def _patched_hf_create_block_mask(
+    compile_block_mask: bool, block_size: int | tuple[int, int], *, device, q_length, kv_length
+) -> Iterator[None]:
     """Swap HF's ``create_block_mask`` for the compiled or eager path.
 
     Transformers still passes ``_compile=True`` on torch>=2.6, so the eager
     path cannot use the raw function or the flag would compile anyway.
+    Its offset wrapper also captures Python integers even for zero offsets;
+    replace that wrapper within the same scope and restore both HF functions.
     """
     original = masking_utils.create_block_mask
+    original_offsets = masking_utils.add_offsets_to_mask_function
     builder = _create_block_mask if compile_block_mask else _eager_create_block_mask
     masking_utils.create_block_mask = partial(builder, BLOCK_SIZE=block_size)
+    masking_utils.add_offsets_to_mask_function = partial(
+        _tensor_offset_mask, device=device, q_length=q_length, kv_length=kv_length
+    )
     try:
         yield
     finally:
         masking_utils.create_block_mask = original
+        masking_utils.add_offsets_to_mask_function = original_offsets
 
 
 def flex_attention_mask_builder(
@@ -166,7 +195,18 @@ def flex_attention_mask_builder(
         q_offset = kv_offset = 0
 
     if sliding_window is not None:
-        mask_function = and_masks(mask_function, sliding_window_overlay(sliding_window))
+        # FLASH's pinned codegen requires a tensor-derived index even for a
+        # uniform value. Expand a one-element allocation over absolute Q/K
+        # coordinates, including packed Q positions mapped into K documents.
+        window = torch.tensor([sliding_window], device=device, dtype=torch.int64).expand(
+            max(q_length + max(q_offset, 0), kv_length + max(kv_offset, 0))
+        )
+
+        def window_mask(batch_idx, head_idx, q_idx, kv_idx):
+            """Keep the window bound in indexed device metadata, not a Python capture."""
+            return kv_idx > q_idx - window[q_idx]
+
+        mask_function = and_masks(mask_function, window_mask)
     if cu_seqlens is not None:
         mask_function = packed_mask_function(
             mask_function=mask_function,
@@ -180,7 +220,9 @@ def flex_attention_mask_builder(
             batch_size=batch_size,
         )
 
-    with _patched_hf_create_block_mask(compile_block_mask, _flex_block_size(device)):
+    with _patched_hf_create_block_mask(
+        compile_block_mask, _flex_block_size(device), device=device, q_length=q_length, kv_length=kv_length
+    ):
         return ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"](
             batch_size=batch_size,
             q_length=q_length,

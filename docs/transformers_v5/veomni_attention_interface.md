@@ -197,6 +197,18 @@ tensors; the pinned CuteDSL lowering can also reject zero-dimensional scalar-ten
 captures, so replacing a Python scalar with a scalar tensor is not sufficient.
 Dtype, head dimensions and other guards can still produce specializations.
 
+Framework-generated sliding-window, softcap, and Q/K offset callbacks use
+indexed device metadata instead of captured Python scalars. Uniform values are
+stored once and broadcast as views; callbacks index them with token positions,
+because constant-index loads such as `buffer[0]` also fail in the pinned FLASH
+code generator. Zero offsets bypass the offset wrapper. Packed coordinates are
+precomputed as row-by-token metadata, avoiding symbolic row-width arithmetic
+inside the callback. These changes preserve causal/window visibility,
+cached suffix alignment, and softcap-before-bias ordering. They do not rewrite
+arbitrary user callbacks or change the explicit backend selection.
+Packed coordinate mapping preserves the caller's index dtype (Int32 on FLASH)
+before invoking nested predicates, so their metadata lookups remain valid.
+
 Keep `mask_mod` / `mask_function` a fixed predicate. Encode per-batch
 geometry in captured tensors such as document ids, span ids, or
 `cu_seqlens`, and reuse the same callable. Python constants inside the predicate

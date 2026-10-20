@@ -125,12 +125,20 @@ def _flex_attention_fa4(
         )
 
     score_mod = None
+    # The pinned FLASH codegen needs an SSA index for auxiliary loads. A
+    # broadcast view keeps one stored value for token-indexed score_mod loads.
+    softcap_buffer = (
+        None
+        if softcap is None
+        else torch.tensor([softcap], device=query.device, dtype=torch.float32).expand(query.shape[-2])
+    )
     if softcap is not None or position_bias is not None:
 
         def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
             """Apply softcap before adding the caller's per-position score bias."""
-            if softcap is not None:
-                score = softcap * torch.tanh(score / softcap)
+            if softcap_buffer is not None:
+                cap = softcap_buffer[q_idx]
+                score = cap * torch.tanh(score / cap)
             if position_bias is not None:
                 score = score + position_bias[batch_idx, head_idx, q_idx, kv_idx]
             return score
