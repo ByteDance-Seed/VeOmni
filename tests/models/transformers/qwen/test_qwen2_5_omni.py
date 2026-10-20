@@ -189,12 +189,9 @@ def test_qwen2_5_omni_vision_and_audio_attention_veomni_sdpa_matches_hf(availabl
         atol=0,
     )
 
-    # Also verify raw ``flex_attention`` and ``veomni_sage_attention`` preserve segment isolation.
-    # Stub the underlying HF ``flex_attention`` and ``sageattn`` kernels so this model-level
-    # test exercises the wrapper's ``cu_seqlens`` splitting on CPU without invoking Inductor
-    # (Ascend's CPU inductor fails with ``AttributeError: 'Subgraph' object has no attribute 'dtype'``).
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-
+    # Also verify ``veomni_sage_attention`` preserves segment isolation.
+    # Stub the underlying ``sageattn`` kernel so this model-level test exercises the
+    # wrapper's ``cu_seqlens`` splitting on CPU.
     from veomni.ops.kernels.attention.standard import sage as sage_backend
 
     def fake_sage(query, key, value, tensor_layout="HND", is_causal=False, sm_scale=None):
@@ -203,29 +200,22 @@ def test_qwen2_5_omni_vision_and_audio_attention_veomni_sdpa_matches_hf(availabl
         weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
         return torch.matmul(weights, value)
 
-    def fake_hf_flex(module, query, key, value, attention_mask, *, scaling=None, **kwargs):
-        assert "cu_seq_lens_q" not in kwargs and "cu_seq_lens_k" not in kwargs
-        out = fake_sage(query, key, value, sm_scale=scaling)
-        return out.transpose(1, 2).contiguous(), None
-
     monkeypatch.setattr(sage_backend, "sageattn", fake_sage)
-    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, "flex_attention", fake_hf_flex)
-    for impl in ("flex_attention", "veomni_sage_attention"):
-        cfg = _tiny_thinker_config().audio_config
-        cfg._attn_implementation = impl
-        with ops_config_scope(eager_ops_config()):
-            attn = Qwen2_5OmniAudioAttention(cfg).eval()
-        attn.load_state_dict(hf_audio_attn.state_dict())
-        h1 = torch.randn(4, cfg.d_model)
-        h2 = h1.clone()
-        h2[2:] += 10.0
-        with torch.no_grad():
-            # Single-segment ([0, 4]) and multi-segment ([0, 2, 4]) both succeed and isolate segments.
-            single_out = attn(h1, cu_seqlens=torch.tensor([0, 4], dtype=torch.int32))
-            assert single_out.shape == (4, cfg.d_model)
-            out1 = attn(h1, cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32))
-            out2 = attn(h2, cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32))
-            torch.testing.assert_close(out1[:2], out2[:2], rtol=1e-5, atol=1e-5)
+    cfg = _tiny_thinker_config().audio_config
+    cfg._attn_implementation = "veomni_sage_attention"
+    with ops_config_scope(eager_ops_config()):
+        attn = Qwen2_5OmniAudioAttention(cfg).eval()
+    attn.load_state_dict(hf_audio_attn.state_dict())
+    h1 = torch.randn(4, cfg.d_model)
+    h2 = h1.clone()
+    h2[2:] += 10.0
+    with torch.no_grad():
+        # Single-segment ([0, 4]) and multi-segment ([0, 2, 4]) both succeed and isolate segments.
+        single_out = attn(h1, cu_seqlens=torch.tensor([0, 4], dtype=torch.int32))
+        assert single_out.shape == (4, cfg.d_model)
+        out1 = attn(h1, cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32))
+        out2 = attn(h2, cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32))
+        torch.testing.assert_close(out1[:2], out2[:2], rtol=1e-5, atol=1e-5)
 
 
 class _StubTokenizer:

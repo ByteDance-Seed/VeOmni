@@ -52,7 +52,6 @@ _RAW_NON_SP_IMPLS = frozenset(
         "flash_attention_2",
         "flash_attention_3",
         "flash_attention_4",
-        "flex_attention",
     }
 )
 
@@ -97,7 +96,7 @@ def lookup(impl: str) -> Callable:
                 )
 
         packed_cu_seqlens = None
-        if impl in ("sdpa", "eager", "flex_attention"):
+        if impl in ("sdpa", "eager"):
             kwargs, packed_cu_seqlens = extract_packed_varlen_cu_seqlens(
                 kwargs,
                 batch_size=query.shape[0],

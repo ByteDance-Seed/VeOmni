@@ -261,7 +261,7 @@ def test_ulysses_head_auxiliary_slices_global_vector_by_rank(monkeypatch):
 
 @pytest.mark.parametrize(
     "impl",
-    ("eager", "sdpa", "flex_attention", "flash_attention_2", "flash_attention_3", "flash_attention_4"),
+    ("eager", "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4"),
 )
 def test_lookup_raw_attention_rejects_active_ulysses_unless_skipped(monkeypatch, impl):
     monkeypatch.setattr(

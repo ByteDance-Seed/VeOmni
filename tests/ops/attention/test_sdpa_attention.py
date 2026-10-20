@@ -344,22 +344,22 @@ def test_sdpa_packed_varlen_rejects_invalid_metadata(monkeypatch):
         )
 
 
-def test_raw_flex_attention_lookup_splits_packed_cu_seqlens_and_accepts_block_mask(monkeypatch):
-    """Raw ``flex_attention`` lookup splits unmasked multi-segment calls and preserves BlockMask calls."""
+def test_sdpa_lookup_splits_packed_cu_seqlens_and_accepts_block_mask(monkeypatch):
+    """``sdpa`` lookup splits unmasked multi-segment calls and preserves BlockMask calls."""
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
     from tests.ops.attention.attention_cases import eager_create_block_mask
 
     recorded_chunks = []
 
-    def fake_hf_flex(module, query, key, value, attention_mask, **kwargs):
+    def fake_hf_sdpa(module, query, key, value, attention_mask, **kwargs):
         recorded_chunks.append((query.shape, attention_mask, dict(kwargs)))
         return eager_attention_forward(module, query, key, value, None, **kwargs)
 
-    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, "flex_attention", fake_hf_flex)
+    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, "sdpa", fake_hf_sdpa)
     module = _FakeAttentionModule()
     module.is_causal = False
-    forward = VeomniOp("attention", "standard", "flex_attention")
+    forward = VeomniOp("attention", "standard", "sdpa")
 
     cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
     q1 = torch.randn(1, 2, 4, 8)
