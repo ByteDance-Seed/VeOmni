@@ -469,7 +469,7 @@ def process_sample_gemma3(
         text = processor.apply_chat_template(prefix_messages, tokenize=False, add_generation_prompt=False)
         image_count = sum(item["type"] == "image" for msg in prefix_messages for item in msg["content"])
         text = _replace_gemma3_image_tokens(text, processor, num_crops, image_count)
-        return processor.tokenizer(text, add_special_tokens=True, return_tensors="pt")["input_ids"][0]
+        return processor.tokenizer(text, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
 
     input_ids = tokenize_prefix(len(messages))
     labels = torch.full_like(input_ids, IGNORE_INDEX)
