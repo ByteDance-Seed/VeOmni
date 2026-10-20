@@ -25,7 +25,7 @@ if get_device_type() == "cpu" or not c10d.is_available() or not c10d.is_backend_
 from torch.testing._internal.common_utils import run_tests
 
 import veomni.models.diffusers.ltx2_3.ltx_core  # noqa: F401
-from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+from veomni.distributed.parallel_state import use_parallel_state
 from veomni.models.diffusers.ltx2_3.ltx_transformer.configuration_ltx2_3_transformer import (
     LTXVideoTransformerModelConfig,
 )
@@ -114,45 +114,37 @@ class LTX2UlyssesTest(SequenceParallelTest):
             for gradient_checkpointing in (False, True):
                 model = _build_model(device, with_audio, gradient_checkpointing)
                 cases = {name: case for name, case in CASES.items() if bool(case[3]) == with_audio}
-                try:
-                    _init_parallel_state(
-                        dp_size=self.world_size, ulysses_size=1, device_type=get_device_type(), name=None
-                    )
+                with use_parallel_state(self.dp_state):
                     refs = {name: _forward_backward(model, *case, device) for name, case in cases.items()}
-                    clear_parallel_state()
 
-                    _init_parallel_state(
-                        dp_size=1, ulysses_size=self.world_size, device_type=get_device_type(), name=None
-                    )
-                    for name, case in cases.items():
-                        tag = f"{name}{' (ckpt)' if gradient_checkpointing else ''}"
-                        try:
+                for name, case in cases.items():
+                    tag = f"{name}{' (ckpt)' if gradient_checkpointing else ''}"
+                    try:
+                        with use_parallel_state(self.sp_state):
                             preds, grads = _forward_backward(model, *case, device)
-                        except RuntimeError as e:
-                            failures.append(f"{tag}: {str(e).splitlines()[0]}")
-                            continue
-                        ref_preds, ref_grads = refs[name]
-                        pred_err = max(((p - r).norm() / r.norm()).item() for p, r in zip(preds, ref_preds))
-                        sp_grad_names = [None] * self.world_size
-                        c10d.all_gather_object(sp_grad_names, set(grads), group=group)
-                        ref_grad_names = set(ref_grads)
-                        assert all(names == ref_grad_names for names in sp_grad_names), (
-                            f"{tag}: gradient-name mismatch; "
-                            f"missing per rank: {[sorted(ref_grad_names - names) for names in sp_grad_names]}"
-                        )
-                        # Param grads cover only this rank's tokens and the loss is replicated on every
-                        # SP rank, so sum over SP and divide by its size (FSDP's mean over the SP mesh).
-                        diff_sq = ref_sq = 0.0
-                        for n, g in grads.items():
-                            c10d.all_reduce(g, group=group)
-                            g /= self.world_size
-                            diff_sq += (g - ref_grads[n]).pow(2).sum().item()
-                            ref_sq += ref_grads[n].pow(2).sum().item()
-                        grad_err = (diff_sq / ref_sq) ** 0.5
-                        if pred_err > 1e-5 or grad_err > 1e-5:
-                            failures.append(f"{tag}: prediction rel err {pred_err:.2e}, grad rel err {grad_err:.2e}")
-                finally:
-                    clear_parallel_state()
+                    except RuntimeError as e:
+                        failures.append(f"{tag}: {str(e).splitlines()[0]}")
+                        continue
+                    ref_preds, ref_grads = refs[name]
+                    pred_err = max(((p - r).norm() / r.norm()).item() for p, r in zip(preds, ref_preds))
+                    sp_grad_names = [None] * self.world_size
+                    c10d.all_gather_object(sp_grad_names, set(grads), group=group)
+                    ref_grad_names = set(ref_grads)
+                    assert all(names == ref_grad_names for names in sp_grad_names), (
+                        f"{tag}: gradient-name mismatch; "
+                        f"missing per rank: {[sorted(ref_grad_names - names) for names in sp_grad_names]}"
+                    )
+                    # Param grads cover only this rank's tokens and the loss is replicated on every
+                    # SP rank, so sum over SP and divide by its size (FSDP's mean over the SP mesh).
+                    diff_sq = ref_sq = 0.0
+                    for n, g in grads.items():
+                        c10d.all_reduce(g, group=group)
+                        g /= self.world_size
+                        diff_sq += (g - ref_grads[n]).pow(2).sum().item()
+                        ref_sq += ref_grads[n].pow(2).sum().item()
+                    grad_err = (diff_sq / ref_sq) ** 0.5
+                    if pred_err > 1e-5 or grad_err > 1e-5:
+                        failures.append(f"{tag}: prediction rel err {pred_err:.2e}, grad rel err {grad_err:.2e}")
         assert not failures, "\n".join(failures)
 
 
