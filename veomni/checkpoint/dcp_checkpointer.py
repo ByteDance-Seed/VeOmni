@@ -68,6 +68,7 @@ _EXTRA_STATE_KEY = "extra_state"
 _EXTRA_STATE_DIRNAME = "extra_state"
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 _ZERO_OPTIMIZER_STATE_MARKER = "__veomni_zero_optimizer_state__"
+_ABSENT_OPTIMIZER_STATE_ATTR = "_veomni_absent_optimizer_state_bases"
 _EXTRA_PARALLEL_FIRST_MESHES = weakref.WeakKeyDictionary()
 _EXTRA_PARALLEL_FIRST_MESH_LOCK = threading.Lock()
 
@@ -143,6 +144,68 @@ def _finish_zero_optimizer_state_resume(optimizer) -> None:
         _reset_zero_optimizer_state_resume(optimizer)
 
 
+def _reset_absent_optimizer_state(optimizer) -> None:
+    """Clear a planner-to-loader handoff for wholly absent optimizer state."""
+    if optimizer is None:
+        return
+    targets = optimizer.values() if isinstance(optimizer, dict) else (optimizer,)
+    for target in targets:
+        setattr(target, _ABSENT_OPTIMIZER_STATE_ATTR, frozenset())
+
+
+def _record_absent_optimizer_state(optimizer, bases) -> None:
+    if optimizer is None:
+        return
+    targets = optimizer.values() if isinstance(optimizer, dict) else (optimizer,)
+    frozen = frozenset(bases)
+    for target in targets:
+        setattr(target, _ABSENT_OPTIMIZER_STATE_ATTR, frozen)
+
+
+def _iter_optimizer_leaves(optimizer):
+    if isinstance(optimizer, dict):
+        for child in optimizer.values():
+            yield from _iter_optimizer_leaves(child)
+        return
+    children = getattr(optimizer, "optimizers_dict", None)
+    if children is not None:
+        for child in children.values():
+            yield from _iter_optimizer_leaves(child)
+        return
+    yield optimizer
+
+
+def _drop_absent_optimizer_state(model, optimizer) -> None:
+    """Remove DCP-created placeholders for parameters with no saved state.
+
+    ``_init_optim_state`` calls ``step()`` with zero gradients, which advances a
+    placeholder ``step`` to one and copies a master weight before the model may
+    be restored. Leaving that state behind makes the first real update use step
+    two. Drop the whole state for a parameter that was entirely absent so the
+    optimizer recreates it lazily from the restored parameter.
+    """
+    bases = getattr(optimizer, _ABSENT_OPTIMIZER_STATE_ATTR, ())
+    if not bases:
+        return
+    names = dict(model.named_parameters())
+    fqns = {
+        base.removeprefix("optimizer.state.")
+        for base in bases
+        if isinstance(base, str) and base.startswith("optimizer.state.")
+    }
+    leaves = tuple(_iter_optimizer_leaves(optimizer))
+    dropped = 0
+    for fqn in sorted(fqns):
+        param = names.get(fqn)
+        if param is None:
+            raise RuntimeError(f"Cannot resolve parameter for absent optimizer state: {fqn}")
+        for leaf in leaves:
+            if leaf.state.pop(param, None) is not None:
+                dropped += 1
+    if dropped:
+        logger.info_rank0("DCP resume dropped %d wholly absent optimizer state entr(ies)", dropped)
+
+
 def _requires_exact_optimizer_state_dtypes(optimizer):
     """Opt in only precision-sensitive optimizers, including MultiOptimizer."""
     optimizer = getattr(optimizer, "optimizer", optimizer)
@@ -204,6 +267,8 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         # The marker is an ephemeral handoff from planning to load_state_dict.
         # Never let a failed plan leave it behind for a later checkpoint.
         _reset_zero_optimizer_state_resume(self.optimizer)
+        if self.optimizer is not None:
+            _reset_absent_optimizer_state(self.optimizer)
         metadata = self.metadata.state_dict_metadata if self.metadata is not None else {}
         has_optimizer_state = any(key.startswith("optimizer.state.") for key in metadata)
         has_zero_state_marker = f"optimizer.{_ZERO_OPTIMIZER_STATE_MARKER}" in metadata
@@ -227,7 +292,7 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
                     path
                     and path[0] == "optimizer"
                     and len(path) > 1
-                    and path[1] == "param_groups"
+                    and (path[1] == "param_groups" or str(path[1]).startswith("param_groups."))
                     and key not in self.metadata.state_dict_metadata
                 ):
                     raise RuntimeError(
@@ -290,6 +355,8 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
                         "explicit checkpoint migration is required"
                     )
                 if lazy_bases and not resume_zero_optimizer_state:
+                    if self.optimizer is not None:
+                        _record_absent_optimizer_state(self.optimizer, lazy_bases)
                     logger.info_rank0(
                         "DCP resume keeps default lazy optimizer state for %d parameter(s) absent from the checkpoint",
                         len(lazy_bases),
@@ -590,29 +657,28 @@ class OptimizerState(Stateful):
                 # MultiOptimizer sub-optimizers can also lose param-group hyperparams
                 # (betas/...) for empty groups after load; restore recurses into them.
                 restore_optimizer_param_group_defaults(self.optimizer)
-                return
-
-            if getattr(self.optimizer, "_is_multi_optimizer", False):
+            elif getattr(self.optimizer, "_is_multi_optimizer", False):
                 self.optimizer.load_state_dict(optim_state_from_dcp_load)
                 restore_optimizer_param_group_defaults(self.optimizer)
-                return
-
-            # Single torch optimizer.
-            # ``strict=False`` matches the DCP planner's allow_partial_load intent:
-            # params that never received a gradient (and thus have no saved Adam
-            # state) keep the default-initialized state that
-            # ``set_optimizer_state_dict`` / ``_init_optim_state`` already created.
-            # Torch 2.11+ raises under the default strict=True when any
-            # requires_grad param is missing from the checkpoint (DeepSeek-V4
-            # indexer ``position_bias`` is one such case on short toy runs).
-            set_optimizer_state_dict(
-                model=self.model,
-                optimizers=self.optimizer,
-                optim_state_dict=optim_state_from_dcp_load,
-                options=StateDictOptions(strict=False),
-            )
-            restore_optimizer_param_group_defaults(self.optimizer)
+            else:
+                # Single torch optimizer.
+                # ``strict=False`` matches the DCP planner's allow_partial_load intent:
+                # params that never received a gradient (and thus have no saved Adam
+                # state) keep the default-initialized state that
+                # ``set_optimizer_state_dict`` / ``_init_optim_state`` already created.
+                # Torch 2.11+ raises under the default strict=True when any
+                # requires_grad param is missing from the checkpoint (DeepSeek-V4
+                # indexer ``position_bias`` is one such case on short toy runs).
+                set_optimizer_state_dict(
+                    model=self.model,
+                    optimizers=self.optimizer,
+                    optim_state_dict=optim_state_from_dcp_load,
+                    options=StateDictOptions(strict=False),
+                )
+                restore_optimizer_param_group_defaults(self.optimizer)
+            _drop_absent_optimizer_state(self.model, self.optimizer)
         finally:
+            _reset_absent_optimizer_state(self.optimizer)
             _finish_zero_optimizer_state_resume(self.optimizer)
 
     def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):

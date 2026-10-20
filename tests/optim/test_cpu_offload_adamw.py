@@ -190,6 +190,83 @@ def test_dcp_keeps_default_state_for_unstepped_parameter(tmp_path):
         )
 
 
+def test_dcp_drops_wholly_absent_optimizer_state_after_resume(tmp_path):
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+    source_model = torch.nn.Linear(1, 1).bfloat16()
+    source_optimizer = CPUOffloadAdamW(source_model.parameters(), lr=0.001)
+    source_model.weight.grad = torch.ones_like(source_model.weight)
+    source_optimizer.step()
+    source_optimizer.zero_grad(set_to_none=True)
+    assert source_model.bias not in source_optimizer.state
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    dcp.save(
+        {"optimizer": OptimizerState(source_model, source_optimizer, parallel_state=parallel_state)},
+        checkpoint_id=tmp_path,
+    )
+
+    target_model = torch.nn.Linear(1, 1).bfloat16()
+    target_optimizer = CPUOffloadAdamW(target_model.parameters(), lr=0.001)
+    # Simulate a fused resume that materializes DCP placeholders before the
+    # restored model value is available. A stale master/step would survive.
+    get_optimizer_state_dict(target_model, target_optimizer)
+    with torch.no_grad():
+        target_model.bias.fill_(7.0)
+    dcp.load(
+        {"optimizer": OptimizerState(target_model, target_optimizer, parallel_state=parallel_state, load=True)},
+        checkpoint_id=tmp_path,
+        planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True, optimizer=target_optimizer),
+    )
+    assert target_model.bias not in target_optimizer.state
+    assert target_optimizer.state[target_model.weight]["step"].item() == 1
+
+    target_model.weight.grad = torch.zeros_like(target_model.weight)
+    target_model.bias.grad = torch.zeros_like(target_model.bias)
+    target_optimizer.step()
+    bias_state = target_optimizer.state[target_model.bias]
+    assert bias_state["step"].item() == 1
+    torch.testing.assert_close(bias_state["master_weight"], torch.full_like(bias_state["master_weight"], 7.0))
+    assert target_optimizer.state[target_model.weight]["step"].item() == 2
+
+
+def test_dcp_rejects_adamw_multi_optimizer_as_muon(tmp_path):
+    from veomni.optim.optimizer import MultiOptimizer
+    from veomni.optim.qwen38_muon import Qwen38MuonAdamW, add_qwen38_plans
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.down_proj = torch.nn.Linear(4, 2, bias=False)
+
+    parallel_state = SimpleNamespace(dp_mode="ddp")
+    source_model = Model().bfloat16()
+    source_child = CPUOffloadAdamW([{"params": [source_model.down_proj.weight]}], lr=0.001)
+    source = MultiOptimizer(source_model, {"all": source_child}, ["all"])
+    source_model.down_proj.weight.grad = torch.ones_like(source_model.down_proj.weight)
+    source.step()
+    source.zero_grad()
+    dcp.save(
+        {"optimizer": OptimizerState(source_model, source, parallel_state=parallel_state)},
+        checkpoint_id=tmp_path,
+    )
+
+    target_model = Model().bfloat16()
+    groups = add_qwen38_plans(target_model, [{"params": [target_model.down_proj.weight], "cpu_offload": False}])
+    target_child = Qwen38MuonAdamW(groups, lr=0.001)
+    target = MultiOptimizer(target_model, {"all": target_child}, ["all"])
+    with pytest.raises(CheckpointException, match="recipe/state is incomplete"):
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(
+                strict_model=False,
+                strict_optimizer_dtype=True,
+                strict_optimizer_recipe=True,
+                optimizer=target,
+            ),
+        )
+
+
 def test_dcp_zero_step_sparse_multi_optimizer_restores_lazy_state(tmp_path):
     from torch.distributed.checkpoint import FileSystemReader
 
