@@ -39,6 +39,7 @@ from rich.console import Console
 from rich.table import Table
 from transformers import set_seed
 
+from tests.tools.ci_config import ci_config_path
 from tests.tools.common_utils import print_device_mem_info
 from tests.tools.launch_utils import find_free_port
 from tests.tools.training_utils import make_eager_ops_config, release_device_memory
@@ -529,7 +530,7 @@ def test_models_patch_fwd_bwd(
     # The ops config consumed per mode is rebuilt in ``forward_backward_step``;
     # this one only has to validate on every device for the first build.
     model_config = ModelArguments(
-        config_path=str(_TOY_CONFIG_DIR / toy_config / "config.json"),
+        config_path=ci_config_path(_TOY_CONFIG_DIR / toy_config / "config.json"),
         ops_implementation=make_eager_ops_config(),
         accelerator=AcceleratorConfig(
             init_device=get_device_type(),

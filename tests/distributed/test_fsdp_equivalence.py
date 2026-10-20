@@ -153,8 +153,10 @@ def _run_fsdp_equivalence(
     single-GPU run covers all micro-batches (with fsdp_size=1).
     """
     from ..tools import compare_metrics, print_comparison_table
+    from ..tools.ci_config import ci_config_path
 
     nproc = _get_nproc()
+    config_path = ci_config_path(config_path)
     test_dir, train_path, dummy_dataset = _setup_model_and_data(model_name, config_path, dataset_type)
 
     try:

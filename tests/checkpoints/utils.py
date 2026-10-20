@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tools import hf_local_or_remote, resolve_ops_overrides
+from tools.ci_config import ci_config_path
 from tools.launch_utils import find_free_port
 
 from veomni.checkpoint.layout import weights_dir
@@ -73,7 +74,7 @@ def get_checkpoint_test_command(
     save_hf_weights=False,
     dp_replicate_size=None,
 ):
-    config_path = MODEL_CONFIGS[model_name]["config_path"]
+    config_path = ci_config_path(MODEL_CONFIGS[model_name]["config_path"])
     tokenizer_path = hf_local_or_remote(MODEL_CONFIGS[model_name]["tokenizer_path"])
     output_dir = get_output_dir(model_name, ep_size, dp_replicate_size)
     port = find_free_port()

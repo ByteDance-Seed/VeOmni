@@ -116,3 +116,55 @@ def test_deepseek_v3_gpu_keeps_default_moe(monkeypatch):
     overrides = training_utils.resolve_ops_overrides("deepseek_v3")
 
     assert not any(flag.startswith("--model.ops_implementation.moe_implementation=") for flag in overrides)
+
+
+def test_gpu_pool_reservations_and_full_node_exclusion():
+    import threading
+
+    from scripts.ci.gpu_pool import GPUJob, run_jobs
+
+    barrier = threading.Barrier(2, timeout=5)
+    lock = threading.Lock()
+    owned = set()
+    seen = {}
+
+    def execute(job, assigned):
+        with lock:
+            assert not owned.intersection(assigned)
+            owned.update(assigned)
+            seen[job.name] = list(assigned)
+        if job.gpus == 4:
+            barrier.wait()
+        else:
+            assert len(owned) == 8
+        with lock:
+            owned.difference_update(assigned)
+        return job.name
+
+    jobs = [GPUJob("a", 4, None), GPUJob("b", 4, None), GPUJob("exclusive", 8, None)]
+    result = run_jobs(jobs, [str(i) for i in range(8)], execute)
+    assert list(result) == ["a", "b", "exclusive"]
+    assert set(seen["a"]).isdisjoint(seen["b"])
+    assert len(seen["exclusive"]) == 8
+
+
+def test_gpu_pool_does_not_dispatch_after_failure():
+    from scripts.ci.gpu_pool import GPUJob, run_jobs
+
+    seen = []
+
+    def execute(job, assigned):
+        seen.append(job.name)
+        raise RuntimeError("worker failed")
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        run_jobs([GPUJob("bad", 8, None), GPUJob("pending", 8, None)], list("01234567"), execute)
+    assert seen == ["bad"]
+
+
+@pytest.mark.parametrize("size", [0, 9])
+def test_gpu_pool_rejects_invalid_reservations(size):
+    from scripts.ci.gpu_pool import GPUJob, run_jobs
+
+    with pytest.raises(ValueError, match="reservation"):
+        run_jobs([GPUJob("bad", size, None)], list("01234567"), lambda *_: None)

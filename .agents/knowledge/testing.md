@@ -5,7 +5,15 @@ will actually run it. Read this before adding a test file.
 
 ## CI selects tests by explicit enumeration
 
-A test that passes locally is not necessarily a test CI runs.
+GPU test invocations and GPU reservations are enumerated in
+`scripts/ci/gpu_tests.json`; the two GPU workflows call
+`scripts/ci/run_gpu_tests.py`. Add or update manifest entries rather than adding
+individual pytest shell lines to the GPU workflows. NPU selection remains in
+the NPU workflows. See `scripts/ci/README.md` for reservations, local commands,
+conditional coverage, and result artifacts.
+
+A test that passes locally is not necessarily a test CI runs. The GPU entries
+below describe the manifest selections used by the named workflows.
 
 | Path | How CI picks it up |
 |------|--------------------|

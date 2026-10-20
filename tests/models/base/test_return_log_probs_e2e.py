@@ -54,8 +54,8 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-TOY_QWEN3 = os.path.join(REPO_ROOT, "tests", "toy_config", "qwen3_toy")
-TOY_QWEN3_VL = os.path.join(REPO_ROOT, "tests", "toy_config", "qwen3vl_toy")
+TOY_QWEN3 = os.path.join(REPO_ROOT, "tests", "toy_config", "ci", "qwen3_tiny")
+TOY_QWEN3_VL = os.path.join(REPO_ROOT, "tests", "toy_config", "ci", "qwen3vl_tiny")
 IGNORE_INDEX = -100
 
 
@@ -213,11 +213,11 @@ def test_return_log_probs_bitwise_matches_logits_reference(toy_path, family):
         model = _build_model(toy_path).eval()
 
         B, L = 2, 16
-        # Keeping token IDs below 32000 avoids the multimodal placeholder ids
+        # Keeping token IDs below 1024 avoids the multimodal placeholder ids
         # (image_token_id, video_token_id, ...) used by VLM configs;
         # this keeps the forward on the text-only path so we can compare
         # bitwise against the lm_head reference.
-        input_ids = torch.randint(0, 32000, (B, L), device=model.device, dtype=torch.long)
+        input_ids = torch.randint(0, 1024, (B, L), device=model.device, dtype=torch.long)
         labels = input_ids.clone()
         labels[0, 0] = IGNORE_INDEX
         labels[1, ::5] = IGNORE_INDEX
@@ -330,7 +330,7 @@ def test_plain_forward_matches_verl_consumer_contract(toy_path, family):
     model = _build_model(toy_path, ce_impl="chunk_loss").eval()
 
     B, L = 2, 16
-    input_ids = torch.randint(0, 32000, (B, L), device=model.device, dtype=torch.long)
+    input_ids = torch.randint(0, 1024, (B, L), device=model.device, dtype=torch.long)
     labels = input_ids.clone()
     labels[0, 0] = IGNORE_INDEX
     labels[1, ::5] = IGNORE_INDEX
@@ -377,7 +377,7 @@ def test_return_log_probs_backward_flows_gradients(toy_path, family):
     model.zero_grad(set_to_none=True)
 
     B, L = 1, 8
-    input_ids = torch.randint(0, 32000, (B, L), device=model.device, dtype=torch.long)
+    input_ids = torch.randint(0, 1024, (B, L), device=model.device, dtype=torch.long)
     labels = input_ids.clone()
     labels[0, 0] = IGNORE_INDEX
 
@@ -426,7 +426,7 @@ def test_return_log_probs_with_topk_distill_populates_three_fields(toy_path, fam
     # VLM configs nest vocab_size under config.text_config; pull it from
     # the lm_head weight to stay model-family-agnostic.
     V = model.lm_head.weight.shape[0]
-    input_ids = torch.randint(0, 32000, (B, L), device=model.device, dtype=torch.long)
+    input_ids = torch.randint(0, 1024, (B, L), device=model.device, dtype=torch.long)
     labels = input_ids.clone()
     labels[0, 0] = IGNORE_INDEX
     labels[1, ::5] = IGNORE_INDEX

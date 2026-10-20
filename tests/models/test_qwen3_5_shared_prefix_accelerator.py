@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(
     reason="shared-prefix training needs the GPU or NPU modeling path",
 )
 
-TOY_CONFIG = "tests/toy_config/qwen3_5_toy"
+TOY_CONFIG = "tests/toy_config/ci/qwen3_5_text_tiny"
 PREFIX, SUFFIX, GROUP = 1990, 96, 3  # prefix deliberately not a multiple of the 64-token chunk
 
 # The GDN ops the two modeling paths bind: vendored Triton on NPU, flash-linear-attention on GPU.
@@ -53,9 +53,9 @@ def model():
 
 def _sequences():
     torch.manual_seed(1)
-    prefix = torch.randint(1000, 60000, (PREFIX,))
-    shared = [torch.cat([prefix, torch.randint(1000, 60000, (SUFFIX,))]) for _ in range(GROUP)]
-    return shared + [torch.randint(1000, 60000, (300,))]  # plus one unrelated sequence
+    prefix = torch.randint(1000, 4000, (PREFIX,))
+    shared = [torch.cat([prefix, torch.randint(1000, 4000, (SUFFIX,))]) for _ in range(GROUP)]
+    return shared + [torch.randint(1000, 4000, (300,))]  # plus one unrelated sequence
 
 
 def _run(model, seqs, weights):

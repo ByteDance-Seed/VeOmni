@@ -8,11 +8,13 @@ import pytest
 import torch
 import yaml
 
+from scripts.ci.gpu_pool import GPUJob, run_jobs
 from veomni.models import build_foundation_model
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability, get_torch_device
 from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available
 
 from ..tools import DummyDataset, ParallelConfig, build_torchrun_cmd, compare_metrics, print_comparison_table
+from ..tools.ci_config import ci_config_path
 from ..tools.training_utils import make_eager_ops_config
 from .utils import prepare_exec_cmd
 
@@ -104,6 +106,7 @@ def main(
     compare_alignment: bool = True,
     extra_args: list[str] | None = None,
 ):
+    config_path = ci_config_path(config_path)
     test_path = f"./{model_name}"
     os.makedirs(test_path, exist_ok=True)
 
@@ -127,21 +130,27 @@ def main(
         raise AssertionError(
             "Alignment tests require at least two parallel modes. Use a smoke test for single-mode coverage."
         )
-    res = {}
-    log_keys = []
-    for task_name, cmd_kwargs in command_list:
-        print(f"{'-' * 10} {task_name} {'-' * 10}")
+
+    def execute(job, assigned):
+        task_name, cmd_kwargs = job.payload
         if extra_args:
             cmd_kwargs["extra_args"] = [*cmd_kwargs.get("extra_args", []), *extra_args]
         cmd = build_torchrun_cmd(**cmd_kwargs)
-        subprocess.run(cmd, check=True)
+        env = os.environ.copy()
+        if assigned:
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(assigned)
+        subprocess.run(cmd, check=True, env=env)
         with open(os.path.join(test_path, f"{task_name}/log_dict.json")) as f:
-            output = json.load(f)
-        if not log_keys:
-            log_keys = set(output.keys())
-        else:
-            assert log_keys == set(output.keys())
-        res[task_name] = output
+            return json.load(f)
+
+    jobs = [GPUJob(name, kwargs["nproc"], (name, kwargs)) for name, kwargs in command_list]
+    if IS_CUDA_AVAILABLE and os.environ.get("VEOMNI_GPU_TEST_PARALLEL") == "1":
+        devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7").split(",")
+        res = run_jobs(jobs, devices, execute)
+    else:
+        res = {job.name: execute(job, []) for job in jobs}
+    log_keys = set(next(iter(res.values())))
+    assert all(set(values) == log_keys for values in res.values())
 
     if compare_alignment:
         assert len(res) >= 2, "Alignment tests require at least two completed runs."
