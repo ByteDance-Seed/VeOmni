@@ -95,8 +95,9 @@ def prepare_wy_repr_bwd_kernel(
                     b_dA += tl.dot(b_dw, tl.trans(b_k_beta_g))
                     b_dk_beta_g = tl.dot(b_A, b_dw)
                     b_dk = b_dk_beta_g * b_beta[:, None] * b_g_exp[:, None]
-                    b_dbeta += tl.sum(b_dk_beta_g * b_k * b_g_exp[:, None], 1)
-                    b_dg += tl.sum(b_dk_beta_g * b_k * b_g_exp[:, None] * b_beta[:, None], 1)
+                    m_k = i_k * BK + tl.arange(0, BK) < K
+                    b_dbeta += tl.sum(tl.where(m_k[None, :], b_dk_beta_g * b_k * b_g_exp[:, None], 0), 1)
+                    b_dg += tl.sum(tl.where(m_k[None, :], b_dk_beta_g * b_k * b_g_exp[:, None] * b_beta[:, None], 0), 1)
                     tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
 
                 for i_v in range(tl.cdiv(V, BV)):
@@ -109,7 +110,8 @@ def prepare_wy_repr_bwd_kernel(
                     b_dA += tl.dot(b_du, tl.trans(b_v_beta))
                     b_dv_beta = tl.dot(b_A, b_du)
                     b_dv = b_dv_beta * b_beta[:, None]
-                    b_dbeta += tl.sum(b_dv_beta * b_v, 1)
+                    m_v = i_v * BV + tl.arange(0, BV) < V
+                    b_dbeta += tl.sum(tl.where(m_v[None, :], b_dv_beta * b_v, 0), 1)
                     tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
 
                 b_dA = tl.where(m_A, b_dA, 0)
@@ -127,12 +129,13 @@ def prepare_wy_repr_bwd_kernel(
                     b_k_beta = (b_k * b_beta[:, None]).to(b_k.dtype)
                     b_A += tl.dot(b_k_beta, tl.trans(b_k))
                     b_dk_beta = tl.dot(b_dA, b_k)
-                    b_dbeta += tl.sum(b_dk_beta * b_k, 1)
+                    m_k = i_k * BK + tl.arange(0, BK) < K
+                    b_dbeta += tl.sum(tl.where(m_k[None, :], b_dk_beta * b_k, 0), 1)
                     b_dk += tl.dot(tl.trans(b_dA), b_k_beta)
                     b_dk += b_dk_beta * b_beta[:, None]
                     tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
 
-                b_dA_A = b_dA * b_A
+                b_dA_A = tl.where(m_A, b_dA * b_A, 0)
                 b_dg += tl.sum(b_dA_A, axis=1) - tl.sum(b_dA_A, axis=0)
                 p_dg = tl.make_block_ptr(dg + offset, (T,), (1,), (i_t * BT,), (BT,), (0,))
                 p_dbeta = tl.make_block_ptr(dbeta + offset, (T,), (1,), (i_t * BT,), (BT,), (0,))

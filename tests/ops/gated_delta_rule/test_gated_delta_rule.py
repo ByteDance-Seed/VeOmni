@@ -727,17 +727,16 @@ def test_chunk_gated_delta_rule_fla_matches_eager(device):
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="chunk_gated_delta_rule npu needs torch_npu")
-@pytest.mark.parametrize("impl", ("triton", "fla_npu"))
+@pytest.mark.parametrize(("impl", "dim"), (("triton", 64), ("triton", 128), ("fla_npu", 128)))
 @pytest.mark.parametrize("packed", (False, True))
-def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl, packed):
+def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl, dim, packed):
     _require_npu_gdr_dependencies(ascendc=impl == "fla_npu")
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
     other = resolve_op("chunk_gated_delta_rule", "standard", impl).wrapper
     torch.manual_seed(19)
     # The Ascend910B v26.6 RecomputeWUFwd kernel supports V=128/256, not 64.
-    # Keep the vendored Triton D=64 coverage and use a supported production
-    # width for AscendC instead of failing before any numerical comparison.
-    batch, seq, heads, dim = 1, 128, 4, 128 if impl == "fla_npu" else 64
+    # Keep D=64 padding coverage and test the production D=128 on both routes.
+    batch, seq, heads = 1, 128, 4
     q = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
     k = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
     v = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)

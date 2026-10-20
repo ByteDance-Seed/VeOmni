@@ -150,11 +150,13 @@ def chunk_bwd_kernel_dqkwg(
                 b_dg_last *= tl.exp(b_g_last)
 
                 b_dq = b_dq * tl.exp(b_g)[:, None] * scale
-                b_dg += tl.sum(b_dq * b_q, axis=1)
+                # GEMM output padding can be undefined even with zero-padded inputs.
+                m_k = i_k * BK + tl.arange(0, BK) < K
+                b_dg += tl.sum(tl.where(m_k[None, :], b_dq * b_q, 0), axis=1)
 
                 b_dk = b_dk * tl.where(m_t, tl.exp(-b_g + b_g_last), 0)[:, None]
-                b_dg -= tl.sum(b_k * b_dk, axis=1)
-                b_dg_last += tl.sum(b_dk * b_k)
+                b_dg -= tl.sum(tl.where(m_k[None, :], b_k * b_dk, 0), axis=1)
+                b_dg_last += tl.sum(tl.where(m_t[:, None] & m_k[None, :], b_dk * b_k, 0))
 
                 if IS_VARLEN:
                     b_ds = tl.where(m_A, b_ds * exp(b_g[:, None] - b_g[None, :]), 0) * scale
@@ -164,7 +166,7 @@ def chunk_bwd_kernel_dqkwg(
                     gdiff_ = tl.load(p_gdiff)
                     b_ds = b_ds * gdiff_ * scale
 
-                b_ds2 = b_ds * tl.dot(b_q, tl.trans(b_k))
+                b_ds2 = tl.where(m_A, b_ds * tl.dot(b_q, tl.trans(b_k)), 0)
                 b_dg += tl.sum(b_ds2, axis=1)
                 b_dg -= tl.sum(b_ds2, axis=0)
 
@@ -421,7 +423,7 @@ def chunk_bwd_dqkwg(
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    BK = 128 if cu_seqlens is None else 64
+    BK = min(128 if cu_seqlens is None else 64, max(16, triton.next_power_of_2(K)))
     BV = 64
     NK = triton.cdiv(K, BK)
     dq = torch.empty_like(q)
