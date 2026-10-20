@@ -2367,7 +2367,7 @@ def qwen4_exp_for_conditional_generation_forward_patched(
 
 # ================================================================
 # Patch: Qwen4ExpTextSparseMoeBlock.forward (MoE router replay)
-# Same contract as Qwen3.5-MoE: when an RL framework has installed a
+# 1. When an RL framework has installed a
 # replay manager via ``set_active_replay``, the manager may substitute
 # ``selected_experts`` with previously recorded target indices. The
 # manager's sole responsibility is choosing indices; all model-specific
@@ -2379,18 +2379,14 @@ def qwen4_exp_for_conditional_generation_forward_patched(
     "Qwen4ExpTextSparseMoeBlock.forward",
     description="Call maybe_replay_indices for RL router replay",
 )
-def qwen4_exp_text_sparse_moe_block_forward_patched(
-    self, hidden_states: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+def qwen4_exp_text_sparse_moe_block_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Replay expert indices while preserving native top-k weighting and local expert ops."""
     batch_size, sequence_length, hidden_dim = hidden_states.shape
     hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
     shared_expert_output = self.shared_expert(hidden_states_reshaped)
     router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
-    # MoE router replay: the Qwen4-Exp ``TopKRouter`` returns pre-softmax
-    # ``router_logits`` and discards its internal post-softmax matrix after
-    # top-k, so we recompute ``softmax`` here. The
-    # native router always renormalizes the top-k probs, so the gathered
-    # weights are renormalized unconditionally.
+    # --- Patch.1: Recompute weights for replayed indices from raw router logits. ---
+    # Match the native router's optional normalization and output dtype.
     if get_active_replay() is not None:
         target_dtype = routing_weights.dtype
         routing_scores = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
@@ -2399,6 +2395,7 @@ def qwen4_exp_text_sparse_moe_block_forward_patched(
         if self.gate.norm_topk_prob:
             routing_weights = routing_weights / routing_weights.sum(-1, keepdim=True)
         routing_weights = routing_weights.to(target_dtype)
+    # --- Patch.1 ---
     expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
 
     shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
