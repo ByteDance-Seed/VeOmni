@@ -23,7 +23,7 @@ from veomni.arguments.arguments_types import (
 from veomni.arguments.arguments_types import (
     TorchCompileConfig as ArgumentsTorchCompileConfig,
 )
-from veomni.distributed.parallel_state import use_parallel_state
+from veomni.distributed.parallel_state import ParallelState, use_parallel_state
 from veomni.distributed.torch_compile import (
     CompileConfig,
     compile_decoder_blocks,
@@ -258,7 +258,7 @@ def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
     position_embeddings = rotary_emb(hidden_states_eager, position_ids)
 
     # An explicit state avoids the logging fallback in get_parallel_state(), which Dynamo cannot trace fullgraph.
-    with use_parallel_state(SimpleNamespace(async_enabled=False)):
+    with use_parallel_state(ParallelState()):
         assert (
             compile_decoder_blocks(
                 compiled_model,
@@ -324,7 +324,7 @@ def test_qwen3_vl_compiled_decoder_matches_eager_packed_flash_attention():
     }
 
     # An explicit state avoids the logging fallback in get_parallel_state(), which Dynamo cannot trace fullgraph.
-    with use_parallel_state(SimpleNamespace(async_enabled=False)):
+    with use_parallel_state(ParallelState()):
         assert (
             compile_decoder_blocks(
                 compiled_model,
