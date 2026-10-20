@@ -11,7 +11,8 @@ A test that passes locally is not necessarily a test CI runs.
 |------|--------------------|
 | `tests/data/` | whole directory, in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
 | `tests/checkpoints/` | whole directory, in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
-| `tests/ops/` | whole directory in `gpu_unit_tests.yml`; NPU runs only a few named files |
+| `tests/ops/` | whole directory in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
+| `tests/models/` | whole directory in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
 | `tests/parallel/context_parallel/` | whole directory, `gpu_unit_tests.yml` only |
 | everything else | **one `pytest` line per file**, listed in `gpu_unit_tests.yml`, and separately in `npu_unit_tests.yml` when it should run on Ascend |
 | `tests/e2e/test_e2e_parallel.py`, `tests/distributed/test_fsdp_equivalence.py` | `gpu_e2e_test.yml` / `npu_e2e_test.yml` |
@@ -22,11 +23,26 @@ Consequences that cut both ways:
   covered. Adding a workflow line for it is redundant churn.
 - Adding a file anywhere else is **invisible to CI** until it is enumerated —
   usually in two workflows. Roughly thirty existing files under
-  `tests/{trainer,utils,models,lora,distributed,parallel,e2e}` are in exactly
+  `tests/{trainer,utils,tools,lora,distributed,parallel,e2e}` are in exactly
   this state, so "a test file exists for X" does not mean X is guarded.
 - The GPU unit job runs on one self-hosted L20-8 fleet with a 120-minute budget
   and `-x` fail-fast. Every new file pays process startup plus model build, and a
   new flaky file blocks the whole suite for everyone.
+
+## What the NPU job can actually run
+
+Both NPU workflows build their own venv with `uv sync --extra npu`, so the
+packages baked into the image's build-time venv are not on the test path. Three
+kernel dependencies land differently, and each decides what a test can reach:
+
+| Package | Where it is | What it gates |
+|---------|-------------|---------------|
+| `triton-ascend` | installed by an explicit workflow step after the sync (`uv sync` prunes anything outside the lockfile, `uv run --frozen` does not) | the vendored Ascend Triton kernels — `causal_conv1d` and `chunk_gated_delta_rule` `triton`, MoE clamped SwiGLU |
+| `fla_npu` | image venv only; the workspace venv does not inherit it | `chunk_gated_delta_rule_implementation=fla_npu`, so that backend is untestable |
+| `flash-linear-attention` | `gpu` extra only, so absent from both | the `fla` backends. Its `HardwareRequirement` lists `npu`, but the GatedDeltaNet docs say it raises on Ascend even when installed — treat `fla` as GPU-only |
+
+The runners are 910B (A2, non-arch35), so kernels gated behind `is_arch35()`
+stay unreachable whatever is installed.
 
 Check whether a file is wired — by name, and by the directory it sits in:
 
@@ -46,13 +62,14 @@ by a `pytest.param` table, so a new case is a few lines:
 
 | Change | Extend |
 |--------|--------|
-| New/changed model registration | `tests/models/test_model_registry.py`, `tests/models/test_models_patch.py` (`TEST_CASES`) |
-| Patched-vs-upstream numerics | `tests/models/test_models_logits_equal_v5.py` (`CASES` / `_LOADER_CASES`) |
-| Host-device sync regressions | `tests/models/test_model_forward_no_implicit_sync.py` |
-| VLM trainer / freeze-ViT | `tests/models/test_vlm_trainer.py` |
-| MoE checkpoint conversion | `tests/models/test_checkpoint_tensor_converter.py` |
+| New/changed model registration/build | `tests/models/base/test_auto_registry.py` (`_MODEL_CASES`) |
+| Patched-vs-upstream numerics | the matching family test under `tests/models/transformers/` or `tests/models/diffusers/` |
+| Host-device sync regressions | `tests/models/transformers/test_model_forward_no_implicit_sync.py` |
+| VLM trainer / freeze-ViT | `tests/trainer/test_vlm_trainer.py` |
+| MoE checkpoint conversion | `tests/models/base/test_checkpoint_tensor_converter.py` |
 | VLM / Omni dummy forward | `tests/distributed/test_dummy_forward.py` (`_vlm_cases` / `_omni_cases`) |
 | `torch.compile` support | `tests/distributed/test_torch_compile.py` |
+| Gradient checkpointing / selective recompute (SAC) | `tests/distributed/test_gradient_checkpointing.py` |
 | Ulysses SP behaviour | `tests/parallel/ulysses/test_ulysses.py` and siblings |
 | Checkpoint callback / DCP round-trip | `tests/checkpoints/test_checkpoint_callback.py`, `test_trainer_saveload.py` |
 | DiT resume / noise-stream equivalence | `tests/checkpoints/test_dit_resume_align.py` |
@@ -63,11 +80,11 @@ by a `pytest.param` table, so a new case is a few lines:
 | LoRA / MoE-LoRA | the enumerated `tests/lora/test_*.py` set |
 | End-to-end parallel parity | `tests/e2e/test_e2e_parallel.py` (`text_test_cases` and friends) |
 
-**2. It is a self-contained kernel or data-pipeline unit test → new file under
-`tests/ops/` or `tests/data/`.** Covered automatically on GPU; do not touch
-`gpu_unit_tests.yml`. One exception: the NPU job runs `tests/data` wholesale but
-enumerates ops files by name, so a new `tests/ops/` file that should run on
-Ascend still needs a line in `npu_unit_tests.yml`.
+**2. It is a self-contained model, kernel, or data-pipeline unit test → new file
+under `tests/models/`, `tests/ops/`, or `tests/data/`.** These directories are
+collected wholesale by the GPU and NPU unit workflows, so do not add a per-file
+workflow entry. Hardware markers and dependency guards inside the test decide
+which cases each job runs.
 
 **3. It genuinely needs a new file elsewhere.** Prefer folding it into an
 enumerated file in the same directory first. If a separate file is warranted
@@ -91,6 +108,15 @@ needed" without a reason is what the reviewer is looking for.
 
 ## Guidance
 
+- A test double wrapping a `VeomniOp` must expose the handle attributes its
+  consumer reads, including `impl`. DeepSeek-V4 keeps eager routing weights in
+  their incoming dtype and casts them for fused MoE; a recording double must
+  identify which path it represents and assert the corresponding dtype.
+- CPU substitutes for Diffusers RMSNorm on Ascend hosts must preserve the
+  pinned upstream CPU math and dtype promotion. `F.rms_norm` is not a drop-in
+  replacement for BF16 inputs with FP32 weights: its BF16 output cannot feed
+  an FP32 Linear without autocast. Exercise the Ascend-host CPU fixture path
+  on non-Ascend CI through indirect fixture parametrization.
 - A standalone Transformers layer can allocate parameters with `torch.empty`
   that only the enclosing `PreTrainedModel.post_init()` initializes. Initialize
   these in the fixture before any rank broadcast; setting a seed does not

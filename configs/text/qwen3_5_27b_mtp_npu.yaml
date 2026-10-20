@@ -2,8 +2,8 @@ model:
   model_path: Qwen3.5-27B
   ops_implementation:
     attn_implementation: eager
-    rms_norm_implementation: npu
-    rotary_pos_emb_implementation: npu
+    rms_norm_implementation: torch_npu
+    rotary_pos_emb_implementation: torch_npu
     cross_entropy_loss_implementation: chunk_loss
     rms_norm_gated_implementation: fla
     causal_conv1d_implementation: fla
