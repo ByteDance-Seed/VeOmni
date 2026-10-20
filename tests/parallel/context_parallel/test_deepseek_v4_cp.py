@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -36,6 +37,14 @@ from veomni.utils.device import (
 
 
 _PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
+
+
+def _load_dsv4_toy_config():
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config._attn_implementation = "eager"
+    return config
 
 
 def _cuda_device_count() -> int:
@@ -171,14 +180,13 @@ def _init_cp_attention(
     batch_size: int = 1,
     sample_slices=None,
     dtype: torch.dtype = torch.float32,
+    dsa_attention_impl: str = "eager",
 ):
     """Enter the process group, build the shared layer, and return the fixture.
 
     ``batch_size`` widens the hidden states, the position ids *and* the mask
-    together. It has to be all three: the compressor's ``block_bias`` carries the
-    batch dimension and is concatenated onto the mask, so a batch-1 mask beside
-    batch-2 hidden states fails on that concatenation instead of on whatever the
-    case was written to exercise.
+    together, so a case exercises a real batch rather than one row broadcast
+    across it.
 
     ``sample_slices`` packs several sequences into the batch row: positions
     restart at each boundary and the mask stops attention crossing one. Without a
@@ -188,8 +196,7 @@ def _init_cp_attention(
     sliding window reaching back across a shard edge inside one sample.
 
     ``dtype`` is float32 for the parity cases, which need the headroom to compare
-    against a single-rank baseline at ``1e-4``. Only the compact-candidate case
-    overrides it, because that path is gated on bfloat16.
+    against a single-rank baseline at ``1e-4``.
     """
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -201,14 +208,15 @@ def _init_cp_attention(
         world_size=world_size,
     )
 
-    from transformers import AutoConfig
-
     from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.ops.config import set_ops_config
 
-    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
+    dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
+    set_ops_config(SimpleNamespace(dsa_attention_implementation=dsa_attention_impl))
 
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(0)
     # Layer 0 is HCA and layer 3 is CSA on the toy config, which has no
     # sliding-only layer type, so drop the compressor the way the Ulysses test
@@ -234,7 +242,7 @@ def _init_cp_attention(
     rotary = dsv4.DeepseekV4RotaryEmbedding(config).to(device=device_type)
     _broadcast_module(rotary)
 
-    return dsv4, layer, _make_forward(layer, rotary), full_hidden, full_position_ids, full_mask
+    return dsv4, layer, _make_forward(layer, rotary), full_hidden, full_position_ids, full_mask, cp_state, dp_state
 
 
 def _run_attention_cp(
@@ -247,16 +255,13 @@ def _run_attention_cp(
     batch_size: int = 1,
     sample_slices=None,
 ) -> None:
-    from veomni.distributed.parallel_state import clear_parallel_state
+    from veomni.distributed.parallel_state import clear_parallel_state, use_parallel_state
 
-    _, layer, _forward, full_hidden, full_position_ids, full_mask = _init_cp_attention(
+    _, layer, _forward, full_hidden, full_position_ids, full_mask, cp_state, dp_state = _init_cp_attention(
         rank, world_size, init_file, seq_len, with_compressor, layer_idx, batch_size, sample_slices
     )
 
-    # Baseline: whole sequence with the parallel state stubbed out. Re-initialising
-    # the state here would contradict the world size the process group was built for.
-    no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
-    with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+    with use_parallel_state(dp_state):
         baseline_input = full_hidden.detach().clone().requires_grad_(True)
         baseline = _forward(baseline_input, full_position_ids, full_mask)
         baseline.sum().backward()
@@ -271,8 +276,9 @@ def _run_attention_cp(
     local_len = seq_len // world_size
     begin = rank * local_len
     local_input = full_hidden[:, begin : begin + local_len].detach().clone().requires_grad_(True)
-    local_output = _forward(local_input, full_position_ids[:, begin : begin + local_len], full_mask)
-    local_output.sum().backward()
+    with use_parallel_state(cp_state):
+        local_output = _forward(local_input, full_position_ids[:, begin : begin + local_len], full_mask)
+        local_output.sum().backward()
 
     summed_grads = {}
     for name, param in layer.named_parameters():
@@ -300,68 +306,65 @@ def _run_attention_cp(
     dist.destroy_process_group()
 
 
-def _stub_sparse_attn_tilelang(query: torch.Tensor, *_args, **_kwargs) -> torch.Tensor:
-    """Stand in for the TileLang kernel, which needs SM90 and is not asserted on here.
+class _RecordingDsaAttention:
+    """``dsa_attention`` stand-in that records the candidate slots each call implies.
 
-    The caller only wants the candidate list the forward built on its way to the
-    kernel, so running the kernel would buy nothing but a hardware requirement --
-    and this is the one compact-candidate case that fits on the two GPUs CI has.
-    ``test_deepseek_v4_model_cp_packed_misaligned_tilelang`` covers the real
-    kernel. The shape follows the caller, which transposes to ``[b, s, h, d]``
-    before calling because the kernel is layout-specific.
+    The slots are what an index-list kernel would read, so recording them is what
+    pins down ``query_offset`` and the narrowed mask without launching a kernel.
     """
-    return torch.zeros_like(query)
+
+    def __init__(self) -> None:
+        self.built: list[torch.Tensor] = []
+
+    def __call__(self, q, ori_kv, cmp_kv, sinks, position_ids, **kwargs):
+        from veomni.ops.kernels.dsa.sparse_indices import build_sparse_attention_indices
+
+        del sinks
+        self.built.append(
+            build_sparse_attention_indices(
+                position_ids=position_ids,
+                sliding_window=kwargs["sliding_window"],
+                kv_len=ori_kv.shape[1],
+                compressed_len=0 if cmp_kv is None else cmp_kv.shape[1],
+                candidates=kwargs["candidates"],
+                query_offset=kwargs["query_offset"],
+                attention_mask=kwargs["attention_mask"],
+            )
+        )
+        return torch.zeros_like(q)
 
 
 def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str, seq_len: int) -> None:
-    """The compact candidates a shard builds must be the global build's own rows.
+    """The candidates a shard asks for must be the global build's own rows.
 
-    The eager path ignores ``sparse_topk_indices``, so requesting TileLang is the
-    only thing that pins down ``query_offset`` / ``kv_full_len`` /
-    ``compressed_len``. Get them wrong and the TileLang kernel silently reads the
-    wrong KV rows.
-
-    Unlike the rest of the file this fixture is bfloat16, and it stays bfloat16
-    even though the kernel is stubbed out: the attention refuses to build a
-    compact list unless the kernel could consume it, so a float32 fixture reaches
-    the builder not at all. The assertion is unaffected -- candidates are integer
-    indices, compared exactly.
+    Get ``query_offset`` or the mask narrowing wrong and an index-list kernel
+    silently reads the wrong KV rows. The assertion compares integer indices,
+    exactly.
     """
-    from veomni.distributed.parallel_state import clear_parallel_state
+    from veomni.distributed.parallel_state import clear_parallel_state, use_parallel_state
 
-    dsv4, _, _forward, full_hidden, full_position_ids, full_mask = _init_cp_attention(
+    _, layer, _forward, full_hidden, full_position_ids, full_mask, cp_state, dp_state = _init_cp_attention(
         rank, world_size, init_file, seq_len, with_compressor=False, dtype=torch.bfloat16
     )
-    dsv4.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
-
-    built = []
-    build_indices = dsv4.build_sparse_attention_indices
-
-    def _record(**kwargs):
-        indices = build_indices(**kwargs)
-        built.append(indices)
-        return indices
+    recorder = _RecordingDsaAttention()
+    layer.veomni_dsa_attention = recorder
 
     local_len = seq_len // world_size
     begin = rank * local_len
-    with (
-        torch.no_grad(),
-        patch(f"{_PATCHED_MODULE}.build_sparse_attention_indices", _record),
-        patch(f"{_PATCHED_MODULE}.sparse_attn_tilelang", _stub_sparse_attn_tilelang),
-    ):
-        no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
-        with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+    with torch.no_grad():
+        with use_parallel_state(dp_state):
             _forward(full_hidden, full_position_ids, full_mask)
-        # Unpacking asserts the forward built exactly one candidate list.
-        (baseline_indices,) = built
-        built.clear()
+        # Unpacking asserts the forward made exactly one attention call.
+        (baseline_indices,) = recorder.built
+        recorder.built.clear()
 
-        _forward(
-            full_hidden[:, begin : begin + local_len],
-            full_position_ids[:, begin : begin + local_len],
-            full_mask,
-        )
-        (local_indices,) = built
+        with use_parallel_state(cp_state):
+            _forward(
+                full_hidden[:, begin : begin + local_len],
+                full_position_ids[:, begin : begin + local_len],
+                full_mask,
+            )
+        (local_indices,) = recorder.built
 
     torch.testing.assert_close(local_indices, baseline_indices[:, begin : begin + local_len], rtol=0, atol=0)
 
@@ -418,6 +421,21 @@ def _assert_close_to_scale(actual: torch.Tensor, expected: torch.Tensor, toleran
     )
 
 
+def _visible_compressed(candidates, seq_len: int, compressed_len: int) -> torch.Tensor:
+    """``[B, S, C]`` bool: the compressed rows each query may read, whatever the slot order."""
+    if candidates.topk_indices is not None:
+        indices = candidates.topk_indices.long()
+        visible = torch.zeros(*indices.shape[:2], compressed_len + 1, dtype=torch.bool, device=indices.device)
+        visible.scatter_(-1, torch.where(indices >= 0, indices, compressed_len), True)
+        return visible[..., :compressed_len]
+    if candidates.range_starts is None:
+        return torch.zeros(1, seq_len, compressed_len, dtype=torch.bool)
+    entries = torch.arange(compressed_len, device=candidates.range_starts.device)
+    starts = candidates.range_starts.reshape(-1, seq_len, 1)
+    ends = candidates.range_ends.reshape(-1, seq_len, 1)
+    return (entries >= starts) & (entries < ends)
+
+
 def _window_starts(rate: int, seq_len: int, sample_slices) -> torch.Tensor:
     """The global window starts, spelled out rather than taken from the helper under test."""
     if sample_slices is None:
@@ -451,9 +469,9 @@ def _run_compressor_cp(
     compressor bug. The zero-window case wants the opposite: the indexer carries
     its *own* copy of the empty-result construction and its own halo exchange and
     row all-gather, and running it is the only way to drive them. Its selection
-    is then observable through ``block_bias``, which is scattered from it.
+    is then observable through the compressor's candidates.
     """
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -465,14 +483,13 @@ def _run_compressor_cp(
         world_size=world_size,
     )
 
-    from transformers import AutoConfig
-
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
-    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
+    dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
 
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(0)
     compressor_class = dsv4.DeepseekV4HCACompressor if kind == "hca" else dsv4.DeepseekV4CSACompressor
     compressor = compressor_class(config).to(device=device_type, dtype=torch.float32)
@@ -508,9 +525,6 @@ def _run_compressor_cp(
                 full_position_ids,
                 sample_slices,
                 (rate,),
-                # The HCA path reads its block bias straight out of the metadata,
-                # so this is what makes the query-row slicing observable.
-                block_bias_rates=(rate,) if kind == "hca" else (),
             ),
         }
 
@@ -524,28 +538,27 @@ def _run_compressor_cp(
             **packed_kwargs,
         )
 
-    no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
-    with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+    with use_parallel_state(dp_state):
         baseline_input = full_hidden.detach().clone().requires_grad_(True)
-        baseline_kv, baseline_bias = _forward(baseline_input, full_position_ids, q_residual)
+        baseline_kv, baseline_candidates = _forward(baseline_input, full_position_ids, q_residual)
         baseline_kv.sum().backward()
         baseline_grads = {name: _grad_or_zeros(param) for name, param in compressor.named_parameters()}
         baseline_kv = baseline_kv.detach()
-        baseline_bias = None if baseline_bias is None else baseline_bias.detach()
         baseline_input_grad = baseline_input.grad.detach().clone()
         compressor.zero_grad(set_to_none=True)
 
     local_len = seq_len // world_size
     begin = rank * local_len
     local_input = full_hidden[:, begin : begin + local_len].detach().clone().requires_grad_(True)
-    local_kv, local_bias = _forward(
-        local_input,
-        full_position_ids[:, begin : begin + local_len],
-        q_residual[:, begin : begin + local_len],
-    )
+    with use_parallel_state(cp_state):
+        local_kv, local_candidates = _forward(
+            local_input,
+            full_position_ids[:, begin : begin + local_len],
+            q_residual[:, begin : begin + local_len],
+        )
 
-    owned = (_window_starts(rate, seq_len, sample_slices) // local_len) == rank
-    local_kv[:, :, owned.to(local_kv.device)].sum().backward()
+        owned = (_window_starts(rate, seq_len, sample_slices) // local_len) == rank
+        local_kv[:, :, owned.to(local_kv.device)].sum().backward()
     # A rank that owns no window never touches ``position_bias`` or ``kv_norm`` and
     # so has no gradient for them, while its peers do. Reducing a zero stand-in
     # instead of skipping keeps every rank in the same collectives.
@@ -560,8 +573,10 @@ def _run_compressor_cp(
     # Global window order is the whole point of the row all-gather, so compare
     # the entire replicated array rather than this rank's contribution to it.
     torch.testing.assert_close(local_kv.detach(), baseline_kv, rtol=1e-4, atol=1e-4)
+    compressed_len = baseline_kv.shape[2]
     torch.testing.assert_close(
-        local_bias.detach(), baseline_bias[..., begin : begin + local_len, :], rtol=1e-4, atol=1e-4
+        _visible_compressed(local_candidates, local_len, compressed_len),
+        _visible_compressed(baseline_candidates, seq_len, compressed_len)[:, begin : begin + local_len],
     )
     # The gathers sum-reduce in backward, so the local input gradient already
     # carries the halo contributions every neighbour made to it.
@@ -599,7 +614,7 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
     local. The packed layout is what forces it to shard the compression metadata
     it is handed, which is global.
     """
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -611,17 +626,18 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
         world_size=world_size,
     )
 
-    from transformers import AutoConfig
-
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+    from veomni.ops import resolve_op
+    from veomni.ops.config import set_ops_config
 
-    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
+    dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
     # The TileLang kernel is the production scorer and the only one with a query
     # partitioning of its own; the eager scorer is covered by the CSA layer test.
-    dsv4.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+    set_ops_config(SimpleNamespace(dsa_indexer_implementation="tilelang"))
 
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(0)
     indexer = dsv4.DeepseekV4Indexer(config).to(device=device_type, dtype=torch.bfloat16)
     _init_position_bias(indexer)
@@ -632,13 +648,14 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
     dist.broadcast(hidden, src=0)
     dist.broadcast(q_residual, src=0)
 
-    # ``use_tilelang`` degrades to the eager scorer rather than failing when the
-    # canonical positions it checks do not line up, and the eager scorer reads the
-    # global ``position_ids`` and so stays right. Without this count, dropping the
-    # query offset entirely would take the kernel out of the comparison and the
+    # Count kernel entries so the comparison cannot stay green after the
+    # TileLang path is skipped. The eager scorer reads global ``position_ids``
+    # and so stays right even if the query offset is dropped. Without this
+    # count, that skip would take the kernel out of the comparison and the
     # parity below would still hold, pinning nothing about the CP query rebasing.
     kernel_runs = []
-    real_kernel = dsv4.v4_lighting_indexer
+    indexer_entry = resolve_op("dsa_indexer", "deepseek_v4", "tilelang")
+    real_kernel = indexer_entry.wrapper
 
     def _counting_kernel(*args, **kwargs):
         kernel_runs.append(None)
@@ -666,19 +683,19 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
             }
 
         kernel_runs.clear()
-        with patch(f"{_PATCHED_MODULE}.v4_lighting_indexer", _counting_kernel):
-            no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
-            with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+        with patch.object(indexer_entry, "wrapper", _counting_kernel):
+            with use_parallel_state(dp_state):
                 baseline = indexer(hidden, q_residual, position_ids, None, 0, **packed_kwargs)
 
-            local = indexer(
-                hidden[:, begin : begin + local_len],
-                q_residual[:, begin : begin + local_len],
-                position_ids[:, begin : begin + local_len],
-                None,
-                0,
-                **packed_kwargs,
-            )
+            with use_parallel_state(cp_state):
+                local = indexer(
+                    hidden[:, begin : begin + local_len],
+                    q_residual[:, begin : begin + local_len],
+                    position_ids[:, begin : begin + local_len],
+                    None,
+                    0,
+                    **packed_kwargs,
+                )
         compared.append((local, baseline[:, begin : begin + local_len], len(kernel_runs)))
 
     # Both layouts run their collectives before anything is asserted, so a
@@ -742,11 +759,9 @@ def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int, 
     so that a guard moved after the halo exchange is caught by the unusable group
     rather than by the compressor's own shard-width check.
     """
-    from transformers import AutoConfig
-
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(0)
     # Layer 0 is HCA and layer 3 is CSA on the toy config; there is no
     # sliding-only layer type, so dropping the compressor is what makes one.
@@ -809,12 +824,10 @@ def test_deepseek_v4_cp_rejects_a_narrow_shard(kind):
     or none does, which is the property that keeps this a clean error instead of
     a ten-minute watchdog timeout.
     """
-    from transformers import AutoConfig
-
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
     class_name, role = _WINDOW_COMPRESSORS[kind]
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(0)
     module = getattr(dsv4, class_name)(config)
     local_len = module.compress_rate - 1
@@ -853,11 +866,9 @@ def test_deepseek_v4_attention_cp_rejects_a_local_length_mask(with_compressor):
 
 def _build_toy_model(seq_len: int):
     """A whole toy model on CPU plus one batch of ids, for the model-forward guards."""
-    from transformers import AutoConfig
-
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(0)
     model = dsv4.DeepseekV4Model(config)
     _init_every_position_bias(model)
@@ -955,7 +966,7 @@ def test_deepseek_v4_attention_cp_packed_sliding_only(cp_size):
 @pytest.mark.skipif(_cuda_device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_deepseek_v4_attention_cp_sparse_indices(cp_size):
-    """A CP shard's compact sparse candidates match the full-sequence build's rows."""
+    """A CP shard's sparse candidates match the full-sequence build's rows."""
     if _cuda_device_count() < cp_size:
         pytest.skip(f"needs {cp_size} devices")
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1170,7 +1181,7 @@ def test_deepseek_v4_compressor_cp_zero_windows_packed_with_indexer():
     have no backward on *any* rank. It cannot hang the way the compressors can.
 
     Only three compressed rows exist against ``index_topk`` 32, so every causally
-    visible slot is selected and the block-bias comparison does not turn on top-k
+    visible slot is selected and the candidate comparison does not turn on top-k
     order.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1214,7 +1225,7 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
     ``test_deepseek_v4_cp_collator_shards_contiguously_by_cp_rank`` pins that the
     collator really produces these three things.
     """
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -1226,20 +1237,17 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
         world_size=world_size,
     )
 
-    from transformers import AutoConfig
-
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.ops.config import set_ops_config
 
-    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
+    dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
     if tilelang:
-        # The model forward withholds the dense mask only for bf16 CUDA tensors
-        # with the TileLang attention selected, so this is the arm that reaches
-        # the compact-candidate path -- and the only place the TileLang indexer
-        # runs inside a CSA layer under CP.
-        dsv4.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
-        dsv4.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+        # The only place the TileLang attention and indexer run inside a whole
+        # packed model under CP.
+        set_ops_config(SimpleNamespace(dsa_attention_implementation="tilelang", dsa_indexer_implementation="tilelang"))
 
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(0)
     model = dsv4.DeepseekV4Model(config).to(device=device_type, dtype=dtype)
     _init_every_position_bias(model)
@@ -1255,14 +1263,11 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
     dist.broadcast(input_ids, src=0)
 
     # Which scorer ran is not observable from the outputs: TileLang and eager
-    # agree when both are reachable, and the model forward silently keeps the
-    # dense mask when they are not. Counting the launches is what stops a parity
+    # agree when both are reachable. Counting the launches is what stops a parity
     # pass that never entered the kernel it exists to exercise.
     counts = dict.fromkeys(("sparse_attn_tilelang", "v4_lighting_indexer"), 0)
 
-    def _counted(name):
-        real = getattr(dsv4, name)
-
+    def _counted(name, real):
         def wrapper(*args, **kwargs):
             counts[name] += 1
             return real(*args, **kwargs)
@@ -1274,13 +1279,27 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
 
     local_len = seq_len // world_size
     begin = rank * local_len
-    with (
-        patch(f"{_PATCHED_MODULE}.sparse_attn_tilelang", _counted("sparse_attn_tilelang")),
-        patch(f"{_PATCHED_MODULE}.v4_lighting_indexer", _counted("v4_lighting_indexer")),
-    ):
-        # Baseline: the whole packed batch with the parallel state stubbed out.
-        no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
-        with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+    with ExitStack() as stack:
+        if tilelang:
+            from veomni.ops import resolve_op
+
+            attention_entry = resolve_op("dsa_attention", "deepseek_v4", "tilelang")
+            indexer_entry = resolve_op("dsa_indexer", "deepseek_v4", "tilelang")
+            stack.enter_context(
+                patch.object(
+                    attention_entry,
+                    "wrapper",
+                    _counted("sparse_attn_tilelang", attention_entry.wrapper),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    indexer_entry,
+                    "wrapper",
+                    _counted("v4_lighting_indexer", indexer_entry.wrapper),
+                )
+            )
+        with use_parallel_state(dp_state):
             baseline = _forward(input_ids, position_ids)
             baseline.sum().backward()
             baseline_grads = {name: _grad_or_zeros(param) for name, param in model.named_parameters()}
@@ -1289,8 +1308,9 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
 
         # Context-parallel: this rank's contiguous shard beside the full-sequence
         # cu-seqlens, which is what the collator hands the model.
-        local = _forward(input_ids[:, begin : begin + local_len], position_ids[:, begin : begin + local_len])
-        local.sum().backward()
+        with use_parallel_state(cp_state):
+            local = _forward(input_ids[:, begin : begin + local_len], position_ids[:, begin : begin + local_len])
+            local.sum().backward()
 
     summed_grads = {}
     for name, param in model.named_parameters():
@@ -1304,7 +1324,10 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
     expected_csa = sum(kind == "compressed_sparse_attention" for kind in config.layer_types) if tilelang else 0
     assert counts["sparse_attn_tilelang"] == 2 * expected_layers, counts
     assert counts["v4_lighting_indexer"] == 2 * expected_csa, counts
-    forward_tol, grad_tol = (1e-4, 1e-4) if dtype == torch.float32 else (8e-3, 1e-1)
+    # bf16: two ULPs of the tensor's max. The shard and the full batch run the
+    # expert GEMMs over different token counts, so a few elements round apart by
+    # up to two ULPs (measured 1.33e-2 with the eager MoE row).
+    forward_tol, grad_tol = (1e-4, 1e-4) if dtype == torch.float32 else (2**-6, 1e-1)
     _assert_close_to_scale(local.detach(), baseline[:, begin : begin + local_len], forward_tol, "forward")
     for name, summed in summed_grads.items():
         _assert_close_to_scale(summed, baseline_grads[name], grad_tol, name)
@@ -1411,12 +1434,12 @@ def test_deepseek_v4_model_cp_packed_misaligned():
 @pytest.mark.skipif(_cuda_device_count() < 4, reason="needs 4 devices")
 @pytest.mark.skipif(not _all_devices_sm90_or_above(), reason="the DeepSeek-V4 TileLang kernels need SM90 or later")
 def test_deepseek_v4_model_cp_packed_misaligned_tilelang():
-    """The same in bf16, where the model withholds the mask and TileLang runs instead.
+    """The same in bf16 with TileLang selected for attention and the indexer.
 
-    Distinct coverage rather than a duplicate: this is the only case that takes
-    the mask-free compact-candidate path end to end under CP -- packed sparse
-    indices rebased by ``query_offset``, sparse MQA in the kernel, and the
-    TileLang Lightning Indexer inside a real CSA layer.
+    Distinct coverage rather than a duplicate: this is the only case that runs
+    the kernels end to end under CP -- packed sparse indices rebased by
+    ``query_offset``, sparse MQA in the kernel, and the TileLang Lightning
+    Indexer inside a real CSA layer.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
@@ -1473,7 +1496,7 @@ def test_deepseek_v4_attention_cp_with_csa_compressor(cp_size):
 
     Sequence length 128 with the toy CSA rate of 4 gives 32 compressed slots
     against ``index_topk`` 32, so every causally visible slot is selected and the
-    block bias this produces does not depend on the top-k *order*. The ranking
+    attention this produces does not depend on the top-k *order*. The ranking
     itself is what ``test_deepseek_v4_indexer_cp`` covers.
     """
     if _cuda_device_count() < cp_size:

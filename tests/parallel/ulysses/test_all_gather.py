@@ -6,7 +6,6 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.testing._internal.common_utils import run_tests
 
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.loss import reduce_sequence_parallel_loss
@@ -126,7 +125,10 @@ class AllToAllCommTest(SequenceParallelTest):
         num_valid_tokens = torch.tensor(1.0, dtype=local_loss.dtype, device=local_loss.device)
         reduced_loss = reduce_sequence_parallel_loss(local_loss, num_valid_tokens)
         reduced_loss.backward()
-        return reduced_loss.item(), local_x.grad.item()
+        # ReduceLoss.backward pre-multiplies by sp_world_size so FSDP2/DDP's
+        # mean over the SP group lands on the true global gradient; divide by
+        # world_size here to mirror that reduction on the standalone shard.
+        return reduced_loss.item(), local_x.grad.item() / dist.get_world_size(group)
 
     @staticmethod
     def _run_loss_grad_ref(shard_values, rank):
@@ -316,4 +318,6 @@ if __name__ == "__main__":
 
     set_seed(seed=0, full_determinism=True)
     enable_high_precision_for_bf16()
+    from torch.testing._internal.common_utils import run_tests
+
     run_tests()
