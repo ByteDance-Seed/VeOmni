@@ -31,13 +31,12 @@ def _parallel_state(sp_size):
 
 def _model(module, *, attention):
     config = Qwen4ExpConfig.from_pretrained(_TOY_CONFIG).vision_config
-    # Build eagerly so CPU-only CI does not import a real FlashAttention
-    # kernel. The FA regression switches the runtime contract after init and
-    # replaces the bound attention op with a recorder.
-    config._attn_implementation = "eager"
+    # Only the FlashAttention recorder case defers binding a hardware kernel.
+    # Eager and SDPA must bind their actual implementations during construction.
+    config._attn_implementation = "eager" if attention == "veomni_flash_attention_2" else attention
     torch.manual_seed(42)
     model = module.Qwen4ExpVisionModel(config).eval()
-    if attention != "eager":
+    if attention == "veomni_flash_attention_2":
         for active_config in (config, *(block.attn.config for block in model.blocks)):
             active_config._attn_implementation = attention
             if hasattr(active_config, "_attn_implementation_internal"):
