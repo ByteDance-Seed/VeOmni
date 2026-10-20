@@ -205,6 +205,7 @@ jobs:
           uv run --frozen pytest -s -x tests/utils/test_count_flops.py
           uv run --frozen pytest -s -x tests/tools/test_training_utils.py
           uv run --frozen pytest -s -x tests/utils/test_hdfs_io.py
+          uv run --frozen pytest -s -x tests/utils/test_profiler_memory.py
       - name: Run Muon optimizer tests
         run: |
           uv run --frozen pytest -s -x tests/optim/test_muon_unit.py

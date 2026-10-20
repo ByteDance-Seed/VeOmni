@@ -27,7 +27,9 @@ import torch
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ...platform import (
+    NVIDIA_GPU,
     NVIDIA_SM90_PLUS,
+    NVIDIA_SM100_PLUS,
     ROCM_GPU,
     GpuKernelRequirement,
     KernelRequirement,
@@ -119,10 +121,13 @@ _FA3_HUB_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
 _FA4_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
     (GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,)), ("flash_attn.cute",)),
 )
+_FLEX_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
+    (GpuKernelRequirement(platforms=(NVIDIA_GPU,)), ()),
+)
 _MAGI_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
     (
-        GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,)),
-        ("magi_attention", "flash_attn_cute", "cuda.bindings", "debugpy"),
+        GpuKernelRequirement(platforms=(NVIDIA_SM100_PLUS,)),
+        ("magi_attention", "flash_attn_cute", "debugpy"),
     ),
 )
 _SAGE_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
@@ -169,7 +174,12 @@ _register_attention(
     interface="veomni_flash_attention_3_hub",
 )
 _register_attention("flash_attention_4", "FlashAttention 4 through Transformers", rows=_FA4_ROWS)
-_register_attention("flex_attention", "PyTorch FlexAttention through Transformers")
+_register_attention(
+    "flex_attention",
+    "PyTorch FlexAttention short-name alias to the VeOmni adapter",
+    rows=_FLEX_ROWS,
+    interface="veomni_flex_attention",
+)
 _register_attention(
     "magi_attention",
     "MagiAttention short-name alias to the VeOmni adapter",
@@ -201,7 +211,11 @@ _register_attention(
     "VeOmni FlashAttention 4 adapter through Transformers",
     rows=_FA4_ROWS,
 )
-_register_attention("veomni_flex_attention", "VeOmni FlexAttention adapter through Transformers")
+_register_attention(
+    "veomni_flex_attention",
+    "VeOmni FlexAttention adapter; SM90+ FLASH / otherwise Triton",
+    rows=_FLEX_ROWS,
+)
 _register_attention(
     "veomni_magi_attention",
     "VeOmni MagiAttention adapter through Transformers",
