@@ -107,10 +107,10 @@ def chunk_bwd_kernel_dqkwg(
                 p_h = tl.make_block_ptr(h_h, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
                 p_dh = tl.make_block_ptr(dh_h, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
 
-                b_v = tl.load(p_v, boundary_check=(0, 1))
-                b_do = tl.load(p_do, boundary_check=(0, 1))
-                b_h = tl.load(p_h, boundary_check=(0, 1))
-                b_dh = tl.load(p_dh, boundary_check=(0, 1))
+                b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
+                b_do = tl.load(p_do, boundary_check=(0, 1), padding_option="zero")
+                b_h = tl.load(p_h, boundary_check=(0, 1), padding_option="zero")
+                b_dh = tl.load(p_dh, boundary_check=(0, 1), padding_option="zero")
 
                 if USE_G:
                     b_dg_last += (tl.sum(b_h * b_dh))
@@ -121,7 +121,7 @@ def chunk_bwd_kernel_dqkwg(
 
                 if USE_DW:
                     p_dv = tl.make_block_ptr(dv_h, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-                    b_dv = tl.load(p_dv, boundary_check=(0, 1))
+                    b_dv = tl.load(p_dv, boundary_check=(0, 1), padding_option="zero")
                     b_dw += tl.dot(b_dv.to(b_v.dtype), b_h.to(b_v.dtype))
 
             if USE_DW:
@@ -132,8 +132,8 @@ def chunk_bwd_kernel_dqkwg(
 
             p_q = tl.make_block_ptr(q_h, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
             p_k = tl.make_block_ptr(k_h, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-            b_q = tl.load(p_q, boundary_check=(0, 1))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
+            b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
 
             p_dq = tl.make_block_ptr(dq_h, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
             p_dk = tl.make_block_ptr(dk_h, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
@@ -145,7 +145,7 @@ def chunk_bwd_kernel_dqkwg(
             if USE_G:
                 b_dg = tl.zeros([BT, ], dtype=tl.float32)
                 p_g = tl.make_block_ptr(g_h, (T,), (1,), (i_t * BT,), (BT,), (0,))
-                b_g = tl.load(p_g, boundary_check=(0,))
+                b_g = tl.load(p_g, boundary_check=(0,), padding_option="zero")
                 b_g_last = tl.load(g_h + (min(i_t * BT + BT, T) - 1) * 1)
                 b_dg_last *= tl.exp(b_g_last)
 
