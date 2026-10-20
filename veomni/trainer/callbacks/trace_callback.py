@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import time
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Union
 
 import torch.distributed as dist
 from tqdm import trange
@@ -28,6 +28,8 @@ logger = get_logger(__name__)
 
 
 if TYPE_CHECKING:
+    import torch
+
     from ..base import BaseTrainer, VeOmniArguments
 
 
@@ -433,7 +435,7 @@ class EnvironMeterCallback(Callback):
         state: TrainerState,
         loss: float,
         loss_dict: Dict[str, float],
-        grad_norm: float,
+        grad_norm: Union[float, "torch.Tensor"],
         aux_metrics: Dict[str, float] = None,
         **kwargs,
     ) -> None:
