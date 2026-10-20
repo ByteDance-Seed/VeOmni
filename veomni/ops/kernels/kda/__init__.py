@@ -29,10 +29,9 @@ from ...registry import register_op
 
 
 def _eager(q, k, v, g, beta, **kwargs):
-    from veomni.models.transformers.kimi_k3.source import modeling_kimi_k3 as src
-
-    fn = getattr(src, "chunk_kda", None)
-    if fn is None:
+    try:
+        from fla.ops.kda import chunk_kda as fn
+    except ImportError:
         from veomni.models.transformers.kimi_k3.source.kda_fallback import chunk_kda_naive as fn
     return fn(q=q, k=k, v=v, g=g, beta=beta, **kwargs)
 
