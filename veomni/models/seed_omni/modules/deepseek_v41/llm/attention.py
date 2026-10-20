@@ -67,11 +67,11 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 
-from ......ops.kernels.deepseek_v4 import sparse_attn_tilelang, sparse_mqa_target_fwd
+from ......ops.kernels.dsa.sparse_mqa_target import sparse_attn_tilelang, sparse_mqa_target_fwd
 from .configuration import DeepseekV41LlmConfig
 from .quantization import fake_quant_linear, round_compress_kv, round_index_act, round_window_kv
 from .quantized import DeepseekV41GroupedLinear, DeepseekV41Linear, linear_quant_dtype
-from .reuse import DeepseekV4RMSNorm
+from .reuse import DeepseekV4RMSNorm, resolve_module_qat_impl
 from .sequence_shard import SequenceShard
 
 
@@ -513,7 +513,7 @@ class DeepseekV41Compressor(nn.Module):
         if self.compress_ratio < 1:
             raise ValueError(f"Layer {layer_idx} has compress_ratio {self.compress_ratio} and cannot compress")
         self.head_dim = config.head_dim
-        self.norm = DeepseekV4RMSNorm(config.head_dim, eps=config.rms_norm_eps)
+        self.norm = DeepseekV4RMSNorm(config.head_dim, eps=config.rms_norm_eps, config=config)
         self.wkv = nn.Linear(config.hidden_size, config.head_dim, bias=False)
         self.wgate = nn.Linear(config.hidden_size, config.head_dim, bias=False) if self.compress_ratio > 1 else None
 
@@ -646,7 +646,8 @@ class DeepseekV41Indexer(nn.Module):
         self.weights_proj = nn.Linear(config.hidden_size, config.index_n_heads, bias=False)
         if self.owns_keys:
             self.wk = nn.Linear(config.head_dim, config.index_head_dim, bias=False)
-            self.k_norm = DeepseekV4RMSNorm(config.index_head_dim, eps=config.rms_norm_eps)
+            self.k_norm = DeepseekV4RMSNorm(config.index_head_dim, eps=config.rms_norm_eps, config=config)
+        self.qat_implementation = resolve_module_qat_impl(config)
 
     def build_keys(
         self,
@@ -662,7 +663,7 @@ class DeepseekV41Indexer(nn.Module):
         """
         keys = self.k_norm(self.wk(latent))
         keys = apply_interleaved_rope(keys, cos, sin)
-        return round_index_act(keys, training=self.training)
+        return round_index_act(keys, training=self.training, qat_implementation=self.qat_implementation)
 
     def forward(
         self,
@@ -686,7 +687,7 @@ class DeepseekV41Indexer(nn.Module):
 
         query = self.wq_b(q_residual).unflatten(-1, (self.n_heads, self.index_head_dim))
         query = apply_interleaved_rope(query, cos.unsqueeze(-2), sin.unsqueeze(-2))
-        query = round_index_act(query, training=self.training)
+        query = round_index_act(query, training=self.training, qat_implementation=self.qat_implementation)
         weights = self.weights_proj(hidden_states) * (self.softmax_scale * self.n_heads**-0.5)
 
         visible = plan.visibility_mask(device)
@@ -762,12 +763,12 @@ class DeepseekV41Attention(nn.Module):
         self.attn_sink = nn.Parameter(torch.zeros(self.n_heads, dtype=torch.float32))
         quant_dtype = linear_quant_dtype(config)
         self.wq_a = DeepseekV41Linear(config.hidden_size, config.q_lora_rank, bias=False, quant_dtype=quant_dtype)
-        self.q_norm = DeepseekV4RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
+        self.q_norm = DeepseekV4RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps, config=config)
         self.wq_b = DeepseekV41Linear(
             config.q_lora_rank, self.n_heads * config.head_dim, bias=False, quant_dtype=quant_dtype
         )
         self.wkv = DeepseekV41Linear(config.hidden_size, config.head_dim, bias=False, quant_dtype=quant_dtype)
-        self.kv_norm = DeepseekV4RMSNorm(config.head_dim, eps=config.rms_norm_eps)
+        self.kv_norm = DeepseekV4RMSNorm(config.head_dim, eps=config.rms_norm_eps, config=config)
         self.wo_a = DeepseekV41GroupedLinear(
             self.n_heads * config.head_dim // self.n_groups,
             self.n_groups * config.o_lora_rank,
@@ -780,6 +781,7 @@ class DeepseekV41Attention(nn.Module):
 
         self.compressor = DeepseekV41Compressor(config, layer_idx) if self.is_kv_source else None
         self.indexer = DeepseekV41Indexer(config, layer_idx) if self.is_index_source else None
+        self.qat_implementation = resolve_module_qat_impl(config)
 
     @property
     def rope_is_compressed(self) -> bool:
@@ -841,13 +843,17 @@ class DeepseekV41Attention(nn.Module):
         batch, seq_len, _ = hidden_states.shape
         cos, sin = rotary_emb(position_ids, compressed=self.rope_is_compressed)
 
-        q_residual = self.q_norm(fake_quant_linear(self.wq_a, hidden_states))
-        query = fake_quant_linear(self.wq_b, q_residual).unflatten(-1, (self.n_heads, self.head_dim))
+        q_residual = self.q_norm(
+            fake_quant_linear(self.wq_a, hidden_states, qat_implementation=self.qat_implementation)
+        )
+        query = fake_quant_linear(self.wq_b, q_residual, qat_implementation=self.qat_implementation).unflatten(
+            -1, (self.n_heads, self.head_dim)
+        )
         query = apply_interleaved_rope(query, cos.unsqueeze(-2), sin.unsqueeze(-2))
 
-        kv = self.kv_norm(fake_quant_linear(self.wkv, hidden_states))
+        kv = self.kv_norm(fake_quant_linear(self.wkv, hidden_states, qat_implementation=self.qat_implementation))
         kv = apply_interleaved_rope(kv, cos, sin)
-        kv = round_window_kv(kv, training=self.training)
+        kv = round_window_kv(kv, training=self.training, qat_implementation=self.qat_implementation)
         if capture is not None:
             # After rotation and rounding, before the compressed rows are
             # concatenated for the attention call -- the window cache is this
@@ -1027,7 +1033,9 @@ class DeepseekV41Attention(nn.Module):
             if self.indexer is not None:
                 shared.index_k = self.indexer.build_keys(latent, group_cos, group_sin)
             rotated = apply_interleaved_rope(latent, group_cos, group_sin)
-            shared.compress_kv = round_compress_kv(rotated, training=self.training)
+            shared.compress_kv = round_compress_kv(
+                rotated, training=self.training, qat_implementation=self.qat_implementation
+            )
             if capture is not None:
                 # Source layers only: consumers read these from ``shared`` during
                 # the same forward and must not copy them onto their own cache.

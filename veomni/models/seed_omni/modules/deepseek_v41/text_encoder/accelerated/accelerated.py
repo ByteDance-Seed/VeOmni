@@ -29,9 +29,8 @@ from typing import Any, Dict, Optional
 import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.ops.kernels.cross_entropy import ForCausalLMLoss
-from veomni.ops.kernels.cross_entropy.chunk_loss import chunk_loss_function
-from veomni.ops.kernels.cross_entropy.eager import eager_cross_entropy
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.ops import VeomniOp
 from veomni.utils.constants import IGNORE_INDEX
 
 from .....mixins.training_module_mixin import post_forward, pre_forward
@@ -51,6 +50,10 @@ class TrainingMixin(BaseTrainingMixin):
     config: DeepseekV41TextEncoderConfig
     device: torch.device
     _chat_template: DeepseekV41ChatTemplate
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.veomni_dspark_ce = VeomniOp("cross_entropy_loss", "standard", "chunk_loss")
 
     @pre_forward("encode")
     def encode_pre(
@@ -170,16 +173,18 @@ class TrainingMixin(BaseTrainingMixin):
         """
         num_supervised_tokens = (labels != IGNORE_INDEX).sum()
         if not self.config.tie_word_embeddings and self.lm_head is not None and self.lm_head.bias is None:
-            loss, _ = chunk_loss_function(
-                hidden_states,
-                self.lm_head.weight,
+            loss, _, _ = ForCausalLMLoss(
+                logits=None,
                 labels=None,
-                chunk_size=_DSPARK_CHUNK_SIZE,
-                vocab_size=self.config.vocab_size,
-                ignore_index=IGNORE_INDEX,
                 shift_labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                chunk_size=_DSPARK_CHUNK_SIZE,
+                ignore_index=IGNORE_INDEX,
                 loss_reduction_group=get_parallel_state().fsdp_group,
                 logits_bias=markov_bias,
+                op=self.veomni_dspark_ce,
             )
             return loss
         if num_supervised_tokens > 0:
@@ -192,7 +197,6 @@ class TrainingMixin(BaseTrainingMixin):
             vocab_size=self.config.vocab_size,
             num_items_in_batch=num_supervised_tokens.clamp(min=1),
             loss_reduction_group=get_parallel_state().fsdp_group,
-            cross_entropy_fn=eager_cross_entropy,
         )
         return loss
 

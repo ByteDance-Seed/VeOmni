@@ -32,7 +32,7 @@ import re
 
 import torch
 
-from ....checkpoint_tensor_loading import ConvertedCheckpointTensor
+from ....checkpoint.convert import ConvertedCheckpointTensor
 from .dequant import dequant_fp4_blockwise, dequant_fp8_blockwise
 from .llm.configuration import (
     RELEASED_ENGRAM_LAYER_IDS,

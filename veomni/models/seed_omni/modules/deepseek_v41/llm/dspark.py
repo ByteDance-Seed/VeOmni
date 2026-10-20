@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_layers import GradientCheckpointingLayer
 
-from ......ops.kernels.deepseek_v4 import sparse_attn_tilelang
+from ......ops.kernels.dsa.sparse_mqa_target import sparse_attn_tilelang
 from .attention import (
     DeepseekV41Attention,
     DeepseekV41AttentionCache,
@@ -96,10 +96,11 @@ class DeepseekV41DSparkBlock(GradientCheckpointingLayer):
                 f"{self.self_attn.compress_ratio}; official DSparkAttention is window-only"
             )
         self.mlp = DeepseekV41SparseMoeBlock(config, n_routed_experts=n_routed, num_experts_per_tok=n_activated)
-        self.input_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.post_attention_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.attn_hc = DeepseekV41HyperConnection(config)
         self.ffn_hc = DeepseekV41HyperConnection(config)
+        self.veomni_mhc_post = self.attn_hc.veomni_mhc_post
 
         if stage_id == 0:
             n_targets = len(config.dspark_target_layer_ids)
@@ -109,9 +110,9 @@ class DeepseekV41DSparkBlock(GradientCheckpointingLayer):
                 bias=False,
                 quant_dtype=linear_quant_dtype(config),
             )
-            self.main_norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.main_norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         if stage_id == config.num_nextn_predict_layers - 1:
-            self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
             self.markov_head = DSparkMarkovHead(config.vocab_size, config.dspark_markov_rank)
             self.confidence_head = DSparkConfidenceHead(config.hidden_size + config.dspark_markov_rank)
 
@@ -193,9 +194,9 @@ class DeepseekV41DSparkBlock(GradientCheckpointingLayer):
         """Rotated window KV for ``hidden_states``, matching ``seed_window``."""
         attn = self.self_attn
         cos, sin = rotary_emb(position_ids, compressed=False)
-        kv = attn.kv_norm(fake_quant_linear(attn.wkv, hidden_states))
+        kv = attn.kv_norm(fake_quant_linear(attn.wkv, hidden_states, qat_implementation=attn.qat_implementation))
         kv = apply_interleaved_rope(kv, cos, sin)
-        return round_window_kv(kv, training=attn.training)
+        return round_window_kv(kv, training=attn.training, qat_implementation=attn.qat_implementation)
 
     def forward_draft(
         self,
@@ -211,13 +212,13 @@ class DeepseekV41DSparkBlock(GradientCheckpointingLayer):
         attn_pre, attn_post, attn_comb = self.attn_hc(hidden_streams)
         collapsed = mhc_collapse(hidden_streams, pre_mix)
         attn_out = self._draft_attention(self.input_layernorm(collapsed), position_ids, rotary_emb, cache, main_x)
-        hidden_streams = mhc_expand(attn_out, residual, attn_post, attn_comb)
+        hidden_streams = mhc_expand(attn_out, residual, attn_post, attn_comb, op=self.veomni_mhc_post)
 
         residual = hidden_streams
         ffn_pre, ffn_post, ffn_comb = self.ffn_hc(hidden_streams)
         collapsed = mhc_collapse(hidden_streams, attn_pre)
         mlp_out, _ = self.mlp(self.post_attention_layernorm(collapsed), image_mask=None)
-        hidden_streams = mhc_expand(mlp_out, residual, ffn_post, ffn_comb)
+        hidden_streams = mhc_expand(mlp_out, residual, ffn_post, ffn_comb, op=self.veomni_mhc_post)
         return hidden_streams, ffn_pre
 
     def _draft_attention(
@@ -244,13 +245,17 @@ class DeepseekV41DSparkBlock(GradientCheckpointingLayer):
         draft_positions = position_ids[:, :1] + 1 + torch.arange(block_size, device=hidden_states.device)
         cos, sin = rotary_emb(draft_positions, compressed=False)
 
-        q_residual = attn.q_norm(fake_quant_linear(attn.wq_a, hidden_states))
-        query = fake_quant_linear(attn.wq_b, q_residual).unflatten(-1, (attn.n_heads, attn.head_dim))
+        q_residual = attn.q_norm(
+            fake_quant_linear(attn.wq_a, hidden_states, qat_implementation=attn.qat_implementation)
+        )
+        query = fake_quant_linear(attn.wq_b, q_residual, qat_implementation=attn.qat_implementation).unflatten(
+            -1, (attn.n_heads, attn.head_dim)
+        )
         query = apply_interleaved_rope(query, cos.unsqueeze(-2), sin.unsqueeze(-2))
 
-        kv = attn.kv_norm(fake_quant_linear(attn.wkv, hidden_states))
+        kv = attn.kv_norm(fake_quant_linear(attn.wkv, hidden_states, qat_implementation=attn.qat_implementation))
         kv = apply_interleaved_rope(kv, cos, sin)
-        kv = round_window_kv(kv, training=attn.training)
+        kv = round_window_kv(kv, training=attn.training, qat_implementation=attn.qat_implementation)
 
         window = cache.window
         if window is None:
@@ -298,13 +303,13 @@ class DeepseekV41DSparkBlock(GradientCheckpointingLayer):
         attn_out = self._packed_draft_attention(
             self.input_layernorm(collapsed), position_ids, rotary_emb, main_x, shard
         )
-        hidden_streams = mhc_expand(attn_out, residual, attn_post, attn_comb)
+        hidden_streams = mhc_expand(attn_out, residual, attn_post, attn_comb, op=self.veomni_mhc_post)
 
         residual = hidden_streams
         ffn_pre, ffn_post, ffn_comb = self.ffn_hc(hidden_streams)
         collapsed = mhc_collapse(hidden_streams, attn_pre)
         mlp_out, _ = self.mlp(self.post_attention_layernorm(collapsed), image_mask=None)
-        hidden_streams = mhc_expand(mlp_out, residual, ffn_post, ffn_comb)
+        hidden_streams = mhc_expand(mlp_out, residual, ffn_post, ffn_comb, op=self.veomni_mhc_post)
         return hidden_streams, ffn_pre
 
     def _packed_draft_attention(
@@ -337,8 +342,12 @@ class DeepseekV41DSparkBlock(GradientCheckpointingLayer):
         batch, seq_len, _ = hidden_states.shape
         cos, sin = rotary_emb(position_ids, compressed=False)
 
-        q_residual = attn.q_norm(fake_quant_linear(attn.wq_a, hidden_states))
-        query = fake_quant_linear(attn.wq_b, q_residual).unflatten(-1, (attn.n_heads, attn.head_dim))
+        q_residual = attn.q_norm(
+            fake_quant_linear(attn.wq_a, hidden_states, qat_implementation=attn.qat_implementation)
+        )
+        query = fake_quant_linear(attn.wq_b, q_residual, qat_implementation=attn.qat_implementation).unflatten(
+            -1, (attn.n_heads, attn.head_dim)
+        )
         query = apply_interleaved_rope(query, cos.unsqueeze(-2), sin.unsqueeze(-2))
 
         kv = self._window_kv(hidden_states, position_ids, rotary_emb)

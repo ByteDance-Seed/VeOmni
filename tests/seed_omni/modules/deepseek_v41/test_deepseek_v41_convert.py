@@ -441,7 +441,7 @@ def _load_converted_llm(tmp_path, released):
 
 def _dequant_state(state):
     """Spend every ``P_scale`` the way training load does."""
-    from veomni.models.checkpoint_tensor_loading import maybe_convert_checkpoint_tensor
+    from veomni.models.checkpoint.convert import maybe_convert_checkpoint_tensor
     from veomni.models.seed_omni.modules.deepseek_v41.checkpoint_tensor_converter import DeepseekV41DequantConverter
 
     converter = DeepseekV41DequantConverter()

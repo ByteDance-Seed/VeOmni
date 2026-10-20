@@ -32,7 +32,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from .....checkpoint_tensor_loading import ConvertedCheckpointTensor
+from .....checkpoint.convert import ConvertedCheckpointTensor
 from ..quant_scheme import quantized_storage_dtype
 from .quantized import dequantize_rows
 

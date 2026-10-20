@@ -32,8 +32,6 @@ know which layers have an n-gram table or how the hashes are indexed.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
-
 import torch
 from transformers.modeling_layers import GradientCheckpointingLayer
 
@@ -61,10 +59,11 @@ class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
         self.self_attn = DeepseekV41Attention(config, layer_idx)
         n_routed, n_activated = config.moe_config_for_layer(layer_idx)
         self.mlp = DeepseekV41SparseMoeBlock(config, n_routed_experts=n_routed, num_experts_per_tok=n_activated)
-        self.input_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.post_attention_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.attn_hc = DeepseekV41HyperConnection(config)
         self.ffn_hc = DeepseekV41HyperConnection(config)
+        self.veomni_mhc_post = self.attn_hc.veomni_mhc_post
 
     def forward(
         self,
@@ -73,14 +72,14 @@ class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
         position_ids: torch.Tensor,
         rotary_emb: DeepseekV41RotaryEmbedding,
         shared: SharedAttentionState,
-        plans: Dict[int, CompressionPlan],
-        image_mask: Optional[torch.Tensor] = None,
-        capture: Optional[DeepseekV41AttentionCache] = None,
-        capture_seq_len: Optional[int] = None,
-        compress_hidden: Optional[torch.Tensor] = None,
-        compress_position_ids: Optional[torch.Tensor] = None,
-        shard: Optional[SequenceShard] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[IndexerLossTerms]]:
+        plans: dict[int, CompressionPlan],
+        image_mask: torch.Tensor | None = None,
+        capture: DeepseekV41AttentionCache | None = None,
+        capture_seq_len: int | None = None,
+        compress_hidden: torch.Tensor | None = None,
+        compress_position_ids: torch.Tensor | None = None,
+        shard: SequenceShard | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, IndexerLossTerms | None]:
         """``[B, S, hc, D]`` in and out, plus the next ``pre``, router logits and indexer KL.
 
         The indexer KL leaves as part of the return value and never as an
@@ -107,13 +106,13 @@ class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
             compress_position_ids=compress_position_ids,
             shard=shard,
         )
-        hidden_streams = mhc_expand(attn_out, residual, attn_post, attn_comb)
+        hidden_streams = mhc_expand(attn_out, residual, attn_post, attn_comb, op=self.veomni_mhc_post)
 
         residual = hidden_streams
         ffn_pre, ffn_post, ffn_comb = self.ffn_hc(hidden_streams)
         collapsed = mhc_collapse(hidden_streams, attn_pre)
         mlp_out, router_logits = self.mlp(self.post_attention_layernorm(collapsed), image_mask)
-        hidden_streams = mhc_expand(mlp_out, residual, ffn_post, ffn_comb)
+        hidden_streams = mhc_expand(mlp_out, residual, ffn_post, ffn_comb, op=self.veomni_mhc_post)
 
         return hidden_streams, ffn_pre, router_logits, indexer_loss
 

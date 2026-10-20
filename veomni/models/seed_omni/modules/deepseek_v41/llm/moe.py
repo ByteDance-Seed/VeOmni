@@ -15,7 +15,7 @@
 """V4.1's MoE: V4's experts behind a router that routes image tokens separately.
 
 The expert side is imported wholesale. ``DeepseekV4Experts`` already carries the
-stacked ``[E, 2I, H]`` / ``[E, H, I]`` layout, the OpSlot-guarded fused-MoE path,
+stacked ``[E, 2I, H]`` / ``[E, H, I]`` layout, the VeomniOp-guarded fused-MoE path,
 the fp4 weight QAT keyed on ``expert_dtype`` and the ``swiglu_limit`` clamp --
 all of which V4.1 wants unchanged -- and ``DeepseekV4MLP`` is the shared expert
 down to the same clamp. Both read the config by attribute name, which is what
@@ -63,7 +63,6 @@ weight decay to a quantity whose whole job is to track load.
 from __future__ import annotations
 
 import copy
-from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -118,8 +117,8 @@ class DeepseekV41TopKRouter(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        image_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        image_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(logits, weights, indices)``, all flattened over batch and sequence.
 
         ``image_mask`` is ``[B, S]`` bool, true inside an image span. ``None``
@@ -156,8 +155,8 @@ class DeepseekV41SparseMoeBlock(nn.Module):
         self,
         config: DeepseekV41LlmConfig,
         *,
-        n_routed_experts: Optional[int] = None,
-        num_experts_per_tok: Optional[int] = None,
+        n_routed_experts: int | None = None,
+        num_experts_per_tok: int | None = None,
     ) -> None:
         super().__init__()
         if n_routed_experts is not None or num_experts_per_tok is not None:
@@ -173,8 +172,8 @@ class DeepseekV41SparseMoeBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        image_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        image_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """``[B, S, D]`` -> the block output and the router logits.
 
         The logits leave as a return value so a balance metric can be computed

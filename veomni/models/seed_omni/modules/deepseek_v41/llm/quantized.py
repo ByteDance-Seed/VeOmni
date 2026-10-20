@@ -57,17 +57,22 @@ achievable rate.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ......distributed.moe import dispatch_to_ep_class
 from ......distributed.parallel_state import get_parallel_state
-from ......ops.kernels.deepseek_v4 import act_quant, fp4_gemm, fp8_gemm
+from ......ops import VeomniOp
+from ......ops.qat import act_quant, fp4_gemm, fp8_gemm
 from ..quant_scheme import QUANT_BLOCK_SIZE, SCALE_DTYPE, SCALE_FMT, quantized_storage_dtype
-from .reuse import DeepseekV4Experts, DeepseekV4GroupedLinear, DeepseekV4MLP
+from .reuse import (
+    DeepseekV4Experts,
+    DeepseekV4GroupedLinear,
+    DeepseekV4MLP,
+    resolve_module_op_impl,
+    resolve_module_qat_impl,
+)
 
 
 # Matches TileLang ``fp8_gemm`` / ``fp4_gemm`` ``block_M``.
@@ -136,7 +141,7 @@ def is_quantized(weight: torch.Tensor) -> bool:
     return weight.dtype in (torch.float8_e4m3fn, torch.float4_e2m1fn_x2, torch.int8)
 
 
-def linear_quant_dtype(config) -> Optional[torch.dtype]:
+def linear_quant_dtype(config) -> torch.dtype | None:
     """The storage dtype for a dense projection, or ``None`` for an ordinary layer.
 
     Every dense projection the release quantizes is fp8 -- fp4 is only ever the
@@ -146,7 +151,7 @@ def linear_quant_dtype(config) -> Optional[torch.dtype]:
     return quantized_storage_dtype(config)
 
 
-def expert_quant_dtype(config) -> Optional[torch.dtype]:
+def expert_quant_dtype(config) -> torch.dtype | None:
     """The storage dtype for the stacked routed experts, or ``None``.
 
     Separate from :func:`linear_quant_dtype` because the experts are the one
@@ -245,7 +250,7 @@ class DeepseekV41Linear(nn.Linear, QuantizedWeightMixin):
         in_features: int,
         out_features: int,
         bias: bool = False,
-        quant_dtype: Optional[torch.dtype] = None,
+        quant_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__(in_features, out_features, bias=bias)
         if quant_dtype is not None:
@@ -278,7 +283,7 @@ class DeepseekV41GroupedLinear(DeepseekV4GroupedLinear, QuantizedWeightMixin):
         out_features: int,
         n_groups: int,
         bias: bool = False,
-        quant_dtype: Optional[torch.dtype] = None,
+        quant_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__(in_features_per_group, out_features, n_groups=n_groups, bias=bias)
         if quant_dtype is None:
@@ -323,8 +328,14 @@ class DeepseekV41SharedExpert(DeepseekV4MLP):
     clamp and the SwiGLU fusion above it keep working untouched.
     """
 
-    def __init__(self, config, quant_dtype: Optional[torch.dtype] = None) -> None:
+    def __init__(self, config, quant_dtype: torch.dtype | None = None) -> None:
         super().__init__(config)
+        self.veomni_swiglu_mlp = VeomniOp(
+            "swiglu_mlp",
+            "standard",
+            resolve_module_op_impl(config, "swiglu_mlp_implementation"),
+        )
+        self.qat_implementation = resolve_module_qat_impl(config)
         if quant_dtype is None:
             return
         for name in ("gate_proj", "up_proj", "down_proj"):
@@ -415,8 +426,14 @@ class DeepseekV41QuantizedExperts(DeepseekV4Experts):
     narrow GEMMs rather than the whole slab.
     """
 
-    def __init__(self, config, quant_dtype: Optional[torch.dtype] = None) -> None:
+    def __init__(self, config, quant_dtype: torch.dtype | None = None) -> None:
         super().__init__(config)
+        self.veomni_moe = VeomniOp(
+            "moe_experts",
+            "standard",
+            resolve_module_op_impl(config, "moe_implementation"),
+        )
+        self.qat_implementation = resolve_module_qat_impl(config)
         self.experts_are_quantized = quant_dtype is not None
         if not self.experts_are_quantized:
             return

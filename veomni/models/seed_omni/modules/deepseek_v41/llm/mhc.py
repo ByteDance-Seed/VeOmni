@@ -50,18 +50,15 @@ rather than to the one that first makes the model run.
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ......ops.dispatch import OpSlot
+from ......ops import VeomniOp
+from ......ops.config import resolve_op_impl
 from .configuration import DeepseekV41LlmConfig
-from .reuse import DeepseekV4UnweightedRMSNorm
+from .reuse import DeepseekV4UnweightedRMSNorm, resolve_module_op_impl
 
-
-veomni_mhc_post = OpSlot("mhc", "post")
 
 #: ``post`` is a placement weight in ``[0, 2]``, so the sigmoid is doubled. Named
 #: because the value is shared with the kernel path, which takes it as an argument.
@@ -82,7 +79,8 @@ class DeepseekV41HyperConnection(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
-        self.input_norm = DeepseekV4UnweightedRMSNorm(eps=config.rms_norm_eps)
+        self.input_norm = DeepseekV4UnweightedRMSNorm(eps=config.rms_norm_eps, config=config)
+        self.veomni_mhc_post = VeomniOp("mhc", "post", resolve_module_op_impl(config, "mhc_implementation"))
         mix = (2 + self.hc_mult) * self.hc_mult
         self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * config.hidden_size))
         self.base = nn.Parameter(torch.empty(mix))
@@ -102,7 +100,7 @@ class DeepseekV41HyperConnection(nn.Module):
         nn.init.zeros_(self.base)
         nn.init.ones_(self.scale)
 
-    def forward(self, hidden_streams: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``[B, S, hc, D]`` -> ``pre[B, S, hc]``, ``post[B, S, hc]``, ``comb[B, S, hc, hc]``."""
         hc = self.hc_mult
         # Normalised over the whole flattened hc*D vector, one statistic per
@@ -139,6 +137,8 @@ def mhc_expand(
     residual: torch.Tensor,
     post: torch.Tensor,
     comb: torch.Tensor,
+    *,
+    op: VeomniOp | None = None,
 ) -> torch.Tensor:
     """Place a sublayer output back across the copies and mix the residual in.
 
@@ -150,12 +150,9 @@ def mhc_expand(
     the reference's spelling materialises a ``[B, S, hc, hc, D]`` intermediate,
     which at hc_mult 4 is four times the stream it is mixing.
     """
-    if veomni_mhc_post.use_non_eager_impl:
-        return veomni_mhc_post(output, residual, post, comb)
-    dtype = output.dtype
-    return post.to(dtype).unsqueeze(-1) * output.unsqueeze(-2) + torch.matmul(
-        comb.to(dtype).transpose(-1, -2), residual
-    )
+    if op is None:
+        op = VeomniOp("mhc", "post", resolve_op_impl("mhc_implementation"))
+    return op(output, residual, post, comb)
 
 
 def require_fp32_pre_mix(pre_mix: torch.Tensor) -> None:

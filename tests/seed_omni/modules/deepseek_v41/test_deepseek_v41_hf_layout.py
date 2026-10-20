@@ -20,8 +20,8 @@ import pytest
 import torch
 from safetensors import safe_open
 
-import veomni.models.module_utils as module_utils
-from veomni.models.module_utils import init_empty_weights, load_model_weights, load_model_weights_ep_sharded
+import veomni.models.checkpoint.weights as module_utils
+from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights, load_model_weights_ep_sharded
 from veomni.models.seed_omni.modules.deepseek_v41.checkpoint_tensor_converter import (
     DeepseekV41LlmConverter,
     dequant_converted_weight,

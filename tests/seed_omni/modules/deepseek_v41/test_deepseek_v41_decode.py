@@ -74,7 +74,7 @@ def _inputs(batch, seqlen, heads, dim, kv_len, topk, *, seed=0, device="cuda"):
     ],
 )
 def test_dense_matches_tilelang_kernel(seqlen, kv_len, topk):
-    from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang
+    from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_attn_tilelang
 
     heads, dim = 8, 512
     q, kv, sinks, idxs = _inputs(1, seqlen, heads, dim, kv_len, topk)
@@ -91,7 +91,7 @@ def test_dense_matches_tilelang_kernel(seqlen, kv_len, topk):
 @requires_kernel
 def test_sink_is_not_silently_dropped():
     """A sink left out of the denominator still produces a valid-looking softmax."""
-    from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang
+    from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_attn_tilelang
 
     heads, dim, kv_len, topk = 8, 512, 128, 640
     q, kv, _, idxs = _inputs(1, 16, heads, dim, kv_len, topk)
@@ -195,7 +195,7 @@ def test_lse_is_base_two_like_the_kernel():
     consumer renormalizes with it, and a uniformly scaled renormalizer still
     yields a distribution that sums to one. Nothing downstream would complain.
     """
-    from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang
+    from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_attn_tilelang
 
     heads, dim, kv_len, topk = 8, 512, 128, 640
     q, kv, sinks, idxs = _inputs(1, 16, heads, dim, kv_len, topk)

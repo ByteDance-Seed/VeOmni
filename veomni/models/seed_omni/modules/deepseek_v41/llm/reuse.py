@@ -30,6 +30,10 @@ not pinned that field. V4.1 rotates locally instead; see
 ``attention.apply_interleaved_rope``.
 """
 
+from typing import Any
+
+from ......ops import VeomniOp
+from ......ops.config import resolve_op_impl, resolve_qat_impl
 from ......utils.device import IS_NPU_AVAILABLE
 
 
@@ -39,13 +43,54 @@ else:
     from ......models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as _generated
 
 
-#: RMS norm with VeOmni's fused-kernel dispatch. V4.1's ``norm_eps`` is 1e-20
-#: against V4's 1e-6, which is a constructor argument rather than a behaviour
-#: difference.
-DeepseekV4RMSNorm = _generated.DeepseekV4RMSNorm
+def resolve_module_op_impl(config: Any, field: str, *, variant: str | None = None) -> str | None:
+    """Resolve one op field from ``config.ops_implementation``, falling back to ``resolve_op_impl``."""
+    ops_impl = getattr(config, "ops_implementation", None)
+    if isinstance(ops_impl, dict) and field in ops_impl and ops_impl[field] is not None:
+        impl = ops_impl[field]
+        if variant is not None:
+            from ......arguments.arguments_types import _DEPRECATED_VARIANT_IMPLEMENTATION_ALIASES
 
-#: The mHC input norm -- RMS without a learned weight.
-DeepseekV4UnweightedRMSNorm = _generated.DeepseekV4UnweightedRMSNorm
+            alias = _DEPRECATED_VARIANT_IMPLEMENTATION_ALIASES.get(field, {}).get(variant, {}).get(impl)
+            if alias is not None:
+                impl = alias
+        return impl
+    return resolve_op_impl(field, variant=variant)
+
+
+def resolve_module_qat_impl(config: Any) -> str:
+    """Resolve ``qat_implementation`` from ``config.ops_implementation``, falling back to ``resolve_qat_impl``."""
+    ops_impl = getattr(config, "ops_implementation", None)
+    if isinstance(ops_impl, dict) and "qat_implementation" in ops_impl and ops_impl["qat_implementation"] is not None:
+        return ops_impl["qat_implementation"]
+    return resolve_qat_impl()
+
+
+class DeepseekV4RMSNorm(_generated.DeepseekV4RMSNorm):
+    """RMS norm with VeOmni's fused-kernel dispatch, respecting module-level ``config.ops_implementation``."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6, config: Any = None) -> None:
+        super().__init__(hidden_size, eps=eps)
+        if config is not None:
+            self.veomni_rms_norm = VeomniOp(
+                "rms_norm",
+                "deepseek_v4",
+                resolve_module_op_impl(config, "rms_norm_implementation"),
+            )
+
+
+class DeepseekV4UnweightedRMSNorm(_generated.DeepseekV4UnweightedRMSNorm):
+    """The mHC input norm -- RMS without a learned weight, respecting module-level ``config.ops_implementation``."""
+
+    def __init__(self, eps: float = 1e-6, config: Any = None) -> None:
+        super().__init__(eps=eps)
+        if config is not None:
+            self.veomni_unweighted_rms_norm = VeomniOp(
+                "rms_norm",
+                "unweighted",
+                resolve_module_op_impl(config, "rms_norm_implementation", variant="unweighted"),
+            )
+
 
 #: Block-diagonal grouped projection, ``o_groups`` independent blocks. This is
 #: the released ``einsum("bsgd,grd->bsgr", o, wo_a.view(groups, rank, -1))``
@@ -53,7 +98,7 @@ DeepseekV4UnweightedRMSNorm = _generated.DeepseekV4UnweightedRMSNorm
 DeepseekV4GroupedLinear = _generated.DeepseekV4GroupedLinear
 
 #: Stacked routed experts: ``gate_up_proj [E, 2I, H]``, ``down_proj [E, H, I]``,
-#: the fused-MoE OpSlot path, fp4 weight QAT keyed on ``expert_dtype``, and the
+#: the fused-MoE VeomniOp path, fp4 weight QAT keyed on ``expert_dtype``, and the
 #: ``swiglu_limit`` clamp. V4.1 changes none of it. Reads the config as
 #: ``num_local_experts`` / ``intermediate_size`` / ``hidden_act``, which
 #: :class:`DeepseekV41LlmConfig` exposes as properties over its own field names.
@@ -63,18 +108,6 @@ DeepseekV4Experts = _generated.DeepseekV4Experts
 #: and one-sided on ``gate``, and FP8 QAT on all three projections.
 DeepseekV4MLP = _generated.DeepseekV4MLP
 
-#: Routed-expert / shared-MLP QAT. The helpers close over this slot in the
-#: generated module, so ``_bind_veomni_ops`` will not see it unless a V4.1
-#: modeling module re-exports the same object (``llm/modeling.py``,
-#: ``llm/accelerated/accelerated.py``).
-veomni_qat_implementation = _generated.veomni_qat_implementation
-
-#: The fused-MoE guard in :class:`DeepseekV4Experts`, re-exported for the same
-#: reason. Unbound, the experts run V4's eager loop, which indexes the stacked
-#: slabs with global expert ids and so cannot run on an EP shard; it also skips
-#: the fp4 expert QAT, which is wired on the fused path only.
-veomni_moe_experts_forward = _generated.veomni_moe_experts_forward
-
 
 __all__ = [
     "DeepseekV4Experts",
@@ -82,6 +115,6 @@ __all__ = [
     "DeepseekV4MLP",
     "DeepseekV4RMSNorm",
     "DeepseekV4UnweightedRMSNorm",
-    "veomni_moe_experts_forward",
-    "veomni_qat_implementation",
+    "resolve_module_op_impl",
+    "resolve_module_qat_impl",
 ]

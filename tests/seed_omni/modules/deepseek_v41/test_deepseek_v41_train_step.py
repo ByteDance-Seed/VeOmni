@@ -30,6 +30,7 @@ import pytest
 import torch
 import yaml
 
+from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated.accelerated import DeepseekV41LlmAccelerated
@@ -48,7 +49,6 @@ from veomni.models.seed_omni.modules.deepseek_v41.vision.accelerated.accelerated
 from veomni.models.seed_omni.modules.deepseek_v41.vision.configuration import DeepseekV41VisionEncoderConfig
 from veomni.models.seed_omni.modules.deepseek_v41.vision.processing import image_token_types
 from veomni.models.seed_omni.utils.conversation import ConversationItem
-from veomni.ops.kernels.cross_entropy import ForCausalLMLoss
 from veomni.utils.constants import IGNORE_INDEX
 
 
@@ -773,30 +773,75 @@ class TestTrainableLayerMatrix:
 
 
 class TestQatOpsSlotBinding:
-    def test_bind_on_accelerated_module_enables_dense_and_expert_qat(self):
-        """YAML ``qat_implementation`` is a no-op unless both slots live here.
-
-        ``_bind_veomni_ops`` only scans the OmniModule's Python module. Dense
-        GEMM / KV / indexer QAT is in ``quantization.py``; routed-expert QAT
-        closes over the reused V4 generated slot. Both have to be attributes
-        of ``accelerated.py`` or the 8xH20 job trains in bf16 while thinking
-        it is doing QAT.
+    def test_module_level_ops_implementation_binds_llm_and_vision_ops(self):
+        """Module-level ``config.ops_implementation`` binds ``VeomniOp`` and ``qat_implementation``
+        directly on each module instance without mutating global ops config.
         """
-        from veomni.arguments.arguments_types import OpsImplementationConfig
-        from veomni.models.auto import _bind_veomni_ops
-        from veomni.models.seed_omni.modules.deepseek_v41.llm import quantization as qat
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated import accelerated as acc
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.reuse import veomni_qat_implementation as expert_slot
+        from veomni.ops import VeomniOp
 
-        dense_slot = qat.veomni_qat_implementation
-        dense_before, expert_before = dense_slot.value, expert_slot.value
-        try:
-            ops = OpsImplementationConfig()
-            ops.qat_implementation = "fp8_blockwise"
-            assert _bind_veomni_ops(acc, ops)
-            assert qat.qat_enabled()
-            assert expert_slot.value == "fp8_blockwise"
-            assert dense_slot is not expert_slot
-        finally:
-            dense_slot._value = dense_before
-            expert_slot._value = expert_before
+        schedule = shrink_layer_schedule(N_LAYERS)
+        llm_cfg = DeepseekV41LlmConfig(
+            hidden_size=HIDDEN,
+            num_attention_heads=4,
+            head_dim=16,
+            qk_rope_head_dim=8,
+            q_lora_rank=16,
+            o_lora_rank=16,
+            o_groups=2,
+            sliding_window=8,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=2,
+            moe_intermediate_size=32,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            n_shared_experts=1,
+            engram_n_heads=ENGRAM_HEADS,
+            engram_head_dim=ENGRAM_HEAD_DIM,
+            engram_max_ngram_size=MAX_NGRAM,
+            hc_mult=2,
+            hc_sinkhorn_iters=3,
+            ops_implementation={
+                "qat_implementation": "fp8_blockwise",
+                "mhc_implementation": "eager",
+                "moe_implementation": "eager",
+                "rms_norm_implementation": "eager",
+                "swiglu_mlp_implementation": "eager",
+            },
+            **schedule,
+        )
+        llm = DeepseekV41LlmAccelerated(llm_cfg)
+        layer0 = llm.model.layers[0]
+        assert layer0.self_attn.qat_implementation == "fp8_blockwise"
+        assert layer0.self_attn.indexer.qat_implementation == "fp8_blockwise"
+        assert layer0.mlp.experts.qat_implementation == "fp8_blockwise"
+        assert layer0.mlp.shared_experts.qat_implementation == "fp8_blockwise"
+        assert isinstance(layer0.veomni_mhc_post, VeomniOp)
+        assert layer0.veomni_mhc_post.impl == "eager"
+        assert isinstance(layer0.mlp.experts.veomni_moe, VeomniOp)
+        assert layer0.mlp.experts.veomni_moe.impl == "eager"
+        assert isinstance(layer0.mlp.shared_experts.veomni_swiglu_mlp, VeomniOp)
+        assert layer0.mlp.shared_experts.veomni_swiglu_mlp.impl == "eager"
+        assert isinstance(layer0.input_layernorm.veomni_rms_norm, VeomniOp)
+        assert layer0.input_layernorm.veomni_rms_norm.impl == "eager"
+
+        vis_cfg = DeepseekV41VisionEncoderConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            llm_hidden_size=HIDDEN,
+            image_size=28,
+            patch_size=14,
+            spatial_merge_size=2,
+            ops_implementation={
+                "attn_implementation": "sdpa",
+                "rms_norm_implementation": "eager",
+            },
+        )
+        vision = DeepseekV41VisionEncoderAccelerated(vis_cfg)
+        v_block0 = vision.vision.blocks[0]
+        assert isinstance(v_block0.attn.veomni_attn, VeomniOp)
+        assert v_block0.attn.veomni_attn.impl == "sdpa"
+        assert isinstance(v_block0.norm1.veomni_rms_norm, VeomniOp)
+        assert v_block0.norm1.veomni_rms_norm.impl == "eager"

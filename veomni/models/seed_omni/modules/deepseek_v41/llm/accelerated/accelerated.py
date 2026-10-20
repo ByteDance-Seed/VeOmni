@@ -55,11 +55,7 @@ from ....base.llm_packing import pack_llm_conversations_for_forward, scatter_llm
 from ...ngram.packing import pack_ngram_inputs
 from ...quant_scheme import quantized_storage_dtype
 from ..configuration import DeepseekV41LlmConfig
-from ..mhc import veomni_mhc_post
 from ..modeling import DeepseekV41Llm
-from ..quantization import veomni_qat_implementation
-from ..reuse import veomni_moe_experts_forward
-from ..reuse import veomni_qat_implementation as veomni_v4_expert_qat_implementation
 from ..sequence_shard import SequenceShard
 
 
@@ -413,8 +409,4 @@ __all__ = [
     "DeepseekV41LlmAccelerated",
     "build_packed_image_mask",
     "fold_indexer_kl_loss",
-    "veomni_mhc_post",
-    "veomni_moe_experts_forward",
-    "veomni_qat_implementation",
-    "veomni_v4_expert_qat_implementation",
 ]

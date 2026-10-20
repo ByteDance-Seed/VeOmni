@@ -34,18 +34,13 @@ The round-trip is eager PyTorch so prefill-sized M does not hit the TileLang
 import torch
 import torch.nn as nn
 
-from ......ops.dispatch import OpsConfigSlot
+from ......ops.config import resolve_qat_impl
 from ......ops.qat import (
     fp4_fake_quant_weight,
     fp8_fake_quant_stacked_weight,
     qat_linear,
 )
 
-
-veomni_qat_implementation = OpsConfigSlot("qat_implementation")
-# ``_bind_veomni_ops`` only scans the OmniModule's own Python module
-# (``modeling.py`` / ``accelerated.py``). Those files re-export this object
-# so ``ops_implementation.qat_implementation`` actually reaches ``qat_enabled``.
 
 #: Official ``fp8_block_size`` for window KV (and dense GEMM activations).
 WINDOW_KV_FP8_BLOCK = 32
@@ -63,20 +58,26 @@ _FP4_E4M3_AMAX_FLOOR = _FP4_MAX * (2**-9)
 _FP4_E8M0_AMAX_FLOOR = _FP4_MAX * (2**-126)
 
 
-def qat_enabled() -> bool:
-    """Whether the FP8/FP4 simulation is on for this run."""
-    return veomni_qat_implementation.value == "fp8_blockwise"
+def qat_enabled(qat_implementation: str | None = None) -> bool:
+    """Whether the FP8/FP4 simulation is on for this module/run."""
+    impl = resolve_qat_impl() if qat_implementation is None else qat_implementation
+    return impl == "fp8_blockwise"
 
 
-def _storage_roundtrip_enabled(training: bool) -> bool:
+def _storage_roundtrip_enabled(training: bool, qat_implementation: str | None = None) -> bool:
     """Inference always rounds; training rounds only under QAT."""
-    return (not training) or qat_enabled()
+    return (not training) or qat_enabled(qat_implementation)
 
 
-def fake_quant_linear(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
+def fake_quant_linear(
+    linear: nn.Module,
+    x: torch.Tensor,
+    *,
+    qat_implementation: str | None = None,
+) -> torch.Tensor:
     """Run ``linear`` with FP8 fake-quantized operands: 128x128 weight tiles,
     1x128 activation blocks with ue8m0 scales."""
-    return qat_linear(linear, x, enabled=qat_enabled())
+    return qat_linear(linear, x, enabled=qat_enabled(qat_implementation))
 
 
 def _ue8m0_scale(amax: torch.Tensor) -> torch.Tensor:
@@ -159,28 +160,48 @@ def _round_trip(x: torch.Tensor, kind: str) -> torch.Tensor:
     return _StorageRoundTrip.apply(x, kind)
 
 
-def round_window_kv(kv: torch.Tensor, *, training: bool) -> torch.Tensor:
+def round_window_kv(
+    kv: torch.Tensor,
+    *,
+    training: bool,
+    qat_implementation: str | None = None,
+) -> torch.Tensor:
     """Official window-KV storage: FP8, 32-wide, whole vector including RoPE."""
-    if kv.numel() == 0 or not _storage_roundtrip_enabled(training):
+    if kv.numel() == 0 or not _storage_roundtrip_enabled(training, qat_implementation):
         return kv
     return _round_trip(kv, "window")
 
 
-def round_compress_kv(kv: torch.Tensor, *, training: bool) -> torch.Tensor:
+def round_compress_kv(
+    kv: torch.Tensor,
+    *,
+    training: bool,
+    qat_implementation: str | None = None,
+) -> torch.Tensor:
     """Official compressed-KV storage: FP4, 16-wide groups, E4M3 scales."""
-    if kv.numel() == 0 or not _storage_roundtrip_enabled(training):
+    if kv.numel() == 0 or not _storage_roundtrip_enabled(training, qat_implementation):
         return kv
     return _round_trip(kv, "compress")
 
 
-def round_index_act(x: torch.Tensor, *, training: bool) -> torch.Tensor:
+def round_index_act(
+    x: torch.Tensor,
+    *,
+    training: bool,
+    qat_implementation: str | None = None,
+) -> torch.Tensor:
     """Official indexer Q/K storage: FP4, 32-wide groups, E8M0 scales."""
-    if x.numel() == 0 or not _storage_roundtrip_enabled(training):
+    if x.numel() == 0 or not _storage_roundtrip_enabled(training, qat_implementation):
         return x
     return _round_trip(x, "index")
 
 
-def fake_quant_expert_weight(weight: torch.Tensor, expert_dtype: str) -> torch.Tensor:
+def fake_quant_expert_weight(
+    weight: torch.Tensor,
+    expert_dtype: str,
+    *,
+    qat_implementation: str | None = None,
+) -> torch.Tensor:
     """Fake-quantize a stacked routed-expert weight ``[E, out, in]``.
 
     Follows the checkpoint's declared ``expert_dtype`` rather than the global QAT
@@ -188,7 +209,7 @@ def fake_quant_expert_weight(weight: torch.Tensor, expert_dtype: str) -> torch.T
     quantized as its own matrix, which is also what expert parallelism needs: EP
     shards only the expert dimension, so no block spans a shard boundary.
     """
-    if not qat_enabled():
+    if not qat_enabled(qat_implementation):
         return weight
     if expert_dtype == "fp4":
         return fp4_fake_quant_weight(weight)

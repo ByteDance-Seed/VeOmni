@@ -96,8 +96,7 @@ deepseek_v41_llm:
   ops_implementation:
     # Fake-quant dense GEMMs to fp8 and routed experts to fp4 (`expert_dtype`).
     # Needs SM90+ (the 8xH20 job); `none` trains in bf16 with no rounding.
-    # Bound through the slots re-exported on the llm accelerated module --
-    # without those, this field is accepted and the helpers stay off.
+    # Resolved per-module from `config.ops_implementation` during init.
     qat_implementation: fp8_blockwise
   accelerator:
     ep_size: 8

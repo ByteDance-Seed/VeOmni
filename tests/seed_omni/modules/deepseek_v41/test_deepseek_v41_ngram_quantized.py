@@ -283,7 +283,7 @@ class TestTrainableTablesDequantizeAtLoad:
         from safetensors import safe_open
         from safetensors.torch import save_file
 
-        from veomni.models.module_utils import _companion_row_transform, _read_ep_dim0_slice
+        from veomni.models.checkpoint.weights import _companion_row_transform, _read_ep_dim0_slice
 
         packed, scale = self._released_rows()
         path = str(tmp_path / "ngram.safetensors")

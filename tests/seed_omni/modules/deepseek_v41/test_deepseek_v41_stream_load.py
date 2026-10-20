@@ -29,9 +29,9 @@ import torch.nn as nn
 from safetensors.torch import save_file
 from torch.distributed.tensor import Shard
 
-import veomni.models.module_utils as module_utils
+import veomni.models.checkpoint.weights as module_utils
 from veomni.distributed.parallel_plan import ParallelPlan
-from veomni.models.module_utils import load_model_weights_ep_sharded
+from veomni.models.checkpoint.weights import load_model_weights_ep_sharded
 from veomni.models.seed_omni.modules.deepseek_v41.checkpoint_tensor_converter import (
     DeepseekV41DequantConverter,
     dequant_converted_weight,

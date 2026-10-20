@@ -211,7 +211,7 @@ def _skip_without_loading_fn(
 
 
 def _refuse_unmerged_export(weights_path: str) -> None:
-    from ..checkpoint.layout import HF_PENDING_MERGE_FILENAME
+    from ...checkpoint.layout import HF_PENDING_MERGE_FILENAME
 
     if os.path.isfile(os.path.join(weights_path, HF_PENDING_MERGE_FILENAME)):
         raise RuntimeError(

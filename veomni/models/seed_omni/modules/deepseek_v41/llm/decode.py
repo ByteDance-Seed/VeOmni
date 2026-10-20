@@ -232,7 +232,11 @@ def _absorb(
     if attn.indexer is not None:
         keys = attn.indexer.build_keys(latent, group_cos, group_sin)
         cache.index_k = keys if cache.index_k is None else torch.cat([cache.index_k, keys], dim=1)
-    rotated = round_compress_kv(apply_interleaved_rope(latent, group_cos, group_sin), training=attn.training)
+    rotated = round_compress_kv(
+        apply_interleaved_rope(latent, group_cos, group_sin),
+        training=attn.training,
+        qat_implementation=attn.qat_implementation,
+    )
     cache.compress_kv = rotated if cache.compress_kv is None else torch.cat([cache.compress_kv, rotated], dim=1)
 
 
@@ -258,7 +262,7 @@ def _decode_topk(
 
     query = indexer.wq_b(q_residual).unflatten(-1, (indexer.n_heads, indexer.index_head_dim))
     query = apply_interleaved_rope(query, cos.unsqueeze(-2), sin.unsqueeze(-2))
-    query = round_index_act(query, training=indexer.training)
+    query = round_index_act(query, training=indexer.training, qat_implementation=indexer.qat_implementation)
     weights = indexer.weights_proj(hidden_states) * (indexer.softmax_scale * indexer.n_heads**-0.5)
 
     scores = torch.einsum("bshd,btd->bsht", query, index_k)
@@ -316,13 +320,15 @@ def decode_attention_step(
     position_ids = torch.tensor([[position]], device=device, dtype=torch.long).expand(batch, 1)
     cos, sin = rotary_emb(position_ids, compressed=attn.rope_is_compressed)
 
-    q_residual = attn.q_norm(fake_quant_linear(attn.wq_a, hidden_states))
-    query = fake_quant_linear(attn.wq_b, q_residual).unflatten(-1, (attn.n_heads, attn.head_dim))
+    q_residual = attn.q_norm(fake_quant_linear(attn.wq_a, hidden_states, qat_implementation=attn.qat_implementation))
+    query = fake_quant_linear(attn.wq_b, q_residual, qat_implementation=attn.qat_implementation).unflatten(
+        -1, (attn.n_heads, attn.head_dim)
+    )
     query = apply_interleaved_rope(query, cos.unsqueeze(-2), sin.unsqueeze(-2))
 
-    kv = attn.kv_norm(fake_quant_linear(attn.wkv, hidden_states))
+    kv = attn.kv_norm(fake_quant_linear(attn.wkv, hidden_states, qat_implementation=attn.qat_implementation))
     kv = apply_interleaved_rope(kv, cos, sin)
-    kv = round_window_kv(kv, training=attn.training)
+    kv = round_window_kv(kv, training=attn.training, qat_implementation=attn.qat_implementation)
     cache.append_window(kv)
 
     # The window rows are all causal and all inside the window by construction,
@@ -416,13 +422,13 @@ def decode_layer_step(
     attn_out = decode_attention_step(
         layer.self_attn, layer.input_layernorm(collapsed), position, rotary_emb, shared, cache
     )
-    hidden_streams = mhc_expand(attn_out, residual, attn_post, attn_comb)
+    hidden_streams = mhc_expand(attn_out, residual, attn_post, attn_comb, op=layer.veomni_mhc_post)
 
     residual = hidden_streams
     ffn_pre, ffn_post, ffn_comb = layer.ffn_hc(hidden_streams)
     collapsed = mhc_collapse(hidden_streams, attn_pre)
     mlp_out, _ = layer.mlp(layer.post_attention_layernorm(collapsed), image_mask)
-    hidden_streams = mhc_expand(mlp_out, residual, ffn_post, ffn_comb)
+    hidden_streams = mhc_expand(mlp_out, residual, ffn_post, ffn_comb, op=layer.veomni_mhc_post)
 
     # ``attn_pre`` fed the FFN's collapse; ``ffn_pre`` feeds the next site's, which
     # is the V4.1 data flow the mHC rewrite exists for -- a `pre` belongs to the

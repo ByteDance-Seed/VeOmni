@@ -320,7 +320,7 @@ class TestRoutedExperts:
         from the wrong offset puts it at order 1, nowhere near 8%, however
         ordinary the largest single deviation might look.
         """
-        from veomni.ops.kernels.deepseek_v4 import fp4_act_quant
+        from veomni.ops.qat import fp4_act_quant
 
         torch.manual_seed(0)
         config = make_config(weight_quantization=RELEASED_QUANTIZATION, n_routed_experts=4, num_experts_per_tok=2)
@@ -358,7 +358,7 @@ class TestExpertParallelLocalHalf:
 
     @requires_sm90
     def test_each_expert_gets_exactly_its_own_tokens(self):
-        from veomni.ops.kernels.deepseek_v4 import fp4_act_quant
+        from veomni.ops.qat import fp4_act_quant
 
         torch.manual_seed(0)
         n_local_experts, hidden, intermediate = 3, 64, 96

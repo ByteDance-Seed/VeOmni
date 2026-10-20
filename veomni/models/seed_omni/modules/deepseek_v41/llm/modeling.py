@@ -66,11 +66,9 @@ from .decoder_layer import DeepseekV41DecoderLayer
 from .dspark import build_dspark_blocks
 from .engram_connection import build_engram_connections
 from .inference import DeepseekV41LlmInferenceMixin
-from .mhc import DeepseekV41HyperConnection, expand_to_streams, identity_pre_mix, mhc_collapse, veomni_mhc_post
+from .mhc import DeepseekV41HyperConnection, expand_to_streams, identity_pre_mix, mhc_collapse
 from .moe import DeepseekV41TopKRouter
-from .quantization import veomni_qat_implementation
-from .reuse import DeepseekV4Experts, DeepseekV4RMSNorm, veomni_moe_experts_forward
-from .reuse import veomni_qat_implementation as veomni_v4_expert_qat_implementation
+from .reuse import DeepseekV4Experts, DeepseekV4RMSNorm
 from .sequence_shard import SequenceShard
 
 
@@ -91,7 +89,7 @@ class DeepseekV41Backbone(nn.Module):
         )
         self.engram = build_engram_connections(config)
         self.mtp = build_dspark_blocks(config)
-        self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         # One instance for the whole stack: the two frequency schedules depend on
         # the config alone, and a per-layer copy would be 40 identical buffers.
         self.rotary_emb = DeepseekV41RotaryEmbedding(config)
@@ -655,8 +653,4 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, PretrainedOmniModule):
 __all__ = [
     "DeepseekV41Backbone",
     "DeepseekV41Llm",
-    "veomni_mhc_post",
-    "veomni_moe_experts_forward",
-    "veomni_qat_implementation",
-    "veomni_v4_expert_qat_implementation",
 ]

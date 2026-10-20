@@ -52,6 +52,8 @@ from veomni.distributed.sequence_parallel import (
     gather_seq_scatter_heads,
     sp_pad_and_slice,
 )
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 from veomni.utils.import_utils import is_flash_attn_2_available
 
@@ -127,16 +129,16 @@ class DeepseekV41VisionRMSNorm(nn.Module):
     that the released ``vision.py`` hardcodes and the vision config never mentions.
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, rms_impl: str | None = None):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        if rms_impl is None:
+            rms_impl = resolve_op_impl("rms_norm_implementation")
+        self.veomni_rms_norm = VeomniOp("rms_norm", "deepseek_v4", rms_impl)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
-        return (self.weight * x).to(dtype)
+        return self.veomni_rms_norm(x, self.weight, eps=self.eps)
 
 
 class DeepseekV41VisionPatchEmbed(nn.Module):
@@ -157,6 +159,11 @@ class DeepseekV41VisionAttention(nn.Module):
         self.head_dim = config.head_dim
         self.wqkv = nn.Linear(config.hidden_size, 3 * config.hidden_size)
         self.wo = nn.Linear(config.hidden_size, config.hidden_size)
+        attn_impl = config.ops_implementation.get(
+            "attn_implementation",
+            getattr(config, "_attn_implementation", None),
+        )
+        self.veomni_attn = VeomniOp("attention", "standard", attn_impl) if attn_impl else None
 
     def forward(
         self,
@@ -177,7 +184,8 @@ class DeepseekV41VisionAttention(nn.Module):
             k = gather_seq_scatter_heads(k, seq_dim=0, head_dim=1, group=sp_group)
             v = gather_seq_scatter_heads(v, seq_dim=0, head_dim=1, group=sp_group)
 
-        if USE_FLASH_ATTN_VARLEN:
+        force_sdpa = self.veomni_attn is not None and self.veomni_attn.impl in ("sdpa", "veomni_sdpa", "eager")
+        if not force_sdpa and USE_FLASH_ATTN_VARLEN:
             out = flash_attn_varlen_func(
                 q.to(torch.bfloat16),
                 k.to(torch.bfloat16),
@@ -188,7 +196,7 @@ class DeepseekV41VisionAttention(nn.Module):
                 max_seqlen_k=max_seqlen,
                 causal=False,
             )
-        elif IS_NPU_AVAILABLE:
+        elif not force_sdpa and IS_NPU_AVAILABLE:
             seqlens = tuple(cu_seqlens[1:].cpu().numpy().tolist())
             out = torch_npu.npu_fusion_attention(
                 q.to(torch.bfloat16),
@@ -227,9 +235,10 @@ class DeepseekV41VisionMLP(nn.Module):
 class DeepseekV41VisionBlock(nn.Module):
     def __init__(self, config: DeepseekV41VisionEncoderConfig):
         super().__init__()
-        self.norm1 = DeepseekV41VisionRMSNorm(config.hidden_size)
+        rms_impl = config.ops_implementation.get("rms_norm_implementation", resolve_op_impl("rms_norm_implementation"))
+        self.norm1 = DeepseekV41VisionRMSNorm(config.hidden_size, rms_impl=rms_impl)
         self.attn = DeepseekV41VisionAttention(config)
-        self.norm2 = DeepseekV41VisionRMSNorm(config.hidden_size)
+        self.norm2 = DeepseekV41VisionRMSNorm(config.hidden_size, rms_impl=rms_impl)
         self.mlp = DeepseekV41VisionMLP(config)
 
     def forward(
@@ -249,9 +258,10 @@ class DeepseekV41ViT(nn.Module):
 
     def __init__(self, config: DeepseekV41VisionEncoderConfig):
         super().__init__()
+        rms_impl = config.ops_implementation.get("rms_norm_implementation", resolve_op_impl("rms_norm_implementation"))
         self.patch_embed = DeepseekV41VisionPatchEmbed(config)
         self.blocks = nn.ModuleList([DeepseekV41VisionBlock(config) for _ in range(config.num_hidden_layers)])
-        self.norm = DeepseekV41VisionRMSNorm(config.hidden_size)
+        self.norm = DeepseekV41VisionRMSNorm(config.hidden_size, rms_impl=rms_impl)
 
     def forward(
         self,
