@@ -1,5 +1,7 @@
-from ....utils.device import IS_NPU_AVAILABLE
-from ...loader import MODELING_REGISTRY
+"""GLM-MoE-DSA modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.models.registry import MODELING_REGISTRY
+from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 @MODELING_REGISTRY.register("glm_moe_dsa")

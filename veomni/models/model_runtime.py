@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from ..arguments.arguments_types import AcceleratorConfig
     from ..data.chat_template import ChatTemplate
     from ..trainer.callbacks import TrainerState
-    from .checkpoint_manager import ModelCheckpointManager
+    from .checkpoint import ModelCheckpointManager
 
 logger = logging.get_logger(__name__)
 
@@ -77,7 +77,7 @@ class VeOmniModelRuntime:
     ``isinstance`` check, so the runtime owns every such boundary itself. Reading
     and writing checkpoints is one: :meth:`load`, :meth:`save_dcp` and
     :meth:`save_hf_or_lora` say *what* this model persists, the
-    :class:`~veomni.models.checkpoint_manager.ModelCheckpointManager` at
+    :class:`~veomni.models.checkpoint.ModelCheckpointManager` at
     :attr:`checkpoint` says *how*, and *when* stays in the trainer callbacks.
 
     Constructing one *builds* it — ``VeOmniModelRuntime(args)`` comes back with a
@@ -231,6 +231,11 @@ class VeOmniModelRuntime:
         from ..utils.checkpoint_utils import should_skip_hf_weight_load
 
         return should_skip_hf_weight_load(self.train_args.checkpoint.load_path, self.args.lora_config)
+
+    @property
+    def weights_path(self) -> Optional[str]:
+        """Checkpoint the initial weights are read from."""
+        return self.args.model_path
 
     def _build_model(self) -> None:
         """Meta-init the model from its config via the registry-aware loader."""
@@ -414,9 +419,7 @@ class VeOmniModelRuntime:
         # Customized parallelize model.
         customized_parallelize_model_function = getattr(self.model, "build_parallelize_model", None)
         if callable(customized_parallelize_model_function):
-            parallelized_model = customized_parallelize_model_function(
-                weights_path=self.args.model_path, args=self.args
-            )
+            parallelized_model = customized_parallelize_model_function(weights_path=self.weights_path, args=self.args)
             if parallelized_model is not None:
                 self.model = parallelized_model
                 self.model.train()
@@ -459,7 +462,7 @@ class VeOmniModelRuntime:
         self.model = torch_parallelize.build_parallelize_model(
             self.model,
             init_device=args.accelerator.init_device,
-            weights_path=args.model_path,
+            weights_path=self.weights_path,
             should_skip_hf_weight_load=skip_hf_weight_load,
             enable_reshard_after_forward=args.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.accelerator.fsdp_config.mixed_precision,
@@ -638,7 +641,7 @@ class VeOmniModelRuntime:
         Part of the build like every other step: a model that came back from
         construction unable to save itself would be half-built.
         """
-        from .checkpoint_manager import ModelCheckpointManager
+        from .checkpoint import ModelCheckpointManager
 
         self.checkpoint = ModelCheckpointManager(self)
 
@@ -671,7 +674,7 @@ class VeOmniModelRuntime:
         """Export this model in whichever format it was trained in.
 
         An in-flight async DCP must be on disk before conversion reads it, so
-        this drains first. ``_prepare_export`` waits again if it has to write
+        this drains first. ``prepare_export`` waits again if it has to write
         a DCP of its own.
         """
         self.checkpoint.wait_for_pending_save()
@@ -685,7 +688,7 @@ class VeOmniModelRuntime:
         """Write the tokenizer/processor/config sidecars that an export needs."""
         import torch.distributed as dist
 
-        from .module_utils import save_model_assets as write_model_assets
+        from .checkpoint.weights import save_model_assets as write_model_assets
 
         if self.train_args.global_rank == 0:
             write_model_assets(self.checkpoint.assets_dir(), self.model_assets)

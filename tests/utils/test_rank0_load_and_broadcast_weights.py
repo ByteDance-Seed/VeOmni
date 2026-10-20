@@ -16,7 +16,7 @@ from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, p
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.distributed.torch_parallelize import _move_model_buffers_to_device, build_parallelize_model
-from veomni.models.module_utils import init_empty_weights, load_model_weights, rank0_load_and_broadcast_weights
+from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights, rank0_load_and_broadcast_weights
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 

@@ -290,15 +290,24 @@ packing; ordinary single-sample attention dispatch is preserved.
 
 ### Attention and validation
 
+The DiT and VAE attention backend comes from
+`model.ops_implementation.attn_implementation`. The
+`MINIMAX_H3_ATTENTION_IMPLEMENTATION` environment variable and the xformers path
+are removed. Masked attention and packed compatibility mode always use PyTorch
+SDPA, and every other call uses the configured kernel.
+
 - `eager` / `sdpa`: explicit per-segment PyTorch SDPA reference path; main-DiT
   projections and MLPs still operate on compact cross-sample rows.
 - `flash_attention_2` / `flash_attention_3` in `model.ops_implementation` resolve
   to VeOmni's local FA2/FA3 backends, and `flash_attention_2_hub` /
   `flash_attention_3_hub` to the Hugging Face Hub kernels
-  (`kernels-community/flash-attn2` / `flash-attn3`, version 1). Each main-DiT
-  layer uses one non-causal varlen call; refiner layers retain one call per
-  sample. The kernel is loaded on the first multi-sample forward and needs
-  BF16/FP16; unavailable kernels are not silently replaced with SDPA.
+  (`kernels-community/flash-attn2` / `flash-attn3`, version 1). Single-sample
+  attention runs one dense call per segment. With multi-sample packing, each
+  main-DiT layer uses one non-causal varlen call and refiner layers retain one
+  call per sample. The kernel is loaded on the first multi-sample forward and
+  needs BF16/FP16; unavailable kernels are not silently replaced with SDPA.
+- `sage_attention`: inference-only, one call per segment. Multi-sample packing
+  rejects it.
 
 `tests/models/test_minimax_h3_packing.py` uses a native tiny model on CPU to
 check packed-versus-serial outputs, losses and gradients (including mixed target
@@ -307,7 +316,7 @@ references, forward-local SP padding and fail-closed inputs. SP collectives are
 mocked there, so it does not establish distributed SP parity. The FA2/FA3 call
 site is checked for all four backends with a kernel stub that asserts the
 varlen layout; kernel correctness itself is covered by
-`tests/ops/test_flash_attn_varlen_padding.py`.
+`tests/ops/attention/flash/test_flash_attention.py`.
 No end-to-end speedup or convergence is claimed. Benchmark against an equivalent,
 tuned non-packed baseline before claiming a performance improvement.
 
@@ -346,7 +355,7 @@ pipe = MiniMaxH3Pipeline.from_pretrained(
     transformer_config_path="pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer/config.json",
     transformer_weights_path="pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer",
     ops_implementation=OpsImplementationConfig(
-        attn_implementation="eager",
+        attn_implementation="flash_attention_2",
         rotary_pos_emb_implementation="eager",
         rms_norm_implementation="eager",
         swiglu_mlp_implementation="eager",

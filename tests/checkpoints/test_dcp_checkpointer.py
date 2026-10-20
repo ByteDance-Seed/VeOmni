@@ -27,7 +27,7 @@ from veomni.distributed.torch_parallelize import (
     parallelize_model_ddp,
     parallelize_model_fsdp2,
 )
-from veomni.models.module_utils import init_empty_weights
+from veomni.models.checkpoint.weights import init_empty_weights
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
 
@@ -804,6 +804,21 @@ class TestDdpMetaInit:
         monkeypatch.setattr(torch_parallelize, "DDP", lambda module, **kwargs: module)
 
         assert parallelize_model_ddp(nn.Linear(2, 2)) is not None
+
+    def test_loads_a_fully_frozen_model_without_a_ddp_wrap(self, wrap_ddp, monkeypatch):
+        """DDP rejects a module whose parameters all have ``requires_grad=False``."""
+        materialize = lambda model, *args, **kwargs: model.to_empty(device="cpu")  # noqa: E731
+        loader = MagicMock(side_effect=materialize)
+        monkeypatch.setattr(torch_parallelize, "load_model_weights", loader)
+        with init_empty_weights():
+            model = _MetaInitModel()
+        model.requires_grad_(False)
+
+        wrapped = wrap_ddp(model, weights_path="hf-path", init_device="meta")
+
+        assert wrapped is model
+        assert loader.call_args.args[1] == "hf-path"
+        assert not model.weight.is_meta
 
     def test_reports_parameters_the_loader_left_on_meta(self, wrap_ddp, monkeypatch):
         # A loader that fills nothing would otherwise fail inside DDP's
@@ -2558,6 +2573,17 @@ class TestResumeDiscovery:
         layout.write_manifest(str(step), global_step=10, world_size=1)
 
         assert self._validate(step) == 10
+
+    @pytest.mark.parametrize(("model_state", "accepted"), [(False, True), (True, False)])
+    def test_a_cursor_only_step_is_accepted_only_when_its_manifest_says_so(self, tmp_path, model_state, accepted):
+        """An ``offline_embedding`` step has no ``model/`` at all, because every module is frozen.
+        Without the manifest's word, the same tree is a step whose shards never started."""
+        from veomni.checkpoint import layout
+
+        step = tmp_path / "global_step_10"
+        layout.write_manifest(str(step), global_step=10, world_size=1, model_state=model_state)
+
+        assert self._validate(step) == (10 if accepted else None)
 
     def test_a_legacy_step_is_accepted_by_its_own_marker(self, tmp_path):
         from veomni.checkpoint.legacy_v0_1_12 import marker_path

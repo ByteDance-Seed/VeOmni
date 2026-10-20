@@ -1,4 +1,6 @@
-from ....loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+"""Register the local MiniMax H3 DiT config and model."""
+
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
 @MODEL_CONFIG_REGISTRY.register("MiniMaxH3DiTModel")
@@ -9,7 +11,7 @@ def register_minimax_h3_transformer_config():
 
 
 @MODELING_REGISTRY.register("MiniMaxH3DiTModel")
-def register_minimax_h3_transformer_modeling(architecture: str = None):
+def register_minimax_h3_transformer_modeling(_architecture: str | None = None):
     from .modeling_minimax_h3_transformer import MiniMaxH3DiTModel
 
     return MiniMaxH3DiTModel
