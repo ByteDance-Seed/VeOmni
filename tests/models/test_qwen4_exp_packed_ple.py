@@ -132,6 +132,34 @@ def test_fragmented_pack_boundary_count_is_local():
         assert border.numel() < bounds.numel() * 8
 
 
+def test_host_boundary_indices_match_multirow_local_tensor_metadata():
+    batch_size = 2
+    local_length = 8
+    sp_size = 2
+    lengths = [3, 13, 4, 12]
+    bounds = torch.tensor([0, *accumulate(lengths)])
+    for rank in range(sp_size):
+        host = packed_ple.local_packed_boundary_indices(
+            bounds,
+            batch_size,
+            local_length,
+            9,
+            rank,
+            sp_size,
+            packed_seq_lens=lengths,
+        )
+        tensor = packed_ple.local_packed_boundary_indices(
+            bounds,
+            batch_size,
+            local_length,
+            9,
+            rank,
+            sp_size,
+        )
+        valid_tensor = tensor[tensor < batch_size * local_length]
+        assert torch.equal(host, valid_tensor)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_chunked_boundary_correction_matches_reference(dtype, monkeypatch):
     torch.manual_seed(991)

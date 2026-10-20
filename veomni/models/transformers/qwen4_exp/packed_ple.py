@@ -87,11 +87,12 @@ def local_packed_boundary_indices(
             global_end = global_start + length
             if global_start // global_length != (global_end - 1) // global_length:
                 raise ValueError("Packed PLE host lengths must not cross batch rows.")
-            overlap_start = max(global_start, local_start)
-            overlap_end = min(global_start + reach, global_end, local_end)
+            batch_index = global_start // global_length
+            row_start = batch_index * global_length
+            overlap_start = max(global_start, row_start + local_start)
+            overlap_end = min(global_start + reach, global_end, row_start + local_end)
             for global_index in range(overlap_start, overlap_end):
-                batch_index = global_index // global_length
-                local_index = global_index - batch_index * global_length - local_start
+                local_index = global_index - row_start - local_start
                 indices.append(batch_index * local_length + local_index)
             global_start = global_end
         return torch.tensor(indices, dtype=torch.long, device=device)
