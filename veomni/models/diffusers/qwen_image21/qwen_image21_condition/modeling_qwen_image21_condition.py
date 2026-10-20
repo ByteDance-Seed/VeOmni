@@ -136,9 +136,24 @@ class QwenImage21ConditionModel(PreTrainedModel):
         latent_height, latent_width = parameters.shape[-2:]
         return parameters, [(1, int(latent_height), int(latent_width))]
 
+    @staticmethod
+    def _text_prompt(sample_inputs) -> str:
+        """Accept direct strings or one text entry from the DiT data transform."""
+        if isinstance(sample_inputs, str):
+            return sample_inputs
+        if isinstance(sample_inputs, (list, tuple)) and len(sample_inputs) == 1:
+            entry = sample_inputs[0]
+            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                modality, value = entry
+                if modality == "text" and isinstance(value, str):
+                    return value
+        raise ValueError("Qwen-Image-2.1 expects one text prompt per sample and no condition-image tokens.")
+
     @torch.no_grad()
     def get_condition(self, inputs, images, **kwargs) -> dict[str, Any]:
-        prompts = inputs if isinstance(inputs, list) else [inputs]
+        prompts = [self._text_prompt(sample_inputs) for sample_inputs in self._as_list(inputs)]
+        if not prompts or len(prompts) != len(images):
+            raise ValueError("Qwen-Image-2.1 expects equally sized, nonempty prompt and target-image batches.")
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompts)
 
         latents = []

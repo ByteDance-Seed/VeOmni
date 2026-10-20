@@ -19,7 +19,8 @@ uv pip install --upgrade \
 ```
 
 The Qwen-Image-2.1 integration is registered only when the installed Diffusers
-build exposes `QwenImage21Transformer2DModel`.
+build exposes `AutoencoderKLQwenImage21`, `QwenImage21Pipeline`, and
+`QwenImage21Transformer2DModel`.
 
 ## Prepare the dataset
 
@@ -34,6 +35,9 @@ The prompt key may be `prompt`, `text`, or `caption`. The image key may be
 `image`, `image_bytes`, `image_path`, or `target_image`. Images are resized to
 the configured resolution, composited onto a white background, and converted
 to opaque RGBA because the Qwen-Image-2.1 VAE has four input channels.
+The shipped config sets `data.mm_configs.image_mode: RGBA` so that image
+loading preserves alpha from paths, URLs, and encoded bytes until compositing.
+The shared image loader otherwise defaults to RGB.
 
 ## Start a single-GPU run
 

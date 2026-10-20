@@ -4,7 +4,9 @@
 
 import copy
 import os
+from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import diffusers
 import pytest
@@ -27,6 +29,7 @@ if _MISSING_COMPONENTS:
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers import QwenImage21Transformer2DModel as DiffusersQwenImage21Transformer2DModel
 
+from veomni.data import build_data_transform
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.state_dict import get_lora_state_dict
 from veomni.lora.weight_loading import load_lora_weights
@@ -42,13 +45,14 @@ from veomni.models.diffusers.qwen_image21.qwen_image21_transformer.configuration
 from veomni.models.diffusers.qwen_image21.qwen_image21_transformer.modeling_qwen_image21_transformer import (
     QwenImage21Transformer2DModel,
 )
+from veomni.trainer.dit_trainer import DiTDataCollator
 
 
-def _toy_model():
+def _toy_model(in_channels=4):
     config = QwenImage21Transformer2DModelConfig(
         patch_size=1,
-        in_channels=4,
-        out_channels=4,
+        in_channels=in_channels,
+        out_channels=in_channels,
         num_layers=1,
         attention_head_dim=8,
         num_attention_heads=1,
@@ -185,6 +189,81 @@ def test_qwen_image21_image_preprocessing_composites_transparency():
 
     assert image_tensor.shape == (1, 4, 1, 4, 4)
     torch.testing.assert_close(image_tensor, torch.ones_like(image_tensor))
+
+
+@pytest.mark.parametrize("image_input", ["path", "bytes"])
+def test_qwen_image21_dataset_transform_preserves_transparency(tmp_path, image_input):
+    """Exercise PNG decoding before condition-model background compositing."""
+    image_path = tmp_path / "transparent.png"
+    Image.new("RGBA", (32, 32), (255, 0, 0, 0)).save(image_path)
+    data_config = yaml.safe_load(Path("configs/dit/qwen_image21_lora.yaml").read_text())["data"]
+    transform = build_data_transform("dit_online", **data_config.get("mm_configs", {}))
+    image = str(image_path) if image_input == "path" else image_path.read_bytes()
+    features = transform({"text": "a white seed", "image": image}, source_name=data_config["source_name"])
+    batch = DiTDataCollator()(features)
+    model = QwenImage21ConditionModel.__new__(QwenImage21ConditionModel)
+    torch.nn.Module.__init__(model)
+    model.config = QwenImage21ConditionModelConfig(height=32, width=32)
+
+    image_tensor = model._image_to_tensor(batch["images"][0][0])
+
+    torch.testing.assert_close(image_tensor, torch.ones_like(image_tensor))
+
+
+def test_qwen_image21_dataset_batch_reaches_supervised_forward(monkeypatch):
+    """Use real transform/collation and condition math with local component doubles."""
+    modeling_path = "veomni.models.diffusers.qwen_image21.qwen_image21_condition.modeling_qwen_image21_condition"
+    monkeypatch.setattr(f"{modeling_path}.get_device_type", lambda: "cpu")
+    monkeypatch.setattr(f"{modeling_path}.get_parallel_state", lambda: SimpleNamespace(dp_rank=0))
+
+    def fake_load_components(self):
+        self.vae = _FakeVAE()
+        self.scheduler = _FakeScheduler()
+
+    monkeypatch.setattr(QwenImage21ConditionModel, "_load_components", fake_load_components)
+    model = QwenImage21ConditionModel(QwenImage21ConditionModelConfig(height=32, width=32))
+    expected_prompts = ["a white seed", "a second white seed"]
+
+    def encode_prompt(prompt, device):
+        assert prompt == expected_prompts
+        return torch.randn(2, 3, 16), torch.ones(2, 3, dtype=torch.long), torch.zeros(2, 3, dtype=torch.bool)
+
+    model._prompt_pipeline = SimpleNamespace(encode_prompt=encode_prompt)
+    image_bytes = BytesIO()
+    Image.new("RGB", (32, 32), "white").save(image_bytes, format="PNG")
+    transform = build_data_transform("dit_online")
+    features = [
+        transform({"text": prompt, "image": image_bytes.getvalue()}, source_name="Qwen-Image")[0]
+        for prompt in expected_prompts
+    ]
+    batch = DiTDataCollator()(features)
+
+    condition = model.get_condition(**batch)
+    ready = model.process_condition(**condition)
+    transformer = _toy_model(in_channels=64).train()
+    output = transformer(**ready)
+    loss = output.loss["mse_loss"]
+    loss.backward()
+
+    assert len(output.predictions) == 2
+    assert torch.isfinite(loss)
+    assert transformer.proj_out.weight.grad is not None
+    assert torch.isfinite(transformer.proj_out.weight.grad).all()
+
+
+@pytest.mark.parametrize(
+    "sample_inputs",
+    [
+        [("image", None), ("text", "a seed")],
+        [("text", "one"), ("text", "two")],
+        [("text", None)],
+        [],
+    ],
+)
+def test_qwen_image21_rejects_non_text_or_ambiguous_modality_inputs(sample_inputs):
+    """Text-to-image normalization must not silently drop unsupported modalities."""
+    with pytest.raises(ValueError, match="one text prompt"):
+        QwenImage21ConditionModel._text_prompt(sample_inputs)
 
 
 class _FakePosterior:

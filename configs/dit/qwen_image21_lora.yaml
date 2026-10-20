@@ -44,6 +44,8 @@ data:
     drop_last: true
   datasets_type: iterable
   data_type: diffusion
+  mm_configs:
+    image_mode: RGBA
   max_seq_len: 4096
   text_keys: text
   dyn_bsz_buffer_size: 200
