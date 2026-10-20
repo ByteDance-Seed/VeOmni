@@ -207,6 +207,12 @@ pip list | grep fla_npu   # verify it is installed
 If the `fla_npu` package is missing when `chunk_gated_delta_rule_implementation: fla_npu` is selected, the backend raises an actionable error when
 the model constructs its `VeomniOp` handle (pointing back to the install step or to `triton` / `eager`).
 
+The native convolution qualification uses independent FP64 segment references
+computed from the exact BF16-rounded inputs and upstream gradient. Using separate
+BF16 reference convolutions rounds each segment's shared-weight gradient before
+addition; cancellation can make that reference less accurate than the fused
+FP32 reduction. The output and gradient tolerances are unchanged.
+
 ### Qwen3.5-9B VL Training
 
 There is no dedicated dense NPU config; reuse the GPU one and set the GatedDeltaNet kernels on the
