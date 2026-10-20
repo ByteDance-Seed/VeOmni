@@ -9,8 +9,8 @@ This guide runs K3 end-to-end on Ascend NPUs through the standard VeOmni VLM
 trainer — `bash train.sh tasks/train_vlm.py <config>` — with no
 task-specific scripts. Verified on 8×910B3 with a 30-step full-parameter
 run: loss `13.5 → 9.3`, ~17 s/step, distributed checkpoint and resumable
-trainer state saved. The model package also carries GPU code paths; a
-verified GPU recipe will follow.
+trainer state saved. The model package also runs on NVIDIA GPUs; see
+[Start training on GPU](#start-training-on-gpu).
 
 ## Install dependencies
 
@@ -110,6 +110,33 @@ Expected on 8×910B3: step-1 loss ≈ 13 (random init over the 163 840 vocab),
 ~17 s/step steady state, checkpoints under `kimi_k3_sft/checkpoints/`
 (both the distributed model checkpoint and the resumable trainer state).
 
+## Start training on GPU
+
+The model package runs the same trainer on NVIDIA GPUs. Install the GPU
+extra (Python >= 3.10, glibc >= 2.28, CUDA 12.x / 13.x):
+
+```bash
+uv sync --extra gpu          # or: pip install -e ".[gpu]"
+```
+
+The GPU recipe `configs/multimodal/kimi_k3/kimi_k3_vl.yaml` pins the
+official-default baseline the NPU fused stack compares against: flash-attn
+FA2 attention (through the sequence-parallel adapter), eager RMSNorm /
+cross-entropy, the official `fla` chunk_kda, and the SituGLU eager expert
+loop (expert-parallel aware; fused GPU MoE rows may follow). Launch it
+exactly like the NPU recipe:
+
+```bash
+bash train.sh tasks/train_vlm.py configs/multimodal/kimi_k3/kimi_k3_vl.yaml \
+    --model.tokenizer_path ./kimi_k3_hf \
+    --data.train_path configs/multimodal/data/k3_coco.yaml
+```
+
+Verified on 8xA100-80G (cu130): step-1 loss ~ 13, ~5 s/step at SP=2 +
+FSDP2 with `ep_size: 1`; `ep_size: 2` works as well — the eager expert
+loop dispatches through the shared EP all-to-all, it just trades compute
+replication for less expert memory per rank.
+
 ## Scale up
 
 The full native architecture — 93 layers / 896 experts, everything else
@@ -178,3 +205,4 @@ make check-patchgen    # CI gate: generated files up to date
 | `tiling function does not exist` | fla-npu OPP pack not installed |
 | `ImportError: chunk_kda_bwd` | fla-npu too old; install the local build |
 | OOM at CE with many images per pack | expanded-length hook not engaged — check the collate table log at startup |
+| GPU vision tower `ImportError: flash_attn` | install the gpu extra (`uv sync --extra gpu` / `pip install -e ".[gpu]"`) — the vision varlen fallback imports flash-attn lazily |
