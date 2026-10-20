@@ -19,9 +19,33 @@ from transformers import PretrainedConfig
 class FluxConfig(PretrainedConfig):
     model_type = "flux"
 
-    def __init__(self, disable_guidance_embedder=False, input_dim=64, num_blocks=19, **kwargs):
+    def __init__(
+        self,
+        disable_guidance_embedder=False,
+        input_dim=64,
+        output_dim=64,
+        num_blocks=19,
+        num_single_layers=38,
+        num_attention_heads=24,
+        attention_head_dim=128,
+        joint_attention_dim=4096,
+        pooled_projection_dim=768,
+        timestep_embedding_dim=256,
+        axes_dims_rope=(16, 56, 56),
+        rope_theta=10000,
+        **kwargs,
+    ):
         self.disable_guidance_embedder = disable_guidance_embedder
         self.input_dim = input_dim
+        self.output_dim = output_dim
         self.num_blocks = num_blocks
+        self.num_single_layers = num_single_layers
+        self.num_attention_heads = num_attention_heads
+        self.attention_head_dim = attention_head_dim
+        self.joint_attention_dim = joint_attention_dim
+        self.pooled_projection_dim = pooled_projection_dim
+        self.timestep_embedding_dim = timestep_embedding_dim
+        self.axes_dims_rope = list(axes_dims_rope)
+        self.rope_theta = rope_theta
 
         super().__init__(**kwargs)
