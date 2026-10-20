@@ -679,3 +679,70 @@ def test_extra_parallel_dcp_resume_restores_parameter_layout(tmp_path, hsdp, opt
         join=True,
         start_method="fork",
     )
+
+
+@pytest.mark.parametrize("saved_field", ["momentum_buffer", "unknown", "custom.nested"])
+def test_dcp_rejects_incompatible_saved_fields_instead_of_treating_parameter_as_lazy(tmp_path, saved_field):
+    dcp.save({"optimizer": {"state": {"weight": {saved_field: torch.ones(1)}}}}, checkpoint_id=tmp_path)
+    fields = {
+        "master_weight": torch.ones(1),
+        "exp_avg": torch.zeros(1),
+        "exp_avg_sq": torch.zeros(1),
+        "step": torch.tensor(0.0),
+    }
+    target = {"optimizer": {"state": {"weight": fields}}}
+    with pytest.raises(CheckpointException, match="missing part of precision-sensitive optimizer state"):
+        dcp.load(
+            target,
+            checkpoint_id=tmp_path,
+            planner=_ModelStrictLoadPlanner(strict_model=False, strict_optimizer_dtype=True),
+        )
+
+
+@pytest.mark.parametrize("scope", ["model", "optimizer"])
+@pytest.mark.parametrize("strict_model", [False, True])
+def test_dcp_rejects_unversioned_same_dimension_layout_before_read(tmp_path, scope, strict_model):
+    from veomni.checkpoint.dcp_checkpointer import _EXTRA_PARALLEL_LAYOUT_MARKER
+
+    dcp.save({scope: {"weight": torch.ones(4)}}, checkpoint_id=tmp_path)
+    untouched = torch.full((4,), 9.0)
+    target = {scope: {"weight": untouched, _EXTRA_PARALLEL_LAYOUT_MARKER: True}}
+    with pytest.raises(CheckpointException, match="layout migration"):
+        dcp.load(target, checkpoint_id=tmp_path, planner=_ModelStrictLoadPlanner(strict_model=strict_model))
+    torch.testing.assert_close(untouched, torch.full((4,), 9.0), rtol=0, atol=0)
+
+
+def test_cpu_offload_state_receipt_survives_dcp_zero_lr_initialization(monkeypatch):
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+    import veomni.optim.cpu_offload_adamw as module
+
+    model = torch.nn.Linear(2, 2).bfloat16()
+    optimizer = CPUOffloadAdamW([{"params": list(model.parameters()), "cpu_offload": True}], lr=0.001)
+    messages = []
+    monkeypatch.setattr(
+        module.logger, "info", lambda message, *args: messages.append(message % args if args else message)
+    )
+    get_optimizer_state_dict(model, optimizer)
+    assert optimizer.state and not optimizer._state_receipt_emitted
+    assert not messages
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    assert optimizer._state_receipt_emitted
+    assert sum("OPTIMIZER_STATE_RECEIPT" in message for message in messages) == 1
+    assert sum("CPU_OPTIMIZER_STEP" in message for message in messages) == 1
+
+
+def test_versioned_extra_parallel_checkpoint_exports_only_model_tensors(tmp_path, monkeypatch):
+    import veomni.checkpoint.dcp_checkpointer as module
+
+    weights = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    dcp.save({"model": {"weight": weights, module._EXTRA_PARALLEL_LAYOUT_MARKER: True}}, checkpoint_id=tmp_path)
+    plan, size, keys = module._get_sharding_plan(tmp_path, shard_size=None)
+    assert set(plan) == {"weight"} and keys == ["model.weight"]
+    assert size == weights.numel() * weights.element_size()
+    monkeypatch.setattr(module, "empty_cache", lambda: None)
+    exported = module._process_shard(plan, str(tmp_path))
+    assert set(exported) == {"weight"}
+    torch.testing.assert_close(exported["weight"], weights, rtol=0, atol=0)

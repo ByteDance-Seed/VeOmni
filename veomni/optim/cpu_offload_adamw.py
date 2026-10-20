@@ -14,7 +14,12 @@ import time
 import torch
 from torch.optim import Optimizer
 
+from veomni.utils.logging import get_logger
+
 from .master_fp32_adamw import FullFP32AdamW, _align_state_to_parameter, _local
+
+
+logger = get_logger(__name__)
 
 
 def select_cpu_offload_groups(model, groups, patterns):
@@ -140,7 +145,7 @@ class CPUOffloadAdamW(FullFP32AdamW):
             self.state[param] = state
 
     def _emit_state_receipt(self):
-        if self._state_receipt_emitted:
+        if self._state_receipt_emitted or not any(group["lr"] != 0 for group in self.param_groups):
             return
         entries = {}
         for state in self.state.values():
@@ -172,7 +177,7 @@ class CPUOffloadAdamW(FullFP32AdamW):
             ),
             local_state=list(entries.values()),
         )
-        print("OPTIMIZER_STATE_RECEIPT " + json.dumps(payload, sort_keys=True), flush=True)
+        logger.info("OPTIMIZER_STATE_RECEIPT " + json.dumps(payload, sort_keys=True))
         self._state_receipt_emitted = True
 
     def _buffer(self, tensor, size):
@@ -272,9 +277,10 @@ class CPUOffloadAdamW(FullFP32AdamW):
             self._synchronize(device)
         self.last_step_seconds = time.perf_counter() - started
         self._emit_state_receipt()
-        self._emit_step_timing()
+        if any(group["lr"] != 0 for group in self.param_groups):
+            self._emit_step_timing()
         return loss
 
     def _emit_step_timing(self):
         if self._offloaded and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
-            print(f"CPU_OPTIMIZER_STEP global_rank0_suboptimizer_seconds={self.last_step_seconds:.6f}", flush=True)
+            logger.info("CPU_OPTIMIZER_STEP global_rank0_suboptimizer_seconds=%.6f", self.last_step_seconds)

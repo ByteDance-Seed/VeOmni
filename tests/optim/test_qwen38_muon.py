@@ -265,27 +265,11 @@ def test_polar_disables_ambient_autocast():
 
 
 def test_dcp_source_metadata_requires_recipe_before_partial_load():
-    # Execute the actual planner class without importing unrelated GPU kernels.
-    import ast
     from types import SimpleNamespace
 
-    from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+    from veomni.checkpoint.dcp_checkpointer import _ModelStrictLoadPlanner
 
-    source = Path(__file__).parents[2] / "veomni/checkpoint/dcp_checkpointer.py"
-    module = ast.parse(source.read_text())
-    node = next(n for n in module.body if isinstance(n, ast.ClassDef) and n.name == "_ModelStrictLoadPlanner")
-    marker_node = next(
-        n
-        for n in module.body
-        if isinstance(n, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "_ZERO_OPTIMIZER_STATE_MARKER" for target in n.targets)
-    )
-    reset_node = next(
-        n for n in module.body if isinstance(n, ast.FunctionDef) and n.name == "_reset_zero_optimizer_state_resume"
-    )
-    scope = {"DefaultLoadPlanner": DefaultLoadPlanner, "torch": torch}
-    exec(compile(ast.Module(body=[marker_node, reset_node, node], type_ignores=[]), str(source), "exec"), scope)
-    planner = scope["_ModelStrictLoadPlanner"](False, strict_optimizer_recipe=True)
+    planner = _ModelStrictLoadPlanner(False, strict_optimizer_recipe=True)
     planner.metadata = SimpleNamespace(state_dict_metadata={})
     planner.mappings = {"optimizer.param_groups.0.qwen38_recipe": ("optimizer", "param_groups", 0, "qwen38_recipe")}
     with pytest.raises(RuntimeError, match="recipe/state is incomplete"):
