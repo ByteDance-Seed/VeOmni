@@ -24,7 +24,7 @@ if get_device_type() == "cpu" or not c10d.is_available() or not c10d.is_backend_
 
 from torch.testing._internal.common_utils import run_tests
 
-from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+from veomni.distributed.parallel_state import use_parallel_state
 from veomni.models.diffusers.wan_t2v.wan_transformer.configuration_wan_transformer import (
     WanTransformer3DModelConfig,
 )
@@ -108,37 +108,33 @@ class WanT2VUlyssesTest(SequenceParallelTest):
             entered = set()
             for i, block in enumerate(model.blocks):
                 block.register_forward_pre_hook(lambda mod, args, i=i, entered=entered: entered.add(i))
-            try:
-                _init_parallel_state(dp_size=self.world_size, ulysses_size=1, device_type=get_device_type(), name=None)
+            with use_parallel_state(self.dp_state):
                 refs = {name: _forward_backward(model, *case, device) for name, case in CASES.items()}
-                clear_parallel_state()
 
-                _init_parallel_state(dp_size=1, ulysses_size=self.world_size, device_type=get_device_type(), name=None)
-                for name, case in CASES.items():
-                    tag = f"{name}{' (ckpt)' if gradient_checkpointing else ''}"
-                    entered.clear()
-                    try:
+            for name, case in CASES.items():
+                tag = f"{name}{' (ckpt)' if gradient_checkpointing else ''}"
+                entered.clear()
+                try:
+                    with use_parallel_state(self.sp_state):
                         out, grads = _forward_backward(model, *case, device)
-                    except RuntimeError as e:
-                        failures.append(f"{tag}: {str(e).splitlines()[0]}")
-                        continue
-                    ref_out, ref_grads = refs[name]
-                    out_err = ((out - ref_out).norm() / ref_out.norm()).item()
-                    # Param grads cover only this rank's tokens and the loss is replicated on every
-                    # SP rank, so sum over SP and divide by its size (FSDP's mean over the SP mesh).
-                    diff_sq = ref_sq = 0.0
-                    for n, g in grads.items():
-                        c10d.all_reduce(g, group=group)
-                        g /= self.world_size
-                        diff_sq += (g - ref_grads[n]).pow(2).sum().item()
-                        ref_sq += ref_grads[n].pow(2).sum().item()
-                    grad_err = (diff_sq / ref_sq) ** 0.5
-                    if out_err > 1e-5 or grad_err > 1e-5:
-                        failures.append(f"{tag}: output rel err {out_err:.2e}, grad rel err {grad_err:.2e}")
-                    if entered != set(range(len(model.blocks))):
-                        failures.append(f"{tag}: blocks bypassed nn.Module.__call__: {entered}")
-            finally:
-                clear_parallel_state()
+                except RuntimeError as e:
+                    failures.append(f"{tag}: {str(e).splitlines()[0]}")
+                    continue
+                ref_out, ref_grads = refs[name]
+                out_err = ((out - ref_out).norm() / ref_out.norm()).item()
+                # Param grads cover only this rank's tokens and the loss is replicated on every
+                # SP rank, so sum over SP and divide by its size (FSDP's mean over the SP mesh).
+                diff_sq = ref_sq = 0.0
+                for n, g in grads.items():
+                    c10d.all_reduce(g, group=group)
+                    g /= self.world_size
+                    diff_sq += (g - ref_grads[n]).pow(2).sum().item()
+                    ref_sq += ref_grads[n].pow(2).sum().item()
+                grad_err = (diff_sq / ref_sq) ** 0.5
+                if out_err > 1e-5 or grad_err > 1e-5:
+                    failures.append(f"{tag}: output rel err {out_err:.2e}, grad rel err {grad_err:.2e}")
+                if entered != set(range(len(model.blocks))):
+                    failures.append(f"{tag}: blocks bypassed nn.Module.__call__: {entered}")
         assert not failures, "\n".join(failures)
 
 
