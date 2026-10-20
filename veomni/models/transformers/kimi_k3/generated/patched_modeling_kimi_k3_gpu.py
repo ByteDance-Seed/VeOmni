@@ -13,6 +13,8 @@
 #      Construct a local situ_and_mul VeomniOp
 #    - method_override: SituAndMul.forward
 #      Always call the local situ_and_mul VeomniOp
+#    - function_replacement: multihead_attention
+#      Vision varlen attention via a lazily-imported flash-attn
 #    - method_override: KimiRMSNorm.__init__
 #      Construct a local rms_norm VeomniOp
 #    - method_override: KimiRMSNorm.forward
@@ -1741,6 +1743,22 @@ class KimiLinearForCausalLM(KimiPreTrainedModel, GenerationMixin):
         return _get_parallel_plan("model")
 
 
+# ======================================================================
+# [PATCHED FUNCTION] multihead_attention
+# Reason: Vision varlen attention via a lazily-imported flash-attn
+# Source: veomni.models.transformers.kimi_k3.kimi_k3_gpu_patch_gen_config
+# ======================================================================
+# Vision varlen attention (flash-attn fallback on non-NPU devices)
+
+
+# Patch 15: the source sets ``flash_attn_varlen_func = None`` at module level
+# (patchgen cannot preserve the try/except import, so the guarded import is
+# flattened to the fallback assignment). ``multihead_attention`` therefore
+# calls ``None`` whenever ``npu_fusion_vision_attention`` falls back to it on
+# a non-NPU device. Replace it with a variant that imports flash-attn lazily
+# at call time: GPU hosts with ``veomni[gpu]`` get the real varlen kernel,
+# NPU hosts never reach this fallback, and environments without flash-attn
+# fail at the call site instead of at import time.
 def multihead_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1751,20 +1769,14 @@ def multihead_attention(
     max_seqlen_k: int | None = None,
     deterministic: bool = False,
 ):
-    """Multi-head attention using flash attention 2.
+    """Multi-head attention using flash attention 2 (lazy import).
 
-    Args:
-        q, k, v: tensor of shape (batch_size, seqlen, num_heads, head_dim),
-            or (tot_seqlens, num_heads, head_dim) if packing.
-        q_cu_seqlens (torch.Tensor): cumulative sequence lengths of q.
-            The first element should be 0 and the last element should be q.shape[0].
-        k_cu_seqlens (torch.Tensor): cumulative sequence lengths of k.
-            The first element should be 0 and the last element should be k.shape[0].
-
-    Returns:
-        output: shape (batch_size, seqlen, dim) or (tot_seqlens, dim) if packing,
-            where dim = num_heads * head_dim
+    Same packed varlen contract as the source ``multihead_attention``:
+    q/k/v of shape ``(tot_seqlens, num_heads, head_dim)`` plus cumulative
+    sequence lengths; returns ``(tot_seqlens, num_heads * head_dim)``.
     """
+    from flash_attn import flash_attn_varlen_func
+
     attn_out = flash_attn_varlen_func(
         q,
         k,
@@ -1778,10 +1790,7 @@ def multihead_attention(
     )
     if isinstance(attn_out, tuple):
         attn_out = attn_out[0]
-
-    attn_out = attn_out.flatten(start_dim=-2)
-
-    return attn_out
+    return attn_out.flatten(start_dim=-2)
 
 
 def eager_attention(

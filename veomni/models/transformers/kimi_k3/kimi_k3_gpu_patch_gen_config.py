@@ -75,6 +75,10 @@ Patches (skeleton):
     full (gathered) sequence on every SP rank and narrow the output back to
     the local shard. The MLA shard-sized causal mask is dropped (all-ones
     training packs); the KDA cu_seqlens derive from the full-sequence mask.
+15. ``multihead_attention`` --lazy flash-attn import: the source's guarded
+    import is flattened to ``flash_attn_varlen_func = None`` by codegen, so
+    the vision varlen fallback would call ``None`` on non-NPU devices; the
+    replacement imports flash-attn at call time instead.
 """
 
 from functools import partial
@@ -165,6 +169,56 @@ config.add_post_import_block(
         return _k3_chunk_kda_op(q=q, k=k, v=v, g=g, beta=beta, **kwargs)
     """
 )
+
+
+# Vision varlen attention (flash-attn fallback on non-NPU devices)
+
+# Patch 15: the source sets ``flash_attn_varlen_func = None`` at module level
+# (patchgen cannot preserve the try/except import, so the guarded import is
+# flattened to the fallback assignment). ``multihead_attention`` therefore
+# calls ``None`` whenever ``npu_fusion_vision_attention`` falls back to it on
+# a non-NPU device. Replace it with a variant that imports flash-attn lazily
+# at call time: GPU hosts with ``veomni[gpu]`` get the real varlen kernel,
+# NPU hosts never reach this fallback, and environments without flash-attn
+# fail at the call site instead of at import time.
+
+
+@config.replace_function(
+    "multihead_attention",
+    description="Vision varlen attention via a lazily-imported flash-attn",
+)
+def multihead_attention_patched(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_cu_seqlens: torch.Tensor | None = None,
+    k_cu_seqlens: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+    deterministic: bool = False,
+):
+    """Multi-head attention using flash attention 2 (lazy import).
+
+    Same packed varlen contract as the source ``multihead_attention``:
+    q/k/v of shape ``(tot_seqlens, num_heads, head_dim)`` plus cumulative
+    sequence lengths; returns ``(tot_seqlens, num_heads * head_dim)``.
+    """
+    from flash_attn import flash_attn_varlen_func
+
+    attn_out = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        q_cu_seqlens,
+        k_cu_seqlens,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal=False,
+        deterministic=deterministic,
+    )
+    if isinstance(attn_out, tuple):
+        attn_out = attn_out[0]
+    return attn_out.flatten(start_dim=-2)
 
 
 # RMSNorm (instance-local VeomniOp, functional fused kernel)

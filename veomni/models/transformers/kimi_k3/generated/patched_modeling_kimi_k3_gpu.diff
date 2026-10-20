@@ -1,6 +1,6 @@
 --- a/veomni/models/transformers/kimi_k3/source/modeling_kimi_k3.py
 +++ b/patched_modeling_kimi_k3_gpu.py
-@@ -1,36 +1,72 @@
+@@ -1,36 +1,74 @@
 -# coding=utf-8
 -# Copyright 2025-2026 The Moonshot AI Team and HuggingFace Inc. team. All rights reserved.
 +# ==============================================================================
@@ -32,6 +32,8 @@
 +#      Construct a local situ_and_mul VeomniOp
 +#    - method_override: SituAndMul.forward
 +#      Always call the local situ_and_mul VeomniOp
++#    - function_replacement: multihead_attention
++#      Vision varlen attention via a lazily-imported flash-attn
 +#    - method_override: KimiRMSNorm.__init__
 +#      Construct a local rms_norm VeomniOp
 +#    - method_override: KimiRMSNorm.forward
@@ -91,7 +93,7 @@
  from transformers.activations import ACT2FN, PytorchGELUTanh
  from transformers.cache_utils import Cache
  from transformers.configuration_utils import PretrainedConfig
-@@ -38,46 +74,49 @@
+@@ -38,46 +76,49 @@
  from transformers.masking_utils import create_causal_mask
  from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
  from transformers.modeling_layers import GradientCheckpointingLayer
@@ -162,7 +164,7 @@
 
  # Flash attention (vision tower only): patchgen hoists conditional imports to
  # the module top level, so `flash_attn_varlen_func` is unconditionally None
-@@ -87,6 +126,12 @@
+@@ -87,6 +128,12 @@
  flash_attn_varlen_func = None
 
 
@@ -175,7 +177,7 @@
  # Register Moonshot-specific activation functions
  class SituAndMul(nn.Module):
      """
-@@ -94,19 +139,15 @@
+@@ -94,19 +141,15 @@
      When linear_beta is set, up is also transformed by linear_beta * tanh(up / linear_beta).
      """
 
@@ -199,7 +201,7 @@
 
 
  ACT2FN["situ"] = SituAndMul
-@@ -245,50 +286,99 @@
+@@ -245,50 +288,99 @@
          return self.conv_states[self.last_linear_layer] is not None
 
 
@@ -332,7 +334,7 @@
 
 
  class KimiMLP(nn.Module):
-@@ -608,7 +698,6 @@
+@@ -608,7 +700,6 @@
          operate on the padded layout (equal shard lengths); unpad/repad use
          the full-sequence attention_mask exactly like the non-SP path.
          """
@@ -340,7 +342,7 @@
 
          _timing = os.environ.get("K3_KDA_SP_TIMING") == "1"
          if _timing:
-@@ -893,6 +982,12 @@
+@@ -893,6 +984,12 @@
          return o
 
 
@@ -353,7 +355,7 @@
  class KimiMoEGate(nn.Module):
      """
      MoEGate adapted from Deepseek-V3.
-@@ -926,10 +1021,9 @@
+@@ -926,10 +1023,9 @@
          self.reset_parameters()
 
      def reset_parameters(self) -> None:
@@ -365,7 +367,7 @@
      def forward(self, hidden_states):
          bsz, seq_len, h = hidden_states.shape
          # compute gating score
-@@ -949,7 +1043,7 @@
+@@ -949,7 +1045,7 @@
              )
 
          # select top-k experts
@@ -374,7 +376,7 @@
          scores = scores.view(bsz * seq_len, -1)
          scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
          if self.num_expert_group > 1 and self.num_expert_group > self.topk_group:
-@@ -994,13 +1088,29 @@
+@@ -994,13 +1090,29 @@
          return topk_idx, topk_weight
 
 
@@ -409,7 +411,7 @@
          super().__init__()
          self.config = config
          self.hidden_dim = config.hidden_size
-@@ -1012,20 +1122,16 @@
+@@ -1012,20 +1124,16 @@
          self.moe_hidden_size = config.routed_expert_hidden_size if self.use_latent_moe else config.hidden_size
          self.latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
 
@@ -438,7 +440,7 @@
          if config.num_shared_experts is not None:
              intermediate_size = config.moe_intermediate_size * config.num_shared_experts
              self.shared_experts = KimiMLP(
-@@ -1059,10 +1165,9 @@
+@@ -1059,10 +1167,9 @@
          if self.use_latent_moe:
              hidden_states = self.routed_expert_down_proj(hidden_states)
 
@@ -452,7 +454,7 @@
 
          if self.use_latent_moe:
              if self.latent_moe_use_norm:
-@@ -1074,41 +1179,6 @@
+@@ -1074,41 +1181,6 @@
          if self.config.num_shared_experts is not None:
              y = y + self.shared_experts(identity)
          return y
@@ -494,7 +496,7 @@
 
 
  class KimiDecoderLayer(GradientCheckpointingLayer):
-@@ -1340,6 +1410,12 @@
+@@ -1340,6 +1412,12 @@
          return prefix_sum, block_residual
 
 
@@ -507,7 +509,7 @@
  class KimiPreTrainedModel(PreTrainedModel):
      config_class = KimiLinearConfig
      base_model_prefix = "model"
-@@ -1354,8 +1430,47 @@
+@@ -1354,8 +1432,47 @@
      }
      _is_stateful = True
 
@@ -555,7 +557,7 @@
          if isinstance(module, nn.Linear):
              module.weight.data.normal_(mean=0.0, std=std)
              if module.bias is not None:
-@@ -1382,8 +1497,15 @@
+@@ -1382,8 +1499,15 @@
      return hidden_states.to(v.dtype)
 
 
@@ -572,7 +574,7 @@
          super().__init__(config)
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
-@@ -1399,14 +1521,12 @@
+@@ -1399,14 +1523,12 @@
              self.output_attn_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
              self.output_attn_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
 
@@ -592,7 +594,7 @@
          self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
          self.gradient_checkpointing = False
          # Initialize weights and apply final processing
-@@ -1520,6 +1640,12 @@
+@@ -1520,6 +1642,12 @@
          ).view(batch_size, seq_len, hidden_size)
 
 
@@ -605,7 +607,7 @@
  class KimiLinearForCausalLM(KimiPreTrainedModel, GenerationMixin):
      @classmethod
      def _supports_default_dynamic_cache(cls) -> bool:
-@@ -1527,41 +1653,36 @@
+@@ -1527,41 +1655,36 @@
 
      _tied_weights_keys = ["lm_head.weight"]
 
@@ -666,7 +668,7 @@
          output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
          output_hidden_states = (
              output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-@@ -1581,22 +1702,43 @@
+@@ -1581,24 +1704,61 @@
              cache_position=cache_position,
          )
 
@@ -707,6 +709,8 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
 -        )
+-
+-
 +            fused_linear_aux=fused_linear_aux,
 +        )
 +
@@ -715,10 +719,68 @@
 +        from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 +
 +        return _get_parallel_plan("model")
-
-
++
++
++# ======================================================================
++# [PATCHED FUNCTION] multihead_attention
++# Reason: Vision varlen attention via a lazily-imported flash-attn
++# Source: veomni.models.transformers.kimi_k3.kimi_k3_gpu_patch_gen_config
++# ======================================================================
++# Vision varlen attention (flash-attn fallback on non-NPU devices)
++
++
++# Patch 15: the source sets ``flash_attn_varlen_func = None`` at module level
++# (patchgen cannot preserve the try/except import, so the guarded import is
++# flattened to the fallback assignment). ``multihead_attention`` therefore
++# calls ``None`` whenever ``npu_fusion_vision_attention`` falls back to it on
++# a non-NPU device. Replace it with a variant that imports flash-attn lazily
++# at call time: GPU hosts with ``veomni[gpu]`` get the real varlen kernel,
++# NPU hosts never reach this fallback, and environments without flash-attn
++# fail at the call site instead of at import time.
  def multihead_attention(
-@@ -2372,6 +2514,12 @@
+     q: torch.Tensor,
+     k: torch.Tensor,
+@@ -1609,20 +1769,14 @@
+     max_seqlen_k: int | None = None,
+     deterministic: bool = False,
+ ):
+-    """Multi-head attention using flash attention 2.
+-
+-    Args:
+-        q, k, v: tensor of shape (batch_size, seqlen, num_heads, head_dim),
+-            or (tot_seqlens, num_heads, head_dim) if packing.
+-        q_cu_seqlens (torch.Tensor): cumulative sequence lengths of q.
+-            The first element should be 0 and the last element should be q.shape[0].
+-        k_cu_seqlens (torch.Tensor): cumulative sequence lengths of k.
+-            The first element should be 0 and the last element should be k.shape[0].
+-
+-    Returns:
+-        output: shape (batch_size, seqlen, dim) or (tot_seqlens, dim) if packing,
+-            where dim = num_heads * head_dim
++    """Multi-head attention using flash attention 2 (lazy import).
++
++    Same packed varlen contract as the source ``multihead_attention``:
++    q/k/v of shape ``(tot_seqlens, num_heads, head_dim)`` plus cumulative
++    sequence lengths; returns ``(tot_seqlens, num_heads * head_dim)``.
+     """
++    from flash_attn import flash_attn_varlen_func
++
+     attn_out = flash_attn_varlen_func(
+         q,
+         k,
+@@ -1636,10 +1790,7 @@
+     )
+     if isinstance(attn_out, tuple):
+         attn_out = attn_out[0]
+-
+-    attn_out = attn_out.flatten(start_dim=-2)
+-
+-    return attn_out
++    return attn_out.flatten(start_dim=-2)
+
+
+ def eager_attention(
+@@ -2372,6 +2523,12 @@
          return x
 
 
@@ -731,7 +793,7 @@
  class KimiK3PreTrainedModel(PreTrainedModel):
      config_class = KimiK3Config
      base_model_prefix = "model"
-@@ -2389,13 +2537,48 @@
+@@ -2389,13 +2546,48 @@
 
      def _init_weights(self, module):
          # important: this ported version of Llava isn't meant for training from scratch - only
@@ -781,7 +843,7 @@
 
          if hasattr(module, "class_embedding"):
              module.class_embedding.data.normal_(mean=0.0, std=std)
-@@ -2446,13 +2629,37 @@
+@@ -2446,13 +2638,37 @@
          self.projector_ln_eps = config.projector_ln_eps
 
 
@@ -820,7 +882,7 @@
          super().__init__(config)
 
          vt_config = VisionTowerConfig(config.vision_config)
-@@ -2471,7 +2678,23 @@
+@@ -2471,7 +2687,23 @@
              raise ValueError(f"Unsupported mm_projector_type: {proj_config.mm_projector_type}")
 
          self.language_model = KimiLinearForCausalLM(config.text_config)
@@ -844,7 +906,7 @@
 
          if hasattr(self.language_model, "dtype"):
              target_dtype = self.language_model.dtype
-@@ -2496,8 +2719,14 @@
+@@ -2496,8 +2728,14 @@
      def get_decoder(self):
          return self.language_model.get_decoder()
 
@@ -861,7 +923,7 @@
 
      def resize_token_embeddings(self, new_num_tokens: int | None = None, pad_to_multiple_of=None) -> nn.Embedding:
          model_embeds = self.language_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
-@@ -2642,35 +2871,46 @@
+@@ -2642,35 +2880,46 @@
          image_features = self.vision_tower(pixel_values, grid_thws)
          return image_features
 
@@ -929,7 +991,7 @@
 
          if inputs_embeds is None:
              # 1. Extra the input embeddings
-@@ -2682,15 +2922,7 @@
+@@ -2682,15 +2931,7 @@
                  if self.mm_projector:
                      image_features = self.mm_projector(image_features)
 
@@ -946,7 +1008,7 @@
                  inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
                      image_features,
                      inputs_embeds,
-@@ -2732,46 +2964,72 @@
+@@ -2732,46 +2973,72 @@
                  attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
                  position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
 
@@ -1043,7 +1105,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2837,3 +3095,34 @@
+@@ -2837,3 +3104,34 @@
 
      def _reorder_cache(self, *args, **kwargs):
          return self.language_model._reorder_cache(*args, **kwargs)
