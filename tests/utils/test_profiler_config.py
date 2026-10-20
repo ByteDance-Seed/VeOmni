@@ -1433,6 +1433,7 @@ def test_non_npu_profiler_records_allocator_history(monkeypatch, tmp_path, backe
     monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", False)
     monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", backend == "cuda")
     monkeypatch.setattr(helper, "IS_MLU_AVAILABLE", backend == "mlu")
+    monkeypatch.setattr(helper, "get_device_type", lambda: backend)
     monkeypatch.setattr(helper.torch, "profiler", fake_profiler)
     monkeypatch.setattr(
         helper,
@@ -1451,4 +1452,5 @@ def test_non_npu_profiler_records_allocator_history(monkeypatch, tmp_path, backe
     )
     profiler.start()
     profiler.stop()
-    assert events == (["start", {}, "stop", {"enabled": None}] if profile_memory else ["start", "stop"])
+    history_kwargs = {"context": "state"} if backend == "cuda" else {}
+    assert events == (["start", history_kwargs, "stop", {"enabled": None}] if profile_memory else ["start", "stop"])
