@@ -13,14 +13,16 @@ from veomni.models.seed_omni.configuration_omni import (
     OmniConfig,
 )
 from veomni.models.seed_omni.modeling_omni import OmniModel
-from veomni.models.seed_omni.modules.fake_model.convert_model import FAKE_A, FAKE_B, load_family_graphs
+from veomni.models.seed_omni.modules.fake_model.convert_model import FAKE_A, FAKE_B, load_fake_omni_graphs
 from veomni.models.seed_omni.modules.fake_model.fake_module_a.configuration import FakeModuleAConfig
 from veomni.models.seed_omni.modules.fake_model.fake_module_a.modeling import FakeModuleA
 from veomni.models.seed_omni.modules.fake_model.fake_module_b.configuration import FakeModuleBConfig
 from veomni.models.seed_omni.modules.fake_model.fake_module_b.modeling import FakeModuleB
 from veomni.models.seed_omni.utils.convert_registry import (
     OMNI_CONVERT_REGISTRY,
+    attach_module_assets,
     convert_checkpoint,
+    load_family_graphs,
 )
 
 
@@ -93,7 +95,7 @@ def test_extra_pairs_reach_the_family_converter(tmp_path):
     source = tmp_path / "src"
     source.mkdir()
     (source / "config.json").write_text(json.dumps({"model_type": "extra_kwargs_test"}), encoding="utf-8")
-    training_graphs, generation_graphs = load_family_graphs()
+    training_graphs, generation_graphs = load_fake_omni_graphs()
 
     def _record_extra(model_path: str, **kwargs) -> dict:
         del model_path
@@ -114,7 +116,7 @@ def test_extra_pairs_reach_the_family_converter(tmp_path):
 def test_convert_fake_omni_writes_both_graphs_and_loads(tmp_path):
     source = _write_fake_omni_source(tmp_path / "src", hidden_size=8)
     output = tmp_path / "omni"
-    training_graphs, generation_graphs = load_family_graphs()
+    training_graphs, generation_graphs = load_fake_omni_graphs()
 
     convert_checkpoint(str(source), str(output))
 
@@ -171,7 +173,7 @@ def test_convert_checkpoint_writes_only_the_graphs_it_has(tmp_path):
     source.mkdir()
     (source / "config.json").write_text(json.dumps({"model_type": "training_only_graphs_test"}), encoding="utf-8")
     output = tmp_path / "omni"
-    training_graphs, _ = load_family_graphs()
+    training_graphs, _ = load_fake_omni_graphs()
 
     def _training_only(model_path: str, **kwargs) -> dict:
         del model_path, kwargs
@@ -195,3 +197,58 @@ def test_convert_checkpoint_writes_only_the_graphs_it_has(tmp_path):
     assert loaded.generation_graph is None
     with pytest.raises(ValueError, match="no generation graph"):
         loaded.generate({})
+
+
+class _MarkerAsset:
+    def save_pretrained(self, save_directory):
+        (Path(save_directory) / "marker_asset.txt").write_text("ok", encoding="utf-8")
+
+
+def test_family_graph_files_and_module_assets_land_in_the_checkpoint(tmp_path):
+    """One FSM file per scenario is keyed by that scenario; assets hung on a module save with it."""
+    fsm = (
+        "initial: run\n"
+        "states:\n"
+        "  run:\n"
+        "    body:\n"
+        "      - {from: fake_module_a, to: end}\n"
+        "    transitions:\n"
+        "      - {condition: {type: default}, next_state: done}\n"
+    )
+    (tmp_path / "train.yaml").write_text("- {from: fake_module_a, to: end}\n", encoding="utf-8")
+    (tmp_path / "gen.yaml").write_text(fsm, encoding="utf-8")
+    (tmp_path / "und.yaml").write_text(fsm, encoding="utf-8")
+    training_graphs, generation_graphs = load_family_graphs(
+        tmp_path, training="train.yaml", generation={"infer_gen": "gen.yaml", "infer_und": "und.yaml"}
+    )
+    assert training_graphs == {"default": [{"from": "fake_module_a", "to": "end"}]}
+    assert list(generation_graphs) == ["infer_gen", "infer_und"]
+    assert generation_graphs["infer_und"]["initial"] == "run"
+
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "module_assets_test"}), encoding="utf-8")
+
+    def _with_assets(model_path: str, **kwargs) -> dict:
+        del model_path, kwargs
+        return {
+            "modules": {
+                FAKE_A: attach_module_assets(FakeModuleA(FakeModuleAConfig()), tokenizer=_MarkerAsset()),
+                FAKE_B: FakeModuleB(FakeModuleBConfig()),
+            },
+            "training_graphs": training_graphs,
+            "generation_graphs": generation_graphs,
+            "infer_type": "infer_und",
+        }
+
+    if "module_assets_test" not in OMNI_CONVERT_REGISTRY.valid_keys():
+        OMNI_CONVERT_REGISTRY.register("module_assets_test", lambda: _with_assets)
+
+    output = tmp_path / "omni"
+    convert_checkpoint(str(source), str(output))
+
+    assert (output / FAKE_A / "marker_asset.txt").is_file()
+    assert not (output / FAKE_B / "marker_asset.txt").exists()
+    config = OmniConfig.from_pretrained(output)
+    assert list(config.generation_graphs) == ["infer_gen", "infer_und"]
+    assert config.infer_type == "infer_und"

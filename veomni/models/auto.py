@@ -94,6 +94,13 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
 
     model_type = getattr(config, "model_type", None)
     if model_type in CONTEXT_PARALLEL_MODEL_TYPES:
+        state = get_parallel_state()
+        if state.ulysses_enabled:
+            raise NotImplementedError(
+                f"Context parallelism cannot be combined with Ulysses for model type {model_type!r} yet; "
+                f"got cp_size={state.cp_size} with ulysses_size={state.ulysses_size}. "
+                "Set ulysses_size=1 to use context parallelism."
+            )
         return
 
     supported = ", ".join(sorted(CONTEXT_PARALLEL_MODEL_TYPES))

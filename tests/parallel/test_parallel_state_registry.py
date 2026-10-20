@@ -20,7 +20,6 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from veomni.distributed import parallel_state as parallel_state_module
 from veomni.distributed.parallel_state import (
     _init_parallel_state,
     clear_parallel_state,
@@ -77,22 +76,15 @@ def _check_mesh_rank_layout(rank, rendezvous):
     dist.init_process_group(
         "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=4, timeout=timedelta(seconds=60)
     )
-    original_init_device_mesh = parallel_state_module.init_device_mesh
-    captured_mesh = {}
-
-    def capture_real_mesh(*args, **kwargs):
-        mesh = original_init_device_mesh(*args, **kwargs)
-        captured_mesh["mesh"] = mesh
-        return mesh
-
-    parallel_state_module.init_device_mesh = capture_real_mesh
     try:
-        # The real mesh and its flattened views are built before the existing
-        # CP+Ulysses guard rejects this unsupported configuration.
-        with pytest.raises(NotImplementedError, match="cannot be combined with Ulysses yet"):
-            _init_parallel_state(cp_size=2, ulysses_size=2, device_type="cpu", name=None)
-
-        mesh = captured_mesh["mesh"]
+        state = _init_parallel_state(dp_size=1, cp_size=2, ulysses_size=2, device_type="cpu", name=None)
+        mesh = state.device_mesh
+        assert state.sp_size == 4
+        assert state.sp_rank == rank
+        assert state.cp_size == 2
+        assert state.cp_rank == rank // 2
+        assert state.ulysses_size == 2
+        assert state.ulysses_rank == rank % 2
         assert mesh.mesh_dim_names == ("dp_shard", "cp", "ulysses")
         assert mesh.mesh.tolist() == [[[0, 1], [2, 3]]]
         assert dist.get_process_group_ranks(mesh.get_group("ulysses")) == [rank // 2 * 2, rank // 2 * 2 + 1]
@@ -100,7 +92,6 @@ def _check_mesh_rank_layout(rank, rendezvous):
         for name in ("sp", "dp_sp", "dp_shard_sp"):
             assert dist.get_process_group_ranks(mesh.get_group(name)) == [0, 1, 2, 3]
 
-        parallel_state_module.init_device_mesh = original_init_device_mesh
         sp_state = _init_parallel_state(dp_size=1, ulysses_size=4, device_type="cpu", name="sp")
         dp_state = _init_parallel_state(dp_size=4, ulysses_size=1, device_type="cpu", name="dp")
         assert sp_state.ulysses_group is not None
@@ -110,13 +101,12 @@ def _check_mesh_rank_layout(rank, rendezvous):
         with use_parallel_state("dp"):
             assert get_ulysses_sequence_parallel_group() is None
     finally:
-        parallel_state_module.init_device_mesh = original_init_device_mesh
         dist.destroy_process_group()
         clear_parallel_state()
 
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="requires the CPU Gloo backend")
-def test_mesh_places_ulysses_inside_cp_without_enabling_combined_parallelism(tmp_path):
+def test_mesh_places_ulysses_inside_cp_with_combined_parallelism(tmp_path):
     mp.spawn(_check_mesh_rank_layout, args=(str(tmp_path / "rendezvous"),), nprocs=4, join=True)
 
 

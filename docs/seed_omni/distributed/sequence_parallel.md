@@ -1,42 +1,87 @@
-# SeedOmni Sequence Parallelism
+# SeedOmni Sequence & Context Parallelism
 
-SeedOmni runs classic single-pass Ulysses sequence parallelism (SP) under one
-SP size shared by the whole graph. Each module that supports SP slices its input
-inside its own `pre_forward`, runs one forward, and all-gathers the result in its
-own `post_forward`. This page describes that contract and why it gives the same
-gradients and metrics as a non-SP run. General Ulysses background is in
-[Ulysses](../../key_features/ulysses.md).
+SeedOmni runs single-pass sequence/context parallelism under one shared
+`dp_size` (and therefore one unified `sp_size = cp_size * ulysses_size`) across
+all distributed modules in the graph. Each module may independently configure
+Ulysses sequence parallelism (`ulysses_size`), context parallelism (`cp_size`),
+or hybrid `cp_size * ulysses_size`, as long as every distributed module resolves
+to the same `dp_size`. Inside its own `pre_forward`, each module slices its
+replicated input according to its own parallel state, runs one forward, and
+all-gathers the result in its own `post_forward`. This page describes that
+contract and why it gives the same gradients and metrics as a non-SP run.
+General Ulysses background is in [Ulysses](../../key_features/ulysses.md).
 Everything else a module may choose for itself (FSDP2, DDP, extra parallel
 groups) is in [Per-Module Parallelism](per_module_parallelism.md).
 
-## 1. Enabling SP
+## 1. Enabling SP / CP
 
-Set the SP size on the global accelerator:
+Set a uniform `ulysses_size` on the global accelerator:
 
 ```bash
-bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+bash train.sh tasks/omni/train_omni.py configs/seed_omni/fake_model/train/base.yaml \
   --model.accelerator.ulysses_size 4
 ```
 
-Every module inherits `ulysses_size` through the accelerator deep-merge in
+Or configure `ulysses_size` / `cp_size` per module in `modules_train.yaml` (for
+example, Ulysses SP on the vision encoder and Context Parallelism on a
+DeepSeek-V4 LLM backbone), provided every module resolves to the same
+`dp_size = world_size // (cp_size * ulysses_size)`:
+
+```yaml
+vision_encoder:
+  accelerator:
+    ulysses_size: 4
+    cp_size: 1
+
+llm_backbone:
+  accelerator:
+    ulysses_size: 1
+    cp_size: 4
+```
+
+Every module inherits from `model.accelerator` through `_deep_update` in
 `build_omni_module_runtime_args` (see
-[How a module's arguments are resolved](../usage/training_and_inference.md#how-a-modules-arguments-are-resolved))
-so the entire graph runs at one uniform SP degree.
+[How a module's arguments are resolved](../usage/training_and_inference.md#how-a-modules-arguments-are-resolved)).
+Because `_deep_update` merges keys individually, if `model.accelerator` sets
+`ulysses_size > 1` and a module wants pure CP (`cp_size > 1`), remember to also
+set `ulysses_size: 1` in that module's `accelerator:` block so the two axes do
+not multiply into a different `dp_size`.
 
-With SP size `S` on `W` ranks the data-parallel size is `W / S`. On a small
-machine this can reach `dp = 1`; compensate with gradient accumulation (a larger
-`global_batch_size` over the same `micro_batch_size`).
+`build_omni_model_runtime_args` validates that all distributed modules and the
+top-level `model.accelerator` resolve to the same `dp_size`.
 
-## 2. Why one SP size for the whole graph
+With `sp_size = cp_size * ulysses_size = S` on `W` ranks the data-parallel size
+is `W / S`. On a small machine this can reach `dp = 1`; compensate with gradient
+accumulation (a larger `global_batch_size` over the same `micro_batch_size`).
 
-`OmniTrainer` builds a single dataloader under the job's `base` parallel state
-(`model.accelerator`), yielding `W / S` distinct shards and replicating each
-shard across a base SP group of `S` ranks. Because each module's `pre_forward`
-slices its replicated input and `post_forward` all-gathers across its SP group,
-and because the gradient, loss, and metric reductions in section 4 pair each
-module's SP group with its data-parallel group, every module inherits the same
-`ulysses_size = S` from `model.accelerator` so its SP groups match the
-dataloader's replication groups.
+## 2. Why all modules share one `dp_size`
+
+Module boundaries do not depend on whether a module uses Ulysses SP, CP, or
+`cp * sp`. Every module gathers its output back to the full sequence in
+`post_forward`, and the next module slices its own input again in `pre_forward`
+(section 3). What ties the modules together is the `dp_size` and the replication
+group over which the dataloader distributes identical samples.
+
+**DeviceMesh layout.** `ParallelState` always constructs its device mesh in the
+order `[pp, dp_replicate, dp_shard, cp, ulysses, tp]`. When `pp_size = 1` and
+`tp_size = 1`, any two modules with the same `dp_size` have the same unified
+`sp_size = cp_size * ulysses_size = W / dp_size`, the exact same `dp_rank`
+(`global_rank // sp_size`), the exact same `dp_group`, the exact same contiguous
+replication group `sp_group` (`[dp_rank * sp_size, (dp_rank + 1) * sp_size)`),
+and the exact same `fsdp_group` (`dp_sp`) — regardless of how each module
+factors `sp_size` into `cp_size * ulysses_size` or splits `dp_size` into
+`dp_replicate * dp_shard`.
+
+**One data stream, replicated once per `dp_rank`.** `OmniTrainer` builds a
+single dataloader under the job's `base` parallel state using the shared
+`dp_size`. It yields `dp_size = W / S` distinct shards and replicates each one
+across the `S` ranks of its `sp_group`. Each module knows its own `ParallelState`
+(`dp_size`, `ulysses_size`, `cp_size`, `sp_size`) and decides inside its own
+scoped execution how to process the replicated data.
+
+**Enforced at argument resolution.** `build_omni_model_runtime_args` checks that
+every distributed module resolves to the same `dp_size` and raises `ValueError`
+before any model weights or process groups are built if any module disagrees.
 
 ## 3. Data flow
 
@@ -51,7 +96,8 @@ for node in training_graph:
 
 - **Replicated data.** The standard `BaseTrainer` sharded loader gives
   `dp_size = W / S` distinct shards and replicates each one to all ranks of its
-  SP group, so every rank in an SP group holds the **same** samples.
+  SP group, so every rank in an SP group holds the **same** samples. The
+  collator does no modality-specific splitting.
 - **Slice in `pre_forward`.** A module with SP support branches on
   `get_parallel_state().sp_size > 1` and slices its replicated input to `1/S`
   with `sp_pad` + `slice_input_tensor` or `sp_pad_and_slice`. Sequence modules
@@ -60,15 +106,17 @@ for node in training_graph:
 - **Gather in `post_forward`.** The matching branch all-gathers with
   `gather_outputs` and strips the padding, so everything downstream of
   `post_forward` (writing hidden states back onto the conversation list,
-  label alignment, loss) is SP-agnostic. Because every rank in the group starts
-  from the same replicated sample, per-rank chunk shapes match for
-  `gather_outputs`.
+  label alignment, loss) is SP-agnostic. `gather_outputs` concatenates
+  per-rank tensors, so every rank of the group must produce the same shapes,
+  which replication guarantees.
 - **Encoder-to-LLM boundary.** Encoder outputs are gathered back to the full
-  sequence, and the backbone assembles its packed sequence from full-length
-  embeddings before slicing again for its own forward.
+  sequence, the backbone assembles its packed sequence from full-length
+  embeddings, then slices again for its own forward. There is no extra reshard
+  mechanism between modules.
 
-Forward and backward activation peaks are both about `1/S` of a full sample.
-The node runner is
+The SP logic lives entirely in each module's `pre_forward` / `post_forward`;
+there is no separate SP hook. Forward and backward activation peaks are both
+about `1/S` of a full sample. The node runner is
 `veomni/models/seed_omni/accelerated/utils/executor.py::execute_train_node`, and
 the primitives are in `veomni/distributed/sequence_parallel/data.py`.
 
@@ -81,13 +129,11 @@ because parameters are sharded and reduced on a mesh that includes SP. The
 result matches the non-SP baseline; this is the same invariant as single-model
 Ulysses in VeOmni.
 
-**Loss requirement.** Decode-side losses must reduce with
+**Loss.** Decode-side losses reduce with
 `reduce_sequence_parallel_loss(..., group=ps.fsdp_group)`, a token-weighted
 reduction over `dp_sp`. With replicated data the SP peers hold identical
 `(ce_sum, n_valid)` pairs, so each distinct DP shard counts once and the SP
-copies cancel. The current in-tree stand-in modules (`fake_model`) do not yet
-apply this reduction; production decode modules (`text_encoder.decode`,
-`vqvae.decode`) implement it.
+copies cancel.
 
 **Metrics.** `metric_meter_set_seqlens` runs in `pre_forward` **before** the
 slice and records full sample lengths. The step meter reduces over `dp_group`,
@@ -103,21 +149,30 @@ The hard rules agents must follow are kept in
 `.agents/knowledge/veomni-seed-omni.md` (§3) and
 `.agents/knowledge/constraints.md` (§7).
 
-## 5. Slicing dimensions
+## 5. Choosing between slicing and item balancing
 
-Sequence-parallel modules with Ulysses attention (text backbones, Qwen3-VL ViT)
-slice along the flat token or patch sequence so even a single long item splits
-evenly across `S` ranks. Block-diagonal image encoders whose attention operates
-per image without Ulysses (SigLIP, VQVAE) slice the replicated image batch
-across the `S` ranks instead, so each image is computed once on one rank and
-gathered in `post_forward`.
+For a **block-diagonal** encoder (each image or clip attends only within itself)
+whose slice boundaries align with items, SP slicing is exactly data balancing:
+each item is computed once on one rank and no all-to-all is needed. SP slicing
+also balances load strictly better than assigning whole items to ranks, because
+it splits by tokens: a single image is still split `S` ways, with at most `S`
+padding tokens once per batch, while whole-item assignment idles ranks when there
+are fewer items than ranks or the items differ in size. For SP-aware encoders
+(global attention, no cross-shard locality, such as a ViT), uniform SP slicing is
+therefore sufficient, and it is what every module does today.
 
 ## 6. Limitations and future work
 
 - **Local operators in audio and video encoders.** Whisper-style conv1d
-  downsampling and video 3D-conv patchify or temporal windows act on the
-  sequence before attention, so encoders with cross-shard local operators need a
-  whole-item scatter/gather path (not yet implemented).
-- **Cross-sample compute balance.** Length- or compute-aware packing across DP
-  groups is not yet implemented.
-- **Per-module SP sizes.** All modules share one SP size (`model.accelerator.ulysses_size`).
+  downsampling and video 3D-conv patchify or temporal windows act on the sharded
+  sequence **before** any all-to-all, so shard boundaries would need halo
+  exchange that Ulysses does not provide. Such encoders need an item-balancing
+  path (keep each item whole on one rank, scatter items and gather embeddings)
+  instead of SP slicing. This path is not implemented.
+- **Cross-sample compute balance.** A text-only sample and a long video sample
+  differ by orders of magnitude in compute, so DP groups can straggle.
+  Length- or compute-aware packing at the dataloader level is not implemented.
+- **Mismatched `dp_size` across modules.** All distributed modules share one
+  `dp_size` (and therefore one `sp_size = cp_size * ulysses_size`); there is no
+  supported way for different modules to use different `dp_size` values. See
+  [section 2](#2-why-all-modules-share-one-dp_size).
