@@ -11,6 +11,7 @@ Usage:
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -108,6 +109,45 @@ class TestGetModelSaveState(unittest.TestCase):
         }
         result = _call_get_model_save_state(self.model, None, fake)
         self.assertEqual(set(result), set(fake))
+
+    def test_live_export_strips_extra_parallel_layout_metadata(self):
+        from torch.distributed.tensor import Shard
+
+        from veomni.checkpoint.dcp_checkpointer import _EXTRA_PARALLEL_LAYOUT_MARKER, ModelState
+        from veomni.utils.save_safetensor_utils import _save_hf_safetensor_distributed
+
+        self.model._fqn2spec_info = {"linear.weight": SimpleNamespace(placement=Shard(0), fsdp_shard_dim=0)}
+        parallel_state = SimpleNamespace(dp_mode="fsdp2")
+        # Keep real ModelState marker emission; only physical mesh restoration
+        # and writer I/O are replaced in this CPU unit test.
+        for mapping in (None, {"linear.weight": 0, _EXTRA_PARALLEL_LAYOUT_MARKER: 0}):
+            with (
+                self.subTest(mapping=mapping),
+                patch.object(
+                    ModelState,
+                    "get_state_dict_with_extra_parallel_dim_preprocess",
+                    side_effect=lambda state, mode: state,
+                ),
+                patch("torch.distributed.checkpoint.HuggingFaceStorageWriter") as writer,
+                patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch"),
+                patch(f"{_MOD}.dcp.save") as save,
+                patch(f"{_MOD}.dist.is_initialized", return_value=False),
+                patch(f"{_MOD}.save_model_assets"),
+                patch(f"{_MOD}.helper"),
+                patch(f"{_MOD}.synchronize"),
+            ):
+                emitted = ModelState(self.model, parallel_state=parallel_state).state_dict()
+                self.assertIs(emitted[_EXTRA_PARALLEL_LAYOUT_MARKER], True)
+                _save_hf_safetensor_distributed(self.model, "/unused/hf", mapping, None, parallel_state=parallel_state)
+                state = save.call_args.kwargs["state_dict"]
+                self.assertNotIn(_EXTRA_PARALLEL_LAYOUT_MARKER, state)
+                self.assertTrue(state)
+                self.assertTrue(all(isinstance(value, torch.Tensor) for value in state.values()))
+                self.assertTrue(all(value.dtype == torch.bfloat16 for value in state.values()))
+                self.assertTrue(all(value.dtype == torch.float32 for value in self.model.parameters()))
+                if mapping is not None:
+                    self.assertEqual(set(state), {"linear.weight"})
+                    self.assertEqual(writer.call_args.kwargs["fqn_to_index_mapping"], {"linear.weight": 0})
 
     def test_fp32_converted_to_bf16(self):
         fake = {

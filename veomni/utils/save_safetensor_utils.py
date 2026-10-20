@@ -45,7 +45,7 @@ def get_model_save_state(
     2. Casts float32 tensors to bfloat16 on copies (original model dtypes are preserved).
     3. Filters out tied weights not present in ``fqn_to_index_mapping``.
     """
-    from veomni.checkpoint.dcp_checkpointer import ModelState
+    from veomni.checkpoint.dcp_checkpointer import _EXTRA_PARALLEL_LAYOUT_MARKER, ModelState
 
     # Use flat state dict so DCP FQNs match the original HF weight_map keys
     # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
@@ -55,6 +55,9 @@ def get_model_save_state(
     # so the original model parameters remain unchanged.
     converted_state = {}
     for k, v in save_state.items():
+        # This versions DCP placement metadata, not a HuggingFace model tensor.
+        if k == _EXTRA_PARALLEL_LAYOUT_MARKER:
+            continue
         if v.dtype == torch.float32:
             logger.info_rank0(f"Converting {k} from {v.dtype} to torch.bfloat16")
             converted_state[k] = v.to(torch.bfloat16)
