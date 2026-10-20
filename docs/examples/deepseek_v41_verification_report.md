@@ -21,8 +21,8 @@ All experiments were executed in **Group 356 (`Zhi-wh-h100`, `cluster_id: 8`, `c
 | **128-GPU Full** | **8-GPU Multimodal Inference Round-Trip on 128-GPU Exported Checkpoint** | 8 (Node 0) | `tasks/omni/infer_omni.py` loading `/mnt/hdfs/.../global_step_100/hf_ckpt` with `modules_infer_fsdp.yaml` | **Pass (`rc=0`, 40-layer FP8/FP4 generation)** | [0abc0b09f0eeb205 (trial 304282868)](https://seed.byteintl.net/development/instance/jobs/0abc0b09f0eeb205) | N/A (Inference stage in `304282868`) |
 | **8-GPU CP Alignment** | **Suite A: `BaseTrainer`-Aligned FSDP2 `text_encoder` (`cp=1` 10 steps & `cp=2` Step 1)** | 8 | Deterministic batch (`seed=42, shuffle=false, gbs=8, mbs=1`), `text_encoder` FSDP2 (`no emb`) | **Pass (`cp=1` 10/10; `cp=2` Step 1 exact match)** | [2304d1595f72d42c](https://seed.byteintl.net/development/instance/jobs/2304d1595f72d42c) / [0aa9829c2c54b033](https://seed.byteintl.net/development/instance/jobs/0aa9829c2c54b033) | [run_20261019_97fe4507](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261019_97fe4507) |
 | **8-GPU CP Alignment** | **Suite B: `emb=8, extra_parallel_only=true` `text_encoder` (`cp=1` 10 steps & `cp=2` Step 1)** | 8 | Deterministic batch (`seed=42, shuffle=false, gbs=8, mbs=1`), `_extra_parallel_only` grad-sync fix | **Pass (`cp=1` 10/10; `cp=2` Step 1 exact match)** | [65d2fbffbbf7a959](https://seed.byteintl.net/development/instance/jobs/65d2fbffbbf7a959) | [run_20261019_1210172e](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261019_1210172e) / [run_20261019_30fd740c](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261019_30fd740c) |
-| **8-GPU CP Alignment** | **Full `cp=1, 2, 4, 8` Multi-Step Suite (`ep_size=4, ep_fsdp=2`)** | 8 | `ep_size=4` (`ep_fsdp=2`) enabling FSDP2 expert resharding after forward/backward across `cp=1,2,4,8` | Queued (`STARTED` in Group 356) | [6fd0c0aef891741e](https://seed.byteintl.net/development/instance/jobs/6fd0c0aef891741e) | Pending queue allocation |
-| **128-GPU Multimodal** | **200-Step Multimodal (`tulu` + `sharegpt4v`) Speed & Convergence Run** | 128 | Local NVMe `/tmp/vdata`, `vision` trainable (`freeze: false`), `text_encoder` FSDP2 (`BaseTrainer`-aligned), `ep=128` | Queued (`STARTED` in Group 356) | [5b0d624d30b5bfde](https://seed.byteintl.net/development/instance/jobs/5b0d624d30b5bfde) | Pending queue allocation |
+| **8-GPU CP Alignment** | **Full `cp=1, 2, 4, 8` Multi-Step Suite (`VeomniOp` + `ViT Ulysses SP + LLM CP`, `f92839dc2`)** | 8 | `commit f92839dc2`, `vision.accelerator.ulysses_size=S, cp_size=1` + `llm.accelerator.cp_size=S` (`S=1,2,4,8`), Suite MM (Multimodal) + Suite A (`FSDP2 text_encoder`) + Suite B (`emb=8 text_encoder`) | Queued (`STARTED`, Priority `A1/40` in Group 356; superseded `6fd0c0aef891741e`) | [45245145371ac415 (trial 304385619)](https://seed.byteintl.net/development/instance/jobs/45245145371ac415) | Pending queue allocation |
+| **128-GPU Multimodal** | **200-Step Multimodal (`tulu` + `sharegpt4v`) Speed & Convergence Run (`f92839dc2`)** | 128 | `commit f92839dc2`, Local NVMe `/tmp/vdata`, `vision` trainable (`freeze: false`), `text_encoder` FSDP2 (`BaseTrainer`-aligned), `ep=128`, `VeomniOp` | Queued (`STARTED`, Priority `A1/40` in Group 356; superseded `5b0d624d30b5bfde`) | [f4be5c6acc57cc8b (trial 304385627)](https://seed.byteintl.net/development/instance/jobs/f4be5c6acc57cc8b) | Pending queue allocation |
 
 ---
 
@@ -266,7 +266,39 @@ To verify that Context Parallelism (`cp_size > 1`) produces the exact same loss 
 | **9** | `0.08` / `0.00` / `0.08` | `1.36` | `0.09` / `0.00` / `0.09` | `1.52` |
 | **10** | **`0.06412` / `0.00000` / `0.06412`** | **`1.08028`** | **`0.06223` / `0.00000` / `0.06223`** | **`1.44423`** |
 
-### 4.3 Why 8-GPU `ep_size=8` OOMed at Step 2 Under `cp >= 2` & Resolution via `ep_size=4` (`ep_fsdp=2`)
+### 4.3 Why 8-GPU `ep_size=8` / `ep_size=4` OOMed at Step 2 Under `cp >= 2` & Resolution in Job `45245145371ac415` (`f92839dc2`)
 
-- **Root Cause**: On 8 GPUs (`world_size=8`), setting `ep_size: 8` creates `DeviceMesh((ep_fsdp=1, ep=8))`. Because `ep_fsdp=1`, PyTorch FSDP2 treats the 48 local experts per layer as **unsharded** (`ep_fsdp=1`) and never frees their unsharded BF16 copy (`2.06 GiB/layer`) after forward or backward! After `optimizer.step()` at Step 1 materializes FP32 AdamW `exp_avg` and `exp_avg_sq` (`8.25 GiB/layer`), static memory reaches `69.24 GiB`, causing Step 2 micro-step accumulation under `cp=2` (`dp_shard=4, cp=2`) to OOM by `~400 MiB`.
-- **Resolution in Job [6fd0c0aef891741e](https://seed.byteintl.net/development/instance/jobs/6fd0c0aef891741e)**: Setting `ep_size: 4` on 8 GPUs gives `DeviceMesh((ep_fsdp=2, ep=4))` (`ep_fsdp = 2 > 1`). Each rank holds the exact same shard size (`96 / 2 = 48` experts worth of parameters), **and** FSDP2 properly reshards and frees the unsharded BF16 parameters after forward and backward (`reshard_after_backward: true`), saving `~8–10 GiB` of VRAM across `cp=1, 2, 4, 8`.
+- **Root Cause Analysis**:
+  1. In job `0aa9829c2c54b033` (`ep_size: 8` on 8 GPUs, `ep_fsdp=1`), `deepseek_v41_llm` had `n_trainable_layers=2` and fell back to top-level AdamW (2 FP32 moments = `8.25 GiB` per trainable layer) without gradient checkpointing. After `optimizer.step()` at Step 1 materialized `16.5 GiB` of AdamW state across 2 layers, static memory reached `69.24 GiB`, causing Step 2 micro-step accumulation under `cp=2` (`dp_shard=4, cp=2`) to OOM by `~350 MiB`.
+  2. In job `6fd0c0aef891741e` (`ep_size: 4` on 8 GPUs, `ep_fsdp=2`), each rank held `96` experts (`384 / 4 = 96`), so unsharding a single MoE layer during backward allocated `4.22 GiB` (`2 × 2.11 GiB`) of temporary BF16 all-gather buffers on top of `68.48 GiB`, also exceeding `79.11 GiB`.
+- **Resolution in Job [45245145371ac415 (trial 304385619)](https://seed.byteintl.net/development/instance/jobs/45245145371ac415) (`commit f92839dc2`)**:
+  - Updated to `origin/szl.omniv2-deepseek-v4.1-flash` (`commit f92839dc236db89c145c2dc529972fe1c334e118`), which includes:
+    1. **`2ee61e9cf`**: Hybrid sequence parallelism supporting `deepseek_v41_vision` Ulysses SP (`ulysses_size: S, cp_size: 1`) + `deepseek_v41_llm` CP (`cp_size: S, ulysses_size: 1`). Whenever top-level or LLM `cp_size = S` (`S > 1`), `deepseek_v41_vision.accelerator.ulysses_size` is explicitly set to `S` (with `cp_size: 1`) so that all modules resolve to a uniform `dp_size = world_size // S`.
+    2. **`5f09fc231` & `f92839dc2`**: Instance-level `VeomniOp` migration across `deepseek_v41` (`llm`, `vision`, `text_encoder`) with per-module `config.ops_implementation` resolution (`veomni_rms_norm`, `veomni_mhc_post`, `veomni_unweighted_rms_norm`, `veomni_swiglu_mlp`, `veomni_moe`, `veomni_attn`, `veomni_dspark_ce`) and `qat_implementation: fp8_blockwise`.
+  - Memory configuration on 8×H100 (80GB): `ep_size: 8` (`48` experts/rank, zero expert all-gather buffer), `gradient_checkpointing: enable: true`, and `deepseek_v41_vision` trainable (`freeze: false`), reducing steady-state VRAM by `>8 GiB` so `cp=1, 2, 4, 8` all fit comfortably within 80GB H100.
+
+---
+
+## 5. `VeomniOp` Module-Level Migration & `ViT Ulysses SP + LLM CP` Verification (`commit f92839dc2`)
+
+### 5.1 Summary of Code Changes in `2ee61e9cf` .. `f92839dc2`
+
+1. **Hybrid Sequence Parallelism (`ViT Ulysses SP + LLM CP`, `commit 2ee61e9cf`)**:
+   - `deepseek_v41_vision` now supports Ulysses Sequence Parallelism (`ulysses_size: S, cp_size: 1`) over the image token sequence (`slice_input_tensor` before the transformer blocks, `gather_seq_scatter_heads` / `gather_heads_scatter_seq` inside `DeepseekV41VisionAttention`, and `gather_outputs` after the downsample mixer).
+   - All `modules_train*.yaml` configs set `deepseek_v41_vision.accelerator: {ulysses_size: 1, cp_size: 1}` by default. When running with top-level `cp_size: S` (`S > 1`), setting `deepseek_v41_vision.accelerator.ulysses_size: S` ensures uniform `dp_size` across `vision`, `text_encoder`, `ngram`, and `llm`.
+2. **Module-Level `VeomniOp` Migration (`commits 5f09fc231 & f92839dc2`)**:
+   - Replaced legacy module-level global `OpSlot` / `OpsConfigSlot` singletons in `deepseek_v41` (`llm`, `vision`, `text_encoder`) with `nn.Module`-attached `VeomniOp` descriptors (`veomni_rms_norm`, `veomni_mhc_post`, `veomni_unweighted_rms_norm`, `veomni_swiglu_mlp`, `veomni_moe`, `veomni_attn`, `veomni_dspark_ce`) resolved from each submodule's `config.ops_implementation` via `apply_veomni_ops`.
+   - `DeepSeekV41MoE` reads `config.ops_implementation.qat_implementation` (`"fp8_blockwise"`) directly on the module instance.
+
+### 5.2 Unit Test Suite Verification on `f92839dc2`
+
+Executed the full `tests/seed_omni/modules/deepseek_v41/` test suite (22 test files) against `f92839dc2`:
+- **Result**: **`410 passed, 17 skipped (CUDA-only tests), 0 failed`**.
+- Key verified test cases:
+  - `test_deepseek_v41_vision_sp.py`:
+    - `test_sharded_vision_forward_and_gradients_match_unsharded[2]` & `[4]`: Verifies `deepseek_v41_vision` forward outputs and parameter gradients under `ulysses_size=2, 4` match `ulysses_size=1`.
+    - `test_omni_vit_ulysses_sp_plus_llm_cp_matches_unsharded[2]` & `[4]`: Verifies end-to-end `SeedOmniModel` with `vision` (`ulysses_size=S, cp_size=1`) + `llm` (`cp_size=S, ulysses_size=1`) matches the unsharded (`S=1`) baseline on forward loss and backward gradients.
+  - `test_deepseek_v41_accelerated.py`:
+    - `test_vit_sp_plus_llm_cp_config_resolves_uniform_dp_size`: Verifies `AcceleratorConfig` resolves uniform `dp_size` when `vision.accelerator.ulysses_size = S` and `llm.accelerator.cp_size = S`.
+    - `test_v41_cp_allowlist_and_vision_ulysses_split`: Verifies `deepseek_v41_llm` is in the CP allowlist while `deepseek_v41_vision` uses Ulysses SP (`cp_size=1`).
+    - `test_veomni_ops_bind_on_submodules`: Verifies all `VeomniOp` descriptors bind to their configured backends (`tilelang`, `liger_kernel`, `triton`, `flash_attention_2`) and `qat_impl="fp8_blockwise"`.
