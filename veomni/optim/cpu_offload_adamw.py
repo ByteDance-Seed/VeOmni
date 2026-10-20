@@ -14,7 +14,8 @@ import time
 import torch
 from torch.optim import Optimizer
 
-from ..utils.logging import get_logger
+from veomni.utils.logging import get_logger
+
 from .master_fp32_adamw import FullFP32AdamW, _align_state_to_parameter, _local
 
 

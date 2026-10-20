@@ -10,7 +10,7 @@ CPU tests cover FP32 reference updates, cold optimizer-state restoration, missin
 
 Resume validates saved tensor shapes and dtypes before DCP reads. Use a fresh optimizer when resuming. The loader prepares target placeholders, then removes those for parameters whose saved state is wholly absent. A partially initialized target optimizer is rejected if its existing state cannot represent the saved state. Partial ordinary AdamW state remains supported. Validation itself allocates no additional master or moment tensors.
 
-Wholly absent lazy states are supported: DCP placeholders are removed on restore, and the optimizer initializes the FP32 master from the current parameter on its first real gradient. Partially missing fields or implicit precision migration remain errors.
+Wholly absent lazy states are supported: DCP placeholders are removed on restore, and the optimizer initializes the FP32 master from the current parameter on its first real gradient. Partially missing fields or implicit precision migration remain errors. A zero-step sparse `MultiOptimizer` checkpoint carries an exclusive marker and restores lazy state. A marker combined with tensor state is rejected; marker-less checkpoints with no optimizer state remain rejected because they are indistinguishable from lost state.
 
 Same-dimension ExtraParallel/FSDP checkpoints carry an explicit EP-outer layout marker in model and optimizer state. Older unversioned layouts require an explicit migration and are rejected before tensor reads, even during partial/optimizer-only restore. The marker is not a model weight and is excluded from HF export.
 
