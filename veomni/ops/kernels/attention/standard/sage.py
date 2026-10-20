@@ -24,14 +24,14 @@ from typing import Optional
 import torch
 
 from .....distributed.parallel_state import get_parallel_state
+from ..helper import (
+    extract_packed_varlen_cu_seqlens,
+    packed_split_attention_forward,
+)
 from ..ulysses import (
     prepare_ulysses_qkv,
     restore_ulysses_output,
     should_apply_ulysses,
-)
-from .sdpa import (
-    extract_packed_varlen_cu_seqlens,
-    packed_split_attention_forward,
 )
 
 

@@ -38,7 +38,7 @@ from ...platform import (
     NvidiaGpuPlatform,
 )
 from ...registry import register_op
-from .standard.sdpa import (
+from .helper import (
     extract_packed_varlen_cu_seqlens,
     packed_split_attention_forward,
 )
