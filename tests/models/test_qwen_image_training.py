@@ -23,9 +23,8 @@ from veomni.data import build_data_transform, build_dataloader, build_dataset
 from veomni.data.multimodal.dit.preprocess import qwen_image_edit_preprocess, qwen_image_preprocess
 from veomni.distributed import parallel_state
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
-from veomni.models import build_foundation_model
+from veomni.models import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY, build_foundation_model
 from veomni.models.auto import build_config
-from veomni.models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.trainer.dit_trainer import DiTDataCollator, DiTTrainer, VeOmniDiTArguments
 
@@ -385,7 +384,8 @@ def test_preprocessor_contract(tmp_path):
         qwen_image_preprocess({"prompt": ["one"], "image": "sample.png"})
 
 
-def test_backbone_reference_forward_and_gradients(snapshot, encoded):
+@pytest.mark.parametrize("cpu_safe_diffusers_rms_norm", [False, True], indirect=True, ids=["native", "ascend-cpu"])
+def test_backbone_reference_forward_and_gradients(snapshot, encoded, cpu_safe_diffusers_rms_norm):
     inputs = condition_model(snapshot, offline=True).process_condition(**encoded)
     model = transformer()
     reference = DiffusersQwenImageTransformer(**model.config.to_diffuser_dict())

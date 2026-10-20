@@ -341,7 +341,7 @@ class ModuleRuntime(VeOmniModelRuntime):
             ops_implementation=args.ops_implementation,
         )
         if self.hf_source is not None:
-            from ....module_utils import load_model_weights
+            from ....checkpoint.weights import load_model_weights
             from ...utils.hf_layout import attach_hf_source_converter
 
             attach_hf_source_converter(self.model, self.hf_source, self.module_name)

@@ -75,8 +75,9 @@ def test_npu_mask_prepared_once_for_all_qwen_blocks(monkeypatch, cpu_diffusers_n
         expected.square().mean().backward()
         reference_grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
         model.zero_grad(set_to_none=True)
+        processor = model.transformer_blocks[0].attn.processor
         original_prepare = modeling._prepare_qwen_attention_mask
-        original_dispatch = modeling.dispatch_attention_fn
+        original_dispatch = processor.veomni_attn_masked
         prepared_masks = []
         dispatched_masks = []
 
@@ -84,13 +85,13 @@ def test_npu_mask_prepared_once_for_all_qwen_blocks(monkeypatch, cpu_diffusers_n
             prepared_masks.append(original_prepare(mask, query_length, "npu", batch_size))
             return prepared_masks[-1]
 
-        def dispatch_with_npu_contract(query, key, value, *, attn_mask, **kwargs):
-            assert attn_mask.shape == (query.shape[0], 1, query.shape[1], key.shape[1])
+        def dispatch_with_npu_contract(module, query, key, value, attn_mask=None, **kwargs):
+            assert attn_mask.shape == (query.shape[0], 1, query.shape[2], key.shape[2])
             dispatched_masks.append(attn_mask)
-            return original_dispatch(query, key, value, attn_mask=attn_mask, **kwargs)
+            return original_dispatch(module, query, key, value, attn_mask, **kwargs)
 
         monkeypatch.setattr(modeling, "_prepare_qwen_attention_mask", prepare_on_npu)
-        monkeypatch.setattr(modeling, "dispatch_attention_fn", dispatch_with_npu_contract)
+        monkeypatch.setattr(processor, "veomni_attn_masked", dispatch_with_npu_contract)
         actual = modeling.QwenImageTransformer2DModel_forward(model, **batch)[0]
         assert len(prepared_masks) == 1
         assert len(dispatched_masks) == model.config.num_layers

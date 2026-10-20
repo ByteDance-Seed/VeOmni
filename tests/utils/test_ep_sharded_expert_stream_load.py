@@ -33,7 +33,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch.distributed.tensor import Shard
 
-import veomni.models.module_utils as module_utils
+import veomni.models.checkpoint.weights as checkpoint_weights
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.models.transformers.deepseek_v3.checkpoint_tensor_converter import DeepseekV3CheckpointTensorConverter
 from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import DeepseekV4CheckpointTensorConverter
@@ -130,7 +130,7 @@ def _load_as_rank(monkeypatch, weights_path: Path, ep_rank: int, model: nn.Modul
         extra_parallel_sizes={"ep": EP_SIZE},
         extra_parallel_rank=lambda name: ep_rank,
     )
-    monkeypatch.setattr(module_utils, "get_parallel_state", lambda: parallel_state)
+    monkeypatch.setattr(checkpoint_weights, "get_parallel_state", lambda: parallel_state)
 
     read_keys = []
 
@@ -156,8 +156,8 @@ def _load_as_rank(monkeypatch, weights_path: Path, ep_rank: int, model: nn.Modul
         def __exit__(self, *exc):
             return self._handle.__exit__(*exc)
 
-    monkeypatch.setattr(module_utils, "safe_open", _RecordingSafeOpen)
-    module_utils.load_model_weights_ep_sharded(model, str(weights_path), init_device="cpu")
+    monkeypatch.setattr(checkpoint_weights, "safe_open", _RecordingSafeOpen)
+    checkpoint_weights.load_model_weights_ep_sharded(model, str(weights_path), init_device="cpu")
     return read_keys
 
 

@@ -26,14 +26,13 @@ from safetensors.torch import load_file, save_file
 from veomni.arguments.arguments_types import AcceleratorConfig, MixedPrecisionConfig, OpsImplementationConfig
 from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state_from_config
 from veomni.distributed.torch_parallelize import build_parallelize_model
-from veomni.models import build_foundation_model
+from veomni.models import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY, build_foundation_model
 from veomni.models.auto import build_config
+from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
 from veomni.models.diffusers.qwen_image.qwen_image_transformer.modeling_qwen_image_transformer import (
     QWEN_IMAGE_ORIGINAL_FORWARD,
     QwenImageTransformer2DModel,
 )
-from veomni.models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
-from veomni.models.module_utils import init_empty_weights, load_model_weights
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device, set_device
 from veomni.utils.helper import enable_full_determinism, enable_high_precision_for_bf16
 
@@ -236,7 +235,7 @@ def prepare(config_path, output, *, weights=None, batch_file=None, records=None,
     else:
         generator = torch.Generator(device="cpu").manual_seed(seed)
         shape = (1, grid * grid, config.in_channels)
-        latent, noise = [torch.randn(shape, generator=generator) for _ in range(2)]
+        latent, noise = (torch.randn(shape, generator=generator) for _ in range(2))
         mask = torch.ones(1, text_tokens, dtype=torch.bool)
         mask[:, -2:] = False
         batch = {
@@ -665,7 +664,7 @@ def compare(reference, candidate, output, *, atol, rtol, rationale):
     if any(not math.isfinite(value) or value < 0 for value in (atol, rtol)) or not rationale.strip():
         raise ValueError("Finite nonnegative tolerances and a threshold rationale are required.")
     reference, candidate, output = Path(reference), Path(candidate), Path(output)
-    baseline, target = [read_json(folder / "run_manifest.json") for folder in (reference, candidate)]
+    baseline, target = (read_json(folder / "run_manifest.json") for folder in (reference, candidate))
     for run in (baseline, target):
         if not run.get("complete") or not run.get("tensors"):
             raise ValueError("Incomplete run; comparison cannot pass.")

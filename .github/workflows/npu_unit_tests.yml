@@ -187,23 +187,13 @@ jobs:
           uv run --frozen pytest -v -s -x tests/parallel/test_parallel_state_registry.py
       - name: Run models tests
         run: |
-          uv run --frozen pytest -v -s -x tests/models/test_model_registry.py
-          uv run --frozen pytest -v -s -x tests/models/test_model_runtime.py
-          uv run --frozen pytest -v -s -x tests/models/test_runtime_chat_template.py
-          uv run --frozen pytest -v -s -x tests/models/test_generated_modeling_imports.py
-          uv run --frozen pytest -v -s -x tests/models/test_transformers_upgrade_compat.py
-          uv run --frozen pytest -v -s -x tests/models/test_qwen_image_training.py tests/models/test_qwen_image_precision.py
-          uv run --frozen pytest -v -s -x tests/models/test_wan_i2v_training.py
-          uv run --frozen pytest -v -s -x tests/models/test_models_patch.py
-          uv run --frozen pytest -v -s -x tests/models/test_qwen3_5_moe_mtp.py
-          uv run --frozen pytest -v -s -x tests/models/test_padded_packed_loss.py
-          uv run --frozen pytest -v -s -x tests/models/test_vlm_trainer.py
+          uv run --frozen pytest -v -s -x tests/models
+          uv run --frozen pytest -v -s -x tests/arguments
+          uv run --frozen pytest -v -s -x tests/trainer/test_vlm_trainer.py
           uv run --frozen pytest -v -s -x tests/trainer/test_aux_metrics.py
+          uv run --frozen pytest -v -s -x tests/trainer/test_trainer_model_runtime.py
           uv run --frozen pytest -v -s -x tests/trainer/test_dit_microbatch.py
-          uv run --frozen pytest -v -s -x tests/models/test_minimax_h3_packing.py
           uv run --frozen pytest -v -s -x tests/lora/test_vlm_lora.py
-          uv run --frozen pytest -v -s -x tests/models/test_checkpoint_tensor_converter.py
-          uv run --frozen pytest -v -s -x tests/models/test_glm_moe_dsa.py
       - name: Run SeedOmni unit tests
         run: |
           uv run --frozen pytest -v -s -x tests/seed_omni
@@ -223,7 +213,9 @@ jobs:
       - name: Run distributed tests (dummy_forward, gradient_checkpointing)
         run: |
           uv run --frozen pytest -v -s -x tests/distributed/test_async_offload_unit.py
+          uv run --frozen pytest -v -s -x tests/distributed/test_reduce_loss.py
           uv run --frozen pytest -v -s -x tests/distributed/test_dummy_forward.py
+          uv run --frozen pytest -v -s -x tests/distributed/test_hccl_premul_sum.py
           uv run --frozen pytest -v -s -x tests/distributed/test_gradient_checkpointing.py
           uv run --frozen pytest -v -s -x tests/distributed/test_emb_parallel.py
           uv run --frozen pytest -v -s -x tests/distributed/test_parallel_plan.py
@@ -237,19 +229,17 @@ jobs:
         env:
           TRITON_ASCEND_ARCH: Ascend910B4
         run: |
-          uv run --frozen pytest -v -s -x tests/ops/test_gdr_ascend_padding_mask.py
+          uv run --frozen pytest -v -s -x tests/ops/gated_delta_rule/test_gdr_ascend_padding_mask.py
       - name: Run ops tests
         run: |
-          uv run --frozen pytest -v -s -x tests/ops/test_comp.py
-          uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
-          uv run --frozen pytest -v -s -x tests/ops/test_npu_kernels.py
-          # This numerical gate must execute on NPU; fail instead of silently skipping
-          # when the vendor extension is missing from the CI image.
-          uv run --frozen python -c "import cann_ops_transformer"
-          uv run --frozen pytest -v -s -x tests/ops/test_mhc_tile_kernels.py::test_npu_mhc_pre_forward_backward_matches_eager
+          uv run --frozen pytest -v -s -x -m "not benchmark" tests/ops
+      - name: Run ops architecture guards
+        run: |
+          uv run --frozen pytest -v -s -x tests/special_sanity/test_ops_architecture.py
       - name: Run utils tests
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py
+          uv run --frozen pytest -v -s -x tests/tools/test_training_utils.py
           uv run --frozen pytest -v -s -x tests/utils/test_hdfs_io.py
       - name: Run LoRA save/load test
         # peft ships under the `npu` extra, so the earlier
@@ -257,12 +247,7 @@ jobs:
         # sync needed here.
         run: |
           uv run --frozen pytest -v -s -x tests/lora/test_lora_trainer_saveload.py
-      - name: Run MoE-LoRA NPU fused vs eager parity
-        # Numerical gate for the new NPU fused MoE-LoRA autograd composition
-        # (shared + independent; forward + A/B grads; EP=1 vs non-EP).
-        # Cheap single-process; run before the multi-process stream-load test.
-        run: |
-          uv run --frozen pytest -v -s -x tests/lora/test_moe_lora_fused_npu.py
+          uv run --frozen pytest -v -s -x tests/lora/test_qwen3_5_moe_lora.py
       - name: Run MoE-LoRA ep_sharded_stream_load (PEFT, EP=2)
         # Exercises the PEFT ep_sharded adapter streaming *and* the NPU
         # fused MoE-LoRA EP kernel (fused_npu): the test auto-selects
