@@ -24,8 +24,22 @@ import torch
 from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
+from .....utils.device import get_torch_device
 from ..shared.scatter import compute_expert_scatter_index, compute_max_expert_tokens
 from ..shared.swiglu import apply_swiglu_clamp
+
+
+def _must_use_shape_derived_bound() -> bool:
+    """Avoid a device scalar read when compiling or capture status is unknown."""
+    if torch.compiler.is_compiling():
+        return True
+    capture_query = getattr(get_torch_device(), "is_current_stream_capturing", None)
+    if not callable(capture_query):
+        return True
+    try:
+        return capture_query() is not False
+    except (NotImplementedError, RuntimeError, TypeError):
+        return True
 
 
 class TritonFusedMoeExpertFunction(torch.autograd.Function):
@@ -341,6 +355,8 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
     Uses a single group_gemm_same_nk call for fc1 instead of two separate calls,
     avoiding the split+contiguous copy when the caller already has merged weights.
+    Eager execution uses the exact maximum expert load as the same-NK launch
+    bound; compilation and stream capture retain the shape-derived bound.
     """
 
     @staticmethod
@@ -365,12 +381,13 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         cumsum_t = torch.cumsum(splits, dim=0)
 
-        # See ``TritonFusedMoeExpertFunction.forward`` for why ``T`` (the token
-        # count) is a valid, tighter per-expert launch bound than the full
-        # scattered row count under distinct top-k routing. The default is the
-        # conservative ``T * top_k`` bound; distinct routers opt in explicitly
-        # with ``assume_distinct_experts=True``.
-        max_expert_tokens = compute_max_expert_tokens(expert_index, expert_index.shape[1], assume_distinct_experts)
+        # The histogram gives exact per-expert row counts, including duplicate
+        # routes. Its scalar read synchronizes, so keep the shape-derived bound
+        # during compilation or stream capture, where host reads are invalid.
+        if _must_use_shape_derived_bound():
+            max_expert_tokens = compute_max_expert_tokens(expert_index, expert_index.shape[1], assume_distinct_experts)
+        else:
+            max_expert_tokens = int(splits.max().item()) if splits.numel() else 0
 
         # Single fc1 gemm: output shape [T, 2I]
         fc1_output = group_gemm_same_nk(
@@ -416,6 +433,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         ctx.num_experts = num_experts
         ctx.swiglu_limit = swiglu_limit
+        ctx.max_expert_tokens = max_expert_tokens
         # These intermediates are cheap to recompute in backward and do not
         # need to remain live for the entire forward-to-backward interval.
         ctx.save_for_backward(
@@ -454,6 +472,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             mask_fc1_2,
         ) = ctx.saved_tensors
         swiglu_limit = ctx.swiglu_limit
+        max_expert_tokens = ctx.max_expert_tokens
         hidden_dim = grad_output.shape[-1]
         grad_output = grad_output.view(-1, hidden_dim)
 
@@ -462,9 +481,8 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         # MOE Step 10
         grad_fc2_output = moe_scatter(grad_output, scatter_index)
-        # ``max_M`` for grouped GEMM is a per-expert launch bound. Duplicate
-        # top-k routes can make one expert receive more rows than the original
-        # token count, so the total scattered row count is a safe bound.
+        # Same-MN weight gradients retain the total scattered row count as
+        # their K bound; same-NK dgrad reuses the forward launch bound.
         num_scattered_tokens = grad_fc2_output.shape[0]
 
         # MOE Step 9 - dgrad
@@ -472,7 +490,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             a=grad_fc2_output,
             b=fc2_weight,
             cumsum_M=cumsum_t,
-            max_M=num_scattered_tokens,
+            max_M=max_expert_tokens,
             transpose_b=False,
         )
 
@@ -524,7 +542,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             a=grad_fc1_output,
             b=fc1_1_2_weight,
             cumsum_M=cumsum_t,
-            max_M=num_scattered_tokens,
+            max_M=max_expert_tokens,
             transpose_b=False,
         )
 
@@ -595,9 +613,11 @@ def group_gemm_fused_moe_forward(
     an fp32 activation.
 
     ``assume_distinct_experts``: whether every token routes to ``top_k``
-    distinct experts (true for ``torch.topk``-gated routers). Defaults to
-    ``False`` (conservative ``T * top_k`` launch bound). Opt in with ``True``
-    for the tight ``max_M = T`` bound. Only affects the non-EP Triton path.
+    distinct experts (true for ``torch.topk``-gated routers). In the split-fc1
+    path, and in the merged path during compilation or stream capture, ``True``
+    permits the shape-derived ``max_M = T`` bound; ``False`` uses ``T * top_k``.
+    Eager merged execution instead uses the observed maximum expert load.
+    Only affects the non-EP Triton path; EP bounds are unchanged.
     """
     routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     # EP comm is outside the Function so all2all is not under no_grad.

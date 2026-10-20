@@ -54,8 +54,15 @@ from tests.ops.tol import (
 from tests.ops.utils import assert_close_with_error, assert_reference_signal, make_grad_leaf, require_nvidia_cuda
 from veomni.ops import resolve_op
 from veomni.ops.kernels.moe_experts.shared.indices import build_moe_indices
+from veomni.ops.kernels.moe_experts.standard import triton as triton_moe_module
 from veomni.ops.kernels.moe_experts.standard.npu import _fc1_weight
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE, is_sm90_or_above
+from veomni.utils.device import (
+    IS_CUDA_AVAILABLE,
+    IS_MLU_AVAILABLE,
+    IS_NPU_AVAILABLE,
+    get_device_type,
+    is_sm90_or_above,
+)
 from veomni.utils.import_utils import is_fused_moe_available, is_quack_gemm_available
 
 
@@ -482,6 +489,7 @@ def _run_fused_three_way(
     require_active_clamp: bool = False,
     grad_routing_atol: float | None = None,
     grad_routing_rtol: float | None = None,
+    assume_distinct_experts: bool = False,
 ):
     """Compare one fused implementation's split and merged layouts with eager math.
 
@@ -504,6 +512,9 @@ def _run_fused_three_way(
     empty = _empty(device, dtype)
     fused = resolve_op("moe_experts", "standard", impl).wrapper
     kwargs = {"num_experts": num_experts, "swiglu_limit": swiglu_limit}
+    fused_kwargs = dict(kwargs)
+    if impl == "fused_triton":
+        fused_kwargs["assume_distinct_experts"] = assume_distinct_experts
 
     if require_active_clamp:
         assert swiglu_limit is not None
@@ -515,8 +526,8 @@ def _run_fused_three_way(
     hidden_s, routing_s, fc1_1_s, fc1_2_s, fc2_s = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
     hidden_m, routing_m, fc1_12_m, fc2_m = map(make_grad_leaf, (hidden, routing, fc1_12, fc2))
     hidden_e, routing_e, fc1_1_e, fc1_2_e, fc2_e = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
-    out_s = fused(hidden_s, routing_s, selected, fc1_1_s, fc1_2_s, fc2_s, empty, **kwargs)
-    out_m = fused(hidden_m, routing_m, selected, empty, empty, fc2_m, fc1_12_m, **kwargs)
+    out_s = fused(hidden_s, routing_s, selected, fc1_1_s, fc1_2_s, fc2_s, empty, **fused_kwargs)
+    out_m = fused(hidden_m, routing_m, selected, empty, empty, fc2_m, fc1_12_m, **fused_kwargs)
     if impl == "fused_triton":
         assert len(out_m.grad_fn.saved_tensors) == 11
     out_e = standard_fused_reference(hidden_e, routing_e, selected, fc1_1_e, fc1_2_e, fc2_e, **kwargs)
@@ -894,3 +905,152 @@ def test_build_moe_indices_cuda_does_not_synchronize(monkeypatch):
     assert cu_seqlens_m.cpu().tolist() == [0, 3, 6, 8]
     assert a_idx.cpu().tolist() == [0, 1, 3, 1, 2, 3, 0, 2]
     assert scatter_index.shape == expert_index.shape
+
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [
+        ("compiling", True),
+        ("capturing", True),
+        ("eager", False),
+        ("unknown", True),
+        ("noncallable", True),
+        ("ambiguous", True),
+        ("query_error", True),
+    ],
+)
+def test_merged_moe_shape_bound_capture_fallback(mode: str, expected: bool, monkeypatch: pytest.MonkeyPatch):
+    """A host scalar read is allowed only when capture is known to be inactive."""
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: mode == "compiling")
+
+    if mode == "compiling":
+
+        def unexpected_device_query():
+            raise AssertionError("Compilation must not query a live device")
+
+        monkeypatch.setattr(triton_moe_module, "get_torch_device", unexpected_device_query)
+    elif mode == "unknown":
+        monkeypatch.setattr(triton_moe_module, "get_torch_device", object)
+    elif mode == "noncallable":
+
+        class DeviceAPI:
+            is_current_stream_capturing = False
+
+        monkeypatch.setattr(triton_moe_module, "get_torch_device", DeviceAPI)
+    else:
+
+        class DeviceAPI:
+            def is_current_stream_capturing(self):
+                if mode == "query_error":
+                    raise RuntimeError("Capture state unavailable")
+                if mode == "ambiguous":
+                    return None
+                return mode == "capturing"
+
+        monkeypatch.setattr(triton_moe_module, "get_torch_device", DeviceAPI)
+
+    assert triton_moe_module._must_use_shape_derived_bound() is expected
+
+
+@pytest.mark.skipif(
+    not (IS_CUDA_AVAILABLE or IS_MLU_AVAILABLE) or not is_fused_moe_available(),
+    reason="Triton fused MoE needs a supported backend + triton",
+)
+@pytest.mark.parametrize(
+    "routing_kind,assume_distinct_experts",
+    [("distinct", False), ("distinct", True), ("duplicate", False)],
+)
+def test_triton_merged_same_nk_exact_bound(
+    routing_kind: str, assume_distinct_experts: bool, monkeypatch: pytest.MonkeyPatch
+):
+    """Tighten all merged launches while preserving split and weight-grad bounds."""
+    if triton_moe_module._must_use_shape_derived_bound():
+        pytest.skip("Exact-bound assertions require a known inactive capture state")
+    from veomni.ops.kernels.moe_experts.shared import group_gemm as gemm_module
+
+    device = torch.device(get_device_type())
+    num_tokens, num_experts, top_k = 128, 8, 2
+    torch.manual_seed(42)
+    if routing_kind == "duplicate":
+        selected = torch.zeros(num_tokens, top_k, device=device, dtype=torch.long)
+    else:
+        selected = torch.randn(num_tokens, num_experts, device=device).topk(top_k, dim=-1).indices
+    routing = torch.full((num_tokens, top_k), 1 / top_k, device=device, dtype=torch.bfloat16)
+    expected = int(torch.bincount(selected.flatten(), minlength=num_experts).max().item())
+    if routing_kind == "distinct":
+        assert expected < num_tokens
+    else:
+        assert expected == num_tokens * top_k
+    shape_bound = num_tokens if assume_distinct_experts else num_tokens * top_k
+    nk_bounds, mn_bounds = [], []
+    original_nk, original_mn = gemm_module.group_gemm_same_nk, gemm_module.group_gemm_same_mn
+
+    def record_nk(*args, **kwargs):
+        """Record each per-expert row bound without changing kernel arguments."""
+        nk_bounds.append(kwargs["max_M"])
+        return original_nk(*args, **kwargs)
+
+    def record_mn(*args, **kwargs):
+        """Record the total-row reduction bound for weight gradients."""
+        mn_bounds.append(kwargs["max_K"])
+        return original_mn(*args, **kwargs)
+
+    monkeypatch.setattr(gemm_module, "group_gemm_same_nk", record_nk)
+    monkeypatch.setattr(gemm_module, "group_gemm_same_mn", record_mn)
+    _run_fused_three_way(
+        "fused_triton",
+        shape=(num_tokens, num_experts, 128, 64, top_k),
+        selected=selected,
+        routing=routing,
+        device=device,
+        seed=7,
+        assume_distinct_experts=assume_distinct_experts,
+    )
+    # The helper runs split forward, merged forward, split backward, merged backward.
+    assert nk_bounds == [shape_bound] * 3 + [expected] * 2 + [num_tokens * top_k] * 3 + [expected] * 2
+    assert mn_bounds == [num_tokens * top_k] * 5
+
+
+def test_triton_merged_stream_capture_uses_shape_bound(monkeypatch: pytest.MonkeyPatch):
+    """Direct capture uses the original bound without reading a device scalar."""
+    require_nvidia_cuda("triton")
+    from veomni.ops.kernels.moe_experts.shared import group_gemm as gemm_module
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    tokens, experts, hidden, intermediate, top_k = 128, 8, 128, 64, 2
+    routes = torch.randn(tokens, experts, device=device).topk(top_k, dim=-1).indices
+    assert torch.bincount(routes.flatten(), minlength=experts).max().item() < tokens
+    gate = torch.full((tokens, top_k), 1 / top_k, device=device, dtype=torch.bfloat16)
+    x = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16)
+    w1 = torch.randn(experts, 2 * intermediate, hidden, device=device, dtype=torch.bfloat16)
+    w2 = torch.randn(experts, hidden, intermediate, device=device, dtype=torch.bfloat16)
+    empty = _empty(device, torch.bfloat16)
+    fused = resolve_op("moe_experts", "standard", "fused_triton").wrapper
+    bounds = []
+    original = gemm_module.group_gemm_same_nk
+
+    def record_bound(*args, **kwargs):
+        """Record capture bounds while keeping the native operation unchanged."""
+        bounds.append(kwargs["max_M"])
+        return original(*args, **kwargs)
+
+    def forward():
+        """Exercise the registered merged implementation under stream capture."""
+        return fused(x, gate, routes, empty, empty, w2, w1, num_experts=experts, assume_distinct_experts=True)
+
+    monkeypatch.setattr(gemm_module, "group_gemm_same_nk", record_bound)
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            forward()
+    warmup_stream.synchronize()
+    bounds.clear()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = forward()
+    assert bounds == [tokens, tokens]
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.isfinite(output).all()
