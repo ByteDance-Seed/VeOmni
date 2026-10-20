@@ -1072,6 +1072,45 @@ def test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence_cp():
     torchrun(_run_vlm_placeholder_equivalence, 2, "cp")
 
 
+@pytest.mark.parametrize(
+    ("attn_impl", "expected_seq_len"),
+    [
+        ("eager", 4),
+        ("veomni_sdpa", 4),
+        ("veomni_flash_attention_2", 8),
+    ],
+)
+def test_qwen4_exp_vision_dummy_forward_uses_local_cu_seqlens_for_non_fa_under_sp(
+    attn_impl: str, expected_seq_len: int
+) -> None:
+    qwen4_exp = importlib.import_module(_PATCHED_MODULE)
+    config = AutoConfig.from_pretrained(_TOY_CONFIG).vision_config
+    config._attn_implementation = attn_impl
+    _install_qwen4_exp_ops_config()
+    vision = qwen4_exp.Qwen4ExpVisionModel(config)
+    sp_state = SimpleNamespace(sp_enabled=True, sp_size=2)
+    captured = {}
+
+    def fake_forward(hidden_states, grid_thw, vit_metadata=None, **kwargs):
+        captured["hidden_shape"] = tuple(hidden_states.shape)
+        captured["grid_thw"] = grid_thw.tolist()
+        captured["vit_metadata"] = vit_metadata
+        captured["vision_dummy"] = kwargs.get("vision_dummy")
+        return "dummy-out"
+
+    with (
+        patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=sp_state),
+        patch.object(qwen4_exp.Qwen4ExpVisionModel, "forward", side_effect=fake_forward),
+    ):
+        assert vision.dummy_forward() == "dummy-out"
+
+    assert captured["hidden_shape"][0] == 4
+    assert captured["grid_thw"] == [[1, 4, 2]]
+    assert captured["vit_metadata"]["cu_seqlens"].tolist() == [0, expected_seq_len]
+    assert captured["vit_metadata"]["max_seqlen"] == expected_seq_len
+    assert captured["vision_dummy"] is True
+
+
 def _run_vision_real_image_cp_non_fa_rejection() -> None:
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
@@ -1114,6 +1153,46 @@ def test_qwen4_exp_vision_real_image_cp_rejects_non_flash_attention():
     if get_device_type() == "npu":
         pytest.skip("Qwen4-Exp Context Parallelism is currently supported on GPU only.")
     torchrun(_run_vision_real_image_cp_non_fa_rejection, world_size=2)
+
+
+def test_qwen4_exp_vision_dummy_attention_allows_non_flash_attention_under_cp() -> None:
+    from veomni.distributed.parallel_state import ParallelState, use_parallel_state
+
+    qwen4_exp = importlib.import_module(_PATCHED_MODULE)
+    config = AutoConfig.from_pretrained(_TOY_CONFIG).vision_config
+    config._attn_implementation = "veomni_sdpa"
+    _install_qwen4_exp_ops_config()
+    attn = qwen4_exp.Qwen4ExpVisionAttention(config).float()
+    hidden_states = torch.randn(4, config.hidden_size)
+    head_dim = config.hidden_size // config.num_heads
+    cos = torch.ones(4, head_dim)
+    sin = torch.zeros(4, head_dim)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+    cp_group = object()
+    fake_mesh = SimpleNamespace(
+        mesh_dim_names=("dp_shard", "cp", "sp"),
+        get_group=lambda dim_name: cp_group if dim_name in ("cp", "sp") else None,
+        get_local_rank=lambda dim_name: 1 if dim_name in ("cp", "sp") else 0,
+    )
+    captured = {}
+
+    def fake_veomni_attn(_module, query_states, *_args, **_kwargs):
+        captured["query_shape"] = tuple(query_states.shape)
+        return query_states, None
+
+    attn.veomni_attn = fake_veomni_attn
+    with patch.object(ParallelState, "world_size", 2):
+        cp_state = ParallelState(dp_size=1, cp_size=2, ulysses_size=1, device_mesh=fake_mesh)
+        with use_parallel_state(cp_state):
+            output = attn(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=(cos, sin),
+                vision_dummy=True,
+            )
+
+    assert output.shape == hidden_states.shape
+    assert captured["query_shape"] == (1, config.num_heads, 4, head_dim)
 
 
 @pytest.mark.parametrize(

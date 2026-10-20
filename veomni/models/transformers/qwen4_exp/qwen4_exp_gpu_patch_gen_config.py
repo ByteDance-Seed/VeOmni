@@ -1757,6 +1757,14 @@ def qwen4_exp_vision_attention_forward_patched(
     position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     **kwargs,
 ) -> torch.Tensor:
+    parallel_state = get_parallel_state()
+    vision_dummy = bool(kwargs.pop("vision_dummy", False))
+    sp_enabled, _, _, _ = _qwen4_exp_sequence_parallel_state(parallel_state)
+    if sp_enabled and not vision_dummy and not is_flash_attention_requested(self.config):
+        raise NotImplementedError(
+            "Qwen4-Exp vision sequence parallelism requires FlashAttention; eager and SDPA "
+            "receive local visual-token Q/K/V but global cu_seqlens and cannot segment that layout safely."
+        )
     seq_length = hidden_states.shape[0]
     query_states, key_states, value_states = (
         self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
@@ -1768,7 +1776,6 @@ def qwen4_exp_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    parallel_state = get_parallel_state()
     if is_flash_attention_requested(self.config):
         # Modification: prefer the int max_seqlen pre-computed once in
         # Qwen4ExpVisionModel.forward (Patch.5). Fall back to the original
@@ -1794,12 +1801,6 @@ def qwen4_exp_vision_attention_forward_patched(
                 **kwargs,
             )
     else:
-        sp_enabled, _, _, _ = _qwen4_exp_sequence_parallel_state(parallel_state)
-        if sp_enabled or bool(getattr(parallel_state, "sp_enabled", False)):
-            raise NotImplementedError(
-                "Qwen4-Exp vision sequence parallelism requires FlashAttention; eager and SDPA "
-                "receive local visual-token Q/K/V but global cu_seqlens and cannot segment that layout safely."
-            )
         # Modification: drop `vision_max_seqlen` from kwargs before falling through
         # to the non-FA path so it doesn't reach kernels that don't expect it.
         kwargs.pop("vision_max_seqlen", None)
@@ -1845,6 +1846,9 @@ def qwen4_exp_vision_model_dummy_forward(self):
     # 2. Derive shapes and dtype from the live model instead of hardcoding them.
     # 3. Under SP, describe the global grid while supplying only this rank's
     #    local patch rows, and avoid runtime metadata synchronization.
+    # 4. Only the FlashAttention varlen path gathers the sequence before
+    #    applying cu_seqlens; chunked non-FA paths split before attention and
+    #    therefore need local varlen boundaries.
     merge_size = self.spatial_merge_size
     parallel_state = get_parallel_state()
     t = 1
@@ -1857,13 +1861,15 @@ def qwen4_exp_vision_model_dummy_forward(self):
     local_patch_count = t * h * w // parallel_state.sp_size
     pixel_values = torch.zeros((local_patch_count, flattened_patch_size), dtype=dtype, device=device)
     grid_thw = torch.tensor([[t, h, w]], dtype=torch.long, device=device)
-    attention_seq_len = t * h * w
+    attention_seq_len = (
+        t * h * w if not parallel_state.sp_enabled or is_flash_attention_requested(self.config) else local_patch_count
+    )
     vit_metadata = {
         "grid_thw_list": [[t, h, w]],
         "cu_seqlens": torch.tensor([0, attention_seq_len], dtype=torch.int32, device="cpu"),
         "max_seqlen": attention_seq_len,
     }
-    return self(hidden_states=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata)
+    return self(hidden_states=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata, vision_dummy=True)
     # --- Patch.1 ---
 
 

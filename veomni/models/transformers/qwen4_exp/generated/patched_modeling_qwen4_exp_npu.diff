@@ -2187,7 +2187,7 @@
      def __init__(self, config: Qwen4ExpVisionConfig) -> None:
          super().__init__()
          self.dim = config.hidden_size
-@@ -1745,13 +2730,16 @@
+@@ -1745,49 +2730,65 @@
          self.config = config
          self.attention_dropout = 0.0
          self.is_causal = False
@@ -2204,8 +2204,16 @@
 -        max_seqlen: int | None = None,
          **kwargs,
      ) -> torch.Tensor:
++        parallel_state = get_parallel_state()
++        vision_dummy = bool(kwargs.pop("vision_dummy", False))
++        sp_enabled, _, _, _ = _qwen4_exp_sequence_parallel_state(parallel_state)
++        if sp_enabled and not vision_dummy and not is_flash_attention_requested(self.config):
++            raise NotImplementedError(
++                "Qwen4-Exp vision sequence parallelism requires FlashAttention; eager and SDPA "
++                "receive local visual-token Q/K/V but global cu_seqlens and cannot segment that layout safely."
++            )
          seq_length = hidden_states.shape[0]
-@@ -1759,35 +2747,47 @@
+         query_states, key_states, value_states = (
              self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
          )
          cos, sin = position_embeddings
@@ -2220,7 +2228,6 @@
 -            self.config._attn_implementation, eager_attention_forward
 -        )
 -
-+        parallel_state = get_parallel_state()
          if is_flash_attention_requested(self.config):
 -            # Flash Attention: Use cu_seqlens for variable length attention
 -            max_seqlen = get_max_seqlen(cu_seqlens, self.config, kwargs={"max_seqlen": max_seqlen})
@@ -2263,19 +2270,13 @@
 +                    **kwargs,
 +                )
          else:
-+            sp_enabled, _, _, _ = _qwen4_exp_sequence_parallel_state(parallel_state)
-+            if sp_enabled or bool(getattr(parallel_state, "sp_enabled", False)):
-+                raise NotImplementedError(
-+                    "Qwen4-Exp vision sequence parallelism requires FlashAttention; eager and SDPA "
-+                    "receive local visual-token Q/K/V but global cu_seqlens and cannot segment that layout safely."
-+                )
 +            # Modification: drop `vision_max_seqlen` from kwargs before falling through
 +            # to the non-FA path so it doesn't reach kernels that don't expect it.
 +            kwargs.pop("vision_max_seqlen", None)
              # Other implementations: Process each chunk separately
              lengths = cu_seqlens[1:] - cu_seqlens[:-1]
              splits = [
-@@ -1795,7 +2795,7 @@
+@@ -1795,7 +2796,7 @@
              ]
 
              attn_outputs = [
@@ -2284,7 +2285,7 @@
                      self,
                      q,
                      k,
-@@ -1845,6 +2845,12 @@
+@@ -1845,6 +2846,12 @@
          return hidden_states
 
 
@@ -2297,7 +2298,7 @@
  @auto_docstring
  class Qwen4ExpVisionModel(Qwen4ExpPreTrainedModel):
      config: Qwen4ExpVisionConfig
-@@ -1884,30 +2890,127 @@
+@@ -1884,30 +2891,127 @@
 
          self.post_init()
 
@@ -2447,7 +2448,7 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1922,33 +3025,150 @@
+@@ -1922,33 +3026,150 @@
          Returns:
              `torch.Tensor`: hidden_states.
          """
@@ -2613,7 +2614,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -1959,6 +3179,39 @@
+@@ -1959,6 +3180,46 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -2624,6 +2625,9 @@
 +        # 2. Derive shapes and dtype from the live model instead of hardcoding them.
 +        # 3. Under SP, describe the global grid while supplying only this rank's
 +        #    local patch rows, and avoid runtime metadata synchronization.
++        # 4. Only the FlashAttention varlen path gathers the sequence before
++        #    applying cu_seqlens; chunked non-FA paths split before attention and
++        #    therefore need local varlen boundaries.
 +        merge_size = self.spatial_merge_size
 +        parallel_state = get_parallel_state()
 +        t = 1
@@ -2636,13 +2640,17 @@
 +        local_patch_count = t * h * w // parallel_state.sp_size
 +        pixel_values = torch.zeros((local_patch_count, flattened_patch_size), dtype=dtype, device=device)
 +        grid_thw = torch.tensor([[t, h, w]], dtype=torch.long, device=device)
-+        attention_seq_len = t * h * w
++        attention_seq_len = (
++            t * h * w
++            if not parallel_state.sp_enabled or is_flash_attention_requested(self.config)
++            else local_patch_count
++        )
 +        vit_metadata = {
 +            "grid_thw_list": [[t, h, w]],
 +            "cu_seqlens": torch.tensor([0, attention_seq_len], dtype=torch.int32, device="cpu"),
 +            "max_seqlen": attention_seq_len,
 +        }
-+        return self(hidden_states=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata)
++        return self(hidden_states=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata, vision_dummy=True)
 +        # --- Patch.1 ---
 +
 +
@@ -2653,7 +2661,7 @@
 
 
  @auto_docstring
-@@ -1969,12 +3222,17 @@
+@@ -1969,12 +3230,17 @@
      _no_split_modules = ["Qwen4ExpDecoderLayer", "Qwen4ExpVisionBlock"]
 
      def __init__(self, config):
@@ -2676,7 +2684,7 @@
          self.post_init()
 
      def get_vision_position_ids(
-@@ -2260,53 +3518,226 @@
+@@ -2260,53 +3526,226 @@
          mm_token_type_ids: torch.IntTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen4ExpModelOutputWithPast:
@@ -2934,7 +2942,7 @@
          outputs = self.language_model(
              input_ids=None,
              position_ids=position_ids,
-@@ -2316,11 +3747,7 @@
+@@ -2316,11 +3755,7 @@
              ple_input_ids=ple_input_ids,
              **kwargs,
          )
@@ -2947,7 +2955,7 @@
 
 
  @auto_docstring
-@@ -2337,6 +3764,27 @@
+@@ -2337,6 +3772,27 @@
      aux_loss: torch.FloatTensor | None = None
 
 
@@ -2975,7 +2983,7 @@
  @auto_docstring
  class Qwen4ExpForConditionalGeneration(Qwen4ExpPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
-@@ -2346,11 +3794,23 @@
+@@ -2346,11 +3802,23 @@
 
      _fsdp_plan = {"lm_head": "keep_full_weight"}
 
@@ -3000,7 +3008,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -2396,47 +3856,10 @@
+@@ -2396,47 +3864,10 @@
          mm_token_type_ids: torch.IntTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -3052,7 +3060,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -2448,33 +3871,64 @@
+@@ -2448,33 +3879,64 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -3132,7 +3140,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -2483,6 +3937,7 @@
+@@ -2483,6 +3945,7 @@
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
              router_logits=outputs.router_logits,
@@ -3140,7 +3148,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -2696,6 +4151,32 @@
+@@ -2696,6 +4159,32 @@
          }
          return causal_mask_mapping
 
