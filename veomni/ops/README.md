@@ -250,9 +250,10 @@ has `attn_mask` and no `cu_seqlens` arguments. `packed_causal_mask`
 composes segments into a dense block-diagonal mask for these
 implementations. Their attention calls and the VeOmni SDPA mask builder drop
 cumulative-length and varlen maximum-length metadata when it describes at most
-one segment per batch row, or when the call carries a 3-D/4-D dense mask.
-When an `sdpa`, `veomni_sdpa`, or `eager` attention call has `attention_mask=None`
-and `batch_size == 1` with multiple segments, the wrapper splits `Q/K/V` along
+one segment per batch row, or when the call carries a 3-D/4-D dense mask or
+`BlockMask`. When an `sdpa`, `veomni_sdpa`, `eager`, `flex_attention`, or
+`veomni_sage_attention` attention call has `attention_mask=None` and
+`batch_size == 1` with multiple segments, the wrapper splits `Q/K/V` along
 the sequence dimension by the segment lengths derived from `cu_seqlens` (after
 any Ulysses gather) and concatenates the per-segment outputs. Multi-segment
 metadata with a 2-D mask or `batch_size != 1` raises, as does multi-segment

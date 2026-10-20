@@ -344,6 +344,84 @@ def test_sdpa_packed_varlen_rejects_invalid_metadata(monkeypatch):
         )
 
 
+def test_raw_flex_attention_lookup_splits_packed_cu_seqlens_and_accepts_block_mask(monkeypatch):
+    """Raw ``flex_attention`` lookup splits unmasked multi-segment calls and preserves BlockMask calls."""
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    from tests.ops.attention.attention_cases import eager_create_block_mask
+
+    recorded_chunks = []
+
+    def fake_hf_flex(module, query, key, value, attention_mask, **kwargs):
+        recorded_chunks.append((query.shape, attention_mask, dict(kwargs)))
+        return eager_attention_forward(module, query, key, value, None, **kwargs)
+
+    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, "flex_attention", fake_hf_flex)
+    module = _FakeAttentionModule()
+    module.is_causal = False
+    forward = VeomniOp("attention", "standard", "flex_attention")
+
+    cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
+    q1 = torch.randn(1, 2, 4, 8)
+    q2 = q1.clone()
+    q2[:, :, 2:, :] += 10.0
+
+    out1, _ = forward(
+        module,
+        q1,
+        q1,
+        q1,
+        None,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+        max_length_q=2,
+        max_length_k=2,
+        is_causal=False,
+    )
+    out2, _ = forward(
+        module,
+        q2,
+        q2,
+        q2,
+        None,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+        max_length_q=2,
+        max_length_k=2,
+        is_causal=False,
+    )
+    # Segment 1 must be completely unaffected by changes in segment 2.
+    torch.testing.assert_close(out1[:, :2], out2[:, :2], rtol=0, atol=0)
+    assert [shape for shape, _, _ in recorded_chunks[:2]] == [torch.Size([1, 2, 2, 8]), torch.Size([1, 2, 2, 8])]
+
+    # BlockMask already isolates segments and must pass through unsplit without .ndim AttributeError.
+    recorded_chunks.clear()
+    block_mask = eager_create_block_mask(
+        lambda b, h, q_idx, kv_idx: q_idx >= kv_idx,
+        B=None,
+        H=None,
+        Q_LEN=4,
+        KV_LEN=4,
+        device=q1.device,
+        BLOCK_SIZE=128,
+    )
+    forward(
+        module,
+        q1,
+        q1,
+        q1,
+        block_mask,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+        max_length_q=2,
+        max_length_k=2,
+    )
+    assert len(recorded_chunks) == 1
+    assert recorded_chunks[0][0] == torch.Size([1, 2, 4, 8])
+    assert recorded_chunks[0][1] is block_mask
+    assert "cu_seq_lens_q" not in recorded_chunks[0][2]
+
+
 def test_veomni_sdpa_pins_mask_backends_only_with_mask(monkeypatch):
     pinned = []
     real_sdpa_kernel = sdpa_backend.sdpa_kernel

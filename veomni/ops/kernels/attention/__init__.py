@@ -75,7 +75,7 @@ def lookup(impl: str) -> Callable:
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Dispatch one attention call through the selected Transformers interface."""
         packed_cu_seqlens = None
-        if impl in ("sdpa", "eager"):
+        if impl in ("sdpa", "eager", "flex_attention"):
             kwargs, packed_cu_seqlens = extract_packed_varlen_cu_seqlens(
                 kwargs,
                 batch_size=query.shape[0],
