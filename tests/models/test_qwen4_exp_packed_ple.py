@@ -385,6 +385,93 @@ def test_production_text_model_builds_packed_ple_metadata_once():
     assert border.tolist() == [0, 1, 2, 3]
 
 
+def test_production_cached_single_segment_skips_packed_ple_metadata():
+    from types import SimpleNamespace
+
+    captured = []
+
+    class Layer:
+        def __call__(self, hidden_states, **kwargs):
+            captured.append(kwargs)
+            return hidden_states
+
+    forward = production_method("qwen4_exp_text_model_forward_patched")
+    inputs_embeds = torch.zeros(1, 4, 8)
+    cache = SimpleNamespace()
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            ple_layer_ids=[2],
+            ple_conv_kernel_size=4,
+            ngram_size=2,
+            hc_count=1,
+            num_hidden_layers=1,
+        ),
+        layers=[Layer()],
+        rotary_emb=lambda hidden_states, position_ids: (torch.zeros(1), torch.zeros(1)),
+        hyper_connection_mixer=lambda hidden_states: hidden_states,
+    )
+    cu_seq_lens_q = torch.tensor([0, 4], dtype=torch.int32)
+    output = forward(
+        model,
+        inputs_embeds=inputs_embeds,
+        position_ids=torch.zeros(4, 1, 4, dtype=torch.long),
+        attention_mask={"linear_attention": None},
+        past_key_values=cache,
+        use_cache=True,
+        ple_input_ids=torch.zeros(1, 4, dtype=torch.long),
+        cu_seq_lens_q=cu_seq_lens_q,
+    )
+    assert torch.equal(output.last_hidden_state, inputs_embeds)
+    assert captured[0]["packed_seq_lens"] == (4,)
+    assert captured[0]["ple_packed_positions"] is None
+    assert captured[0]["ple_packed_boundary_indices"] is None
+    assert torch.equal(captured[0]["cu_seq_lens_q"], cu_seq_lens_q)
+
+
+def test_production_cached_single_segment_decoder_keeps_attention_culen():
+    from types import SimpleNamespace
+
+    captured = {}
+
+    class Ple:
+        def __call__(self, hidden_states, *args, **kwargs):
+            captured["ple_cu_seq_lens_q"] = kwargs.get("cu_seq_lens_q")
+            return torch.zeros_like(hidden_states)
+
+    class HyperConnection:
+        def __call__(self, hidden_states):
+            weights = torch.zeros(hidden_states.shape[0], hidden_states.shape[1], 1, dtype=hidden_states.dtype)
+            return hidden_states, hidden_states, weights
+
+    class Attention:
+        def __call__(self, hidden_states, position_embeddings, **kwargs):
+            captured["attention_cu_seq_lens_q"] = kwargs.get("cu_seq_lens_q")
+            return hidden_states, None
+
+    method = production_method("qwen4_exp_text_decoder_layer_forward_patched")
+    cu_seq_lens_q = torch.tensor([0, 4], dtype=torch.int32)
+    hidden_states = torch.zeros(1, 4, 8)
+    result = method(
+        SimpleNamespace(
+            ple=Ple(),
+            layer_type="full_attention",
+            attn_hyper_connection=HyperConnection(),
+            self_attn=Attention(),
+            mlp_hyper_connection=HyperConnection(),
+            mlp=lambda hidden_states: hidden_states,
+        ),
+        hidden_states,
+        position_embeddings=(torch.zeros(1), torch.zeros(1)),
+        past_key_values=object(),
+        ple_input_ids=torch.zeros(1, 4, dtype=torch.long),
+        cu_seq_lens_q=cu_seq_lens_q,
+        packed_seq_lens=(4,),
+    )
+    assert torch.equal(result, hidden_states)
+    assert captured["ple_cu_seq_lens_q"] is None
+    assert torch.equal(captured["attention_cu_seq_lens_q"], cu_seq_lens_q)
+
+
 @pytest.mark.parametrize("target", ["ple", "conv", "ngram", "text_model"])
 def test_packed_cache_rejection_precedes_mutation(target):
     from types import SimpleNamespace
@@ -415,7 +502,7 @@ def test_packed_cache_rejection_precedes_mutation(target):
             model,
             inputs_embeds=torch.zeros(1, 4, 8),
             past_key_values=cache,
-            cu_seq_lens_q=torch.tensor([0, 4]),
+            cu_seq_lens_q=torch.tensor([0, 2, 4]),
         )
     with pytest.raises(NotImplementedError, match="cached"):
         call()

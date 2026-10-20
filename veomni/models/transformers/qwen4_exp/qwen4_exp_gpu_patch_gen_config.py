@@ -1527,12 +1527,18 @@ def qwen4_exp_text_decoder_layer_forward_patched(
 ) -> torch.FloatTensor:
     # --- Patch.1: Thread the packed boundaries into the PLE token mixers. ---
     if self.ple is not None:
+        # A cached forward with one segment is ordinary decode/prefill, not a
+        # packed batch. Keep the cache path's implicit history while retaining
+        # cu_seq_lens_q for the attention layers below.
+        cached_single_segment = (
+            past_key_values is not None and packed_seq_lens is not None and len(packed_seq_lens) == 1
+        )
         hidden_states = hidden_states + self.ple(
             hidden_states,
             ple_input_ids,
             past_key_values,
             conv_mask=conv_mask,
-            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_q=None if cached_single_segment else cu_seq_lens_q,
             packed_seq_lens=packed_seq_lens,
             packed_positions=ple_packed_positions,
             packed_boundary_indices=ple_packed_boundary_indices,
@@ -1603,12 +1609,6 @@ def qwen4_exp_text_model_forward_patched(
     sp_enabled, sp_group, sp_rank, sp_size = _qwen4_exp_sequence_parallel_state(parallel_state)
     if sp_enabled and (use_cache or past_key_values is not None):
         raise NotImplementedError("Qwen4-Exp does not support cache prefill or decode under Ulysses/CP.")
-    if (
-        (use_cache or past_key_values is not None)
-        and self.config.ple_layer_ids
-        and kwargs.get("cu_seq_lens_q") is not None
-    ):
-        raise NotImplementedError("Packed PLE boundaries cannot be combined with cached PLE state.")
     # --- Patch.1 ---
     # --- Patch.5: Export host-side packed lengths once per forward. ---
     # The trainer moves cu_seq_lens_q onto the device, so every layer deriving
@@ -1622,6 +1622,10 @@ def qwen4_exp_text_model_forward_patched(
         packed_seq_lens = _qwen4_exp_validate_packed_seq_lens(
             cu_seq_lens_q.diff().tolist(), inputs_embeds.shape[0], sequence_length
         )
+    cache_active = bool(use_cache or past_key_values is not None)
+    cached_single_segment = cache_active and packed_seq_lens is not None and len(packed_seq_lens) == 1
+    if cache_active and self.config.ple_layer_ids and cu_seq_lens_q is not None and not cached_single_segment:
+        raise NotImplementedError("Packed PLE boundaries cannot be combined with cached PLE state.")
     # --- Patch.5 ---
     # CODEPATH: @ArthurZucker fix flagging for no reason here
     if self.config.ple_layer_ids and ple_input_ids is None:
@@ -1633,7 +1637,7 @@ def qwen4_exp_text_model_forward_patched(
     # materialize a global segment x reach window on every layer.
     ple_packed_positions = None
     ple_packed_boundary_indices = None
-    if self.config.ple_layer_ids and cu_seq_lens_q is not None:
+    if self.config.ple_layer_ids and cu_seq_lens_q is not None and not cached_single_segment:
         ple_reach = (self.config.ple_conv_kernel_size - 1) * self.config.ngram_size
         ple_packed_positions = local_packed_positions(
             cu_seq_lens_q,
