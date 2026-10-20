@@ -130,6 +130,43 @@ def test_attention_broadcast_mask_matches_pairwise_outputs_and_gradients(monkeyp
     assert mask_shapes == [torch.Size([3, 1, 1, 4])]
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_npu_attention_mask_view_preserves_storage_and_cpu_parity(dtype, monkeypatch):
+    """Exercise CANN's required mask shape without quadratic caller-side storage."""
+    from veomni.models.diffusers.hunyuanvideo15.native.modules import attention as attention_module
+    from veomni.utils.device import get_device_type, get_torch_device
+
+    if get_device_type() != "npu" or not get_torch_device().is_available():
+        pytest.skip("An accessible NPU is required")
+    get_torch_device().set_device(0)
+    torch.manual_seed(42)
+    valid_cpu = torch.tensor([[True, False, True, False], [False] * 4, [True] * 4])
+    inputs_cpu = [torch.randn(3, 4, 2, 128, dtype=dtype, requires_grad=True) for _ in range(3)]
+    expected = attention_module.attention(*inputs_cpu, attn_mask=valid_cpu)
+    inputs = [value.detach().to("npu").requires_grad_() for value in inputs_cpu]
+    valid = valid_cpu.to("npu")
+    sdpa = attention_module.F.scaled_dot_product_attention
+    mask_storage = []
+
+    def record_sdpa(*args, **kwargs):
+        """Inspect the view passed to the actual NPU attention implementation."""
+        mask = kwargs["attn_mask"]
+        mask_storage.append((mask.shape, mask.untyped_storage().nbytes(), mask.stride(2)))
+        return sdpa(*args, **kwargs)
+
+    monkeypatch.setattr(attention_module.F, "scaled_dot_product_attention", record_sdpa)
+    actual = attention_module.attention(*inputs, attn_mask=valid)
+    atol, rtol = (2e-4, 2e-3) if dtype == torch.float32 else (1e-2, 5e-2)
+    torch.testing.assert_close(actual.cpu(), expected, atol=atol, rtol=rtol)
+    assert torch.count_nonzero(actual[~valid]) == 0
+    assert mask_storage == [(torch.Size([3, 1, 4, 4]), valid.numel(), 0)]
+    actual.float().square().mean().backward()
+    expected.float().square().mean().backward()
+    for value, reference in zip(inputs, inputs_cpu):
+        assert torch.isfinite(value.grad).all()
+        torch.testing.assert_close(value.grad.cpu(), reference.grad, atol=atol, rtol=rtol)
+
+
 @pytest.mark.parametrize(
     "initial_slicing,initial_tiling", [(False, False), (True, False), (False, True), (True, True)]
 )

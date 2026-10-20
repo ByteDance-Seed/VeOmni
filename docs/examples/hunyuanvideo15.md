@@ -155,9 +155,12 @@ Production initialization is unchanged.
 
 Review regression checks also compare broadcast key masks against pairwise
 attention masks for both outputs and gradients, including invalid queries,
-fully masked samples and causal attention. The implementation retains only a
-`[B,1,1,L]` key mask and zeroes invalid query outputs instead of allocating a
-`[B,1,L,L]` validity mask.
+fully masked samples and causal attention. The caller retains a `[B,1,1,L]`
+key mask and zeroes invalid query outputs. On NPU, CANN requires the query
+dimension, so the caller passes a `[B,1,L,L]` zero-stride `expand` view backed by
+the same `B*L` mask elements. NPU fp32/bf16 tests verify this storage property
+and CPU parity for outputs and gradients. This does not guarantee linear mask
+storage inside the attention backend.
 
 VAE regressions cover normal, exceptional and nested slicing/tiling contexts.
 A real two-process CPU/Gloo test compares tiled decoding with serial decoding,
@@ -166,12 +169,15 @@ channels, and fp32/bf16 autocast. Optional tile parallelism requires an initiali
 VeOmni SP mesh; all SP ranks must call decode, and only SP rank zero receives
 the reconstructed video.
 
-On 2026-10-20, the review-fix suite on an A100 passed 24 model tests, including
-all four CUDA precision/checkpointing cases, plus six data/registry tests.
-The source-reference and full-NPU opt-in tests were skipped. CUDA-to-CPU maximum
-output errors were 8.34e-7 in fp32 and 3.91e-3 in bf16. The CPU-only model suite
-also passed 20 tests; its accelerator and opt-in cases skipped. NPU hardware
-regressions were not rerun because the available cards were occupied.
+On 2026-10-20, after the CANN mask-shape fix, the combined model/data/registry
+suite passed 32 tests on NPU (74.23 seconds) and 30 on an A100 (15.76 seconds).
+The source-reference and full-NPU opt-in tests were skipped on both hosts;
+the two NPU-specific mask-view cases also skipped on CUDA. All four accelerator
+precision/checkpointing cases passed on each backend. NPU-to-CPU maximum output
+errors were 1.70e-4 in fp32 and 3.91e-3 in bf16. The earlier A100 review-fix run
+measured 8.34e-7 in fp32 and 3.91e-3 in bf16. Both precisions on each backend
+produced decreasing losses over two AdamW updates. The CPU-only model suite
+previously passed 20 tests; its accelerator and opt-in cases skipped.
 
 On Ascend910_9382, the full 8.33B/54-layer backbone also completed bf16 forward,
 backward and two SGD updates with activation checkpointing. Peak allocated tensor

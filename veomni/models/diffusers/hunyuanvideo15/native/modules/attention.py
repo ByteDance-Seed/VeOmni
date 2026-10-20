@@ -21,6 +21,10 @@ def attention(q, k, v, drop_rate=0.0, attn_mask=None, causal=False, attn_mode="t
         if attn_mask.dtype != torch.bool:
             raise TypeError("The attention boundary requires a boolean validity mask")
         mask = attn_mask[:, None, None, :]
+        if q.device.type == "npu":
+            # CANN requires the query dimension, even for a key-only mask.
+            # expand is a zero-stride view; do not materialize a pairwise mask here.
+            mask = mask.expand(-1, 1, q.shape[1], -1)
     out = F.scaled_dot_product_attention(
         q.transpose(1, 2),
         k.transpose(1, 2),
