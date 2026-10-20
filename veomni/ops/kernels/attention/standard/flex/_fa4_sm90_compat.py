@@ -23,6 +23,8 @@ _retired_compile_caches = ()
 
 
 def _make_sm90_mask_forwarder(original, cute, cutlass):
+    """Wrap the native callback path with full Q/K bounds for auxiliary reads."""
+
     @cute.jit
     def apply_mask(
         self,
@@ -39,6 +41,7 @@ def _make_sm90_mask_forwarder(original, cute, cutlass):
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
     ) -> None:
+        """Restore native bounds before an auxiliary mask can index padded rows."""
         # Sparse forward may turn off sequence bounds on later KV blocks,
         # while the current Q tile still contains padded rows. Restore native
         # Q/K index protection before any auxiliary callback reads metadata.
@@ -82,7 +85,13 @@ def _make_sm90_mask_forwarder(original, cute, cutlass):
 
 
 def install_fa4_sm90_aux_bounds_fix():
-    """Install before tracing; keep optional FA4 imports and SM100 methods intact."""
+    """Install the pinned callback fix and isolate its forward/backward caches.
+
+    Return True when installed (including an earlier installation), or False
+    when FA4 is absent or has another version. A mismatched pinned signature
+    raises before patching. Optional imports and separate SM100 methods stay
+    intact; installation must happen before tracing attention calls.
+    """
     global _retired_compile_caches
     try:
         if version("flash-attn-4") != "4.0.0b16":

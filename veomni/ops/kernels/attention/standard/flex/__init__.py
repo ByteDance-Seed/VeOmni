@@ -126,7 +126,12 @@ def flex_attention_forward(
     Token-major inputs describe a single token stream, with packing in the mask.
     ``skip_ulysses`` opts a call out of sync Ulysses when its tokens are not
     on the SP mesh. Async Ulysses stays outside attention.
+
+    The second result is optional LSE, never attention weights. Requests for
+    ``output_attentions=True`` fail before distributed work or backend dispatch.
     """
+    if kwargs.get("output_attentions", False):
+        raise ValueError("FlexAttention does not support `output_attentions=True`; use eager attention.")
     if not isinstance(attention_mask, BlockMask):
         raise TypeError(f"FlexAttention requires a BlockMask, got {type(attention_mask).__name__}.")
 

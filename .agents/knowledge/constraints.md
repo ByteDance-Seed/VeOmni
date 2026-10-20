@@ -272,6 +272,7 @@ Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__
     - See [FLASH compilation](../../docs/transformers_v5/veomni_attention_interface.md#flash-compilation-and-mask-construction).
 
 30a. **Q/K/V layouts and visibility are explicit**
+    - Reject `output_attentions=True` at the shared Flex entry before Ulysses or backend selection. The second result is optional LSE, never attention weights; returning LSE from Triton does not satisfy an attention-weight request.
     - Accept matching 3D `[T,H,D]` or 4D `[B,H,S,D]` inputs. Normalize 3D with views before validation, dispatch and Ulysses; never infer axes from sizes. Keep Q/K lengths independent and K/V lengths/heads consistent.
     - BlockMask owns packed-document visibility. Restore output/LSE to the caller's layout after inverse exchange; see [input layouts and mask semantics](../../docs/transformers_v5/veomni_attention_interface.md#input-layouts-and-mask-semantics).
 

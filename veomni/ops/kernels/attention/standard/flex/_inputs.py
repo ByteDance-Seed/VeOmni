@@ -20,7 +20,12 @@ import torch
 def _normalize_flex_qkv(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
-    """Normalize THD or BHSD inputs to BHSD without guessing axis order."""
+    """Normalize THD or BHSD inputs to BHSD and report whether they were THD.
+
+    THD inputs use transpose/unsqueeze views. Reject incompatible batch sizes,
+    K/V lengths or heads, Q/K dimensions, empty axes and non-integral GQA groups.
+    Q and K lengths and V head dimensions may differ.
+    """
     if query.ndim not in (3, 4) or key.ndim != query.ndim or value.ndim != query.ndim:
         raise ValueError("FlexAttention requires Q/K/V with the same ndim: 3D [T,H,D] or 4D [B,H,S,D].")
     if any(dim == 0 for tensor in (query, key, value) for dim in tensor.shape):

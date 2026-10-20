@@ -404,6 +404,42 @@ def test_flex_attention_rejects_invalid_gqa(query_heads, kv_heads, expected_mess
         )
 
 
+@pytest.mark.parametrize("backend", [None, "TRITON", "FLASH"])
+@pytest.mark.parametrize("token_major", [False, True])
+@pytest.mark.parametrize("output_attentions", [None, False, True])
+def test_flex_attention_output_attentions_contract(monkeypatch, backend, token_major, output_attentions):
+    """Reject attention-weight requests before communication; preserve other calls."""
+    query = torch.randn(8, 4, 8) if token_major else torch.randn(1, 4, 8, 8)
+    mask = _causal_block_mask(8, query.device)
+    kwargs = {} if backend is None else {"kernel_options": {"BACKEND": backend}}
+    if output_attentions is not None:
+        kwargs["output_attentions"] = output_attentions
+
+    def unexpected_parallel_state():
+        """Fail if an unsupported request reaches distributed state lookup."""
+        pytest.fail("Attention-weight requests must fail before Ulysses or backend execution")
+
+    if output_attentions:
+        monkeypatch.setattr(flex_backend, "get_parallel_state", unexpected_parallel_state)
+        with pytest.raises(ValueError, match="does not support `output_attentions=True`"):
+            flex_backend.flex_attention_forward(_FakeAttentionModule(), query, query, query, mask, **kwargs)
+        return
+
+    def backend_forward(module, query, key, value, attention_mask, **kwargs):
+        """Keep backend output observable without compiling an attention kernel."""
+        assert attention_mask is mask
+        return query.transpose(1, 2), None
+
+    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda **kwargs: False)
+    monkeypatch.setattr(flex_backend, "_flex_attention_triton", backend_forward)
+    monkeypatch.setattr(flex_backend, "_flex_attention_fa4", backend_forward)
+    output, auxiliary = flex_backend.flex_attention_forward(
+        _FakeAttentionModule(), query, query, query, mask, **kwargs
+    )
+    torch.testing.assert_close(output, query if token_major else query.transpose(1, 2))
+    assert auxiliary is None
+
+
 def test_flex_attention_rejects_unsupported_masks(monkeypatch):
     query = torch.randn(1, 4, 8, 8)
     module = _FakeAttentionModule()

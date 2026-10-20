@@ -43,10 +43,12 @@ def _flash_attn_cute_available() -> bool:
 
 
 def _dtype_supports_flex_fa4(dtype: torch.dtype) -> bool:
+    """Allow the FP16 and BF16 input dtypes supported by the FLASH backend."""
     return dtype in _FA4_DTYPES
 
 
 def _head_dim_supports_flex_fa4(head_dim: int) -> bool:
+    """Exclude dimensions that trigger the pinned FA4 backward compiler defect."""
     # FA4 cute backward preprocess ICE when hd % 32 != 0
     # (Dao-AILab/flash-attention#2492). hd % 32 == 0 skips the OOB
     # predicate and can train. TODO: drop this gate after upgrading
@@ -102,6 +104,7 @@ def _flex_attention_fa4(
     if softcap is not None or position_bias is not None:
 
         def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
+            """Apply softcap before adding the caller's per-position score bias."""
             if softcap is not None:
                 score = softcap * torch.tanh(score / softcap)
             if position_bias is not None:

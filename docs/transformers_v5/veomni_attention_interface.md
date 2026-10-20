@@ -120,6 +120,12 @@ caller's layout after inverse exchange. When Triton returns LSE, it has shape
 `[heads, tokens]` for 3D input and `[batch, heads, sequence]` for 4D input; FLASH
 continues to return `None` for LSE.
 
+The second result is optional LSE, not attention weights. Flex rejects
+`output_attentions=True` before Ulysses communication or backend selection,
+whether the backend is automatic, FLASH, or Triton. Use eager attention when
+attention weights are required; omitting the option or passing `False` keeps
+the existing output contract.
+
 Transformers models may pass `sliding_window` metadata alongside a native
 BlockMask whose predicate already encodes the window. The adapter accepts but
 does not use that integer metadata to reconstruct or alter visibility; the
