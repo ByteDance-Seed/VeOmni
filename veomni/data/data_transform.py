@@ -30,6 +30,22 @@ if TYPE_CHECKING:
 DATA_TRANSFORM_REGISTRY = Registry("DataTransform")
 
 
+def _replace_gemma3_image_tokens(text: str, processor: "ProcessorMixin", num_crops: torch.Tensor, image_count: int):
+    """Expand each original Gemma 3 image placeholder exactly once."""
+    text_parts = text.split(processor.boi_token)
+    if len(text_parts) != image_count + 1:
+        raise ValueError(
+            f"Gemma 3 chat template produced {len(text_parts) - 1} image placeholders for {image_count} images."
+        )
+
+    replacements = [
+        processor.replace_image_token({"num_crops": num_crops}, image_idx) for image_idx in range(image_count)
+    ]
+    return text_parts[0] + "".join(
+        replacement + suffix for replacement, suffix in zip(replacements, text_parts[1:], strict=True)
+    )
+
+
 def _get_exact_token_id(tokenizer: "PreTrainedTokenizer", token: str, fallback_token: str | None = None) -> int:
     candidates = (token,) if fallback_token is None else (token, fallback_token)
     unk_token_id = getattr(tokenizer, "unk_token_id", None)
@@ -452,9 +468,7 @@ def process_sample_gemma3(
         prefix_messages = messages[:end]
         text = processor.apply_chat_template(prefix_messages, tokenize=False, add_generation_prompt=False)
         image_count = sum(item["type"] == "image" for msg in prefix_messages for item in msg["content"])
-        for image_idx in range(image_count):
-            replacement = processor.replace_image_token({"num_crops": num_crops}, image_idx)
-            text = text.replace(processor.boi_token, replacement, 1)
+        text = _replace_gemma3_image_tokens(text, processor, num_crops, image_count)
         return processor.tokenizer(text, add_special_tokens=True, return_tensors="pt")["input_ids"][0]
 
     input_ids = tokenize_prefix(len(messages))

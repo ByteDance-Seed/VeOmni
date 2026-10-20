@@ -46,16 +46,16 @@ def _get_vlm_visual_module(model):
         if base_model is not model:
             return _get_vlm_visual_module(base_model)
 
-    # Qwen-VL wrappers are not consistent across transformers versions:
-    # older releases may expose `visual` directly on the conditional model
-    # for backward compatibility, while newer ones only keep `model.visual`.
-    visual = getattr(model, "visual", None)
-    if visual is not None:
-        return visual
+    # VLM wrappers are not consistent across model families and transformers
+    # versions. Qwen uses `visual`, while Gemma 3 uses `vision_tower`.
+    for module_name in ("visual", "vision_tower"):
+        visual = getattr(model, module_name, None)
+        if visual is not None:
+            return visual
 
     inner_model = getattr(model, "model", None)
-    if inner_model is not None:
-        return getattr(inner_model, "visual", None)
+    if inner_model is not None and inner_model is not model:
+        return _get_vlm_visual_module(inner_model)
 
     return None
 
@@ -194,10 +194,15 @@ class VLMModelRuntime(VeOmniModelRuntime):
         if param_groups is not None:
             return super()._build_optimizer(param_groups=param_groups)
 
+        model_config = self.model_config
+        is_omni = model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe")
+        visual = self.model.thinker.visual if is_omni else _get_vlm_visual_module(self.model)
+        visual_param_ids = {id(param) for param in visual.parameters()} if visual is not None else set()
+
         vit_params, other_params = [], []
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                if "visual" in name:
+                if id(param) in visual_param_ids or (visual is None and "visual" in name):
                     vit_params.append(param)
                 else:
                     other_params.append(param)

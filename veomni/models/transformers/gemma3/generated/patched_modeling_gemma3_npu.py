@@ -15,8 +15,10 @@
 #      OpSlot guard for NPU fused RoPE
 #    - method_override: Gemma3Model.__init__
 #      Construct the generated text tower instead of the upstream AutoModel class
+#    - method_override: Gemma3Model.forward
+#      Preserve packed-sample boundaries in Gemma 3 VLM attention masks
 #    - method_override: Gemma3TextModel.forward
-#      Pass packed-sequence boundaries into VeOmni FlexAttention mask preparation
+#      Pass packed-sequence boundaries into VeOmni mask preparation
 #    - method_override: Gemma3ForCausalLM.forward
 #      Adapt Gemma 3 causal-LM loss to VeOmni's fused-loss output contract
 #    - method_override: Gemma3ForConditionalGeneration.__init__
@@ -71,6 +73,7 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
+from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
 # Additional import blocks for patches
@@ -104,6 +107,54 @@ def get_gemma3_position_ids(
 ) -> dict[str, torch.LongTensor]:
     position_ids = torch.arange(input_ids.shape[-1], dtype=torch.long, device=input_ids.device)
     return {"position_ids": position_ids.unsqueeze(0).expand(input_ids.shape[0], -1)}
+
+
+def create_gemma3_masks(
+    config,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    past_key_values: Cache | None,
+    position_ids: torch.Tensor | None,
+    token_type_ids: torch.Tensor | None,
+    cu_seq_lens_q: torch.Tensor | None,
+) -> dict:
+    """Build Gemma 3 full/sliding masks while retaining packed-sample boundaries."""
+    mask_kwargs = {
+        "config": config,
+        "inputs_embeds": inputs_embeds,
+        "attention_mask": attention_mask,
+        "past_key_values": past_key_values,
+        "position_ids": position_ids,
+        "cu_seq_lens_q": cu_seq_lens_q,
+    }
+
+    if token_type_ids is None:
+        return {
+            "full_attention": create_causal_mask(**mask_kwargs),
+            "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+        }
+
+    block_sequence_ids = get_block_sequence_ids_for_mask(token_type_ids, device=inputs_embeds.device)
+    full_mask = create_causal_mask(**mask_kwargs, block_sequence_ids=block_sequence_ids)
+
+    preprocess_kwargs = mask_kwargs.copy()
+    preprocess_kwargs.pop("cu_seq_lens_q")
+    early_exit, _, _, _, kv_length, _, kv_offset = _preprocess_mask_arguments(
+        **preprocess_kwargs,
+        layer_idx=0,
+    )
+    padded_block_sequence_ids = block_sequence_ids
+    if not early_exit:
+        padded_block_sequence_ids = maybe_pad_block_sequence_ids(
+            block_sequence_ids, attention_mask, kv_length, kv_offset
+        )
+
+    sliding_mask = create_causal_mask(
+        **mask_kwargs,
+        or_mask_function=blockwise_overlay(padded_block_sequence_ids),
+        and_mask_function=sliding_window_overlay(config.sliding_window),
+    )
+    return {"full_attention": full_mask, "sliding_attention": sliding_mask}
 
 
 @auto_docstring(
@@ -859,7 +910,7 @@ def create_masks_for_vision_model(
 
 # ======================================================================
 # [MODIFIED CLASS] Gemma3Model
-# Methods patched: __init__
+# Methods patched: __init__, forward
 # ======================================================================
 
 
@@ -932,39 +983,9 @@ class Gemma3Model(Gemma3PreTrainedModel):
         use_cache: bool | None = None,
         **lm_kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Gemma3ModelOutputWithPast:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-            config.text_config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.text_config.vocab_size]`.
-
-        Example:
-
-        ```python
-        >>> from PIL import Image
-        >>> import httpx
-        >>> from io import BytesIO
-        >>> from transformers import AutoProcessor, Gemma3ForConditionalGeneration
-
-        >>> model = Gemma3ForConditionalGeneration.from_pretrained("google/gemma32-3b-mix-224")
-        >>> processor = AutoProcessor.from_pretrained("google/gemma32-3b-mix-224")
-
-        >>> prompt = "Where is the cat standing?"
-        >>> url = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/pipeline-cat-chonk.jpeg"
-        >>> with httpx.stream("GET", url) as response:
-        ...     image = Image.open(BytesIO(response.read()))
-
-        >>> inputs = processor(images=image, text=prompt,  return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(**inputs,)
-        >>> processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Where is the cat standing?\nsnow"
-        ```"""
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        # Replace image id with PAD if the image token if OOV, to avoid index-errors
         if input_ids is not None and self.config.image_token_id >= self.vocab_size:
             special_image_mask = input_ids == self.config.image_token_id
             llm_input_ids = input_ids.clone()
@@ -975,7 +996,6 @@ class Gemma3Model(Gemma3PreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(llm_input_ids)
 
-        # Merge text and images
         if pixel_values is not None:
             image_features = self.get_image_features(pixel_values, return_dict=True).pooler_output
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -984,24 +1004,16 @@ class Gemma3Model(Gemma3PreTrainedModel):
             )
             inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
 
-        # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
-            mask_kwargs = {
-                "config": self.config.get_text_config(),
-                "inputs_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-            }
-
-            if token_type_ids is not None:
-                block_sequence_ids = get_block_sequence_ids_for_mask(token_type_ids, device=inputs_embeds.device)
-                causal_mask_mapping = create_masks_for_vision_model(
-                    block_sequence_ids=block_sequence_ids,
-                    **mask_kwargs,
-                )
-            else:
-                causal_mask_mapping = create_masks_for_generate(**mask_kwargs)
+            causal_mask_mapping = create_gemma3_masks(
+                config=self.config.get_text_config(),
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+                token_type_ids=token_type_ids,
+                cu_seq_lens_q=lm_kwargs.get("cu_seq_lens_q"),
+            )
 
         outputs = self.language_model(
             attention_mask=causal_mask_mapping,
@@ -1186,6 +1198,8 @@ class Gemma3ForConditionalGeneration(Gemma3PreTrainedModel, GenerationMixin):
         return get_gemma3_position_ids
 
     def get_extra_collate_infos(self):
+        if get_parallel_state().sp_enabled:
+            raise ValueError("Gemma 3 VLM does not support sequence parallelism; set cp_size=1 and ulysses_size=1.")
         return {
             "pixel_values": (0, False, None, None),
             "token_type_ids": (-1, True, 0, 1),
