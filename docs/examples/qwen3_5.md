@@ -170,6 +170,14 @@ model:
 Triton kernel (the arch35 native path is gated behind `is_arch35()`). arch35 (`Ascend910_95` /
 `Ascend950`) is not supported end-to-end: the vendored `causal_conv1d` raises there (see above).
 
+These instance-local GDN selectors also apply to Qwen4-Exp. Keep the model's
+configured output-gate activation: selecting AscendC does not change sigmoid
+to SiLU. On Ascend910B, the v26.6.0 `RecomputeWUFwd` kernel accepts value-head
+widths 128 or 256; a 64-wide toy input fails native tiling before it exercises
+the GDN math. The NPU parity test uses a supported 128-wide AscendC input and
+checks both ordinary sequences and packed samples whose boundaries are not
+multiples of the recurrent chunk size.
+
 The prebuilt NPU images on [quay.io](https://quay.io/repository/ascend/veomni?tab=tags) already
 bundle `fla_npu`:
 
@@ -217,7 +225,7 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5/qwen3_5_vl.yaml \
     --train.max_steps 20
 ```
 
-Drop `chunk_gated_delta_rule_implementation` to `npu` if `fla_npu` is not installed.
+Set `chunk_gated_delta_rule_implementation` to `triton` if `fla_npu` is not installed.
 
 ### Qwen3.5 MoE 35B VL Training
 
