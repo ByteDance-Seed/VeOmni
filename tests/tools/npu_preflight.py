@@ -6,6 +6,11 @@ import argparse
 
 
 def check_npu_runtime(expected_devices: int = 8) -> int:
+    """Return the exact visible count after successful compute on every NPU.
+
+    Missing packages, unavailable devices and failed readback raise exceptions
+    so an Ascend CI runner cannot pass by skipping all native tests.
+    """
     if expected_devices < 1:
         raise ValueError("expected_devices must be positive")
 

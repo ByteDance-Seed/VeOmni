@@ -124,6 +124,7 @@ def test_deepseek_v3_gpu_keeps_default_moe(monkeypatch):
     "fault", ["missing_package", "unavailable", "wrong_count", "compute_error", "bad_readback", None]
 )
 def test_npu_ci_preflight_fails_closed(monkeypatch, fault):
+    """Reject runtime failures and visit all eight devices on the success path."""
     from tests.tools.npu_preflight import check_npu_runtime
 
     visited = []
@@ -133,20 +134,24 @@ def test_npu_ci_preflight_fails_closed(monkeypatch, fault):
         device = SimpleNamespace(type="npu")
 
         def __init__(self, index):
+            """Track the device identity and scalar value for the fake runtime."""
             self.index = index
             self.value = 1.0
 
         def add_(self, value):
+            """Model arithmetic or a device-specific execution failure."""
             if fault == "compute_error" and self.index == 3:
                 raise RuntimeError("device execution failed")
             self.value += value
             return self
 
         def mul_(self, value):
+            """Complete the preflight's arithmetic without real hardware."""
             self.value *= value
             return self
 
         def item(self):
+            """Model either a correct readback or a nonfinite device result."""
             return float("nan") if fault == "bad_readback" else self.value
 
     backend = SimpleNamespace(
@@ -173,6 +178,7 @@ def test_npu_ci_preflight_fails_closed(monkeypatch, fault):
 
 @pytest.mark.parametrize("count", [0, -1])
 def test_npu_ci_preflight_rejects_invalid_count(count):
+    """Validate the requested count before importing any native dependencies."""
     from tests.tools.npu_preflight import check_npu_runtime
 
     with pytest.raises(ValueError, match="must be positive"):
