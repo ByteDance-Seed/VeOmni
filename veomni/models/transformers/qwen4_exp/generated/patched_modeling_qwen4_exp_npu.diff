@@ -1135,7 +1135,7 @@
 +                    block_starts[None, None] + self.compress_ratio - 1
 +                    <= query_positions[None, query_start:query_end, None]
 +                )
-+                scores = scores.masked_fill(~visible, float("-inf"))
++                scores = scores.masked_fill(~visible, -1.0)  # NPU TopKV2 faults on sparse -inf rows (ReLU scores >= 0)
 +                top_blocks = scores.topk(top_count, dim=-1).indices
 +                top_valid = visible.gather(-1, top_blocks)
 +                selected_starts = block_starts[top_blocks]
