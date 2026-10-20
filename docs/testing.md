@@ -203,6 +203,45 @@ tests require TileLang on an SM90+ NVIDIA GPU, and the `cann` parity tests requi
 with `cann_ops_transformer`. Its mHC kernel parity is covered by `tests/ops/mhc/test_mhc.py` and
 requires TileKernels on an SM90+ NVIDIA GPU or CANN on an Ascend NPU.
 
+DeepSeek-V4 expert-parallel training is exercised separately by
+`tests/e2e/test_e2e_parallel.py::test_deepseek_v4_expert_parallel_alignment`:
+four-rank FSDP2, SP=1, EP=1 versus EP=2, and two optimizer steps. This uses
+eager DSA/mHC with fused routed experts, so it does not qualify the SM90+
+kernel paths. The CPU duplicate-hash-route regression verifies that EP split
+counts match unique token/expert dispatch pairs; repeated routing weights are
+summed when combining outputs.
+The GPU CI also runs `test_deepseek_v4_expert_parallel_fixed_route_vjp_matches_fp32_reference`
+in `tests/models/transformers/deepseek_v4/test_deepseek_v4.py`: four-rank EP=4, unequal token
+payloads, ordinary and duplicate expert slots, and three held-out seeds. Output,
+input/routing gradients and expert-weight gradients are compared with a global
+FP32 mathematical VJP using the same BF16 bit patterns and the rounding budget
+described below. This isolates expert transport/kernel numerics, not FSDP2
+gradient averaging or whole-model optimizer trajectories.
+
+Controlled two-step BF16 FSDP2 runs matched initial FP32 master weights,
+buffers, optimizer settings and every rank's micro-batches. Aggregate execution
+gates passed, but whole-model pre-clipping gradient relative L2 differed by
+about 4.61% for EP2 versus EP1 before aligning routing-weight placement. Non-EP
+Triton experts now weight the down-projection output, matching EP and the eager
+reference, instead of weighting the BF16 activation before that projection.
+Both split/merged weights and shared/independent LoRA use this order; for LoRA,
+the routing weight scales the complete base-plus-adapter output.
+
+On the same four-rank fixture, this reduced first-step whole-model gradient
+relative L2 to 0.0751%, with bit-identical non-expert gradients. Expert weight
+gradients still differ across EP reduction layouts. First-step update relative
+L2 was 2.62%; after that update, second-step gradient relative L2 was 4.24% and
+update relative L2 was 5.21%. These measurements do not establish whole-model
+update parity or convergence. First-step AdamW replay and clipping passed their
+separate oracles in the earlier diagnostic runs.
+
+`tests/ops/moe_experts/test_moe_experts_ep.py` checks output and all VJPs against
+the single-expert EP projection order without relaxing split/merged parity.
+`tests/ops/moe_experts_lora/test_moe_experts_lora.py` checks that zero-B adapters preserve base
+output, input/routing and base-weight gradients, while retaining trainable
+B-gradients. Both files run in GPU CI. Duplicate routes still have distinct
+EP/non-EP reduction layouts; no bitwise guarantee is made for arbitrary routes.
+
 ---
 
 ### 2. VLM Trainer Test (`tests/trainer/test_vlm_trainer.py`)
