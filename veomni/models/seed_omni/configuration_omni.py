@@ -363,9 +363,7 @@ class OmniConfig(PretrainedConfig):
                 **self.ops_implementation,
                 **dict(self._module_entries[name].get("ops_implementation") or {}),
             }
-            attn_implementation = loaded.ops_implementation.get("attn_implementation")
-            if attn_implementation is not None:
-                loaded._attn_implementation = attn_implementation
+            loaded._sync_attn_implementation()
         return remaining
 
     @property

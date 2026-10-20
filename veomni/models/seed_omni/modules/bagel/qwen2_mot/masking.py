@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 from torch.nn.attention.flex_attention import BlockMask
 
-from ......ops.kernels.attention.magi import MagiAttentionMask
+from ......ops.mask import MagiAttentionMask
 
 
 _MOT_BLOCK_SIZE = 128

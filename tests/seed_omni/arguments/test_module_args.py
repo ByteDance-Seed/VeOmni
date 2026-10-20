@@ -406,12 +406,17 @@ def test_the_checkpoint_fills_in_what_the_launcher_yaml_leaves_out(tmp_path):
 
 def test_a_launcher_yaml_still_wins_where_it_names_the_same_field(tmp_path):
     """The checkpoint is a default, not a freeze; deep-merged per field."""
+    from veomni.arguments import OpsImplementationConfig
+
     exported = _exported_root(tmp_path)
     modules_yaml = {MODULE_A: {}, MODULE_B: {"ops_implementation": {"attn_implementation": "sdpa"}}}
 
     modules = build_omni_model_runtime_args(_args_over(exported, modules_yaml)).modules
 
-    assert modules[MODULE_B].ops_implementation.attn_implementation == "sdpa"
+    assert (
+        modules[MODULE_B].ops_implementation.attn_implementation
+        == OpsImplementationConfig(attn_implementation="sdpa").attn_implementation
+    )
     # Untouched by the YAML, so still the exported value rather than the global.
     assert modules[MODULE_A].ops_implementation.attn_implementation == _exported_attn(exported, MODULE_A)
 

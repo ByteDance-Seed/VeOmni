@@ -118,7 +118,7 @@ resolve from `get_parallel_state().{ulysses,sp,cp,dp}_group` (the current state'
 device-mesh subgroup) — there are no group globals. Since `use_parallel_state`
 (via the graph's `module_context`) already scopes `_PARALLEL_STATE` per module for
 its forward and its grad-checkpoint recompute, the global attention integration
-(`veomni_flash_attention_2_with_sp`, which only reaches the group through
+(`veomni_flash_attention_2`, which only reaches the group through
 `get_ulysses_sequence_parallel_group()`) automatically all-to-alls over the
 scoped module's own group. No key bookkeeping. (No group-injection seam: SP unit
 tests build a real state via `_init_parallel_state(dp_size=1, ulysses_size=world_size)`
@@ -128,7 +128,7 @@ and toggle the no-SP path with `set_parallel_state(None)`.)
 config (e.g. `Qwen3VLVisionEncoderConfig.vision_config`,
 `Qwen3VLLlmConfig.text_config`) MUST declare `sub_configs = {"<name>": <Cfg>}` on
 the top-level config so transformers propagates `attn_implementation`
-(`veomni_flash_attention_2_with_sp`) to the inner model. Without it the inner
+(`veomni_flash_attention_2`) to the inner model. Without it the inner
 model silently falls back to SDPA — the Ulysses all-to-all lives in the
 flash-attention path, so SDPA leaves the sliced chunk ungathered while the
 cu_seqlens describe the full sequence (a `split_with_sizes` size mismatch).

@@ -149,27 +149,25 @@ through the call in the first place. Unpadding is a deterministic index derived
 from `window_starts`, so the gather stays differentiable and the padding rows
 receive no gradient.
 
-**The query axis had to be separated from the KV geometry.** The sparse index
-builders read a single `seq_len` and used it for three roles that coincide under
+**The query axis had to be separated from the KV geometry.** Expanding the
+sparse contract into candidate slots needs three lengths that coincide under
 Ulysses and separate under CP: the number of query rows, the absolute
 full-resolution KV row of each sliding candidate, and the offset that lifts a
-compressed slot into the concatenated KV buffer. Under CP the first becomes `L`
-while the other two stay `S_global`, which is why
-`build_packed_sparse_attention_indices` and `build_sparse_attention_indices`
-take `query_offset` and `kv_full_len`. Both default to today's behaviour,
-because every non-CP caller keeps the old signature — so the type system cannot
-catch a missed call site. The same conflation was in the call site:
-`compressed_len` was computed as `kv.shape[-2] - q.shape[-2]`, which under CP
-evaluates to `S_global + C - L` instead of `C`, and is now carried explicitly
-from the compressor. This whole class of error is silent. Shapes stay
-self-consistent and the model attends to the wrong rows, so the mitigation is
-the parity test that compares each shard's built indices against the matching
-slice of the full-sequence build.
+compressed slot past the full-resolution rows. Under CP the first becomes `L`
+while the other two stay `S_global`. `dsa_attention` therefore takes the
+full-resolution and compressed KV as separate tensors, so both KV lengths are
+read off their own shapes, plus a `query_offset` that rebases a local query
+onto its global row. `query_offset` defaults to 0, which is right for every
+caller that is neither CP nor decode — so the type system cannot catch a missed
+call site. This whole class of error is silent. Shapes stay self-consistent and
+the model attends to the wrong rows, so the mitigation is the parity test that
+compares each shard's candidate slots against the matching slice of the
+full-sequence build.
 
 **Compressed slot values stay global; window token indices are rebased.** Two
 index spaces look alike and must not be confused. Attention and indexer indices
-— `topk_indices`, sliding-window indices, `range_starts` / `range_ends`,
-`block_bias` columns — address the *replicated* global KV, so their values are
+— `topk_indices`, sliding-window indices, `range_starts` / `range_ends` —
+address the *replicated* global KV, so their values are
 untouched under CP and the arrays are only sliced by query row. The compressor's
 `window_indices` address the rank's own `kv` / `gate` tensors and so are rebased
 by `cp_rank * L` **and** by the halo width, since they index
@@ -207,13 +205,14 @@ The same property constrains tests: a CP test must finish every collective
 before it asserts, or a genuine parity failure on one rank strands the others in
 a watchdog timeout instead of reporting the mismatch.
 
-**The TileLang indexer demotes silently.** `use_tilelang` is a conjunction of
-runtime preconditions and falls back to the eager scorer rather than raising, so
-a parity test can stay green while the kernel it exists to exercise stops
-running. Any test claiming kernel coverage needs a pass-through counter to pin
-it. Nothing currently runs the TileLang indexer inside a bf16 CSA layer under CP
-— layer parity is float32 and the indexer's own test is a bare bf16 module — so
-that pin is what a future test of that combination would need.
+**The TileLang indexer no longer demotes silently.** Selection is
+`dsa_indexer_implementation` through a local `VeomniOp`. Choosing `tilelang`
+resolves that registry row; there is no `use_tilelang` conjunction that falls
+back to the eager scorer. Tests that claim kernel coverage still need a
+pass-through counter, because a CP parity check can stay green if the kernel is
+never entered. Nothing currently runs the TileLang indexer inside a bf16 CSA
+layer under CP — layer parity is float32 and the indexer's own test is a bare
+bf16 module — so that pin is what a future test of that combination would need.
 
 ## Where the implementation diverged from the design and the plan
 
@@ -308,5 +307,5 @@ full global compressed array; a CSA layer pays two extra collectives, since the
 compressor and its indexer compress the same windows at different head
 dimensions and cannot share a result; and `exchange_compressor_halos`
 all-gathers from every rank when only two neighbours are ever read.
-`tests/models/test_model_forward_no_implicit_sync.py` does not exercise CP, so
+`tests/models/transformers/test_model_forward_no_implicit_sync.py` does not exercise CP, so
 the CP paths have no automated guard against device-to-host syncs.

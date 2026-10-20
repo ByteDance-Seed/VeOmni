@@ -56,7 +56,7 @@ import torch.distributed.checkpoint as dcp
 
 from ....utils import helper
 from ....utils.registry import Registry
-from ...checkpoint_tensor_loading import (
+from ...checkpoint.convert import (
     ConvertedCheckpointTensor,
     checkpoint_converter_fused_expert_target,
     checkpoint_converter_is_dim0_zero_pad,
@@ -71,7 +71,7 @@ from .convert_registry import GraphFiles, load_family_graphs
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
-    from ...checkpoint_tensor_loading import CheckpointTensorConverter
+    from ...checkpoint.convert import CheckpointTensorConverter
     from ..modules.module_configuration_base import OmniModuleConfig
 
 
@@ -578,7 +578,7 @@ def load_module_from_hf_source(
     on CPU first and is then dispatched by accelerate, so host memory must hold
     the module once. Assets are not bound here.
     """
-    from ...module_utils import init_empty_weights, load_model_weights
+    from ...checkpoint.weights import init_empty_weights, load_model_weights
 
     init_kwargs: dict[str, Any] = {}
     if torch_dtype is not None:

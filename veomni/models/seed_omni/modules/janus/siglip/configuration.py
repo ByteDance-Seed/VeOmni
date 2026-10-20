@@ -20,11 +20,15 @@ class JanusSiglipConfig(OmniModuleConfig):
     """Top-level config for the Janus SigLIP encoder + aligner."""
 
     model_type = "janus_siglip"
+    sub_configs = {"vision_config": JanusVisionConfig}
 
     def __init__(
         self,
         vision_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
-        self.vision_config = JanusVisionConfig(**vision_config) if vision_config else JanusVisionConfig()
+        if isinstance(vision_config, JanusVisionConfig):
+            self.vision_config = vision_config
+        else:
+            self.vision_config = JanusVisionConfig(**vision_config) if vision_config else JanusVisionConfig()
         super().__init__(**kwargs)

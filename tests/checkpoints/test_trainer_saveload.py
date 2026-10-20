@@ -1,7 +1,6 @@
 import copy
 import os
 import shutil
-import signal
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional
@@ -23,16 +22,16 @@ try:
 except Exception as _:
     from checkpoint_verification_utils import verify_dcp_to_hf_conversion
 
-from tests.tools.launch_utils import find_free_port
 from veomni.arguments import parse_args
 from veomni.checkpoint.layout import weights_dir
 from veomni.data import build_dummy_dataset
-from veomni.models.seed_omni.modules.qwen3.llm.configuration import Qwen3LlmConfig
-from veomni.models.seed_omni.modules.qwen3.llm.modeling import Qwen3Llm
+from veomni.models.seed_omni.modules.fake_model.fake_module_a.configuration import FakeModuleAConfig
+from veomni.models.seed_omni.modules.fake_model.fake_module_a.modeling import FakeModuleA
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
 from veomni.utils import helper
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_torch_device
 
 
 os.environ["NCCL_DEBUG"] = "OFF"
@@ -42,23 +41,6 @@ os.environ["NCCL_DEBUG"] = "OFF"
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 logger = helper.create_logger(__name__)
-
-
-def _run_bounded_process_group(command: list[str], timeout: float = 180.0) -> None:
-    process = subprocess.Popen(command, start_new_session=True)
-    try:
-        return_code = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
-        raise
-
-    if return_code != 0:
-        raise subprocess.CalledProcessError(return_code, command)
 
 
 def flatten_dict(d, parent_key="", sep="_"):
@@ -331,28 +313,20 @@ def test_trainer_save_hf_safetensor(ep_size: int):
     _run_trainer_save_hf_safetensor("qwen3_moe", ep_size)
 
 
+@pytest.mark.skipif(
+    not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) or get_torch_device().device_count() < 2,
+    reason="requires at least 2 accelerator devices",
+)
 def test_frozen_omni_module_resume_loads_hf_weights(tmp_path):
-    snapshot_dir = tmp_path / "frozen_llm"
+    from tests.tools.launch_utils import find_free_port, run_bounded_process_group
+
+    snapshot_dir = tmp_path / "frozen_module"
     output_dir = tmp_path / "output"
     resume_root = output_dir / "checkpoints" / "global_step_1"
     resume_root.mkdir(parents=True)
 
-    config = Qwen3LlmConfig(
-        text_config={
-            "vocab_size": 128,
-            "hidden_size": 64,
-            "intermediate_size": 128,
-            "num_hidden_layers": 1,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 16,
-            "max_position_embeddings": 128,
-            "tie_word_embeddings": False,
-            "use_cache": False,
-        },
-        freeze=True,
-    )
-    model = Qwen3Llm(config)
+    config = FakeModuleAConfig(hidden_size=64, freeze=True)
+    model = FakeModuleA(config)
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.fill_(0.125)
@@ -367,7 +341,7 @@ def test_frozen_omni_module_resume_loads_hf_weights(tmp_path):
         f"--master-port={find_free_port()}",
         "tests/checkpoints/omni_frozen_resume_runner.py",
         # `model.model_path` is the split-checkpoint ROOT; the runner resolves
-        # `frozen_llm` (the module name) as this module's subfolder under it.
+        # `frozen_module` (the module name) as this module's subfolder under it.
         "--model.model_path",
         str(tmp_path),
         "--model.ops_implementation.attn_implementation",
@@ -406,4 +380,4 @@ def test_frozen_omni_module_resume_loads_hf_weights(tmp_path):
         "--train.micro_batch_size",
         "1",
     ]
-    _run_bounded_process_group(command)
+    run_bounded_process_group(command)

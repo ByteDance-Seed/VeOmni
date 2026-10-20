@@ -6,6 +6,7 @@ family's native class works without this accelerated wrapper. Only the
 SP-aware training pre/forward/post hooks stay here.
 """
 
+from functools import partial
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -17,8 +18,8 @@ from veomni.distributed.sequence_parallel import (
     slice_input_tensor,
     sp_pad,
 )
-from veomni.ops.kernels.cross_entropy import ForCausalLMLoss
-from veomni.ops.kernels.cross_entropy.eager import eager_cross_entropy
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.ops import VeomniOp
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.tensor_utils import naflatten, unflatten
 
@@ -271,7 +272,6 @@ class TrainingMixin(TrainingModuleMixin):
                     vocab_size=self.config.vocab_size,
                     num_items_in_batch=num_supervised_tokens.clamp(min=1),
                     loss_reduction_group=fsdp_group,
-                    cross_entropy_fn=eager_cross_entropy,
                 )
         else:
             logits = self._project(hidden_states)
@@ -282,7 +282,6 @@ class TrainingMixin(TrainingModuleMixin):
                 vocab_size=self.config.vocab_size,
                 num_items_in_batch=num_supervised_tokens.clamp(min=1),
                 loss_reduction_group=fsdp_group,
-                cross_entropy_fn=eager_cross_entropy,
             )
 
         return {
@@ -292,6 +291,9 @@ class TrainingMixin(TrainingModuleMixin):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        ce_impl = self.config.ops_implementation.get("cross_entropy_loss_implementation", "eager")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", ce_impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self._conversation_carrier: Any = None
         self._encode_batch_shape: torch.LongTensor | None = None
         # Active sample's packed token count. Under SP the encode output-gather hook

@@ -198,10 +198,11 @@ surfaced (and fixed) a few omni-specific interactions:
   but then `ep_size` is ignored, so set only one of the two. (The non-`ep` extra-parallel
   dims such as the text encoder's `emb` still use the explicit `extra_parallel_*` lists,
   since `__post_init__` only appends `ep`.)
-- **Fused MoE kernel** is bound because `qwen3_moe/llm/modeling.py` re-exports the
-  patched module's OpSlots into the omni module namespace (so
-  `build_foundation_model`'s `_bind_veomni_ops` finds them); the EP-aware kernel
-  reads `get_parallel_state().ep_group`, resolved per-node via `module_context`.
+- **Fused MoE kernel** is bound as an instance-local `VeomniOp("moe_experts", ...)`
+  on each `Qwen3MoeSparseMoeBlock` during `Qwen3MoeLlm.__init__` (scoped to the
+  module's own `OmniModuleConfig.ops_implementation` via `PretrainedOmniModule`);
+  the EP-aware kernel reads `get_parallel_state().ep_group`, resolved per-node via
+  `module_context`.
 - **Gradient checkpointing** recompute is re-scoped to the module's `ParallelState`
   (`ModuleRuntime._recompute_context`, carried by the recompute policy) so EP stays enabled
   during backward recompute.

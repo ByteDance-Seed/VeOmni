@@ -41,7 +41,7 @@ three orders of magnitude wrong.
 import pytest
 import torch
 
-from veomni.ops.kernels.deepseek_v4 import act_quant, fp4_act_quant, fp4_gemm, fp8_gemm, fp8_weight_quant
+from veomni.ops.qat import act_quant, fp4_act_quant, fp4_gemm, fp8_gemm, fp8_weight_quant
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
 
 

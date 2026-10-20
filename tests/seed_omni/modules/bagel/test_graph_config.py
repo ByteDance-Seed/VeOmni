@@ -31,9 +31,7 @@ def test_bagel_train_yaml_loads_with_v2_module_names():
     assert "bagel_flow_connector.decode_velocity" in endpoints
     assert "end" in endpoints
     runtime_modules = load_module_runtime_args(modules_path=bagel_cfg_dir() / "train/modules_train.yaml")
-    assert runtime_modules["bagel_qwen2_mot"].ops_implementation.attn_implementation == (
-        "veomni_flex_attention_with_sp"
-    )
+    assert runtime_modules["bagel_qwen2_mot"].ops_implementation.attn_implementation == ("veomni_flex_attention")
 
 
 def test_bagel_train_graph_fan_in_execution_order():
@@ -104,9 +102,7 @@ def test_bagel_train_plus_infer_merges_generation_graph(infer_graph: str):
     }
     assert cfg.generation_graph is not None
     runtime_modules = load_module_runtime_args(modules_path=bagel_cfg_dir() / "train/modules_train.yaml")
-    assert runtime_modules["bagel_qwen2_mot"].ops_implementation.attn_implementation == (
-        "veomni_flex_attention_with_sp"
-    )
+    assert runtime_modules["bagel_qwen2_mot"].ops_implementation.attn_implementation == ("veomni_flex_attention")
     assert cfg.generation_graph["initial"] == "prompt_encode"
     assert "done" not in cfg.generation_graph["states"]
     assert any(

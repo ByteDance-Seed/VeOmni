@@ -135,6 +135,26 @@ jobs:
           uv pip install --python .venv/bin/python ninja
           uv run --frozen ninja --version
           uv run --frozen python -c "import cann_ops_transformer"
+      - name: Install triton-ascend
+        # The Ascend Triton kernels (vendored GatedDeltaNet, MoE clamped SwiGLU)
+        # need triton-ascend, which is deliberately not in the lockfile. The image
+        # ships it in its own build-time venv, but the steps above create a fresh
+        # one in the workspace, so install it here. `uv sync` prunes anything
+        # absent from the lockfile; `uv run --frozen` does not, so this survives
+        # the test steps below — but the later `Sync dependencies [diffusers]`
+        # step does prune it again, which is fine since the Wan DiT test after it
+        # uses no Triton kernel (unlike ninja, which that step reinstalls).
+        #
+        # Community triton and triton-ascend both ship triton/_C/libtriton.so and
+        # only triton-ascend's carries the Ascend backend, so whoever writes that
+        # path last wins. Install in two steps to force the order (a single
+        # parallel uv transaction does not guarantee it) and verify the patch
+        # stuck. Mirrors docker/ascend/Dockerfile.ascend_9.1.0_*_910b.x86.
+        run: |
+          uv pip install --python .venv/bin/python triton==3.2.0
+          uv pip install --python .venv/bin/python triton-ascend==3.2.1 \
+            --index=https://mirrors.huaweicloud.com/ascend/repos/pypi
+          uv run --frozen python -c "from triton._C.libtriton import ascend"
       - name: Check final pip list
         run: |
           uv pip list

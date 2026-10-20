@@ -12,65 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for OmniTrainer explicit step contexts (no GPU / distributed)."""
+"""Unit tests for OmniTrainer step contexts and OmniModelRuntime forwarding (no GPU / distributed)."""
 
-from collections import OrderedDict
+import os
+import subprocess
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import psutil
 import pytest
 
+from tests.tools.launch_utils import find_free_port, run_bounded_process_group
 from veomni.distributed.offloading import build_activation_offloading_context, custom_save_on_cpu
-from veomni.trainer.omni.omni_trainer import cascade_module_reshard
-
-
-class _FakeModuleRuntime:
-    def __init__(self) -> None:
-        self.reshard_calls: list[bool] = []
-
-    def _model_reshard(self, reshard: bool) -> None:
-        self.reshard_calls.append(reshard)
-
-
-def _module_runtimes(n: int = 2) -> OrderedDict[str, _FakeModuleRuntime]:
-    return OrderedDict((f"m{i}", _FakeModuleRuntime()) for i in range(n))
-
-
-def test_cascade_module_reshard_noop_without_accumulation():
-    runtimes = _module_runtimes()
-    cascade_module_reshard(runtimes, micro_step=0, num_micro_steps=1)
-    for runtime in runtimes.values():
-        assert runtime.reshard_calls == []
-
-
-def test_cascade_module_reshard_noop_on_middle_step():
-    runtimes = _module_runtimes()
-    cascade_module_reshard(runtimes, micro_step=1, num_micro_steps=3)
-    for runtime in runtimes.values():
-        assert runtime.reshard_calls == []
-
-
-@pytest.mark.parametrize(
-    ("micro_step", "expected"),
-    [
-        (0, False),
-        (2, True),
-    ],
-)
-def test_cascade_module_reshard_first_and_last(micro_step, expected):
-    runtimes = _module_runtimes(n=2)
-    cascade_module_reshard(runtimes, micro_step=micro_step, num_micro_steps=3)
-    for runtime in runtimes.values():
-        assert runtime.reshard_calls == [expected]
 
 
 def test_build_activation_offloading_disabled():
+    """Activation offloading returns nullcontext pair when disabled."""
     fwd, bwd = build_activation_offloading_context(enable_activation=False, enable_gradient_checkpointing=False)
     assert isinstance(fwd, nullcontext)
     assert isinstance(bwd, nullcontext)
 
 
 def test_build_activation_offloading_enabled():
+    """Activation offloading wraps forward in custom_save_on_cpu when enabled."""
     fwd, bwd = build_activation_offloading_context(
         enable_activation=True,
         enable_gradient_checkpointing=False,
@@ -81,7 +46,7 @@ def test_build_activation_offloading_enabled():
 
 
 def test_build_training_context_offload_flags():
-    """Smoke: _build_training_context wires nullcontext when offload is disabled."""
+    """_build_training_context wires nullcontext when offload is disabled."""
     from veomni.trainer.omni.omni_trainer import OmniTrainer
 
     trainer = object.__new__(OmniTrainer)
@@ -110,3 +75,32 @@ def test_omni_model_runtime_forwards_composed_model_surface():
     assert runtime.modules_dict == {"a": "module-a"}
     with pytest.raises(AttributeError):
         _ = runtime.not_a_model_attribute
+
+
+def test_run_bounded_process_group_kills_sigterm_ignoring_torchrun_workers(tmp_path):
+    """Workers in separate sessions that ignore SIGTERM must not survive timeout cleanup."""
+    pid_file = tmp_path / "worker.pid"
+    worker_script = tmp_path / "sigterm_ignoring_worker.py"
+    worker_script.write_text(
+        "import os, pathlib, signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(300)\n",
+        encoding="utf-8",
+    )
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nnodes=1",
+        "--nproc_per_node=1",
+        f"--master_port={find_free_port()}",
+        str(worker_script),
+    ]
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_bounded_process_group(cmd, timeout=2.0, grace_timeout=0.5)
+
+    assert pid_file.is_file(), "worker did not start before timeout"
+    worker_pid = int(pid_file.read_text(encoding="utf-8").strip())
+    assert not psutil.pid_exists(worker_pid) or psutil.Process(worker_pid).status() == psutil.STATUS_ZOMBIE
+    assert not os.path.exists(f"/proc/{worker_pid}") or not psutil.pid_exists(worker_pid)

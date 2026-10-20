@@ -8,7 +8,7 @@ from safetensors import safe_open
 from transformers.utils import SAFE_WEIGHTS_NAME
 
 from tests.seed_omni.modules.bagel.helpers import config_cls, tiny_bagel_qwen2_cfg
-from veomni.models.module_utils import load_model_weights
+from veomni.models.checkpoint.weights import load_model_weights
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import accelerated
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.checkpoint_conversion import (
     BagelQwen2MoTCheckpointTensorConverter,
@@ -30,7 +30,7 @@ def _flex_config() -> BagelQwen2MoTConfig:
         num_attention_heads=4,
         num_key_value_heads=1,
         max_position_embeddings=64,
-        attn_implementation="veomni_flex_attention_with_sp",
+        attn_implementation="veomni_flex_attention",
     )
 
 
@@ -159,3 +159,64 @@ def test_accelerated_qkv_preserves_hf_checkpoint_schema_and_loaders(tmp_path) ->
         torch.testing.assert_close(getattr(hf_loaded.model.layers[0].self_attn, name).bias, expected.bias)
         torch.testing.assert_close(getattr(veomni_loaded.model.layers[0].self_attn, name).weight, expected.weight)
         torch.testing.assert_close(getattr(veomni_loaded.model.layers[0].self_attn, name).bias, expected.bias)
+
+
+def test_bagel_qwen2_mot_selects_module_level_ops_without_global_ops_config() -> None:
+    cfg = BagelQwen2MoTConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        max_position_embeddings=64,
+        ops_implementation={
+            "attn_implementation": "flex_attention",
+            "rms_norm_implementation": "eager",
+            "swiglu_mlp_implementation": "eager",
+            "rotary_pos_emb_implementation": "eager",
+        },
+    )
+    model = accelerated.BagelQwen2MoTAccelerated(cfg)
+
+    layer = model.model.layers[0]
+    assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
+    assert layer.mlp.veomni_swiglu_mlp.impl == "eager"
+    assert layer.self_attn.veomni_rope.impl == "eager"
+    assert layer.self_attn.veomni_attn is not None
+    assert layer.self_attn.veomni_attn.impl == "veomni_flex_attention"
+    assert layer.self_attn.veomni_denoise_attn.impl == "veomni_flash_attention_2"
+
+
+def test_bagel_siglip_navit_selects_module_level_ops_and_forwards() -> None:
+    from veomni.models.seed_omni.modules.bagel.siglip_navit.configuration import BagelSiglipNavitConfig
+    from veomni.models.seed_omni.modules.bagel.siglip_navit.modeling import BagelSiglipNavit
+
+    cfg = BagelSiglipNavitConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        image_size=28,
+        patch_size=14,
+        ops_implementation={
+            "attn_implementation": "sdpa",
+            "rotary_pos_emb_vision_implementation": "eager",
+        },
+    )
+    model = BagelSiglipNavit(cfg).eval()
+    attn = model.vision_model.encoder.layers[0].self_attn
+    assert attn.veomni_attn.impl == "sdpa"
+    assert attn.veomni_rope.impl == "eager"
+
+    packed_patches = torch.randn(4, 3 * 14 * 14)
+    position_ids = torch.arange(4, dtype=torch.long)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+    out = model.vision_model(
+        patchified_pixel_values=packed_patches,
+        patchified_position_ids=position_ids,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=4,
+    )
+    assert out.shape == (4, 32)
+    assert torch.isfinite(out).all()

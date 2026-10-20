@@ -12,25 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3Moe NPU/SP patched modeling generation.
+Patch configuration for Qwen3Moe NPU VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models.transformers.qwen3_moe.qwen3_moe_npu_patch_gen_config -o veomni/models/transformers/qwen3_moe/generated --diff
-
-This keeps only the needed v5 patches:
-1. NPU replacements for rotary/rms_norm/mlp.
-2. Fused loss path in Qwen3MoeForCausalLM.forward.
-3. Register get_parallel_plan on Qwen3MoeForCausalLM.
 """
 
 from veomni.models.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config import (
     PatchedQwen3MoeExperts,
-    apply_rotary_pos_emb_patched,
+    qwen3_moe_attention_forward_patched,
+    qwen3_moe_for_question_answering_init_patched,
+    qwen3_moe_for_sequence_classification_forward_patched,
+    qwen3_moe_for_sequence_classification_init_patched,
+    qwen3_moe_for_token_classification_init_patched,
     qwen3_moe_forcausallm_forward_patched,
+    qwen3_moe_forcausallm_init_patched,
     qwen3_moe_get_parallel_plan_patched,
     qwen3_moe_mlp_forward_patched,
+    qwen3_moe_mlp_init_patched,
     qwen3_moe_model_forward_patched,
     qwen3_moe_rmsnorm_forward_patched,
+    qwen3_moe_rmsnorm_init_patched,
     qwen3_moe_topk_router_forward_patched,
 )
 from veomni.models.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config import (
@@ -42,7 +44,7 @@ from veomni.patchgen.patch_spec import PatchConfig
 config = PatchConfig(
     source_module="transformers.models.qwen3_moe.modeling_qwen3_moe",
     target_file="patched_modeling_qwen3_moe_npu.py",
-    description="Qwen3Moe with NPU replacements and VeOmni SP/fused loss patches",
+    description="Qwen3Moe with VeOmni patches and VeomniOp NPU replacements",
 )
 
 # Mirror additional imports + post-import helpers from the GPU config so the
@@ -55,31 +57,35 @@ config.helpers.extend(gpu_config.helpers)
 # now superseded by ``Qwen3MoeCausalLMOutputWithLogProbs`` for the FSDP2-safe
 # pre-backward unshard hook on ``lm_head``).
 config.drop_imported_names.update(gpu_config.drop_imported_names)
+config.exclude.extend(gpu_config.exclude)
 
 
-# ── RMSNorm (OpSlot guard, functional NPU kernel) ──────────────────────────
-
-
+config.override_method(
+    "Qwen3MoeRMSNorm.__init__",
+    replacement=qwen3_moe_rmsnorm_init_patched,
+    description="Construct a local rms_norm VeomniOp",
+)
 config.override_method(
     "Qwen3MoeRMSNorm.forward",
     replacement=qwen3_moe_rmsnorm_forward_patched,
-    description="OpSlot guard for NPU fused RMSNorm (standard formulation)",
+    description="Always call the local rms_norm VeomniOp",
 )
-
-# ── SwiGLU MLP (OpSlot guard, functional NPU kernel) ───────────────────────
-
-
+config.override_method(
+    "Qwen3MoeMLP.__init__",
+    replacement=qwen3_moe_mlp_init_patched,
+    description="Construct a local swiglu_mlp VeomniOp",
+)
 config.override_method(
     "Qwen3MoeMLP.forward",
     replacement=qwen3_moe_mlp_forward_patched,
-    description="OpSlot guard for NPU fused SwiGLU MLP",
+    description="Always call the local swiglu_mlp VeomniOp",
 )
 
 
 config.replace_class(
     "Qwen3MoeExperts",
     replacement=PatchedQwen3MoeExperts,
-    description="Use v5 gate_up_proj expert weights and explicit VeOmni fused MoE path",
+    description="Always call moe_experts VeomniOp on v5 gate_up_proj weights",
 )
 
 
@@ -94,16 +100,6 @@ config.override_method(
 )
 
 
-config.replace_function(
-    "apply_rotary_pos_emb",
-    replacement=apply_rotary_pos_emb_patched,
-    description="OpSlot guard for NPU fused RoPE",
-)
-
-# Dummy reference resolved at codegen time from the generated module.
-rotate_half = None  # noqa: E305
-
-
 config.override_method(
     "Qwen3MoeModel.forward",
     replacement=qwen3_moe_model_forward_patched,
@@ -112,9 +108,35 @@ config.override_method(
 
 
 config.override_method(
+    "Qwen3MoeForCausalLM.__init__",
+    replacement=qwen3_moe_forcausallm_init_patched,
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
+)
+config.override_method(
     "Qwen3MoeForCausalLM.forward",
     replacement=qwen3_moe_forcausallm_forward_patched,
-    description="Support fused cross entropy path in Qwen3MoeForCausalLM.forward",
+    description="Always call ForCausalLMLoss and load_balancing_loss VeomniOps",
+)
+
+config.override_method(
+    "Qwen3MoeForSequenceClassification.__init__",
+    replacement=qwen3_moe_for_sequence_classification_init_patched,
+    description="Construct the local base model and bind sequence-classification loss",
+)
+config.override_method(
+    "Qwen3MoeForSequenceClassification.forward",
+    replacement=qwen3_moe_for_sequence_classification_forward_patched,
+    description="Always call the local sequence-classification loss",
+)
+config.override_method(
+    "Qwen3MoeForTokenClassification.__init__",
+    replacement=qwen3_moe_for_token_classification_init_patched,
+    description="Construct the local base model for token classification",
+)
+config.override_method(
+    "Qwen3MoeForQuestionAnswering.__init__",
+    replacement=qwen3_moe_for_question_answering_init_patched,
+    description="Construct the local base model for question answering",
 )
 
 
@@ -122,4 +144,11 @@ config.override_method(
     "Qwen3MoeForCausalLM.get_parallel_plan",
     replacement=qwen3_moe_get_parallel_plan_patched,
     description="Register Qwen3Moe expert parallel plan for v5 generated modeling",
+)
+
+config.adopt_init_modifications(gpu_config)
+config.override_method(
+    "Qwen3MoeAttention.forward",
+    replacement=qwen3_moe_attention_forward_patched,
+    description="Always call the local rope and attention VeomniOps",
 )
