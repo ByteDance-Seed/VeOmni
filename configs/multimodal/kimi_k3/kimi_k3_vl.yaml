@@ -10,14 +10,19 @@ model:
   # Kimi K3 tokenizer: HF-format dir or hub repo id
   tokenizer_path: /path/to/kimi_k3_hf
   ops_implementation:
-    # GPU stack: flash-attn SP wrapper, liger rms norm, chunked CE.
-    # The Kimi-specific fused kernels (chunk_kda AscendC, situ fused MoE,
-    # situ_and_mul) are NPU-only; on GPU they fall back to the pure-PyTorch
-    # eager paths, and SituGLU experts always run the eager expert loop
-    # (moe_implementation therefore has no effect for this model on GPU).
+    # GPU baseline stack: the official flash-attn FA2 kernel through the
+    # VeOmni SP adapter (same vendor kernel; the adapter only adds the
+    # sequence-parallel hooks), pure-PyTorch eager RMSNorm / CE, and the
+    # official fla chunk_kda. No liger / chunk_loss overrides, so the run
+    # measures the official-default baseline the NPU fused stack compares
+    # against. The Kimi-specific fused kernels (chunk_kda AscendC, situ
+    # fused MoE, situ_and_mul) are NPU-only; on GPU everything else runs
+    # the official modeling / pure-PyTorch eager paths, and SituGLU experts
+    # always run the eager expert loop (moe_implementation therefore has no
+    # effect for this model on GPU).
     attn_implementation: veomni_flash_attention_2
-    rms_norm_implementation: liger_kernel
-    cross_entropy_loss_implementation: chunk_loss
+    rms_norm_implementation: eager
+    cross_entropy_loss_implementation: eager
     chunk_kda_implementation: eager
     situ_and_mul_implementation: eager
   optimizer:
