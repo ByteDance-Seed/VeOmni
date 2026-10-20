@@ -2502,7 +2502,7 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1922,33 +3058,150 @@
+@@ -1922,33 +3058,145 @@
          Returns:
              `torch.Tensor`: hidden_states.
          """
@@ -2643,15 +2643,10 @@
 +        # `**kwargs` to every block; the patched Qwen4ExpVisionAttention.forward
 +        # picks it up via `vision_max_seqlen` and falls back to the original
 +        # recompute when the key is absent (so non-VeOmni callers keep working).
-+        # Gate is two-pronged:
-+        #   (a) `_VEOMNI_VISION_ATTENTION_PATCHED` — set per generated file. True
-+        #       when Qwen4ExpVisionAttention.forward is patched to consume
-+        #       ``vision_max_seqlen``. GPU and NPU both register that consumer.
-+        #   (b) `is_flash_attention_requested(self.config)` — only FA's
-+        #       `flash_attn_varlen_func` benefits from the int hand-off; eager
-+        #       and sdpa paths in the consumer pop+discard the kwarg, so the
-+        #       host sync would be wasted.
-+        if _VEOMNI_VISION_ATTENTION_PATCHED and is_flash_attention_requested(self.config):
++        # Gate: `_VEOMNI_VISION_ATTENTION_PATCHED` is set per generated file when
++        # Qwen4ExpVisionAttention.forward is patched to consume ``vision_max_seqlen``.
++        # GPU and NPU both register that consumer.
++        if _VEOMNI_VISION_ATTENTION_PATCHED:
 +            if precomputed_max_seqlen is not None:
 +                # Collator-side max already accounts for sp-pad; use as-is.
 +                kwargs["vision_max_seqlen"] = precomputed_max_seqlen
@@ -2668,7 +2663,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -1959,6 +3212,39 @@
+@@ -1959,6 +3207,39 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -2708,7 +2703,7 @@
 
 
  @auto_docstring
-@@ -1969,12 +3255,17 @@
+@@ -1969,12 +3250,17 @@
      _no_split_modules = ["Qwen4ExpDecoderLayer", "Qwen4ExpVisionBlock"]
 
      def __init__(self, config):
@@ -2731,7 +2726,7 @@
          self.post_init()
 
      def get_vision_position_ids(
-@@ -2260,53 +3551,226 @@
+@@ -2260,53 +3546,226 @@
          mm_token_type_ids: torch.IntTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen4ExpModelOutputWithPast:
@@ -2989,7 +2984,7 @@
          outputs = self.language_model(
              input_ids=None,
              position_ids=position_ids,
-@@ -2316,11 +3780,7 @@
+@@ -2316,11 +3775,7 @@
              ple_input_ids=ple_input_ids,
              **kwargs,
          )
@@ -3002,7 +2997,7 @@
 
 
  @auto_docstring
-@@ -2337,6 +3797,27 @@
+@@ -2337,6 +3792,27 @@
      aux_loss: torch.FloatTensor | None = None
 
 
@@ -3030,7 +3025,7 @@
  @auto_docstring
  class Qwen4ExpForConditionalGeneration(Qwen4ExpPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
-@@ -2346,11 +3827,23 @@
+@@ -2346,11 +3822,23 @@
 
      _fsdp_plan = {"lm_head": "keep_full_weight"}
 
@@ -3055,7 +3050,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -2396,47 +3889,10 @@
+@@ -2396,47 +3884,10 @@
          mm_token_type_ids: torch.IntTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -3107,7 +3102,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -2448,33 +3904,64 @@
+@@ -2448,33 +3899,64 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -3187,7 +3182,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -2483,6 +3970,7 @@
+@@ -2483,6 +3965,7 @@
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
              router_logits=outputs.router_logits,
@@ -3195,7 +3190,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -2696,6 +4184,32 @@
+@@ -2696,6 +4179,32 @@
          }
          return causal_mask_mapping
 

@@ -18,8 +18,7 @@ Covers the thinker training path (text + vision + audio, dense — no MoE):
   - PreTrained.get_rope_index with per-video use_audio_in_video derived from
     audio_seqlens (interleaved video-with-audio / video-without-audio in the
     same batch) and tolerant of attention_mask=None
-  - Vision attention dispatch via VARLEN_ATTENTION_TYPES (covers the
-    veomni_flash_attention_* custom names)
+  - Vision and audio attention dispatch via self.veomni_attn
   - Vision encoder forward with SP gather/slice (full + windowed cu_seqlens
     extended for the SP pad tail) and a new dummy_forward for FSDP rank
     asymmetry

@@ -184,7 +184,6 @@ logger = logging.get_logger(__name__)
 all_to_all = None
 
 # Names resolved at codegen time from generated imports.
-is_flash_attention_requested = None
 get_max_seqlen = None
 
 
