@@ -16,7 +16,15 @@ def _check_dummy_vision(monkeypatch, backend, sp_size, device="cpu", dtype=torch
     module = importlib.import_module(
         f"veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_{backend}"
     )
-    state = SimpleNamespace(sp_enabled=sp_size > 1, sp_size=sp_size, sp_rank=0)
+    state = SimpleNamespace(
+        sp_enabled=sp_size > 1,
+        sp_size=sp_size,
+        sp_rank=0,
+        ulysses_enabled=sp_size > 1,
+        ulysses_size=sp_size,
+        ulysses_rank=0,
+        ulysses_group=None,
+    )
     monkeypatch.setattr(module, "get_parallel_state", lambda: state)
     # ``sp_pad_and_slice`` lives in this module and resolves the state through
     # its own import, so patching only the generated modeling module would make
@@ -43,12 +51,10 @@ def _check_dummy_vision(monkeypatch, backend, sp_size, device="cpu", dtype=torch
         "cu_seqlens": torch.tensor([0, local_count], dtype=torch.int32, device="cpu"),
         "max_seqlen": local_count,
     }
-    expected = reference(
-        pixels,
-        grid,
-        return_dict=True,
-        vit_metadata=vit_metadata,
-    )
+    if sp_size > 1:
+        with pytest.raises(NotImplementedError, match="requires FlashAttention"):
+            reference(pixels, grid, return_dict=True, vit_metadata=vit_metadata)
+    expected = reference(pixels, grid, return_dict=True, vit_metadata=vit_metadata, vision_dummy=True)
     actual = model.dummy_forward().pooler_output
     expected = expected.pooler_output
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
