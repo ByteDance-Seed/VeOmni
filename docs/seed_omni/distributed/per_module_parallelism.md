@@ -22,6 +22,7 @@ A module's choices live in its block of the `modules` YAML, under
 | Eager (inference only) | `fsdp_config.fsdp_mode: eager` | A single-process replica with no mesh; rejected for training |
 | Embedding parallel | `extra_parallel_names: ["emb"]`, `extra_parallel_sizes: [N]`, `extra_parallel_placement_innermost: [false]` | A vocabulary-sharded text encoder; see [Sharded Embedding](../../key_features/sharded_embedding.md) |
 | Expert parallel | `ep_size: N`, `ep_outside: false` (shorthand for an `ep` extra parallel group) | A MoE backbone |
+| Sequence / Context parallel | `ulysses_size: U`, `cp_size: C` (must satisfy `U * C = W / dp_size` across all modules) | Ulysses SP on encoders/ViT, CP or `cp * sp` on long-context backbones |
 | Gradient checkpointing | `gradient_checkpointing.enable: false` | Off for cheap modules (text encoders, VAE, flow connector) |
 
 Two per-module properties are not accelerator settings but change how the
@@ -45,10 +46,14 @@ module is wrapped and saved:
   `base` parallel state derived from `model.accelerator`. Every module consumes
   the same micro-batch, so the data-parallel layout of the loader is the job's,
   not any module's.
-- **The SP size.** `model.accelerator.ulysses_size` is inherited by every
-  module and must not be overridden per module. The reason is the shared data
-  stream above; see
-  [Why one SP size](sequence_parallel.md#2-why-one-sp-size-for-the-whole-graph).
+- **The `dp_size` (and unified `sp_size = cp_size * ulysses_size`).** Every
+  distributed module and the top-level `model.accelerator` must resolve to the
+  same `dp_size = world_size // (cp_size * ulysses_size)`. Within that shared
+  `sp_size`, each module may independently choose Ulysses SP (`ulysses_size`),
+  Context Parallelism (`cp_size`), or hybrid `cp_size * ulysses_size`.
+  `build_omni_model_runtime_args` validates that all distributed modules and
+  `model.accelerator` share the same `dp_size`;
+  see [Sequence & Context Parallelism](sequence_parallel.md#2-why-all-modules-share-one-dp_size-and-one-sp_size--w--dp_size).
 - **The step.** One `loss.backward()` runs over the whole graph, followed by
   one optimizer step per module; gradient accumulation and the global batch are
   job-level settings.
