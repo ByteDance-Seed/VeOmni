@@ -267,6 +267,71 @@ def test_production_ngram_history_matches_independent_samples():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_production_packed_ngram_uses_previous_rank_halo_under_sp():
+    from types import MethodType, SimpleNamespace
+
+    ids = torch.tensor([[2, 4, 5, 0, 7, 8, 9, 3, 1, 2, 3, 4]])
+    bounds = torch.tensor([0, 5, ids.shape[-1]])
+    local_length = ids.shape[-1] // 2
+    context_len = 2
+    local_tails = [
+        ids[:, start + local_length - context_len : start + local_length]
+        for start in range(0, ids.shape[-1], local_length)
+    ]
+
+    def all_gather(outputs, _tensor, group=None):
+        assert len(outputs) == len(local_tails)
+        for output, tail in zip(outputs, local_tails):
+            output.copy_(tail)
+
+    def make_embedding():
+        embedding = SimpleNamespace(
+            eos_token_id=0,
+            context_len=context_len,
+            ngram_size=3,
+            heads_per_ngram=2,
+            layer_multipliers=torch.tensor([31, 53, 71]),
+            ngram_heads_vocab_sizes=torch.tensor([101, 103, 107, 109]),
+            ngram_heads_offsets=torch.tensor([0, 101, 204, 311]),
+            rows_per_checkpoint_shard=1000,
+            _distributed_lookup=lambda shards, rows, output_dtype=None: rows[:, None].float(),
+        )
+        embedding._shift_right_ignore_eos = MethodType(
+            production_method("_shift_right_ignore_eos", "PatchedQwen4ExpTextNGramEmbedding"), embedding
+        )
+        return embedding
+
+    embedding = make_embedding()
+    forward = production_method("forward", "PatchedQwen4ExpTextNGramEmbedding")
+    expected = torch.cat(
+        [forward(embedding, ids[:, a:b], None).view(1, b - a, -1) for a, b in zip(bounds, bounds[1:])],
+        1,
+    )
+
+    outputs = []
+    for rank in range(2):
+        parallel_state = SimpleNamespace(
+            cp_enabled=True,
+            cp_group=object(),
+            cp_rank=rank,
+            cp_size=2,
+            ulysses_enabled=False,
+        )
+        sp_forward = production_method(
+            "forward",
+            "PatchedQwen4ExpTextNGramEmbedding",
+            extra_namespace={
+                "dist": SimpleNamespace(all_gather=all_gather),
+                "get_parallel_state": lambda state=parallel_state: state,
+            },
+        )
+        local_ids = ids[:, rank * local_length : (rank + 1) * local_length]
+        positions = packed_ple.local_packed_positions(bounds, 1, local_length, rank, 2)
+        outputs.append(sp_forward(embedding, local_ids, None, packed_positions=positions).view(1, local_length, -1))
+
+    torch.testing.assert_close(torch.cat(outputs, 1), expected, rtol=0, atol=0)
+
+
 def test_production_text_model_builds_packed_ple_metadata_once():
     from types import SimpleNamespace
 

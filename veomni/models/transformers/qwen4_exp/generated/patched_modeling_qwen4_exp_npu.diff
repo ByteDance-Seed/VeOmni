@@ -1699,7 +1699,7 @@
 +        sp_enabled, sp_group, sp_rank, sp_size = _qwen4_exp_sequence_parallel_state(parallel_state)
 +        if sp_enabled and past_key_values is not None:
 +            raise NotImplementedError("Qwen4-Exp PLE n-gram history does not support cache state under Ulysses/CP.")
-+        if sp_enabled and self.context_len > 0 and packed_positions is None:
++        if sp_enabled and self.context_len > 0:
 +            if input_ids.shape[1] < self.context_len:
 +                raise ValueError(
 +                    f"The local Ulysses/CP sequence length ({input_ids.shape[1]}) must be at least the PLE "

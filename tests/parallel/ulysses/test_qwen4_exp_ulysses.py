@@ -219,11 +219,21 @@ def _run_ple_halo_equivalence(packed: bool = False, parallel_mode: str = "ulysse
         local_slice = slice(rank * local_seq_len, (rank + 1) * local_seq_len)
         local_ids = full_ids[:, local_slice].contiguous()
 
+        boundaries = [0, local_seq_len - 1, seq_len] if packed else None
+        cu_seq_lens = torch.tensor(boundaries, dtype=torch.int32, device=device) if boundaries is not None else None
         with use_parallel_state(dp_state):
-            expected_embeddings = ple.ple_embedding(full_ids, past_key_values=None).detach()
+            expected_embeddings = ple.ple_embedding(
+                full_ids,
+                past_key_values=None,
+                cu_seq_lens_q=cu_seq_lens,
+            ).detach()
 
         with use_parallel_state(sp_state):
-            actual_embeddings = ple.ple_embedding(local_ids, past_key_values=None).detach()
+            actual_embeddings = ple.ple_embedding(
+                local_ids,
+                past_key_values=None,
+                cu_seq_lens_q=cu_seq_lens,
+            ).detach()
         torch.testing.assert_close(_gather_sequence(actual_embeddings), expected_embeddings)
 
         torch.manual_seed(29)
@@ -234,8 +244,6 @@ def _run_ple_halo_equivalence(packed: bool = False, parallel_mode: str = "ulysse
             device=device,
             requires_grad=True,
         )
-        boundaries = [0, local_seq_len - 1, seq_len] if packed else None
-        cu_seq_lens = torch.tensor(boundaries, dtype=torch.int32, device=device) if boundaries is not None else None
         with use_parallel_state(dp_state):
             expected_output = ple._short_conv(
                 full_hidden,
