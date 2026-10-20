@@ -37,8 +37,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from ._moe_fused_weight_map import PER_EXPERT_SPLIT_TO_FUSED_PATTERN
-from .checkpoint_tensor_loading import ConvertedCheckpointTensor
+from .checkpoint.convert import ConvertedCheckpointTensor
+from .checkpoint.moe_map import PER_EXPERT_SPLIT_TO_FUSED_PATTERN
 
 
 class PerExpertFusedCheckpointTensorConverter:

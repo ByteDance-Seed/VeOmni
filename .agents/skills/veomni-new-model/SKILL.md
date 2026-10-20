@@ -118,6 +118,14 @@ Extend a loader only when existing contracts cannot express model construction.
 Keep backend-specific imports isolated so one backend does not break another's
 import path.
 
+Model/config registries live in `veomni/models/registry.py`; use the public
+`veomni.models` builders for construction. When binding optimized operations,
+construct instance-local `VeomniOp` handles from the installed ops selection.
+Keep model-specific input normalization and loss policy in modeling, and keep
+registered op contracts tensor-level. Do not introduce mutable module-level
+dispatch callables. Follow the current peer model and op documentation rather
+than restoring a removed dispatch API.
+
 First obtain a working eager/native path on representative small inputs.
 Introduce fused kernels or distributed execution only after this reference works.
 FSDP2 wrapping is generic in `build_parallelize_model()`; `parallel_plan.py`

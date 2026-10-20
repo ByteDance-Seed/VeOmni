@@ -1,4 +1,4 @@
-from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from ...registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
 @MODEL_CONFIG_REGISTRY.register("HunyuanVideo15Model")

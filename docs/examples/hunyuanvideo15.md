@@ -135,7 +135,7 @@ TF32 in the test only to compare the same arithmetic precision:
 PYTHONPATH=. python -m pytest -q \
   tests/models/test_hunyuanvideo15.py \
   tests/data/test_hunyuanvideo15_data.py \
-  tests/models/test_model_registry.py -k hunyuanvideo15
+  tests/models/base/test_auto_registry.py -k hunyuanvideo15
 make quality
 ```
 
@@ -178,6 +178,14 @@ errors were 1.70e-4 in fp32 and 3.91e-3 in bf16. The earlier A100 review-fix run
 measured 8.34e-7 in fp32 and 3.91e-3 in bf16. Both precisions on each backend
 produced decreasing losses over two AdamW updates. The CPU-only model suite
 previously passed 20 tests; its accelerator and opt-in cases skipped.
+
+After merging upstream `3089331` on 2026-10-20, the focused suite passed
+32 tests on NPU (two opt-in cases skipped) and 26 on CPU (eight accelerator
+or opt-in cases skipped). Registration now uses `veomni.models.registry`, and
+the registry check lives in `tests/models/base/test_auto_registry.py`.
+The shared registry, gradient-checkpointing, DiT microbatch and resume suites
+also passed 373 tests with one hardware-dependent skip. These shared tests do
+not establish full pretrained HunyuanVideo trainer resume equivalence.
 
 On Ascend910_9382, the full 8.33B/54-layer backbone also completed bf16 forward,
 backward and two SGD updates with activation checkpointing. Peak allocated tensor

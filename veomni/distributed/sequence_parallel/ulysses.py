@@ -135,6 +135,30 @@ def _all_to_all_single(
     return output
 
 
+class _AsyncA2A(torch.autograd.Function):
+    """Wait on an async all-to-all started by ``_all_to_all_single(async_op=True)``.
+
+    ``x`` only anchors the gradient graph: backward performs the inverse
+    exchange on the incoming gradient, matching the exchange that ``x`` went
+    through, so gradients reach the pre-exchange tensor.
+    """
+
+    @staticmethod
+    def forward(ctx, wait_fn, x, scatter_dim, gather_dim, group):
+        ctx.group, ctx.scatter_dim, ctx.gather_dim = group, scatter_dim, gather_dim
+        return wait_fn()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return (
+            None,
+            _all_to_all_single(grad_output, ctx.gather_dim, ctx.scatter_dim, ctx.group),
+            None,
+            None,
+            None,
+        )
+
+
 def all_to_all_tensor(
     x: Tensor,
     scatter_dim: int,

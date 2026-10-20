@@ -280,7 +280,7 @@ def test_reject_misaligned_batches_and_unsupported_scope():
 
 @pytest.mark.skipif(not os.environ.get("HUNYUANVIDEO15_SOURCE"), reason="Pinned upstream source not supplied")
 def test_upstream_output_gradient_and_full_parameter_schema():
-    from .hunyuanvideo15_reference import load_reference
+    from tests.models.hunyuanvideo15_reference import load_reference
 
     torch.manual_seed(123)
     reference_cls = load_reference(os.environ["HUNYUANVIDEO15_SOURCE"])
@@ -394,9 +394,8 @@ def test_native_vae_encode_strict_reload(tmp_path):
 
 
 def test_foundation_loader_preserves_native_weights(tmp_path):
+    from tests.tools.training_utils import make_eager_ops_config
     from veomni.models import build_foundation_model
-
-    from ..tools.training_utils import make_eager_ops_config
 
     original = HunyuanVideo15Model(tiny_config()).eval()
     original.save_pretrained(tmp_path)

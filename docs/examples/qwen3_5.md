@@ -113,19 +113,20 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
 ## Start training on NPU
 
 Qwen3.5 runs on Ascend NPUs, but its GatedDeltaNet kernels are **not** auto-selected: all three
-OpSlot-driven ops (`rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule`) default to `fla`,
+model-local kernels (`rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule`) default to `fla`,
 which requires a GPU and raises on NPU. They must be set explicitly.
 
 ### Kernel backends
 
-`npu` provides vendored MindSpeed-MM Triton kernels for all three ops:
+The Ascend rows are `torch_npu` for gated RMSNorm and `triton`, the vendored MindSpeed-MM
+Triton-Ascend kernels, for the other two ops:
 
 ```yaml
 model:
   ops_implementation:
-    rms_norm_gated_implementation: npu
-    causal_conv1d_implementation: npu
-    chunk_gated_delta_rule_implementation: npu
+    rms_norm_gated_implementation: torch_npu
+    causal_conv1d_implementation: triton
+    chunk_gated_delta_rule_implementation: triton
 ```
 
 `rms_norm_gated` is the exception: it is a `torch_npu` op composition rather than Triton, so only
@@ -146,20 +147,22 @@ and `triton-ascend` on a mutually compatible release set.
 > rather than mis-computing. Validated on `Ascend910B2C`. arch35 support would need to come
 > from upstream MindSpeed-MM.
 
-### `npu_ascendc` — AscendC fused backend (`chunk_gated_delta_rule` only)
+### `fla_npu` — AscendC fused backend (`chunk_gated_delta_rule` only)
 
-`npu_ascendc` is a second NPU backend for `chunk_gated_delta_rule` that delegates the heavy GDN
+`fla_npu` is a second NPU backend for `chunk_gated_delta_rule` that delegates the heavy GDN
 compute to the external [`fla_npu`](https://github.com/flashserve/flash-linear-attention-npu)
 package (registered as `torch.ops.npu.*` fused ops); only the Triton glue stays vendored under
-`_ascend/triton_core`. It coexists with `npu` (pure vendored Triton), which remains the fallback.
-Set only `chunk_gated_delta_rule` to `npu_ascendc`; keep `rms_norm_gated` / `causal_conv1d` on `npu`:
+`veomni/ops/kernels/gated_delta_rule/vendor/triton_core`. It coexists with `triton` (pure vendored
+Triton-Ascend), which remains the fallback.
+Set only `chunk_gated_delta_rule` to `fla_npu`; keep `rms_norm_gated` on `torch_npu` and
+`causal_conv1d` on `triton`:
 
 ```yaml
 model:
   ops_implementation:
-    rms_norm_gated_implementation: npu
-    causal_conv1d_implementation: npu
-    chunk_gated_delta_rule_implementation: npu_ascendc
+    rms_norm_gated_implementation: torch_npu
+    causal_conv1d_implementation: triton
+    chunk_gated_delta_rule_implementation: fla_npu
 ```
 
 `fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It supports Ascend
@@ -191,8 +194,8 @@ cd torch_custom/fla_npu/ && bash build.sh
 pip list | grep fla_npu   # verify it is installed
 ```
 
-If `fla_npu` is absent when `npu_ascendc` is selected, the backend raises an actionable error at
-`OpSlot.bind()` time (pointing back to the install step or to `npu` / `eager`).
+If the `fla_npu` package is missing when `chunk_gated_delta_rule_implementation: fla_npu` is selected, the backend raises an actionable error when
+the model constructs its `VeomniOp` handle (pointing back to the install step or to `triton` / `eager`).
 
 ### Qwen3.5-9B VL Training
 
@@ -200,18 +203,17 @@ There is no dedicated dense NPU config; reuse the GPU one and set the GatedDelta
 command line. Nothing else needs overriding: the YAML's `attn_implementation: flash_attention_2` is
 also the recommended NPU value (see [NPU-friendly operator
 configurations](../hardware_support/typical_usage.md)), and `rms_norm`, `rotary_pos_emb`,
-`swiglu_mlp` and `cross_entropy_loss` are left at their dataclass defaults there, so VeOmni
-normalizes them to NPU-compatible values automatically
-([`_NPU_DEFAULT_FALLBACK`](../../veomni/arguments/arguments_types.py#L979)). The three
-GatedDeltaNet ops are deliberately **not** in that table, which is why they must be explicit:
+`swiglu_mlp` and `cross_entropy_loss` are left unset there, so `VeomniOp` resolves them to the NPU defaults
+from `OP_REGISTRY.default_impl`. The three
+GatedDeltaNet ops default to `"fla"` instead, which is why they must be explicit:
 
 ```shell
 bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5/qwen3_5_vl.yaml \
     --model.model_path ${HOME}/Qwen3.5-9B \
     --data.train_path ./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml \
-    --model.ops_implementation.rms_norm_gated_implementation npu \
-    --model.ops_implementation.causal_conv1d_implementation npu \
-    --model.ops_implementation.chunk_gated_delta_rule_implementation npu_ascendc \
+    --model.ops_implementation.rms_norm_gated_implementation torch_npu \
+    --model.ops_implementation.causal_conv1d_implementation triton \
+    --model.ops_implementation.chunk_gated_delta_rule_implementation fla_npu \
     --train.max_steps 20
 ```
 
@@ -219,7 +221,7 @@ Drop `chunk_gated_delta_rule_implementation` to `npu` if `fla_npu` is not instal
 
 ### Qwen3.5 MoE 35B VL Training
 
-A ready-to-run MoE-VL config wired for `npu_ascendc` (plus `fused_npu` MoE, NPU RMSNorm/RoPE and
+A ready-to-run MoE-VL config wired for `fla_npu` (plus `fused_npu` MoE, NPU RMSNorm/RoPE and
 Ulysses SP) is provided at
 [`configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml`](../../configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml):
 
@@ -250,6 +252,39 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_m
 `muon_expert_zero_comm: true` selects whole-expert `Shard(0)` when the
 EP-local expert count is divisible by the EP-FSDP size; otherwise VeOmni logs
 a warning and falls back to the communication path.
+
+## Shared-prefix training
+
+In GRPO-style RL each prompt is sampled `n` times and the `n` rollouts are trained as `n` packed
+`prompt + response` sequences, so the prompt is computed `n` times. With shared-prefix training the
+text backbone computes each prompt once per micro-batch: GatedDeltaNet layers fork the recurrent
+state at the end of the prompt, softmax-attention layers reuse the prompt's keys and values, and the
+LM head scores each shared position once. Outputs and gradients match packed training to within the
+difference that re-batching the same sequences produces by itself.
+
+The work drops from `n * (P + R)` tokens to `P + n * R`, and on Qwen3.5-4B about 84% of that ratio is
+realised. Long prompts gain most; under roughly 1k prompt tokens there is little to save.
+
+It is a field on the **model config**, off by default, and it needs a non-eager linear-attention
+backend: `triton` on Ascend, `fla` on GPU.
+
+```json
+{ "text_config": { "shared_prefix_training": true } }
+```
+
+Set it in the `config.json` of the model directory the trainer loads. Nothing else changes: detection
+is internal to the patched modeling, so a trainer driving VeOmni needs no flag of its own and no
+adapter code. When nothing in a micro-batch shares a prefix, or the batch carries image or video
+inputs, the ordinary packed path runs unchanged.
+
+What the caller has to get right is that a micro-batch holds **whole rollout groups**, i.e. a
+multiple of `n` sequences, with no reordering between packing and the forward. A group split across
+micro-batches is still correct, only slower, since just the rollouts that land together share work.
+With `verl` (`model_engine=veomni`) that means the legacy trainer with group-aware batch balancing,
+`use_dynamic_bsz` off, and `ppo_micro_batch_size_per_gpu` a multiple of `rollout.n`; the config field
+travels through `actor_rollout_ref.model.hf_config_path`, which is why no verl-side change is needed.
+
+Current limits: text-only prompts; dense Qwen3.5; no Ulysses SP, MTP or KV cache (each raises).
 
 ## Ulysses Sequence Parallelism
 
@@ -283,7 +318,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
 
 ### Selecting linear-attention kernels
 
-GatedDeltaNet has three OpSlot-driven kernels: `rms_norm_gated`, `causal_conv1d`, and
+GatedDeltaNet has three instance-local kernels: `rms_norm_gated`, `causal_conv1d`, and
 `chunk_gated_delta_rule`. All three default to `fla` — the FLA Triton kernels shipped under the
 `gpu` extra, which is the recommended value on GPU and required for varlen training.
 
