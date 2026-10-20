@@ -208,3 +208,30 @@ def test_base_trainer_global_step_not_overcounted_on_stop_iteration(single_rank_
     trainer.train()
 
     assert trainer.state.global_step == n_batches == len(optimizer_steps)
+
+
+@pytest.mark.parametrize("sp_rank", [0, 1])
+def test_dit_sp_exhaustion_is_collective(monkeypatch, sp_rank):
+    """Under SP only sp_rank 0 reads data; exhaustion must still reach the broadcast so peers don't hang."""
+    import veomni.trainer.dit_trainer as dit_module
+
+    broadcasts = []
+
+    def fake_broadcast(obj_list, src, group):
+        broadcasts.append(obj_list[0])
+        obj_list[0] = None  # rank 0's view of an exhausted loader
+
+    ps = SimpleNamespace(sp_enabled=True, sp_rank=sp_rank, sp_group=None)
+    monkeypatch.setattr(dit_module, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(dit_module, "use_parallel_state", lambda _: nullcontext())
+    monkeypatch.setattr(dit_module.dist, "broadcast_object_list", fake_broadcast)
+    monkeypatch.setattr(dit_module.dist, "get_global_rank", lambda group, rank: rank)
+
+    trainer = DiTTrainer.__new__(DiTTrainer)
+    trainer.base = SimpleNamespace(model=SimpleNamespace(parallel_state=None), state=base_module.TrainerState())
+
+    with pytest.raises(StopIteration):
+        trainer.train_step(iter([]) if sp_rank == 0 else None)
+
+    assert broadcasts == [None]
+    assert trainer.base.state.global_step == 0
