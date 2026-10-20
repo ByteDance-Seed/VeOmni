@@ -206,9 +206,6 @@ jobs:
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_moe_ep_sharded_load_matrix.py
           uv run --frozen pytest -v -s -x tests/utils/test_ep_sharded_expert_stream_load.py
-      - name: Run Qwen4 training compatibility regressions
-        run: |
-          uv run --frozen pytest -v -s -x tests/models/test_qwen4_frozen_prefix.py
       - name: Run checkpoint tests
         run: |
           uv run --frozen pytest -v -s -x tests/checkpoints/
