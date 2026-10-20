@@ -39,7 +39,7 @@ pyproject.toml
 │   │                  + liger-kernel + FLA + quack + TileLang/TileKernels + DLPack ext
 │   │                  + diffusers / av / librosa / soundfile / ftfy / peft
 │   │                  + megatron-energon (optional dataset format)
-│   ├── magi         Optional NVIDIA SM90+ MagiAttention FFA (combine with gpu):
+│   ├── magi         Optional NVIDIA SM100+ MagiAttention FFA (combine with gpu):
 │   │                  magi-attention + create-block-mask-cuda + flash-attn-cute
 │   │                  + magi-to-hstu-cuda + debugpy; source-built CUDA extensions
 │   ├── npu          Ascend NPU x86_64 — full superset, minus CUDA-only kernels:
@@ -73,7 +73,7 @@ conflicts with the NPU extras.
 
 ```bash
 uv sync --extra gpu --dev                      # NVIDIA GPU
-uv sync --extra gpu --extra magi --dev         # NVIDIA GPU + MagiAttention (SM90+)
+uv sync --extra gpu --extra magi --dev         # NVIDIA GPU + MagiAttention (SM100+)
 uv sync --extra npu --dev                      # Ascend NPU x86
 uv sync --extra npu_aarch64 --dev              # Ascend NPU ARM
 ```
@@ -83,8 +83,8 @@ FA3, and FlashMLA wheels. FA2 is installed from prebuilt wheels on x86_64 and
 omitted on aarch64. FA4 and FlashQLA are pure-Python PyPI wheels.
 The aarch64 FA3 wheel requires glibc 2.34 or newer. uv caches built wheels
 under `~/.cache/uv`. MagiAttention is not part of that default GPU set:
-`--extra magi` also pulls `gpu` and source-builds SM90/SM100 CUDA extensions.
-Omit it on Ampere/Ada (SM80/SM89) and CPU environments.
+`--extra magi` also pulls `gpu` and source-builds SM100 CUDA extensions.
+Omit it on older GPUs and CPU environments.
 
 The `npu` and `npu_aarch64` extras both install the complete Ascend software
 stack and multimodal dependencies. Only `npu_aarch64` omits `torchcodec`
@@ -114,7 +114,7 @@ forced into a specific 5.x patch.
 | `flash-attn-4` (cute) | PyPI `4.0.0b16` | pure-Python wheel |
 | `flash-qla` | PyPI `0.1.2` | pure-Python wheel with usable metadata; requires TileLang 0.1.9; full forward/backward support on SM90 and SM100 |
 | `tile-kernels` | PyPI `1.0.0` | DeepSeek V4 mHC forward/backward; requires TileLang 0.1.9 and SM90+ |
-| `magi-attention` + `create-block-mask-cuda`, `flash-attn-cute`, `magi-to-hstu-cuda` | git revs | optional `--extra magi`; SM90/SM100 source builds, omitted by the default GPU CI install |
+| `magi-attention` + `create-block-mask-cuda`, `flash-attn-cute`, `magi-to-hstu-cuda` | git revs | optional `--extra magi`; SM100 source builds, omitted by the default GPU CI install |
 
 FlashQLA 0.1.2 supports full forward/backward execution on NVIDIA SM90 and
 SM100. Its SM120 path is forward-only, so VeOmni's full op registration is
@@ -154,7 +154,7 @@ pinned `demonatic/flash-attention` fork, and it takes its toolchain from
 
 ```bash
 uv sync --extra gpu --dev                          # local dev (cp311 or cp312)
-uv sync --extra gpu --extra magi --dev             # + MagiAttention (SM90+)
+uv sync --extra gpu --extra magi --dev             # + MagiAttention (SM100+)
 uv lock                                             # after pyproject edits
 uv sync --locked --all-packages --extra gpu --dev  # docker / CI (no magi)
 ```
