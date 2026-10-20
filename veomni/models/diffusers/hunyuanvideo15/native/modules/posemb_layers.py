@@ -177,7 +177,10 @@ def apply_rotary_emb(
     xk_out = None
     if isinstance(freqs_cis, tuple):
         cos, sin = reshape_for_broadcast(freqs_cis, xq, head_first)  # [S, D]
-        cos, sin = cos.to(xq.device), sin.to(xq.device)
+        # FSDP2 may cast tables only on the first forward, not recomputation.
+        # Keep backward's saved metadata stable in the rotary math's FP32 dtype.
+        cos = cos.to(device=xq.device, dtype=torch.float32)
+        sin = sin.to(device=xq.device, dtype=torch.float32)
         # real * cos - imag * sin
         # imag * cos + real * sin
         xq_out = (xq.float() * cos + rotate_half(xq.float()) * sin).type_as(xq)

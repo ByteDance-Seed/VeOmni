@@ -85,6 +85,101 @@ def test_forward_backward_update_and_strict_reload(tmp_path, checkpointing):
     torch.testing.assert_close(model(**data).predictions, reloaded(**data).predictions, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("table_dtypes", [(torch.bfloat16, torch.float32), (torch.float32, torch.bfloat16)])
+def test_rotary_checkpoint_accepts_table_dtype_changes(table_dtypes):
+    """Recompute may receive the original tables instead of FSDP's cast views."""
+    from torch.utils.checkpoint import checkpoint
+
+    from veomni.models.diffusers.hunyuanvideo15.native.modules.posemb_layers import apply_rotary_emb
+
+    inputs = [torch.randn(1, 4, 2, 12, dtype=torch.bfloat16, requires_grad=True) for _ in range(2)]
+    references = [value.detach().clone().requires_grad_() for value in inputs]
+    # Exactly representable values isolate metadata changes from BF16 roundoff.
+    parity = torch.arange(48).reshape(4, 12) % 2
+    tables = ((parity == 0).float(), (parity == 1).float())
+    calls = 0
+
+    def rotate(q, k):
+        nonlocal calls
+        dtype = table_dtypes[min(calls, 1)]
+        calls += 1
+        return apply_rotary_emb(q, k, tuple(value.to(dtype) for value in tables))
+
+    actual = checkpoint(rotate, *inputs, use_reentrant=False)
+    expected = apply_rotary_emb(*references, tuple(value.to(table_dtypes[0]) for value in tables))
+    sum(value.float().square().sum() for value in actual).backward()
+    sum(value.float().square().sum() for value in expected).backward()
+    assert calls == 2
+    for value, reference, source, expected_source in zip(actual, expected, inputs, references):
+        torch.testing.assert_close(value, reference, rtol=0, atol=0)
+        torch.testing.assert_close(source.grad, expected_source.grad, rtol=0, atol=0)
+
+
+def _hunyuanvideo15_fsdp_checkpoint_worker():
+    import copy
+
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+    from veomni.distributed.parallel_state import _init_parallel_state
+    from veomni.utils.device import get_device_type
+
+    torch.set_num_threads(2)
+    device = get_device_type()
+    world_size = torch.distributed.get_world_size()
+    _init_parallel_state(dp_size=world_size, dp_shard_size=world_size)
+    torch.manual_seed(42)
+    config = HunyuanVideo15Config(
+        hidden_size=256, heads_num=2, mm_double_blocks_depth=2, text_states_dim=32, vision_states_dim=8
+    )
+    reference = HunyuanVideo15Model(config).to(device).train()
+    initialize_nonzero_linears(reference)
+    checkpointed = copy.deepcopy(reference)
+    checkpointed.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    mesh = init_device_mesh(device, (world_size,))
+    policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, cast_forward_inputs=True)
+    flow = FlowMatchingConditioner(314, device)
+    data = flow(torch.randn(1, 32, 2, 4, 4, dtype=torch.bfloat16, device=device))
+    data.update(
+        text_states=torch.randn(1, 8, 32, dtype=torch.bfloat16, device=device),
+        encoder_attention_mask=torch.tensor([[True] * 4 + [False] * 4], device=device),
+        byt5_text_states=torch.randn(1, 4, 1472, dtype=torch.bfloat16, device=device),
+        byt5_text_mask=torch.tensor([[True, True, False, False]], device=device),
+    )
+    results = []
+    for model in (reference, checkpointed):
+        for block in model.double_blocks:
+            fully_shard(block, mesh=mesh, mp_policy=policy)
+        fully_shard(model, mesh=mesh, mp_policy=policy)
+        output = model(**data)
+        output.loss["mse_loss"].backward()
+        grads = {
+            name: parameter.grad.to_local().detach().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+        assert grads and all(torch.isfinite(grad).all() for grad in grads.values())
+        assert any(torch.count_nonzero(grad) for grad in grads.values())
+        results.append((output.predictions.detach().clone(), grads))
+    expected, actual = results
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    assert actual[1].keys() == expected[1].keys()
+    for name in expected[1]:
+        # Recompute sees the original FP32 values instead of first-pass BF16 rounding.
+        torch.testing.assert_close(actual[1][name], expected[1][name], rtol=5e-2, atol=1e-2)
+
+
+def test_hunyuanvideo15_fsdp_bf16_checkpoint():
+    """The documented FSDP2/BF16 path must survive checkpoint recomputation."""
+    from tests.tools.launch_utils import torchrun
+    from veomni.utils.device import get_device_type, get_torch_device
+
+    accelerator = get_torch_device()
+    if get_device_type() not in ("cuda", "npu") or not accelerator.is_available() or accelerator.device_count() < 2:
+        pytest.skip("Two accessible CUDA GPUs or NPUs are required")
+    torchrun(_hunyuanvideo15_fsdp_checkpoint_worker, world_size=2)
+
+
 def test_masked_condition_tokens_do_not_change_output():
     torch.manual_seed(123)
     model = HunyuanVideo15Model(tiny_config(glyph=True)).eval()

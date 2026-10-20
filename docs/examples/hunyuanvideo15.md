@@ -180,9 +180,12 @@ produced decreasing losses over two AdamW updates. The CPU-only model suite
 previously passed 20 tests; its accelerator and opt-in cases skipped.
 
 After merging upstream `3089331` on 2026-10-20, the focused suite passed
-32 tests on NPU (two opt-in cases skipped) and 26 on CPU (eight accelerator
+35 tests on NPU (two opt-in cases skipped) and 28 on CPU (nine accelerator
 or opt-in cases skipped). Registration now uses `veomni.models.registry`, and
 the registry check lives in `tests/models/base/test_auto_registry.py`.
+This includes a real two-rank FSDP2/BF16 checkpoint regression on NPU and CPU
+regressions for both RoPE table-dtype transitions. Rotary tables remain FP32
+through recomputation so saved tensor metadata stays stable.
 The shared registry, gradient-checkpointing, DiT microbatch and resume suites
 also passed 373 tests with one hardware-dependent skip. These shared tests do
 not establish full pretrained HunyuanVideo trainer resume equivalence.

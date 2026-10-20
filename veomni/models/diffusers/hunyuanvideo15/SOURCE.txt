@@ -21,6 +21,7 @@ Changes:
 - Dense attention uses PyTorch SDPA with broadcast key-validity masks and
   zeroed invalid queries; output and gradient semantics match the pairwise mask.
 - Blocks use the Transformers GradientCheckpointingLayer contract.
+- Rotary tables use stable FP32 math across FSDP2 checkpoint recomputation.
 - Standard tuple utilities replace hyvideo.commons imports.
 - Frozen loading is local-only; glyph torch.load uses weights_only=True.
 - VAE parallel-state import points to VeOmni; tile parallelism is not enabled.
