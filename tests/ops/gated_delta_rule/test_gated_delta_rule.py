@@ -318,7 +318,9 @@ def test_causal_conv1d_fla_matches_eager(device):
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="causal_conv1d npu needs torch_npu")
-def test_causal_conv1d_npu_matches_eager_forward_and_backward():
+@pytest.mark.parametrize("dim", (256, 640))
+@pytest.mark.parametrize("packed", (False, True))
+def test_causal_conv1d_npu_matches_eager_forward_and_backward(dim, packed):
     _require_npu_gdr_dependencies()
     from veomni.ops.kernels.gated_delta_rule.vendor.triton.utils import is_arch35
 
@@ -328,16 +330,20 @@ def test_causal_conv1d_npu_matches_eager_forward_and_backward():
     eager = resolve_op("causal_conv1d", "standard", "eager").wrapper
     other = resolve_op("causal_conv1d", "standard", "triton").wrapper
     torch.manual_seed(13)
-    # Forward tiles the channel axis at 256 when there is no initial state.
-    batch, seq, dim, kernel = 2, 64, 256, 4
+    # 640 channels reproduces Qwen4-Exp's real U8CP2 GDN head shard.
+    batch, seq, kernel = (1, 128, 4) if packed else (2, 64, 4)
     x = torch.randn(batch, seq, dim, device="npu", dtype=torch.bfloat16)
     weight = torch.randn(dim, kernel, device="npu", dtype=torch.bfloat16)
     bias = torch.randn(dim, device="npu", dtype=torch.bfloat16)
 
     x_e, w_e, b_e = make_grad_leaves(x, weight, bias)
     x_o, w_o, b_o = make_grad_leaves(x, weight, bias)
-    out_e = eager(x_e, w_e, b_e, activation="silu")
-    out_o = other(x_o, w_o, b_o, activation="silu")
+    cu = torch.tensor([0, 61, 128], device="npu", dtype=torch.int32) if packed else None
+    if packed:
+        out_e = torch.cat([eager(chunk, w_e, b_e, activation="silu") for chunk in x_e.split((61, 67), dim=1)], dim=1)
+    else:
+        out_e = eager(x_e, w_e, b_e, activation="silu")
+    out_o = other(x_o, w_o, b_o, cu_seqlens=cu, activation="silu")
     torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
 
     grad_output = torch.randn_like(out_e)

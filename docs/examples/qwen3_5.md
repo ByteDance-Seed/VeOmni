@@ -176,7 +176,9 @@ to SiLU. On Ascend910B, the v26.6.0 `RecomputeWUFwd` kernel accepts value-head
 widths 128 or 256; a 64-wide toy input fails native tiling before it exercises
 the GDN math. The NPU parity test uses a supported 128-wide AscendC input and
 checks both ordinary sequences and packed samples whose boundaries are not
-multiples of the recurrent chunk size.
+multiples of the recurrent chunk size. The vendored convolution also selects
+a smaller channel tile for head shards such as Qwen4-Exp U8CP2's 640 channels,
+preserving the existing 32-channel alignment and UB budget.
 
 The prebuilt NPU images on [quay.io](https://quay.io/repository/ascend/veomni?tab=tags) already
 bundle `fla_npu`:
