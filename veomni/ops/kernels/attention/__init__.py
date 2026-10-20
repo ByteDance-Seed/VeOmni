@@ -42,6 +42,19 @@ from .helper import (
     extract_packed_varlen_cu_seqlens,
     packed_split_attention_forward,
 )
+from .ulysses import should_apply_ulysses
+
+
+_RAW_NON_SP_IMPLS = frozenset(
+    {
+        "eager",
+        "sdpa",
+        "flash_attention_2",
+        "flash_attention_3",
+        "flash_attention_4",
+        "flex_attention",
+    }
+)
 
 
 def _module_eager_forward(module: torch.nn.Module) -> Callable | None:
@@ -74,6 +87,15 @@ def lookup(impl: str) -> Callable:
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Dispatch one attention call through the selected Transformers interface."""
+        if impl in _RAW_NON_SP_IMPLS:
+            skip_ulysses = bool(kwargs.pop("skip_ulysses", False))
+            if kwargs.get("dsa_position_ids") is None and should_apply_ulysses(skip_ulysses=skip_ulysses):
+                raise ValueError(
+                    f"Attention implementation {impl!r} does not perform Ulysses sequence-parallel exchanges; "
+                    "use a 'veomni_*' attention implementation (such as 'veomni_sdpa') or pass skip_ulysses=True "
+                    "when Q/K/V are already gathered."
+                )
+
         packed_cu_seqlens = None
         if impl in ("sdpa", "eager", "flex_attention"):
             kwargs, packed_cu_seqlens = extract_packed_varlen_cu_seqlens(

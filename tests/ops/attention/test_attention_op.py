@@ -257,3 +257,60 @@ def test_ulysses_head_auxiliary_slices_global_vector_by_rank(monkeypatch):
         group=object(),
     )
     torch.testing.assert_close(sliced, torch.tensor([2, 3]))
+
+
+@pytest.mark.parametrize(
+    "impl",
+    ("eager", "sdpa", "flex_attention", "flash_attention_2", "flash_attention_3", "flash_attention_4"),
+)
+def test_lookup_raw_attention_rejects_active_ulysses_unless_skipped(monkeypatch, impl):
+    monkeypatch.setattr(
+        ulysses_backend,
+        "get_parallel_state",
+        lambda: SimpleNamespace(ulysses_size=2, async_enabled=False),
+    )
+    module = _EagerAttentionModule()
+    query = torch.randn(1, 4, 6, 8)
+    cu_seqlens = torch.tensor([0, 12], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="does not perform Ulysses sequence-parallel exchanges"):
+        lookup(impl)(module, query, query, query, None, cu_seq_lens_q=cu_seqlens, cu_seq_lens_k=cu_seqlens)
+
+    captured = {}
+
+    def fake_forward(mod, q, k, v, attention_mask, **kwargs):
+        captured["kwargs"] = kwargs
+        return q.transpose(1, 2), "ok"
+
+    if impl != "eager":
+        monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, impl, fake_forward)
+
+    output, metadata = lookup(impl)(
+        module,
+        query,
+        query,
+        query,
+        None,
+        skip_ulysses=True,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+    )
+    torch.testing.assert_close(output, query.transpose(1, 2))
+    assert metadata in ("eager-local", "ok")
+    if impl != "eager":
+        assert "skip_ulysses" not in captured["kwargs"]
+
+    # DeepSeek-V4's eager -> veomni_dsa_attention bridge already exchanges Q/KV before lookup("eager").
+    if impl == "eager":
+        dsa_out, dsa_meta = lookup("eager")(
+            module,
+            query,
+            query,
+            query,
+            None,
+            dsa_position_ids=torch.arange(6).unsqueeze(0),
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+        )
+        torch.testing.assert_close(dsa_out, query.transpose(1, 2))
+        assert dsa_meta == "eager-local"
