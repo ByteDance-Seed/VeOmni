@@ -12,7 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+
+"""Flux modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
 @MODEL_CONFIG_REGISTRY.register("flux")
@@ -23,7 +26,7 @@ def register_flux_config():
 
 
 @MODELING_REGISTRY.register("flux")
-def register_flux_modeling(architecture: str):
+def register_flux_modeling(_architecture: str):
     from .modeling_flux import FluxModel
 
     return FluxModel

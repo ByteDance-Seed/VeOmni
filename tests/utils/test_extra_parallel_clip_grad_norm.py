@@ -266,7 +266,9 @@ def main():
         total_grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
 
         # check whether total grad norm meets our expectation
-        torch.testing.assert_close(total_grad_norm_pre_clip, expected=expected_total_grad_norm, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(
+            total_grad_norm_pre_clip.item(), expected=expected_total_grad_norm, atol=1e-6, rtol=1e-6
+        )
 
         # go through each param grad one-by-one after clipping to check whether their value meets our expectation
         clip_coeff = min(max_grad_norm / expected_total_grad_norm, 1.0)

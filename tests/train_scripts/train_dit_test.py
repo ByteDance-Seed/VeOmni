@@ -34,7 +34,7 @@ class LogDictSaveCallback(Callback):
         self.log_dict["loss"].append(loss)
         for key, value in loss_dict.items():
             self.log_dict[key].append(value)
-        self.log_dict["grad_norm"].append(grad_norm)
+        self.log_dict["grad_norm"].append(float(grad_norm))
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         if self.trainer.args.train.global_rank == 0:
