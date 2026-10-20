@@ -1,13 +1,12 @@
-"""VeOmni-accelerated BAGEL Qwen2-MoT — fused OpSlot ops plus training-graph hooks.
+"""VeOmni-accelerated BAGEL Qwen2-MoT — instance-local VeomniOp ops plus training-graph hooks.
 
 Native weights and packed ``forward`` live on :class:`BagelQwen2MoTCore`.
 This module adds packed CFG denoise, fused RMSNorm / SwiGLU / RoPE,
-``fused_attention_forward``, and the training pre/forward/post hooks.
+attention ``VeomniOp`` dispatch, and the training pre/forward/post hooks.
 """
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import torch
@@ -21,9 +20,9 @@ from .......distributed.sequence_parallel import (
     slice_input_tensor,
     sp_pad,
 )
-from .......ops.dispatch import OpSlot
-from .......ops.kernels.attention import MagiAttentionMask, fused_attention_forward
-from .......utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+from .......ops import VeomniOp
+from .......ops.kernels.swiglu_mlp import has_plain_linear_projections
+from .......ops.mask import MagiAttentionMask
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
@@ -45,7 +44,6 @@ from ..checkpoint_conversion import (
 from ..configuration import BagelQwen2MoTConfig
 from ..masking import build_mot_block_mask, build_mot_magi_mask, pad_mot_attention_metadata
 from ..modeling import (
-    _FLASH_ATTENTION_2,
     BagelQwen2MoTAttention,
     BagelQwen2MoTCore,
     InferenceMixin,
@@ -56,8 +54,7 @@ from ..modeling import (
 from ..processing import PackedConversation, preprocess_mot_inputs
 
 
-if IS_NPU_AVAILABLE:
-    import torch_npu
+_FLASH_ATTENTION_2 = "veomni_flash_attention_2"
 
 
 class TrainingMixin(TrainingModuleMixin):
@@ -338,13 +335,14 @@ class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
     """
 
 
-veomni_rms_norm = OpSlot("rms_norm", "standard")
-veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
-veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
-
-
 class Qwen2RMSNormAccelerated(Qwen2RMSNorm):
-    """Qwen2 RMSNorm with VeOmni OpSlot fused dispatch."""
+    """Qwen2 RMSNorm with instance-local VeomniOp fused dispatch."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6, *, config: BagelQwen2MoTConfig | None = None) -> None:
+        super().__init__(hidden_size, eps=eps)
+        self.config = config
+        rms_impl = config.ops_implementation.get("rms_norm_implementation", "eager") if config is not None else "eager"
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", rms_impl)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Empty modality branches retain zero-gradient FSDP anchors. Liger's
@@ -352,14 +350,19 @@ class Qwen2RMSNormAccelerated(Qwen2RMSNorm):
         if hidden_states.numel() == 0:
             return super().forward(hidden_states)
 
-        if veomni_rms_norm.use_non_eager_impl:
-            return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        if self.veomni_rms_norm.impl != "eager":
+            return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 
         return super().forward(hidden_states)
 
 
 class Qwen2MLPAccelerated(Qwen2MLP):
-    """Qwen2 SwiGLU MLP with VeOmni OpSlot fused dispatch."""
+    """Qwen2 SwiGLU MLP with instance-local VeomniOp fused dispatch."""
+
+    def __init__(self, config: BagelQwen2MoTConfig) -> None:
+        super().__init__(config)
+        impl = config.ops_implementation.get("swiglu_mlp_implementation", "eager")
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", impl)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Empty modality branches retain zero-gradient FSDP anchors. Liger's
@@ -367,14 +370,23 @@ class Qwen2MLPAccelerated(Qwen2MLP):
         if x.numel() == 0:
             return super().forward(x)
 
-        if veomni_swiglu_mlp.use_non_eager_impl:
+        if self.veomni_swiglu_mlp.impl != "eager":
             if self.config.hidden_act not in {"silu", "swish"}:
                 raise ValueError(
                     f"Liger SwiGLU requires hidden_act='silu' or 'swish', got {self.config.hidden_act!r}. "
                     "Set model.ops_implementation.swiglu_mlp_implementation='eager' "
                     "to use the Transformers reference implementation."
                 )
-            return veomni_swiglu_mlp(self, x)
+            if has_plain_linear_projections(self):
+                return self.veomni_swiglu_mlp(
+                    x,
+                    self.gate_proj.weight,
+                    self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+                    self.up_proj.weight,
+                    self.up_proj.bias if self.up_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+                    self.down_proj.weight,
+                    self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+                )
 
         return super().forward(x)
 
@@ -385,9 +397,13 @@ def _apply_rotary_pos_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
     unsqueeze_dim: int = 1,
+    *,
+    rope_op: VeomniOp | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Packed RoPE with optional fused OpSlot dispatch."""
-    if q.numel() != 0 and k.numel() != 0 and veomni_apply_rotary_pos_emb.use_non_eager_impl:
+    """Packed RoPE with optional instance-local VeomniOp dispatch."""
+    if rope_op is None:
+        rope_op = VeomniOp("rope", "full", "eager")
+    if q.numel() != 0 and k.numel() != 0 and rope_op.impl != "eager":
         if unsqueeze_dim != 1:
             raise NotImplementedError("BAGEL packed fused RoPE requires unsqueeze_dim=1.")
         if q.ndim != 3 or k.ndim != 3 or cos.ndim != 2 or sin.ndim != 2:
@@ -403,7 +419,7 @@ def _apply_rotary_pos_emb(
         # The shared full-RoPE kernels consume [batch, heads, sequence, head_dim].
         # BAGEL stores packed Q/K as [tokens, heads, head_dim], so adapt through
         # a synthetic batch dimension and restore the packed layout afterwards.
-        q_embed, k_embed = veomni_apply_rotary_pos_emb(
+        q_embed, k_embed = rope_op(
             q.transpose(0, 1).unsqueeze(0),
             k.transpose(0, 1).unsqueeze(0),
             cos.unsqueeze(0),
@@ -419,15 +435,23 @@ def _apply_rotary_pos_emb(
 
 
 _PACKED_FUSED_ATTN_IMPLEMENTATIONS = (
-    "veomni_flex_attention_with_sp",
-    "veomni_magi_attention_with_sp",
+    "veomni_flex_attention",
+    "veomni_magi_attention",
 )
-_FLEX_ATTN_IMPLEMENTATIONS = frozenset({"flex_attention", "veomni_flex_attention_with_sp"})
-_MAGI_ATTN_IMPLEMENTATIONS = frozenset({"magi_attention", "veomni_magi_attention_with_sp"})
+_FLEX_ATTN_IMPLEMENTATIONS = frozenset({"flex_attention", "veomni_flex_attention"})
+_MAGI_ATTN_IMPLEMENTATIONS = frozenset({"magi_attention", "veomni_magi_attention"})
+
+
+def _normalize_packed_attn_impl(attn_implementation: str | None) -> str | None:
+    if attn_implementation in _FLEX_ATTN_IMPLEMENTATIONS:
+        return "veomni_flex_attention"
+    if attn_implementation in _MAGI_ATTN_IMPLEMENTATIONS:
+        return "veomni_magi_attention"
+    return attn_implementation
 
 
 class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
-    """MoT attention with fused RoPE and ``fused_attention_forward``."""
+    """MoT attention with instance-local RoPE and attention VeomniOps."""
 
     def __init__(
         self,
@@ -437,6 +461,20 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         rms_norm_cls: type[Qwen2RMSNorm] = Qwen2RMSNorm,
     ):
         super().__init__(config, layer_idx, rms_norm_cls=rms_norm_cls)
+        rope_impl = config.ops_implementation.get("rotary_pos_emb_implementation", "eager")
+        self.veomni_rope = VeomniOp("rope", "full", rope_impl)
+        raw_attn = config.ops_implementation.get("attn_implementation", getattr(config, "_attn_implementation", None))
+        attn_impl = _normalize_packed_attn_impl(raw_attn)
+        if attn_impl in _FLEX_ATTN_IMPLEMENTATIONS:
+            self.veomni_attn: VeomniOp | None = VeomniOp("attention", "standard", attn_impl)
+        elif attn_impl in _MAGI_ATTN_IMPLEMENTATIONS:
+            try:
+                self.veomni_attn = VeomniOp("attention", "standard", attn_impl)
+            except RuntimeError:
+                self.veomni_attn = None
+        else:
+            self.veomni_attn = None
+        self.veomni_denoise_attn = VeomniOp("attention", "standard", _FLASH_ATTENTION_2)
         self.register_load_state_dict_pre_hook(combine_qkv_state_dict_pre_hook)
         self.register_state_dict_post_hook(split_qkv_state_dict_post_hook)
 
@@ -480,7 +518,19 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         sin: torch.Tensor,
         unsqueeze_dim: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+        return _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim, rope_op=self.veomni_rope)
+
+    def _resolve_packed_attn_op(self, *, context: str) -> VeomniOp:
+        attn_impl = _normalize_packed_attn_impl(self.config._attn_implementation)
+        if attn_impl not in _PACKED_FUSED_ATTN_IMPLEMENTATIONS:
+            raise ValueError(
+                f"BAGEL Qwen2-MoT {context} requires packed fused attention "
+                f"({', '.join(_PACKED_FUSED_ATTN_IMPLEMENTATIONS)}), got "
+                f"{self.config._attn_implementation!r}."
+            )
+        if self.veomni_attn is not None and self.veomni_attn.impl == attn_impl:
+            return self.veomni_attn
+        return VeomniOp("attention", "standard", attn_impl)
 
     def attend(
         self,
@@ -489,13 +539,8 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         packed_value_states: torch.Tensor,
         attention_mask: BlockMask | MagiAttentionMask,
     ) -> torch.Tensor:
-        if self.config._attn_implementation not in _PACKED_FUSED_ATTN_IMPLEMENTATIONS:
-            raise ValueError(
-                "BAGEL Qwen2-MoT training requires packed fused attention "
-                f"({', '.join(_PACKED_FUSED_ATTN_IMPLEMENTATIONS)}), got "
-                f"{self.config._attn_implementation!r}."
-            )
-        packed_attn_output, _ = fused_attention_forward(
+        attn_op = self._resolve_packed_attn_op(context="training")
+        packed_attn_output, _ = attn_op(
             self,
             packed_query_states.transpose(0, 1).unsqueeze(0),
             packed_key_states.transpose(0, 1).unsqueeze(0),
@@ -521,13 +566,8 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         max_length_k: int,
     ) -> torch.Tensor:
         if attention_mask is not None:
-            if self.config._attn_implementation not in _PACKED_FUSED_ATTN_IMPLEMENTATIONS:
-                raise ValueError(
-                    "BAGEL Qwen2-MoT packed prefill requires packed fused attention "
-                    f"({', '.join(_PACKED_FUSED_ATTN_IMPLEMENTATIONS)}), got "
-                    f"{self.config._attn_implementation!r}."
-                )
-            packed_attn_output, _ = fused_attention_forward(
+            attn_op = self._resolve_packed_attn_op(context="packed prefill")
+            packed_attn_output, _ = attn_op(
                 self,
                 packed_query_states.transpose(0, 1).unsqueeze(0),
                 merged_key_states.transpose(0, 1).unsqueeze(0),
@@ -541,56 +581,23 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
             )
             return packed_attn_output.squeeze(0)
 
-        if IS_CUDA_AVAILABLE:
-            packed_attn_output, _ = fused_attention_forward(
-                self,
-                packed_query_states.transpose(0, 1).unsqueeze(0),
-                merged_key_states.transpose(0, 1).unsqueeze(0),
-                merged_value_states.transpose(0, 1).unsqueeze(0),
-                attention_mask=None,
-                dropout=0.0,
-                is_causal=is_causal,
-                cu_seq_lens_q=cu_seq_lens_q,
-                cu_seq_lens_k=cu_seq_lens_k,
-                max_length_q=max_length_q,
-                max_length_k=max_length_k,
-                # Inference owns its packed KV-cache layout and does not enter the
-                # training-only module Ulysses redistribution.
-                skip_ulysses=True,
-            )
-            return packed_attn_output.squeeze(0)
-
-        head_num = packed_query_states.shape[1]
-        if is_causal:
-            atten_mask_npu = torch.triu(torch.ones([2048, 2048]), diagonal=1).bool().to(packed_query_states.device)
-            return torch_npu.npu_fusion_attention(
-                packed_query_states,
-                merged_key_states,
-                merged_value_states,
-                head_num,
-                pse=None,
-                padding_mask=None,
-                atten_mask=atten_mask_npu,
-                scale=1.0 / math.sqrt(packed_query_states.shape[-1]),
-                keep_prob=1,
-                input_layout="TND",
-                actual_seq_qlen=tuple(cu_seq_lens_q[1:].cpu().numpy().tolist()),
-                actual_seq_kvlen=tuple(cu_seq_lens_k[1:].cpu().numpy().tolist()),
-                sparse_mode=3,
-            )[0]
-        return torch_npu.npu_fusion_attention(
-            packed_query_states,
-            merged_key_states,
-            merged_value_states,
-            head_num,
-            pse=None,
-            atten_mask=None,
-            scale=1.0 / math.sqrt(packed_query_states.shape[-1]),
-            keep_prob=1,
-            input_layout="TND",
-            actual_seq_qlen=tuple(cu_seq_lens_q[1:].cpu().numpy().tolist()),
-            actual_seq_kvlen=tuple(cu_seq_lens_k[1:].cpu().numpy().tolist()),
-        )[0]
+        packed_attn_output, _ = self.veomni_denoise_attn(
+            self,
+            packed_query_states.transpose(0, 1).unsqueeze(0),
+            merged_key_states.transpose(0, 1).unsqueeze(0),
+            merged_value_states.transpose(0, 1).unsqueeze(0),
+            attention_mask=None,
+            dropout=0.0,
+            is_causal=is_causal,
+            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_k=cu_seq_lens_k,
+            max_length_q=max_length_q,
+            max_length_k=max_length_k,
+            # Inference owns its packed KV-cache layout and does not enter the
+            # training-only module Ulysses redistribution.
+            skip_ulysses=True,
+        )
+        return packed_attn_output.squeeze(0)
 
 
 class InferenceMixinAccelerated(InferenceMixin):
@@ -622,7 +629,6 @@ class InferenceMixinAccelerated(InferenceMixin):
             update_past_key_values=False,
             is_causal=False,
             mode="gen",
-            attention_implementation=_FLASH_ATTENTION_2,
         )
         tail.meta[BAGEL_PHASE_KEY] = BAGEL_FLOW_HIDDEN
         tail.value = outputs["hidden_states"].to(device=self.device, dtype=self.dtype)

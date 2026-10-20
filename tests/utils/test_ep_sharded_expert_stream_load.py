@@ -33,7 +33,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch.distributed.tensor import Shard
 
-import veomni.models.module_utils as module_utils
+import veomni.models.checkpoint.weights as checkpoint_weights
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.models.transformers.deepseek_v3.checkpoint_tensor_converter import DeepseekV3CheckpointTensorConverter
 from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import DeepseekV4CheckpointTensorConverter
@@ -137,7 +137,7 @@ def _load_as_rank(monkeypatch, weights_path: Path, ep_rank: int, model: nn.Modul
         extra_parallel_sizes={"ep": EP_SIZE},
         extra_parallel_rank=lambda name: ep_rank,
     )
-    monkeypatch.setattr(module_utils, "get_parallel_state", lambda: parallel_state)
+    monkeypatch.setattr(checkpoint_weights, "get_parallel_state", lambda: parallel_state)
 
     read_keys = []
 
@@ -163,8 +163,8 @@ def _load_as_rank(monkeypatch, weights_path: Path, ep_rank: int, model: nn.Modul
         def __exit__(self, *exc):
             return self._handle.__exit__(*exc)
 
-    monkeypatch.setattr(module_utils, "safe_open", _RecordingSafeOpen)
-    module_utils.load_model_weights_ep_sharded(model, str(weights_path), init_device="cpu")
+    monkeypatch.setattr(checkpoint_weights, "safe_open", _RecordingSafeOpen)
+    checkpoint_weights.load_model_weights_ep_sharded(model, str(weights_path), init_device="cpu")
     return read_keys
 
 
@@ -223,7 +223,7 @@ def test_a_fusion_converter_without_expert_streaming_still_bails(monkeypatch, tm
 
 def test_a_whole_tensor_extra_parallel_transform_is_refused_before_any_read(monkeypatch, tmp_path):
     _write_checkpoint(tmp_path)
-    real_safe_open = module_utils.safe_open
+    real_safe_open = checkpoint_weights.safe_open
 
     class _NoReads:
         def __init__(self, *args, **kwargs):
@@ -244,7 +244,7 @@ def test_a_whole_tensor_extra_parallel_transform_is_refused_before_any_read(monk
         def __exit__(self, *exc):
             return self._handle.__exit__(*exc)
 
-    monkeypatch.setattr(module_utils, "safe_open", _NoReads)
+    monkeypatch.setattr(checkpoint_weights, "safe_open", _NoReads)
     with pytest.raises(
         NotImplementedError,
         match=r"transforms ExtraParallel key 'model\.layers\.0\.mlp\.experts\.gate_up_proj'",

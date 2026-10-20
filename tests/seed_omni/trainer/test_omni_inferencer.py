@@ -14,7 +14,7 @@ import torch
 
 from veomni.arguments.omni_arguments_types import OmniModuleRuntimeArguments
 from veomni.arguments.parser import _instantiate_recursive
-from veomni.ops import apply_ops_config
+from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.trainer.omni.omni_inferencer import (
     InferenceRequest,
     OmniInferencer,
@@ -119,7 +119,6 @@ def test_eager_inference_keeps_the_launcher_kernels(tmp_path):
     """
     from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
     from veomni.models.seed_omni.modules.fake_model.fake_module_a.modeling import FakeModuleA
-    from veomni.ops.config.singleton import get_ops_config
 
     (tmp_path / "config.json").write_text(
         json.dumps({"model_type": "fake_module_a", "hidden_size": 8}), encoding="utf-8"
@@ -150,9 +149,9 @@ def test_eager_inference_keeps_the_launcher_kernels(tmp_path):
             patch.object(ModuleRuntime, "_build_model_assets", lambda self: None),
         ):
             runtime._init_eager_inference()
+            assert get_ops_config() is restore
     finally:
-        if restore is not None:
-            apply_ops_config(restore)
+        set_ops_config(restore)
 
     # Against the resolved value, not the literal written above: with
     # MODELING_BACKEND=veomni the args layer promotes this to the SP-aware

@@ -25,14 +25,14 @@ from tests.seed_omni.modules.bagel.helpers import (
     tiny_align_qwen2_cfg,
 )
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated.accelerated import BagelQwen2MoTAccelerated
-from veomni.ops.kernels.attention.magi import _fa4_cuda as magi_fa4_backend
+from veomni.ops.kernels.attention.standard.magi import _fa4_cuda as magi_fa4_backend
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 _PATCH_LATENT_DIM = 4
 _CASES: tuple[ToyCase, ...] = ("ce_only", "vit_ce", "mse_only", "mixed")
-_MAGI_IMPLEMENTATION = "veomni_magi_attention_with_sp"
-_FLEX_IMPLEMENTATION = "veomni_flex_attention_with_sp"
+_MAGI_IMPLEMENTATION = "veomni_magi_attention"
+_FLEX_IMPLEMENTATION = "veomni_flex_attention"
 
 
 def _is_magi_ffa_available() -> bool:

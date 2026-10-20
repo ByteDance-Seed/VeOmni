@@ -107,13 +107,13 @@ Training from an upstream root:
   - `model.seed_omni_model_path` is set to the view; `model.model_path` is unchanged.
 - [`_validate_hf_view_modules`](../../../veomni/arguments/omni_arguments_types.py#L141) checks every module comes from the layout; with `save_hf_weights`,
   [`_check_hf_source_exportable`](../../../veomni/arguments/omni_arguments_types.py#L121) checks the source has safetensors.
-- [`OmniConfig.load_checkpoint_sidecars`](../../../veomni/models/seed_omni/configuration_omni.py#L421) records the `HFSource`, which each `ModuleRuntime` receives.
+- [`OmniConfig.load_checkpoint_sidecars`](../../../veomni/models/seed_omni/configuration_omni.py#L419) records the `HFSource`, which each `ModuleRuntime` receives.
 - `ModuleRuntime._build_model` builds the module on meta and
-  [attaches the key converter](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L371);
+  [attaches the key converter](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L385);
   [`weights_path`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L233) is the upstream root.
 - The FSDP2 / DDP wrap (per module, or [composed](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L306)) loads weights:
-  - [`load_model_weights`](../../../veomni/models/module_utils.py#L405) and the [rank-0 broadcast loader](../../../veomni/models/module_utils.py#L1223) skip keys the converter declares, without reading them;
-  - [`load_model_weights_ep_sharded`](../../../veomni/models/module_utils.py#L655) (`ep_sharded_stream_load`) renames each source key with the converter before planning its rank's slice, so per-expert source keys are read only by the rank that owns the expert, and dispatches the layout's `generated_tensors` last;
+  - [`load_model_weights`](../../../veomni/models/checkpoint/weights.py#L410) and the [rank-0 broadcast loader](../../../veomni/models/checkpoint/weights.py#L1228) skip keys the converter declares, without reading them;
+  - [`load_model_weights_ep_sharded`](../../../veomni/models/checkpoint/weights.py#L660) (`ep_sharded_stream_load`) renames each source key with the converter before planning its rank's slice, so per-expert source keys are read only by the rank that owns the expert, and dispatches the layout's `generated_tensors` last;
   - [`HFSourceKeyConverter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L380) renames the module's own keys and hands them to the module's converter.
 
 HF export (`CheckpointCallback` → [`OmniModelRuntime.save_hf_or_lora`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L611)):
@@ -124,7 +124,7 @@ HF export (`CheckpointCallback` → [`OmniModelRuntime.save_hf_or_lora`](../../.
 Bare `OmniModel.from_pretrained` and eager inference:
 
 - [`OmniModel.from_pretrained`](../../../veomni/models/seed_omni/modeling_omni.py#L203) resolves the root first;
-- [`_load_module_from_hf_source`](../../../veomni/models/seed_omni/modeling_omni.py#L348) loads each module with [`load_module_from_hf_source`](../../../veomni/models/seed_omni/utils/hf_layout.py#L561) and binds its assets from the view;
+- [`_load_module_from_hf_source`](../../../veomni/models/seed_omni/modeling_omni.py#L330) loads each module with [`load_module_from_hf_source`](../../../veomni/models/seed_omni/utils/hf_layout.py#L561) and binds its assets from the view;
 - [`resolve_hf_source_device_map`](../../../veomni/models/seed_omni/utils/hf_layout.py#L527) gives `device_map` its `from_pretrained` meaning (`"auto"` is planned by accelerate over `_no_split_modules`). A multi-device map loads on CPU, then `accelerate.dispatch_model` places the module.
 
 Offline convert: a family with a layout and no converter splits through

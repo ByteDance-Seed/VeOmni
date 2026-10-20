@@ -1,8 +1,8 @@
 """BAGEL Qwen2 MoT backbone."""
 
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -30,26 +30,6 @@ from .masking import build_mot_sdpa_mask
 from .processing import PackedConversation, preprocess_mot_inputs
 
 
-_FLASH_ATTENTION_2 = "veomni_flash_attention_2_with_sp"
-
-
-@contextmanager
-def _temporary_attention_implementation(
-    config: BagelQwen2MoTConfig,
-    implementation: Optional[str],
-) -> Iterator[None]:
-    if implementation is None:
-        yield
-        return
-
-    previous = config._attn_implementation
-    config._attn_implementation = implementation
-    try:
-        yield
-    finally:
-        config._attn_implementation = previous
-
-
 class InferenceMixin:
     """FSM ``generate`` / serial denoise / velocity-collection — HF ``GenerationMixin`` analog.
 
@@ -71,7 +51,6 @@ class InferenceMixin:
         update_past_key_values: bool = True,
         is_causal: bool = True,
         mode: str = "und",
-        attention_implementation: Optional[str] = None,
         packed_attention_metadata: Optional[torch.Tensor] = None,
         packed_vae_token_indexes: Optional[torch.Tensor] = None,
         packed_text_indexes: Optional[torch.Tensor] = None,
@@ -95,8 +74,7 @@ class InferenceMixin:
             call_kwargs["packed_vae_token_indexes"] = packed_vae_token_indexes
             call_kwargs["packed_text_indexes"] = packed_text_indexes
 
-        with _temporary_attention_implementation(self.config, attention_implementation):
-            output = self.model.forward_packed_inference(**call_kwargs)
+        output = self.model.forward_packed_inference(**call_kwargs)
 
         return {
             "hidden_states": output.packed_query_sequence,
@@ -193,7 +171,6 @@ class InferenceMixin:
                 update_past_key_values=False,
                 is_causal=False,
                 mode="gen",
-                attention_implementation=_FLASH_ATTENTION_2,
             )
             hiddens.append(outputs["hidden_states"])
         if not hiddens:
@@ -393,7 +370,6 @@ class InferenceMixin:
             update_past_key_values=True,
             is_causal=True,
             mode="und",
-            attention_implementation=_FLASH_ATTENTION_2,
         )
         main_context.append_packed_query(
             cache=outputs["past_key_values"],
@@ -756,6 +732,17 @@ class BagelQwen2RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+def _build_rms_norm(
+    rms_norm_cls: type[Qwen2RMSNorm],
+    hidden_size: int,
+    config: BagelQwen2MoTConfig,
+) -> Qwen2RMSNorm:
+    try:
+        return rms_norm_cls(hidden_size, eps=config.rms_norm_eps, config=config)
+    except TypeError:
+        return rms_norm_cls(hidden_size, eps=config.rms_norm_eps)
+
+
 class BagelQwen2MoTAttention(nn.Module):
     def __init__(
         self,
@@ -778,11 +765,11 @@ class BagelQwen2MoTAttention(nn.Module):
 
         self._build_qkv_proj()
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-        self.q_norm = rms_norm_cls(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = rms_norm_cls(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = _build_rms_norm(rms_norm_cls, self.head_dim, config)
+        self.k_norm = _build_rms_norm(rms_norm_cls, self.head_dim, config)
         self.o_proj_moe_gen = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-        self.q_norm_moe_gen = rms_norm_cls(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm_moe_gen = rms_norm_cls(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm_moe_gen = _build_rms_norm(rms_norm_cls, self.head_dim, config)
+        self.k_norm_moe_gen = _build_rms_norm(rms_norm_cls, self.head_dim, config)
 
     def _build_qkv_proj(self) -> None:
         self.q_proj = nn.Linear(self.hidden_size, self.query_size, bias=True)
@@ -1152,10 +1139,10 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
         self.self_attn = attention_cls(config, layer_idx, rms_norm_cls=rms_norm_cls)
         self.mlp = mlp_cls(config)
         self.mlp_moe_gen = mlp_cls(config)
-        self.input_layernorm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm_moe_gen = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm_moe_gen = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = _build_rms_norm(rms_norm_cls, config.hidden_size, config)
+        self.input_layernorm_moe_gen = _build_rms_norm(rms_norm_cls, config.hidden_size, config)
+        self.post_attention_layernorm = _build_rms_norm(rms_norm_cls, config.hidden_size, config)
+        self.post_attention_layernorm_moe_gen = _build_rms_norm(rms_norm_cls, config.hidden_size, config)
 
     def _apply_moe_norm(
         self,
@@ -1349,8 +1336,8 @@ class BagelQwen2MoTBackbone(nn.Module):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm_moe_gen = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = _build_rms_norm(rms_norm_cls, config.hidden_size, config)
+        self.norm_moe_gen = _build_rms_norm(rms_norm_cls, config.hidden_size, config)
         self.rotary_emb = BagelQwen2RotaryEmbedding(config=config)
         self.use_moe = "Mo" in config.layer_module
         self.attention_cls = attention_cls

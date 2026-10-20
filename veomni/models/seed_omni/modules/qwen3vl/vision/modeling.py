@@ -27,7 +27,7 @@ from veomni.utils import logging
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 from ......distributed.parallel_state import get_parallel_state
-from ......models.checkpoint_tensor_loading import ConvertedCheckpointTensor
+from ......models.checkpoint.convert import ConvertedCheckpointTensor
 from ....utils.conversation import ConversationItem
 from ...module_modeling_base import PretrainedOmniModule
 from .configuration import Qwen3VLVisionEncoderConfig

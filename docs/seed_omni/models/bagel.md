@@ -172,7 +172,7 @@ training does not use FlashAttention-2.
 | SDPA | eager | `infer/modules_infer_eager.yaml` | Single-process inference and the dense-mask oracle |
 
 Leave the YAML on `flex_attention` unless you are opting into Magi. Enable Magi
-from the CLI (the launcher rewrites it to `veomni_magi_attention_with_sp`):
+from the CLI (the launcher rewrites it to `veomni_magi_attention`):
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
@@ -185,7 +185,7 @@ Magi requires physical batch size 1, `cp_size == 1`, and NVIDIA SM90 or newer.
 Ulysses still works. On 8 ranks, `--model.accelerator.ulysses_size 4` gives
 `dp_shard=2` and SP4. Packed Magi/Flex is the training (and FSDP prefill) path;
 the denoise loop still uses FlashAttention-2. The Magi adapter contract is in
-[`docs/transformers_v5/veomni_fused_attention.md`](../../transformers_v5/veomni_fused_attention.md).
+[`docs/transformers_v5/veomni_attention_interface.md`](../../transformers_v5/veomni_attention_interface.md).
 
 #### SM90 nfunc vs dataset
 

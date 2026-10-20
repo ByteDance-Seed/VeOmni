@@ -20,7 +20,7 @@ from safetensors.torch import save_file
 from transformers import Qwen3Config
 
 from veomni.arguments.omni_arguments_types import OmniModuleRuntimeArguments, _validate_hf_view_modules
-from veomni.models.module_utils import _load_state_dict
+from veomni.models.checkpoint.weights import _load_state_dict
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.qwen3.hf_layout import QWEN3_HF_LAYOUT

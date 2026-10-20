@@ -32,6 +32,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_recurrent_attention_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling
@@ -40,13 +41,10 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import (
     Qwen4ExpModel,
     Qwen4ExpModelOutputWithPast,
     Qwen4ExpTextModel,
+    Qwen4ExpTextRMSNormGated,
     Qwen4ExpVisionModel,
     apply_mask_to_padding_states,
-    apply_rotary_pos_emb,
-    causal_conv1d_fn,
     causal_conv1d_update,
-    load_balancing_loss_func,
-    torch_chunk_gated_delta_rule,
     torch_recurrent_gated_delta_rule,
 )
 from transformers.processing_utils import Unpack
@@ -56,13 +54,18 @@ from veomni.distributed.context_parallel.dsa_cp import all_gather_compressed_row
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
+from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
     qwen3_5_vision_model_rot_pos_emb,
 )
+from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.attention.ulysses import prepare_ulysses_qkv, restore_ulysses_output
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils import logging
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -78,6 +81,64 @@ config = PatchConfig(
     target_file="patched_modeling_qwen4_exp_gpu.py",
     description="Qwen4-Exp initial GPU VLM-SFT integration with explicit PLE/QSA limits",
 )
+config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
+
+
+@config.override_method(
+    "Qwen4ExpTextRMSNorm.__init__",
+    description="Construct a local rms_norm offset VeomniOp",
+)
+def qwen4_exp_rmsnorm_init_patched(self, dim: int, group_size: int | None = None, eps: float = 1e-6) -> None:
+    nn.Module.__init__(self)
+    self.eps = eps
+    self.weight = nn.Parameter(torch.zeros(dim))
+    self.group_size = group_size
+    if group_size is not None and dim % group_size != 0:
+        raise ValueError(f"hidden_size ({dim}) must be divisible by group_size ({group_size}).")
+    self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
+
+
+@config.override_method(
+    "Qwen4ExpTextRMSNorm.forward",
+    description="Call rms_norm offset, passing optional group_size",
+)
+def qwen4_exp_rmsnorm_forward_patched(self, x):
+    return self.veomni_rms_norm(x, self.weight, eps=self.eps, group_size=self.group_size)
+
+
+@config.override_method(
+    "Qwen4ExpTextMLP.__init__",
+    description="Construct a local swiglu_mlp VeomniOp",
+)
+def qwen4_exp_text_mlp_init_patched(self, config, intermediate_size=None):
+    nn.Module.__init__(self)
+    self.config = config
+    self.hidden_size = config.hidden_size
+    self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
+    self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+    self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+    self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+    self.act_fn = ACT2FN[config.hidden_act]
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+
+
+@config.override_method(
+    "Qwen4ExpTextMLP.forward",
+    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+)
+def qwen4_exp_text_mlp_forward_patched(self, x):
+    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+        return self.veomni_swiglu_mlp(
+            x,
+            self.gate_proj.weight,
+            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+            self.up_proj.weight,
+            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+            self.down_proj.weight,
+            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+        )
+    return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
 
 config.add_import("copy", names=["copy"])
 config.add_import("dataclasses", names=["dataclass"])
@@ -99,26 +160,14 @@ config.add_import(
     "veomni.ops.kernels.attention.ulysses",
     names=["prepare_ulysses_qkv", "restore_ulysses_output"],
 )
-config.add_import("veomni.ops.kernels.qwen4_exp", names=["qsa_attn_tilelang"])
+config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import("veomni.ops.config", names=["resolve_op_impl"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
+config.add_import("veomni.models.utils.moe_utils", names=["merged_experts_act_fn_forward"])
+config.add_import("veomni.models.loss_utils", names=["ForCausalLMLoss", "load_balancing_loss"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 config.add_import("veomni.utils.model_outputs", names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin"])
 config.add_import("veomni.utils.seqlen_pos_transform_utils", names=["pos2culen"])
-config.add_post_import_block(
-    """
-    # Bound by ``_bind_veomni_ops`` before model construction. Qwen4-Exp
-    # runs eager QSA by default and dispatches to the TileLang sparse-attention
-    # kernel when ``qsa_attention_implementation='tilelang'``. GatedDeltaNet
-    # binds the same kernels as Qwen3.5.
-    from veomni.ops.dispatch import OpSlot, OpsConfigSlot
-    veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
-    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-    veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
-    veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
-    veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
-    veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
-    veomni_qsa_attention_implementation = OpsConfigSlot("qsa_attention_implementation")
-    """
-)
 config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = True")
 config.add_import("veomni.utils", names=["logging"])
 config.add_post_import_block("""
@@ -127,11 +176,13 @@ logger = logging.get_logger(__name__)
 """)
 
 
-# OpSlots are declared in the generated module's post-import block.
-veomni_rms_norm_gated = None
-veomni_causal_conv1d = None
-veomni_chunk_gated_delta_rule = None
-veomni_qsa_attention_implementation = None
+# ``all_to_all`` is imported into the generated file; this sentinel exists
+# so the PLE replacement class can mention it while the patch config loads.
+all_to_all = None
+
+# Names resolved at codegen time from generated imports.
+is_flash_attention_requested = None
+get_max_seqlen = None
 
 
 @config.override_method(
@@ -200,7 +251,7 @@ def _qwen4_exp_validate_packed_seq_lens(
 
 @config.override_method(
     "Qwen4ExpTextGatedDeltaNet.__init__",
-    description="Bind instance-local GDN kernels for Qwen4-Exp Ulysses",
+    description="Bind instance-local GDN VeomniOps; keep Qwen4ExpTextRMSNormGated for the weight",
 )
 def qwen4_exp_gated_deltanet_init_patched(self, config, layer_idx):
     super().__init__()
@@ -239,18 +290,21 @@ def qwen4_exp_gated_deltanet_init_patched(self, config, layer_idx):
     self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
     self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
     # --- Patch.1 ---
-    self.veomni_causal_conv1d_fn = veomni_causal_conv1d.bound_kernel()
-    self.veomni_chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel()
-    if veomni_rms_norm_gated.use_non_eager_impl:
-        from veomni.utils.device import get_device_id
-
-        self.norm = veomni_rms_norm_gated(
-            self.head_v_dim,
-            eps=self.layer_norm_epsilon,
-            activation=config.output_gate_type or config.hidden_act,
-            device=get_device_id(),
-            dtype=config.dtype if config.dtype is not None else torch.get_default_dtype(),
-        )
+    self.veomni_rms_norm_gated = VeomniOp(
+        "rms_norm_gated",
+        "standard",
+        resolve_op_impl("rms_norm_gated_implementation"),
+    )
+    self.veomni_causal_conv1d = VeomniOp(
+        "causal_conv1d",
+        "standard",
+        resolve_op_impl("causal_conv1d_implementation"),
+    )
+    self.veomni_chunk_gated_delta_rule = VeomniOp(
+        "chunk_gated_delta_rule",
+        "standard",
+        resolve_op_impl("chunk_gated_delta_rule_implementation"),
+    )
     # --- Patch.1 ---
 
 
@@ -305,7 +359,7 @@ def qwen4_exp_gated_deltanet_forward_patched(
                 f"ulysses_size ({ulysses_size}) must divide Qwen4-Exp GatedDeltaNet key heads "
                 f"({self.num_k_heads}) and value heads ({self.num_v_heads})."
             )
-        if self.veomni_causal_conv1d_fn is None or self.veomni_chunk_gated_delta_rule is None:
+        if self.veomni_causal_conv1d.impl == "eager" or self.veomni_chunk_gated_delta_rule.impl == "eager":
             raise RuntimeError(
                 "Qwen4-Exp GatedDeltaNet Ulysses requires non-eager causal_conv1d and "
                 "chunk_gated_delta_rule implementations."
@@ -359,15 +413,15 @@ def qwen4_exp_gated_deltanet_forward_patched(
             ),
             dim=0,
         )
-        mixed_qkv = self.veomni_causal_conv1d_fn(
-            x=mixed_qkv,
-            weight=conv_weight,
-            bias=self.conv1d.bias,
+        mixed_qkv = self.veomni_causal_conv1d(
+            mixed_qkv,
+            conv_weight,
+            self.conv1d.bias,
+            cu_seq_lens_q,
             activation=self.activation,
             seq_idx=None,
             backend="triton",
-            cu_seqlens=cu_seq_lens_q,
-        )[0]
+        )
     else:
         local_num_k_heads = self.num_k_heads
         local_num_v_heads = self.num_v_heads
@@ -376,28 +430,33 @@ def qwen4_exp_gated_deltanet_forward_patched(
         if packed_seq_lens is not None:
             if cache_params is not None:
                 raise ValueError("Qwen4-Exp packed GDN training does not support recurrent cache state.")
-            if self.veomni_causal_conv1d_fn is not None:
-                mixed_qkv = self.veomni_causal_conv1d_fn(
-                    x=mixed_qkv,
-                    weight=self.conv1d.weight.squeeze(1),
-                    bias=self.conv1d.bias,
-                    activation=self.activation,
-                    seq_idx=None,
-                    backend="triton",
-                    cu_seqlens=cu_seq_lens_q,
-                )[0]
-            else:
+            conv_weight = self.conv1d.weight.squeeze(1)
+            if self.veomni_causal_conv1d.impl == "eager":
+                # Eager has no varlen path, so run each packed segment on its own.
                 mixed_qkv = torch.cat(
                     [
-                        causal_conv1d_fn(
-                            segment.transpose(1, 2),
-                            self.conv1d.weight.squeeze(1),
+                        self.veomni_causal_conv1d(
+                            segment,
+                            conv_weight,
                             self.conv1d.bias,
+                            None,
                             activation=self.activation,
-                        ).transpose(1, 2)
+                            seq_idx=None,
+                            backend="triton",
+                        )
                         for segment in mixed_qkv.split(packed_seq_lens, dim=1)
                     ],
                     dim=1,
+                )
+            else:
+                mixed_qkv = self.veomni_causal_conv1d(
+                    mixed_qkv,
+                    conv_weight,
+                    self.conv1d.bias,
+                    cu_seq_lens_q,
+                    activation=self.activation,
+                    seq_idx=None,
+                    backend="triton",
                 )
         elif use_precomputed_states and seq_len == 1 and not cache_params.layers[self.layer_idx].record_past:
             mixed_qkv = mixed_qkv.transpose(1, 2)
@@ -410,21 +469,21 @@ def qwen4_exp_gated_deltanet_forward_patched(
                 self.activation,
             ).transpose(1, 2)
         else:
-            mixed_qkv = mixed_qkv.transpose(1, 2)
             if cache_params is not None:
                 mixed_qkv = cache_params.update_conv_state(
-                    mixed_qkv, self.layer_idx, conv_kernel_size=self.conv_kernel_size
-                )
-            mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv.transpose(1, 2), self.layer_idx, conv_kernel_size=self.conv_kernel_size
+                ).transpose(1, 2)
+            mixed_qkv = self.veomni_causal_conv1d(
                 mixed_qkv,
                 self.conv1d.weight.squeeze(1),
                 self.conv1d.bias,
+                None,
                 activation=self.activation,
-                **kwargs,
+                seq_idx=None,
+                backend="triton",
             )
             if cache_params is not None:
-                mixed_qkv = mixed_qkv[:, :, -seq_len:]
-            mixed_qkv = mixed_qkv.transpose(1, 2)
+                mixed_qkv = mixed_qkv[:, -seq_len:]
 
     query, key, value = torch.split(mixed_qkv, [local_key_dim, local_key_dim, local_value_dim], dim=-1)
     query = query.reshape(batch_size, -1, local_num_k_heads, self.head_k_dim).contiguous()
@@ -444,54 +503,43 @@ def qwen4_exp_gated_deltanet_forward_patched(
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
     recurrent_state = cache_params.layers[self.layer_idx].recurrent_states[0] if use_precomputed_states else None
-    if ulysses_enabled:
+    if ulysses_enabled or (packed_seq_lens is not None and self.veomni_chunk_gated_delta_rule.impl != "eager"):
         core_attn_out, last_recurrent_state = self.veomni_chunk_gated_delta_rule(
             query,
             key,
             value,
-            g=g,
-            beta=beta,
-            initial_state=None,
+            g,
+            beta,
+            None,
+            cu_seq_lens_q,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seq_lens_q,
         )
     elif packed_seq_lens is not None:
-        if self.veomni_chunk_gated_delta_rule is not None:
-            core_attn_out, last_recurrent_state = self.veomni_chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
+        # Eager has no varlen path, so run each packed segment on its own.
+        outputs = []
+        for q_segment, k_segment, v_segment, g_segment, beta_segment in zip(
+            query.split(packed_seq_lens, dim=1),
+            key.split(packed_seq_lens, dim=1),
+            value.split(packed_seq_lens, dim=1),
+            g.split(packed_seq_lens, dim=1),
+            beta.split(packed_seq_lens, dim=1),
+            strict=True,
+        ):
+            segment_output, _ = self.veomni_chunk_gated_delta_rule(
+                q_segment,
+                k_segment,
+                v_segment,
+                g_segment,
+                beta_segment,
+                None,
+                None,
                 output_final_state=False,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seq_lens_q,
             )
-        else:
-            outputs = []
-            for q_segment, k_segment, v_segment, g_segment, beta_segment in zip(
-                query.split(packed_seq_lens, dim=1),
-                key.split(packed_seq_lens, dim=1),
-                value.split(packed_seq_lens, dim=1),
-                g.split(packed_seq_lens, dim=1),
-                beta.split(packed_seq_lens, dim=1),
-                strict=True,
-            ):
-                segment_output, _ = torch_chunk_gated_delta_rule(
-                    q_segment,
-                    k_segment,
-                    v_segment,
-                    g=g_segment,
-                    beta=beta_segment,
-                    initial_state=None,
-                    output_final_state=False,
-                    use_qk_l2norm_in_kernel=True,
-                )
-                outputs.append(segment_output)
-            core_attn_out = torch.cat(outputs, dim=1)
-            last_recurrent_state = None
+            outputs.append(segment_output)
+        core_attn_out = torch.cat(outputs, dim=1)
+        last_recurrent_state = None
     elif use_precomputed_states and seq_len == 1:
         core_attn_out, last_recurrent_state = torch_recurrent_gated_delta_rule(
             query,
@@ -506,17 +554,16 @@ def qwen4_exp_gated_deltanet_forward_patched(
             **kwargs,
         )
     else:
-        core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
+        core_attn_out, last_recurrent_state = self.veomni_chunk_gated_delta_rule(
             query,
             key,
             value,
-            g=g,
-            beta=beta,
-            initial_state=recurrent_state,
+            g,
+            beta,
+            recurrent_state,
+            kwargs.pop("cu_seq_lens_q", None),
             output_final_state=cache_params is not None,
             use_qk_l2norm_in_kernel=True,
-            cu_seqlens=kwargs.pop("cu_seq_lens_q", None),
-            **kwargs,
         )
 
     if cache_params is not None:
@@ -530,10 +577,22 @@ def qwen4_exp_gated_deltanet_forward_patched(
             group=parallel_state.ulysses_group,
         )
 
-    core_attn_out = self.norm(core_attn_out.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
+    core_attn_out = self.veomni_rms_norm_gated(
+        core_attn_out.reshape(-1, self.head_v_dim),
+        z.reshape(-1, self.head_v_dim),
+        self.norm.weight,
+        eps=self.layer_norm_epsilon,
+        activation=self.norm.activation,
+    )
     core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
     return self.out_proj(core_attn_out)
     # --- Patch.1 ---
+
+
+@config.modify_init("Qwen4ExpTextQSAIndexer", description="Bind an instance-local partial rope VeomniOp")
+def qwen4_exp_text_qsa_indexer_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
 
 
 @config.override_method(
@@ -581,7 +640,7 @@ def qwen4_exp_qsa_indexer_forward_patched(
             f"got cos={local_cos.shape[1]}, sin={local_sin.shape[1]}, local_seq_len={local_seq_len}."
         )
     local_start = rank * local_seq_len
-    q = apply_rotary_pos_emb(q, cos=local_cos, sin=local_sin, unsqueeze_dim=2)
+    q, _ = self.veomni_rope(q, q, local_cos, local_sin, unsqueeze_dim=2)
 
     if cu_seq_lens_q is None:
         segments = [(batch_idx, 0, global_seq_len) for batch_idx in range(batch_size)]
@@ -684,12 +743,16 @@ def qwen4_exp_qsa_indexer_forward_patched(
         window_indices = local_offsets[:, None] + torch.arange(self.compress_ratio, device=hidden_states.device)[None]
         pooled_keys = extended_keys[local_batch_ids[:, None], window_indices].float().mean(dim=1).to(raw_keys.dtype)
         pooled_keys = self.k_layernorm(pooled_keys)
-        pooled_keys = apply_rotary_pos_emb(
-            pooled_keys.unsqueeze(1),
-            cos=local_cos[local_batch_ids, local_offsets],
-            sin=local_sin[local_batch_ids, local_offsets],
-        ).squeeze(1)
-        pooled_keys = pooled_keys.unsqueeze(0)
+        # Rotate the owned blocks as one [1, 1, blocks, D] sequence, the rope op's
+        # [B, H, S, D] layout, with per-block start positions.
+        pooled_keys = pooled_keys[None, None]
+        pooled_keys, _ = self.veomni_rope(
+            pooled_keys,
+            pooled_keys,
+            local_cos[local_batch_ids, local_offsets][None],
+            local_sin[local_batch_ids, local_offsets][None],
+        )
+        pooled_keys = pooled_keys[0]
     else:
         # Keep both the projection and RMSNorm parameters in the autograd graph
         # on ranks that own no complete block.
@@ -763,9 +826,16 @@ def qwen4_exp_qsa_indexer_forward_patched(
     # --- Patch.1 ---
 
 
+@config.modify_init("Qwen4ExpTextAttention", description="Bind instance-local rope and QSA attention VeomniOps")
+def qwen4_exp_text_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
+    self.veomni_qsa_attn = VeomniOp("qsa_attention", "standard", resolve_op_impl("qsa_attention_implementation"))
+
+
 @config.override_method(
     "Qwen4ExpTextAttention.forward",
-    description="Run dense-mask eager QSA with global selection and Ulysses QKV exchange",
+    description="Call the local rope and QSA attention VeomniOps with the global selection",
 )
 def qwen4_exp_text_attention_forward_patched(
     self,
@@ -821,13 +891,7 @@ def qwen4_exp_text_attention_forward_patched(
     # Under Ulysses these embeddings already belong to this rank's sequence
     # shard. The trailing slice preserves the non-SP cache continuation path.
     cos, sin = (tensor[:, -hidden_states.shape[1] :, :] for tensor in position_embeddings)
-    query_states, key_states = apply_rotary_pos_emb(
-        query_states,
-        key_states,
-        cos,
-        sin,
-        unsqueeze_dim=2,
-    )
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin, unsqueeze_dim=2)
     # --- Patch.2 ---
 
     if past_key_values is not None:
@@ -853,17 +917,16 @@ def qwen4_exp_text_attention_forward_patched(
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
     # --- Patch.3 ---
-    # Compact QSA indices are understood only by this module's patched eager
-    # function, so bypass the global registry for this QSA-specific call.
-    attn_output, attn_weights = eager_attention_forward(
-        self,
+    # The compact selection already encodes causality and packed-sample
+    # boundaries, so the QSA op takes it instead of a dense mask.
+    attn_output, attn_weights = self.veomni_qsa_attn(
         query_states,
         key_states,
         value_states,
-        attention_mask,
+        selection,
         scaling=self.scaling,
         dropout=0.0 if not self.training else self.attention_dropout,
-        selected_indices=selection,
+        attention_mask=attention_mask,
     )
 
     if parallel_state.ulysses_enabled:
@@ -874,103 +937,12 @@ def qwen4_exp_text_attention_forward_patched(
     return attn_output, attn_weights
 
 
-def repeat_kv(hidden_states: torch.Tensor, repeats: int) -> torch.Tensor:
-    if repeats == 1:
-        return hidden_states
-    batch_size, kv_heads, seq_len, head_dim = hidden_states.shape
-    hidden_states = hidden_states[:, :, None].expand(batch_size, kv_heads, repeats, seq_len, head_dim)
-    return hidden_states.reshape(batch_size, kv_heads * repeats, seq_len, head_dim)
-
-
-@config.replace_function("eager_attention_forward", description="Optional dense QSA dispatch with TileLang backend")
-def qwen4_exp_eager_attention_forward_patched(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs: Unpack[TransformersKwargs],
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run standard eager attention, optionally constrained by compact QSA indices.
-
-    Q/K/V use ``[B, H, S, D]`` and indices use ``[B, S, K]``. Invalid slots
-    are ``-1``. Query heads may be a multiple of KV heads (GQA/MQA).
-
-    Like the native Transformers Qwen4-Exp eager path, this implementation
-    materializes the full ``[B, H, S, S]`` score tensor. It is an intentionally
-    simple numerical reference, not a memory-efficient sparse backend.
-    """
-
-    selected_indices = kwargs.pop("selected_indices", None)
-    if selected_indices is None:
-        key_states = repeat_kv(key, module.num_key_value_groups)
-        value_states = repeat_kv(value, module.num_key_value_groups)
-        attention_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-        if attention_mask is not None:
-            attention_weights = attention_weights + attention_mask
-        attention_weights = F.softmax(attention_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-        attention_weights = F.dropout(attention_weights, p=dropout, training=module.training)
-        return torch.matmul(attention_weights, value_states).transpose(1, 2).contiguous(), attention_weights
-
-    # --- Patch.1: Dispatch QSA to eager or TileLang attention. ---
-    # Dispatch QSA calls to the TileLang sparse-attention kernel when
-    # `qsa_attention_implementation='tilelang'`.
-    # If dropout != 0, fall back to the eager path;
-    qsa_implementation = veomni_qsa_attention_implementation.value
-    if qsa_implementation not in {"eager", "tilelang"}:
-        raise ValueError(
-            f"Unknown qsa_attention_implementation={qsa_implementation!r}; expected 'eager' or 'tilelang'."
-        )
-    if qsa_implementation == "tilelang":
-        if attention_mask is not None:
-            raise ValueError(
-                "qsa_attention_implementation='tilelang' requires no attention_mask; "
-                f"got attention_mask={type(attention_mask).__name__}."
-            )
-        if dropout == 0:
-            return qsa_attn_tilelang(query, key, value, selected_indices, scaling), None
-        logger.warning_once(
-            f"qsa_attention_implementation='tilelang' has no dropout path; attention_dropout={dropout} "
-            "falls back to the dense eager QSA reference, which materializes the [B, H, S, S] score tensor."
-        )
-    # --- Patch.1 ---
-    # --- Patch.2 Preserve the Transformers eager contract for every non-QSA caller. ---
-    kv_heads, kv_len, kv_head_dim = key.shape[1:]
-    batch_size, query_heads, query_len, head_dim = query.shape
-    selected_token_mask = torch.zeros(
-        (*selected_indices.shape[:-1], kv_len + 1),
-        dtype=torch.bool,
-        device=selected_indices.device,
-    )
-    scatter_indices = torch.where(selected_indices >= 0, selected_indices, kv_len)
-    allowed = selected_token_mask.scatter_(-1, scatter_indices.long(), True)[..., :kv_len][:, None]
-    repeats = query_heads // kv_heads
-    key_states = repeat_kv(key, repeats)
-    value_states = repeat_kv(value, repeats)
-    attention_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        if attention_mask.is_floating_point():
-            attention_weights = attention_weights + attention_mask
-        else:
-            allowed = allowed & attention_mask
-    attention_weights = attention_weights.masked_fill(~allowed, torch.finfo(attention_weights.dtype).min)
-    probabilities = F.softmax(attention_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    probabilities = probabilities.masked_fill(~allowed, 0)
-    denominator = probabilities.sum(dim=-1, keepdim=True)
-    probabilities = probabilities / torch.where(denominator > 0, denominator, torch.ones_like(denominator))
-    probabilities = F.dropout(probabilities, p=dropout, training=module.training)
-    return torch.matmul(probabilities, value_states).transpose(1, 2).contiguous(), attention_weights
-    # --- Patch.2 ---
-
-
 @config.replace_class(
     "Qwen4ExpTextExperts",
-    description="Use the VeOmni MoE OpSlot while preserving Qwen4-Exp fused expert weights",
+    description="Always call moe_experts VeomniOp on v5 gate_up_proj weights",
 )
 class PatchedQwen4ExpTextExperts(nn.Module):
-    """Qwen4-Exp expert tensors with optional VeOmni fused dispatch."""
+    """Qwen4-Exp expert tensors with a local moe_experts VeomniOp."""
 
     def __init__(self, config):
         super().__init__()
@@ -981,6 +953,8 @@ class PatchedQwen4ExpTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
+        self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
 
     def forward(
         self,
@@ -988,31 +962,29 @@ class PatchedQwen4ExpTextExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        # --- Patch.1: Route expert computation through the VeOmni MoE backend. ---
-        if veomni_moe_experts_forward.use_non_eager_impl:
-            return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
         # --- Patch.1 ---
-
-        # --- Patch.2: Preserve the upstream fused expert weight layout. ---
-        final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-        return final_hidden_states
-        # --- Patch.2 ---
+        if not self.use_swiglu_mlp:
+            return merged_experts_act_fn_forward(
+                hidden_states,
+                top_k_index,
+                top_k_weights,
+                self.gate_up_proj,
+                self.down_proj,
+                self.act_fn,
+                self.num_experts,
+            )
+        unused = self.gate_up_proj.new_empty(0)
+        return self.veomni_moe(
+            hidden_states,
+            top_k_weights,
+            top_k_index,
+            unused,
+            unused,
+            self.down_proj,
+            self.gate_up_proj,
+            num_experts=self.num_experts,
+        )
+        # --- Patch.1 ---
 
 
 # ================================================================
@@ -1755,6 +1727,13 @@ config.override_method(
 )
 
 
+@config.modify_init("Qwen4ExpVisionAttention", description="Bind instance-local rope and attention VeomniOps")
+def qwen4_exp_vision_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+
+
 @config.override_method(
     "Qwen4ExpVisionModel.dummy_forward",
     description="Add a config-derived dummy vision forward for rank-asymmetric FSDP batches",
@@ -1765,8 +1744,8 @@ def qwen4_exp_vision_model_dummy_forward(self):
     # 2. Derive shapes and dtype from the live model instead of hardcoding them.
     # 3. Under SP, describe the global grid while supplying only this rank's
     #    local patch rows, and avoid runtime metadata synchronization.
-    # 4. Use local varlen boundaries when the selected vision attention does not
-    #    perform the Ulysses sequence exchange.
+    # 4. Only the ``veomni_*`` attention adapters gather the Ulysses sequence,
+    #    so other selections (``eager``) keep local varlen boundaries.
     merge_size = self.spatial_merge_size
     parallel_state = get_parallel_state()
     t = 1
@@ -1781,7 +1760,7 @@ def qwen4_exp_vision_model_dummy_forward(self):
     grid_thw = torch.tensor([[t, h, w]], dtype=torch.long, device=device)
     attention_seq_len = (
         t * h * w
-        if not parallel_state.sp_enabled or self.config._attn_implementation.endswith("_with_sp")
+        if not parallel_state.sp_enabled or self.config._attn_implementation.startswith("veomni_")
         else local_patch_count
     )
     vit_metadata = {
@@ -2161,9 +2140,33 @@ class Qwen4ExpCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen4ExpCaus
     """
 
 
+# ================================================================
+# Patch: Qwen4ExpForConditionalGeneration.__init__
+# 1. Bind instance-local CE and load-balancing VeomniOps used by VLM SFT.
+# ================================================================
+@config.override_method(
+    "Qwen4ExpForConditionalGeneration.__init__",
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
+)
+def qwen4_exp_for_conditional_generation_init_patched(self, config):
+    super().__init__(config)
+    self.model = Qwen4ExpModel(config)
+    self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+    self.veomni_lb = VeomniOp(
+        "load_balancing_loss",
+        "standard",
+        resolve_op_impl("load_balancing_loss_implementation"),
+    )
+    self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
+    self.post_init()
+
+
 @config.override_method(
     "Qwen4ExpForConditionalGeneration.forward",
-    description="Use VeOmni fused loss for Qwen4-Exp VLM SFT without MTP loss",
+    description="Always call ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 def qwen4_exp_for_conditional_generation_forward_patched(
     self,
@@ -2208,27 +2211,14 @@ def qwen4_exp_for_conditional_generation_forward_patched(
     logits = None
     fused_linear_aux = None
     if labels is not None:
-        if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.text_config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-        else:
-            logits = self.lm_head(hidden_states)
-            loss, _, fused_linear_aux = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.text_config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-            if fused_linear_aux is not None:
-                logits = None
+        loss, logits, fused_linear_aux = self.loss_function(
+            logits=logits,
+            labels=labels,
+            vocab_size=self.config.text_config.vocab_size,
+            hidden_states=hidden_states,
+            weights=self.lm_head.weight,
+            **kwargs,
+        )
     else:
         logits = self.lm_head(hidden_states)
     # --- Patch.1 ---
@@ -2252,21 +2242,13 @@ def qwen4_exp_for_conditional_generation_forward_patched(
                 padding=False,
                 group=parallel_state.ulysses_group,
             )
-        if veomni_load_balancing_loss.use_non_eager_impl:
-            aux_loss = veomni_load_balancing_loss(
-                outputs.router_logits,
-                self.config.text_config.num_experts,
-                self.config.text_config.num_experts_per_tok,
-                router_attention_mask,
-            )
-        else:
-            aux_loss = load_balancing_loss_func(
-                outputs.router_logits,
-                self.config.text_config.num_experts,
-                self.config.text_config.num_experts_per_tok,
-                router_attention_mask,
-            )
-        if labels is not None and isinstance(aux_loss, torch.Tensor):
+        aux_loss = self.load_balancing_loss(
+            outputs.router_logits,
+            self.config.text_config.num_experts,
+            self.config.text_config.num_experts_per_tok,
+            router_attention_mask,
+        )
+        if isinstance(loss, torch.Tensor) and isinstance(aux_loss, torch.Tensor):
             loss = loss + self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
     # MTP is intentionally absent: no MTP module is constructed and no MTP
     # objective is added to the SFT loss.

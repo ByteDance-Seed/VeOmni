@@ -311,7 +311,7 @@ def test_index_mapping_is_parsed_once_across_modules_sharing_a_checkpoint(tmp_pa
     """Sibling omni modules routinely point at the same checkpoint."""
     _write_index(tmp_path, {"layer.weight": "model-00001-of-00002.safetensors"})
     parses = []
-    import veomni.models.checkpoint_tensor_loading as ctl
+    import veomni.models.checkpoint as ctl
 
     real = ctl.parse_fqn_to_index_mapping_from_json
     monkeypatch.setattr(ctl, "parse_fqn_to_index_mapping_from_json", lambda p: (parses.append(p), real(p))[1])
@@ -324,7 +324,7 @@ def test_index_mapping_is_parsed_once_across_modules_sharing_a_checkpoint(tmp_pa
 
 
 def test_index_mapping_is_not_read_until_asked_for(tmp_path, index_cache, monkeypatch):
-    import veomni.models.checkpoint_tensor_loading as ctl
+    import veomni.models.checkpoint as ctl
 
     monkeypatch.setattr(
         ctl,

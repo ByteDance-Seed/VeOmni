@@ -84,7 +84,7 @@ class OmniModuleRuntimeArguments(ModelArguments):
         if self.model_path:
             entry["model_path"] = self.model_path
         if self.ops_implementation is not None:
-            entry["ops_implementation"] = asdict(self.ops_implementation)
+            entry["ops_implementation"] = {k: v for k, v in asdict(self.ops_implementation).items() if v is not None}
         if model_config := hf_module_model_config(self.model_config):
             entry["model_config"] = deepcopy(model_config)
         if self.processor_config:

@@ -842,3 +842,64 @@ def test_qwen3_train_plus_infer_merges_generation_graph():
     assert cfg.generation_graph is not None
     assert cfg.generation_graph["initial"] == "text_ar"
     assert "done" not in cfg.generation_graph["states"]
+
+
+def test_seed_omni_modules_select_ops_from_module_config_not_global_ops_config():
+    """Each OmniModule resolves its VeomniOp handles from its own config, ignoring the global ops config."""
+    TextEncoder = _accelerated_model_cls("text_encoder")
+    TextEncoderConfig = _config_cls("text_encoder")
+
+    te_eager = TextEncoder(
+        TextEncoderConfig(
+            vocab_size=64,
+            hidden_size=16,
+            tie_word_embeddings=False,
+            ops_implementation={"cross_entropy_loss_implementation": "eager"},
+        )
+    )
+    te_chunk = TextEncoder(
+        TextEncoderConfig(
+            vocab_size=64,
+            hidden_size=16,
+            tie_word_embeddings=False,
+            ops_implementation={"cross_entropy_loss_implementation": "chunk_loss"},
+        )
+    )
+
+    assert te_eager.veomni_ce.impl == "eager"
+    assert te_chunk.veomni_ce.impl == "chunk_loss"
+
+    JanusVqvae = _accelerated_model_cls("janus_vqvae")
+    JanusVqvaeConfig = _config_cls("janus_vqvae")
+    vq_cfg = dict(
+        vq_config={
+            "embed_dim": 4,
+            "num_embeddings": 16,
+            "base_channels": 32,
+            "channel_multiplier": [1, 1],
+            "num_res_blocks": 1,
+            "latent_channels": 32,
+            "out_channels": 3,
+            "in_channels": 3,
+            "num_patches": 2,
+            "projection_dim": 16,
+        },
+        head_config={"hidden_size": 16, "intermediate_size": 16, "image_token_embed_dim": 16, "vocab_size": 16},
+        aligner_config={"input_dim": 4, "hidden_size": 16, "depth": 1},
+    )
+    vq_eager = JanusVqvae(
+        JanusVqvaeConfig(**vq_cfg, ops_implementation={"cross_entropy_loss_implementation": "eager"})
+    )
+    vq_chunk = JanusVqvae(
+        JanusVqvaeConfig(**vq_cfg, ops_implementation={"cross_entropy_loss_implementation": "chunk_loss"})
+    )
+    assert vq_eager.veomni_ce.impl == "eager"
+    assert vq_chunk.veomni_ce.impl == "chunk_loss"
+
+    JanusSiglipConfig = _config_cls("janus_siglip")
+    siglip_cfg = JanusSiglipConfig(
+        vision_config={"hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 1, "num_attention_heads": 4},
+        ops_implementation={"attn_implementation": "sdpa"},
+    )
+    assert siglip_cfg._attn_implementation == "sdpa"
+    assert siglip_cfg.vision_config._attn_implementation == "sdpa"

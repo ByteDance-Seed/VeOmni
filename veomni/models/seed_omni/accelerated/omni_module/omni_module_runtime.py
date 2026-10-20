@@ -285,8 +285,8 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         args = self.args
         assert self.is_eager
-        from .....ops import apply_ops_config
-        from ....auto import bind_ops_to_modeling
+        from dataclasses import asdict
+
         from ... import OMNI_MODEL_REGISTRY
 
         model_path = args.model_path
@@ -295,11 +295,13 @@ class ModuleRuntime(VeOmniModelRuntime):
         load_kwargs = {}
         ops = args.ops_implementation
         if ops is not None:
-            apply_ops_config(ops)
+            self.module_config.ops_implementation = {
+                **dict(self.module_config.ops_implementation or {}),
+                **{k: v for k, v in asdict(ops).items() if v is not None},
+            }
             if ops.attn_implementation is not None:
+                self.module_config._attn_implementation = ops.attn_implementation
                 load_kwargs["attn_implementation"] = ops.attn_implementation
-        # Before construction: slots read inside ``__init__`` need the binding.
-        bind_ops_to_modeling(cls)
         if dist.is_initialized():
             device_map = {"": f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"}
         else:
@@ -351,7 +353,21 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         args = self.args
         logger.info_rank0(f"ModuleRuntime '{self.module_name}': build module model")
+        from dataclasses import asdict
+
+        from .....arguments import OpsImplementationConfig
         from .....models import build_foundation_model
+
+        ops = args.ops_implementation
+        if ops is not None:
+            self.module_config.ops_implementation = {
+                **dict(self.module_config.ops_implementation or {}),
+                **{k: v for k, v in asdict(ops).items() if v is not None},
+            }
+            if ops.attn_implementation is not None:
+                self.module_config._attn_implementation = ops.attn_implementation
+        else:
+            ops = OpsImplementationConfig(**dict(getattr(self.module_config, "ops_implementation", None) or {}))
 
         acc = self.mesh_accelerator
         init_device = "meta" if self.reads_offline_cache else acc.init_device
@@ -360,10 +376,10 @@ class ModuleRuntime(VeOmniModelRuntime):
             weights_path=args.model_path if self.hf_source is None else None,
             torch_dtype="float32" if acc.fsdp_config.mixed_precision.enable else "bfloat16",
             init_device=init_device if self.hf_source is None else "meta",
-            ops_implementation=args.ops_implementation,
+            ops_implementation=ops,
         )
         if self.hf_source is not None:
-            from ....module_utils import load_model_weights
+            from ....checkpoint.weights import load_model_weights
             from ...utils.hf_layout import attach_hf_source_converter
 
             attach_hf_source_converter(self.model, self.hf_source, self.module_name)

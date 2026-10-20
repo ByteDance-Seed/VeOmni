@@ -49,10 +49,8 @@ import torch
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 from transformers.core_model_loading import WeightRenaming, rename_source_key
 
-from veomni.ops.kernels.deepseek_v4 import fp4_act_quant, fp8_weight_quant
-
-from ....utils import logging
-from ...checkpoint_tensor_loading import ConvertedCheckpointTensor, export_weights
+from veomni.models.checkpoint.convert import ConvertedCheckpointTensor, export_weights
+from veomni.utils import logging
 
 
 logger = logging.get_logger(__name__)
@@ -122,8 +120,8 @@ def convert_deepseek_v4_checkpoint_key(name: str, *, target_model_prefix: str = 
         return name
     has_model_prefix = name.startswith("model.")
     source_name = name.removeprefix("model.") if has_model_prefix else name
-    # Upgrade old VeOmni keys before HF's broad inference-name rewrite can
-    # add a second compressor prefix. The model always uses the current HF key.
+    # Upgrade legacy VeOmni scorer keys before HF's broad inference-name
+    # rewrite can add a second compressor prefix.
     if re.match(r"^layers\.\d+\.self_attn\.compressor\.indexer\.weights_proj\.", source_name):
         source_name = source_name.replace(".indexer.weights_proj.", ".indexer.scorer.weights_proj.")
         return f"{target_model_prefix}{source_name}"
@@ -253,7 +251,7 @@ class DeepseekV4CheckpointTensorConverter:
         fused_proj = "down_proj" if proj_name == "down_proj" else "gate_up_proj"
         return f"{prefix}.experts.{fused_proj}", int(expert_id_str)
 
-    def for_expert_range(self, start: int, num_local: int) -> "DeepseekV4CheckpointTensorConverter":
+    def for_expert_range(self, start: int, num_local: int) -> DeepseekV4CheckpointTensorConverter:
         if start < 0 or num_local <= 0 or start + num_local > self.num_experts:
             raise ValueError(
                 f"Expert range [{start}, {start + num_local}) is outside this converter's {self.num_experts} experts."
@@ -419,9 +417,11 @@ class DeepseekV4CheckpointTensorConverter:
 
             # 4. quantize the weight
             fp4_quantize = "ffn.experts." in origin and expert_dtype == "fp4"
+            from veomni.models.transformers.deepseek_v4.export_quant import fp4_act_quant, fp8_weight_quant
+
             param = param.to(torch.bfloat16)
             if fp4_quantize:
-                weight, scale = fp4_act_quant(param, block_size=32)
+                weight, scale = fp4_act_quant(param, block_size=32, inplace=False)
                 weight = weight.view(torch.int8)
             else:
                 weight, scale = fp8_weight_quant(param, block_size=128, scale_fmt=scale_fmt, scale_dtype=scale_dtype)

@@ -13,7 +13,7 @@ from veomni.models.seed_omni.modules.bagel.qwen2_mot.masking import (
     build_mot_sdpa_mask,
     pad_mot_attention_metadata,
 )
-from veomni.ops.kernels.attention import MagiAttentionMask
+from veomni.ops.mask import MagiAttentionMask
 
 
 def _expand_magi_mask(mask: MagiAttentionMask, sequence_length: int) -> torch.Tensor:
@@ -74,11 +74,11 @@ def test_accelerated_build_attention_mask_dispatches_flex_and_magi() -> None:
     metadata = build_mot_attention_metadata([[4, 4]], [["full", "causal"]], device=torch.device("cpu"))
     flex_mask = BagelQwen2MoTAttentionAccelerated.build_attention_mask(
         metadata,
-        attn_implementation="veomni_flex_attention_with_sp",
+        attn_implementation="veomni_flex_attention",
     )
     magi_mask = BagelQwen2MoTAttentionAccelerated.build_attention_mask(
         metadata,
-        attn_implementation="veomni_magi_attention_with_sp",
+        attn_implementation="veomni_magi_attention",
     )
     assert isinstance(flex_mask, BlockMask)
     assert isinstance(magi_mask, MagiAttentionMask)

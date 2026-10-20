@@ -31,7 +31,7 @@ class JanusLlamaConfig(OmniModuleConfig):
 
     model_type = "janus_llama"
     # Register the nested backbone config so transformers propagates
-    # ``attn_implementation`` (e.g. veomni_flash_attention_2_with_sp) down to it —
+    # ``attn_implementation`` (e.g. veomni_flash_attention_2) down to it —
     # otherwise the inner ``LlamaModel`` silently falls back to SDPA and breaks
     # under sequence parallelism (sliced q vs full-length mask).
     sub_configs = {"text_config": LlamaConfig}

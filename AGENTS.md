@@ -21,6 +21,7 @@ On session start, read the following:
 Read on demand:
 - `.agents/knowledge/testing.md` — how CI selects tests, and how to decide whether a change needs one; read before adding or wiring a test
 - `.agents/knowledge/multimodal_metadata.md` — multimodal metadata precompute contract; read before touching VLM/Omni collators, ViT forwards, or the model metadata hooks
+- `.agents/knowledge/veomni-seed-omni.md` — SeedOmni runtime architecture, config resolution, and SP/FSDP/DDP/resume constraints; read before touching `veomni/models/seed_omni/`, `veomni/trainer/omni/`, `veomni/data/seed_omni/`, or `tasks/omni/`
 
 ---
 

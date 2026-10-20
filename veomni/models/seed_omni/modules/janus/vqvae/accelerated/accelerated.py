@@ -5,13 +5,15 @@ native :class:`JanusVqvae` in ``modeling.py`` — this file only carries the
 training encode/decode graph hooks + the FSDP dummy-encode override.
 """
 
+from functools import partial
 from typing import Any, Dict, List, Optional
 
 import torch
-import torch.nn.functional as F
 
 from .......distributed.parallel_state import get_parallel_state
 from .......distributed.sequence_parallel import gather_outputs, slice_input_tensor
+from .......models.loss_utils import ForCausalLMLoss
+from .......ops import VeomniOp
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
@@ -210,6 +212,12 @@ class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin, MeterMixin):
 class JanusVqvaeAccelerated(VeOmniMixin, JanusVqvae):
     """Training/runtime VQVAE — FSDP dummy encode + SP-aware VQ loss."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        ce_impl = self.config.ops_implementation.get("cross_entropy_loss_implementation", "eager")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", ce_impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+
     def encode(
         self,
         pixel_values: Optional[torch.Tensor] = None,
@@ -220,16 +228,27 @@ class JanusVqvaeAccelerated(VeOmniMixin, JanusVqvae):
         return self._encode_pixels(pixel_values)
 
     def _vq_loss(self, hidden_states: torch.Tensor, gt_token_ids: torch.Tensor) -> torch.Tensor:
-        from veomni.distributed.sequence_parallel import reduce_sequence_parallel_loss
-
         labels = gt_token_ids.to(hidden_states.device)
         logits = self.generation_head(hidden_states)
         flat_labels = labels.reshape(-1)
-        ce_sum = F.cross_entropy(logits.reshape(-1, logits.size(-1)), flat_labels, ignore_index=-100, reduction="sum")
         ps = get_parallel_state()
         n_valid_local = (flat_labels != -100).sum()
-        local_mean = ce_sum / n_valid_local.clamp(min=1)
-        return reduce_sequence_parallel_loss(local_mean, n_valid_local.to(local_mean.dtype), group=ps.fsdp_group)
+        if n_valid_local > 0:
+            loss, _, _ = self.loss_function(
+                logits=logits,
+                shift_labels=flat_labels,
+                vocab_size=logits.size(-1),
+                loss_reduction_group=ps.fsdp_group,
+            )
+            return loss
+        loss, _, _ = ForCausalLMLoss(
+            logits=logits,
+            shift_labels=flat_labels,
+            vocab_size=logits.size(-1),
+            num_items_in_batch=n_valid_local.clamp(min=1),
+            loss_reduction_group=ps.fsdp_group,
+        )
+        return loss
 
 
 __all__ = ["JanusVqvaeAccelerated"]

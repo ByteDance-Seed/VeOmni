@@ -32,7 +32,7 @@ class Qwen3VLVisionEncoderConfig(OmniModuleConfig):
 
     model_type = "qwen3vl_vision"
     # Register the nested vision config so transformers propagates
-    # ``attn_implementation`` (e.g. veomni_flash_attention_2_with_sp) down to it —
+    # ``attn_implementation`` (e.g. veomni_flash_attention_2) down to it —
     # otherwise the inner ``Qwen3VLVisionModel`` silently falls back to SDPA and
     # breaks under sequence parallelism (the ViT's Ulysses all-to-all lives in the
     # flash-attention path; SDPA leaves the sliced patch chunk ungathered while the

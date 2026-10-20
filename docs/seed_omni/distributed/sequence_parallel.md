@@ -54,7 +54,7 @@ With `sp_size = cp_size * ulysses_size = S` on `W` ranks the data-parallel size
 is `W / S`. On a small machine this can reach `dp = 1`; compensate with gradient
 accumulation (a larger `global_batch_size` over the same `micro_batch_size`).
 
-## 2. Why all modules share one `dp_size` (and one `sp_size = W / dp_size`)
+## 2. Why all modules share one `dp_size`
 
 Module boundaries do not depend on whether a module uses Ulysses SP, CP, or
 `cp * sp`. Every module gathers its output back to the full sequence in
@@ -171,6 +171,7 @@ therefore sufficient, and it is what every module does today.
 - **Cross-sample compute balance.** A text-only sample and a long video sample
   differ by orders of magnitude in compute, so DP groups can straggle.
   Length- or compute-aware packing at the dataloader level is not implemented.
-- **Per-module SP sizes.** All modules share one SP size; there is no supported
-  way to run, for example, the backbone at SP 4 and an encoder at SP 1. See
-  [section 2](#2-why-one-sp-size-for-the-whole-graph) for what it would take.
+- **Mismatched `dp_size` across modules.** All distributed modules share one
+  `dp_size` (and therefore one `sp_size = cp_size * ulysses_size`); there is no
+  supported way for different modules to use different `dp_size` values. See
+  [section 2](#2-why-all-modules-share-one-dp_size).

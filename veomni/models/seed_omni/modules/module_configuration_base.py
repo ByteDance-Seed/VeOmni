@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 from copy import deepcopy
+from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from transformers import PretrainedConfig
@@ -43,7 +44,7 @@ class OmniModuleConfig(PretrainedConfig):
     def __init__(
         self,
         model_path: str | None = None,
-        ops_implementation: dict[str, Any] | None = None,
+        ops_implementation: dict[str, Any] | Any | None = None,
         model_config: dict[str, Any] | None = None,
         processor_config: dict[str, Any] | None = None,
         **kwargs,
@@ -54,12 +55,19 @@ class OmniModuleConfig(PretrainedConfig):
         self.model_path = model_path
         # Sparse: only what this location explicitly selected. A composed load
         # merges the file, the model's default, and the module entry per field.
-        self.ops_implementation = dict(ops_implementation or {})
+        if ops_implementation is not None and is_dataclass(ops_implementation):
+            self.ops_implementation = {k: v for k, v in asdict(ops_implementation).items() if v is not None}
+        else:
+            self.ops_implementation = dict(ops_implementation or {})
         # Overrides the composed model applies to the module: hyperparameters
         # for the model, kwargs for the preprocessor.
         self.model_config = dict(model_config or {})
         self.processor_config = dict(processor_config or {})
         super().__init__(**kwargs)
+        if "attn_implementation" not in kwargs:
+            attn_implementation = self.ops_implementation.get("attn_implementation")
+            if attn_implementation is not None:
+                self._attn_implementation = attn_implementation
 
     def to_diff_dict(self) -> dict[str, Any]:
         """Drop the composed-model fields this config never set.
@@ -163,6 +171,8 @@ class OmniModuleConfig(PretrainedConfig):
         def as_dict(field: str, value: Any) -> dict[str, Any] | None:
             if value is None:
                 return None
+            if is_dataclass(value):
+                return {k: v for k, v in asdict(value).items() if v is not None}
             if not isinstance(value, dict):
                 raise ValueError(f"{field} must be a dict, got {type(value).__name__}.")
             return value
