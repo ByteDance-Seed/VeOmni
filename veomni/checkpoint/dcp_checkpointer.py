@@ -654,6 +654,13 @@ def _from_local_preserve_device(local_tensor, device_mesh, placements, *, shape=
     )
 
 
+def _chunk_extent(extent: int, num_chunks: int, index: int) -> int:
+    """Extent of ``index`` under ``torch.chunk`` / DTensor ``Shard`` semantics."""
+    full = -(-extent // num_chunks)
+    start = min(full * index, extent)
+    return min(extent, start + full) - start
+
+
 def _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim, extra_parallel_name=None):
     """Global shape/stride of one ExtraParallel slice on the FSDP sub-mesh."""
     shape = list(loaded_tensor.shape)
@@ -678,17 +685,23 @@ def _dropped_extra_parallel_shape(loaded_tensor, ep_shard_dim, fsdp_shard_dim, e
         fsdp_size = mesh.size(fsdp_dim)
         coordinate = mesh.get_coordinate()
         ep_rank, fsdp_rank = coordinate[ep_dim], coordinate[fsdp_dim]
-        size, remainder = divmod(shape[ep_shard_dim], fsdp_size * ep_size)
-        chunks = [size + 1] * remainder + [size] * (fsdp_size * ep_size - remainder)
+        extent = shape[ep_shard_dim]
         if ep_dim < fsdp_dim:
-            ep_local_indices = range(ep_rank * fsdp_size, (ep_rank + 1) * fsdp_size)
-            local_index = ep_rank * fsdp_size + fsdp_rank
+            # restore_extra_parallel_dim lays same-dimension checkpoints out as
+            # EP-outer / FSDP-inner nested chunks. Mirror that layout instead
+            # of flat chunking when the extent is not evenly divisible.
+            ep_extent = _chunk_extent(extent, ep_size, ep_rank)
+            expected_local = _chunk_extent(ep_extent, fsdp_size, fsdp_rank)
         else:
-            ep_local_indices = range(ep_rank, fsdp_size * ep_size, ep_size)
-            local_index = fsdp_rank * ep_size + ep_rank
-        shape[ep_shard_dim] = sum(chunks[index] for index in ep_local_indices)
-        if chunks[local_index] != loaded_tensor.to_local().shape[ep_shard_dim]:
+            # Legacy FSDP-outer metadata has no contiguous EP slice unless the
+            # extent is evenly divisible by both mesh dimensions.
+            if extent % (fsdp_size * ep_size):
+                raise RuntimeError("Unsupported uneven ExtraParallel/FSDP shard layout")
+            ep_extent = extent // ep_size
+            expected_local = ep_extent // fsdp_size
+        if expected_local != loaded_tensor.to_local().shape[ep_shard_dim]:
             raise RuntimeError("Unsupported uneven ExtraParallel/FSDP shard layout")
+        shape[ep_shard_dim] = ep_extent
     else:
         shape[ep_shard_dim] = loaded_tensor.to_local().shape[ep_shard_dim]
     stride = [1] * len(shape)

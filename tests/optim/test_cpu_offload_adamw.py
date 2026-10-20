@@ -351,7 +351,7 @@ def _restore_fsdp_only_extra_parallel_worker(rank, world, rendezvous):
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor import DTensor, Shard
 
-    from veomni.checkpoint.dcp_checkpointer import restore_extra_parallel_dim
+    from veomni.checkpoint.dcp_checkpointer import drop_extra_parallel_dim, restore_extra_parallel_dim
 
     dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world)
     try:
@@ -419,6 +419,21 @@ def _restore_fsdp_only_extra_parallel_worker(rank, world, rendezvous):
         assert same_dim_restored.device_mesh.mesh_dim_names == ("ep", "ep_fsdp")
         torch.testing.assert_close(same_dim_restored.to_local(), same_dim_local, rtol=0, atol=0)
         torch.testing.assert_close(same_dim_restored.full_tensor(), same_dim_full, rtol=0, atol=0)
+
+        # A 6-element extent on a 2x2 mesh is the smallest case where flat and
+        # EP-outer / FSDP-inner chunking differ: [2, 1, 2, 1] versus
+        # [2, 2, 1, 1]. The drop must reconstruct the parameter mesh and retain
+        # this rank's physical local shard without rejecting uneven ranks.
+        same_dim_dropped = drop_extra_parallel_dim(
+            same_dim_restored,
+            fsdp_mesh,
+            fsdp_shard_dim=0,
+            extra_parallel_name="ep",
+        )
+        assert same_dim_dropped.device_mesh == fsdp_mesh
+        assert tuple(same_dim_dropped.placements) == (Shard(0),)
+        assert same_dim_dropped.shape == (same_dim_full.shape[0] // 2,)
+        torch.testing.assert_close(same_dim_dropped.to_local(), same_dim_local, rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
 
