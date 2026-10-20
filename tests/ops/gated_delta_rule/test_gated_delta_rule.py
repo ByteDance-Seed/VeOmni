@@ -336,7 +336,11 @@ def test_causal_conv1d_npu_matches_eager_forward_and_backward(dim, packed):
     weight = torch.randn(dim, kernel, device="npu", dtype=torch.bfloat16)
     bias = torch.randn(dim, device="npu", dtype=torch.bfloat16)
 
-    x_e, w_e, b_e = make_grad_leaves(x, weight, bias)
+    # Independent segments must accumulate their shared-parameter gradients in
+    # high precision. Separate BF16 conv calls round each partial before adding,
+    # which can lose small cancellation residuals and falsely reject a more
+    # accurate fused FP32 reduction (notably for the packed 640-channel shard).
+    x_e, w_e, b_e = make_grad_leaves(*(tensor.cpu().double() for tensor in (x, weight, bias)))
     x_o, w_o, b_o = make_grad_leaves(x, weight, bias)
     cu = torch.tensor([0, 61, 128], device="npu", dtype=torch.int32) if packed else None
     if packed:
@@ -344,14 +348,14 @@ def test_causal_conv1d_npu_matches_eager_forward_and_backward(dim, packed):
     else:
         out_e = eager(x_e, w_e, b_e, activation="silu")
     out_o = other(x_o, w_o, b_o, cu_seqlens=cu, activation="silu")
-    torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
+    torch.testing.assert_close(out_o.float().cpu(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
 
-    grad_output = torch.randn_like(out_e)
-    out_e.backward(grad_output)
+    grad_output = torch.randn_like(out_o)
+    out_e.backward(grad_output.cpu().double())
     out_o.backward(grad_output)
     for actual, expected in zip((x_o, w_o, b_o), (x_e, w_e, b_e), strict=True):
         torch.testing.assert_close(
-            actual.grad.float(),
+            actual.grad.float().cpu(),
             expected.grad.float(),
             atol=GDN_FUSED_GRAD_ATOL,
             rtol=GDN_FUSED_GRAD_RTOL,

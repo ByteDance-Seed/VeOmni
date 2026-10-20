@@ -90,3 +90,9 @@ On a host with at least two CUDA or NPU devices, the test uses VLM dummy data,
 `ple_size=2`, `ep_size=2`, and `ulysses_size=2` to cover FSDP2 streaming load
 and a fused-MoE forward/backward training smoke with finite loss and gradient
 norm. It does not load the released 95 GiB PLE table.
+
+The native convolution qualification uses independent FP64 segment references
+computed from the exact BF16-rounded inputs and upstream gradient. Using separate
+BF16 reference convolutions rounds each segment's shared-weight gradient before
+addition; cancellation can make that reference less accurate than the fused
+FP32 reduction. The output and gradient tolerances are unchanged.
