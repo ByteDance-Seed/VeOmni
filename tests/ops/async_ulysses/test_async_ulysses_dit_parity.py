@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from scripts.ci.launch_plan import runner_device_count
 from tests.parallel.ulysses.utils import SequenceParallelTest, sync_tensor
 from veomni.distributed.parallel_state import use_parallel_state
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
@@ -220,7 +221,7 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
             pass
 
     @pytest.mark.skipif(
-        get_torch_device().device_count() < DIT_SP_WORLD_SIZE,
+        runner_device_count() < DIT_SP_WORLD_SIZE,
         reason=f"device_count should be >= {DIT_SP_WORLD_SIZE}",
     )
     @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses dit")
@@ -308,7 +309,7 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
         _assert_close_with_diagnostics("input.grad", full_input_grad, part_input_grad, atol=1e-4, rtol=1e-4)
 
     @pytest.mark.skipif(
-        get_torch_device().device_count() < DIT_SP_WORLD_SIZE,
+        runner_device_count() < DIT_SP_WORLD_SIZE,
         reason=f"device_count should be >= {DIT_SP_WORLD_SIZE}",
     )
     @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses dit")

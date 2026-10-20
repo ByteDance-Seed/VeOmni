@@ -168,3 +168,176 @@ def test_gpu_pool_rejects_invalid_reservations(size):
 
     with pytest.raises(ValueError, match="reservation"):
         run_jobs([GPUJob("bad", size, None)], list("01234567"), lambda *_: None)
+
+
+@pytest.mark.parametrize("backend,count", [("cpu", 0), ("cuda", 1), ("npu", 1)])
+def test_launch_plan_default_and_sequential_concurrent_peaks(backend, count):
+    from scripts.ci.launch_plan import CasePlan, LaunchSpec, RunnerCapabilities, default_plan
+
+    caps = RunnerCapabilities(backend, () if backend == "cpu" else tuple("01234567"))
+    assert default_plan(caps).cards(caps) == count
+    first, second, cpu = LaunchSpec(nproc=1), LaunchSpec(nproc=2), LaunchSpec(nproc=4, device="cpu")
+    sequential = CasePlan.sequential(first, second, cpu)
+    concurrent = CasePlan.concurrent(second, second, cpu)
+    assert sequential.cards(caps) == (2 if count else 0)
+    assert concurrent.cards(caps) == (4 if count else 0)
+    assert CasePlan.from_dict(concurrent.to_dict()) == concurrent
+    assert cpu.nproc == 4 and cpu.cards(caps) == 0
+
+
+def test_launch_plan_parameters_use_owned_capacity(monkeypatch, tmp_path):
+    import json
+
+    from scripts.ci.launch_plan import PlanContext, from_parameter, runner_capabilities, runner_device_count
+
+    path = tmp_path / "caps.json"
+    path.write_text(json.dumps(dict(backend="cuda", devices=list("01234567"))))
+    monkeypatch.setenv("VEOMNI_CI_CAPABILITIES", str(path))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5")
+    assert runner_device_count() == 8
+    context = PlanContext(dict(cp_size=4), runner_capabilities())
+    assert from_parameter("cp_size")(context).nproc == 4
+
+
+@pytest.mark.parametrize("nproc,nnodes", [(0, 1), (True, 1), (2, 2)])
+def test_launch_plan_rejects_invalid_local_launch(nproc, nnodes):
+    from scripts.ci.launch_plan import LaunchSpec, ResourcePlanError
+
+    with pytest.raises(ResourcePlanError):
+        LaunchSpec(nproc=nproc, nnodes=nnodes)
+
+
+def test_launch_validation_rejects_underdeclared_or_foreign_devices(monkeypatch, tmp_path):
+    import json
+
+    from scripts.ci.launch_plan import CasePlan, LaunchSpec, ResourcePlanError
+    from scripts.ci.pytest_plan import validate_launch
+
+    path = tmp_path / "caps.json"
+    path.write_text(json.dumps(dict(backend="cuda", devices=list("01234567"))))
+    monkeypatch.setenv("VEOMNI_CI_CAPABILITIES", str(path))
+    monkeypatch.setenv("VEOMNI_CI_ACTIVE_PLAN", json.dumps(CasePlan.sequential(LaunchSpec(nproc=2)).to_dict()))
+    monkeypatch.setenv("VEOMNI_CI_LEASE", '["4", "5"]')
+    validate_launch(2, env={"CUDA_VISIBLE_DEVICES": "4,5"}, record=False)
+    with pytest.raises(ResourcePlanError, match="disagrees"):
+        validate_launch(4, record=False)
+    with pytest.raises(ResourcePlanError, match="visibility"):
+        validate_launch(2, env={"CUDA_VISIBLE_DEVICES": "0,1"}, record=False)
+    mixed = CasePlan.sequential(LaunchSpec(nproc=2), LaunchSpec(nproc=2, device="cpu"))
+    monkeypatch.setenv("VEOMNI_CI_ACTIVE_PLAN", json.dumps(mixed.to_dict()))
+    validate_launch(2, env={"CUDA_VISIBLE_DEVICES": ""}, record=False)
+    validate_launch(2, env={"CUDA_VISIBLE_DEVICES": "4,5"}, record=False)
+
+
+def test_npu_adapter_preserves_owned_host_slice_and_resets_ranks():
+    from scripts.ci.accelerator import child_environment
+    from scripts.ci.launch_plan import ResourcePlanError, RunnerCapabilities
+
+    caps = RunnerCapabilities("npu", tuple(str(i) for i in range(8, 16)))
+    env = child_environment(caps, ["10", "11"], environ={"ASCEND_DEVICE_ID": "8", "RANK": "7"})
+    assert env["ASCEND_VISIBLE_DEVICES"] == env["ASCEND_RT_VISIBLE_DEVICES"] == "10,11"
+    assert "ASCEND_DEVICE_ID" not in env and "RANK" not in env
+    assert env["HCCL_HOST_SOCKET_PORT_RANGE"] == env["HCCL_NPU_SOCKET_PORT_RANGE"] == "auto"
+    with pytest.raises(ResourcePlanError, match="owned slice"):
+        child_environment(caps, ["0", "1"], environ={})
+    with pytest.raises(ResourcePlanError, match="ascending"):
+        child_environment(caps, ["11", "10"], environ={})
+    cpu = child_environment(caps, [], cpu=True, environ={})
+    assert cpu["CUDA_VISIBLE_DEVICES"] == cpu["ASCEND_RT_VISIBLE_DEVICES"] == ""
+    assert cpu["TORCH_DEVICE_BACKEND_AUTOLOAD"] == "0"
+
+
+def test_case_batches_preserve_inventory_and_resource_requests():
+    from scripts.ci.run_accelerator_tests import make_batches
+
+    rows = [dict(nodeid=f"case-{i}", file="test.py", cards=2 if i % 2 else 4) for i in range(9)]
+    batches = make_batches([(dict(name="test"), rows)], durations={"case-1": 200}, target_seconds=30, max_cases=2)
+    observed = [row for batch in batches for row in batch["cases"]]
+    assert sorted(row["nodeid"] for row in observed) == sorted(row["nodeid"] for row in rows)
+    assert all(len(batch["cases"]) <= 2 for batch in batches)
+    assert all(row["cards"] == batch["cards"] for batch in batches for row in batch["cases"])
+    assert any(len(batch["cases"]) == 1 and batch["cases"][0]["nodeid"] == "case-1" for batch in batches)
+
+
+def test_device_pool_drains_for_waiting_large_job():
+    from scripts.ci.device_pool import DeviceJob, run_jobs
+
+    order = []
+    jobs = [DeviceJob("first", 4, None), DeviceJob("large", 8, None), DeviceJob("backfill", 4, None)]
+    run_jobs(jobs, list("01234567"), lambda job, assigned: order.append(job.name), drain_after=0)
+    assert order == ["first", "large", "backfill"]
+
+
+def test_device_pool_can_run_cpu_work_beside_an_exclusive_device_job():
+    import threading
+
+    from scripts.ci.device_pool import DeviceJob, run_jobs
+
+    barrier = threading.Barrier(2, timeout=5)
+    assignments = {}
+
+    def execute(job, assigned):
+        assignments[job.name] = assigned
+        barrier.wait()
+
+    run_jobs([DeviceJob("accelerator", 8, None), DeviceJob("cpu", 0, None)], list("01234567"), execute)
+    assert assignments["cpu"] == []
+    assert assignments["accelerator"] == list("01234567")
+
+
+def test_case_workspaces_isolate_relative_checkpoints_and_caches(tmp_path):
+    from scripts.ci.run_accelerator_tests import _workspace
+
+    first, second = tmp_path / "first", tmp_path / "second"
+    _workspace(first)
+    _workspace(second)
+    (first / "cache" / "dataset").write_text("first")
+    assert not (second / "cache" / "dataset").exists()
+    assert (first / "tests").resolve() == (second / "tests").resolve()
+
+
+def test_rendezvous_allocator_does_not_reuse_a_pending_launch_port(monkeypatch, tmp_path):
+    from scripts.ci import ports
+
+    candidates = iter([12345, 12345, 12346])
+    monkeypatch.setattr(ports, "_free_port", lambda: next(candidates))
+    registry = str(tmp_path / "ports.json")
+    assert ports.find_free_port(registry) == 12345
+    assert ports.find_free_port(registry) == 12346
+
+
+def test_callable_launch_provider_is_not_used_as_a_pytest_decorator():
+    from scripts.ci.launch_plan import PlanContext, RunnerCapabilities, from_parameter
+
+    provider = from_parameter("nproc")
+    marker = pytest.mark.launch_plan(provider=provider)
+
+    @marker
+    def sample():
+        return "test body"
+
+    assert sample() == "test body"
+    context = PlanContext(dict(nproc=4), RunnerCapabilities("cuda", tuple("01234567")))
+    assert sample.pytestmark[0].kwargs["provider"](context).nproc == 4
+
+
+def test_unittest_plan_reads_world_size_without_running_constructor(monkeypatch):
+    from types import SimpleNamespace
+
+    from scripts.ci import pytest_plan
+    from scripts.ci.launch_plan import LaunchSpec, RunnerCapabilities
+
+    class DistributedCase:
+        def __init__(self):
+            raise AssertionError("Collection must not construct a distributed test")
+
+        @property
+        def world_size(self):
+            return 4
+
+        def ci_launch_plan(self):
+            return LaunchSpec(nproc=self.world_size)
+
+    monkeypatch.setattr(pytest_plan, "runner_capabilities", lambda: RunnerCapabilities("cuda", tuple("01234567")))
+    item = SimpleNamespace(instance=None, cls=DistributedCase, get_closest_marker=lambda _: None)
+    assert pytest_plan.resolve_plan(item).launches[0].nproc == 4

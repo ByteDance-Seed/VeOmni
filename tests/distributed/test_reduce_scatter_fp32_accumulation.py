@@ -14,6 +14,7 @@ from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Replicate, Shard
 
+from scripts.ci.launch_plan import LaunchSpec
 from veomni.arguments import FSDPConfig, MixedPrecisionConfig
 from veomni.arguments.arguments_types import validate_low_precision_reduce_scatter_comm
 from veomni.arguments.parser import _instantiate_recursive, parse_args
@@ -28,6 +29,11 @@ from veomni.distributed.parallel_plan import SpecInfo
 from veomni.distributed.torch_parallelize import _configure_fsdp_gradient_reduction
 from veomni.utils import device as device_utils
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+
+
+_CI_CPU_4 = LaunchSpec(nproc=4, device="cpu")
+
+_CI_ACCELERATOR_4 = LaunchSpec(nproc=4, device="accelerator")
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -768,9 +774,10 @@ def _run_transport_policy_gloo(rank, rendezvous):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_4)
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="requires the CPU Gloo backend")
 def test_transport_policy_gloo_noncontiguous_hsdp_consensus(tmp_path):
-    mp.spawn(_run_transport_policy_gloo, args=(str(tmp_path / "rendezvous"),), nprocs=4, join=True)
+    mp.spawn(_run_transport_policy_gloo, args=(str(tmp_path / "rendezvous"),), nprocs=_CI_CPU_4.nproc, join=True)
 
 
 def _run_reduce_scatter_nccl() -> None:
@@ -973,15 +980,17 @@ def _run_transport_policy_fsdp2_gradients(fsdp_mesh, hsdp_mesh, device):
         reduce_scatter_module.FP32ReduceScatterWithLowPrecisionTransport = original_comm_class
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="requires four CUDA devices")
 def test_reduce_scatter_fp32_accumulation_nccl():
     from ..tools.launch_utils import torchrun
 
-    torchrun(_run_reduce_scatter_nccl, world_size=4)
+    torchrun(_run_reduce_scatter_nccl, world_size=_CI_ACCELERATOR_4.nproc)
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="requires four CUDA devices")
 def test_reduce_scatter_fp32_accumulation_fsdp2_step():
     from ..tools.launch_utils import torchrun
 
-    torchrun(_run_fsdp2_optimizer_step, world_size=4)
+    torchrun(_run_fsdp2_optimizer_step, world_size=_CI_ACCELERATOR_4.nproc)

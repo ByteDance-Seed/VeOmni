@@ -20,6 +20,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 
+from scripts.ci.launch_plan import LaunchSpec
 from veomni.distributed import torch_parallelize
 from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import (
@@ -30,6 +31,12 @@ from veomni.distributed.torch_parallelize import (
 from veomni.models.checkpoint.weights import init_empty_weights
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
+
+
+_CI_CPU_PROMOTION = LaunchSpec(nproc=4, device="cpu")
+
+
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 
 def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path):
@@ -202,12 +209,18 @@ class TestMultiOptimizerState:
             else:
                 assert expected_value == actual_value
 
+    @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
     def test_fsdp2_multi_optimizer_roundtrip(self, tmp_path):
         """Run the MultiOptimizer DCP round-trip across two real FSDP2 ranks."""
         from tests.tools.launch_utils import find_free_port
 
         os.environ["_TEST_MASTER_PORT"] = str(find_free_port())
-        mp.spawn(_fsdp2_multi_optimizer_worker, args=(2, tmp_path), nprocs=2, join=True)
+        mp.spawn(
+            _fsdp2_multi_optimizer_worker,
+            args=(_CI_ACCELERATOR_2.nproc, tmp_path),
+            nprocs=_CI_ACCELERATOR_2.nproc,
+            join=True,
+        )
 
     def test_multi_optimizer_sparse_state_excludes_synthetic(self, tmp_path):
         """A fresh sub-optimizer must not have synthetic state materialized in the checkpoint."""
@@ -2627,6 +2640,7 @@ def _staged_promotion_worker(rank: int, world_size: int, base: str, scenario: st
     dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_PROMOTION)
 class TestPromotionAcrossRanks:
     """The promotion, run for real on four ranks over its own gloo group.
 
@@ -2643,7 +2657,12 @@ class TestPromotionAcrossRanks:
         base = str(tmp_path / scenario)
         os.makedirs(base, exist_ok=True)
         os.environ["_TEST_MASTER_PORT"] = str(find_free_port())
-        mp.spawn(_staged_promotion_worker, args=(4, base, scenario), nprocs=4, join=True)
+        mp.spawn(
+            _staged_promotion_worker,
+            args=(_CI_CPU_PROMOTION.nproc, base, scenario),
+            nprocs=_CI_CPU_PROMOTION.nproc,
+            join=True,
+        )
         return base, [open(os.path.join(base, f"outcome_{r}")).read() for r in range(4)]
 
     def test_promotion_completes_on_every_rank(self, tmp_path):

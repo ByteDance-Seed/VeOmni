@@ -28,9 +28,14 @@ import shutil
 
 import pytest
 
+from scripts.ci.launch_plan import CasePlan, LaunchSpec, runner_device_count
 from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
 
 from ..tools import ParallelConfig
+
+
+_BASELINE_LAUNCH = LaunchSpec(nproc=1)
+_FSDP_LAUNCH = LaunchSpec(nproc=2)
 
 
 _gpt_oss_npu_skip = pytest.mark.skipif(IS_NPU_AVAILABLE, reason="GPT-OSS FSDP equivalence is GPU-only today")
@@ -88,7 +93,7 @@ def _run_single_gpu_training(model_name, config_path, model_path, train_path, ou
         train_path=train_path,
         output_dir=output_dir,
         task_name="single_gpu",
-        nproc=1,
+        nproc=_BASELINE_LAUNCH.nproc,
         init_device=get_device_type(),
         extra_args=[
             *_fsdp_equivalence_extra_args(model_name),
@@ -104,10 +109,10 @@ def _get_nproc():
     from veomni.utils.device import get_torch_device
 
     torch_device = get_torch_device()
-    count = torch_device.device_count() if torch_device.is_available() else 0
+    count = runner_device_count() if torch_device.is_available() else 0
     if count < 2:
         pytest.skip(f"Requires at least 2 devices, found {count}")
-    return 2
+    return _FSDP_LAUNCH.nproc
 
 
 def _run_fsdp2_training(model_name, config_path, model_path, train_path, output_dir, nproc=None):
@@ -256,6 +261,7 @@ _text_test_cases = [
 ]
 
 
+@pytest.mark.launch_plan(provider=CasePlan.sequential(_BASELINE_LAUNCH, _FSDP_LAUNCH))
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", _text_test_cases)
 def test_text_fsdp_equivalence(
     model_name: str,

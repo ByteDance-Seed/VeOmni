@@ -5,12 +5,19 @@ will actually run it. Read this before adding a test file.
 
 ## CI selects tests by explicit enumeration
 
-GPU test invocations and GPU reservations are enumerated in
-`scripts/ci/gpu_tests.json`; the two GPU workflows call
-`scripts/ci/run_gpu_tests.py`. Add or update manifest entries rather than adding
-individual pytest shell lines to the GPU workflows. NPU selection remains in
-the NPU workflows. See `scripts/ci/README.md` for reservations, local commands,
-conditional coverage, and result artifacts.
+GPU/NPU suite selections are enumerated in `scripts/ci/gpu_tests.json` and
+`scripts/ci/npu_tests.json`. Both use the common accelerator case scheduler in
+`scripts/ci/run_accelerator_tests.py`; NPU workflows keep serial dispatch pending
+hardware validation of concurrent HCCL isolation. Add a suite selection for a
+file outside a collected directory. Do not add per-file pytest workflow lines
+or manual device quotas.
+
+Resource plans use the same `nproc/world_size` configuration as worker startup.
+Use `pytest.mark.launch_plan(provider=...)` for multi-card tests; an unmarked
+case defaults to one selected accelerator card, or CPU on a CPU-only host.
+Explicit CPU plans reserve zero cards. See `docs/design/ci_case_scheduling.md`
+for the author API, defaults and mismatch rules, and `scripts/ci/README.md` for
+local commands and result artifacts.
 
 A test that passes locally is not necessarily a test CI runs. The GPU entries
 below describe the manifest selections used by the named workflows.
@@ -22,15 +29,15 @@ below describe the manifest selections used by the named workflows.
 | `tests/ops/` | whole directory in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
 | `tests/models/` | whole directory in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
 | `tests/parallel/context_parallel/` | whole directory, `gpu_unit_tests.yml` only |
-| everything else | **one `pytest` line per file**, listed in `gpu_unit_tests.yml`, and separately in `npu_unit_tests.yml` when it should run on Ascend |
+| everything else | **one selection per file** in the appropriate GPU/NPU suite manifest |
 | `tests/e2e/test_e2e_parallel.py`, `tests/distributed/test_fsdp_equivalence.py` | `gpu_e2e_test.yml` / `npu_e2e_test.yml` |
 
 Consequences that cut both ways:
 
 - Adding a file under one of the directory-level entries above is already
-  covered. Adding a workflow line for it is redundant churn.
+  covered. Adding another selection for it is redundant churn.
 - Adding a file anywhere else is **invisible to CI** until it is enumerated —
-  usually in two workflows. Roughly thirty existing files under
+  in the GPU and/or NPU suite manifests. Roughly thirty existing files under
   `tests/{trainer,utils,tools,lora,distributed,parallel,e2e}` are in exactly
   this state, so "a test file exists for X" does not mean X is guarded.
 - The GPU unit job runs on one self-hosted L20-8 fleet with a 120-minute budget
@@ -56,8 +63,8 @@ Check whether a file is wired — by name, and by the directory it sits in:
 
 ```bash
 TEST_PATH=tests/trainer/test_my_new_thing.py
-rg -n "$(basename "$TEST_PATH")" .github/workflows/
-rg -n "$(dirname  "$TEST_PATH")" .github/workflows/
+rg -n "$(basename "$TEST_PATH")" scripts/ci/*tests.json
+rg -n "$(dirname  "$TEST_PATH")" scripts/ci/*tests.json
 ```
 
 ## Decision rule
@@ -97,8 +104,8 @@ which cases each job runs.
 **3. It genuinely needs a new file elsewhere.** Prefer folding it into an
 enumerated file in the same directory first. If a separate file is warranted
 (different fixtures, different launcher, meaningfully different runtime), then
-add it to `gpu_unit_tests.yml`, and to `npu_unit_tests.yml` if the behaviour is
-not GPU-specific. Say in the PR what it costs in wall time.
+add it to the GPU suite manifest, and the NPU suite manifest if the behaviour
+is not GPU-specific. Say in the PR what it costs in wall time.
 
 **4. Add no test.** Legitimate cases:
 

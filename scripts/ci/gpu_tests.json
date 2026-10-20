@@ -2,7 +2,6 @@
   {
     "name": "01-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -13,7 +12,6 @@
   {
     "name": "02-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -24,7 +22,6 @@
   {
     "name": "03-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -35,7 +32,6 @@
   {
     "name": "04-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -46,7 +42,6 @@
   {
     "name": "05-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -57,7 +52,6 @@
   {
     "name": "06-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -68,7 +62,6 @@
   {
     "name": "07-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -79,7 +72,6 @@
   {
     "name": "08-unit",
     "suite": "unit",
-    "gpus": 4,
     "conditional": false,
     "args": [
       "-s",
@@ -90,7 +82,6 @@
   {
     "name": "09-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -101,7 +92,6 @@
   {
     "name": "10-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -112,7 +102,6 @@
   {
     "name": "11-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -123,7 +112,6 @@
   {
     "name": "12-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -134,7 +122,6 @@
   {
     "name": "13-unit",
     "suite": "unit",
-    "gpus": 4,
     "conditional": false,
     "args": [
       "-s",
@@ -145,20 +132,17 @@
   {
     "name": "14-unit",
     "suite": "unit",
-    "gpus": 2,
     "conditional": false,
     "args": [
       "-s",
       "-x",
       "--ignore=tests/models/test_omni_fsdp.py",
       "tests/models"
-    ],
-    "priority": 1
+    ]
   },
   {
     "name": "15-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -169,7 +153,6 @@
   {
     "name": "16-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -180,7 +163,6 @@
   {
     "name": "17-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -191,7 +173,6 @@
   {
     "name": "18-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -202,7 +183,6 @@
   {
     "name": "19-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -213,7 +193,6 @@
   {
     "name": "20-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -224,7 +203,6 @@
   {
     "name": "21-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -235,7 +213,6 @@
   {
     "name": "22-unit",
     "suite": "unit",
-    "gpus": 2,
     "conditional": true,
     "args": [
       "-s",
@@ -246,7 +223,6 @@
   {
     "name": "23-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -257,7 +233,6 @@
   {
     "name": "24-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -268,7 +243,6 @@
   {
     "name": "25-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -279,7 +253,6 @@
   {
     "name": "26-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -290,7 +263,6 @@
   {
     "name": "27-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -301,7 +273,6 @@
   {
     "name": "28-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -312,7 +283,6 @@
   {
     "name": "29-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -323,7 +293,6 @@
   {
     "name": "30-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -334,7 +303,6 @@
   {
     "name": "31-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -345,7 +313,6 @@
   {
     "name": "32-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -356,7 +323,6 @@
   {
     "name": "33-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -367,7 +333,6 @@
   {
     "name": "34-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -378,7 +343,6 @@
   {
     "name": "35-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -389,7 +353,6 @@
   {
     "name": "36-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -400,7 +363,6 @@
   {
     "name": "37-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -411,7 +373,6 @@
   {
     "name": "38-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -424,7 +385,6 @@
   {
     "name": "39-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -435,7 +395,6 @@
   {
     "name": "40-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -446,7 +405,6 @@
   {
     "name": "41-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -457,7 +415,6 @@
   {
     "name": "42-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -468,7 +425,6 @@
   {
     "name": "43-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -479,7 +435,6 @@
   {
     "name": "44-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -490,7 +445,6 @@
   {
     "name": "45-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -501,7 +455,6 @@
   {
     "name": "46-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -512,7 +465,6 @@
   {
     "name": "47-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -523,7 +475,6 @@
   {
     "name": "48-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -534,7 +485,6 @@
   {
     "name": "49-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -545,7 +495,6 @@
   {
     "name": "50-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -556,7 +505,6 @@
   {
     "name": "51-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -567,7 +515,6 @@
   {
     "name": "52-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -578,7 +525,6 @@
   {
     "name": "53-unit",
     "suite": "unit",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -589,7 +535,6 @@
   {
     "name": "54-unit",
     "suite": "unit",
-    "gpus": 4,
     "conditional": false,
     "args": [
       "-s",
@@ -600,7 +545,6 @@
   {
     "name": "55-unit",
     "suite": "unit",
-    "gpus": 2,
     "conditional": false,
     "args": [
       "-s",
@@ -611,7 +555,6 @@
   {
     "name": "56-unit",
     "suite": "unit",
-    "gpus": 2,
     "conditional": false,
     "args": [
       "-s",
@@ -622,7 +565,6 @@
   {
     "name": "57-e2e",
     "suite": "e2e",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -633,7 +575,6 @@
   {
     "name": "58-e2e",
     "suite": "e2e",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",
@@ -644,7 +585,6 @@
   {
     "name": "60-e2e",
     "suite": "e2e",
-    "gpus": 8,
     "conditional": false,
     "args": [
       "-s",

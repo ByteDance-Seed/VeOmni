@@ -23,6 +23,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 from transformers.modeling_layers import GradientCheckpointingLayer
 
+from scripts.ci.launch_plan import LaunchSpec
 from veomni.arguments.arguments_types import OffloadConfig
 from veomni.distributed.async_offload import (
     GetCnt,
@@ -37,6 +38,9 @@ from veomni.distributed.async_offload import (
     reset_async_activation_offload,
 )
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_torch_device
+
+
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 
 class _AsyncOffloadFSDPBlock(GradientCheckpointingLayer):
@@ -578,6 +582,7 @@ def _run_async_offload_base_trainer_fsdp2_gc():
     dist.barrier()
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 @pytest.mark.skipif(
     not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE),
     reason="CUDA or NPU is required for FSDP2 async-offload integration",
@@ -585,4 +590,4 @@ def _run_async_offload_base_trainer_fsdp2_gc():
 def test_async_offload_base_trainer_fsdp2_gc_integration():
     from ..tools.launch_utils import torchrun
 
-    torchrun(_run_async_offload_base_trainer_fsdp2_gc, world_size=2)
+    torchrun(_run_async_offload_base_trainer_fsdp2_gc, world_size=_CI_ACCELERATOR_2.nproc)

@@ -10,6 +10,8 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from scripts.ci.launch_plan import CasePlan, LaunchSpec
+
 from ..tools import DummyDataset as DummyDataset
 from ..tools import ParallelConfig
 
@@ -108,6 +110,36 @@ def _moe_model_modes():
     return modes
 
 
+def parallel_launches(is_moe, max_sp_size=None, max_ep_size=None):
+    modes = _moe_model_modes() if is_moe else _base_model_modes()
+    return [
+        (mode, LaunchSpec(nproc=mode.sp_size * 4))
+        for mode in modes
+        if (max_sp_size is None or mode.sp_size <= max_sp_size)
+        and (max_ep_size is None or mode.ep_size <= max_ep_size)
+    ]
+
+
+def alignment_plan(capabilities, is_moe=False, max_sp_size=None, max_ep_size=None):
+    groups, group, count = [], [], 0
+    for _, launch in parallel_launches(is_moe, max_sp_size, max_ep_size):
+        if group and count + launch.nproc > max(1, len(capabilities.devices)):
+            groups.append(tuple(group))
+            group, count = [], 0
+        group.append(launch)
+        count += launch.nproc
+    if group:
+        groups.append(tuple(group))
+    return CasePlan(tuple(groups))
+
+
+def alignment_case_plan(context):
+    return alignment_plan(
+        context.capabilities,
+        **{key: context.params[key] for key in ("is_moe", "max_sp_size", "max_ep_size") if key in context.params},
+    )
+
+
 def prepare_exec_cmd(
     test_tasks: list[str],
     model_name: str,
@@ -142,15 +174,11 @@ def prepare_exec_cmd(
         List of (task_name, cmd_kwargs) tuples, where cmd_kwargs is a dict of
         keyword arguments for :func:`build_torchrun_cmd`.
     """
-    model_modes: list[ParallelMode] = _base_model_modes() if not is_moe else _moe_model_modes()
-    if max_sp_size is not None:
-        model_modes = [m for m in model_modes if m.sp_size <= max_sp_size]
-    if max_ep_size is not None:
-        model_modes = [m for m in model_modes if m.ep_size <= max_ep_size]
+    launches = parallel_launches(is_moe, max_sp_size, max_ep_size)
 
     command_list = []
     for task in test_tasks:
-        for mode in model_modes:
+        for mode, launch in launches:
             task_name = f"{model_name}_{task}_{mode}"
             cmd_kwargs = dict(
                 script=f"tests/train_scripts/{task}.py",
@@ -159,7 +187,7 @@ def prepare_exec_cmd(
                 train_path=train_path,
                 output_dir=os.path.join(output_dir, task_name),
                 parallel_config=ParallelConfig(sp_size=mode.sp_size, ep_size=mode.ep_size, fsdp_mode="fsdp2"),
-                nproc=mode.sp_size * 4,
+                nproc=launch.nproc,
                 # Forwarded to ``resolve_ops_overrides`` inside
                 # ``build_torchrun_cmd`` so per-model NPU eager fallbacks
                 # (e.g. DeepSeek-V3 RMSNorm/RoPE, Qwen2-VL multimodal RoPE)

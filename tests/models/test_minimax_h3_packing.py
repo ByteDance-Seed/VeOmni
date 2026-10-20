@@ -10,6 +10,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
+from scripts.ci.launch_plan import LaunchSpec
 from veomni.models.diffusers.minimax_h3.minimax_h3_condition.configuration_minimax_h3_condition import (
     MiniMaxH3ConditionModelConfig,
 )
@@ -26,6 +27,9 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_
 )
 from veomni.trainer.dit_trainer import DiTDataCollator
 from veomni.utils.import_utils import is_torch_npu_available
+
+
+_CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
 
 
 def tiny_model(num_attention_heads=2):
@@ -940,6 +944,7 @@ def _check_sequence_parallel_gradients(rank, init_method, cases):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo required")
 def test_sequence_parallel_gradients_match_single_rank_after_sp_average(tmp_path):
     cases = []
@@ -952,7 +957,9 @@ def test_sequence_parallel_gradients_match_single_rank_after_sp_average(tmp_path
         loss.backward()
         grads = {name: param.grad.clone() for name, param in model.named_parameters()}
         cases.append((f"{task} heads={heads}", heads, model.state_dict(), sample, loss.detach(), grads))
-    mp.spawn(_check_sequence_parallel_gradients, args=((tmp_path / "rendezvous").as_uri(), cases), nprocs=2)
+    mp.spawn(
+        _check_sequence_parallel_gradients, args=((tmp_path / "rendezvous").as_uri(), cases), nprocs=_CI_CPU_2.nproc
+    )
 
 
 _HUB_UNAVAILABLE = pytest.mark.skipif(

@@ -14,7 +14,8 @@ import pytest
 import torch
 import torch.distributed as c10d
 
-from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+from scripts.ci.launch_plan import runner_device_count
+from veomni.utils.device import get_device_type, get_dist_comm_backend
 
 
 if get_device_type() == "cpu" or not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
@@ -48,7 +49,7 @@ class FluxJointAttentionUlyssesTest(SequenceParallelTest):
 
     # Flash kernels only accept FP16/BF16, so this FP32 comparison has to run on SDPA. With no
     # ops config installed, `bind_flux_attention` binds `veomni_sdpa`.
-    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
+    @pytest.mark.skipif(runner_device_count() < 2, reason="device_count should be >= 2")
     def test_matches_full_sequence_reference(self):
         group = self._get_process_group()
         device = torch.device(get_device_type(), self.rank)

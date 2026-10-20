@@ -117,25 +117,32 @@ tests/
 
 | Category | Directory | GPU Req | Execution | Purpose |
 |---|---|---|---|---|
-| **Models** | `tests/models/` | 0-1 GPU | pytest | Registry/build contracts, model parity, and implementation selection |
-| **Ops** | `tests/ops/` | 0-1 GPU (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Registry contracts, hardware guards, numerical correctness, and performance |
-| **Data pipeline** | `tests/data/` | 0-1 GPU | pytest | Data loading, collation, preprocessing |
-| **Parallelism** | `tests/parallel/` | 4-8 GPUs | torchrun / pytest | SP, EP, data-balance primitives |
-| **Distributed runtime** | `tests/distributed/` | 0-2+ GPUs | pytest + torchrun | FSDP equivalence, dummy forward, gradient checkpointing, vocab-parallel embedding |
+| **Models** | `tests/models/` | 0-4 GPUs | pytest | Registry/build contracts, model parity, and implementation selection |
+| **Ops** | `tests/ops/` | 0-4 GPUs (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Registry contracts, hardware guards, numerical correctness, and performance |
+| **Data pipeline** | `tests/data/` | 0-8 GPUs | pytest + torchrun | Data loading, collation, preprocessing, and distributed resume |
+| **Parallelism** | `tests/parallel/` | 0-8 GPUs | torchrun / pytest | SP, EP, data-balance primitives |
+| **Distributed runtime** | `tests/distributed/` | 0-4 GPUs | pytest + torchrun | FSDP equivalence, dummy forward, gradient checkpointing, vocab-parallel embedding |
 | **SeedOmni** | `tests/seed_omni/` | 0; 2 for `e2e/` | pytest (+ torchrun for `e2e/`) | Multi-module OmniModel, runtimes, trainer, launcher, module mixins |
 | **E2E parallel** | `tests/e2e/` | 4+ GPUs | torchrun (subprocess) | SP/EP alignment across full training runs |
 | **Checkpoints** | `tests/checkpoints/` | 0-8 GPUs | pytest + torchrun | Save/load, DCP→HF conversion |
 | **Utilities** | `tests/utils/` | 0-8 GPUs | pytest + torchrun | FLOPs, grad clipping, weight broadcast |
 | **Sanity** | `tests/special_sanity/` | 0 | script + pytest | Device API lint and op-architecture path guards |
 
-Unit CI does not run `pytest tests/`. `gpu_unit_tests.yml` and
-`npu_unit_tests.yml` collect `tests/ops/` (`not benchmark`), `tests/models/`,
-`tests/data/`, `tests/checkpoints/`, and `tests/arguments/` as directories.
-They also run `tests/special_sanity/test_ops_architecture.py`. Other files are
-listed one pytest invocation at a time. E2E jobs own
-`tests/e2e/test_e2e_parallel.py` and `tests/distributed/test_fsdp_equivalence.py`.
-A new file outside those directory collections is invisible to CI until a
-workflow line is added.
+Unit CI does not run `pytest tests/`. Suite selection is defined in the
+[GPU manifest](../scripts/ci/gpu_tests.json) and
+[NPU manifest](../scripts/ci/npu_tests.json), consumed by the
+[accelerator runner](../scripts/ci/run_accelerator_tests.py). Directory selections
+collect their children automatically; a file outside them must be added to its
+suite.
+
+The [case scheduling contract](design/ci_case_scheduling.md) defines planning
+from the actual `nproc/world_size` configuration, device isolation and GPU/NPU
+scheduling. The default launch plan uses one card of the selected accelerator
+backend on GPU/NPU runners, and CPU on CPU-only runners. Multi-card tests must
+expose their launch configuration; `skipif` describes eligibility, not a
+resource reservation. See [runner usage](../scripts/ci/README.md) for commands
+and result artifacts. NPU workflows use serial dispatch until concurrent HCCL
+isolation has been validated on NPU hardware.
 
 ---
 
@@ -276,7 +283,8 @@ requires TileKernels on an SM90+ NVIDIA GPU or CANN on an Ascend NPU.
 - FSDP2 always enabled, `nproc_per_node = sp_size * 4`
 - 2 epochs, 2 max_steps per run
 
-**Models**: All supported text, VLM, omni, and DiT models.
+**Models**: The text, VLM, omni, and DiT parameter tables in
+`tests/e2e/test_e2e_parallel.py` define coverage.
 
 **GPU**: 4+ GPUs (up to 8 for sp=2).
 
@@ -363,6 +371,26 @@ CPU, and multi-rank cases spawn CPU gloo ranks with `torch.multiprocessing`;
 
 ---
 
+## Launch Plans for New Tests
+
+A test without an explicit launch plan uses one card of the runner's selected
+accelerator backend, or CPU on a CPU-only runner. Single-card tests may use this
+default. Declare a CPU plan for tests that must run without accelerator access.
+
+Multi-card tests must expose a plan derived from the same `nproc`, `world_size`,
+or parallel configuration used to launch their workers. A module, class, or
+fixture family may provide a shared plan. Parameterized tests resolve their
+plan for each parameter combination; they do not need entries in a device-quota
+table. A `skipif` marker alone does not declare a launch plan.
+
+Keep launch configuration independent of the number of cards currently free.
+An undersized plan is an error; it must not cause a smaller topology, a backend
+fallback, or a resource-induced skip. Use isolated output/cache paths and
+allocated rendezvous ports for concurrent cases. See the
+[test-author contract](design/ci_case_scheduling.md#writing-new-tests) for details.
+
+---
+
 ## New Model Onboarding: Test Checklist
 
 When adding a new model to VeOmni, the following tests should be created or updated.
@@ -431,8 +459,9 @@ pytest → family-specific eager parity test
 pytest → test_text_parallel_align(model_name, config, ...)
   → materialize_weights(config) → random weights on disk
   → DummyDataset(dataset_type) → parquet files
-  → for each (sp_size, ep_size):
-      prepare_exec_cmd() → torchrun command
+  → prepare_exec_cmd() → kwargs for each (sp_size, ep_size)
+  → dispatch independent modes on disjoint devices when GPU parallel mode is enabled
+      build_torchrun_cmd(**kwargs) → fresh torchrun command and rendezvous port
       subprocess.run(torchrun ... train_text_test.py ...)
         → TestTextTrainer.train() → log_dict.json
   → compare_multi_items(all_log_dicts, rtol, atol)
@@ -444,7 +473,7 @@ pytest → test_text_fsdp_equivalence(config, ...)
   → materialize_weights(config)
   → DummyDataset(text)
   → run_training_config(nproc=1, init_device=device)      # baseline
-  → run_training_config(nproc=2+, init_device=meta, fsdp2) # FSDP
+  → run_training_config(nproc=2, init_device=meta, fsdp2)  # fixed two-rank FSDP
   → compare_metrics(baseline_grad_norm, fsdp_grad_norm)
 ```
 

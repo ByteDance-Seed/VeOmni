@@ -32,6 +32,7 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     Qwen2VLForConditionalGeneration as HFQwen2VLForConditionalGeneration,
 )
 
+from scripts.ci.launch_plan import LaunchSpec
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
@@ -42,6 +43,9 @@ from tests.models.tiny_configs import tiny_qwen2_vl_config as _tiny_config
 from tests.ops.tol import EAGER_GRAD_ATOL, EAGER_GRAD_RTOL
 from tests.tools.launch_utils import torchrun
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+
+
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 
 IMAGE_TOKEN_ID = 120
@@ -103,10 +107,11 @@ def _qwen2_vl_vision_fsdp_checkpoint_worker():
         )
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Liger vision RoPE with FSDP2 needs GPU")
 def test_qwen2_vl_default_vision_rope_with_fsdp_checkpoint():
     pytest.importorskip("liger_kernel.ops.rope")
-    torchrun(_qwen2_vl_vision_fsdp_checkpoint_worker, world_size=2)
+    torchrun(_qwen2_vl_vision_fsdp_checkpoint_worker, world_size=_CI_ACCELERATOR_2.nproc)
 
 
 def _build_ours(config: Qwen2VLConfig, ops: SimpleNamespace | None = None):

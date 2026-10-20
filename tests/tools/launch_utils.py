@@ -1,7 +1,6 @@
 # tests/utils.py
 import os
 import signal
-import socket
 import subprocess
 
 import psutil
@@ -9,14 +8,9 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from scripts.ci.ports import find_free_port as find_free_port
+from scripts.ci.pytest_plan import validate_launch
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
-
-
-def find_free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        return s.getsockname()[1]
 
 
 def _collect_process_tree(root_pid: int) -> tuple[list[psutil.Process], set[int]]:
@@ -123,6 +117,7 @@ def _dist_worker_entry(rank, world_size, port, func, args, kwargs):
 
 
 def torchrun(func, world_size: int = 4, *args, **kwargs):
+    validate_launch(world_size, record=False)
     if get_torch_device().is_available() and get_torch_device().device_count() < world_size:
         pytest.skip(f"Requires {world_size} {get_device_type()} devices")
 

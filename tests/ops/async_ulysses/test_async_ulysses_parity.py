@@ -7,6 +7,7 @@ import torch
 import torch.distributed as c10d
 import torch.distributed as dist
 
+from scripts.ci.launch_plan import runner_device_count
 from tests.parallel.ulysses.attention import Attention
 from tests.parallel.ulysses.utils import SequenceParallelTest, sync_tensor
 from veomni.distributed.parallel_state import use_parallel_state
@@ -94,7 +95,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         t = torch.ones_like(output)
         return torch.sum(output * t)
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
+    @pytest.mark.skipif(runner_device_count() < 2, reason="device_count should be >= 2")
     @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses")
     def test_self_attn(self):
         self._get_process_group()
@@ -142,7 +143,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         _assert_parameter_gradients_close(attn_dp_grads, attn_sp_grads)
         torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
+    @pytest.mark.skipif(runner_device_count() < 2, reason="device_count should be >= 2")
     @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses")
     def test_self_attn_padding(self):
         self._get_process_group()

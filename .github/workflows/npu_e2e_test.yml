@@ -12,6 +12,8 @@ on:
     paths:
       - "**/*.py"
       - "!scripts/**/*.py"
+      - "scripts/ci/**"
+      - "tests/toy_config/ci/**"
       - .github/workflows/npu_e2e_test.yml
       - "pyproject.toml"
       - "uv.lock"
@@ -21,6 +23,8 @@ on:
     paths:
       - "**/*.py"
       - "!scripts/**/*.py"
+      - "scripts/ci/**"
+      - "tests/toy_config/ci/**"
       - .github/workflows/npu_e2e_test.yml
       - "pyproject.toml"
       - "uv.lock"
@@ -141,9 +145,7 @@ jobs:
         # ships it in its own build-time venv, but the steps above create a fresh
         # one in the workspace, so install it here. `uv sync` prunes anything
         # absent from the lockfile; `uv run --frozen` does not, so this survives
-        # the test steps below — but the later `Sync dependencies [diffusers]`
-        # step does prune it again, which is fine since the Wan DiT test after it
-        # uses no Triton kernel (unlike ninja, which that step reinstalls).
+        # accelerator case runner below.
         #
         # Community triton and triton-ascend both ship triton/_C/libtriton.so and
         # only triton-ascend's carries the Ascend backend, so whoever writes that
@@ -158,45 +160,12 @@ jobs:
       - name: Check final pip list
         run: |
           uv pip list
-      - name: Run e2e training test
+      - name: Run accelerator case tests
         run: |
-          uv run --frozen pytest -v -s -x tests/e2e/test_e2e_parallel.py
-      - name: Free NPUs between test steps
-        # pytest's mp.spawn / torchrun workers sometimes outlive the pytest
-        # session — they hold tens of GiB on NPU and OOM the next test.
-        # Kill stale Python processes and verify NPU memory is freed.
+          uv run --frozen python -m scripts.ci.run_accelerator_tests --backend npu --suite e2e --serial
+      - name: Upload accelerator test results
         if: always()
-        run: |
-          npu-smi info || true
-          pids=$(ps -eo pid,args | grep -E 'python.*torchrun|python.*pytest' | grep -v grep | awk '{print $1}' | sort -u | tr '\n' ' ')
-          if [ -n "$pids" ]; then
-            echo "Killing stale NPU processes: $pids"
-            kill -9 $pids 2>/dev/null || true
-            sleep 3
-            npu-smi info || true
-          fi
-      - name: Run FSDP equivalence tests
-        run: |
-          uv run --frozen pytest -v -s -x tests/distributed/test_fsdp_equivalence.py
-      - name: Free NPUs between test steps
-        if: always()
-        run: |
-          npu-smi info || true
-          pids=$(ps -eo pid,args | grep -E 'python.*torchrun|python.*pytest' | grep -v grep | awk '{print $1}' | sort -u | tr '\n' ' ')
-          if [ -n "$pids" ]; then
-            echo "Killing stale NPU processes: $pids"
-            kill -9 $pids 2>/dev/null || true
-            sleep 3
-            npu-smi info || true
-          fi
-      - name: Sync dependencies [diffusers]
-        run: |
-          # diffusers ships under the `npu` extra (rolled in from the dropped
-          # `dit` extra), so no additional extra is needed here.
-          uv sync --frozen --python "$(command -v python3)" --extra npu --group dev
-          uv pip install --python .venv/bin/python ninja
-          uv run --frozen ninja --version
-          uv run --frozen python -c "import cann_ops_transformer"
-      - name: Run diffusers tests
-        run: |
-          uv run --frozen pytest -v -s -x tests/e2e/test_e2e_parallel.py::test_wan_dit_parallel_align
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-e2e-results
+          path: outputs/accelerator-ci/e2e

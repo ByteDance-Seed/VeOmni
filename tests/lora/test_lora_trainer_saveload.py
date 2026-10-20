@@ -33,9 +33,11 @@ Run (4 GPUs):
 import os
 from typing import Any, Dict, List, Optional
 
+import pytest
 import torch
 from torch.distributed.checkpoint import FileSystemReader
 
+from scripts.ci.launch_plan import LaunchSpec, runner_device_count
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.checkpoint.layout import weights_dir
 from veomni.data import build_dummy_dataset
@@ -43,6 +45,9 @@ from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
 from veomni.utils import helper
+
+
+_LORA_MAX_NPROC = 4
 
 
 os.environ["NCCL_DEBUG"] = "OFF"
@@ -270,6 +275,9 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.launch_plan(
+    provider=lambda context: LaunchSpec(nproc=max(1, min(len(context.capabilities.devices), _LORA_MAX_NPROC)))
+)
 def test_lora_trainer_saveload():
     """Run the LoRA save/load test via torchrun and assert it passes."""
     import shutil
@@ -282,12 +290,12 @@ def test_lora_trainer_saveload():
     from ..tools.launch_utils import find_free_port
 
     torch_device = get_torch_device()
-    device_count = torch_device.device_count() if torch_device.is_available() else 0
+    device_count = runner_device_count() if torch_device.is_available() else 0
     if device_count < 1:
         pytest.skip("Requires at least 1 accelerator device")
 
-    nproc = min(device_count, 4)
-    output_dir = "/tmp/test_lora_saveload"
+    nproc = min(device_count, _LORA_MAX_NPROC)
+    output_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "test_lora_saveload")
     port = find_free_port()
 
     cmd = [

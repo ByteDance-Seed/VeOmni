@@ -29,6 +29,8 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from scripts.ci.launch_plan import LaunchSpec, runner_device_count
+from tests.tools.launch_utils import find_free_port
 from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.optim.muon import DistributedMuon
 from veomni.utils.device import (
@@ -36,6 +38,9 @@ from veomni.utils.device import (
     get_dist_comm_backend,
     get_torch_device,
 )
+
+
+_CI_LAUNCH = LaunchSpec(nproc=4)
 
 
 SEED = 4242
@@ -542,7 +547,7 @@ def _run_qwen3_moe(use_zero_comm: bool) -> None:
 
 def _has_devices(n: int) -> bool:
     try:
-        return get_torch_device().device_count() >= n
+        return runner_device_count() >= n
     except Exception:
         return False
 
@@ -564,72 +569,78 @@ def _torchrun_cmd(nproc: int, port: int, mode: str, use_zero_comm: bool) -> list
 def _find_free_port() -> int:
     # Torchrun executes this file directly, so imports from ``tests`` must stay
     # on the pytest parent path.
-    from tests.tools.launch_utils import find_free_port
 
     return find_free_port()
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_dense_4gpu():
-    cmd = _torchrun_cmd(nproc=4, port=_find_free_port(), mode="dense", use_zero_comm=False)
+    cmd = _torchrun_cmd(nproc=_CI_LAUNCH.nproc, port=_find_free_port(), mode="dense", use_zero_comm=False)
     env = os.environ.copy()
     env.setdefault("NCCL_DEBUG", "WARN")
     result = subprocess.run(cmd, env=env, check=True)
     assert result.returncode == 0
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_dense_empty_shards_4gpu():
-    cmd = _torchrun_cmd(nproc=4, port=_find_free_port(), mode="dense_empty", use_zero_comm=False)
+    cmd = _torchrun_cmd(nproc=_CI_LAUNCH.nproc, port=_find_free_port(), mode="dense_empty", use_zero_comm=False)
     env = os.environ.copy()
     env.setdefault("NCCL_DEBUG", "WARN")
     result = subprocess.run(cmd, env=env, check=True)
     assert result.returncode == 0
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_dense_hsdp_4gpu():
     """HSDP must use the all-to-all path, not a per-param all-gather."""
-    cmd = _torchrun_cmd(nproc=4, port=_find_free_port(), mode="dense_hsdp", use_zero_comm=False)
+    cmd = _torchrun_cmd(nproc=_CI_LAUNCH.nproc, port=_find_free_port(), mode="dense_hsdp", use_zero_comm=False)
     env = os.environ.copy()
     env.setdefault("NCCL_DEBUG", "WARN")
     result = subprocess.run(cmd, env=env, check=True)
     assert result.returncode == 0
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_dense_mixed_dtype_4gpu():
-    cmd = _torchrun_cmd(nproc=4, port=_find_free_port(), mode="dense_mixed_dtype", use_zero_comm=False)
+    cmd = _torchrun_cmd(nproc=_CI_LAUNCH.nproc, port=_find_free_port(), mode="dense_mixed_dtype", use_zero_comm=False)
     env = os.environ.copy()
     env.setdefault("NCCL_DEBUG", "WARN")
     result = subprocess.run(cmd, env=env, check=True)
     assert result.returncode == 0
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_dense_head_split_4gpu():
     """Head-block orthogonalization must survive the all-to-all owner path."""
-    cmd = _torchrun_cmd(nproc=4, port=_find_free_port(), mode="dense_head_split", use_zero_comm=False)
+    cmd = _torchrun_cmd(nproc=_CI_LAUNCH.nproc, port=_find_free_port(), mode="dense_head_split", use_zero_comm=False)
     env = os.environ.copy()
     env.setdefault("NCCL_DEBUG", "WARN")
     result = subprocess.run(cmd, env=env, check=True)
     assert result.returncode == 0
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_qwen3_moe_default_backend_4gpu():
     """Default backend: ``Shard(1)`` on experts + ep_fsdp all-gather in Muon."""
-    cmd = _torchrun_cmd(nproc=4, port=_find_free_port(), mode="moe", use_zero_comm=False)
+    cmd = _torchrun_cmd(nproc=_CI_LAUNCH.nproc, port=_find_free_port(), mode="moe", use_zero_comm=False)
     env = os.environ.copy()
     env.setdefault("NCCL_DEBUG", "WARN")
     result = subprocess.run(cmd, env=env, check=True)
     assert result.returncode == 0
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_qwen3_moe_zero_comm_backend_4gpu():
     """Zero-comm backend: ``Shard(0)`` on experts + local batched NS."""
-    cmd = _torchrun_cmd(nproc=4, port=_find_free_port(), mode="moe", use_zero_comm=True)
+    cmd = _torchrun_cmd(nproc=_CI_LAUNCH.nproc, port=_find_free_port(), mode="moe", use_zero_comm=True)
     env = os.environ.copy()
     env.setdefault("NCCL_DEBUG", "WARN")
     result = subprocess.run(cmd, env=env, check=True)

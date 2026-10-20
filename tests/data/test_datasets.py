@@ -25,6 +25,8 @@ from utils import (
     process_dummy_example,
 )
 
+from scripts.ci.launch_plan import LaunchSpec
+from tests.tools.launch_utils import find_free_port
 from veomni.arguments import parse_args
 from veomni.data import dataset as dataset_module
 from veomni.data.data_collator import MainCollator
@@ -48,6 +50,9 @@ from veomni.trainer.callbacks import (
 )
 from veomni.utils import helper
 from veomni.utils.helper import get_cache_dir
+
+
+_CI_LAUNCH = LaunchSpec(nproc=8)
 
 
 logger = helper.create_logger(__name__)
@@ -236,12 +241,12 @@ if __name__ == "__main__":
 
 
 def build_command(dataset_type: str, dyn_bsz: bool, data_path: str):
-    port = 12345 + random.randint(0, 100)
+    port = find_free_port()
 
     command = [
         "torchrun",
         "--nnodes=1",
-        "--nproc_per_node=8",
+        f"--nproc_per_node={_CI_LAUNCH.nproc}",
         f"--master_port={port}",
         "tests/data/test_datasets.py",
         "--model.config_path=test",
@@ -320,6 +325,7 @@ TEST_DATASETS = ["mapping", "iterable"]
 DYN_BSZ = [True, False]
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.parametrize("dataset_type", TEST_DATASETS)
 @pytest.mark.parametrize("dyn_bsz", DYN_BSZ)
 def test_multisource_dataset(dataset_type: str, dyn_bsz: bool, dummy_multisource_dataset_ci):
@@ -329,6 +335,7 @@ def test_multisource_dataset(dataset_type: str, dyn_bsz: bool, dummy_multisource
     assert result.returncode == 0
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.parametrize("dataset_type", TEST_DATASETS)
 @pytest.mark.parametrize("dyn_bsz", DYN_BSZ)
 def test_native_dataset(dataset_type: str, dyn_bsz: bool, dummy_native_dataset_ci):

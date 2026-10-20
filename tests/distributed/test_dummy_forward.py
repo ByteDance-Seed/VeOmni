@@ -16,8 +16,12 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from scripts.ci.launch_plan import LaunchSpec
 from veomni.arguments import MixedPrecisionConfig
 from veomni.utils.device import empty_cache
+
+
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 
 _TEXT_SEQ_LEN = 64
@@ -217,6 +221,7 @@ _vlm_cases = [
 ]
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 @pytest.mark.parametrize("model_type, config_path, batch_fn", _vlm_cases)
 def test_asymmetric_forward_vlm(model_type: str, config_path: str, batch_fn):
     """Verify no NCCL hang when some ranks lack image/video data under FSDP2."""
@@ -224,7 +229,7 @@ def test_asymmetric_forward_vlm(model_type: str, config_path: str, batch_fn):
 
     torchrun(
         partial(_asymmetric_forward_worker, model_type, config_path, batch_fn),
-        world_size=2,
+        world_size=_CI_ACCELERATOR_2.nproc,
     )
 
 
@@ -248,6 +253,7 @@ _omni_cases = [
 ]
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 @pytest.mark.parametrize("model_type, config_path, batch_fn", _omni_cases)
 def test_asymmetric_forward_omni(model_type: str, config_path: str, batch_fn):
     """Verify no NCCL hang when some ranks lack image/audio/video data under FSDP2."""
@@ -255,5 +261,5 @@ def test_asymmetric_forward_omni(model_type: str, config_path: str, batch_fn):
 
     torchrun(
         partial(_asymmetric_forward_worker, model_type, config_path, batch_fn),
-        world_size=2,
+        world_size=_CI_ACCELERATOR_2.nproc,
     )

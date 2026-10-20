@@ -3,7 +3,8 @@ import sys
 import torch
 import torch.distributed as c10d
 
-from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+from scripts.ci.launch_plan import runner_device_count
+from veomni.utils.device import get_device_type, get_dist_comm_backend
 
 
 if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
@@ -41,7 +42,7 @@ class WanUlyssesUnpatchifyPaddingTest(SequenceParallelTest):
     def world_size(self):
         return 4
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    @pytest.mark.skipif(runner_device_count() < 4, reason="device_count should be >= 4")
     def test_non_divisible_seq_len_round_trips_losslessly(self):
         self._get_process_group()
         sp_group = get_ulysses_sequence_parallel_group()

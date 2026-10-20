@@ -9,6 +9,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import create_block_mask
 
+from scripts.ci.launch_plan import runner_device_count
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_dist_comm_backend, get_torch_device
 
 
@@ -70,7 +71,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         t = torch.ones_like(output)
         return torch.sum(output * t)
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    @pytest.mark.skipif(runner_device_count() < 4, reason="device_count should be >= 4")
     def test_self_attn(self):
         with ieee_fp32_matmul():
             self._get_process_group()
@@ -121,7 +122,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
             torch.testing.assert_close(attn_dp_q_grad, attn_sp_q_grad, atol=2e-3, rtol=1e-4)
             torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    @pytest.mark.skipif(runner_device_count() < 4, reason="device_count should be >= 4")
     def test_self_attn_padding(self):
         with ieee_fp32_matmul():
             self._get_process_group()
@@ -272,7 +273,7 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
             torch.testing.assert_close(gathered_gradient, baseline_tensor.grad, rtol=8e-2, atol=8e-2)
 
     @pytest.mark.skipif(
-        not IS_CUDA_AVAILABLE or get_torch_device().device_count() < 2,
+        not IS_CUDA_AVAILABLE or runner_device_count() < 2,
         reason="attention backend Ulysses parity requires at least 2 CUDA devices",
     )
     def test_flash_wrapper_matches_non_sp_oracle(self):
@@ -299,7 +300,7 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
             flash_backend._flash_attention_forward = original_backend
 
     @pytest.mark.skipif(
-        not IS_CUDA_AVAILABLE or get_torch_device().device_count() < 2,
+        not IS_CUDA_AVAILABLE or runner_device_count() < 2,
         reason="FlexAttention Ulysses parity requires at least 2 CUDA devices",
     )
     def test_flex_wrapper_matches_non_sp_oracle(self):
@@ -353,7 +354,7 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
         self._assert_qkv_gradients(local, baseline)
 
     @pytest.mark.skipif(
-        not IS_CUDA_AVAILABLE or get_torch_device().device_count() < 2,
+        not IS_CUDA_AVAILABLE or runner_device_count() < 2,
         reason="packed FlexAttention Ulysses parity requires at least 2 CUDA devices",
     )
     def test_packed_causal_flex_wrapper_matches_non_sp_oracle(self):
@@ -413,7 +414,7 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
         self._assert_qkv_gradients(local, baseline)
 
     @pytest.mark.skipif(
-        not IS_CUDA_AVAILABLE or not _MAGI_PACKAGE_AVAILABLE or get_torch_device().device_count() < 2,
+        not IS_CUDA_AVAILABLE or not _MAGI_PACKAGE_AVAILABLE or runner_device_count() < 2,
         reason="MagiAttention Ulysses parity requires at least 2 supported CUDA devices",
     )
     def test_magi_wrapper_matches_non_sp_oracle(self):

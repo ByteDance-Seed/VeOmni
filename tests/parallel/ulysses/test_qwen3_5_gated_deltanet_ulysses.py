@@ -19,6 +19,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from scripts.ci.launch_plan import from_parameter, runner_device_count
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_dist_comm_backend, get_torch_device
 
 
@@ -329,6 +330,7 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str, bsz
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=from_parameter("world_size", device="accelerator"))
 @pytest.mark.parametrize("world_size", [2])
 @pytest.mark.parametrize("bsz", [1, 8, 16, 32])
 @pytest.mark.parametrize("seq_len", [256, 2048])
@@ -336,7 +338,7 @@ def test_qwen3_5_gated_deltanet_sp_equivalence(world_size, bsz, seq_len):
     """Ensure SP partitioned forward outputs and grads match the non-SP baseline."""
     if causal_conv1d_fn is None or not get_torch_device().is_available():
         pytest.skip("FLA causal_conv1d or accelerator not available")
-    if get_torch_device().device_count() < world_size:
+    if runner_device_count() < world_size:
         pytest.skip(f"Requires at least {world_size} devices for SP equivalence test")
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         init_file = tmp.name
@@ -398,6 +400,7 @@ def _run_gated_deltanet_sp_determinism(rank: int, world_size: int, init_file: st
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=from_parameter("world_size", device="accelerator"))
 @pytest.mark.parametrize("world_size", [2])
 @pytest.mark.parametrize("bsz", [1, 4])
 @pytest.mark.parametrize("seq_len", [8, 2048, 32768])
@@ -405,7 +408,7 @@ def test_qwen3_5_gated_deltanet_forward_deterministic_sp(world_size, bsz, seq_le
     """Ensure repeated SP forward passes are deterministic per rank."""
     if causal_conv1d_fn is None or not get_torch_device().is_available():
         pytest.skip("FLA causal_conv1d or accelerator not available")
-    if get_torch_device().device_count() < world_size:
+    if runner_device_count() < world_size:
         pytest.skip(f"Requires at least {world_size} devices for SP determinism test")
     if seq_len % world_size != 0:
         pytest.skip(f"seq_len must be divisible by world_size (seq_len={seq_len}, world_size={world_size})")

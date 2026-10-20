@@ -27,6 +27,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from scripts.ci.launch_plan import LaunchSpec, from_parameter, runner_device_count
 from veomni.utils.device import (
     IS_CUDA_AVAILABLE,
     get_device_type,
@@ -34,6 +35,11 @@ from veomni.utils.device import (
     get_gpu_compute_capability,
     get_torch_device,
 )
+
+
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
+
+_CI_ACCELERATOR_4 = LaunchSpec(nproc=4, device="accelerator")
 
 
 _PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
@@ -55,7 +61,7 @@ def _cuda_device_count() -> int:
     directly instead of going through that gate, so a plain device count would
     let a multi-NPU host start a suite that cannot run there.
     """
-    return get_torch_device().device_count() if IS_CUDA_AVAILABLE else 0
+    return runner_device_count() if IS_CUDA_AVAILABLE else 0
 
 
 def _all_devices_sm90_or_above() -> bool:
@@ -65,7 +71,7 @@ def _all_devices_sm90_or_above() -> bool:
     calls ``set_device(rank)`` of its own. On a mixed-capability host the marker
     would pass on device 0 and the kernel would then fail on some other rank.
     """
-    count = _cuda_device_count()
+    count = get_torch_device().device_count() if IS_CUDA_AVAILABLE else 0
     return count > 0 and all(get_gpu_compute_capability(index) >= 90 for index in range(count))
 
 
@@ -910,6 +916,7 @@ def test_deepseek_v4_model_without_sp_still_defaults_position_ids():
     torch.testing.assert_close(defaulted, explicit, rtol=0, atol=0)
 
 
+@pytest.mark.launch_plan(provider=from_parameter("cp_size", device="accelerator"))
 @pytest.mark.skipif(_cuda_device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_deepseek_v4_attention_cp_sliding_only(cp_size):
@@ -940,6 +947,7 @@ def test_deepseek_v4_attention_cp_sliding_only(cp_size):
 _PACKED_SLIDING_SAMPLES = ((0, 70), (70, 128))
 
 
+@pytest.mark.launch_plan(provider=from_parameter("cp_size", device="accelerator"))
 @pytest.mark.skipif(_cuda_device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_deepseek_v4_attention_cp_packed_sliding_only(cp_size):
@@ -963,6 +971,7 @@ def test_deepseek_v4_attention_cp_packed_sliding_only(cp_size):
         )
 
 
+@pytest.mark.launch_plan(provider=from_parameter("cp_size", device="accelerator"))
 @pytest.mark.skipif(_cuda_device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_deepseek_v4_attention_cp_sparse_indices(cp_size):
@@ -979,6 +988,7 @@ def test_deepseek_v4_attention_cp_sparse_indices(cp_size):
         )
 
 
+@pytest.mark.launch_plan(provider=from_parameter("cp_size", device="accelerator"))
 @pytest.mark.skipif(_cuda_device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_deepseek_v4_attention_cp_with_compressor(cp_size):
@@ -999,6 +1009,7 @@ def test_deepseek_v4_attention_cp_with_compressor(cp_size):
         )
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 @pytest.mark.skipif(_cuda_device_count() < 2, reason="needs 2 devices")
 def test_deepseek_v4_attention_cp_with_compressor_batch_2():
     """The same HCA layer at batch 2, which is where the KV gather's backward broke.
@@ -1018,12 +1029,13 @@ def test_deepseek_v4_attention_cp_with_compressor_batch_2():
         init_file = os.path.join(tmpdir, "init")
         mp.spawn(
             _run_attention_cp,
-            args=(2, init_file, 128, True, 0, 2),
-            nprocs=2,
+            args=(_CI_ACCELERATOR_2.nproc, init_file, 128, True, 0, 2),
+            nprocs=_CI_ACCELERATOR_2.nproc,
             join=True,
         )
 
 
+@pytest.mark.launch_plan(provider=from_parameter("cp_size", device="accelerator"))
 @pytest.mark.skipif(_cuda_device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("kind", ["hca", "csa"])
 @pytest.mark.parametrize("cp_size", [2, 4])
@@ -1076,6 +1088,7 @@ _PACKED_COMPRESSOR_FIXTURES = {
 }
 
 
+@pytest.mark.launch_plan(provider=from_parameter("cp_size", device="accelerator"))
 @pytest.mark.skipif(_cuda_device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("kind", ["hca", "csa"])
 @pytest.mark.parametrize("cp_size", [2, 4])
@@ -1094,6 +1107,7 @@ def test_deepseek_v4_compressor_cp_packed_straddling(kind, cp_size):
         )
 
 
+@pytest.mark.launch_plan(provider=from_parameter("cp_size", device="accelerator"))
 @pytest.mark.skipif(_cuda_device_count() < 2, reason="needs 2 devices")
 # The TileLang scorer is what this case is about -- it is the only one that
 # partitions queries itself, and the run below counts kernel invocations to prove
@@ -1125,6 +1139,7 @@ def test_deepseek_v4_indexer_cp(cp_size):
 _ZERO_WINDOW_UNPACKED_SEQ_LEN = {"hca": 80, "csa": 10}
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 @pytest.mark.skipif(_cuda_device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("kind", ["hca", "csa"])
 def test_deepseek_v4_compressor_cp_zero_windows_unpacked(kind):
@@ -1145,8 +1160,8 @@ def test_deepseek_v4_compressor_cp_zero_windows_unpacked(kind):
         init_file = os.path.join(tmpdir, "init")
         mp.spawn(
             _run_compressor_cp,
-            args=(2, init_file, kind, _ZERO_WINDOW_UNPACKED_SEQ_LEN[kind], None),
-            nprocs=2,
+            args=(_CI_ACCELERATOR_2.nproc, init_file, kind, _ZERO_WINDOW_UNPACKED_SEQ_LEN[kind], None),
+            nprocs=_CI_ACCELERATOR_2.nproc,
             join=True,
         )
 
@@ -1166,6 +1181,7 @@ _ZERO_WINDOW_PACKED_SEQ_LEN = 16
 _ZERO_WINDOW_PACKED_SAMPLES = ((0, 6), (6, 16))
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 @pytest.mark.skipif(_cuda_device_count() < 4, reason="needs 4 devices")
 def test_deepseek_v4_compressor_cp_zero_windows_packed_with_indexer():
     """The same, packed, with the CSA compressor's real Lightning Indexer attached.
@@ -1188,8 +1204,15 @@ def test_deepseek_v4_compressor_cp_zero_windows_packed_with_indexer():
         init_file = os.path.join(tmpdir, "init")
         mp.spawn(
             _run_compressor_cp,
-            args=(4, init_file, "csa", _ZERO_WINDOW_PACKED_SEQ_LEN, _ZERO_WINDOW_PACKED_SAMPLES, True),
-            nprocs=4,
+            args=(
+                _CI_ACCELERATOR_4.nproc,
+                init_file,
+                "csa",
+                _ZERO_WINDOW_PACKED_SEQ_LEN,
+                _ZERO_WINDOW_PACKED_SAMPLES,
+                True,
+            ),
+            nprocs=_CI_ACCELERATOR_4.nproc,
             join=True,
         )
 
@@ -1415,22 +1438,35 @@ def _run_cp_collator_contract(rank: int, world_size: int, init_file: str) -> Non
     dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 @pytest.mark.skipif(_cuda_device_count() < 4, reason="needs 4 devices")
 def test_deepseek_v4_cp_collator_shards_contiguously_by_cp_rank():
     """The collator gives rank ``r`` rows ``[r*L, (r+1)*L)``, global positions, global cu-seqlens."""
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
-        mp.spawn(_run_cp_collator_contract, args=(4, init_file), nprocs=4, join=True)
+        mp.spawn(
+            _run_cp_collator_contract,
+            args=(_CI_ACCELERATOR_4.nproc, init_file),
+            nprocs=_CI_ACCELERATOR_4.nproc,
+            join=True,
+        )
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 @pytest.mark.skipif(_cuda_device_count() < 4, reason="needs 4 devices")
 def test_deepseek_v4_model_cp_packed_misaligned():
     """A whole packed model under CP matches the single-rank forward and backward."""
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
-        mp.spawn(_run_model_cp_packed, args=(4, init_file, torch.float32, False), nprocs=4, join=True)
+        mp.spawn(
+            _run_model_cp_packed,
+            args=(_CI_ACCELERATOR_4.nproc, init_file, torch.float32, False),
+            nprocs=_CI_ACCELERATOR_4.nproc,
+            join=True,
+        )
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 @pytest.mark.skipif(_cuda_device_count() < 4, reason="needs 4 devices")
 @pytest.mark.skipif(not _all_devices_sm90_or_above(), reason="the DeepSeek-V4 TileLang kernels need SM90 or later")
 def test_deepseek_v4_model_cp_packed_misaligned_tilelang():
@@ -1443,9 +1479,15 @@ def test_deepseek_v4_model_cp_packed_misaligned_tilelang():
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
-        mp.spawn(_run_model_cp_packed, args=(4, init_file, torch.bfloat16, True), nprocs=4, join=True)
+        mp.spawn(
+            _run_model_cp_packed,
+            args=(_CI_ACCELERATOR_4.nproc, init_file, torch.bfloat16, True),
+            nprocs=_CI_ACCELERATOR_4.nproc,
+            join=True,
+        )
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 @pytest.mark.skipif(_cuda_device_count() < 4, reason="needs 4 devices")
 def test_deepseek_v4_attention_cp_unpacked_misaligned():
     """A shard length that is a multiple of no compression rate still matches.
@@ -1459,9 +1501,15 @@ def test_deepseek_v4_attention_cp_unpacked_misaligned():
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
-        mp.spawn(_run_attention_cp, args=(4, init_file, 68, False), nprocs=4, join=True)
+        mp.spawn(
+            _run_attention_cp,
+            args=(_CI_ACCELERATOR_4.nproc, init_file, 68, False),
+            nprocs=_CI_ACCELERATOR_4.nproc,
+            join=True,
+        )
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 @pytest.mark.skipif(_cuda_device_count() < 4, reason="needs 4 devices")
 def test_deepseek_v4_attention_cp_unpacked_misaligned_with_compressor():
     """A misaligned shard that is still wide enough to compress.
@@ -1480,9 +1528,15 @@ def test_deepseek_v4_attention_cp_unpacked_misaligned_with_compressor():
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
-        mp.spawn(_run_attention_cp, args=(4, init_file, 160, True), nprocs=4, join=True)
+        mp.spawn(
+            _run_attention_cp,
+            args=(_CI_ACCELERATOR_4.nproc, init_file, 160, True),
+            nprocs=_CI_ACCELERATOR_4.nproc,
+            join=True,
+        )
 
 
+@pytest.mark.launch_plan(provider=from_parameter("cp_size", device="accelerator"))
 @pytest.mark.skipif(_cuda_device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_deepseek_v4_attention_cp_with_csa_compressor(cp_size):
