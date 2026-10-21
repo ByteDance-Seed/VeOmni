@@ -141,9 +141,3 @@ jobs:
             extra_args+=(--include-conditional)
           fi
           uv run --frozen python -m scripts.ci.accelerator --backend cuda --suite unit "${extra_args[@]}"
-      - name: Upload GPU unit test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gpu-unit-results
-          path: outputs/accelerator-ci/unit

@@ -108,9 +108,3 @@ jobs:
       - name: Run GPU e2e tests on eight GPUs
         run: |
           uv run --frozen python -m scripts.ci.accelerator --backend cuda --suite e2e
-      - name: Upload GPU e2e test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gpu-e2e-results
-          path: outputs/accelerator-ci/e2e

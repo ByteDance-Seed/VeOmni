@@ -182,9 +182,3 @@ jobs:
       - name: Run accelerator case tests
         run: |
           uv run --frozen python -m scripts.ci.accelerator --backend npu --suite unit --serial
-      - name: Upload accelerator test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: npu-unit-results
-          path: outputs/accelerator-ci/unit

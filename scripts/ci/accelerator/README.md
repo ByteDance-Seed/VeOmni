@@ -92,9 +92,12 @@ CPU BLAS and compiler threads are bounded.
 
 ## Results and local commands
 
-Results are written under `outputs/accelerator-ci/{unit,e2e}` and uploaded by CI,
-including on failure. Use a fresh `--output-dir` for each local measurement.
-Artifacts include full case inventory, resolved plans, batches, device
+Results are written under `outputs/accelerator-ci/{unit,e2e}`, including on
+failure. CI workflows retain progress and failure diagnostics in the Actions
+console log; they do not upload the output directory as a GitHub artifact.
+Full result files are available in the job workspace while it exists.
+Use a fresh `--output-dir` for each local measurement.
+Result files include full case inventory, resolved plans, batches, device
 assignments, per-case timings/outcomes, logs, JUnit XML, observed distributed
 launches, source fingerprints and the suite's elapsed wall time. Sum of batch
 or case durations is not elapsed wall time when work overlaps. Measured timings,
@@ -129,7 +132,7 @@ entry `display_id`; aggregated `cases.json` carries each case's full
 
 Failures print the
 node ID, traceback (up to 200 lines), and the last 80 batch-log lines; full logs
-remain artifacts. GitHub Actions also receives an error annotation. Cancelled
+remain in the local output directory. GitHub Actions also receives an error annotation. Cancelled
 batches are labelled separately from failed tests. The final summary reports
 outcomes, failed/cancelled batches, batches never started and the first failure.
 
