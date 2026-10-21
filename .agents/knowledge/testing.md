@@ -13,6 +13,8 @@ directory. Do not add per-file pytest workflow lines or manual device quotas.
 CPU-only parsing, preprocessing, eager references and mocked backend tests need
 an explicit CPU launch plan. Mark entire modules only when all cases are CPU-only;
 use individual case markers in files that also exercise accelerator kernels.
+The lightweight device-API workflow imports CPU-marked architecture/docstring
+tests directly, so it installs pytest even though it does not install Torch.
 
 CPU numerical flakes need fresh-process reproduction, not only warm repeats.
 The QSA CPU fused-kernel mock promotes only `exp` to FP64 and casts back:
