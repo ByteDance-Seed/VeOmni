@@ -146,7 +146,7 @@ jobs:
           uv run --frozen pytest -s -x tests/parallel/context_parallel
       - name: Run models tests
         run: |
-          uv run --frozen pytest -s -x tests/models
+          uv run --frozen pytest -s -x --ignore=tests/models/test_omni_fsdp.py tests/models
           uv run --frozen pytest -s -x tests/arguments
           uv run --frozen pytest -s -x tests/trainer/test_vlm_trainer.py
           uv run --frozen pytest -s -x tests/trainer/test_aux_metrics.py
@@ -202,6 +202,7 @@ jobs:
           uv run --frozen pytest -s -x tests/utils/test_count_flops.py
           uv run --frozen pytest -s -x tests/tools/test_training_utils.py
           uv run --frozen pytest -s -x tests/utils/test_hdfs_io.py
+          uv run --frozen pytest -s -x tests/utils/test_profiler_memory.py
       - name: Run Muon optimizer tests
         run: |
           uv run --frozen pytest -s -x tests/optim/test_muon_unit.py

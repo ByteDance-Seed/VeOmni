@@ -33,6 +33,7 @@ _GPU_SM80 = ("gpu", (("nvidia", 80, None), ("rocm", None, None)))
 _GPU_NVIDIA = ("gpu", (("nvidia", None, None),))
 _GPU_NVIDIA_SM80 = ("gpu", (("nvidia", 80, None),))
 _GPU_NVIDIA_SM90 = ("gpu", (("nvidia", 90, None),))
+_GPU_NVIDIA_SM100 = ("gpu", (("nvidia", 100, None),))
 _GPU_NVIDIA_SM90_TO_SM100 = ("gpu", (("nvidia", 90, 100),))
 _NPU = ("npu", ())
 _MLU = ("mlu", ())
@@ -52,14 +53,14 @@ _BUILTIN_ENTRIES = (
     ("attention", "standard", "flash_attention_3", "cuda", _GPU_NVIDIA_SM90, ("flash_attn_interface",)),
     ("attention", "standard", "flash_attention_3_hub", "cuda", _GPU_NVIDIA_SM90, ("kernels",)),
     ("attention", "standard", "flash_attention_4", "cuda", _GPU_NVIDIA_SM90, ("flash_attn.cute",)),
-    ("attention", "standard", "flex_attention", "any", _ANY, ()),
+    ("attention", "standard", "flex_attention", "cuda", _GPU_NVIDIA, ()),
     (
         "attention",
         "standard",
         "magi_attention",
         "cuda",
-        _GPU_NVIDIA_SM90,
-        ("magi_attention", "flash_attn_cute", "cuda.bindings", "debugpy"),
+        _GPU_NVIDIA_SM100,
+        ("magi_attention", "flash_attn_cute", "debugpy"),
     ),
     ("attention", "standard", "veomni_flash_attention_2", "cuda", _GPU_SM80, ("flash_attn",)),
     ("attention", "standard", "veomni_flash_attention_2", "npu", _NPU, ()),
@@ -75,14 +76,14 @@ _BUILTIN_ENTRIES = (
     ),
     ("attention", "standard", "veomni_flash_attention_3_hub", "cuda", _GPU_NVIDIA_SM90, ("kernels",)),
     ("attention", "standard", "veomni_flash_attention_4", "cuda", _GPU_NVIDIA_SM90, ("flash_attn.cute",)),
-    ("attention", "standard", "veomni_flex_attention", "any", _ANY, ()),
+    ("attention", "standard", "veomni_flex_attention", "cuda", _GPU_NVIDIA, ()),
     (
         "attention",
         "standard",
         "veomni_magi_attention",
         "cuda",
-        _GPU_NVIDIA_SM90,
-        ("magi_attention", "flash_attn_cute", "cuda.bindings", "debugpy"),
+        _GPU_NVIDIA_SM100,
+        ("magi_attention", "flash_attn_cute", "debugpy"),
     ),
     ("attention", "standard", "veomni_sage_attention", "cuda", _GPU_NVIDIA_SM80, ("sageattention",)),
     ("attention", "standard", "veomni_sdpa", "any", _ANY, ()),

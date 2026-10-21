@@ -105,17 +105,16 @@ def test_veomni_hf_patches_pair_attention_and_mask_without_overwriting_stock():
     assert "veomni_flash_attention_2" in OP_REGISTRY.list_registered("attention", "standard")
 
 
-def test_magi_short_name_uses_installed_veomni_interface(monkeypatch):
+@pytest.mark.parametrize("impl", ("flex_attention", "magi_attention"))
+def test_attention_short_name_uses_installed_veomni_interface(monkeypatch, impl):
     captured = {}
 
     def replacement(module, query, key, value, attention_mask, **kwargs):
         captured.update(module=module, query=query, kwargs=kwargs)
-        return query.transpose(1, 2), "magi-metadata"
+        return query.transpose(1, 2), f"{impl}-metadata"
 
-    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, "veomni_magi_attention", replacement)
-    wrapper = next(
-        entry.wrapper for entry in OP_REGISTRY.list_entries("attention", "standard") if entry.impl == "magi_attention"
-    )
+    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, f"veomni_{impl}", replacement)
+    wrapper = next(entry.wrapper for entry in OP_REGISTRY.list_entries("attention", "standard") if entry.impl == impl)
     module = SimpleNamespace(is_causal=True)
     query = torch.randn(2, 4, 3, 8)
 
@@ -125,7 +124,7 @@ def test_magi_short_name_uses_installed_veomni_interface(monkeypatch):
     assert captured["query"] is query
     assert captured["kwargs"]["scaling"] == 0.5
     torch.testing.assert_close(output, query.transpose(1, 2))
-    assert metadata == "magi-metadata"
+    assert metadata == f"{impl}-metadata"
 
 
 def test_apply_veomni_attention_patch_is_idempotent():

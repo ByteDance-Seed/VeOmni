@@ -110,11 +110,11 @@ Core entry points:
    - Qwen4-Exp's `ple` dimension is currently the only persistent ExtraParallel use. Its lookup, gradient scaling, optimizer, and checkpoint paths operate over the complete flattened PLE mesh while inputs remain sequence-sharded.
 
 8b. **Qwen4-Exp QSA indices are global full-resolution token indices**
-   - `qsa_attention_implementation` selects blocks with local queries and globally gathered pooled keys, then gathers `[B,L,K]` selections to `[B,S,K]` before the Ulysses attention call.
+   - `qsa_attention_implementation` selects blocks with local queries and globally gathered pooled keys, returning local `[B,L,K]` selections for each rank's query shard while `Qwen4ExpTextAttention` keeps `query_states` local (`[B,H_q,L,D]`) and all-gathers `key_states`/`value_states` (`[B,H_kv,S,D]`) over the active sequence- or context-parallel group.
    - Index values address global full-resolution K/V directly; `-1` is the only invalid-slot sentinel. Do not rebase them by rank or lift them past a compressed-KV segment.
-   - Packed block boundaries come exclusively from global `cu_seq_lens_q`. Blocks must never cross a packed-sample boundary or be derived from an SP shard boundary.
-   - Keep selections compact through distributed collection and Q/K/V exchange. Unsupported layouts must fail before entering collectives.
-   - The eager backend deliberately expands the compact indices to an `[B,1,S,S]` mask and runs dense GQA. It is a numerical reference with quadratic memory/runtime scaling, not evidence that a fused backend implements gather semantics.
+   - Packed block boundaries come exclusively from global `cu_seq_lens_q`. Blocks must never cross a packed-sample boundary or be derived from an SP/CP shard boundary.
+   - Keep selections compact through distributed collection and KV all-gather. Unsupported layouts must fail before entering collectives.
+   - The eager backend deliberately expands the compact indices to an `[B,1,L,S]` mask and runs dense GQA. It is a numerical reference with quadratic memory/runtime scaling, not evidence that a fused backend implements gather semantics.
 
 8c. **Differentiable SP collectives must remain in every rank's autograd graph**
    - Rank-local packed boundaries can make a gathered halo unused on some ranks. Preserve a zero-valued dependency on the gathered tensor so every rank executes the same backward collective sequence; otherwise a later all-reduce can be matched against another rank's gather backward and fail with inconsistent collective counts.
@@ -246,10 +246,9 @@ Core files:
 
 ## Environment Reproducibility
 
-27. **Exact uv synchronization removes separately installed overlays**
-    - MagiAttention itself is the optional `--extra magi` extra (`uv sync --extra gpu --extra magi`).
-      The SM90 CUTLASS overlay is then installed by `scripts/kernel/install_magi_sm90.sh`.
-      Reinstall the overlay after a later exact `uv sync` before running MagiAttention on SM90.
+27. **MagiAttention is an SM100+ optional extra**
+    - MagiAttention requires `--extra gpu --extra magi` and NVIDIA SM100 or newer.
+      SM90 uses FlexAttention's FA4 backend instead.
 
 28. **In-place collective reductions in backward must own their gradient buffer**
     - Autograd can pass the same incoming gradient to multiple branches. `.contiguous()` does not copy an already contiguous tensor, so reducing that tensor in place can silently change a sibling branch's gradient and the caller's `grad_outputs`.
@@ -261,3 +260,25 @@ Core files:
     - FSDP2 can cast fixed vision cos/sin tables to BF16 on the first block forward while non-reentrant checkpoint recomputation sees the original FP32 tables. Saving them unchanged makes checkpoint backward raise a metadata mismatch.
     - Full RoPE eager and Liger adapters normalize fixed tables saved for backward to `q.dtype`, independently of the forward compute tables. Trainable tables retain the eager gradient path.
     - Cover both table-dtype change directions and text/vision layouts in `tests/ops/rope/test_rope.py`. `tests/models/transformers/qwen/test_qwen2_vl.py` additionally runs the default Liger vision path with real two-rank FSDP2 and BF16 mixed precision.
+
+## FlexAttention
+
+Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__.py` owns dispatch/Ulysses, `_inputs.py` owns input handling, `_fa4.py` owns compiled execution, and `_fa4_sm90_compat.py` owns the pinned bounds shim. The mask builder remains in `attention/mask/flex.py`.
+
+30. **FLASH execution uses fixed-shape compilation**
+    - Compile FLASH with `dynamic=False, fullgraph=True`; variable lengths can require new specializations. Do not increase global cache limits or fall back to dense eager attention on cache exhaustion.
+    - Validate exact BlockMask bounds against normalized post-Ulysses Q/K lengths. Keep custom predicates compatible with the pinned FLASH lowering.
+    - BlockMask construction remains eager; compiled creation and dynamic-length graph reuse belong to a follow-up change.
+    - See [FLASH compilation](../../docs/transformers_v5/veomni_attention_interface.md#flash-compilation-and-mask-construction).
+
+30a. **Q/K/V layouts and visibility are explicit**
+    - Reject `output_attentions=True` at the shared Flex entry before Ulysses or backend selection. The second result is optional LSE, never attention weights; returning LSE from Triton does not satisfy an attention-weight request.
+    - Accept matching 3D `[T,H,D]` or 4D `[B,H,S,D]` inputs. Normalize 3D with views before validation, dispatch and Ulysses; never infer axes from sizes. Keep Q/K lengths independent and K/V lengths/heads consistent.
+    - BlockMask owns packed-document visibility. Restore output/LSE to the caller's layout after inverse exchange; see [input layouts and mask semantics](../../docs/transformers_v5/veomni_attention_interface.md#input-layouts-and-mask-semantics).
+
+30b. **Pinned FA4 auxiliary callbacks require bounds protection**
+    - Install the version/signature-gated `4.0.0b16` compatibility forwarder before compilation. Auxiliary metadata reads must be safe for padded tile positions; validate with allocator-disabled memcheck (`PYTORCH_NO_CUDA_MEMORY_CACHING=1`).
+    - For affected auxiliary callbacks with bounds disabled, restore full native Q/K bounds. Keep this correctness baseline independent of tail-only or Q-only optimizations.
+    - Use separate JIT-cache namespaces and bump them when shader semantics change. Retain old cache objects and prepare both replacement caches before publishing installation.
+    - Native b16 omits broadcast strides from its forward cache key. Materialize zero-stride Q/K/V views after KV expansion, bump the cache namespace, and test mixed layouts through the same production cache. Automatic FLASH routing must retain Triton for unsupported sparse dimensions, missing full-block tables, architecture-mismatched BlockMask tiles (128×128 on SM90; 256×128 on SM100/110), and trainable score bias. Explicit backend selection retains native validation.
+    - See [FA4 partial-tile compatibility](../../docs/transformers_v5/veomni_attention_interface.md#fa4-partial-tile-compatibility) for the mechanism, hardware validation scope and upgrade requirements.
