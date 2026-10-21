@@ -88,6 +88,8 @@ def from_parameter(name, *, device="accelerator"):
     """Use the very parameter passed to the launcher's nproc/world_size argument."""
 
     def resolve(context):
+        if name not in context.params:
+            raise ResourcePlanError(f"Launch plan needs parameter {name!r}; got {sorted(context.params)}")
         return LaunchSpec(nproc=context.params[name], device=device)
 
     return resolve

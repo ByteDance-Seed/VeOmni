@@ -78,6 +78,9 @@ case plan and lease. Every distributed launch starts fresh workers.
 
 The launcher's owned process group and tracked descendants are drained before
 its lease is released, even if the launcher has already exited.
+Ctrl-C cancels owned collection/execution subprocesses before the thread pool
+waits for callbacks. Cancellation reaches nested worker scopes; process cleanup
+still drains each owned group and tracked descendants before releasing its lease.
 Failures stop new dispatches by default while active batches finish cleanup.
 `--keep-going` records failures and attempts all batches; `--serial` disables
 concurrent dispatch for diagnosis. CPU BLAS and compiler threads are bounded.
@@ -132,7 +135,7 @@ projection deliberately raises instead of guessing whether to transpose it.
 | `scheduler.py` | Disjoint device leases, greedy dispatch and draining |
 | `pytest_plugin.py` | Case inventory, launch validation and pytest results |
 | `runtime/devices.py` | GPU/NPU probing and child visibility |
-| `runtime/workers.py` | Workspaces, subprocess timeouts and scoped cleanup |
+| `runtime/workers.py` | Workspaces, interruptible thread pools, subprocess timeouts and scoped cleanup |
 | `runtime/ports.py` | Run-scoped rendezvous port allocation |
 | `suites/gpu.json`, `suites/npu.json` | Unit/e2e selections and environment settings |
 

@@ -9,7 +9,6 @@ import shutil
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from scripts.ci.accelerator import ROOT
@@ -17,7 +16,7 @@ from scripts.ci.accelerator.batching import make_batches
 from scripts.ci.accelerator.launch_plan import ResourcePlanError, RunnerCapabilities
 from scripts.ci.accelerator.runtime.devices import child_environment
 from scripts.ci.accelerator.runtime.ports import find_free_port
-from scripts.ci.accelerator.runtime.workers import create_workspace, run_process
+from scripts.ci.accelerator.runtime.workers import create_workspace, interruptible_executor, run_process
 from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs
 
 
@@ -108,9 +107,9 @@ def main():
         return selection, rows
 
     try:
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            inventories = list(executor.map(collect, selected))
-    except Exception as exc:
+        with interruptible_executor(max_workers=8) as (executor, scope):
+            inventories = list(executor.map(lambda selection: scope.run(collect, selection), selected))
+    except (Exception, KeyboardInterrupt, SystemExit) as exc:
         (output / "summary.json").write_text(
             json.dumps(
                 dict(suite=args.suite, started=started, ended=time.time(), stage="collection", error=repr(exc)),
@@ -173,6 +172,7 @@ def main():
         ]
         record = dict(
             name=name,
+            returncode=1,
             selection=row["selection"]["name"],
             cards=row["cards"],
             assigned=assigned,
@@ -185,7 +185,10 @@ def main():
         try:
             with (output / f"{name}.log").open("w") as log:
                 run_process(command, worker_env, log, 5400, cwd=workspace)
-            result = json.loads((output / f"{name}.results.json").read_text())
+            result_path = output / f"{name}.results.json"
+            if not result_path.is_file():
+                raise ResourcePlanError(f"Worker produced no results: {result_path}")
+            result = json.loads(result_path.read_text())
             if result["exitstatus"] or {case["nodeid"] for case in result["cases"]} != set(record["planned_cases"]):
                 raise ResourcePlanError(f"Case execution differs from inventory: {name}")
             record["returncode"] = 0
@@ -214,8 +217,10 @@ def main():
                 execute(job, list(caps.devices) if job.cards else [])
         else:
             run_jobs(jobs, list(caps.devices), execute)
-    except Exception as exc:
+    except (Exception, KeyboardInterrupt, SystemExit) as exc:
         error = repr(exc)
+        if not isinstance(exc, Exception):
+            raise
     finally:
         summary = dict(
             suite=args.suite,
@@ -251,10 +256,11 @@ def main():
         changed = [
             name
             for name, digest in sources.items()
-            if hashlib.sha256((ROOT / name).read_bytes()).hexdigest() != digest
+            if not (ROOT / name).is_file() or hashlib.sha256((ROOT / name).read_bytes()).hexdigest() != digest
         ]
         summary["changed_sources"] = changed
-        (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         if changed:
-            error = "Sources changed during execution"
+            error = error or "Sources changed during execution"
+            summary["error"] = error
+        (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return int(error is not None or len(finished) != len(jobs) or any(row["returncode"] for row in finished.values()))

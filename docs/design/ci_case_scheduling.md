@@ -60,7 +60,7 @@ collected against the complete runner slice to catch such losses.
 
 `pytest.mark.skipif(device_count < N)` markers express eligibility,
 not exact resource reservations. For example,
-[the CP case](../../tests/parallel/context_parallel/test_deepseek_v4_cp.py#L920)
+[the CP eligibility marker](../../tests/parallel/context_parallel/test_deepseek_v4_cp.py#L920)
 checks a two-device minimum but launches either two or four workers according
 to its parameter. The
 [launcher defaults](../../tests/tools/launch_utils.py#L119) and
@@ -192,6 +192,12 @@ to verify backend and parallel-topology coverage. Release resources only after s
 cleanup of the launcher's process group and tracked descendants, including
 when its group leader has already exited. Failures stop new dispatches by default; the
 measurement mode may continue while recording all failures.
+
+On Ctrl-C, collection and scheduling cancel their owned subprocess scopes before
+waiting for thread-pool callbacks. Workers then use the existing bounded
+SIGTERM/SIGKILL cleanup to drain process groups and tracked descendants.
+Unrelated processes are outside the cancellation scope. Interrupted execution
+records retain a failure return code and the summary records the interruption.
 
 ## GPU/NPU boundary
 

@@ -50,7 +50,10 @@ def validate_launch(nproc, *, command=None, env=None, nnodes=1, record=True):
         raise ResourcePlanError(f"Launch nproc={nproc}, nnodes={nnodes} disagrees with {plan.to_dict()}")
     env = os.environ if env is None else env
     caps = runner_capabilities()
-    lease = json.loads(os.environ["VEOMNI_CI_LEASE"])
+    encoded_lease = os.environ.get("VEOMNI_CI_LEASE")
+    if encoded_lease is None:
+        raise ResourcePlanError("VEOMNI_CI_ACTIVE_PLAN is set without VEOMNI_CI_LEASE")
+    lease = json.loads(encoded_lease)
     specs = [spec for spec in plan.launches if spec.nproc == nproc]
     key = "CUDA_VISIBLE_DEVICES" if caps.backend == "cuda" else "ASCEND_RT_VISIBLE_DEVICES"
     visible = [value for value in env.get(key, "").split(",") if value]

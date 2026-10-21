@@ -124,7 +124,7 @@ tests/
 | **Parallelism** | `tests/parallel/` | 0-8 GPUs | torchrun / pytest | SP, EP, data-balance primitives |
 | **Distributed runtime** | `tests/distributed/` | 0-4 GPUs | pytest + torchrun | FSDP equivalence, dummy forward, gradient checkpointing, vocab-parallel embedding |
 | **SeedOmni** | `tests/seed_omni/` | 0; 2 for `e2e/` | pytest (+ torchrun for `e2e/`) | Multi-module OmniModel, runtimes, trainer, launcher, module mixins |
-| **E2E parallel** | `tests/e2e/` | 4+ GPUs | torchrun (subprocess) | SP/EP alignment across full training runs |
+| **E2E parallel** | `tests/e2e/` | Per-case launch plan (up to 8 GPUs) | torchrun (subprocess) | SP/EP alignment across full training runs |
 | **Checkpoints** | `tests/checkpoints/` | 0-8 GPUs | pytest + torchrun | Save/load, DCP→HF conversion |
 | **Utilities** | `tests/utils/` | 0-8 GPUs | pytest + torchrun | FLOPs, grad clipping, weight broadcast |
 | **Sanity** | `tests/special_sanity/` | 0 | script + pytest | Device API lint and op-architecture path guards |

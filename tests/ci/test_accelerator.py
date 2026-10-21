@@ -114,6 +114,10 @@ def test_launch_validation_rejects_underdeclared_or_foreign_devices(monkeypatch,
     monkeypatch.setenv("VEOMNI_CI_ACTIVE_PLAN", json.dumps(CasePlan.sequential(LaunchSpec(nproc=2)).to_dict()))
     monkeypatch.setenv("VEOMNI_CI_LEASE", '["4", "5"]')
     validate_launch(2, env={"CUDA_VISIBLE_DEVICES": "4,5"}, record=False)
+    with monkeypatch.context() as missing_lease:
+        missing_lease.delenv("VEOMNI_CI_LEASE")
+        with pytest.raises(ResourcePlanError, match="without VEOMNI_CI_LEASE"):
+            validate_launch(2, record=False)
     with pytest.raises(ResourcePlanError, match="disagrees"):
         validate_launch(4, record=False)
     with pytest.raises(ResourcePlanError, match="visibility"):
@@ -316,3 +320,158 @@ def test_unittest_plan_reads_world_size_without_running_constructor(monkeypatch)
     monkeypatch.setattr(pytest_plugin, "runner_capabilities", lambda: RunnerCapabilities("cuda", tuple("01234567")))
     item = SimpleNamespace(instance=None, cls=DistributedCase, get_closest_marker=lambda _: None)
     assert pytest_plugin.resolve_plan(item).launches[0].nproc == 4
+
+
+def test_launch_plan_missing_parameter_has_resource_error():
+    from scripts.ci.accelerator.launch_plan import PlanContext, ResourcePlanError, RunnerCapabilities, from_parameter
+
+    with pytest.raises(ResourcePlanError, match="world_size"):
+        from_parameter("world_size")(PlanContext(dict(other=2), RunnerCapabilities("cpu")))
+
+
+@pytest.mark.parametrize("stage", ["scheduling", "collection", "shutdown"])
+def test_interrupt_drains_owned_workers_before_executor_shutdown(stage, tmp_path):
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    import psutil
+
+    pid_path = tmp_path / "owned.pid"
+    driver = tmp_path / "driver.py"
+    worker_code = (
+        "import os, signal, time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"Path({str(pid_path)!r}).write_text(str(os.getpid())); time.sleep(60)"
+    )
+    shutdown_ready = tmp_path / "shutdown.ready"
+    shutdown_driver = (
+        "import time\nfrom pathlib import Path\n"
+        "from concurrent.futures import ThreadPoolExecutor\n"
+        "original_shutdown = ThreadPoolExecutor.shutdown\n"
+        "def shutdown(self, *args, **kwargs):\n"
+        f"    Path({str(shutdown_ready)!r}).touch()\n"
+        "    return original_shutdown(self, *args, **kwargs)\n"
+        "ThreadPoolExecutor.shutdown = shutdown\n"
+        "def execute(job, assigned):\n"
+        "    if job.name == 'owned': return launch()\n"
+        f"    while not Path({str(pid_path)!r}).exists(): time.sleep(0.01)\n"
+        "    raise RuntimeError('another callback failed')\n"
+        "run_jobs([DeviceJob('owned', 0, None), DeviceJob('bad', 0, None)], [], execute)\n"
+    )
+    driver.write_text(
+        "import os, sys\n"
+        "from scripts.ci.accelerator.runtime.workers import run_process\n"
+        "from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs\n"
+        "def launch(*args):\n"
+        "    with open(sys.argv[2], 'w') as log:\n"
+        f"        run_process([sys.executable, '-c', {worker_code!r}], os.environ.copy(), log, 60)\n"
+        + (
+            "run_jobs([DeviceJob('owned', 0, None)], [], launch)\n"
+            if stage == "scheduling"
+            else shutdown_driver
+            if stage == "shutdown"
+            else "from scripts.ci.accelerator.runtime.workers import interruptible_executor\n"
+            "with interruptible_executor(max_workers=1) as (executor, scope):\n"
+            "    list(executor.map(lambda value: scope.run(launch), [None]))\n"
+        )
+    )
+    with (tmp_path / "driver.log").open("w") as log:
+        process = subprocess.Popen(
+            [sys.executable, str(driver), str(pid_path), str(tmp_path / "worker.log")],
+            env={**os.environ, "PYTHONPATH": os.getcwd()},
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            ready = shutdown_ready if stage == "shutdown" else pid_path
+            while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert ready.exists(), (tmp_path / "driver.log").read_text()
+            owned = psutil.Process(int(pid_path.read_text()))
+            process.send_signal(signal.SIGINT)
+            process.wait(timeout=12)
+            assert process.returncode != 0
+            assert not owned.is_running() or owned.status() == psutil.STATUS_ZOMBIE
+            assert unrelated.poll() is None
+        finally:
+            if pid_path.exists():
+                try:
+                    os.killpg(int(pid_path.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+            unrelated.terminate()
+            unrelated.wait(timeout=5)
+
+
+@pytest.mark.parametrize("failure", ["changed_source", "missing_results", "interrupt"])
+def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, failure):
+    import json
+    import sys
+    from pathlib import Path
+
+    from scripts.ci.accelerator import runner
+
+    root = tmp_path / "checkout"
+    (root / "tests").mkdir(parents=True)
+    source = root / "pyproject.toml"
+    source.write_text("original\n")
+    (root / "uv.lock").write_text("lock\n")
+    test_file = root / "tests/test_sample.py"
+    test_file.write_text("def test_one(): pass\n")
+    output = tmp_path / "results"
+    nodeid = "tests/test_sample.py::test_one"
+
+    def run_process(command, env, log, timeout, **kwargs):
+        if "scripts.ci.accelerator.runtime.devices" in command:
+            Path(command[-2]).write_text(json.dumps(dict(backend="cpu", devices=[])))
+        elif "--collect-only" in command:
+            inventory = next(arg.split("=", 1)[1] for arg in command if arg.startswith("--ci-inventory="))
+            Path(inventory).write_text(
+                json.dumps(
+                    [
+                        dict(
+                            nodeid=nodeid,
+                            file=str(test_file),
+                            cards=0,
+                            skip=None,
+                            plan=dict(groups=[[dict(nproc=1, device="cpu", nnodes=1)]]),
+                        )
+                    ]
+                )
+            )
+        elif failure == "interrupt":
+            raise KeyboardInterrupt()
+        elif failure == "changed_source":
+            source.write_text("changed\n")
+            Path(env["CI_CASE_RESULTS"]).write_text(json.dumps(dict(exitstatus=0, cases=[dict(nodeid=nodeid)])))
+
+    monkeypatch.setattr(runner, "ROOT", root)
+    monkeypatch.setattr(runner, "run_process", run_process)
+    monkeypatch.setattr(
+        sys, "argv", ["ci", "--suite", "unit", "--backend", "cpu", "--only", "ci-unit", "--output-dir", str(output)]
+    )
+    if failure == "interrupt":
+        with pytest.raises(KeyboardInterrupt):
+            runner.main()
+    else:
+        assert runner.main() == 1
+    summary = json.loads((output / "summary.json").read_text())
+    if failure == "changed_source":
+        assert summary["changed_sources"] == ["pyproject.toml"]
+        assert summary["error"] == "Sources changed during execution"
+    else:
+        record = next(iter(summary["commands"].values()))
+        assert record["returncode"] != 0
+        if failure == "missing_results":
+            assert "ResourcePlanError" in record["error"] and ".results.json" in record["error"]
+        else:
+            assert "KeyboardInterrupt" in summary["error"]

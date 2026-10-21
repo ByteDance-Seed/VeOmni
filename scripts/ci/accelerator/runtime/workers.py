@@ -4,19 +4,92 @@ import os
 import signal
 import subprocess
 import time
+from concurrent.futures import CancelledError, ThreadPoolExecutor, wait
+from contextlib import contextmanager
+from contextvars import ContextVar
+from threading import Event
 
 import psutil
 
 from scripts.ci.accelerator import ROOT
 
 
+_CANCELLATION = ContextVar("ci_worker_cancellation", default=None)
+
+
+class _CancellationScope:
+    def __init__(self):
+        self.event = Event()
+        self.parent = _CANCELLATION.get()
+
+    def check(self):
+        if self.parent is not None:
+            self.parent.check()
+        if self.event.is_set():
+            raise CancelledError("CI worker interrupted")
+
+    def run(self, function, *args, **kwargs):
+        token = _CANCELLATION.set(self)
+        try:
+            self.check()
+            return function(*args, **kwargs)
+        finally:
+            _CANCELLATION.reset(token)
+
+
+class _WorkerExecutor(ThreadPoolExecutor):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.futures = []
+
+    def submit(self, *args, **kwargs):
+        future = super().submit(*args, **kwargs)
+        self.futures.append(future)
+        return future
+
+
+@contextmanager
+def interruptible_executor(*, max_workers):
+    """Cancel owned subprocesses before waiting for interrupted callbacks."""
+    scope = _CancellationScope()
+    executor = _WorkerExecutor(max_workers=max_workers)
+    try:
+        yield executor, scope
+    except (KeyboardInterrupt, SystemExit):
+        scope.event.set()
+        raise
+    finally:
+        interrupted = None
+        while True:
+            try:
+                executor.shutdown(wait=False, cancel_futures=scope.event.is_set())
+                pending = [future for future in executor.futures if not future.done()]
+                if pending:
+                    wait(pending, timeout=0.2)
+                    continue
+                executor.shutdown(wait=True)
+                break
+            except (KeyboardInterrupt, SystemExit) as exc:
+                scope.event.set()
+                interrupted = exc
+        # Future completion proves callbacks finished cleanup. A Thread.join
+        # interrupted by SIGINT can report a stopped thread before it returns.
+        if interrupted is not None:
+            raise interrupted
+
+
 def run_process(command, env, log, timeout, *, cwd=ROOT, allowed_codes=(0,)):
     """Track this launcher only; clean descendants before releasing its lease."""
+    scope = _CANCELLATION.get()
+    if scope is not None:
+        scope.check()
     known = {}
     process = subprocess.Popen(command, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     started = time.monotonic()
     try:
         while process.poll() is None:
+            if scope is not None:
+                scope.check()
             try:
                 for child in psutil.Process(process.pid).children(recursive=True):
                     known[(child.pid, child.create_time())] = child

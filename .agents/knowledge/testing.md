@@ -24,19 +24,19 @@ Explicit CPU plans reserve zero cards. See `docs/design/ci_case_scheduling.md`
 for the author API, defaults and mismatch rules, and `scripts/ci/accelerator/README.md` for
 local commands and result artifacts.
 
-A test that passes locally is not necessarily a test CI runs. The GPU entries
-below describe the manifest selections used by the named workflows.
+A test that passes locally is not necessarily a test CI runs. The entries below
+describe selections in `scripts/ci/accelerator/suites/gpu.json` and `npu.json`.
 
 | Path | How CI picks it up |
 |------|--------------------|
-| `tests/ci/` | whole directory, in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
-| `tests/data/` | whole directory, in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
-| `tests/checkpoints/` | whole directory, in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
-| `tests/ops/` | whole directory in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
-| `tests/models/` | whole directory in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
-| `tests/parallel/context_parallel/` | whole directory, `gpu_unit_tests.yml` only |
+| `tests/ci/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
+| `tests/data/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
+| `tests/checkpoints/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
+| `tests/ops/` | whole directory in both GPU/NPU manifests (`suite: unit`) |
+| `tests/models/` | whole directory in both GPU/NPU manifests (`suite: unit`) |
+| `tests/parallel/context_parallel/` | whole directory, GPU manifest only (`suite: unit`) |
 | everything else | **one selection per file** in the appropriate GPU/NPU suite manifest |
-| `tests/e2e/test_e2e_parallel.py`, `tests/distributed/test_fsdp_equivalence.py` | `gpu_e2e_test.yml` / `npu_e2e_test.yml` |
+| `tests/e2e/test_e2e_parallel.py`, `tests/distributed/test_fsdp_equivalence.py` | GPU/NPU manifests (`suite: e2e`) |
 
 Consequences that cut both ways:
 
@@ -49,6 +49,12 @@ Consequences that cut both ways:
 - The GPU unit job runs on one self-hosted L20-8 fleet with a 120-minute budget
   and `-x` fail-fast. Every new file pays process startup plus model build, and a
   new flaky file blocks the whole suite for everyone.
+
+Accelerator runner thread pools must cancel owned worker scopes before waiting
+for callbacks on interruption. Preserve scoped process cleanup and failure
+artifacts; do not terminate unrelated device users or rely on the batch timeout.
+Use future completion to prove callbacks drained: an interrupted `Thread.join`
+can report a stopped thread before its callback finishes cleanup.
 
 ## What the NPU job can actually run
 

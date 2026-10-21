@@ -1,8 +1,10 @@
 """Backend-independent scheduling with disjoint leases and bounded backfilling."""
 
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, wait
 from dataclasses import dataclass
+
+from scripts.ci.accelerator.runtime.workers import interruptible_executor
 
 
 @dataclass(frozen=True)
@@ -30,7 +32,7 @@ def run_jobs(jobs, devices, run, *, max_cpu_jobs=2, drain_after=120.0):
     active = {}
     results = {}
     waiting_since = time.monotonic()
-    with ThreadPoolExecutor(max_workers=max(1, len(devices) + max_cpu_jobs)) as executor:
+    with interruptible_executor(max_workers=max(1, len(devices) + max_cpu_jobs)) as (executor, scope):
         while pending or active:
             head = next((job for job in pending if job.cards), None)
             draining = head is not None and time.monotonic() - waiting_since >= drain_after
@@ -45,7 +47,7 @@ def run_jobs(jobs, devices, run, *, max_cpu_jobs=2, drain_after=120.0):
                 assigned = available[: job.cards]
                 del available[: job.cards]
                 pending.remove(job)
-                active[executor.submit(run, job, assigned)] = (job, assigned)
+                active[executor.submit(scope.run, run, job, assigned)] = (job, assigned)
                 if job is head:
                     waiting_since = time.monotonic()
                     if draining:
