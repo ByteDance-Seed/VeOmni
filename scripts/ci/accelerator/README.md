@@ -8,13 +8,15 @@ launch configuration of each collected case.
 ```sh
 uv run --frozen python -m scripts.ci.accelerator --backend cuda --suite unit --include-conditional
 uv run --frozen python -m scripts.ci.accelerator --backend cuda --suite e2e
-uv run --frozen python -m scripts.ci.accelerator --backend npu --suite unit --serial
+uv run --frozen python -m scripts.ci.accelerator --backend npu --suite unit
+uv run --frozen python -m scripts.ci.accelerator --backend npu --suite e2e --serial
 ```
 
-NPU workflows use serial dispatch until concurrent HCCL/device isolation has
-been validated on Ascend hardware. GPU/NPU device discovery, owned host IDs,
-child visibility and logical-rank mapping are handled by accelerator adapters.
-NPU assignments stay inside the runner's existing eight-card slice.
+NPU unit tests use parallel dispatch; NPU e2e tests use serial dispatch.
+GPU/NPU device discovery, owned host IDs, child visibility and logical-rank
+mapping are handled by accelerator adapters. NPU assignments stay inside the
+runner's existing eight-card slice. Use `--serial` to serialize a local
+diagnostic run.
 
 ## Adding tests to CI
 

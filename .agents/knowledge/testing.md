@@ -7,10 +7,9 @@ will actually run it. Read this before adding a test file.
 
 GPU/NPU suite selections are enumerated in `scripts/ci/accelerator/suites/gpu.json` and
 `scripts/ci/accelerator/suites/npu.json`. Both use the common accelerator case scheduler in
-`scripts/ci/accelerator/runner.py`; NPU workflows keep serial dispatch pending
-hardware validation of concurrent HCCL isolation. Add a suite selection for a
-file outside a collected directory. Do not add per-file pytest workflow lines
-or manual device quotas.
+`scripts/ci/accelerator/runner.py`; NPU unit uses parallel dispatch and NPU e2e
+uses serial dispatch. Add a suite selection for a file outside a collected
+directory. Do not add per-file pytest workflow lines or manual device quotas.
 
 New functions/parameters already included by an existing selection need no
 manifest update. Check node-ID and pytest filters as well as file/directory

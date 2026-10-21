@@ -129,8 +129,11 @@ def test_launch_validation_rejects_underdeclared_or_foreign_devices(monkeypatch,
 
 
 def test_npu_adapter_preserves_owned_host_slice_and_resets_ranks():
+    import threading
+
     from scripts.ci.accelerator.launch_plan import ResourcePlanError, RunnerCapabilities
     from scripts.ci.accelerator.runtime.devices import child_environment
+    from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs
 
     caps = RunnerCapabilities("npu", tuple(str(i) for i in range(8, 16)))
     env = child_environment(caps, ["10", "11"], environ={"ASCEND_DEVICE_ID": "8", "RANK": "7"})
@@ -144,6 +147,22 @@ def test_npu_adapter_preserves_owned_host_slice_and_resets_ranks():
     cpu = child_environment(caps, [], cpu=True, environ={})
     assert cpu["CUDA_VISIBLE_DEVICES"] == cpu["ASCEND_RT_VISIBLE_DEVICES"] == ""
     assert cpu["TORCH_DEVICE_BACKEND_AUTOLOAD"] == "0"
+
+    # Exercise simultaneous 4+2+2 leases on the upper physical-host slice.
+    barrier = threading.Barrier(3, timeout=5)
+
+    def execute(job, assigned):
+        env = child_environment(caps, assigned, environ={"ASCEND_DEVICE_ID": "8", "RANK": "7"})
+        assert len(assigned) == job.cards
+        assert "ASCEND_DEVICE_ID" not in env and "RANK" not in env
+        assert env["ASCEND_VISIBLE_DEVICES"] == env["ASCEND_RT_VISIBLE_DEVICES"]
+        barrier.wait()
+        return set(env["ASCEND_RT_VISIBLE_DEVICES"].split(","))
+
+    jobs = [DeviceJob("four", 4, None), DeviceJob("two-a", 2, None), DeviceJob("two-b", 2, None)]
+    slices = list(run_jobs(jobs, list(caps.devices), execute).values())
+    assert set.union(*slices) == set(caps.devices)
+    assert sum(map(len, slices)) == len(set.union(*slices))  # No device is leased twice.
 
 
 def test_case_batches_preserve_inventory_and_resource_requests():
