@@ -181,7 +181,7 @@ measured 8.34e-7 in fp32 and 3.91e-3 in bf16. Both precisions on each backend
 produced decreasing losses over two AdamW updates. The CPU-only model suite
 previously passed 20 tests; its accelerator and opt-in cases skipped.
 
-With upstream `3089331` and bidirectional attention, the focused suite passed
+Before the latest review fixes, with upstream `3089331` and bidirectional attention, the focused suite passed
 34 tests on NPU (two opt-in cases skipped), 32 on an A100 (four NPU-specific
 or opt-in cases skipped), and 27 on CPU (nine accelerator or opt-in cases
 skipped). Registration now uses `veomni.models.registry`, and
@@ -194,6 +194,23 @@ tables back to FP32 cannot recover their original values. Per-forward
 casting, so both passes use identical values. The strengthened A100 regression
 covers double- and single-stream blocks and compares predictions and every
 gradient exactly (`rtol=0, atol=0`) with checkpointing disabled.
+
+Random initialization with `init_device: meta` uses the adapter's native
+`_init_weights` recipes on parameter-bearing leaves. These restore zero output,
+modulation and condition embeddings, patch Xavier/zero-channel initialization,
+timestep normal weights, and PyTorch defaults for other layers. Container-only
+hooks are insufficient under Transformers 5.16. CPU regressions discard and
+NaN-poison all constructor values before invoking the actual trainer
+materialization path for both text projections and both block types. Existing
+pretrained loading is checked tensor-for-tensor before any manual state reload.
+Partial-checkpoint tests also preserve every supplied tensor while initializing
+missing weights or biases according to the same native rules.
+
+The latest review-fix run (2026-10-22) passed 26 focused CPU tests (nine
+accelerator or opt-in skips) and 31 focused A100 tests (four NPU or opt-in
+skips), including the exact two-rank gradient comparison. These environments
+used PyTorch 2.10.0 and Transformers 5.16.1. The opt-in pinned-source comparison
+was not enabled, and occupied NPUs prevented a fresh NPU run for these fixes.
 
 The shared registry, gradient-checkpointing, DiT microbatch and resume suites
 also passed 373 tests with one hardware-dependent skip. These shared tests do

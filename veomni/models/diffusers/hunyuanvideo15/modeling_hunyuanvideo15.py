@@ -9,6 +9,11 @@ from transformers.utils import ModelOutput
 
 from ....distributed.parallel_state import get_parallel_state
 from .configuration_hunyuanvideo15 import HunyuanVideo15Config
+from .native.modules.embed_layers import PatchEmbed, TimestepEmbedder
+from .native.modules.mlp_layers import FinalLayer
+from .native.modules.modulate_layers import ModulateDiT
+from .native.modules.norm_layers import RMSNorm
+from .native.modules.token_refiner import IndividualTokenRefinerBlock
 from .native.transformer import HunyuanVideo_1_5_DiffusionTransformer as NativeTransformer
 
 
@@ -35,11 +40,57 @@ class HunyuanVideo15Model(PreTrainedModel):
             if not name.startswith("_") and name != "training":
                 setattr(self, name, value)
 
-        # Native constructors already applied their initialization (including
-        # zero condition-type embeddings). Register HF metadata without replacing it.
+        # HF 5.16 may skip parameterless containers during initialization. Attach
+        # native recipes to the parameter-bearing leaves that it does dispatch.
         for module in self.modules():
-            module._is_hf_initialized = True
+            if isinstance(module, PatchEmbed):
+                module.proj._hunyuan_init = "patch"
+            elif isinstance(module, TimestepEmbedder):
+                for index in (0, 2):
+                    module.mlp[index]._hunyuan_init = "timestep"
+            elif isinstance(module, ModulateDiT):
+                module.linear._hunyuan_init = "zero"
+            elif isinstance(module, (FinalLayer, IndividualTokenRefinerBlock)):
+                module.adaLN_modulation[1]._hunyuan_init = "zero"
+                if isinstance(module, FinalLayer):
+                    module.linear._hunyuan_init = "zero"
+        if config.use_cond_type_embedding:
+            self.cond_type_embedding._hunyuan_init = "zero"
+
+        # Eager native constructors already initialized real parameters. Meta
+        # constructors have no values: leave their flags unset so HF can initialize
+        # any parameters missing from a subsequently loaded checkpoint.
+        if not any(parameter.is_meta for parameter in self.parameters()):
+            for module in self.modules():
+                module._is_hf_initialized = True
         self.post_init()
+
+    @torch.no_grad()
+    def _init_weights(self, module):
+        """Restore native initialization after meta parameters are materialized."""
+        # HF initialize_weights guards torch.nn.init against overwriting loaded
+        # tensors. Native RMSNorm uses fill_ directly, so respect its flag here.
+        if isinstance(module, RMSNorm):
+            if hasattr(module, "weight") and not getattr(module.weight, "_is_hf_initialized", False):
+                module.reset_parameters()
+        elif isinstance(module, (torch.nn.Linear, torch.nn.Conv3d, torch.nn.Embedding, torch.nn.LayerNorm)):
+            module.reset_parameters()
+        recipe = getattr(module, "_hunyuan_init", None)
+        if recipe == "zero":
+            torch.nn.init.zeros_(module.weight)
+            if getattr(module, "bias", None) is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif recipe == "timestep":
+            torch.nn.init.normal_(module.weight, std=0.02)
+        elif recipe == "patch":
+            # Views do not inherit HF's per-parameter initialization flag.
+            if not getattr(module.weight, "_is_hf_initialized", False):
+                channels = self.config.in_channels
+                image_weights = module.weight[:, :channels]
+                torch.nn.init.xavier_uniform_(image_weights.view(image_weights.shape[0], -1))
+                torch.nn.init.zeros_(module.weight[:, channels:])
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
 
     def get_input_embeddings(self):
         return self.img_in

@@ -23,6 +23,8 @@ Changes:
 - Blocks use the Transformers GradientCheckpointingLayer contract.
 - Per-forward RotaryTables leaves preserve identical FP32 constants across FSDP2
   input casting and checkpoint recomputation, including both block types.
+- The adapter restores native leaf initialization after meta materialization,
+  including zero output/modulation/condition weights and patch/timestep rules.
 - Standard tuple utilities replace hyvideo.commons imports.
 - Frozen loading is local-only; glyph torch.load uses weights_only=True.
 - VAE parallel-state import points to VeOmni; tile parallelism is not enabled.

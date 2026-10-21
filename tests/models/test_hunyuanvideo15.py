@@ -61,6 +61,73 @@ def batch(glyph=False):
     )
 
 
+@pytest.mark.parametrize("text_projection", ["linear", "single_refiner"])
+def test_meta_materialization_preserves_native_initialization(text_projection, monkeypatch):
+    """Run the trainer's random-init path after discarding every constructor value."""
+    from veomni.distributed import torch_parallelize
+    from veomni.models import init_empty_weights
+    from veomni.models.diffusers.hunyuanvideo15.native.modules.norm_layers import RMSNorm
+
+    config = tiny_config(glyph=True)
+    config.text_projection = text_projection
+    config.mm_single_blocks_depth = 1
+    with init_empty_weights():
+        model = HunyuanVideo15Model(config)
+    assert all(parameter.is_meta for parameter in model.parameters())
+    materialize = torch_parallelize._to_empty_preserving_nonpersistent_buffers
+
+    def poison_parameters(model, device):
+        materialize(model, device)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.fill_(float("nan"))
+
+    monkeypatch.setattr(torch_parallelize, "_to_empty_preserving_nonpersistent_buffers", poison_parameters)
+    torch.manual_seed(42)
+    torch_parallelize._materialize_and_load_weights(
+        model,
+        None,
+        "cpu",
+        should_skip_hf_weight_load=False,
+        is_peft_model=False,
+        adapter_path=None,
+        broadcast_from_rank0=False,
+    )
+    assert all(not parameter.is_meta and torch.isfinite(parameter).all() for parameter in model.parameters())
+    zero_layers = [model.final_layer.linear, model.final_layer.adaLN_modulation[1]]
+    for block in model.double_blocks:
+        zero_layers.extend([block.img_mod.linear, block.txt_mod.linear])
+    zero_layers.extend(block.modulation.linear for block in model.single_blocks)
+    if text_projection == "single_refiner":
+        zero_layers.extend(block.adaLN_modulation[1] for block in model.txt_in.individual_token_refiner.blocks)
+    for layer in zero_layers:
+        assert torch.count_nonzero(layer.weight) == torch.count_nonzero(layer.bias) == 0
+    assert torch.count_nonzero(model.cond_type_embedding.weight) == 0
+    projection = model.img_in.proj
+    assert torch.count_nonzero(projection.weight[:, config.in_channels :]) == 0
+    assert torch.count_nonzero(projection.bias) == 0
+    image_weights = projection.weight[:, : config.in_channels].flatten(1)
+    bound = (6 / sum(image_weights.shape)) ** 0.5
+    assert image_weights.abs().max() <= bound
+    assert image_weights.abs().max() > 0.8 * bound
+    for module in model.modules():
+        if isinstance(module, (torch.nn.LayerNorm, RMSNorm)) and getattr(module, "weight", None) is not None:
+            torch.testing.assert_close(module.weight, torch.ones_like(module.weight), rtol=0, atol=0)
+            if getattr(module, "bias", None) is not None:
+                assert torch.count_nonzero(module.bias) == 0
+    for layer in (model.time_in.mlp[0], model.time_in.mlp[2]):
+        assert 0.017 < layer.weight.std().item() < 0.023
+        assert 0 < layer.bias.abs().max() <= layer.in_features**-0.5
+    # Ordinary native Linear biases use PyTorch's uniform initialization, not HF zeros.
+    ordinary = model.byt5_in.fc1
+    assert 0 < ordinary.bias.abs().max() <= ordinary.in_features**-0.5
+    assert ordinary.weight.abs().max() <= ordinary.in_features**-0.5
+    result = model(**batch(glyph=True))
+    assert torch.count_nonzero(result.predictions) == 0
+    result.loss["mse_loss"].backward()
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+
+
 @pytest.mark.parametrize("checkpointing", [False, True])
 def test_forward_backward_update_and_strict_reload(tmp_path, checkpointing):
     torch.manual_seed(123)
@@ -81,8 +148,35 @@ def test_forward_backward_update_and_strict_reload(tmp_path, checkpointing):
     assert not torch.equal(before, model.img_in.proj.weight)
     model.eval().save_pretrained(tmp_path)
     reloaded = HunyuanVideo15Model.from_pretrained(tmp_path, local_files_only=True).eval()
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(reloaded.state_dict()[name], value, rtol=0, atol=0)
     reloaded.load_state_dict(model.state_dict(), strict=True)
     torch.testing.assert_close(model(**data).predictions, reloaded(**data).predictions, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("missing_parameter", ["weight", "bias"])
+def test_partial_pretrained_initialization_preserves_loaded_parameters(tmp_path, missing_parameter):
+    from safetensors.torch import load_file, save_file
+
+    model = HunyuanVideo15Model(tiny_config(glyph=True))
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(0.125)
+    model.save_pretrained(tmp_path)
+    path = tmp_path / "model.safetensors"
+    state = load_file(path)
+    for layer in ("img_in.proj", "byt5_in.fc1", "time_in.mlp.0", "final_layer.linear"):
+        del state[f"{layer}.{missing_parameter}"]
+    save_file(state, path, metadata={"format": "pt"})
+    reloaded = HunyuanVideo15Model.from_pretrained(tmp_path, local_files_only=True)
+    for name, value in state.items():
+        torch.testing.assert_close(reloaded.state_dict()[name], value, rtol=0, atol=0)
+    assert all(torch.isfinite(parameter).all() for parameter in reloaded.parameters())
+    assert torch.count_nonzero(getattr(reloaded.final_layer.linear, missing_parameter)) == 0
+    if missing_parameter == "weight":
+        assert torch.count_nonzero(reloaded.img_in.proj.weight[:, model.config.in_channels :]) == 0
+    else:
+        assert torch.count_nonzero(reloaded.img_in.proj.bias) == 0
 
 
 @pytest.mark.parametrize("table_dtypes", [(torch.bfloat16, torch.float32), (torch.float32, torch.bfloat16)])
