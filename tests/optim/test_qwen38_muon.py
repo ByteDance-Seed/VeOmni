@@ -108,6 +108,55 @@ def test_adam_fallback_matches_existing_fp32_optimizer():
         torch.testing.assert_close(opt.state[p]["master_weight"], r, atol=1e-7, rtol=1e-6)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_trainable_ple_lookup_matches_fp32_adam_and_resumes(dtype):
+    torch.manual_seed(14)
+    model = torch.nn.Module()
+    model.ngram_embedding = torch.nn.ModuleDict({"shard_0": torch.nn.Embedding(12, 8, dtype=dtype)})
+    p = model.ngram_embedding["shard_0"].weight
+    reference_p = torch.nn.Parameter(p.detach().float().clone())
+    initial = p.detach().clone()
+
+    def build(param):
+        groups = module.add_qwen38_plans(model, [{"params": [param], "weight_decay": 0.0, "cpu_offload": True}])
+        assert json.loads(groups[0]["qwen38_plan"]) == [["adamw", 0, 12]]
+        return module.Qwen38MuonAdamW(groups, lr=1e-4)
+
+    opt = build(p)
+    reference = torch.optim.Adam([reference_p], lr=1e-4, betas=(0.9, 0.95), foreach=False)
+    for step in range(6):
+        opt.zero_grad()
+        model.ngram_embedding["shard_0"](torch.tensor([0, 2, 2, 5])).square().mean().backward()
+        reference_p.grad = p.grad.float().clone()
+        opt.step()
+        reference.step()
+        for key in ("master_weight", "exp_avg", "exp_avg_sq"):
+            assert opt.state[p][key].dtype == torch.float32
+            assert opt.state[p][key].device.type == "cpu"
+        torch.testing.assert_close(opt.state[p]["master_weight"], reference_p, atol=1e-7, rtol=1e-6)
+        assert torch.equal(p, opt.state[p]["master_weight"].to(dtype))
+        assert torch.equal(p.detach()[6:], initial[6:])
+        if step == 2:
+            saved = copy.deepcopy(opt.state_dict())
+            fresh_p = torch.nn.Parameter(p.detach().clone())
+            model.ngram_embedding["shard_0"].weight = fresh_p
+            fresh = build(fresh_p)
+            fresh.load_state_dict(saved)
+            p, opt = fresh_p, fresh
+
+    for group in ({"params": [p], "weight_decay": 0.1}, {"params": [p]}):
+        with pytest.raises(ValueError, match="zero weight decay"):
+            module.add_qwen38_plans(model, [group])
+    groups = module.add_qwen38_plans(model, [{"params": [p], "weight_decay": 0.0}])
+    groups[0]["weight_decay"] = 0.1
+    with pytest.raises(ValueError, match="final optimizer groups"):
+        module.Qwen38MuonAdamW(groups)
+    saved = copy.deepcopy(opt.state_dict())
+    saved["param_groups"][0]["weight_decay"] = 0.1
+    with pytest.raises(RuntimeError, match="PLE lookup marker and zero weight decay"):
+        opt.load_state_dict(saved)
+
+
 def test_resume_rejects_old_adam_and_changed_splits():
     p = torch.nn.Parameter(torch.ones(8, 5, dtype=torch.bfloat16))
     opt = make_optimizer(p, [("muon", 0, 8)])
@@ -176,6 +225,8 @@ def _distributed_worker(rank, world, rendezvous, checkpoint_dir):
         # The added row-axis cases cross a logical Muon matrix: row 6 cuts
         # [4, 8) in 2D; row 4 cuts [3, 8) independently within each expert.
         cases = [
+            ((12, 8), 0, [("adamw", 0, 12)]),
+            ((12, 8), 1, [("adamw", 0, 12)]),
             ((12, 9), 0, aligned_2d),
             ((12, 9), 1, aligned_2d),
             ((4, 8, 9), 0, aligned_3d),

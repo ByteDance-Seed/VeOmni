@@ -99,8 +99,6 @@ def logical_plan(model, name, param):
     if "indexer" in name or ".visual." in name:
         raise ValueError("This recipe requires the QSA indexer and vision tower to remain frozen")
     if isinstance(owner, torch.nn.Embedding):
-        if "ngram_embedding" in name:
-            raise ValueError("This recipe requires the CPU PLE lookup tables to remain frozen")
         return adam
     if param.ndim < 2 or leaf == "bias" or isinstance(owner, (torch.nn.Conv1d, torch.nn.Conv2d)):
         return adam
@@ -159,7 +157,16 @@ def add_qwen38_plans(model, groups):
     for group in groups:
         for p in group["params"]:
             plan = logical_plan(model, names[id(p)], p)
-            planned.append({**group, "params": [p], "qwen38_plan": json.dumps(plan), "qwen38_recipe": RECIPE})
+            metadata = {}
+            if "ngram_embedding" in names[id(p)]:
+                if group.get("weight_decay") != 0.0:
+                    raise ValueError(
+                        "Trainable PLE lookup tables require explicit zero weight decay; set no_decay_params accordingly"
+                    )
+                metadata["qwen38_ple_lookup"] = True
+            planned.append(
+                {**group, **metadata, "params": [p], "qwen38_plan": json.dumps(plan), "qwen38_recipe": RECIPE}
+            )
     return planned
 
 
@@ -202,6 +209,8 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
         for group in self.param_groups:
             if group.get("qwen38_recipe") != RECIPE or len(group["params"]) != 1:
                 raise ValueError("Use add_qwen38_plans to construct exact logical-slice groups")
+            if group.get("qwen38_ple_lookup") and group["weight_decay"] != 0.0:
+                raise ValueError("Trainable PLE lookup tables require zero weight decay in the final optimizer groups")
             group.setdefault("muon_momentum", momentum)
             p = group["params"][0]
             plan = json.loads(group["qwen38_plan"])
@@ -264,6 +273,10 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
 
     def load_state_dict(self, state_dict):
         for saved, current in zip(state_dict["param_groups"], self.param_groups, strict=True):
+            if current.get("qwen38_ple_lookup") and (
+                saved.get("qwen38_ple_lookup") is not True or saved.get("weight_decay") != 0.0
+            ):
+                raise RuntimeError("Muon resume requires the PLE lookup marker and zero weight decay")
             for key in ("qwen38_recipe", "qwen38_plan", "muon_momentum"):
                 if saved.get(key) != current[key]:
                     raise RuntimeError(f"Muon resume recipe mismatch: {key}; AdamW migration is not implicit")

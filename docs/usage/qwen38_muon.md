@@ -17,8 +17,13 @@ Ulysses/CP, expert routing, and global gradient clipping unchanged. The generic
   Output projections and PLE key/value projections are whole linear maps.
 - Embeddings, LM head, router, gated-residual projections, GDN z/a/b,
   normalization, convolution, and bias parameters use AdamW.
-- Indexer, vision tower and CPU PLE tables must remain frozen. Unknown trainable
-  maps and LoRA parameters fail closed rather than silently receiving Muon.
+- Trainable PLE lookup tables use Adam (the AdamW fallback with zero weight
+  decay). Include `ngram_embedding` in `no_decay_params`; nonzero decay on these
+  tables is rejected. Their FP32 optimizer states can use the existing selective
+  CPU offload while the compute tables retain their distributed device placement.
+- Indexer and vision tower must remain frozen. The optional CPU-only PLE lookup
+  remains a frozen-table feature; disable it to train the lookup tables. Unknown
+  trainable maps and LoRA parameters fail closed rather than silently receiving Muon.
 
 The schedule is generated from the Polar Express authors' implementation with
 `l=1e-3, num_iters=8, degree=5, safety_factor_eps=1e-2, cushion=0.02` and pinned in
