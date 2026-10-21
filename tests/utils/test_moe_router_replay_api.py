@@ -247,6 +247,8 @@ _GENERATED_FILES = {
     _REPO_ROOT / "veomni/models/transformers/qwen3_moe/generated/patched_modeling_qwen3_moe_gpu.py": 1,
     _REPO_ROOT / "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_gpu.py": 1,
     _REPO_ROOT / "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_npu.py": 1,
+    _REPO_ROOT / "veomni/models/transformers/qwen4_exp/generated/patched_modeling_qwen4_exp_gpu.py": 1,
+    _REPO_ROOT / "veomni/models/transformers/qwen4_exp/generated/patched_modeling_qwen4_exp_npu.py": 1,
     # TopKRouter + HashRouter.
     _REPO_ROOT / "veomni/models/transformers/deepseek_v4/generated/patched_modeling_deepseek_v4_gpu.py": 2,
     _REPO_ROOT / "veomni/models/transformers/deepseek_v4/generated/patched_modeling_deepseek_v4_npu.py": 2,
