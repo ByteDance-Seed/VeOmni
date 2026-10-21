@@ -20,6 +20,12 @@ CPU-planned worker cases scope `torch.utils.checkpoint.DefaultDeviceType` to
 fall back to the registered NPU and AMP capability queries can initialize a
 hidden device. Preserve this scope across fixture setup and teardown as well
 as the test body; accelerator plans and full-visibility collection stay unchanged.
+During that scope, optimizer foreach-capability queries use the canonical
+`torch.utils._foreach_utils` helper. torch_npu 2.10 replaces the optimizer's
+alias with a device-name lookup that initializes NPU even for CPU parameters.
+Restore the prior alias on exit, preserving explicit foreach/fused options.
+A synthetic registered backend alone misses vendor monkeypatches: exercise
+the pinned wheel's optimizer patch in CPU isolation audits too.
 
 CPU numerical flakes need fresh-process reproduction, not only warm repeats.
 The QSA CPU fused-kernel mock promotes only `exp` to FP64 and casts back:

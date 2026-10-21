@@ -204,6 +204,8 @@ def pytest_runtest_protocol(item, nextitem):
     case = rows.get(item.nodeid)
     previous_device_type = None
     if case and all(spec.device == "cpu" for spec in CasePlan.from_dict(case["plan"]).launches):
+        import torch.optim.optimizer as optimizer_module
+        from torch.utils._foreach_utils import _get_foreach_kernels_supported_devices
         from torch.utils.checkpoint import DefaultDeviceType
 
         # CPU-only checkpoint inputs fall back to this global default. A
@@ -211,10 +213,16 @@ def pytest_runtest_protocol(item, nextitem):
         # querying AMP support, even though every tensor stays on CPU.
         previous_device_type = DefaultDeviceType.get_device_type()
         DefaultDeviceType.set_device_type("cpu")
+        # torch_npu replaces the optimizer's alias with a device-name query.
+        # CPU optimizers use Torch's original, query-free capability helper;
+        # explicit foreach/fused settings retain their ordinary semantics.
+        previous_foreach_query = optimizer_module._get_foreach_kernels_supported_devices
+        optimizer_module._get_foreach_kernels_supported_devices = _get_foreach_kernels_supported_devices
     try:
         yield
     finally:
         if previous_device_type is not None:
+            optimizer_module._get_foreach_kernels_supported_devices = previous_foreach_query
             DefaultDeviceType.set_device_type(previous_device_type)
     row = item.config._ci_results.get(item.nodeid)
     if row:

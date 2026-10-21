@@ -328,6 +328,52 @@ def test_cpu_checkpoint_does_not_query_registered_accelerator(monkeypatch, cpu, 
     assert DefaultDeviceType.get_device_type() == backend
 
 
+@pytest.mark.parametrize("cpu", [False, True])
+@pytest.mark.parametrize("foreach", [None, False, True])
+@pytest.mark.parametrize("optimizer_name", ["AdamW", "SGD"])
+def test_cpu_optimizer_does_not_query_hidden_accelerator(monkeypatch, cpu, foreach, optimizer_name):
+    from types import SimpleNamespace
+
+    import torch
+    import torch.optim.optimizer as optimizer_module
+
+    from scripts.ci.accelerator import pytest_plugin
+    from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec
+
+    def vendor_device_query():
+        raise RuntimeError("Optimizer queried hidden accelerator device")
+
+    # torch_npu replaces this alias with a policy that queries its device name,
+    # including when AdamW/SGD parameters are entirely CPU tensors.
+    monkeypatch.setattr(optimizer_module, "_get_foreach_kernels_supported_devices", vendor_device_query)
+    monkeypatch.delenv("CI_CASE_PROGRESS", raising=False)
+    plan = CasePlan.sequential(LaunchSpec(device="cpu" if cpu else "accelerator"))
+    item = SimpleNamespace(
+        nodeid="sample", config=SimpleNamespace(_ci_batch_cases={"sample": {"plan": plan.to_dict()}}, _ci_results={})
+    )
+    parameter = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+    reference = torch.nn.Parameter(parameter.detach().clone())
+    constructor = getattr(torch.optim, optimizer_name)
+    optimizer = constructor([parameter], lr=0.01, foreach=foreach)
+    reference_optimizer = constructor([reference], lr=0.01, foreach=False)
+    parameter.grad = torch.tensor([0.25, -0.5])
+    reference.grad = parameter.grad.clone()
+    reference_optimizer.step()
+    protocol = pytest_plugin.pytest_runtest_protocol(item, None)
+    next(protocol)
+    try:
+        if not cpu and foreach is None:
+            with pytest.raises(RuntimeError, match="queried hidden accelerator device"):
+                optimizer.step()
+        else:
+            optimizer.step()
+            torch.testing.assert_close(parameter, reference)
+        assert optimizer.param_groups[0]["foreach"] is foreach
+    finally:
+        protocol.close()
+    assert optimizer_module._get_foreach_kernels_supported_devices is vendor_device_query
+
+
 def test_case_workspaces_isolate_relative_checkpoints_and_caches(tmp_path):
     from scripts.ci.accelerator.runtime.workers import create_workspace
 

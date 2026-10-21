@@ -257,6 +257,11 @@ execution and teardown, then restores the prior value. Checkpoint otherwise
 uses a registered accelerator as its fallback even for CPU-only inputs, which
 can initialize a hidden NPU when checking autocast support. Collection and
 accelerator-planned cases retain their original checkpoint device settings.
+CPU cases also use Torch's canonical foreach-capability helper for optimizer
+defaults. The torch_npu optimizer override queries the NPU device name even
+when optimizer parameters are all CPU tensors. The worker restores that
+override after the case; explicit `foreach` and `fused` settings keep their
+normal Torch behavior, and accelerator cases retain the vendor policy.
 
 Both unit and e2e suites consume the same planner/scheduler. Suite selection
 defines which cases run, and launch plans define their resource requirements.

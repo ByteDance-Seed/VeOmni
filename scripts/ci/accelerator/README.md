@@ -99,6 +99,10 @@ Explicit CPU cases also scope checkpoint's fallback device to CPU through
 fixture setup, execution and teardown, restoring the previous value afterward.
 This prevents CPU checkpoint recomputation from querying a registered but
 hidden NPU's autocast support.
+CPU optimizer defaults use Torch's original capability helper during the same
+scope, so torch_npu's foreach policy does not initialize a hidden device.
+Explicit optimizer options are preserved, and the vendor helper is restored
+when the case ends.
 
 ## Results and local commands
 
