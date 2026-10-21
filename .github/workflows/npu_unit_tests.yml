@@ -181,5 +181,4 @@ jobs:
           uv pip list
       - name: Run accelerator case tests
         run: |
-          # Temporary diagnostic run: collect all NPU unit failures before restoring fail-fast.
-          uv run --frozen python -m scripts.ci.accelerator --backend npu --suite unit --keep-going
+          uv run --frozen python -m scripts.ci.accelerator --backend npu --suite unit
