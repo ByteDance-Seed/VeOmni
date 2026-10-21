@@ -36,10 +36,10 @@ def naflatten(
     pieces: list[torch.Tensor] = []
     for x in hid:
         if x.dim() == 1:
-            prefix_rows.append(torch.tensor([x.numel()], dtype=torch.long))
+            prefix_rows.append(torch.tensor([x.numel()], dtype=torch.long, device="cpu"))
             pieces.append(x.reshape(-1))
         else:
-            prefix_rows.append(torch.tensor(tuple(x.shape[:-1]), dtype=torch.long))
+            prefix_rows.append(torch.tensor(tuple(x.shape[:-1]), dtype=torch.long, device="cpu"))
             pieces.append(x.flatten(0, -2))
     shape = torch.stack(prefix_rows)
     return torch.cat(pieces), shape

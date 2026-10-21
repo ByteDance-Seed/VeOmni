@@ -61,6 +61,15 @@ def test_naflatten_and_unflatten_roundtrip():
     for a, b in zip(tensors_1d, restored_1d, strict=True):
         torch.testing.assert_close(a, b)
 
+    # Even when a non-CPU default device is active, shape metadata stays on CPU.
+    with torch.device("meta"):
+        meta_3d = [torch.empty(2, 3, 8), torch.empty(1, 5, 8)]
+        meta_1d = [torch.empty(4), torch.empty(7)]
+        _, meta_shape_3d = naflatten(meta_3d)
+        _, meta_shape_1d = naflatten(meta_1d)
+    assert meta_shape_3d.device.type == "cpu"
+    assert meta_shape_1d.device.type == "cpu"
+
 
 def test_all_registered_classes_are_module_mixins():
     accelerated_keys = set(OMNI_ACCELERATED_MODEL_REGISTRY.valid_keys())

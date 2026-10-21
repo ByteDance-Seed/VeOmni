@@ -26,8 +26,8 @@ Or, keeping `--model.accelerator.ulysses_size 4` (or `model.accelerator.ulysses_
 in `base.yaml`) so the top-level accelerator also resolves to `dp_size = W / 4`,
 configure `ulysses_size` / `cp_size` per module in `modules_train.yaml` (for
 example, Ulysses SP on the vision encoder and Context Parallelism on a
-DeepSeek-V4 LLM backbone), provided every distributed module and
-`model.accelerator` resolve to the same
+DeepSeek-V4 LLM backbone), provided `pp_size = tp_size = 1` and every
+distributed module and `model.accelerator` resolve to the same
 `dp_size = world_size // (cp_size * ulysses_size)`:
 
 ```yaml
@@ -92,7 +92,7 @@ before any model weights or process groups are built if any module disagrees.
 # dataloader: W/S distinct shards; each shard is replicated to every rank of its SP group
 for node in training_graph:
     kw  = module.pre_forward(**data)    # sp_size > 1: pad + slice 1/S (sequence or batch dim)
-    out = module(**kw)                  # one forward; attention does the in-group all-to-all
+    out = module(**kw)                  # one forward; attention runs its configured SP/CP collective
     out = module.post_forward(**out)    # sp_size > 1: gather_outputs back to the full sequence, unpad
 # one loss.backward() over the whole graph; FSDP2 reduces gradients on a mesh that includes SP
 ```
@@ -136,9 +136,14 @@ Ulysses in VeOmni.
 
 **Loss.** Decode-side losses reduce with
 `reduce_sequence_parallel_loss(..., group=ps.fsdp_group)`, a token-weighted
-reduction over `dp_sp`. With replicated data the SP peers hold identical
-`(ce_sum, n_valid)` pairs, so each distinct DP shard counts once and the SP
-copies cancel.
+reduction over `dp_sp` that sums each rank's numerator (`local_mean * n_valid`)
+and denominator (`n_valid`) across the group. When decode runs on
+sequence-sliced shards, each rank contributes its own shard-local
+`(ce_sum, n_valid)` and the reduction combines their numerators and denominators
+into the global token-weighted mean; on an unsliced full-replica decode path
+(where the backbone has already gathered full-sequence hidden states before
+`decode`), SP peers hold identical `(ce_sum, n_valid)` pairs so the replicated
+copies cancel and each distinct DP shard counts once.
 
 **Metrics.** `metric_meter_set_seqlens` runs in `pre_forward` **before** the
 slice and records full sample lengths. The step meter reduces over `dp_group`,
