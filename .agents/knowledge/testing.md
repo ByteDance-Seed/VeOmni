@@ -15,6 +15,11 @@ an explicit CPU launch plan. Mark entire modules only when all cases are CPU-onl
 use individual case markers in files that also exercise accelerator kernels.
 The lightweight device-API workflow imports CPU-marked architecture/docstring
 tests directly, so it installs pytest even though it does not install Torch.
+CPU-planned worker cases scope `torch.utils.checkpoint.DefaultDeviceType` to
+`cpu` and restore it afterward. On Ascend, CPU-only checkpoint inputs otherwise
+fall back to the registered NPU and AMP capability queries can initialize a
+hidden device. Preserve this scope across fixture setup and teardown as well
+as the test body; accelerator plans and full-visibility collection stay unchanged.
 
 CPU numerical flakes need fresh-process reproduction, not only warm repeats.
 The QSA CPU fused-kernel mock promotes only `exp` to FP64 and casts back:

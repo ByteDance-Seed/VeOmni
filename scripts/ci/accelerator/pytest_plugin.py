@@ -200,7 +200,22 @@ def pytest_unconfigure(config):
 def pytest_runtest_protocol(item, nextitem):
     started = time.time()
     _progress(dict(kind="start", nodeid=item.nodeid, timestamp=started))
-    yield
+    rows = getattr(item.config, "_ci_batch_cases", {})
+    case = rows.get(item.nodeid)
+    previous_device_type = None
+    if case and all(spec.device == "cpu" for spec in CasePlan.from_dict(case["plan"]).launches):
+        from torch.utils.checkpoint import DefaultDeviceType
+
+        # CPU-only checkpoint inputs fall back to this global default. A
+        # registered NPU backend can otherwise initialize hidden devices while
+        # querying AMP support, even though every tensor stays on CPU.
+        previous_device_type = DefaultDeviceType.get_device_type()
+        DefaultDeviceType.set_device_type("cpu")
+    try:
+        yield
+    finally:
+        if previous_device_type is not None:
+            DefaultDeviceType.set_device_type(previous_device_type)
     row = item.config._ci_results.get(item.nodeid)
     if row:
         row["wall_seconds"] = time.time() - started

@@ -251,6 +251,12 @@ so changing environment variables inside an initialized worker is insufficient.
 Explicit CPU plans also need an NPU-aware availability check; an empty Ascend
 visibility string must not be assumed to behave exactly like CUDA's empty
 visibility string without checking the installed runtime.
+During an explicitly CPU-planned case, the pytest worker sets
+`torch.utils.checkpoint.DefaultDeviceType` to `cpu` across fixture setup,
+execution and teardown, then restores the prior value. Checkpoint otherwise
+uses a registered accelerator as its fallback even for CPU-only inputs, which
+can initialize a hidden NPU when checking autocast support. Collection and
+accelerator-planned cases retain their original checkpoint device settings.
 
 Both unit and e2e suites consume the same planner/scheduler. Suite selection
 defines which cases run, and launch plans define their resource requirements.

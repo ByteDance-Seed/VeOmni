@@ -283,6 +283,51 @@ def test_device_pool_can_run_cpu_work_beside_an_exclusive_device_job():
     assert assignments["accelerator"] == list("01234567")
 
 
+@pytest.mark.parametrize("cpu", [False, True])
+@pytest.mark.parametrize("use_reentrant", [False, True])
+def test_cpu_checkpoint_does_not_query_registered_accelerator(monkeypatch, cpu, use_reentrant):
+    from types import SimpleNamespace
+
+    import torch
+    from torch.utils.checkpoint import DefaultDeviceType, checkpoint
+
+    from scripts.ci.accelerator import pytest_plugin
+    from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec
+
+    # Model torch_npu's registered backend without requiring its runtime.
+    backend = torch._C._get_privateuse1_backend_name()
+
+    def reject_amp_query():
+        raise RuntimeError("CPU checkpoint queried hidden accelerator AMP")
+
+    monkeypatch.setattr(torch, backend, SimpleNamespace(get_amp_supported_dtype=reject_amp_query), raising=False)
+    monkeypatch.setattr(DefaultDeviceType, "_default_device_type", backend)
+    monkeypatch.delenv("CI_CASE_PROGRESS", raising=False)
+    plan = CasePlan.sequential(LaunchSpec(device="cpu" if cpu else "accelerator"))
+    config = SimpleNamespace(_ci_batch_cases={"sample": {"plan": plan.to_dict()}}, _ci_results={})
+    item = SimpleNamespace(nodeid="sample", config=config)
+    protocol = pytest_plugin.pytest_runtest_protocol(item, None)
+    next(protocol)
+    try:
+        value = torch.randn(4, requires_grad=True)
+
+        def run_checkpoint():
+            checkpoint(lambda x: x.sin().square(), value, use_reentrant=use_reentrant).sum().backward()
+
+        if cpu:
+            assert DefaultDeviceType.get_device_type() == "cpu"
+            run_checkpoint()
+            torch.testing.assert_close(value.grad, 2 * value.detach().sin() * value.detach().cos())
+        else:
+            assert DefaultDeviceType.get_device_type() == backend
+            with pytest.raises(RuntimeError, match="queried hidden accelerator AMP"):
+                run_checkpoint()
+    finally:
+        # Cleanup also runs when setup, the test or teardown raises.
+        protocol.close()
+    assert DefaultDeviceType.get_device_type() == backend
+
+
 def test_case_workspaces_isolate_relative_checkpoints_and_caches(tmp_path):
     from scripts.ci.accelerator.runtime.workers import create_workspace
 

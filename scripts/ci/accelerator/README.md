@@ -95,6 +95,10 @@ peers. Failure to drain owned processes always stops admission and cancels
 running peers, even with `--keep-going`, because the affected device lease
 cannot be safely reused. `--serial` uses the same failure policy with one batch at a time.
 CPU BLAS and compiler threads are bounded.
+Explicit CPU cases also scope checkpoint's fallback device to CPU through
+fixture setup, execution and teardown, restoring the previous value afterward.
+This prevents CPU checkpoint recomputation from querying a registered but
+hidden NPU's autocast support.
 
 ## Results and local commands
 
