@@ -534,6 +534,71 @@ def test_minimax_m3_vl_placeholder_mask_fallback_gathers_input_ids_under_sp(modu
     assert seen["inputs_embeds"].shape[1] == local_len
 
 
+@pytest.mark.parametrize("with_metadata", [False, True], ids=["grid_tensor", "grid_list"])
+@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+def test_minimax_m3_vl_sp_drops_vision_padding_features(module_name, modality, with_metadata, monkeypatch):
+    """SP=2 with a 1x2x2 grid gathers two features (one from the padding) for a single placeholder."""
+    from veomni.models.registry import get_model_config
+
+    modeling = importlib.import_module(module_name)
+    config = get_model_config("./tests/toy_config/minimax_m3_vl_toy")
+    model = modeling.MiniMaxM3SparseForConditionalGeneration(config).model.eval()
+    assert model.vision_tower.config.spatial_merge_size == 2
+    sp_size, local_len = 2, 4
+    token_id = config.image_token_id if modality == "image" else config.video_token_id
+    full_ids = torch.randint(0, 100, (1, sp_size * local_len))
+    full_ids[0, 5] = token_id
+    embed_tokens = model.get_input_embeddings()
+    hidden_size = embed_tokens.weight.shape[1]
+    real_feature, padding_feature = torch.randn(1, hidden_size), torch.randn(1, hidden_size)
+
+    def fake_all_gather(tensor_list, tensor, group):
+        for rank, chunk in enumerate(full_ids.split(local_len, dim=1)):
+            tensor_list[rank].copy_(chunk)
+
+    def fake_gather_outputs(x, gather_dim, group):
+        if gather_dim == 1:
+            return embed_tokens(full_ids)
+        # Rank 0 holds the four real patch rows, rank 1 the SP-padding rows.
+        return torch.cat([real_feature, padding_feature])
+
+    monkeypatch.setattr(
+        modeling,
+        "get_parallel_state",
+        lambda: SimpleNamespace(sp_enabled=True, sp_size=sp_size, sp_group=None, fsdp_enabled=False),
+    )
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    monkeypatch.setattr(modeling, "gather_outputs", fake_gather_outputs)
+    monkeypatch.setattr(modeling, "slice_input_tensor", lambda x, dim, group: x)
+    local_features = SimpleNamespace(pooler_output=real_feature)
+    monkeypatch.setattr(model, f"get_{modality}_features", lambda *args, **kwargs: local_features)
+
+    seen = {}
+
+    class _LanguageModelStub(torch.nn.Module):
+        def get_input_embeddings(self):
+            return embed_tokens
+
+        def forward(self, inputs_embeds, **kwargs):
+            seen["inputs_embeds"] = inputs_embeds
+            return SimpleNamespace(last_hidden_state=inputs_embeds, past_key_values=None)
+
+    model.language_model = _LanguageModelStub()
+    grid_thw = torch.tensor([[1, 2, 2]])
+    pixel_key = "pixel_values" if modality == "image" else "pixel_values_videos"
+    metadata = {f"{modality}_grid_thw_list": [[1, 2, 2]]} if with_metadata else None
+    with torch.no_grad():
+        output = model(
+            input_ids=full_ids[:, :local_len],
+            **{pixel_key: torch.zeros(2, 1), f"{modality}_grid_thw": grid_thw},
+            multimodal_metadata=metadata,
+        )
+
+    torch.testing.assert_close(seen["inputs_embeds"][0, 5], real_feature[0])
+    torch.testing.assert_close(getattr(output, f"{modality}_hidden_states"), real_feature)
+
+
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
 def test_minimax_m3_vl_parallel_plan_targets_the_expert_parameters(module_name):
     """Every EP plan pattern must match the stacked expert weights of the multimodal model."""

@@ -107,6 +107,18 @@ def _grid_thw_to_list(grid_thw, grid_thw_list):
     return grid_thw.tolist()
 
 
+def _drop_sp_padding_features(features, grid_thw, grid_thw_list, merge_size):
+    """Keep the gathered features of real merged tokens, dropping the SP-padding tail.
+
+    Under SP the vision tower pads its pixel rows to a multiple of
+    ``sp_size * merge_size**2`` before slicing, so the gathered projector output
+    ends with features of that synthetic tail. Placeholder masks only cover the
+    real ``sum(t * h * w) // merge_size**2`` tokens.
+    """
+    grid_thw_list = _grid_thw_to_list(grid_thw, grid_thw_list)
+    return features[: sum(t * h * w for t, h, w in grid_thw_list) // merge_size**2]
+
+
 def _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings):
     """Return the indexer's normed, rotated ``[B, S, G, D]`` queries and ``[B, S, 1, D]`` keys.
 
@@ -1640,6 +1652,8 @@ class MiniMaxM3VLModel(MiniMaxM3VLPreTrainedModel):
     #    across ranks and preventing asymmetric collectives from hanging
     # 4. when no precomputed image/video masks are passed under SP, gather the
     #    sharded input_ids before deriving the placeholder masks
+    # 5. under SP, drop the gathered features of the vision SP-padding tail so they
+    #    match the placeholder tokens (and the fallback mask's count check)
     # ================================================================
     @can_return_tuple
     @auto_docstring
@@ -1705,6 +1719,14 @@ class MiniMaxM3VLModel(MiniMaxM3VLPreTrainedModel):
             ).pooler_output.to(inputs_embeds.device, inputs_embeds.dtype)
             if parallel_state.sp_enabled:
                 image_features = gather_outputs(image_features, gather_dim=0, group=parallel_state.sp_group)
+                # --- Patch.5 ---
+                image_features = _drop_sp_padding_features(
+                    image_features,
+                    image_grid_thw,
+                    image_vit_kwargs["vit_metadata"]["grid_thw_list"],
+                    self.vision_tower.config.spatial_merge_size,
+                )
+                # --- Patch.5 ---
 
         elif parallel_state.fsdp_enabled:
             fake_vision = self.vision_tower.dummy_forward()
@@ -1718,6 +1740,14 @@ class MiniMaxM3VLModel(MiniMaxM3VLPreTrainedModel):
             ).pooler_output.to(inputs_embeds.device, inputs_embeds.dtype)
             if parallel_state.sp_enabled:
                 video_features = gather_outputs(video_features, gather_dim=0, group=parallel_state.sp_group)
+                # --- Patch.5 ---
+                video_features = _drop_sp_padding_features(
+                    video_features,
+                    video_grid_thw,
+                    video_vit_kwargs["vit_metadata"]["grid_thw_list"],
+                    self.vision_tower.config.spatial_merge_size,
+                )
+                # --- Patch.5 ---
         elif parallel_state.fsdp_enabled:
             fake_vision = self.vision_tower.dummy_forward()
             fake_features = self.multi_modal_projector(fake_vision.last_hidden_state.squeeze(0))

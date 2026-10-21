@@ -26,6 +26,7 @@ from veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config
     MiniMaxM3VLCausalLMOutputWithLogProbs,
     PatchedMiniMaxM3VLExperts,
     PatchedMiniMaxM3VLPreTrainedModel,
+    _drop_sp_padding_features,
     _grid_thw_to_list,
     _minimax_m3_indexer_project,
     _minimax_m3_sparse_attention,
@@ -82,6 +83,7 @@ config.add_import(
 config.add_import("veomni.models.utils.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
 config.add_import("veomni.utils.device", names=["IS_NPU_AVAILABLE"])
 config.add_helper(_grid_thw_to_list)
+config.add_helper(_drop_sp_padding_features)
 config.add_helper(_minimax_m3_indexer_project)
 config.add_helper(_require_varlen_attention)
 config.add_helper(_minimax_m3_sparse_attention)
