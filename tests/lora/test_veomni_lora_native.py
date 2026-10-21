@@ -303,3 +303,33 @@ def test_peft_bidirectional_interop(tmp_path):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_disable_adapter_restores_nested_context_after_exception():
+    """Reference inference bypasses nonzero adapters without changing weights."""
+    base = Toy()
+    reference = copy.deepcopy(base)
+    model = VeOmniLoraModel(base, _base_config())
+    _randomize_lora_b(model)
+    x = torch.randn(3, 32)
+    adapted = model(x).detach().clone()
+    expected = reference(x).detach()
+    assert not torch.equal(adapted, expected)
+    with pytest.raises(RuntimeError, match="test exception"):
+        with model.disable_adapter():
+            torch.testing.assert_close(model(x), expected, rtol=0, atol=0)
+            with model.disable_adapter():
+                torch.testing.assert_close(model(x), expected, rtol=0, atol=0)
+            torch.testing.assert_close(model(x), expected, rtol=0, atol=0)
+            raise RuntimeError("test exception")
+    torch.testing.assert_close(model(x), adapted, rtol=0, atol=0)
+
+
+def test_disable_adapter_rejects_merged_layers_before_changing_flags():
+    model = VeOmniLoraModel(Toy(), _base_config())
+    layers = [m for m in model.modules() if isinstance(m, LoraLinear)]
+    layers[-1].merge()
+    with pytest.raises(ValueError, match="unmerged"):
+        with model.disable_adapter():
+            pytest.fail("Merged weights cannot provide the base-policy reference")
+    assert all(not layer.disable_adapters for layer in layers)

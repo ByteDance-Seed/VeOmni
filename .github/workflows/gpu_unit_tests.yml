@@ -231,6 +231,7 @@ jobs:
         # Order: cheap unit tests first to fail fast, trainer/ep2 last (multi-subprocess, ~5-10 min each).
         run: |
           uv run --frozen pytest -s -x tests/lora/test_target_mapping.py
+          uv run --frozen pytest -s -x tests/lora/test_veomni_lora_native.py
           uv run --frozen pytest -s -x tests/lora/test_qwen3_5_moe_lora.py
           uv run --frozen pytest -s -x tests/lora/test_dense_mlp_lora.py
           uv run --frozen pytest -s -x tests/lora/test_veomni_lora_moe_native.py
