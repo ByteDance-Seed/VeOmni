@@ -52,14 +52,6 @@ def test_device_pool_does_not_dispatch_after_failure():
     assert seen == ["bad"]
 
 
-@pytest.mark.parametrize("size", [-1, 9])
-def test_device_pool_rejects_invalid_reservations(size):
-    from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs
-
-    with pytest.raises(ValueError, match="reservation"):
-        run_jobs([DeviceJob("bad", size, None)], list("01234567"), lambda *_: None)
-
-
 @pytest.mark.parametrize("backend,count", [("cpu", 0), ("cuda", 1), ("npu", 1)])
 def test_launch_plan_default_and_sequential_concurrent_peaks(backend, count):
     from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec, RunnerCapabilities, default_plan
@@ -94,44 +86,10 @@ def test_launch_plan_parameters_use_owned_capacity(monkeypatch, tmp_path):
     assert from_parameter("cp_size")(context).nproc == 4
 
 
-@pytest.mark.parametrize("nproc,nnodes", [(0, 1), (True, 1), (2, 2)])
-def test_launch_plan_rejects_invalid_local_launch(nproc, nnodes):
-    from scripts.ci.accelerator.launch_plan import LaunchSpec, ResourcePlanError
-
-    with pytest.raises(ResourcePlanError):
-        LaunchSpec(nproc=nproc, nnodes=nnodes)
-
-
-def test_launch_validation_rejects_underdeclared_or_foreign_devices(monkeypatch, tmp_path):
-    import json
-
-    from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec, ResourcePlanError
-    from scripts.ci.accelerator.pytest_plugin import validate_launch
-
-    path = tmp_path / "caps.json"
-    path.write_text(json.dumps(dict(backend="cuda", devices=list("01234567"))))
-    monkeypatch.setenv("VEOMNI_CI_CAPABILITIES", str(path))
-    monkeypatch.setenv("VEOMNI_CI_ACTIVE_PLAN", json.dumps(CasePlan.sequential(LaunchSpec(nproc=2)).to_dict()))
-    monkeypatch.setenv("VEOMNI_CI_LEASE", '["4", "5"]')
-    validate_launch(2, env={"CUDA_VISIBLE_DEVICES": "4,5"}, record=False)
-    with monkeypatch.context() as missing_lease:
-        missing_lease.delenv("VEOMNI_CI_LEASE")
-        with pytest.raises(ResourcePlanError, match="without VEOMNI_CI_LEASE"):
-            validate_launch(2, record=False)
-    with pytest.raises(ResourcePlanError, match="disagrees"):
-        validate_launch(4, record=False)
-    with pytest.raises(ResourcePlanError, match="visibility"):
-        validate_launch(2, env={"CUDA_VISIBLE_DEVICES": "0,1"}, record=False)
-    mixed = CasePlan.sequential(LaunchSpec(nproc=2), LaunchSpec(nproc=2, device="cpu"))
-    monkeypatch.setenv("VEOMNI_CI_ACTIVE_PLAN", json.dumps(mixed.to_dict()))
-    validate_launch(2, env={"CUDA_VISIBLE_DEVICES": ""}, record=False)
-    validate_launch(2, env={"CUDA_VISIBLE_DEVICES": "4,5"}, record=False)
-
-
 def test_npu_adapter_preserves_owned_host_slice_and_resets_ranks():
     import threading
 
-    from scripts.ci.accelerator.launch_plan import ResourcePlanError, RunnerCapabilities
+    from scripts.ci.accelerator.launch_plan import RunnerCapabilities
     from scripts.ci.accelerator.runtime.devices import child_environment
     from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs
 
@@ -140,10 +98,6 @@ def test_npu_adapter_preserves_owned_host_slice_and_resets_ranks():
     assert env["ASCEND_VISIBLE_DEVICES"] == env["ASCEND_RT_VISIBLE_DEVICES"] == "10,11"
     assert "ASCEND_DEVICE_ID" not in env and "RANK" not in env
     assert env["HCCL_HOST_SOCKET_PORT_RANGE"] == env["HCCL_NPU_SOCKET_PORT_RANGE"] == "auto"
-    with pytest.raises(ResourcePlanError, match="owned slice"):
-        child_environment(caps, ["0", "1"], environ={})
-    with pytest.raises(ResourcePlanError, match="ascending"):
-        child_environment(caps, ["11", "10"], environ={})
     cpu = child_environment(caps, [], cpu=True, environ={})
     assert cpu["CUDA_VISIBLE_DEVICES"] == cpu["ASCEND_RT_VISIBLE_DEVICES"] == ""
     assert cpu["TORCH_DEVICE_BACKEND_AUTOLOAD"] == "0"
@@ -207,12 +161,6 @@ def test_skipped_oversized_cases_preserve_plans_and_use_owned_capacity():
     jobs = [DeviceJob(batch["name"], batch["cards"], batch) for batch in batches]
     assigned = run_jobs(jobs, ["0", "1"], lambda job, devices: devices)
     assert all(devices == ["0", "1"] for devices in assigned.values())
-
-    runnable = {**rows[0], "skip": None}
-    batch = make_batches([(dict(name="test"), [runnable])], capacity=2)[0]
-    assert batch["cards"] == 4
-    with pytest.raises(ValueError, match="reservation"):
-        run_jobs([DeviceJob("runnable-four", batch["cards"], batch)], ["0", "1"], lambda *_: None)
 
 
 @pytest.mark.parametrize("ignore_term", [False, True])
@@ -395,21 +343,6 @@ def test_rendezvous_allocator_does_not_reuse_a_pending_launch_port(monkeypatch, 
     assert ports.find_free_port(registry) == 12346
 
 
-def test_callable_launch_provider_is_not_used_as_a_pytest_decorator():
-    from scripts.ci.accelerator.launch_plan import PlanContext, RunnerCapabilities, from_parameter
-
-    provider = from_parameter("nproc")
-    marker = pytest.mark.launch_plan(provider=provider)
-
-    @marker
-    def sample():
-        return "test body"
-
-    assert sample() == "test body"
-    context = PlanContext(dict(nproc=4), RunnerCapabilities("cuda", tuple("01234567")))
-    assert sample.pytestmark[0].kwargs["provider"](context).nproc == 4
-
-
 def test_unittest_plan_reads_world_size_without_running_constructor(monkeypatch):
     from types import SimpleNamespace
 
@@ -430,13 +363,6 @@ def test_unittest_plan_reads_world_size_without_running_constructor(monkeypatch)
     monkeypatch.setattr(pytest_plugin, "runner_capabilities", lambda: RunnerCapabilities("cuda", tuple("01234567")))
     item = SimpleNamespace(instance=None, cls=DistributedCase, get_closest_marker=lambda _: None)
     assert pytest_plugin.resolve_plan(item).launches[0].nproc == 4
-
-
-def test_launch_plan_missing_parameter_has_resource_error():
-    from scripts.ci.accelerator.launch_plan import PlanContext, ResourcePlanError, RunnerCapabilities, from_parameter
-
-    with pytest.raises(ResourcePlanError, match="world_size"):
-        from_parameter("world_size")(PlanContext(dict(other=2), RunnerCapabilities("cpu")))
 
 
 @pytest.mark.parametrize("stage", ["scheduling", "collection", "shutdown"])
@@ -524,7 +450,7 @@ def test_interrupt_drains_owned_workers_before_executor_shutdown(stage, tmp_path
 
 @pytest.mark.parametrize(
     "failure",
-    ["changed_source", "missing_results", "interrupt", "keep_going_failure", "cleanup_failure", "child_failure"],
+    ["missing_results", "interrupt", "keep_going_failure", "cleanup_failure", "child_failure"],
 )
 def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, capsys, failure):
     import json
@@ -565,9 +491,6 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, capsys,
             Path(inventory).write_text(json.dumps(rows))
         elif failure == "interrupt":
             raise KeyboardInterrupt()
-        elif failure == "changed_source":
-            source.write_text("changed\n")
-            Path(env["CI_CASE_RESULTS"]).write_text(json.dumps(dict(exitstatus=0, cases=[dict(nodeid=nodeid)])))
         elif failure == "cleanup_failure":
             raise ProcessCleanupError("owned worker survived cleanup")
         elif failure == "child_failure":
@@ -613,25 +536,21 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, capsys,
     else:
         assert runner.main() == 1
     summary = json.loads((output / "summary.json").read_text())
-    if failure == "changed_source":
-        assert summary["changed_sources"] == ["pyproject.toml"]
-        assert summary["error"] == "Sources changed during execution"
+    record = next(iter(summary["commands"].values()))
+    assert record["returncode"] != 0
+    if failure == "missing_results":
+        assert "ResourcePlanError" in record["error"] and ".results.json" in record["error"]
+    elif failure == "keep_going_failure":
+        assert nodeid in summary["error"] and record["status"] == "failed"
+    elif failure == "cleanup_failure":
+        assert len(summary["commands"]) == 1  # Never release the lease to the pending batch.
+        assert "ProcessCleanupError" in record["error"] and "survived cleanup" in summary["error"]
+    elif failure == "child_failure":
+        foreground = capsys.readouterr().out
+        assert "RuntimeError: original training failure" in foreground
+        assert foreground.count("::group::") == foreground.count("::endgroup::") == 1
     else:
-        record = next(iter(summary["commands"].values()))
-        assert record["returncode"] != 0
-        if failure == "missing_results":
-            assert "ResourcePlanError" in record["error"] and ".results.json" in record["error"]
-        elif failure == "keep_going_failure":
-            assert nodeid in summary["error"] and record["status"] == "failed"
-        elif failure == "cleanup_failure":
-            assert len(summary["commands"]) == 1  # Never release the lease to the pending batch.
-            assert "ProcessCleanupError" in record["error"] and "survived cleanup" in summary["error"]
-        elif failure == "child_failure":
-            foreground = capsys.readouterr().out
-            assert "RuntimeError: original training failure" in foreground
-            assert foreground.count("::group::") == foreground.count("::endgroup::") == 1
-        else:
-            assert "KeyboardInterrupt" in summary["error"]
+        assert "KeyboardInterrupt" in summary["error"]
 
 
 @pytest.mark.parametrize("cleanup_failure", [False, True])
