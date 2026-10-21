@@ -75,7 +75,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from tools.data_generators import DummyDataset  # noqa: E402
 from tools.launch_utils import find_free_port  # noqa: E402
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 
 
 _CI_LAUNCH = LaunchSpec(nproc=2)

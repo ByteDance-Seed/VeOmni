@@ -5,18 +5,23 @@ will actually run it. Read this before adding a test file.
 
 ## CI selects tests by explicit enumeration
 
-GPU/NPU suite selections are enumerated in `scripts/ci/gpu_tests.json` and
-`scripts/ci/npu_tests.json`. Both use the common accelerator case scheduler in
-`scripts/ci/run_accelerator_tests.py`; NPU workflows keep serial dispatch pending
+GPU/NPU suite selections are enumerated in `scripts/ci/accelerator/suites/gpu.json` and
+`scripts/ci/accelerator/suites/npu.json`. Both use the common accelerator case scheduler in
+`scripts/ci/accelerator/runner.py`; NPU workflows keep serial dispatch pending
 hardware validation of concurrent HCCL isolation. Add a suite selection for a
 file outside a collected directory. Do not add per-file pytest workflow lines
 or manual device quotas.
+
+New functions/parameters already included by an existing selection need no
+manifest update. Check node-ID and pytest filters as well as file/directory
+paths. See `docs/testing.md` under "Registering Tests in CI" for the manifest
+example and collection verification command.
 
 Resource plans use the same `nproc/world_size` configuration as worker startup.
 Use `pytest.mark.launch_plan(provider=...)` for multi-card tests; an unmarked
 case defaults to one selected accelerator card, or CPU on a CPU-only host.
 Explicit CPU plans reserve zero cards. See `docs/design/ci_case_scheduling.md`
-for the author API, defaults and mismatch rules, and `scripts/ci/README.md` for
+for the author API, defaults and mismatch rules, and `scripts/ci/accelerator/README.md` for
 local commands and result artifacts.
 
 A test that passes locally is not necessarily a test CI runs. The GPU entries
@@ -24,6 +29,7 @@ below describe the manifest selections used by the named workflows.
 
 | Path | How CI picks it up |
 |------|--------------------|
+| `tests/ci/` | whole directory, in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
 | `tests/data/` | whole directory, in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
 | `tests/checkpoints/` | whole directory, in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
 | `tests/ops/` | whole directory in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
@@ -63,8 +69,8 @@ Check whether a file is wired — by name, and by the directory it sits in:
 
 ```bash
 TEST_PATH=tests/trainer/test_my_new_thing.py
-rg -n "$(basename "$TEST_PATH")" scripts/ci/*tests.json
-rg -n "$(dirname  "$TEST_PATH")" scripts/ci/*tests.json
+rg -n "$(basename "$TEST_PATH")" scripts/ci/accelerator/suites/*.json
+rg -n "$(dirname  "$TEST_PATH")" scripts/ci/accelerator/suites/*.json
 ```
 
 ## Decision rule

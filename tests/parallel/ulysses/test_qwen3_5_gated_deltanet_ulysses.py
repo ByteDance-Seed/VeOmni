@@ -19,7 +19,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from scripts.ci.launch_plan import from_parameter, runner_device_count
+from scripts.ci.accelerator.launch_plan import from_parameter, runner_device_count
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_dist_comm_backend, get_torch_device
 
 

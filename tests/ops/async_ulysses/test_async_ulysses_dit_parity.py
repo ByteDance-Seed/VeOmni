@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from scripts.ci.launch_plan import runner_device_count
+from scripts.ci.accelerator.launch_plan import runner_device_count
 from tests.parallel.ulysses.utils import SequenceParallelTest, sync_tensor
 from veomni.distributed.parallel_state import use_parallel_state
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads

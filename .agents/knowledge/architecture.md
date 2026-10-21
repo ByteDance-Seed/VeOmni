@@ -263,6 +263,7 @@ configs/
 
 ```
 tests/
+├── ci/              CPU tests for CI planning, scheduling and launch validation
 ├── models/  Kernel-aware model loading, integration, and helper tests
 ├── ops/            Op registry contracts and per-family kernel tests
 ├── arguments/      Argument parsing and ops_implementation alias tests
@@ -301,12 +302,12 @@ tests/
 Distributed tests (`tests/parallel/`, `tests/distributed/`, `tests/e2e/`) may require multiple GPUs and use `torchrun` or `tests/tools/launch_utils.py`.
 
 **A passing local run does not mean CI runs it.**
-`scripts/ci/gpu_tests.json` and `npu_tests.json` enumerate unit/e2e selections.
-Both manifests collect `tests/data`, `tests/checkpoints`, `tests/models`, and
+`scripts/ci/accelerator/suites/gpu.json` and `suites/npu.json` enumerate unit/e2e selections.
+Both manifests collect `tests/ci`, `tests/data`, `tests/checkpoints`, `tests/models`, and
 `tests/ops` as whole directories; GPU also collects
 `tests/parallel/context_parallel`. Files outside directory selections need an
 entry in the appropriate suite manifest. Both accelerator backends use
-`scripts/ci/run_accelerator_tests.py`; launch plans reuse each case's actual
+`scripts/ci/accelerator/runner.py`; launch plans reuse each case's actual
 `nproc/world_size` configuration. Do not add manual device quotas or per-file
 pytest workflow lines. See `.agents/knowledge/testing.md` before adding a test.
 

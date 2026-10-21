@@ -107,7 +107,7 @@ jobs:
           uv sync --frozen --extra gpu --group dev
       - name: Run GPU e2e tests on eight GPUs
         run: |
-          uv run --frozen python scripts/ci/run_gpu_tests.py --backend cuda --suite e2e
+          uv run --frozen python -m scripts.ci.accelerator --backend cuda --suite e2e
       - name: Upload GPU e2e test results
         if: always()
         uses: actions/upload-artifact@v4

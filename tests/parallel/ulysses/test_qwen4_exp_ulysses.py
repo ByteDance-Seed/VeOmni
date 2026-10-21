@@ -24,7 +24,7 @@ import torch
 import torch.distributed as dist
 from transformers import AutoConfig
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import torchrun
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
 

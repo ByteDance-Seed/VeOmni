@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import find_free_port
 from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.utils.data_balance.data_balance import Qwen3VLEncoderDataBalance

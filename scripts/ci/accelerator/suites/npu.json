@@ -365,6 +365,16 @@
     ]
   },
   {
+    "name": "ci-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/ci/"
+    ]
+  },
+  {
     "name": "npu-e2e-01",
     "suite": "e2e",
     "args": [

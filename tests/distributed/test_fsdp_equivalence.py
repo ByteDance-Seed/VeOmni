@@ -28,7 +28,7 @@ import shutil
 
 import pytest
 
-from scripts.ci.launch_plan import CasePlan, LaunchSpec, runner_device_count
+from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec, runner_device_count
 from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
 
 from ..tools import ParallelConfig

@@ -140,7 +140,7 @@ jobs:
           if [ "$QWEN3_5_ULYSSES" = "true" ]; then
             extra_args+=(--include-conditional)
           fi
-          uv run --frozen python scripts/ci/run_gpu_tests.py --backend cuda --suite unit "${extra_args[@]}"
+          uv run --frozen python -m scripts.ci.accelerator --backend cuda --suite unit "${extra_args[@]}"
       - name: Upload GPU unit test results
         if: always()
         uses: actions/upload-artifact@v4

@@ -36,7 +36,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from scripts.ci.launch_plan import LaunchSpec, runner_device_count
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from tests.tools.launch_utils import find_free_port
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 

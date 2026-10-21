@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from scripts.ci.launch_plan import CasePlan, LaunchSpec
+from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec
 
 from ..tools import DummyDataset as DummyDataset
 from ..tools import ParallelConfig

@@ -8,9 +8,9 @@ import pytest
 import torch
 import yaml
 
-from scripts.ci.accelerator import child_environment
-from scripts.ci.device_pool import DeviceJob, run_jobs
-from scripts.ci.launch_plan import LaunchSpec, runner_capabilities, runner_device_count
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_capabilities, runner_device_count
+from scripts.ci.accelerator.runtime.devices import child_environment
+from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs
 from veomni.models import build_foundation_model
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability, get_torch_device
 from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available

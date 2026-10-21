@@ -32,7 +32,7 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     Qwen2VLForConditionalGeneration as HFQwen2VLForConditionalGeneration,
 )
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,

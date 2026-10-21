@@ -20,7 +20,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed import torch_parallelize
 from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import (

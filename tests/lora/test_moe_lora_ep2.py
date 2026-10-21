@@ -90,7 +90,7 @@ import pytest
 import torch
 import yaml
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 
 from .test_moe_lora_trainer import (
     LOG_DICT,

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.ci.launch_plan import LaunchSpec, runner_device_count
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.checkpoint import layout
 from veomni.utils.device import IS_CUDA_AVAILABLE
 

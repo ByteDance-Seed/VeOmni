@@ -23,7 +23,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 from transformers.modeling_layers import GradientCheckpointingLayer
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.arguments_types import OffloadConfig
 from veomni.distributed.async_offload import (
     GetCnt,

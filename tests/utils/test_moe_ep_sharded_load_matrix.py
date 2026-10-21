@@ -58,7 +58,7 @@ import torch.nn as nn
 from safetensors.torch import save_file
 from torch.distributed.tensor import DTensor, Shard
 
-from scripts.ci.launch_plan import LaunchSpec, runner_device_count
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model

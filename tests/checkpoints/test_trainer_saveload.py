@@ -9,7 +9,7 @@ import pytest
 import torch
 import yaml
 
-from scripts.ci.launch_plan import runner_device_count
+from scripts.ci.accelerator.launch_plan import runner_device_count
 
 
 try:
@@ -24,7 +24,7 @@ try:
 except Exception as _:
     from checkpoint_verification_utils import verify_dcp_to_hf_conversion
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.checkpoints.utils import get_checkpoint_test_nproc
 from veomni.arguments import parse_args
 from veomni.checkpoint.layout import weights_dir

@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni import MetricMeterMixin
 from veomni.utils import helper, omni_helper
 from veomni.utils.omni_helper import OmniEnvironMeter

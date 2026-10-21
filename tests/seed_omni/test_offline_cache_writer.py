@@ -25,7 +25,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from datasets import load_dataset
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.seed_omni.seedomni_transform import process_seedomni_cached_example
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter, _first_rank_of_its_dp_rank

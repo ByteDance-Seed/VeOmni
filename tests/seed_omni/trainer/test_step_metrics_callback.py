@@ -16,7 +16,7 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.trainer.callbacks.omni_callbacks.step_metrics_callback import OmniStepMetricsCallback
 
 

@@ -16,7 +16,7 @@ import pytest
 import torch
 import torch.distributed as c10d
 
-from scripts.ci.launch_plan import runner_device_count
+from scripts.ci.accelerator.launch_plan import runner_device_count
 from veomni.utils.device import get_device_type, get_dist_comm_backend
 
 

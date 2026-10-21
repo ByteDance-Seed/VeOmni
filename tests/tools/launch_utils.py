@@ -8,8 +8,8 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from scripts.ci.ports import find_free_port as find_free_port
-from scripts.ci.pytest_plan import validate_launch
+from scripts.ci.accelerator.pytest_plugin import validate_launch
+from scripts.ci.accelerator.runtime.ports import find_free_port as find_free_port
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 

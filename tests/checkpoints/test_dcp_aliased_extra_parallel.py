@@ -25,7 +25,7 @@ import torch.nn as nn
 from torch.distributed._tensor import Shard
 from torch.distributed.checkpoint import FileSystemReader
 
-from scripts.ci.launch_plan import LaunchSpec, runner_device_count
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.arguments import MixedPrecisionConfig
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.utils.device import get_torch_device

@@ -15,7 +15,7 @@ from PIL import Image
 from safetensors.torch import load_file, save_file
 from torch.utils.checkpoint import CheckpointError, _CheckpointFrame
 
-from scripts.ci.launch_plan import CasePlan, LaunchSpec, runner_device_count
+from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec, runner_device_count
 from tests.models.test_qwen_image_training import cpu_diffusers_normalization, snapshot, transformer
 from tests.precision import qwen_image as precision_module
 from tests.precision.qwen_image import capture, compare, encode, prepare, sha256, tensor_difference, verify_fixture

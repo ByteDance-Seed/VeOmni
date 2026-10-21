@@ -58,7 +58,7 @@ from utils import (
     setup_test_distributed,
 )
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
 from veomni.data.data_collator import MainCollator

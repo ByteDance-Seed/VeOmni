@@ -37,7 +37,7 @@ import pytest
 import torch
 from torch.distributed.checkpoint import FileSystemReader
 
-from scripts.ci.launch_plan import LaunchSpec, runner_device_count
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.checkpoint.layout import weights_dir
 from veomni.data import build_dummy_dataset

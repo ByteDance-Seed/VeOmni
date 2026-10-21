@@ -29,7 +29,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
-from scripts.ci.launch_plan import LaunchSpec, runner_device_count
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from tests.tools.launch_utils import find_free_port
 from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.optim.muon import DistributedMuon

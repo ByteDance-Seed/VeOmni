@@ -14,7 +14,7 @@ from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler, WanImag
 from diffusers.models import normalization
 from diffusers.video_processor import VideoProcessor
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.async_offload import apply_async_activation_offload
 from veomni.models.diffusers.wan_t2v.wan_condition import modeling_wan_condition as condition_module
 from veomni.models.diffusers.wan_t2v.wan_condition.configuration_wan_condition import (

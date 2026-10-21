@@ -563,6 +563,16 @@
     ]
   },
   {
+    "name": "ci-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/ci/"
+    ]
+  },
+  {
     "name": "57-e2e",
     "suite": "e2e",
     "conditional": false,

@@ -6,7 +6,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from scripts.ci.launch_plan import ResourcePlanError, RunnerCapabilities
+from scripts.ci.accelerator.launch_plan import ResourcePlanError, RunnerCapabilities
 
 
 def child_environment(capabilities, assigned, *, cpu=False, environ=None):

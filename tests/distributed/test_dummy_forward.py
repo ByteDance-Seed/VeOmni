@@ -16,7 +16,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import MixedPrecisionConfig
 from veomni.utils.device import empty_cache
 

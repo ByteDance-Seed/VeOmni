@@ -13,7 +13,7 @@ import torch.nn as nn
 from packaging.version import Version
 from torch.distributed._tensor import DTensor, Shard
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import find_free_port
 from veomni.arguments import ModelArguments, TrainingArguments, parse_args
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm

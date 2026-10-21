@@ -25,7 +25,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Shard
 
-from scripts.ci.launch_plan import LaunchSpec, runner_device_count
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from tests.tools.launch_utils import find_free_port
 from veomni.arguments.arguments_types import MixedPrecisionConfig
 from veomni.distributed.parallel_state import _init_parallel_state

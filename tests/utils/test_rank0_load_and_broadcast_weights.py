@@ -9,7 +9,7 @@ from safetensors.torch import save_file
 from torch import distributed as dist
 from torch import nn
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import find_free_port
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 from veomni.distributed.parallel_plan import ParallelPlan

@@ -5,8 +5,8 @@ import torch.distributed as c10d
 import torch.distributed as dist
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 
-from scripts.ci.launch_plan import LaunchSpec
-from scripts.ci.pytest_plan import validate_launch
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.pytest_plugin import validate_launch
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 from veomni.distributed.sequence_parallel import get_ulysses_sequence_parallel_group
 from veomni.utils.device import get_device_id, get_dist_comm_backend, get_torch_device

@@ -6,96 +6,19 @@ import hashlib
 import json
 import os
 import shutil
-import signal
-import subprocess
 import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import psutil
-
-from scripts.ci.accelerator import child_environment
-from scripts.ci.device_pool import DeviceJob, run_jobs
-from scripts.ci.launch_plan import ResourcePlanError, RunnerCapabilities
-from scripts.ci.ports import find_free_port
-
-
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def run_process(command, env, log, timeout, *, cwd=ROOT, allowed_codes=(0,)):
-    """Track this launcher only; clean descendants before releasing its lease."""
-    known = {}
-    process = subprocess.Popen(command, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-    started = time.monotonic()
-    try:
-        while process.poll() is None:
-            try:
-                for child in psutil.Process(process.pid).children(recursive=True):
-                    known[(child.pid, child.create_time())] = child
-            except psutil.Error:
-                pass
-            if time.monotonic() - started > timeout:
-                raise TimeoutError(f"CI worker exceeded {timeout}s: {command}")
-            time.sleep(0.2)
-        if process.returncode not in allowed_codes:
-            raise subprocess.CalledProcessError(process.returncode, command)
-    finally:
-        for child in known.values():
-            try:
-                child.terminate()
-            except psutil.Error:
-                pass
-        _, alive = psutil.wait_procs(list(known.values()), timeout=5)
-        for child in alive:
-            try:
-                child.kill()
-            except psutil.Error:
-                pass
-        psutil.wait_procs(alive, timeout=5)
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=35)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-
-
-def make_batches(inventories, *, target_seconds=120, max_cases=64):
-    batches = []
-    for selection, rows in inventories:
-        groups = {}
-        for row in rows:
-            groups.setdefault((row["file"], row["cards"]), []).append(row)
-        for (_, cards), cases in groups.items():
-            current = []
-            estimated = 0.0
-            for row in cases:
-                # Fixed weights bound batch size; measurements do not affect dispatch.
-                cost = 60.0 if cards > 1 else 2.0
-                if current and (len(current) >= max_cases or estimated + cost > target_seconds):
-                    batches.append(dict(selection=selection, cards=cards, cases=current, estimated_seconds=estimated))
-                    current, estimated = [], 0.0
-                current.append(row)
-                estimated += cost
-            if current:
-                batches.append(dict(selection=selection, cards=cards, cases=current, estimated_seconds=estimated))
-    # Larger reservations first; the device pool backfills with fitting jobs.
-    # Stable ordering preserves collection order among equal reservations.
-    batches.sort(key=lambda row: -row["cards"])
-    for index, row in enumerate(batches):
-        row["name"] = f"{row['selection']['name']}-batch-{index:04d}"
-    return batches
-
-
-def _workspace(path):
-    path.mkdir(parents=True, exist_ok=False)
-    for name in ("tests", "veomni", "scripts", "tasks", "configs", "pyproject.toml"):
-        (path / name).symlink_to(ROOT / name, target_is_directory=(ROOT / name).is_dir())
-    (path / "cache").mkdir()
+from scripts.ci.accelerator import ROOT
+from scripts.ci.accelerator.batching import make_batches
+from scripts.ci.accelerator.launch_plan import ResourcePlanError, RunnerCapabilities
+from scripts.ci.accelerator.runtime.devices import child_environment
+from scripts.ci.accelerator.runtime.ports import find_free_port
+from scripts.ci.accelerator.runtime.workers import create_workspace, run_process
+from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs
 
 
 def main():
@@ -121,7 +44,7 @@ def main():
     started = time.time()
     source_paths = [
         path
-        for pattern in ("scripts/ci/*.py", "scripts/ci/*.json", "tests/**/*.py", "tests/toy_config/**/*.json")
+        for pattern in ("scripts/ci/**/*.py", "scripts/ci/**/*.json", "tests/**/*.py", "tests/toy_config/**/*.json")
         for path in ROOT.glob(pattern)
     ]
     source_paths.extend([ROOT / "pyproject.toml", ROOT / "uv.lock"])
@@ -134,7 +57,10 @@ def main():
     probe_env = child_environment(RunnerCapabilities("cpu"), [], environ=env) if args.backend == "cpu" else env
     with (output / "probe.log").open("w") as log:
         run_process(
-            [sys.executable, "-m", "scripts.ci.accelerator", str(caps_path), args.backend], probe_env, log, 120
+            [sys.executable, "-m", "scripts.ci.accelerator.runtime.devices", str(caps_path), args.backend],
+            probe_env,
+            log,
+            120,
         )
     value = json.loads(caps_path.read_text())
     caps = RunnerCapabilities(value["backend"], tuple(value["devices"]))
@@ -143,7 +69,7 @@ def main():
     env["OMP_NUM_THREADS"] = str(max(1, min(8, (os.cpu_count() or 8) // 8)))
     env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
     env["VEOMNI_GPU_TEST_PARALLEL"] = "0" if args.serial else "1"
-    manifest_path = Path(__file__).with_name("npu_tests.json" if caps.backend == "npu" else "gpu_tests.json")
+    manifest_path = Path(__file__).parent / "suites" / ("npu.json" if caps.backend == "npu" else "gpu.json")
     manifest = json.loads(manifest_path.read_text())
     selected = [
         row
@@ -168,7 +94,7 @@ def main():
             *selection["args"],
             *args.pytest_arg,
             "-p",
-            "scripts.ci.pytest_plan",
+            "scripts.ci.accelerator.pytest_plugin",
             "--collect-only",
             "-q",
             f"--ci-inventory={inventory_path}",
@@ -196,7 +122,9 @@ def main():
     (output / "inventory.json").write_text(
         json.dumps([{**selection, "cases": rows} for selection, rows in inventories], indent=2) + "\n"
     )
-    batches = make_batches(inventories, target_seconds=args.batch_seconds, max_cases=args.batch_cases)
+    batches = make_batches(
+        inventories, target_seconds=args.batch_seconds, max_cases=args.batch_cases, capacity=len(caps.devices)
+    )
     (output / "batches.json").write_text(json.dumps(batches, indent=2) + "\n")
     if args.collect_only:
         return 0
@@ -207,7 +135,7 @@ def main():
         row = job.payload
         name = row["name"]
         workspace = output / "work" / name
-        _workspace(workspace)
+        create_workspace(workspace)
         temporary = tempfile.mkdtemp(prefix="vci-", dir="/tmp")
         worker_env = child_environment(
             caps, assigned, cpu=not row["cards"], environ={**env, **row["selection"].get("env", {})}
@@ -239,7 +167,7 @@ def main():
             str(ROOT / "pyproject.toml"),
             f"--rootdir={ROOT}",
             "-p",
-            "scripts.ci.pytest_plan",
+            "scripts.ci.accelerator.pytest_plugin",
             f"--ci-batch={batch_path}",
             f"--junitxml={output / (name + '.xml')}",
         ]
@@ -330,7 +258,3 @@ def main():
         if changed:
             error = "Sources changed during execution"
     return int(error is not None or len(finished) != len(jobs) or any(row["returncode"] for row in finished.values()))
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

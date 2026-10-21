@@ -9,6 +9,7 @@ and provides guidance on which tests to add when onboarding a new model.
 
 ```
 tests/
+├── ci/                             # CPU tests for accelerator CI tooling
 ├── tools/                          # Shared test infrastructure (comparison, data gen, launch)
 ├── toy_config/                     # Minimal model configs for fast CI testing
 ├── testdata/                       # Sample images, audio, etc.
@@ -129,9 +130,9 @@ tests/
 | **Sanity** | `tests/special_sanity/` | 0 | script + pytest | Device API lint and op-architecture path guards |
 
 Unit CI does not run `pytest tests/`. Suite selection is defined in the
-[GPU manifest](../scripts/ci/gpu_tests.json) and
-[NPU manifest](../scripts/ci/npu_tests.json), consumed by the
-[accelerator runner](../scripts/ci/run_accelerator_tests.py). Directory selections
+[GPU manifest](../scripts/ci/accelerator/suites/gpu.json) and
+[NPU manifest](../scripts/ci/accelerator/suites/npu.json), consumed by the
+[accelerator runner](../scripts/ci/accelerator/runner.py). Directory selections
 collect their children automatically; a file outside them must be added to its
 suite.
 
@@ -140,7 +141,7 @@ from the actual `nproc/world_size` configuration, device isolation and GPU/NPU
 scheduling. The default launch plan uses one card of the selected accelerator
 backend on GPU/NPU runners, and CPU on CPU-only runners. Multi-card tests must
 expose their launch configuration; `skipif` describes eligibility, not a
-resource reservation. See [runner usage](../scripts/ci/README.md) for commands
+resource reservation. See [runner usage](../scripts/ci/accelerator/README.md) for commands
 and result artifacts. NPU workflows use serial dispatch until concurrent HCCL
 isolation has been validated on NPU hardware.
 
@@ -374,6 +375,74 @@ CPU, and multi-rank cases spawn CPU gloo ranks with `torch.multiprocessing`;
 | `mixins/` | Opt-in module mixins: training-graph hooks, metric meter, offline encoding and the cache writer |
 | `modules/` | One folder per module family (`base/`, `janus/`, `qwen3/`, `qwen3vl/`, `bagel/`): chat templates, packing, module smoke tests; shared fixtures in `modules/helpers.py` |
 | `e2e/` | `train_omni.py` / `infer_omni.py` under torchrun on the fake model (2 CUDA devices) |
+
+---
+
+## Registering Tests in CI
+
+Test selection is maintained in the
+[GPU suite manifest](../scripts/ci/accelerator/suites/gpu.json) and
+[NPU suite manifest](../scripts/ci/accelerator/suites/npu.json). Each manifest
+contains both `unit` and `e2e` selections. The runner collects those selections
+and schedules the resulting cases using their launch plans.
+
+Workflows configure runners, dependencies, triggers, job-wide environment and
+runner options. Keep test selections in the manifests so local runs and CI use
+the same collection source. Test-specific environment variables belong in a
+selection's optional `env` object. Device requirements belong in the test's
+launch plan.
+
+### When a manifest needs an update
+
+| Test change | Required registration |
+|---|---|
+| Add a function or parameter combination included by an existing selection | No manifest or workflow change |
+| Add a file inside a directory already collected by the relevant manifest | No manifest or workflow change |
+| Add a file outside existing collection scopes | Add a selection to each applicable backend manifest |
+| Add a new CI machine requirement, dependency setup or workflow trigger | Update the corresponding workflow as well |
+
+Check the complete selection arguments: a node ID or a `-k` filter can narrow
+collection within a file or directory. The existence of a manifest entry for
+that file does not guarantee that every new case is included. A launch-plan
+marker declares resources; it does not register a test with CI.
+
+For example, if a new `tests/e2e/test_my_model.py` file is outside the existing
+scopes, append an entry like this to `suites/gpu.json` (replace the illustrative
+file path with the actual new file):
+
+```json
+{
+  "name": "my-model-e2e",
+  "suite": "e2e",
+  "conditional": false,
+  "args": ["-s", "-x", "tests/e2e/test_my_model.py"]
+}
+```
+
+Use a unique `name` within each backend manifest. Set `suite` to `unit` or
+`e2e`; keep ordinary selections unconditional. Conditional selections require
+an explicit workflow gate and are enabled with `--include-conditional`.
+Preserve any required pytest flags or filters in `args`. Do not add a per-file
+pytest step to the workflow or a second selection for an already covered
+scope. Add the corresponding NPU selection when the test is intended to run
+on NPU, retaining its hardware/dependency guards.
+
+A function or parameter added to `tests/e2e/test_e2e_parallel.py` is collected
+by that file's existing GPU e2e selection; it does not need another JSON entry.
+For a new multi-card case, also expose the shared `nproc/world_size`
+configuration as a [launch plan](#launch-plans-for-new-tests).
+
+On a runner with the selected backend, check collection before execution:
+
+```sh
+uv run --frozen python -m scripts.ci.accelerator --backend cuda --suite e2e --only my-model-e2e --collect-only --output-dir outputs/accelerator-ci/my-model-collection
+```
+
+Use the selection name with `--only`. Inspect `inventory.json` for the expected
+parameterized node IDs, eligibility and resolved plans. Use a fresh output
+directory for each invocation. See the
+[accelerator README](../scripts/ci/accelerator/README.md) for the full runner
+interface and result files.
 
 ---
 

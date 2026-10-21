@@ -5,6 +5,9 @@ subsets using each case's launch configuration. Unit and e2e tests share the
 same planning and scheduling core; GPU and NPU adapters provide device discovery
 and process visibility.
 
+For commands, module responsibilities and result files, see the
+[accelerator README](../../scripts/ci/accelerator/README.md).
+
 Independent training launches use fresh distributed workers and process groups.
 Scheduling preserves numerical tolerances, worker world sizes, SP/EP/CP/HSDP
 configurations, and test data.
@@ -67,7 +70,8 @@ shared plan inputs rather than a second quota definition.
 ## Writing new tests
 
 - Place a test inside an existing CI collection scope, or explicitly add its
-  selection to the suite. Suite membership is separate from resource planning.
+  selection to the suite. Suite membership is separate from resource planning;
+  see [registration rules](../testing.md#registering-tests-in-ci).
 - A single-card test may use the default plan. State CPU-only intent when the
   test must not allocate accelerator memory.
 - A multi-card test uses a common launcher and a plan derived from its existing
@@ -93,11 +97,11 @@ its result.
 ## Test API
 
 Use the `provider` keyword on `pytest.mark.launch_plan`. A provider is either a
-[LaunchSpec](../../scripts/ci/launch_plan.py#L30), a
-[CasePlan](../../scripts/ci/launch_plan.py#L48), or a callable accepting a
-[PlanContext](../../scripts/ci/launch_plan.py#L81) and returning one of those
+[LaunchSpec](../../scripts/ci/accelerator/launch_plan.py#L30), a
+[CasePlan](../../scripts/ci/accelerator/launch_plan.py#L48), or a callable accepting a
+[PlanContext](../../scripts/ci/accelerator/launch_plan.py#L81) and returning one of those
 values. The planner calls it through
-[resolve_plan](../../scripts/ci/pytest_plan.py#L22). Using a keyword prevents pytest from interpreting a
+[resolve_plan](../../scripts/ci/accelerator/pytest_plugin.py#L22). Using a keyword prevents pytest from interpreting a
 callable provider as the test function being decorated.
 
 A fixed distributed launch keeps its process count in one place:
@@ -105,7 +109,7 @@ A fixed distributed launch keeps its process count in one place:
 ```python
 import pytest
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import torchrun
 
 PARALLEL = LaunchSpec(nproc=4)
@@ -118,7 +122,7 @@ def test_distributed_parity():
 A parameterized launch uses the same parameter for planning and execution:
 
 ```python
-from scripts.ci.launch_plan import from_parameter
+from scripts.ci.accelerator.launch_plan import from_parameter
 
 @pytest.mark.launch_plan(provider=from_parameter("cp_size"))
 @pytest.mark.parametrize("cp_size", [2, 4])
@@ -154,6 +158,12 @@ Resolve every multi-device case through its shared launch configuration and
 verify the inventory before dispatch. Missing launch plans must not introduce
 silent single-card execution.
 
+Cases already skipped in the full-visibility inventory keep their declared
+plans and card requirements. If such a request exceeds the runner's capacity,
+place it in a skipped-only batch using the complete owned slice so worker
+imports retain the same device visibility. Runnable cases must never receive
+a smaller reservation than their declared requirement.
+
 Scheduling operates on case records, but launching thousands of fresh pytest
 interpreters would add substantial import and fixture cost. Automatically batch
 compatible cases with the same resource requirements and fixture affinity,
@@ -179,7 +189,8 @@ before importing torch or the accelerator runtime. A run-scoped, locked port
 registry prevents reuse while another launch is preparing to bind. Common launchers validate actual `nproc`, node count, and child device visibility
 against the plan and lease. Compare observed launch arguments with the baseline
 to verify backend and parallel-topology coverage. Release resources only after scoped
-launcher/descendant cleanup. Failures stop new dispatches by default; the
+cleanup of the launcher's process group and tracked descendants, including
+when its group leader has already exited. Failures stop new dispatches by default; the
 measurement mode may continue while recording all failures.
 
 ## GPU/NPU boundary

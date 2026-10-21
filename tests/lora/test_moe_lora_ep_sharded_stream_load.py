@@ -58,7 +58,7 @@ import shutil
 import pytest
 import yaml
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 
 # Reuse the battle-tested trainer harness. The trainer subprocess entry
 # point + snapshot comparator + CLI helpers are shared; the base-model

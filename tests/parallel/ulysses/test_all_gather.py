@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from scripts.ci.launch_plan import LaunchSpec, runner_device_count
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.loss import reduce_sequence_parallel_loss
 from veomni.distributed.sequence_parallel.ulysses import _all_gather, _Gather

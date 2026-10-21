@@ -10,7 +10,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.diffusers.minimax_h3.minimax_h3_condition.configuration_minimax_h3_condition import (
     MiniMaxH3ConditionModelConfig,
 )

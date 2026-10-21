@@ -181,7 +181,7 @@ jobs:
           uv pip list
       - name: Run accelerator case tests
         run: |
-          uv run --frozen python -m scripts.ci.run_accelerator_tests --backend npu --suite unit --serial
+          uv run --frozen python -m scripts.ci.accelerator --backend npu --suite unit --serial
       - name: Upload accelerator test results
         if: always()
         uses: actions/upload-artifact@v4

@@ -20,7 +20,7 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed import parallel_state as parallel_state_module
 from veomni.distributed.parallel_state import (
     _init_parallel_state,

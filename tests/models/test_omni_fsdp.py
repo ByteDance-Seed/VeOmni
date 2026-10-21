@@ -19,7 +19,7 @@ import sys
 
 import pytest
 
-from scripts.ci.launch_plan import LaunchSpec, from_parameter, runner_device_count
+from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter, runner_device_count
 from tests.tools.launch_utils import find_free_port, run_bounded_process_group
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 

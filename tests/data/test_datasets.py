@@ -25,7 +25,7 @@ from utils import (
     process_dummy_example,
 )
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import find_free_port
 from veomni.arguments import parse_args
 from veomni.data import dataset as dataset_module

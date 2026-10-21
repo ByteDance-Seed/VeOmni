@@ -36,7 +36,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.emb_parallel import AllToAllEmbedding, ShardedEmbedding, VocabParallelLinear, sharded_embedding
 from veomni.utils.device import get_device_type
 

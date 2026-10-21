@@ -14,7 +14,7 @@ from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Replicate, Shard
 
-from scripts.ci.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import FSDPConfig, MixedPrecisionConfig
 from veomni.arguments.arguments_types import validate_low_precision_reduce_scatter_comm
 from veomni.arguments.parser import _instantiate_recursive, parse_args
