@@ -137,6 +137,30 @@ def _all_to_all_single(
     return output
 
 
+class _AsyncA2A(torch.autograd.Function):
+    """Wait on an async all-to-all started by ``_all_to_all_single(async_op=True)``.
+
+    ``x`` only anchors the gradient graph: backward performs the inverse
+    exchange on the incoming gradient, matching the exchange that ``x`` went
+    through, so gradients reach the pre-exchange tensor.
+    """
+
+    @staticmethod
+    def forward(ctx, wait_fn, x, scatter_dim, gather_dim, group):
+        ctx.group, ctx.scatter_dim, ctx.gather_dim = group, scatter_dim, gather_dim
+        return wait_fn()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return (
+            None,
+            _all_to_all_single(grad_output, ctx.gather_dim, ctx.scatter_dim, ctx.group),
+            None,
+            None,
+            None,
+        )
+
+
 def all_to_all_tensor(
     x: Tensor,
     scatter_dim: int,
@@ -205,10 +229,12 @@ class _Gather(torch.autograd.Function):
     - True (default): sum the grad across ranks. After a mid-model gather each
       rank consumed a DIFFERENT segment of the full sequence downstream, so its
       grads only cover its own rows — summing reconstructs the full grad.
-    - False: no all-reduce. Used at the model output, where the downstream loss
+    - False: no all-reduce. At the model output, where the downstream loss
       (e.g. the MiniMaxH3 wrapper's MSE over the full output) is identical on
-      every SP rank, so the incoming grad is already the true full grad and a
-      sum would multiply it by the SP world size.
+      every SP rank, the incoming grad is already the true full grad. The
+      data-parallel gradient reduction (FSDP2 over dp_shard_sp, DDP over
+      dp_sp) still averages over the SP ranks, so pair it with
+      ``grad_scale=True``; otherwise every gradient is scaled by 1/sp_size.
     """
 
     @staticmethod

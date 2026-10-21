@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ...loader import MODELING_REGISTRY
+
+"""GPT-OSS modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.models.registry import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("gpt_oss")
@@ -19,11 +22,12 @@ def register_gpt_oss_modeling(architecture: str):
     architecture = architecture or "GptOssForCausalLM"
 
     try:
-        import transformers.models.gpt_oss
+        import transformers.models.gpt_oss  # noqa: F401
     except ImportError as e:
         raise RuntimeError(
             "GPT-OSS support requires a Transformers build that provides `transformers.models.gpt_oss`."
         ) from e
+
     from .generated.patched_modeling_gpt_oss_gpu import (
         GptOssForCausalLM,
         GptOssForSequenceClassification,

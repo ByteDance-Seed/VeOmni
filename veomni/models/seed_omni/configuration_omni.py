@@ -1,101 +1,63 @@
-"""
-OmniConfig — central configuration for OmniModel V2.
+"""OmniConfig — HF ``PretrainedConfig`` for a composed :class:`OmniModel`.
 
-:class:`OmniConfig` describes **only** the composed model: module checkpoint layout,
-training DAG, and every generation FSM.  It is a plain ``PretrainedConfig`` — it reads
-and writes an on-disk checkpoint and knows nothing about the VeOmni launcher.
+This is the checkpoint-shaped composite only: a map of per-module entries, the
+training DAG, and every generation FSM. ``_module_entries[name]`` is a dict
+(``model_path``, ``ops_implementation``, ``model_config``, ``processor_config``).
+:attr:`OmniConfig._module_configs` is each module's own loaded ``config.json``,
+an :class:`OmniModuleConfig`.
 
-A checkpoint carries **all** the generation scenarios it was exported with, keyed by
-``infer_type`` (``infer_gen`` / ``infer_edit`` / ``infer_und`` / …).  ``infer_type``
-selects which one is active; :attr:`OmniConfig.generation_graph` returns it.  Scenario
-choice is therefore a property of the config, not something baked in at YAML-load time.
+Kernels are stated in two places, because a module and the model composing it
+are different authorities: this config's root ``ops_implementation`` is the
+composed model's default for every module, the entry's ``ops_implementation``
+is its say over one module, and the module's own ``config.json`` carries what
+it was exported with. Loading a module config merges them per field onto that
+config, lowest to highest: the file, then this root, then the entry. A caller's
+kwargs are not a fourth place: :meth:`OmniConfig.apply_omni_kwargs` merges
+each into the field it overrides — root ``ops_implementation``, or a module
+entry's ``model_path`` / ``ops_implementation`` / ``model_config`` /
+``processor_config`` — before anything loads.
 
-Building one from the launcher split-file layout is the runtime layer's job:
-:func:`~veomni.arguments.omni_arguments_types.resolve_omni_model` /
-:func:`~veomni.arguments.omni_arguments_types.build_omni_model_runtime`
-return :class:`~veomni.arguments.omni_arguments_types.OmniModelRuntimeArguments`
-(the full launcher view), and its ``.to_hf_config()`` projects that onto this
-checkpoint-shaped config.
-Per-module **runtime** args (FSDP, optimizer, dataloader, …) live on
-:class:`~veomni.arguments.omni_arguments_types.OmniModelRuntimeArguments.modules`.
-
-Launcher inputs consumed by that builder (see :class:`~veomni.arguments.OmniArguments`):
-
-  * ``model.model_path``   — split-checkpoint root folder (one subdir per module).
-  * ``model.model_config.modules`` — per-module YAML overrides (``modules_train.yaml``).
-  * ``model.model_config.train_graph`` — the training DAG (``graph_train.yaml``).
-  * ``model.model_config.modules`` — per-module YAML (``modules_train.yaml`` for
-    training; override with ``--model.model_config.modules …/modules_infer.yaml``
-    at inference time).
-  * ``model.model_config.infer_graph`` — scenario -> generation-graph file map.
-
-Stored ``modules`` entries look like:
-
-  janus_llama:
-    subfolder: janus_llama
-    model:
-      ops_implementation:
-        attn_implementation: flash_attention_2
-      model_config: {freeze: false}
-
-  # ── Active training subset.  A flat list of edges; each endpoint is a
-  #    self-describing `module[.method]` string (bare module → `.forward`).
-  #    Active nodes are derived from the endpoints.  `to: end` declares a leaf
-  #    node (virtual sink) — every node MUST appear on at least one edge.
-  training_graph:
-    - {from: siglip,            to: janus_llama}
-    - {from: vqvae.encode,      to: janus_llama}
-    - {from: wte_lm_head.encode, to: janus_llama}
-    - {from: janus_llama,       to: wte_lm_head.decode}
-    - {from: janus_llama,       to: vqvae.decode}
-    - {from: wte_lm_head.decode, to: end}
-    - {from: vqvae.decode,      to: end}
-
-  # ── Inference FSMs, one per scenario.  Each state.body is a list of inline
-  #    `{from, to}` edges (endpoints as `module[.method]` strings, bare module →
-  #    `.generate`); node order is derived (unique endpoints in declaration
-  #    order, excluding `end`).  The `done` state is auto-injected by the
-  #    framework — never declare it here, never set `done_state`.  Transitions
-  #    whose `next_state: done` land on the built-in terminal state which then
-  #    triggers each active module's `finalize` hook (text decode /
-  #    image save / etc).
-  #    States carry no iteration budget — a state body iterates until one of
-  #    its transitions fires, and modules decide when via signals (the AR
-  #    loop) or after a single pass via `default` (bridge/leaf states).
-  infer_type: infer_interleave
-  generation_graphs:
-    infer_interleave:
-      initial: text_ar
-      states:
-        text_ar:
-          body:
-            - {from: wte_lm_head, to: janus_llama}
-            - {from: janus_llama, to: wte_lm_head}
-            - {from: wte_lm_head, to: end}
-          transitions:
-            - {condition: {type: module_signal, key: start_image_gen}, next_state: image_vq}
-        image_vq:
-          body:
-            - {from: janus_llama, to: vqvae}
-            - {from: vqvae,       to: janus_llama}
-          transitions:
-            - {condition: {type: module_signal, key: image_complete}, next_state: text_ar}
-    infer_und:
-      initial: text_ar
-      states: {...}
+A checkpoint stores every training DAG under ``training_graphs`` (keyed by
+``train_type``) and every generation FSM under ``generation_graphs`` (keyed by
+``infer_type``). :attr:`OmniConfig.training_graph` / :attr:`OmniConfig.generation_graph`
+are the active entries. A single-scenario file uses the name ``default``.
 """
 
 import json
 import os
+import re
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Collection, Dict, List, Optional, Tuple, Union
 
 import yaml
 from transformers import PretrainedConfig
 
 
+if TYPE_CHECKING:
+    from .modules.module_configuration_base import OmniModuleConfig
+    from .utils.hf_layout import HFSource
+
+
 DEFAULT_TRAINING_GRAPH_FILE = "training_graph.yaml"
 DEFAULT_GENERATION_GRAPH_FILE = "generation_graph.yaml"
+DEFAULT_GRAPH_SCENARIO = "default"
+
+_SAFE_INFER_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def check_infer_type_names(names: Collection[str]) -> None:
+    """Reject ``infer_type`` names that cannot name ``graphs/generation_<infer_type>.mmd``.
+
+    Run whenever a config receives its generation graphs, so a bad name fails on
+    every rank at build time rather than on rank 0 alone, mid-save, after the
+    module weights are already on disk.
+    """
+    for name in names:
+        if not isinstance(name, str) or not _SAFE_INFER_TYPE.fullmatch(name):
+            raise ValueError(
+                f"Invalid infer_type {name!r}: scenario names must match {_SAFE_INFER_TYPE.pattern} "
+                "so they can be used as diagram filenames."
+            )
 
 
 def select_graph(
@@ -105,12 +67,7 @@ def select_graph(
     empty_hint: str = "",
     unknown_hint: str = "scenario",
 ) -> Any:
-    """Pick the active graph out of a scenario map; unset ``scenario`` takes the first.
-
-    Shared by :class:`OmniConfig` and
-    :class:`~veomni.arguments.omni_arguments_types.OmniModelRuntimeArguments`
-    so both resolve training and generation scenarios identically.
-    """
+    """Pick the active graph out of a scenario map; unset ``scenario`` takes the first."""
     if not graphs:
         raise ValueError(f"No graph scenarios are declared. {empty_hint}".strip())
     if scenario is None:
@@ -121,46 +78,163 @@ def select_graph(
     return graphs[scenario]
 
 
+# Fields a caller may overwrite on one ``_module_entries[name]`` entry. Root overwrites
+# are only kernels (``ops_implementation`` and each ``xxx_implementation``).
+_MODULE_OVERRIDE_FIELDS = frozenset({"model_path", "ops_implementation", "model_config", "processor_config"})
+_MODULE_DICT_FIELDS = frozenset({"model_config", "processor_config"})
+
+
+def _ops_field_names() -> frozenset:
+    """Field names selectable on :class:`~veomni.arguments.OpsImplementationConfig`."""
+    from dataclasses import fields
+
+    from ...arguments import OpsImplementationConfig
+
+    return frozenset(f.name for f in fields(OpsImplementationConfig))
+
+
+def pop_omni_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Lift :class:`OmniConfig` overwrites out of a load's kwargs.
+
+    Transformers turns an unrecognized kwarg into a config attribute, and a
+    dotted one into an attribute nothing will ever look up. These keys are this
+    config's own overwrites — the root ``ops_implementation`` (and each
+    ``xxx_implementation``) and every ``<module>.<field>`` — so they come out
+    before ``from_pretrained`` runs. Whether a dotted key is legal is decided
+    later, by :meth:`OmniConfig.apply_omni_kwargs`, once the checkpoint's
+    module names exist.
+    """
+    ops_fields = _ops_field_names()
+    return {
+        key: kwargs.pop(key) for key in list(kwargs) if key in ops_fields or key == "ops_implementation" or "." in key
+    }
+
+
+def _split_omni_kwargs(
+    kwargs: Dict[str, Any],
+    module_names: Collection[str],
+) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """Split popped overwrites into root kernels, per-module entry fields, and the rest.
+
+    Root, merged into :attr:`OmniConfig.ops_implementation`:
+    ``xxx_implementation=`` / ``ops_implementation={...}``.
+
+    Per module, merged into that entry:
+
+    * ``<module>.xxx_implementation=`` / ``<module>.ops_implementation={...}``
+    * ``<module>.model_path=`` — replaces the path
+    * ``<module>.model_config={...}`` / ``<module>.processor_config={...}`` —
+      dicts, merged per field
+
+    Returns ``(root_ops, per_module, remaining)``. ``remaining`` is what the
+    caller meant for HF (``torch_dtype``, ``device_map``, …). A block states
+    choices rather than replacing the layer it lands on.
+    """
+    ops_fields = _ops_field_names()
+    root_ops: Dict[str, Any] = {}
+    per_module: Dict[str, Dict[str, Any]] = {}
+    remaining: Dict[str, Any] = {}
+
+    def ops_selection(key: str, field: str, value: Any) -> Dict[str, Any]:
+        if field == "ops_implementation":
+            if not isinstance(value, dict):
+                raise ValueError(
+                    f"Load kwarg {key!r} must be a dict of kernel selections, got {type(value).__name__}."
+                )
+            unknown = sorted(set(value) - ops_fields)
+            if unknown:
+                raise ValueError(f"Load kwarg {key!r} has no such kernel fields: {', '.join(unknown)}.")
+            return dict(value)
+        return {field: value}
+
+    for key, value in kwargs.items():
+        if key in ops_fields or key == "ops_implementation":
+            root_ops.update(ops_selection(key, key, value))
+            continue
+        if "." not in key:
+            remaining[key] = value
+            continue
+        name, _, field = key.partition(".")
+        if name not in module_names:
+            known = ", ".join(sorted(module_names)) or "none"
+            raise ValueError(
+                f"Load kwarg {key!r} names module {name!r}, which this checkpoint does not "
+                f"declare. Known modules: {known}."
+            )
+        overrides = per_module.setdefault(name, {})
+        if field in ops_fields or field == "ops_implementation":
+            overrides.setdefault("ops_implementation", {}).update(ops_selection(key, field, value))
+        elif field == "model_path":
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"Load kwarg {key!r} must be a non-empty path string, got {value!r}.")
+            overrides["model_path"] = value
+        elif field in _MODULE_DICT_FIELDS:
+            if not isinstance(value, dict):
+                raise ValueError(f"Load kwarg {key!r} must be a dict, got {type(value).__name__}.")
+            overrides.setdefault(field, {}).update(value)
+        else:
+            overridable = ", ".join(sorted(_MODULE_OVERRIDE_FIELDS | ops_fields))
+            raise ValueError(
+                f"Load kwarg {key!r} cannot override {field!r}. Overridable module fields: {overridable}."
+            )
+
+    return root_ops, per_module, remaining
+
+
 class OmniConfig(PretrainedConfig):
-    """Configuration for OmniModel V2.
+    """Checkpoint config for :class:`~veomni.models.seed_omni.modeling_omni.OmniModel`.
 
-    All nested dicts are stored as plain Python dicts for JSON serialisability.
-        Typed accessors (``module_model_config``, ``module_processor_config``,
-        ``module_subfolder``, ``training_edges``) provide a stable surface for the
-        runtime / visualisation tools.
-
-    Tokenizers and processors are per-module assets saved alongside each
-    module's checkpoint (e.g. ``janus_text_encoder/tokenizer.json``).
+    ``_module_entries`` is the dict of checkpoint entries. A loaded module config is
+    :attr:`_module_configs`. Tokenizers and processors are per-module assets
+    next to each module's weights.
     """
 
     model_type = "omni"
-    # ``modules`` / ``training_graph`` / ``generation_graphs`` are required, so
+    # ``_module_entries`` / ``training_graphs`` / ``generation_graphs`` are required, so
     # transformers must not probe defaults via a bare ``OmniConfig()`` — it does
     # that in ``to_diff_dict`` (and therefore ``__repr__``) unless told otherwise.
     has_no_defaults_at_init = True
 
     def __init__(
         self,
-        modules: Dict[str, Dict],
-        training_graph: List[Dict],
+        _module_entries: Dict[str, Dict[str, Any]],
+        training_graphs: Dict[str, List[Dict]],
         generation_graphs: Dict[str, Dict],
         *,
+        train_type: Optional[str] = None,
         infer_type: Optional[str] = None,
         generation_kwargs: Optional[Dict] = None,
+        ops_implementation: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
-        self.modules = modules
-        self.training_graph = training_graph
+        self._module_entries = _module_entries
+        self.training_graphs = training_graphs
         self.generation_graphs = generation_graphs
+        check_infer_type_names(generation_graphs or {})
+        self.train_type = train_type
         self.infer_type = infer_type
         self.generation_kwargs = generation_kwargs
+        # Model-level kernels: this composed model's defaults for every module
+        # it holds. Sparse — only what was explicitly selected. A loaded module
+        # config ranks its own file under this, then under the module entry.
+        self.ops_implementation: Dict[str, Any] = dict(ops_implementation or {})
+        # Each module's own typed config, built by :meth:`from_pretrained`.
+        # In-memory only: the modules are described by their own files, and a
+        # copy here would be a second place to keep in sync. Dropped by
+        # :meth:`to_dict`.
+        self._module_configs: Dict[str, OmniModuleConfig] = {}
+        # The upstream HF checkpoint the module weights are read from, when this
+        # config was loaded off a weight-free view of one (see
+        # :mod:`~veomni.models.seed_omni.utils.hf_layout`). In-memory only, like
+        # :attr:`_module_configs`: a saved config describes its own files.
+        self._hf_source: Optional[HFSource] = None
 
         super().__init__(**kwargs)
 
     @property
-    def training_edges(self) -> List[Dict]:
-        """Active training subset — the flat list of edge dicts."""
-        return list(self.training_graph)
+    def train_types(self) -> List[str]:
+        """Declared training scenarios, in declaration order."""
+        return list(self.training_graphs)
 
     @property
     def infer_types(self) -> List[str]:
@@ -168,20 +242,35 @@ class OmniConfig(PretrainedConfig):
         return list(self.generation_graphs)
 
     @property
-    def generation_graph(self) -> Dict:
-        """The generation FSM selected by :attr:`infer_type`.
+    def training_graph(self) -> List[Dict]:
+        """The training DAG selected by :attr:`train_type` (first scenario if unset)."""
+        if not self.training_graphs:
+            return []
+        return select_graph(
+            self.training_graphs,
+            self.train_type,
+            empty_hint=f"Populate `training_graphs` (or load a checkpoint with `{DEFAULT_TRAINING_GRAPH_FILE}`).",
+            unknown_hint="train_type",
+        )
 
-        A checkpoint carries every scenario it was exported with; ``infer_type``
-        picks which one :class:`~veomni.models.seed_omni.modeling_omni.OmniModel`
-        binds. Unset means the first declared scenario.
+    @training_graph.setter
+    def training_graph(self, value: List[Dict]) -> None:
+        raise AttributeError(
+            "`training_graph` is read-only — it is whichever entry of `training_graphs` "
+            "`train_type` names. Assign `training_graphs` / `train_type` instead."
+        )
+
+    @property
+    def generation_graph(self) -> Dict:
+        """The generation FSM selected by :attr:`infer_type` (first scenario if unset).
+
+        An empty ``generation_graphs`` returns ``{}``.
         """
+        if not self.generation_graphs:
+            return {}
         return select_graph(
             self.generation_graphs,
             self.infer_type,
-            empty_hint=(
-                "Populate `generation_graphs` (via `model.model_config.infer_graph`, or by loading a "
-                f"checkpoint whose `{DEFAULT_GENERATION_GRAPH_FILE}` sidecar has them)."
-            ),
             unknown_hint="infer_type",
         )
 
@@ -194,262 +283,222 @@ class OmniConfig(PretrainedConfig):
 
     @property
     def module_names(self) -> List[str]:
-        # Config ``modules:`` declaration order (dict insertion order). This is the
-        # canonical, FIXED order that drives serial CPU-preprocessor execution in
-        # both training (SeedOmniCollator) and inference (OmniInferencer); declare
-        # modules so any order-dependent prep (e.g. vision patchify before the text
-        # chat-template) runs in the right sequence.
-        return list(self.modules.keys())
-
-    def module_subfolder(self, name: str) -> str:
-        """Return the resolved on-disk path segment for ``name`` (may be absolute)."""
-        entry = self.modules.get(name)
-        if entry is None:
-            raise KeyError(f"Module '{name}' not found in OmniConfig.modules")
-        if isinstance(entry, PretrainedConfig):
-            return self.module_checkpoint_subfolder(name)
-        if isinstance(entry, str):
-            return entry
-        if isinstance(entry, dict):
-            model_block = entry.get("model")
-            if isinstance(model_block, dict):
-                path = model_block.get("model_path") or model_block.get("weights_path")
-                if path:
-                    return path
-            subfolder = entry.get("subfolder")
-            if subfolder:
-                return str(subfolder)
-        return name
-
-    def module_checkpoint_subfolder(self, name: str) -> str:
-        """Relative subfolder under an omni checkpoint root for ``name``."""
-        if name not in self.modules:
-            raise KeyError(f"Module '{name}' not found in OmniConfig.modules")
-        return name
-
-    def normalize_modules_for_hf_export(self) -> Dict[str, Dict[str, Any]]:
-        """Slim ``modules`` block for HF ``config.json`` (subfolder + load options)."""
-        from transformers import PretrainedConfig
-
-        normalized: Dict[str, Dict[str, Any]] = {}
-        for name in self.module_names:
-            entry = self.modules.get(name)
-            if isinstance(entry, PretrainedConfig):
-                normalized[name] = {"subfolder": self.module_checkpoint_subfolder(name)}
-                ops = self.module_ops_implementation(name)
-                if ops:
-                    normalized[name]["model"] = {"ops_implementation": deepcopy(ops)}
-                continue
-            slim: Dict[str, Any] = {"subfolder": self.module_checkpoint_subfolder(name)}
-            model_block = self._module_export_model_block(name)
-            if model_block:
-                slim["model"] = model_block
-            normalized[name] = slim
-        return normalized
-
-    def _module_export_model_block(self, name: str) -> Dict[str, Any]:
-        model_block: Dict[str, Any] = {}
-        ops = self.module_ops_implementation(name)
-        if ops:
-            model_block["ops_implementation"] = deepcopy(ops)
-        model_config = self.module_model_config(name)
-        if model_config:
-            model_block["model_config"] = model_config
-        return model_block
+        # ``_module_entries`` declaration order (dict insertion order). This is the
+        # canonical order for serial CPU-preprocessor execution.
+        return list(self._module_entries.keys())
 
     def copy_for_hf_export(
         self,
         *,
-        training_graph: Optional[List[Dict]] = None,
+        training_graphs: Optional[Dict[str, List[Dict]]] = None,
         generation_graphs: Optional[Dict[str, Dict]] = None,
     ) -> "OmniConfig":
-        """Return a checkpoint-serializable copy with model-only module entries and graph sidecars."""
+        """Return a checkpoint-serializable copy (no in-memory load paths)."""
         export_dict = self.to_dict()
-        export_dict["modules"] = self.normalize_modules_for_hf_export()
-        export_dict["training_graph"] = list(training_graph if training_graph is not None else self.training_graph)
+        export_dict["training_graphs"] = deepcopy(
+            training_graphs if training_graphs is not None else self.training_graphs
+        )
         export_dict["generation_graphs"] = deepcopy(
             generation_graphs if generation_graphs is not None else self.generation_graphs
         )
+        export_dict["train_type"] = self.train_type
         export_dict["infer_type"] = self.infer_type
         accepted = {k: v for k, v in export_dict.items() if k in OmniConfig.__init__.__code__.co_varnames}
         return OmniConfig.from_dict(accepted)
 
-    def module_model_config(self, name: str) -> Dict[str, Any]:
-        """Per-module ``from_pretrained`` overrides stored in the config."""
-        from transformers import PretrainedConfig
+    def apply_omni_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Absorb a caller's overwrites into this config.
 
-        entry = self.modules.get(name)
-        if isinstance(entry, PretrainedConfig):
-            return {}
-        if not isinstance(entry, dict):
-            return {}
-        model_block = entry.get("model")
-        if not isinstance(model_block, dict):
-            return {}
-        overrides = model_block.get("model_config")
-        return dict(overrides or {})
+        Returns the kwargs that were not overwrites, for the caller to forward
+        to HF. Root ``xxx_implementation=`` / ``ops_implementation={...}`` merge
+        into :attr:`ops_implementation`. A ``<module>.<field>=`` merges into
+        that module's entry: ``model_path``, ``ops_implementation``,
+        ``model_config``, ``processor_config``. Dict fields merge per key, so a
+        caller states choices rather than replacing the whole block;
+        ``model_path`` is a single path and replaces the entry's.
 
-    def module_processor_config(self, name: str) -> Dict[str, Any]:
-        """Per-module ``processor_config`` kwargs for preprocessor ``from_pretrained``."""
-        entry = self.modules.get(name)
-        if not isinstance(entry, dict):
-            return {}
-        return dict(entry.get("processor_config") or {})
+        Resolution happens here, once, rather than being threaded down to the
+        loader: afterwards this config alone describes the run, and a save
+        reproduces it — the same treatment ``infer_type`` and
+        ``training_graphs`` already get as load kwargs.
 
-    def module_ops_implementation(self, name: str) -> Dict[str, Any]:
-        """Per-module VeOmni kernel options persisted in the checkpoint."""
-        cached = getattr(self, "_module_load_options", {}).get(name, {})
-        ops = cached.get("ops_implementation")
-        if ops:
-            return dict(ops)
+        A ``model_path`` or ``model_config`` overwrite drops that module's
+        cached config: both change which file a later load reads. A kernel
+        overwrite is written onto a cached module config when one is already
+        loaded, in the same order as load — the config's current ops, then
+        this root, then the module entry.
+        """
+        root_ops, per_module, remaining = _split_omni_kwargs(kwargs, self.module_names)
+        self.ops_implementation = {**self.ops_implementation, **root_ops}
+        for name, overrides in per_module.items():
+            entry = self._module_entries[name]
+            if "ops_implementation" in overrides:
+                entry["ops_implementation"] = {
+                    **dict(entry.get("ops_implementation") or {}),
+                    **overrides["ops_implementation"],
+                }
+            if "model_config" in overrides:
+                entry["model_config"] = {**dict(entry.get("model_config") or {}), **overrides["model_config"]}
+            if "processor_config" in overrides:
+                entry["processor_config"] = {
+                    **dict(entry.get("processor_config") or {}),
+                    **overrides["processor_config"],
+                }
+            if "model_path" in overrides:
+                entry["model_path"] = overrides["model_path"]
+            if "model_path" in overrides or "model_config" in overrides:
+                self._module_configs.pop(name, None)
+        # Root kernels apply to every loaded module. An entry's kernels apply to that one.
+        ops_names = (
+            self.module_names
+            if root_ops
+            else [name for name, overrides in per_module.items() if "ops_implementation" in overrides]
+        )
+        for name in ops_names:
+            loaded = self._module_configs.get(name)
+            if loaded is None:
+                continue
+            loaded.ops_implementation = {
+                **dict(loaded.ops_implementation or {}),
+                **self.ops_implementation,
+                **dict(self._module_entries[name].get("ops_implementation") or {}),
+            }
+            loaded._sync_attn_implementation()
+        return remaining
 
-        entry = self.modules.get(name)
-        if not isinstance(entry, dict):
-            return {}
-        model_block = entry.get("model")
-        if not isinstance(model_block, dict):
-            return {}
-        ops = model_block.get("ops_implementation")
-        return dict(ops or {})
-
-    def _stash_module_load_options(self) -> None:
-        """Preserve ``model.ops_implementation`` before module configs are hydrated."""
-        options: Dict[str, Dict[str, Any]] = {}
-        for name in self.module_names:
-            ops = self.module_ops_implementation(name)
-            if ops:
-                options[name] = {"ops_implementation": deepcopy(ops)}
-        self._module_load_options = options
+    @property
+    def checkpoint_root(self) -> Optional[str]:
+        """Directory this config was loaded from, when it was loaded from one."""
+        return getattr(self, "_name_or_path", None) or None
 
     def resolve_module_path(self, checkpoint_root: Optional[Union[str, os.PathLike]], name: str) -> str:
         """Resolve the on-disk path for module ``name`` under ``checkpoint_root``."""
-        subfolder = self.module_subfolder(name)
-        if os.path.isabs(subfolder):
-            return subfolder
-        if checkpoint_root is None:
-            return subfolder
-        return os.path.join(str(checkpoint_root), subfolder)
+        from .modules.module_configuration_base import OmniModuleConfig
+
+        return OmniModuleConfig.resolve_path(checkpoint_root, name, self._module_entries[name].get("model_path"))
 
     def to_dict(self) -> Dict[str, Any]:
-        """JSON-serializable dict; ``modules`` is slimmed to subfolder stubs."""
-        modules = self.modules
-        self.modules = self.normalize_modules_for_hf_export()
-        try:
-            return super().to_dict()
-        finally:
-            self.modules = modules
+        """JSON-serializable dict. ``model_path`` is the module name."""
+        for name in self.module_names:
+            self._module_entries[name]["model_path"] = name
+        output = super().to_dict()
+        output.pop("_module_configs", None)
+        output.pop("_hf_source", None)
+        return output
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        """Load ``config.json``, graph sidecars, and per-module ``PretrainedConfig`` objects."""
+        """Load ``config.json``, graph YAML sidecars, and each module's typed config.
+
+        Per-module ``config.json`` is resolved through ``OMNI_MODEL_REGISTRY`` —
+        only registered omni modules can live in an :class:`OmniConfig`.
+
+        Caller overwrites may be passed here too, and mean the same as they do
+        at :meth:`~veomni.models.seed_omni.OmniModel.from_pretrained`: root
+        ``ops_implementation`` and a module's ``model_path``,
+        ``ops_implementation``, ``model_config``, ``processor_config``. The
+        config that comes back is the resolved one, and handing it to
+        ``OmniModel.from_pretrained(path, config=...)`` loads the same model.
+
+        An upstream HF checkpoint whose ``model_type`` has a registered
+        :class:`~veomni.models.seed_omni.utils.hf_layout.OmniHFLayout` loads
+        too, through a weight-free split view of it.
+        """
+        from .utils.hf_layout import resolve_omni_checkpoint_root
+
+        pretrained_model_name_or_path = resolve_omni_checkpoint_root(pretrained_model_name_or_path)
+        # Out before transformers sees them: it would turn each one into a
+        # config attribute. Judged against this config's entries once it exists.
+        omni_kwargs = pop_omni_kwargs(kwargs)
         config = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-        root = getattr(config, "_name_or_path", None) or str(pretrained_model_name_or_path)
-        config._stash_module_load_options()
-        config._hydrate_graphs_from_checkpoint(root)
-        config._hydrate_modules_from_checkpoint(root)
+        root = config.checkpoint_root or str(pretrained_model_name_or_path)
+        config.apply_omni_kwargs(omni_kwargs)
+        config.load_checkpoint_sidecars(root)
         return config
 
-    def _hydrate_modules_from_checkpoint(self, checkpoint_root: Union[str, os.PathLike]) -> None:
-        """Load each module's ``config.json`` into :class:`PretrainedConfig` instances."""
+    def load_checkpoint_sidecars(self, checkpoint_root: Union[str, os.PathLike]) -> None:
+        """Load what a split checkpoint keeps beside its root ``config.json``.
+
+        That is the graph YAML sidecars and each module's typed config. A config
+        built in memory rather than read from disk (a launcher's
+        ``OmniModelRuntimeArguments.to_hf_config()``) has its entries and graphs
+        but no module configs; this fills them from ``checkpoint_root`` so the
+        config can be handed to ``OmniModel.from_pretrained(path, config=...)``.
+
+        A graph map already populated is kept: a caller may run a checkpoint
+        under a graph it was not exported with (a launcher YAML overriding the
+        sidecar).
+        """
+        from .modules.module_configuration_base import OmniModuleConfig
+        from .utils.hf_layout import read_hf_source
+
         root = str(checkpoint_root)
-        hydrated: Dict[str, Any] = {}
+        self._hf_source = read_hf_source(root)
+        self._load_graphs_from_pretrained(root)
         for name in self.module_names:
-            entry = self.modules.get(name)
-            if isinstance(entry, PretrainedConfig):
-                hydrated[name] = entry
-                continue
-            overrides = self.module_model_config(name)
-            subfolder = self.module_checkpoint_subfolder(name)
-            module_dir = os.path.join(root, subfolder)
-            config_path = os.path.join(module_dir, "config.json")
-            if not os.path.isfile(config_path):
-                hydrated[name] = entry if entry is not None else {"subfolder": subfolder}
-                continue
-            from .modules import OMNI_MODEL_REGISTRY, read_hf_model_type
+            entry = self._module_entries[name]
+            module_name_or_path = OmniModuleConfig.resolve_path(root, name, entry.get("model_path"))
+            # Ops rank: the file's own, then this config's base, then this entry.
+            self._module_configs[name] = OmniModuleConfig.from_pretrained(
+                module_name_or_path,
+                model_config=entry.get("model_config"),
+                processor_config=entry.get("processor_config"),
+                ops_implementation=entry.get("ops_implementation"),
+                base_ops_implementation=self.ops_implementation,
+            )
 
-            model_type = read_hf_model_type(module_dir)
-            if model_type in OMNI_MODEL_REGISTRY.valid_keys():
-                mod_cls = OMNI_MODEL_REGISTRY[model_type]()
-                hf_config = mod_cls.config_class.from_pretrained(module_dir)
-            else:
-                with open(config_path, encoding="utf-8") as f:
-                    hf_config = PretrainedConfig.from_dict(json.load(f))
-            if overrides:
-                hf_config.update(deepcopy(overrides))
-            hydrated[name] = hf_config
-        self.modules = hydrated
+    def _load_graphs_from_pretrained(self, checkpoint_root: Union[str, os.PathLike]) -> None:
+        """Load ``training_graphs`` and ``generation_graphs`` from YAML sidecars when present.
 
-    def _hydrate_graphs_from_checkpoint(self, checkpoint_root: Union[str, os.PathLike]) -> None:
-        """Load ``training_graph`` and ``generation_graphs`` from their fixed-name YAML sidecars."""
+        A map already populated is left alone, because a sidecar is the
+        checkpoint's default rather than an override of an explicit caller.
+
+        A module-only split checkpoint has neither file yet; train / generate
+        then fail until a sidecar is added or the caller passes an override.
+        """
         root = str(checkpoint_root)
+        if not self.training_graphs:
+            self.training_graphs = self._read_graph_sidecar(root, DEFAULT_TRAINING_GRAPH_FILE, list)
+        if not self.generation_graphs:
+            self.generation_graphs = self._read_graph_sidecar(root, DEFAULT_GENERATION_GRAPH_FILE, dict)
+            check_infer_type_names(self.generation_graphs)
 
-        training_path = os.path.join(root, DEFAULT_TRAINING_GRAPH_FILE)
-        if not os.path.isfile(training_path):
-            raise FileNotFoundError(f"Omni checkpoint missing required graph sidecar: {training_path}")
-        self.training_graph = self._read_graph_file(training_path, "training_graph")
-
-        generation_path = os.path.join(root, DEFAULT_GENERATION_GRAPH_FILE)
-        if not os.path.isfile(generation_path):
-            raise FileNotFoundError(f"Omni checkpoint missing required graph sidecar: {generation_path}")
-        self.generation_graphs = self._read_generation_graphs(generation_path)
-
-    @staticmethod
-    def _read_generation_graphs(path: str) -> Dict[str, Dict]:
-        """Read the ``generation_graphs`` sidecar: ``{scenario_name: fsm_spec}``."""
-        with open(path, encoding="utf-8") as f:
-            payload = yaml.safe_load(f)
-        if not isinstance(payload, dict):
-            raise ValueError(f"Malformed generation-graph sidecar {path}: expected a mapping, got {type(payload)}.")
-        if "generation_graphs" not in payload:
-            if "generation_graph" in payload:
-                raise ValueError(
-                    f"{path} uses the single-graph `generation_graph:` layout, which is no longer supported. "
-                    "A checkpoint now stores every scenario under `generation_graphs: {<infer_type>: <fsm>}` "
-                    "and selects one via `infer_type`. Re-export the checkpoint with "
-                    "scripts/seed_omni/export_omni_checkpoint.py."
-                )
-            raise ValueError(f"Malformed generation-graph sidecar {path}: missing top-level `generation_graphs:` key.")
-        graphs = payload["generation_graphs"]
-        if not isinstance(graphs, dict):
-            raise ValueError(f"Malformed generation-graph sidecar {path}: `generation_graphs` must be a mapping.")
-        return graphs
+    @classmethod
+    def _read_graph_sidecar(cls, root: str, filename: str, payload_type: type) -> Dict:
+        """A sidecar's scenario map, or ``{}`` when the checkpoint has no such file."""
+        path = os.path.join(root, filename)
+        return cls._read_graph_file(path, payload_type) if os.path.isfile(path) else {}
 
     def save_pretrained(self, save_directory: Union[str, os.PathLike], push_to_hub: bool = False, **kwargs):
         """Write ``config.json`` plus graph YAML sidecars for HF-style reload."""
         save_directory = str(save_directory)
         os.makedirs(save_directory, exist_ok=True)
 
-        for name, entry in self.modules.items():
-            if isinstance(entry, PretrainedConfig):
-                module_dir = os.path.join(save_directory, self.module_checkpoint_subfolder(name))
-                os.makedirs(module_dir, exist_ok=True)
-                entry.save_pretrained(module_dir)
+        for name in self.module_names:
+            hf_config = self._module_configs[name]
+            module_dir = os.path.join(save_directory, name)
+            os.makedirs(module_dir, exist_ok=True)
+            hf_config.save_pretrained(module_dir)
 
         export_config = self.copy_for_hf_export()
 
-        self._write_graph_file(
-            os.path.join(save_directory, DEFAULT_TRAINING_GRAPH_FILE),
-            "training_graph",
-            export_config.training_graph,
-        )
-        self._write_graph_file(
-            os.path.join(save_directory, DEFAULT_GENERATION_GRAPH_FILE),
-            "generation_graphs",
-            export_config.generation_graphs,
-        )
+        if export_config.training_graphs:
+            self._write_graph_file(
+                os.path.join(save_directory, DEFAULT_TRAINING_GRAPH_FILE),
+                export_config.training_graphs,
+            )
+        if export_config.generation_graphs:
+            self._write_graph_file(
+                os.path.join(save_directory, DEFAULT_GENERATION_GRAPH_FILE),
+                export_config.generation_graphs,
+            )
 
-        # The sidecar files above are the sole source of truth for both graphs —
-        # `config.json` never carries them inline, so `from_pretrained` always
-        # re-hydrates via `_hydrate_graphs_from_checkpoint` (fixed filenames).
         config_dict = export_config.to_dict()
-        config_dict.pop("training_graph", None)
+        config_dict.pop("training_graphs", None)
         config_dict.pop("generation_graphs", None)
 
         config_path = os.path.join(save_directory, "config.json")
         with open(config_path, "w", encoding="utf-8") as f:
-            # No sort_keys: ``modules`` declaration order is load-bearing (it drives
-            # serial CPU-preprocessor execution — see :meth:`module_names`), and JSON
-            # key sorting is recursive, so it would silently reorder the modules.
             json.dump(config_dict, f, indent=2)
             f.write("\n")
 
@@ -461,55 +510,55 @@ class OmniConfig(PretrainedConfig):
             raise NotImplementedError("OmniConfig push_to_hub is not implemented yet.")
 
     @staticmethod
-    def _write_graph_file(path: str, key: str, payload: Any) -> None:
+    def _write_graph_file(path: str, payload: Any) -> None:
+        """Dump ``payload`` as the YAML document. Filename identifies train vs generation."""
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            yaml.safe_dump({key: payload}, f, sort_keys=False, allow_unicode=True)
+            yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
 
     @staticmethod
-    def _read_graph_file(path: str, key: str):
-        """Read a graph sidecar written by :meth:`_write_graph_file`.
+    def _read_graph_file(path: str, value_type: type) -> Dict[str, Any]:
+        """Load a graph sidecar: ``{scenario_name: graph}``.
 
-        Checkpoint sidecars are plain YAML documents; the launcher's ``inherit:``
-        composition is a build-time feature and never appears here.
+        ``value_type`` is the per-scenario payload: ``list`` (training DAG) or
+        ``dict`` (generation FSM). A bare payload (one DAG / one FSM) is stored
+        under :data:`DEFAULT_GRAPH_SCENARIO`.
         """
         with open(path, encoding="utf-8") as f:
             payload = yaml.safe_load(f)
-        if isinstance(payload, dict) and key in payload:
-            return payload[key]
+        if isinstance(payload, list) and value_type is list:
+            payload = {DEFAULT_GRAPH_SCENARIO: payload}
+        elif isinstance(payload, dict) and value_type is dict and {"initial", "states"} <= set(payload):
+            payload = {DEFAULT_GRAPH_SCENARIO: payload}
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"Malformed graph sidecar {path}: expected a mapping of scenario name to graph, "
+                f"got {type(payload).__name__}."
+            )
+        for name, graph in payload.items():
+            if not isinstance(graph, value_type):
+                raise ValueError(
+                    f"Malformed graph sidecar {path}: scenario {name!r} expected "
+                    f"{value_type.__name__}, got {type(graph).__name__}."
+                )
         return payload
 
     @classmethod
     def from_dict(cls, config_dict: Dict, **kwargs) -> "OmniConfig":
-        """Build an :class:`OmniConfig` from a YAML-shaped dict.
+        """Build an :class:`OmniConfig` from a dict.
 
-        Module blocks are kept verbatim; the split-checkpoint root and per-module
-        path resolution belong to the runtime layer
-        (:class:`~veomni.arguments.omni_arguments_types.OmniModelRuntimeArguments`)
-        and are not stored here. Unknown top-level keys are dropped silently so the
-        launcher YAML can carry training-only fields.
-
-        HF ``config.json`` stores graph payloads in YAML sidecars and leaves
-        placeholder ``training_graph`` / omits ``generation_graphs`` until
-        :meth:`from_pretrained` hydrates them.
+        Unknown top-level keys are dropped. Graph payloads in an HF checkpoint
+        live in YAML sidecars; :meth:`from_pretrained` loads them.
         """
         config_dict = dict(config_dict)
-        # Unknown keys are dropped below, so the retired singular field would go
-        # silently inert — leaving a config whose FSM vanished. Reject it instead.
-        if "generation_graph" in config_dict:
-            raise ValueError(
-                "`generation_graph` (a single FSM) is no longer a config field. A config now "
-                "declares every scenario in `generation_graphs: {<infer_type>: <fsm>}` and "
-                "selects one via `infer_type`."
-            )
         accepted = {k: v for k, v in config_dict.items() if k in cls.__init__.__code__.co_varnames}
         if "generation_graphs" not in accepted:
             accepted["generation_graphs"] = {}
-        if "training_graph" not in accepted:
-            accepted["training_graph"] = []
-        if "modules" not in accepted:
-            accepted["modules"] = {}
+        if "training_graphs" not in accepted:
+            accepted["training_graphs"] = {}
+        if "_module_entries" not in accepted:
+            accepted["_module_entries"] = {}
         return cls(**{**accepted, **kwargs})
 
 
-__all__ = ["OmniConfig", "select_graph"]
+__all__ = ["OmniConfig"]

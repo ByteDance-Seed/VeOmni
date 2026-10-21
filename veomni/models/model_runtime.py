@@ -24,6 +24,7 @@ This split is what lets a single-model trainer and a multi-module omni model
 share one build sequence instead of maintaining divergent copies of it.
 """
 
+import os
 from dataclasses import fields
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -35,7 +36,7 @@ from ..distributed.parallel_state import (
     get_parallel_state_by_name,
     use_parallel_state,
 )
-from ..utils import helper, logging
+from ..utils import helper, logging, recompute_utils
 
 
 if TYPE_CHECKING:
@@ -46,7 +47,7 @@ if TYPE_CHECKING:
     from ..arguments.arguments_types import AcceleratorConfig
     from ..data.chat_template import ChatTemplate
     from ..trainer.callbacks import TrainerState
-    from .checkpoint_manager import ModelCheckpointManager
+    from .checkpoint import ModelCheckpointManager
 
 logger = logging.get_logger(__name__)
 
@@ -76,7 +77,7 @@ class VeOmniModelRuntime:
     ``isinstance`` check, so the runtime owns every such boundary itself. Reading
     and writing checkpoints is one: :meth:`load`, :meth:`save_dcp` and
     :meth:`save_hf_or_lora` say *what* this model persists, the
-    :class:`~veomni.models.checkpoint_manager.ModelCheckpointManager` at
+    :class:`~veomni.models.checkpoint.ModelCheckpointManager` at
     :attr:`checkpoint` says *how*, and *when* stays in the trainer callbacks.
 
     Constructing one *builds* it — ``VeOmniModelRuntime(args)`` comes back with a
@@ -91,11 +92,15 @@ class VeOmniModelRuntime:
     :attr:`model_name` its :class:`ParallelState` registers under, so a job
     composing several models hands each one its own slice and its own mesh
     without any of them having to know how to find itself inside a larger
-    config. ``train`` comes alongside because a handful of decisions are
+    config. ``train_args`` comes alongside because a handful of decisions are
     genuinely job-wide: where checkpoints are written, and whether a resume path
     makes the initial HF weight load redundant (see :attr:`skip_hf_weight_load`).
-    ``chat_template_name`` likewise — the job picks it (``data.chat_template``),
-    but only the runtime holds the preprocessor to build it from.
+    The constructor still takes ``train=``; storing it as ``train_args`` leaves
+    :meth:`train` free to forward ``nn.Module.train()``.
+
+    Which chat template to build is on this model's arguments
+    (``model.chat_template``); only the runtime holds the preprocessor to
+    build it from.
 
     A model whose build differs (a VLM freezing its tower, a DiT carrying a
     condition model) subclasses this and overrides the step that differs, rather
@@ -110,7 +115,7 @@ class VeOmniModelRuntime:
     model_name: str
     model: Optional[torch.nn.Module] = None
     model_config: PretrainedConfig = PretrainedConfig()
-    train: "TrainingArguments"
+    train_args: "TrainingArguments"
     optimizer: Optional["Optimizer"] = None
     lr_scheduler: Optional["LRScheduler"] = None
     # Class-level so __getattr__ never fires for them before the build runs.
@@ -119,9 +124,8 @@ class VeOmniModelRuntime:
     checkpoint: Optional["ModelCheckpointManager"] = None
     tokenizer: Optional[Any] = None
     processor: Optional[Any] = None
-    chat_template_name: Optional[str] = None
     chat_template: Optional["ChatTemplate"] = None
-    model_assets: List[Any] = []
+    model_assets: Optional[List[Any]] = None
 
     def __init__(
         self,
@@ -129,12 +133,11 @@ class VeOmniModelRuntime:
         model_name: str = "base",
         *,
         train: "TrainingArguments",
-        chat_template_name: Optional[str] = None,
     ):
         self.args = args
         self.model_name = model_name
-        self.train = train
-        self.chat_template_name = chat_template_name
+        self.train_args = train
+        self.model_assets = []
         self.setup()
         with use_parallel_state(self.model_name):
             self._build_model()
@@ -166,9 +169,16 @@ class VeOmniModelRuntime:
         Its own by default. A composed runtime whose wrap happens one level up
         overrides this so mesh and init follow the owner of the wrap rather than
         the model's local overlay (see
-        :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime`).
+        :class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime`).
         """
         return self.args.accelerator
+
+    def train(self, mode: bool = True):
+        """Forward ``nn.Module.train()``. Job-wide knobs live on :attr:`train_args`."""
+        model = self.model
+        if model is None:
+            raise AttributeError(f"{type(self).__name__}.model is not built yet.")
+        return model.train(mode)
 
     def setup(self) -> None:
         """Build this model's device mesh and register it under :attr:`model_name`.
@@ -193,6 +203,24 @@ class VeOmniModelRuntime:
         return get_parallel_state_by_name(self.model_name)
 
     @property
+    def unwrapped_module(self) -> torch.nn.Module:
+        """The :class:`~torch.nn.Module`, peeling ``DistributedDataParallel`` if present.
+
+        FSDP2 shards in place, so this is :attr:`model` itself. DDP wraps, and
+        capability hooks (``get_position_id_func``, collate metadata, fused
+        ``loss_function``) live on the inner module — :meth:`__getattr__` does
+        not find them on the wrapper, and a write through the handle would land
+        on the handle, not the module.
+        """
+        model = self.model
+        if model is None:
+            raise AttributeError(f"{type(self).__name__}.model is not built yet.")
+        inner = getattr(model, "module", None)
+        if isinstance(inner, torch.nn.Module):
+            return inner
+        return model
+
+    @property
     def skip_hf_weight_load(self) -> bool:
         """Whether the initial HF weight materialization can be skipped.
 
@@ -202,7 +230,12 @@ class VeOmniModelRuntime:
         """
         from ..utils.checkpoint_utils import should_skip_hf_weight_load
 
-        return should_skip_hf_weight_load(self.train.checkpoint.load_path, self.args.lora_config)
+        return should_skip_hf_weight_load(self.train_args.checkpoint.load_path, self.args.lora_config)
+
+    @property
+    def weights_path(self) -> Optional[str]:
+        """Checkpoint the initial weights are read from."""
+        return self.args.model_path
 
     def _build_model(self) -> None:
         """Meta-init the model from its config via the registry-aware loader."""
@@ -224,7 +257,7 @@ class VeOmniModelRuntime:
         """Load the preprocessor this model reads its inputs through.
 
         Also assembles :attr:`model_assets`, the sidecars an export writes beside
-        this model's weights, and :attr:`chat_template` when the job named one.
+        this model's weights, and :attr:`chat_template` when this model named one.
         The config is always among the sidecars; the preprocessor joins it if
         there was one to load. The chat template is not in that list and is not
         written onto the tokenizer: it is a data-layout choice, so an export
@@ -258,7 +291,7 @@ class VeOmniModelRuntime:
         do, and the template how a *conversation* becomes a training sample —
         including the assistant-only label mask that no jinja can express. A
         trainer therefore never assembles one; it reads :attr:`chat_template`
-        the way it reads :attr:`tokenizer`. Stays ``None`` when the job names
+        the way it reads :attr:`tokenizer`. Stays ``None`` when this model names
         none (plaintext, diffusion, a Qwen-Omni model that formats through its
         processor) and, with a warning, when a name *was* given but nothing
         loaded to build it from. A job that needs a template and named none
@@ -273,8 +306,13 @@ class VeOmniModelRuntime:
         path = self.args.tokenizer_path
         try:
             loaded = build_processor(path, **(self.args.processor_config or {}))
-        except Exception as e:  # noqa: BLE001 — surfaced later by whoever reads text
-            logger.warning_once(f"{type(self).__name__}: no preprocessor loaded from {path}: {e}.")
+        except OSError as e:
+            # A local snapshot that simply has no preprocessor is fine (toy
+            # configs, diffusion). A typo'd path or a hub/network failure is
+            # not — those must not leave tokenizer/processor silently None.
+            if not (isinstance(path, str) and os.path.exists(path)):
+                raise
+            logger.warning(f"{type(self).__name__}: no preprocessor loaded from {path}: {e}.")
             loaded = None
 
         if loaded is not None:
@@ -285,37 +323,32 @@ class VeOmniModelRuntime:
                 self.tokenizer = loaded
             self.model_assets.append(loaded)
 
-        if not self.chat_template_name:
+        if not self.args.chat_template:
             return
 
         preprocessor = self.processor or self.tokenizer
         if preprocessor is None:
             logger.warning_once(
-                f"{type(self).__name__}: chat template {self.chat_template_name!r} was requested but no "
+                f"{type(self).__name__}: chat template {self.args.chat_template!r} was requested but no "
                 "preprocessor loaded to build it from; leaving it unset."
             )
             return
 
         from ..data.chat_template import build_chat_template
 
-        self.chat_template = build_chat_template(self.chat_template_name, preprocessor)
+        self.chat_template = build_chat_template(self.args.chat_template, preprocessor)
 
-    def _build_parallelized_model(self) -> None:
-        """FSDP2/DDP-wrap the model and load its weights.
+    def _apply_async_activation_offload(self) -> None:
+        """Patch this model's offload targets for async activation offload, if enabled.
 
-        The wrap preserves ``requires_grad`` (the shard inherits it) and the
-        loader writes weights in place, so a freeze applied in
-        :meth:`_freeze_model_module` survives and is not re-asserted here.
+        Must run BEFORE FSDP2 sharding. Uses per-instance __call__ patching so
+        that async_save_on_cpu is OUTER to the checkpoint boundary pushed by
+        GradientCheckpointingLayer, matching MindSpeed-MM's GC+async offload
+        behavior: hidden_states inputs are offloaded to CPU (via
+        _NoopSaveInputs), while intermediate activations are handled by GC
+        recomputation (via _checkpoint_hook).
         """
-        args = self.args
-
-        # Apply async activation offload BEFORE FSDP2 sharding.
-        # Uses per-instance __call__ patching so that async_save_on_cpu is
-        # OUTER to the checkpoint boundary pushed by GradientCheckpointingLayer,
-        # matching MindSpeed-MM's GC+async offload behavior: hidden_states
-        # inputs are offloaded to CPU (via _NoopSaveInputs), while intermediate
-        # activations are handled by GC recomputation (via _checkpoint_hook).
-        offload_config = args.accelerator.offload_config
+        offload_config = self.args.accelerator.offload_config
         if offload_config.enable_async_activation:
             from ..distributed.async_offload import apply_async_activation_offload
 
@@ -325,12 +358,68 @@ class VeOmniModelRuntime:
                 host_cache_limit_bytes=int(offload_config.activation_offload_host_cache_limit_gb * 1024**3),
             )
 
+    def _recompute_context(self):
+        """The context every recomputation runs in; subclasses may override.
+
+        SeedOmni brings its module's ``ParallelState`` back for the recompute half
+        of a checkpointed block. Handing it to the policy (rather than arming
+        gradient checkpointing a second time) is what keeps the per-block
+        decisions applied by :func:`recompute_utils.apply_recompute_policy`.
+        """
+        return None
+
+    def _build_recompute_policy(self) -> "recompute_utils.RecomputePolicy":
+        """This run's recompute policy, from the accelerator config.
+
+        A runtime that requires a recompute context cannot run reentrant
+        checkpointing — torch takes no ``context_fn`` there — so the run would
+        recompute with the wrong parallel state current instead of failing. It is
+        rejected here rather than left to the first checkpointed block. With
+        checkpointing off there is no such call and ``enable_reentrant`` says
+        nothing, so the combination is only rejected while it can take effect.
+        """
+        gc_cfg = self.args.accelerator.gradient_checkpointing
+        if gc_cfg.enable and self._recompute_context() is not None and gc_cfg.enable_reentrant:
+            raise ValueError(
+                f"{type(self).__name__} recomputes inside its own context, which "
+                "model.accelerator.gradient_checkpointing.enable_reentrant=True cannot express: "
+                "reentrant checkpointing takes no context_fn. Set enable_reentrant=False."
+            )
+        return recompute_utils.build_policy(
+            enabled=gc_cfg.enable,
+            enable_reentrant=gc_cfg.enable_reentrant,
+            early_stop=gc_cfg.early_stop,
+            recompute_layers=gc_cfg.recompute_layers,
+            selective_recompute_layers=gc_cfg.selective_recompute_layers,
+            save_ops=gc_cfg.save_ops,
+            recompute_context=self._recompute_context(),
+            offload_active=self.args.accelerator.offload_config.enable_activation
+            or self.args.accelerator.offload_config.enable_async_activation,
+            compile_enabled=self.args.accelerator.torch_compile.enable,
+        )
+
+    def _build_parallelized_model(self) -> None:
+        """FSDP2/DDP-wrap the model and load its weights.
+
+        The wrap preserves ``requires_grad`` (the shard inherits it) and the
+        loader writes weights in place, so a freeze applied in
+        :meth:`_freeze_model_module` survives and is not re-asserted here.
+        """
+        args = self.args
+        if args.accelerator.fsdp_config.fsdp_mode == "eager":
+            # ``build_parallelize_model`` has no unwrapped branch, so an eager
+            # mode reaching it would be handed to DDP instead.
+            raise ValueError(
+                "model.accelerator.fsdp_config.fsdp_mode='eager' is only supported by SeedOmni "
+                "module inference (ModuleRuntime._init_eager_inference)."
+            )
+
+        self._apply_async_activation_offload()
+
         # Customized parallelize model.
         customized_parallelize_model_function = getattr(self.model, "build_parallelize_model", None)
         if callable(customized_parallelize_model_function):
-            parallelized_model = customized_parallelize_model_function(
-                weights_path=self.args.model_path, args=self.args
-            )
+            parallelized_model = customized_parallelize_model_function(weights_path=self.weights_path, args=self.args)
             if parallelized_model is not None:
                 self.model = parallelized_model
                 self.model.train()
@@ -355,9 +444,14 @@ class VeOmniModelRuntime:
         skip_hf_weight_load = self.skip_hf_weight_load
         if skip_hf_weight_load:
             logger.info_rank0(
-                f"Checkpoint resume enabled (load_path={self.train.checkpoint.load_path}); "
+                f"Checkpoint resume enabled (load_path={self.train_args.checkpoint.load_path}); "
                 "skipping HF weight materialization before checkpoint restore."
             )
+
+        # Recomputation strategy for this run: which blocks at the end of the stack
+        # recompute, and how many of those run SAC.
+        gc_cfg = args.accelerator.gradient_checkpointing
+        recompute_policy = self._build_recompute_policy()
 
         from ..distributed import torch_parallelize
         from ..distributed.torch_compile import CompileConfig
@@ -368,14 +462,18 @@ class VeOmniModelRuntime:
         self.model = torch_parallelize.build_parallelize_model(
             self.model,
             init_device=args.accelerator.init_device,
-            weights_path=args.model_path,
+            weights_path=self.weights_path,
             should_skip_hf_weight_load=skip_hf_weight_load,
             enable_reshard_after_forward=args.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.accelerator.fsdp_config.mixed_precision,
-            enable_gradient_checkpointing=args.accelerator.gradient_checkpointing.enable,
-            basic_modules=list(set(getattr(self.model, "_no_split_modules", None) or []) | set(args.basic_modules)),
-            enable_reentrant=args.accelerator.gradient_checkpointing.enable_reentrant,
-            early_stop=args.accelerator.gradient_checkpointing.early_stop,
+            enable_gradient_checkpointing=gc_cfg.enable,
+            # Configured classes only, in configuration order: parallelize reads
+            # the model's own ``_no_split_modules`` itself, and recompute needs
+            # this list unmerged and ordered so it can rank the block stacks.
+            basic_modules=list(args.basic_modules or []),
+            recompute_policy=recompute_policy,
+            enable_reentrant=gc_cfg.enable_reentrant,
+            early_stop=gc_cfg.early_stop,
             enable_forward_prefetch=args.accelerator.fsdp_config.forward_prefetch,
             enable_fsdp_offload=args.accelerator.fsdp_config.offload,
             fsdp_offload_pin_memory=args.accelerator.fsdp_config.offload_pin_memory,
@@ -383,6 +481,7 @@ class VeOmniModelRuntime:
             ep_sharded_stream_load=args.ep_sharded_stream_load,
             max_load_broadcast_size=args.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
+            low_precision_reduce_scatter_comm=args.accelerator.fsdp_config.low_precision_reduce_scatter_comm,
             compile_config=compile_config,
             **kwargs,
         )
@@ -419,9 +518,9 @@ class VeOmniModelRuntime:
             return
 
         # Customized LoRA model setup.
-        model_setup_lora = getattr(self.model, "setup_lora", None)
-        if callable(model_setup_lora):
-            customized_lora_model = model_setup_lora(lora_config)
+        customized_setup_lora_function = getattr(self.model, "setup_lora", None)
+        if callable(customized_setup_lora_function):
+            customized_lora_model = customized_setup_lora_function(lora_config)
             if customized_lora_model is not None:
                 self.model = customized_lora_model
                 logger.info_rank0("Setup customized LoRA model.")
@@ -542,9 +641,9 @@ class VeOmniModelRuntime:
         Part of the build like every other step: a model that came back from
         construction unable to save itself would be half-built.
         """
-        from .checkpoint_manager import ModelCheckpointManager
+        from .checkpoint import ModelCheckpointManager
 
-        self.checkpoint = ModelCheckpointManager(self, self.train.checkpoint)
+        self.checkpoint = ModelCheckpointManager(self)
 
     def load(self) -> None:
         """Restore this model and its optimizer from the configured load path.
@@ -558,16 +657,39 @@ class VeOmniModelRuntime:
         """Write this model's resumable checkpoint for ``state.global_step``."""
         self.checkpoint.save_dcp(state)
 
+    def extra_state(self) -> Dict[str, Any]:
+        """Model-bound state to persist beside the weights.
+
+        Models with extra state (e.g. the DiT condition model's noise/timestep
+        generator) contribute it here. The checkpoint manager merges the result
+        into the model's extra_state blob. Default: nothing.
+        """
+        return {}
+
+    def load_extra_state(self, extra_state: Dict[str, Any]) -> None:
+        """Restore what :meth:`extra_state` produced. Default: nothing."""
+        return
+
     def save_hf_or_lora(self, state: "TrainerState", stage: str = "step_end") -> None:
-        """Export this model in whichever format it was trained in."""
+        """Export this model in whichever format it was trained in.
+
+        An in-flight async DCP must be on disk before conversion reads it, so
+        this drains first. ``prepare_export`` waits again if it has to write
+        a DCP of its own.
+        """
+        self.checkpoint.wait_for_pending_save()
         self.checkpoint.save_hf_or_lora(state, stage=stage)
+
+    def wait_for_pending_save(self) -> None:
+        """Block until this model's in-flight async save is on disk, if any."""
+        self.checkpoint.wait_for_pending_save()
 
     def save_model_assets(self) -> None:
         """Write the tokenizer/processor/config sidecars that an export needs."""
         import torch.distributed as dist
 
-        from .module_utils import save_model_assets as write_model_assets
+        from .checkpoint.weights import save_model_assets as write_model_assets
 
-        if self.train.global_rank == 0:
-            write_model_assets(self.train.checkpoint.model_assets_dir, self.model_assets)
+        if self.train_args.global_rank == 0:
+            write_model_assets(self.checkpoint.assets_dir(), self.model_assets)
         dist.barrier()

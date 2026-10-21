@@ -33,11 +33,9 @@ from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmni
 from ..data import build_data_transform, build_dataloader
 from ..data.data_collator import DataCollator
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
-from ..models import build_foundation_model
-from ..models.auto import build_config
-from ..models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from ..models import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY, build_config, build_foundation_model
 from ..models.model_runtime import VeOmniModelRuntime
-from ..ops import apply_ops_config
+from ..ops.config import set_ops_config
 from ..utils import helper
 from ..utils.device import (
     get_device_type,
@@ -114,10 +112,11 @@ class DiTDataCollator(DataCollator):
     def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
         batch = defaultdict(list)
 
-        # batching features
+        # Fill keys missing from a sample with None so every column stays aligned with its samples.
+        keys = dict.fromkeys(key for feature in features for key in feature)
         for feature in features:
-            for key in feature.keys():
-                batch[key].append(feature[key])
+            for key in keys:
+                batch[key].append(feature.get(key))
 
         return batch
 
@@ -144,10 +143,6 @@ class DiTDataArguments(DataArguments):
     offline_embedding_save_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Path to save offline embeddings."},
-    )
-    shuffle: bool = field(
-        default=True,
-        metadata={"help": "Whether or not to shuffle the dataset."},
     )
     data_transform: Optional[str] = field(
         default="dit_online",
@@ -190,14 +185,6 @@ class DiTModelRuntime(VeOmniModelRuntime):
 
     condition_model: PreTrainedModel = None
 
-    @property
-    def training_task(self) -> str:
-        return self.train.training_task
-
-    @property
-    def trains_the_dit(self) -> bool:
-        return self.training_task in ("offline_training", "online_training")
-
     def _build_model(self):
         logger.info_rank0("Build model")
         args: DiTModelArguments = self.args
@@ -205,13 +192,13 @@ class DiTModelRuntime(VeOmniModelRuntime):
         # ``model_class._from_config``, not ``build_foundation_model``) sees a
         # populated ops singleton / LOSS_MAPPING. ``build_foundation_model``
         # below will re-apply the same config — that call is idempotent.
-        apply_ops_config(args.ops_implementation)
+        set_ops_config(args.ops_implementation)
         dit_config = build_config(args.config_path, **args.model_config)
         self.model_config = dit_config
         logger.info_rank0(f"Detected DiT model type: {dit_config.model_type}.")
         self._build_condition_model(dit_config.condition_model_type)
-        if self.trains_the_dit:
-            logger.info_rank0(f"Task: {self.training_task}, prepare dit model.")
+        if self.train_args.training_task != "offline_embedding":
+            logger.info_rank0(f"Task: {self.train_args.training_task}, prepare dit model.")
             self.model = build_foundation_model(
                 config_path=args.config_path,
                 weights_path=args.model_path,
@@ -223,18 +210,18 @@ class DiTModelRuntime(VeOmniModelRuntime):
             self.model_config = getattr(self.model, "config", None)
         else:
             self.model = None
-            logger.info_rank0(f"Task: {self.training_task}, dit model is not prepared.")
+            logger.info_rank0(f"Task: {self.train_args.training_task}, dit model is not prepared.")
 
     def _build_condition_model(self, condition_model_type: str) -> None:
         args: DiTModelArguments = self.args
         config_class = MODEL_CONFIG_REGISTRY[condition_model_type]()
         condition_cfg = config_class.from_pretrained(
             args.condition_model_path,
-            seed=self.train.seed,  # seed for randn noise and scheduler
+            seed=self.train_args.seed,  # seed for randn noise and scheduler
             **args.condition_model_cfg,
         )
         model_class = MODELING_REGISTRY[condition_model_type]()
-        if self.training_task == "offline_training":
+        if self.train_args.training_task == "offline_training":
             self.condition_model = model_class._from_config(condition_cfg, meta_init=True)
             logger.info_rank0("Condition model loaded with empty weights.")
         else:
@@ -245,12 +232,39 @@ class DiTModelRuntime(VeOmniModelRuntime):
     def _freeze_model_module(self):
         self.condition_model.requires_grad_(False)
 
-        if self.trains_the_dit:
+        if self.train_args.training_task != "offline_embedding":
             super()._freeze_model_module()
+
+    def extra_state(self) -> dict[str, Any]:
+        """Model-bound state: the condition model's noise/timestep generator."""
+        rng_state_dict = getattr(self.condition_model, "rng_state_dict", None)
+        if (
+            self.condition_model is not None
+            and rng_state_dict is None
+            and getattr(self.condition_model, "generator", None) is not None
+        ):
+            logger.warning_rank0(
+                "Condition model owns a ``generator`` but exposes no ``rng_state_dict``; "
+                "its noise/timestep stream will not be restored across a resume."
+            )
+        return {} if rng_state_dict is None else {"condition_model_rng_state": rng_state_dict()}
+
+    def load_extra_state(self, extra_state: dict[str, Any]) -> None:
+        condition_model_rng_state = extra_state.get("condition_model_rng_state")
+        if condition_model_rng_state is None:
+            return
+        loader = getattr(self.condition_model, "load_rng_state_dict", None)
+        if loader is None:
+            logger.warning_rank0(
+                "Checkpoint carries condition-model RNG state but the model cannot restore it; "
+                "the resumed run may replay its initial noise stream."
+            )
+        else:
+            loader(condition_model_rng_state)
 
     def _build_parallelized_model(self) -> None:
         """``offline_embedding`` builds no DiT, so there is nothing to wrap."""
-        if self.trains_the_dit:
+        if self.train_args.training_task != "offline_embedding":
             super()._build_parallelized_model()
 
     def _build_model_assets(self) -> None:
@@ -260,24 +274,28 @@ class DiTModelRuntime(VeOmniModelRuntime):
         exporting: ``offline_embedding`` builds no DiT at all, it writes cached
         condition embeddings, which need no model sidecars.
         """
-        self.model_assets = [self.model_config] if self.trains_the_dit else []
+        self.model_assets = [self.model_config] if self.train_args.training_task != "offline_embedding" else []
 
     def _build_optimizer(self, param_groups=None) -> None:
         """``offline_embedding`` trains nothing, so there is nothing to optimize."""
-        if self.trains_the_dit:
+        if self.train_args.training_task != "offline_embedding":
             super()._build_optimizer(param_groups=param_groups)
 
     def load(self) -> None:
-        if self.trains_the_dit:
+        if self.train_args.training_task != "offline_embedding":
             super().load()
 
     def save_dcp(self, state) -> None:
-        if self.trains_the_dit:
+        if self.train_args.training_task != "offline_embedding":
             super().save_dcp(state)
 
     def save_hf_or_lora(self, state, stage: str = "step_end") -> None:
-        if self.trains_the_dit:
+        if self.train_args.training_task != "offline_embedding":
             super().save_hf_or_lora(state, stage=stage)
+
+    def save_model_assets(self) -> None:
+        if self.train_args.training_task != "offline_embedding":
+            super().save_model_assets()
 
 
 class DiTTrainer:
@@ -308,31 +326,25 @@ class DiTTrainer:
         self.base.model = self._build_model_runtime()
         self.base.LOG_SAMPLE = args.data.log_sample
 
-        # rewrite _build_data_transform, build data transform for offline or online dit data
-        self._build_data_transform()
+        with use_parallel_state(self.base.model.parallel_state):
+            # rewrite _build_data_transform, build data transform for offline or online dit data
+            self._build_data_transform()
+            # rewrite _build_dataset, init offline_embedding_saver after build_dataset
+            self._build_dataset()
+            # Do not use maincollator in dit training
+            # self.base._build_collate_fn()
+            # rewrite _build_dataloader, build dataloader only on sp_rank_0 to save memory
+            self._build_dataloader()
 
-        # rewrite _build_dataset, init offline_embedding_saver after build_dataset
-        self._build_dataset()
-
-        # Do not use maincollator in dit training
-        # self.base._build_collate_fn()
-
-        # rewrite _build_dataloader, build dataloader only on sp_rank_0 to save memory
-        self._build_dataloader()
-
-        if self.trains_the_dit:
+        if self.training_task != "offline_embedding":
             self.base._build_lr_scheduler()
-            self.base._build_training_context()
+            self.base._build_training_context(self.base.model)
 
         self.base._init_callbacks()
 
     @property
     def condition_model(self) -> PreTrainedModel:
         return self.base.model.condition_model
-
-    @property
-    def trains_the_dit(self) -> bool:
-        return self.base.model.trains_the_dit
 
     def _build_model_runtime(self) -> DiTModelRuntime:
         """Build (and own) this job's DiT. Override to swap in another runtime."""
@@ -343,7 +355,6 @@ class DiTTrainer:
         # registers ParallelState("base") before seed
         self.base.device = self.base._setup(args)
         args.train.dyn_bsz = False
-        args.train.micro_batch_size = 1
         # dataloader_batch_size was computed in __post_init__ when dyn_bsz was still True
         # (default), so it was set to 1. Recompute now that dyn_bsz=False.
         args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
@@ -354,17 +365,16 @@ class DiTTrainer:
             else:
                 self.offline_embedding_save_dir = args.data.offline_embedding_save_dir
 
-            args.data.drop_last = False
-            args.data.shuffle = False
+            args.data.dataloader.drop_last = False
+            args.data.dataloader.shuffle = False
             args.train.checkpoint.save_epochs = 0
             args.train.checkpoint.save_hf_weights = False
-            # No gradient accumulation needed; process one sample per step to
-            # avoid broadcast_object_list serialising all micro-batches at once
-            # which can OOM CPU memory with large video data.
-            args.train.global_batch_size = get_parallel_state().dp_size
-            args.train.dataloader_batch_size = 1
+            # Keep one microbatch per step to limit video broadcast memory; embedding needs no accumulation.
+            args.train.global_batch_size = args.train.micro_batch_size * get_parallel_state().dp_size
+            args.train.dataloader_batch_size = args.train.micro_batch_size
+            args.train.gradient_accumulation_steps = 1
             logger.info_rank0(
-                f"Task offline_embedding. Drop last: {args.data.drop_last}, shuffle: {args.data.shuffle}"
+                f"Task offline_embedding. Drop last: {args.data.dataloader.drop_last}, shuffle: {args.data.dataloader.shuffle}"
             )
             args.train.num_train_epochs = 1
 
@@ -404,7 +414,8 @@ class DiTTrainer:
                     math.ceil(self.base.train_dataset.data_len / args.train.global_batch_size)
                     * args.train.global_batch_size
                 )
-                self.base.train_dataset.data_len = padded_len
+                # Keep the source length intact for MappingDataset's repeated-index mapping.
+                self.base.train_dataset = torch.utils.data.Subset(self.base.train_dataset, range(padded_len))
                 args._train_steps = padded_len // dp_size // args.train.dataloader_batch_size
                 self.base.train_steps = args.train_steps
             else:
@@ -450,6 +461,7 @@ class DiTTrainer:
                 persistent_workers=args.data.dataloader.persistent_workers,
                 in_order=args.data.dataloader.in_order,
                 seed=args.train.seed,
+                shuffle=args.data.dataloader.shuffle,
                 collate_fn=DiTDataCollator(),
                 save_steps=args.train.checkpoint.save_steps,
             )
@@ -525,7 +537,7 @@ class DiTTrainer:
         with torch.no_grad():
             micro_batch = self.condition_model.process_condition(**micro_batch)
 
-        with use_parallel_state("base"), self.base.model_fwd_context:
+        with use_parallel_state(self.base.model.parallel_state), self.base.model_fwd_context:
             outputs = self.base.model(**micro_batch)
 
         loss: torch.Tensor
@@ -533,7 +545,7 @@ class DiTTrainer:
         # DiT postforward does not read ambient ParallelState.
         loss, loss_dict = self.postforward(outputs, micro_batch)
 
-        with use_parallel_state("base"), self.base.model_bwd_context:
+        with use_parallel_state(self.base.model.parallel_state), self.base.model_bwd_context:
             loss.backward()
 
         del micro_batch
@@ -543,7 +555,7 @@ class DiTTrainer:
         self.base.state.global_step += 1
 
         # SP broadcast of micro_batches
-        with use_parallel_state("base"):
+        with use_parallel_state(self.base.model.parallel_state):
             if get_parallel_state().sp_enabled:
                 if get_parallel_state().sp_rank == 0:
                     micro_batches = next(data_iterator)
@@ -560,7 +572,7 @@ class DiTTrainer:
             else:
                 micro_batches = next(data_iterator)
 
-        self.base._reset_async_activation_offload_if_enabled()
+        self.base._reset_async_activation_offload_if_enabled(self.base.model)
         self.on_step_begin(micro_batches=micro_batches)
 
         self.base.sync_before_train_step()

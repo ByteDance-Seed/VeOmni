@@ -1,4 +1,4 @@
-# VeOmni training / inference config for OmniModel V2 - BAGEL-7B-MoT.
+# VeOmni training / inference config for OmniModel - BAGEL-7B-MoT.
 
 model:
   model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
@@ -55,7 +55,6 @@ data:
   multisource_datasets_type: veomni_weighted_multisource
   # Iterable has no __len__; train_steps = ceil(train_sample / global_batch_size).
   train_sample: 1000000
-  chat_template: default
   dataloader:
     type: native
     num_workers: 4

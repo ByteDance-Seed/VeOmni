@@ -141,16 +141,17 @@ The Trainer uses a callback system to decouple logging, checkpointing, and evalu
 
 VeOmni includes several built-in callbacks:
 
-- **[EnvironMeterCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/trace_callback.py)**: Logs system metrics (MFU, FLOPs, memory usage).
+- **[EnvironMeterCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/trace_callback.py)**: Logs system metrics (MFU, FLOPs, memory usage). Memory metrics describe the worst rank: device and host used memory / usage are the max over ranks, available host memory the min.
+- **[OmniStepMetricsCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py)**: The `OmniTrainer` counterpart. Each SeedOmni module that mixes in `MetricMeterMixin` reports its own tokens (via `metric_meter_set_seqlens` in `pre_forward`, before any SP slice) and FLOPs (`estimate_flops`); `OmniEnvironMeter` sums the FLOPs into one MFU and logs tokens per module under `trace/<module>/`. MFU is omitted while no module is metered. See [Metric Meter](../seed_omni/mixins/metric_meter.md) for what a module implements.
 - **[TqdmCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/trace_callback.py)**: Displays a progress bar.
 - **[WandbTraceCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/trace_callback.py)**: Logs metrics to wandb.
 - **[ProfileTraceCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/trace_callback.py)**: Handles profiling.
 - **[ChannelLossCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/channel_loss_callback.py)**: Logs detached per-channel causal-LM loss metrics when `train.channel_loss.enable=true`.
 - **[CheckpointCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Saves resumable DCP checkpoints, exports HuggingFace / LoRA weights, and writes the config / tokenizer sidecars.
-- **[GlobalStateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/global_state_callback.py)**: Saves global_state (dataloader cursor, rng, meters) as `trainer_state_rank_{N}.pt`, separate from the DCP `lr_scheduler.pt`.
+- **[GlobalStateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/global_state_callback.py)**: Saves the job cursor per rank — the dataloader position as `loader/rank_{N}.pt`, the step counter, rng and meters as `extra_state/rank_{N}.pt` — separate from the model's `model/lr_scheduler.pt`. Runs last, and writes the step's `checkpoint_manifest.json`.
 - **[EvaluateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/evaluate_callback.py)**: Runs evaluation on the validation set.
 
-On-disk layout for DCP / scheduler / job cursor (current vs previous `extra_state/`): [Checkpoint layout](checkpoint.md).
+On-disk layout for weights, optimizer, scheduler and job cursor, and how a checkpoint from an earlier layout is still resumed: [Checkpoint layout](checkpoint.md).
 
 ### Custom Callbacks
 
@@ -177,10 +178,8 @@ To implement a specific training task (like VLM training), compose a `BaseTraine
 1. **`_build_model_runtime(self)`**:
    Return the runtime that owns this job's model. Auxiliary components — tokenizer, processor, chat template — are built there rather than on the trainer, so override `VeOmniModelRuntime._build_model_assets` on a runtime subclass if a model needs different ones.
    ```python
-   def _build_model_runtime(self) -> MyModelRuntime:
-       return MyModelRuntime(
-           self.args.model, "base", train=self.args.train, chat_template_name=self.args.data.chat_template
-       )
+    def _build_model_runtime(self) -> MyModelRuntime:
+        return MyModelRuntime(self.args.model, "base", train=self.args.train)
    ```
 
 2. **`VeOmniModelRuntime._freeze_model_module` / `_build_optimizer`**:

@@ -2,7 +2,8 @@
 
 The whole VQVAE-side hyper-parameters travel under ``vq_config`` — that
 mirrors the original :class:`transformers.JanusVQVAEConfig` schema so the
-``scripts/convert_model.py`` extractor can dump the field unchanged.
+``scripts/seed_omni/convert_model.py`` extractor can dump the field
+unchanged.
 
 ``freeze`` (default ``True``) matches the published Janus recipe — the
 module freezes only its inner VQVAE codec (``vqmodel``) and keeps the
@@ -14,11 +15,12 @@ after build); this config only carries the knob.
 
 from typing import Any, Dict, Optional
 
-from transformers import PretrainedConfig
 from transformers.models.janus.configuration_janus import JanusVQVAEConfig as _hfvqconfig
 
+from ...module_configuration_base import OmniModuleConfig
 
-class JanusVqvaeConfig(PretrainedConfig):
+
+class JanusVqvaeConfig(OmniModuleConfig):
     """Top-level config for the Janus VQVAE + generation head."""
 
     model_type = "janus_vqvae"

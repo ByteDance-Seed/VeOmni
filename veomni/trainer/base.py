@@ -60,7 +60,7 @@ from ..distributed.parallel_state import (
 )
 from ..distributed.torch_compile import mark_compile_step_begin
 from ..models.model_runtime import VeOmniModelRuntime
-from ..ops.batch_invariant_ops import set_batch_invariant_mode
+from ..ops.batch_invariant import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.device import (
     get_device_type,
@@ -193,9 +193,13 @@ class VeOmniIter:
         return {}
 
 
-def _resolve_offload_config(args) -> OffloadConfig:
-    """Return activation-offload config, or the disabled defaults if a stub omitted it."""
-    accelerator = getattr(getattr(args, "model", None), "accelerator", None)
+def _resolve_model_offload_config(model) -> OffloadConfig:
+    """Offload knobs live on this model's accelerator, not the job args.
+
+    ``model.args.accelerator`` must exist — a missing handle is a build bug,
+    not a reason to silently disable activation offload.
+    """
+    accelerator = model.args.accelerator
     config = getattr(accelerator, "offload_config", None)
     return config if config is not None else OffloadConfig()
 
@@ -258,9 +262,6 @@ class BaseTrainer(Stateful, ABC):
     collate_fn: DataCollator
     train_dataloader: DistributedDataloader
 
-    # Model
-    model: VeOmniModelRuntime = None
-
     # Training context
     model_fwd_context: Any
     model_bwd_context: Any
@@ -280,6 +281,28 @@ class BaseTrainer(Stateful, ABC):
     start_epoch: int = 0  # start epoch
     start_step: int = 0  # start step
 
+    @property
+    def model(self) -> VeOmniModelRuntime:
+        """The runtime this job trains.
+
+        Raises if unset so a composed trainer (DPO) cannot silently read the
+        class default ``None`` from a base method that still takes no explicit
+        runtime. Single-model trainers assign this during build; multi-model
+        trainers pass the runtime into those methods instead of binding it here.
+        """
+        try:
+            return self._model
+        except AttributeError:
+            raise AttributeError(
+                f"{type(self).__name__}.model is unset. Single-model trainers assign it "
+                "during build; a multi-model trainer must pass the runtime into "
+                "base methods explicitly."
+            ) from None
+
+    @model.setter
+    def model(self, value: VeOmniModelRuntime) -> None:
+        self._model = value
+
     def __init__(self, args: VeOmniArguments):
         """
         Initialize the trainer.
@@ -297,14 +320,17 @@ class BaseTrainer(Stateful, ABC):
         # Builds the model: meta-init, freeze, parallelize and optimizer all run
         # under the mesh the runtime registered, so nothing below needs a scope.
         self.model = self._build_model_runtime()
-        # build dataset and dataloader
-        self._build_data_transform()
-        self._build_dataset()
-        self._build_collate_fn()
-        self._build_dataloader()
+        # Collators capture SP from ambient ``get_parallel_state()``. The
+        # runtime's build scope has already exited, so re-enter this model's
+        # mesh rather than relying on it still being current.
+        with use_parallel_state(self.model.parallel_state):
+            self._build_data_transform()
+            self._build_dataset()
+            self._build_collate_fn()
+            self._build_dataloader()
         # The dataset fixes train_steps, which the schedule needs.
         self._build_lr_scheduler()
-        self._build_training_context()
+        self._build_training_context(self.model)
         self._init_callbacks()
 
     @staticmethod
@@ -385,7 +411,6 @@ class BaseTrainer(Stateful, ABC):
             self.args.model,
             model_name=model_name,
             train=self.args.train,
-            chat_template_name=self.args.data.chat_template,
         )
 
     def _build_lr_scheduler(self):
@@ -412,6 +437,7 @@ class BaseTrainer(Stateful, ABC):
             dataset_name=args.data.dataset_name,
             transform=self.data_transform,
             seed=args.train.seed,
+            shuffle=args.data.dataloader.shuffle,
             **asdict(args.data),
         )
         dataset_length = None if not hasattr(self.train_dataset, "__len__") else len(self.train_dataset)
@@ -454,20 +480,26 @@ class BaseTrainer(Stateful, ABC):
             **dataloader_kwargs,
         )
 
-    def _build_training_context(self):
-        """Build training context for distributed training."""
-        offload_config = _resolve_offload_config(self.args)
+    def _build_training_context(self, model) -> None:
+        """Build fwd/bwd contexts from this model's offload config.
 
-        # Async activation offload uses per-module saved_tensors_hooks (applied
-        # before FSDP sharding), so the global fwd/bwd contexts are nullcontext.
+        Async activation offload uses per-module ``saved_tensors_hooks`` (applied
+        before FSDP sharding), so the trainer-level contexts are ``nullcontext``.
+        Sync offload still wraps the step in ``saved_tensors_hooks``; its knobs
+        live on the runtime, not the job args.
+        """
+        accelerator = model.args.accelerator
+        offload_config = _resolve_model_offload_config(model)
+
         if offload_config.enable_async_activation:
             from contextlib import nullcontext
 
             self.model_fwd_context, self.model_bwd_context = nullcontext(), nullcontext()
             return
+        enable_gc = bool(accelerator.gradient_checkpointing.enable)
         self.model_fwd_context, self.model_bwd_context = build_activation_offloading_context(
             offload_config.enable_activation,
-            self.args.model.accelerator.gradient_checkpointing.enable,
+            enable_gc,
             offload_config.activation_gpu_limit,
         )
 
@@ -528,6 +560,18 @@ class BaseTrainer(Stateful, ABC):
     def save_hf_or_lora(self, state: TrainerState, stage: str = "step_end") -> None:
         """Export this job's weights in whichever format the model was trained in."""
         self.model.save_hf_or_lora(state, stage=stage)
+
+    def wait_for_pending_save(self) -> None:
+        """Drain this job's in-flight async checkpoint writes, if any."""
+        self.model.wait_for_pending_save()
+
+    def save_model_assets(self) -> None:
+        """Write this job's tokenizer/config sidecars.
+
+        The fan-out is the point: a trainer holding a second model extends this
+        to export both, and the callback that triggers it keeps knowing only *when*.
+        """
+        self.model.save_model_assets()
 
     def on_train_begin(self):
         for callback in self._callbacks:
@@ -640,18 +684,18 @@ class BaseTrainer(Stateful, ABC):
                 channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
             )
             with (
-                use_parallel_state("base"),
+                use_parallel_state(self.model.parallel_state),
                 self.model_fwd_context,
                 set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
                 channel_forward_context,
             ):
                 outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
-            with use_parallel_state("base"):
+            with use_parallel_state(self.model.parallel_state):
                 loss, loss_dict, aux_metrics = self.postforward(outputs, micro_batch)
 
             with (
-                use_parallel_state("base"),
+                use_parallel_state(self.model.parallel_state),
                 self.model_bwd_context,
                 set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
             ):
@@ -687,9 +731,9 @@ class BaseTrainer(Stateful, ABC):
             elif micro_step == num_micro_steps - 1:
                 model.set_requires_all_reduce(True)
 
-    def _reset_async_activation_offload_if_enabled(self):
-        if _resolve_offload_config(self.args).enable_async_activation:
-            reset_async_activation_offload(self.model)
+    def _reset_async_activation_offload_if_enabled(self, model) -> None:
+        if _resolve_model_offload_config(model).enable_async_activation:
+            reset_async_activation_offload(model)
 
     def sync_before_train_step(self):
         if self.args.train.sync_each_train_step:
@@ -703,7 +747,7 @@ class BaseTrainer(Stateful, ABC):
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
-        self._reset_async_activation_offload_if_enabled()
+        self._reset_async_activation_offload_if_enabled(self.model)
         self.on_step_begin(micro_batches=micro_batches)
 
         # Forward and backward for each micro batch

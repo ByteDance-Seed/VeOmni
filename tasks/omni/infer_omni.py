@@ -1,4 +1,4 @@
-"""SeedOmni V2 inference via the VeOmni runtime (split checkpoint + generation FSM).
+"""SeedOmni inference via the VeOmni runtime (split checkpoint + generation FSM).
 
 This is the **framework** inference path:
 
@@ -8,23 +8,48 @@ This is the **framework** inference path:
 * When every module is ``fsdp_mode: eager``, :class:`~veomni.trainer.omni.omni_inferencer.OmniInferencer`
   loads a composed :class:`~veomni.models.seed_omni.modeling_omni.OmniModel` from the split checkpoint.
 * When any module opts into FSDP2 / DDP / ExtraParallel, the handle becomes
-  :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`.
+  :class:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModelRuntime`.
 
 For **native eager** inference on a split checkpoint (simple process + generate, no
 VeOmni runtime / YAML launcher), use ``tasks/omni/infer_omni_native.py`` instead.
 
 Examples
 --------
-Single-process eager (default — ``resolve_model(for_inference=True)`` forces eager
-unless ``modules_infer_*.yaml`` overrides):
+Single-process eager (``build_omni_model_runtime_args(args, for_inference=True)``
+forces eager unless the ``modules:`` overlay pins another ``fsdp_mode``):
 
     python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml \\
         --model.model_config.infer_type vision_understanding \\
         --infer.prompt "What is in this image?" \\
-        --infer.image /path/to/image.jpg \\
+        --infer.images /path/to/image.jpg \\
         --infer.output_dir qwen3vl_out
 
-Distributed inference (override modules to FSDP2 / DDP in ``modules_infer_fsdp.yaml``):
+Media is decoded by the same fetchers the training transform uses, so a request
+carries the same metadata a training sample does (a clip's sampling rate, a
+video's frame timeline)::
+
+    --infer.images /path/to/image.jpg           # an image
+    --infer.audios /path/to/speech.wav          # standalone sound
+    --infer.videos /path/to/clip.mp4            # a clip
+
+``infer.mm_configs`` holds the decode knobs — the same free-form bag training
+spells ``data.mm_configs``, reaching the same fetchers, so a key means the same
+thing on either side. It is not inherited from the training config: state the
+decode budget an inference run wants. Like ``infer.generation_kwargs``, set a
+group of them in the launcher YAML and override one on the command line with a
+dotted flag. A clip with sound is one entry in ``videos`` plus the flag, never
+also an entry in ``audios``, since the two streams share a timeline the backbone
+interleaves::
+
+    infer:
+      videos: [/path/to/clip.mp4]
+      mm_configs:
+        use_audio_in_video: true
+        fps: 2.0
+
+    --infer.mm_configs.fps 4.0                # overrides just that key
+
+Distributed inference (modules keep their DDP / FSDP2 wraps):
 
     bash train.sh tasks/omni/infer_omni.py \\
         configs/seed_omni/Janus/janus_1.3b/train/base.yaml \\
@@ -33,7 +58,8 @@ Distributed inference (override modules to FSDP2 / DDP in ``modules_infer_fsdp.y
         --infer.prompt "A cat on a windowsill"
 """
 
-from veomni.arguments import OmniArguments, parse_omni_args
+from veomni.arguments.omni_arguments_types import OmniArguments
+from veomni.arguments.omni_parser import parse_omni_args
 from veomni.trainer.omni import OmniInferencer
 
 

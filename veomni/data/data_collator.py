@@ -15,7 +15,7 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -28,6 +28,7 @@ from ..utils import logging
 from ..utils.constants import IGNORE_INDEX, MODALITY
 from ..utils.seqlen_pos_transform_utils import (
     coalesce_tail_padding_cu_seqlens,
+    packed_sequence_slices_from_cu_seqlens,
     prepare_fa_kwargs_from_position_ids,
     valid_seqlens_from_cu_seqlens,
 )
@@ -43,9 +44,6 @@ MetadataCollateFunc = Callable[[Dict[str, Any], Dict[str, int]], None]
 
 
 logger = logging.get_logger(__name__)
-
-if TYPE_CHECKING:
-    from ..models.seed_omni.processing_omni import OmniProcessor
 
 _LINEAR_ATTN_TAIL_PADDING_LENGTH = "_linear_attn_tail_padding_length"
 
@@ -65,8 +63,9 @@ def add_flash_attention_kwargs_from_position_ids(
 
     Args:
         batch: The batch dictionary containing position_ids. Will be modified in-place to add
-               cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k, and
-               linear_attn_cu_seq_lens_q. When ``linear_attn_tail_padding_length > 0``,
+               cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k,
+               linear_attn_cu_seq_lens_q, packed_sequence_slices, and
+               attention_mask_is_all_ones. When ``linear_attn_tail_padding_length > 0``,
                also stores ``tail_padding_length`` (0-d ``torch.int32`` tensor) so
                downstream valid-seqlens helpers can strip the coalesced pad segment and
                distributed/PP stages preserve the metadata.
@@ -102,6 +101,18 @@ def add_flash_attention_kwargs_from_position_ids(
     batch["max_length_q"] = max_length_q
     batch["max_length_k"] = max_length_k
     batch["linear_attn_cu_seq_lens_q"] = cu_seq_lens_q
+    # Slice conversion is host-side. Compile/GPU callers may already have moved
+    # ``cu_seq_lens_q``; copy rather than reject, matching DSV4's fallback.
+    host_cu = cu_seq_lens_q if cu_seq_lens_q.device.type == "cpu" else cu_seq_lens_q.detach().cpu()
+    batch["packed_sequence_slices"] = packed_sequence_slices_from_cu_seqlens(host_cu)
+    attention_mask = batch.get("attention_mask")
+    if not isinstance(attention_mask, torch.Tensor):
+        batch["attention_mask_is_all_ones"] = True
+    elif attention_mask.device.type == "cpu":
+        batch["attention_mask_is_all_ones"] = bool(attention_mask.all())
+    else:
+        # ``None`` leaves the device-side check to the consumer.
+        batch["attention_mask_is_all_ones"] = None
 
     return cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k
 
@@ -141,6 +152,7 @@ class DataCollateInfo:
 DEFAULT_DATA_COLLATE_INFO: Dict[str, DataCollateInfo] = {
     "input_ids": DataCollateInfo(-1, True, 0, 1),
     "labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
+    "mtp_labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
     "attention_mask": DataCollateInfo(-1, False, 1, 1),
     "position_ids": DataCollateInfo(-1, False, 0, 1),
     "pixel_values": DataCollateInfo(0, True, 0, 4),
@@ -454,6 +466,7 @@ class MainCollator(DataCollator):
     """
 
     def __post_init__(self):
+        """Build the ordered collation pipeline and merge model-specific field rules."""
         self.preforward_pipeline = []
         self.collate_infos: Dict[str, DataCollateInfo] = {}
 
@@ -559,84 +572,3 @@ class PackingPostCollator(DataCollator):
         logits_list = logits.split(seq_lens, dim=0)
         outputs.logits = logits_list
         return outputs
-
-
-@dataclass
-class SeedOmniCollator(DataCollator):
-    """List-only collator for the SeedOmni V2 ``conversation_list`` schema.
-
-    Pairs with ``data_type: seedomni`` (see
-    ``veomni/data/seed_omni/seedomni_transform.py``) which emits
-    per-sample ``{"conversation_list": [ConversationItem, ...]}``.
-    This collator turns ``N`` such dicts into a single batched dict
-    ``{"conversation_list": [[ConversationItem, ...], ...]}`` plus any extra
-    keys present in the samples (passed through unchanged as a per-sample list).
-
-    No stacking, no padding, no sequence-parallel slicing — the V2 design
-    contract puts all of that inside model modules' ``pre_forward``,
-    where each module knows which fields it owns and how to slice them.
-    The data layer's job stops at "list of per-sample dicts → dict of
-    per-sample lists".
-
-    The collator is intentionally **agnostic** about the exact set of
-    keys present: any sample-level key is gathered into a list of length
-    ``batch_size``.  This keeps the schema open for later extensions
-    (precomputed features, offline-embedding payloads, etc.) without
-    needing to update the collator.
-
-    Image / audio tensors inside ``conversation_list`` items keep their
-    original shapes — different samples may carry images of different
-    resolutions, so the values **must not** be torch.stacked here.
-    Vision encoders (e.g. ``JanusSiglip``) collate them in their own
-    ``pre_forward`` after their image processor has matched shapes.
-
-    Example::
-
-        collator = SeedOmniCollator(processor=processor)
-        batch = collator([
-            {"conversation_list": [{"type": "text", "value": "hi", ...}]},
-            {"conversation_list": [{"type": "image", "value": <Tensor>, ...}]},
-        ])
-        # batch == {"conversation_list": [[ConversationItem(...)], ...]}
-
-    ``processor`` is an :class:`~veomni.models.seed_omni.processing_omni.OmniProcessor` built
-    via :meth:`~veomni.models.seed_omni.processing_omni.OmniProcessor.from_config` from the
-    active graph modules' config (see ``OmniTrainer._build_train_dataloader``). Its preprocessor
-    chain runs, in order, over the grouped batch (``conversation_list`` plus any extra
-    keys) so the heavy per-module CPU input-prep (tokenize / image normalize, and
-    for Janus packed training the packed-tensor write-back) executes inside the
-    DataLoader worker and overlaps with GPU compute via prefetch, instead of
-    blocking the main process inside each module's ``pre_forward``.
-    """
-
-    processor: "OmniProcessor"
-
-    def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-        if not features:
-            raise ValueError("SeedOmniCollator received an empty feature list")
-
-        # Gather keys across all samples.  Strict alignment (every sample
-        # must share the same key set) — silent dropping of fields would
-        # be a debugging nightmare.
-        first_keys = set(features[0].keys())
-        for i, f in enumerate(features[1:], start=1):
-            if set(f.keys()) != first_keys:
-                raise ValueError(
-                    f"SeedOmniCollator: sample {i} has keys {set(f.keys())} but sample 0 has {first_keys}; "
-                    f"all samples in a batch must carry the same key set."
-                )
-        if "conversation_list" not in first_keys:
-            raise KeyError(
-                "SeedOmniCollator: every sample must have a 'conversation_list' key "
-                "(produced by the seedomni data_transform); "
-                f"got {first_keys}"
-            )
-
-        batch = {key: [f[key] for f in features] for key in first_keys}
-
-        # Worker-side CPU input-prep (tokenize / image normalize) over the grouped
-        # batch. Mutates items in place; the modules' thin pre_forward then only
-        # moves to device. Order is FIXED and SERIAL: ``config.modules:``
-        # declaration order (see :class:`OmniProcessor`).
-        self.processor.preprocess_batch(batch, inference=False)
-        return batch

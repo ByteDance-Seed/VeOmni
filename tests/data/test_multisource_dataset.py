@@ -1,12 +1,10 @@
 import argparse
 import copy
-import dataclasses
 import os
 import subprocess
 import sys
 import time
 from contextlib import nullcontext
-from dataclasses import field
 from functools import partial
 from typing import Any, Dict, List, Literal, cast
 from unittest.mock import patch
@@ -122,17 +120,9 @@ class TrainerTest(BaseTrainer):
 
         self.args.train.num_train_epochs = 3
 
-        # we have to add a shuffle field to the args because it does not have one,
-        # and we need it to control the behavior of HF datasets,
-        # because it is shuffled it will store samples in a buffer,
-        # and such a buffer will be en  which will be discarded during resuming,
-        # thus causing the resumed training to see different samples from the original training
-        shuffle_field = field(default=True)
-        shuffle_field.name = "shuffle"
-        shuffle_field.type = bool
-        shuffle_field._field_type = dataclasses._FIELD
-        self.args.data.__dataclass_fields__["shuffle"] = shuffle_field
-        self.args.data.shuffle = False
+        # The HF streaming shuffle buffer is not checkpointed, so a resumed run
+        # would see different samples from the original one.
+        self.args.data.dataloader.shuffle = False
         return device
 
     def _build_model_runtime(self):
@@ -193,7 +183,7 @@ class TrainerTest(BaseTrainer):
     def _build_lr_scheduler(self):
         self.model.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.model.optimizer, lambda _: 1.0)
 
-    def _build_training_context(self):
+    def _build_training_context(self, model=None):
         self.model_fwd_context = nullcontext()
         self.model_bwd_context = nullcontext()
 

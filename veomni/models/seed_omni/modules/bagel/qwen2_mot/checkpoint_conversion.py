@@ -17,7 +17,7 @@ import torch
 from transformers.conversion_mapping import register_checkpoint_conversion_mapping
 from transformers.core_model_loading import ConversionOps, WeightConverter
 
-from ......models.checkpoint_tensor_loading import ConvertedCheckpointTensor
+from ......models.checkpoint.convert import ConvertedCheckpointTensor
 
 
 _QKV_COMPONENTS = ("q", "k", "v")

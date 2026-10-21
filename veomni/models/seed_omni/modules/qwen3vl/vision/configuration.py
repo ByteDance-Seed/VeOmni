@@ -8,10 +8,12 @@ key for ``OMNI_CONFIG_REGISTRY`` / ``OMNI_MODEL_REGISTRY``.
 
 from typing import Any, Dict, Optional
 
-from transformers import PretrainedConfig, Qwen3VLVisionConfig
+from transformers import Qwen3VLVisionConfig
+
+from ...module_configuration_base import OmniModuleConfig
 
 
-class Qwen3VLVisionEncoderConfig(PretrainedConfig):
+class Qwen3VLVisionEncoderConfig(OmniModuleConfig):
     """Top-level config for the Qwen3-VL vision tower (ViT + patch merger + deepstack).
 
     Three optional knobs adapt the tower to a different LLM backbone (e.g.
@@ -30,7 +32,7 @@ class Qwen3VLVisionEncoderConfig(PretrainedConfig):
 
     model_type = "qwen3vl_vision"
     # Register the nested vision config so transformers propagates
-    # ``attn_implementation`` (e.g. veomni_flash_attention_2_with_sp) down to it —
+    # ``attn_implementation`` (e.g. veomni_flash_attention_2) down to it —
     # otherwise the inner ``Qwen3VLVisionModel`` silently falls back to SDPA and
     # breaks under sequence parallelism (the ViT's Ulysses all-to-all lives in the
     # flash-attention path; SDPA leaves the sliced patch chunk ungathered while the

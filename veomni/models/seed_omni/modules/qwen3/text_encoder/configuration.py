@@ -16,7 +16,8 @@ class Qwen3TextEncoderConfig(TextEncoderConfig):
       in the decode hidden-state assembly. When ``False`` the original text-only
       template is used verbatim. With it on, :meth:`Qwen3TextEncoder.freeze_model`
       also trains *only* the vision special-token embedding rows — their ids are
-      resolved from the module's own tokenizer, so no token-id list is configured.
+      resolved from the module's own tokenizer, so no token-id list is configured —
+      and ``configure_optimizer`` applies the module's weight decay to those rows only.
     """
 
     model_type = "qwen3_text_encoder"

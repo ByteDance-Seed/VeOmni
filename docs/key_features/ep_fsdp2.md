@@ -40,31 +40,31 @@ Let's take Qwen3-MoE-30B-A3B model for example, which has 128 experts, hidden di
 * Up projection: [128, 768, 2048]
 * Down projection: [128, 2048, 768]
 
-Next, let's understand how they are sharded by EP and FSDP2 in logical view.
+Next, let's examine how EP and FSDP2 shard them from a logical perspective.
 
-First consider a case of 2 x 8-GPU instances (16 GPUs in total), and we set FSDP2 size to 16 (always same as #GPU), EP size to 8. For clearity, we focus on down projection layer
+First, consider two 8-GPU instances (16 GPUs total). Set the FSDP2 size to 16 (always equal to the number of GPUs) and the EP size to 8. For clarity, focus on the down-projection layer.
 
-* Inside one instance, sharded by EP first -> [128/8=16, 2048, 768], assigned device mesh of [0, 1, 2, 3, 4, 5, 6, 7] for EP.
-    * Same on the other instance, which is assign with EP device mesh of [8, 9, 10, 11, 12, 13, 14, 15].
-* Since for rank 0 and 8, they hold the same partition of experts (first 16 experts), they become a FSDP2 group (FSDP degree of 2), sharded along dim-1 -> [16, 2048/2=1024, 768], assigned with FSDP2 device mesh of [0, 8].
-    * Same for other rank pairs that hold the same partition of experts.
+* In the first instance, EP shards the weights to [128/8=16, 2048, 768] and assigns ranks [0, 1, 2, 3, 4, 5, 6, 7] to the EP device mesh.
+    * The second instance uses the same sharding with EP device mesh [8, 9, 10, 11, 12, 13, 14, 15].
+* Ranks 0 and 8 hold the same expert partition (the first 16 experts), so they form an FSDP2 group with degree 2. FSDP2 shards dimension 1 to [16, 2048/2=1024, 768] on device mesh [0, 8].
+    * The same process applies to every other pair of ranks that holds the same expert partition.
 
 In summary,
 
-* For expert module, EP size x FSDP2 size = world size
-    * Logically they have 2-dim device mesh of [EP, EP_FSDP].
-* For non-expert module, since EP does not affect them, they only have FSDP2, where FSDP2 size = world size.
-    * Only 1-dim device mesh of [FSDP, ]
+* For an expert module, EP size x expert FSDP2 size = world size.
+    * Logically, the module uses a two-dimensional device mesh [EP, EP_FSDP].
+* For a non-expert module, EP does not apply, so FSDP2 size = world size.
+    * The module uses a one-dimensional device mesh [FSDP].
 
-At this step, you already understand how EP+FSDP2 is designed in VeOmni which is sufficient to setup the training! If you are not interested in the implementation details, you can skip the following sections.
+At this point, you understand enough of VeOmni's EP+FSDP2 design to set up training. Skip the following sections if you do not need the implementation details.
 
-The methods discussed in the following sections are transparent to the end users and automatically applied by VeOmni, without any additional efforts to configure.
+VeOmni applies the methods in the following sections automatically, without additional user configuration.
 
 ## Expert Parallelism Details
 
 > File: veomni/distributed/parallel_plan.py
 
-As a model-centric framework, VeOmni registers leaf expert weight keys, i.e, "fully qualified name" (fqn) in the model's definition as an attribute. (see `veomni/models/transformers/qwen3_moe/parallel_plan.py` for example.)
+As a model-centric framework, VeOmni registers each leaf expert weight's fully qualified name (FQN) as an attribute in the model definition. See `veomni/models/transformers/qwen3_moe/parallel_plan.py` for an example.
 
 In this way, each model exposes `get_parallel_plan()` method which returns a `ParallelPlan` containing an `ep_plan` dict. Keys are parameter FQN patterns that identify expert weights; values are `Shard(dim=...)` telling which tensor dimension is sharded across EP ranks (in this case always dim-0 to shard expert number).
 

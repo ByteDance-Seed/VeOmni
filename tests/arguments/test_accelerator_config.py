@@ -28,7 +28,6 @@ Run:
 
 import dataclasses
 import json
-import re
 
 import pytest
 
@@ -312,7 +311,7 @@ def test_index_mapping_is_parsed_once_across_modules_sharing_a_checkpoint(tmp_pa
     """Sibling omni modules routinely point at the same checkpoint."""
     _write_index(tmp_path, {"layer.weight": "model-00001-of-00002.safetensors"})
     parses = []
-    import veomni.models.checkpoint_tensor_loading as ctl
+    import veomni.models.checkpoint as ctl
 
     real = ctl.parse_fqn_to_index_mapping_from_json
     monkeypatch.setattr(ctl, "parse_fqn_to_index_mapping_from_json", lambda p: (parses.append(p), real(p))[1])
@@ -325,7 +324,7 @@ def test_index_mapping_is_parsed_once_across_modules_sharing_a_checkpoint(tmp_pa
 
 
 def test_index_mapping_is_not_read_until_asked_for(tmp_path, index_cache, monkeypatch):
-    import veomni.models.checkpoint_tensor_loading as ctl
+    import veomni.models.checkpoint as ctl
 
     monkeypatch.setattr(
         ctl,
@@ -399,22 +398,22 @@ def test_global_grad_clip_scope_is_accepted_now_that_omni_clip_implements_it():
 
 
 @pytest.mark.parametrize(
-    ("key", "moved_to"),
+    "key",
     [
-        ("init_device", "model.accelerator.init_device"),
-        ("broadcast_model_weights_from_rank0", "model.broadcast_model_weights_from_rank0"),
-        ("ep_sharded_stream_load", "model.ep_sharded_stream_load"),
-        ("gradient_checkpointing", "model.accelerator.gradient_checkpointing"),
-        ("torch_compile", "model.accelerator.torch_compile"),
-        ("accelerator", "model.accelerator"),
-        ("optimizer", "model.optimizer"),
+        "init_device",
+        "broadcast_model_weights_from_rank0",
+        "ep_sharded_stream_load",
+        "gradient_checkpointing",
+        "torch_compile",
+        "accelerator",
+        "optimizer",
     ],
 )
-def test_parser_rejects_a_key_that_used_to_live_on_train(key, moved_to, world_size):
+def test_parser_rejects_a_key_that_used_to_live_on_train(key, world_size):
     world_size(1)
     value = {"enable": True} if key in ("gradient_checkpointing", "torch_compile") else "meta"
 
-    with pytest.raises(ValueError, match=rf"train\.{key} has moved to {re.escape(moved_to)}"):
+    with pytest.raises(ValueError, match=rf"train\.{key} is not a field of TrainingArguments"):
         _instantiate_recursive(TrainingArguments, {key: value}, path="train")
 
 

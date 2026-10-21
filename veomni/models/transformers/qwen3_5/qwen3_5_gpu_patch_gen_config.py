@@ -12,15 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3_5 GPU/SP patched modeling generation.
+Patch configuration for Qwen3_5 VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config -o veomni/models/transformers/qwen3_5/generated --diff
 
-Language-model focused patches from qwen3_next example:
-1. Device-agnostic GatedDeltaNet init and varlen FLA forward.
-2. DecoderLayer forward with cu_seq_lens_q passthrough.
-3. Use VeOmni fused loss path in Qwen3_5ForConditionalGeneration.forward.
+Sequence parallel, vision, GDN, and fused loss call local VeomniOp.
 """
 
 from copy import copy
@@ -32,7 +29,9 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5CausalLMOutputWithPast,
@@ -40,26 +39,25 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Model,
     Qwen3_5ModelOutputWithPast,
     Qwen3_5RMSNormGated,
-    Qwen3_5TextModel,
-    Qwen3_5VisionModel,
+    Qwen3_5TextConfig,
     apply_mask_to_padding_states,
-    torch_chunk_gated_delta_rule,
 )
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, logging
+from transformers.utils import TransformersKwargs
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import sp_pad_and_slice
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
-from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.device import get_device_id
+from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import (  # noqa: F401  consumed by in-config dataclass + emitted forward
     FusedLinearAuxOutput,
     FusedLinearAuxOutputMixin,
 )
-
-
-logger = logging.get_logger(__name__)
 
 
 config = PatchConfig(
@@ -67,6 +65,7 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_5_gpu.py",
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
+config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
 
 
 @config.override_method(
@@ -108,98 +107,110 @@ config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
-config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
-# transformers 5.16 no longer imports the FLA / causal-conv1d symbols at module
-# import time: `causal_conv1d_fn` / `causal_conv1d_update` /
-# `torch_chunk_gated_delta_rule` / `torch_recurrent_gated_delta_rule` are now
-# module-level torch implementations decorated with
-# `@use_kernel_func_from_hub_with_fallback(...)`, `FusedRMSNormGated` and
-# `is_fast_path_available` are gone entirely. The previous `drop_import_names`
-# call plus the `<name> = None` post-import placeholders therefore have nothing
-# left to neutralise, and the placeholders would shadow-then-collide with the
-# upstream definitions (ruff F811). VeOmni's kernel selection still happens
-# through the OpSlot guards declared below and consumed in
-# `Qwen3_5GatedDeltaNet.__init__`.
-
-config.add_post_import_block(
-    """
-    # ── OpSlot declarations ──────────────────────────────────────────────────
-    # Bound at model-build time by _bind_veomni_ops() in auto.py. The three
-    # linear-attention slots replace the previous import-time
-    # `if FusedRMSNormGated is None ... else ...` /
-    # `chunk_gated_delta_rule or torch_chunk_gated_delta_rule` selection so the
-    # backend (eager / fla / flash_qla) is picked from
-    # OpsImplementationConfig instead of "is the library importable".
-    from veomni.ops.dispatch import OpSlot
-    veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
-    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-    veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
-    veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
-    veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
-    """
+config.add_import("veomni.utils.constants", names=["IGNORE_INDEX", "IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
+config.add_import(
+    "veomni.ops.config",
+    names=["resolve_op_impl"],
 )
-
-# True in GPU generated files, False in NPU. Read by qwen3_5_vision_model_forward
-# (Patch.5) to gate the host sync: the int hand-off to flash_attn_varlen_func
-# only pays off when Qwen3_5VisionAttention.forward has been patched to consume
-# the kwarg. Only the GPU patch configs register that override; the NPU
-# configs reuse the upstream HF body which recomputes max_seqlen itself and
-# would otherwise leak `vision_max_seqlen` into `attention_interface(**kwargs)`.
+config.drop_import_names(
+    "FusedRMSNormGated",
+    "causal_conv1d_fn",
+    "chunk_gated_delta_rule",
+    "fused_recurrent_gated_delta_rule",
+)
+config.add_import(
+    "veomni.models.utils.attention_utils",
+    names=["prepare_dense_attention_inputs"],
+)
+config.add_import(
+    "veomni.models.loss_utils",
+    names=["ForCausalLMLoss"],
+)
+# True when Qwen3_5VisionAttention.forward is patched to consume
+# ``vision_max_seqlen``. GPU and NPU both register that consumer.
 config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = True")
 
 
 # Dummy definitions for names that exist in the generated file's scope but not here.
 # The patchgen only extracts the function body; these are resolved at codegen time.
 Qwen3_5GatedDeltaNet = None
-causal_conv1d_update = None  # decode-only; upstream module-level torch impl
-torch_chunk_gated_delta_rule = None  # noqa: F811 — also imported above for the forward patch
-torch_recurrent_gated_delta_rule = None  # decode-only; upstream module-level torch impl
+causal_conv1d_update = None
+torch_recurrent_gated_delta_rule = None
 gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
 gather_outputs = None
 slice_input_tensor = None
-veomni_rms_norm = None  # OpSlot, declared in post-import block above
-veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
-veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
-veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
 # Names referenced by the patched Qwen3_5VisionAttention.forward; resolved at
 # codegen time from the imports already present in the generated modeling file.
 ALL_ATTENTION_FUNCTIONS = None
 eager_attention_forward = None
-apply_rotary_pos_emb_vision = None
 is_flash_attention_requested = None
-# Sentinel injected via add_post_import_block. True only in the GPU generated
-# files where Qwen3_5VisionAttention.forward is patched to consume
-# `vision_max_seqlen`. NPU configs inject False — see Patch.5 below.
+# Sentinel injected via add_post_import_block. True when
+# Qwen3_5VisionAttention.forward is patched to consume ``vision_max_seqlen``.
 _VEOMNI_VISION_ATTENTION_PATCHED = True
 
 
-# ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
-# Mirrors qwen3_5_moe's pattern: the slot binds to liger_rms_norm_qwen3_5
-# (registered for variant="qwen3_5") when rms_norm_implementation="liger_kernel"
-# and falls through to the original HF code otherwise. Replaces the previous
-# unconditional class swap to LigerRMSNormForQwen3Next so eager mode is honoured.
+# ── RMSNorm (always call local qwen3_5 VeomniOp) ─────────────────────────
+
+
+@config.override_method(
+    "Qwen3_5RMSNorm.__init__",
+    description="Construct a local rms_norm offset VeomniOp",
+)
+def qwen3_5_rmsnorm_init_patched(self, dim: int, eps: float = 1e-6) -> None:
+    nn.Module.__init__(self)
+    self.eps = eps
+    self.weight = nn.Parameter(torch.zeros(dim))
+    self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
 
 
 @config.override_method(
     "Qwen3_5RMSNorm.forward",
-    description="OpSlot guard for Liger fused RMSNorm (Qwen3.5 1+weight formulation)",
+    description="Always call the local rms_norm offset VeomniOp",
 )
 def qwen3_5_rmsnorm_forward_patched(self, x):
-    # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
-    if veomni_rms_norm.use_non_eager_impl:
-        return veomni_rms_norm(x, self.weight, self.eps)
-    # Original HF code below, unchanged.
-    output = self._norm(x.float())
-    # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
-    # See https://github.com/huggingface/transformers/pull/29402
-    output = output * (1.0 + self.weight.float())
-    return output.type_as(x)
+    return self.veomni_rms_norm(x, self.weight, eps=self.eps)
+
+
+@config.override_method(
+    "Qwen3_5MLP.__init__",
+    description="Construct a local swiglu_mlp VeomniOp",
+)
+def qwen3_5_mlp_init_patched(self, config: Qwen3_5Config, intermediate_size: int):
+    nn.Module.__init__(self)
+    self.config = config
+    self.hidden_size = config.hidden_size
+    self.intermediate_size = intermediate_size
+    self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+    self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+    self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+    self.act_fn = ACT2FN[config.hidden_act]
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+
+
+@config.override_method(
+    "Qwen3_5MLP.forward",
+    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+)
+def qwen3_5_mlp_forward_patched(self, x):
+    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+        return self.veomni_swiglu_mlp(
+            x,
+            self.gate_proj.weight,
+            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+            self.up_proj.weight,
+            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+            self.down_proj.weight,
+            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+        )
+    return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 @config.override_method(
     "Qwen3_5GatedDeltaNet.__init__",
-    description="OpSlot dispatch for FusedRMSNormGated, causal_conv1d, chunk_gated_delta_rule (Qwen3.5 GatedDeltaNet)",
+    description="Construct local GDN VeomniOps; keep Qwen3_5RMSNormGated for the weight",
 )
 def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: int):
     super().__init__()
@@ -214,6 +225,7 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
     self.conv_kernel_size = config.linear_conv_kernel_dim
     self.layer_idx = layer_idx
     self.activation = config.hidden_act
+    self.act = ACT2FN[config.hidden_act]
     self.layer_norm_epsilon = config.rms_norm_eps
 
     # QKV
@@ -231,45 +243,34 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
     # instantiate once and copy inv_dt in init_weights of PretrainedModel
     self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
 
-    # Lower bound kept away from 0 so log(A) never becomes -inf
     A = torch.empty(self.num_v_heads).uniform_(0.01, 16)
     self.A_log = nn.Parameter(torch.log(A))
 
-    # Modification: OpSlot dispatch for fused gated RMSNorm. The slot stores
-    # the FusedRMSNormGated *class* (see veomni.ops.kernels.gated_delta_rule),
-    # so calling it constructs a module with the fused kernel; eager falls
-    # through to upstream Qwen3_5RMSNormGated.
-    if veomni_rms_norm_gated.use_non_eager_impl:
-        self.norm = veomni_rms_norm_gated(
-            self.head_v_dim,
-            eps=self.layer_norm_epsilon,
-            activation=self.activation,
-            device=get_device_id(),
-            dtype=config.dtype if config.dtype is not None else torch.get_default_dtype(),
-        )
-    else:
-        self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+    self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+    self.veomni_rms_norm_gated = VeomniOp(
+        "rms_norm_gated",
+        "standard",
+        resolve_op_impl("rms_norm_gated_implementation"),
+    )
+    self.veomni_causal_conv1d = VeomniOp(
+        "causal_conv1d",
+        "standard",
+        resolve_op_impl("causal_conv1d_implementation"),
+    )
+    self.veomni_chunk_gated_delta_rule = VeomniOp(
+        "chunk_gated_delta_rule",
+        "standard",
+        resolve_op_impl("chunk_gated_delta_rule_implementation"),
+    )
 
     self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
-
     self.layer_type = config.layer_types[layer_idx]
 
-    # Modification: OpSlot dispatch for causal conv1d / chunk gated delta-rule.
-    # We freeze the resolved kernel (or None for eager) on the instance via
-    # `.bound_kernel()`; storing the OpSlot itself would couple the instance to
-    # the module-global slot, and a second model rebinding the slot with a
-    # different impl would silently switch this instance's kernel too.
-    # `eager` leaves causal_conv1d_fn = None (the varlen path then raises) and
-    # falls back to the torch chunk_gated_delta_rule, which `forward` rejects
-    # for varlen training; the decode-only `*_update` aliases are kept None
-    # because the precomputed-state path raises NotImplementedError anyway.
-    # transformers 5.16 dropped the `<fla_name> or <torch_fallback>` pairs:
-    # `causal_conv1d_update` / `torch_recurrent_gated_delta_rule` are now the
-    # upstream module-level torch implementations, so the `or` fallbacks (and
-    # the removed `is_fast_path_available` warning) no longer apply.
-    self.causal_conv1d_fn = veomni_causal_conv1d.bound_kernel()
+    # Transformers 5.16 exposes the decode fallbacks as module-level torch
+    # implementations instead of optional FLA imports. The precomputed-state
+    # branch below is still intentionally unsupported, but keep the attributes
+    # aligned with upstream for callers that inspect the module.
     self.causal_conv1d_update = causal_conv1d_update
-    self.chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel() or torch_chunk_gated_delta_rule
     self.recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
 
     self.in_proj_qkv = nn.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
@@ -385,28 +386,24 @@ def qwen3_5_gated_deltanet_forward_patched(
             mixed_qkv_t = mixed_qkv.transpose(1, 2)
             conv_state = F.pad(mixed_qkv_t, (self.conv_kernel_size - mixed_qkv_t.shape[-1], 0))
             cache_params.conv_states[self.layer_idx] = conv_state
-        if self.causal_conv1d_fn is not None:
-            # Modification: shard conv1d weights per Ulysses rank to match head-sharded channels.
-            if ulysses_enabled:
-                conv_weight = self._get_local_conv1d_weight(
-                    ulysses_rank=ulysses_rank,
-                    local_key_dim=local_key_dim,
-                    local_value_dim=local_value_dim,
-                )
-            else:
-                conv_weight = self.conv1d.weight.squeeze(1)
-            # mixed_qkv is [B, S, D] — FLA causal_conv1d expects [B, S, D].
-            mixed_qkv = self.causal_conv1d_fn(
-                x=mixed_qkv,
-                weight=conv_weight,
-                bias=self.conv1d.bias,
-                activation=self.activation,
-                seq_idx=None,
-                backend="triton",
-                cu_seqlens=cu_seq_lens_q,
-            )[0]
+        # Modification: shard conv1d weights per Ulysses rank to match head-sharded channels.
+        if ulysses_enabled:
+            conv_weight = self._get_local_conv1d_weight(
+                ulysses_rank=ulysses_rank,
+                local_key_dim=local_key_dim,
+                local_value_dim=local_value_dim,
+            )
         else:
-            raise NotImplementedError("This path is not supported yet because it can't process varlen now.")
+            conv_weight = self.conv1d.weight.squeeze(1)
+        mixed_qkv = self.veomni_causal_conv1d(
+            mixed_qkv,
+            conv_weight,
+            self.conv1d.bias,
+            cu_seq_lens_q,
+            activation=self.activation,
+            seq_idx=None,
+            backend="triton",
+        )
 
     query, key, value = torch.split(
         mixed_qkv,
@@ -430,7 +427,7 @@ def qwen3_5_gated_deltanet_forward_patched(
     # raises (`expected 4096, but got 8192` for a Qwen3.5-4B-style config).
     # Forcing contiguous here is a no-op when the layout already matches (so it stays
     # cheap for FLA / eager paths) and unblocks the FlashQLA backend without bloating
-    # OpSlot factory wrappers. Fix all three for symmetry — q/k usually become contiguous
+    # kernel factory wrappers. Fix all three for symmetry — q/k usually become contiguous
     # via repeat_interleave below in GQA configs, but non-GQA models would otherwise hit
     # the same stride mismatch on q/k from a stricter kernel.
     query = query.contiguous()
@@ -452,30 +449,17 @@ def qwen3_5_gated_deltanet_forward_patched(
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
     if not use_precomputed_states:
-        # Modification: instance-local guard. The kernel was selected at
-        # ``__init__`` time and cached on ``self.chunk_gated_delta_rule``;
-        # reading the module-global OpSlot here would diverge if a second
-        # model rebinds it with a different config (the OpSlot is a process-
-        # wide singleton).
-        if self.chunk_gated_delta_rule is torch_chunk_gated_delta_rule:
-            raise RuntimeError(
-                "Varlen training requires a non-eager chunk_gated_delta_rule kernel. "
-                "Set chunk_gated_delta_rule_implementation='fla' (and install flash-linear-attention) "
-                "or 'flash_qla' (ships under the gpu extra, Hopper sm90 only) in OpsImplementationConfig."
-            )
-        else:
-            # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
-            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=cache_params is not None,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seq_lens_q,
-            )
+        core_attn_out, last_recurrent_state = self.veomni_chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            None,
+            cu_seq_lens_q,
+            output_final_state=cache_params is not None,
+            use_qk_l2norm_in_kernel=True,
+        )
     else:
         core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
             query,
@@ -501,24 +485,104 @@ def qwen3_5_gated_deltanet_forward_patched(
     # reshape input data into 2D tensor
     core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
     z = z.reshape(-1, self.head_v_dim)
-    core_attn_out = self.norm(core_attn_out, z)
+    core_attn_out = self.veomni_rms_norm_gated(
+        core_attn_out,
+        z,
+        self.norm.weight,
+        eps=self.layer_norm_epsilon,
+        activation=self.activation,
+    )
     core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
     output = self.out_proj(core_attn_out)
     return output
 
 
-# NOTE: `Qwen3_5TextModel._update_linear_attn_mask` was removed in transformers
-# 5.16. `Qwen3_5TextModel.forward` now builds a per-attention-type mask mapping
-# with `create_causal_mask` / `create_recurrent_attention_mask`, so the previous
-# override (which avoided the `cache_position[0] > 0` host sync) had nothing left
-# to hook. Upstream's `create_recurrent_attention_mask` already decides the
-# cached-forward case from shapes (`inputs_embeds.shape[1] == 1`) and — unlike
-# the old override — trims the 2-D mask to the local sequence instead of
-# dropping it, which is the more correct behaviour for chunked prefill. It still
-# reads `torch.all(attention_mask == 1)` (guarded by `is_tracing`), so the
-# all-ones host sync is upstream behaviour now; re-optimising that belongs in a
-# separate change.
+@config.override_method(
+    "Qwen3_5TextModel.forward",
+    description="Expose the MTP head's inputs on demand via mtp_context",
+)
+def qwen3_5_text_model_forward_patched(
+    self,
+    input_ids: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    use_cache: bool | None = None,
+    return_mtp_context: bool = False,
+    **kwargs: Unpack[TransformersKwargs],
+) -> Qwen3_5ModelOutputWithPast:
+    """Run the text backbone and expose the inputs required by the MTP head.
+
+    Args:
+        return_mtp_context (`bool`, *optional*): Whether to retain the backbone inputs required by the MTP objective.
+    """
+    if (input_ids is None) ^ (inputs_embeds is not None):
+        raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+    if inputs_embeds is None:
+        inputs_embeds = self.embed_tokens(input_ids)
+
+    if use_cache and past_key_values is None:
+        past_key_values = DynamicCache(config=self.config)
+
+    if position_ids is None:
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+        position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
+    elif position_ids.ndim == 2:
+        position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
+
+    if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+        text_position_ids = position_ids[0]
+        position_ids = position_ids[1:]
+    else:
+        text_position_ids = None
+
+    if not isinstance(causal_mask_mapping := attention_mask, dict):
+        mask_kwargs = {
+            "config": self.config,
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": text_position_ids,
+        }
+        causal_mask_mapping = {
+            "full_attention": create_causal_mask(**mask_kwargs),
+            "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
+        }
+
+    hidden_states = inputs_embeds
+    position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+    for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+        hidden_states = decoder_layer(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=causal_mask_mapping[self.config.layer_types[i]],
+            position_ids=text_position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **kwargs,
+        )
+
+    hidden_states = self.norm(hidden_states)
+
+    mtp_context = None
+    if return_mtp_context:
+        mtp_context = {
+            "inputs_embeds": inputs_embeds,
+            "position_embeddings": position_embeddings,
+            "attention_mask": causal_mask_mapping["full_attention"],
+            "position_ids": text_position_ids,
+        }
+
+    return Qwen3_5MTPContextOutput(  # noqa: F821 defined via add_helper_after
+        last_hidden_state=hidden_states,
+        past_key_values=past_key_values,
+        mtp_context=mtp_context,
+    )
 
 
 @config.override_method(
@@ -558,7 +622,14 @@ def qwen3_5_decoder_layer_forward_patched(
             cu_seq_lens_q=linear_attn_cu_seq_lens_q,
         )
     elif self.block_type == "full_attention":
-        # Self Attention
+        # Self Attention. SDPA/eager reject GDN cu_seq_lens metadata.
+        attn_impl = getattr(getattr(self, "self_attn", None), "veomni_attn", None)
+        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
+            kwargs,
+            impl=attn_impl.impl if attn_impl is not None else "eager",
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+        )
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -566,7 +637,7 @@ def qwen3_5_decoder_layer_forward_patched(
             past_key_values=past_key_values,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
-            **kwargs,
+            **attn_kwargs,
         )
 
     hidden_states = residual + hidden_states
@@ -577,6 +648,130 @@ def qwen3_5_decoder_layer_forward_patched(
     hidden_states = self.mlp(hidden_states)
     hidden_states = residual + hidden_states
     return hidden_states
+
+
+# ── MTP (multi-token prediction) ─────────────────────────────────────────────
+
+
+@config.add_helper
+def _mtp_loss_weight(text_config):
+    """Resolve the MTP loss weight, or None when MTP is disabled."""
+    weight = getattr(text_config, "mtp_loss_weight", None)
+    if weight is None:
+        return None
+    weight = float(weight)
+    if weight <= 0.0:
+        return None
+    if int(getattr(text_config, "mtp_num_hidden_layers", 0) or 0) <= 0:
+        return None
+    return weight
+
+
+@config.add_helper
+def compute_mtp_loss(mtp_loss_fn, hidden_states, mtp_labels, weights, vocab_size, **kwargs):
+    """Compute one token-normalized loss over all MTP depths."""
+    if mtp_labels.ndim != 3:
+        raise ValueError(
+            f"MTP labels must have shape [batch, depth, sequence]; got mtp_labels.shape={tuple(mtp_labels.shape)}."
+        )
+    if len(hidden_states) != mtp_labels.shape[1]:
+        raise ValueError(
+            "MTP hidden-state depth must match the label depth; "
+            f"got {len(hidden_states)} hidden-state row(s) and {mtp_labels.shape[1]} label row(s)."
+        )
+
+    batch_size, num_depths, sequence_length = mtp_labels.shape
+    stacked_hidden_states = torch.stack(hidden_states, dim=1)
+    flat_hidden_states = stacked_hidden_states.reshape(batch_size * num_depths, sequence_length, -1)
+    flat_labels = mtp_labels.reshape(batch_size * num_depths, sequence_length)
+
+    valid_target_count = (flat_labels != IGNORE_INDEX).sum()  # noqa: F821
+    has_valid_target = valid_target_count > 0
+    safe_labels = flat_labels.clone()
+    safe_labels.reshape(-1)[0] = torch.where(
+        has_valid_target,
+        safe_labels.reshape(-1)[0],
+        safe_labels.new_zeros(()),
+    )
+
+    loss_kwargs = dict(kwargs)
+    loss_kwargs.pop("shift_labels", None)
+    loss_kwargs["num_items_in_batch"] = valid_target_count.clamp_min(1)
+    mtp_loss, _, _ = mtp_loss_fn(
+        logits=None,
+        labels=safe_labels,
+        vocab_size=vocab_size,
+        hidden_states=flat_hidden_states,
+        weights=weights,
+        shift_labels=safe_labels,
+        **loss_kwargs,
+    )
+    return mtp_loss * has_valid_target.to(mtp_loss.dtype)
+
+
+@config.add_helper_after("Qwen3_5DecoderLayer")
+class Qwen3_5MTP(nn.Module):
+    """Qwen3.5 multi-token-prediction head."""
+
+    def __init__(self, config: Qwen3_5TextConfig):
+        """Build MTP decoder layers that share the foundation embeddings and head."""
+        super().__init__()
+        assert not getattr(config, "mtp_use_dedicated_embeddings", False), (
+            "mtp_use_dedicated_embeddings=True is not supported: the MTP head shares the main "
+            "model's embed_tokens, and the checkpoint carries no mtp.embed_tokens weight."
+        )
+        num_layers = int(config.mtp_num_hidden_layers)
+        assert "full_attention" in config.layer_types, (
+            f"Qwen3.5 MTP requires a full_attention layer type to mirror; got layer_types={config.layer_types}"
+        )
+        mtp_layer_idx = config.layer_types.index("full_attention")
+
+        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.layers = nn.ModuleList(
+            [Qwen3_5DecoderLayer(config, mtp_layer_idx) for _ in range(num_layers)]  # noqa: F821
+        )
+        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, ...]:
+        """Return one recurrently teacher-forced hidden-state row per MTP depth."""
+        assert kwargs.get("past_key_values") is None and not kwargs.get("use_cache", False), (
+            "Qwen3.5 MTP only supports full-sequence objective computation; cached decoding runs in the "
+            "inference engine."
+        )
+
+        depth_hidden_states = []
+        for depth, decoder_layer in enumerate(self.layers):
+            shift = depth + 1
+            shifted_embeds = F.pad(inputs_embeds, (0, 0, 0, shift))[:, shift:, :]
+            hidden_states = self.fc(
+                torch.cat(
+                    [self.pre_fc_norm_embedding(shifted_embeds), self.pre_fc_norm_hidden(hidden_states)],
+                    dim=-1,
+                )
+            )
+            hidden_states = decoder_layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=False,
+                **kwargs,
+            )
+            hidden_states = self.norm(hidden_states)
+            depth_hidden_states.append(hidden_states)
+
+        return tuple(depth_hidden_states)
 
 
 @config.override_method(
@@ -904,10 +1099,8 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
     # recompute when the key is absent (so non-VeOmni callers keep working).
     # Gate is two-pronged:
     #   (a) `_VEOMNI_VISION_ATTENTION_PATCHED` — set per generated file. True
-    #       only in GPU generated files where the consumer override is
-    #       registered. NPU configs inject False because they reuse upstream
-    #       HF Qwen3_5VisionAttention.forward, which recomputes max_seqlen and
-    #       would leak the unused kwarg into `attention_interface(**kwargs)`.
+    #       when Qwen3_5VisionAttention.forward is patched to consume
+    #       ``vision_max_seqlen``. GPU and NPU both register that consumer.
     #   (b) `is_flash_attention_requested(self.config)` — only FA's
     #       `flash_attn_varlen_func` benefits from the int hand-off; eager
     #       and sdpa paths in the consumer pop+discard the kwarg, so the
@@ -972,6 +1165,13 @@ def qwen3_5_vision_model_dummy_forward(self):
     return self(hidden_states=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata)
 
 
+@config.modify_init("Qwen3_5VisionAttention", description="Bind instance-local rope and attention VeomniOps")
+def qwen3_5_vision_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+
+
 @config.override_method(
     "Qwen3_5VisionAttention.forward",
     description=(
@@ -993,15 +1193,11 @@ def qwen3_5_vision_attention_forward_patched(
         self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
     )
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
     query_states = query_states.transpose(0, 1).unsqueeze(0)
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
-
-    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-        self.config._attn_implementation, eager_attention_forward
-    )
 
     if is_flash_attention_requested(self.config):
         # Modification: prefer the int max_seqlen pre-computed once in
@@ -1011,7 +1207,7 @@ def qwen3_5_vision_attention_forward_patched(
         max_seqlen = kwargs.pop("vision_max_seqlen", None)
         if max_seqlen is None:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-        attn_output, _ = attention_interface(
+        attn_output, _ = self.veomni_attn(
             self,
             query_states,
             key_states,
@@ -1035,7 +1231,7 @@ def qwen3_5_vision_attention_forward_patched(
         splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
 
         attn_outputs = [
-            attention_interface(
+            self.veomni_attn(
                 self,
                 q,
                 k,
@@ -1289,15 +1485,25 @@ def qwen3_5_model_forward(
         **kwargs,
     )
 
-    return Qwen3_5ModelOutputWithPast(
-        **outputs,
-        rope_deltas=self.rope_deltas,
-    )
+    return Qwen3_5MTPContextOutput(**outputs, rope_deltas=self.rope_deltas)  # noqa: F821
 
 
 @config.override_method(
-    "Qwen3_5ForCausalLM.forward", description="Support fused cross entropy path in Qwen3_5ForCausalLM.forward"
+    "Qwen3_5ForCausalLM.__init__",
+    description="Bind ForCausalLMLoss VeomniOp on Qwen3_5ForCausalLM",
 )
+def qwen3_5_forcausallm_init_patched(self, config):
+    super().__init__(config)
+    self.model = Qwen3_5TextModel(config)
+    self.vocab_size = config.vocab_size
+    self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+    self.post_init()
+
+
+@config.override_method("Qwen3_5ForCausalLM.forward", description="Always call ForCausalLMLoss VeomniOp")
 def qwen3_5_forcausallm_forward_patched(
     self,
     input_ids: torch.LongTensor | None = None,
@@ -1355,30 +1561,14 @@ def qwen3_5_forcausallm_forward_patched(
     logits = None
     fused_linear_aux = None
     if labels is not None:
-        # Modification: OpSlot guard for cross-entropy loss.
-        if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-        else:
-            logits = self.lm_head(hidden_states)
-            loss, _, fused_linear_aux = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-            if fused_linear_aux is not None:
-                # fused_linear_aux path empties loss/logits slots; clear the local 3D
-                # logits so output mirrors the OpSlot branch's contract.
-                logits = None
+        loss, logits, fused_linear_aux = self.loss_function(
+            logits=logits,
+            labels=labels,
+            vocab_size=self.config.vocab_size,
+            hidden_states=hidden_states,
+            weights=self.lm_head.weight,
+            **kwargs,
+        )
     else:
         logits = self.lm_head(hidden_states)
 
@@ -1402,19 +1592,32 @@ def qwen3_5_forcausallm_forward_patched(
 @config.add_helper_after("Qwen3_5CausalLMOutputWithPast")
 @dataclass
 class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5CausalLMOutputWithPast):
-    r"""
-    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
-        Language modeling loss (for next-token prediction).
-    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
-        Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
-        The rope index difference between sequence length and multimodal rope.
-    fused_linear_aux (`FusedLinearAuxOutput`, *optional*):
-        Per-token tensors produced by the fused-linear loss path
-        (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
-        ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
-        ``None`` on the plain loss path; populated when ``return_log_probs=True``.
+    r"""Language-model output with multimodal RoPE and fused-loss auxiliaries.
+
+    Args:
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+            Language modeling loss (for next-token prediction).
+        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+            The rope index difference between sequence length and multimodal rope.
+        fused_linear_aux (`FusedLinearAuxOutput`, *optional*):
+            Per-token tensors produced by the fused-linear loss path
+            (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
+            ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
+            ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
+
+
+@config.add_helper_after("Qwen3_5ModelOutputWithPast")
+@dataclass
+class Qwen3_5MTPContextOutput(Qwen3_5ModelOutputWithPast):
+    r"""
+    mtp_context (`dict`, *optional*):
+        Inputs retained when the outer model requests an MTP objective.
+    """
+
+    mtp_context: dict | None = None
 
 
 @config.add_helper
@@ -1524,6 +1727,37 @@ class _Qwen3_5FakeForPosID(SimpleNamespace):
 
 
 @config.override_method(
+    "Qwen3_5ForConditionalGeneration.__init__",
+    description="Bind ForCausalLMLoss VeomniOp and build the MTP head when text_config.mtp_loss_weight is set",
+)
+def qwen3_5_forconditional_generation_init_patched(self, config):
+    """Initialize conditional generation, bind fused loss, and construct the MTP head when enabled."""
+    super().__init__(config)
+    self.model = Qwen3_5Model(config)  # noqa: F821
+    self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+
+    self.mtp = None
+    mtp_loss_weight = _mtp_loss_weight(config.text_config)  # noqa: F821 defined via add_helper
+    if mtp_loss_weight is not None:
+        parallel_state = get_parallel_state()
+        assert not parallel_state.sp_enabled, (
+            "Qwen3.5 MTP does not support Ulysses/context sequence parallel yet: the MTP embedding "
+            "shift crosses rank boundaries. ForCausalLMLoss uses shift_labels when they are provided, "
+            "including when SP is on. "
+            "Set train.accelerator.ulysses_size=1 and cp_size=1, or unset text_config.mtp_loss_weight."
+        )
+        self.mtp = Qwen3_5MTP(config.text_config)  # noqa: F821 defined via add_helper_after
+        logger.info_rank0(
+            f"Qwen3.5 MTP enabled: {config.text_config.mtp_num_hidden_layers} layer(s), loss weight {mtp_loss_weight}."
+        )
+
+    self.post_init()
+
+
+@config.override_method(
     "Qwen3_5ForConditionalGeneration.get_position_id_func",
     description="Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.",
 )
@@ -1553,7 +1787,7 @@ def qwen3_5_forconditional_generation_get_metadata_collate_func(self):
 
 @config.override_method(
     "Qwen3_5ForConditionalGeneration.forward",
-    description="Support fused cross entropy path in Qwen3_5ForConditionalGeneration.forward",
+    description="Always call ForCausalLMLoss VeomniOp and combine weighted MTP loss",
 )
 def qwen3_5_forconditional_generation_forward_patched(
     self,
@@ -1569,13 +1803,16 @@ def qwen3_5_forconditional_generation_forward_patched(
     video_grid_thw: torch.LongTensor | None = None,
     cache_position: torch.LongTensor | None = None,
     logits_to_keep: int | torch.Tensor = 0,
+    mtp_labels: torch.LongTensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen3_5CausalLMOutputWithLogProbs:
-    r"""
-    cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-        Indices depicting the position of the input sequence tokens in the sequence. Retained in the
-        signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
-    """
+    """Run conditional generation and combine foundation and weighted MTP losses."""
+    requires_mtp_context = self.mtp is not None and labels is not None
+    if requires_mtp_context and mtp_labels is None:
+        raise ValueError("Qwen3.5 MTP loss requires `mtp_labels` when `labels` are provided.")
+
+    model_kwargs = dict(kwargs)
+    model_kwargs["return_mtp_context"] = requires_mtp_context
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,
@@ -1587,7 +1824,7 @@ def qwen3_5_forconditional_generation_forward_patched(
         past_key_values=past_key_values,
         inputs_embeds=inputs_embeds,
         cache_position=cache_position,
-        **kwargs,
+        **model_kwargs,
     )
 
     hidden_states = outputs[0]
@@ -1599,34 +1836,45 @@ def qwen3_5_forconditional_generation_forward_patched(
     logits = None
     fused_linear_aux = None
     if labels is not None:
-        # Modification: OpSlot guard for cross-entropy loss.
-        if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.text_config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-        else:
-            logits = self.lm_head(hidden_states)
-            loss, _, fused_linear_aux = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.text_config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-            if fused_linear_aux is not None:
-                # fused_linear_aux path empties loss/logits slots; clear the local 3D
-                # logits so output mirrors the OpSlot branch's contract.
-                logits = None
+        loss, logits, fused_linear_aux = self.loss_function(
+            logits=logits,
+            labels=labels,
+            vocab_size=self.config.text_config.vocab_size,
+            hidden_states=hidden_states,
+            weights=self.lm_head.weight,
+            **kwargs,
+        )
     else:
         logits = self.lm_head(hidden_states)
 
-    return Qwen3_5CausalLMOutputWithLogProbs(
+    loss_dict = None
+    if requires_mtp_context:
+        mtp_context = getattr(outputs, "mtp_context", None)
+        if mtp_context is None:
+            raise RuntimeError("Qwen3.5 MTP context was requested but the language model did not return it.")
+        mtp_hidden_states = self.mtp(
+            hidden_states=outputs[0],
+            inputs_embeds=mtp_context["inputs_embeds"],
+            position_embeddings=mtp_context["position_embeddings"],
+            attention_mask=mtp_context["attention_mask"],
+            position_ids=mtp_context["position_ids"],
+            cu_seq_lens_q=kwargs.get("cu_seq_lens_q"),
+            cu_seq_lens_k=kwargs.get("cu_seq_lens_k"),
+            max_length_q=kwargs.get("max_length_q"),
+            max_length_k=kwargs.get("max_length_k"),
+        )
+        mtp_loss = compute_mtp_loss(  # noqa: F821 defined via add_helper
+            self.loss_function,
+            mtp_hidden_states,
+            mtp_labels,
+            weights=self.lm_head.weight,
+            vocab_size=self.config.text_config.vocab_size,
+            **kwargs,
+        )
+        weight = _mtp_loss_weight(self.config.text_config)  # noqa: F821 defined via add_helper
+        loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
+
+    output = Qwen3_5CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
@@ -1635,3 +1883,66 @@ def qwen3_5_forconditional_generation_forward_patched(
         rope_deltas=outputs.rope_deltas,
         fused_linear_aux=fused_linear_aux,
     )
+    if loss_dict is not None:
+        output.loss = loss_dict
+    return output
+
+
+@config.modify_init("Qwen3_5Attention", description="Bind instance-local rope and attention VeomniOps")
+def qwen3_5_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+
+
+@config.override_method(
+    "Qwen3_5Attention.forward",
+    description="Always call the local rope and attention VeomniOps",
+)
+def qwen3_5_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None,
+    past_key_values: Cache | None = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states, gate = torch.chunk(self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
+    gate = gate.reshape(*input_shape, -1)
+
+    query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+    attn_output, attn_weights = self.veomni_attn(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = attn_output * torch.sigmoid(gate)
+
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights
+
+
+config.add_import("transformers.utils", names=["logging"])
+config.add_post_import_block("""
+from transformers.utils import logging
+logger = logging.get_logger(__name__)
+""")

@@ -52,6 +52,7 @@ model:
         reduce_dtype: float32
     offload_config:
       enable_activation: false
+  chat_template: gpt_oss
 
 data:
   # Download with:
@@ -61,7 +62,6 @@ data:
   train_size: 20000000
   datasets_type: mapping
   data_type: conversation
-  chat_template: gpt_oss
   max_seq_len: 4096
   text_keys: messages
   dyn_bsz_buffer_size: 200

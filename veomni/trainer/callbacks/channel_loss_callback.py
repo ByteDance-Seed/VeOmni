@@ -21,7 +21,6 @@ under ``torch.no_grad()`` before the extra CE work runs.
 
 from __future__ import annotations
 
-import importlib
 import inspect
 import re
 from collections import defaultdict
@@ -30,7 +29,6 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from numbers import Integral
 from typing import TYPE_CHECKING, Any, Callable
-from weakref import WeakSet
 
 import torch
 import torch.distributed as dist
@@ -57,25 +55,6 @@ _ACTIVE_CHANNEL_LOSS_COMPUTER: ContextVar[ChannelLossComputer | None] = ContextV
 )
 
 
-class _OpSlotDispatcher:
-    """Shared dispatcher for a module-global causal-loss OpSlot."""
-
-    def __init__(self, slot: Any, original_kernel: Callable[..., Any]) -> None:
-        self.slot = slot
-        self.original_kernel = original_kernel
-        self.owners: WeakSet[Any] = WeakSet()
-
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        result = self.original_kernel(*args, **kwargs)
-        owner = _ACTIVE_CHANNEL_LOSS_COMPUTER.get()
-        if owner is not None and owner in self.owners:
-            owner._observe_opslot_call(self.original_kernel, args, kwargs)
-        return result
-
-
-_OP_SLOT_DISPATCHERS: dict[Any, _OpSlotDispatcher] = {}
-
-
 class ChannelLossMetadataError(ValueError):
     """Raised when channel metadata cannot be aligned with packed segments."""
 
@@ -92,7 +71,6 @@ class ChannelLossComputer:
         self._original_loss_fn: Callable[..., Any] | None = None
         self._model_ref: torch.nn.Module | None = None
         self._installed = False
-        self._wrapped_opslots: list[Any] = []
 
         self._source_ids: list[ChannelKey] = []
         self._position_ids: torch.Tensor | None = None
@@ -111,9 +89,17 @@ class ChannelLossComputer:
         """Walk common wrappers to find the module whose forward calls ``loss_function``."""
 
         visited = set()
-        cur: torch.nn.Module | None = model
+        cur: Any = model
         while cur is not None and id(cur) not in visited:
             visited.add(id(cur))
+            if not isinstance(cur, torch.nn.Module):
+                nxt = getattr(cur, "unwrapped_module", None)
+                if nxt is None:
+                    nxt = getattr(cur, "model", None)
+                if isinstance(nxt, torch.nn.Module) and nxt is not cur:
+                    cur = nxt
+                    continue
+                return None
             cls_name = type(cur).__name__
             is_native_lora = any(cls.__name__ == "VeOmniLoraModel" for cls in type(cur).__mro__)
             if is_native_lora:
@@ -156,23 +142,38 @@ class ChannelLossComputer:
         if self._installed:
             return
 
+        # ``trainer.model`` is a VeOmniModelRuntime handle: reads forward via
+        # ``__getattr__``, writes do not. Peel it (and DDP) before patching.
+        if not isinstance(model, torch.nn.Module):
+            unwrapped = getattr(model, "unwrapped_module", None)
+            if not isinstance(unwrapped, torch.nn.Module):
+                unwrapped = getattr(model, "model", None)
+            if isinstance(unwrapped, torch.nn.Module):
+                model = unwrapped
+
         host = self._resolve_loss_fn_host(model)
         if host is None or not hasattr(host, "loss_function"):
             logger.warning_rank0(
                 "Channel loss: could not locate model.loss_function "
-                f"(outer_type={type(model).__name__}, inner_type={type(host).__name__ if host else None}). "
-                "Only OpSlot-based fused CE paths, if any, can be observed."
+                f"(outer_type={type(model).__name__}, inner_type={type(host).__name__ if host else None})."
             )
         else:
             self._original_loss_fn = host.loss_function
-            host.loss_function = self._wrapped_loss_fn
+            wrapper = self._wrapped_loss_fn
+            host.loss_function = wrapper
+            if host.loss_function is not wrapper:
+                raise RuntimeError(
+                    "Channel loss wrap did not stick on "
+                    f"{type(host).__name__} (outer={type(model).__name__}); "
+                    "the runtime handle forwards reads but not writes — pass "
+                    "the nn.Module."
+                )
             self._model_ref = host
             logger.info_rank0(
                 f"Channel loss: wrapped {type(host).__name__}.loss_function (outer={type(model).__name__})."
             )
 
-        self._wrap_causal_loss_opslots(model, host)
-        self._installed = self._original_loss_fn is not None or bool(self._wrapped_opslots)
+        self._installed = self._original_loss_fn is not None
         if not self._installed:
             logger.warning_rank0("Channel loss: no causal loss hook was installed.")
 
@@ -180,64 +181,9 @@ class ChannelLossComputer:
         if self._model_ref is not None and self._original_loss_fn is not None:
             self._model_ref.loss_function = self._original_loss_fn
 
-        for slot in reversed(self._wrapped_opslots):
-            dispatcher = _OP_SLOT_DISPATCHERS.get(slot)
-            if dispatcher is None:
-                continue
-            dispatcher.owners.discard(self)
-            if dispatcher.owners:
-                continue
-            if getattr(slot, "_kernel", None) is dispatcher:
-                slot._kernel = dispatcher.original_kernel
-            _OP_SLOT_DISPATCHERS.pop(slot, None)
-
         self._original_loss_fn = None
         self._model_ref = None
-        self._wrapped_opslots = []
         self._installed = False
-
-    def _wrap_causal_loss_opslots(
-        self,
-        model: torch.nn.Module,
-        host: torch.nn.Module | None,
-    ) -> None:
-        modules = []
-        seen = set()
-        for root in (model, host):
-            if root is None:
-                continue
-            for cls in type(root).__mro__:
-                module_name = getattr(cls, "__module__", None)
-                if not module_name or module_name in seen:
-                    continue
-                seen.add(module_name)
-                try:
-                    modules.append(importlib.import_module(module_name))
-                except Exception:
-                    continue
-
-        for module in modules:
-            slot = getattr(module, "veomni_causal_lm_loss", None)
-            if slot is None or not getattr(slot, "use_non_eager_impl", False):
-                continue
-            original_kernel = getattr(slot, "_kernel", None)
-            if original_kernel is None:
-                continue
-            dispatcher = _OP_SLOT_DISPATCHERS.get(slot)
-            if dispatcher is None:
-                dispatcher = _OpSlotDispatcher(slot, original_kernel)
-                _OP_SLOT_DISPATCHERS[slot] = dispatcher
-                slot._kernel = dispatcher
-                logger.info_rank0(f"Channel loss: installed dispatcher for {module.__name__}.veomni_causal_lm_loss.")
-            elif getattr(slot, "_kernel", None) is not dispatcher:
-                logger.warning_rank0(
-                    f"Channel loss: {module.__name__}.veomni_causal_lm_loss was rebound after interception; "
-                    "skipping this slot."
-                )
-                continue
-
-            dispatcher.owners.add(self)
-            self._wrapped_opslots.append(slot)
 
     @property
     def capture_active(self) -> bool:
@@ -250,28 +196,6 @@ class ChannelLossComputer:
             yield
         finally:
             _ACTIVE_CHANNEL_LOSS_COMPUTER.reset(token)
-
-    def _observe_opslot_call(
-        self,
-        original_kernel: Callable[..., Any],
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-    ) -> None:
-        call_args = _bind_loss_call_args(original_kernel, args, kwargs)
-        labels = call_args.get("labels")
-        ignore_index = call_args.get("ignore_index", IGNORE_INDEX)
-        if ignore_index is None:
-            ignore_index = IGNORE_INDEX
-        if self.capture_active and self._source_ids and labels is not None:
-            self.compute_side_channel(
-                logits=call_args.get("logits"),
-                labels=labels,
-                vocab_size=call_args.get("vocab_size"),
-                hidden_states=call_args.get("hidden_states"),
-                weights=call_args.get("weights"),
-                shift_labels=call_args.get("shift_labels"),
-                ignore_index=ignore_index,
-            )
 
     def begin_step(
         self,
@@ -391,12 +315,13 @@ class ChannelLossComputer:
         ignore_index: int,
     ) -> list[dict[str, Any]]:
         sp_enabled = bool(self.parallel_state.sp_enabled)
-        if sp_enabled:
-            effective_labels = labels
-        elif shift_labels is not None:
+        # Match ``ForCausalLMLoss``: a provided ``shift_labels`` wins, including under SP.
+        if shift_labels is not None:
             effective_labels = shift_labels
-        else:
+        elif not sp_enabled:
             effective_labels = F.pad(labels, (0, 1), value=ignore_index)[..., 1:].contiguous()
+        else:
+            effective_labels = labels
 
         labels_flat = effective_labels.reshape(-1)
         attention_mask_flat = _position_aligned_attention_mask_flat(
@@ -887,7 +812,8 @@ class ChannelLossCallback(Callback):
     def on_train_begin(self, state: TrainerState, **kwargs: Any) -> None:
         if not self.enabled:
             return
-        self.computer.install(self.trainer.model)
+        model = getattr(self.trainer.model, "unwrapped_module", self.trainer.model)
+        self.computer.install(model)
         logger.info_rank0(
             "Channel loss enabled "
             f"(interval={self.config.interval}, source_id_keys={self.config.source_id_keys}, "
@@ -1001,7 +927,7 @@ class ChannelLossCallback(Callback):
         state: TrainerState,
         loss: float,
         loss_dict: dict[str, float],
-        grad_norm: float,
+        grad_norm: float | torch.Tensor,
         **kwargs: Any,
     ) -> None:
         if not self._collect_step:

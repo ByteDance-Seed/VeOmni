@@ -1,7 +1,7 @@
 """Generic word-token embedding (``wte``) + LM head as a graph node.
 
-``TextEncoder(InferenceMixin, OmniPreTrainedModel)`` — mirrors HF's own
-``PreTrainedModel`` + ``GenerationMixin`` split: ``OmniPreTrainedModel``
+``TextEncoder(InferenceMixin, PretrainedOmniModule)`` — mirrors HF's own
+``PreTrainedModel`` + ``GenerationMixin`` split: ``PretrainedOmniModule``
 owns weights / ``forward`` (here, ``encode`` / ``decode``, which mirror a
 VQ codec pre/post stage so the backbone stays vocab-agnostic), while
 ``InferenceMixin`` owns the FSM ``generate`` sampling helpers shared by every
@@ -19,10 +19,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizerBase
 
+from veomni.distributed.emb_parallel import ShardedEmbedding
 from veomni.utils.tensor_utils import naflatten, unflatten
 
-from ....omni_pretrained_model import OmniPreTrainedModel
 from ....utils.conversation import ConversationItem, seal_outputs
+from ...module_modeling_base import PretrainedOmniModule
 from .chat_template import TextEncoderChatTemplate
 from .configuration import TextEncoderConfig
 
@@ -55,8 +56,8 @@ class InferenceMixin:
     helpers below, plus the FSM inference state initialized in
     :meth:`TextEncoder.__init__`.
 
-    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
-    :class:`TextEncoder`'s bases: ``OmniPreTrainedModel`` ships no-op
+    Listed *before* :class:`~...module_modeling_base.PretrainedOmniModule` in
+    :class:`TextEncoder`'s bases: ``PretrainedOmniModule`` ships no-op
     ``reset_local_inference_state`` / ``finalize`` defaults (kept so
     inference-only modules that don't mix this in still satisfy the FSM
     runtime's unconditional ``module.finalize(ctx=...)`` call), and MRO
@@ -132,7 +133,7 @@ class InferenceMixin:
             logits = self._top_p_filter(logits, top_p)
         probs = F.softmax(logits, dim=-1)
         token = torch.multinomial(probs, num_samples=1)
-        return token
+        return int(token.item())
 
     def _token_id_tensor(self, token_id: int) -> torch.Tensor:
         device = self.device
@@ -174,18 +175,20 @@ class InferenceMixin:
         return {"type": "text", "value": text, "meta": meta}
 
 
-class TextEncoder(InferenceMixin, OmniPreTrainedModel):
+class TextEncoder(InferenceMixin, PretrainedOmniModule):
     """Word-token embedding + LM head, plus shared FSM ``generate`` sampling helpers."""
 
     config_class = TextEncoderConfig
     base_model_prefix = ""
-    _no_split_modules: list = ["Embedding"]
+    # ``ShardedEmbedding`` must be its own FSDP2 unit: under ``emb`` its table is
+    # vocab-split and a parent unit would mix different ranks' vocab slices.
+    _no_split_modules: list = ["ShardedEmbedding"]
     main_input_name = "input_ids"
 
     def __init__(self, config: TextEncoderConfig):
         super().__init__(config)
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = ShardedEmbedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
         if config.tie_word_embeddings:
             self.lm_head = None
         else:
@@ -200,8 +203,6 @@ class TextEncoder(InferenceMixin, OmniPreTrainedModel):
         self._bos_injected: bool = False
         self.post_init()
 
-    # ── Embedding accessors ────────────────────────────────────────────────────
-
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
 
@@ -209,8 +210,8 @@ class TextEncoder(InferenceMixin, OmniPreTrainedModel):
         self.embed_tokens = value
 
     def get_output_embeddings(self) -> Optional[nn.Module]:
-        # When tied there is no separate ``lm_head`` — ``_project`` reuses
-        # ``embed_tokens.weight`` directly. Returning ``embed_tokens`` makes the
+        # When tied there is no separate ``lm_head`` — ``_project`` goes through
+        # ``embed_tokens.project``. Returning ``embed_tokens`` makes the
         # generic load-time weight-tie a harmless self-assignment instead of
         # crashing on a ``None`` output module.
         if self.config.tie_word_embeddings:
@@ -221,8 +222,6 @@ class TextEncoder(InferenceMixin, OmniPreTrainedModel):
         if not self.config.tie_word_embeddings:
             self.lm_head = new_embeddings
 
-    # ── Forward ────────────────────────────────────────────────────────────────
-
     def forward(self, **kwargs) -> Dict[str, Any]:  # type: ignore[override]
         return self.encode(**kwargs)
 
@@ -232,13 +231,10 @@ class TextEncoder(InferenceMixin, OmniPreTrainedModel):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         input_ids = input_ids.unsqueeze(0) if input_ids.dim() == 1 else input_ids
-        embeds = self._embed_tokens(input_ids)
+        embeds = self.embed_tokens(input_ids)
         return {
             "inputs_embeds": embeds.squeeze(0) if embeds.size(0) == 1 else embeds,
         }
-
-    def _embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
 
     def decode(
         self,
@@ -284,7 +280,9 @@ class TextEncoder(InferenceMixin, OmniPreTrainedModel):
     def _project(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self.config.tie_word_embeddings:
             return self.lm_head(hidden_states)
-        return F.linear(hidden_states, self.embed_tokens.weight)
+        # Never read ``embed_tokens.weight`` here: under FSDP2 it is only unsharded
+        # inside the embedding's own hooks, which ``project`` runs in.
+        return self.embed_tokens.project(hidden_states)
 
 
 __all__ = ["InferenceMixin", "TextEncoder", "scatter_text_encoder_embeds"]

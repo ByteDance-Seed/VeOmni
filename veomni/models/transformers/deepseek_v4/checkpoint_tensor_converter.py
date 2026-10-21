@@ -49,10 +49,8 @@ import torch
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 from transformers.core_model_loading import WeightRenaming, rename_source_key
 
-from veomni.ops.kernels.deepseek_v4 import fp4_act_quant, fp8_weight_quant
-
-from ....utils import logging
-from ...checkpoint_tensor_loading import ConvertedCheckpointTensor, export_weights
+from veomni.models.checkpoint.convert import ConvertedCheckpointTensor, export_weights
+from veomni.utils import logging
 
 
 logger = logging.get_logger(__name__)
@@ -77,52 +75,6 @@ _DEEPSEEK_V4_WEIGHT_RENAMINGS = [
     transform
     for transform in (get_checkpoint_conversion_mapping("deepseek_v4") or [])
     if isinstance(transform, WeightRenaming)
-]
-# NOTE: Transformers's DeepSeek-V4 weight reverse renaming is buggy, manually fix it here.
-_INDEXER_REVERSE_RENAMINGS = [
-    WeightRenaming(
-        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.scorer\.weights_proj\.",
-        target_patterns=r"layers.\1.attn.indexer.weights_proj.",
-    ),
-    WeightRenaming(
-        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.q_b_proj\.",
-        target_patterns=r"layers.\1.attn.indexer.wq_b.",
-    ),
-    WeightRenaming(
-        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.position_bias$",
-        target_patterns=r"layers.\1.attn.indexer.compressor.ape",
-    ),
-    WeightRenaming(
-        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.kv_proj\.",
-        target_patterns=r"layers.\1.attn.indexer.compressor.wkv.",
-    ),
-    WeightRenaming(
-        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.gate_proj\.",
-        target_patterns=r"layers.\1.attn.indexer.compressor.wgate.",
-    ),
-    WeightRenaming(
-        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.kv_norm\.",
-        target_patterns=r"layers.\1.attn.indexer.compressor.norm.",
-    ),
-]
-_NESTED_REVERSE_RENAMINGS = [
-    WeightRenaming(
-        source_patterns=rf"^layers\.(\d+)\.self_attn\.(.+)\.{target}\.",
-        target_patterns=rf"layers.\1.attn.\2.{source}.",
-    )
-    for source, target in (
-        ("wq_a", "q_a_proj"),
-        ("wq_b", "q_b_proj"),
-        ("wkv", "kv_proj"),
-        ("wgate", "gate_proj"),
-        ("wo_a", "o_a_proj"),
-        ("wo_b", "o_b_proj"),
-    )
-]
-_DEEPSEEK_V4_WEIGHT_REVERSE_RENAMINGS = [
-    *_INDEXER_REVERSE_RENAMINGS,
-    *_NESTED_REVERSE_RENAMINGS,
-    *[transform.reverse_transform() for transform in reversed(_DEEPSEEK_V4_WEIGHT_RENAMINGS)],
 ]
 _FP4_E2M1_VALUES = (
     0.0,
@@ -168,8 +120,8 @@ def convert_deepseek_v4_checkpoint_key(name: str, *, target_model_prefix: str = 
         return name
     has_model_prefix = name.startswith("model.")
     source_name = name.removeprefix("model.") if has_model_prefix else name
-    # Upgrade old VeOmni keys before HF's broad inference-name rewrite can
-    # add a second compressor prefix. The model always uses the current HF key.
+    # Upgrade legacy VeOmni scorer keys before HF's broad inference-name
+    # rewrite can add a second compressor prefix.
     if re.match(r"^layers\.\d+\.self_attn\.compressor\.indexer\.weights_proj\.", source_name):
         source_name = source_name.replace(".indexer.weights_proj.", ".indexer.scorer.weights_proj.")
         return f"{target_model_prefix}{source_name}"
@@ -242,16 +194,27 @@ class DeepseekV4CheckpointTensorConverter:
     Buffers per-expert tensors as they stream from safetensor files, and emits
     merged tensors once all experts for a given (layer, projection) are collected.
 
+    Implements ``fused_expert_target`` / ``for_expert_range`` so
+    ``ep_sharded_stream_load`` can read only this rank's experts (including their
+    FP4/FP8 scale companions) and stack the local ``[E/ep, ...]`` slice.
+
     Args:
-        num_experts: Number of routed experts per MoE layer
-            (``config.n_routed_experts`` — equal to ``config.num_local_experts``
-            via ``DeepseekV4Config.attribute_map``).
+        num_experts: Number of routed experts this converter stacks
+            (``config.n_routed_experts`` for a full-rank converter — equal to
+            ``config.num_local_experts`` via ``DeepseekV4Config.attribute_map``;
+            ``E/ep`` after :meth:`for_expert_range`).
+        expert_offset: Checkpoint index of the first expert it stacks; experts
+            ``[expert_offset, expert_offset + num_experts)`` become rows
+            ``0..num_experts-1``.
+        target_model_prefix: Prefix prepended by :func:`convert_deepseek_v4_checkpoint_key`
+            (``"model."`` for CausalLM, ``""`` for the bare Model).
     """
 
-    def __init__(self, num_experts: int, *, target_model_prefix: str = "model."):
+    def __init__(self, num_experts: int, *, expert_offset: int = 0, target_model_prefix: str = "model."):
         self.num_experts = num_experts
+        self.expert_offset = expert_offset
         self.target_model_prefix = target_model_prefix
-        # {(prefix, proj_name): {expert_id: tensor}}
+        # {(prefix, proj_name): {local_expert_id: tensor}}
         self._expert_buffer: dict[tuple[str, str], dict[int, torch.Tensor]] = {}
         # {prefix: {proj_name: stacked_tensor}} for gate/up merge waiting
         self._stacked_buffer: dict[str, dict[str, torch.Tensor]] = {}
@@ -273,6 +236,31 @@ class DeepseekV4CheckpointTensorConverter:
             return False
         converted_name = convert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
         return self.can_handle(name) or (converted_name.endswith(".weight") and _is_quantized_weight(tensor))
+
+    def fused_expert_target(self, name: str) -> tuple[str, int] | None:
+        """Map a per-expert weight or its scale to ``(fused_param, expert_index)``."""
+        if _is_mtp_checkpoint_key(name):
+            return None
+        converted_name = convert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
+        weight_name = _weight_name_from_scale_name(converted_name) or converted_name
+        match = _EXPERT_PATTERN.match(weight_name)
+        if not match:
+            return None
+        prefix, expert_id_str, proj_name = match.groups()
+        proj_name = _PROJ_NAME_ALIASES.get(proj_name, proj_name)
+        fused_proj = "down_proj" if proj_name == "down_proj" else "gate_up_proj"
+        return f"{prefix}.experts.{fused_proj}", int(expert_id_str)
+
+    def for_expert_range(self, start: int, num_local: int) -> DeepseekV4CheckpointTensorConverter:
+        if start < 0 or num_local <= 0 or start + num_local > self.num_experts:
+            raise ValueError(
+                f"Expert range [{start}, {start + num_local}) is outside this converter's {self.num_experts} experts."
+            )
+        return DeepseekV4CheckpointTensorConverter(
+            num_experts=num_local,
+            expert_offset=self.expert_offset + start,
+            target_model_prefix=self.target_model_prefix,
+        )
 
     def convert(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
         if _is_mtp_checkpoint_key(name):
@@ -325,7 +313,12 @@ class DeepseekV4CheckpointTensorConverter:
 
         prefix, expert_id_str, proj_name = match.groups()
         proj_name = _PROJ_NAME_ALIASES.get(proj_name, proj_name)
-        expert_id = int(expert_id_str)
+        expert_id = int(expert_id_str) - self.expert_offset
+        if not 0 <= expert_id < self.num_experts:
+            raise ValueError(
+                f"{name}: expert {int(expert_id_str)} is outside this converter's range "
+                f"[{self.expert_offset}, {self.expert_offset + self.num_experts})."
+            )
         buf_key = (prefix, proj_name)
 
         if buf_key not in self._expert_buffer:
@@ -393,6 +386,13 @@ class DeepseekV4CheckpointTensorConverter:
         expert_dtype = config.expert_dtype
         scale_fmt = "ue8m0"
         scale_dtype = torch.float8_e8m0fnu if expert_dtype == "fp4" else torch.float32
+        # HF's renamings are not invertible (e.g. reversing ``.norm.`` -> ``.kv_norm.`` also rewrites the native
+        # ``attn.kv_norm``), so map names back by inverting the load-time renaming over the checkpoint index.
+        origin_names = {
+            convert_deepseek_v4_checkpoint_key(origin, target_model_prefix=self.target_model_prefix): origin
+            for origin in fqn_to_index_mapping
+            if not _is_mtp_checkpoint_key(origin)
+        }
         export_weight_names = set()
         for name, param in export_weights(model):
             # 1. replace mlp.experts.0.(gate_proj|up_proj|down_proj).weight to mlp.experts.0.(w1|w2|w3).weight
@@ -402,10 +402,8 @@ class DeepseekV4CheckpointTensorConverter:
                 name = ".".join(fields)
 
             # 2. reverse the renaming
-            origin, _ = rename_source_key(
-                name.removeprefix(self.target_model_prefix), _DEEPSEEK_V4_WEIGHT_REVERSE_RENAMINGS, []
-            )
-            assert origin in fqn_to_index_mapping, f"Unexpected exported weight name: {name}, origin: {origin}"
+            origin = origin_names.get(name)
+            assert origin is not None, f"Unexpected exported weight name: {name}"
 
             # 3. check if the weight needs to be quantized
             scale_name = None
@@ -419,9 +417,11 @@ class DeepseekV4CheckpointTensorConverter:
 
             # 4. quantize the weight
             fp4_quantize = "ffn.experts." in origin and expert_dtype == "fp4"
+            from veomni.models.transformers.deepseek_v4.export_quant import fp4_act_quant, fp8_weight_quant
+
             param = param.to(torch.bfloat16)
             if fp4_quantize:
-                weight, scale = fp4_act_quant(param, block_size=32)
+                weight, scale = fp4_act_quant(param, block_size=32, inplace=False)
                 weight = weight.view(torch.int8)
             else:
                 weight, scale = fp8_weight_quant(param, block_size=128, scale_fmt=scale_fmt, scale_dtype=scale_dtype)

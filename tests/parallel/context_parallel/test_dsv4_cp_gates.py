@@ -53,9 +53,22 @@ def test_gate_rejects_context_parallel_on_npu(monkeypatch):
     monkeypatch.setattr(
         auto_module,
         "get_parallel_state",
-        lambda: SimpleNamespace(cp_enabled=True),
+        lambda: SimpleNamespace(cp_enabled=True, ulysses_enabled=False),
     )
-    monkeypatch.setattr(auto_module, "is_torch_npu_available", lambda: True)
+    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", True)
 
     with pytest.raises(NotImplementedError, match="GPU-only"):
+        check_context_parallel_supported(SimpleNamespace(model_type="deepseek_v4"))
+
+
+def test_gate_rejects_combined_cp_and_ulysses_on_single_model_forward(monkeypatch):
+    monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(
+        auto_module,
+        "get_parallel_state",
+        lambda: SimpleNamespace(cp_enabled=True, ulysses_enabled=True, cp_size=2, ulysses_size=2),
+    )
+    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", False)
+
+    with pytest.raises(NotImplementedError, match="cannot be combined with Ulysses for model type 'deepseek_v4' yet"):
         check_context_parallel_supported(SimpleNamespace(model_type="deepseek_v4"))

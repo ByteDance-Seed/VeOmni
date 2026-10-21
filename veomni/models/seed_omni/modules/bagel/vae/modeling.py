@@ -23,10 +23,9 @@ import torch.nn as nn
 from einops import rearrange
 from torch import Tensor
 
-from ....mixins.offline_encoding_mixin import OfflineEncodingMixin
-from ....omni_pretrained_model import OmniPreTrainedModel
-from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
-from ..sources import BAGEL_GENERATED_LATENT, BAGEL_VAE_CONTEXT
+from ....utils.conversation import ConversationItem, iter_desired_items
+from ...module_modeling_base import PretrainedOmniModule
+from ..sources import BAGEL_CONTEXT_KEY, BAGEL_GENERATED_LATENT, BAGEL_PHASE_KEY, BAGEL_VAE_CONTEXT
 from .configuration import BagelVAEConfig
 from .processing import BAGEL_VAE_PIXEL_SHAPE, BagelVAEPreprocessor, BagelVAEProcessor, crop_latent_to_image_shape
 
@@ -40,16 +39,16 @@ def select_bagel_vae_context_items(
     if conversation_list is None:
         raise ValueError("BagelVAE requires conversation_list to select VAE context items.")
 
-    items = list(iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_VAE_CONTEXT]))
+    items = list(iter_desired_items(conversation_list, types=["image"], meta={BAGEL_CONTEXT_KEY: [BAGEL_VAE_CONTEXT]}))
     if exclude_dummy:
-        return [item for item in items if not is_dummy(item)]
+        return [item for item in items if not item.is_dummy]
     return items
 
 
 class InferenceMixin:
     """FSM ``encode_context`` / ``decode_generated`` — HF ``GenerationMixin`` analog.
 
-    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
+    Listed *before* :class:`~...module_modeling_base.PretrainedOmniModule` in
     :class:`BagelVAE`'s bases for consistency with every other module's
     native / accelerated split (see ``janus/llama/modeling.py`` for the full
     MRO rationale where a competing no-op default exists — this module
@@ -84,7 +83,7 @@ class InferenceMixin:
                 downsample=int(self.config.downsample),
             )
             image_item.value = latent.to(device=self.device, dtype=self.dtype)
-            image_item.source = BAGEL_VAE_CONTEXT
+            image_item.meta[BAGEL_CONTEXT_KEY] = BAGEL_VAE_CONTEXT
         return {"conversation_list": conversation_list}
 
     def decode_generated(
@@ -135,13 +134,15 @@ class InferenceMixin:
 
         # Final image decode consumes the completed latent emitted by the flow connector.
         decode_items: list[ConversationItem] = []
-        for item in iter_desired_items(conversation_list, types=["output"], sources=[BAGEL_GENERATED_LATENT]):
-            if not is_dummy(item):
+        for item in iter_desired_items(
+            conversation_list, types=["output"], meta={BAGEL_PHASE_KEY: [BAGEL_GENERATED_LATENT]}
+        ):
+            if not item.is_dummy:
                 decode_items.append(item)
         return decode_items
 
 
-class BagelVAE(InferenceMixin, OmniPreTrainedModel):
+class BagelVAE(InferenceMixin, PretrainedOmniModule):
     config_class = BagelVAEConfig
     image_processor_class = BagelVAEProcessor
     preprocessor_class = BagelVAEPreprocessor
@@ -153,26 +154,23 @@ class BagelVAE(InferenceMixin, OmniPreTrainedModel):
 
     def __init__(self, config: BagelVAEConfig, **kwargs: Any) -> None:
         super().__init__(config, **kwargs)
-        cache_mode = OfflineEncodingMixin.validated_cache_mode(config)
-        if cache_mode in {"full", "encode_only"}:
-            self.encoder = Encoder(
-                resolution=config.resolution,
-                in_channels=config.in_channels,
-                ch=config.ch,
-                ch_mult=config.ch_mult,
-                num_res_blocks=config.num_res_blocks,
-                z_channels=config.z_channels,
-            )
-        if cache_mode == "full":
-            self.decoder = Decoder(
-                resolution=config.resolution,
-                in_channels=config.in_channels,
-                ch=config.ch,
-                out_ch=config.out_ch,
-                ch_mult=config.ch_mult,
-                num_res_blocks=config.num_res_blocks,
-                z_channels=config.z_channels,
-            )
+        self.encoder = Encoder(
+            resolution=config.resolution,
+            in_channels=config.in_channels,
+            ch=config.ch,
+            ch_mult=config.ch_mult,
+            num_res_blocks=config.num_res_blocks,
+            z_channels=config.z_channels,
+        )
+        self.decoder = Decoder(
+            resolution=config.resolution,
+            in_channels=config.in_channels,
+            ch=config.ch,
+            out_ch=config.out_ch,
+            ch_mult=config.ch_mult,
+            num_res_blocks=config.num_res_blocks,
+            z_channels=config.z_channels,
+        )
         self._image_processor: BagelVAEProcessor | None = None
         self.post_init()
 
@@ -181,29 +179,13 @@ class BagelVAE(InferenceMixin, OmniPreTrainedModel):
             self.eval()
             self.requires_grad_(False)
 
-    def _require_encoder(self) -> Encoder:
-        encoder = getattr(self, "encoder", None)
-        if encoder is None:
-            raise RuntimeError(
-                f"BagelVAE requires the VAE encoder; cache_mode={OfflineEncodingMixin.validated_cache_mode(self.config)!r}."
-            )
-        return encoder
-
-    def _require_decoder(self) -> Decoder:
-        decoder = getattr(self, "decoder", None)
-        if decoder is None:
-            raise RuntimeError(
-                f"BagelVAE requires the VAE decoder; cache_mode={OfflineEncodingMixin.validated_cache_mode(self.config)!r}."
-            )
-        return decoder
-
     @property
     def _encoder_device(self) -> torch.device:
-        return self._require_encoder().conv_in.weight.device
+        return self.encoder.conv_in.weight.device
 
     @property
     def _decoder_device(self) -> torch.device:
-        return self._require_decoder().conv_in.weight.device
+        return self.decoder.conv_in.weight.device
 
     @contextmanager
     def _runtime_context(self, tensor: torch.Tensor):
@@ -236,16 +218,14 @@ class BagelVAE(InferenceMixin, OmniPreTrainedModel):
         **kwargs: object,
     ) -> dict[str, Any]:
         del kwargs
-        decoder = self._require_decoder()
         latents = latents.to(device=self._decoder_device, dtype=self.dtype)
         latents = latents / self.config.scale_factor + self.config.shift_factor
         with self._runtime_context(latents):
-            pixel_values = decoder(latents)
+            pixel_values = self.decoder(latents)
         return {"pixel_values": pixel_values.to(dtype=self.dtype)}
 
     def _encode_posterior(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        encoder = self._require_encoder()
-        return torch.chunk(encoder(pixel_values), 2, dim=1)
+        return torch.chunk(self.encoder(pixel_values), 2, dim=1)
 
     def _sample_scaled_latents(self, posterior: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         mean, logvar = posterior

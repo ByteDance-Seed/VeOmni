@@ -1,0 +1,10 @@
+# Understanding-only variant: the second module never runs, so a launcher with
+# both scenarios has two genuinely different FSMs to select between.
+initial: run
+
+states:
+  run:
+    body:
+      - { from: fake_module_a, to: end }
+    transitions:
+      - { condition: { type: default }, next_state: done }

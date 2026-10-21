@@ -9,29 +9,14 @@ from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import (
     Qwen3MoeCheckpointTensorConverter,
     convert_qwen3_moe_fqn_to_index_mapping,
 )
+from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import Qwen3MoeModel
 
-# Re-export the patched module's OpSlots into THIS module's namespace.
-# ``build_foundation_model`` binds kernels by walking ``model_cls.__module__``
-# (here = this omni wrapper module) for ``OpSlot`` objects — the real OpSlots
-# live in ``patched_modeling_qwen3_moe_gpu``. Without this re-export the fused,
-# EP-aware MoE kernel is never bound, so the eager experts loop runs and
-# crashes under Expert Parallel (it indexes the EP-sharded experts weight with
-# global expert ids). These are the same singleton OpSlots, so binding them
-# here activates the fused path globally.
-from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import (  # noqa: F401
-    Qwen3MoeModel,
-    veomni_apply_rotary_pos_emb,
-    veomni_moe_experts_forward,
-    veomni_rms_norm,
-    veomni_swiglu_mlp,
-)
-
-from ....omni_pretrained_model import OmniPreTrainedModel
 from ...base.llm_packing import SimpleArGenerationMixin
+from ...module_modeling_base import PretrainedOmniModule
 from .configuration import Qwen3MoeLlmConfig
 
 
-class Qwen3MoeLlm(SimpleArGenerationMixin, OmniPreTrainedModel):
+class Qwen3MoeLlm(SimpleArGenerationMixin, PretrainedOmniModule):
     """Qwen3-MoE backbone (no wte, no lm_head).
 
     Multi-modal inputs are already embedded by the sibling text encoder and live

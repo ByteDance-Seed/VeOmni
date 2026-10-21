@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SeedOmni V2 graph layer: shared edge/node types + training DAG + inference FSM."""
+"""SeedOmni graph layer: shared edge/node types + training DAG + inference FSM."""
 
 from .base import END, EdgeDef, NodeDef, is_end
 from .generation_graph import FSM_SIGNAL_KEY, GenerationGraph

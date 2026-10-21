@@ -1,22 +1,13 @@
-import logging
 import os
-import sys
 
 import torch
 import torch.distributed as c10d
-
-from veomni.utils.device import get_device_id, get_dist_comm_backend, get_torch_device
-
-
-if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
-    logging.error("c10d NCCL not available, skipping tests", file=sys.stderr)
-    sys.exit(0)
-
 import torch.distributed as dist
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 
-from veomni.distributed.parallel_state import _init_parallel_state
+from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 from veomni.distributed.sequence_parallel import get_ulysses_sequence_parallel_group
+from veomni.utils.device import get_device_id, get_dist_comm_backend, get_torch_device
 
 
 def sync_tensor(variable, dim=1):
@@ -67,15 +58,19 @@ class SequenceParallelTest(CommonDistributedDataParallelTest, MultiProcessTestCa
         os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
         self._spawn_processes()
 
+    def tearDown(self):
+        clear_parallel_state()
+        super().tearDown()
+
     def _get_process_group(self):
         store = self._get_store()
         get_torch_device().set_device(self.rank)
         c10d.init_process_group(get_dist_comm_backend(), store=store, rank=self.rank, world_size=self.world_size)
-        # Build a real ParallelState (Ulysses SP over all ranks) instead of
-        # injecting a raw group: the SP getters resolve from the current state's
-        # device mesh. ``set_parallel_state(None)`` in a test disables SP (the DP
-        # reference path). ``device_type`` defaults to the current accelerator.
-        _init_parallel_state(dp_size=1, ulysses_size=self.world_size)
+        # Build both the Ulysses SP state and the non-SP (DP) reference state so
+        # tests can run either path under ``with use_parallel_state(...):``
+        # without mutating or clearing global state in the middle of a test.
+        self.sp_state = _init_parallel_state(dp_size=1, ulysses_size=self.world_size, name="sp")
+        self.dp_state = _init_parallel_state(dp_size=self.world_size, ulysses_size=1, name="dp")
         group = get_ulysses_sequence_parallel_group()
         self.rank = dist.get_rank(group)
         return group
