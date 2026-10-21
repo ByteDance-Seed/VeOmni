@@ -139,8 +139,8 @@ model:
 | `flash_attention_2` | Flash Attention v2 | Yes after rewrite | `flash-attn` |
 | `flash_attention_3` | Flash Attention v3 | Yes after rewrite | `flash-attn-interface` |
 | `flash_attention_4` | Flash Attention v4 | Yes after rewrite | `flash-attn.cute` |
-| `flex_attention` | PyTorch FlexAttention | Yes after rewrite | Native `BlockMask`; CUDA for compiled training |
-| `magi_attention` | MagiAttention FFA | Yes after rewrite | `--extra magi`; SM90+; model-provided `MagiAttentionMask` |
+| `flex_attention` | PyTorch FlexAttention | Yes after rewrite | NVIDIA GPU; native `BlockMask`; SM90+ uses FA4 when available, otherwise Triton |
+| `magi_attention` | MagiAttention FFA | Yes after rewrite | `--extra magi`; NVIDIA SM100+; model-provided `MagiAttentionMask` |
 | `sage_attention` | SageAttention | Yes after rewrite | `sageattention` |
 | `native-sparse` | Sparse attention | No | — |
 

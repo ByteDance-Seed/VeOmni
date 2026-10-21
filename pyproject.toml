@@ -35,7 +35,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Hardware extras gpu / npu / npu_aarch64 are mutually exclusive
-# (`[tool.uv].conflicts`). MagiAttention is optional NVIDIA SM90+ and
+# (`[tool.uv].conflicts`). MagiAttention is optional NVIDIA SM100+ and
 # requires gpu: `uv sync --extra gpu --extra magi`.
 dev = [
   "pre-commit>=4.0.0,<5.0",
@@ -95,7 +95,7 @@ gpu = [
   "hf_transfer",
 ]
 
-# MagiAttention FFA (NVIDIA SM90+). Requires gpu via veomni[gpu]; conflicts with npu extras.
+# MagiAttention FFA (NVIDIA SM100+). Requires gpu via veomni[gpu]; conflicts with npu extras.
 magi = [
   "veomni[gpu]",
   # MagiAttention 1.1.1 imports debugpy unconditionally from
@@ -225,7 +225,7 @@ conflicts = [
 patchgen = { path = "patchgen-pkg", editable = true }
 magi-attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
 # MagiAttention upstream designates this contributor-maintained support branch
-# for its arbitrary-mask FA4 packages and SM90 ffa-fa3 overlay. Dao-AILab does
+# for its arbitrary-mask FA4 packages. Dao-AILab does
 # not publish equivalent packages.
 # Keep the immutable shared revision until an organization-owned source exists.
 create-block-mask-cuda = { git = "https://github.com/demonatic/flash-attention.git", rev = "ee1d15159cda6f3f97bfab9e487da146a8254970", subdirectory = "csrc/utils/create_block_mask" }
@@ -331,11 +331,10 @@ magi-attention = ["setuptools>=78.1.1", "wheel", "packaging>=24.2", "ninja", "to
 magi-to-hstu-cuda = ["setuptools", "wheel", "packaging", "ninja", { requirement = "torch", match-runtime = true }]
 
 [tool.uv.extra-build-variables]
-# SM90 uses the separately installed CUTLASS FFA overlay, while SM100+ uses
-# CUTE DSL/JIT. Build their shared extensions for both architectures; CP
-# communication remains outside the CP1 scope.
-magi-attention = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "90,100", MAGI_ATTENTION_PREBUILD_FFA = "0", MAGI_ATTENTION_SKIP_MAGI_ATTN_COMM_BUILD = "1" }
-create-block-mask-cuda = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "90,100" }
+# MagiAttention uses CUTE DSL/JIT on SM100+. Build its extensions for the
+# supported architecture; CP communication remains outside the CP1 scope.
+magi-attention = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "100", MAGI_ATTENTION_PREBUILD_FFA = "0", MAGI_ATTENTION_SKIP_MAGI_ATTN_COMM_BUILD = "1" }
+create-block-mask-cuda = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "100" }
 magi-to-hstu-cuda = { MAX_JOBS = "8" }
 
 [tool.setuptools.dynamic]

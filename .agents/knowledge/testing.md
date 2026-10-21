@@ -129,6 +129,10 @@ needed" without a reason is what the reviewer is looking for.
 
 ## Guidance
 
+- Compiled backward can donate saved buffers and reject `retain_graph=True`.
+  Numerical comparisons should use independent leaf tensors for the reference
+  graph and differentiate each graph once without retaining it. Keep test inputs
+  deterministic; do not disable compiler buffer donation globally for a test.
 - A test double wrapping a `VeomniOp` must expose the handle attributes its
   consumer reads, including `impl`. DeepSeek-V4 keeps eager routing weights in
   their incoming dtype and casts them for fused MoE; a recording double must

@@ -217,6 +217,102 @@ tests require TileLang on an SM90+ NVIDIA GPU, and the `cann` parity tests requi
 with `cann_ops_transformer`. Its mHC kernel parity is covered by `tests/ops/mhc/test_mhc.py` and
 requires TileKernels on an SM90+ NVIDIA GPU or CANN on an Ascend NPU.
 
+DeepSeek-V4 expert-parallel training is exercised separately by
+`tests/e2e/test_e2e_parallel.py::test_deepseek_v4_expert_parallel_alignment`:
+four-rank FSDP2, SP=1, EP=1 versus EP=2, and two optimizer steps. This uses
+eager DSA/mHC with fused routed experts, so it does not qualify the SM90+
+kernel paths. The CPU duplicate-hash-route regression verifies that EP split
+counts match unique token/expert dispatch pairs; repeated routing weights are
+summed when combining outputs.
+The GPU CI also runs `test_deepseek_v4_expert_parallel_fixed_route_vjp_matches_fp32_reference`
+in `tests/models/transformers/deepseek_v4/test_deepseek_v4.py`: four-rank EP=4, unequal token
+payloads, ordinary and duplicate expert slots, and three held-out seeds. Output,
+input/routing gradients and expert-weight gradients are compared with a global
+FP32 mathematical VJP using the same BF16 bit patterns and the rounding budget
+described below. This isolates expert transport/kernel numerics, not FSDP2
+gradient averaging or whole-model optimizer trajectories.
+
+Controlled two-step BF16 FSDP2 runs matched initial FP32 master weights,
+buffers, optimizer settings and every rank's micro-batches. Aggregate execution
+gates passed, but whole-model pre-clipping gradient relative L2 differed by
+about 4.61% for EP2 versus EP1 before aligning routing-weight placement. Non-EP
+Triton experts now weight the down-projection output, matching EP and the eager
+reference, instead of weighting the BF16 activation before that projection.
+Both split/merged weights and shared/independent LoRA use this order; for LoRA,
+the routing weight scales the complete base-plus-adapter output.
+
+On the same four-rank fixture, this reduced first-step whole-model gradient
+relative L2 to 0.0751%, with bit-identical non-expert gradients. Expert weight
+gradients still differ across EP reduction layouts. First-step update relative
+L2 was 2.62%; after that update, second-step gradient relative L2 was 4.24% and
+update relative L2 was 5.21%. These measurements do not establish whole-model
+update parity or convergence. First-step AdamW replay and clipping passed their
+separate oracles in the earlier diagnostic runs.
+
+`tests/ops/moe_experts/test_moe_experts_ep.py` checks output and all VJPs against
+the single-expert EP projection order without relaxing split/merged parity.
+`tests/ops/moe_experts_lora/test_moe_experts_lora.py` checks that zero-B adapters preserve base
+output, input/routing and base-weight gradients, while retaining trainable
+B-gradients. Both files run in GPU CI. Duplicate routes still have distinct
+EP/non-EP reduction layouts; no bitwise guarantee is made for arbitrary routes.
+
+`tests/e2e/test_e2e_parallel.py::test_deepseek_v4_compiled_fsdp2_training_alignment` compares
+eager and fullgraph Inductor through four-rank packed FSDP2 training, with
+static 512-token shapes and EP/SP disabled. Loss and gradient norm are checked
+at `rtol=atol=1e-3`; this checks aggregate training metrics, not per-parameter
+update alignment, convergence or bitwise equivalence.
+It keeps DSA/mHC/norm/shared MLP/loss eager and routed experts on `fused_triton`. Enabled
+ExtraParallel with compilation remains rejected. Single-device decoder trace
+and gradient checks live in `tests/distributed/test_torch_compile.py`.
+Backend `eager` capture compares two identically loaded BF16 models: loss within
+`rtol=atol=1e-4` and every parameter gradient within `rtol=atol=1e-3`. The
+Inductor execution gate runs two batches through the compiled decoder blocks and
+requires a finite loss, finite gradients and an AdamW step for each; it does not
+compare against eager BF16, which is not an exact numerical oracle. A separate
+fixed-route expert test feeds random hidden states, fixed top-k routes and a
+random cotangent to the Inductor-compiled and the eager fused experts, and
+compares output, input/routing gradients and both expert-weight gradients against
+an FP32 copy of the same experts on the eager `moe_experts` path. Outputs must be
+within `rtol=1e-2, atol=2e-2` of the reference; each gradient must have cosine
+similarity above 0.999 and be within `rtol=2e-2, atol=3e-2`; compiled and eager
+outputs and gradients must agree within `rtol=1e-2, atol=2e-2`. These local gates do not qualify
+whole-model numerical training correctness or the SM90+ optimized kernels.
+
+Controlled two-step BF16 FSDP2 runs matched initial FP32 master weights,
+buffers, optimizer settings and every rank's micro-batches. Aggregate execution
+gates passed, but whole-model pre-clipping gradient relative L2 differed by
+about 5.81% for Inductor versus eager. First-step AdamW replay and clipping
+passed their scoped oracles; whole-model update parity and convergence remain
+unqualified. See the separate EP validation PR for expert transport validation.
+
+`test_deepseek_v4_compiled_decoder_gradients_track_the_fp32_oracle` checks that
+compiled BF16 gradients track the direction of an FP32 reference about as
+closely as eager BF16 gradients do. From one fixed set of BF16-rounded weights
+(with hash-routing tables filled) and the same input, it runs the eager and the
+fullgraph Inductor BF16 models, both in batch-invariant mode, and an eager FP32
+forward/backward over those same values. Losses must be within
+`rtol=5e-3, atol=1e-2` of the FP32 reference and within `rtol=1e-3, atol=2e-3`
+of each other, and all three must give gradients to the same parameters.
+Gradients are compared by direction only, excluding `indexer.weights_proj`: the
+cosine between all gradients and the reference must exceed 0.995 for each mode
+and the two modes' cosines must agree within 2e-3; per parameter whose
+reference gradient norm is at least 1e-4, the Inductor cosine must exceed 0.97
+and trail eager by at most 5e-3. Cosine similarity is scale-invariant, so this
+test does not bound gradient magnitude or relative L2 error; only its loss
+checks are magnitude-sensitive. The reference runs the eager MoE implementation
+rather than the Triton grouped GEMM both BF16 modes use, so its distance also
+contains that implementation difference.
+
+Measurements taken for this document, none of which a test asserts: an earlier
+revision of the decoder harness (one 64-token sequence, filled hash-routing
+tables, no batch-invariant mode) read whole-model gradient relative L2 to the
+FP32 reference of 1.70% (eager) and 1.48% (Inductor), with the two BF16 modes
+2.08% apart. These were not re-measured with the current harness. In the
+four-rank run at step 1, eager and Inductor pre-clipping gradient norms agree to
+1.5e-4 relative and the cosine between the two gradients is 0.9985.
+`TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1` does not close the four-rank gap:
+5.84% and 6.02% at steps 1 and 2, against 5.48% and 5.79% by default.
+
 ---
 
 ### 2. VLM Trainer Test (`tests/trainer/test_vlm_trainer.py`)
@@ -324,7 +420,7 @@ requires TileKernels on an SM90+ NVIDIA GPU or CANN on an Ascend NPU.
 | `moe_experts/test_moe_experts.py` | Eager/Triton/Quack MoE parity, split/merged weights, and hardware guards | CPU for guards; CUDA for optimized kernels |
 | `dsa/test_dsa*.py` | DSA registry, CPU guards, and TileLang/cuDNN numerical parity | CPU for guards; matching CUDA hardware for optimized kernels |
 | `attention/flash/test_flash_attention.py` | FlashAttention contracts | CUDA |
-| `attention/magi/` | Magi mask, installer, FA4 metadata, and numerical contracts | CPU for guards; SM90/SM100 for optimized kernels |
+| `attention/magi/` | Magi mask, SM100+ guard, FA4 metadata, and numerical contracts | CPU for guards; SM100+ for optimized kernels |
 | `batch_invariant/test_batch_invariant.py` | Batch-invariant ATen patch lifecycle and math | CPU for lifecycle; CUDA for Triton kernels |
 
 Cross-entropy is covered at two layers: `tests/ops/loss/test_cross_entropy_loss.py`
@@ -558,6 +654,23 @@ pytest → test_text_fsdp_equivalence(config, ...)
 ```
 
 ---
+
+## Batch-invariant FP32 GEMM precision
+
+`test_matmul_persistent_preserves_ieee_fp32_precision_and_batch_invariance` in
+`tests/ops/batch_invariant/test_batch_invariant.py` checks one FP32
+`matmul_persistent` product, with and without bias, against FP64 arithmetic over
+the same operands (`rtol=1e-6, atol=1e-5`), and requires bitwise-equal results
+when the rows are computed as two separate batches. It is the only FP64
+reference case in the file: BF16/FP16, strided and padded-tile products are not
+compared against FP64. The GPU unit workflow runs the entire
+`tests/ops/` directory.
+
+The invariant Triton GEMM explicitly uses IEEE input precision. Triton's default
+TF32 dot precision truncates FP32 projection inputs even when PyTorch's matmul
+precision is `highest`; setting the PyTorch policy alone does not configure a
+Triton kernel. This fixes that operator's FP32 accuracy, but does not establish
+whole-model BF16 gradient, parameter-update or convergence parity.
 
 ## Architecture Notes
 

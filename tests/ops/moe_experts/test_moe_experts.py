@@ -24,7 +24,7 @@ from transformers import GptOssConfig, Qwen3MoeConfig
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
 
-from tests.ops.moe_experts.reference import standard_fused_reference
+from tests.ops.moe_experts.reference import standard_ep_reference, standard_fused_reference
 from tests.ops.tol import (
     EAGER_ATOL,
     EAGER_GRAD_ATOL,
@@ -485,9 +485,9 @@ def _run_fused_three_way(
 ):
     """Compare one fused implementation's split and merged layouts with eager math.
 
-    The reference is ``standard_fused_reference``: eager math in the fused
-    rows' routing order. The production eager row uses Hugging Face order,
-    which drifts from it by BF16 rounding at production shapes.
+    Non-EP Triton uses ``standard_ep_reference`` (post-``fc2`` routing-weight
+    order matching EP and Hugging Face eager), while Quack uses
+    ``standard_fused_reference`` (pre-``fc2`` routing-weight order).
     """
     torch.manual_seed(seed)
     if device is None:
@@ -519,7 +519,8 @@ def _run_fused_three_way(
     out_m = fused(hidden_m, routing_m, selected, empty, empty, fc2_m, fc1_12_m, **kwargs)
     if impl == "fused_triton":
         assert len(out_m.grad_fn.saved_tensors) == 11
-    out_e = standard_fused_reference(hidden_e, routing_e, selected, fc1_1_e, fc1_2_e, fc2_e, **kwargs)
+    reference_fn = standard_ep_reference if impl == "fused_triton" else standard_fused_reference
+    out_e = reference_fn(hidden_e, routing_e, selected, fc1_1_e, fc1_2_e, fc2_e, **kwargs)
     torch.testing.assert_close(out_s, out_m, rtol=0, atol=0)
 
     go = torch.randn_like(out_s)

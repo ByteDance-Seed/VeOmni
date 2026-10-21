@@ -8,7 +8,7 @@ import pytest
 import torch
 import yaml
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_capabilities, runner_device_count
+from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec, runner_capabilities, runner_device_count
 from scripts.ci.accelerator.runtime.devices import child_environment
 from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs
 from veomni.models import build_foundation_model
@@ -23,6 +23,8 @@ from .utils import alignment_case_plan, alignment_plan, prepare_exec_cmd
 _QWEN4_LAUNCH = LaunchSpec(nproc=2)
 _LORA_PARALLEL = dict(is_moe=False, max_sp_size=1)
 _DYN_PARALLEL = dict(is_moe=True, max_sp_size=2, max_ep_size=1)
+_DEEPSEEK_V4_EP_PARALLEL = dict(is_moe=True, max_sp_size=1, max_ep_size=2)
+_DEEPSEEK_V4_COMPILE_LAUNCH = LaunchSpec(nproc=4)
 
 
 # Models without a patchgen path are commented out in their respective case
@@ -519,6 +521,83 @@ def test_text_parallel_smoke(
         max_ep_size=max_ep_size,
         compare_alignment=False,
     )
+
+
+@pytest.mark.launch_plan(provider=lambda context: alignment_plan(context.capabilities, **_DEEPSEEK_V4_EP_PARALLEL))
+def test_deepseek_v4_expert_parallel_alignment(dummy_deepseek_v4_dense_packed_text_dataset):
+    """Compare two optimizer steps with EP=1/2 on the same four-rank FSDP2 job.
+
+    Keep SP disabled so this explicitly validates expert sharding and token
+    dispatch rather than conflating it with the existing SP-only smoke test.
+    Eager DSA/mHC work on the SM89 CI fleet; routed MoE stays fused.
+    """
+    main(
+        task_name="train_text_test",
+        model_name="deepseek_v4",
+        config_path="./tests/toy_config/deepseek_v4_toy",
+        is_moe=_DEEPSEEK_V4_EP_PARALLEL["is_moe"],
+        rtol=_DEFAULT_RTOL,
+        atol=_DEFAULT_ATOL,
+        train_path=dummy_deepseek_v4_dense_packed_text_dataset,
+        max_sp_size=_DEEPSEEK_V4_EP_PARALLEL["max_sp_size"],
+        max_ep_size=_DEEPSEEK_V4_EP_PARALLEL["max_ep_size"],
+        compare_alignment=True,
+        extra_args=[
+            "--model.ops_implementation.dsa_indexer_implementation=eager",
+            "--model.ops_implementation.dsa_attention_implementation=eager",
+            "--model.ops_implementation.mhc_implementation=eager",
+        ],
+    )
+
+
+@pytest.mark.skipif(
+    not IS_CUDA_AVAILABLE or runner_device_count() < _DEEPSEEK_V4_COMPILE_LAUNCH.nproc,
+    reason="DeepSeek V4 compiled trainer parity requires four CUDA devices",
+)
+@pytest.mark.launch_plan(provider=CasePlan.sequential(_DEEPSEEK_V4_COMPILE_LAUNCH, _DEEPSEEK_V4_COMPILE_LAUNCH))
+def test_deepseek_v4_compiled_fsdp2_training_alignment(dummy_deepseek_v4_dense_packed_text_dataset, tmp_path):
+    """Compare eager/Inductor through packed FSDP2 training, with EP off."""
+    config = "./tests/toy_config/deepseek_v4_toy"
+    weights = tmp_path / "weights"
+    _materialize_weights_dir(config, str(weights))
+    results = {}
+    for enabled in (False, True):
+        name = "inductor" if enabled else "eager"
+        output = tmp_path / name
+        cmd = build_torchrun_cmd(
+            script="tests/train_scripts/train_text_test.py",
+            config_path=config,
+            model_path=str(weights),
+            train_path=dummy_deepseek_v4_dense_packed_text_dataset,
+            output_dir=str(output),
+            parallel_config=ParallelConfig(sp_size=1, ep_size=1, fsdp_mode="fsdp2"),
+            nproc=_DEEPSEEK_V4_COMPILE_LAUNCH.nproc,
+            model_name="deepseek_v4",
+            extra_args=[
+                "--data.max_seq_len=512",
+                "--data.dataloader.num_workers=0",
+                "--train.dyn_bsz=True",
+                "--train.pad_to_length=True",
+                f"--model.accelerator.torch_compile.enable={enabled}",
+                "--model.accelerator.torch_compile.fullgraph=True",
+                "--model.ops_implementation.rms_norm_implementation=eager",
+                "--model.ops_implementation.swiglu_mlp_implementation=eager",
+                "--model.ops_implementation.cross_entropy_loss_implementation=eager",
+                "--model.ops_implementation.rotary_pos_emb_implementation=eager",
+                "--model.ops_implementation.dsa_indexer_implementation=eager",
+                "--model.ops_implementation.dsa_attention_implementation=eager",
+                "--model.ops_implementation.mhc_implementation=eager",
+            ],
+        )
+        subprocess.run(cmd, check=True)
+        with open(output / "log_dict.json") as f:
+            results[name] = json.load(f)
+        assert results[name] and all(
+            len(values) == 2 and torch.isfinite(torch.tensor(values)).all() for values in results[name].values()
+        )
+    for metric in results["eager"]:
+        print_comparison_table(results, metric, title="DeepSeek V4 FSDP2 compile")
+    compare_metrics(results, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.launch_plan(provider=lambda context: alignment_plan(context.capabilities, **_DYN_PARALLEL))

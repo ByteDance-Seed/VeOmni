@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from functools import partial
 
 import torch
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -30,24 +31,34 @@ from transformers.masking_utils import (
     sliding_window_overlay,
 )
 
+from .....utils.device import get_gpu_compute_capability, is_nvidia_cuda_device
 from ..ulysses import should_apply_ulysses, ulysses_mask_lengths
 from .packed import packed_mask_function
 
 
-def _eager_create_block_mask(*args, **kwargs):
-    """Keep ``create_block_mask`` uncompiled.
+_SM100_BLOCK_SIZE = (256, 128)
+_DEFAULT_BLOCK_SIZE = 128
 
-    Transformers still passes ``_compile=True`` on torch>=2.6. Compiled
-    ``create_block_mask`` belongs on the magi-vs-flex branch, not here.
-    """
+
+def _flex_block_size(device: torch.device | str | int | None) -> int | tuple[int, int]:
+    """Use FA4's SM100 Q tile, and retain the default size elsewhere."""
+    if is_nvidia_cuda_device(device):
+        if get_gpu_compute_capability(device) >= 100:
+            return _SM100_BLOCK_SIZE
+    return _DEFAULT_BLOCK_SIZE
+
+
+def _eager_create_block_mask(*args, **kwargs):
+    """Eager ``create_block_mask`` with HF's deprecated ``_compile`` forced off."""
     kwargs["_compile"] = False
     return create_block_mask(*args, **kwargs)
 
 
 @contextmanager
-def _eager_hf_create_block_mask() -> Iterator[None]:
+def _patched_hf_create_block_mask(block_size: int | tuple[int, int]) -> Iterator[None]:
+    """Use the architecture-specific tile size without HF's deprecated compilation flag."""
     original = masking_utils.create_block_mask
-    masking_utils.create_block_mask = _eager_create_block_mask
+    masking_utils.create_block_mask = partial(_eager_create_block_mask, BLOCK_SIZE=block_size)
     try:
         yield
     finally:
@@ -78,6 +89,9 @@ def flex_attention_mask_builder(
     require an additional 2D mask.
     Canonical masks can be rebuilt from global lengths; custom predicates
     require global metadata.
+
+    BlockMask construction stays eager. The builder chooses a compatible tile
+    size but does not change the caller's visibility predicate.
     """
     sliding_window = kwargs.pop("sliding_window", None)
     if cu_seqlens_k is None:
@@ -127,7 +141,7 @@ def flex_attention_mask_builder(
             batch_size=batch_size,
         )
 
-    with _eager_hf_create_block_mask():
+    with _patched_hf_create_block_mask(_flex_block_size(device)):
         return ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"](
             batch_size=batch_size,
             q_length=q_length,

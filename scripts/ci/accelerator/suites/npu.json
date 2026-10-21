@@ -375,6 +375,17 @@
     ]
   },
   {
+    "name": "moe-router-replay-api-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_moe_router_replay_api.py"
+    ]
+  },
+  {
     "name": "npu-e2e-01",
     "suite": "e2e",
     "args": [

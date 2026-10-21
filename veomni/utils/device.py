@@ -52,6 +52,11 @@ def get_device_type() -> str:
     return device
 
 
+def is_nvidia_cuda_device(device: torch.types.Device | int | None) -> bool:
+    """Return whether an explicit device uses NVIDIA CUDA rather than ROCm."""
+    return device is not None and torch.device(device).type == "cuda" and torch.version.hip is None
+
+
 def get_device_name() -> str:
     """Get real device name, e.g. A100, H100"""
     return get_torch_device().get_device_name()

@@ -573,6 +573,26 @@
     ]
   },
   {
+    "name": "moe-router-replay-api-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_moe_router_replay_api.py"
+    ]
+  },
+  {
+    "name": "profiler-memory-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_profiler_memory.py"
+    ]
+  },
+  {
     "name": "57-e2e",
     "suite": "e2e",
     "conditional": false,
