@@ -16,7 +16,6 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_com
 from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available
 
 from ..tools import DummyDataset, ParallelConfig, build_torchrun_cmd, compare_metrics, print_comparison_table
-from ..tools.ci_config import ci_config_path
 from ..tools.training_utils import make_eager_ops_config
 from .utils import alignment_case_plan, alignment_plan, prepare_exec_cmd
 
@@ -113,7 +112,6 @@ def main(
     compare_alignment: bool = True,
     extra_args: list[str] | None = None,
 ):
-    config_path = ci_config_path(config_path)
     test_path = f"./{model_name}"
     os.makedirs(test_path, exist_ok=True)
 

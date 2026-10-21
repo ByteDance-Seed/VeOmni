@@ -109,7 +109,7 @@ SNAPSHOT_POST = "lora_snapshot_post.pt"
 # directly via ``json.load``.
 LOG_DICT = "log_dict.json"
 
-_TOY_CONFIG_PATH = "tests/toy_config/ci/qwen3_moe_tiny/config.json"
+_TOY_CONFIG_PATH = "tests/toy_config/qwen3_moe_toy/config.json"
 
 
 os.environ["NCCL_DEBUG"] = "OFF"

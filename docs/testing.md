@@ -468,6 +468,11 @@ allocated rendezvous ports for concurrent cases. See the
 
 ## New Model Onboarding: Test Checklist
 
+Local tests and CI use the same canonical configs under `tests/toy_config/`.
+Reuse the [shared toy fixtures](../tests/toy_config/README.md) and preserve their
+model/input contracts; do not create CI-specific copies or switch configs based
+on the execution environment.
+
 When adding a new model to VeOmni, the following tests should be created or updated.
 See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_model.md) for step-by-step instructions.
 

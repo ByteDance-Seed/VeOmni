@@ -66,7 +66,7 @@ def _call(impl: str, variant: str, hidden, routing, selected, fc1, fc2, loras, *
 
 _SHAPES = {
     "small": dict(B=32, H=64, I=96, E=4, top_k=2, r=8),
-    # qwen3_moe_toy expert dimensions: the kernel tiles see production-sized H and I.
+    # Explicit larger dimensions retain kernel-tile coverage independently of model fixtures.
     "qwen3_moe": dict(B=64, H=2048, I=768, E=16, top_k=2, r=16),
 }
 

@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(
     reason="shared-prefix training needs the GPU or NPU modeling path",
 )
 
-TOY_CONFIG = "tests/toy_config/ci/qwen3_5_text_tiny"
+TOY_CONFIG = "tests/toy_config/qwen3_5_fsdp_equiv_toy"
 PREFIX, SUFFIX, GROUP = 1990, 96, 3  # prefix deliberately not a multiple of the 64-token chunk
 
 # The GDN ops the two modeling paths bind: vendored Triton on NPU, flash-linear-attention on GPU.

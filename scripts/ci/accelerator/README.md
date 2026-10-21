@@ -100,10 +100,10 @@ GPU acceptance.
 
 ## Small integration fixtures
 
-`tests/toy_config/ci/` contains opt-in smaller fixtures for synthetic checkpoint,
-LoRA, model parity and e2e tests. `tests/tools/ci_config.py` resolves only existing
-alternatives at explicitly opted-in build sites. Shared example configs and
-processor/tokenizer integration fixtures remain separate.
+`tests/toy_config/` is the shared fixture set for local tests and CI. Tests load
+the canonical `*_toy/config.json` paths directly, with no environment-specific
+copies or path rewriting. See the [toy config guide](../../../tests/toy_config/README.md)
+for fixture selection and constraints. Processor assets stay alongside their configs.
 
 These configs preserve model families, expert counts/top-k, backend selection,
 parallel world sizes and data shapes. Qwen3.5 retains three linear-attention
