@@ -14,6 +14,13 @@ CPU-only parsing, preprocessing, eager references and mocked backend tests need
 an explicit CPU launch plan. Mark entire modules only when all cases are CPU-only;
 use individual case markers in files that also exercise accelerator kernels.
 
+CPU numerical flakes need fresh-process reproduction, not only warm repeats.
+The QSA CPU fused-kernel mock promotes only `exp` to FP64 and casts back:
+PyTorch 2.11 CPU FP32 `torch.exp` was observed to return inaccurate values on
+its first parallel call, reproducing the original 757-element CI mismatch.
+Keep the adapter's FP32 arithmetic and strict output/gradient tolerances; the
+independent FP64 SDPA oracle alone does not fix an inaccurate candidate mock.
+
 New functions/parameters already included by an existing selection need no
 manifest update. Check node-ID and pytest filters as well as file/directory
 paths. See `docs/testing.md` under "Registering Tests in CI" for the manifest

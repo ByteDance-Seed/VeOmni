@@ -432,7 +432,10 @@ def _npu_reference_forward(q, k, v, blocked, scale):
     scores = (q @ k.transpose(-1, -2)) * scale
     maximum = scores.masked_fill(blocked, -torch.inf).amax(-1, keepdim=True)
     maximum = maximum.masked_fill(~torch.isfinite(maximum), 0)
-    weights = torch.exp(scores - maximum).masked_fill(blocked, 0)
+    # CPU FP32 exp can lose accuracy on its first parallel call (observed with
+    # PyTorch 2.11). Stabilize the mock kernel's exponential only; attention
+    # matmuls, normalization and gradient accumulation retain the input dtype.
+    weights = torch.exp((scores - maximum).double()).to(scores.dtype).masked_fill(blocked, 0)
     denominator = weights.sum(-1, keepdim=True).clamp_min(1e-30)
     return (weights / denominator) @ v, maximum, denominator
 
@@ -440,7 +443,8 @@ def _npu_reference_forward(q, k, v, blocked, scale):
 def _npu_reference_backward(q, k, v, grad, blocked, output, maximum, denominator, scale):
     repeats = q.shape[1] // k.shape[1]
     kr, vr = k.repeat_interleave(repeats, 1), v.repeat_interleave(repeats, 1)
-    probabilities = torch.exp((q @ kr.transpose(-1, -2)) * scale - maximum).masked_fill(blocked, 0) / denominator
+    exponent = (q @ kr.transpose(-1, -2)) * scale - maximum
+    probabilities = torch.exp(exponent.double()).to(exponent.dtype).masked_fill(blocked, 0) / denominator
     ds = probabilities * ((grad @ vr.transpose(-1, -2)) - (grad * output).sum(-1, keepdim=True))
     dq = (ds @ kr) * scale
     dk = (ds.transpose(-1, -2) @ q) * scale
@@ -492,17 +496,28 @@ def test_torch_npu_pruned_gqa_output_gradients_and_saved_tensors(monkeypatch):
         reference = F.scaled_dot_product_attention(*reference_inputs, attn_mask=allowed, enable_gqa=True, scale=0.31)
         expected = torch.autograd.grad(reference, reference_inputs, grad.double())
     diagnostics = (
-        f"CPU QSA oracle=FP64 math SDPA, candidate={q.device}/{q.dtype}, "
+        f"CPU QSA seed=71, oracle=FP64 math SDPA, mock_exp=FP64, candidate={q.device}/{q.dtype}, "
+        f"qkv_shapes={[tuple(tensor.shape) for tensor in (q, k, v)]}, scale=0.31, chunk_size=128, "
         f"torch={torch.__version__}, cpu={torch.backends.cpu.get_cpu_capability()}, "
         f"threads={torch.get_num_threads()}, matmul_precision={torch.get_float32_matmul_precision()}"
     )
 
-    def message(detail):
-        return f"{detail}\n{diagnostics}"
+    def assert_aligned(name, actual, ref, rtol, atol):
+        def message(detail):
+            delta = (actual.double() - ref).abs()
+            flat_index = delta.reshape(-1).argmax().item()
+            return (
+                f"{name}: {detail}\n{diagnostics}\n"
+                f"max_abs_error={delta.max().item():.9g}, flat_index={flat_index}, "
+                f"actual={actual.reshape(-1)[flat_index].item():.9g}, "
+                f"reference={ref.reshape(-1)[flat_index].item():.9g}"
+            )
 
-    torch.testing.assert_close(result.double(), reference, rtol=2e-5, atol=2e-6, msg=message)
-    for actual, ref in zip(candidate, expected, strict=True):
-        torch.testing.assert_close(actual.double(), ref, rtol=3e-5, atol=4e-6, msg=message)
+        torch.testing.assert_close(actual.double(), ref, rtol=rtol, atol=atol, msg=message)
+
+    assert_aligned("output", result, reference, rtol=2e-5, atol=2e-6)
+    for name, actual, ref in zip(("dq", "dk", "dv"), candidate, expected, strict=True):
+        assert_aligned(name, actual, ref, rtol=3e-5, atol=4e-6)
     assert torch.count_nonzero(result[:, :, 0]) == 0
     assert torch.count_nonzero(result[:, :, -1]) == 0
 

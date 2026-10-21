@@ -573,6 +573,12 @@ CPU numerical checks should state their input dtype and device. An independent
 FP64 math reference can check an FP32 candidate without relying on automatic
 SDPA backend selection. Keep output and gradient tolerances explicit; changing
 a reference does not justify loosening the candidate's error bounds.
+For intermittent CPU numerical failures, reproduce in fresh processes as well
+as repeated calls: a first-call math error can disappear after warmup. Include
+the failing output/gradient name, seed, shapes, dtype, CPU and thread settings
+in assertion diagnostics. The QSA CPU mock evaluates exponentials in FP64 and
+casts back to FP32 to avoid a reproduced first-call CPU FP32 `exp` accuracy
+issue; its matrix products, normalization and gradient accumulation stay FP32.
 
 Multi-card tests must expose a plan derived from the same `nproc`, `world_size`,
 or parallel configuration used to launch their workers. A module, class, or
