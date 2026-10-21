@@ -20,9 +20,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from veomni.utils.loss_observer import get_chunk_loss_consumer, report_chunk_loss_observer_error
+
 from .....registry import SavedState
 from . import eager as _eager
-from .eager import _grad_and_value, _Meta, _needs_input_grad
+from .eager import _grad_and_value, _Meta, _needs_input_grad, _suspend_saved_tensor_hooks
 
 
 def _ce_loss_func(
@@ -33,12 +35,61 @@ def _ce_loss_func(
     ignore_index: int,
 ) -> Tensor:
     """Per-chunk body: linear then eager CE."""
+    return _ce_loss_and_logits(hidden_states, weight, labels, num_items_in_batch, ignore_index)[0]
+
+
+def _ce_loss_and_logits(hidden_states, weight, labels, num_items_in_batch, ignore_index):
     labels_flat = labels.reshape(-1)
     hidden_flat = hidden_states.reshape(-1, hidden_states.size(-1))
     logits = F.linear(hidden_flat, weight).float()
-    return _eager.cross_entropy_from_logits(
+    loss = _eager.cross_entropy_from_logits(
         logits, labels_flat, ignore_index=ignore_index, num_items_in_batch=num_items_in_batch
     )
+    return loss, logits
+
+
+class _ChunkObserver:
+    """Reuse one projection; observer errors cannot retry or mutate training CE."""
+
+    def __init__(self):
+        self.consumer = get_chunk_loss_consumer()
+        self.chunks = []
+
+    def evaluate(self, argnums, hidden, weight, labels, denom, ignore_index):
+        args = (hidden, weight, labels, denom, ignore_index)
+        if self.consumer is None:
+            if argnums:
+                return _grad_and_value(_ce_loss_func, argnums, *args)
+            return (), _ce_loss_func(*args)
+        if argnums:
+            with _suspend_saved_tensor_hooks():
+                grads, (loss, logits) = torch.func.grad_and_value(_ce_loss_and_logits, argnums=argnums, has_aux=True)(
+                    *args
+                )
+        else:
+            grads, (loss, logits) = (), _ce_loss_and_logits(*args)
+        try:
+            with torch.no_grad():
+                tokens = F.cross_entropy(
+                    logits.detach(), labels.reshape(-1), ignore_index=ignore_index, reduction="none"
+                ).reshape_as(labels)
+            self.chunks.append(tokens)
+        except Exception as error:
+            if not report_chunk_loss_observer_error(error):
+                raise
+            self.consumer = None
+            self.chunks.clear()
+        return grads, loss
+
+    def finish(self, split_dim):
+        if self.consumer is not None:
+            try:
+                self.consumer(torch.cat(self.chunks, dim=split_dim).detach())
+            except Exception as error:
+                if not report_chunk_loss_observer_error(error):
+                    raise
+            finally:
+                self.chunks.clear()
 
 
 def forward(
@@ -87,10 +138,13 @@ def forward(
     split_dim = 1 if hidden.ndim >= 3 else 0
     hidden_chunks = hidden.split(chunk_size, dim=split_dim)
     label_chunks = labels.split(chunk_size, dim=split_dim)
+    observer = _ChunkObserver()
     accumulated_loss = torch.zeros((), device=hidden.device, dtype=torch.float32)
     if not hidden_needs_grad and not weight_needs_grad:
         for hidden_chunk, label_chunk in zip(hidden_chunks, label_chunks, strict=True):
-            accumulated_loss = accumulated_loss + _ce_loss_func(hidden_chunk, weight, label_chunk, denom, ignore_index)
+            _, chunk_loss = observer.evaluate((), hidden_chunk, weight, label_chunk, denom, ignore_index)
+            accumulated_loss = accumulated_loss + chunk_loss
+        observer.finish(split_dim)
         return accumulated_loss, SavedState(
             (hidden.new_empty(0), weight.new_empty(0)),
             _Meta(True, False, False),
@@ -106,9 +160,7 @@ def forward(
     grad_weight = torch.zeros_like(weight) if weight_needs_grad else None
     grad_chunks = grad_hidden.split(chunk_size, dim=split_dim) if hidden_needs_grad else (None,) * len(hidden_chunks)
     for hidden_chunk, label_chunk, grad_chunk in zip(hidden_chunks, label_chunks, grad_chunks, strict=True):
-        grads, chunk_loss = _grad_and_value(
-            _ce_loss_func, argnums, hidden_chunk, weight, label_chunk, denom, ignore_index
-        )
+        grads, chunk_loss = observer.evaluate(argnums, hidden_chunk, weight, label_chunk, denom, ignore_index)
         accumulated_loss = accumulated_loss + chunk_loss
         if hidden_needs_grad and weight_needs_grad:
             chunk_grad_hidden, chunk_grad_weight = grads
@@ -121,6 +173,7 @@ def forward(
             (chunk_grad_weight,) = grads
             grad_weight.add_(chunk_grad_weight)
 
+    observer.finish(split_dim)
     return accumulated_loss, SavedState(
         (
             grad_hidden if hidden_needs_grad else hidden.new_empty(0),
