@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import time
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Union
 
 from tqdm import trange
 
@@ -27,6 +27,8 @@ logger = get_logger(__name__)
 
 
 if TYPE_CHECKING:
+    import torch
+
     from ..base import BaseTrainer, VeOmniArguments
 
 
@@ -212,7 +214,9 @@ class EnvironMeterCallback(Callback):
         super().__init__(trainer)
 
         args: "VeOmniArguments" = self.trainer.args
-        self.lora_config = trainer.model.get_lora_config() if hasattr(trainer.model, "get_lora_config") else None
+        # LoRA config lives on VeOmniLoraModel, which DDP does not forward.
+        module = getattr(trainer.model, "unwrapped_module", None)
+        self.lora_config = module.get_lora_config() if hasattr(module, "get_lora_config") else None
         self.freeze_vit = getattr(args.train, "freeze_vit", None) if self.lora_config is None else None
         self.trainer.environ_meter = helper.EnvironMeter(
             config=trainer.model.model_config,
@@ -235,7 +239,7 @@ class EnvironMeterCallback(Callback):
         state: TrainerState,
         loss: float,
         loss_dict: Dict[str, float],
-        grad_norm: float,
+        grad_norm: Union[float, "torch.Tensor"],
         aux_metrics: Dict[str, float] = None,
         **kwargs,
     ) -> None:

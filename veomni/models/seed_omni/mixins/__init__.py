@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SeedOmni V2 mixins: base lifecycle + training / inference graph hooks + metric meter."""
+"""SeedOmni mixins: base lifecycle + training / inference graph hooks + offline encoding + metric meter."""
 
 from .base_mixin import BaseMixin
 from .data_balance_mixin import DataBalanceMixin, DataBalanceSpec, ItemTensorField, ModuleStructure
@@ -34,7 +34,7 @@ __all__ = [
     "post_forward",
     "pre_generate",
     "post_generate",
+    "OfflineEncodingMixin",
     "MetricMeterMixin",
     "MetricMeterResult",
-    "OfflineEncodingMixin",
 ]

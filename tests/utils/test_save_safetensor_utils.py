@@ -198,6 +198,39 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
         )
         self.assertIsNone(writer_cls.call_args.kwargs["fqn_to_index_mapping"])
 
+    def test_consolidation_keeps_e8m0_block_scales(self):
+        """Block-scaled exports store their scales as e8m0, which older safetensors cannot name."""
+        import tempfile
+        from pathlib import Path
+
+        import torch.distributed.checkpoint as dcp
+        from safetensors.torch import load_file
+        from torch.distributed.checkpoint import HuggingFaceStorageWriter
+        from torch.distributed.checkpoint._consolidate_hf_safetensors import consolidate_safetensors_files
+
+        from veomni.checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
+
+        apply_dcp_consolidation_patch()
+        fake = {
+            "w.weight": torch.randn(4, 64).to(torch.float8_e4m3fn),
+            "w.scale": torch.randint(120, 135, (4, 2), dtype=torch.uint8).view(torch.float8_e8m0fnu),
+        }
+        with tempfile.TemporaryDirectory() as output_dir:
+            sharded = str(Path(output_dir) / "sharded")
+            mapping = dict.fromkeys(fake, 1)
+            dcp.save(
+                fake,
+                storage_writer=HuggingFaceStorageWriter(sharded, save_distributed=True, fqn_to_index_mapping=mapping),
+            )
+            consolidate_safetensors_files(sharded, output_dir, mapping)
+            loaded = {}
+            for file in Path(output_dir).glob("*.safetensors"):
+                loaded.update(load_file(file))
+
+        for key, value in fake.items():
+            self.assertEqual(loaded[key].dtype, value.dtype)
+            self.assertTrue(torch.equal(loaded[key].view(torch.uint8), value.view(torch.uint8)), key)
+
     def test_no_filtering_when_all_keys_match(self):
         fake = {"a": torch.randn(2, 2, dtype=torch.bfloat16), "b": torch.randn(2, 2, dtype=torch.bfloat16)}
         mapping = {"a": 0, "b": 0}
@@ -348,7 +381,7 @@ class TestLegacySaveModelWeights(unittest.TestCase):
 
         from safetensors.torch import load_file
 
-        from veomni.models.module_utils import _get_shard_info, save_model_weights
+        from veomni.models.checkpoint.weights import _get_shard_info, save_model_weights
 
         state_dict = {
             "weight": torch.ones(4, dtype=torch.float32),
@@ -370,7 +403,7 @@ class TestLegacySaveModelWeights(unittest.TestCase):
         torch.testing.assert_close(loaded["expert_ids"], state_dict["expert_ids"])
 
     def test_native_dtypes_use_actual_size_for_torch_serialization(self):
-        from veomni.models.module_utils import _get_shard_info
+        from veomni.models.checkpoint.weights import _get_shard_info
 
         state_dict = {
             "complex": torch.ones(3, dtype=torch.complex64),
@@ -382,13 +415,13 @@ class TestLegacySaveModelWeights(unittest.TestCase):
         self.assertEqual(total_size, expected_size)
 
     def test_safetensors_rejects_unsupported_native_dtype(self):
-        from veomni.models.module_utils import _get_shard_info
+        from veomni.models.checkpoint.weights import _get_shard_info
 
         with self.assertRaisesRegex(ValueError, "Unsupported dtype for safetensors serialization: torch.complex64"):
             _get_shard_info({"complex": torch.ones(1, dtype=torch.complex64)}, None, 5_000_000_000, True)
 
     def test_invalid_save_dtype_is_rejected_for_integer_only_state(self):
-        from veomni.models.module_utils import _get_shard_info
+        from veomni.models.checkpoint.weights import _get_shard_info
 
         with self.assertRaisesRegex(ValueError, "Unknown save dtype: not_a_dtype"):
             _get_shard_info({"ids": torch.arange(4)}, "not_a_dtype", 5_000_000_000, False)

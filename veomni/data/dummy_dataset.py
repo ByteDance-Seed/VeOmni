@@ -110,6 +110,27 @@ class DummyQwenVLDataset(Dataset):
         ]
 
 
+class DummyQwen4ExpDataset(DummyQwenVLDataset):
+    """Small VLM batch matching the Qwen4-Exp toy configuration.
+
+    Qwen4-Exp's toy vocabulary is intentionally tiny and its vision patch size
+    differs from the existing Qwen2/3-VL fixtures. Multimodal positions contain
+    the same zeroed ids produced by the real Qwen-VL data transform; the model
+    reconstructs image/video ids from the explicit masks before PLE hashing.
+    """
+
+    def __init__(self, size: int, seq_length: int):
+        super().__init__(size=size, seq_length=seq_length, patch_size=4)
+        self.vocab_size = 120
+
+    def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
+        example = super().__getitem__(index)[0]
+        multimodal_mask = self.image_mask | self.video_mask
+        example["input_ids"].masked_fill_(multimodal_mask, 0)
+        example["labels"].masked_fill_(multimodal_mask, IGNORE_INDEX)
+        return [example]
+
+
 class DummyQwenOmniDataset(Dataset):
     def __init__(
         self, size: int, seq_length: int, patch_size: int = 14, temporal_patch_size: int = 2, merge_size: int = 2
@@ -332,6 +353,8 @@ def build_dummy_dataset(task_type: str, size: int, max_seq_len: int) -> "Dataset
         return DummyQwenVLDataset(size=size, seq_length=max_seq_len, patch_size=14)
     elif task_type == "qwen3vl":
         return DummyQwenVLDataset(size=size, seq_length=max_seq_len, patch_size=16)
+    elif task_type == "qwen4exp":
+        return DummyQwen4ExpDataset(size=size, seq_length=max_seq_len)
     elif task_type == "qwen2omni":
         return DummyQwenOmniDataset(size=size, seq_length=max_seq_len, patch_size=14)
     elif task_type == "qwen3omni":

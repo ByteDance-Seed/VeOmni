@@ -26,7 +26,7 @@ import torch
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 from veomni.utils.tensor_utils import naflatten
 
-from ...utils.conversation import ConversationItem, is_dummy
+from ...utils.conversation import ConversationItem
 
 
 def pack_llm_conversations_for_forward(
@@ -44,11 +44,16 @@ def pack_llm_conversations_for_forward(
     for sample in conversations:
         sample_lengths = 0
         for item in sample:
-            if item.role == "dummy":
+            if item.is_dummy:
                 continue
             embeds = item.value
             embeds_length = embeds.size(0)
-            chunk_attention_mask = item.meta.pop("attention_mask", None)
+            # Read, don't consume: packing is not the item's last reader.
+            # scatter_llm_hidden_states writes hidden states back onto these same
+            # items, and any second forward over one conversation (a re-forward,
+            # a reference pass) would otherwise pack it with a fabricated
+            # all-ones mask the second time, silently.
+            chunk_attention_mask = item.meta.get("attention_mask")
             if chunk_attention_mask is None:
                 chunk_attention_mask = torch.ones(embeds_length, dtype=torch.long, device=device)
             inputs_embeds_list.append(embeds.to(device))
@@ -78,7 +83,7 @@ def scatter_llm_hidden_states(
     hidden_states_list_iter = iter(hidden_states_list)
     for sample in conversation_list:
         for part in sample:
-            if is_dummy(part):
+            if part.is_dummy:
                 continue
             part.value = next(hidden_states_list_iter)
     if next(hidden_states_list_iter, None) is not None:

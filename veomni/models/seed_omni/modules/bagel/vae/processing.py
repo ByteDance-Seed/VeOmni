@@ -1,7 +1,7 @@
 """Image processor + worker-side preprocessor for BAGEL VAE.
 
 :class:`BagelVAEPreprocessor` is the picklable, weight-free CPU worker
-counterpart (see :class:`~veomni.models.seed_omni.processing.base.ModulePreprocessorBase`) —
+counterpart (see :class:`~veomni.models.seed_omni.modules.module_processing_base.ModulePreprocessorBase`) —
 built straight off the checkpoint dir, with no model instance involved. Like
 :mod:`..siglip_navit.processing`, BAGEL ships no separate
 ``preprocessor_config.json``: the image processor is derived from the
@@ -21,10 +21,9 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 
-from ....mixins.offline_encoding_mixin import OfflineEncodingMixin
-from ....processing import ModulePreprocessorBase
-from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, is_dummy, iter_desired_items
-from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
+from ...module_processing_base import ModulePreprocessorBase
+from ..sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT, bagel_context
 from .configuration import BagelVAEConfig
 
 
@@ -35,7 +34,7 @@ class BagelVAEProcessor(BaseImageProcessor):
     """BAGEL VAE image processor.
 
     Owns raw-image resize and normalization for VAE encode. Carrier selection,
-    source tagging, and latent scatter stay in the module mixin.
+    context tagging, and latent scatter stay in the module mixin.
     """
 
     model_input_names = ["pixel_values"]
@@ -355,25 +354,26 @@ def copy_image_item(item: ConversationItem) -> ConversationItem:
         type=item.type,
         value=value,
         role=item.role,
-        source=item.source,
+        is_dummy=item.is_dummy,
         meta=copy.deepcopy(item.meta),
     )
 
 
-def route_image_sources(
+def route_image_contexts(
     conversation_list: list[list[ConversationItem]],
     *,
     inference: bool,
     infer_type: object,
 ) -> None:
+    """Expand raw images into their SigLIP and/or VAE context copies (``BAGEL_CONTEXT_KEY``)."""
     for sample in conversation_list:
         routed: list[ConversationItem] = []
         for item in sample:
-            if item.type != "image" or is_dummy(item):
+            if item.type != "image" or item.is_dummy:
                 routed.append(item)
                 continue
 
-            if item.source in {BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT}:
+            if bagel_context(item) in {BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT}:
                 routed.append(item)
                 continue
 
@@ -382,37 +382,39 @@ def route_image_sources(
             if inference and item.role == "user":
                 if infer_type == "infer_edit":
                     vae_item = copy_image_item(item)
-                    vae_item.source = BAGEL_VAE_CONTEXT
-                    item.source = BAGEL_SIGLIP_CONTEXT
+                    vae_item.meta[BAGEL_CONTEXT_KEY] = BAGEL_VAE_CONTEXT
+                    item.meta[BAGEL_CONTEXT_KEY] = BAGEL_SIGLIP_CONTEXT
                     routed.extend([vae_item, item])
                 else:
-                    item.source = BAGEL_SIGLIP_CONTEXT
+                    item.meta[BAGEL_CONTEXT_KEY] = BAGEL_SIGLIP_CONTEXT
                     routed.append(item)
                 continue
 
             # Training data declares each raw image's role via ``_img_tag``.
             tag = item.meta.get(_IMG_TAG_KEY)
             if tag is None or tag not in _VALID_IMG_TAGS:
-                raise ValueError(f"BAGEL route_image_sources received image with invalid {_IMG_TAG_KEY}: {tag!r}.")
+                raise ValueError(f"BAGEL route_image_contexts received image with invalid {_IMG_TAG_KEY}: {tag!r}.")
             if tag == "und":
-                item.source = BAGEL_SIGLIP_CONTEXT
+                item.meta[BAGEL_CONTEXT_KEY] = BAGEL_SIGLIP_CONTEXT
                 routed.append(item)
             elif tag == "gen":
-                item.source = BAGEL_VAE_CONTEXT
+                item.meta[BAGEL_CONTEXT_KEY] = BAGEL_VAE_CONTEXT
                 routed.append(item)
             else:
                 # tag == "edit": the same physical image is both VAE context and
                 # SigLIP context. Preserve the infer_edit ordering (VAE before
                 # SigLIP) so downstream marker wrapping stays stable.
                 vae_item = copy_image_item(item)
-                vae_item.source = BAGEL_VAE_CONTEXT
-                item.source = BAGEL_SIGLIP_CONTEXT
+                vae_item.meta[BAGEL_CONTEXT_KEY] = BAGEL_VAE_CONTEXT
+                item.meta[BAGEL_CONTEXT_KEY] = BAGEL_SIGLIP_CONTEXT
                 routed.extend([vae_item, item])
 
         sample[:] = routed
 
 
 BAGEL_VAE_PIXEL_SHAPE = "bagel_vae_pixel_shape"
+# Set by ``offline_encode``: the item already holds its cached posterior, not pixels.
+BAGEL_VAE_POSTERIOR = "bagel_vae_posterior"
 
 
 class BagelVAEPreprocessor(ModulePreprocessorBase):
@@ -432,26 +434,21 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
 
     @classmethod
     def from_pretrained(
-        cls, module_path: str, *, config_overrides: dict[str, Any] | None = None, **kwargs: Any
-    ) -> BagelVAEPreprocessor | None:
+        cls,
+        module_path: str,
+        *,
+        config_overrides: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> BagelVAEPreprocessor:
         """Build straight from the checkpoint dir — no model instance needed.
 
-        Returns ``None`` under ``cache_mode="process_only"``: training then reads
-        already-preprocessed cached conversations, so no CPU image prep is needed
-        for this module.
         BAGEL ships no standalone ``preprocessor_config.json``; the image
-        processor is derived from the module's own ``config.json``.
-
-        ``config_overrides`` (the module's YAML ``model_config:`` block, e.g.
-        ``train_with_cache``'s ``support_cache: true`` / ``train_type``) is
-        applied on top of the on-disk default so ``cache_mode`` below agrees
-        with what the live model was actually configured with.
+        processor is derived from the module's own ``config.json``, with
+        ``config_overrides`` (the module's YAML ``model_config:`` block) on top.
         """
         del kwargs
-        config = BagelVAEConfig.from_pretrained(module_path, **(config_overrides or {}))
-        OfflineEncodingMixin.patch_config(config, **(config_overrides or {}))
-        if OfflineEncodingMixin.validated_cache_mode(config) == "process_only":
-            return None
+        # ``model_config=`` (not ``**kwargs``): HF drops kwargs the class does not declare.
+        config = BagelVAEConfig.from_pretrained(module_path, model_config=config_overrides)
         return cls(BagelVAEProcessor.from_config(config))
 
     def bind_dummy_inputs(self, config: BagelVAEConfig, dtype: torch.dtype | None = None) -> None:
@@ -469,14 +466,18 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
         generation_kwargs: dict[str, Any] | None = None,
     ) -> None:
         infer_type = None if generation_kwargs is None else generation_kwargs.get("infer_type")
-        route_image_sources(conversation_list, inference=inference, infer_type=infer_type)
+        route_image_contexts(conversation_list, inference=inference, infer_type=infer_type)
 
         image_items: list[ConversationItem] = []
         missing_samples: list[list[ConversationItem]] = []
         for sample in conversation_list:
-            sample_image_items = list(iter_desired_items([sample], types=["image"], sources=[BAGEL_VAE_CONTEXT]))
+            sample_image_items = list(
+                iter_desired_items([sample], types=["image"], meta={BAGEL_CONTEXT_KEY: [BAGEL_VAE_CONTEXT]})
+            )
             if sample_image_items:
-                image_items.extend(sample_image_items)
+                image_items.extend(
+                    item for item in sample_image_items if not item.is_dummy and not item.meta.get(BAGEL_VAE_POSTERIOR)
+                )
             elif not inference:
                 missing_samples.append(sample)
 
@@ -488,7 +489,7 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
                 image_items, inputs["pixel_values"], inputs["pixel_shapes"], strict=True
             ):
                 item.value = pixels.to(dtype=self._dtype)
-                item.source = BAGEL_VAE_CONTEXT
+                item.meta[BAGEL_CONTEXT_KEY] = BAGEL_VAE_CONTEXT
                 item.meta[BAGEL_VAE_PIXEL_SHAPE] = pixel_shape.to(dtype=torch.long)
 
         if not missing_samples:
@@ -509,14 +510,17 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
             dummy_pixel_values = self._dummy_pixel_values.to(dtype=self._dtype)
             dummy_pixel_shape = self._dummy_pixel_shape.to(dtype=torch.long)
 
+        # The placeholder stands in for a generation target, the primary VAE row.
         for sample in missing_samples:
             sample.append(
                 ConversationItem(
                     type="image",
                     value=dummy_pixel_values.clone(),
-                    role="dummy",
-                    source=BAGEL_VAE_CONTEXT,
+                    role="assistant",
+                    is_dummy=True,
                     meta={
+                        _IMG_TAG_KEY: "gen",
+                        BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT,
                         BAGEL_VAE_PIXEL_SHAPE: dummy_pixel_shape.clone(),
                     },
                 )
@@ -528,5 +532,5 @@ __all__ = [
     "BagelVAEPreprocessor",
     "copy_image_item",
     "crop_latent_to_image_shape",
-    "route_image_sources",
+    "route_image_contexts",
 ]

@@ -1,4 +1,3 @@
-import copy
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
@@ -266,7 +265,8 @@ def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
     config._attn_implementation = "eager"
 
     eager_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0)
-    compiled_layer = copy.deepcopy(eager_layer)
+    compiled_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0)
+    compiled_layer.load_state_dict(eager_layer.state_dict())
     if use_checkpoint:
         for layer in (eager_layer, compiled_layer):
             layer.gradient_checkpointing = True
@@ -331,7 +331,8 @@ def test_qwen3_vl_compiled_decoder_matches_eager_packed_flash_attention():
     config._attn_implementation = "flash_attention_2"
 
     eager_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype)
-    compiled_layer = copy.deepcopy(eager_layer)
+    compiled_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype)
+    compiled_layer.load_state_dict(eager_layer.state_dict())
     compiled_model = ToyQwen3VLModel(compiled_layer)
     hidden_states_eager = torch.randn(1, 7, config.hidden_size, device=device, dtype=dtype, requires_grad=True)
     hidden_states_compiled = hidden_states_eager.detach().clone().requires_grad_(True)
@@ -458,15 +459,15 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
     monkeypatch.setattr("veomni.trainer.vlm_trainer.reduce_global_loss_token", lambda token_count: token_count)
 
     trainer = VLMTrainer.__new__(VLMTrainer)
+    model_args = SimpleNamespace(
+        optimizer=SimpleNamespace(max_grad_norm=1.0),
+        accelerator=SimpleNamespace(offload_config=OffloadConfig()),
+    )
     trainer.base = SimpleNamespace(
-        args=SimpleNamespace(
-            model=SimpleNamespace(
-                optimizer=SimpleNamespace(max_grad_norm=1.0),
-                accelerator=SimpleNamespace(offload_config=OffloadConfig()),
-            )
-        ),
+        args=SimpleNamespace(model=model_args),
         state=SimpleNamespace(global_step=0),
         model=SimpleNamespace(
+            args=model_args,
             _veomni_compile_uses_cuda_graphs=True,
             clip_grad_norm=lambda: torch.tensor(0.0),
             optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda: None),
@@ -479,8 +480,8 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
         on_step_begin=lambda **_: None,
         on_step_end=lambda **_: None,
     )
-    trainer.base._reset_async_activation_offload_if_enabled = lambda: (
-        BaseTrainer._reset_async_activation_offload_if_enabled(trainer.base)
+    trainer.base._reset_async_activation_offload_if_enabled = (
+        lambda model: BaseTrainer._reset_async_activation_offload_if_enabled(trainer.base, model)
     )
 
     trainer.train_step(iter([[{}, {}]]))
@@ -496,7 +497,7 @@ def test_vlm_runtime_rejects_unsupported_compile_model_while_building(monkeypatc
     calls = []
 
     def build_unsupported_model(runtime):
-        calls.append("build_model")
+        calls.append("_build_model")
         runtime.model = ToyModel()
         runtime.model.config = SimpleNamespace(model_type="qwen2_5_vl", vision_config=SimpleNamespace())
         runtime.model.input_modalities = ("image", "text")
@@ -508,8 +509,8 @@ def test_vlm_runtime_rejects_unsupported_compile_model_while_building(monkeypatc
     # build's own scope looking for a state that was never registered.
     monkeypatch.setattr(VLMModelRuntime, "setup", lambda _: None)
     monkeypatch.setattr("veomni.models.model_runtime.use_parallel_state", lambda _name: nullcontext())
-    monkeypatch.setattr(VLMModelRuntime, "build_model", build_unsupported_model)
-    monkeypatch.setattr(VLMModelRuntime, "freeze_model", lambda _: calls.append("freeze_model"))
+    monkeypatch.setattr(VLMModelRuntime, "_build_model", build_unsupported_model)
+    monkeypatch.setattr(VLMModelRuntime, "_freeze_model_module", lambda _: calls.append("_freeze_model_module"))
 
     args = SimpleNamespace(
         accelerator=SimpleNamespace(
@@ -522,7 +523,7 @@ def test_vlm_runtime_rejects_unsupported_compile_model_while_building(monkeypatc
     with pytest.raises(RuntimeError, match="only for dense Qwen3-VL"):
         VLMModelRuntime(args, train=SimpleNamespace())
 
-    assert calls == ["build_model"]
+    assert calls == ["_build_model"]
 
 
 def test_compile_config_detects_cuda_graphs():

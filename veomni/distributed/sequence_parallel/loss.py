@@ -30,7 +30,7 @@ class ReduceLoss(torch.autograd.Function):
         group=None,
     ) -> torch.Tensor:
         # ``group`` defaults to the comm-global unified SP group (single-model
-        # path). SeedOmni V2 passes each module's OWN SP group so heterogeneous
+        # path). SeedOmni passes each module's OWN SP group so heterogeneous
         # per-module SP reduces over the right ranks (the comm-global unified
         # group is just the last-built module's and would be wrong here).
         if group is None:

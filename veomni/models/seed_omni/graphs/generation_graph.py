@@ -15,30 +15,29 @@ Each state specifies:
 
          a. Ensure ``e.from_`` is executed.  If it has any unprocessed
             in-body fan-in, that's a body-ordering bug — error.
-         b. Decrement ``e.to``'s pending fan-in.  When it hits zero
-            (i.e. all body edges into ``e.to`` have been processed),
-            execute ``e.to``.
+         b. Decrement ``e.to``'s pending fan-in.  ``pending`` is a gate on
+            a later ``from_`` appearance of that node, not a trigger to
+            run ``e.to``.  A node that only appears as ``to:`` is never
+            executed; pin a leaf with ``{from: leaf, to: end}``.
 
       Each executed node merges its return dict into ``ctx`` directly
       (``ctx.update(out)``).  Edges declare execution order only — they
-      do not route individual fields.  Early FSM steps use
-      ``conversation_list``; later AR steps use ``input_ids`` /
-      ``past_key_values`` / ``hidden_states`` as modules write them.
+      do not route individual fields.  Modules write whatever keys the next
+      node needs onto ``ctx`` (``input_ids``, ``hidden_states``, …).
 
       This rule generalises "first-encounter execution":
 
-        * For purely linear bodies (e.g. ``text_ar`` =
-          ``tok_enc → llama → tok_dec``) it executes every node exactly
+        * For purely linear bodies (e.g. ``s1`` =
+          ``module_A → module_B → module_C``) it executes every node exactly
           once, in declaration order.
-        * For multi-source nodes (e.g. understanding/I2T where
-          ``janus_llama`` consumes both ``inputs_embeds`` and
-          ``und_image_embeds``) the backbone executes only after the
+        * For multi-source nodes (``module_B`` consumes keys written by both
+          ``module_A`` and ``module_C``) the backbone executes only after the
           last in-body fan-in edge has fired — both keys are already
           in ``ctx`` from upstream ``ctx.update(out)`` calls.
-        * For self-feedback bodies (``image_vq`` =
-          ``ar_to_vae_dec, vae_dec_to_ar``) ``vae_decode`` writes
-          ``embed`` (or ``inputs_embeds``) into ``ctx``; the next
-          ``janus_llama`` step reads it directly — no edge renaming.
+        * For self-feedback bodies (``s2`` =
+          ``module_B → module_A, module_A → module_B``) ``module_A`` writes
+          a key into ``ctx``; the next ``module_B`` step reads it directly —
+          no edge renaming.
 
       An edge with ``to: end`` is purely declarative — it pins the producing
       node into the active set without routing anywhere.
@@ -62,14 +61,12 @@ FSM view.  A dotted endpoint (``module.method`` — e.g. ``encode``, ``decode``,
         ``{type: module_signal, key: K}``
             Fires when ``context["module_signal"] == K``.  Modules write a
             one-shot string signal into ``ctx["module_signal"]`` from inside
-            ``generate_step`` / ``decode`` — e.g. ``JanusTextEncoder.decode``
-            sets ``"start_image_gen"`` / ``"text_done"`` after sampling; a VQ
-            decoder sets ``"image_complete"`` on the final patch.  The
-            framework **auto-clears** ``ctx["module_signal"]`` once the
-            transition fires.  This is how an AR loop state (e.g. ``image_vq``)
-            keeps iterating until its module says "done".  The FSM never
-            inspects raw token ids — vocabulary semantics stay inside the
-            module.
+            ``generate_step`` / ``decode`` (e.g. ``module_A.decode`` sets
+            ``"advance"`` / ``"done"``).  The framework **auto-clears**
+            ``ctx["module_signal"]`` once the transition fires.  This is how
+            an AR loop state keeps iterating until its module says "done".
+            The FSM never inspects raw token ids — vocabulary semantics stay
+            inside the module.
 
         ``{type: default}``
             The catch-all (switch-``default``) branch — matches
@@ -102,6 +99,7 @@ See also
 ``training_graph.py``  — DAG view driven by ``OmniConfig.training_graph``.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -109,6 +107,7 @@ from .base import (
     EdgeDef,
     NodeDef,
     is_end,
+    validate_graph_modules,
 )
 
 
@@ -124,19 +123,18 @@ def _mermaid_id(name: str) -> str:
 
 # Reserved name for the framework-injected terminal state.  Every FSM
 # automatically gains a ``done`` state with empty body and no transitions —
-# users must NOT declare it in their YAML.  All
-# transitions whose ``next_state`` is ``"done"`` therefore land on this
-# built-in state, and ``OmniModel.generate`` calls each active module's
-# :meth:`OmniModule.finalize` hook once the FSM enters it.
+# users must NOT declare it in their YAML.  Transitions whose ``next_state``
+# is ``"done"`` land here. Entering ``done`` means the previous state's body
+# already ran to completion (EOS / a finished image span); artefacts were
+# collected from ``ctx["generated"]`` on that step. ``finalize`` is **not**
+# invoked on this path — only when the driver aborts before ``done``
+# (``max_new_tokens``).
 DONE_STATE_NAME: str = "done"
 
 # Single ctx slot for module-driven FSM transitions.  Modules set
 # ``ctx[FSM_SIGNAL_KEY] = "<signal_name>"``; YAML ``module_signal.key``
 # matches that string value (not a separate boolean flag per signal).
 FSM_SIGNAL_KEY: str = "module_signal"
-
-
-# ── Condition helpers ─────────────────────────────────────────────────────────
 
 
 _KNOWN_CONDITION_TYPES = frozenset({"module_signal", "default"})
@@ -186,9 +184,6 @@ class FiredTransition:
     from_state: str
     to_state: str
     condition: str  # human-readable condition description, e.g. ``module_signal(text_done)``
-
-
-# ── State ─────────────────────────────────────────────────────────────────────
 
 
 class _State:
@@ -250,9 +245,6 @@ class _State:
                 )
 
 
-# ── GenerationGraph ───────────────────────────────────────────────────────────
-
-
 class GenerationGraph:
     """FSM view over the nodes / edges pools that drives multi-modal inference.
 
@@ -263,12 +255,14 @@ class GenerationGraph:
         ``initial`` (str) and ``states`` (dict of state specs).  Each state's
         ``body`` is a list of inline ``{from, to}`` edge dicts; the node pool
         is derived from their endpoints.
+
+    Construction checks only the FSM's own structure. The endpoints are checked
+    against the loaded modules by :meth:`validate_modules` before a request
+    runs: a training job builds this graph too, but may load only a subset of
+    the modules it names (an ``offline_embedding`` run loads just the encoder).
     """
 
-    def __init__(
-        self,
-        generation_graph: Dict,
-    ):
+    def __init__(self, generation_graph: Dict):
         # `done` is reserved — auto-injected below.  Users must NOT redeclare
         # it; doing so silently lets a custom body/transitions override the
         # framework's terminal semantics, which is exactly the kind of magic
@@ -276,18 +270,8 @@ class GenerationGraph:
         if DONE_STATE_NAME in generation_graph["states"]:
             raise ValueError(
                 f"State name '{DONE_STATE_NAME}' is reserved and auto-injected by the framework. "
-                f"Remove the explicit `{DONE_STATE_NAME}:` block from your generation_graph YAML — "
-                f"transitions targeting `next_state: {DONE_STATE_NAME}` will land on the built-in "
-                f"terminal state, which then triggers each active module's `finalize` hook."
-            )
-        # The pre-existing `done_state` config knob is gone — the framework
-        # always uses `DONE_STATE_NAME`.  If the user still has it lying
-        # around, reject loudly so they migrate cleanly.
-        if "done_state" in generation_graph:
-            raise ValueError(
-                "`generation_graph.done_state` is no longer configurable — the terminal state "
-                f"is hardcoded to '{DONE_STATE_NAME}'. Remove the `done_state:` line from your "
-                "generation_graph YAML."
+                f"Do not declare a `{DONE_STATE_NAME}:` block; transitions with "
+                f"`next_state: {DONE_STATE_NAME}` land on the built-in terminal state."
             )
 
         self._initial: str = generation_graph["initial"]
@@ -295,9 +279,10 @@ class GenerationGraph:
             name: _State(name, spec) for name, spec in generation_graph["states"].items()
         }
 
-        # Inject the built-in terminal state.  Empty body, no outgoing
-        # transitions: the FSM "rests" here and the orchestrator picks up the
-        # post-processing baton via finalize hooks.
+        # Inject the built-in terminal state. Empty body, no outgoing
+        # transitions: the FSM rests here. The previous state's endpoints
+        # already flushed complete artefacts into ``ctx``; there is no
+        # extra finalize pass on entry.
         self._states[DONE_STATE_NAME] = _State(DONE_STATE_NAME, {"body": [], "transitions": []})
 
         # Derive the node pool from every state's body edges (canonical names).
@@ -324,7 +309,9 @@ class GenerationGraph:
         # Runtime state — reset before each generate call.
         self._current: str = self._initial
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
+    def validate_modules(self, modules: Mapping[str, Any]) -> None:
+        """Every endpoint must name one of ``modules`` and an existing method on it."""
+        validate_graph_modules(self._node_pool.values(), modules)
 
     def reset(self) -> None:
         """Reset FSM to the initial state for a new generation request."""
@@ -333,8 +320,6 @@ class GenerationGraph:
     def is_done(self) -> bool:
         """Return True when the FSM has reached the framework-injected terminal state."""
         return self._current == self._done_sentinel
-
-    # ── Step & Transition ─────────────────────────────────────────────────────
 
     def iter_nodes(self, ctx: Dict[str, Any]) -> Iterator[NodeDef]:
         """Yield the nodes to run for ONE iteration of the current state body.
@@ -370,6 +355,15 @@ class GenerationGraph:
         state = self._current_state
         executed: set = set()
 
+        # A signal is one-shot per body pass, and this pass owns the clearing.
+        # :meth:`maybe_transition` pops the signal it acts on, but it runs
+        # between passes and only when some transition matches. A state that
+        # stays put until one named signal fires — every AR decode loop — has
+        # no `default` to fall through, so a signal it does not watch survives
+        # into here and stops the body after its first node, on this pass and
+        # every pass after it, until `max_new_tokens` runs out.
+        ctx.pop(FSM_SIGNAL_KEY, None)
+
         # Per-node first appearance as `from_` in body — distinguishes
         # **feed-forward** edges (with `to: X` *before* X's first `from_`
         # position; these must complete before X runs) from
@@ -377,9 +371,8 @@ class GenerationGraph:
         # for the next iteration / state).  Nodes that never appear as
         # `from_` in body get ``len(body)`` so every incoming edge
         # counts as feed-forward — this is the "to-only sink" case
-        # (e.g. ``janus_llama`` in ``image_vq_start`` whose body is
-        # ``[emit_start_to_janus_llama, janus_llama_sink]`` — the sink edge
-        # triggers ``janus_llama``).
+        # (e.g. ``module_B`` in a body ``[module_A → module_B, module_B → end]``
+        # — the sink edge is what triggers ``module_B``).
         first_from_idx: Dict[str, int] = {}
         for i, e in enumerate(state.body):
             if not is_end(e.from_) and e.from_ not in first_from_idx:
@@ -435,14 +428,21 @@ class GenerationGraph:
         else ``None``. The caller may format a transition trace from the
         returned value.
 
-        For ``module_signal`` transitions ``context["module_signal"]`` is popped
-        before the state switch.
+        ``context["module_signal"]`` is popped before the state switch whichever
+        transition fires, not only a ``module_signal`` one. A signal is one-shot
+        per body iteration: it is how the node that just ran says "stop this
+        body", and :meth:`iter_nodes` reads it as exactly that. A module may
+        emit a signal that no condition in the current state names — a decoder
+        setting ``image_complete`` in a state that only watches ``text_done`` —
+        and the state then leaves on its ``default`` transition. Leaving the key
+        behind would spuriously fire any later state that does name that signal.
+        (The body pass clears a leftover signal of its own accord, so a stale
+        key cannot truncate a later body.)
         """
         state = self._current_state
         for trans in state.transitions:
             if trans.condition.check(context):
-                if trans.condition.type == "module_signal":
-                    context.pop(FSM_SIGNAL_KEY, None)
+                context.pop(FSM_SIGNAL_KEY, None)
                 self._transition_to(trans.next_state, context)
                 return FiredTransition(
                     from_state=state.name,
@@ -450,8 +450,6 @@ class GenerationGraph:
                     condition=trans.condition.describe(),
                 )
         return None
-
-    # ── Accessors ─────────────────────────────────────────────────────────────
 
     @property
     def initial_state(self) -> str:
@@ -468,8 +466,6 @@ class GenerationGraph:
     def state_node_sequence(self, state_name: str) -> List[str]:
         """Return the derived node-execution sequence for a given state."""
         return list(self._states[state_name].node_sequence)
-
-    # ── Visualization ─────────────────────────────────────────────────────────
 
     def to_mermaid(self, title: Optional[str] = None) -> str:
         """Render the FSM as a Mermaid ``flowchart LR`` with body subgraphs.
@@ -506,7 +502,7 @@ class GenerationGraph:
 
         done_name = self._done_sentinel
 
-        # ── Entry / terminal markers (small circles) ──────────────────────────
+        # Entry / terminal markers (small circles).
         lines.append('    fsm_start(("▶")):::fsm_start')
         has_done_target = done_name is not None and any(
             trans.next_state == done_name for state in self._states.values() for trans in state.transitions
@@ -514,7 +510,7 @@ class GenerationGraph:
         if has_done_target:
             lines.append('    fsm_done(("⏹")):::fsm_terminal')
 
-        # ── Body subgraphs (skip the done state — empty body, no value) ───────
+        # Skip the done state: empty body, no value.
         drawn: List[str] = []
         for name, state in self._states.items():
             if name == done_name:
@@ -534,11 +530,10 @@ class GenerationGraph:
                 lines.append(f"        {name}__{_mermaid_id(e.from_)} --> {name}__{_mermaid_id(e.to)}")
             lines.append("    end")
 
-        # ── Entry edge ────────────────────────────────────────────────────────
         if self._initial in self._states and self._initial != done_name:
             lines.append(f"    fsm_start ==> state_{self._initial}")
 
-        # ── State transitions (thick ==> arrows with quoted condition labels) ─
+        # State transitions: thick ``==>`` arrows with quoted condition labels.
         for name in drawn:
             for trans in self._states[name].transitions:
                 if trans.next_state == done_name:
@@ -548,7 +543,6 @@ class GenerationGraph:
                 cond = trans.condition.describe()
                 lines.append(f'    state_{name} ==>|"{cond}"| {target}')
 
-        # ── Class definitions / styling ──────────────────────────────────────
         lines += [
             "    classDef body_node fill:#fff,stroke:#666",
             "    classDef fsm_start fill:#dff,stroke:#06c,stroke-width:2px",
@@ -560,8 +554,6 @@ class GenerationGraph:
             lines.append(f"    style state_{self._initial} fill:#eef,stroke:#06c,stroke-width:2px")
 
         return "\n".join(lines)
-
-    # ── Internal ──────────────────────────────────────────────────────────────
 
     @property
     def _current_state(self) -> _State:

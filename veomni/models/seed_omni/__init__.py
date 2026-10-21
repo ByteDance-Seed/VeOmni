@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# ── SeedOmni V2 public API ──────────────────────────────────────────────────
 # Exports cluster around three concerns:
 #
 #   1. Core graph / runtime types (:class:`OmniConfig`, :class:`OmniModel`,
@@ -35,10 +34,11 @@ from .modules import (
     OMNI_CONFIG_REGISTRY,
     OMNI_MODEL_REGISTRY,
     OMNI_PROCESSOR_REGISTRY,
+    OmniModuleConfig,
+    PretrainedOmniModule,
     read_hf_model_type,
     read_model_type,
 )
-from .omni_pretrained_model import OmniPreTrainedModel
 from .processing_omni import OmniProcessor
 from .utils.conversation import build_conversation
 
@@ -47,19 +47,20 @@ __all__ = [
     # Core
     "OmniConfig",
     "OmniModel",
-    "OmniPreTrainedModel",
+    "OmniModuleConfig",
+    "PretrainedOmniModule",
     "OmniProcessor",
     "BaseMixin",
     "TrainingModuleMixin",
     "InferenceModuleMixin",
-    "MetricMeterMixin",
     "OfflineEncodingMixin",
+    "MetricMeterMixin",
+    "build_conversation",
     "TrainingGraph",
     "GenerationGraph",
     "NodeDef",
     "EdgeDef",
     "END",
-    "build_conversation",
     # Module registry
     "OMNI_ACCELERATED_MODEL_REGISTRY",
     "OMNI_CONFIG_REGISTRY",

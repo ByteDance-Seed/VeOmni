@@ -8,6 +8,8 @@ from typing import Any, Callable, Iterator
 
 import torch
 
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+
 
 def _build_denoise_index_layout(
     key_values_lens: torch.Tensor,
@@ -457,7 +459,11 @@ class MotGenerationState:
 
         # Official InterleaveInferencer wraps generate_image in bf16 autocast, so
         # the CFG scale/norm/renorm math is not the same as eager bf16 * python float.
-        autocast = torch.amp.autocast(device.type, dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
+        autocast = (
+            torch.amp.autocast(device.type, dtype=torch.bfloat16)
+            if IS_CUDA_AVAILABLE and device.type == get_device_type()
+            else nullcontext()
+        )
         with autocast:
             guided = cfg_text_velocity + cfg_text_scale * (main_velocity - cfg_text_velocity)
             if cfg_renorm_type == "text_channel":

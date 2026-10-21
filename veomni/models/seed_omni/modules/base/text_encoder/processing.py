@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ....processing import ModulePreprocessorBase
 from ....utils.conversation import ConversationItem
+from ...module_processing_base import ModulePreprocessorBase
 from .chat_template import TextEncoderChatTemplate
 
 

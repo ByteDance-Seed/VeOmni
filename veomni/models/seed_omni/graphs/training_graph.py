@@ -8,13 +8,13 @@ self-describing ``module[.method]`` string (a bare module defaults to
 ``.forward``). A launcher ``graph_train.yaml`` *is* that list, at the file top
 level with no wrapper key::
 
-    - {from: janus_siglip,             to: janus_llama}
-    - {from: janus_vqvae.encode,       to: janus_llama}
-    - {from: janus_text_encoder.encode, to: janus_llama}
-    - {from: janus_llama,              to: janus_text_encoder.decode}
-    - {from: janus_llama,              to: janus_vqvae.decode}
-    - {from: janus_text_encoder.decode, to: end}   # leaf → end
-    - {from: janus_vqvae.decode,       to: end}    # leaf → end
+    - {from: module_A,         to: module_B}
+    - {from: module_C.encode,  to: module_B}
+    - {from: module_D.encode,  to: module_B}
+    - {from: module_B,         to: module_D.decode}
+    - {from: module_B,         to: module_C.decode}
+    - {from: module_D.decode,  to: end}   # leaf → end
+    - {from: module_C.decode,  to: end}   # leaf → end
 
 Active nodes are *derived* from the endpoints of those edges (excluding the
 virtual :data:`~.graph.END` keyword); a node's identity is its canonical
@@ -27,10 +27,8 @@ queue.
 
 Each active node executes **exactly once** per forward pass.  Edges declare
 **topology only** (execution order) — there is no per-node input routing: every
-node receives the same shared ``batch``. Conversation graphs move state through
-the ``conversation_list`` carrier; packed graphs (Janus ``pack_encode`` /
-``pack_forward`` / ``pack_decode``) read packed tensors already written onto
-that batch dict.
+node receives the same shared ``batch``. Modules read and write keys on that
+dict; a later packed graph can store tensors on it the same way.
 
 Single-loss protocol
 --------------------
@@ -64,9 +62,10 @@ See also
 """
 
 from collections import defaultdict, deque
-from typing import Dict, Iterator, List, Optional
+from collections.abc import Mapping
+from typing import Any, Dict, Iterator, List, Optional
 
-from .base import EdgeDef, NodeDef, is_end
+from .base import EdgeDef, NodeDef, is_end, validate_graph_modules
 
 
 def _mermaid_id(name: str) -> str:
@@ -85,6 +84,7 @@ class TrainingGraph:
         training_graph: List[Dict],
         *,
         default_method: str = "forward",
+        modules: Optional[Mapping[str, Any]] = None,
     ):
         if not training_graph:
             raise ValueError(
@@ -118,6 +118,8 @@ class TrainingGraph:
 
         self._active_nodes: List[NodeDef] = [self._node_by_name[n] for n in active_node_names]
         self._active_edges: List[EdgeDef] = resolved_edges
+        if modules is not None:
+            validate_graph_modules(self._active_nodes, modules)
 
         # Sanity: every active node has *some* outgoing edge (forbidding orphans
         # is the whole point of the `to: end` keyword).  By construction every
@@ -135,8 +137,6 @@ class TrainingGraph:
         # the FSM's ``_current`` state. ``step`` runs the node at the cursor;
         # ``maybe_transition`` advances it. Reset before each forward pass.
         self._cursor: int = 0
-
-    # ── public API ────────────────────────────────────────────────────────────
 
     @property
     def execution_order(self) -> List[str]:
@@ -175,7 +175,7 @@ class TrainingGraph:
             raise KeyError(f"'{node}' is not an active node. Active: {sorted(self._node_by_name)}.")
         return n.method
 
-    # ── Lifecycle (mirror of GenerationGraph) ───────────────────────────────────
+    # Lifecycle: mirror of GenerationGraph.
 
     def reset(self) -> None:
         """Re-point the cursor at the first node for a fresh forward pass.
@@ -201,14 +201,14 @@ class TrainingGraph:
             raise RuntimeError("TrainingGraph.current_node_name: cursor past the last node (graph is done).")
         return self._execution_order[self._cursor]
 
-    # ── Step & Transition (mirror of GenerationGraph) ───────────────────────────
+    # Step & transition: mirror of GenerationGraph.
 
     def iter_nodes(self) -> Iterator[NodeDef]:
         """Yield each active node in execution order (selection only — no forward).
 
         The graph only *chooses* what runs next; it never runs a model forward.
         The caller executes each yielded ``NodeDef`` (``module`` + ``method``)
-        and mutates the shared ``conversation_list`` carrier in place. After the
+        and mutates the shared ``batch`` dict in place. After the
         caller consumes a node, this generator advances the cursor
         (:meth:`maybe_transition`) and yields the next, until :meth:`is_done`.
         Mirror of :meth:`GenerationGraph.iter_nodes` (one FSM body iteration).
@@ -226,8 +226,6 @@ class TrainingGraph:
         """
         self._cursor += 1
         return not self.is_done()
-
-    # ── visualization ────────────────────────────────────────────────────────
 
     def to_mermaid(
         self,
@@ -342,8 +340,6 @@ class TrainingGraph:
         ]
         return "\n".join(lines)
 
-    # ── internal ─────────────────────────────────────────────────────────────
-
     @staticmethod
     def _edge_label(e: EdgeDef) -> str:
         """Render a body edge label (topology-only — no field routing)."""
@@ -360,15 +356,15 @@ class TrainingGraph:
 
         in_degree: Dict[str, int] = {n: len(deps[n]) for n in nodes}
         # Sort by user-declared order (active_nodes preserves first-appearance).
-        order_index = {n: i for i, n in enumerate(nodes)}
-        queue: deque = deque(sorted((n for n in nodes if in_degree[n] == 0), key=order_index.get))
+        order_index: Dict[str, int] = {n: i for i, n in enumerate(nodes)}
+        queue: deque = deque(sorted((n for n in nodes if in_degree[n] == 0), key=lambda n: order_index[n]))
         order: List[str] = []
 
         while queue:
             n = queue.popleft()
             order.append(n)
             # Process in declaration order for stability.
-            for other in sorted(nodes, key=order_index.get):
+            for other in sorted(nodes, key=lambda n: order_index[n]):
                 if n in deps[other]:
                     deps[other].discard(n)
                     in_degree[other] -= 1

@@ -2,15 +2,17 @@
 
 from typing import Any, Dict, Optional
 
-from transformers import PretrainedConfig, Qwen3MoeConfig
+from transformers import Qwen3MoeConfig
+
+from ...module_configuration_base import OmniModuleConfig
 
 
-class Qwen3MoeLlmConfig(PretrainedConfig):
+class Qwen3MoeLlmConfig(OmniModuleConfig):
     """Top-level config for the Qwen3-MoE AR backbone (no wte, no lm_head)."""
 
     model_type = "qwen3_moe_llm"
     # Register the nested backbone config so transformers propagates
-    # ``attn_implementation`` (e.g. veomni_flash_attention_2_with_sp) down to it —
+    # ``attn_implementation`` (e.g. veomni_flash_attention_2) down to it —
     # otherwise the inner ``Qwen3MoeModel`` silently falls back to SDPA and breaks
     # under sequence parallelism (sliced q vs full-length mask).
     sub_configs = {"text_config": Qwen3MoeConfig}

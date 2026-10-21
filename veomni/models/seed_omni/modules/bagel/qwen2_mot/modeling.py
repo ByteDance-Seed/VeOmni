@@ -1,8 +1,8 @@
 """BAGEL Qwen2 MoT backbone."""
 
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -11,40 +11,30 @@ from torch.nn.functional import scaled_dot_product_attention
 from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
 from transformers.utils import ModelOutput
 
-from ....omni_pretrained_model import OmniPreTrainedModel
-from ....utils.conversation import ConversationItem, get_tail_output_item
-from ..sources import BAGEL_FLOW_HIDDEN, BAGEL_FLOW_QUERY, BAGEL_FLOW_VELOCITY, BAGEL_START_TOKEN
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+
+from ....utils.conversation import ConversationItem
+from ...module_modeling_base import PretrainedOmniModule
+from ..sources import (
+    BAGEL_FLOW_HIDDEN,
+    BAGEL_FLOW_QUERY,
+    BAGEL_FLOW_VELOCITY,
+    BAGEL_PHASE_KEY,
+    BAGEL_START_TOKEN,
+    bagel_phase,
+    get_tail_phase_item,
+)
 from .configuration import BagelQwen2MoTConfig
 from .generation_state import MotGenerationState
 from .masking import build_mot_sdpa_mask
 from .processing import PackedConversation, preprocess_mot_inputs
 
 
-_FLASH_ATTENTION_2 = "veomni_flash_attention_2_with_sp"
-
-
-@contextmanager
-def _temporary_attention_implementation(
-    config: BagelQwen2MoTConfig,
-    implementation: Optional[str],
-) -> Iterator[None]:
-    if implementation is None:
-        yield
-        return
-
-    previous = config._attn_implementation
-    config._attn_implementation = implementation
-    try:
-        yield
-    finally:
-        config._attn_implementation = previous
-
-
 class InferenceMixin:
     """FSM ``generate`` / serial denoise / velocity-collection — HF ``GenerationMixin`` analog.
 
     Listed *before* :class:`BagelQwen2MoTCore` (and therefore before
-    :class:`~....omni_pretrained_model.OmniPreTrainedModel`): the pretrained
+    :class:`~...module_modeling_base.PretrainedOmniModule`): the pretrained
     base ships a no-op ``reset_local_inference_state``, and MRO resolves
     left-to-right — put second, that no-op would shadow the real one below.
     """
@@ -61,7 +51,6 @@ class InferenceMixin:
         update_past_key_values: bool = True,
         is_causal: bool = True,
         mode: str = "und",
-        attention_implementation: Optional[str] = None,
         packed_attention_metadata: Optional[torch.Tensor] = None,
         packed_vae_token_indexes: Optional[torch.Tensor] = None,
         packed_text_indexes: Optional[torch.Tensor] = None,
@@ -85,8 +74,7 @@ class InferenceMixin:
             call_kwargs["packed_vae_token_indexes"] = packed_vae_token_indexes
             call_kwargs["packed_text_indexes"] = packed_text_indexes
 
-        with _temporary_attention_implementation(self.config, attention_implementation):
-            output = self.model.forward_packed_inference(**call_kwargs)
+        output = self.model.forward_packed_inference(**call_kwargs)
 
         return {
             "hidden_states": output.packed_query_sequence,
@@ -114,7 +102,7 @@ class InferenceMixin:
             hidden_states = self._prefill_prompt(conversation_list, generation_kwargs)
         elif self._generation_state.main.cache is None:
             tail = conversation_list[-1]
-            if tail.type != "output" or tail.source != BAGEL_START_TOKEN:
+            if tail.type != "output" or bagel_phase(tail) != BAGEL_START_TOKEN:
                 raise ValueError("BAGEL understanding prefill requires a tail assistant BOS embedding.")
             self._prefill_prompt(conversation_list[:-1], generation_kwargs)
             hidden_states = self._decode_next_token(conversation_list)
@@ -130,7 +118,7 @@ class InferenceMixin:
             if tail.type != "output":
                 raise ValueError(f"BAGEL understanding decode expects tail output item, got {tail.type!r}.")
             tail.value = hidden_states[-1:].contiguous()
-            tail.source = None
+            tail.meta.pop(BAGEL_PHASE_KEY, None)
         return {"conversation_list": conversation_list}
 
     def _prepare_denoise_query(
@@ -143,9 +131,9 @@ class InferenceMixin:
 
         self._generation_state.validate_cfg_request(generation_kwargs or {})
         self._generation_state.main.require_ready()
-        tail = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_QUERY])
+        tail = get_tail_phase_item(conversation_list, BAGEL_FLOW_QUERY)
         if tail is None or not torch.is_tensor(tail.value):
-            raise ValueError("BAGEL Qwen2-MoT denoise branch requires source='bagel_flow_query'.")
+            raise ValueError(f"BAGEL Qwen2-MoT denoise branch requires an output in phase {BAGEL_FLOW_QUERY!r}.")
 
         query = tail.value
         if query.dim() == 3 and query.shape[0] == 1:
@@ -183,13 +171,12 @@ class InferenceMixin:
                 update_past_key_values=False,
                 is_causal=False,
                 mode="gen",
-                attention_implementation=_FLASH_ATTENTION_2,
             )
             hiddens.append(outputs["hidden_states"])
         if not hiddens:
             raise RuntimeError("BAGEL Qwen2-MoT denoise branch produced no branch hidden states.")
 
-        tail.source = BAGEL_FLOW_HIDDEN
+        tail.meta[BAGEL_PHASE_KEY] = BAGEL_FLOW_HIDDEN
         tail.value = torch.cat(hiddens, dim=0).to(device=self.device, dtype=self.dtype)
         return {"conversation_list": conversation_list}
 
@@ -204,9 +191,11 @@ class InferenceMixin:
             raise ValueError("BAGEL Qwen2-MoT collect_velocity requires conversation_list.")
 
         self._generation_state.validate_cfg_request(generation_kwargs or {})
-        tail = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_VELOCITY])
+        tail = get_tail_phase_item(conversation_list, BAGEL_FLOW_VELOCITY)
         if tail is None or not torch.is_tensor(tail.value):
-            raise ValueError("BAGEL Qwen2-MoT velocity collection requires source='bagel_flow_velocity'.")
+            raise ValueError(
+                f"BAGEL Qwen2-MoT velocity collection requires an output in phase {BAGEL_FLOW_VELOCITY!r}."
+            )
 
         velocity = tail.value
         if velocity.dim() == 3 and velocity.shape[0] == 1:
@@ -381,7 +370,6 @@ class InferenceMixin:
             update_past_key_values=True,
             is_causal=True,
             mode="und",
-            attention_implementation=_FLASH_ATTENTION_2,
         )
         main_context.append_packed_query(
             cache=outputs["past_key_values"],
@@ -428,7 +416,7 @@ class InferenceMixin:
         return NaiveCache(len(self.model.layers))
 
 
-class BagelQwen2MoTCore(OmniPreTrainedModel):
+class BagelQwen2MoTCore(PretrainedOmniModule):
     """Shared weights, packed train/infer forward, and generation-state shell.
 
     Public eager and accelerated classes mix their inference mixins onto this
@@ -520,7 +508,7 @@ def _sdpa_context(device: torch.device):
     dispatcher cannot pick MATH (OOM) or a newer CUDNN kernel. CPU/NPU keep the
     default dispatcher because Efficient is CUDA-only.
     """
-    if device.type == "cuda":
+    if IS_CUDA_AVAILABLE and device.type == get_device_type():
         return sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION])
     return nullcontext()
 
@@ -744,6 +732,17 @@ class BagelQwen2RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+def _build_rms_norm(
+    rms_norm_cls: type[Qwen2RMSNorm],
+    hidden_size: int,
+    config: BagelQwen2MoTConfig,
+) -> Qwen2RMSNorm:
+    try:
+        return rms_norm_cls(hidden_size, eps=config.rms_norm_eps, config=config)
+    except TypeError:
+        return rms_norm_cls(hidden_size, eps=config.rms_norm_eps)
+
+
 class BagelQwen2MoTAttention(nn.Module):
     def __init__(
         self,
@@ -766,11 +765,11 @@ class BagelQwen2MoTAttention(nn.Module):
 
         self._build_qkv_proj()
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-        self.q_norm = rms_norm_cls(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = rms_norm_cls(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = _build_rms_norm(rms_norm_cls, self.head_dim, config)
+        self.k_norm = _build_rms_norm(rms_norm_cls, self.head_dim, config)
         self.o_proj_moe_gen = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-        self.q_norm_moe_gen = rms_norm_cls(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm_moe_gen = rms_norm_cls(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm_moe_gen = _build_rms_norm(rms_norm_cls, self.head_dim, config)
+        self.k_norm_moe_gen = _build_rms_norm(rms_norm_cls, self.head_dim, config)
 
     def _build_qkv_proj(self) -> None:
         self.q_proj = nn.Linear(self.hidden_size, self.query_size, bias=True)
@@ -1140,10 +1139,10 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
         self.self_attn = attention_cls(config, layer_idx, rms_norm_cls=rms_norm_cls)
         self.mlp = mlp_cls(config)
         self.mlp_moe_gen = mlp_cls(config)
-        self.input_layernorm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm_moe_gen = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm_moe_gen = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = _build_rms_norm(rms_norm_cls, config.hidden_size, config)
+        self.input_layernorm_moe_gen = _build_rms_norm(rms_norm_cls, config.hidden_size, config)
+        self.post_attention_layernorm = _build_rms_norm(rms_norm_cls, config.hidden_size, config)
+        self.post_attention_layernorm_moe_gen = _build_rms_norm(rms_norm_cls, config.hidden_size, config)
 
     def _apply_moe_norm(
         self,
@@ -1337,8 +1336,8 @@ class BagelQwen2MoTBackbone(nn.Module):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm_moe_gen = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = _build_rms_norm(rms_norm_cls, config.hidden_size, config)
+        self.norm_moe_gen = _build_rms_norm(rms_norm_cls, config.hidden_size, config)
         self.rotary_emb = BagelQwen2RotaryEmbedding(config=config)
         self.use_moe = "Mo" in config.layer_module
         self.attention_cls = attention_cls
