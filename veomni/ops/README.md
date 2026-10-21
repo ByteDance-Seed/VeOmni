@@ -96,7 +96,9 @@ descriptions, hardware requirements, and package requirements; an
 implementation registered for multiple devices therefore appears more than
 once.
 
-MagiAttention is optional and can be installed with:
+FlexAttention is registered for NVIDIA GPUs. Its adapter selects FA4 on SM90+
+when supported and otherwise uses Triton. MagiAttention requires NVIDIA SM100+
+and is optional; install it with:
 
 ```bash
 uv sync --extra gpu --extra magi --dev

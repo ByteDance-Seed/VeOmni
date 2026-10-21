@@ -127,3 +127,17 @@ jobs:
         # from the dropped `dit` extra), so no extra sync step is needed.
         run: |
           uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py::test_wan_dit_parallel_align
+      - name: Free GPUs before SeedOmni runtime acceptance
+        if: always()
+        run: |
+          nvidia-smi || true
+          pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u | tr '\n' ' ')
+          if [ -n "$pids" ]; then
+            echo "Killing stale GPU processes: $pids"
+            kill -9 $pids 2>/dev/null || true
+            sleep 3
+            nvidia-smi || true
+          fi
+      - name: Run SeedOmni runtime acceptance
+        run: |
+          uv run --frozen pytest -s -x tests/models/test_omni_fsdp.py

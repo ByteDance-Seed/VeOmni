@@ -21,6 +21,7 @@ On session start, read the following:
 Read on demand:
 - `.agents/knowledge/testing.md` — how CI selects tests, and how to decide whether a change needs one; read before adding or wiring a test
 - `.agents/knowledge/multimodal_metadata.md` — multimodal metadata precompute contract; read before touching VLM/Omni collators, ViT forwards, or the model metadata hooks
+- `.agents/knowledge/veomni-seed-omni.md` — SeedOmni runtime architecture, config resolution, and SP/FSDP/DDP/resume constraints; read before touching `veomni/models/seed_omni/`, `veomni/trainer/omni/`, `veomni/data/seed_omni/`, or `tasks/omni/`
 
 ---
 
@@ -105,6 +106,7 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 | Code review (before opening a PR) | `/veomni-review` |
 | Add new model | `/veomni-new-model` |
 | Write or refresh a model's patchgen modeling | `/veomni-patchgen-model` |
+| Add / modify SeedOmni module or graph | `/veomni-seed-omni` |
 | Add new op/kernel | `/veomni-new-op` |
 | Update dependencies (uv) | `/veomni-uv-update` |
 | Performance profiling | `/veomni-profile` |
@@ -115,6 +117,7 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 
 - **"Add support for model X"** → `/veomni-new-model`
 - **"Write a patch_gen_config" / "regenerate the generated modeling" / "add NPU patchgen" / "port X to patchgen"** → `/veomni-patchgen-model` (also the modeling step inside `/veomni-new-model`)
+- **"Add OmniModule (mixin)" / "extend seed_omni" / "wire into omni graph (nodes/edges/end)" / "split <model> into omni subfolders + per-module callback" / "modify training_graph or generation_graph"** → `/veomni-seed-omni`
 - **"Add a new kernel / fused op"** → `/veomni-new-op`
 - **"Fix this error" / "training hangs" / "wrong results"** → `/veomni-debug`
 - **"Add a new capability" / "refactor" / "clean up"** → `/veomni-develop`
