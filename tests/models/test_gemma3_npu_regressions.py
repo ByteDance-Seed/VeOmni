@@ -25,7 +25,7 @@ from veomni.models.transformers.gemma3.generated import patched_modeling_gemma3_
 from veomni.ops import VeomniOp
 
 
-def test_gemma3_vlm_binds_instance_local_ops_and_runs_text_loss():
+def _build_tiny_gemma3_vlm():
     text_config = tiny_gemma3_text_config()
     vision_config = SiglipVisionConfig(
         hidden_size=32,
@@ -45,7 +45,11 @@ def test_gemma3_vlm_binds_instance_local_ops_and_runs_text_loss():
     ops = eager_ops_config()
     stamp_attn_implementation(config, ops.attn_implementation)
     with ops_config_scope(ops):
-        model = gemma3_modeling.Gemma3ForConditionalGeneration(config)
+        return gemma3_modeling.Gemma3ForConditionalGeneration(config)
+
+
+def test_gemma3_vlm_binds_instance_local_ops_and_runs_text_loss():
+    model = _build_tiny_gemma3_vlm()
 
     assert isinstance(model.veomni_ce, VeomniOp)
     assert model.veomni_ce.impl == "eager"
@@ -55,6 +59,28 @@ def test_gemma3_vlm_binds_instance_local_ops_and_runs_text_loss():
     input_ids = torch.tensor([[2, 5, 6, 7]])
     output = model(input_ids=input_ids, labels=input_ids, use_cache=False)
     assert torch.isfinite(output.loss)
+
+
+def test_gemma3_vlm_text_only_distributed_batch_touches_visual_parameters(monkeypatch):
+    model = _build_tiny_gemma3_vlm().eval()
+    parallel_state = SimpleNamespace(fsdp_enabled=False)
+    monkeypatch.setattr(gemma3_modeling, "get_parallel_state", lambda: parallel_state)
+    input_ids = torch.tensor([[2, 5, 6, 7]])
+
+    with torch.no_grad():
+        baseline_logits = model(input_ids=input_ids, use_cache=False).logits
+        parallel_state.fsdp_enabled = True
+        distributed_logits = model(input_ids=input_ids, use_cache=False).logits
+    torch.testing.assert_close(distributed_logits, baseline_logits)
+
+    output = model(input_ids=input_ids, labels=input_ids, use_cache=False)
+    output.loss.backward()
+    visual_parameters = list(model.model.vision_tower.parameters()) + list(
+        model.model.multi_modal_projector.parameters()
+    )
+    assert visual_parameters
+    assert all(parameter.grad is not None for parameter in visual_parameters)
+    assert all(torch.count_nonzero(parameter.grad) == 0 for parameter in visual_parameters)
 
 
 def test_gemma3_vlm_sdpa_mask_preserves_packed_boundaries():

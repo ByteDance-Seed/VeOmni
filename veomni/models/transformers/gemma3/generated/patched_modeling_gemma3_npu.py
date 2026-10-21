@@ -27,6 +27,8 @@
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Gemma3Attention.forward
 #      Always call the local rope and attention VeomniOps
+#    - method_override: Gemma3Model.dummy_vision_forward
+#      Run minimal vision and projector forwards for text-only distributed microbatches
 #    - method_override: Gemma3Model.__init__
 #      Construct the generated text tower instead of the upstream AutoModel class
 #    - method_override: Gemma3Model.forward
@@ -941,7 +943,7 @@ def create_masks_for_vision_model(
 
 # ======================================================================
 # [MODIFIED CLASS] Gemma3Model
-# Methods patched: __init__, forward
+# Methods patched: dummy_vision_forward, __init__, forward
 # ======================================================================
 
 
@@ -1034,6 +1036,9 @@ class Gemma3Model(Gemma3PreTrainedModel):
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_features
             )
             inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+        elif get_parallel_state().fsdp_enabled:
+            dummy_dependency = self.dummy_vision_forward().to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds + dummy_dependency * 0.0
 
         if not isinstance(causal_mask_mapping := attention_mask, dict):
             causal_mask_mapping = create_gemma3_masks(
@@ -1064,6 +1069,37 @@ class Gemma3Model(Gemma3PreTrainedModel):
             attentions=outputs.attentions,
             image_hidden_states=image_features if pixel_values is not None else None,
         )
+
+    def dummy_vision_forward(self):
+        patch_size = self.config.vision_config.patch_size
+        if isinstance(patch_size, int):
+            patch_height = patch_width = patch_size
+        else:
+            patch_height, patch_width = patch_size
+
+        vision_parameter = next(self.vision_tower.parameters())
+        pixel_values = torch.zeros(
+            (1, self.config.vision_config.num_channels, patch_height, patch_width),
+            dtype=vision_parameter.dtype,
+            device=vision_parameter.device,
+        )
+        vision_outputs = self.vision_tower(
+            pixel_values=pixel_values,
+            interpolate_pos_encoding=True,
+            return_dict=True,
+        )
+        dependency = vision_outputs.last_hidden_state.mean()
+        if vision_outputs.pooler_output is not None:
+            dependency = dependency + vision_outputs.pooler_output.mean()
+
+        projector_input = vision_outputs.last_hidden_state.new_zeros(
+            (
+                1,
+                self.multi_modal_projector.patches_per_image**2,
+                self.config.vision_config.hidden_size,
+            )
+        )
+        return dependency + self.multi_modal_projector(projector_input).mean()
 
 
 # ======================================================================
