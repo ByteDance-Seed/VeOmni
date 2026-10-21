@@ -19,6 +19,23 @@ def test_hybrid_topology_requires_an_explicit_opt_in(monkeypatch, cp_size, dp_sh
     assert config.ulysses_size * config.cp_size * config.dp_size == 32
 
 
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None, [], {}])
+def test_hybrid_opt_in_rejects_non_booleans_before_topology_resolution(monkeypatch, value):
+    def unexpected_topology_resolution(self):
+        pytest.fail("Invalid hybrid opt-in must fail before topology resolution")
+
+    monkeypatch.setattr(AcceleratorConfig, "_resolve_topology", unexpected_topology_resolution)
+    with pytest.raises(ValueError, match="allow_hybrid_cp must be a boolean"):
+        AcceleratorConfig(allow_hybrid_cp=value)
+
+
+def test_false_hybrid_opt_in_preserves_single_axis_topology(monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "32")
+    config = AcceleratorConfig(ulysses_size=8, allow_hybrid_cp=False)
+    assert config.dp_size == 4
+    assert config.cp_size == 1
+
+
 @pytest.mark.parametrize("npu", [False, True])
 def test_hybrid_model_guard_keeps_other_families_closed(monkeypatch, npu):
     monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)

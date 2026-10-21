@@ -846,6 +846,9 @@ class AcceleratorConfig:
     )
 
     def __post_init__(self):
+        if not isinstance(self.allow_hybrid_cp, bool):
+            raise ValueError(f"allow_hybrid_cp must be a boolean; got {self.allow_hybrid_cp!r}.")
+
         # although expert parallel and extra parallel are both provided in the arguments,
         # the implementation is configuring extra parallelism to include expert parallelism.
         # Guarded so re-instantiating from a saved config (asdict round-trip) does not
