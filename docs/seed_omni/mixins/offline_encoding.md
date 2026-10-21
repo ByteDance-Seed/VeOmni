@@ -226,8 +226,8 @@ VeOmni run logic.
 
 | Function | Module's job | Called by | Effect |
 |----------|--------------|-----------|--------|
-| The offline-embedding method, e.g. `offline_encode(**kwargs) -> dict` | **Must implement** on the sibling `*OfflineMixin`, under any name. Turn tensor inputs into deterministic cache tensors. | The `offline_embedding` graph node naming it, through [`execute_train_node`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L27) | Produces the cache artifacts. |
-| The offline-training method, e.g. `online_process(**kwargs) -> dict` | **Must implement** on the sibling `*OfflineMixin`, under any name, without touching weights. Turn cache tensors back into the tensors training needs. | The `offline_training` graph node naming it, through [`execute_train_node`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L27) | Materializes runtime tensors from the cache. |
+| The offline-embedding method, e.g. `offline_encode(**kwargs) -> dict` | **Must implement** on the sibling `*OfflineMixin`, under any name. Turn tensor inputs into deterministic cache tensors. | The `offline_embedding` graph node naming it, through [`execute_train_node`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L28) | Produces the cache artifacts. |
+| The offline-training method, e.g. `online_process(**kwargs) -> dict` | **Must implement** on the sibling `*OfflineMixin`, under any name, without touching weights. Turn cache tensors back into the tensors training needs. | The `offline_training` graph node naming it, through [`execute_train_node`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L28) | Materializes runtime tensors from the cache. |
 | `@pre_forward` / `@post_forward` for both methods | **Must write** on the module. Translate between the graph's conversation payload and the method's tensors. The mixin defines none. | [`TrainingModuleMixin.pre_forward`](../../../veomni/models/seed_omni/mixins/training_module_mixin.py#L59) / [`post_forward`](../../../veomni/models/seed_omni/mixins/training_module_mixin.py#L66) | The endpoint receives tensors and the graph receives the hook's output. |
 
 ### What each hook does
@@ -303,7 +303,7 @@ given. Two rules follow:
   passed in. Under `fsdp_scope: model` the root wrap already hands the graph
   copies.
 - The offline-embedding node must put its edits where the batch sees them. The
-  [`pre_forward` / `post_forward` hooks](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L61)
+  [`pre_forward` / `post_forward` hooks](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L63)
   run on the batch itself, outside the module's wrap, so edits made there land.
   The method body gets its kwargs after the module wrap's cast, so in-place
   edits there are lost unless it returns `conversation_list`. BAGEL's VAE
