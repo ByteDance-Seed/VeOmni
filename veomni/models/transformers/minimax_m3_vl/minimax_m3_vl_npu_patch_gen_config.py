@@ -28,6 +28,8 @@ from veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config
     PatchedMiniMaxM3VLPreTrainedModel,
     _grid_thw_to_list,
     _minimax_m3_indexer_project,
+    _minimax_m3_sparse_attention,
+    _require_varlen_attention,
     collate_multimodal_metadata,
     minimax_m3_vl_3d_rotary_embedding_forward_patched,
     minimax_m3_vl_attention_bind_ops,
@@ -81,12 +83,14 @@ config.add_import("veomni.models.utils.attention_utils", names=["VARLEN_ATTENTIO
 config.add_import("veomni.utils.device", names=["IS_NPU_AVAILABLE"])
 config.add_helper(_grid_thw_to_list)
 config.add_helper(_minimax_m3_indexer_project)
+config.add_helper(_require_varlen_attention)
+config.add_helper(_minimax_m3_sparse_attention)
 config.add_helper(collate_multimodal_metadata)
 
 config.replace_class(
     "MiniMaxM3VLPreTrainedModel",
     replacement=PatchedMiniMaxM3VLPreTrainedModel,
-    description="Allow VeOmni flash-attention implementations for the config-driven vision tower",
+    description="Allow VeOmni flash-attention implementations for the vision tower and dense language layers",
 )
 
 config.replace_class(
@@ -144,12 +148,12 @@ config.override_method(
 config.modify_init(
     "MiniMaxM3VLAttention",
     replacement=minimax_m3_vl_attention_bind_ops,
-    description="Bind instance-local MiniMax sparse attention VeomniOps",
+    description="Bind instance-local attention VeomniOps: standard attention for dense layers, MSA for sparse ones",
 )
 config.override_method(
     "MiniMaxM3VLAttention.forward",
     replacement=minimax_m3_vl_attention_forward_patched,
-    description="Run packed MiniMax language attention through the TND sparse attention operators",
+    description="Run dense layers through varlen attention and sparse layers through the TND sparse attention operators",
 )
 config.override_method(
     "MiniMaxM3VLTextModel.forward",

@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 
 _MODELING_MODULES = (
@@ -75,6 +76,31 @@ def _single_layer_sparse_text_model(modeling):
     return modeling.MiniMaxM3VLTextModel(config).eval()
 
 
+class _VarlenReferenceAttention:
+    """CPU stand-in for varlen FlashAttention: causal SDPA per packed segment, ``[1, H, S, D]`` in, ``[1, S, H, D]`` out."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, module, query, key, value, attention_mask, dropout=0.0, scaling=None, **kwargs):
+        assert attention_mask is None
+        self.calls += 1
+        bounds = kwargs["cu_seq_lens_q"].tolist()
+        outputs = [
+            F.scaled_dot_product_attention(
+                query[:, :, start:end],
+                key[:, :, start:end],
+                value[:, :, start:end],
+                dropout_p=dropout,
+                is_causal=True,
+                scale=scaling,
+                enable_gqa=True,
+            )
+            for start, end in zip(bounds[:-1], bounds[1:])
+        ]
+        return torch.cat(outputs, dim=2).transpose(1, 2), None
+
+
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
 @pytest.mark.parametrize("layer_type", ["minimax_m3_sparse", "full_attention"], ids=["sparse", "full"])
 def test_minimax_m3_vl_packed_attention_matches_separate_samples(module_name, layer_type):
@@ -82,7 +108,12 @@ def test_minimax_m3_vl_packed_attention_matches_separate_samples(module_name, la
     modeling = importlib.import_module(module_name)
     model = modeling.MiniMaxM3VLTextModel(_text_config(modeling, layer_types=[layer_type])).eval()
     reference = _upstream_text_model(model)
-    # The shared config selects the ViT backend only; language attention must ignore it.
+    attention = model.layers[0].self_attn
+    if layer_type == "full_attention":
+        # Dense layers dispatch the configured varlen backend; FlashAttention needs
+        # an accelerator, so a per-segment SDPA stands in for it here.
+        assert attention.veomni_attn.op == "attention"
+        attention.veomni_attn = _VarlenReferenceAttention()
     model.config._attn_implementation = "veomni_flash_attention_2"
     hidden_size = model.config.hidden_size
     first = torch.randn(1, 2, hidden_size, requires_grad=True)
@@ -112,10 +143,73 @@ def test_minimax_m3_vl_packed_attention_matches_separate_samples(module_name, la
         dim=1,
     )
     torch.testing.assert_close(actual, expected)
+    if layer_type == "full_attention":
+        assert attention.veomni_attn.calls == 1
 
     (packed_grad,) = torch.autograd.grad(actual.square().sum(), packed)
     first_grad, second_grad = torch.autograd.grad(expected.square().sum(), (first, second))
     torch.testing.assert_close(packed_grad, torch.cat((first_grad, second_grad), dim=1))
+
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+def test_minimax_m3_vl_sparse_layers_never_bind_the_standard_attention(module_name):
+    """Each layer binds only the operators its layer type calls."""
+    modeling = importlib.import_module(module_name)
+    model = modeling.MiniMaxM3VLTextModel(
+        _text_config(
+            modeling,
+            num_hidden_layers=2,
+            layer_types=["minimax_m3_sparse", "full_attention"],
+            mlp_layer_types=["dense", "dense"],
+        )
+    )
+    sparse, dense = (layer.self_attn for layer in model.layers)
+    assert (sparse.veomni_msa_indexer.op, sparse.veomni_msa_attention.op) == ("minimax_sparse_attention",) * 2
+    assert not hasattr(sparse, "veomni_attn")
+    assert dense.veomni_attn.op == "attention"
+    assert not hasattr(dense, "veomni_msa_attention")
+
+
+@pytest.mark.parametrize("module_name", _MODELING_MODULES)
+@pytest.mark.parametrize(
+    ("attn_implementation", "cu_seq_lens", "ulysses_enabled", "rejected"),
+    [
+        ("eager", [0, 2, 5], False, True),
+        ("eager", [0, 5], True, True),
+        ("flash_attention_2", [0, 5], True, True),
+        ("eager", [0, 5], False, False),
+        ("veomni_flash_attention_2", [0, 2, 5], True, False),
+    ],
+    ids=["eager_packed", "eager_ulysses", "non_sp_varlen_ulysses", "eager_single_sequence", "sp_varlen_ulysses"],
+)
+def test_minimax_m3_vl_dense_language_attention_requires_varlen_backend(
+    module_name, attn_implementation, cu_seq_lens, ulysses_enabled, rejected, monkeypatch
+):
+    """Without a mask, non-varlen dense attention would mix packed samples; non-VeOmni backends skip the Ulysses exchange."""
+    modeling = importlib.import_module(module_name)
+    model = modeling.MiniMaxM3VLTextModel(_text_config(modeling, layer_types=["full_attention"])).eval()
+    model.config._attn_implementation = attn_implementation
+    model.layers[0].self_attn.veomni_attn = _VarlenReferenceAttention()
+    # SP is off so the dense op runs locally; only the backend check sees Ulysses.
+    monkeypatch.setattr(
+        modeling,
+        "get_parallel_state",
+        lambda: SimpleNamespace(sp_enabled=False, ulysses_enabled=ulysses_enabled),
+    )
+    cu_seq_lens = torch.tensor(cu_seq_lens, dtype=torch.int32)
+    forward_kwargs = dict(
+        inputs_embeds=torch.randn(1, 5, model.config.hidden_size),
+        cu_seq_lens_q=cu_seq_lens,
+        cu_seq_lens_k=cu_seq_lens,
+        max_length_q=5,
+        max_length_k=5,
+    )
+
+    if rejected:
+        with pytest.raises(ValueError, match="dense language attention needs a varlen FlashAttention backend"):
+            model(**forward_kwargs)
+    else:
+        model(**forward_kwargs)
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)

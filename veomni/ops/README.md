@@ -85,8 +85,9 @@ replay.
 MiniMax M3 `minimax_sparse_attention` takes packed TND tensors with the
 standard varlen `cu_seqlens` / `max_seqlen` metadata. `indexer` selects
 `[T, G, topk]` key blocks per query and KV group (`-1` marks an unused slot);
-`attention` applies them with token-level causality inside each block, or runs
-dense causal attention when no selection is passed. It has no config field yet:
+`attention` applies them with token-level causality inside each block. Only
+sparse layers call it; dense MiniMax layers use the standard `attention` family
+selected by `attn_implementation`. It has no config field yet:
 the model resolves the default row, and a kernel backend adds its rows (and a
 `minimax_sparse_attention_implementation` field once there is a choice). MoE
 `swiglu_oai` keeps the merged gate/up layout and replaces SiLU with the clamped

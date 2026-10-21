@@ -512,11 +512,11 @@ def _case_modes(case_id: str, is_moe: bool) -> tuple[list[ModelMode], list[Model
         ]
 
     if case_id == "minimax_m3_vl":
-        # Upstream MiniMax M3 VL supports neither Flash Attention nor packed
-        # sequences, so the HF reference runs eager attention. VeOmni's language
-        # attention always goes through the packed MiniMax sparse attention ops
-        # regardless of ``attn_implementation`` (which only selects the ViT
-        # backend), so the default VeOmni mode grid still applies.
+        # Upstream MiniMax M3 VL runs Flash Attention only through MiniMax's own
+        # Hub kernel and does not pack sequences, so the HF reference runs eager
+        # attention. VeOmni runs the dense language layers and the ViT on the
+        # selected varlen backend and the sparse layers on the packed MiniMax
+        # sparse attention ops, so the default VeOmni mode grid still applies.
         hf_modes = [ModelMode("hf", "eager")]
 
     if case_id in ("qwen3_5", "qwen3_5_moe"):

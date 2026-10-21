@@ -163,7 +163,7 @@ def _block_causal_keep(
     return keep | padding[:, None, :, None]
 
 
-def _dense_attention(
+def _masked_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -243,38 +243,32 @@ def minimax_sparse_attention_eager(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    block_indices: torch.Tensor | None,
+    block_indices: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
     *,
-    block_size: int | None,
+    block_size: int,
     scale: float,
     dropout_p: float = 0.0,
 ) -> torch.Tensor:
-    """Causal (block-sparse when ``block_indices`` is given) attention on TND tensors; see the package docstring."""
+    """Causal block-sparse attention on TND tensors; see the package docstring."""
     num_query_heads, num_groups = q.shape[1], k.shape[1]
     if num_query_heads % num_groups != 0:
         raise ValueError(f"Query heads ({num_query_heads}) must be divisible by KV heads ({num_groups}).")
-    if block_indices is not None and block_indices.shape[1] != num_groups:
+    if block_indices.shape[1] != num_groups:
         raise ValueError(
             f"MiniMax block_indices must have one selection per KV head ({num_groups}), got {block_indices.shape[1]}."
         )
 
     indices, padding = _packed_to_padded_indices(cu_seqlens, max_seqlen, q.shape[0], q.device)
     padded_q, padded_k, padded_v = (_unpack(tensor, indices, padding).transpose(1, 2) for tensor in (q, k, v))
+    padded_block_indices = _unpack(block_indices, indices, padding, fill=-1).transpose(1, 2)
+    keep = _block_causal_keep(
+        padded_block_indices,
+        padding,
+        num_query_heads=num_query_heads,
+        block_size=block_size,
+    )
 
-    if block_indices is None:
-        positions = torch.arange(max_seqlen, device=q.device)
-        causal_keep = positions[None, :] <= positions[:, None]
-        keep = causal_keep[None, None] & ~padding[:, None, None, :]
-    else:
-        padded_block_indices = _unpack(block_indices, indices, padding, fill=-1).transpose(1, 2)
-        keep = _block_causal_keep(
-            padded_block_indices,
-            padding,
-            num_query_heads=num_query_heads,
-            block_size=block_size,
-        )
-
-    output = _dense_attention(padded_q, padded_k, padded_v, keep, scale=scale, dropout_p=dropout_p)
+    output = _masked_attention(padded_q, padded_k, padded_v, keep, scale=scale, dropout_p=dropout_p)
     return _pack(output, indices)

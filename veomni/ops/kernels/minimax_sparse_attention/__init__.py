@@ -26,9 +26,11 @@ implementation without touching the model:
 ``attention(q, k, v, block_indices, cu_seqlens, max_seqlen, *, block_size, scale, dropout_p)``
     ``q`` is ``[T, Hq, D]`` and ``k``/``v`` are ``[T, G, D]`` without GQA
     repetition; query head ``h`` belongs to KV group ``h // (Hq // G)``.
-    ``block_indices`` is the indexer output, or ``None`` for dense causal
-    attention. Token-level causality inside a selected block is enforced by
-    the operator. Returns ``[T, Hq, D]``.
+    ``block_indices`` is the indexer output. Token-level causality inside a
+    selected block is enforced by the operator. Returns ``[T, Hq, D]``.
+
+Only sparse layers use these operators. Dense MiniMax layers call the standard
+``attention`` family (a varlen FlashAttention backend) from the model instead.
 
 ``T`` is the full packed token count seen by this rank after the Ulysses
 all-to-all, and ``cu_seqlens`` describes every packed sequence, including the

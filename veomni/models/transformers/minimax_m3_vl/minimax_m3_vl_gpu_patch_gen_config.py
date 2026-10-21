@@ -91,7 +91,7 @@ config.add_import("veomni.utils.device", names=["IS_NPU_AVAILABLE"])
 
 @config.replace_class(
     "MiniMaxM3VLPreTrainedModel",
-    description="Allow VeOmni flash-attention implementations for the config-driven vision tower",
+    description="Allow VeOmni flash-attention implementations for the vision tower and dense language layers",
 )
 class PatchedMiniMaxM3VLPreTrainedModel(PreTrainedModel):
     config: MiniMaxM3VLConfig | MiniMaxM3VLTextConfig
@@ -265,32 +265,115 @@ def _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings):
         )
 
 
+@config.add_helper
+def _require_varlen_attention(attention_implementation, *, num_segments, ulysses_enabled, attention_name):
+    """Reject a backend that would mix packed sequences or skip the Ulysses exchange.
+
+    MiniMax attention passes no mask, so only a varlen backend keeps packed
+    sequences (media inputs or text samples) apart, and only the VeOmni
+    ``veomni_*`` adapters run the Ulysses all-to-all; anything else silently
+    attends across sequences or within the local shard only.
+    """
+    varlen_backend = attention_implementation in VARLEN_ATTENTION_TYPES and (
+        not ulysses_enabled or attention_implementation.startswith("veomni_")
+    )
+    if not varlen_backend and (num_segments > 1 or ulysses_enabled):
+        raise ValueError(
+            f"MiniMax M3 VL {attention_name} needs a varlen FlashAttention backend (flash_attention_2/3/4) for "
+            "multiple packed sequences, and its VeOmni veomni_* adapter under Ulysses, "
+            f"got {attention_implementation!r}."
+        )
+
+
+@config.add_helper
+def _minimax_m3_sparse_attention(
+    attention, query_states, key_states, value_states, hidden_states, position_embeddings, *, dropout, **kwargs
+):
+    """Run one sparse layer's block selection and attention on packed ``[1, H, S, D]`` Q/K/V.
+
+    Under Ulysses, the main Q/K/V use the sequence/head all-to-all, the
+    per-KV-group index Q is split across ranks exactly like K, and the
+    single-head index K is all-gathered. The MiniMax sparse attention operators
+    consume TND tensors; any padded layout they need stays inside them. Returns
+    ``[1, S, Hq, D]`` in the local sequence layout.
+    """
+    query_states = query_states.transpose(1, 2)
+    key_states = key_states.transpose(1, 2)
+    value_states = value_states.transpose(1, 2)
+    indexer = attention.indexer
+    index_query, index_key = _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings)
+
+    parallel_state = get_parallel_state()
+    if parallel_state.ulysses_enabled:
+        query_states, key_states, value_states, _ = prepare_ulysses_qkv(
+            query_states,
+            key_states,
+            value_states,
+            group=parallel_state.ulysses_group,
+            ulysses_size=parallel_state.ulysses_size,
+        )
+        index_query = gather_seq_scatter_kv_heads(
+            index_query,
+            group=parallel_state.ulysses_group,
+            ulysses_size=parallel_state.ulysses_size,
+        )
+        index_key = gather_outputs(index_key, gather_dim=1, group=parallel_state.ulysses_group)
+
+    # The text model guarantees packed varlen metadata; training packs samples
+    # with identical query/key boundaries.
+    cu_seqlens = kwargs["cu_seq_lens_q"]
+    max_seqlen = kwargs["max_length_q"]
+    block_indices = attention.veomni_msa_indexer(
+        index_query[0],
+        index_key[0],
+        cu_seqlens,
+        max_seqlen=max_seqlen,
+        block_size=indexer.block_size,
+        topk_blocks=indexer.topk_blocks,
+        local_blocks=indexer.local_blocks,
+    )
+    attn_output = attention.veomni_msa_attention(
+        query_states[0],
+        key_states[0],
+        value_states[0],
+        block_indices,
+        cu_seqlens,
+        max_seqlen=max_seqlen,
+        block_size=indexer.block_size,
+        scale=attention.scaling,
+        dropout_p=dropout,
+    ).unsqueeze(0)
+
+    if parallel_state.ulysses_enabled:
+        attn_output = restore_ulysses_output(attn_output, group=parallel_state.ulysses_group)
+    return attn_output
+
+
 @config.modify_init(
     "MiniMaxM3VLAttention",
-    description="Bind instance-local MiniMax sparse attention VeomniOps",
+    description="Bind instance-local attention VeomniOps: standard attention for dense layers, MSA for sparse ones",
 )
 def minimax_m3_vl_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_msa_attention = VeomniOp("minimax_sparse_attention", "attention")
-    self.veomni_msa_indexer = VeomniOp("minimax_sparse_attention", "indexer") if self.indexer is not None else None
+    if self.indexer is None:
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    else:
+        self.veomni_msa_indexer = VeomniOp("minimax_sparse_attention", "indexer")
+        self.veomni_msa_attention = VeomniOp("minimax_sparse_attention", "attention")
 
 
 # ================================================================
 # Patch: MiniMaxM3VLAttention.forward
-# 1. keep decoder inputs/outputs packed and apply the precomputed RoPE before
-#    any sequence-parallel communication
-# 2. under Ulysses, exchange main Q/K/V and the per-KV-group index Q with the
-#    same head/sequence all-to-all, and all-gather the single-head index K
-# 3. run block selection and attention through the TND MiniMax sparse
-#    attention operators (instance-local ``minimax_sparse_attention``
-#    VeomniOps, eager by default); any padded layout they need stays inside them
-# 4. keep language attention independent from the generic ViT-controlled
-#    ``attn_implementation`` configuration; attention masks and KV cache are
-#    rejected upstream in the text model, so this is the only path
+# 1. dispatch on the layer type after RoPE: dense layers call the standard
+#    attention VeomniOp (a varlen FlashAttention backend, whose ``veomni_*``
+#    adapter runs the Ulysses all-to-all), sparse layers run the TND MiniMax
+#    sparse attention operators; both keep inputs/outputs packed. Attention
+#    masks and KV cache are rejected upstream in the text model, so this is the
+#    only path
 # ================================================================
 @config.override_method(
     "MiniMaxM3VLAttention.forward",
-    description="Run packed MiniMax language attention through the TND sparse attention operators",
+    description="Run dense layers through varlen attention and sparse layers through the TND sparse attention operators",
 )
 def minimax_m3_vl_attention_forward_patched(
     self,
@@ -307,68 +390,34 @@ def minimax_m3_vl_attention_forward_patched(
     key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-    # --- Patch.1 ---
     cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
     # --- Patch.1 ---
-
-    # --- Patch.2 ---
-    query_states = query_states.transpose(1, 2)
-    key_states = key_states.transpose(1, 2)
-    value_states = value_states.transpose(1, 2)
-    index_query = index_key = None
-    if self.indexer is not None:
-        index_query, index_key = _minimax_m3_indexer_project(self.indexer, hidden_states, position_embeddings)
-
-    parallel_state = get_parallel_state()
-    if parallel_state.ulysses_enabled:
-        query_states, key_states, value_states, _ = prepare_ulysses_qkv(
+    dropout = 0.0 if not self.training else self.attention_dropout
+    if self.indexer is None:
+        attn_output, _ = self.veomni_attn(
+            self,
             query_states,
             key_states,
             value_states,
-            group=parallel_state.ulysses_group,
-            ulysses_size=parallel_state.ulysses_size,
+            None,
+            dropout=dropout,
+            scaling=self.scaling,
+            **kwargs,
         )
-        if index_query is not None:
-            index_query = gather_seq_scatter_kv_heads(
-                index_query,
-                group=parallel_state.ulysses_group,
-                ulysses_size=parallel_state.ulysses_size,
-            )
-            index_key = gather_outputs(index_key, gather_dim=1, group=parallel_state.ulysses_group)
-    # --- Patch.2 ---
-
-    # --- Patch.3 ---
-    # The text model guarantees packed varlen metadata; training packs samples
-    # with identical query/key boundaries.
-    cu_seqlens = kwargs["cu_seq_lens_q"]
-    max_seqlen = kwargs["max_length_q"]
-    block_indices = None
-    if self.indexer is not None:
-        block_indices = self.veomni_msa_indexer(
-            index_query[0],
-            index_key[0],
-            cu_seqlens,
-            max_seqlen=max_seqlen,
-            block_size=self.indexer.block_size,
-            topk_blocks=self.indexer.topk_blocks,
-            local_blocks=self.indexer.local_blocks,
+    else:
+        attn_output = _minimax_m3_sparse_attention(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            hidden_states,
+            position_embeddings,
+            dropout=dropout,
+            **kwargs,
         )
-    attn_output = self.veomni_msa_attention(
-        query_states[0],
-        key_states[0],
-        value_states[0],
-        block_indices,
-        cu_seqlens,
-        max_seqlen=max_seqlen,
-        block_size=self.indexer.block_size if self.indexer is not None else None,
-        scale=self.scaling,
-        dropout_p=0.0 if not self.training else self.attention_dropout,
-    ).unsqueeze(0)
-
-    if parallel_state.ulysses_enabled:
-        attn_output = restore_ulysses_output(attn_output, group=parallel_state.ulysses_group)
-    # --- Patch.3 ---
+    # --- Patch.1 ---
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     return self.o_proj(attn_output), None
@@ -475,20 +524,12 @@ def minimax_m3_vl_vision_model_forward_patched(self, pixel_values, grid_thw, **k
     )
 
     parallel_state = get_parallel_state()
-    # The vision attention passes no mask, so only a varlen backend keeps media
-    # samples apart, and only the VeOmni ``veomni_*`` adapters run the ViT Ulysses
-    # all-to-all; anything else silently attends across samples or within the
-    # local shard only.
-    attention_implementation = self.config._attn_implementation
-    varlen_backend = attention_implementation in VARLEN_ATTENTION_TYPES and (
-        not parallel_state.ulysses_enabled or attention_implementation.startswith("veomni_")
+    _require_varlen_attention(
+        self.config._attn_implementation,
+        num_segments=len(grid_thw_list),
+        ulysses_enabled=parallel_state.ulysses_enabled,
+        attention_name="vision attention",
     )
-    if not varlen_backend and (len(grid_thw_list) > 1 or parallel_state.ulysses_enabled):
-        raise ValueError(
-            "MiniMax M3 VL vision attention needs a varlen FlashAttention backend (flash_attention_2/3/4) for "
-            "multiple media inputs, and its VeOmni veomni_* adapter under Ulysses, "
-            f"got {attention_implementation!r}."
-        )
 
     sp_pad_seq_len = 0
     if parallel_state.sp_enabled:
@@ -766,7 +807,8 @@ def minimax_m3_vl_model_forward_patched(
 #    collator's varlen kwargs flow unchanged to the attention layers, and a
 #    lone unpadded sequence without them is described as a one-segment pack;
 #    padded batches and KV cache are rejected (context parallelism is refused
-#    at model build by ``check_context_parallel_supported``)
+#    at model build by ``check_context_parallel_supported``); dense layers
+#    need a varlen backend to keep packed samples apart
 # 3. generate RoPE once from the local packed position IDs; attention and the
 #    indexer apply it before their respective Ulysses communications
 # ================================================================
@@ -812,10 +854,14 @@ def minimax_m3_vl_text_model_forward_patched(
             )
         # A lone sequence is a one-segment pack. The attention mask is assumed
         # all-ones as in VeOmni's collator: reading it would cost a device sync.
-        # Metadata is built on the host from shapes; the operators copy it to
-        # the device without blocking, as for NPU's host-side metadata.
+        # Metadata is built from shapes, on the device for CUDA FlashAttention
+        # and on the host for NPU's host-side varlen interface.
         sequence_length = inputs_embeds.shape[1]
-        cu_seq_lens = torch.tensor([0, sequence_length], dtype=torch.int32)
+        cu_seq_lens = torch.tensor(
+            [0, sequence_length],
+            dtype=torch.int32,
+            device=torch.device("cpu") if IS_NPU_AVAILABLE else inputs_embeds.device,
+        )
         kwargs.update(
             cu_seq_lens_q=cu_seq_lens,
             cu_seq_lens_k=cu_seq_lens,
@@ -827,6 +873,13 @@ def minimax_m3_vl_text_model_forward_patched(
         raise ValueError(
             "MiniMax M3 VL packed inputs (cu_seq_lens_q/max_length_q) must have batch size 1, "
             f"got {inputs_embeds.shape[0]}."
+        )
+    if any(layer.self_attn.indexer is None for layer in self.layers[: self.config.num_hidden_layers]):
+        _require_varlen_attention(
+            self.config._attn_implementation,
+            num_segments=kwargs["cu_seq_lens_q"].numel() - 1,
+            ulysses_enabled=parallel_state.ulysses_enabled,
+            attention_name="dense language attention",
         )
     # --- Patch.2 ---
 

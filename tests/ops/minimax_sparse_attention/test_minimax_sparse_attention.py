@@ -131,15 +131,9 @@ def _upstream_attention(indexer, sample, q, k, v, block_indices):
     """Upstream ``build_block_mask`` + ``eager_attention_forward`` on one unpadded sample."""
     upstream = _upstream()
     query, key, value = (tensor.transpose(0, 1).unsqueeze(0) for tensor in (q, k, v))
-    if block_indices is None:
-        positions = torch.arange(sample.seq_len)
-        attention_mask = torch.zeros(1, 1, sample.seq_len, sample.seq_len).masked_fill(
-            positions[None, :] > positions[:, None], torch.finfo(torch.float32).min
-        )
-    else:
-        attention_mask = indexer.build_block_mask(
-            block_indices, None, sample.seq_len, query.dtype, query.device, sample.position_ids
-        )
+    attention_mask = indexer.build_block_mask(
+        block_indices, None, sample.seq_len, query.dtype, query.device, sample.position_ids
+    )
     module = SimpleNamespace(num_key_value_groups=_NUM_QUERY_HEADS // _NUM_GROUPS, training=False)
     output, _ = upstream.eager_attention_forward(module, query, key, value, attention_mask, scaling=_HEAD_DIM**-0.5)
     return output[0]
@@ -166,19 +160,16 @@ def test_indexer_matches_upstream_per_sample():
 # float64 guards padded query rows: a fully masked row turns into NaN once the
 # float32 softmax sees the float64 dtype-min mask, and leaks into K/V gradients.
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["fp32", "fp64"])
-@pytest.mark.parametrize("sparse", [True, False], ids=["block_sparse", "dense_causal"])
-def test_attention_matches_upstream_per_sample_forward_and_backward(sparse, dtype):
+def test_attention_matches_upstream_per_sample_forward_and_backward(dtype):
     indexer, samples = _per_sample_inputs()
     for sample in samples:
         sample.q, sample.k, sample.v = (getattr(sample, name).to(dtype) for name in ("q", "k", "v"))
     packed_q, packed_k, packed_v = (
         torch.cat([getattr(sample, name) for sample in samples]).requires_grad_(True) for name in ("q", "k", "v")
     )
-    block_indices = None
-    if sparse:
-        block_indices = torch.cat(
-            [_canonical_block_indices(sample.reference_indices[0].transpose(0, 1)) for sample in samples]
-        ).to(torch.int32)
+    block_indices = torch.cat(
+        [_canonical_block_indices(sample.reference_indices[0].transpose(0, 1)) for sample in samples]
+    ).to(torch.int32)
     output = minimax_sparse_attention_eager(
         packed_q,
         packed_k,
@@ -197,8 +188,7 @@ def test_attention_matches_upstream_per_sample_forward_and_backward(sparse, dtyp
     offset = 0
     for sample in samples:
         q, k, v = (getattr(sample, name).clone().requires_grad_(True) for name in ("q", "k", "v"))
-        reference_indices = sample.reference_indices if sparse else None
-        expected = _upstream_attention(indexer, sample, q, k, v, reference_indices)
+        expected = _upstream_attention(indexer, sample, q, k, v, sample.reference_indices)
         grads = torch.autograd.grad(expected, (q, k, v), grad_output[offset : offset + sample.seq_len])
         expected_outputs.append(expected)
         for accumulated, grad in zip(expected_grads, grads):
@@ -257,9 +247,10 @@ def test_padded_layout_round_trips_sp_padding_segment():
 def test_rejects_device_tensor_max_seqlen():
     q = torch.randn(4, _NUM_QUERY_HEADS, _HEAD_DIM)
     k = torch.randn(4, _NUM_GROUPS, _HEAD_DIM)
+    block_indices = torch.zeros(4, _NUM_GROUPS, _TOPK_BLOCKS, dtype=torch.int32)
     with pytest.raises(TypeError, match="Python int"):
         minimax_sparse_attention_eager(
-            q, k, k, None, _cu_seqlens([4]), torch.tensor(4), block_size=None, scale=_HEAD_DIM**-0.5
+            q, k, k, block_indices, _cu_seqlens([4]), torch.tensor(4), block_size=_BLOCK_SIZE, scale=_HEAD_DIM**-0.5
         )
 
 
@@ -291,8 +282,7 @@ def test_bfloat16_block_expansion_matches_boolean_expansion(seq_len, block_size)
 
 @pytest.mark.skipif(not is_torch_npu_available(), reason="Requires Ascend NPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-@pytest.mark.parametrize("sparse", [True, False], ids=["block_sparse", "dense_causal"])
-def test_npu_fused_attention_matches_cpu_reference_forward_and_backward(dtype, sparse):
+def test_npu_fused_attention_matches_cpu_reference_forward_and_backward(dtype):
     torch.manual_seed(42)
     lengths = _SEQUENCE_LENGTHS
     total_length, head_dim = sum(lengths), 64
@@ -302,22 +292,20 @@ def test_npu_fused_attention_matches_cpu_reference_forward_and_backward(dtype, s
         for heads in (_NUM_QUERY_HEADS, _NUM_GROUPS, _NUM_GROUPS)
     ]
     npu_inputs = [tensor.detach().to(device="npu", dtype=dtype).requires_grad_() for tensor in cpu_inputs]
-    block_indices = None
-    if sparse:
-        block_indices = minimax_sparse_indexer_eager(
-            cpu_inputs[1].detach(),
-            cpu_inputs[1][:, :1].detach(),
-            cu_seqlens,
-            max(lengths),
-            block_size=_BLOCK_SIZE,
-            topk_blocks=_TOPK_BLOCKS,
-            local_blocks=_LOCAL_BLOCKS,
-        )
+    block_indices = minimax_sparse_indexer_eager(
+        cpu_inputs[1].detach(),
+        cpu_inputs[1][:, :1].detach(),
+        cu_seqlens,
+        max(lengths),
+        block_size=_BLOCK_SIZE,
+        topk_blocks=_TOPK_BLOCKS,
+        local_blocks=_LOCAL_BLOCKS,
+    )
     kwargs = dict(block_size=_BLOCK_SIZE, scale=head_dim**-0.5)
     expected = minimax_sparse_attention_eager(*cpu_inputs, block_indices, cu_seqlens, max(lengths), **kwargs)
     actual = minimax_sparse_attention_eager(
         *npu_inputs,
-        block_indices.to("npu") if sparse else None,
+        block_indices.to("npu"),
         cu_seqlens,
         max(lengths),
         **kwargs,
