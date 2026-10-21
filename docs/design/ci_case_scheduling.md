@@ -201,9 +201,19 @@ SIGTERM/SIGKILL cleanup to drain process groups and tracked descendants.
 Unrelated processes are outside the cancellation scope. Interrupted execution
 records retain a failure return code and the summary records the interruption.
 
-Foreground logs show batch/device assignments, case outcomes and overall
-progress. A 30-second heartbeat identifies each running case. Failure output
-includes the node ID, traceback and log tail; full diagnostics stay in artifacts.
+Foreground case logs use `[unit-09-case-0001][STATUS][devices=0,1,2,3] nodeid`,
+with `[e2e-57-case-0001]` for e2e and `[devices=cpu]` for CPU batches. Entry
+IDs come from the manifest; case IDs are one-based indices within each entry's
+collected inventory, including parameterized cases. IDs remain stable across
+batching, sorting and dispatch order. Batch indices are not displayed.
+`START` / `DONE` use the entry ID, file and case count. `RUN`, outcomes and
+running-case heartbeats use the full case ID and pytest node ID. Outcome
+statuses include `(completed/total)` across the suite; cancellation does not
+advance this counter. A 30-second `RUNNING` heartbeat includes elapsed batch
+time. Collection uses the entry ID and summaries the suite ID, both with
+`[devices=-]`. Execution records carry the entry `display_id`; aggregated
+`cases.json` carries the full case `display_id`. Artifact filenames are unchanged.
+Failure output includes the node ID, traceback and log tail; full diagnostics stay in artifacts.
 Cancelled batches are distinguished from test failures, and the original
 failure remains the final error even if a cancelled peer exits first. Preserve
 observed outcomes as partial results when cancellation prevents pytest from

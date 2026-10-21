@@ -15,7 +15,7 @@ from pathlib import Path
 from scripts.ci.accelerator import ROOT
 from scripts.ci.accelerator.batching import make_batches
 from scripts.ci.accelerator.launch_plan import ResourcePlanError, RunnerCapabilities
-from scripts.ci.accelerator.reporting import BatchProgress, RunReporter, print_log_tail
+from scripts.ci.accelerator.reporting import BatchProgress, RunReporter, format_status, print_log_tail, selection_label
 from scripts.ci.accelerator.runtime.devices import child_environment
 from scripts.ci.accelerator.runtime.ports import find_free_port
 from scripts.ci.accelerator.runtime.workers import create_workspace, interruptible_executor, run_process
@@ -106,13 +106,19 @@ def main():
                 run_process(command, collect_env, log, 600, allowed_codes=(0, 5))
         except Exception as exc:
             if not isinstance(exc, CancelledError):
-                print(f"COLLECTION FAILED {name}: {exc}", flush=True)
+                print(
+                    format_status(selection_label(args.suite, name), "FAILED", None, f"collection: {exc}"), flush=True
+                )
                 print_log_tail(output / f"{name}.collection.log")
             raise
         if not inventory_path.exists():
             raise ResourcePlanError(f"Collection produced no inventory: {name}")
         rows = json.loads(inventory_path.read_text())
-        print(f"COLLECT {name} cases={len(rows)}", flush=True)
+        target = " ".join(arg for arg in selection["args"] if arg.startswith("tests/")) or name
+        print(
+            format_status(selection_label(args.suite, name), "COLLECT", None, f"{target} (cases={len(rows)})"),
+            flush=True,
+        )
         return selection, rows
 
     try:
@@ -143,7 +149,14 @@ def main():
         return 0
     collected_at = time.time()
     finished = {}
-    reporter = RunReporter(sum(len(rows) for _, rows in inventories), len(batches), keep_going=args.keep_going)
+    reporter = RunReporter(
+        sum(len(rows) for _, rows in inventories),
+        len(batches),
+        suite=args.suite,
+        inventories=inventories,
+        batches=batches,
+        keep_going=args.keep_going,
+    )
 
     def execute(job, assigned):
         row = job.payload
@@ -197,8 +210,17 @@ def main():
             planned_cases=[case["nodeid"] for case in row["cases"]],
             temporary_directory=temporary,
         )
-        progress = BatchProgress(reporter, name, assigned, output / f"{name}.progress.jsonl", output / f"{name}.log")
-        print(f"START {name} devices={assigned} cases={len(row['cases'])} log={progress.log_path}", flush=True)
+        progress = BatchProgress(
+            reporter,
+            name,
+            assigned,
+            output / f"{name}.progress.jsonl",
+            output / f"{name}.log",
+            batch_file=row["cases"][0]["nodeid"].split("::", 1)[0],
+            case_count=len(row["cases"]),
+        )
+        record["display_id"] = reporter.label(name)
+        progress.start()
         try:
             with (output / f"{name}.log").open("w") as log:
                 run_process(
@@ -226,7 +248,7 @@ def main():
             else:
                 reason = f"Cancelled after {reporter.first_failure}" if reporter.first_failure else str(exc)
                 record.update(returncode=130, status="cancelled", error=reason)
-                print(f"CANCELLED {name}: {reason}", flush=True)
+                progress.cancelled(reason)
             raise
         except Exception as exc:
             record.update(returncode=getattr(exc, "returncode", 1), error=repr(exc))
@@ -249,7 +271,7 @@ def main():
             record.update(ended=time.time(), wall_seconds=time.time() - record["started"])
             (output / f"{name}.json").write_text(json.dumps(record, indent=2) + "\n")
             finished[name] = record
-            print(f"DONE {name} rc={record.get('returncode', 1)} {record['wall_seconds']:.1f}s", flush=True)
+            progress.done(record)
         return record
 
     jobs = [DeviceJob(row["name"], row["cards"], row) for row in batches]
@@ -288,7 +310,14 @@ def main():
             path = output / f"{job.name}.results.json"
             if path.exists():
                 for case in json.loads(path.read_text())["cases"]:
-                    case_rows.append({**case, "batch": job.name, "selection": job.payload["selection"]["name"]})
+                    case_rows.append(
+                        {
+                            **case,
+                            "batch": job.name,
+                            "selection": job.payload["selection"]["name"],
+                            "display_id": reporter.label(job.name, case["nodeid"]),
+                        }
+                    )
         (output / "cases.json").write_text(json.dumps(case_rows, indent=2) + "\n")
         with (output / "cases.csv").open("w") as handle:
             writer = csv.DictWriter(

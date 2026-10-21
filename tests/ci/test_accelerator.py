@@ -539,17 +539,35 @@ def test_first_failure_cancels_running_process_and_stops_dispatch(tmp_path):
 
 
 @pytest.mark.parametrize("keep_going", [False, True])
-def test_case_progress_failure_is_visible_and_can_cancel_peers(tmp_path, capsys, keep_going):
+@pytest.mark.parametrize("suite,assigned,devices", [("unit", [], "cpu"), ("e2e", ["0", "1"], "0,1")])
+def test_case_progress_failure_is_visible_and_can_cancel_peers(tmp_path, capsys, keep_going, suite, assigned, devices):
     import json
     from concurrent.futures import CancelledError
 
     from scripts.ci.accelerator.reporting import BatchProgress, CaseFailure, RunReporter
 
-    reporter = RunReporter(2, 2, keep_going=keep_going, heartbeat_seconds=0)
+    selection = dict(name="09-unit" if suite == "unit" else "npu-e2e-07")
+    rows = [dict(nodeid="test_a.py::test_bad"), dict(nodeid="test_a.py::test_peer")]
+    batches = [dict(name=name, selection=selection, cases=[row]) for name, row in zip(("failed-batch", "peer"), rows)]
+    reporter = RunReporter(
+        2,
+        2,
+        suite=suite,
+        inventories=[(selection, rows)],
+        batches=list(reversed(batches)),
+        keep_going=keep_going,
+        heartbeat_seconds=0,
+    )
+    prefix = "unit-09" if suite == "unit" else "e2e-07"
     path = tmp_path / "progress.jsonl"
-    failed = BatchProgress(reporter, "failed-batch", ["0"], path, tmp_path / "failed.log")
-    peer = BatchProgress(reporter, "peer", ["1"], tmp_path / "peer.jsonl", tmp_path / "peer.log")
+    failed = BatchProgress(
+        reporter, "failed-batch", assigned, path, tmp_path / "failed.log", batch_file="test_a.py", case_count=1
+    )
+    peer = BatchProgress(reporter, "peer", assigned, tmp_path / "peer.jsonl", tmp_path / "peer.log")
+    peer.path.write_text(json.dumps(dict(kind="start", nodeid=rows[1]["nodeid"])) + "\n")
+    peer.poll(check_abort=False)
     event = dict(kind="failure", nodeid="test_a.py::test_bad", outcome="failed", detail="assert 1 == 2")
+    failed.start()
     encoded = json.dumps(event)
     path.write_text(encoded[:15])
     failed.poll()
@@ -563,9 +581,19 @@ def test_case_progress_failure_is_visible_and_can_cancel_peers(tmp_path, capsys,
             failed.poll()
         with pytest.raises(CancelledError, match="test_bad"):
             peer.poll()
+    with path.open("a") as handle:
+        handle.write(json.dumps(dict(event, kind="result")) + "\n")
+    failed.poll(check_abort=False)
     output = capsys.readouterr().out
-    assert "FAIL failed-batch" in output and "assert 1 == 2" in output
-    assert "CASE FAILED 1/2" in output and "RUNNING peer" in output
+    assert f"[{prefix}][START][devices={devices}] test_a.py (cases=1)" in output
+    assert f"[{prefix}-case-0001][FAILED (1/2)][devices={devices}] test_a.py::test_bad" in output
+    assert "    assert 1 == 2" in output
+    assert output.count("[FAILED (1/2)]") == 1 and f"[{prefix}-case-0002][RUNNING][devices={devices}]" in output
+    peer.cancelled("another case failed")
+    failed.done(dict(wall_seconds=1.2, returncode=1))
+    output = capsys.readouterr().out
+    assert f"[{prefix}-case-0002][CANCELLED][devices={devices}]" in output
+    assert f"[{prefix}][DONE][devices={devices}] test_a.py (cases=1, elapsed=1.2s, rc=1)" in output
     assert failed.partial_results()["cases"][0]["outcome"] == "failed"
     reporter.summary({"peer": dict(status="cancelled")})
     assert "'cancelled': 1" in capsys.readouterr().out

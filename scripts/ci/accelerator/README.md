@@ -98,8 +98,34 @@ launches, source fingerprints and the suite's elapsed wall time. Sum of batch
 or case durations is not elapsed wall time when work overlaps. Measured timings,
 including `durations.json`, are reporting artifacts and are not scheduling inputs.
 
-The foreground log prints batch assignments, each case outcome with overall
-progress, and a running-case heartbeat every 30 seconds. Failures print the
+Foreground case statuses use `[unit-09-case-0001][STATUS][devices=0,1,2,3] nodeid`
+(or `[e2e-57-case-0001]` and `[devices=cpu]`). The entry ID comes from the
+manifest: `09-unit` becomes `unit-09`, `npu-e2e-01` becomes `e2e-01`, and
+`ci-unit` becomes `unit-ci`. Each case gets a one-based, four-digit index within
+its entry's collected inventory, including parameterized cases. This index is
+independent of batching, card-count sorting and parallel completion order.
+All batches from one entry share its entry ID; no batch number is shown.
+
+`START` / `DONE` are batch-level statuses: they use the entry ID, file and case
+count. `RUN`, case outcomes, and running-case heartbeats use the full case ID
+and pytest node ID, including parameters. Outcome statuses include
+`(completed/total)` across the suite; cancelled cases do not advance this
+counter. `RUNNING` heartbeats include elapsed batch time every 30 seconds.
+Collection uses the entry ID; final summaries use `[unit]` / `[e2e]`. Both use
+`[devices=-]` because they do not describe an individual device lease. Internal
+batch names and artifact filenames are unchanged. Execution records carry the
+entry `display_id`; aggregated `cases.json` carries each case's full
+`display_id` for locating outcomes by their foreground IDs.
+
+```text
+[unit-09][START][devices=cpu] tests/foo/test_bar.py (cases=2)
+[unit-09-case-0001][RUN][devices=cpu] tests/foo/test_bar.py::test_a
+[unit-09-case-0001][PASSED (12/4508)][devices=cpu] tests/foo/test_bar.py::test_a
+[e2e-57-case-0001][FAILED (3/120)][devices=0,1,2,3] tests/e2e/test_parallel.py::test_alignment
+    ... traceback ...
+```
+
+Failures print the
 node ID, traceback (up to 200 lines), and the last 80 batch-log lines; full logs
 remain artifacts. GitHub Actions also receives an error annotation. Cancelled
 batches are labelled separately from failed tests. The final summary reports
