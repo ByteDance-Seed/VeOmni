@@ -435,7 +435,7 @@ def qwen_vision_worker():
     from veomni.models.seed_omni.graphs.base import NodeDef
     from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated.accelerated import Qwen3VLVisionEncoderAccelerated
     from veomni.models.seed_omni.modules.qwen3vl.vision.configuration import Qwen3VLVisionEncoderConfig
-    from veomni.models.seed_omni.modules.qwen3vl.vision.processing import _OMNI_GRID, _SOURCE
+    from veomni.models.seed_omni.modules.qwen3vl.vision.processing import _OMNI_GRID
     from veomni.models.seed_omni.utils.conversation import ConversationItem
 
     rank = int(os.environ["LOCAL_RANK"])
@@ -485,8 +485,8 @@ def qwen_vision_worker():
                             ConversationItem(
                                 type="video" if grid[0] > 1 else "image",
                                 value=pixel,
-                                role="user" if real_count else "dummy",
-                                source=_SOURCE,
+                                role="user",
+                                is_dummy=not real_count,
                                 meta={_OMNI_GRID: grid},
                             )
                             for pixel, grid in zip(pixels, grids)
@@ -513,7 +513,7 @@ def qwen_vision_worker():
                     if method == "forward":
                         for item in batch["conversation_list"][0]:
                             snapshots.append(item.value.detach().clone())
-                            if item.role == "dummy":
+                            if item.is_dummy:
                                 local_sum = local_sum + item.value.float().sum() * 0
                             else:
                                 logits = item.value.float()[:, :8]
