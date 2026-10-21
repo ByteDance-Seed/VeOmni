@@ -401,6 +401,10 @@ def test_fa4_shared_cache_broadcast_layouts(monkeypatch, record_property, broadc
 def test_fa4_shared_cache_outer_compile_materializes_broadcast(monkeypatch, record_property):
     from functools import wraps
 
+    from veomni.ops.kernels.attention.standard import flex
+
+    if flex.get_gpu_compute_capability(torch.device("cuda")) != 90 or not flex._fa4._flash_attn_cute_available():
+        pytest.skip("requires NVIDIA SM90 and FA4 for the SM90 compatibility tests")
     from flash_attn.cute import interface
 
     original = interface._flash_attn_fwd
