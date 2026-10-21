@@ -263,9 +263,18 @@ def test_text_encoder_fsdp_no_split_modules_preserved():
 
 def test_text_encoder_selects_ops_from_module_config_not_global_ops_config():
     """Each OmniModule resolves its VeomniOp handles from its own config."""
+    from veomni.ops.registry import OP_REGISTRY
+
     TextEncoder = _accelerated_model_cls("text_encoder")
     TextEncoderConfig = _config_cls("text_encoder")
 
+    te_default = TextEncoder(
+        TextEncoderConfig(
+            vocab_size=64,
+            hidden_size=16,
+            tie_word_embeddings=False,
+        )
+    )
     te_eager = TextEncoder(
         TextEncoderConfig(
             vocab_size=64,
@@ -283,6 +292,7 @@ def test_text_encoder_selects_ops_from_module_config_not_global_ops_config():
         )
     )
 
+    assert te_default.veomni_ce.impl == OP_REGISTRY.default_impl("cross_entropy_loss", "standard")
     assert te_eager.veomni_ce.impl == "eager"
     assert te_chunk.veomni_ce.impl == "chunk_loss"
 
