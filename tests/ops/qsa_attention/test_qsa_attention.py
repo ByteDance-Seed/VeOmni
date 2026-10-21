@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen4-Exp QSA rows: eager reference parity, TileLang kernels, and dispatch guards."""
+"""Qwen4-Exp QSA rows: eager reference parity, TileLang and torch_npu kernels, and dispatch guards."""
 
 import copy
 import importlib
@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from veomni.ops import resolve_op
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 
 
 DEVICE = get_device_type()
@@ -417,3 +417,201 @@ def test_qwen4_exp_attention_layer_tilelang_matches_fp32_reference():
 
     torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
     assert _cosine_similarity(actual_input.grad, reference_input.grad) > 0.95
+
+
+def _npu_reference_forward(q, k, v, blocked, scale):
+    repeats = q.shape[1] // k.shape[1]
+    k, v = k.repeat_interleave(repeats, 1), v.repeat_interleave(repeats, 1)
+    scores = (q @ k.transpose(-1, -2)) * scale
+    maximum = scores.masked_fill(blocked, -torch.inf).amax(-1, keepdim=True)
+    maximum = maximum.masked_fill(~torch.isfinite(maximum), 0)
+    weights = torch.exp(scores - maximum).masked_fill(blocked, 0)
+    denominator = weights.sum(-1, keepdim=True).clamp_min(1e-30)
+    return (weights / denominator) @ v, maximum, denominator
+
+
+def _npu_reference_backward(q, k, v, grad, blocked, output, maximum, denominator, scale):
+    repeats = q.shape[1] // k.shape[1]
+    kr, vr = k.repeat_interleave(repeats, 1), v.repeat_interleave(repeats, 1)
+    probabilities = torch.exp((q @ kr.transpose(-1, -2)) * scale - maximum).masked_fill(blocked, 0) / denominator
+    ds = probabilities * ((grad @ vr.transpose(-1, -2)) - (grad * output).sum(-1, keepdim=True))
+    dq = (ds @ kr) * scale
+    dk = (ds.transpose(-1, -2) @ q) * scale
+    dv = probabilities.transpose(-1, -2) @ grad
+    shape = (*k.shape[:2], repeats, *k.shape[2:])
+    return dq, dk.reshape(shape).sum(2), dv.reshape(shape).sum(2)
+
+
+def test_torch_npu_pruned_gqa_output_gradients_and_saved_tensors(monkeypatch):
+    from veomni.ops.kernels.qsa_attention.standard import torch_npu as npu_qsa
+
+    torch.manual_seed(71)
+    calls = []
+
+    def forward(*args):
+        calls.append(args[1].shape[2])
+        return _npu_reference_forward(*args)
+
+    monkeypatch.setattr(npu_qsa, "_forward", forward)
+    monkeypatch.setattr(npu_qsa, "_backward", _npu_reference_backward)
+    q = torch.randn(2, 6, 257, 8, requires_grad=True)
+    k = torch.randn(2, 2, 769, 8, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    indices = torch.randint(0, 127, (2, 257, 7))
+    indices[:, 128:256] += 512
+    indices[:, 0] = -1
+    indices[:, -1] = -1
+    indices[:, 1, 1] = indices[:, 1, 0]
+    indices[:, 2, 1:] = -1
+    grad = torch.randn_like(q)
+    saved = []
+
+    def pack(tensor):
+        saved.append((tensor.dtype, tensor.shape))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda x: x):
+        result = npu_qsa._CompactFusedAttention.apply(q, k, v, indices, 0.31, 128)
+    candidate = torch.autograd.grad(result, (q, k, v), grad)
+    assert calls == [128, 128, 1]  # Backward does not replay forward or gather KV.
+    assert not any(dtype == torch.bool for dtype, _ in saved)
+    allowed = ~npu_qsa._blocked_mask(indices, k.shape[2])
+    reference = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed, enable_gqa=True, scale=0.31)
+    expected = torch.autograd.grad(reference, (q, k, v), grad)
+    torch.testing.assert_close(result, reference, rtol=2e-5, atol=2e-6)
+    for actual, ref in zip(candidate, expected, strict=True):
+        torch.testing.assert_close(actual, ref, rtol=3e-5, atol=4e-6)
+    assert torch.count_nonzero(result[:, :, 0]) == 0
+    assert torch.count_nonzero(result[:, :, -1]) == 0
+
+
+def test_torch_npu_ranges_cover_every_selected_index_with_partial_last_block():
+    from veomni.ops.kernels.qsa_attention.standard import torch_npu as npu_qsa
+
+    indices = torch.tensor([[[300, -1, 300], [511, 420, -1], [768, -1, -1]]])
+    ranges = npu_qsa._kv_ranges(indices, 769, 2)
+    assert ranges == [(256, 512), (768, 769)]
+    for block, (lo, hi) in enumerate(ranges):
+        local = indices[:, block * 2 : (block + 1) * 2]
+        valid = local[local >= 0]
+        assert torch.all((valid >= lo) & (valid < hi))
+
+
+def test_torch_npu_masked_rows_are_constant_zero_even_with_backend_residue(monkeypatch):
+    from veomni.ops.kernels.qsa_attention.standard import torch_npu as npu_qsa
+
+    torch.manual_seed(83)
+
+    def forward(*args):
+        output, maximum, denominator = _npu_reference_forward(*args)
+        # A fused backend may leave subnormal values on fully masked rows.
+        output = output.masked_fill(args[3].all(-1, keepdim=True), 1e-38)
+        return output, maximum, denominator
+
+    def backward(*args):
+        dq, dk, dv = _npu_reference_backward(*args)
+        dq = dq.masked_fill(args[4].all(-1, keepdim=True), 1e-38)
+        empty = args[4].all((-1, -2), keepdim=True)
+        return dq, dk.masked_fill(empty, 1e-38), dv.masked_fill(empty, 1e-38)
+
+    monkeypatch.setattr(npu_qsa, "_forward", forward)
+    monkeypatch.setattr(npu_qsa, "_backward", backward)
+    q = torch.randn(2, 4, 4, 8, requires_grad=True)
+    k = torch.randn(2, 2, 128, 8, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    indices = torch.tensor([[[0, 2], [-1, -1], [-1, -1], [-1, -1]]] * 2)
+    output = npu_qsa._CompactFusedAttention.apply(q, k, v, indices, 0.31, 2)
+    # Only masked rows contribute to this objective. Every gradient is zero.
+    grad = torch.ones_like(output)
+    grad[:, :, 0] = 0
+    gradients = torch.autograd.grad(output, (q, k, v), grad)
+    assert torch.count_nonzero(output[:, :, 1:]) == 0
+    for gradient in gradients:
+        assert torch.count_nonzero(gradient) == 0
+
+
+def test_torch_npu_int8_scatter_mask_matches_boolean_reference_exactly():
+    from veomni.ops.kernels.qsa_attention.standard import torch_npu as npu_qsa
+
+    # Non-contiguous indices, duplicates, padding and an entirely masked row.
+    indices = torch.tensor([[[0, 0, -1, 6], [-1, -1, -1, -1], [5, 2, 5, -1]]])
+    indices = indices.repeat(2, 1, 2)[..., ::2]
+    reference = torch.ones((*indices.shape[:-1], 8), dtype=torch.bool)
+    slots = torch.where(indices >= 0, indices, 7).long()
+    reference.scatter_(-1, slots, False)
+    expected = reference[..., :7].unsqueeze(1).contiguous()
+    actual = npu_qsa._blocked_mask(indices, 7)
+    assert actual.dtype == torch.bool
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_torch_npu_row_rejects_an_attention_mask():
+    from veomni.ops.kernels.qsa_attention.standard import torch_npu as npu_row
+
+    q, k, v = torch.randn(1, 2, 4, 8), torch.randn(1, 1, 4, 8), torch.randn(1, 1, 4, 8)
+    with pytest.raises(ValueError, match="requires no attention_mask"):
+        npu_row.wrapper(q, k, v, _causal_indices(4), scaling=0.25, attention_mask=torch.zeros(1, 1, 4, 4))
+
+
+def test_torch_npu_row_dropout_falls_back_to_eager_with_warning(monkeypatch):
+    from veomni.ops.kernels.qsa_attention.standard import torch_npu as npu_row
+
+    warnings = []
+    monkeypatch.setattr(npu_row.logger, "warning_once", lambda message, *args, **kwargs: warnings.append(message))
+    torch.manual_seed(0)
+    q = torch.randn(1, 4, 8, 16)
+    k = torch.randn(1, 2, 8, 16)
+    v = torch.randn(1, 2, 8, 16)
+    indices = _causal_indices(8)
+
+    torch.manual_seed(1)
+    actual, _ = npu_row.wrapper(q, k, v, indices, scaling=0.25, dropout=0.1)
+    torch.manual_seed(1)
+    expected, _ = _eager_qsa()(q, k, v, indices, scaling=0.25, dropout=0.1)
+
+    torch.testing.assert_close(actual, expected)
+    assert len(warnings) == 1 and "no dropout path" in warnings[0]
+
+
+def _require_npu():
+    pytest.importorskip("torch_npu")
+    if not IS_NPU_AVAILABLE:
+        pytest.skip("requires an Ascend NPU")
+
+
+def test_torch_npu_native_int8_mask_and_fused_gqa_backward():
+    _require_npu()
+    from veomni.ops.kernels.qsa_attention.standard import torch_npu as npu_qsa
+
+    torch.manual_seed(71)
+    # Two pruned KV intervals, duplicate indices, padding, one masked row,
+    # and a final entirely masked query block exercise native CANN semantics.
+    indices = torch.randint(0, 128, (1, 192, 16))
+    indices[:, 64:128] += 128
+    indices[:, 0] = -1
+    indices[:, 128:] = -1
+    indices[:, 1, 1] = indices[:, 1, 0]
+    indices[:, 2, 1:] = -1
+    blocked = torch.ones((1, 192, 257), dtype=torch.bool)
+    blocked.scatter_(-1, torch.where(indices >= 0, indices, 256), False)
+    blocked = blocked[..., :256].unsqueeze(1).contiguous()
+    native_indices = indices.to("npu")
+    torch.testing.assert_close(npu_qsa._blocked_mask(native_indices, 256).cpu(), blocked, rtol=0, atol=0)
+
+    shape_q, shape_kv = (1, 4, 192, 64), (1, 2, 256, 64)
+    inputs = [torch.randn(shape, dtype=torch.bfloat16) for shape in (shape_q, shape_kv, shape_kv)]
+    reference_inputs = [x.float().requires_grad_() for x in inputs]
+    native_inputs = [x.to("npu").requires_grad_() for x in inputs]
+    grad = torch.randn(shape_q, dtype=torch.bfloat16)
+    scale = 64**-0.5
+    reference, _, _ = _npu_reference_forward(*reference_inputs, blocked, scale)
+    expected_grads = torch.autograd.grad(reference, reference_inputs, grad.float())
+    actual = npu_qsa._CompactFusedAttention.apply(*native_inputs, native_indices, scale, 64)
+    actual_grads = torch.autograd.grad(actual, native_inputs, grad.to("npu"))
+    torch.testing.assert_close(actual.float().cpu(), reference, rtol=0.03, atol=0.02)
+    for candidate, expected in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(candidate.float().cpu(), expected, rtol=0.03, atol=0.02)
+    assert torch.count_nonzero(actual[:, :, 0]).item() == 0
+    assert torch.count_nonzero(actual[:, :, 128:]).item() == 0
+    assert torch.count_nonzero(actual_grads[0][:, :, 128:]).item() == 0
