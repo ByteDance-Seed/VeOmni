@@ -64,8 +64,7 @@ def run_process(command, env, log, timeout, *, cwd=ROOT, allowed_codes=(0,)):
                 process.wait()
 
 
-def make_batches(inventories, *, durations=None, target_seconds=120, max_cases=64):
-    durations = durations or {}
+def make_batches(inventories, *, target_seconds=120, max_cases=64):
     batches = []
     for selection, rows in inventories:
         groups = {}
@@ -75,7 +74,8 @@ def make_batches(inventories, *, durations=None, target_seconds=120, max_cases=6
             current = []
             estimated = 0.0
             for row in cases:
-                cost = max(0.01, durations.get(row["nodeid"], 60.0 if cards > 1 else 2.0))
+                # Fixed weights bound batch size; measurements do not affect dispatch.
+                cost = 60.0 if cards > 1 else 2.0
                 if current and (len(current) >= max_cases or estimated + cost > target_seconds):
                     batches.append(dict(selection=selection, cards=cards, cases=current, estimated_seconds=estimated))
                     current, estimated = [], 0.0
@@ -83,9 +83,9 @@ def make_batches(inventories, *, durations=None, target_seconds=120, max_cases=6
                 estimated += cost
             if current:
                 batches.append(dict(selection=selection, cards=cards, cases=current, estimated_seconds=estimated))
-    # Start long smaller batches first; bounded backfilling subsequently drains
-    # for full-node jobs. History affects order, never resource requests.
-    batches.sort(key=lambda row: (-row["estimated_seconds"], row["cards"]))
+    # Larger reservations first; the device pool backfills with fitting jobs.
+    # Stable ordering preserves collection order among equal reservations.
+    batches.sort(key=lambda row: -row["cards"])
     for index, row in enumerate(batches):
         row["name"] = f"{row['selection']['name']}-batch-{index:04d}"
     return batches
@@ -108,7 +108,6 @@ def main():
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--only", help="Comma-separated suite selection names")
     parser.add_argument("--pytest-arg", action="append", default=[])
-    parser.add_argument("--history", type=Path, help="Previous per-case duration JSON; optional")
     parser.add_argument("--collect-only", action="store_true")
     parser.add_argument("--batch-seconds", type=float, default=120)
     parser.add_argument("--batch-cases", type=int, default=64)
@@ -197,10 +196,7 @@ def main():
     (output / "inventory.json").write_text(
         json.dumps([{**selection, "cases": rows} for selection, rows in inventories], indent=2) + "\n"
     )
-    durations = json.loads(args.history.read_text()) if args.history else {}
-    batches = make_batches(
-        inventories, durations=durations, target_seconds=args.batch_seconds, max_cases=args.batch_cases
-    )
+    batches = make_batches(inventories, target_seconds=args.batch_seconds, max_cases=args.batch_cases)
     (output / "batches.json").write_text(json.dumps(batches, indent=2) + "\n")
     if args.collect_only:
         return 0

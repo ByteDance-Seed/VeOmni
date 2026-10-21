@@ -144,6 +144,12 @@ resource reservation. See [runner usage](../scripts/ci/README.md) for commands
 and result artifacts. NPU workflows use serial dispatch until concurrent HCCL
 isolation has been validated on NPU hardware.
 
+Batches are ordered by required card count, largest first, and greedily assigned
+to free devices with smaller jobs filling remaining space. Fixed case weights
+(60 seconds for multi-card work, 2 seconds for single-card/CPU work) control
+batch size only. Measured timings are reporting artifacts; scheduling does not
+require historical timings.
+
 ---
 
 ## Shared Test Infrastructure (`tests/tools/`)

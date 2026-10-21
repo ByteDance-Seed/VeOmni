@@ -38,14 +38,17 @@ and [test author guide](../../docs/testing.md#launch-plans-for-new-tests).
 Collection resolves plans with the complete owned device slice. Sequential
 launches reserve their maximum; concurrent launches reserve their sum. Cases
 with matching resource requirements and source-file fixture affinity are
-batched automatically. The default target is 120 estimated seconds with at
-most 64 cases per batch; unknown cases use a conservative initial estimate.
-`--history PATH` accepts a previous `durations.json` for batching and ordering.
-History never changes process counts or device requirements.
+batched automatically. Fixed per-case weights are 60 seconds for multi-card
+cases and 2 seconds for single-card or CPU cases. The default batch target is
+120 estimated seconds with at most 64 cases. These weights only control batch
+size; they are not runtime predictions or dispatch priorities.
 
-Ready batches receive disjoint device leases. Smaller work can backfill idle
-cards; after a queue head has waited 120 seconds, accelerator admission pauses
-until it fits. CPU work has its own concurrency limit. Each batch has an
+The queue is stably sorted by card count, largest first, with collection order
+preserved among equal requests. Scan the queue and dispatch every batch that
+fits the currently free devices, assigning disjoint leases. Smaller work can
+backfill idle cards. Once the accelerator queue head has waited 120 seconds,
+the next dispatch check pauses admission of later accelerator batches until
+the head fits. CPU work has its own concurrency limit. Each batch has an
 isolated working directory and cache. Temporary directories use short paths
 under `/tmp` so DataLoader Unix socket names stay within the platform limit;
 they are cleaned up after the batch, or retained with failure artifacts. Rendezvous ports
@@ -66,7 +69,8 @@ including on failure. Use a fresh `--output-dir` for each local measurement.
 Artifacts include full case inventory, resolved plans, batches, device
 assignments, per-case timings/outcomes, logs, JUnit XML, observed distributed
 launches, source fingerprints and the suite's elapsed wall time. Sum of batch
-or case durations is not elapsed wall time when work overlaps.
+or case durations is not elapsed wall time when work overlaps. Measured timings,
+including `durations.json`, are reporting artifacts and are not scheduling inputs.
 
 `--collect-only` writes the inventory and batch plan without running tests.
 `--only` selects comma-separated manifest entries. `--pytest-arg` passes an

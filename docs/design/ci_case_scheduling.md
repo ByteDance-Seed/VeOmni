@@ -157,19 +157,22 @@ silent single-card execution.
 Scheduling operates on case records, but launching thousands of fresh pytest
 interpreters would add substantial import and fixture cost. Automatically batch
 compatible cases with the same resource requirements and fixture affinity,
-using a target estimated duration and a case-count limit for unknown durations.
-Timing estimates guide batching; they do not impose a hard runtime bound on an
-individual case. Execution timeouts bound stalled workers. Unknown multi-card cases receive a
-conservative duration estimate so they are split into small batches. A batch can reuse
+using fixed weights of 60 seconds per multi-card case and 2 seconds per
+single-card or CPU case. The default batch target is 120 estimated seconds,
+with at most 64 cases. These weights control batching only; they are not
+runtime predictions or priorities and do not bound individual case runtimes.
+Execution timeouts bound stalled workers. A batch can reuse
 the pytest interpreter as an ordinary module invocation does; distributed
 subprocesses still start fresh for each original launch.
 
-Dispatch a fitting ready batch onto disjoint devices. Use waiting age and
-observed runtime for ordering and batching, never to lower a resource request.
-Allow small jobs to fill otherwise idle space. When the accelerator queue head
-has waited 120 seconds, stop admitting smaller accelerator jobs and let active
-batches drain until that head fits. CPU work has a separate concurrency limit. Results stay keyed by node ID,
-independent of completion order.
+Stably sort batches by required card count, largest first; preserve collection
+order among equal requests. Scan the queue and dispatch fitting batches onto
+disjoint devices, letting smaller jobs fill otherwise idle space. When the
+accelerator queue head has waited 120 seconds, the next dispatch check stops
+admitting later accelerator jobs and lets active batches drain until that head
+fits. CPU work has a separate concurrency limit. No historical timings are
+required or consumed. Measured case timings remain available as reporting
+artifacts. Results stay keyed by node ID, independent of completion order.
 
 Each worker receives its visible-device mapping and a unique rendezvous port
 before importing torch or the accelerator runtime. A run-scoped, locked port

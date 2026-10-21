@@ -251,12 +251,27 @@ def test_case_batches_preserve_inventory_and_resource_requests():
     from scripts.ci.run_accelerator_tests import make_batches
 
     rows = [dict(nodeid=f"case-{i}", file="test.py", cards=2 if i % 2 else 4) for i in range(9)]
-    batches = make_batches([(dict(name="test"), rows)], durations={"case-1": 200}, target_seconds=30, max_cases=2)
+    batches = make_batches([(dict(name="test"), rows)], target_seconds=120, max_cases=2)
     observed = [row for batch in batches for row in batch["cases"]]
     assert sorted(row["nodeid"] for row in observed) == sorted(row["nodeid"] for row in rows)
     assert all(len(batch["cases"]) <= 2 for batch in batches)
     assert all(row["cards"] == batch["cards"] for batch in batches for row in batch["cases"])
-    assert any(len(batch["cases"]) == 1 and batch["cases"][0]["nodeid"] == "case-1" for batch in batches)
+    assert [batch["cards"] for batch in batches] == [4, 4, 4, 2, 2]
+    assert [row["nodeid"] for batch in batches if batch["cards"] == 4 for row in batch["cases"]] == [
+        "case-0",
+        "case-2",
+        "case-4",
+        "case-6",
+        "case-8",
+    ]
+    assert all(batch["estimated_seconds"] == len(batch["cases"]) * 60 for batch in batches)
+
+    # Fixed weights split one-card and CPU work without consulting measured time.
+    for cards in (0, 1):
+        single = [dict(nodeid=f"single-{i}", file="test.py", cards=cards) for i in range(61)]
+        batches = make_batches([(dict(name="single"), single)])
+        assert [len(batch["cases"]) for batch in batches] == [60, 1]
+        assert [batch["estimated_seconds"] for batch in batches] == [120, 2]
 
 
 def test_device_pool_drains_for_waiting_large_job():
