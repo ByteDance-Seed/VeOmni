@@ -16,18 +16,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from functools import partial
+from collections.abc import Callable
 
 import torch
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
-from transformers import masking_utils
 from transformers.masking_utils import (
-    ALL_MASK_ATTENTION_FUNCTIONS,
     and_masks,
     bidirectional_mask_function,
     causal_mask_function,
+    fast_all,
+    padding_mask_function,
+    prepare_padding_mask,
 )
 
 from .....utils.device import get_gpu_compute_capability, is_nvidia_cuda_device
@@ -89,31 +88,6 @@ def _tensor_offset_mask(
     return offset_mask
 
 
-@contextmanager
-def _patched_hf_create_block_mask(
-    compile_block_mask: bool, block_size: int | tuple[int, int], *, device, q_length, kv_length
-) -> Iterator[None]:
-    """Swap HF's ``create_block_mask`` for the compiled or eager path.
-
-    Transformers still passes ``_compile=True`` on torch>=2.6, so the eager
-    path cannot use the raw function or the flag would compile anyway.
-    Its offset wrapper also captures Python integers even for zero offsets;
-    replace that wrapper within the same scope and restore both HF functions.
-    """
-    original = masking_utils.create_block_mask
-    original_offsets = masking_utils.add_offsets_to_mask_function
-    builder = _create_block_mask if compile_block_mask else _eager_create_block_mask
-    masking_utils.create_block_mask = partial(builder, BLOCK_SIZE=block_size)
-    masking_utils.add_offsets_to_mask_function = partial(
-        _tensor_offset_mask, device=device, q_length=q_length, kv_length=kv_length
-    )
-    try:
-        yield
-    finally:
-        masking_utils.create_block_mask = original
-        masking_utils.add_offsets_to_mask_function = original_offsets
-
-
 def flex_attention_mask_builder(
     batch_size: int,
     q_length: int,
@@ -128,7 +102,7 @@ def flex_attention_mask_builder(
     compile_block_mask: bool = True,
     **kwargs,
 ) -> BlockMask:
-    """Build a Transformers FlexAttention mask.
+    """Build an SP-aware native BlockMask without replacing HF module globals.
 
     Expand local lengths to the Ulysses-global sequence only when the
     adapter would gather Q/K/V itself: ``ulysses_size > 1`` and not
@@ -220,16 +194,21 @@ def flex_attention_mask_builder(
             batch_size=batch_size,
         )
 
-    with _patched_hf_create_block_mask(
-        compile_block_mask, _flex_block_size(device), device=device, q_length=q_length, kv_length=kv_length
-    ):
-        return ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"](
-            batch_size=batch_size,
-            q_length=q_length,
-            kv_length=kv_length,
-            q_offset=q_offset,
-            kv_offset=kv_offset,
-            mask_function=mask_function,
-            attention_mask=attention_mask,
-            **kwargs,
-        )
+    # Match the pinned HF padding/offset composition. Keep the all-valid
+    # fast path, including its behavior for short all-valid padding masks.
+    if attention_mask is not None and not fast_all(attention_mask):
+        padding_mask = prepare_padding_mask(attention_mask, kv_length, kv_offset)
+        mask_function = and_masks(mask_function, padding_mask_function(padding_mask))
+    mask_function = _tensor_offset_mask(
+        mask_function, q_offset, kv_offset, device=device, q_length=q_length, kv_length=kv_length
+    )
+    builder = _create_block_mask if compile_block_mask else _eager_create_block_mask
+    return builder(
+        mask_mod=mask_function,
+        B=batch_size,
+        H=None,
+        Q_LEN=q_length,
+        KV_LEN=kv_length,
+        device=device,
+        BLOCK_SIZE=_flex_block_size(device),
+    )

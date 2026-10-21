@@ -165,11 +165,25 @@ and requires repeated inputs to reuse graphs within a limited compile budget.
 Arbitrary changes to predicate code or captured Python state can still
 specialize; these tests do not promise graph reuse for every custom predicate.
 
+Mask construction composes padding and offset predicates within each call and
+passes device, sequence lengths and block sizes directly to `create_block_mask`.
+It does not replace Transformers module helpers, so overlapping calls cannot
+leave another invocation's device or geometry installed for native HF callers.
+The padding composition retains the pinned HF all-valid fast path and right
+padding behavior for cached offsets.
+
 Use `compile_block_mask=False` for explicit eager construction. Both paths
-suppress HF's deprecated `_compile` flag. Eager construction may materialize
+set the deprecated `_compile` flag to `False`; the compiled path uses the cached
+wrapper instead. Eager construction may materialize
 token-square intermediates, so it can cost substantially more memory on long
 sequences. Compare compilation cost, steady execution, and peak memory for the
 actual workload before selecting it as a fallback.
+
+With pinned PyTorch 2.11, compiled CPU construction with boolean padding and
+nonzero offsets can hit an Inductor `VecMask` C++ codegen error. Use
+`compile_block_mask=False` for CPU construction if this occurs. CUDA FLASH
+validation uses normal GPU codegen; the CPU limitation does not require
+disabling compiled mask construction on CUDA.
 
 ### Dynamic compilation
 
