@@ -404,15 +404,5 @@
       "-x",
       "tests/distributed/test_fsdp_equivalence.py"
     ]
-  },
-  {
-    "name": "npu-e2e-03",
-    "suite": "e2e",
-    "args": [
-      "-v",
-      "-s",
-      "-x",
-      "tests/e2e/test_e2e_parallel.py::test_wan_dit_parallel_align"
-    ]
   }
 ]

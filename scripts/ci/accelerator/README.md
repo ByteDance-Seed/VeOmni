@@ -168,9 +168,9 @@ Multimodal fixtures retain their token IDs, vocabularies and RoPE dimensions;
 text-only fixtures use vocabularies of 4096. Qwen3-MoE retains four MoE
 layers for the LoRA per-layer EP slicing assertions. Vision/audio widths are matched to
 the text connectors. Existing numerical tolerances and checkpoint/optimizer
-round-trip assertions are unchanged. GPU e2e selection includes one Wan alignment invocation. Qwen3-MoE
-EP1/4/8 saveload cases check HF export alongside DCP/optimizer restoration and
-independent CLI DCP-to-HF verification.
+round-trip assertions are unchanged. GPU and NPU e2e suites each include one
+Wan alignment invocation. Qwen3-MoE EP1/4/8 saveload cases check HF export
+alongside DCP/optimizer restoration and independent CLI DCP-to-HF verification.
 
 Fused checkpoint formats also require distinguishable weight layouts: for
 Qwen3-VL-MoE, keep expert intermediate width different from hidden width, and
