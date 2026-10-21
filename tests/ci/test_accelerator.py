@@ -413,9 +413,10 @@ def test_interrupt_drains_owned_workers_before_executor_shutdown(stage, tmp_path
 
 
 @pytest.mark.parametrize(
-    "failure", ["changed_source", "missing_results", "interrupt", "keep_going_failure", "cleanup_failure"]
+    "failure",
+    ["changed_source", "missing_results", "interrupt", "keep_going_failure", "cleanup_failure", "child_failure"],
 )
-def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, failure):
+def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, capsys, failure):
     import json
     import sys
     from pathlib import Path
@@ -459,6 +460,21 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, failure
             Path(env["CI_CASE_RESULTS"]).write_text(json.dumps(dict(exitstatus=0, cases=[dict(nodeid=nodeid)])))
         elif failure == "cleanup_failure":
             raise ProcessCleanupError("owned worker survived cleanup")
+        elif failure == "child_failure":
+            import subprocess
+
+            try:
+                subprocess.run(
+                    [sys.executable, "-c", "raise RuntimeError('original training failure')"],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=True,
+                )
+            except subprocess.CalledProcessError:
+                # A long pytest/subprocess report must not bury the rank error.
+                log.write("subprocess wrapper frame\n" * 100)
+                log.flush()
+                raise
         elif failure == "keep_going_failure":
             Path(env["CI_CASE_PROGRESS"]).write_text(
                 json.dumps(dict(kind="failure", nodeid=nodeid, outcome="failed", detail="original assertion")) + "\n"
@@ -472,6 +488,8 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, failure
 
     monkeypatch.setattr(runner, "ROOT", root)
     monkeypatch.setattr(runner, "run_process", run_process)
+    if failure == "child_failure":
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.setattr(
         sys, "argv", ["ci", "--suite", "unit", "--backend", "cpu", "--only", "ci-unit", "--output-dir", str(output)]
     )
@@ -498,6 +516,10 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, failure
         elif failure == "cleanup_failure":
             assert len(summary["commands"]) == 1  # Never release the lease to the pending batch.
             assert "ProcessCleanupError" in record["error"] and "survived cleanup" in summary["error"]
+        elif failure == "child_failure":
+            foreground = capsys.readouterr().out
+            assert "RuntimeError: original training failure" in foreground
+            assert foreground.count("::group::") == foreground.count("::endgroup::") == 1
         else:
             assert "KeyboardInterrupt" in summary["error"]
 

@@ -1,7 +1,9 @@
 """Foreground case progress and failure diagnostics for concurrent batches."""
 
+import codecs
 import json
 import os
+import sys
 import time
 from collections import Counter
 from concurrent.futures import CancelledError
@@ -31,13 +33,30 @@ def format_status(label, status, assigned, target):
     return f"[{label}][{status}][devices={devices}] {target}"
 
 
-def print_log_tail(path, *, lines=80):
+def print_failure_log(path, *, label):
+    """Stream complete failed-worker output so nested process errors stay visible."""
     if not path.is_file():
         return
-    with path.open("rb") as handle:
-        handle.seek(max(0, path.stat().st_size - 65536))
-        tail = handle.read().decode(errors="replace").splitlines()[-lines:]
-    print(f"--- log tail: {path} ---\n" + "\n".join(tail), flush=True)
+    grouped = os.environ.get("GITHUB_ACTIONS") == "true"
+    title = f"{label}: full worker output ({path})"
+    print(f"::group::{title}" if grouped else f"--- {title} ---", flush=True)
+    try:
+        with path.open("rb") as handle:
+            # A cleanup failure can leave a writer alive. Read the existing
+            # bytes only, without following that writer or loading the whole log.
+            remaining = os.fstat(handle.fileno()).st_size
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            while remaining:
+                chunk = handle.read(min(65536, remaining))
+                if not chunk:
+                    break
+                sys.stdout.write(decoder.decode(chunk))
+                remaining -= len(chunk)
+            sys.stdout.write(decoder.decode(b"", final=True))
+    except OSError as exc:
+        print(f"Could not read worker log: {exc}", flush=True)
+    finally:
+        print("\n::endgroup::" if grouped else "", flush=True)
 
 
 class RunReporter:
@@ -95,7 +114,7 @@ class RunReporter:
             lines = detail.splitlines()
             print("\n".join("    " + line for line in lines[:200]), flush=True)
             if len(lines) > 200:
-                print("    ... full traceback is retained in the batch log/results artifact", flush=True)
+                print("    ... full traceback is in the complete worker output below", flush=True)
 
     def fail(self, batch, message, *, assigned=None, target=None, nodeid=None, detail=None):
         with self.lock:

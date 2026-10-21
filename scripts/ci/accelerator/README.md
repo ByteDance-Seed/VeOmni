@@ -130,9 +130,13 @@ entry `display_id`; aggregated `cases.json` carries each case's full
     ... traceback ...
 ```
 
-Failures print the
-node ID, traceback (up to 200 lines), and the last 80 batch-log lines; full logs
-remain in the local output directory. GitHub Actions also receives an error annotation. Cancelled
+Failures print the node ID and pytest traceback summary (up to 200 lines),
+followed by the complete failed worker's combined stdout/stderr. GitHub Actions
+places this output in a collapsible group labelled with the manifest entry ID;
+local runs print it inline. This preserves training-rank tracebacks and torchrun
+errors that precede pytest's outer `CalledProcessError`. Logs are streamed in
+bounded chunks after worker cleanup; successful batches keep compact progress
+output. GitHub Actions also receives an error annotation. Cancelled
 batches are labelled separately from failed tests. The final summary reports
 outcomes, failed/cancelled batches, batches never started and the first failure.
 

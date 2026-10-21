@@ -15,7 +15,13 @@ from pathlib import Path
 from scripts.ci.accelerator import ROOT
 from scripts.ci.accelerator.batching import make_batches
 from scripts.ci.accelerator.launch_plan import ResourcePlanError, RunnerCapabilities
-from scripts.ci.accelerator.reporting import BatchProgress, RunReporter, format_status, print_log_tail, selection_label
+from scripts.ci.accelerator.reporting import (
+    BatchProgress,
+    RunReporter,
+    format_status,
+    print_failure_log,
+    selection_label,
+)
 from scripts.ci.accelerator.runtime.devices import child_environment
 from scripts.ci.accelerator.runtime.ports import find_free_port
 from scripts.ci.accelerator.runtime.workers import (
@@ -114,7 +120,7 @@ def main():
                 print(
                     format_status(selection_label(args.suite, name), "FAILED", None, f"collection: {exc}"), flush=True
                 )
-                print_log_tail(output / f"{name}.collection.log")
+                print_failure_log(output / f"{name}.collection.log", label=selection_label(args.suite, name))
             raise
         if not inventory_path.exists():
             raise ResourcePlanError(f"Collection produced no inventory: {name}")
@@ -249,7 +255,7 @@ def main():
             if progress.failures:
                 record.update(returncode=1, status="failed", error=reporter.first_failure)
                 with reporter.lock:
-                    print_log_tail(progress.log_path)
+                    print_failure_log(progress.log_path, label=reporter.label(name))
             else:
                 reason = f"Cancelled after {reporter.first_failure}" if reporter.first_failure else str(exc)
                 record.update(returncode=130, status="cancelled", error=reason)
@@ -263,7 +269,7 @@ def main():
             else:
                 progress.worker_failure(exc)
             with reporter.lock:
-                print_log_tail(progress.log_path)
+                print_failure_log(progress.log_path, label=reporter.label(name))
             if not args.keep_going or isinstance(exc, ProcessCleanupError):
                 raise
         finally:

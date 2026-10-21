@@ -215,9 +215,12 @@ advance this counter. A 30-second `RUNNING` heartbeat includes elapsed batch
 time. Collection uses the entry ID and summaries the suite ID, both with
 `[devices=-]`. Execution records carry the entry `display_id`; aggregated
 `cases.json` carries the full case `display_id`. Artifact filenames are unchanged.
-Failure output includes the node ID, traceback and log tail. Full diagnostics
-stay in the runner's local output directory; CI does not upload that directory
-as a GitHub artifact. Progress and failure diagnostics remain in the Actions console log.
+Failure output includes the node ID and pytest traceback summary, followed by
+the failed worker's complete combined stdout/stderr. Actions groups this output
+under the manifest entry ID so training-rank tracebacks remain accessible when
+pytest reports an outer subprocess error. Local runs print the same output
+inline. Stream the existing log in bounded chunks after worker cleanup, while
+successful batches retain compact progress output.
 Cancelled batches are distinguished from test failures, and the original
 failure remains the final error even if a cancelled peer exits first. Preserve
 observed outcomes as partial results when cancellation prevents pytest from
