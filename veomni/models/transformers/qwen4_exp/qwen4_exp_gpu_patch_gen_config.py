@@ -183,6 +183,9 @@ logger = logging.get_logger(__name__)
 # so the PLE replacement class can mention it while the patch config loads.
 all_to_all = None
 
+# Names resolved at codegen time from generated imports.
+is_flash_attention_requested = None
+
 
 @config.override_method(
     "Qwen4ExpTextModel.reverse_embedding",
