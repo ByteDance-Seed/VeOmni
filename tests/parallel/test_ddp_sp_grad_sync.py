@@ -28,7 +28,6 @@ gradients differ from the reference, so the parity check cannot pass vacuously.
 
 import argparse
 import os
-import random
 import subprocess
 from typing import Optional
 
@@ -37,6 +36,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from tests.tools.launch_utils import find_free_port
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
@@ -227,9 +227,7 @@ def _run_ddp_sp_grad_sync_test(
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={world_size}",
-        # Fresh port per run: back-to-back torchrun launches otherwise collide
-        # with the previous one's TIME_WAIT socket.
-        f"--master_port={29500 + random.randint(0, 200)}",
+        f"--master_port={find_free_port()}",
         "tests/parallel/test_ddp_sp_grad_sync.py",
         f"--ulysses-size={ulysses_size}",
         f"--micro-batches={micro_batches}",

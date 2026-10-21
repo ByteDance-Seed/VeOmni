@@ -61,7 +61,7 @@ def _toy_model(attn_implementation="eager", device="cpu", dtype="float32", confi
         torch_dtype=dtype,
         attn_implementation=attn_implementation,
         init_device=device,
-        ops_implementation=make_eager_ops_config(),
+        ops_implementation=make_eager_ops_config(attn_implementation=attn_implementation),
     ).to(device)
 
 

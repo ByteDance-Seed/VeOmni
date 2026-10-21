@@ -60,7 +60,6 @@ def _shared_parameter_report(model) -> tuple[int, int, list[str]]:
 
 
 def _shared_weights_worker(ep_size: int = 1):
-    from veomni import _apply_patches
     from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.distributed.torch_parallelize import build_parallelize_model
     from veomni.models.auto import build_foundation_model
@@ -68,8 +67,6 @@ def _shared_weights_worker(ep_size: int = 1):
 
     from ..models.test_diffusion_gemma import build_toy_batch
     from ..tools.training_utils import make_eager_ops_config
-
-    _apply_patches()
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()
@@ -149,7 +146,6 @@ def _shared_weights_worker(ep_size: int = 1):
 
 def _recompute_worker(ep_size: int = 1):
     """Same model, same batch, gradient checkpointing off then on."""
-    from veomni import _apply_patches
     from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.distributed.torch_parallelize import build_parallelize_model
     from veomni.models.auto import build_foundation_model
@@ -157,8 +153,6 @@ def _recompute_worker(ep_size: int = 1):
 
     from ..models.test_diffusion_gemma import build_toy_batch
     from ..tools.training_utils import make_eager_ops_config
-
-    _apply_patches()
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()
@@ -241,7 +235,6 @@ def _component_grad_norm_worker(ep_size: int = 2, return_logits: bool = True):
     """``print_ar_df_norm``'s split backward, against a single backward of the sum."""
     from types import SimpleNamespace
 
-    from veomni import _apply_patches
     from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.distributed.torch_parallelize import build_parallelize_model
     from veomni.models.auto import build_config, build_foundation_model
@@ -250,8 +243,6 @@ def _component_grad_norm_worker(ep_size: int = 2, return_logits: bool = True):
 
     from ..models.test_diffusion_gemma import build_toy_batch, toy_runtime
     from ..tools.training_utils import make_eager_ops_config
-
-    _apply_patches()
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()

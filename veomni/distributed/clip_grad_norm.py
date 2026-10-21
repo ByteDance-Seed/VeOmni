@@ -98,7 +98,8 @@ def veomni_clip_grad_norm(
 
 def veomni_compute_grad_norm(model, norm_type: float = 2.0) -> float:
     """Global gradient norm without clipping, reduced the same way as ``veomni_clip_grad_norm``."""
-    return veomni_clip_grad_norm(model, max_norm=0.0, norm_type=norm_type, clip=False)
+    grad_norm = veomni_clip_grad_norm(model, max_norm=0.0, norm_type=norm_type, clip=False)
+    return grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm)
 
 
 # The two clippers below serve an OmniModel, where every module runs under its own

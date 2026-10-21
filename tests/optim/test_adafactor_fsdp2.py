@@ -28,6 +28,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from transformers.optimization import Adafactor
 
+from tests.tools.launch_utils import find_free_port
 from veomni.checkpoint.dcp_checkpointer import drop_extra_parallel_dim, restore_extra_parallel_dim
 from veomni.optim import build_optimizer
 from veomni.optim.optimizer import DistributedAdafactor
@@ -147,7 +148,7 @@ def test_fsdp2_adafactor_2gpu():
         "torch.distributed.run",
         "--nnodes=1",
         "--nproc_per_node=2",
-        "--master_port=4321",
+        f"--master_port={find_free_port()}",
         os.path.abspath(__file__),
     ]
     env = os.environ.copy()

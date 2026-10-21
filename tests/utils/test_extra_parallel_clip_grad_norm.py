@@ -13,6 +13,7 @@ import torch.nn as nn
 from packaging.version import Version
 from torch.distributed._tensor import DTensor, Shard
 
+from tests.tools.launch_utils import find_free_port
 from veomni.arguments import ModelArguments, TrainingArguments, parse_args
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm, veomni_compute_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
@@ -305,7 +306,7 @@ def _run_clip_grad_norm_fsdp2_test(
         "torchrun",
         "--nnodes=1",
         "--nproc_per_node=8",
-        "--master_port=4321",
+        f"--master_port={find_free_port()}",
         "tests/utils/test_extra_parallel_clip_grad_norm.py",
         "--model.config_path=test",
         f"--model.accelerator.ep_size={ep_size}",

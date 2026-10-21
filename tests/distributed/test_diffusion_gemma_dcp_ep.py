@@ -105,14 +105,11 @@ def _dcp_round_trip_worker(ep_size: int = 2):
 
     from torch.distributed.checkpoint import FileSystemReader
 
-    from veomni import _apply_patches
     from veomni.checkpoint import layout
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
     from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.optim import build_optimizer
     from veomni.utils.device import get_device_type
-
-    _apply_patches()
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()

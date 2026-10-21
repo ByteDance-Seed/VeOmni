@@ -68,7 +68,7 @@ def _build_model(config_path: str, device, config_kwargs=None):
         attn_implementation="veomni_flash_attention_2",
         init_device="cuda",
         config_kwargs=config_kwargs,
-        ops_implementation=make_eager_ops_config(),
+        ops_implementation=make_eager_ops_config(attn_implementation="veomni_flash_attention_2"),
     ).to(device)
     if model.config.model_type in ("llada_moe", "llada2_uni"):
         # Spread the router logits: bf16 noise from a different GEMM row count must not

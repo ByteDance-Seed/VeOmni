@@ -145,12 +145,9 @@ def _expected_products(model, scales, ep_size) -> list[torch.Tensor]:
 
 
 def _fold_preserves_the_forward_worker(ep_size: int):
-    from veomni import _apply_patches
     from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.models.transformers.diffusion_gemma import align_nemo
     from veomni.utils.device import get_device_type
-
-    _apply_patches()
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()
