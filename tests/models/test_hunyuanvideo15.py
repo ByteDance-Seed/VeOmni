@@ -130,7 +130,12 @@ def _hunyuanvideo15_fsdp_checkpoint_worker():
     _init_parallel_state(dp_size=world_size, dp_shard_size=world_size)
     torch.manual_seed(42)
     config = HunyuanVideo15Config(
-        hidden_size=256, heads_num=2, mm_double_blocks_depth=2, text_states_dim=32, vision_states_dim=8
+        hidden_size=256,
+        heads_num=2,
+        mm_double_blocks_depth=2,
+        mm_single_blocks_depth=1,
+        text_states_dim=32,
+        vision_states_dim=8,
     )
     reference = HunyuanVideo15Model(config).to(device).train()
     initialize_nonzero_linears(reference)
@@ -148,7 +153,7 @@ def _hunyuanvideo15_fsdp_checkpoint_worker():
     )
     results = []
     for model in (reference, checkpointed):
-        for block in model.double_blocks:
+        for block in (*model.double_blocks, *model.single_blocks):
             fully_shard(block, mesh=mesh, mp_policy=policy)
         fully_shard(model, mesh=mesh, mp_policy=policy)
         output = model(**data)
@@ -165,8 +170,9 @@ def _hunyuanvideo15_fsdp_checkpoint_worker():
     torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
     assert actual[1].keys() == expected[1].keys()
     for name in expected[1]:
-        # Recompute sees the original FP32 values instead of first-pass BF16 rounding.
-        torch.testing.assert_close(actual[1][name], expected[1][name], rtol=5e-2, atol=1e-2)
+        torch.testing.assert_close(
+            actual[1][name], expected[1][name], rtol=0, atol=0, msg=lambda msg, name=name: f"{name}: {msg}"
+        )
 
 
 def test_hunyuanvideo15_fsdp_bf16_checkpoint():

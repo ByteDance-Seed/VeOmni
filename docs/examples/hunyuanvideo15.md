@@ -187,8 +187,14 @@ or opt-in cases skipped), and 27 on CPU (nine accelerator or opt-in cases
 skipped). Registration now uses `veomni.models.registry`, and
 the registry check lives in `tests/models/base/test_auto_registry.py`.
 This includes real two-rank FSDP2/BF16 checkpoint regressions on GPU/NPU and CPU
-regressions for both RoPE table-dtype transitions. Rotary tables remain FP32
-through recomputation so saved tensor metadata stays stable.
+regressions for both RoPE table-dtype transitions. PR review subsequently exposed
+gradient drift despite matching saved-tensor metadata: converting BF16-rounded
+tables back to FP32 cannot recover their original values. Per-forward
+`RotaryTables` leaves now keep the original FP32 constants outside FSDP input
+casting, so both passes use identical values. The strengthened A100 regression
+covers double- and single-stream blocks and compares predictions and every
+gradient exactly (`rtol=0, atol=0`) with checkpointing disabled.
+
 The shared registry, gradient-checkpointing, DiT microbatch and resume suites
 also passed 373 tests with one hardware-dependent skip. These shared tests do
 not establish full pretrained HunyuanVideo trainer resume equivalence.

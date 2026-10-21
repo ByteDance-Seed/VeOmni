@@ -23,6 +23,20 @@ from typing import List, Tuple, Union
 import torch
 
 
+class RotaryTables:
+    """Fixed FP32 tables kept outside FSDP's activation-input dtype traversal.
+
+    This plain leaf object is created per forward and shared with checkpoint
+    recomputation. A tuple/dataclass would expose the tables to FSDP's first-pass
+    BF16 cast, changing their values relative to the recomputed forward.
+    """
+
+    __slots__ = ("values",)
+
+    def __init__(self, cos: torch.Tensor, sin: torch.Tensor):
+        self.values = (cos.float(), sin.float())
+
+
 def _to_tuple(x, dim=2):
     if isinstance(x, int):
         return (x,) * dim
@@ -153,7 +167,7 @@ def rotate_half(x):
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
-    freqs_cis: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    freqs_cis: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], RotaryTables],
     head_first: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -174,11 +188,12 @@ def apply_rotary_emb(
         Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
 
     """
+    if isinstance(freqs_cis, RotaryTables):
+        freqs_cis = freqs_cis.values
     xk_out = None
     if isinstance(freqs_cis, tuple):
         cos, sin = reshape_for_broadcast(freqs_cis, xq, head_first)  # [S, D]
-        # FSDP2 may cast tables only on the first forward, not recomputation.
-        # Keep backward's saved metadata stable in the rotary math's FP32 dtype.
+        # Preserve the source's FP32 rotary arithmetic and saved tensor metadata.
         cos = cos.to(device=xq.device, dtype=torch.float32)
         sin = sin.to(device=xq.device, dtype=torch.float32)
         # real * cos - imag * sin

@@ -31,7 +31,7 @@ from .modules.embed_layers import PatchEmbed, TextProjection, TimestepEmbedder, 
 from .modules.mlp_layers import MLP, FinalLayer, LinearWarpforSingle, MLPEmbedder
 from .modules.modulate_layers import ModulateDiT, apply_gate, modulate
 from .modules.norm_layers import get_norm_layer
-from .modules.posemb_layers import apply_rotary_emb, get_nd_rotary_pos_embed
+from .modules.posemb_layers import RotaryTables, apply_rotary_emb, get_nd_rotary_pos_embed
 from .modules.token_refiner import SingleTokenRefiner
 
 
@@ -602,7 +602,7 @@ class HunyuanVideo_1_5_DiffusionTransformer(nn.Module):
                 )
                 extra_encoder_hidden_states = extra_encoder_hidden_states + cond_emb
             txt, text_mask = self.reorder_txt_token(extra_encoder_hidden_states, txt, extra_attention_mask, text_mask)
-        freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
+        freqs_cis = RotaryTables(freqs_cos, freqs_sin) if freqs_cos is not None else None
         for index, block in enumerate(self.double_blocks):
             force_full_attn = (
                 self.attn_mode in ["flex-block-attn"]
@@ -640,7 +640,7 @@ class HunyuanVideo_1_5_DiffusionTransformer(nn.Module):
                     x,
                     vec,
                     txt_len=txt_seq_len,
-                    freqs_cis=(freqs_cos, freqs_sin),
+                    freqs_cis=freqs_cis,
                     text_mask=text_mask,
                     attn_param=self.attn_param,
                     is_flash=force_full_attn,
