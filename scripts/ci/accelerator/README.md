@@ -81,9 +81,12 @@ its lease is released, even if the launcher has already exited.
 Ctrl-C cancels owned collection/execution subprocesses before the thread pool
 waits for callbacks. Cancellation reaches nested worker scopes; process cleanup
 still drains each owned group and tracked descendants before releasing its lease.
-Failures stop new dispatches by default while active batches finish cleanup.
-`--keep-going` records failures and attempts all batches; `--serial` disables
-concurrent dispatch for diagnosis. CPU BLAS and compiler threads are bounded.
+By default, the first failed pytest phase or worker stops admission and cancels
+other running batches in this suite/job. The runner waits for bounded process
+cleanup before exiting with failure. It does not wait for those tests to finish.
+`--keep-going` records failures and attempts all cases/batches without cancelling
+peers. `--serial` uses the same failure policy with one batch at a time.
+CPU BLAS and compiler threads are bounded.
 
 ## Results and local commands
 
@@ -94,6 +97,19 @@ assignments, per-case timings/outcomes, logs, JUnit XML, observed distributed
 launches, source fingerprints and the suite's elapsed wall time. Sum of batch
 or case durations is not elapsed wall time when work overlaps. Measured timings,
 including `durations.json`, are reporting artifacts and are not scheduling inputs.
+
+The foreground log prints batch assignments, each case outcome with overall
+progress, and a running-case heartbeat every 30 seconds. Failures print the
+node ID, traceback (up to 200 lines), and the last 80 batch-log lines; full logs
+remain artifacts. GitHub Actions also receives an error annotation. Cancelled
+batches are labelled separately from failed tests. The final summary reports
+outcomes, failed/cancelled batches, batches never started and the first failure.
+
+When a worker is cancelled before pytest writes its final results, the runner
+saves observed outcomes in a partial results artifact. Cases interrupted while
+running are marked `cancelled`; never-started cases are not counted as executed.
+JUnit output is retained when pytest had time to write it. Partial runs are
+failures and are not complete CI coverage measurements.
 
 `--collect-only` writes the inventory and batch plan without running tests.
 `--only` selects comma-separated manifest entries. `--pytest-arg` passes an
@@ -130,6 +146,7 @@ projection deliberately raises instead of guessing whether to transpose it.
 |---|---|
 | `__main__.py` | Shared command-line entry point |
 | `runner.py` | Collection, dispatch and result aggregation |
+| `reporting.py` | Foreground progress, failure diagnostics and partial outcomes |
 | `launch_plan.py` | Pure launch descriptions and runner capabilities |
 | `batching.py` | Fixed-weight batching and card-count ordering |
 | `scheduler.py` | Disjoint device leases, greedy dispatch and draining |

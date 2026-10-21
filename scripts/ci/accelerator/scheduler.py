@@ -1,7 +1,7 @@
 """Backend-independent scheduling with disjoint leases and bounded backfilling."""
 
 import time
-from concurrent.futures import FIRST_COMPLETED, wait
+from concurrent.futures import FIRST_COMPLETED, CancelledError, wait
 from dataclasses import dataclass
 
 from scripts.ci.accelerator.runtime.workers import interruptible_executor
@@ -14,7 +14,7 @@ class DeviceJob:
     payload: object
 
 
-def run_jobs(jobs, devices, run, *, max_cpu_jobs=2, drain_after=120.0):
+def run_jobs(jobs, devices, run, *, max_cpu_jobs=2, drain_after=120.0, cancel_on_error=False, stop_event=None):
     """Release a lease only after its callback has cleaned up all descendants.
 
     A waiting head job may be bypassed until its drain deadline. Stop admitting
@@ -32,12 +32,23 @@ def run_jobs(jobs, devices, run, *, max_cpu_jobs=2, drain_after=120.0):
     active = {}
     results = {}
     waiting_since = time.monotonic()
-    with interruptible_executor(max_workers=max(1, len(devices) + max_cpu_jobs)) as (executor, scope):
+    with interruptible_executor(max_workers=max(1, len(devices) + max_cpu_jobs), cancel_on_error=cancel_on_error) as (
+        executor,
+        scope,
+    ):
+
+        def check_stop():
+            if stop_event is not None and stop_event.is_set():
+                scope.event.set()
+                raise CancelledError("Scheduling cancelled after a worker failure")
+
         while pending or active:
+            check_stop()
             head = next((job for job in pending if job.cards), None)
             draining = head is not None and time.monotonic() - waiting_since >= drain_after
             cpu_active = sum(job.cards == 0 for job, _ in active.values())
             for job in list(pending):
+                check_stop()
                 if job.cards == 0:
                     if cpu_active >= max_cpu_jobs:
                         continue
@@ -54,7 +65,7 @@ def run_jobs(jobs, devices, run, *, max_cpu_jobs=2, drain_after=120.0):
                         break
             if not active:
                 raise RuntimeError("No runnable job in a validated resource queue")
-            done, _ = wait(active, return_when=FIRST_COMPLETED)
+            done, _ = wait(active, return_when=FIRST_COMPLETED, timeout=0.2 if stop_event is not None else None)
             for future in done:
                 job, assigned = active.pop(future)
                 results[job.name] = future.result()

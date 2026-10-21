@@ -412,7 +412,7 @@ def test_interrupt_drains_owned_workers_before_executor_shutdown(stage, tmp_path
             unrelated.wait(timeout=5)
 
 
-@pytest.mark.parametrize("failure", ["changed_source", "missing_results", "interrupt"])
+@pytest.mark.parametrize("failure", ["changed_source", "missing_results", "interrupt", "keep_going_failure"])
 def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, failure):
     import json
     import sys
@@ -453,12 +453,24 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, failure
         elif failure == "changed_source":
             source.write_text("changed\n")
             Path(env["CI_CASE_RESULTS"]).write_text(json.dumps(dict(exitstatus=0, cases=[dict(nodeid=nodeid)])))
+        elif failure == "keep_going_failure":
+            Path(env["CI_CASE_PROGRESS"]).write_text(
+                json.dumps(dict(kind="failure", nodeid=nodeid, outcome="failed", detail="original assertion")) + "\n"
+            )
+            kwargs["on_poll"]()
+            import subprocess
+
+            exc = subprocess.CalledProcessError(1, command)
+            kwargs["on_failure"](exc)
+            raise exc
 
     monkeypatch.setattr(runner, "ROOT", root)
     monkeypatch.setattr(runner, "run_process", run_process)
     monkeypatch.setattr(
         sys, "argv", ["ci", "--suite", "unit", "--backend", "cpu", "--only", "ci-unit", "--output-dir", str(output)]
     )
+    if failure == "keep_going_failure":
+        sys.argv.append("--keep-going")
     if failure == "interrupt":
         with pytest.raises(KeyboardInterrupt):
             runner.main()
@@ -473,5 +485,214 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, failure
         assert record["returncode"] != 0
         if failure == "missing_results":
             assert "ResourcePlanError" in record["error"] and ".results.json" in record["error"]
+        elif failure == "keep_going_failure":
+            assert nodeid in summary["error"] and record["status"] == "failed"
         else:
             assert "KeyboardInterrupt" in summary["error"]
+
+
+def test_first_failure_cancels_running_process_and_stops_dispatch(tmp_path):
+    import os
+    import sys
+    import time
+
+    import psutil
+
+    from scripts.ci.accelerator.runtime.workers import run_process
+    from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs
+
+    ready = tmp_path / "worker.pid"
+    called = []
+
+    def execute(job, assigned):
+        called.append(job.name)
+        if job.name == "bad":
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert ready.exists()
+            raise RuntimeError("first failure")
+        assert job.name == "running"
+        code = f"import os,time; from pathlib import Path; Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(60)"
+        with (tmp_path / "worker.log").open("w") as log:
+            run_process([sys.executable, "-c", code], os.environ.copy(), log, 5)
+
+    try:
+        with pytest.raises(RuntimeError, match="first failure"):
+            run_jobs(
+                [DeviceJob(name, 0, None) for name in ("running", "bad", "pending")],
+                [],
+                execute,
+                cancel_on_error=True,
+            )
+        assert called == ["running", "bad"]
+        worker = psutil.Process(int(ready.read_text()))
+        assert not worker.is_running() or worker.status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        pass
+    finally:
+        if ready.exists():
+            try:
+                os.kill(int(ready.read_text()), 9)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.parametrize("keep_going", [False, True])
+def test_case_progress_failure_is_visible_and_can_cancel_peers(tmp_path, capsys, keep_going):
+    import json
+    from concurrent.futures import CancelledError
+
+    from scripts.ci.accelerator.reporting import BatchProgress, CaseFailure, RunReporter
+
+    reporter = RunReporter(2, 2, keep_going=keep_going, heartbeat_seconds=0)
+    path = tmp_path / "progress.jsonl"
+    failed = BatchProgress(reporter, "failed-batch", ["0"], path, tmp_path / "failed.log")
+    peer = BatchProgress(reporter, "peer", ["1"], tmp_path / "peer.jsonl", tmp_path / "peer.log")
+    event = dict(kind="failure", nodeid="test_a.py::test_bad", outcome="failed", detail="assert 1 == 2")
+    encoded = json.dumps(event)
+    path.write_text(encoded[:15])
+    failed.poll()
+    with path.open("a") as handle:
+        handle.write(encoded[15:] + "\n")
+    if keep_going:
+        failed.poll()
+        peer.poll()
+    else:
+        with pytest.raises(CaseFailure, match="test_bad"):
+            failed.poll()
+        with pytest.raises(CancelledError, match="test_bad"):
+            peer.poll()
+    output = capsys.readouterr().out
+    assert "FAIL failed-batch" in output and "assert 1 == 2" in output
+    assert "CASE FAILED 1/2" in output and "RUNNING peer" in output
+    assert failed.partial_results()["cases"][0]["outcome"] == "failed"
+    reporter.summary({"peer": dict(status="cancelled")})
+    assert "'cancelled': 1" in capsys.readouterr().out
+
+
+def test_pytest_failure_reports_before_slow_teardown_and_keeps_partial_outcome(tmp_path, capsys):
+    import os
+    import sys
+    import time
+
+    from scripts.ci.accelerator.reporting import BatchProgress, CaseFailure, RunReporter
+    from scripts.ci.accelerator.runtime.workers import run_process
+
+    test_file = tmp_path / "test_fails.py"
+    test_file.write_text(
+        "import pytest,time\n"
+        "@pytest.fixture\n"
+        "def slow_cleanup():\n"
+        "    yield\n"
+        "    time.sleep(60)\n"
+        "def test_bad(slow_cleanup):\n"
+        "    print('useful child diagnostic', flush=True)\n"
+        "    assert 1 == 2\n"
+    )
+    progress_file = tmp_path / "progress.jsonl"
+    log_path = tmp_path / "worker.log"
+    progress = BatchProgress(RunReporter(1, 1), "failed", [], progress_file, log_path)
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "-p",
+        "scripts.ci.accelerator.pytest_plugin",
+        str(test_file),
+    ]
+    env = {**os.environ, "PYTHONPATH": os.getcwd(), "CI_CASE_PROGRESS": str(progress_file), "PYTHONUNBUFFERED": "1"}
+    for key in ("VEOMNI_CI_ACTIVE_PLAN", "CI_CASE_RESULTS"):
+        env.pop(key, None)
+    started = time.monotonic()
+    with log_path.open("w") as log:
+        with pytest.raises(CaseFailure, match="test_bad"):
+            run_process(command, env, log, 20, on_poll=progress.poll)
+    assert time.monotonic() - started < 20
+    assert "assert 1 == 2" in capsys.readouterr().out
+    assert "useful child diagnostic" in log_path.read_text()
+    assert progress.partial_results()["cases"][0]["outcome"] == "failed"
+
+
+def test_reported_failure_stops_admission_before_failed_batch_finishes():
+    import threading
+
+    from scripts.ci.accelerator.reporting import RunReporter
+    from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs
+
+    reporter = RunReporter(3, 3)
+    peer_started = threading.Event()
+    release_cleanup = threading.Event()
+    called = []
+
+    def execute(job, assigned):
+        called.append(job.name)
+        if job.name == "bad":
+            assert peer_started.wait(5)
+            reporter.fail("bad", "test_failed")
+            assert release_cleanup.wait(5)
+            raise RuntimeError("original failure")
+        if job.name == "short":
+            peer_started.set()
+            assert reporter.stop_event.wait(5)
+            threading.Timer(0.5, release_cleanup.set).start()
+            return
+        pytest.fail("A queued batch started after the failed phase was reported")
+
+    from concurrent.futures import CancelledError
+
+    with pytest.raises((CancelledError, RuntimeError)):
+        run_jobs(
+            [DeviceJob(name, 0, None) for name in ("bad", "short", "pending")],
+            [],
+            execute,
+            cancel_on_error=True,
+            stop_event=reporter.stop_event,
+        )
+    assert set(called) == {"bad", "short"}
+    assert reporter.first_failure == "bad: test_failed"
+
+
+def test_worker_exit_notifies_failure_before_descendant_cleanup(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    import psutil
+
+    from scripts.ci.accelerator.runtime.workers import run_process
+
+    ready = tmp_path / "child.pid"
+    child_code = (
+        f"import os,time; from pathlib import Path; Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(60)"
+    )
+    launcher = (
+        "import subprocess,sys,time\nfrom pathlib import Path\n"
+        f"subprocess.Popen([sys.executable,'-c',{child_code!r}])\n"
+        f"while not Path({str(ready)!r}).exists(): time.sleep(0.01)\n"
+        "sys.exit(3)\n"
+    )
+    observed = []
+
+    def failure(exc):
+        child = psutil.Process(int(ready.read_text()))
+        observed.append((exc.returncode, child.is_running() and child.status() != psutil.STATUS_ZOMBIE))
+
+    try:
+        with (tmp_path / "worker.log").open("w") as log:
+            with pytest.raises(subprocess.CalledProcessError):
+                run_process([sys.executable, "-c", launcher], os.environ.copy(), log, 5, on_failure=failure)
+        assert observed == [(3, True)]
+        try:
+            child = psutil.Process(int(ready.read_text()))
+            assert not child.is_running() or child.status() == psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            pass
+    finally:
+        if ready.exists():
+            try:
+                os.kill(int(ready.read_text()), 9)
+            except ProcessLookupError:
+                pass

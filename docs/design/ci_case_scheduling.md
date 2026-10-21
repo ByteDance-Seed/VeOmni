@@ -190,14 +190,24 @@ registry prevents reuse while another launch is preparing to bind. Common launch
 against the plan and lease. Compare observed launch arguments with the baseline
 to verify backend and parallel-topology coverage. Release resources only after scoped
 cleanup of the launcher's process group and tracked descendants, including
-when its group leader has already exited. Failures stop new dispatches by default; the
-measurement mode may continue while recording all failures.
+when its group leader has already exited. By default the first failed pytest
+phase or worker stops new dispatches and cancels running peers in the same
+suite/job. Wait for owned process cleanup, then return failure. `--keep-going`
+continues all cases and batches without cancelling peers.
 
 On Ctrl-C, collection and scheduling cancel their owned subprocess scopes before
 waiting for thread-pool callbacks. Workers then use the existing bounded
 SIGTERM/SIGKILL cleanup to drain process groups and tracked descendants.
 Unrelated processes are outside the cancellation scope. Interrupted execution
 records retain a failure return code and the summary records the interruption.
+
+Foreground logs show batch/device assignments, case outcomes and overall
+progress. A 30-second heartbeat identifies each running case. Failure output
+includes the node ID, traceback and log tail; full diagnostics stay in artifacts.
+Cancelled batches are distinguished from test failures, and the original
+failure remains the final error even if a cancelled peer exits first. Preserve
+observed outcomes as partial results when cancellation prevents pytest from
+writing its final file. Never-started cases do not count as executed coverage.
 
 ## GPU/NPU boundary
 

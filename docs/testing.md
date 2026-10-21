@@ -562,6 +562,13 @@ allocated rendezvous ports for concurrent cases. See the
 
 ---
 
+The accelerator runner fails fast by default: the first failure stops dispatch
+and cancels running peers in the same suite/job, then waits for scoped process
+cleanup. Foreground output shows case progress, a 30-second heartbeat, failure
+tracebacks/log tails and a final summary. Use `--keep-going` to collect all
+failures. See [failure reporting](../scripts/ci/accelerator/README.md#results-and-local-commands)
+for full logs and partial-result artifacts.
+
 ## New Model Onboarding: Test Checklist
 
 Local tests and CI use the same canonical configs under `tests/toy_config/`.

@@ -199,14 +199,19 @@ def pytest_unconfigure(config):
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item, nextitem):
     started = time.time()
+    _progress(dict(kind="start", nodeid=item.nodeid, timestamp=started))
     yield
     row = item.config._ci_results.get(item.nodeid)
     if row:
         row["wall_seconds"] = time.time() - started
-        output = os.environ.get("CI_CASE_PROGRESS")
-        if output:
-            with open(output, "a") as handle:
-                handle.write(json.dumps(row) + "\n")
+        _progress(dict(row, kind="result"))
+
+
+def _progress(row):
+    output = os.environ.get("CI_CASE_PROGRESS")
+    if output:
+        with open(output, "a") as handle:
+            handle.write(json.dumps(row) + "\n")
 
 
 def pytest_runtest_logreport(report):
@@ -216,6 +221,7 @@ def pytest_runtest_logreport(report):
     row["phases"].append(dict(when=report.when, outcome=report.outcome, duration=report.duration))
     if report.failed:
         row.update(outcome="failed", detail=str(report.longrepr))
+        _progress(dict(row, kind="failure"))
     elif row["outcome"] != "failed":
         if report.skipped:
             row.update(outcome="xfail" if hasattr(report, "wasxfail") else "skipped", detail=str(report.longrepr))

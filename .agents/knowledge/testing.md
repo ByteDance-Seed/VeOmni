@@ -50,6 +50,9 @@ Consequences that cut both ways:
   and `-x` fail-fast. Every new file pays process startup plus model build, and a
   new flaky file blocks the whole suite for everyone.
 
+The accelerator runner cancels running peers on the first failure by default;
+`--keep-going` continues all cases. Foreground logs must identify case progress,
+the original failure and cancelled peers without conflating their outcomes.
 Accelerator runner thread pools must cancel owned worker scopes before waiting
 for callbacks on interruption. Preserve scoped process cleanup and failure
 artifacts; do not terminate unrelated device users or rely on the batch timeout.

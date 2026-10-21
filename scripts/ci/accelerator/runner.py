@@ -9,11 +9,13 @@ import shutil
 import sys
 import tempfile
 import time
+from concurrent.futures import CancelledError, as_completed
 from pathlib import Path
 
 from scripts.ci.accelerator import ROOT
 from scripts.ci.accelerator.batching import make_batches
 from scripts.ci.accelerator.launch_plan import ResourcePlanError, RunnerCapabilities
+from scripts.ci.accelerator.reporting import BatchProgress, RunReporter, print_log_tail
 from scripts.ci.accelerator.runtime.devices import child_environment
 from scripts.ci.accelerator.runtime.ports import find_free_port
 from scripts.ci.accelerator.runtime.workers import create_workspace, interruptible_executor, run_process
@@ -65,6 +67,7 @@ def main():
     caps = RunnerCapabilities(value["backend"], tuple(value["devices"]))
     env["VEOMNI_CI_CAPABILITIES"] = str(caps_path)
     env["VEOMNI_CI_PORT_REGISTRY"] = str(output / "ports.json")
+    env["PYTHONUNBUFFERED"] = "1"
     env["OMP_NUM_THREADS"] = str(max(1, min(8, (os.cpu_count() or 8) // 8)))
     env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
     env["VEOMNI_GPU_TEST_PARALLEL"] = "0" if args.serial else "1"
@@ -98,8 +101,14 @@ def main():
             "-q",
             f"--ci-inventory={inventory_path}",
         ]
-        with (output / f"{name}.collection.log").open("w") as log:
-            run_process(command, collect_env, log, 600, allowed_codes=(0, 5))
+        try:
+            with (output / f"{name}.collection.log").open("w") as log:
+                run_process(command, collect_env, log, 600, allowed_codes=(0, 5))
+        except Exception as exc:
+            if not isinstance(exc, CancelledError):
+                print(f"COLLECTION FAILED {name}: {exc}", flush=True)
+                print_log_tail(output / f"{name}.collection.log")
+            raise
         if not inventory_path.exists():
             raise ResourcePlanError(f"Collection produced no inventory: {name}")
         rows = json.loads(inventory_path.read_text())
@@ -107,8 +116,13 @@ def main():
         return selection, rows
 
     try:
-        with interruptible_executor(max_workers=8) as (executor, scope):
-            inventories = list(executor.map(lambda selection: scope.run(collect, selection), selected))
+        with interruptible_executor(max_workers=8, cancel_on_error=True) as (executor, scope):
+            futures = {
+                executor.submit(scope.run, collect, selection): index for index, selection in enumerate(selected)
+            }
+            inventories = [None] * len(selected)
+            for future in as_completed(futures):
+                inventories[futures[future]] = future.result()
     except (Exception, KeyboardInterrupt, SystemExit) as exc:
         (output / "summary.json").write_text(
             json.dumps(
@@ -129,6 +143,7 @@ def main():
         return 0
     collected_at = time.time()
     finished = {}
+    reporter = RunReporter(sum(len(rows) for _, rows in inventories), len(batches), keep_going=args.keep_going)
 
     def execute(job, assigned):
         row = job.payload
@@ -173,6 +188,7 @@ def main():
         record = dict(
             name=name,
             returncode=1,
+            status="failed",
             selection=row["selection"]["name"],
             cards=row["cards"],
             assigned=assigned,
@@ -181,22 +197,49 @@ def main():
             planned_cases=[case["nodeid"] for case in row["cases"]],
             temporary_directory=temporary,
         )
-        print(f"START {name} devices={assigned} cases={len(row['cases'])}", flush=True)
+        progress = BatchProgress(reporter, name, assigned, output / f"{name}.progress.jsonl", output / f"{name}.log")
+        print(f"START {name} devices={assigned} cases={len(row['cases'])} log={progress.log_path}", flush=True)
         try:
             with (output / f"{name}.log").open("w") as log:
-                run_process(command, worker_env, log, 5400, cwd=workspace)
+                run_process(
+                    command,
+                    worker_env,
+                    log,
+                    5400,
+                    cwd=workspace,
+                    on_poll=progress.poll,
+                    on_failure=progress.worker_failure,
+                )
             result_path = output / f"{name}.results.json"
             if not result_path.is_file():
                 raise ResourcePlanError(f"Worker produced no results: {result_path}")
             result = json.loads(result_path.read_text())
             if result["exitstatus"] or {case["nodeid"] for case in result["cases"]} != set(record["planned_cases"]):
                 raise ResourcePlanError(f"Case execution differs from inventory: {name}")
-            record["returncode"] = 0
+            record.update(returncode=0, status="passed")
+        except CancelledError as exc:
+            progress.poll(check_abort=False)
+            if progress.failures:
+                record.update(returncode=1, status="failed", error=reporter.first_failure)
+                with reporter.lock:
+                    print_log_tail(progress.log_path)
+            else:
+                reason = f"Cancelled after {reporter.first_failure}" if reporter.first_failure else str(exc)
+                record.update(returncode=130, status="cancelled", error=reason)
+                print(f"CANCELLED {name}: {reason}", flush=True)
+            raise
         except Exception as exc:
             record.update(returncode=getattr(exc, "returncode", 1), error=repr(exc))
+            progress.worker_failure(exc)
+            with reporter.lock:
+                print_log_tail(progress.log_path)
             if not args.keep_going:
                 raise
         finally:
+            progress.poll(check_abort=False)
+            result_path = output / f"{name}.results.json"
+            if not result_path.exists():
+                result_path.write_text(json.dumps(progress.partial_results(), indent=2) + "\n")
             if record.get("returncode", 1):
                 retained = workspace / "temporary-files"
                 shutil.move(temporary, retained)
@@ -216,12 +259,15 @@ def main():
             for job in jobs:
                 execute(job, list(caps.devices) if job.cards else [])
         else:
-            run_jobs(jobs, list(caps.devices), execute)
+            run_jobs(
+                jobs, list(caps.devices), execute, cancel_on_error=not args.keep_going, stop_event=reporter.stop_event
+            )
     except (Exception, KeyboardInterrupt, SystemExit) as exc:
-        error = repr(exc)
+        error = reporter.first_failure or repr(exc)
         if not isinstance(exc, Exception):
             raise
     finally:
+        error = error or reporter.first_failure
         summary = dict(
             suite=args.suite,
             backend=caps.backend,
@@ -262,5 +308,7 @@ def main():
         if changed:
             error = error or "Sources changed during execution"
             summary["error"] = error
+            reporter.fail("runner", "Sources changed during execution")
+        reporter.summary(finished)
         (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return int(error is not None or len(finished) != len(jobs) or any(row["returncode"] for row in finished.values()))

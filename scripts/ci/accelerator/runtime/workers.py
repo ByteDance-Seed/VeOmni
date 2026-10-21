@@ -49,14 +49,15 @@ class _WorkerExecutor(ThreadPoolExecutor):
 
 
 @contextmanager
-def interruptible_executor(*, max_workers):
+def interruptible_executor(*, max_workers, cancel_on_error=False):
     """Cancel owned subprocesses before waiting for interrupted callbacks."""
     scope = _CancellationScope()
     executor = _WorkerExecutor(max_workers=max_workers)
     try:
         yield executor, scope
-    except (KeyboardInterrupt, SystemExit):
-        scope.event.set()
+    except BaseException as exc:
+        if cancel_on_error or not isinstance(exc, Exception):
+            scope.event.set()
         raise
     finally:
         interrupted = None
@@ -78,7 +79,7 @@ def interruptible_executor(*, max_workers):
             raise interrupted
 
 
-def run_process(command, env, log, timeout, *, cwd=ROOT, allowed_codes=(0,)):
+def run_process(command, env, log, timeout, *, cwd=ROOT, allowed_codes=(0,), on_poll=None, on_failure=None):
     """Track this launcher only; clean descendants before releasing its lease."""
     scope = _CANCELLATION.get()
     if scope is not None:
@@ -90,6 +91,8 @@ def run_process(command, env, log, timeout, *, cwd=ROOT, allowed_codes=(0,)):
         while process.poll() is None:
             if scope is not None:
                 scope.check()
+            if on_poll is not None:
+                on_poll()
             try:
                 for child in psutil.Process(process.pid).children(recursive=True):
                     known[(child.pid, child.create_time())] = child
@@ -98,8 +101,14 @@ def run_process(command, env, log, timeout, *, cwd=ROOT, allowed_codes=(0,)):
             if time.monotonic() - started > timeout:
                 raise TimeoutError(f"CI worker exceeded {timeout}s: {command}")
             time.sleep(0.2)
+        if on_poll is not None:
+            on_poll()
         if process.returncode not in allowed_codes:
             raise subprocess.CalledProcessError(process.returncode, command)
+    except Exception as exc:
+        if on_failure is not None and not isinstance(exc, CancelledError):
+            on_failure(exc)
+        raise
     finally:
 
         def remember_group():
