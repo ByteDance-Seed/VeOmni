@@ -1,5 +1,8 @@
 """Regression tests for VLM-style optimizer param groups + DCP resume."""
 
+import copy
+
+import pytest
 import torch
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -201,3 +204,66 @@ def test_restore_defaults_fixes_corrupted_empty_group():
 
     p.grad = torch.randn_like(p)
     opt.step()
+
+
+@pytest.mark.parametrize("extra_parallel", [False, True])
+def test_qwen38_vlm_groups_resolve_ple_decay_before_planning(monkeypatch, extra_parallel):
+    """VLM supplies per-tower learning rates without explicit decay fields."""
+    import veomni.optim.optimizer as factory
+
+    model = torch.nn.Module()
+    model.ngram_embedding = torch.nn.Embedding(7, 4, dtype=torch.bfloat16)
+    model.lm_head = torch.nn.Linear(4, 7, bias=False, dtype=torch.bfloat16)
+    monkeypatch.setattr(factory, "_should_build_extra_parallel_aware", lambda _: extra_parallel)
+    if extra_parallel:
+        # Exercise the exact factory hand-off without needing a device mesh.
+        def build_extra(model, lr, betas, eps, decay, fused, kind, groups, *args, cpu_offload_kwargs):
+            assert kind == "qwen38_muon"
+            return factory.Qwen38MuonAdamW(groups, lr, betas, eps, decay, **cpu_offload_kwargs)
+
+        monkeypatch.setattr(factory, "build_extra_parallel_fsdp2_optimizer", build_extra)
+
+    def build():
+        return build_optimizer(
+            model,
+            optimizer_type="qwen38_muon",
+            lr=2e-5,
+            weight_decay=0.1,
+            no_decay_params=["ngram_embedding"],
+            param_groups=[{"params": list(model.parameters()), "lr": 1e-5}],
+            cpu_offload_param_patterns=["ngram_embedding"],
+        )
+
+    opt = build()
+    groups = {id(p): g for g in opt.param_groups for p in g["params"]}
+    ple = model.ngram_embedding.weight
+    assert groups[id(ple)]["weight_decay"] == 0.0
+    assert groups[id(ple)]["qwen38_ple_lookup"] is True
+    assert groups[id(model.lm_head.weight)]["weight_decay"] == 0.1
+    assert all(g["lr"] == 1e-5 for g in opt.param_groups)
+    reference = torch.nn.Parameter(ple.detach().float().clone())
+    adam = torch.optim.AdamW([reference], lr=1e-5, weight_decay=0.0, betas=(0.9, 0.95))
+    for _ in range(2):
+        ple.grad = torch.randn_like(ple)
+        reference.grad = ple.grad.float()
+        model.lm_head.weight.grad = torch.randn_like(model.lm_head.weight)
+        opt.step()
+        adam.step()
+        torch.testing.assert_close(opt.state[ple]["master_weight"], reference)
+    saved = copy.deepcopy(opt.state_dict())
+    resumed = build()
+    resumed.load_state_dict(saved)
+    assert torch.equal(resumed.state[ple]["master_weight"], opt.state[ple]["master_weight"])
+
+
+def test_qwen38_explicit_ple_decay_still_rejected():
+    model = torch.nn.Module()
+    model.ngram_embedding = torch.nn.Embedding(7, 4)
+    with pytest.raises(ValueError, match="explicit zero weight decay"):
+        build_optimizer(
+            model,
+            optimizer_type="qwen38_muon",
+            no_decay_params=["ngram_embedding"],
+            cpu_offload_param_patterns=["ngram_embedding"],
+            param_groups=[{"params": list(model.parameters()), "weight_decay": 0.1}],
+        )

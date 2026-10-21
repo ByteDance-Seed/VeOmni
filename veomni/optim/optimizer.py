@@ -528,6 +528,19 @@ def build_optimizer(
             param_groups = _make_param_groups_for_subset(
                 model, model.parameters(), weight_decay, no_decay_modules, no_decay_params
             )
+        if optimizer_type == "qwen38_muon":
+            # VLM groups may specify only per-tower learning rates. Resolve the
+            # configured decay policy before validating trainable PLE tables.
+            resolved_groups = []
+            for group in param_groups:
+                if "weight_decay" in group:
+                    resolved_groups.append(group)
+                else:
+                    for decay_group in _make_param_groups_for_subset(
+                        model, group["params"], weight_decay, no_decay_modules, no_decay_params
+                    ):
+                        resolved_groups.append({**group, **decay_group})
+            param_groups = resolved_groups
         param_groups = select_cpu_offload_groups(model, param_groups, patterns)
         if optimizer_type == "qwen38_muon":
             param_groups = add_qwen38_plans(model, param_groups)
