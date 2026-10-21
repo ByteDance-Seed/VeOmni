@@ -569,6 +569,11 @@ In mixed modules, mark individual CPU cases so optimized GPU/NPU kernel tests
 retain accelerator reservations. CPU workers hide accelerator devices and share
 the scheduler's separate CPU concurrency limit.
 
+CPU numerical checks should state their input dtype and device. An independent
+FP64 math reference can check an FP32 candidate without relying on automatic
+SDPA backend selection. Keep output and gradient tolerances explicit; changing
+a reference does not justify loosening the candidate's error bounds.
+
 Multi-card tests must expose a plan derived from the same `nproc`, `world_size`,
 or parallel configuration used to launch their workers. A module, class, or
 fixture family may provide a shared plan. Parameterized tests resolve their

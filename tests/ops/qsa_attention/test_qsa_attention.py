@@ -23,6 +23,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import resolve_op
@@ -461,10 +462,10 @@ def test_torch_npu_pruned_gqa_output_gradients_and_saved_tensors(monkeypatch):
 
     monkeypatch.setattr(npu_qsa, "_forward", forward)
     monkeypatch.setattr(npu_qsa, "_backward", _npu_reference_backward)
-    q = torch.randn(2, 6, 257, 8, requires_grad=True)
-    k = torch.randn(2, 2, 769, 8, requires_grad=True)
+    q = torch.randn(2, 6, 257, 8, device="cpu", dtype=torch.float32, requires_grad=True)
+    k = torch.randn(2, 2, 769, 8, device="cpu", dtype=torch.float32, requires_grad=True)
     v = torch.randn_like(k, requires_grad=True)
-    indices = torch.randint(0, 127, (2, 257, 7))
+    indices = torch.randint(0, 127, (2, 257, 7), device=q.device)
     indices[:, 128:256] += 512
     indices[:, 0] = -1
     indices[:, -1] = -1
@@ -483,11 +484,25 @@ def test_torch_npu_pruned_gqa_output_gradients_and_saved_tensors(monkeypatch):
     assert calls == [128, 128, 1]  # Backward does not replay forward or gather KV.
     assert not any(dtype == torch.bool for dtype, _ in saved)
     allowed = ~npu_qsa._blocked_mask(indices, k.shape[2])
-    reference = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed, enable_gqa=True, scale=0.31)
-    expected = torch.autograd.grad(reference, (q, k, v), grad)
-    torch.testing.assert_close(result, reference, rtol=2e-5, atol=2e-6)
+    # Keep the candidate and its KV-gradient accumulation in FP32. The oracle
+    # uses independent FP64 leaves and explicit math SDPA, so CPU Flash kernel
+    # selection cannot change the reference arithmetic across CI hosts.
+    reference_inputs = tuple(tensor.detach().double().requires_grad_(True) for tensor in (q, k, v))
+    with sdpa_kernel(SDPBackend.MATH):
+        reference = F.scaled_dot_product_attention(*reference_inputs, attn_mask=allowed, enable_gqa=True, scale=0.31)
+        expected = torch.autograd.grad(reference, reference_inputs, grad.double())
+    diagnostics = (
+        f"CPU QSA oracle=FP64 math SDPA, candidate={q.device}/{q.dtype}, "
+        f"torch={torch.__version__}, cpu={torch.backends.cpu.get_cpu_capability()}, "
+        f"threads={torch.get_num_threads()}, matmul_precision={torch.get_float32_matmul_precision()}"
+    )
+
+    def message(detail):
+        return f"{detail}\n{diagnostics}"
+
+    torch.testing.assert_close(result.double(), reference, rtol=2e-5, atol=2e-6, msg=message)
     for actual, ref in zip(candidate, expected, strict=True):
-        torch.testing.assert_close(actual, ref, rtol=3e-5, atol=4e-6)
+        torch.testing.assert_close(actual.double(), ref, rtol=3e-5, atol=4e-6, msg=message)
     assert torch.count_nonzero(result[:, :, 0]) == 0
     assert torch.count_nonzero(result[:, :, -1]) == 0
 
