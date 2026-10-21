@@ -33,10 +33,11 @@ describe selections in `scripts/ci/accelerator/suites/gpu.json` and `npu.json`.
 | `tests/data/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
 | `tests/checkpoints/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
 | `tests/ops/` | whole directory in both GPU/NPU manifests (`suite: unit`) |
-| `tests/models/` | whole directory in both GPU/NPU manifests (`suite: unit`) |
+| `tests/models/` | unit selection in both manifests; GPU excludes `test_omni_fsdp.py`, NPU collects the whole directory |
 | `tests/parallel/context_parallel/` | whole directory, GPU manifest only (`suite: unit`) |
 | everything else | **one selection per file** in the appropriate GPU/NPU suite manifest |
 | `tests/e2e/test_e2e_parallel.py`, `tests/distributed/test_fsdp_equivalence.py` | GPU/NPU manifests (`suite: e2e`) |
+| `tests/models/test_omni_fsdp.py` | GPU manifest `59-e2e` (`suite: e2e`); NPU coverage remains in the models unit selection |
 
 Consequences that cut both ways:
 
