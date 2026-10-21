@@ -239,3 +239,27 @@ def test_offline_cache_step_writes_every_micro_batch_without_autograd():
     ]
     assert trainer.state.global_step == 1
     trainer.on_step_end.assert_called_once_with(loss=0.0, loss_dict={}, grad_norm=0.0)
+
+
+@pytest.mark.parametrize("num_micro_steps", [1, 2, 4])
+def test_forward_backward_step_averages_accumulated_gradients(num_micro_steps):
+    parameter = torch.nn.Parameter(torch.tensor(2.0))
+    trainer = object.__new__(OmniTrainer)
+    trainer.args = SimpleNamespace(train=SimpleNamespace(enable_batch_invariant_mode=False))
+    trainer.preforward = lambda batch: batch
+    trainer.model_fwd_context = nullcontext()
+    trainer.model_bwd_context = nullcontext()
+
+    def forward(batch):
+        loss = (parameter * batch["input"]).square()
+        return {"loss": loss, "losses": {"node": loss}}
+
+    trainer.model = SimpleNamespace(forward=forward)
+    inputs = torch.arange(1, num_micro_steps + 1, dtype=torch.float32)
+    reference = parameter.detach().clone().requires_grad_()
+    (reference * inputs).square().mean().backward()
+    for value in inputs:
+        loss, losses = trainer.forward_backward_step({"input": value}, num_micro_steps=num_micro_steps)
+        torch.testing.assert_close(loss.detach(), (parameter.detach() * value).square())
+        assert losses["node"] is loss
+    torch.testing.assert_close(parameter.grad, reference.grad)

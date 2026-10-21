@@ -120,6 +120,18 @@ about `1/S` of a full sample. The node runner is
 `veomni/models/seed_omni/accelerated/utils/executor.py::execute_train_node`, and
 the primitives are in `veomni/distributed/sequence_parallel/data.py`.
 
+## Cross-DP encoder balancing
+
+Token-wise SP slicing balances work within one SP group. Qwen3-VL additionally
+balances whole items across the module-local DP group before SP slicing and
+restores outputs after SP gather. `DataBalanceMixin` declares the item fields,
+costs and inverse output splits; full original token lengths remain the
+metering input. The legacy `Qwen3VLEncoderDataBalance` entry points use the same
+`ModuleDataBalancer` transport while retaining separate image/video slots and
+merged/deepstack output restoration. See
+[declarative encoder data balance](../module_data_balance.md) for the validated
+scope and remaining performance gates.
+
 ## 4. Correctness invariants
 
 **Gradients.** `gather_outputs` uses an autograd-aware gather: its backward

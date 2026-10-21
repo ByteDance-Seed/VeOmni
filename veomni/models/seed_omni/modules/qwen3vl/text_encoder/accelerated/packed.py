@@ -34,6 +34,7 @@ class PackedTrainingMixin:
         if packed_input_ids is None:
             raise ValueError("Qwen3-VL text encoder pack_encode: packed_input_ids is required.")
         input_ids = packed_input_ids.reshape(-1).to(device=self.device, non_blocking=True)
+        self.metric_meter_set_seqlens("pack_encode", [int(input_ids.numel())])
         if get_parallel_state().sp_size > 1:
             self._pack_sp_own_len = int(input_ids.size(0))
             input_ids = sp_pad(input_ids, dim=0, pad_value=0)
