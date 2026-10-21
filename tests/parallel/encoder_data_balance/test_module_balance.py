@@ -239,6 +239,9 @@ def test_qwen_video_cost_is_framewise_not_clip_squared():
     class Vision(BalanceMixin, MetricMeterMixin):
         config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
 
+        def estimate_flops(self, seqlens):
+            return float(sum(seqlens))
+
         def data_balance_pre(self, method, tensors, metadata):
             assert metadata["merged_lengths"] == [4]
             assert metadata["attention_costs"] == [8]
@@ -247,7 +250,8 @@ def test_qwen_video_cost_is_framewise_not_clip_squared():
 
     vision = Vision()
     vision._balance_vision_inputs("forward", torch.ones(16, 3), torch.tensor([[2, 2, 4]]))
-    assert vision.metric_meter_token_lengths("forward", {}) == [2, 2]
+    vision.metric_meter_add("forward")
+    assert vision.metric_meter_collect() == (4.0, [2, 2])
 
 
 def distributed_worker():
@@ -427,11 +431,11 @@ def qwen_vision_worker():
 
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
     from veomni.distributed.sequence_parallel import reduce_sequence_parallel_loss
-    from veomni.models.seed_omni.accelerator.executor import execute_train_node
+    from veomni.models.seed_omni.accelerated.utils.executor import execute_train_node
     from veomni.models.seed_omni.graphs.base import NodeDef
     from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated.accelerated import Qwen3VLVisionEncoderAccelerated
     from veomni.models.seed_omni.modules.qwen3vl.vision.configuration import Qwen3VLVisionEncoderConfig
-    from veomni.models.seed_omni.modules.qwen3vl.vision.processing import _OMNI_GRID, _SOURCE
+    from veomni.models.seed_omni.modules.qwen3vl.vision.processing import _OMNI_GRID
     from veomni.models.seed_omni.utils.conversation import ConversationItem
 
     rank = int(os.environ["LOCAL_RANK"])
@@ -462,7 +466,7 @@ def qwen_vision_worker():
                     "num_position_embeddings": 16,
                 }
             )
-            cfg._attn_implementation = "eager" if sp == 1 else "veomni_flash_attention_2_with_sp"
+            cfg._attn_implementation = "eager" if sp == 1 else "veomni_flash_attention_2"
             model = Qwen3VLVisionEncoderAccelerated(cfg).to(device=device, dtype=torch.bfloat16).train()
             fully_shard(model, mesh=ps.fsdp_mesh)
             owner = rank // sp
@@ -481,8 +485,8 @@ def qwen_vision_worker():
                             ConversationItem(
                                 type="video" if grid[0] > 1 else "image",
                                 value=pixel,
-                                role="user" if real_count else "dummy",
-                                source=_SOURCE,
+                                role="user",
+                                is_dummy=not real_count,
                                 meta={_OMNI_GRID: grid},
                             )
                             for pixel, grid in zip(pixels, grids)
@@ -509,7 +513,7 @@ def qwen_vision_worker():
                     if method == "forward":
                         for item in batch["conversation_list"][0]:
                             snapshots.append(item.value.detach().clone())
-                            if item.role == "dummy":
+                            if item.is_dummy:
                                 local_sum = local_sum + item.value.float().sum() * 0
                             else:
                                 logits = item.value.float()[:, :8]

@@ -9,28 +9,18 @@ those feature spans back to the image ``ConversationItem.value`` fields.
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn.functional import scaled_dot_product_attention
-
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
-
-from ....omni_pretrained_model import OmniPreTrainedModel
-from ....utils.conversation import ConversationItem, iter_desired_items
-from ..sources import BAGEL_SIGLIP_CONTEXT
-
-
-if IS_CUDA_AVAILABLE:
-    from flash_attn import flash_attn_varlen_func
-
-if IS_NPU_AVAILABLE:
-    import torch_npu
 from transformers.activations import ACT2FN
 
+from veomni.ops import VeomniOp
+
+from ....utils.conversation import ConversationItem, iter_desired_items
+from ...module_modeling_base import PretrainedOmniModule
+from ..sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig
 from .processing import _OMNI_POSITION_IDS, _OMNI_TOKEN_LEN, BagelSiglipNavitPreprocessor, BagelSiglipNavitProcessor
 
@@ -46,7 +36,7 @@ def select_siglip_image_items(
         iter_desired_items(
             conversation_list,
             types=["image"],
-            sources=[BAGEL_SIGLIP_CONTEXT],
+            meta={BAGEL_CONTEXT_KEY: [BAGEL_SIGLIP_CONTEXT]},
         )
     )
 
@@ -90,7 +80,7 @@ def scatter_siglip_image_embeds(
     lengths = token_lens.detach().cpu().reshape(-1).tolist()
     for item, length in zip(image_items, lengths, strict=True):
         item.value = image_embeds[offset : offset + int(length)].to(device=device, dtype=dtype)
-        item.source = BAGEL_SIGLIP_CONTEXT
+        item.meta[BAGEL_CONTEXT_KEY] = BAGEL_SIGLIP_CONTEXT
         offset += int(length)
 
     if offset != int(image_embeds.shape[0]):
@@ -100,7 +90,7 @@ def scatter_siglip_image_embeds(
 class InferenceMixin:
     """FSM ``generate`` — HF ``GenerationMixin`` analog.
 
-    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
+    Listed *before* :class:`~...module_modeling_base.PretrainedOmniModule` in
     :class:`BagelSiglipNavit`'s bases for consistency with every other
     module's native / accelerated split (see ``janus/llama/modeling.py`` for
     the full MRO rationale where a competing no-op default exists).
@@ -130,7 +120,7 @@ class InferenceMixin:
         return {"conversation_list": batched[0]}
 
 
-class BagelSiglipNavit(InferenceMixin, OmniPreTrainedModel):
+class BagelSiglipNavit(InferenceMixin, PretrainedOmniModule):
     config_class = BagelSiglipNavitConfig
     image_processor_class = BagelSiglipNavitProcessor
     preprocessor_class = BagelSiglipNavitPreprocessor
@@ -248,25 +238,6 @@ class RotaryEmbedding2D(nn.Module):
         return emb.cos(), emb.sin()
 
 
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.to(device=q.device, dtype=q.dtype).unsqueeze(1)
-    sin = sin.to(device=q.device, dtype=q.dtype).unsqueeze(1)
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
 class PositionEmbedding(nn.Module):
     def __init__(self, max_num_patch_per_side: int, hidden_size: int) -> None:
         super().__init__()
@@ -347,18 +318,8 @@ class BagelSiglipVisionEmbeddings(nn.Module):
         return patch_embeds + position_embeds.to(device=patch_embeds.device, dtype=patch_embeds.dtype)
 
 
-def _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=False):
-    num_seqs = cu_seqlens_q.shape[0] - 1
-    outputs = []
-    for i in range(num_seqs):
-        q_start, q_end = cu_seqlens_q[i].item(), cu_seqlens_q[i + 1].item()
-        k_start, k_end = cu_seqlens_k[i].item(), cu_seqlens_k[i + 1].item()
-        qi = q[q_start:q_end].transpose(0, 1).unsqueeze(0)
-        ki = k[k_start:k_end].transpose(0, 1).unsqueeze(0)
-        vi = v[k_start:k_end].transpose(0, 1).unsqueeze(0)
-        oi = scaled_dot_product_attention(qi, ki, vi, is_causal=causal)
-        outputs.append(oi.squeeze(0).transpose(0, 1))
-    return torch.cat(outputs, dim=0)
+def _is_flash_attention_impl(impl: str | None) -> bool:
+    return impl is not None and "flash_attention" in impl
 
 
 class BagelSiglipAttention(nn.Module):
@@ -367,10 +328,27 @@ class BagelSiglipAttention(nn.Module):
         self.config = config
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = False
         self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
         self.k_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
         self.v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
         self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
+
+        rope_impl = config.ops_implementation.get(
+            "rotary_pos_emb_vision_implementation",
+            config.ops_implementation.get("rotary_pos_emb_implementation", "eager"),
+        )
+        self.veomni_rope = VeomniOp("rope", "full", rope_impl)
+
+        attn_impl = config.ops_implementation.get(
+            "attn_implementation",
+            getattr(config, "_attn_implementation", None),
+        )
+        if not attn_impl or attn_impl == "eager":
+            attn_impl = "veomni_sdpa"
+        self.veomni_attn = VeomniOp("attention", "standard", attn_impl)
 
     def forward(
         self,
@@ -392,48 +370,55 @@ class BagelSiglipAttention(nn.Module):
                 raise ValueError("2D RoPE tensors are required when BagelSiglipNavitConfig.rope=True.")
             qh, qw = query_states[:, :, : self.head_dim // 2], query_states[:, :, self.head_dim // 2 :]
             kh, kw = key_states[:, :, : self.head_dim // 2], key_states[:, :, self.head_dim // 2 :]
-            qh, kh = _apply_rotary_pos_emb(qh, kh, cos_h, sin_h)
-            qw, kw = _apply_rotary_pos_emb(qw, kw, cos_w, sin_w)
+            cos_h = cos_h.to(device=query_states.device, dtype=query_states.dtype)
+            sin_h = sin_h.to(device=query_states.device, dtype=query_states.dtype)
+            cos_w = cos_w.to(device=query_states.device, dtype=query_states.dtype)
+            sin_w = sin_w.to(device=query_states.device, dtype=query_states.dtype)
+            qh, kh = self.veomni_rope(qh, kh, cos_h, sin_h)
+            qw, kw = self.veomni_rope(qw, kw, cos_w, sin_w)
             query_states = torch.cat([qh, qw], dim=-1)
             key_states = torch.cat([kh, kw], dim=-1)
 
-        if IS_CUDA_AVAILABLE:
-            attn_output = flash_attn_varlen_func(
-                query_states.to(torch.bfloat16),
-                key_states.to(torch.bfloat16),
-                value_states.to(torch.bfloat16),
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                causal=False,
+        query_states = query_states.to(torch.bfloat16).transpose(0, 1).unsqueeze(0)
+        key_states = key_states.to(torch.bfloat16).transpose(0, 1).unsqueeze(0)
+        value_states = value_states.to(torch.bfloat16).transpose(0, 1).unsqueeze(0)
+        dropout = 0.0 if not self.training else self.attention_dropout
+
+        if _is_flash_attention_impl(self.veomni_attn.impl):
+            attn_output, _ = self.veomni_attn(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=None,
+                scaling=self.scaling,
+                dropout=dropout,
+                cu_seq_lens_q=cu_seqlens,
+                cu_seq_lens_k=cu_seqlens,
+                max_length_q=max_seqlen,
+                max_length_k=max_seqlen,
+                is_causal=False,
+                skip_ulysses=True,
             )
         else:
-            if self.config._attn_implementation in ("flash_attention_2", "veomni_flash_attention_2_with_sp"):
-                attn_output = torch_npu.npu_fusion_attention(
-                    query_states.to(torch.bfloat16),
-                    key_states.to(torch.bfloat16),
-                    value_states.to(torch.bfloat16),
-                    query_states.shape[1],
-                    pse=None,
-                    atten_mask=None,
-                    scale=1.0 / math.sqrt(query_states.shape[-1]),
-                    keep_prob=1,
-                    input_layout="TND",
-                    actual_seq_qlen=tuple(cu_seqlens[1:].cpu().numpy().tolist()),
-                    actual_seq_kvlen=tuple(cu_seqlens[1:].cpu().numpy().tolist()),
+            lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+            splits = [torch.split(tensor, lengths, dim=2) for tensor in (query_states, key_states, value_states)]
+            attn_outputs = [
+                self.veomni_attn(
+                    self,
+                    q,
+                    k,
+                    v,
+                    attention_mask=None,
+                    scaling=self.scaling,
+                    dropout=dropout,
+                    is_causal=False,
+                    skip_ulysses=True,
                 )[0]
-            else:
-                attn_output = _sdpa_varlen_attn(
-                    query_states.to(torch.bfloat16),
-                    key_states.to(torch.bfloat16),
-                    value_states.to(torch.bfloat16),
-                    cu_seqlens,
-                    cu_seqlens,
-                    max_seqlen,
-                    max_seqlen,
-                    causal=False,
-                )
+                for q, k, v in zip(*splits, strict=True)
+            ]
+            attn_output = torch.cat(attn_outputs, dim=1)
+
         return self.out_proj(attn_output.reshape(total_q_len, -1).to(hidden_states.dtype))
 
 

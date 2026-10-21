@@ -1,24 +1,29 @@
+"""Adapted from https://github.com/MiniMax-AI/MiniMax-H3"""
+
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from veomni.distributed.sequence_parallel.async_ulysses_dit import _AsyncA2A
 from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
 from veomni.distributed.sequence_parallel.ulysses import (
     _all_to_all_single,
+    _AsyncA2A,
     _Gather,
 )
-from veomni.utils.device import IS_NPU_AVAILABLE
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 
-from .core import attention_forward, gradient_checkpoint_forward
-
-
-if IS_NPU_AVAILABLE:
-    from torch_npu import npu_rms_norm, npu_rotary_mul
+from .core import (
+    bind_minimax_attention,
+    is_flash_attn_impl,
+    is_sdpa_attn_impl,
+    minimax_attention,
+)
 
 
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
@@ -53,31 +58,18 @@ def unpack_audio(rows: torch.Tensor, audio_channel: int, steps: int, latent_dim:
     return rows.reshape(audio_channel, steps, latent_dim).permute(0, 2, 1).contiguous()
 
 
-class _ASCEND_RMSNorm(nn.RMSNorm):
-    def forward(self, x):
-        return npu_rms_norm(x, self.weight, epsilon=self.eps)[0]
+class VeomniRMSNorm(nn.Module):
+    """``rms_norm`` / ``standard``. Impl from ``rms_norm_implementation``, else eager."""
 
+    def __init__(self, size: int, *, eps: float):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(size))
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
 
-def _norm(size: int, *, eps: float) -> nn.RMSNorm:
-    if IS_NPU_AVAILABLE:
-        return _ASCEND_RMSNorm(size, eps=eps)
-    return nn.RMSNorm(size, eps=eps)
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = torch.chunk(x, 2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    # cos/sin are precomputed once per forward and shared across all blocks.
-    rot_dim = cos.shape[-1]
-    x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
-    if IS_NPU_AVAILABLE:
-        x_rot = npu_rotary_mul(x_rot, cos, sin, rotary_mode="half")
-    else:
-        x_rot = (x_rot * cos) + (_rotate_half(x_rot) * sin)
-    return torch.cat((x_rot, x_pass), dim=-1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the interned ``rms_norm`` handle."""
+        return self.veomni_rms_norm(x, self.weight, eps=self.eps)
 
 
 def _modulate_scale_shift(x, shift, scale, indices):
@@ -89,19 +81,27 @@ def _modulate_gate(x, gate, other, indices):
     return (x + gate.index_select(0, indices) * other).to(x.dtype)
 
 
-def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale):
-    out = torch.empty_like(q)
+class _PackedBounds(NamedTuple):
+    """Packed segment bounds as device ``int32`` tensor and host integers."""
+
+    device: torch.Tensor
+    host: tuple[int, ...]
+
+
+def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale, compatibility_mode=False):
+    # Zero uncovered SP rows so discarded outputs cannot poison parameter gradients.
+    out = torch.zeros_like(q)
     # Host-side segment bounds: the DiT / token-refiner entries convert the
     # cu_seqlens tensor once per forward and pass a tuple. Tensor fallback
     # keeps any external caller working (paying one sync).
-    bounds = tuple(cu_seqlens) if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
+    bounds = tuple(cu_seqlens.tolist()) if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
     for start, stop in zip(bounds[:-1], bounds[1:]):
         if stop == start:
             continue
         seg_q = q[start:stop].transpose(0, 1).unsqueeze(0)
         seg_k = k[start:stop].transpose(0, 1).unsqueeze(0)
         seg_v = v[start:stop].transpose(0, 1).unsqueeze(0)
-        seg_out = attention_forward(seg_q, seg_k, seg_v, scale=softmax_scale)
+        seg_out = nn.functional.scaled_dot_product_attention(seg_q, seg_k, seg_v, scale=softmax_scale)
         out[start:stop] = seg_out.squeeze(0).transpose(0, 1)
     return out
 
@@ -152,11 +152,105 @@ class MiniMaxH3Attention(nn.Module):
         inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
         self.qkv_proj = nn.Linear(hidden_size, inner_dim * 3, bias=False)
-        self.q_norm = _norm(attention_head_dim, eps=qk_norm_eps)
-        self.k_norm = _norm(attention_head_dim, eps=qk_norm_eps)
+        self.q_norm = VeomniRMSNorm(attention_head_dim, eps=qk_norm_eps)
+        self.k_norm = VeomniRMSNorm(attention_head_dim, eps=qk_norm_eps)
         self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
+        # Packed FA is bound later. FA3/FA4 cannot be constructed on NPU or pre-SM90.
+        impl = resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
+        if is_flash_attn_impl(impl):
+            impl = "veomni_sdpa"
+        bind_minimax_attention(self, is_causal=False, impl=impl)
+        # 3-axis rope is shorter than head_dim (96 vs 128 in production). q/k are [S, H, D].
+        self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
 
-    def forward(self, x, *, rope_cos, rope_sin, cu_seqlens, max_seqlen=None, use_ulysses=False):
+    def _run_packed_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | None,
+        valid_seqlen: int,
+    ) -> torch.Tensor:
+        """One FlashAttention varlen call over the packed multi-sample sequence."""
+        total = q.shape[0]
+        query = q[:valid_seqlen].unsqueeze(0).transpose(1, 2)
+        key = k[:valid_seqlen].unsqueeze(0).transpose(1, 2)
+        value = v[:valid_seqlen].unsqueeze(0).transpose(1, 2)
+        max_seqlen = valid_seqlen if max_seqlen is None else max_seqlen
+        if not isinstance(cu_seqlens, torch.Tensor):
+            cu_seqlens = torch.tensor(cu_seqlens, device=query.device, dtype=torch.int32)
+        cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32)
+        packed = minimax_attention(
+            self,
+            query,
+            key,
+            value,
+            scaling=self.softmax_scale,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+        )
+        packed = packed.squeeze(0).transpose(0, 1)
+        if packed.shape[0] == total:
+            return packed
+        # Zero uncovered SP rows so discarded outputs cannot poison parameter gradients.
+        out = q.new_zeros(total, q.shape[1], q.shape[2])
+        out[:valid_seqlen] = packed
+        return out
+
+    def _segment_attention(self, q, k, v, *, cu_seqlens, compatibility_mode=False):
+        """Attend inside each segment with the bound handle; SDPA when SDPA is bound or for packed compatibility."""
+        if compatibility_mode or is_sdpa_attn_impl(self.config._attn_implementation):
+            return _sdpa_varlen_attention(
+                q,
+                k,
+                v,
+                cu_seqlens=cu_seqlens,
+                softmax_scale=self.softmax_scale,
+                compatibility_mode=compatibility_mode,
+            )
+        bounds = tuple(cu_seqlens.tolist()) if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
+        # Zero uncovered SP rows so discarded outputs cannot poison parameter gradients.
+        out = torch.zeros_like(q)
+        for start, stop in zip(bounds[:-1], bounds[1:]):
+            if stop == start:
+                continue
+            segment = minimax_attention(
+                self,
+                q[start:stop].transpose(0, 1).unsqueeze(0),
+                k[start:stop].transpose(0, 1).unsqueeze(0),
+                v[start:stop].transpose(0, 1).unsqueeze(0),
+                scaling=self.softmax_scale,
+            )
+            out[start:stop] = segment.squeeze(0).transpose(0, 1)
+        return out
+
+    def _attention(self, q, k, v, *, cu_seqlens, max_seqlen, valid_seqlen):
+        """Varlen flash for packed multi-sample bounds, per-segment attention otherwise."""
+        packed_attention = isinstance(cu_seqlens, _PackedBounds)
+        if packed_attention and is_flash_attn_impl(self.config._attn_implementation):
+            return self._run_packed_attention(
+                q, k, v, cu_seqlens=cu_seqlens.device, max_seqlen=max_seqlen, valid_seqlen=valid_seqlen
+            )
+        return self._segment_attention(
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens.host if packed_attention else cu_seqlens,
+            compatibility_mode=packed_attention,
+        )
+
+    def forward(self, x, *, rope_cos, rope_sin, cu_seqlens, max_seqlen=None, valid_seqlen=None, use_ulysses=False):
+        if valid_seqlen is None:
+            if isinstance(cu_seqlens, _PackedBounds):
+                valid_seqlen = cu_seqlens.host[-1]
+            elif isinstance(cu_seqlens, tuple):
+                valid_seqlen = cu_seqlens[-1]
+            else:
+                valid_seqlen = x.shape[0]
         sp_group = get_ulysses_sequence_parallel_group() if use_ulysses else None
         total = x.shape[0]
         qkv = self.qkv_proj(x)
@@ -176,16 +270,21 @@ class MiniMaxH3Attention(nn.Module):
             out_blocks = []
             o_wait, o_prev = None, None
             for i, b in enumerate(blocks):
+                w_next = None
                 if i + 1 < nb:  # launch block i+1: transfers while block i computes
                     w_next = _all_to_all_single(blocks[i + 1], 1, 0, sp_group, async_op=True)
                 full = _AsyncA2A.apply(w, b, 1, 0, sp_group)  # [SEQ, 1, 3, d]: this rank's head of block i
                 q = self.q_norm(full[:, :, 0])
                 k = self.k_norm(full[:, :, 1])
                 if rope_cos is not None:
-                    q = _apply_rope(q, rope_cos, rope_sin)
-                    k = _apply_rope(k, rope_cos, rope_sin)
-                o = _sdpa_varlen_attention(
-                    q, k, full[:, :, 2], cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale
+                    q, k = self.veomni_rope(q, k, rope_cos, rope_sin)
+                o = self._attention(
+                    q,
+                    k,
+                    full[:, :, 2],
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    valid_seqlen=valid_seqlen,
                 )
                 if o_wait is not None:  # block i-1's inverse exchange finished during this sdpa
                     out_blocks.append(_AsyncA2A.apply(o_wait, o_prev, 0, 1, sp_group))
@@ -201,9 +300,8 @@ class MiniMaxH3Attention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
             if rope_cos is not None:
-                q = _apply_rope(q, rope_cos, rope_sin)
-                k = _apply_rope(k, rope_cos, rope_sin)
-            out = _sdpa_varlen_attention(q, k, v, cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale)
+                q, k = self.veomni_rope(q, k, rope_cos, rope_sin)
+            out = self._attention(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, valid_seqlen=valid_seqlen)
         out = out.reshape(total, self.num_heads * self.head_dim)
         return self.out_proj(out)
 
@@ -244,13 +342,20 @@ class MiniMaxH3AdalnProj(nn.Module):
 class MiniMaxH3TokenRefinerBlock(nn.Module):
     def __init__(self, hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, norm_eps, qk_norm_eps):
         super().__init__()
-        self.norm1 = _norm(hidden_size, eps=norm_eps)
-        self.norm2 = _norm(hidden_size, eps=norm_eps)
+        self.norm1 = VeomniRMSNorm(hidden_size, eps=norm_eps)
+        self.norm2 = VeomniRMSNorm(hidden_size, eps=norm_eps)
         self.attn = MiniMaxH3Attention(hidden_size, num_attention_heads, attention_head_dim, qk_norm_eps)
         self.mlp = MiniMaxH3MLP(hidden_size, ffn_hidden_size)
 
-    def forward(self, x, *, cu_seqlens, max_seqlen):
-        x = x + self.attn(self.norm1(x), rope_cos=None, rope_sin=None, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+    def forward(self, x, *, cu_seqlens, max_seqlen, valid_seqlen):
+        x = x + self.attn(
+            self.norm1(x),
+            rope_cos=None,
+            rope_sin=None,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            valid_seqlen=valid_seqlen,
+        )
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -276,11 +381,30 @@ class MiniMaxH3TokenRefiner(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.final_norm = _norm(hidden_size, eps=final_norm_eps)
+        self.final_norm = VeomniRMSNorm(hidden_size, eps=final_norm_eps)
 
-    def forward(self, x, *, cu_seqlens, max_seqlen):
+    def forward(self, x, *, cu_seqlens, max_seqlen, valid_seqlen=None, sample_local=False):
+        if sample_local and isinstance(cu_seqlens, _PackedBounds) and len(cu_seqlens.host) > 2:
+            bounds = cu_seqlens.host
+            segments = [(i, start, stop) for i, (start, stop) in enumerate(zip(bounds, bounds[1:])) if stop > start]
+            if len(segments) > 1:
+                # Small BF16 refiner GEMMs can change rounding with the row count.
+                # Keep them sample-local: pretrained main-DiT blocks amplify those
+                # differences. The much larger main-DiT sequence stays packed.
+                outputs = []
+                for index, start, stop in segments:
+                    length = stop - start
+                    # Device bounds via slicing the packed tensor: no host-to-device copy per sample.
+                    device_cu = cu_seqlens.device[index : index + 2] - cu_seqlens.device[index]
+                    local_cu = _PackedBounds(device_cu, (0, length))
+                    outputs.append(
+                        self.forward(x[start:stop], cu_seqlens=local_cu, max_seqlen=length, valid_seqlen=length)
+                    )
+                return torch.cat(outputs, dim=0)
+        if valid_seqlen is None:
+            valid_seqlen = x.shape[0]
         for block in self.blocks:
-            x = block(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            x = block(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, valid_seqlen=valid_seqlen)
         return self.final_norm(x)
 
 
@@ -297,15 +421,27 @@ class MiniMaxH3DiTBlock(nn.Module):
         qk_norm_eps,
     ):
         super().__init__()
-        self.norm1 = _norm(hidden_size, eps=norm_eps)
-        self.norm2 = _norm(hidden_size, eps=norm_eps)
+        self.norm1 = VeomniRMSNorm(hidden_size, eps=norm_eps)
+        self.norm2 = VeomniRMSNorm(hidden_size, eps=norm_eps)
         self.attn = MiniMaxH3Attention(hidden_size, num_attention_heads, attention_head_dim, qk_norm_eps)
         self.mlp = MiniMaxH3MLP(hidden_size, ffn_hidden_size)
         self.adaln_proj = MiniMaxH3AdalnProj(
             hidden_size, time_embed_dim, adaln_out_features, expand_ratio=6, modality_num=MINIMAX_H3_ADALN_MODALITY_NUM
         )
 
-    def forward(self, x, *, t_emb, combined_indices, rope_cos, rope_sin, cu_seqlens, max_seqlen, use_ulysses=False):
+    def forward(
+        self,
+        x,
+        *,
+        t_emb,
+        combined_indices,
+        rope_cos,
+        rope_sin,
+        cu_seqlens,
+        max_seqlen,
+        valid_seqlen,
+        use_ulysses=False,
+    ):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
         residual = x
         h = self.norm1(x)
@@ -316,6 +452,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             rope_sin=rope_sin,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            valid_seqlen=valid_seqlen,
             use_ulysses=use_ulysses,
         )
         x = _modulate_gate(residual, gate_msa, h, combined_indices)
@@ -340,7 +477,7 @@ class MiniMaxH3FinalLayer(nn.Module):
     ):
         super().__init__()
         video_patch_dim = latents_dim * patch_size[0] * patch_size[1] * patch_size[2]
-        self.norm = _norm(hidden_size, eps=final_norm_eps)
+        self.norm = VeomniRMSNorm(hidden_size, eps=final_norm_eps)
         self.adaln_proj = MiniMaxH3AdalnProj(
             hidden_size, time_embed_dim, final_adaln_out_features, expand_ratio=2, modality_num=1
         )
@@ -384,6 +521,10 @@ class MiniMaxH3DiT(nn.Module):
     ):
         super().__init__()
         self._block_offload_enabled = False
+        # HF's marker: ``gradient_checkpointing_enable()`` walks ``modules()`` and writes both
+        # this flag and ``_gradient_checkpointing_func`` here, so the block loop below reads the
+        # run's setting and the policy's per-block decisions without owning a strategy itself.
+        self.gradient_checkpointing = False
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_channels_latents = latents_dim
@@ -464,6 +605,7 @@ class MiniMaxH3DiT(nn.Module):
         text_pos,
         refiner_cu_seqlens,
         refiner_max_seqlen,
+        packed_batch,
         seq_len,
         device,
     ):
@@ -474,7 +616,13 @@ class MiniMaxH3DiT(nn.Module):
         audio_embed = self.audio_patch_proj(audio_rows)
         text_rows = text_embeddings_selected.to(device=device)
         text_embed = self.condition_proj(text_rows)
-        text_embed = self.token_refiner(text_embed, cu_seqlens=refiner_cu_seqlens, max_seqlen=refiner_max_seqlen)
+        text_embed = self.token_refiner(
+            text_embed,
+            cu_seqlens=refiner_cu_seqlens,
+            max_seqlen=refiner_max_seqlen,
+            valid_seqlen=text_embed.shape[0],
+            sample_local=packed_batch,
+        )
 
         embeddings = torch.zeros((seq_len, self.hidden_size), device=device, dtype=dtype)
         embeddings[text_pos] = text_embed.to(dtype)[: text_pos.shape[0]]
@@ -500,10 +648,9 @@ class MiniMaxH3DiT(nn.Module):
         img_pos_for_infer_output_info,
         packed_seq_params,
         refiner_packed_seq_params,
-        use_gradient_checkpointing=False,
-        use_gradient_checkpointing_offload=False,
         update_audio_mask=None,
         skip_mask_out_condition=False,
+        packed_batch=False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inverse_indices = inverse_indices.view(-1).to(torch.long)
         token_tags = token_tags.view(-1).to(torch.long)
@@ -522,11 +669,16 @@ class MiniMaxH3DiT(nn.Module):
         sp_group = get_ulysses_sequence_parallel_group()
         sp_world = dist.get_world_size(sp_group) if sp_group is not None else 1
         sp_rank = dist.get_rank(sp_group) if sp_group is not None else 0
+        if packed_batch and (sp_world != 1 or self._block_offload_enabled):
+            raise ValueError("H3 multi-sample packing does not support sequence parallelism or block offload.")
 
         cu_seqlens = packed_seq_params["cu_seqlens_q"].to(torch.int32)
         max_seqlen = int(packed_seq_params["max_seqlen_q"])
         refiner_cu = refiner_packed_seq_params["cu_seqlens_q"].to(torch.int32)
         refiner_max = int(refiner_packed_seq_params["max_seqlen_q"])
+        # Host bounds come from packing/conditioning; reading the device tensor is only a fallback.
+        cu_host = packed_seq_params.get("cu_seqlens_host") or tuple(cu_seqlens.tolist())
+        refiner_host = refiner_packed_seq_params.get("cu_seqlens_host") or tuple(refiner_cu.tolist())
 
         if x.dim() != 3 or x.shape[0] != 1:
             raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
@@ -555,8 +707,9 @@ class MiniMaxH3DiT(nn.Module):
             img_pos=img_pos.to(device),
             audio_pos=audio_pos.to(device),
             text_pos=text_pos.to(device),
-            refiner_cu_seqlens=tuple(refiner_cu.to(device).tolist()),
+            refiner_cu_seqlens=_PackedBounds(refiner_cu.to(device), refiner_host) if packed_batch else refiner_host,
             refiner_max_seqlen=refiner_max,
+            packed_batch=packed_batch,
             seq_len=padded_seq_len,
             device=device,
         )
@@ -570,10 +723,9 @@ class MiniMaxH3DiT(nn.Module):
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
         inverse_indices = inverse_indices.to(device)
 
-        # cos/sin are shared across all blocks; compute once instead of per q/k
-        # in _apply_rope. Same fp32 inputs, same ops: bit-identical results.
-        rope_cos = torch.cos(rope_freqs).to(decoder_input.dtype).unsqueeze(1)
-        rope_sin = torch.sin(rope_freqs).to(decoder_input.dtype).unsqueeze(1)
+        # Shared [S, rotary_dim] tables. Attention's partial RoPE unsqueezes the head axis.
+        rope_cos = torch.cos(rope_freqs).to(decoder_input.dtype)
+        rope_sin = torch.sin(rope_freqs).to(decoder_input.dtype)
 
         if sp_world > 1:
             decoder_input = decoder_input.narrow(0, unit * sp_rank, unit)
@@ -581,15 +733,25 @@ class MiniMaxH3DiT(nn.Module):
             inverse_indices = inverse_indices.narrow(0, unit * sp_rank, unit)
 
         hidden = decoder_input
-        cu_seqlens = cu_seqlens.to(device)
-        # Single device→host sync per forward: segment bounds shared across
-        # every block instead of one tolist() per attention module. Bounds stay
+        # Host bounds were read once above and are shared by every block. Bounds stay
         # at the ORIGINAL seq_len: the per-segment SDPA is non-causal, so an
         # extended bound would leak pad keys into the last real rows. Pad rows
-        # fall outside every segment and are dropped by the index_select below
-        # (their uninitialized attention output never reaches the loss).
-        cu_bounds = tuple(cu_seqlens.tolist())
+        # fall outside every segment, have zero attention output, and are
+        # dropped by the index_select below.
+        cu_seqlens = _PackedBounds(cu_seqlens.to(device), cu_host) if packed_batch else cu_host
         block_swap = self._block_swap if self._block_offload_enabled else 0
+        # Every block takes the same arguments; only the recompute decision differs, and
+        # the bound policy folds that into ``self._gradient_checkpointing_func``.
+        block_kwargs = {
+            "t_emb": t_emb,
+            "combined_indices": combined_indices,
+            "rope_cos": rope_cos,
+            "rope_sin": rope_sin,
+            "cu_seqlens": cu_seqlens,
+            "max_seqlen": max_seqlen,
+            "valid_seqlen": seq_len,
+            "use_ulysses": sp_world > 1,
+        }
         for i, block in enumerate(self.blocks):
             if self._block_offload_enabled:
                 if i == 0:
@@ -600,19 +762,10 @@ class MiniMaxH3DiT(nn.Module):
                         b.to("cpu")
                     for b in self.blocks[block_swap:]:
                         b.to(device)
-            hidden = gradient_checkpoint_forward(
-                block,
-                use_gradient_checkpointing,
-                use_gradient_checkpointing_offload,
-                hidden,
-                t_emb=t_emb,
-                combined_indices=combined_indices,
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
-                cu_seqlens=cu_bounds,
-                max_seqlen=max_seqlen,
-                use_ulysses=sp_world > 1,
-            )
+            if self.gradient_checkpointing:
+                hidden = self._gradient_checkpointing_func(block, hidden, **block_kwargs)
+            else:
+                hidden = block(hidden, **block_kwargs)
 
         if self._block_offload_enabled:
             for b in self.blocks[block_swap:]:
@@ -623,11 +776,14 @@ class MiniMaxH3DiT(nn.Module):
         if sp_group is not None:
             # Rebuild the full packed sequence so the output position
             # index_select / update_mask below see the original layout. The
-            # backward splits without all-reduce (grad_scale=False,
-            # sum_grad=False): the downstream loss is replicated across the SP
-            # ranks, so a sum would multiply the gradient by the SP world size.
-            video_logits = _Gather.apply(sp_group, video_logits, 0, False, False)
-            audio_logits = _Gather.apply(sp_group, audio_logits, 0, False, False)
+            # downstream loss is replicated across the SP ranks, so the
+            # backward keeps this rank's slice of the full gradient without an
+            # all-reduce (sum_grad=False). The data-parallel gradient reduction
+            # (FSDP2 over dp_shard_sp, DDP over dp_sp) also averages over the
+            # SP ranks, so the slice is scaled by the SP world size
+            # (grad_scale=True) to compensate.
+            video_logits = _Gather.apply(sp_group, video_logits, 0, True, False)
+            audio_logits = _Gather.apply(sp_group, audio_logits, 0, True, False)
 
         video_logits = video_logits.index_select(0, infer_out_pos.to(device))
         audio_logits = audio_logits.index_select(0, audio_pos.to(device))

@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Transformer modeling that calls local ``VeomniOp`` handles.
+
+Importing this package registers the models listed below on the
+``models`` registries. Add the next model here when it is ready.
+"""
+
 from . import (
     deepseek_v3,
     deepseek_v4,
@@ -32,6 +38,7 @@ from . import (
     qwen3_omni_moe,
     qwen3_vl,
     qwen3_vl_moe,
+    qwen4_exp,
     seed_oss,
     wan,
 )
@@ -42,6 +49,7 @@ __all__ = [
     "deepseek_v4",
     "flux",
     "gemma3",
+    "glm_moe_dsa",
     "gpt_oss",
     "llama",
     "movqgan",
@@ -54,9 +62,9 @@ __all__ = [
     "qwen3_5_moe",
     "qwen3_moe",
     "qwen3_omni_moe",
-    "seed_oss",
-    "wan",
     "qwen3_vl",
     "qwen3_vl_moe",
-    "glm_moe_dsa",
+    "qwen4_exp",
+    "seed_oss",
+    "wan",
 ]

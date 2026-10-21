@@ -1,9 +1,9 @@
 """Configuration for BAGEL's latent VAE module."""
 
-from transformers import PretrainedConfig
+from ...module_configuration_base import OmniModuleConfig
 
 
-class BagelVAEConfig(PretrainedConfig):
+class BagelVAEConfig(OmniModuleConfig):
     """BAGEL FLUX-style latent autoencoder config."""
 
     model_type = "bagel_vae"

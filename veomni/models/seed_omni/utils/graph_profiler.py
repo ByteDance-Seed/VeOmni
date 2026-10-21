@@ -28,7 +28,7 @@ from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_torch_devi
 
 
 if TYPE_CHECKING:
-    from ....arguments import OmniGraphProfileArguments
+    from ....arguments.omni_arguments_types import OmniGraphProfileArguments
 
 
 class GraphProfiler:

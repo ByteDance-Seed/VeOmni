@@ -1,17 +1,17 @@
-# VeOmni training / inference config for OmniModel V2 — Qwen3-VL-2B-Instruct.
+# VeOmni training / inference config for OmniModel — Qwen3-VL-2B-Instruct.
 #
 # Launch training (text + image + video understanding SFT):
 #   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml
 #
 # Launch inference (image/video understanding):
 #   python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml \
-#     --infer.image /path/to/image.jpg \
+#     --infer.images /path/to/image.jpg \
 #     --infer.prompt "What is in this image?" \
 #     --infer.output_dir qwen3vl_out
 #
 # Prerequisite — split the upstream Qwen3-VL checkpoint:
-#   python scripts/convert_model.py \
-#     --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-VL-2B-Instruct \
+#   python scripts/seed_omni/convert_model.py \
+#     --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-VL-2B-Instruct \
 #     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct
 #
 # Produces three module sub-folders (qwen3vl_vision / qwen3vl_text_encoder /

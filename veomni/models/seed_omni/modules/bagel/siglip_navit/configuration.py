@@ -2,10 +2,10 @@
 
 from typing import List, Optional
 
-from transformers import PretrainedConfig
+from ...module_configuration_base import OmniModuleConfig
 
 
-class BagelSiglipNavitConfig(PretrainedConfig):
+class BagelSiglipNavitConfig(OmniModuleConfig):
     """BAGEL SigLIP NaViT vision encoder config."""
 
     model_type = "bagel_siglip_navit"

@@ -28,10 +28,15 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
 from ..arguments import MixedPrecisionConfig
+from ..arguments.arguments_types import validate_low_precision_reduce_scatter_comm
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
-from ..utils import logging
+from ..utils import logging, recompute_utils
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
+from .fsdp2.reduce_scatter import (
+    ReduceScatterTransportPolicy,
+    register_fp32_reduce_scatter_with_low_precision_transport,
+)
 from .parallel_plan import ParallelPlan, get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
 from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_runtime
@@ -93,7 +98,7 @@ def _has_extra_parallel_plan(model: nn.Module) -> bool:
     The question both ExtraParallel guards below actually need to ask. A plan is
     a property of the *model*, unlike ``ParallelState.any_extra_parallel_enabled``,
     which only says an ep dim exists in the mesh — and a mesh dim is inherited by
-    every sub-module of a SeedOmni V2 config, including the ones that have no
+    every sub-module of a SeedOmni config, including the ones that have no
     experts.
     """
     plan = get_runtime_parallel_plan(model)
@@ -236,7 +241,7 @@ def _materialize_and_load_weights(
         else:
             if ep_sharded_stream_load:
                 # The flag is set once for a whole run, but this helper runs once
-                # per model -- once per OmniModule under SeedOmni V2 -- and a model
+                # per model -- once per OmniModule under SeedOmni -- and a model
                 # with no ExtraParallel plan (vision encoder, VAE, connector) has
                 # no expert tensors to stream. Skipping is not a silent degrade:
                 # there was never a fast path to take here, and refusing instead
@@ -364,8 +369,8 @@ def _is_fsdp_wrap_target(fqn: str, class_name: str, targets: Collection[str]) ->
     ``fqn.startswith(prefix + ".")``.
 
     Scoping exists because a class name alone is ambiguous on a composed model.
-    ``Embedding`` is a legitimate wrap unit under the text encoder (whose tied
-    head gathers the weight explicitly), but wrapping the same class under the
+    ``Embedding`` is a legitimate wrap unit under a child that reads the weight
+    only through the embedding's own forward, but wrapping the same class under the
     VQVAE makes ``JanusVQVAEVectorQuantizer.forward`` read a sharded codebook —
     it touches ``self.embedding.weight`` directly, never through the
     embedding's own ``__call__``, so no unshard hook fires.
@@ -383,6 +388,20 @@ def _is_fsdp_wrap_target(fqn: str, class_name: str, targets: Collection[str]) ->
     return False
 
 
+def _configure_fsdp_gradient_reduction(
+    module: FSDPModule,
+    *,
+    gradient_divide_factor: float,
+    use_low_precision_transport: bool,
+    transport_reduction_scales: dict[nn.Module, float],
+) -> None:
+    if use_low_precision_transport:
+        transport_reduction_scales[module] = 1.0 / gradient_divide_factor
+    else:
+        # Singleton, cross-node and unknown-placement groups keep native scaling.
+        module.set_gradient_divide_factor(gradient_divide_factor)
+
+
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str | Mapping[str, str]] = None,
@@ -390,6 +409,7 @@ def parallelize_model_fsdp2(
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
+    low_precision_reduce_scatter_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
@@ -418,6 +438,15 @@ def parallelize_model_fsdp2(
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
     parallel_state = get_parallel_state()
+
+    use_low_precision_transport = validate_low_precision_reduce_scatter_comm(
+        low_precision_reduce_scatter_comm, mixed_precision
+    )
+    if use_low_precision_transport:
+        if get_device_type() != "cuda":
+            raise RuntimeError("Low-precision ReduceScatter transport is only supported on CUDA/NCCL.")
+    elif low_precision_reduce_scatter_comm:
+        logger.info_rank0("Parameter dtype matches reduce dtype; using the native PyTorch collective.")
 
     model_no_split_modules = getattr(model, "_no_split_modules", None) or []
     target_classes = set(model_no_split_modules) | set(basic_modules or [])
@@ -455,6 +484,36 @@ def parallelize_model_fsdp2(
         fqn2spec_info = parallel_plan.apply(model, parallel_state.extra_parallel_fsdp_device_mesh)
 
         model._fqn2spec_info = fqn2spec_info
+        persistent_extra_parallel_params = {
+            param
+            for fqn, param in model.named_parameters()
+            if fqn2spec_info[fqn].persistent_fsdp_shard_dim is not None
+        }
+        persistent_para_names = {
+            spec_info.para_name
+            for spec_info in fqn2spec_info.values()
+            if spec_info.persistent_fsdp_shard_dim is not None
+        }
+        if persistent_extra_parallel_params:
+            if parallel_state.dp_replicate_enabled:
+                raise NotImplementedError("Persistent ExtraParallel parameters do not support HSDP replicas yet.")
+            for para in persistent_para_names:
+                para_mesh = parallel_state.extra_parallel_fsdp_device_mesh[para]
+                flat_mesh = parallel_state.extra_parallel_flat_device_mesh[para]
+                if (
+                    para_mesh is None
+                    or para_mesh.ndim != 2
+                    or para_mesh.size() != parallel_state.world_size
+                    or flat_mesh is None
+                ):
+                    raise NotImplementedError(
+                        f"Persistent {para} parameters currently require a 2D ({para}_fsdp, {para}) mesh "
+                        "covering the complete world."
+                    )
+                logger.info_rank0(
+                    f"Persistent {para} 2D layout: rows={para_mesh.size(1)} ({para}), "
+                    f"columns={para_mesh.size(0)} ({para}_fsdp); parameter all-gather is disabled."
+                )
         _extra_parallel_mesh = {}
         _extra_parallel_map = {}
         for para in parallel_state.extra_parallel_names:
@@ -480,6 +539,8 @@ def parallelize_model_fsdp2(
     else:
         parallel_plan = None
         fqn2spec_info = None
+        persistent_extra_parallel_params = set()
+        persistent_para_names = set()
         _extra_parallel_mesh = None
         _extra_parallel_map = None
 
@@ -551,6 +612,11 @@ def parallelize_model_fsdp2(
         "reshard_after_forward": enable_reshard_after_forward,
         "shard_placement_fn": _veomni_shard_placement_fn,
     }
+    if persistent_extra_parallel_params:
+        # These params already carry their complete 2D DTensor placement. Every
+        # ancestor FSDP group must ignore them or the parent layer/root would
+        # absorb them and reintroduce a parameter all-gather.
+        fsdp_kwargs["ignored_params"] = persistent_extra_parallel_params
     # prepare mp_policy kwargs
     if mixed_precision.enable:
         mp_policy = MixedPrecisionPolicy(
@@ -565,6 +631,11 @@ def parallelize_model_fsdp2(
     offload_pin_memory = kwargs.pop("fsdp_offload_pin_memory", True)
     model._fsdp_cpu_offload_enabled = enable_fsdp_cpu_offload
     if enable_fsdp_cpu_offload:
+        if persistent_extra_parallel_params:
+            raise NotImplementedError(
+                "FSDP CPU offload is not supported with persistent ExtraParallel parameters: "
+                "FSDP does not manage or stage ignored parameters."
+            )
         logger.info_rank0("Enable FSDP2 CPU offload for parameters, gradients, and optimizer states.")
         # ``CPUOffloadPolicy`` defaults to ``pin_memory=True``: the offloaded CPU
         # param shards are page-locked, which (a) is accounted as non-reclaimable
@@ -653,7 +724,7 @@ def parallelize_model_fsdp2(
     # TODO(https://github.com/ByteDance-Seed/VeOmni/issues/241):
     # NPU is missing PreSumMul ReduceOp. Need to remove this condition after the issue is resolved.
     if IS_NPU_AVAILABLE and parallel_state.any_extra_parallel_enabled:
-        from veomni.ops.platform.npu import apply_hccl_premul_sum_patch
+        from .hccl_premul_sum import apply_hccl_premul_sum_patch
 
         apply_hccl_premul_sum_patch()
 
@@ -661,6 +732,18 @@ def parallelize_model_fsdp2(
     #   e.g. sorted_fqn_list = ['decoder.embed_tokens', 'embed_tokens', 'decoder']
     sorted_fqn_list = sort_fqn_by_submodule_first(list(layer_pairs.keys()))
     layer_pairs_list = [(fqn, layer_pairs[fqn]) for fqn in sorted_fqn_list]
+    if use_low_precision_transport:
+        transport_reduction_scales = {}
+        transport_policy = ReduceScatterTransportPolicy()
+        fsdp_transport_enabled = transport_policy.can_use(parallel_state.fsdp_mesh)
+        extra_parallel_transport_enabled = {
+            para: transport_policy.can_use(para_kwargs["mesh"])
+            for para, para_kwargs in extra_parallel_fsdp_kwargs.items()
+            if para_kwargs is not None
+        }
+        fsdp_reduction_scale = 1.0 / parallel_state.fsdp_mesh.size()
+    else:
+        transport_reduction_scales = None
 
     for layer_fqn, (layer_mod, extra_parallel_mod) in layer_pairs_list:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
@@ -675,6 +758,11 @@ def parallelize_model_fsdp2(
             for _para_mod in extra_parallel_mod[para]:
                 if isinstance(_para_mod, FSDPModule):
                     continue
+                if any(param in persistent_extra_parallel_params for param in _para_mod.parameters()):
+                    # Persistent params remain on the complete 2D mesh. Any
+                    # non-persistent siblings are picked up by the enclosing
+                    # decoder/root FSDP group through the normal bottom-up walk.
+                    continue
                 # shard para module (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens)
                 fully_shard(_para_mod, **extra_parallel_fsdp_kwargs[para])
                 # average para (e.g. ep) grads across para (e.g. ep) ranks
@@ -686,9 +774,15 @@ def parallelize_model_fsdp2(
                 if IS_NPU_AVAILABLE:
                     # NPU is using torch 2.7
                     _para_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
-                else:
-                    # from torch 2.8
+                elif transport_reduction_scales is None:
                     _para_mod.set_gradient_divide_factor(gradient_divide_factor)
+                else:
+                    _configure_fsdp_gradient_reduction(
+                        _para_mod,
+                        gradient_divide_factor=gradient_divide_factor,
+                        use_low_precision_transport=extra_parallel_transport_enabled[para],
+                        transport_reduction_scales=transport_reduction_scales,
+                    )
                 layer_mod._fsdp_modules.append(_para_mod)
 
         # shard module that needs to ignore mixed precision control
@@ -696,6 +790,8 @@ def parallelize_model_fsdp2(
             for sub_mod in layer_mod.modules():
                 if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
                     fully_shard(sub_mod, **fsdp_kwargs_without_mp)
+                    # Keep these modules off transport_reduction_scales: their genuine FP32
+                    # gradients need native FP32 communication, not a lossy wire cast.
                     layer_mod._fsdp_modules.append(sub_mod)
 
         # Shard everything else in the module:
@@ -706,6 +802,8 @@ def parallelize_model_fsdp2(
         #      no need to shard layer_mod again.
         if not isinstance(layer_mod, FSDPModule):
             fully_shard(layer_mod, **fsdp_kwargs)
+            if transport_reduction_scales is not None and fsdp_transport_enabled:
+                transport_reduction_scales[layer_mod] = fsdp_reduction_scale
             layer_mod._fsdp_modules.append(layer_mod)
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
 
@@ -720,6 +818,25 @@ def parallelize_model_fsdp2(
     # above pass `reshard_after_forward` explicitly).
     root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
     fully_shard(model, **root_fsdp_kwargs)
+    # Persistent ExtraParallel parameters are ignored by every FSDP group and
+    # retain their original 2D DTensor identity. Record them after wrapping so
+    # gradient clipping can reduce their unique local shards once over the
+    # flattened 2D mesh instead of traversing the two mesh axes separately.
+    model._persistent_extra_parallel_param_ids = {id(param) for param in persistent_extra_parallel_params}
+
+    if use_low_precision_transport:
+        assert transport_reduction_scales is not None
+        if fsdp_transport_enabled:
+            transport_reduction_scales[model] = fsdp_reduction_scale
+        registered = register_fp32_reduce_scatter_with_low_precision_transport(
+            model,
+            transport_dtype=getattr(torch, mixed_precision.param_dtype),
+            reduction_scales=transport_reduction_scales,
+        )
+        logger.info_rank0(
+            f"Registered {mixed_precision.param_dtype} ReduceScatter transport with FP32 output on "
+            f"{registered} FSDP module{'s' if registered != 1 else ''}."
+        )
 
     # configure manual prefetching when needed
     need_manual_prefetch = (
@@ -788,7 +905,8 @@ def parallelize_model_ddp(
     does either — ``build_model`` returns an empty model and ``BaseTrainer`` has
     no load step of its own — so the wrap used to reach DDP's constructor with
     meta parameters and die there on ``Tensor.item()``. A model that arrives with
-    real weights already loaded must not be touched here.
+    real weights already loaded must not be touched here. A model with no
+    parameter that requires grad is loaded but returned unwrapped.
     """
     parallel_state = get_parallel_state()
 
@@ -796,7 +914,7 @@ def parallelize_model_ddp(
     # DDP module's experts are whole. Refuse rather than load full tensors into a
     # model whose plan says they are sharded -- until now the meta crash below hid
     # this combination. Keyed on the model's plan, not on
-    # ``any_extra_parallel_enabled``: a SeedOmni V2 sub-module inherits the global
+    # ``any_extra_parallel_enabled``: a SeedOmni sub-module inherits the global
     # accelerator's ep dim whether or not it owns any experts, so the mesh alone
     # would refuse a plan-less DDP vision tower that is perfectly fine.
     if parallel_state.any_extra_parallel_enabled and _has_extra_parallel_plan(model):
@@ -839,36 +957,18 @@ def parallelize_model_ddp(
                 f"{unmaterialized[:5]}{'...' if len(unmaterialized) > 5 else ''}"
             )
 
-    # PyTorch DDP rejects modules with zero trainable params. Fully-frozen
-    # encoders (e.g. Seedream offline_cache OE/ViT/VAE under ``no_grad``) still
-    # need the meta→device materialize + weight load above; skip the DDP wrap
-    # and return the bare replica (FSDP2 path already accepts all-frozen).
-    if not any(p.requires_grad for p in model.parameters()):
-        logger.info_rank0(
-            f"Skipping DDP wrap for fully-frozen module {type(model).__name__} (no trainable parameters)."
-        )
+    # DDP's constructor rejects a module with no parameter that requires grad,
+    # and a frozen replica (e.g. every encoder of an ``offline_embedding`` run)
+    # has no gradient to all-reduce. Its weights are loaded above; skip the wrap.
+    if not any(param.requires_grad for param in model.parameters()):
+        logger.info_rank0("No parameter requires grad: loaded the weights without a DDP wrap.")
         return model
 
-    # ``broadcast_buffers=False`` to match the FSDP2 path, which is the same
-    # replication story: ``ParallelState.fsdp_mesh`` treats DDP as HSDP with a
-    # single ``dp_replicate`` dim, and ``fully_shard`` syncs no buffers at all
-    # (torch's FSDP has no ``_sync_module_states`` equivalent), so a module's
-    # buffer behaviour must not depend on which ``dp_mode`` the config picked.
-    #
-    # Nothing is lost by not broadcasting. Config-derived buffers are already
-    # per-rank correct: a static rope table is identical everywhere, and
-    # dynamic-rope ``inv_freq`` is recomputed from *this* rank's sequence length,
-    # so pushing rank0's copy would actively corrupt the others. Genuinely
-    # replicated mutable state — ``nn.BatchNorm*`` running stats — is NOT fixed by
-    # this broadcast either: it overwrites every rank with rank0's copy, i.e.
-    # discards the other ranks' statistics, and it would break any module owning
-    # more than one graph node, because ``call_graph_endpoint`` enters the wrapper
-    # once per node and the in-place pre-forward ``copy_`` then hits a buffer the
-    # first node's autograd graph saved for backward (PyTorch #22095 / #66504).
-    # ``SyncBatchNorm`` is the one real fix — it all-reduces the statistics inside
-    # forward — and it works identically under DDP, FSDP2 and HSDP.
-    #
-    # See constraint 7e in `.agents/knowledge/constraints.md`.
+    # ``broadcast_buffers=False`` because FSDP2 syncs no buffers at all, and a
+    # module's buffer semantics must not change with the ``fsdp_mode`` a config
+    # happened to pick. Nothing is lost: rank0's copy is either identical to the
+    # others or, for dynamic-rope ``inv_freq``, wrong for them. See constraint 7a
+    # in `.agents/knowledge/constraints.md`.
     return DDP(
         model,
         device_ids=[parallel_state.local_rank],
@@ -885,7 +985,9 @@ def build_parallelize_model(
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
+    recompute_policy: Optional[recompute_utils.RecomputePolicy] = None,
     muon_expert_zero_comm: bool = False,
+    low_precision_reduce_scatter_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
@@ -900,8 +1002,15 @@ def build_parallelize_model(
             module's path; the composed wrap passes one path per child.
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
+        recompute_policy: Per-block recomputation strategy, bound after HF has
+            enabled gradient checkpointing and before FSDP2 shards the blocks.
     """
     parallel_state = get_parallel_state()
+    if low_precision_reduce_scatter_comm is not False:
+        # Only literal False bypasses validation; false-like non-booleans must still raise.
+        validate_low_precision_reduce_scatter_comm(
+            low_precision_reduce_scatter_comm, mixed_precision, fsdp_mode=parallel_state.dp_mode
+        )
     compile_config = compile_config or CompileConfig()
 
     if not parallel_state.fsdp_enabled:
@@ -918,9 +1027,20 @@ def build_parallelize_model(
         if use_reentrant:
             torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
 
+        # The entry points the policy does not bind keep whatever HF is given here,
+        # so the run's own recompute context has to be in it — otherwise a module
+        # whose blocks are not selected would recompute outside its scoping.
+        recompute_context_fn = kwargs.pop("recompute_context_fn", None)
+        if recompute_context_fn is None and recompute_policy is not None:
+            recompute_context_fn = recompute_utils.recompute_context_fn(recompute_policy.recompute_context)
+        if use_reentrant:
+            # ``checkpoint`` rejects any other ``context_fn`` when reentrant, and
+            # reentrant recomputation never enters one anyway.
+            recompute_context_fn = None
+
         gradient_checkpointing_kwargs = {
             "use_reentrant": use_reentrant,
-            "context_fn": kwargs.pop("recompute_context_fn", noop_context_fn),
+            "context_fn": recompute_context_fn or noop_context_fn,
         }
         if not use_reentrant:
             gradient_checkpointing_kwargs["early_stop"] = checkpoint_early_stop
@@ -928,6 +1048,13 @@ def build_parallelize_model(
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
         )
+
+    # Layer selection and SAC are bound per block, after HF has set its own
+    # function on every checkpointing layer and before FSDP shards them. Runs
+    # outside the branch above: models whose block loops drive checkpointing
+    # themselves (MiniMax-H3) still need their blocks bound.
+    if recompute_policy is not None:
+        recompute_utils.apply_recompute_policy(model, recompute_policy, basic_modules=basic_modules)
 
     if parallel_state.tp_enabled:
         logger.info_rank0("Apply tensor parallel to the model.")
@@ -946,6 +1073,7 @@ def build_parallelize_model(
                 mixed_precision=mixed_precision,
                 basic_modules=basic_modules,
                 muon_expert_zero_comm=muon_expert_zero_comm,
+                low_precision_reduce_scatter_comm=low_precision_reduce_scatter_comm,
                 compile_config=compile_config,
                 should_skip_hf_weight_load=should_skip_hf_weight_load,
                 **kwargs,

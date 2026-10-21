@@ -6,10 +6,12 @@ The ``model_type`` string is the lookup key used by
 ``TextEncoder.__init__``.
 """
 
-from transformers import PretrainedConfig
+from typing import Optional
+
+from ...module_configuration_base import OmniModuleConfig
 
 
-class TextEncoderConfig(PretrainedConfig):
+class TextEncoderConfig(OmniModuleConfig):
     """Config for the generic word-token embedding + LM head module.
 
     Parameters
@@ -19,13 +21,16 @@ class TextEncoderConfig(PretrainedConfig):
     hidden_size:
         LLM hidden-state dimension.  Must match the backbone model.
     tie_word_embeddings:
-        If ``True``, ``decode`` projects via ``embed_tokens.weight`` (no
+        If ``True``, ``decode`` projects through ``embed_tokens.project`` (no
         separate ``lm_head``).  If ``False``, an independent
         ``nn.Linear`` is allocated.  Default: ``True``.
     lm_head_bias:
         Only meaningful when ``tie_word_embeddings`` is ``False``.  When
         ``True`` the untied ``lm_head`` gains a bias term.  Default:
         ``False``.
+    pad_token_id:
+        ``padding_idx`` of ``embed_tokens``: that row gets no gradient, as in
+        ``nn.Embedding``.  Default: ``None`` (every row trains).
     """
 
     model_type = "text_encoder"
@@ -36,6 +41,7 @@ class TextEncoderConfig(PretrainedConfig):
         hidden_size: int = 4096,
         tie_word_embeddings: bool = True,
         lm_head_bias: bool = False,
+        pad_token_id: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -43,3 +49,4 @@ class TextEncoderConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.tie_word_embeddings = tie_word_embeddings
         self.lm_head_bias = lm_head_bias
+        self.pad_token_id = pad_token_id

@@ -13,7 +13,9 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Union
+
+import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
 
@@ -26,7 +28,6 @@ if TYPE_CHECKING:
 class TrainerState:
     global_step: int = 0
     epoch: int = 0
-    stage: Optional[str] = None
 
 
 class Callback:
@@ -42,7 +43,7 @@ class Callback:
         state: TrainerState,
         loss: float,
         loss_dict: Dict[str, float],
-        grad_norm: float,
+        grad_norm: Union[float, torch.Tensor],
         aux_metrics: Dict[str, float] = None,
         **kwargs,
     ) -> None:

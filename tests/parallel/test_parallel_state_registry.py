@@ -12,21 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``_init_parallel_state`` registry behaviour, including ``name=None``.
+"""``_init_parallel_state`` registry and CPU/Gloo mesh behavior."""
 
-Single-rank gloo, so this runs anywhere. The registry, the topology cache and
-the ambient state are process globals, hence the teardown.
-"""
+from datetime import timedelta
 
 import pytest
 import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from veomni.distributed.parallel_state import (
     _init_parallel_state,
     clear_parallel_state,
     get_parallel_state,
     get_parallel_state_by_name,
+    set_parallel_state,
+    use_parallel_state,
 )
+from veomni.distributed.sequence_parallel import comm as sp_comm
+from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
 
 
 @pytest.fixture
@@ -67,3 +70,52 @@ def test_a_later_named_init_adopts_the_cached_anonymous_state(single_rank_group)
 
     assert named is anonymous
     assert get_parallel_state_by_name("base") is anonymous
+
+
+def _check_mesh_rank_layout(rank, rendezvous):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=4, timeout=timedelta(seconds=60)
+    )
+    try:
+        state = _init_parallel_state(dp_size=1, cp_size=2, ulysses_size=2, device_type="cpu", name=None)
+        mesh = state.device_mesh
+        assert state.sp_size == 4
+        assert state.sp_rank == rank
+        assert state.cp_size == 2
+        assert state.cp_rank == rank // 2
+        assert state.ulysses_size == 2
+        assert state.ulysses_rank == rank % 2
+        assert mesh.mesh_dim_names == ("dp_shard", "cp", "ulysses")
+        assert mesh.mesh.tolist() == [[[0, 1], [2, 3]]]
+        assert dist.get_process_group_ranks(mesh.get_group("ulysses")) == [rank // 2 * 2, rank // 2 * 2 + 1]
+        assert dist.get_process_group_ranks(mesh.get_group("cp")) == [rank % 2, rank % 2 + 2]
+        for name in ("sp", "dp_sp", "dp_shard_sp"):
+            assert dist.get_process_group_ranks(mesh.get_group(name)) == [0, 1, 2, 3]
+
+        sp_state = _init_parallel_state(dp_size=1, ulysses_size=4, device_type="cpu", name="sp")
+        dp_state = _init_parallel_state(dp_size=4, ulysses_size=1, device_type="cpu", name="dp")
+        assert sp_state.ulysses_group is not None
+        assert dp_state.ulysses_group is None
+        with use_parallel_state("sp"):
+            assert get_ulysses_sequence_parallel_group() is sp_state.ulysses_group
+        with use_parallel_state("dp"):
+            assert get_ulysses_sequence_parallel_group() is None
+    finally:
+        dist.destroy_process_group()
+        clear_parallel_state()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="requires the CPU Gloo backend")
+def test_mesh_places_ulysses_inside_cp_with_combined_parallelism(tmp_path):
+    mp.spawn(_check_mesh_rank_layout, args=(str(tmp_path / "rendezvous"),), nprocs=4, join=True)
+
+
+def test_ulysses_group_resolves_only_from_current_parallel_state(single_rank_group):
+    assert not hasattr(sp_comm, "_ULYSSES_SP_GROUP_OVERRIDE")
+    assert not hasattr(sp_comm, "set_ulysses_sequence_parallel_group")
+
+    state = _init_parallel_state(dp_size=1, ulysses_size=1, device_type="cpu", name=None)
+    assert get_ulysses_sequence_parallel_group() is state.ulysses_group
+
+    set_parallel_state(None)
+    assert get_ulysses_sequence_parallel_group() is None

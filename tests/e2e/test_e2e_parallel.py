@@ -8,11 +8,11 @@ import pytest
 import torch
 import yaml
 
-from veomni.models.auto import build_foundation_model
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
+from veomni.models import build_foundation_model
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability, get_torch_device
 from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available
 
-from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
+from ..tools import DummyDataset, ParallelConfig, build_torchrun_cmd, compare_metrics, print_comparison_table
 from ..tools.training_utils import make_eager_ops_config
 from .utils import prepare_exec_cmd
 
@@ -21,11 +21,6 @@ from .utils import prepare_exec_cmd
 # lists with a TODO; uncomment once the corresponding model gains a v5
 # patchgen path.
 _dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires diffusers")
-# Qwen3.5 GatedDeltaNet has no NPU kernel today; eager-only path also requires
-# non-varlen training (dyn_bsz=False), but the e2e command uses dyn_bsz=True.
-_qwen3_5_npu_skip = pytest.mark.skipif(
-    IS_NPU_AVAILABLE, reason="Qwen3.5 GatedDeltaNet has no NPU backend (varlen path)"
-)
 _qwen_image_npu_skip = pytest.mark.skipif(IS_NPU_AVAILABLE, reason="Qwen-Image training is GPU-only for now")
 
 
@@ -54,6 +49,26 @@ _DEEPSEEK_V4_TILELANG_TRAINING_ARGS = [
     "--model.ops_implementation.dsa_indexer_implementation=tilelang",
     "--model.ops_implementation.dsa_attention_implementation=tilelang",
     "--model.ops_implementation.mhc_implementation=tilelang",
+]
+
+_QWEN4_EXP_CONFIG = "./tests/toy_config/qwen4_exp_toy/config.json"
+_ACCELERATOR = get_torch_device()
+# GatedDeltaNet under Ulysses SP rejects eager, so both hardware paths need a varlen kernel:
+# flash-linear-attention on CUDA, torch_npu plus the vendored Triton-Ascend kernels on Ascend.
+_QWEN4_EXP_RMS = "fla" if IS_CUDA_AVAILABLE else "torch_npu"
+_QWEN4_EXP_VARLEN = "fla" if IS_CUDA_AVAILABLE else "triton"
+_QWEN4_EXP_TRAINING_ARGS = [
+    "--model.ops_implementation.attn_implementation=flash_attention_2",
+    f"--model.ops_implementation.qsa_attention_implementation={'tilelang' if IS_CUDA_AVAILABLE else 'eager'}",
+    f"--model.ops_implementation.rms_norm_gated_implementation={_QWEN4_EXP_RMS}",
+    f"--model.ops_implementation.causal_conv1d_implementation={_QWEN4_EXP_VARLEN}",
+    f"--model.ops_implementation.chunk_gated_delta_rule_implementation={_QWEN4_EXP_VARLEN}",
+    "--model.accelerator.extra_parallel_names=ple",
+    "--model.accelerator.extra_parallel_sizes=2",
+    "--model.accelerator.extra_parallel_placement_innermost=false",
+    "--model.broadcast_model_weights_from_rank0=false",
+    "--model.ep_sharded_stream_load=true",
+    "--train.enable_batch_invariant_mode=False",
 ]
 
 
@@ -92,17 +107,7 @@ def main(
     test_path = f"./{model_name}"
     os.makedirs(test_path, exist_ok=True)
 
-    # Models with stacked 3D expert params (gate_up_proj [E, 2*I, H], down_proj [E, H, I]):
-    #
-    # - qwen3_5_moe: native HF safetensor format is already stacked. HF's save_pretrained() with
-    #   save_original_format=True calls revert_weight_conversion() that splits them into per-expert
-    #   keys (experts.*.gate_proj.weight, etc.), but VeOmni has no runtime converter for this model.
-    #   Disable save_original_format to save in native stacked format.
-    #
-    # - qwen3_moe (v5): VeOmni registers a runtime CheckpointTensorConverter that merges per-expert
-    #   HF keys back to fused format at load time, so save_original_format=True works correctly.
-    save_original_format = model_name != "qwen3_5_moe"
-    _materialize_weights_dir(config_path, test_path, save_original_format=save_original_format)
+    _materialize_weights_dir(config_path, test_path)
 
     test_tasks = [task_name]
     command_list = prepare_exec_cmd(
@@ -199,6 +204,15 @@ text_test_cases = [
         None,  # max_sp_size
         None,  # max_ep_size
     ),
+    pytest.param(
+        "glm_moe_dsa",
+        "./tests/toy_config/glm_moe_dsa_toy",
+        True,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        1,  # max_sp_size: the DSA attention / indexer has no sequence-parallel path
+        None,  # max_ep_size
+    ),
 ]
 
 deepseek_v4_text_smoke_test_cases = [
@@ -212,7 +226,7 @@ deepseek_v4_text_smoke_test_cases = [
         # gather around compressors). Exercise SP=1 vs SP=2 alignment.
         2,
         # The GPU fused-MoE path now preserves DeepSeek-V4's ``swiglu_limit``
-        # clamp, so keep the smoke test on the default fused_triton MoE path.
+        # clamp, so keep the smoke test on the default triton MoE path.
         # EP remains disabled here because the surrounding V4 e2e coverage is
         # an SP alignment smoke test, not an EP alignment test.
         1,
@@ -283,7 +297,6 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
-        marks=_qwen3_5_npu_skip,
     ),
     pytest.param(
         "qwen3_5",
@@ -292,7 +305,6 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
-        marks=_qwen3_5_npu_skip,
     ),
 ]
 
@@ -590,6 +602,54 @@ def test_qwen3vl_lora_smoke(dummy_qwen3vl_dataset, tmp_path):
     )
 
 
+@pytest.mark.skipif(
+    not _ACCELERATOR.is_available() or _ACCELERATOR.device_count() < 2,
+    reason="Qwen4-Exp VLM SFT pipeline smoke requires two CUDA or NPU devices",
+)
+def test_qwen4_exp_training_smoke(tmp_path):
+    """Exercise toy Qwen4-Exp VLM SFT with PLE=2, EP=2, and SP=2."""
+    model_path = tmp_path / "model"
+    output_dir = tmp_path / "output"
+    _materialize_weights_dir(_QWEN4_EXP_CONFIG, str(model_path), save_original_format=False)
+
+    dummy_dataset = DummyDataset(
+        num_samples=8,
+        seq_len=64,
+        dataset_type="qwen4exp",
+        cache_name=f"qwen4_exp_pipeline_{tmp_path.name}",
+    )
+    try:
+        cmd = build_torchrun_cmd(
+            script="tests/train_scripts/train_vlm_test.py",
+            config_path=_QWEN4_EXP_CONFIG,
+            model_path=str(model_path),
+            train_path=dummy_dataset.save_path,
+            output_dir=str(output_dir),
+            parallel_config=ParallelConfig(sp_size=2, ep_size=2, fsdp_mode="fsdp2"),
+            nproc=2,
+            extra_args=[
+                *_QWEN4_EXP_TRAINING_ARGS,
+                "--data.max_seq_len=64",
+                "--train.global_batch_size=4",
+                "--model.accelerator.gradient_checkpointing.enable=false",
+                "--model.optimizer.lr=0.01",
+            ],
+            model_name="qwen4_exp",
+        )
+        env = dict(os.environ)
+        if IS_NPU_AVAILABLE:
+            env.setdefault("HCCL_HOST_SOCKET_PORT_RANGE", "auto")
+            env.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", "auto")
+        subprocess.run(cmd, check=True, env=env)
+
+        with open(output_dir / "log_dict.json") as f:
+            result = json.load(f)
+        assert result
+        assert all(values and torch.isfinite(torch.tensor(values)).all() for values in result.values())
+    finally:
+        dummy_dataset.clean_cache()
+
+
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", qwen2omni_test_cases)
 def test_qwen2omni_parallel_align(
     model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_qwen2omni_dataset
@@ -641,6 +701,27 @@ def test_wan_dit_uses_bfloat16_and_flash_attention():
             "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
         ]
         assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
+
+
+def test_deepseek_v4_e2e_casts_fused_triton_moe_to_bfloat16():
+    command_list = prepare_exec_cmd(
+        ["train_text_test"],
+        "deepseek_v4",
+        "./tests/toy_config/deepseek_v4_toy",
+        model_path="./deepseek_v4",
+        train_path="./dummy_text",
+        output_dir="./deepseek_v4",
+        is_moe=True,
+        max_ep_size=1,
+    )
+
+    assert command_list
+    for _, cmd_kwargs in command_list:
+        assert cmd_kwargs["extra_args"] == [
+            "--model.accelerator.fsdp_config.mixed_precision.enable=True",
+            "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+            "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+        ]
 
 
 @_gpt_oss_fa4_quack_skip

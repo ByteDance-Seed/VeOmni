@@ -1,4 +1,4 @@
-# VeOmni cached VAE posterior training config for OmniModel V2 - BAGEL-7B-MoT.
+# VeOmni cached VAE posterior training config for OmniModel - BAGEL-7B-MoT.
 
 model:
   model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
@@ -52,7 +52,6 @@ data:
   train_path: outputs/bagel_vae_cached_dataset
   datasets_type: iterable
   train_sample: 1000000
-  chat_template: default
   dataloader:
     type: native
     num_workers: 4
@@ -61,7 +60,7 @@ data:
     prefetch_factor: 2
 
 train:
-  train_type: train_with_cache
+  training_task: offline_training
   seed: 42
   num_train_epochs: 1
   global_batch_size: 32

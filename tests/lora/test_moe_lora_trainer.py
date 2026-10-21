@@ -81,6 +81,7 @@ import torch.distributed as dist
 import yaml
 
 from veomni.arguments import VeOmniArguments, parse_args
+from veomni.checkpoint.layout import weights_dir
 from veomni.data import build_dummy_dataset
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import Callback, TrainerState
@@ -272,9 +273,6 @@ class MoeLoraTrainer(BaseTrainer):
     any state the checkpoint callback loaded.
     """
 
-    def _build_model_assets(self) -> None:
-        self.model_assets = [self.model_config]
-
     def _build_data_transform(self) -> None:
         pass
 
@@ -373,8 +371,9 @@ def _build_and_save_toy_base(dest_dir: str) -> None:
     16 experts, 4 layers). Module-scoped means once per pytest invocation.
     """
     from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.models import build_foundation_model
     from veomni.utils import helper as _helper
+
+    from .utils import build_lora_test_model
 
     _helper.set_seed(42)
     ops = OpsImplementationConfig(
@@ -385,7 +384,7 @@ def _build_and_save_toy_base(dest_dir: str) -> None:
         swiglu_mlp_implementation="eager",
         rotary_pos_emb_implementation="eager",
     )
-    model = build_foundation_model(
+    model = build_lora_test_model(
         config_path=_TOY_CONFIG_PATH,
         weights_path=None,
         torch_dtype="bfloat16",
@@ -583,9 +582,11 @@ def _writer_adapter_path(writer_dir: str, save_step: int = 4) -> str:
     """Path to the writer's HF-format LoRA adapter (the resume target for the adapter test).
 
     Uses the *final* step's adapter so the resumer's pre-snapshot can be
-    compared directly against the writer's post-snapshot.
+    compared directly against the writer's post-snapshot. The adapter is an
+    export and lives in its own ``lora_ckpt/``, beside the resume state rather
+    than inside it.
     """
-    return os.path.join(writer_dir, "checkpoints", f"global_step_{save_step}")
+    return os.path.join(writer_dir, "checkpoints", f"global_step_{save_step}", "lora_ckpt")
 
 
 def _assert_writer_artifacts_exist(writer_dir: str, mode: str, *, final_step: int = 4) -> None:
@@ -600,10 +601,12 @@ def _assert_writer_artifacts_exist(writer_dir: str, mode: str, *, final_step: in
     hf_dir = _writer_adapter_path(writer_dir, save_step=final_step)
 
     assert os.path.isdir(dcp_dir), f"[{mode}] missing DCP checkpoint dir at {dcp_dir}"
-    dcp_files = os.listdir(dcp_dir)
-    # DCP writes one .distcp file per rank plus a .metadata file -- enough
+    # The weights are their own DCP directory now; the optimizer state sits in a
+    # sibling. DCP writes one .distcp file per rank plus a .metadata file -- enough
     # to verify the save actually ran rather than just creating the dir.
-    assert any(f.endswith(".metadata") for f in dcp_files), f"[{mode}] DCP metadata missing in {dcp_dir}: {dcp_files}"
+    weights = weights_dir(dcp_dir)
+    dcp_files = os.listdir(weights)
+    assert any(f.endswith(".metadata") for f in dcp_files), f"[{mode}] DCP metadata missing in {weights}: {dcp_files}"
 
     assert os.path.isdir(hf_dir), f"[{mode}] missing HF LoRA adapter dir at {hf_dir}"
     # VeOmniLoraModel embeds MoE metadata inside adapter_config.json (under the

@@ -1,7 +1,7 @@
 """Qwen3-VL OmniModule mixins.
 
 Splits a monolithic ``Qwen3VLForConditionalGeneration`` into composable
-sub-modules for the SeedOmni V2 graph runtime:
+sub-modules for the SeedOmni graph runtime:
 
 * ``qwen3vl_vision``       — ViT + patch merger + DeepStack mergers.
 * ``qwen3vl_text_encoder`` — embed_tokens (+ lm_head) + tokenizer + chat template.

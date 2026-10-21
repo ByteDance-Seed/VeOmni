@@ -20,7 +20,7 @@ pipe = MiniMaxH3Pipeline.from_pretrained(
     transformer_config_path="pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer/config.json",
     transformer_weights_path="pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer",
     ops_implementation=OpsImplementationConfig(
-        attn_implementation="eager",
+        attn_implementation="flash_attention_2",
         rotary_pos_emb_implementation="eager",
         rms_norm_implementation="eager",
         swiglu_mlp_implementation="eager",
@@ -44,8 +44,8 @@ write_video_audio(
     video=video,
     audio=audio,
     output_path="t2va.mp4",
-    fps=24,
-    audio_sample_rate=32000,
+    fps=pipe.frame_rate,
+    audio_sample_rate=pipe.audio_vae.sample_rate,
 )
 
 # Text + First Frame + Last Frame -> Video + Audio
@@ -67,6 +67,6 @@ write_video_audio(
     video=video,
     audio=audio,
     output_path="fl2va.mp4",
-    fps=24,
-    audio_sample_rate=32000,
+    fps=pipe.frame_rate,
+    audio_sample_rate=pipe.audio_vae.sample_rate,
 )

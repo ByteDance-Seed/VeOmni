@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SeedOmni V2 training / inference orchestrators (independent from V1 ``BaseTrainer``).
+"""SeedOmni training / inference orchestrators (independent from ``BaseTrainer``).
 
 Only :class:`OmniTrainer` / :class:`OmniInferencer` are re-exported here — the entry
 points (``tasks/omni/train_omni.py`` / ``tasks/omni/infer_omni.py``) are the only real
 consumers of this package-level surface. Everything else (``ModuleRuntime``,
 ``OmniModelRuntime``, the per-module callbacks, ``MultiOptimizer``/``MultiLRScheduler``,
-``build_module_runtime_args``, …) is always imported directly from its owning submodule
-(``veomni.models.seed_omni.accelerator.*``, ``veomni.arguments.*``,
-``veomni.trainer.callbacks.omni_callbacks``, ``veomni.trainer.omni.omni_trainer``) —
+``build_omni_module_runtime_args``, …) is always imported directly from its owning submodule
+(``veomni.models.seed_omni.accelerated.*``, ``veomni.arguments.*``,
+``veomni.trainer.callbacks.omni_callbacks``) —
 import it from there instead of adding it back here.
 """
 

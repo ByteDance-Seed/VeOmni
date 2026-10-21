@@ -2,15 +2,17 @@
 
 from typing import Any, Dict, Optional
 
-from transformers import PretrainedConfig, Qwen3Config
+from transformers import Qwen3Config
+
+from ...module_configuration_base import OmniModuleConfig
 
 
-class Qwen3LlmConfig(PretrainedConfig):
+class Qwen3LlmConfig(OmniModuleConfig):
     """Top-level config for the Qwen3 AR backbone (no wte, no lm_head)."""
 
     model_type = "qwen3_llm"
     # Register the nested backbone config so transformers propagates
-    # ``attn_implementation`` (e.g. veomni_flash_attention_2_with_sp) down to it —
+    # ``attn_implementation`` (e.g. veomni_flash_attention_2) down to it —
     # otherwise the inner ``Qwen3Model`` silently falls back to SDPA and breaks
     # under sequence parallelism (sliced q vs full-length mask).
     sub_configs = {"text_config": Qwen3Config}
@@ -28,7 +30,7 @@ class Qwen3LlmConfig(PretrainedConfig):
         # This backbone owns no wte / lm_head, so there is nothing to tie — the
         # real ``embed_tokens``<->head tie lives in ``qwen3_text_encoder``. The
         # source Qwen3 ``text_config`` defaults the flag True, which would drive
-        # the shared post-load tie (``module_utils.post_process_after_weight_loading``)
+        # the shared post-load tie (``checkpoint.weights.post_process_after_weight_loading``)
         # into this module's ``nn.Identity()`` input embedding and crash with
         # ``KeyError: 'weight'``. Force it off on both the outer + nested config so
         # the tie is skipped (the check ANDs both sides).

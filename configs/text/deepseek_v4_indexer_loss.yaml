@@ -106,6 +106,7 @@ model:
         enable: true
     offload_config:
       enable_activation: false
+  chat_template: chatml
 
 data:
   # tulu-3-sft-mixture/data, not tulu-3-sft-mixture/. get_data_files lists a directory
@@ -113,7 +114,6 @@ data:
   # .cache entry it raises " files are not supported" before it ever sees a parquet.
   train_path: tulu-3-sft-mixture/data
   data_type: conversation
-  chat_template: chatml
   max_seq_len: 8192
   train_size: 100000000
   text_keys: messages
