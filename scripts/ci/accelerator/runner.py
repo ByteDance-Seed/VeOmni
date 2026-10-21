@@ -18,7 +18,12 @@ from scripts.ci.accelerator.launch_plan import ResourcePlanError, RunnerCapabili
 from scripts.ci.accelerator.reporting import BatchProgress, RunReporter, format_status, print_log_tail, selection_label
 from scripts.ci.accelerator.runtime.devices import child_environment
 from scripts.ci.accelerator.runtime.ports import find_free_port
-from scripts.ci.accelerator.runtime.workers import create_workspace, interruptible_executor, run_process
+from scripts.ci.accelerator.runtime.workers import (
+    ProcessCleanupError,
+    create_workspace,
+    interruptible_executor,
+    run_process,
+)
 from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs
 
 
@@ -252,10 +257,14 @@ def main():
             raise
         except Exception as exc:
             record.update(returncode=getattr(exc, "returncode", 1), error=repr(exc))
-            progress.worker_failure(exc)
+            if isinstance(exc, ProcessCleanupError):
+                reporter.stop_event.set()
+                reporter.fail(name, str(exc), assigned=assigned, target=progress.current, nodeid=progress.current)
+            else:
+                progress.worker_failure(exc)
             with reporter.lock:
                 print_log_tail(progress.log_path)
-            if not args.keep_going:
+            if not args.keep_going or isinstance(exc, ProcessCleanupError):
                 raise
         finally:
             progress.poll(check_abort=False)

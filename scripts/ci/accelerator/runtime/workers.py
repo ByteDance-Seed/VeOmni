@@ -17,6 +17,10 @@ from scripts.ci.accelerator import ROOT
 _CANCELLATION = ContextVar("ci_worker_cancellation", default=None)
 
 
+class ProcessCleanupError(RuntimeError):
+    """Owned workers survived cleanup; their device lease cannot be reused."""
+
+
 class _CancellationScope:
     def __init__(self):
         self.event = Event()
@@ -56,7 +60,7 @@ def interruptible_executor(*, max_workers, cancel_on_error=False):
     try:
         yield executor, scope
     except BaseException as exc:
-        if cancel_on_error or not isinstance(exc, Exception):
+        if cancel_on_error or isinstance(exc, ProcessCleanupError) or not isinstance(exc, Exception):
             scope.event.set()
         raise
     finally:
@@ -152,7 +156,7 @@ def run_process(command, env, log, timeout, *, cwd=ROOT, allowed_codes=(0,), on_
             if process.poll() is not None and not alive():
                 break
         else:
-            raise RuntimeError("CI worker cleanup could not drain its process group and tracked descendants")
+            raise ProcessCleanupError("CI worker cleanup could not drain its process group and tracked descendants")
 
 
 def create_workspace(path):

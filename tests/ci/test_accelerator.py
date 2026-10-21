@@ -412,13 +412,16 @@ def test_interrupt_drains_owned_workers_before_executor_shutdown(stage, tmp_path
             unrelated.wait(timeout=5)
 
 
-@pytest.mark.parametrize("failure", ["changed_source", "missing_results", "interrupt", "keep_going_failure"])
+@pytest.mark.parametrize(
+    "failure", ["changed_source", "missing_results", "interrupt", "keep_going_failure", "cleanup_failure"]
+)
 def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, failure):
     import json
     import sys
     from pathlib import Path
 
     from scripts.ci.accelerator import runner
+    from scripts.ci.accelerator.runtime.workers import ProcessCleanupError
 
     root = tmp_path / "checkout"
     (root / "tests").mkdir(parents=True)
@@ -435,24 +438,27 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, failure
             Path(command[-2]).write_text(json.dumps(dict(backend="cpu", devices=[])))
         elif "--collect-only" in command:
             inventory = next(arg.split("=", 1)[1] for arg in command if arg.startswith("--ci-inventory="))
-            Path(inventory).write_text(
-                json.dumps(
-                    [
-                        dict(
-                            nodeid=nodeid,
-                            file=str(test_file),
-                            cards=0,
-                            skip=None,
-                            plan=dict(groups=[[dict(nproc=1, device="cpu", nnodes=1)]]),
-                        )
-                    ]
+            rows = [
+                dict(
+                    nodeid=nodeid,
+                    file=str(test_file),
+                    cards=0,
+                    skip=None,
+                    plan=dict(groups=[[dict(nproc=1, device="cpu", nnodes=1)]]),
                 )
-            )
+            ]
+            if failure == "cleanup_failure":
+                pending_file = root / "tests/test_pending.py"
+                pending_file.write_text("def test_pending(): pass\n")
+                rows.append({**rows[0], "nodeid": "tests/test_pending.py::test_pending", "file": str(pending_file)})
+            Path(inventory).write_text(json.dumps(rows))
         elif failure == "interrupt":
             raise KeyboardInterrupt()
         elif failure == "changed_source":
             source.write_text("changed\n")
             Path(env["CI_CASE_RESULTS"]).write_text(json.dumps(dict(exitstatus=0, cases=[dict(nodeid=nodeid)])))
+        elif failure == "cleanup_failure":
+            raise ProcessCleanupError("owned worker survived cleanup")
         elif failure == "keep_going_failure":
             Path(env["CI_CASE_PROGRESS"]).write_text(
                 json.dumps(dict(kind="failure", nodeid=nodeid, outcome="failed", detail="original assertion")) + "\n"
@@ -469,8 +475,10 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, failure
     monkeypatch.setattr(
         sys, "argv", ["ci", "--suite", "unit", "--backend", "cpu", "--only", "ci-unit", "--output-dir", str(output)]
     )
-    if failure == "keep_going_failure":
+    if failure in ("keep_going_failure", "cleanup_failure"):
         sys.argv.append("--keep-going")
+    if failure == "cleanup_failure":
+        sys.argv.append("--serial")
     if failure == "interrupt":
         with pytest.raises(KeyboardInterrupt):
             runner.main()
@@ -487,22 +495,27 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, failure
             assert "ResourcePlanError" in record["error"] and ".results.json" in record["error"]
         elif failure == "keep_going_failure":
             assert nodeid in summary["error"] and record["status"] == "failed"
+        elif failure == "cleanup_failure":
+            assert len(summary["commands"]) == 1  # Never release the lease to the pending batch.
+            assert "ProcessCleanupError" in record["error"] and "survived cleanup" in summary["error"]
         else:
             assert "KeyboardInterrupt" in summary["error"]
 
 
-def test_first_failure_cancels_running_process_and_stops_dispatch(tmp_path):
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_first_failure_cancels_running_process_and_stops_dispatch(tmp_path, cleanup_failure):
     import os
     import sys
     import time
 
     import psutil
 
-    from scripts.ci.accelerator.runtime.workers import run_process
+    from scripts.ci.accelerator.runtime.workers import ProcessCleanupError, run_process
     from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs
 
     ready = tmp_path / "worker.pid"
     called = []
+    peer_failures = []
 
     def execute(job, assigned):
         called.append(job.name)
@@ -511,11 +524,12 @@ def test_first_failure_cancels_running_process_and_stops_dispatch(tmp_path):
             while not ready.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             assert ready.exists()
-            raise RuntimeError("first failure")
+            error_type = ProcessCleanupError if cleanup_failure else RuntimeError
+            raise error_type("first failure")
         assert job.name == "running"
         code = f"import os,time; from pathlib import Path; Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(60)"
         with (tmp_path / "worker.log").open("w") as log:
-            run_process([sys.executable, "-c", code], os.environ.copy(), log, 5)
+            run_process([sys.executable, "-c", code], os.environ.copy(), log, 5, on_failure=peer_failures.append)
 
     try:
         with pytest.raises(RuntimeError, match="first failure"):
@@ -523,9 +537,10 @@ def test_first_failure_cancels_running_process_and_stops_dispatch(tmp_path):
                 [DeviceJob(name, 0, None) for name in ("running", "bad", "pending")],
                 [],
                 execute,
-                cancel_on_error=True,
+                cancel_on_error=not cleanup_failure,
             )
-        assert called == ["running", "bad"]
+        assert sorted(called) == ["bad", "running"]
+        assert not peer_failures  # The peer was cancelled, rather than reaching its timeout.
         worker = psutil.Process(int(ready.read_text()))
         assert not worker.is_running() or worker.status() == psutil.STATUS_ZOMBIE
     except psutil.NoSuchProcess:
