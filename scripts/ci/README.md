@@ -10,7 +10,7 @@ GPU and NPU unit/e2e suites share one entry point:
 uv run --frozen python -m scripts.ci.accelerator --backend cuda --suite unit --include-conditional
 uv run --frozen python -m scripts.ci.accelerator --backend cuda --suite e2e
 uv run --frozen python -m scripts.ci.accelerator --backend npu --suite unit
-uv run --frozen python -m scripts.ci.accelerator --backend npu --suite e2e --serial
+uv run --frozen python -m scripts.ci.accelerator --backend npu --suite e2e
 ```
 
 See the [accelerator README](accelerator/README.md) for suite selection,

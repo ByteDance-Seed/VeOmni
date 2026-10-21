@@ -7,8 +7,8 @@ will actually run it. Read this before adding a test file.
 
 GPU/NPU suite selections are enumerated in `scripts/ci/accelerator/suites/gpu.json` and
 `scripts/ci/accelerator/suites/npu.json`. Both use the common accelerator case scheduler in
-`scripts/ci/accelerator/runner.py`; NPU unit uses parallel dispatch and NPU e2e
-uses serial dispatch. Add a suite selection for a file outside a collected
+`scripts/ci/accelerator/runner.py`; GPU/NPU unit and e2e workflows all use
+parallel dispatch. Add a suite selection for a file outside a collected
 directory. Do not add per-file pytest workflow lines or manual device quotas.
 
 New functions/parameters already included by an existing selection need no

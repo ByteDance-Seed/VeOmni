@@ -254,9 +254,9 @@ visibility string without checking the installed runtime.
 
 Both unit and e2e suites consume the same planner/scheduler. Suite selection
 defines which cases run, and launch plans define their resource requirements.
-NPU unit CI enables parallel dispatch within its owned eight-card slice;
-NPU e2e CI uses `--serial`. Hardware and conditional eligibility remain part
-of test collection.
+GPU/NPU unit and e2e CI all enable parallel dispatch. NPU assignments stay
+within the runner's owned eight-card slice. Hardware and conditional eligibility
+remain part of test collection.
 
 ## Validation and results
 

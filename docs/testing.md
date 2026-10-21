@@ -142,8 +142,8 @@ scheduling. The default launch plan uses one card of the selected accelerator
 backend on GPU/NPU runners, and CPU on CPU-only runners. Multi-card tests must
 expose their launch configuration; `skipif` describes eligibility, not a
 resource reservation. See [runner usage](../scripts/ci/accelerator/README.md) for commands
-and result artifacts. NPU unit tests use parallel dispatch; NPU e2e tests use
-serial dispatch. Both use the same launch plans and scheduler core.
+and result artifacts. GPU/NPU unit and e2e workflows all use parallel dispatch
+with the same launch plans and scheduler core.
 
 Batches are ordered by required card count, largest first, and greedily assigned
 to free devices with smaller jobs filling remaining space. Fixed case weights

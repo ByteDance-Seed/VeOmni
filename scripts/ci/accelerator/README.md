@@ -9,10 +9,10 @@ launch configuration of each collected case.
 uv run --frozen python -m scripts.ci.accelerator --backend cuda --suite unit --include-conditional
 uv run --frozen python -m scripts.ci.accelerator --backend cuda --suite e2e
 uv run --frozen python -m scripts.ci.accelerator --backend npu --suite unit
-uv run --frozen python -m scripts.ci.accelerator --backend npu --suite e2e --serial
+uv run --frozen python -m scripts.ci.accelerator --backend npu --suite e2e
 ```
 
-NPU unit tests use parallel dispatch; NPU e2e tests use serial dispatch.
+GPU/NPU unit and e2e workflows all use parallel dispatch.
 GPU/NPU device discovery, owned host IDs, child visibility and logical-rank
 mapping are handled by accelerator adapters. NPU assignments stay inside the
 runner's existing eight-card slice. Use `--serial` to serialize a local
