@@ -170,6 +170,7 @@ config.add_import("veomni.models.loss_utils", names=["ForCausalLMLoss", "load_ba
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 config.add_import("veomni.utils.model_outputs", names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin"])
 config.add_import("veomni.utils.seqlen_pos_transform_utils", names=["pos2culen"])
+config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = True")
 config.add_import("veomni.utils", names=["logging"])
 config.add_post_import_block("""
@@ -2365,3 +2366,43 @@ def qwen4_exp_for_conditional_generation_forward_patched(
         router_logits=outputs.router_logits,
         fused_linear_aux=fused_linear_aux,
     )
+
+
+# ================================================================
+# Patch: Qwen4ExpTextSparseMoeBlock.forward (MoE router replay)
+# 1. When an RL framework has installed a
+# replay manager via ``set_active_replay``, the manager may substitute
+# ``selected_experts`` with previously recorded target indices. The
+# manager's sole responsibility is choosing indices; all model-specific
+# post-topk weight math (softmax recompute, gather, renorm, dtype cast)
+# is replicated here so the cross-framework controller stays
+# model-agnostic.
+# ================================================================
+@config.override_method(
+    "Qwen4ExpTextSparseMoeBlock.forward",
+    description="Call maybe_replay_indices for RL router replay",
+)
+def qwen4_exp_text_sparse_moe_block_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Replay expert indices while preserving native top-k weighting and local expert ops."""
+    batch_size, sequence_length, hidden_dim = hidden_states.shape
+    hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+    shared_expert_output = self.shared_expert(hidden_states_reshaped)
+    router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+    # --- Patch.1: Recompute weights for replayed indices from raw router logits. ---
+    # Match the native router's optional normalization and output dtype.
+    if get_active_replay() is not None:
+        target_dtype = routing_weights.dtype
+        routing_scores = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+        selected_experts = maybe_replay_indices(self.gate, routing_scores, selected_experts)
+        routing_weights = routing_scores.gather(1, selected_experts)
+        if self.gate.norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(-1, keepdim=True)
+        routing_weights = routing_weights.to(target_dtype)
+    # --- Patch.1 ---
+    expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+
+    shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
+
+    expert_output = expert_output + shared_expert_output
+    expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
+    return expert_output

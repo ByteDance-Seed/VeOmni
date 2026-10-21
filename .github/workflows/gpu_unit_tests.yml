@@ -200,6 +200,7 @@ jobs:
         # TODO: run all tests under tests/utils/ once all util tests are verified
         run: |
           uv run --frozen pytest -s -x tests/utils/test_count_flops.py
+          uv run --frozen pytest -s -x tests/utils/test_moe_router_replay_api.py
           uv run --frozen pytest -s -x tests/tools/test_training_utils.py
           uv run --frozen pytest -s -x tests/utils/test_hdfs_io.py
           uv run --frozen pytest -s -x tests/utils/test_profiler_memory.py

@@ -354,3 +354,36 @@ def test_addmm_beta_zero_skips_nan_bias(monkeypatch):
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(actual, a @ b)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Batch-invariant GEMM precision test requires CUDA")
+def test_matmul_persistent_preserves_ieee_fp32_precision_and_batch_invariance():
+    """FP32 matmul_persistent must keep IEEE mantissa bits instead of truncating to TF32."""
+    from veomni.ops.batch_invariant.triton import matmul_persistent
+
+    device = torch.device("cuda")
+    m, k, n = 16, 64, 32
+    generator = torch.Generator(device="cpu").manual_seed(0)
+
+    # Low-order mantissa bits distinguish IEEE FP32 from TF32 rounding while
+    # keeping intermediate products well inside normal FP32 range.
+    lhs = (1.0 + 1e-6 * torch.randint(1, 2000, (m, k), generator=generator, dtype=torch.float32)).to(device)
+    rhs = (1.0 + 1e-6 * torch.randint(1, 2000, (k, n), generator=generator, dtype=torch.float32)).to(device)
+    bias = (1e-6 * torch.randint(1, 2000, (n,), generator=generator, dtype=torch.float32)).to(device)
+
+    expected_mm = (lhs.double() @ rhs.double()).float()
+    expected_addmm = (lhs.double() @ rhs.double() + bias.double()).float()
+
+    actual_mm = matmul_persistent(lhs, rhs)
+    actual_addmm = matmul_persistent(lhs, rhs, bias=bias)
+
+    torch.testing.assert_close(actual_mm, expected_mm, atol=1e-5, rtol=1e-6)
+    torch.testing.assert_close(actual_addmm, expected_addmm, atol=1e-5, rtol=1e-6)
+
+    split_mm = torch.cat([matmul_persistent(lhs[:7], rhs), matmul_persistent(lhs[7:], rhs)], dim=0)
+    split_addmm = torch.cat(
+        [matmul_persistent(lhs[:7], rhs, bias=bias), matmul_persistent(lhs[7:], rhs, bias=bias)],
+        dim=0,
+    )
+    assert torch.equal(actual_mm, split_mm)
+    assert torch.equal(actual_addmm, split_addmm)
