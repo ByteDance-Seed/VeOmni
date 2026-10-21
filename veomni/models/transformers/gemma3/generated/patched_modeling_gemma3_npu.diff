@@ -615,13 +615,15 @@
  @auto_docstring(
      custom_intro="""
      The Base Gemma3 model which consists of a vision backbone and a language model without language modeling head.,
-@@ -767,14 +956,14 @@
+@@ -767,14 +956,16 @@
      # we are filtering the logits/labels so we shouldn't divide the loss based on num_items_in_batch
      accepts_loss_kwargs = False
 
 -    def __init__(self, config: Gemma3Config):
 +    def __init__(self, config):
          super().__init__(config)
++        # Gemma projects last_hidden_state directly and never consumes SigLIP's pooling head.
++        config.vision_config.vision_use_head = False
          self.vision_tower = AutoModel.from_config(config=config.vision_config)
          self.multi_modal_projector = Gemma3MultiModalProjector(config)
          self.vocab_size = config.text_config.vocab_size
@@ -633,7 +635,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -827,39 +1016,9 @@
+@@ -827,39 +1018,9 @@
          use_cache: bool | None = None,
          **lm_kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Gemma3ModelOutputWithPast:
@@ -673,7 +675,7 @@
          if input_ids is not None and self.config.image_token_id >= self.vocab_size:
              special_image_mask = input_ids == self.config.image_token_id
              llm_input_ids = input_ids.clone()
-@@ -870,7 +1029,6 @@
+@@ -870,7 +1031,6 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(llm_input_ids)
 
@@ -681,7 +683,7 @@
          if pixel_values is not None:
              image_features = self.get_image_features(pixel_values, return_dict=True).pooler_output
              image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
-@@ -878,25 +1036,21 @@
+@@ -878,25 +1038,21 @@
                  input_ids, inputs_embeds=inputs_embeds, image_features=image_features
              )
              inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
@@ -721,7 +723,7 @@
 
          outputs = self.language_model(
              attention_mask=causal_mask_mapping,
-@@ -915,6 +1069,43 @@
+@@ -915,6 +1071,37 @@
              attentions=outputs.attentions,
              image_hidden_states=image_features if pixel_values is not None else None,
          )
@@ -744,18 +746,12 @@
 +            interpolate_pos_encoding=True,
 +            return_dict=True,
 +        )
-+        dependency = vision_outputs.last_hidden_state.mean()
-+        if vision_outputs.pooler_output is not None:
-+            dependency = dependency + vision_outputs.pooler_output.mean()
-+
-+        projector_input = vision_outputs.last_hidden_state.new_zeros(
-+            (
-+                1,
-+                self.multi_modal_projector.patches_per_image**2,
-+                self.config.vision_config.hidden_size,
-+            )
++        projector_input = vision_outputs.last_hidden_state.expand(
++            -1,
++            self.multi_modal_projector.patches_per_image**2,
++            -1,
 +        )
-+        return dependency + self.multi_modal_projector(projector_input).mean()
++        return self.multi_modal_projector(projector_input).mean()
 +
 +
 +# ======================================================================
@@ -765,7 +761,7 @@
 
 
  @auto_docstring(
-@@ -928,10 +1119,20 @@
+@@ -928,10 +1115,20 @@
      # Fix: https://github.com/huggingface/transformers/issues/40564
      accepts_loss_kwargs = False
 
@@ -787,7 +783,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -953,52 +1154,7 @@
+@@ -953,52 +1150,7 @@
          use_cache: bool | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **lm_kwargs: Unpack[TransformersKwargs],
@@ -841,7 +837,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1014,35 +1170,58 @@
+@@ -1014,35 +1166,58 @@
          )
 
          hidden_states = outputs[0]
@@ -922,7 +918,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1086,6 +1265,17 @@
+@@ -1086,6 +1261,17 @@
              )
 
          return create_masks_for_generate(**mask_kwargs)

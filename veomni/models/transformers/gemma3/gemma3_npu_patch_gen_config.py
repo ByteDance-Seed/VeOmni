@@ -156,18 +156,12 @@ def gemma3_model_dummy_vision_forward(self):
         interpolate_pos_encoding=True,
         return_dict=True,
     )
-    dependency = vision_outputs.last_hidden_state.mean()
-    if vision_outputs.pooler_output is not None:
-        dependency = dependency + vision_outputs.pooler_output.mean()
-
-    projector_input = vision_outputs.last_hidden_state.new_zeros(
-        (
-            1,
-            self.multi_modal_projector.patches_per_image**2,
-            self.config.vision_config.hidden_size,
-        )
+    projector_input = vision_outputs.last_hidden_state.expand(
+        -1,
+        self.multi_modal_projector.patches_per_image**2,
+        -1,
     )
-    return dependency + self.multi_modal_projector(projector_input).mean()
+    return self.multi_modal_projector(projector_input).mean()
 
 
 @config.override_method(
@@ -176,6 +170,8 @@ def gemma3_model_dummy_vision_forward(self):
 )
 def gemma3_model_init_npu(self, config):
     super().__init__(config)
+    # Gemma projects last_hidden_state directly and never consumes SigLIP's pooling head.
+    config.vision_config.vision_use_head = False
     self.vision_tower = AutoModel.from_config(config=config.vision_config)
     self.multi_modal_projector = Gemma3MultiModalProjector(config)
     self.vocab_size = config.text_config.vocab_size

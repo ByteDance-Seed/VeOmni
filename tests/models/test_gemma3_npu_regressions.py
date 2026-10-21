@@ -53,6 +53,8 @@ def test_gemma3_vlm_binds_instance_local_ops_and_runs_text_loss():
 
     assert isinstance(model.veomni_ce, VeomniOp)
     assert model.veomni_ce.impl == "eager"
+    assert not model.model.vision_tower.use_head
+    assert not hasattr(model.model.vision_tower, "head")
     assert model.model.language_model.layers[0].input_layernorm.veomni_rms_norm.variant == "offset"
     assert not hasattr(gemma3_modeling, "veomni_causal_lm_loss")
 
@@ -75,12 +77,29 @@ def test_gemma3_vlm_text_only_distributed_batch_touches_visual_parameters(monkey
 
     output = model(input_ids=input_ids, labels=input_ids, use_cache=False)
     output.loss.backward()
-    visual_parameters = list(model.model.vision_tower.parameters()) + list(
-        model.model.multi_modal_projector.parameters()
-    )
+    visual_parameters = {
+        **{f"vision_tower.{name}": parameter for name, parameter in model.model.vision_tower.named_parameters()},
+        **{
+            f"multi_modal_projector.{name}": parameter
+            for name, parameter in model.model.multi_modal_projector.named_parameters()
+        },
+    }
     assert visual_parameters
-    assert all(parameter.grad is not None for parameter in visual_parameters)
-    assert all(torch.count_nonzero(parameter.grad) == 0 for parameter in visual_parameters)
+    text_only_gradient_names = {name for name, parameter in visual_parameters.items() if parameter.grad is not None}
+    assert text_only_gradient_names == visual_parameters.keys()
+    assert all(torch.count_nonzero(parameter.grad) == 0 for parameter in visual_parameters.values())
+
+    model.zero_grad(set_to_none=True)
+    image_input_ids = torch.tensor([[2, 120, 120, 120, 120, 7]])
+    image_output = model(
+        input_ids=image_input_ids,
+        pixel_values=torch.randn(1, 3, 8, 8),
+        labels=image_input_ids,
+        use_cache=False,
+    )
+    image_output.loss.backward()
+    image_gradient_names = {name for name, parameter in visual_parameters.items() if parameter.grad is not None}
+    assert image_gradient_names == text_only_gradient_names
 
 
 def test_gemma3_vlm_sdpa_mask_preserves_packed_boundaries():

@@ -118,7 +118,7 @@ For the Gemma 3 VLM, legacy keys under `language_model.model.*`, `vision_tower.v
 
 Keep the multimodal forward contract intact. Gemma 3 requires `pixel_values` and image-aware `token_type_ids` in addition to the text tensors, and its model-specific position-ID function must remain compatible with VeOmni's packing and sequence-parallel paths.
 
-For distributed training, account for ranks that receive text-only microbatches while peer ranks receive multimodal data. Run a minimal dummy forward through every trainable modality tower and projector, then attach the result to the text path with a zero-valued dependency so DDP/FSDP reductions observe all parameters without changing logits or loss.
+For distributed training, account for ranks that receive text-only microbatches while peer ranks receive multimodal data. Disable unused trainable auxiliary heads, run a minimal dummy forward through every modality component used by the real media path, and attach the result to the text path with a zero-valued dependency. Verify that real-media and text-only microbatches touch the same trainable modality parameters so DDP/FSDP reductions remain symmetric without changing logits or loss.
 
 When replacing the outer VLM loss, preserve the upstream shifted-label and attention-mask behavior. Do not treat successful text-backbone execution as coverage for the multimodal wrapper.
 
@@ -158,7 +158,7 @@ Extend an existing model test when practical. Cover generated-module import, loc
 - [ ] NPU patch spec reuses device-neutral GPU patch bodies
 - [ ] Text and multimodal model types are registered as applicable
 - [ ] Multimodal checkpoint namespaces and input contracts are verified
-- [ ] Text-only distributed microbatches retain zero-valued dependencies on trainable modality modules
+- [ ] Real-media and text-only distributed microbatches touch the same trainable modality parameters
 - [ ] Generated model and diff are reproducible
 - [ ] Import, quality, and focused model tests pass
 - [ ] No configs, scripts, datasets, logs, plots, reports, or checkpoints are included
