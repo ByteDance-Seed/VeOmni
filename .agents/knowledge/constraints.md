@@ -265,6 +265,10 @@ Core files:
    - `TextDPOTrainer` and `DiTTrainer` compose a `BaseTrainer` and override `forward_backward_step()`; they do not inherit the base implementation.
    - Lifecycle work added only inside `BaseTrainer.forward_backward_step()` is skipped by these trainers. Update every supported override or reject the unsupported trainer explicitly.
 
+24a. **OmniTrainer's backward must match its mean-over-micro-batches step loss**
+   - Each graph forward returns a per-micro-batch loss, not a loss already weighted over the full accumulation step. Divide its backward scalar by `num_micro_steps`; retain the original scalar for the logging average in `train_step`. Otherwise changing DP/SP topology at fixed global batch changes accumulation count and multiplies the gradient and clipping norm by that count.
+   - Do not apply the same division to `BaseTrainer`: its `postforward` already uses `mean_global_loss` to weight each micro-batch by its share of the full step's supervised tokens.
+
 25. **Kernel handles belong to model instances**
    - Modeling classes construct `VeomniOp` handles from the installed ops selection and store them on the instance. Do not introduce mutable module-level dispatch callables.
    - Model-specific input normalization and loss policy stay in `models`; the registered wrapper remains a tensor-level contract shared by every consumer.
