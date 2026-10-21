@@ -60,6 +60,7 @@ import torch
 import torch._dynamo.config as dynamo_config
 from torch import nn
 from torch.distributed.fsdp import FSDPModule
+from torch.func import grad_and_value, vmap
 from transformers import initialization as init
 from transformers import masking_utils
 from transformers.activations import ACT2FN
@@ -93,12 +94,12 @@ from transformers.utils.generic import is_flash_attention_requested, maybe_autoc
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from ....distributed.parallel_state import get_parallel_state
-from ....ops import fused_moe_forward
-from ....ops.dispatch import OpSlot
-from ....ops.kernels.cross_entropy.chunk_loss import ChunkLoss
-from ....ops.kernels.cross_entropy.dllm import dllm_masked_cross_entropy
+from ....ops import VeomniOp
+from ....ops.config import resolve_op_impl
+from ....ops.kernels.moe_experts.standard.activation_gate import refuse_fused_moe_on_unsupported_activation
 from ....utils import logging
 from ....utils.constants import IGNORE_INDEX
+from ...loss_utils.dllm import dllm_masked_cross_entropy
 from . import align_nemo
 from .configuration_diffusion_gemma import DiffusionGemmaConfig, DiffusionGemmaTextConfig
 from .dg_hole import (
@@ -135,8 +136,6 @@ from .ffpa_attention import ffpa_preflight, resolve_attention_interface
 
 
 logger = logging.get_logger(__name__)
-
-veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 
 
 class DiffusionGemmaTextRotaryEmbedding(nn.Module):
@@ -959,6 +958,9 @@ class DiffusionGemmaTextExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.hidden_activation = config.hidden_activation
         self.act_fn = ACT2FN[config.hidden_activation]
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        if self.veomni_moe.impl != "eager":
+            refuse_fused_moe_on_unsupported_activation(config, self.veomni_moe.impl)
 
     def forward(
         self,
@@ -973,18 +975,19 @@ class DiffusionGemmaTextExperts(nn.Module):
         # work at all. Under EP each rank holds only `E/ep` experts, while the router keeps
         # emitting global expert ids, so the eager loop below would index
         # `gate_up_proj[expert_idx]` out of range (or silently into the wrong expert).
-        # `fused_moe_forward` owns the all-to-all and the global->local id mapping. Same
+        # `self.veomni_moe` owns the all-to-all and the global->local id mapping. Same
         # guard and the same stacked layout as deepseek_v3 / qwen3_moe.
-        if veomni_moe_experts_forward.use_non_eager_impl:
-            return fused_moe_forward(
+        if self.veomni_moe.impl != "eager":
+            unused = self.gate_up_proj.new_empty(0)
+            return self.veomni_moe(
+                hidden_states,
+                top_k_weights.to(final_hidden_states.dtype),
+                top_k_index,
+                unused,
+                unused,
+                self.down_proj,
+                self.gate_up_proj,
                 num_experts=self.num_experts,
-                routing_weights=top_k_weights.to(final_hidden_states.dtype),
-                selected_experts=top_k_index,
-                hidden_states=hidden_states,
-                fc1_1_weight=None,
-                fc1_2_weight=None,
-                fc2_weight=self.down_proj,
-                fc1_1_2_weight=self.gate_up_proj,
                 activation=self.hidden_activation,
             )
 
@@ -2544,7 +2547,7 @@ class DiffusionGemmaModel(DiffusionGemmaPreTrainedModel):
         # Asked of transformers rather than matched here, because the name this arrives
         # under is not the name the recipe wrote, and it is rewritten by *two* independent
         # mechanisms. `OpsImplementationConfig` rewrites `flash_attention_N` to
-        # `veomni_flash_attention_N_with_sp` whenever `MODELING_BACKEND=veomni`, which is
+        # `veomni_flash_attention_N` whenever `MODELING_BACKEND=veomni`, which is
         # the default -- so a literal `== "flash_attention_2"` never fired for a real run.
         # And `_check_and_adjust_attn_implementation` rewrites the same names to
         # `kernels-community/flash-attn2` and friends when flash-attn is not importable but
@@ -3370,6 +3373,75 @@ def encoder_ar_targets(
     counts.index_add_(0, segment, supervised[0].to(torch.float32))
     weights = supervised.to(torch.float32) / counts.clamp(min=1)[segment]
     return labels, weights
+
+
+class ChunkLoss(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states: torch.Tensor,
+        head_weight: torch.Tensor,
+        head_bias: torch.Tensor | None,
+        loss_forward: Callable,
+        loss_kwargs_chunks: list[dict],
+        chunk_size: int,
+    ):
+        if head_bias is not None:
+            raise NotImplementedError("head_bias is not supported in ChunkLoss")
+
+        device = hidden_states.device
+        accumulated_loss = torch.tensor(0.0, device=device)
+        grad_inputs = torch.empty_like(hidden_states)
+        grad_weight = torch.zeros_like(head_weight)
+
+        grad_inputs_chunks = torch.split(grad_inputs, chunk_size, dim=1)
+        hidden_states_chunks = torch.split(hidden_states, chunk_size, dim=1)
+        for hidden_states_chunk, grad_inputs_chunk, loss_kwargs in zip(
+            hidden_states_chunks, grad_inputs_chunks, loss_kwargs_chunks, strict=False
+        ):
+            (chunk_grad_input, chunk_grad_weight), (chunk_loss, _) = ChunkLoss.compute_loss(
+                loss_forward, hidden_states_chunk, head_weight, head_bias, loss_kwargs
+            )
+            accumulated_loss.add_(chunk_loss)
+            grad_inputs_chunk.copy_(chunk_grad_input)
+            grad_weight.add_(chunk_grad_weight)
+
+        ctx.save_for_backward(grad_inputs, grad_weight)
+        return accumulated_loss
+
+    @staticmethod
+    def backward(ctx, *grad_output):
+        grad_input, grad_weight = ctx.saved_tensors
+        if torch.ne(grad_output[0], torch.tensor(1.0, device=grad_output[0].device)):
+            grad_input = grad_input * grad_output[0]
+            grad_weight = grad_weight * grad_output[0]
+
+        return grad_input, grad_weight, None, None, None, None
+
+    @staticmethod
+    def compute_loss(
+        loss_forward: Callable,
+        chunk_input: torch.Tensor,
+        head_weight: torch.Tensor,
+        head_bias: torch.Tensor | None,
+        chunk_loss_kwargs: dict,
+    ):
+        def _compute_single_chunk(c_input, h_weight, h_bias, kwargs):
+            return loss_forward(c_input, h_weight, h_bias, **kwargs)
+
+        with torch.enable_grad():
+            chunk_input = chunk_input.detach().requires_grad_()
+            head_weight = head_weight.detach().requires_grad_()
+            if head_bias is not None:
+                head_bias = head_bias.detach().requires_grad_()
+
+            grad_and_value_fn = grad_and_value(_compute_single_chunk, argnums=(0, 1), has_aux=True)
+            vmap_fn = vmap(grad_and_value_fn, in_dims=(0, None, None, 0))
+            (grad_input, grad_weight), (chunk_loss, chunk_logits) = vmap_fn(
+                chunk_input, head_weight, head_bias, chunk_loss_kwargs
+            )
+
+        return (grad_input, grad_weight.sum(dim=0)), (chunk_loss.sum(dim=0), chunk_logits)
 
 
 def chunked_weighted_causal_loss(

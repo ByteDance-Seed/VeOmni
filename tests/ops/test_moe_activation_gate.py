@@ -36,22 +36,19 @@ import torch.nn.functional as F
 from transformers.activations import ACT2FN
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
-from veomni.models.auto import _bind_veomni_ops
-from veomni.ops.dispatch import OpSlot
-from veomni.ops.kernels.moe import apply_veomni_fused_moe_patch
-from veomni.ops.kernels.moe.activation_gate import (
+from veomni.models.auto import check_model_build_prerequisites
+from veomni.ops.config import get_ops_config, set_ops_config
+from veomni.ops.kernels.moe_experts.standard.activation_gate import (
     _KERNEL_ACTIVATIONS,
     moe_expert_activation,
     refuse_fused_moe_on_unsupported_activation,
 )
-from veomni.ops.kernels.moe.group_gemm import group_gemm_fused_moe_forward
+from veomni.ops.kernels.moe_experts.standard.triton import group_gemm_fused_moe_forward
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 from veomni.utils.import_utils import is_fused_moe_available
 
 
-_REGISTRY_MODULE = "veomni.ops.kernel_registry"
-_GATE_MODULE = "veomni.ops.kernels.moe.activation_gate"
-_MOE_MODULE = "veomni.ops.kernels.moe"
+_GATE_MODULE = "veomni.ops.kernels.moe_experts.standard.activation_gate"
 
 
 def _all_eager_ops_config(**overrides) -> OpsImplementationConfig:
@@ -184,7 +181,7 @@ def test_the_triton_gate_matches_the_kernel_alias_table():
     the kernel turns a build-time refusal into a first-forward crash.
     """
     _skip_without_triton_moe()
-    from veomni.ops.kernels.moe._kernels.kernel.triton_utils.activation import _ACTIVATION_ALIASES
+    from veomni.ops.kernels.moe_experts.shared.activation import _ACTIVATION_ALIASES
 
     assert _KERNEL_ACTIVATIONS["triton"] == frozenset(_ACTIVATION_ALIASES)
 
@@ -226,74 +223,37 @@ def test_a_missing_config_warns():
     mock_logger.warning_rank0.assert_called_once()
 
 
-@patch("veomni.utils.import_utils.is_torch_npu_available", return_value=False)
-@patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", True)
-@patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", False)
-@patch(f"{_REGISTRY_MODULE}.get_gpu_compute_capability", return_value=80)
-def test_build_time_binding_refuses_before_the_kernel_pointer_is_set(_mock_cc, _mock_npu):
-    """The guard has to fire inside the bind, which is pre-``load_model``.
+def test_build_time_prerequisite_refuses_unsupported_activation():
+    """The guard fires in ``check_model_build_prerequisites``, before ``load_model``."""
+    DiffusionGemmaConfig = pytest.importorskip(
+        "veomni.models.transformers.diffusion_gemma.configuration_diffusion_gemma"
+    ).DiffusionGemmaConfig
 
-    Checking it anywhere later means the first wrong forward has already run.
-    """
-    slot = OpSlot("moe_experts", "standard")
-    fake_module = SimpleNamespace(veomni_moe_experts_forward=slot)
-    config = SimpleNamespace(text_config=SimpleNamespace(hidden_activation="quick_gelu"))
-
-    with pytest.raises(ValueError, match="cannot compute the expert activation"):
-        _bind_veomni_ops(fake_module, _all_eager_ops_config(moe_implementation="fused_triton"), config)
-
-    # Refuse before OpSlot.bind -- a failed build must not leave the module-global
-    # slot fused-bound for a later construction in the same process.
-    assert slot.use_non_eager_impl is False
-    assert slot._impl_name is None
+    prev = get_ops_config()
+    try:
+        set_ops_config(_all_eager_ops_config(moe_implementation="fused_triton"))
+        config = DiffusionGemmaConfig(text_config={"hidden_activation": "quick_gelu"})
+        with pytest.raises(ValueError, match="cannot compute the expert activation"):
+            check_model_build_prerequisites(config)
+    finally:
+        set_ops_config(prev)
 
 
-@patch(f"{_MOE_MODULE}.is_torch_npu_available", return_value=False)
-@patch(f"{_MOE_MODULE}.is_fused_moe_available", return_value=True)
-def test_the_patch_helper_keeps_its_single_argument_signature(_mock_fused, _mock_npu):
-    """Third-party backends intercept ``apply_veomni_fused_moe_patch`` by name.
-
-    The gate therefore runs in ``_bind_veomni_ops``; the helper itself must keep
-    binding with just a kernel name.
-    """
-    apply_veomni_fused_moe_patch(fused_moe_kernel="triton")
-
-
-@patch("veomni.utils.import_utils.is_torch_npu_available", return_value=False)
-@patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", True)
-@patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", False)
-@patch(f"{_REGISTRY_MODULE}.get_gpu_compute_capability", return_value=80)
-def test_a_dense_gelu_model_is_left_alone(_mock_cc, _mock_npu):
-    """``moe_implementation`` defaults to ``fused_triton`` for every model.
-
-    Dense Gemma is GELU and has no experts, so a guard keyed on the config
-    alone would refuse to build it. It is keyed on the slot being present.
-    """
-    fake_module = SimpleNamespace(veomni_rms_norm_forward=OpSlot("rms_norm", "standard"))
-    config = SimpleNamespace(hidden_activation="gelu_pytorch_tanh")
-
-    _bind_veomni_ops(fake_module, _all_eager_ops_config(moe_implementation="fused_triton"), config)
-
-
-@patch("veomni.utils.import_utils.is_torch_npu_available", return_value=False)
-@patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", True)
-@patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", False)
-@patch(f"{_REGISTRY_MODULE}.get_gpu_compute_capability", return_value=80)
-def test_eager_moe_keeps_serving_a_gelu_activation(_mock_cc, _mock_npu):
+def test_eager_moe_keeps_serving_a_gelu_activation():
     """The eager expert loop reads ``config.hidden_activation`` and is correct."""
-    fake_module = SimpleNamespace(veomni_moe_experts_forward=OpSlot("moe_experts", "standard"))
-    config = SimpleNamespace(text_config=SimpleNamespace(hidden_activation="gelu_pytorch_tanh"))
+    DiffusionGemmaConfig = pytest.importorskip(
+        "veomni.models.transformers.diffusion_gemma.configuration_diffusion_gemma"
+    ).DiffusionGemmaConfig
 
-    _bind_veomni_ops(fake_module, _all_eager_ops_config(moe_implementation="eager"), config)
+    prev = get_ops_config()
+    try:
+        set_ops_config(_all_eager_ops_config(moe_implementation="eager"))
+        check_model_build_prerequisites(DiffusionGemmaConfig())
+    finally:
+        set_ops_config(prev)
 
 
-@patch("veomni.utils.import_utils.is_torch_npu_available", return_value=False)
-@patch(f"{_MOE_MODULE}.is_torch_npu_available", return_value=False)
-@patch(f"{_MOE_MODULE}.is_fused_moe_available", return_value=True)
-@patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", True)
-@patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", False)
-@patch(f"{_REGISTRY_MODULE}.get_gpu_compute_capability", return_value=80)
-def test_diffusion_gemma_builds_on_fused_triton(_mock_cc, _mock_fused, _mock_moe_npu, _mock_npu):
+def test_diffusion_gemma_builds_on_fused_triton():
     """The 26B recipe, which is ``fused_triton`` + ``gelu_pytorch_tanh``.
 
     An earlier revision of this gate refused every non-SwiGLU activation on
@@ -305,12 +265,12 @@ def test_diffusion_gemma_builds_on_fused_triton(_mock_cc, _mock_fused, _mock_moe
         "veomni.models.transformers.diffusion_gemma.configuration_diffusion_gemma"
     ).DiffusionGemmaConfig
 
-    slot = OpSlot("moe_experts", "standard")
-    fake_module = SimpleNamespace(veomni_moe_experts_forward=slot)
-
-    _bind_veomni_ops(fake_module, _all_eager_ops_config(moe_implementation="fused_triton"), DiffusionGemmaConfig())
-
-    assert slot.use_non_eager_impl is True
+    prev = get_ops_config()
+    try:
+        set_ops_config(_all_eager_ops_config(moe_implementation="fused_triton"))
+        check_model_build_prerequisites(DiffusionGemmaConfig())
+    finally:
+        set_ops_config(prev)
 
 
 def _eager_moe_forward(

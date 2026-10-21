@@ -28,6 +28,7 @@ shares the packed mask and in-place loss of ``llada.dllm_utils``.
 """
 
 from collections.abc import Callable
+from functools import partial
 from typing import Optional
 
 import torch
@@ -51,18 +52,15 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.ops.dispatch import OpSlot
+from veomni.models.loss_utils import load_balancing_loss
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.moe_experts.standard.activation_gate import refuse_fused_moe_on_unsupported_activation
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
 from ..llada.dllm_utils import bidirectional_attention_mask, dllm_lm_head_loss, ulysses_load_balancing_loss
 from .configuration_llada_moe import LLaDAMoEConfig
-
-
-veomni_rms_norm = OpSlot("rms_norm", "standard")
-veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
-veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
-veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
-veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 
 
 def rotate_half(x):
@@ -80,8 +78,6 @@ def apply_rotary_pos_emb(
     position_ids: Optional[torch.Tensor] = None,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
-        return veomni_apply_rotary_pos_emb(q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim)
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -155,6 +151,7 @@ class LLaDAMoEAttention(nn.Module):
         self.q_norm = LLaDAMoERMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
         self.k_norm = LLaDAMoERMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = getattr(config, "sliding_window", None)
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
 
     def forward(
         self,
@@ -172,7 +169,7 @@ class LLaDAMoEAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
@@ -208,10 +205,19 @@ class LLaDAMoEMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        if veomni_swiglu_mlp.use_non_eager_impl:
-            return veomni_swiglu_mlp(self, x)
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+            return self.veomni_swiglu_mlp(
+                x,
+                self.gate_proj.weight,
+                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+                self.up_proj.weight,
+                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+                self.down_proj.weight,
+                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+            )
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
@@ -227,6 +233,10 @@ class LLaDAMoEExperts(torch.nn.Module):
         )
         self.down_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
+        self.hidden_act = config.hidden_act
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        if self.veomni_moe.impl != "eager":
+            refuse_fused_moe_on_unsupported_activation(config, self.veomni_moe.impl)
 
     def forward(
         self,
@@ -235,8 +245,19 @@ class LLaDAMoEExperts(torch.nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
-        if veomni_moe_experts_forward.use_non_eager_impl:
-            return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
+        if self.veomni_moe.impl != "eager":
+            unused = self.gate_up_proj.new_empty(0)
+            return self.veomni_moe(
+                hidden_states,
+                top_k_weights.to(final_hidden_states.dtype),
+                top_k_index,
+                unused,
+                unused,
+                self.down_proj,
+                self.gate_up_proj,
+                num_experts=self.num_experts,
+                activation=self.hidden_act,
+            )
 
         with torch.no_grad():
             expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
@@ -326,15 +347,10 @@ class LLaDAMoERMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if veomni_rms_norm.use_non_eager_impl:
-            return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -649,6 +665,10 @@ class LLaDAMoEForCausalLM(LLaDAMoEPreTrainedModel, GenerationMixin):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
+        self.veomni_lb = VeomniOp(
+            "load_balancing_loss", "standard", resolve_op_impl("load_balancing_loss_implementation")
+        )
+        self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -717,15 +737,8 @@ class LLaDAMoEForCausalLM(LLaDAMoEPreTrainedModel, GenerationMixin):
                 aux_loss = ulysses_load_balancing_loss(
                     outputs.router_logits, self.num_experts, self.num_experts_per_tok
                 )
-            elif veomni_load_balancing_loss.use_non_eager_impl:
-                aux_loss = veomni_load_balancing_loss(
-                    outputs.router_logits,
-                    self.num_experts,
-                    self.num_experts_per_tok,
-                    attention_mask,
-                )
             else:
-                aux_loss = load_balancing_loss_func(
+                aux_loss = self.load_balancing_loss(
                     outputs.router_logits,
                     self.num_experts,
                     self.num_experts_per_tok,

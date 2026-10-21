@@ -159,6 +159,22 @@ class DiffusionGemmaTextConfig(PreTrainedConfig):
         # No need to handle BC for new models, because they have no old-format `rope_scaling`
         return kwargs
 
+    def _validate_build_prerequisites(self) -> None:
+        from ....ops.config import get_ops_config
+        from ....ops.kernels.moe_experts.standard.activation_gate import (
+            refuse_fused_moe_on_unsupported_activation,
+        )
+
+        ops_config = get_ops_config()
+        if ops_config is None:
+            return
+        moe_impl = getattr(ops_config, "moe_implementation", "eager")
+        if moe_impl is None or moe_impl == "eager":
+            return
+        refuse_fused_moe_on_unsupported_activation(self, moe_impl)
+
+    validate_build_prerequisites = _validate_build_prerequisites
+
 
 @auto_docstring(checkpoint="google/diffusiongemma-26B-A4B-it")
 @strict
@@ -355,6 +371,24 @@ class DiffusionGemmaConfig(PreTrainedConfig):
             self.vision_config = CONFIG_MAPPING[self.vision_config["model_type"]](**self.vision_config)
 
         super().__post_init__(**kwargs)
+
+    def _validate_build_prerequisites(self) -> None:
+        if self.text_config is not None:
+            self.text_config.validate_build_prerequisites()
+
+    validate_build_prerequisites = _validate_build_prerequisites
+
+
+# Attach after @strict has built __class_validators__ (which scans every public
+# ``validate_*`` method and runs them inside ``__init__`` before ``from_dict``
+# applies model_config overrides or ``build_foundation_model`` calls
+# ``check_model_build_prerequisites``).
+DiffusionGemmaTextConfig.__class_validators__ = [
+    v for v in DiffusionGemmaTextConfig.__class_validators__ if v.__name__ != "_validate_build_prerequisites"
+]
+DiffusionGemmaConfig.__class_validators__ = [
+    v for v in DiffusionGemmaConfig.__class_validators__ if v.__name__ != "_validate_build_prerequisites"
+]
 
 
 __all__ = ["DiffusionGemmaTextConfig", "DiffusionGemmaConfig"]

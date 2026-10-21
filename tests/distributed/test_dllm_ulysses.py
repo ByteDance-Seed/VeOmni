@@ -58,18 +58,17 @@ def _both_topologies(world_size: int):
 
 def _build_model(config_path: str, device, config_kwargs=None):
     from veomni.models import build_foundation_model
-    from veomni.ops import apply_ops_config
 
     from ..tools.training_utils import make_eager_ops_config
 
-    apply_ops_config(make_eager_ops_config())
     torch.manual_seed(0)
     model = build_foundation_model(
         config_path,
         torch_dtype="bfloat16",
-        attn_implementation="veomni_flash_attention_2_with_sp",
+        attn_implementation="veomni_flash_attention_2",
         init_device="cuda",
         config_kwargs=config_kwargs,
+        ops_implementation=make_eager_ops_config(),
     ).to(device)
     if model.config.model_type in ("llada_moe", "llada2_uni"):
         # Spread the router logits: bf16 noise from a different GEMM row count must not

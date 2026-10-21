@@ -33,7 +33,7 @@ from veomni.utils.constants import IGNORE_INDEX
 
 def build_model(checkpoint_path: str, device: str, load_device: str = "cpu"):
     from scripts.verify_diffusion_gemma import _move_shared_model
-    from veomni.models.module_utils import init_empty_weights, load_model_weights
+    from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
 
     config = DiffusionGemmaConfig.from_pretrained(checkpoint_path)
     config.dtype = torch.bfloat16

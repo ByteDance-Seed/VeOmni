@@ -670,3 +670,61 @@ def test_iterable_repeat_advances_inner_epoch():
     stream.set_epoch(3)
     assert list(islice(stream, 2)) == ["a", "a"]
     assert inner.epochs == [13, 14]
+
+
+def test_iterable_hf_dataset_keeps_every_row_with_multiple_workers():
+    """A wrapped HF dataset shards itself across workers; we must not drop its rows."""
+    from datasets import Dataset as HFDataset
+    from torch.utils.data import DataLoader
+
+    for num_workers in (0, 2):
+        raw = HFDataset.from_dict({"id": list(range(48))}).to_iterable_dataset(num_shards=1)
+        stream = ShardedIterableDataset(raw, dp_rank=0, dp_size=1, repeat=False)
+        rows = [row["id"] for row in DataLoader(stream, batch_size=None, num_workers=num_workers)]
+        assert sorted(rows) == list(range(48)), f"num_workers={num_workers}: got {len(rows)} rows"
+
+
+def test_iterable_hf_dataset_still_shards_across_dp_ranks():
+    from datasets import Dataset as HFDataset
+    from torch.utils.data import DataLoader
+
+    raw = HFDataset.from_dict({"id": list(range(48))}).to_iterable_dataset(num_shards=1)
+    ranks = []
+    for rank in range(2):
+        stream = ShardedIterableDataset(raw, dp_rank=rank, dp_size=2, repeat=False)
+        ranks.append([row["id"] for row in DataLoader(stream, batch_size=None, num_workers=2)])
+    assert [len(items) for items in ranks] == [24, 24]
+    assert sorted(ranks[0] + ranks[1]) == list(range(48))
+
+
+def test_iterable_hf_dataset_repeat_passes_do_not_overlap_across_workers(tmp_path):
+    """Per-pass set_epoch must not race on HF's shared-memory epoch across workers."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from datasets import load_dataset
+    from torch.utils.data import DataLoader, get_worker_info
+
+    sizes = {0: 5, 1: 3}  # file index -> rows; ids 0..4 live in file 0, 5..7 in file 1
+    pq.write_table(pa.table({"id": list(range(0, 5))}), tmp_path / "part-0.parquet")
+    pq.write_table(pa.table({"id": list(range(5, 8))}), tmp_path / "part-1.parquet")
+    files = sorted(str(p) for p in tmp_path.glob("*.parquet"))
+    raw = load_dataset("parquet", data_files=files, split="train", streaming=True).shuffle(seed=1, buffer_size=4)
+    raw = raw.map(lambda x: {"id": x["id"], "wid": get_worker_info().id})
+    stream = ShardedIterableDataset(raw, dp_rank=0, dp_size=1, repeat=True)
+
+    per_worker = {0: [], 1: []}
+    for i, row in enumerate(DataLoader(stream, batch_size=None, num_workers=2)):
+        per_worker[int(row["wid"])].append(0 if row["id"] < 5 else 1)
+        if i == 1999:
+            break
+
+    def file_per_pass(seq):
+        files_read, i = [], 0
+        while i < len(seq) and i + sizes[seq[i]] <= len(seq):
+            files_read.append(seq[i])
+            i += sizes[seq[i]]
+        return files_read
+
+    w0, w1 = file_per_pass(per_worker[0]), file_per_pass(per_worker[1])
+    overlaps = sum(a == b for a, b in zip(w0, w1))
+    assert overlaps == 0, f"{overlaps}/{min(len(w0), len(w1))} passes had both workers read the same shard"

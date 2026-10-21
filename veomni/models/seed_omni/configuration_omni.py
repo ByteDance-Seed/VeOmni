@@ -25,6 +25,7 @@ are the active entries. A single-scenario file uses the name ``default``.
 
 import json
 import os
+import re
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Collection, Dict, List, Optional, Tuple, Union
 
@@ -34,11 +35,29 @@ from transformers import PretrainedConfig
 
 if TYPE_CHECKING:
     from .modules.module_configuration_base import OmniModuleConfig
+    from .utils.hf_layout import HFSource
 
 
 DEFAULT_TRAINING_GRAPH_FILE = "training_graph.yaml"
 DEFAULT_GENERATION_GRAPH_FILE = "generation_graph.yaml"
 DEFAULT_GRAPH_SCENARIO = "default"
+
+_SAFE_INFER_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def check_infer_type_names(names: Collection[str]) -> None:
+    """Reject ``infer_type`` names that cannot name ``graphs/generation_<infer_type>.mmd``.
+
+    Run whenever a config receives its generation graphs, so a bad name fails on
+    every rank at build time rather than on rank 0 alone, mid-save, after the
+    module weights are already on disk.
+    """
+    for name in names:
+        if not isinstance(name, str) or not _SAFE_INFER_TYPE.fullmatch(name):
+            raise ValueError(
+                f"Invalid infer_type {name!r}: scenario names must match {_SAFE_INFER_TYPE.pattern} "
+                "so they can be used as diagram filenames."
+            )
 
 
 def select_graph(
@@ -191,6 +210,7 @@ class OmniConfig(PretrainedConfig):
         self._module_entries = _module_entries
         self.training_graphs = training_graphs
         self.generation_graphs = generation_graphs
+        check_infer_type_names(generation_graphs or {})
         self.train_type = train_type
         self.infer_type = infer_type
         self.generation_kwargs = generation_kwargs
@@ -203,6 +223,11 @@ class OmniConfig(PretrainedConfig):
         # copy here would be a second place to keep in sync. Dropped by
         # :meth:`to_dict`.
         self._module_configs: Dict[str, OmniModuleConfig] = {}
+        # The upstream HF checkpoint the module weights are read from, when this
+        # config was loaded off a weight-free view of one (see
+        # :mod:`~veomni.models.seed_omni.utils.hf_layout`). In-memory only, like
+        # :attr:`_module_configs`: a saved config describes its own files.
+        self._hf_source: Optional[HFSource] = None
 
         super().__init__(**kwargs)
 
@@ -360,6 +385,7 @@ class OmniConfig(PretrainedConfig):
             self._module_entries[name]["model_path"] = name
         output = super().to_dict()
         output.pop("_module_configs", None)
+        output.pop("_hf_source", None)
         return output
 
     @classmethod
@@ -375,7 +401,14 @@ class OmniConfig(PretrainedConfig):
         ``ops_implementation``, ``model_config``, ``processor_config``. The
         config that comes back is the resolved one, and handing it to
         ``OmniModel.from_pretrained(path, config=...)`` loads the same model.
+
+        An upstream HF checkpoint whose ``model_type`` has a registered
+        :class:`~veomni.models.seed_omni.utils.hf_layout.OmniHFLayout` loads
+        too, through a weight-free split view of it.
         """
+        from .utils.hf_layout import resolve_omni_checkpoint_root
+
+        pretrained_model_name_or_path = resolve_omni_checkpoint_root(pretrained_model_name_or_path)
         # Out before transformers sees them: it would turn each one into a
         # config attribute. Judged against this config's entries once it exists.
         omni_kwargs = pop_omni_kwargs(kwargs)
@@ -399,8 +432,10 @@ class OmniConfig(PretrainedConfig):
         sidecar).
         """
         from .modules.module_configuration_base import OmniModuleConfig
+        from .utils.hf_layout import read_hf_source
 
         root = str(checkpoint_root)
+        self._hf_source = read_hf_source(root)
         self._load_graphs_from_pretrained(root)
         for name in self.module_names:
             entry = self._module_entries[name]
@@ -417,7 +452,7 @@ class OmniConfig(PretrainedConfig):
     def _load_graphs_from_pretrained(self, checkpoint_root: Union[str, os.PathLike]) -> None:
         """Load ``training_graphs`` and ``generation_graphs`` from YAML sidecars when present.
 
-        Attributes named in ``skip`` are left alone, because a sidecar is the
+        A map already populated is left alone, because a sidecar is the
         checkpoint's default rather than an override of an explicit caller.
 
         A module-only split checkpoint has neither file yet; train / generate
@@ -428,6 +463,7 @@ class OmniConfig(PretrainedConfig):
             self.training_graphs = self._read_graph_sidecar(root, DEFAULT_TRAINING_GRAPH_FILE, list)
         if not self.generation_graphs:
             self.generation_graphs = self._read_graph_sidecar(root, DEFAULT_GENERATION_GRAPH_FILE, dict)
+            check_infer_type_names(self.generation_graphs)
 
     @classmethod
     def _read_graph_sidecar(cls, root: str, filename: str, payload_type: type) -> Dict:

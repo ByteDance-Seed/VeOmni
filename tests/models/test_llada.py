@@ -7,16 +7,14 @@ import types
 import pytest
 import torch
 
+from tests.tools.training_utils import make_eager_ops_config
 from veomni.data.chat_template import build_chat_template
 from veomni.data.data_collator import DataCollateInfo, MainCollator
 from veomni.data.data_transform import DATA_TRANSFORM_REGISTRY, apply_dllm_masking
 from veomni.models import build_foundation_model
-from veomni.ops import apply_ops_config
-from veomni.ops.kernels.cross_entropy import dllm_masked_cross_entropy
+from veomni.models.loss_utils import dllm_masked_cross_entropy
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import IS_CUDA_AVAILABLE
-
-from ..tools.training_utils import make_eager_ops_config
 
 
 TOY_CONFIG = "./tests/toy_config/llada_toy"
@@ -57,10 +55,13 @@ def _messages():
 
 
 def _toy_model(attn_implementation="eager", device="cpu", dtype="float32", config=TOY_CONFIG):
-    apply_ops_config(make_eager_ops_config())
     torch.manual_seed(0)
     return build_foundation_model(
-        config, torch_dtype=dtype, attn_implementation=attn_implementation, init_device=device
+        config,
+        torch_dtype=dtype,
+        attn_implementation=attn_implementation,
+        init_device=device,
+        ops_implementation=make_eager_ops_config(),
     ).to(device)
 
 
@@ -216,7 +217,7 @@ def test_packed_loss_matches_separate_samples_sdpa(monkeypatch):
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="flash varlen needs CUDA")
 def test_packed_loss_matches_separate_samples_flash_varlen(monkeypatch):
     pytest.importorskip("flash_attn")
-    separate, packed, _ = _packed_vs_separate(monkeypatch, "veomni_flash_attention_2_with_sp", "cuda", "bfloat16")
+    separate, packed, _ = _packed_vs_separate(monkeypatch, "veomni_flash_attention_2", "cuda", "bfloat16")
     torch.testing.assert_close(packed, separate, rtol=2e-2, atol=2e-2)
 
 

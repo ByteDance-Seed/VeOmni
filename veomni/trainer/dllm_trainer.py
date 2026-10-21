@@ -28,7 +28,7 @@ from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel.loss import sum_over_ulysses_shards
 from ..models.model_runtime import VeOmniModelRuntime
-from ..ops.batch_invariant_ops import set_batch_invariant_mode
+from ..ops.batch_invariant import set_batch_invariant_mode
 from ..utils import helper
 from ..utils.device import synchronize
 from ..utils.loss_utils import dllm_mean_global_loss
@@ -42,9 +42,9 @@ logger = helper.create_logger(__name__)
 #: Models whose loss and router statistics `DllmTrainer` knows how to reduce over a sequence shard.
 SEQUENCE_PARALLEL_MODEL_TYPES = ("llada", "llada_moe", "llada_v", "llada2_uni")
 ULYSSES_ATTENTION_TYPES = (
-    "veomni_flash_attention_2_with_sp",
-    "veomni_flash_attention_3_with_sp",
-    "veomni_flash_attention_4_with_sp",
+    "veomni_flash_attention_2",
+    "veomni_flash_attention_3",
+    "veomni_flash_attention_4",
 )
 
 
@@ -269,7 +269,7 @@ class DllmTrainer:
         """Refuse the SP configurations whose numbers would come out wrong rather than crash.
 
         Ulysses rides on `flash_attention_forward`'s all-to-all, which only the
-        `veomni_flash_*_with_sp` backends run: sdpa or eager would attend within the
+        `veomni_flash_*` backends run: sdpa or eager would attend within the
         shard and train normally on a truncated context.
         """
         state = get_parallel_state()
@@ -288,7 +288,7 @@ class DllmTrainer:
         attn_implementation = model_config._attn_implementation
         if attn_implementation not in ULYSSES_ATTENTION_TYPES:
             raise ValueError(
-                f"Sequence parallelism needs a `veomni_flash_attention_*_with_sp` backend for its all-to-all, "
+                f"Sequence parallelism needs a `veomni_flash_attention_*` backend for its all-to-all, "
                 f"got `{attn_implementation}`. Set `model.ops_implementation.attn_implementation: flash_attention_2`."
             )
         vision_config = getattr(model_config, "vision_config", None)

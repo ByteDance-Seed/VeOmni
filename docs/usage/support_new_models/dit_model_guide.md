@@ -150,6 +150,73 @@ image streams across SP ranks and gathers the image stream back before the
 output head, mirroring the Wan/Flux pattern. `num_attention_heads` must be
 divisible by `ulysses_size`.
 
+The `Qwen-Image` and `Qwen-Image-Edit` preprocessors preserve the raw record
+aliases (`prompt`/`text`/`caption`, `image_path`/`target_image`, and the Edit
+`source_image(s)`/`edit_image(s)` aliases). They normalize them to modality
+pairs, matching the shared multimodal data convention:
+
+```python
+# One Edit sample after preprocessing, before image loading:
+inputs = [("image", None), ("text", "Make the car red")]
+outputs = [("image", None)]
+images = ["source.png", "target.png"]
+videos = []
+```
+
+For multiple references, add an input image placeholder for each source and
+keep all source images before the single target image. Text-to-image samples
+have only the text input and target image. The generic `dit_online` transform
+loads this one image list; the Qwen condition model validates the placeholders
+and splits sources from the target. It resizes a separate copy of each source
+to the EditPlus 384×384 condition area for VL encoding, preserving aspect ratio
+and the reference pipeline's rounding and interpolation. The VAE path applies
+the configured `height`, `width`, and `image_resize_mode` to the originals.
+`configs/dit/qwen_image_edit_2511.yaml` enables this Edit-2511 path and its
+`zero_cond_t` modulation. Existing encoded Qwen caches are unchanged.
+
+### Wan I2V conditioning
+
+The non-expanded-timestep I2V path (Wan2.2 I2V-A14B) uses
+`model.condition_model_cfg.image_conditioning: true`. A local snapshot's
+`transformer/config.json` also enables this mode when `in_channels` differs
+from `out_channels`. TI2V-5B uses `expand_timesteps` instead; T2V uses neither.
+
+For channel-concatenated I2V, the condition model preprocesses the video once,
+keeps its first normalized image frame, fills subsequent image frames with
+zeros, and VAE-encodes that complete condition video. It stores the raw
+condition posterior in `image_latents` and the temporal mask in `mask` alongside
+the target posterior and text context. `process_condition` normalizes both
+posteriors, and the DiT concatenates `[noisy_target, mask, image_condition]`.
+Copying the first latent across time is not equivalent to encoding zero-valued
+image frames. Legacy I2V offline embeddings missing `image_latents` or `mask`
+must be regenerated; the code rejects them rather than synthesizing a condition.
+
+The frame count must be `1 + k * vae.config.scale_factor_temporal`. The A14B
+example sets `data.mm_configs.frame_factor: 4` and `frame_factor_remainder: 1`
+to enforce this during video sampling. These settings follow A14B's VAE and
+must be checked when switching snapshots.
+
+The encoded latent's temporal and spatial dimensions must each be divisible by
+the corresponding transformer `patch_size`. Predictions and training targets
+must have identical shapes; incompatible inputs raise an error instead of
+silently discarding supervised frames or image borders.
+
+Expanded-timestep TI2V-5B clamps the first latent frame to the clean condition
+and uses zero timesteps there. Its flow target remains `noise - latents`;
+`process_condition` sets `loss_start_frame=1` for each sample so the transformer
+averages MSE over subsequent frames only. A sample must contain at least one
+latent frame after the condition. T2V and channel-concatenated A14B use the
+default `loss_start_frame=0` and supervise the full target video. Existing
+TI2V-5B encoded caches retain their format; the loss boundary is set during
+`process_condition` for both online and offline training.
+
+Both Wan I2V examples enable gradient checkpointing and disable async activation
+offload. Wan invokes checkpointing outside `block.__call__`, whereas the current
+async offload implementation wraps `block.__call__`. Combining them nests the
+offload saved-tensor hooks inside the checkpoint hooks and suppresses
+recomputation. Keep `model.accelerator.offload_config.enable_async_activation`
+disabled until Wan's outer checkpoint boundary supports that integration.
+
 ### Config Bridge — `to_diffuser_dict()` and `to_dict()`
 
 `to_diffuser_dict()` uses Python's `inspect` module to extract exactly the
@@ -231,6 +298,16 @@ Then add your module to `veomni/models/diffusers/__init__.py`:
 ```python
 from . import your_dit
 ```
+
+Also expose the diffusers registration side effects from
+`veomni/models/__init__.py`:
+
+```python
+from . import diffusers, transformers
+```
+
+Add that root import only when the family is fully registered. The current
+placeholder diffusers packages are intentionally not public registry entries.
 
 ---
 
@@ -331,7 +408,7 @@ separately for logging/visualization).
 
 ```python
 # veomni/models/diffusers/your_dit/your_condition/__init__.py
-from ....loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 @MODEL_CONFIG_REGISTRY.register("YourConditionModel")
 def register_config():
@@ -560,7 +637,7 @@ Ulysses SP requires an AllToAll before and after the attention kernel.
 For diffusers models this is done via an **attention processor** installed with
 `attn.set_processor(...)`.
 
-### Pattern (mirrors `veomni/ops/kernels/attention` registration)
+### Pattern (uses the registered attention interfaces in `veomni/ops`)
 
 1. Implement a `your_eager_attention_forward` function — the non-flash fallback.
    It must follow the `ALL_ATTENTION_FUNCTIONS` calling convention:
@@ -570,7 +647,7 @@ For diffusers models this is done via an **attention processor** installed with
 
 2. In `YourSPAttnProcessor.__init__`, store the implementation name and expose
    the attributes that `flash_attention_forward` (from
-   `veomni/ops/kernels/attention`)
+   `veomni/ops/kernels/attention/standard/flash.py`)
    reads from `module`:
 
    ```python
@@ -609,9 +686,8 @@ For diffusers models this is done via an **attention processor** installed with
    )[0]  # returns (B, seq, heads, head_dim)
    ```
 
-   The `veomni_flash_attention_*_with_sp` functions registered in
-   `ALL_ATTENTION_FUNCTIONS` (see
-   `veomni/ops/kernels/attention/__init__.py`) will
+   The `veomni_flash_attention_*` functions registered in
+   `ALL_ATTENTION_FUNCTIONS` (see `veomni/ops/install.py`) will
    select the correct FA2/FA3/FA4 kernel automatically.
 
 5. Install the processor on every attention block:
@@ -632,7 +708,7 @@ For diffusers models this is done via an **attention processor** installed with
 
 ```python
 # veomni/models/diffusers/your_dit/your_transformer/__init__.py
-from ....loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 @MODEL_CONFIG_REGISTRY.register("YourTransformerModel")
 def register_config():
@@ -662,7 +738,7 @@ model:
   config_path: ./configs/model_configs/your_model/your_model.json
   condition_model_path: YourOrg/YourModel-Diffusers
   ops_implementation:
-    attn_implementation: veomni_flash_attention_2_with_sp
+    attn_implementation: veomni_flash_attention_2
   accelerator:
     init_device: meta
     ulysses_size: 4
@@ -732,6 +808,7 @@ Copy the remaining fields from the Diffusers transformer config into the same JS
 
 - [ ] `veomni/models/diffusers/your_dit/__init__.py` (imports sub-packages)
 - [ ] `veomni/models/diffusers/__init__.py` updated with `from . import your_dit`
+- [ ] `veomni/models/__init__.py` imports `diffusers` so registration runs
 - [ ] Condition model config: `PretrainedConfig` subclass with `get_config_dict` override
 - [ ] Condition model: `get_condition()` and `process_condition()` implemented
 - [ ] Condition model registered in `MODEL_CONFIG_REGISTRY` and `MODELING_REGISTRY`
@@ -746,7 +823,7 @@ Copy the remaining fields from the Diffusers transformer config into the same JS
 
 ### If Supporting Ulysses SP
 
-- [ ] `_VEOMNI_SP_ATTN_IMPLS` frozenset defined (the three `veomni_flash_attention_*_with_sp` names)
+- [ ] The model recognizes the three `veomni_flash_attention_*` names as SP-aware attention
 - [ ] `YourEagerAttentionForward` function with `ALL_ATTENTION_FUNCTIONS` convention
 - [ ] `YourSPAttnProcessor` with `SimpleNamespace` config, `is_causal=False`, `layer_idx=None`
 - [ ] SP guard in forward patch: slice/gather only when `ulysses_enabled and attn_impl in _VEOMNI_SP_ATTN_IMPLS`
@@ -764,5 +841,5 @@ Copy the remaining fields from the Diffusers transformer config into the same JS
 | NCCL deadlock on SP with gradient checkpointing | SP gather not inside the checkpoint boundary | Ensure `gather_outputs` is called outside the block loop, not inside `_gradient_checkpointing_func` |
 | Wrong shape after AllToAll in attention | Q/K/V not transposed before `flash_attention_forward` | `flash_attention_forward` expects `(B, heads, seq, head_dim)`; transpose before calling |
 | Double SP gather (output is wrong) | `flash_attention_forward` called without `skip_ulysses=True` while AllToAll already done manually | Pass `skip_ulysses=True` to all `attention_interface(...)` calls in the SP processor |
-| `KeyError` in `ALL_ATTENTION_FUNCTIONS` | `apply_veomni_attention_patch()` not called before model load | `ops` patch is applied via `apply_ops_patch()` at startup; ensure it runs before the register function |
+| `KeyError` in `ALL_ATTENTION_FUNCTIONS` | `apply_veomni_attention_patch()` not called before model load | Kernel integrations are installed by `apply_ops_patch()` when `veomni.ops` is imported; ensure that happens before model loading |
 | `process_condition` key names mismatch | Returned dict keys don't match `forward()` parameter names | Check that every key in `process_condition` output corresponds to a `forward()` parameter |

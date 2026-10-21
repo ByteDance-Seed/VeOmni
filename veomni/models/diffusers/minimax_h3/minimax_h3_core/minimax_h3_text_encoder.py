@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from transformers import Qwen3VLConfig, Qwen3VLModel
 
@@ -13,6 +14,76 @@ PRESENTATION_VIDEO_TAG = 0
 QWEN_VIDEO_SAMPLE_FPS = 2.0
 QWEN_TEMPORAL_PATCH = 2
 MINIMAX_SUPPORTED_FPS = 24
+
+
+def prepare_ref_prompt(processor, tokenizer, prompt, ref_blocks):
+    """Build the native Ref2VA presentation from ordered, prepared references."""
+    pixel_values = image_grid_thw = pixel_values_videos = video_grid_thw = None
+    counters = {"image": 0, "audio": 0, "video": 0}
+    images, videos, timestamps_per_video, condition_labels = [], [], [], []
+    for block in ref_blocks:
+        kind = block["kind"]
+        if kind == "image":
+            counters["image"] += 1
+            condition_labels.append(("image", counters["image"]))
+            images.append(block["prepared_image"])
+        elif kind == "audio":
+            counters["audio"] += 1
+            condition_labels.append(("audio", counters["audio"]))
+        elif kind in ("video", "video_audio"):
+            if int(block["ref_audio_t"]) > 0:
+                counters["audio"] += 1
+                condition_labels.append(("audio", counters["audio"]))
+            counters["video"] += 1
+            condition_labels.append(("video", counters["video"]))
+            sampled, timestamps = sample_qwen_video_frames(block["prepared_frames"])
+            videos.append(np.stack([np.asarray(f) for f in sampled]))
+            timestamps_per_video.append(timestamps)
+        else:
+            raise ValueError(f"unknown reference kind: {kind}")
+    image_counts, video_counts, video_timestamps = [], [], []
+    if images:
+        pixel_values, image_grid_thw, image_counts = image_token_counts(processor, images)
+    if videos:
+        pixel_values_videos, video_grid_thw, video_counts, video_timestamps = video_token_counts(
+            processor, videos, timestamps_per_video
+        )
+    input_ids, text_token_tags = presentation_ref2va(
+        tokenizer, prompt, condition_labels, image_counts, video_counts, video_timestamps
+    )
+    return input_ids, text_token_tags, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw
+
+
+def encode_prompt(text_encoder, processor, tokenizer, prompt, *, device, dtype, keyframes=None, ref_blocks=None):
+    """Encode the same T2VA/FL2VA/Ref2VA presentation used by native inference.
+
+    Keyframes must already be resized, and Ref2VA blocks must contain the same
+    prepared images/frames and ordering used for the conditional cache.
+    """
+    if keyframes and ref_blocks:
+        raise ValueError("Specify keyframes or ref_blocks, not both.")
+    pixel_values = image_grid_thw = pixel_values_videos = video_grid_thw = None
+    if ref_blocks:
+        input_ids, tags, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw = prepare_ref_prompt(
+            processor, tokenizer, prompt, ref_blocks
+        )
+    elif keyframes:
+        pixel_values, image_grid_thw, counts = image_token_counts(processor, keyframes)
+        input_ids, tags = presentation_fl2va(tokenizer, prompt, counts)
+    else:
+        input_ids, tags = presentation_t2va(tokenizer, prompt)
+    ids = input_ids.unsqueeze(0).to(device)
+    kwargs = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+    if pixel_values is not None:
+        kwargs["pixel_values"] = pixel_values.to(device, dtype)
+        kwargs["image_grid_thw"] = image_grid_thw.to(device, torch.long)
+    if pixel_values_videos is not None:
+        kwargs["pixel_values_videos"] = pixel_values_videos.to(device, dtype)
+        kwargs["video_grid_thw"] = video_grid_thw.to(device, torch.long)
+    hidden = text_encoder(**kwargs)
+    # Layout builders consume the host-built tags. Inference explicitly moves
+    # them to its device; training cache generation need not copy them back.
+    return {"prompt_embeds": hidden.to(device, dtype), "text_token_tags": tags.view(-1).long()}
 
 
 class MiniMaxH3TextEncoder(torch.nn.Module):

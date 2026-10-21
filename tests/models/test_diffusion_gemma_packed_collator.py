@@ -34,12 +34,11 @@ import pytest
 import torch
 
 import veomni.trainer.diffusion_gemma_trainer as dg_trainer
+from tests.models.test_diffusion_gemma_canvas_batching import _toy_model
 from veomni.data.data_collator import DiffusionGemmaCollator
 from veomni.models.transformers.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaConfig
 from veomni.models.transformers.diffusion_gemma.modeling_diffusion_gemma import expand_self_conditioning_mask
 from veomni.trainer.diffusion_gemma_trainer import DiffusionGemmaTrainer, diffusion_gemma_sample_cost
-
-from .test_diffusion_gemma_canvas_batching import _toy_model
 
 
 #: Ragged on both axes -- prompt length and canvas count -- which is the case

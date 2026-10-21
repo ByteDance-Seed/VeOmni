@@ -51,7 +51,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal, Optional, Union, get_args
 
 import yaml
 
@@ -76,6 +76,8 @@ from .parser import _deep_update, _instantiate_recursive
 
 logger = logging.get_logger(__name__)
 
+OmniTrainingTask = Literal["online_training", "offline_embedding", "offline_training"]
+
 
 def _is_omni_checkpoint_root(path: Optional[str]) -> bool:
     return bool(path) and os.path.isfile(os.path.join(str(path), "config.json"))
@@ -92,6 +94,97 @@ def _try_load_omni_checkpoint_config(path: Optional[str]):
 DEFAULT_SCENARIO = "default"
 
 
+def _resolve_hf_checkpoint_view(model_runtime: OmniModelRuntimeArguments) -> str:
+    """Set ``seed_omni_model_path`` to the weight-free split view when ``model_path`` is upstream HF.
+
+    ``model.model_path`` is never rewritten: loggers and saved launch args keep
+    the user-facing path. Downstream (module configs, assets, the collator's
+    preprocessors, inference) reads :attr:`OmniModelRuntimeArguments.seed_omni_model_path`,
+    while module weights still come from the HF checkpoint the view records.
+    A split root sets ``seed_omni_model_path`` equal to ``model_path``.
+    """
+    from ..models.seed_omni.utils.hf_layout import read_hf_source, resolve_omni_checkpoint_root
+
+    model_path = model_runtime.model_path
+    view = resolve_omni_checkpoint_root(model_path)
+    if view != model_path:
+        source = read_hf_source(view)
+        logger.info_rank0(
+            f"OmniModel: `model.model_path` is a HuggingFace `{source.model_type}` checkpoint; "
+            f"loading its modules through the {source.model_type} HF layout "
+            f"(seed_omni_model_path: {view})."
+        )
+    model_runtime.seed_omni_model_path = view
+    return view
+
+
+def _check_hf_source_exportable(model_path: str) -> None:
+    """Fail at startup, not at the first HF save, when the source cannot be written back."""
+    from ..models.seed_omni.utils.hf_layout import read_hf_source, source_tensor_specs, source_weight_files
+
+    source = read_hf_source(model_path)
+    if source is None:
+        return
+    try:
+        weight_files = source_weight_files(source.path)
+    except FileNotFoundError as e:
+        raise ValueError(
+            f"`train.checkpoint.save_hf_weights` exports in the source layout, which needs safetensors weights: {e} "
+            "Convert the checkpoint to safetensors, or disable save_hf_weights."
+        ) from e
+    try:
+        source_tensor_specs(source.path, weight_files)
+    except ValueError as e:
+        raise ValueError(f"`train.checkpoint.save_hf_weights` cannot write this source back: {e}") from e
+
+
+def _validate_hf_view_modules(
+    model_path: str,
+    modules: dict[str, OmniModuleRuntimeArguments],
+    *,
+    ep_sharded_stream_load: bool = False,
+) -> None:
+    """Under an HF ``model_path`` every module is one the family layout cuts from that checkpoint.
+
+    ``ep_sharded_stream_load`` is the top-level flag, which the composed wrap
+    (``fsdp_scope: model``) reads instead of the per-module ones.
+    """
+    from ..models.seed_omni.utils.hf_layout import read_hf_source
+
+    source = read_hf_source(model_path)
+    if source is None:
+        return
+    layout_modules = set(source.layout.modules)
+    for name, module_args in modules.items():
+        if name not in layout_modules:
+            raise ValueError(
+                f"Module {name!r} is not part of the `{source.model_type}` HF layout "
+                f"(modules: {sorted(layout_modules)}); an HF `model.model_path` only loads the family's own modules. "
+                "Convert the checkpoint to compose other modules."
+            )
+        if os.path.normpath(str(module_args.model_path)) != os.path.normpath(os.path.join(model_path, name)):
+            raise ValueError(
+                f"Module {name!r} sets its own model_path ({module_args.model_path!r}), but `model.model_path` is a "
+                f"HuggingFace `{source.model_type}` checkpoint every module loads from. Drop the per-module "
+                "model_path, or convert the checkpoint to compose modules from several sources."
+            )
+    streaming = sorted(name for name, args in modules.items() if args.ep_sharded_stream_load)
+    if ep_sharded_stream_load or streaming:
+        raise ValueError(
+            f"ep_sharded_stream_load (model: {ep_sharded_stream_load}, modules: {streaming}) does not apply the "
+            f"`{source.model_type}` HF layout's key renames. Disable it, or convert the checkpoint to a split one."
+        )
+    overrides = {
+        name: sorted(keys) for name, args in modules.items() if (keys := hf_module_model_config(args.model_config))
+    }
+    if overrides:
+        logger.warning_rank0(
+            f"Per-module model_config overrides {overrides} apply to this run, but an HF export of the "
+            f"`{source.model_type}` checkpoint keeps its source config.json; an override that changes the "
+            "architecture will not be reflected there."
+        )
+
+
 def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool = False) -> OmniModelRuntimeArguments:
     """Resolve ``args.model`` launcher fields into a fully populated :class:`OmniModelRuntimeArguments`.
 
@@ -103,10 +196,13 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         raise ValueError("`model.model_path` (split-checkpoint root) is required for OmniModel.")
 
     # ``model_path`` is already local: ``BaseModelArguments.__post_init__`` localizes
-    # it, so per-module subfolders join against a path that exists on disk and
-    # ``_try_load_omni_checkpoint_config`` below can open its ``config.json``.
-    model_path = model_runtime.model_path
-    omni_cfg = _try_load_omni_checkpoint_config(model_path)
+    # it. ``seed_omni_model_path`` is the root configs / assets / graphs are read
+    # from (a weight-free view when ``model_path`` is an upstream HF checkpoint).
+    seed_omni_model_path = _resolve_hf_checkpoint_view(model_runtime)
+    # An ``offline_embedding`` run trains nothing, so it never exports HF weights.
+    if not for_inference and args.train.checkpoint.save_hf_weights and args.train.training_task != "offline_embedding":
+        _check_hf_source_exportable(seed_omni_model_path)
+    omni_cfg = _try_load_omni_checkpoint_config(seed_omni_model_path)
 
     train_modules = model_runtime.launcher_config("modules")
     if train_modules is None and omni_cfg is not None:
@@ -115,7 +211,7 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         # being re-derived as ``<root>/<name>``.
         train_modules = {}
         for name in omni_cfg.module_names:
-            module_override: dict[str, Any] = {"model_path": omni_cfg.resolve_module_path(model_path, name)}
+            module_override: dict[str, Any] = {"model_path": omni_cfg.resolve_module_path(seed_omni_model_path, name)}
             if overrides := omni_cfg._module_entries[name].get("model_config"):
                 module_override["model_config"] = overrides
             train_modules[name] = module_override
@@ -155,9 +251,12 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
 
     modules = build_omni_module_runtime_args(
         _to_module_global_args(model_runtime),
-        model_path,
+        seed_omni_model_path,
         train_modules,
         for_inference=for_inference,
+    )
+    _validate_hf_view_modules(
+        seed_omni_model_path, modules, ep_sharded_stream_load=model_runtime.ep_sharded_stream_load
     )
     for module_args in modules.values():
         _validate_omni_accelerator(module_args.accelerator)
@@ -175,6 +274,7 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
     model_kwargs = {name: getattr(model_runtime, name) for name in shared_fields}
     return OmniModelRuntimeArguments(
         **model_kwargs,
+        seed_omni_model_path=seed_omni_model_path,
         modules=modules,
         training_graphs=training_graphs,
         generation_graphs=generation_graphs,
@@ -409,7 +509,10 @@ class OmniDataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal["seedomni"] = field(default="seedomni", metadata={"help": "Type of the training data."})
+    data_type: Literal["seedomni", "seedomni_cached"] = field(
+        default="seedomni",
+        metadata={"help": "Type of the training data; `seedomni_cached` reads an offline-cache dataset."},
+    )
     datasets_type: str = field(
         default="mapping",
         metadata={"help": "Type of the datasets."},
@@ -450,8 +553,10 @@ class OmniDataArguments:
     )
 
     def __post_init__(self):
-        if self.data_type != "seedomni":
-            raise ValueError(f"OmniTrainer only builds the seedomni transform; got data.data_type={self.data_type!r}.")
+        if self.data_type not in {"seedomni", "seedomni_cached"}:
+            raise ValueError(
+                f"OmniTrainer only builds the seedomni transforms; got data.data_type={self.data_type!r}."
+            )
         self.enable_multisource = self.train_path.endswith(".yaml")
 
         if self.enable_multisource:
@@ -563,6 +668,18 @@ class OmniTrainingArguments:
         default=0,
         metadata={"help": "MoE expert load heatmap interval. Not supported by OmniTrainer; must be <= 0 (disabled)."},
     )
+    training_task: OmniTrainingTask = field(
+        default="online_training",
+        metadata={
+            "help": "Training task. online_training: encode raw data online. offline_embedding: run the "
+            "training graph with every module frozen and write the cache. offline_training: train from the "
+            "cache; every module that mixes in OfflineEncodingMixin is built on meta."
+        },
+    )
+    offline_cache_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Output directory for training_task='offline_embedding'."},
+    )
     graph_profile: OmniGraphProfileArguments = field(default_factory=OmniGraphProfileArguments)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
@@ -570,6 +687,19 @@ class OmniTrainingArguments:
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
+        if self.training_task not in get_args(OmniTrainingTask):
+            known = ", ".join(get_args(OmniTrainingTask))
+            raise ValueError(f"Unknown train.training_task {self.training_task!r}; expected one of: {known}.")
+        if self.training_task == "offline_embedding" and not self.offline_cache_dir:
+            raise ValueError(
+                "`train.offline_cache_dir` is required when `train.training_task` is 'offline_embedding'."
+            )
+        if self.training_task == "offline_embedding" and self.num_train_epochs != 1:
+            raise ValueError(
+                "`train.training_task='offline_embedding'` writes every sample it reads, so "
+                f"`train.num_train_epochs` must be 1; got {self.num_train_epochs}."
+            )
+
         if self.dyn_bsz_physical_overflow_ratio < 1.0:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
@@ -659,6 +789,16 @@ def _validate_omni_accelerator(accelerator: AcceleratorConfig) -> None:
         raise ValueError("accelerator.torch_compile.enable is not supported by SeedOmni yet.")
 
 
+def _validate_training_task_data(train: OmniTrainingArguments, data: OmniDataArguments) -> None:
+    """Only ``offline_training`` reads an offline cache; the other tasks read raw ``seedomni`` data."""
+    if (train.training_task == "offline_training") != (data.data_type == "seedomni_cached"):
+        expected = "seedomni_cached" if train.training_task == "offline_training" else "seedomni"
+        raise ValueError(
+            f"`train.training_task={train.training_task!r}` needs `data.data_type={expected!r}`; "
+            f"got {data.data_type!r}."
+        )
+
+
 def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
     """Reject an eager module under a top-level ``fsdp_scope='model'`` before any weights load."""
     fsdp_config = accelerator.fsdp_config
@@ -702,6 +842,7 @@ class OmniArguments:
         self.train._derive_batch_config(self.model.accelerator)
 
         _validate_omni_accelerator(self.model.accelerator)
+        _validate_training_task_data(self.train, self.data)
 
     def _to_module_global_args(self) -> OmniModuleRuntimeArguments:
         """Project ``model`` defaults onto :class:`OmniModuleRuntimeArguments` for per-module merging."""

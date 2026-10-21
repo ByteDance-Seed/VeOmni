@@ -9,11 +9,10 @@ import types
 import pytest
 import torch
 
+from tests.models.test_llada import REPO_ROOT, _packed_vs_separate, _sample, _toy_model
 from veomni.models.transformers.llada_moe.checkpoint_tensor_converter import LLaDAMoECheckpointTensorConverter
 from veomni.trainer import dllm_trainer
 from veomni.trainer.dllm_trainer import DllmTrainer
-
-from .test_llada import REPO_ROOT, _packed_vs_separate, _sample, _toy_model
 
 
 TOY_CONFIG = "./tests/toy_config/llada_moe_toy"

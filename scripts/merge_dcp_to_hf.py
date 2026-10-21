@@ -17,7 +17,7 @@ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGH
 
 from veomni.checkpoint.dcp_checkpointer import _get_sharding_plan, _process_shard
 from veomni.checkpoint.layout import weights_dir
-from veomni.models.loader import get_model_config
+from veomni.models.registry import get_model_config
 from veomni.utils import helper
 
 
@@ -66,8 +66,8 @@ def _aliased_hf_keys(model_assets_dir: str) -> Optional[set[str]]:
     leaves the export as it was rather than guessing at which names are aliases.
     """
     try:
-        from veomni.models.loader import get_model_class, get_model_config
-        from veomni.models.module_utils import init_empty_weights
+        from veomni.models.checkpoint.weights import init_empty_weights
+        from veomni.models.registry import get_model_class, get_model_config
 
         config = get_model_config(model_assets_dir)
         model_class = get_model_class(config)

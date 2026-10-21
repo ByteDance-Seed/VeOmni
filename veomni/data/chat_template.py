@@ -75,9 +75,9 @@ def build_chat_template(
 ) -> "ChatTemplate":
     """Builds any registered template, text-only or multimodal.
 
-    Text-only templates take a tokenizer; multimodal ones take the processor,
-    which carries both the tokenizer and the grid parameters they need. Callers
-    pass whatever their modality has, matching the template their config names.
+    Multimodal templates need the processor, which carries both the tokenizer and
+    the grid parameters they use. Text-only templates accept either and encode
+    through the tokenizer, so callers can pass the processor whenever one loaded.
 
     ``kwargs`` reach the template constructor. No template currently declares
     one, so an unrecognised option raises there instead of being silently
@@ -91,8 +91,8 @@ class ChatTemplate(ABC):
     Abstract class for chat template.
     """
 
-    def __init__(self, tokenizer: "PreTrainedTokenizer") -> None:
-        self.tokenizer = tokenizer
+    def __init__(self, tokenizer_or_processor: Union["PreTrainedTokenizer", "ProcessorMixin"]) -> None:
+        self.tokenizer = getattr(tokenizer_or_processor, "tokenizer", tokenizer_or_processor)
 
     @abstractmethod
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
@@ -198,8 +198,9 @@ class TokenizerTemplate(ChatTemplate):
 class GptOssTokenizerTemplate(TokenizerTemplate):
     """GPT-OSS native template with its terminal assistant-token rewrite."""
 
-    def __init__(self, tokenizer: "PreTrainedTokenizer") -> None:
-        super().__init__(tokenizer)
+    def __init__(self, tokenizer_or_processor: Union["PreTrainedTokenizer", "ProcessorMixin"]) -> None:
+        super().__init__(tokenizer_or_processor)
+        tokenizer = self.tokenizer
         self.return_token_id = tokenizer.convert_tokens_to_ids("<|return|>")
         self.end_token_id = tokenizer.convert_tokens_to_ids("<|end|>")
         if self.return_token_id == tokenizer.unk_token_id or self.end_token_id == tokenizer.unk_token_id:

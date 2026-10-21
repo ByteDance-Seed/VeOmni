@@ -26,7 +26,7 @@ from ..arguments import VeOmniArguments
 from ..data import DiffusionGemmaCollator, build_data_transform
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..models.transformers.diffusion_gemma import align_nemo
-from ..ops.batch_invariant_ops import set_batch_invariant_mode
+from ..ops.batch_invariant import set_batch_invariant_mode
 from ..utils import helper
 from ..utils.constants import IGNORE_INDEX
 from ..utils.dist_utils import all_reduce

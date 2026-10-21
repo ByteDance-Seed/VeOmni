@@ -207,6 +207,15 @@ def test_async_offload_patch_is_confined_to_selected_instances_and_models():
     apply_async_activation_offload(first_model, ["selected"])
     apply_async_activation_offload(second_model, ["selected"])
 
+    patched_class = type(first_model.selected)
+    apply_async_activation_offload(first_model, ["selected"])
+    assert type(first_model.selected) is patched_class
+    value = torch.randn(2, 4, requires_grad=True)
+    output = first_model.selected(value)
+    torch.testing.assert_close(output, value * 2)
+    output.sum().backward()
+    torch.testing.assert_close(value.grad, torch.full_like(value, 2))
+
     assert type(first_model.selected) is not DecoderLayer
     assert type(first_model.unselected) is DecoderLayer
     assert type(second_model.unselected) is DecoderLayer

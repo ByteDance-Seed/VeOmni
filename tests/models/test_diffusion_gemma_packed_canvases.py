@@ -27,6 +27,7 @@ the sample's full encoder length is rotated, runs, and returns a plausible numbe
 import pytest
 import torch
 
+from tests.models.test_diffusion_gemma_canvas_batching import _toy_model
 from veomni.models.transformers.diffusion_gemma.dg_hole import (
     canvas_owner_segments,
     canvas_visible_intervals,
@@ -36,8 +37,6 @@ from veomni.models.transformers.diffusion_gemma.modeling_diffusion_gemma import 
     IGNORE_INDEX,
     encoder_ar_targets,
 )
-
-from .test_diffusion_gemma_canvas_batching import _toy_model
 
 
 CANVAS = 16

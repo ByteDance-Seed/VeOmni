@@ -41,14 +41,13 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from tests.models.test_diffusion_gemma import build_toy_batch, build_toy_model, toy_runtime
 from veomni.checkpoint import layout
 from veomni.models.transformers.diffusion_gemma import modeling_diffusion_gemma
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 from veomni.trainer.diffusion_gemma_trainer import DiffusionGemmaTrainer
-
-from ..models.test_diffusion_gemma import build_toy_batch, build_toy_model, toy_runtime
 
 
 TOTAL_STEPS = 6

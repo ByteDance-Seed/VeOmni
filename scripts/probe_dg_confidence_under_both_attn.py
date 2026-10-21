@@ -70,7 +70,7 @@ import veomni.models.transformers.diffusion_gemma.modeling_diffusion_gemma as mo
 from veomni.arguments.arguments_types import OpsImplementationConfig  # noqa: E402
 from veomni.data.data_collator import DiffusionGemmaCollator  # noqa: E402
 from veomni.models import build_foundation_model  # noqa: E402
-from veomni.models.module_utils import load_model_weights  # noqa: E402
+from veomni.models.checkpoint.weights import load_model_weights  # noqa: E402
 from veomni.models.transformers.diffusion_gemma.parallel_plan import retie_encoder_to_decoder  # noqa: E402
 
 

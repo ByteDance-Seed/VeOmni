@@ -18,9 +18,9 @@ The runtime deliberately preserves the released checkpoint's
 dim 0 so ExtraParallel can stream its local row slice without ever
 materializing or concatenating the complete ~95 GiB PLE table.
 
-MTP remains outside the supported VLM-SFT model. The regular loader consumes
-``mtp.*`` tensors here, while the streaming loader uses the optional
-``should_skip_without_loading`` capability to avoid reading them at all.
+MTP remains outside the supported VLM-SFT model. Every weight loader uses the
+optional ``should_skip_without_loading`` capability to pass over ``mtp.*``
+tensors without reading them; :meth:`convert` still consumes any that reach it.
 """
 
 import math
@@ -29,8 +29,8 @@ from typing import Dict, List, Optional
 
 import torch
 
-from ....utils import logging
-from ...checkpoint_tensor_loading import ConvertedCheckpointTensor
+from veomni.models.checkpoint.convert import ConvertedCheckpointTensor
+from veomni.utils import logging
 
 
 logger = logging.get_logger(__name__)

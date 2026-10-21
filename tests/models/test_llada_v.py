@@ -9,12 +9,11 @@ import torch
 from PIL import Image
 from transformers import SiglipImageProcessor
 
+from tests.models.test_llada import MASK_ID, REPO_ROOT, _CharTokenizer, _fake_ps, _toy_model
 from veomni.data.chat_template import build_chat_template
 from veomni.data.data_collator import DataCollateInfo, MainCollator
 from veomni.data.data_transform import DATA_TRANSFORM_REGISTRY
 from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX
-
-from .test_llada import MASK_ID, REPO_ROOT, _CharTokenizer, _fake_ps, _toy_model
 
 
 TOY_CONFIG = "./tests/toy_config/llada_v_toy"

@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from ...checkpoint_tensor_loading import ConvertedCheckpointTensor
+from ...checkpoint.convert import ConvertedCheckpointTensor
 
 
 _RAW_TO_DIFFUSION_PREFIXES = (

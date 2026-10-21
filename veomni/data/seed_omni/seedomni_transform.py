@@ -77,6 +77,7 @@ Registered as ``data_type: seedomni`` in
 from __future__ import annotations
 
 import json
+import pickle
 from typing import Any, List
 
 from ...models.seed_omni.utils.conversation import ConversationItem
@@ -239,4 +240,22 @@ def process_seedomni_example(
     media = fetch_media(media_refs, f"process_seedomni_example: preprocessor for source {source!r}", kwargs)
 
     conversation_list = _build_conversation_list(constructed, media)
+    return [{"conversation_list": conversation_list}]
+
+
+@DATA_TRANSFORM_REGISTRY.register("seedomni_cached")
+def process_seedomni_cached_example(
+    example: dict[str, Any],
+    **kwargs,
+) -> list[dict[str, Any]]:
+    """Read a cached SeedOmni conversation carrier from a parquet row.
+
+    Offline-cache production stores the already-materialized
+    ``conversation_list`` as pickle bytes so cached tensors keep their exact
+    dtype/shape and no source-specific raw dataset parsing runs on reload.
+    """
+    del kwargs
+    conversation_list = example["conversation_list"]
+    if isinstance(conversation_list, (bytes, bytearray)):
+        conversation_list = pickle.loads(conversation_list)
     return [{"conversation_list": conversation_list}]

@@ -25,7 +25,7 @@ with the op's ``loss_weight_i = 1/(p_mask_i * answer_length_i)`` and
 import torch
 import torch.nn.functional as F
 
-from veomni.ops.kernels.cross_entropy.dllm import dllm_masked_cross_entropy
+from veomni.models.loss_utils.dllm import dllm_masked_cross_entropy
 
 
 IGNORE = -100
@@ -130,7 +130,7 @@ def test_no_masked_token_returns_zero_with_grad():
     assert torch.count_nonzero(logits.grad) == 0
 
 
-def test_reexported_from_cross_entropy_package():
-    from veomni.ops.kernels.cross_entropy import dllm_masked_cross_entropy as reexported
+def test_reexported_from_loss_utils_package():
+    from veomni.models.loss_utils import dllm_masked_cross_entropy as reexported
 
     assert reexported is dllm_masked_cross_entropy

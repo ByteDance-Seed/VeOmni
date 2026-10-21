@@ -152,7 +152,7 @@ def _move_shared_model(model: torch.nn.Module, device: str) -> None:
 def check_load_and_forward(
     checkpoint_path: str, text_only: bool = False, device: str = "cuda", load_device: str = "cpu"
 ) -> bool:
-    from veomni.models.module_utils import init_empty_weights, load_model_weights
+    from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
 
     config = DiffusionGemmaConfig.from_pretrained(checkpoint_path)
     if text_only:

@@ -20,7 +20,7 @@ import pytest
 import torch
 from torch import nn
 
-from veomni.models.module_utils import post_process_after_weight_loading
+from veomni.models.checkpoint.weights import post_process_after_weight_loading
 
 
 class _SharedStack(nn.Module):

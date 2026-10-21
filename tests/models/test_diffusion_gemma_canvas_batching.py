@@ -31,6 +31,7 @@ import pytest
 import torch
 from huggingface_hub.errors import StrictDataclassFieldValidationError
 
+from tests.models.test_diffusion_gemma import build_toy_model
 from veomni.data.data_collator import DiffusionGemmaCollator
 from veomni.models.transformers.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaConfig
 from veomni.models.transformers.diffusion_gemma.dg_hole import canvas_visible_intervals, sliding_visible_intervals
@@ -41,8 +42,6 @@ from veomni.models.transformers.diffusion_gemma.modeling_diffusion_gemma import 
     _fold_canvas_axis,
     _repeat_cache_onto_canvas_rows,
 )
-
-from .test_diffusion_gemma import build_toy_model
 
 
 #: Enough canvases that a middle one has both a clean past and a clean future.

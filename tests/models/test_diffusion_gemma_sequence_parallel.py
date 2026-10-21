@@ -34,11 +34,10 @@ import torch
 
 import veomni.data.data_collator as collator_module
 import veomni.models.transformers.diffusion_gemma.dg_sequence_parallel as dg_sp
+from tests.models.test_diffusion_gemma import build_toy_model
 from veomni.data.data_collator import DiffusionGemmaCollator
 from veomni.distributed.parallel_state import ParallelState
 from veomni.utils.constants import IGNORE_INDEX
-
-from .test_diffusion_gemma import build_toy_model
 
 
 CANVAS = 8

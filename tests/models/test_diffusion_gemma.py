@@ -106,7 +106,7 @@ def build_toy_batch(config, batch_size=2, prompt_len=24, seed=123):
 
 class TestRegistration:
     def test_registered_under_model_type(self):
-        from veomni.models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+        from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
         assert MODEL_CONFIG_REGISTRY["diffusion_gemma"]() is DiffusionGemmaConfig
         assert MODELING_REGISTRY["diffusion_gemma"]("DiffusionGemmaForBlockDiffusion") is (
@@ -125,8 +125,8 @@ class TestRegistration:
         [
             "flash_attention_2",
             "flash_attention_3",
-            "veomni_flash_attention_2_with_sp",
-            "veomni_flash_attention_3_with_sp",
+            "veomni_flash_attention_2",
+            "veomni_flash_attention_3",
         ],
     )
     def test_every_flash_attention_name_is_refused(self, implementation):
@@ -139,7 +139,7 @@ class TestRegistration:
         with pytest.raises(ValueError, match="does not support FlashAttention"):
             build_toy_model(attn_implementation=implementation)
 
-    @pytest.mark.parametrize("name", ["flash_attention_4", "veomni_flash_attention_4_with_sp"])
+    @pytest.mark.parametrize("name", ["flash_attention_4", "veomni_flash_attention_4"])
     def test_flash_attention_4_is_closed_too(self, name):
         """Which error arrives first depends on the image, so this asserts only that one does.
 
@@ -206,7 +206,7 @@ class TestRegistration:
         """
         monkeypatch.setenv("MODELING_BACKEND", "veomni")
         resolved = OpsImplementationConfig(attn_implementation=f"flash_attention_{version}")
-        assert resolved.attn_implementation == f"veomni_flash_attention_{version}_with_sp"
+        assert resolved.attn_implementation == f"veomni_flash_attention_{version}"
 
 
 class TestModelAssets:
@@ -393,7 +393,7 @@ class TestCheckpointLayout:
     def test_load_preserves_tying_and_values(self, tmp_path):
         from transformers.initialization import no_init_weights
 
-        from veomni.models.module_utils import init_empty_weights, load_model_weights
+        from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
 
         stored = self._write_toy_checkpoint(str(tmp_path))
         config = DiffusionGemmaConfig.from_pretrained(TOY_CONFIG_PATH)
@@ -433,7 +433,7 @@ class TestCheckpointLayout:
     def test_loads_a_raw_gemma4_layout_without_silent_missing_weights(self, tmp_path):
         from transformers.initialization import no_init_weights
 
-        from veomni.models.module_utils import init_empty_weights, load_model_weights
+        from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
         from veomni.models.transformers.diffusion_gemma import register_diffusion_gemma_modeling
         from veomni.models.transformers.diffusion_gemma.gemma4_initialization import (
             SELF_CONDITIONING_PARAMETER_NAMES,

@@ -23,7 +23,9 @@ from ltx_core.model.transformer.ops import (
 )
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.transformer_args import TransformerArgs
-from ltx_core.utils import rms_norm
+
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 
 
 @dataclass
@@ -78,8 +80,9 @@ class TransformerOpsConfig:
         )
 
 
-# Frozen, so safe to share as a default argument across callers that want the
-# stock PyTorch ops without explicit construction.
+# Import-time snapshot of stock PyTorch callables. Do not pass this object
+# into a model that should follow the active ops config; construct a fresh
+# ``TransformerOpsConfig()`` at model ``__init__`` instead.
 DEFAULT_TRANSFORMER_OPS = TransformerOpsConfig()
 
 
@@ -96,6 +99,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         if ops is None:
             ops = TransformerOpsConfig()
+        self.veomni_rms_norm_unweighted = VeomniOp(
+            "rms_norm", "unweighted", resolve_op_impl("rms_norm_implementation", variant="unweighted")
+        )
         self.ada_zero_function = ops.ada_zero_function
         self.post_sa_function = ops.post_sa_function
         if video is not None:
@@ -245,13 +251,16 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 prompt_timestep,
                 context_mask,
                 self.norm_eps,
+                self.veomni_rms_norm_unweighted,
             )
-        return attn(rms_norm(x, eps=self.norm_eps), context=context, mask=context_mask)
+        return attn(self.veomni_rms_norm_unweighted(x, eps=self.norm_eps), context=context, mask=context_mask)
 
     def forward(  # noqa: PLR0915
         self,
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
+        sp_video_length: int | None = None,
+        sp_audio_length: int | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         if video is None and audio is None:
             raise ValueError("At least one of video or audio must be provided")
@@ -278,6 +287,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 mask=video.self_attention_mask,
                 perturbation_mask=video.self_attn_perturbation_mask,
                 all_perturbed=video.self_attn_all_perturbed,
+                sp_valid_length=sp_video_length,
             )
             vx = vx + vx_msa_out * vgate_msa
             del vgate_msa, norm_vx, vx_msa_out
@@ -306,6 +316,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 mask=audio.self_attention_mask,
                 perturbation_mask=audio.self_attn_perturbation_mask,
                 all_perturbed=audio.self_attn_all_perturbed,
+                sp_valid_length=sp_audio_length,
             )
             ax = ax + ax_msa_out * agate_msa
             del agate_msa, norm_ax, ax_msa_out
@@ -357,6 +368,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                         context=a2v_ax_scaled,
                         pe=video.cross_positional_embeddings,
                         k_pe=audio.cross_positional_embeddings,
+                        sp_context_length=sp_audio_length,
                     )
                     * gate_out_a2v
                     * video.cross_attn_perturbation_mask
@@ -392,6 +404,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                         context=v2a_vx_scaled,
                         pe=audio.cross_positional_embeddings,
                         k_pe=video.cross_positional_embeddings,
+                        sp_context_length=sp_video_length,
                     )
                     * gate_out_v2a
                     * audio.cross_attn_perturbation_mask
@@ -431,12 +444,15 @@ def apply_cross_attention_adaln(
     prompt_timestep: torch.Tensor,
     context_mask: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
+    rms_norm_op: VeomniOp | None = None,
 ) -> torch.Tensor:
     batch_size = x.shape[0]
     shift_kv, scale_kv = (
         prompt_scale_shift_table[None, None].to(device=x.device, dtype=x.dtype)
         + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
     ).unbind(dim=2)
-    attn_input = rms_norm(x, eps=norm_eps) * (1 + q_scale) + q_shift
+    if rms_norm_op is None:
+        raise TypeError("apply_cross_attention_adaln requires an instance-local rms_norm handle")
+    attn_input = rms_norm_op(x, eps=norm_eps) * (1 + q_scale) + q_shift
     encoder_hidden_states = context * (1 + scale_kv) + shift_kv
     return attn(attn_input, context=encoder_hidden_states, mask=context_mask) * q_gate

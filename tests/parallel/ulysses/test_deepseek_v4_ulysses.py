@@ -19,7 +19,6 @@ from __future__ import annotations
 import os
 import tempfile
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -30,6 +29,14 @@ from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torc
 
 
 _PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
+
+
+def _load_dsv4_toy_config():
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config._attn_implementation = "eager"
+    return config
 
 
 def _broadcast_module(module: torch.nn.Module) -> None:
@@ -66,20 +73,25 @@ def _run_deepseek_v4_attention_sp_fw_bw(
         world_size=world_size,
     )
 
-    from transformers import AutoConfig
-
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
-    _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
+    sp_state = _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type, name="sp")
+    dp_state = _init_parallel_state(dp_size=world_size, ulysses_size=1, device_type=device_type, name="dp")
 
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(0)
     # Layer 0 is HCA (compressor). Layer type with sliding-only is unavailable on
     # the toy config, so disable the compressor when we want pure sliding MQA.
     layer = dsv4.DeepseekV4Attention(config, layer_idx=0).to(device=device_type, dtype=torch.float32)
     if not with_compressor:
         layer.compressor = None
+    with torch.no_grad():
+        torch.nn.init.zeros_(layer.sinks)
+        if layer.compressor is not None:
+            torch.nn.init.normal_(layer.compressor.position_bias, std=0.02)
+            if getattr(layer.compressor, "indexer", None) is not None:
+                torch.nn.init.normal_(layer.compressor.indexer.position_bias, std=0.02)
     _broadcast_module(layer)
     layer.train()
 
@@ -116,10 +128,7 @@ def _run_deepseek_v4_attention_sp_fw_bw(
     baseline_param_grads = None
     baseline_input_grad = None
     if rank == 0:
-        # The stub has to carry every parallel-state attribute the attention
-        # forward reads, or the baseline raises instead of taking the single-rank path.
-        no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
-        with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+        with use_parallel_state(dp_state):
             baseline_hidden = full_hidden.detach().clone().requires_grad_(True)
             baseline_out, _ = layer(
                 baseline_hidden,
@@ -140,16 +149,17 @@ def _run_deepseek_v4_attention_sp_fw_bw(
 
     dist.barrier()
 
-    sp_out_local, _ = layer(
-        local_hidden,
-        position_embeddings=local_position_embeddings,
-        position_ids=local_position_ids,
-        attention_mask=full_mask,
-    )
-    # Scale local loss by 1 so the full-sequence mean matches baseline.mean():
-    # sum_local / (B*S*H) * sp = mean over full when grads are all-reduced.
-    total_numel = float(bsz * seq_len * sp_out_local.shape[-1])
-    (sp_out_local.sum() / total_numel).backward()
+    with use_parallel_state(sp_state):
+        sp_out_local, _ = layer(
+            local_hidden,
+            position_embeddings=local_position_embeddings,
+            position_ids=local_position_ids,
+            attention_mask=full_mask,
+        )
+        # Scale local loss by 1 so the full-sequence mean matches baseline.mean():
+        # sum_local / (B*S*H) * sp = mean over full when grads are all-reduced.
+        total_numel = float(bsz * seq_len * sp_out_local.shape[-1])
+        (sp_out_local.sum() / total_numel).backward()
 
     for param in layer.parameters():
         if param.grad is not None:
@@ -207,16 +217,16 @@ def _run_deepseek_v4_indexer_sp_equivalence(rank: int, world_size: int, init_fil
         world_size=world_size,
     )
 
-    from transformers import AutoConfig
-
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+    from veomni.ops.config import set_ops_config
 
-    _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
-    dsv4.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+    sp_state = _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type, name="sp")
+    dp_state = _init_parallel_state(dp_size=world_size, ulysses_size=1, device_type=device_type, name="dp")
+    set_ops_config(SimpleNamespace(dsa_indexer_implementation="tilelang"))
 
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(1)
     indexer = dsv4.DeepseekV4CSACompressor(config).indexer.to(device=device_type, dtype=torch.bfloat16)
     with torch.no_grad():
@@ -244,10 +254,7 @@ def _run_deepseek_v4_indexer_sp_equivalence(rank: int, world_size: int, init_fil
             sequence_slices = None
             packed_metadata = None
 
-        # The stub has to carry every parallel-state attribute the indexer reads,
-        # or the baseline raises instead of taking the single-rank path.
-        no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
-        with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+        with use_parallel_state(dp_state):
             expected = indexer(
                 hidden_states,
                 q_residual,
@@ -257,15 +264,16 @@ def _run_deepseek_v4_indexer_sp_equivalence(rank: int, world_size: int, init_fil
                 packed_sequence_slices=sequence_slices,
                 packed_compression_metadata=packed_metadata,
             )
-        actual = indexer(
-            hidden_states,
-            q_residual,
-            position_ids,
-            None,
-            0,
-            packed_sequence_slices=sequence_slices,
-            packed_compression_metadata=packed_metadata,
-        )
+        with use_parallel_state(sp_state):
+            actual = indexer(
+                hidden_states,
+                q_residual,
+                position_ids,
+                None,
+                0,
+                packed_sequence_slices=sequence_slices,
+                packed_compression_metadata=packed_metadata,
+            )
         torch.testing.assert_close(actual.sort(dim=-1).values, expected.sort(dim=-1).values, rtol=0, atol=0)
 
     dist.barrier()

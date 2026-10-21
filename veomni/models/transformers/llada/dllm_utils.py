@@ -33,9 +33,9 @@ from transformers.masking_utils import create_bidirectional_mask
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel.loss import SumOverShards
-from ....ops.kernels.cross_entropy import dllm_masked_cross_entropy
 from ....utils.constants import IGNORE_INDEX
-from ..attention_utils import VARLEN_ATTENTION_TYPES
+from ...loss_utils.dllm import dllm_masked_cross_entropy
+from ...utils.attention_utils import VARLEN_ATTENTION_TYPES
 
 
 def bidirectional_attention_mask(

@@ -22,7 +22,7 @@ def _fake_ps(ulysses_size: int = 1, sp_rank: int = 0, cp_size: int = 1):
 def _model_config(**overrides):
     fields = {
         "model_type": "llada",
-        "_attn_implementation": "veomni_flash_attention_2_with_sp",
+        "_attn_implementation": "veomni_flash_attention_2",
         "num_attention_heads": 4,
         "num_key_value_heads": 4,
     }
@@ -214,7 +214,7 @@ def test_sequence_parallel_shards_count_the_whole_row(monkeypatch):
             {
                 "ulysses_size": 2,
                 "model_type": "llada_v",
-                "vision_config": types.SimpleNamespace(_attn_implementation="veomni_flash_attention_2_with_sp"),
+                "vision_config": types.SimpleNamespace(_attn_implementation="veomni_flash_attention_2"),
             },
             "vision tower",
         ),

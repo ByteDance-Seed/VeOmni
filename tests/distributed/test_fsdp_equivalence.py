@@ -33,10 +33,6 @@ from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
 from ..tools import ParallelConfig
 
 
-# Qwen3.5 GatedDeltaNet has no NPU kernel today (varlen path unsupported).
-_qwen3_5_npu_skip = pytest.mark.skipif(
-    IS_NPU_AVAILABLE, reason="Qwen3.5 GatedDeltaNet has no NPU backend (varlen path)"
-)
 _gpt_oss_npu_skip = pytest.mark.skipif(IS_NPU_AVAILABLE, reason="GPT-OSS FSDP equivalence is GPU-only today")
 
 _DEFAULT_RTOL = 1e-1
@@ -229,7 +225,6 @@ _text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen3_5",
-        marks=_qwen3_5_npu_skip,
     ),
     pytest.param(
         "qwen3_5_moe",
@@ -238,7 +233,6 @@ _text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen3_5_moe",
-        marks=_qwen3_5_npu_skip,
     ),
     pytest.param(
         "deepseek_v3",

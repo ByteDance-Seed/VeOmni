@@ -43,7 +43,7 @@ def save_module_subdirectory(
     where a module was *loaded* from, which may be another checkpoint entirely,
     and must not decide where this one writes.
     """
-    from ....module_utils import save_model_assets
+    from ....checkpoint import save_model_assets
 
     module_dir = os.path.join(save_directory, name)
     os.makedirs(module_dir, exist_ok=True)

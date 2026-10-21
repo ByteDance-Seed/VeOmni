@@ -23,19 +23,22 @@ declared module, composes their models into one ``OmniModel`` and cascades the
 
 import os
 from contextlib import nullcontext
+from functools import partial
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import FSDPModule
+from torch.utils.checkpoint import noop_context_fn
 
 from .....distributed.clip_grad_norm import veomni_omni_module_clip_grad_norm
 from .....distributed.parallel_state import use_parallel_state
-from .....utils import logging
+from .....utils import logging, recompute_utils
 from .....utils.checkpoint_utils import should_skip_hf_weight_load
 from .....utils.device import get_device_type
 from ....model_runtime import VeOmniModelRuntime
+from ...mixins.offline_encoding_mixin import OfflineEncodingMixin
 from ...utils.checkpoint import OmniModuleCheckpointManager
 from ..utils.dispatch import unwrap_module_chain
 
@@ -45,6 +48,7 @@ if TYPE_CHECKING:
     from .....arguments.omni_arguments_types import OmniModuleRuntimeArguments, OmniTrainingArguments
     from .....trainer.callbacks import TrainerState
     from ...modules.module_configuration_base import OmniModuleConfig
+    from ...utils.hf_layout import HFSource
 
 
 logger = logging.get_logger(__name__)
@@ -94,6 +98,11 @@ class ModuleRuntime(VeOmniModelRuntime):
     genuinely different topologies ("freeze the ViT, EP-shard the LLM, DDP the
     VAE") while sharing one build sequence.
 
+    ``train_args`` is the job-wide ``train:`` section (:class:`OmniTrainingArguments`),
+    shared by every module and ``None`` for inference builds. It is config, not a
+    train/infer switch (``for_inference`` is): the runtime reads ``training_task``
+    and the checkpoint paths from it.
+
     Job-wide concerns (process-group init, data pipeline, trace metering, the
     train loop) are **never** run here — :class:`OmniTrainer` owns them once, and
     cascades its ``on_{train,epoch,step}_*`` hooks into each module so every
@@ -106,6 +115,7 @@ class ModuleRuntime(VeOmniModelRuntime):
 
     args: "OmniModuleRuntimeArguments"
     train_args: Optional["OmniTrainingArguments"] = None
+    hf_source: Optional["HFSource"] = None
     _has_trainable_parameters: Optional[bool] = None
 
     def __init__(
@@ -115,13 +125,15 @@ class ModuleRuntime(VeOmniModelRuntime):
         *,
         module_config: "OmniModuleConfig",
         global_accelerator: "AcceleratorConfig",
-        train: Optional["OmniTrainingArguments"] = None,
+        train_args: Optional["OmniTrainingArguments"] = None,
         for_inference: bool = False,
+        hf_source: Optional["HFSource"] = None,
     ):
         self.args = args
         self.model_name = module_name
         self.module_config = module_config
-        self.train_args = train
+        self.hf_source = hf_source
+        self.train_args = train_args
         self.optimizer = None
         self.lr_scheduler = None
         self._global_accelerator = global_accelerator
@@ -145,10 +157,24 @@ class ModuleRuntime(VeOmniModelRuntime):
             with self._scoped():
                 self._build_model()
                 self._build_model_assets()
+                if self.reads_offline_cache:
+                    # Stay on meta. ``OmniModelRuntime._parallelize_composed_model``
+                    # detaches this module before the composed wrap so it is not
+                    # materialised with the rest under ``fsdp_scope='model'``.
+                    logger.info_rank0(
+                        f"ModuleRuntime '{self.module_name}': mixes in OfflineEncodingMixin, so "
+                        "offline_training reads it from the cache; left on meta, frozen and unwrapped."
+                    )
+                    self.model.requires_grad_(False)
+                    return
                 self._freeze_model_module()
+                if self.train_args is not None and self.train_args.training_task == "offline_embedding":
+                    # Trains nothing, so no module gets an optimizer or a checkpoint manager.
+                    self.model.requires_grad_(False)
                 self._build_parallelized_model()
                 if not self.wrap_omni_model:
-                    self._scope_recompute_to_parallel_state()
+                    # Parallel-state scoping for recompute rides in the policy; the
+                    # apply step inside ``_build_parallelized_model`` is the last writer.
                     self._build_optimizer()
                     self.build_checkpoint()
 
@@ -185,6 +211,33 @@ class ModuleRuntime(VeOmniModelRuntime):
         if self.wrap_omni_model:
             return self._global_accelerator
         return self.args.accelerator
+
+    @property
+    def reads_offline_cache(self) -> bool:
+        """Whether this module runs on cached data, built on meta.
+
+        True under ``train.training_task='offline_training'`` for a module whose
+        class mixes in :class:`OfflineEncodingMixin`: that task reads every
+        cacheable module from the cache, so the module loads no weights and has
+        nothing to train or save. The class is resolved from the config because
+        this decides the init device before the module exists.
+        """
+        if self.train_args is None or self.train_args.training_task != "offline_training":
+            return False
+        from .....models.loader import get_model_class
+
+        model_cls = get_model_class(self.module_config)
+        return isinstance(model_cls, type) and issubclass(model_cls, OfflineEncodingMixin)
+
+    @property
+    def weights_path(self) -> Optional[str]:
+        """The upstream HF checkpoint under an HF ``model_path``, else this module's split subfolder.
+
+        ``args.model_path`` stays the module's subfolder either way: under an HF
+        ``model_path`` it is the weight-free view's, where the config and assets
+        are read from.
+        """
+        return self.hf_source.path if self.hf_source is not None else self.args.model_path
 
     @property
     def module_name(self) -> str:
@@ -231,6 +284,24 @@ class ModuleRuntime(VeOmniModelRuntime):
             device_map = {"": f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"}
         else:
             device_map = "auto"
+        if self.hf_source is not None:
+            from ...utils.hf_layout import load_module_from_hf_source
+
+            logger.info_rank0(
+                f"ModuleRuntime '{self.module_name}': eager inference load "
+                f"(model_type={model_type}, cls={cls.__name__}, device_map={device_map}) from {self.hf_source.path}"
+            )
+            self.model = load_module_from_hf_source(
+                cls,
+                self.module_config,
+                self.hf_source,
+                self.module_name,
+                device_map=device_map,
+                torch_dtype=torch.bfloat16,
+            ).eval()
+            self.model_config = self.model.config
+            self._build_model_assets()
+            return
         logger.info_rank0(
             f"ModuleRuntime '{self.module_name}': eager inference load "
             f"(model_type={model_type}, cls={cls.__name__}, device_map={device_map}) from {model_path}"
@@ -248,21 +319,36 @@ class ModuleRuntime(VeOmniModelRuntime):
         """Meta-init this module's sub-model from ``module_config``.
 
         The config comes from the composed :class:`OmniConfig`, which already
-        applied this module's ``model_config`` overwrites; ``model_path`` is
-        read only for the weights.
+        applied this module's ``model_config`` overwrites; :attr:`weights_path`
+        is read only for the weights.
+
+        Under an HF ``model_path`` the module is built on meta first so the
+        :class:`~veomni.models.seed_omni.utils.hf_layout.HFSourceKeyConverter`
+        is in place before any weight is read — here for a non-meta
+        ``init_device``, otherwise by the parallelize step.
         """
         args = self.args
         logger.info_rank0(f"ModuleRuntime '{self.module_name}': build module model")
         from .....models import build_foundation_model
 
         acc = self.mesh_accelerator
+        init_device = "meta" if self.reads_offline_cache else acc.init_device
         self.model = build_foundation_model(
             config_path=self.module_config,
-            weights_path=args.model_path,
+            weights_path=args.model_path if self.hf_source is None else None,
             torch_dtype="float32" if acc.fsdp_config.mixed_precision.enable else "bfloat16",
-            init_device=acc.init_device,
+            init_device=init_device if self.hf_source is None else "meta",
             ops_implementation=args.ops_implementation,
         )
+        if self.hf_source is not None:
+            from ....checkpoint.weights import load_model_weights
+            from ...utils.hf_layout import attach_hf_source_converter
+
+            attach_hf_source_converter(self.model, self.hf_source, self.module_name)
+            # Mirrors the loaders' ``empty_init``: off rank 0 a CPU init stays on meta.
+            off_rank0 = dist.is_initialized() and dist.get_rank() != 0
+            if init_device != "meta" and not (init_device == "cpu" and off_rank0):
+                load_model_weights(self.model, self.hf_source.path, init_device)
         self.model_config = self.model.config
 
     def _build_model_assets(self) -> None:
@@ -361,15 +447,58 @@ class ModuleRuntime(VeOmniModelRuntime):
         """Training steps that need the wrapped parameters, once the composed OmniModel is wrapped.
 
         Under ``fsdp_scope='model'`` :meth:`__init__` stops after building this
-        module on meta; the optimizer, the checkpoint manager and the recompute
-        scope all bind to the DTensor parameters ``fully_shard`` creates, so
+        module on meta; the recompute apply step, the optimizer and the checkpoint
+        manager all need the DTensor parameters ``fully_shard`` creates, so
         :class:`OmniModelRuntime` calls this after its wrap. Inference needs
         none of them.
         """
         with self._scoped():
-            self._scope_recompute_to_parallel_state()
+            self._apply_recompute_policy()
             self._build_optimizer()
             self.build_checkpoint()
+
+    def _apply_recompute_policy(self) -> None:
+        """Arm checkpointing and apply this module's recompute policy.
+
+        The composed wrap runs ``build_parallelize_model`` with
+        ``enable_gradient_checkpointing=False`` (each module arms its own), so this
+        is where ``fsdp_scope='model'`` gets both: HF's entry point first, then the
+        per-block decisions, never the other way round — a later
+        ``gradient_checkpointing_enable`` writes over every block's function.
+
+        The enable carries this module's recompute context, so the entry points the
+        policy does not bind (an inactive policy, or a model whose blocks were not
+        found) still recompute inside the module's ``ParallelState``; the policy
+        composes the same context onto the blocks it does bind.
+        """
+        gc = self.args.accelerator.gradient_checkpointing
+        if not gc.enable:
+            return
+        model = unwrap_module_chain(self.model)
+        policy = self._build_recompute_policy()
+
+        gradient_checkpointing_kwargs = {
+            "use_reentrant": gc.enable_reentrant,
+            "context_fn": recompute_utils.recompute_context_fn(policy.recompute_context) or noop_context_fn,
+            "early_stop": gc.early_stop,
+        }
+
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+        # ``basic_modules`` is what ranks the block stacks, the same list the
+        # ``fsdp_scope='module'`` path hands to the wrap; without it the two scopes
+        # could bind different stacks for one configuration.
+        recompute_utils.apply_recompute_policy(model, policy, basic_modules=list(self.args.basic_modules or []))
+
+    def _recompute_context(self):
+        """Run the recompute half of every checkpointed block under this module's ParallelState.
+
+        The forward is already wrapped in :meth:`OmniModelRuntime.module_context`, but
+        the recompute (in backward) escapes it: reads of the free
+        ``get_parallel_state()`` (EP groups, vocab-parallel ``emb`` group, …) must
+        resolve to this module's mesh there too. Both the enable and every block the
+        policy binds carry this, so SAC and the module's scoping survive together.
+        """
+        return partial(use_parallel_state, self.module_name)
 
     def _scoped(self):
         """Context manager making this module's ParallelState current.
@@ -385,35 +514,6 @@ class ModuleRuntime(VeOmniModelRuntime):
         if self.is_eager:
             return nullcontext()
         return use_parallel_state(self.module_name)
-
-    def _scope_recompute_to_parallel_state(self) -> None:
-        """Make gradient-checkpoint recompute re-enter this module's ParallelState.
-
-        torch ``checkpoint``'s ``context_fn`` returns ``(forward_ctx, recompute_ctx)``;
-        the forward is already wrapped in :meth:`OmniModelRuntime.module_context`, but the
-        recompute (in backward) escapes it. Setting ``recompute_ctx`` to
-        :func:`use_parallel_state` keeps reads of the free ``get_parallel_state()``
-        (EP groups, vocab-parallel ``emb`` group, …) resolving to this module's mesh
-        during recompute. ``use_reentrant=True`` does not honour ``context_fn`` — but
-        the omni path runs non-reentrant (``accelerator.gradient_checkpointing.enable_reentrant``
-        defaults to ``False``).
-        """
-        name = self.module_name
-        gc = self.args.accelerator.gradient_checkpointing
-
-        def _recompute_context_fn():
-            return nullcontext(), use_parallel_state(name)
-
-        # DDP wraps the model (``.module``) and does not expose
-        # ``gradient_checkpointing_enable``; FSDP2 wraps in place. Unwrap so the
-        # call reaches the raw HF model regardless of dp_mode.
-        if gc.enable:
-            unwrap_module_chain(self.model).gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={
-                    "use_reentrant": gc.enable_reentrant,
-                    "context_fn": _recompute_context_fn,
-                }
-            )
 
     @property
     def has_trainable_parameters(self) -> bool:
@@ -436,8 +536,8 @@ class ModuleRuntime(VeOmniModelRuntime):
         if not should_skip_hf_weight_load(load_path, self.args.lora_config):
             return False
 
-        # A parameterless module has no persistent state for HF or DCP to restore
-        # (e.g. a process-only stage), so there is nothing to materialize.
+        # A parameterless module has no persistent state for HF or DCP to restore,
+        # so there is nothing to materialize.
         if not self.model.state_dict():
             return True
 
@@ -598,8 +698,9 @@ def build_omni_module_runtime(
     *,
     module_config: "OmniModuleConfig",
     global_accelerator: "AcceleratorConfig",
-    train: Optional["OmniTrainingArguments"] = None,
+    train_args: Optional["OmniTrainingArguments"] = None,
     for_inference: bool = False,
+    hf_source: Optional["HFSource"] = None,
 ) -> ModuleRuntime:
     """Build the :class:`ModuleRuntime` for one module of a composed model."""
     return ModuleRuntime(
@@ -607,8 +708,9 @@ def build_omni_module_runtime(
         module_name=module_name,
         module_config=module_config,
         global_accelerator=global_accelerator,
-        train=train,
+        train_args=train_args,
         for_inference=for_inference,
+        hf_source=hf_source,
     )
 
 

@@ -13,6 +13,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from veomni.arguments import GradientCheckpointingConfig
 from veomni.distributed.torch_compile import CompileConfig
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 
@@ -84,7 +85,7 @@ def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPat
         accelerator=SimpleNamespace(
             init_device="meta",
             torch_compile=CompileConfig(),
-            gradient_checkpointing=SimpleNamespace(enable=False, enable_reentrant=False, early_stop=True),
+            gradient_checkpointing=GradientCheckpointingConfig(enable=False),
             fsdp_config=SimpleNamespace(
                 fsdp_mode="fsdp2",
                 fsdp_scope="module",
@@ -96,7 +97,7 @@ def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPat
                 low_precision_reduce_scatter_comm=False,
                 max_load_broadcast_size=20.0,
             ),
-            offload_config=SimpleNamespace(enable_async_activation=False),
+            offload_config=SimpleNamespace(enable_activation=False, enable_async_activation=False),
         ),
     )
 

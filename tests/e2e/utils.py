@@ -168,6 +168,10 @@ def prepare_exec_cmd(
             )
             if model_name == "wan_t2v":
                 cmd_kwargs["extra_args"] = list(_WAN_BFLOAT16_TRAINING_ARGS)
+            elif model_name == "deepseek_v4":
+                # fused_triton MoE needs bf16/fp16 activations; the toy
+                # checkpoint is materialized in float32.
+                cmd_kwargs["extra_args"] = list(_WAN_BFLOAT16_TRAINING_ARGS)
             elif model_name == "gpt_oss":
                 cmd_kwargs["extra_args"] = list(_GPT_OSS_FA4_QUACK_TRAINING_ARGS)
             command_list.append((task_name, cmd_kwargs))
