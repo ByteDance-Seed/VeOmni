@@ -211,6 +211,11 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
                 raise ValueError("Use add_qwen38_plans to construct exact logical-slice groups")
             if group.get("qwen38_ple_lookup") and group["weight_decay"] != 0.0:
                 raise ValueError("Trainable PLE lookup tables require zero weight decay in the final optimizer groups")
+            if group.get("qwen38_ple_lookup"):
+                p = group["params"][0]
+                # Owner-local lazy counters cannot be checkpointed as replicated scalars.
+                mesh = p.device_mesh.mesh.tolist() if isinstance(p, DTensor) else None
+                group["qwen38_ple_step_layout"] = json.dumps(["owner-grid-v1", mesh])
             group.setdefault("muon_momentum", momentum)
             p = group["params"][0]
             plan = json.loads(group["qwen38_plan"])
@@ -233,6 +238,70 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
                     raise ValueError(f"Muon reconstruction exceeds the explicit workspace limit: {tuple(shape)}")
                 if any((stop - start) * p.shape[-1] > max_logical_matrix_numel for _, start, stop in plan):
                     raise ValueError("Muon logical matrix exceeds the explicit workspace limit")
+
+    @property
+    def checkpoint_save_requires_state(self):
+        return any(group.get("qwen38_ple_lookup") for group in self.param_groups)
+
+    @contextmanager
+    def checkpoint_state(self, *, load=False):
+        """Fill save coverage without an optimizer step or changing live lazy state.
+
+        Load targets need all buffers; save only fills missing PLE owners. These
+        temporary zero-step masters are discarded on resume, after model restore.
+        """
+        added = []
+        try:
+            with torch.no_grad():
+                for group in self.param_groups:
+                    if not load and not group.get("qwen38_ple_lookup"):
+                        continue
+                    for p in group["params"]:
+                        if self.state.get(p):
+                            continue
+                        target = torch.device("cpu") if id(p) in self._offloaded else p.device
+                        master = p.detach().to(device=target, copy=True).float()
+                        self.state[p] = dict(
+                            step=torch.tensor(0.0),
+                            master_weight=master,
+                            exp_avg=torch.zeros_like(master),
+                            exp_avg_sq=torch.zeros_like(master),
+                        )
+                        added.append(p)
+            yield
+        finally:
+            if not load:
+                for p in added:
+                    self.state.pop(p, None)
+
+    @staticmethod
+    def _ple_step_tensor(p, step):
+        if not isinstance(p, DTensor):
+            return torch.as_tensor(step).detach().cpu().clone()
+        shape = torch.Size(p.device_mesh.mesh.shape)
+        local = torch.as_tensor(step).detach().cpu().reshape((1,) * len(shape)).clone()
+        placements = tuple(Shard(axis) for axis in range(len(shape)))
+        metadata = DTensor.from_local(
+            local.to("meta"),
+            p.device_mesh,
+            placements,
+            run_check=False,
+            shape=shape,
+            stride=torch.empty(shape, device="meta").stride(),
+        )
+        # Keep counters on CPU even when the owning parameter mesh is NPU/CUDA.
+        return DTensor(local, metadata._spec, requires_grad=False)
+
+    def state_dict(self):
+        with self.checkpoint_state():
+            result = super().state_dict()
+            for saved, group in zip(result["param_groups"], self.param_groups, strict=True):
+                if group.get("qwen38_ple_lookup"):
+                    for key, p in zip(saved["params"], group["params"], strict=True):
+                        state = dict(result["state"][key])
+                        state["step"] = self._ple_step_tensor(p, state["step"])
+                        result["state"][key] = state
+            return result
 
     def _emit_state_receipt(self):
         # CPUOffloadAdamW.step runs only the pure Adam groups. Emit after *all*
@@ -272,15 +341,48 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
         self._state_receipt_emitted = True
 
     def load_state_dict(self, state_dict):
+        state_dict = {**state_dict, "state": dict(state_dict["state"])}
+        lazy = []
         for saved, current in zip(state_dict["param_groups"], self.param_groups, strict=True):
-            if current.get("qwen38_ple_lookup") and (
-                saved.get("qwen38_ple_lookup") is not True or saved.get("weight_decay") != 0.0
-            ):
-                raise RuntimeError("Muon resume requires the PLE lookup marker and zero weight decay")
+            if current.get("qwen38_ple_lookup"):
+                if (
+                    saved.get("qwen38_ple_lookup") is not True
+                    or saved.get("weight_decay") != 0.0
+                    or saved.get("qwen38_ple_step_layout") != current["qwen38_ple_step_layout"]
+                ):
+                    raise RuntimeError(
+                        "Muon resume requires the PLE lookup marker and zero weight decay with owner-step layout; explicit migration required"
+                    )
+                for key, p in zip(saved["params"], current["params"], strict=True):
+                    entry = state_dict["state"].get(key)
+                    if not entry:
+                        continue
+                    step = entry["step"]
+                    if isinstance(p, DTensor):
+                        expected = self._ple_step_tensor(p, 0.0)
+                        if (
+                            not isinstance(step, DTensor)
+                            or step.shape != expected.shape
+                            or step.device_mesh != expected.device_mesh
+                            or step.placements != expected.placements
+                        ):
+                            raise RuntimeError("PLE optimizer step requires the exact owner-grid checkpoint layout")
+                    elif isinstance(step, DTensor) or step.ndim != 0:
+                        raise RuntimeError("PLE optimizer step layout does not match parameter")
+                    scalar = _local(step).detach().cpu().reshape(()).clone()
+                    if not torch.isfinite(scalar) or scalar < 0 or scalar != scalar.floor():
+                        raise RuntimeError("Invalid PLE optimizer step")
+                    if scalar.item() == 0:
+                        state_dict["state"].pop(key)
+                        lazy.append(p)
+                    else:
+                        state_dict["state"][key] = {**entry, "step": scalar}
             for key in ("qwen38_recipe", "qwen38_plan", "muon_momentum"):
                 if saved.get(key) != current[key]:
                     raise RuntimeError(f"Muon resume recipe mismatch: {key}; AdamW migration is not implicit")
         super().load_state_dict(state_dict)
+        for p in lazy:
+            self.state.pop(p, None)
 
     @torch.no_grad()
     def step(self, closure=None):

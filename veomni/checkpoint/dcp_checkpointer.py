@@ -40,14 +40,13 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     _get_fqns,
     get_model_state_dict,
-    get_optimizer_state_dict,
     set_model_state_dict,
     set_optimizer_state_dict,
 )
 from torch.distributed.checkpoint.stateful import Stateful
 
 from ..distributed.parallel_state import get_parallel_state
-from ..optim.optimizer import restore_optimizer_param_group_defaults
+from ..optim.optimizer import optimizer_state_dict_for_checkpoint, restore_optimizer_param_group_defaults
 from ..utils import logging
 from ..utils.device import empty_cache, synchronize
 from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
@@ -675,7 +674,7 @@ class OptimizerState(Stateful):
             assert self.optimizer._is_multi_optimizer, (
                 "ExtraParallel is enabled but optimizer is not a MultiOptimizer instance"
             )
-            vanilla_optim_sd = self.optimizer.state_dict()
+            vanilla_optim_sd = self.optimizer.state_dict(for_load=self._load)
             optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
                 vanilla_optim_sd, "restore"
             )
@@ -685,13 +684,13 @@ class OptimizerState(Stateful):
 
         if getattr(self.optimizer, "_is_multi_optimizer", False):
             if self._load:
-                return self.optimizer.state_dict()
+                return self.optimizer.state_dict(for_load=True)
             sparse = self.optimizer._sparse_state_dict()
             if not any(key.startswith("state.") for key in sparse):
                 sparse[_ZERO_OPTIMIZER_STATE_MARKER] = True
             return sparse
 
-        state_dict = get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
+        state_dict = optimizer_state_dict_for_checkpoint(self.model, self.optimizer, for_load=self._load)
         if not self._load and not state_dict["state"]:
             state_dict[_ZERO_OPTIMIZER_STATE_MARKER] = True
         return state_dict

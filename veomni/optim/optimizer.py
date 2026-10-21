@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -288,6 +289,15 @@ class AnyPrecisionAdamW(Optimizer):
                     p.data.addcdiv_(exp_avg, centered_variance, value=-step_size)
 
 
+def optimizer_state_dict_for_checkpoint(model, optimizer, *, for_load=False, flatten=False):
+    """Let optimizers prepare exact lazy-state buffers before PyTorch's getter."""
+    prepare = getattr(optimizer, "checkpoint_state", None)
+    with prepare(load=for_load) if prepare is not None else nullcontext():
+        return get_optimizer_state_dict(
+            model, optimizer, options=StateDictOptions(flatten_optimizer_state_dict=flatten)
+        )
+
+
 class MultiOptimizer(Optimizer, Stateful):
     """
     A container that handles multiple optimizers (for extra_parallel and non-extra_parallel parameters when extra_parallel+fsdp2 is enabled)
@@ -319,12 +329,14 @@ class MultiOptimizer(Optimizer, Stateful):
 
     def state_dict(
         self,
+        *,
+        for_load=True,
     ) -> Dict[str, Any]:
         # get the flatten state dict for multi-optimizer
         merged: Dict[str, Any] = {}
         for name in self.key_names:
             opt = self.optimizers_dict.get(name)
-            sd = get_optimizer_state_dict(self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True))
+            sd = optimizer_state_dict_for_checkpoint(self.model, opt, for_load=for_load, flatten=True)
             # check for key clashes before merging
             overlap = set(merged.keys()) & set(sd.keys())
             if overlap:
@@ -351,9 +363,9 @@ class MultiOptimizer(Optimizer, Stateful):
         merged: Dict[str, Any] = {}
         for name in self.key_names:
             opt = self.optimizers_dict.get(name)
-            if not opt.state:
+            if not opt.state and not getattr(opt, "checkpoint_save_requires_state", False):
                 continue
-            sd = get_optimizer_state_dict(self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True))
+            sd = optimizer_state_dict_for_checkpoint(self.model, opt, flatten=True)
             overlap = set(merged.keys()) & set(sd.keys())
             if overlap:
                 raise KeyError(

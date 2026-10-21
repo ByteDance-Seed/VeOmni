@@ -383,3 +383,167 @@ def test_fresh_process_dcp_next_update_is_exact(tmp_path):
             join=True,
             start_method="fork",
         )
+
+
+def _ple_asymmetric_worker(rank, world, rendezvous, path, phase, mode):
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState, _ModelStrictLoadPlanner
+    from veomni.optim.optimizer import MultiOptimizer
+
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world)
+    try:
+        persistent = mode == "persistent"
+        mesh = (
+            init_device_mesh("cpu", (2, 2), mesh_dim_names=("ple_fsdp", "ple"))
+            if persistent
+            else init_device_mesh("cpu", (world,))
+        )
+        placements = [Shard(1), Shard(0)] if persistent else [Shard(0)]
+        model = torch.nn.Module()
+        model.ngram_embedding = torch.nn.ModuleDict(
+            {name: torch.nn.Embedding(8, 8, dtype=torch.bfloat16) for name in ("all", "partial", "never")}
+        )
+        for embedding in model.ngram_embedding.values():
+            full = torch.arange(64).reshape(8, 8).bfloat16() / 64
+            embedding.weight = torch.nn.Parameter(distribute_tensor(full, mesh, placements))
+        model.lm_head = torch.nn.Linear(8, 8, bias=False, dtype=torch.bfloat16)
+        model.lm_head.weight.data.fill_(0.125)
+        groups = module.add_qwen38_plans(
+            model, [{"params": list(model.parameters()), "weight_decay": 0.0, "cpu_offload": True}]
+        )
+        leaf = module.Qwen38MuonAdamW(groups, lr=1e-4)
+        optimizer = MultiOptimizer(model, {"ple": leaf}, ["ple"]) if mode != "single" else leaf
+        ps = SimpleNamespace(dp_mode="fsdp2")
+        if persistent:
+            model._fqn2spec_info = {
+                name: SimpleNamespace(placement=Shard(0), fsdp_shard_dim=1, persistent_fsdp_shard_dim=1)
+                for name, _ in model.named_parameters()
+                if "ngram_embedding" in name
+            }
+            ps.extra_parallel_names = ["ple"]
+            ps.extra_parallel_fsdp_device_mesh = {"ple": mesh}
+        partial = model.ngram_embedding["partial"].weight
+        never = model.ngram_embedding["never"].weight
+        active = rank % 2 == 0
+
+        def update(first):
+            leaf.zero_grad(set_to_none=True)
+            for name, param in model.named_parameters():
+                if "never" in name or (first and "partial" in name and not active):
+                    continue
+                scale = 0.125 if first else 0.25
+                if "ngram_embedding" in name:
+                    # The owner received local row requests; other owners never
+                    # enter lookup and retain grad=None for this table.
+                    local = param.to_local()
+                    torch.nn.functional.embedding(torch.tensor([0, 1, 1]), local).sum().mul(scale).backward()
+                else:
+                    param.grad = torch.ones_like(param) * scale
+            leaf.step()
+
+        if phase == "save":
+            update(True)
+            before = {p: dict(s) for p, s in leaf.state.items()}
+            dcp.save(
+                {
+                    "model": ModelState(model, parallel_state=ps),
+                    "optimizer": OptimizerState(model, optimizer, parallel_state=ps),
+                },
+                checkpoint_id=path,
+            )
+            assert set(leaf.state) == set(before)
+            assert partial in leaf.state if active else partial not in leaf.state
+            assert never not in leaf.state
+            update(False)
+            torch.save(
+                {
+                    name: {
+                        "weight": _local_test(p).clone(),
+                        "state": {k: _local_test(v).clone() for k, v in leaf.state.get(p, {}).items()},
+                    }
+                    for name, p in model.named_parameters()
+                },
+                Path(path) / f"expected-{rank}.pt",
+            )
+        else:
+            # Deliberately wrong model contents expose stale lazy master copies.
+            for p in model.parameters():
+                p.data.fill_(-1)
+            dcp.load(
+                {
+                    "model": ModelState(model, parallel_state=ps),
+                    "optimizer": OptimizerState(model, optimizer, parallel_state=ps, load=True),
+                },
+                checkpoint_id=path,
+                planner=_ModelStrictLoadPlanner(True, True, True, optimizer=optimizer),
+            )
+            assert partial in leaf.state if active else partial not in leaf.state
+            if active:
+                assert leaf.state[partial]["step"].item() == 1
+            assert never not in leaf.state
+            update(False)
+            assert leaf.state[partial]["step"].item() == (2 if active else 1)
+            expected = torch.load(Path(path) / f"expected-{rank}.pt", weights_only=True)
+            for name, p in model.named_parameters():
+                torch.testing.assert_close(_local_test(p), expected[name]["weight"], rtol=0, atol=0)
+                actual = {k: _local_test(v) for k, v in leaf.state.get(p, {}).items()}
+                assert actual.keys() == expected[name]["state"].keys()
+                for key in actual:
+                    torch.testing.assert_close(actual[key], expected[name]["state"][key], rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+def _local_test(tensor):
+    from torch.distributed.tensor import DTensor
+
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor.detach()
+
+
+@pytest.mark.parametrize("mode", ["single", "multi", "persistent"])
+def test_ple_asymmetric_owner_checkpoint_and_cold_resume(tmp_path, mode):
+    import torch.multiprocessing as mp
+
+    for phase in ("save", "resume"):
+        mp.start_processes(
+            _ple_asymmetric_worker,
+            args=(
+                4 if mode == "persistent" else 2,
+                str(tmp_path / f"rdzv-{phase}"),
+                str(tmp_path / "checkpoint"),
+                phase,
+                mode,
+            ),
+            nprocs=4 if mode == "persistent" else 2,
+            join=True,
+            start_method="fork",
+        )
+
+
+def test_unused_ple_snapshot_does_not_initialize_or_advance_live_state():
+    from veomni.optim.optimizer import optimizer_state_dict_for_checkpoint
+
+    model = torch.nn.Module()
+    model.ngram_embedding = torch.nn.Embedding(7, 4, dtype=torch.bfloat16)
+    groups = module.add_qwen38_plans(
+        model, [{"params": list(model.parameters()), "weight_decay": 0.0, "cpu_offload": True}]
+    )
+    opt = module.Qwen38MuonAdamW(groups, lr=1e-4)
+    saved = optimizer_state_dict_for_checkpoint(model, opt)
+    assert not opt.state
+    state = saved["state"]["ngram_embedding.weight"]
+    assert state["step"].item() == 0
+    assert torch.equal(state["master_weight"], model.ngram_embedding.weight.float())
+    assert not state["exp_avg"].count_nonzero() and not state["exp_avg_sq"].count_nonzero()
+    # A raw pre-versioned PLE checkpoint must not silently broadcast a scalar.
+    direct = opt.state_dict()
+    direct["param_groups"][0].pop("qwen38_ple_step_layout")
+    with pytest.raises(RuntimeError, match="explicit migration"):
+        opt.load_state_dict(direct)

@@ -70,3 +70,14 @@ FP32 masters, row/column/whole-expert sharding, exact recipe rejection and DCP
 restore. These are not a substitute for native NPU numerical, memory,
 throughput, and fresh-process checkpoint validation. Keep the profile a
 candidate until those gates pass.
+
+
+Trainable PLE checkpointing keeps each table owner's lazy Adam counter on an
+explicit owner-grid DTensor. Owners that have not received lookup requests
+contribute zero-moment, zero-step buffers to the snapshot so DCP sees complete
+coverage. This does not run an optimizer update or initialize live save-side
+state. On resume, zero-step owners become lazy again and create their master
+from the restored model on their first real update. Owner-grid identity is
+versioned; old scalar-counter PLE checkpoints or changed mesh rank layouts
+require explicit migration. This does not change the checkpoint layout of
+frozen PLE or non-PLE Muon parameters.
