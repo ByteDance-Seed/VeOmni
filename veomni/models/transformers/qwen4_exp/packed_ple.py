@@ -75,6 +75,7 @@ def local_packed_boundary_indices(
     global_length = local_length * sp_size
     if batch_size < 1 or local_length < 1 or reach < 0 or not 0 <= sp_rank < sp_size:
         raise ValueError("Invalid packed PLE boundary shape, reach, or SP rank.")
+    target_device = cu_seq_lens.device if device is None else device
     if packed_seq_lens is not None:
         lengths = tuple(int(length) for length in packed_seq_lens)
         if not lengths or any(length <= 0 for length in lengths) or sum(lengths) != batch_size * global_length:
@@ -95,9 +96,9 @@ def local_packed_boundary_indices(
                 local_index = global_index - row_start - local_start
                 indices.append(batch_index * local_length + local_index)
             global_start = global_end
-        return torch.tensor(indices, dtype=torch.long, device=device)
+        return torch.tensor(indices, dtype=torch.long, device=target_device)
 
-    bounds = cu_seq_lens.to(device=device, dtype=torch.long)
+    bounds = cu_seq_lens.to(device=target_device, dtype=torch.long)
     candidates = bounds[:-1, None] + torch.arange(reach, device=bounds.device)[None, :]
     batch = torch.div(candidates, global_length, rounding_mode="floor")
     within_row = candidates.remainder(global_length)

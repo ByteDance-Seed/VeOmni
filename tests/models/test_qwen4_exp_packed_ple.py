@@ -412,6 +412,48 @@ def test_production_text_model_builds_packed_ple_metadata_once():
     assert positions.tolist() == [[1, 2, 3, 4]]
     assert border.tolist() == [0, 1, 2, 3]
 
+    import math
+
+    ple_captured = {}
+
+    def ple_embedding(input_ids, past_key_values, **kwargs):
+        ple_captured["embedding_packed_positions"] = kwargs.get("packed_positions")
+        return torch.zeros(1, 4, 8)
+
+    def short_conv(hidden_states, past_key_values, **kwargs):
+        ple_captured["conv_packed_positions"] = kwargs.get("packed_positions")
+        ple_captured["conv_packed_boundary_indices"] = kwargs.get("packed_boundary_indices")
+        return hidden_states
+
+    ple_forward = production_method(
+        "qwen4_exp_text_ple_layer_forward_patched",
+        extra_namespace={"math": math},
+    )
+    ple_layer = SimpleNamespace(
+        ple_embedding=ple_embedding,
+        key_proj=lambda x: x,
+        norm_key=lambda x: x,
+        value_proj=lambda x: x,
+        norm_query=lambda x: x,
+        norm_conv=lambda x: x,
+        _short_conv=short_conv,
+        hc_count=1,
+        hidden_size=8,
+    )
+    ple_forward(
+        ple_layer,
+        inputs_embeds,
+        torch.zeros(1, 4, dtype=torch.long),
+        None,
+        cu_seq_lens_q=torch.tensor([0, 3, 8]),
+        packed_seq_lens=(3, 5),
+        packed_positions=positions,
+        packed_boundary_indices=border,
+    )
+    assert ple_captured["embedding_packed_positions"] is positions
+    assert ple_captured["conv_packed_positions"] is positions
+    assert ple_captured["conv_packed_boundary_indices"] is border
+
 
 def test_production_cached_single_segment_skips_packed_ple_metadata():
     from types import SimpleNamespace

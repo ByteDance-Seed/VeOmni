@@ -998,13 +998,14 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen4ExpTextQSAIndexer
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
 class Qwen4ExpTextQSAIndexer(nn.Module):
     """Select QSA token indices from compressed key blocks."""
 
+    # [modified __init__] Bind an instance-local partial rope VeomniOp
     def __init__(self, config: Qwen4ExpTextConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
@@ -1021,6 +1022,8 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         )
         self.q_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
         self.k_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
+        # Bind an instance-local partial rope VeomniOp
+        self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
 
     def forward(
         self,
@@ -1283,13 +1286,14 @@ def eager_attention_forward(
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen4ExpTextAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
 class Qwen4ExpTextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
+    # [modified __init__] Bind instance-local rope and QSA attention VeomniOps
     def __init__(self, config: Qwen4ExpTextConfig, layer_idx: int):
         super().__init__()
         self.config = config
@@ -1314,6 +1318,9 @@ class Qwen4ExpTextAttention(nn.Module):
         self.q_norm = Qwen4ExpTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen4ExpTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.indexer = Qwen4ExpTextQSAIndexer(config, layer_idx)
+        # Bind instance-local rope and QSA attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
+        self.veomni_qsa_attn = VeomniOp("qsa_attention", "standard", resolve_op_impl("qsa_attention_implementation"))
 
     def forward(
         self,
@@ -2087,6 +2094,7 @@ class Qwen4ExpTextPLELayer(nn.Module):
             output_dtype=hidden_states.dtype,
             cu_seq_lens_q=cu_seq_lens_q,
             packed_seq_lens=packed_seq_lens,
+            packed_positions=packed_positions,
         )
         # --- Patch.1 ---
         key_normed = self.norm_key(self.key_proj(embeddings)).unflatten(-1, (self.hc_count, self.hidden_size))
@@ -2761,11 +2769,12 @@ class Qwen4ExpVisionPatchMerger(nn.Module):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen4ExpVisionAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
 class Qwen4ExpVisionAttention(nn.Module):
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Qwen4ExpVisionConfig) -> None:
         super().__init__()
         self.dim = config.hidden_size
@@ -2778,6 +2787,9 @@ class Qwen4ExpVisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,

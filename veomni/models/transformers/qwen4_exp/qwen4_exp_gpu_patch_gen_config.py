@@ -1474,6 +1474,7 @@ def qwen4_exp_text_ple_layer_forward_patched(
         output_dtype=hidden_states.dtype,
         cu_seq_lens_q=cu_seq_lens_q,
         packed_seq_lens=packed_seq_lens,
+        packed_positions=packed_positions,
     )
     # --- Patch.1 ---
     key_normed = self.norm_key(self.key_proj(embeddings)).unflatten(-1, (self.hc_count, self.hidden_size))
