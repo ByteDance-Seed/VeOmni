@@ -21,8 +21,13 @@
 ``cross_entropy_loss`` ``standard`` is token-level CE. Empty ``weight`` means
 the first tensor is already logits; that path is eager-only.
 ``liger_kernel`` and ``chunk_loss`` require a projection weight. Label
-shift and SP reduction stay in the caller. ``chunk_logprobs`` / top-k
-distill are not this kernel.
+shift and SP reduction stay in the caller.
+
+``token_logprobs`` ``standard`` computes per-token ``log p(y_t)`` from
+already-projected logits and target labels, with device-separated rows for
+PyTorch ``eager``, GPU ``flash_attn`` Triton cross-entropy, and Ascend NPU
+``torch_npu`` cross-entropy. The chunked fused-linear RL log-probs and
+top-k distillation autograd Functions live in ``token_logprobs/chunked.py``.
 """
 
 from ...platform import GpuKernelRequirement, NpuKernelRequirement
@@ -32,9 +37,13 @@ from .cross_entropy_loss.standard import eager as ce_eager
 from .cross_entropy_loss.standard import liger_kernel as ce_liger
 from .load_balancing_loss.standard import eager as lb_eager
 from .load_balancing_loss.standard import triton as lb_triton
+from .token_logprobs.standard import eager as tlp_eager
+from .token_logprobs.standard import flash_attn as tlp_flash_attn
+from .token_logprobs.standard import torch_npu as tlp_torch_npu
 
 
 _GPU = GpuKernelRequirement()
+_NPU = NpuKernelRequirement()
 
 
 register_op(
@@ -95,6 +104,35 @@ register_op(
     ce_chunk.forward,
     ce_chunk.backward,
     description="Chunked token-level cross-entropy loss",
-    requirement=NpuKernelRequirement(),
+    requirement=_NPU,
+    default=True,
+)
+
+register_op(
+    "token_logprobs",
+    "standard",
+    "eager",
+    wrapper=tlp_eager.wrapper,
+    description="PyTorch token-level log-probabilities from logits",
+)
+
+register_op(
+    "token_logprobs",
+    "standard",
+    "flash_attn",
+    wrapper=tlp_flash_attn.wrapper,
+    description="FlashAttention Triton cross-entropy token-level log-probabilities",
+    requirement=_GPU,
+    requires=("flash_attn.ops.triton.cross_entropy",),
+    default=True,
+)
+
+register_op(
+    "token_logprobs",
+    "standard",
+    "torch_npu",
+    wrapper=tlp_torch_npu.wrapper,
+    description="Ascend torch_npu cross-entropy token-level log-probabilities",
+    requirement=_NPU,
     default=True,
 )
