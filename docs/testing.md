@@ -546,7 +546,28 @@ interface and result files.
 
 A test without an explicit launch plan uses one card of the runner's selected
 accelerator backend, or CPU on a CPU-only runner. Single-card tests may use this
-default. Declare a CPU plan for tests that must run without accelerator access.
+default. Declare a CPU plan for CPU-only work, including preprocessing, config
+validation, eager CPU references, and tests with mocked accelerator kernels.
+A backend name in a test function does not imply that it needs that hardware.
+The scheduler follows the launch plan; it does not infer device use from tensor
+factories or test names.
+
+```python
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_cpu_reference():
+    ...
+```
+
+For an entirely CPU-only module, use
+`pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))`.
+In mixed modules, mark individual CPU cases so optimized GPU/NPU kernel tests
+retain accelerator reservations. CPU workers hide accelerator devices and share
+the scheduler's separate CPU concurrency limit.
 
 Multi-card tests must expose a plan derived from the same `nproc`, `world_size`,
 or parallel configuration used to launch their workers. A module, class, or

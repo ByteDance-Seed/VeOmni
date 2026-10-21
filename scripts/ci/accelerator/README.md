@@ -35,8 +35,12 @@ the manifest example, registration rules and collection check command.
 ## Launch plans
 
 An unmarked case defaults to one card of the selected accelerator backend, or
-CPU on a CPU-only runner. A CPU plan reserves no accelerator cards. Multi-card
-tests expose their existing `nproc`, `world_size` or parallel configuration
+CPU on a CPU-only runner. A CPU plan reserves no accelerator cards. Mark CPU-only
+preprocessing, config checks, eager CPU references and mocked backend tests with
+`pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))`. Use a module
+`pytestmark` only when every case is CPU-only; mixed files need case-level
+markers. Hardware names in test functions do not determine resource allocation.
+Multi-card tests expose their existing `nproc`, `world_size` or parallel configuration
 through `pytest.mark.launch_plan(provider=...)`. A provider may be a shared
 `LaunchSpec`, a `CasePlan`, or a pure function of collected parameters and the
 runner's immutable capabilities. Module/class markers can supply a shared plan;

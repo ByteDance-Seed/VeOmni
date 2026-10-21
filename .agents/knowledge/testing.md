@@ -10,6 +10,9 @@ GPU/NPU suite selections are enumerated in `scripts/ci/accelerator/suites/gpu.js
 `scripts/ci/accelerator/runner.py`; GPU/NPU unit and e2e workflows all use
 parallel dispatch. Add a suite selection for a file outside a collected
 directory. Do not add per-file pytest workflow lines or manual device quotas.
+CPU-only parsing, preprocessing, eager references and mocked backend tests need
+an explicit CPU launch plan. Mark entire modules only when all cases are CPU-only;
+use individual case markers in files that also exercise accelerator kernels.
 
 New functions/parameters already included by an existing selection need no
 manifest update. Check node-ID and pytest filters as well as file/directory

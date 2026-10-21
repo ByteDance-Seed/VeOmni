@@ -27,6 +27,7 @@ import pytest
 import torch.nn as nn
 from torch.utils.checkpoint import noop_context_fn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import GradientCheckpointingConfig
 from veomni.distributed import parallel_state
 from veomni.distributed.parallel_state import ParallelState, use_parallel_state
@@ -35,6 +36,9 @@ from veomni.models.seed_omni.accelerated.omni_module import omni_module_runtime
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 from veomni.models.seed_omni.mixins.offline_encoding_mixin import OfflineEncodingMixin
 from veomni.utils import recompute_utils
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _fsdp(scope: str, mode: str = "fsdp2") -> SimpleNamespace:

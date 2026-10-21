@@ -783,6 +783,7 @@ def test_qwen3omni_parallel_align(
     )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_wan_dit_uses_bfloat16_and_flash_attention():
     command_list = prepare_exec_cmd(
         ["train_dit_test"],
@@ -806,6 +807,7 @@ def test_wan_dit_uses_bfloat16_and_flash_attention():
         assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_deepseek_v4_e2e_casts_fused_triton_moe_to_bfloat16():
     command_list = prepare_exec_cmd(
         ["train_text_test"],
@@ -828,6 +830,7 @@ def test_deepseek_v4_e2e_casts_fused_triton_moe_to_bfloat16():
 
 
 @_gpt_oss_fa4_quack_skip
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_gpt_oss_parallel_uses_fa4_and_quack():
     command_list = prepare_exec_cmd(
         ["train_text_test"],
