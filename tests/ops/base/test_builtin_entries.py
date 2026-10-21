@@ -134,6 +134,9 @@ _BUILTIN_ENTRIES = (
     ("cross_entropy_loss", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("cross_entropy_loss", "standard", "chunk_loss", "any", _ANY, ()),
     ("cross_entropy_loss", "standard", "chunk_loss", "npu", _NPU, ()),
+    ("token_logprobs", "standard", "eager", "any", _ANY, ()),
+    ("token_logprobs", "standard", "flash_attn", "cuda", _GPU, ("flash_attn.ops.triton.cross_entropy",)),
+    ("token_logprobs", "standard", "torch_npu", "npu", _NPU, ()),
     ("mhc", "pre", "eager", "any", _ANY, ()),
     ("mhc", "pre", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tile_kernels",)),
     ("mhc", "pre", "cann", "npu", _NPU, ("cann_ops_transformer",)),
@@ -239,6 +242,8 @@ def test_builtin_entry_catalog_is_exact():
 _BUILTIN_DEFAULT_ENTRIES = {
     ("cross_entropy_loss", "standard", "liger_kernel", "cuda"),
     ("cross_entropy_loss", "standard", "chunk_loss", "npu"),
+    ("token_logprobs", "standard", "flash_attn", "cuda"),
+    ("token_logprobs", "standard", "torch_npu", "npu"),
     ("load_balancing_loss", "standard", "triton", "cuda"),
     ("moe_experts", "standard", "fused_triton", "cuda"),
     ("moe_experts", "standard", "fused_mlu", "mlu"),
