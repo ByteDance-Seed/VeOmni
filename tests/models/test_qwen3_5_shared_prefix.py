@@ -11,7 +11,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.transformers.qwen3_5.shared_prefix import build_shared_prefix_plan
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 torch.manual_seed(0)

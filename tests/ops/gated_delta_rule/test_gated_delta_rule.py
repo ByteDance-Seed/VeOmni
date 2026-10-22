@@ -781,35 +781,90 @@ def test_chunk_gated_delta_rule_npu_accepts_cpu_cu_seqlens():
     not is_nvidia_cuda_available(min_cc=90, max_cc=100),
     reason="flash_qla requires an NVIDIA GPU from SM90 through SM100",
 )
-def test_chunk_gated_delta_rule_flash_qla_matches_eager():
+@pytest.mark.parametrize("group_size", [1, 2, 4])
+def test_chunk_gated_delta_rule_flash_qla_matches_eager(group_size: int):
     pytest.importorskip("flash_qla")
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
     other = resolve_op("chunk_gated_delta_rule", "standard", "flash_qla").wrapper
-    torch.manual_seed(2)
-    batch, seq, heads, dim = 1, 32, 2, 128
-    q = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-    g = -torch.rand(batch, seq, heads, device="cuda", dtype=torch.float32) * 0.5
-    beta = torch.rand(batch, seq, heads, device="cuda", dtype=torch.bfloat16)
+    torch.manual_seed(0)
+    cu_seqlens = torch.tensor([0, 19, 64], device="cuda", dtype=torch.int32)
+    num_k_heads = 2
+    num_v_heads = num_k_heads * group_size
+    head_dim = 128
+    q_base = torch.randn(1, 64, num_k_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k_base = torch.randn(1, 64, num_k_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    v_base = torch.randn(1, 64, num_v_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    g_base = -torch.rand(1, 64, num_v_heads, device="cuda", dtype=torch.float32)
+    beta_base = torch.sigmoid(torch.randn(1, 64, num_v_heads, device="cuda", dtype=torch.bfloat16))
+    h0_base = torch.randn(2, num_v_heads, head_dim, head_dim, device="cuda", dtype=torch.float32) * 0.1
+    grad_out = torch.randn(1, 64, num_v_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    grad_state = torch.randn(2, num_v_heads, head_dim, head_dim, device="cuda", dtype=torch.float32)
 
-    q_e, k_e, v_e, g_e, b_e = make_grad_leaves(q, k, v, g, beta)
-    q_o, k_o, v_o, g_o, b_o = make_grad_leaves(q, k, v, g, beta)
-    # FlashQLA ignores ``chunk_size``. Compare at the vendor / eager default (64).
-    out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, use_qk_l2norm_in_kernel=True)
-    out_o, _ = other(q_o, k_o, v_o, g_o, b_o, use_qk_l2norm_in_kernel=True)
-    assert torch.allclose(out_e, out_o, atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
+    def run_eager_reference():
+        q, k, v, g, beta, h0 = make_grad_leaves(q_base, k_base, v_base, g_base, beta_base, h0_base)
+        q_in = q.repeat_interleave(group_size, dim=2) if group_size > 1 else q
+        k_in = k.repeat_interleave(group_size, dim=2) if group_size > 1 else k
+        bounds = cu_seqlens.tolist()
+        seg_outs = []
+        seg_states = []
+        for seg_idx, (start, end) in enumerate(zip(bounds[:-1], bounds[1:], strict=True)):
+            seg_out, seg_state = eager(
+                q_in[:, start:end],
+                k_in[:, start:end],
+                v[:, start:end],
+                g[:, start:end],
+                beta[:, start:end],
+                h0[seg_idx : seg_idx + 1],
+                None,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+            seg_outs.append(seg_out)
+            seg_states.append(seg_state)
+        out = torch.cat(seg_outs, dim=1)
+        final_state = torch.cat(seg_states, dim=0)
+        loss = (out * grad_out).sum() + (final_state.float() * grad_state).sum()
+        loss.backward()
+        return out, final_state, (q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad)
 
-    go = torch.randn_like(out_e)
-    out_e.backward(go)
-    out_o.backward(go)
-    for actual, expected in zip((q_o, k_o, v_o, g_o, b_o), (q_e, k_e, v_e, g_e, b_e), strict=True):
+    def run_case(wrapper, *, expand_qk: bool):
+        q, k, v, g, beta, h0 = make_grad_leaves(q_base, k_base, v_base, g_base, beta_base, h0_base)
+        q_in = q.repeat_interleave(group_size, dim=2) if expand_qk and group_size > 1 else q
+        k_in = k.repeat_interleave(group_size, dim=2) if expand_qk and group_size > 1 else k
+        out, final_state = wrapper(
+            q_in,
+            k_in,
+            v,
+            g,
+            beta,
+            h0,
+            cu_seqlens,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        loss = (out * grad_out).sum() + (final_state.float() * grad_state).sum()
+        loss.backward()
+        return out, final_state, (q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad)
+
+    ref_out, ref_state, ref_grads = run_eager_reference()
+    grouped_out, grouped_state, grouped_grads = run_case(other, expand_qk=False)
+
+    torch.testing.assert_close(grouped_out, ref_out, atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
+    torch.testing.assert_close(grouped_state.float(), ref_state.float(), atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
+    for actual_grad, expected_grad in zip(grouped_grads, ref_grads, strict=True):
         torch.testing.assert_close(
-            actual.grad,
-            expected.grad,
+            actual_grad.float(),
+            expected_grad.float(),
             atol=GDN_CHUNK_GRAD_ATOL,
             rtol=GDN_CHUNK_GRAD_RTOL,
         )
+
+    if group_size > 1:
+        expanded_out, expanded_state, expanded_grads = run_case(other, expand_qk=True)
+        torch.testing.assert_close(grouped_out, expanded_out, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(grouped_state, expanded_state, atol=1e-3, rtol=1e-3)
+        for actual_grad, expected_grad in zip(grouped_grads, expanded_grads, strict=True):
+            torch.testing.assert_close(actual_grad.float(), expected_grad.float(), atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize(
