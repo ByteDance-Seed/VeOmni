@@ -114,12 +114,15 @@ Native hooks in `modeling.py`, used during inference with no VeOmni graph:
 | `reset_local_inference_state()` / `reset_global_inference_state()` | inference | clear per-request / per-generation FSM state |
 | `finalize(*, ctx)` | inference | flush buffered output when `max_new_tokens` is hit |
 
-Optional capabilities are mixins on the accelerated class, each with its own
-page: [Module CPU Preprocessors](../mixins/module_preprocessor.md)
-(`ModulePreprocessorBase`: worker-side CPU input preparation and FSDP batch
-anchors), [Metric Meter](../mixins/metric_meter.md) (per-module tokens and
-theoretical FLOPs; `OmniModel` has no single `model_type` to estimate FLOPs on)
-and [Offline Encoding](../mixins/offline_encoding.md) (cache a module's encoder
+CPU input preparation is a separate picklable worker class, not a mixin: a
+native class points `preprocessor_class` at a
+[Module CPU Preprocessor](../mixins/module_preprocessor.md)
+(`ModulePreprocessorBase`, run by `OmniProcessor` in DataLoader workers for
+worker-side CPU input preparation and FSDP batch anchors). Optional capabilities
+on the model itself are mixins on the accelerated class, each with its own page:
+[Metric Meter](../mixins/metric_meter.md) (per-module tokens and theoretical
+FLOPs; `OmniModel` has no single `model_type` to estimate FLOPs on) and
+[Offline Encoding](../mixins/offline_encoding.md) (cache a module's encoder
 output once and train from the cache).
 
 ### 2.2 `ConversationItem`: the data carrier (`utils/conversation.py`)

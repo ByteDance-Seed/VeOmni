@@ -14,9 +14,9 @@ at that subclass.
 
 ## Why preprocessing is per-module and CPU-only
 
-The global data transform ([`process_seedomni_example`](../../../veomni/data/seed_omni/seedomni_transform.py#L140))
+The global data transform ([`process_seedomni_example`](../../../veomni/data/seed_omni/seedomni_transform.py#L183))
 decodes raw media and produces a model-agnostic `conversation_list` of
-[`ConversationItem`](../../../veomni/models/seed_omni/utils/conversation.py#L56)
+[`ConversationItem`](../../../veomni/models/seed_omni/utils/conversation.py#L78)
 objects. Only each module knows which items it consumes, how its chat template or
 image processor transforms them, and what dummy placeholder shape its FSDP
 wrapper needs when a micro-batch has no real items for that modality.
@@ -101,7 +101,7 @@ class VisionPreprocessor(ModulePreprocessorBase):
 | Function | Called by | Effect |
 |----------|-----------|--------|
 | [`ModulePreprocessorBase.append_batch_anchor(conversation_list, item)`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L128) | Module's `preprocess_conversations` when `inference=False` and no real input for this module exists in the micro-batch | Appends `item` (`is_dummy=True`) to `conversation_list[0]` — a single anchor row per micro-batch rather than one per sample, keeping FSDP2 collectives aligned without running `N` dummy forward passes. |
-| [`bind_module_assets(model, *, checkpoint_path=None, preprocessor=None, config_overrides=None)`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L145) | [`PretrainedOmniModule.from_pretrained`](../../../veomni/models/seed_omni/modules/module_modeling_base.py#L36) and [`ModuleRuntime._build_model_assets`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L354) | Copies CPU asset attributes (`_processor`, `_image_processor`, `_video_processor`, `_tokenizer`, `_chat_template`) from the preprocessor onto `model` if not already set, so `generate()` and HF checkpoint export can access them. |
+| [`bind_module_assets(model, *, checkpoint_path=None, preprocessor=None, config_overrides=None)`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L145) | [`PretrainedOmniModule.from_pretrained`](../../../veomni/models/seed_omni/modules/module_modeling_base.py#L36) and [`ModuleRuntime._build_model_assets`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L392) | Copies CPU asset attributes (`_processor`, `_image_processor`, `_video_processor`, `_tokenizer`, `_chat_template`) from the preprocessor onto `model` if not already set, so `generate()` and HF checkpoint export can access them. |
 
 ## Call flow
 
@@ -123,9 +123,9 @@ class VisionPreprocessor(ModulePreprocessorBase):
 ## Tests
 
 - [`tests/seed_omni/data/test_preprocessor.py`](../../../tests/seed_omni/data/test_preprocessor.py):
-  - [strict key alignment across collated samples](../../../tests/seed_omni/data/test_preprocessor.py#L47),
-  - [mixed-resolution images preserved unstacked and normalized per item](../../../tests/seed_omni/data/test_preprocessor.py#L57), and
-  - [`append_batch_anchor` attaches a single dummy anchor row when a modality is absent](../../../tests/seed_omni/data/test_preprocessor.py#L96).
+  - [strict key alignment across collated samples](../../../tests/seed_omni/data/test_preprocessor.py#L48),
+  - [mixed-resolution images preserved unstacked and normalized per item](../../../tests/seed_omni/data/test_preprocessor.py#L58), and
+  - [`append_batch_anchor` attaches a single dummy anchor row when a modality is absent](../../../tests/seed_omni/data/test_preprocessor.py#L97).
 - [`tests/seed_omni/model/test_processor.py`](../../../tests/seed_omni/model/test_processor.py):
   - [preprocessors run in module order](../../../tests/seed_omni/model/test_processor.py#L31),
   - [`model_config` and `processor_config` overrides reach `from_pretrained`](../../../tests/seed_omni/model/test_processor.py#L157), and
