@@ -115,7 +115,9 @@ Native hooks in `modeling.py`, used during inference with no VeOmni graph:
 | `finalize(*, ctx)` | inference | flush buffered output when `max_new_tokens` is hit |
 
 Optional capabilities are mixins on the accelerated class, each with its own
-page: [Metric Meter](../mixins/metric_meter.md) (per-module tokens and
+page: [Module CPU Preprocessors](../mixins/module_preprocessor.md)
+(`ModulePreprocessorBase`: worker-side CPU input preparation and FSDP batch
+anchors), [Metric Meter](../mixins/metric_meter.md) (per-module tokens and
 theoretical FLOPs; `OmniModel` has no single `model_type` to estimate FLOPs on)
 and [Offline Encoding](../mixins/offline_encoding.md) (cache a module's encoder
 output once and train from the cache).
