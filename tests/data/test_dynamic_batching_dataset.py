@@ -64,9 +64,8 @@ from veomni.data import build_dataloader
 from veomni.data.data_collator import MainCollator
 from veomni.data.dataset import (
     DynamicBatchingSizeDataset,
-    get_length_by_attention_mask_fn,
-    get_length_by_input_ids_fn,
     get_length_by_labels_fn,
+    get_length_fn,
     get_length_fn_by_count_mode,
 )
 from veomni.data.dynamic_batching import TextBatchingStrategy
@@ -86,10 +85,6 @@ logger = helper.create_logger(__name__)
 MICRO_BATCH_SEQ_LENGTH = 32  # Max tokens per batch
 READY_FOR_MICRO_BATCH_THRESHOLD = 10  # Minimum samples in buffer before batching
 DATASET_SIZE = 50
-
-
-def get_length_fn(item):
-    return item["attention_mask"].sum()
 
 
 def _make_sample(token_id: int, total_tokens: int = 4, effective_tokens: int = 2) -> Dict[str, torch.Tensor]:
@@ -310,9 +305,9 @@ def test_dynamic_batching_without_get_item():
 def test_get_length_fn_by_count_mode():
     sample = _make_sample(token_id=7, total_tokens=5, effective_tokens=3)
 
-    assert get_length_by_attention_mask_fn(sample) == 5
+    assert get_length_fn(sample) == 5
     assert get_length_by_labels_fn(sample) == 3
-    assert get_length_by_input_ids_fn(sample) == 5
+    assert get_length_fn({"input_ids": sample["input_ids"]}) == 5
     assert get_length_fn_by_count_mode("total")(sample) == 5
     assert get_length_fn_by_count_mode("effective")(sample) == 3
     assert get_length_by_labels_fn({"attention_mask": sample["attention_mask"]}) == 5
@@ -322,18 +317,18 @@ def test_get_length_fn_by_count_mode():
         "attention_mask": [1, 1, 1, 1, 0],
         "labels": [IGNORE_INDEX, 2, IGNORE_INDEX, 4, 5],
     }
-    assert get_length_by_attention_mask_fn(list_sample) == 4
+    assert get_length_fn(list_sample) == 4
     assert get_length_by_labels_fn(list_sample) == 3
-    assert get_length_by_input_ids_fn(list_sample) == 5
+    assert get_length_fn({"input_ids": list_sample["input_ids"]}) == 5
 
     np_sample = {
         "input_ids": np.arange(5),
         "attention_mask": np.array([1, 1, 1, 0, 0]),
         "labels": np.array([IGNORE_INDEX, 1, 2, IGNORE_INDEX, IGNORE_INDEX]),
     }
-    assert get_length_by_attention_mask_fn(np_sample) == 3
+    assert get_length_fn(np_sample) == 3
     assert get_length_by_labels_fn(np_sample) == 2
-    assert get_length_by_input_ids_fn(np_sample) == 5
+    assert get_length_fn({"input_ids": np_sample["input_ids"]}) == 5
 
     unsupported_labels_sample = {
         "input_ids": [1, 2, 3],
@@ -343,6 +338,7 @@ def test_get_length_fn_by_count_mode():
     assert get_length_by_labels_fn(unsupported_labels_sample) == 2
 
     input_ids_only_sample = {"input_ids": np.arange(4)}
+    assert get_length_fn(input_ids_only_sample) == 4
     assert get_length_by_labels_fn(input_ids_only_sample) == 4
     assert get_length_by_labels_fn([list_sample, np_sample]) == 5
     assert get_length_by_labels_fn(None) == 0
@@ -351,6 +347,74 @@ def test_get_length_fn_by_count_mode():
 
     with pytest.raises(ValueError, match="Unknown dyn_bsz count_mode"):
         get_length_fn_by_count_mode("bad-mode")
+
+
+def test_seedomni_conversation_list_dyn_bsz_lengths_and_strategy():
+    from veomni.data.seed_omni.collator import SeedOmniCollator
+    from veomni.models.seed_omni.utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
+
+    conv_sample = {
+        "conversation_list": [
+            ConversationItem(
+                type="text",
+                value=torch.tensor([1, 2, 3]),
+                role="user",
+                meta={
+                    "attention_mask": torch.ones(3, dtype=torch.long),
+                    "labels": torch.full((3,), IGNORE_INDEX, dtype=torch.long),
+                    _OMNI_TOKEN_LEN: 3,
+                },
+            ),
+            ConversationItem(
+                type="image",
+                value=torch.zeros(4, 8),
+                role="user",
+                meta={_OMNI_TOKEN_LEN: 4},
+            ),
+            ConversationItem(
+                type="text",
+                value=torch.tensor([10, 11, 12, 13, 14]),
+                role="assistant",
+                meta={
+                    "attention_mask": torch.ones(5, dtype=torch.long),
+                    "labels": torch.tensor([IGNORE_INDEX, 11, 12, 13, 14], dtype=torch.long),
+                    _OMNI_TOKEN_LEN: 5,
+                },
+            ),
+            ConversationItem(
+                type="image",
+                value=torch.zeros(3, 8, 8),
+                role="assistant",
+                meta={_OMNI_TOKEN_LEN: 8},
+            ),
+            ConversationItem(
+                type="image",
+                value=torch.zeros(2, 8),
+                role="user",
+                is_dummy=True,
+                meta={_OMNI_TOKEN_LEN: 2},
+            ),
+        ]
+    }
+
+    # Total length includes all items (including is_dummy=True): 3 + 4 + 5 + 8 + 2 = 22.
+    assert get_length_fn(conv_sample) == 22
+    # Effective length excludes is_dummy=True and user items: 4 (assistant text) + 8 (assistant image) = 12.
+    assert get_length_by_labels_fn(conv_sample) == 12
+
+    strategy = TextBatchingStrategy(
+        token_micro_bsz=24,
+        buffer_size=1,
+        get_length_fn=get_length_by_labels_fn,
+        physical_token_cap=44,
+        get_physical_length_fn=get_length_fn,
+    )
+    strategy.put_item(conv_sample)
+    strategy.put_item(conv_sample)
+    micro_batch = strategy.get_micro_batch(step=0)
+    assert len(micro_batch) == 2
+    collated = SeedOmniCollator()(micro_batch)
+    assert len(collated["conversation_list"]) == 2
 
 
 def test_text_batching_strategy_effective_count_mode():
@@ -380,7 +444,7 @@ def test_text_batching_strategy_effective_mode_can_overflow_total_budget_with_la
         buffer_size=1,
         get_length_fn=get_length_by_labels_fn,
         physical_token_cap=6,
-        get_physical_length_fn=get_length_by_attention_mask_fn,
+        get_physical_length_fn=get_length_fn,
     )
     samples = [
         _make_sample(token_id=1, total_tokens=3, effective_tokens=2),
@@ -404,7 +468,7 @@ def test_text_batching_strategy_effective_mode_honors_physical_cap():
         buffer_size=1,
         get_length_fn=get_length_by_labels_fn,
         physical_token_cap=8,
-        get_physical_length_fn=get_length_by_attention_mask_fn,
+        get_physical_length_fn=get_length_fn,
     )
     samples = [
         _make_sample(token_id=1, total_tokens=6, effective_tokens=2),
@@ -439,7 +503,7 @@ def test_dynamic_batching_size_dataset_effective_mode_can_overflow_total_budget_
         dynamic_batching_collate_fn=lambda samples: samples,
         get_length_fn=get_length_by_labels_fn,
         physical_token_cap=6,
-        get_physical_length_fn=get_length_by_attention_mask_fn,
+        get_physical_length_fn=get_length_fn,
         save_by_idx=False,
     )
 
@@ -465,7 +529,7 @@ def test_dynamic_batching_size_dataset_effective_mode_honors_physical_cap():
         dynamic_batching_collate_fn=lambda samples: samples,
         get_length_fn=get_length_by_labels_fn,
         physical_token_cap=8,
-        get_physical_length_fn=get_length_by_attention_mask_fn,
+        get_physical_length_fn=get_length_fn,
         save_by_idx=False,
     )
 
