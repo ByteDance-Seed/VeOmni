@@ -4,6 +4,7 @@ from collections import defaultdict
 from typing import Dict
 
 import torch
+import torch.distributed as dist
 
 from veomni.arguments import parse_args
 from veomni.trainer.callbacks import Callback, TrainerState
@@ -44,12 +45,23 @@ class LogDictSaveCallback(Callback):
         super().__init__(trainer)
         self.log_dict = defaultdict(list)
 
+    def _dp_mean(self, value: float) -> float:
+        if not (dist.is_available() and dist.is_initialized()):
+            return float(value)
+        ps = self.trainer.model.parallel_state
+        dp_group = ps.dp_group
+        if dp_group is None or ps.dp_size <= 1:
+            return float(value)
+        t = torch.tensor([float(value)], dtype=torch.float32, device=self.trainer.device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM, group=dp_group)
+        return float(t.item() / dist.get_world_size(dp_group))
+
     def on_step_end(
         self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
     ) -> None:
-        self.log_dict["loss"].append(loss)
+        self.log_dict["loss"].append(self._dp_mean(loss))
         for key, value in loss_dict.items():
-            self.log_dict[key].append(value)
+            self.log_dict[key].append(self._dp_mean(value))
         self.log_dict["grad_norm"].append(float(grad_norm))
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
