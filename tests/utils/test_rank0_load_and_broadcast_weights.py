@@ -456,8 +456,11 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
         with use_parallel_state(ps):
             _check_rank0_broadcast(args, weights_path, cpu_offload=args.model.accelerator.fsdp_config.offload)
     finally:
-        dist.destroy_process_group()
-        clear_parallel_state()
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            clear_parallel_state()
 
 
 def run_load_weights_test(args: Arguments) -> None:
@@ -482,8 +485,11 @@ def run_load_weights_test(args: Arguments) -> None:
         with use_parallel_state(ps):
             _check_load_weights_no_scatter(args, weights_path, cpu_offload=args.model.accelerator.fsdp_config.offload)
     finally:
-        dist.destroy_process_group()
-        clear_parallel_state()
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            clear_parallel_state()
 
 
 def run_all_tests(args: Arguments) -> None:
@@ -545,8 +551,11 @@ def run_all_tests(args: Arguments) -> None:
                 fn()
         dist.barrier()
     finally:
-        dist.destroy_process_group()
-        clear_parallel_state()
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            clear_parallel_state()
 
 
 @pytest.mark.launch_plan(provider=_CI_LAUNCH)

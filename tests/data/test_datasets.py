@@ -330,11 +330,14 @@ def main():
             sys.argv = [sys.argv[0]] + remaining_argv
             args = parse_args(VeOmniArguments)
             _run_single_dataset_scenario(args)
-    finally:
         if dist.is_initialized():
             dist.barrier()
-            dist.destroy_process_group()
-        clear_parallel_state()
+    finally:
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            clear_parallel_state()
 
 
 if __name__ == "__main__":

@@ -857,11 +857,14 @@ def _main_distributed_test():
                     save_by_idx=test_args.save_by_idx,
                     multi_sample_per_iteration=test_args.multi_sample_per_iteration,
                 )
-        finally:
             if dist.is_initialized():
                 dist.barrier()
-                dist.destroy_process_group()
-            clear_parallel_state()
+        finally:
+            try:
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+            finally:
+                clear_parallel_state()
 
 
 if __name__ == "__main__":

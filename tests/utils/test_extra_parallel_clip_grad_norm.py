@@ -148,6 +148,8 @@ _FSDP2_4GPU_SCENARIOS: tuple[tuple[str, int, int, int | None, bool], ...] = (
     ("fsdp2_ep4_cpu_offload", 4, 1, None, True),
     ("fsdp2_emb4_no_offload", 1, 4, None, False),
     ("fsdp2_emb4_cpu_offload", 1, 4, None, True),
+    ("fsdp2_ep2_emb2_no_offload", 2, 2, None, False),
+    ("fsdp2_ep2_emb2_cpu_offload", 2, 2, None, True),
     ("fsdp2_ep2_emb4_no_offload", 2, 4, None, False),
     ("fsdp2_ep2_emb4_cpu_offload", 2, 4, None, True),
 )
@@ -224,10 +226,18 @@ def _run_clip_scenario(
         ep_fsdp_group = None
         if ps.extra_parallel_group("ep") and ps.extra_parallel_fsdp_device_mesh["ep"] is not None:
             ep_fsdp_group = ps.extra_parallel_fsdp_device_mesh["ep"]["ep_fsdp"].get_group()
+            assert dist.get_world_size(group=ep_fsdp_group) == dp_shard // ep_size, (
+                f"[{label}] expected ep_fsdp group size {dp_shard // ep_size}, got {dist.get_world_size(group=ep_fsdp_group)}"
+            )
 
         emb_fsdp_group = None
         if ps.extra_parallel_group("emb") and ps.extra_parallel_fsdp_device_mesh["emb"] is not None:
             emb_fsdp_group = ps.extra_parallel_fsdp_device_mesh["emb"]["emb_fsdp"].get_group()
+            assert dist.get_world_size(group=emb_fsdp_group) == dp_shard // emb_size, (
+                f"[{label}] expected emb_fsdp group size {dp_shard // emb_size}, got {dist.get_world_size(group=emb_fsdp_group)}"
+            )
+            if emb_size == 2 and dp_shard == 4:
+                assert dist.get_world_size(group=emb_fsdp_group) == 2
 
         # build optimizer to register ep param groups when ep is enabled
         optimizer = build_optimizer(
@@ -366,8 +376,11 @@ def main():
             )
         dist.barrier()
     finally:
-        dist.destroy_process_group()
-        clear_parallel_state()
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            clear_parallel_state()
 
 
 def _run_clip_grad_norm_suite(suite: str, nproc: int, reverse_scenarios: bool = False) -> None:

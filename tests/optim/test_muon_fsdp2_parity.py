@@ -590,8 +590,11 @@ def _run_dense_all() -> None:
             fn()
         dist.barrier()
     finally:
-        dist.destroy_process_group()
-        clear_parallel_state()
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            clear_parallel_state()
 
 
 def _run_moe_all() -> None:
@@ -607,8 +610,11 @@ def _run_moe_all() -> None:
             _run_qwen3_moe(use_zero_comm=use_zero_comm, init_dist=False)
         dist.barrier()
     finally:
-        dist.destroy_process_group()
-        clear_parallel_state()
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            clear_parallel_state()
 
 
 def _has_devices(n: int) -> bool:

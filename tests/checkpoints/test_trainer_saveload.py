@@ -298,6 +298,19 @@ def _run_trainer_saveload_and_verify(
     shutil.rmtree(get_output_dir(model_name, ep_size, dp_replicate_size, nproc=nproc))
 
 
+def _exceeds_checkpoint_capacity(nproc: int) -> bool:
+    return not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) or nproc > min(
+        get_checkpoint_test_nproc(), runner_device_count()
+    )
+
+
+def _saveload_nproc_skip_mark(nproc: int):
+    return pytest.mark.skipif(
+        f"_exceeds_checkpoint_capacity({nproc})",
+        reason=f"Requires nproc={nproc}, exceeds configured/available devices",
+    )
+
+
 # MoE save/load coverage on 4 GPUs:
 # - qwen3_moe ep=1: 1D FSDP (no EP)
 # - qwen3_moe ep=2: 2D expert mesh (ep_fsdp=2, ep=2) with both axes active
@@ -305,11 +318,11 @@ def _run_trainer_saveload_and_verify(
 # - deepseek_v3 ep=2: DeepSeek-V3 converter + 2D expert mesh (ep_fsdp=2, ep=2)
 # - deepseek_v4 ep=1: hash-MoE tid2eid + fused experts + mHC DCP resume
 _SAVELOAD_CASES = [
-    pytest.param("qwen3_moe", 1, 4, id="qwen3_moe-1"),
-    pytest.param("qwen3_moe", 2, 4, id="qwen3_moe-2"),
-    pytest.param("qwen3_moe", 4, 4, id="qwen3_moe-4"),
-    pytest.param("deepseek_v3", 2, 4, id="deepseek_v3-2"),
-    pytest.param("deepseek_v4", 1, 4, id="deepseek_v4-1"),
+    pytest.param("qwen3_moe", 1, 4, id="qwen3_moe-1", marks=_saveload_nproc_skip_mark(4)),
+    pytest.param("qwen3_moe", 2, 4, id="qwen3_moe-2", marks=_saveload_nproc_skip_mark(4)),
+    pytest.param("qwen3_moe", 4, 4, id="qwen3_moe-4", marks=_saveload_nproc_skip_mark(4)),
+    pytest.param("deepseek_v3", 2, 4, id="deepseek_v3-2", marks=_saveload_nproc_skip_mark(4)),
+    pytest.param("deepseek_v4", 1, 4, id="deepseek_v4-1", marks=_saveload_nproc_skip_mark(4)),
 ]
 
 
@@ -323,8 +336,8 @@ def test_trainer_saveload(model_name: str, ep_size: int, nproc: int):
 # - nproc=8, ep=2, dp_replicate=2 -> 3D expert mesh (2, 2, 2), all three dims active (ep_fsdp > 1).
 # - nproc=4, ep=2, dp_replicate=2 -> 3D expert mesh (2, 1, 2), degenerate ep_fsdp=1 boundary.
 _HSDP_SAVELOAD_CASES = [
-    pytest.param(2, 8, id="ep2-8gpu"),
-    pytest.param(2, 4, id="ep2-4gpu"),
+    pytest.param(2, 8, id="ep2-8gpu", marks=_saveload_nproc_skip_mark(8)),
+    pytest.param(2, 4, id="ep2-4gpu", marks=_saveload_nproc_skip_mark(4)),
 ]
 
 

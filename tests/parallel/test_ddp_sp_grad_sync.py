@@ -253,8 +253,11 @@ def main() -> None:
             )
         dist.barrier()
     finally:
-        dist.destroy_process_group()
-        clear_parallel_state()
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            clear_parallel_state()
 
 
 def _run_ddp_sp_grad_sync_test(reverse_scenarios: bool = False) -> None:
