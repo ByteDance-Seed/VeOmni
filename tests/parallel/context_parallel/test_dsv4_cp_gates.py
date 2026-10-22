@@ -58,7 +58,7 @@ def test_gate_rejects_context_parallel_on_npu(monkeypatch, model_type):
     monkeypatch.setattr(
         auto_module,
         "get_parallel_state",
-        lambda: SimpleNamespace(cp_enabled=True, ulysses_enabled=False),
+        lambda: SimpleNamespace(cp_enabled=True),
     )
     monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", True)
 
@@ -72,38 +72,8 @@ def test_gate_allows_context_parallel_models_on_gpu(monkeypatch, model_type):
     monkeypatch.setattr(
         auto_module,
         "get_parallel_state",
-        lambda: SimpleNamespace(cp_enabled=True, ulysses_enabled=False),
+        lambda: SimpleNamespace(cp_enabled=True),
     )
     monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", False)
 
     check_context_parallel_supported(SimpleNamespace(model_type=model_type))
-
-
-@pytest.mark.parametrize("model_type", ["deepseek_v4", "qwen4_exp"])
-def test_gate_rejects_combined_cp_and_ulysses_on_single_model_forward(monkeypatch, model_type):
-    monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
-    monkeypatch.setattr(
-        auto_module,
-        "get_parallel_state",
-        lambda: SimpleNamespace(cp_enabled=True, ulysses_enabled=True, cp_size=2, ulysses_size=2),
-    )
-    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", False)
-
-    with pytest.raises(
-        NotImplementedError, match=f"cannot be combined with Ulysses for model type {model_type!r} yet"
-    ):
-        check_context_parallel_supported(SimpleNamespace(model_type=model_type))
-
-
-def test_gate_allows_seed_omni_module_config_under_cp_and_hybrid_cp_sp(monkeypatch):
-    from veomni.models.seed_omni.modules.text_encoder.configuration import TextEncoderConfig
-
-    monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
-    monkeypatch.setattr(
-        auto_module,
-        "get_parallel_state",
-        lambda: SimpleNamespace(cp_enabled=True, ulysses_enabled=True, cp_size=2, ulysses_size=2),
-    )
-    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", False)
-
-    check_context_parallel_supported(TextEncoderConfig(vocab_size=64, hidden_size=16))

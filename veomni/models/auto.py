@@ -92,29 +92,8 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     if IS_NPU_AVAILABLE:
         raise NotImplementedError("Context parallelism is GPU-only in this release; set cp_size=1 on Ascend/NPU runs.")
 
-    from .seed_omni.modules.module_configuration_base import OmniModuleConfig
-
-    if isinstance(config, OmniModuleConfig):
-        inner_config = getattr(config, "text_config", None) or getattr(config, "vision_config", None)
-        inner_model_type = getattr(inner_config, "model_type", None)
-        state = get_parallel_state()
-        if inner_model_type in CONTEXT_PARALLEL_MODEL_TYPES and state.ulysses_enabled:
-            raise NotImplementedError(
-                f"Context parallelism cannot be combined with Ulysses for model type {inner_model_type!r} yet; "
-                f"got cp_size={state.cp_size} with ulysses_size={state.ulysses_size}. "
-                "Set ulysses_size=1 to use context parallelism."
-            )
-        return
-
     model_type = getattr(config, "model_type", None)
     if model_type in CONTEXT_PARALLEL_MODEL_TYPES:
-        state = get_parallel_state()
-        if state.ulysses_enabled:
-            raise NotImplementedError(
-                f"Context parallelism cannot be combined with Ulysses for model type {model_type!r} yet; "
-                f"got cp_size={state.cp_size} with ulysses_size={state.ulysses_size}. "
-                "Set ulysses_size=1 to use context parallelism."
-            )
         return
 
     supported = ", ".join(sorted(CONTEXT_PARALLEL_MODEL_TYPES))
