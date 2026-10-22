@@ -19,6 +19,11 @@ from __future__ import annotations
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 @pytest.mark.parametrize("impl", ["eager", "sdpa"])
 def test_drop_packed_attention_metadata_strips_gdn_keys_for_sdpa_and_eager(impl):

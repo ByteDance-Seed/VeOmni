@@ -1,5 +1,6 @@
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.training_utils import make_eager_ops_config, unbuilt_runtime
 from veomni.models import build_foundation_model
 from veomni.trainer.vlm_trainer import (
@@ -9,6 +10,9 @@ from veomni.trainer.vlm_trainer import (
     VLMModelRuntime,
     _get_vlm_visual_module,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 _FREEZE_VIT_VLM_CASES = [

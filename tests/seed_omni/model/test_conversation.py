@@ -1,8 +1,13 @@
 """``ConversationItem`` routing: items are selected by data tags, never by module."""
 
+import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_a_dummy_is_selected_by_the_same_filter_as_the_items_it_stands_in_for():

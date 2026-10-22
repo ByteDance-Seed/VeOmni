@@ -43,6 +43,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.utils import moe_router_replay
 from veomni.utils.moe_router_replay import (
     SUPPORTED_MOE_MODEL_TYPES,
@@ -51,6 +52,9 @@ from veomni.utils.moe_router_replay import (
     set_active_replay,
     validate_model_for_replay,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 @pytest.fixture(autouse=True)
