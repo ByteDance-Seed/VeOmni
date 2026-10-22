@@ -441,9 +441,15 @@ def process_sample_gemma3(
     from .multimodal.image_utils import fetch_images
 
     source = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")
-    conversations = conv_preprocess(source, sample.get("conversations", sample), **kwargs)
+    conversations = sample.get("conversations")
+    if conversations is None:
+        conversations = sample
+    conversations = conv_preprocess(source, conversations, **kwargs)
 
-    images = fetch_images(sample.get("images", []), **kwargs)
+    images = sample.get("images")
+    if images is None:
+        images = []
+    images = fetch_images(images, **kwargs)
     if images:
         image_inputs = processor.image_processor(images=images, return_tensors="pt", do_pan_and_scan=False)
         num_crops = image_inputs.pop("num_crops", torch.zeros(len(images), dtype=torch.long))

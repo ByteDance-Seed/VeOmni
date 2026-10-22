@@ -257,6 +257,7 @@ class VLMTrainer:
             processor=self.base.model.processor,
             chat_template=self.base.model.chat_template,
             position_id_func=self.base.model.unwrapped_module.get_position_id_func(),
+            max_seq_len=args.data.max_seq_len,
             **args.data.mm_configs,
         )
 

@@ -99,3 +99,47 @@ def test_process_sample_gemma3_keeps_one_bos_and_assistant_label_boundary(monkey
     assert result["input_ids"].tolist() == [1, 2, 3, 4, 5]
     assert result["input_ids"].tolist().count(1) == 1
     assert result["labels"].tolist() == [IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, 4, 5]
+
+
+def test_process_sample_gemma3_handles_interleaved_tulu_sample_with_null_columns(monkeypatch):
+    class FakeTokenizer:
+        image_token_id = 99
+
+        def __call__(self, text, *, add_special_tokens, return_tensors):
+            del add_special_tokens, return_tensors
+            ids = [1 if token == "<user>" else 2 if token == "<assistant>" else 3 for token in text.split()]
+            return {"input_ids": torch.tensor([ids])}
+
+    processor = SimpleNamespace(
+        boi_token="<image>",
+        image_seq_length=256,
+        tokenizer=FakeTokenizer(),
+        apply_chat_template=lambda messages, **_kwargs: " ".join(
+            f"<{message['role']}> {message['content'][0]['text']}" for message in messages
+        ),
+    )
+    fetched_images = []
+    monkeypatch.setattr(
+        "veomni.data.multimodal.image_utils.fetch_images",
+        lambda images, **_kwargs: fetched_images.extend(images) or [],
+    )
+
+    result = process_sample_gemma3(
+        sample={
+            "source_name": "tulu-3-sft-mixture",
+            "conversations": None,
+            "images": None,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "answer"},
+            ],
+        },
+        processor=processor,
+        position_id_func=lambda input_ids, **_kwargs: {
+            "position_ids": torch.arange(input_ids.shape[-1]).unsqueeze(0)
+        },
+    )[0]
+
+    assert fetched_images == []
+    assert result["input_ids"].tolist() == [1, 3, 2, 3]
+    assert result["labels"].tolist() == [IGNORE_INDEX, IGNORE_INDEX, 2, 3]

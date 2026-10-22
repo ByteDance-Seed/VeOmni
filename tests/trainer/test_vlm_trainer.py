@@ -88,6 +88,31 @@ def test_optimizer_uses_vit_lr_for_gemma3_vision_tower(monkeypatch):
     assert not vision_param_ids.intersection(id(param) for param in other_group["params"])
 
 
+def test_vlm_data_transform_receives_configured_max_seq_len(monkeypatch):
+    args = SimpleNamespace(data=SimpleNamespace(max_seq_len=16384, mm_configs={}))
+    model = SimpleNamespace(
+        model_config=SimpleNamespace(model_type="gemma3"),
+        processor=object(),
+        chat_template=object(),
+        unwrapped_module=SimpleNamespace(get_position_id_func=lambda: object()),
+    )
+    trainer = object.__new__(vlm_trainer.VLMTrainer)
+    trainer.base = SimpleNamespace(args=args, model=model)
+    captured = {}
+
+    def fake_build_data_transform(model_type, **kwargs):
+        captured["model_type"] = model_type
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(vlm_trainer, "build_data_transform", fake_build_data_transform)
+
+    trainer._build_data_transform()
+
+    assert captured["model_type"] == "gemma3"
+    assert captured["max_seq_len"] == 16384
+
+
 @pytest.mark.parametrize("freeze_vit", [False, True])
 @pytest.mark.parametrize("config_path", _FREEZE_VIT_VLM_CASES)
 def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
