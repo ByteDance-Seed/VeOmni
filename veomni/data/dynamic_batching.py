@@ -66,7 +66,10 @@ class DynBszBuffer:
         self._buffer.append(item)
         if self._get_length_fn is not None:
             length = self._get_length_fn(item)
-        elif "conversation_list" in item:
+        elif (
+            any(k in item for k in ("conversation_list", "packed_attention_mask", "packed_input_ids", "input_ids"))
+            and "attention_mask" not in item
+        ):
             length = get_length_fn(item)
         else:
             if "attention_mask" not in item:
@@ -215,7 +218,13 @@ class TextBatchingStrategy(BaseBatchingStrategy):
         if "input_ids" in item and item["input_ids"].shape[-1] <= 1:
             print("WARNING: EMPTY STRING.")
             return
-        if "conversation_list" in item and not item["conversation_list"]:
+        if (
+            "conversation_list" in item
+            and not item["conversation_list"]
+            and not any(
+                k in item for k in ("attention_mask", "packed_attention_mask", "input_ids", "packed_input_ids")
+            )
+        ):
             print("WARNING: EMPTY STRING.")
             return
         self.buffer.append(item)
