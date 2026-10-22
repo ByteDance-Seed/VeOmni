@@ -1378,14 +1378,14 @@ class DynamicBatchingSizeDataset(IterableDataset):
             physical_length = item[2] if len(item) > 2 else length
 
             if length + seq_length > self.micro_batch_seq_length:
-                if seq_length > 0:
+                if micro_batch:
                     continue
                 elif not self.force_generate_long_sequence:
                     # Usually it is impossible to reach this branch because too long samples would not be added to the buffer if force_generate_long_sequence is False.
                     continue
 
             if self.physical_token_cap is not None and physical_length + physical_seq_length > self.physical_token_cap:
-                if seq_length > 0:
+                if micro_batch:
                     continue
                 logger.warning(
                     f"Sample physical length {physical_length} exceeds physical token cap {self.physical_token_cap}; emitting it alone."

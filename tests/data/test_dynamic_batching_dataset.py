@@ -539,6 +539,45 @@ def test_dynamic_batching_size_dataset_effective_mode_honors_physical_cap():
     assert [sum(sample["attention_mask"].sum().item() for sample in batch) for batch in micro_batches] == [6, 8]
 
 
+def test_zero_effective_length_first_sample_still_enforces_physical_cap():
+    samples = [
+        _make_sample(token_id=1, total_tokens=6, effective_tokens=0),
+        _make_sample(token_id=2, total_tokens=6, effective_tokens=2),
+        _make_sample(token_id=3, total_tokens=2, effective_tokens=2),
+    ]
+
+    strategy = TextBatchingStrategy(
+        token_micro_bsz=4,
+        buffer_size=1,
+        get_length_fn=get_length_by_labels_fn,
+        physical_token_cap=8,
+        get_physical_length_fn=get_length_fn,
+    )
+    for sample in samples:
+        strategy.put_item(sample)
+    micro_batch = strategy.get_micro_batch(step=0)
+    assert [sample["input_ids"][0].item() for sample in micro_batch] == [1, 3]
+    assert sum(sample["attention_mask"].sum().item() for sample in micro_batch) == 8
+
+    class ZeroEffectiveFirstDataset(IterableDataset):
+        def __iter__(self):
+            yield from samples
+
+    dynamic_ds = DynamicBatchingSizeDataset(
+        dataset=ZeroEffectiveFirstDataset(),
+        micro_batch_seq_length=4,
+        ready_for_micro_batch_threshold=1,
+        dynamic_batching_collate_fn=lambda batch_samples: batch_samples,
+        get_length_fn=get_length_by_labels_fn,
+        physical_token_cap=8,
+        get_physical_length_fn=get_length_fn,
+        save_by_idx=False,
+    )
+    micro_batches = list(dynamic_ds)
+    assert [[sample["input_ids"][0].item() for sample in batch] for batch in micro_batches] == [[1], [2, 3]]
+    assert [sum(sample["attention_mask"].sum().item() for sample in batch) for batch in micro_batches] == [6, 8]
+
+
 @pytest.mark.parametrize("save_by_idx", [False, True])
 def test_save_load_state_dict(save_by_idx):
     """Unit test for DynamicBatchingSizeDataset state_dict and load_state_dict.

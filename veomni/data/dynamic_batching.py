@@ -102,7 +102,7 @@ class DynBszBuffer:
             fits_physical_cap = physical_token_cap is None or (
                 physical_seq_len <= physical_token_cap - cum_physical_len
             )
-            first_forced_sample = force is True and cum_seq_len == 0
+            first_forced_sample = force is True and not samples
             if self.cur_idx not in self.del_idxs and (
                 first_forced_sample or (fits_effective_budget and fits_physical_cap)
             ):
