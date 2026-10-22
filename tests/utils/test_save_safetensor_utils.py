@@ -232,6 +232,91 @@ class TestGetModelSaveState(unittest.TestCase):
                 state = get_model_save_state(model, mapping)
             self.assertEqual(set(state.keys()), expected_keys)
 
+    def test_converter_export_weights_passes_should_quantize_and_keeps_scale_on_same_owner(self):
+        from veomni.utils.save_safetensor_utils import get_model_save_state
+
+        raw_origins = [
+            ("layers.0.attn.wq_a.weight", True),
+            ("layers.0.attn.wkv.weight", True),
+            ("layers.0.hc_attn_base", False),
+        ]
+        quant_calls_by_rank: dict[int, list[str]] = {0: [], 1: []}
+
+        class _QuantAwareConverter:
+            def can_handle(self, name):
+                return True
+
+            def convert(self, name, tensor):
+                return None
+
+            def export_weights(self, m, *, should_quantize=None):
+                for origin, is_quant in raw_origins:
+                    if should_quantize is not None and not should_quantize(origin):
+                        continue
+                    if is_quant:
+                        quant_calls_by_rank[current_rank].append(origin)
+                        yield origin, torch.zeros(2, 2, dtype=torch.float8_e4m3fn)
+                        yield f"{origin.removesuffix('.weight')}.scale", torch.ones(1, 1, dtype=torch.float32)
+                    else:
+                        yield origin, torch.ones(2, dtype=torch.float32)
+
+        model = _TinyModel()
+        model._create_checkpoint_tensor_converter = staticmethod(lambda m: _QuantAwareConverter())
+
+        states_by_rank = {}
+        for current_rank in (0, 1):
+            mock_dist = MagicMock(
+                is_initialized=MagicMock(return_value=True),
+                get_rank=MagicMock(return_value=current_rank),
+                get_world_size=MagicMock(return_value=2),
+            )
+            with patch(f"{_MOD}.dist", mock_dist):
+                states_by_rank[current_rank] = get_model_save_state(model, None)
+
+        # Rank 0 owns idx 0 (wq_a + scale) and idx 2 (hc_attn_base); Rank 1 owns idx 1 (wkv + scale)
+        self.assertEqual(quant_calls_by_rank[0], ["layers.0.attn.wq_a.weight"])
+        self.assertEqual(quant_calls_by_rank[1], ["layers.0.attn.wkv.weight"])
+        self.assertEqual(
+            set(states_by_rank[0].keys()),
+            {"layers.0.attn.wq_a.weight", "layers.0.attn.wq_a.scale", "layers.0.hc_attn_base"},
+        )
+        self.assertEqual(
+            set(states_by_rank[1].keys()),
+            {"layers.0.attn.wkv.weight", "layers.0.attn.wkv.scale"},
+        )
+
+    def test_verify_hf_checkpoint_weights_supports_deepseek_v4_release_format(self):
+        import os
+        import tempfile
+
+        from safetensors.torch import save_file
+
+        from tests.checkpoints.checkpoint_verification_utils import verify_hf_checkpoint_weights
+        from tests.models.tiny_configs import tiny_deepseek_v4_config
+        from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
+            create_deepseek_v4_checkpoint_tensor_converter,
+        )
+        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+            DeepseekV4ForCausalLM,
+        )
+        from veomni.utils.save_safetensor_utils import get_model_save_state
+
+        cfg = tiny_deepseek_v4_config()
+        model = DeepseekV4ForCausalLM(cfg).float()
+        model._create_checkpoint_tensor_converter = staticmethod(create_deepseek_v4_checkpoint_tensor_converter)
+        dcp_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+        with patch(f"{_MOD}.dist", MagicMock(is_initialized=MagicMock(return_value=False))):
+            hf_release_state = get_model_save_state(model, None)
+
+        self.assertIn("embed.weight", hf_release_state)
+        self.assertIn("layers.0.ffn.experts.0.w1.weight", hf_release_state)
+        self.assertEqual(hf_release_state["layers.0.hc_attn_base"].dtype, torch.float32)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_file(hf_release_state, os.path.join(tmp_dir, "model.safetensors"))
+            self.assertTrue(verify_hf_checkpoint_weights(tmp_dir, dcp_state, safe_serialization=True))
+
 
 # ===========================================================================
 # _save_hf_safetensor_distributed tests

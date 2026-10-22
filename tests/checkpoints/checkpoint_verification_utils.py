@@ -218,6 +218,60 @@ def verify_hf_checkpoint_structure(hf_checkpoint_dir: str, safe_serialization: b
     return True
 
 
+def _is_deepseek_v4_release_checkpoint(state_dict: Dict[str, torch.Tensor]) -> bool:
+    if "embed.weight" in state_dict or "head.weight" in state_dict:
+        return True
+    return any(k.startswith(("layers.", "model.layers.")) and (".attn." in k or ".ffn." in k) for k in state_dict)
+
+
+def _convert_deepseek_v4_release_checkpoint_for_verification(
+    loaded_state_dict: Dict[str, torch.Tensor],
+    dcp_state_dict: Dict[str, torch.Tensor],
+) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """Convert a DeepSeek-V4 release-format HF checkpoint back to v5 model keys for DCP comparison."""
+    from veomni.models.checkpoint.convert import maybe_convert_checkpoint_tensor
+    from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
+        DeepseekV4CheckpointTensorConverter,
+    )
+
+    num_experts = None
+    for k, v in dcp_state_dict.items():
+        if k.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")) and v.ndim == 3:
+            num_experts = int(v.shape[0])
+            break
+    if num_experts is None:
+        expert_ids = [
+            int(k.split(".experts.")[1].split(".")[0])
+            for k in loaded_state_dict
+            if ".experts." in k and k.split(".experts.")[1].split(".")[0].isdigit()
+        ]
+        num_experts = (max(expert_ids) + 1) if expert_ids else 1
+
+    target_model_prefix = "model." if any(k.startswith("model.") for k in dcp_state_dict) else ""
+    converter = DeepseekV4CheckpointTensorConverter(
+        num_experts=num_experts,
+        target_model_prefix=target_model_prefix,
+    )
+    converted_loaded: Dict[str, torch.Tensor] = {}
+    for k, v in loaded_state_dict.items():
+        res = maybe_convert_checkpoint_tensor(k, v, converter)
+        if res is not None:
+            converted_loaded[res.name] = res.tensor
+    for res in converter.finalize():
+        converted_loaded[res.name] = res.tensor
+
+    expected_state: Dict[str, torch.Tensor] = {}
+    for k, tensor in dcp_state_dict.items():
+        if tensor.is_floating_point():
+            if k.endswith((".weight", ".gate_up_proj", ".down_proj")):
+                expected_state[k] = tensor.to(torch.bfloat16)
+            else:
+                expected_state[k] = tensor.to(torch.float32)
+        else:
+            expected_state[k] = tensor
+    return converted_loaded, expected_state
+
+
 def verify_hf_checkpoint_weights(
     hf_checkpoint_dir: str,
     original_state_dict: Dict[str, torch.Tensor],
@@ -229,6 +283,15 @@ def verify_hf_checkpoint_weights(
     try:
         # Load the saved weights back
         loaded_state_dict = load_hf_checkpoint(hf_checkpoint_dir, safe_serialization)
+        if _is_deepseek_v4_release_checkpoint(loaded_state_dict) and not _is_deepseek_v4_release_checkpoint(
+            original_state_dict
+        ):
+            logger.info(
+                "Detected DeepSeek-V4 release format in HF checkpoint; converting to v5 format for verification"
+            )
+            loaded_state_dict, original_state_dict = _convert_deepseek_v4_release_checkpoint_for_verification(
+                loaded_state_dict, original_state_dict
+            )
 
         # Compare keys
         original_keys = set(original_state_dict.keys())
@@ -340,9 +403,18 @@ def verify_dcp_to_hf_conversion(
         traceback.print_exc()
         return False
 
-    # Convert floating DCP tensors to bf16 to match HF export dtype. Integer /
-    # boolean buffers (e.g. DeepSeek-V4 hash-router ``tid2eid``) must keep their
-    # original dtype — the save path already skips non-floating tensors.
+    # Convert floating DCP tensors to bf16 to match HF export dtype, except when the
+    # HF checkpoint is in DeepSeek-V4 release format where non-weight floating tensors
+    # (hc_*, sinks, position_bias, e_score_correction_bias) stay in fp32.
+    loaded_hf_preview = load_hf_checkpoint(hf_checkpoint_dir, safe_serialization)
+    if _is_deepseek_v4_release_checkpoint(loaded_hf_preview):
+        logger.info("Passing raw DCP state dict for DeepSeek-V4 release-format verification...")
+        return verify_hf_checkpoint(
+            hf_checkpoint_dir=hf_checkpoint_dir,
+            original_state_dict=dcp_state_dict,
+            safe_serialization=safe_serialization,
+        )
+
     logger.info("Converting floating DCP weights from fp32 to bf16 for exact comparison...")
     dcp_state_dict_bf16 = {
         key: (tensor.to(torch.bfloat16) if tensor.is_floating_point() else tensor)

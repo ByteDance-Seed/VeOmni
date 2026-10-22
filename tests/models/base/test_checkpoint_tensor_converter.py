@@ -800,6 +800,129 @@ class TestDeepseekV4ConverterConvert:
                 f"{key}: got {exported[key].dtype}, expected {expected_dtype}"
             )
 
+    def test_export_weights_synthesizes_release_mapping_when_none(self):
+        from tests.models.tiny_configs import tiny_deepseek_v4_config
+        from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
+            _build_default_deepseek_v4_fqn_to_index_mapping,
+        )
+        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+            DeepseekV4ForCausalLM,
+        )
+
+        cfg = tiny_deepseek_v4_config()
+        model = DeepseekV4ForCausalLM(cfg).float()
+        converter = DeepseekV4CheckpointTensorConverter(num_experts=cfg.n_routed_experts)
+
+        exported = dict(converter.export_weights(model))
+
+        assert getattr(model, "_veomni_fqn_to_index_mapping", None) is not None
+        assert "embed.weight" in exported
+        assert "head.weight" in exported
+        assert "layers.0.ffn.experts.0.w1.weight" in exported
+        assert "layers.0.hc_attn_base" in exported
+        assert exported["embed.weight"].dtype == torch.bfloat16
+        assert exported["layers.0.ffn.experts.0.w1.weight"].dtype == torch.bfloat16
+        assert exported["layers.0.hc_attn_base"].dtype == torch.float32
+        assert not any(k.endswith(".scale") for k in exported)
+
+        # With quant_config and 32-divisible weights, .scale entries are synthesized for quantized projections
+        cfg.quantization_config = {"quant_method": "fp8", "weight_block_size": [16, 16]}
+        quant_mapping = _build_default_deepseek_v4_fqn_to_index_mapping(model)
+        assert "layers.0.attn.wq_a.scale" in quant_mapping
+        assert "layers.0.ffn.experts.0.w1.scale" in quant_mapping
+        assert "embed.scale" not in quant_mapping
+        assert "layers.0.attn.compressor.wkv.scale" not in quant_mapping
+        assert "layers.3.attn.indexer.weights_proj.scale" not in quant_mapping
+
+    def test_export_weights_skips_unmapped_tied_weights_and_handles_none_block_size(self, monkeypatch):
+        from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
+
+        mapping = {"embed.weight": 1}
+        model = SimpleNamespace(
+            config=SimpleNamespace(quantization_config={"weight_block_size": None}),
+            _veomni_fqn_to_index_mapping=mapping,
+        )
+        monkeypatch.setattr(
+            module,
+            "export_weights",
+            lambda m: iter(
+                [
+                    ("model.embed_tokens.weight", torch.ones(4, 4, dtype=torch.float32)),
+                    ("lm_head.weight", torch.ones(4, 4, dtype=torch.float32)),
+                ]
+            ),
+        )
+
+        exported = dict(DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS).export_weights(model))
+
+        assert set(exported) == {"embed.weight"}
+        assert exported["embed.weight"].dtype == torch.bfloat16
+
+    def test_export_weights_accepts_fused_expert_fqn_mapping(self, monkeypatch):
+        from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
+
+        mapping = {
+            "model.layers.0.mlp.experts.gate_up_proj": 2,
+            "model.layers.0.mlp.experts.down_proj": 3,
+        }
+        live_items = []
+        for e in range(2):
+            live_items.append((f"model.layers.0.mlp.experts.{e}.gate_proj.weight", torch.ones(4, 4)))
+            live_items.append((f"model.layers.0.mlp.experts.{e}.up_proj.weight", torch.ones(4, 4)))
+            live_items.append((f"model.layers.0.mlp.experts.{e}.down_proj.weight", torch.ones(4, 4)))
+        model = SimpleNamespace(
+            config=SimpleNamespace(),
+            _veomni_fqn_to_index_mapping=mapping,
+        )
+        monkeypatch.setattr(module, "export_weights", lambda m: iter(live_items))
+
+        exported = dict(DeepseekV4CheckpointTensorConverter(num_experts=2).export_weights(model))
+
+        expected_keys = {f"layers.0.ffn.experts.{e}.{w}.weight" for e in range(2) for w in ("w1", "w2", "w3")}
+        assert set(exported) == expected_keys
+
+    def test_export_weights_should_quantize_skips_non_owner_quantization(self, monkeypatch):
+        from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
+        from veomni.models.transformers.deepseek_v4 import export_quant
+
+        mapping = {
+            "layers.0.attn.wq_a.weight": 1,
+            "layers.0.attn.wq_a.scale": 1,
+            "layers.0.attn.wkv.weight": 2,
+            "layers.0.attn.wkv.scale": 2,
+        }
+        quantized_calls: list[torch.Size] = []
+
+        def fake_fp8_weight_quant(x, block_size, scale_fmt, scale_dtype):
+            quantized_calls.append(x.shape)
+            return x.to(torch.float8_e4m3fn), torch.ones((1, 1), dtype=scale_dtype)
+
+        model = SimpleNamespace(
+            config=SimpleNamespace(expert_dtype="fp8"),
+            _veomni_fqn_to_index_mapping=mapping,
+        )
+        monkeypatch.setattr(
+            module,
+            "export_weights",
+            lambda m: iter(
+                [
+                    ("model.layers.0.self_attn.q_a_proj.weight", torch.ones(4, 4, dtype=torch.bfloat16)),
+                    ("model.layers.0.self_attn.kv_proj.weight", torch.ones(8, 8, dtype=torch.bfloat16)),
+                ]
+            ),
+        )
+        monkeypatch.setattr(export_quant, "fp8_weight_quant", fake_fp8_weight_quant)
+
+        exported = dict(
+            DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS).export_weights(
+                model,
+                should_quantize=lambda origin: origin == "layers.0.attn.wq_a.weight",
+            )
+        )
+
+        assert quantized_calls == [torch.Size([4, 4])]
+        assert set(exported) == {"layers.0.attn.wq_a.weight", "layers.0.attn.wq_a.scale"}
+
     def test_dequantizes_block_scaled_fp8_weight(self):
         weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))
         scale = torch.tensor([[1.0, 2.0], [4.0, 8.0]])

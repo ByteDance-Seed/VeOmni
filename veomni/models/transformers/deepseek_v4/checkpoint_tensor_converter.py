@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import re
 from functools import lru_cache
-from typing import Generator
+from typing import Callable, Generator
 
 import torch
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
@@ -75,6 +75,61 @@ _DEEPSEEK_V4_WEIGHT_RENAMINGS = [
     for transform in (get_checkpoint_conversion_mapping("deepseek_v4") or [])
     if isinstance(transform, WeightRenaming)
 ]
+_DEEPSEEK_V4_WEIGHT_REVERSE_RENAMINGS = [
+    WeightRenaming(
+        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.scorer\.weights_proj\.",
+        target_patterns=r"layers.\1.attn.indexer.weights_proj.",
+    ),
+    WeightRenaming(
+        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.q_b_proj\.",
+        target_patterns=r"layers.\1.attn.indexer.wq_b.",
+    ),
+    WeightRenaming(
+        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.position_bias$",
+        target_patterns=r"layers.\1.attn.indexer.compressor.ape",
+    ),
+    WeightRenaming(
+        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.kv_proj\.",
+        target_patterns=r"layers.\1.attn.indexer.compressor.wkv.",
+    ),
+    WeightRenaming(
+        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.gate_proj\.",
+        target_patterns=r"layers.\1.attn.indexer.compressor.wgate.",
+    ),
+    WeightRenaming(
+        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.kv_norm\.",
+        target_patterns=r"layers.\1.attn.indexer.compressor.norm.",
+    ),
+    WeightRenaming(
+        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.kv_norm\.",
+        target_patterns=r"layers.\1.attn.compressor.norm.",
+    ),
+    WeightRenaming(
+        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.kv_proj\.",
+        target_patterns=r"layers.\1.attn.compressor.wkv.",
+    ),
+    WeightRenaming(
+        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.gate_proj\.",
+        target_patterns=r"layers.\1.attn.compressor.wgate.",
+    ),
+    WeightRenaming(
+        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.position_bias$",
+        target_patterns=r"layers.\1.attn.compressor.ape",
+    ),
+    *[
+        transform.reverse_transform()
+        for transform in reversed(_DEEPSEEK_V4_WEIGHT_RENAMINGS)
+        if transform.source_patterns != [r"\.norm\."]
+    ],
+]
+_QUANTIZED_RELEASE_WEIGHT_PATTERN = re.compile(
+    r"^layers\.\d+\.(?:"
+    r"attn\.(?:wq_a|wq_b|wkv|wo_a|wo_b)|"
+    r"attn\.indexer\.wq_b|"
+    r"ffn\.shared_experts\.w[123]|"
+    r"ffn\.experts\.\d+\.w[123]"
+    r")\.weight$"
+)
 _FP4_E2M1_VALUES = (
     0.0,
     0.5,
@@ -130,6 +185,92 @@ def convert_deepseek_v4_checkpoint_key(name: str, *, target_model_prefix: str = 
     if has_model_prefix and converted_name == source_name:
         return name
     return converted_name
+
+
+def _revert_deepseek_v4_checkpoint_key(name: str, *, target_model_prefix: str = "model.") -> str:
+    """Convert Transformers v5 parameter names back to DeepSeek release checkpoint names."""
+    if _is_mtp_checkpoint_key(name):
+        return name
+    source_name = name.removeprefix(target_model_prefix) if target_model_prefix else name
+    if source_name.startswith("model.") and source_name.removeprefix("model.").startswith(_BASE_MODEL_KEY_PREFIXES):
+        source_name = source_name.removeprefix("model.")
+    if "mlp.experts." in source_name:
+        fields = source_name.split(".")
+        if len(fields) >= 2 and fields[-2] in _PROJ_NAME_TO_W_NAME:
+            fields[-2] = _PROJ_NAME_TO_W_NAME[fields[-2]]
+            source_name = ".".join(fields)
+    reverted_name, _ = rename_source_key(source_name, _DEEPSEEK_V4_WEIGHT_REVERSE_RENAMINGS, [])
+    return reverted_name
+
+
+def _extract_quant_config(config) -> tuple[dict, int, str, bool]:
+    quant_cfg = getattr(config, "quantization_config", None) or {}
+    if not isinstance(quant_cfg, dict):
+        quant_cfg = quant_cfg.to_dict() if hasattr(quant_cfg, "to_dict") else vars(quant_cfg)
+    weight_block_size = quant_cfg.get("weight_block_size") or (128, 128)
+    fp8_block_size = int(weight_block_size[0])
+    expert_dtype = getattr(config, "expert_dtype", None) or quant_cfg.get("expert_dtype") or "fp8"
+    has_quant = bool(
+        quant_cfg.get("quant_method") == "fp8"
+        or getattr(config, "expert_dtype", None) in ("fp4", "fp8")
+        or quant_cfg.get("expert_dtype") in ("fp4", "fp8")
+    )
+    return quant_cfg, fp8_block_size, expert_dtype, has_quant
+
+
+def _build_default_deepseek_v4_fqn_to_index_mapping(model, *, target_model_prefix: str = "model.") -> dict[str, int]:
+    """Synthesize a 1-shard release-format ``fqn_to_index_mapping`` from *model* when none was loaded."""
+    config = getattr(model, "config", None)
+    _quant_cfg, fp8_block_size, expert_dtype, has_quant = _extract_quant_config(config)
+    state_dict_fn = getattr(model, "state_dict", None)
+    if not callable(state_dict_fn):
+        return {}
+
+    state_dict = state_dict_fn()
+    tie_word_embeddings = bool(getattr(config, "tie_word_embeddings", False))
+    num_experts_cfg = getattr(config, "n_routed_experts", None) or getattr(config, "num_local_experts", None)
+
+    mapping: dict[str, int] = {}
+
+    def _add_entry(origin_key: str, shape: tuple[int, ...]) -> None:
+        mapping[origin_key] = 1
+        if not has_quant or not _QUANTIZED_RELEASE_WEIGHT_PATTERN.fullmatch(origin_key) or len(shape) != 2:
+            return
+        if "ffn.experts." in origin_key and expert_dtype == "fp4":
+            can_quantize = shape[1] % 32 == 0
+        else:
+            can_quantize = shape[0] % fp8_block_size == 0 and shape[1] % fp8_block_size == 0
+        if can_quantize:
+            mapping[f"{origin_key.removesuffix('.weight')}.scale"] = 1
+
+    for name, param in state_dict.items():
+        if tie_word_embeddings and name == "lm_head.weight":
+            continue
+        shape = tuple(param.shape)
+        if name.endswith(".mlp.experts.gate_up_proj") and len(shape) == 3:
+            num_experts = int(num_experts_cfg or shape[0])
+            prefix = name.removesuffix(".gate_up_proj")
+            expert_shape = (shape[1] // 2, shape[2])
+            for e in range(num_experts):
+                for w_name in ("w1", "w3"):
+                    origin_key = _revert_deepseek_v4_checkpoint_key(
+                        f"{prefix}.{e}.{w_name}.weight", target_model_prefix=target_model_prefix
+                    )
+                    _add_entry(origin_key, expert_shape)
+        elif name.endswith(".mlp.experts.down_proj") and len(shape) == 3:
+            num_experts = int(num_experts_cfg or shape[0])
+            prefix = name.removesuffix(".down_proj")
+            expert_shape = (shape[1], shape[2])
+            for e in range(num_experts):
+                origin_key = _revert_deepseek_v4_checkpoint_key(
+                    f"{prefix}.{e}.w2.weight", target_model_prefix=target_model_prefix
+                )
+                _add_entry(origin_key, expert_shape)
+        else:
+            origin_key = _revert_deepseek_v4_checkpoint_key(name, target_model_prefix=target_model_prefix)
+            _add_entry(origin_key, shape)
+
+    return mapping
 
 
 @lru_cache(maxsize=None)
@@ -379,24 +520,64 @@ class DeepseekV4CheckpointTensorConverter:
         self._scaled_weight_buffer.clear()
         return finalized
 
-    def export_weights(self, model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor]]:
-        config = model.config
-        fqn_to_index_mapping = model._veomni_fqn_to_index_mapping
-        quant_cfg = getattr(config, "quantization_config", None) or {}
-        if not isinstance(quant_cfg, dict):
-            quant_cfg = quant_cfg.to_dict() if hasattr(quant_cfg, "to_dict") else vars(quant_cfg)
-        weight_block_size = quant_cfg.get("weight_block_size", (128, 128))
-        fp8_block_size = int(weight_block_size[0])
-        expert_dtype = getattr(config, "expert_dtype", None) or quant_cfg.get("expert_dtype", "fp8")
+    def export_weights(
+        self,
+        model: torch.nn.Module,
+        *,
+        should_quantize: Callable[[str], bool] | None = None,
+    ) -> Generator[tuple[str, torch.Tensor]]:
+        config = getattr(model, "config", None)
+        fqn_to_index_mapping = getattr(model, "_veomni_fqn_to_index_mapping", None)
+        if fqn_to_index_mapping is None:
+            fqn_to_index_mapping = _build_default_deepseek_v4_fqn_to_index_mapping(
+                model, target_model_prefix=self.target_model_prefix
+            )
+            model._veomni_fqn_to_index_mapping = fqn_to_index_mapping
+
+        _quant_cfg, fp8_block_size, expert_dtype, _has_quant = _extract_quant_config(config)
         scale_fmt = "ue8m0"
         scale_dtype = torch.float8_e8m0fnu if expert_dtype == "fp4" else torch.float32
+
+        # Expand any v5 fused expert keys in fqn_to_index_mapping into per-expert release keys.
+        expanded_fused: dict[str, int] = {}
+        removed_fused: list[str] = []
+        for key, shard_idx in fqn_to_index_mapping.items():
+            if key.endswith(".mlp.experts.gate_up_proj"):
+                prefix = key.removesuffix(".gate_up_proj")
+                for e in range(self.num_experts):
+                    for w_name in ("w1", "w3"):
+                        origin_k = _revert_deepseek_v4_checkpoint_key(
+                            f"{prefix}.{e}.{w_name}.weight", target_model_prefix=self.target_model_prefix
+                        )
+                        expanded_fused[origin_k] = shard_idx
+                removed_fused.append(key)
+            elif key.endswith(".mlp.experts.down_proj"):
+                prefix = key.removesuffix(".down_proj")
+                for e in range(self.num_experts):
+                    origin_k = _revert_deepseek_v4_checkpoint_key(
+                        f"{prefix}.{e}.w2.weight", target_model_prefix=self.target_model_prefix
+                    )
+                    expanded_fused[origin_k] = shard_idx
+                removed_fused.append(key)
+        if expanded_fused:
+            for key in removed_fused:
+                fqn_to_index_mapping.pop(key, None)
+            fqn_to_index_mapping.update(expanded_fused)
+
         # HF's renamings are not invertible (e.g. reversing ``.norm.`` -> ``.kv_norm.`` also rewrites the native
         # ``attn.kv_norm``), so map names back by inverting the load-time renaming over the checkpoint index.
-        origin_names = {
-            convert_deepseek_v4_checkpoint_key(origin, target_model_prefix=self.target_model_prefix): origin
-            for origin in fqn_to_index_mapping
-            if not _is_mtp_checkpoint_key(origin)
-        }
+        origin_names: dict[str, str] = {}
+        for origin in fqn_to_index_mapping:
+            if _is_mtp_checkpoint_key(origin):
+                continue
+            converted = convert_deepseek_v4_checkpoint_key(origin, target_model_prefix=self.target_model_prefix)
+            if "mlp.experts." in converted:
+                fields = converted.split(".")
+                if len(fields) >= 2 and fields[-2] in _PROJ_NAME_TO_W_NAME:
+                    fields[-2] = _PROJ_NAME_TO_W_NAME[fields[-2]]
+                    converted = ".".join(fields)
+            origin_names[converted] = origin
+
         export_weight_names = set()
         for name, param in export_weights(model):
             # 1. replace mlp.experts.0.(gate_proj|up_proj|down_proj).weight to mlp.experts.0.(w1|w2|w3).weight
@@ -407,7 +588,12 @@ class DeepseekV4CheckpointTensorConverter:
 
             # 2. reverse the renaming
             origin = origin_names.get(name)
-            assert origin is not None, f"Unexpected exported weight name: {name}"
+            if origin is None:
+                if not fqn_to_index_mapping:
+                    origin = _revert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
+                else:
+                    logger.info_rank0(f"Skipping exported weight not in fqn_to_index_mapping: {name}")
+                    continue
 
             # 3. check if the weight needs to be quantized
             scale_name = None
@@ -415,10 +601,17 @@ class DeepseekV4CheckpointTensorConverter:
                 scale_name = origin.removesuffix(".weight") + ".scale"
 
             if scale_name is None or scale_name not in fqn_to_index_mapping:
+                export_weight_names.add(origin)
+                if should_quantize is not None and not should_quantize(origin):
+                    continue
                 if origin.endswith(".weight") and param.dtype == torch.float32:
                     param = param.to(torch.bfloat16)
-                export_weight_names.add(origin)
                 yield origin, param
+                continue
+
+            export_weight_names.add(origin)
+            export_weight_names.add(scale_name)
+            if should_quantize is not None and not should_quantize(origin):
                 continue
 
             # 4. quantize the weight
@@ -434,8 +627,6 @@ class DeepseekV4CheckpointTensorConverter:
                     param, block_size=fp8_block_size, scale_fmt=scale_fmt, scale_dtype=scale_dtype
                 )
 
-            export_weight_names.add(origin)
-            export_weight_names.add(scale_name)
             yield origin, weight
             yield scale_name, scale
 

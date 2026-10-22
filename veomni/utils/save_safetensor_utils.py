@@ -59,23 +59,58 @@ def get_model_save_state(
 
     converter = get_checkpoint_tensor_converter(model) if model is not None else None
     if converter is not None and callable(getattr(converter, "export_weights", None)):
-        if getattr(model, "_veomni_fqn_to_index_mapping", None) is None and fqn_to_index_mapping is not None:
-            model._veomni_fqn_to_index_mapping = fqn_to_index_mapping
+        import inspect
+
+        effective_mapping = (
+            fqn_to_index_mapping
+            if fqn_to_index_mapping is not None
+            else getattr(model, "_veomni_fqn_to_index_mapping", None)
+        )
+        if effective_mapping is not None:
+            model._veomni_fqn_to_index_mapping = effective_mapping
         is_dist = dist.is_initialized()
         rank = dist.get_rank() if is_dist else 0
         world_size = dist.get_world_size() if is_dist else 1
+        use_shard_owner = effective_mapping is not None and len(set(effective_mapping.values())) > 1
+
+        def _owner_rank(key: str, tensor_idx: int) -> int:
+            if use_shard_owner and effective_mapping is not None and key in effective_mapping:
+                return effective_mapping[key] % world_size
+            return tensor_idx % world_size
+
+        quant_tensor_idx = 0
+
+        def _should_quantize(origin: str) -> bool:
+            nonlocal quant_tensor_idx
+            idx = quant_tensor_idx
+            quant_tensor_idx += 1
+            return rank == _owner_rank(origin, idx)
+
+        sig = inspect.signature(converter.export_weights)
+        accepts_should_quantize = "should_quantize" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
         save_state = {}
         ps_ctx = use_parallel_state(parallel_state) if parallel_state is not None else nullcontext()
         with ps_ctx:
-            for idx, (k, v) in enumerate(converter.export_weights(model)):
+            exported_iter = (
+                converter.export_weights(model, should_quantize=_should_quantize)
+                if (is_dist and accepts_should_quantize)
+                else converter.export_weights(model)
+            )
+            tensor_idx = -1
+            for k, v in exported_iter:
+                if not k.endswith(".scale"):
+                    tensor_idx += 1
                 if fqn_to_index_mapping is not None and k not in fqn_to_index_mapping:
                     logger.info_rank0(f"Skipping weight not in HF weight_map: {k}")
                     continue
-                if is_dist:
+                if is_dist and not accepts_should_quantize:
+                    base_key = f"{k.removesuffix('.scale')}.weight" if k.endswith(".scale") else k
                     owner = (
-                        fqn_to_index_mapping[k] % world_size
-                        if (fqn_to_index_mapping is not None and k in fqn_to_index_mapping)
-                        else idx % world_size
+                        effective_mapping[k] % world_size
+                        if (use_shard_owner and effective_mapping is not None and k in effective_mapping)
+                        else _owner_rank(base_key, max(tensor_idx, 0))
                     )
                     if rank != owner:
                         continue
