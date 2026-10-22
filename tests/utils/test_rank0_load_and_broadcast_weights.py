@@ -1,4 +1,3 @@
-import random
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +11,8 @@ from torch import distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.tools.launch_utils import find_free_port
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import _init_parallel_state
@@ -19,6 +20,10 @@ from veomni.distributed.torch_parallelize import _move_model_buffers_to_device, 
 from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights, rank0_load_and_broadcast_weights
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+
+
+_CI_LAUNCH = LaunchSpec(nproc=4)
+_CI_OFFLOAD_LAUNCH = LaunchSpec(nproc=2)
 
 
 try:
@@ -649,6 +654,7 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
         clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(
     not dist.is_available() or get_device_type() == "cpu",
     reason=(
@@ -665,8 +671,8 @@ def test_load_dist_model_weights_matches_standard(tmp_path: Path, cpu_offload: b
     checkpoint_dir = tmp_path / "ckpt"
     weights_path = _write_checkpoint(checkpoint_dir, is_parallel=True)
 
-    world_size = 4
-    port = 12345 + random.randint(0, 100)
+    world_size = _CI_LAUNCH.nproc
+    port = find_free_port()
     command = [
         "torchrun",
         f"--nproc_per_node={world_size}",
@@ -826,6 +832,7 @@ def run_load_weights_test(args: Arguments) -> None:
         clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(
     not dist.is_available() or get_device_type() == "cpu",
     reason=(
@@ -850,8 +857,8 @@ def test_load_weights_no_scatter(tmp_path: Path, cpu_offload: bool) -> None:
     checkpoint_dir = tmp_path / "ckpt"
     weights_path = _write_checkpoint(checkpoint_dir, is_parallel=False)
 
-    world_size = 4
-    port = 12345 + random.randint(0, 100)
+    world_size = _CI_LAUNCH.nproc
+    port = find_free_port()
     command = [
         "torchrun",
         f"--nproc_per_node={world_size}",
@@ -877,6 +884,7 @@ def test_load_weights_no_scatter(tmp_path: Path, cpu_offload: bool) -> None:
     assert result.returncode == 0
 
 
+@pytest.mark.launch_plan(provider=_CI_OFFLOAD_LAUNCH)
 @pytest.mark.skipif(
     not dist.is_available() or get_device_type() == "cpu",
     reason=(
@@ -890,8 +898,8 @@ def test_fsdp_cpu_offload_training_keeps_buffers_on_compute_device(tmp_path: Pat
         pytest.skip("FSDP2 CPU-offload residency gate requires at least two accelerator devices.")
 
     weights_path = _write_buffer_checkpoint(tmp_path / "ckpt")
-    world_size = 2
-    port = 12345 + random.randint(0, 100)
+    world_size = _CI_OFFLOAD_LAUNCH.nproc
+    port = find_free_port()
     command = [
         "torchrun",
         f"--nproc_per_node={world_size}",

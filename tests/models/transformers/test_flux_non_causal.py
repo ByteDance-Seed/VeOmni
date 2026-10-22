@@ -1,9 +1,14 @@
+import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.transformers.flux.modeling_flux import (
     FluxJointAttention,
     FluxSingleTransformerBlock,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _rotary_embedding(seq_len, head_dim):

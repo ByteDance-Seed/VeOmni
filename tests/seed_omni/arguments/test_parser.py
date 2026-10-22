@@ -13,9 +13,13 @@ import typing
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.omni_arguments_types import OmniArguments, OmniDataArguments, OmniModuleRuntimeArguments
 from veomni.arguments.omni_parser import parse_omni_args
 from veomni.arguments.parser import _instantiate_recursive
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _contains_pep604_union(annotation) -> bool:
