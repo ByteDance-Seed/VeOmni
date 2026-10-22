@@ -5,8 +5,12 @@ from typing import Literal
 import pytest
 from utils import DummyDataset, process_dummy_example
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data import build_dataloader, build_dataset
 from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _fake_ps(sp_size: int):

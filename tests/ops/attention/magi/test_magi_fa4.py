@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Magi FA4 CUDA internals: backend resolve, CUTLASS setup, metadata cache, autograd."""
+"""Magi FA4 CUDA internals: SM100+ guard, metadata cache, autograd."""
 
 from __future__ import annotations
 
 import sys
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -35,80 +35,6 @@ def _isolate_magi_fa4_caches(monkeypatch):
     monkeypatch.setattr(magi_metadata, "_cache_entry", None)
     yield
     magi_kernel.prepare_kernel.cache_clear()
-
-
-def _set_fake_cutlass_backend(monkeypatch, *, available: bool) -> dict[str, object] | None:
-    fake_package = ModuleType("flash_attn_cute")
-    fake_package.__path__ = []
-    monkeypatch.setitem(sys.modules, "flash_attn_cute", fake_package)
-    monkeypatch.delitem(sys.modules, "flash_attn_cute.ffa_fa3", raising=False)
-    monkeypatch.delitem(sys.modules, "flash_attn_cute.ffa_fa3.flash_attn_config", raising=False)
-
-    if not available:
-        return None
-
-    fake_cutlass_package = ModuleType("flash_attn_cute.ffa_fa3")
-    fake_cutlass_package.__path__ = []
-    fake_interface = ModuleType("flash_attn_cute.ffa_fa3.flash_attn_interface")
-    fake_interface._flash_attn_forward = lambda: None
-    fake_interface._flash_attn_backward = lambda: None
-    fake_config = ModuleType("flash_attn_cute.ffa_fa3.flash_attn_config")
-    build_flags = {
-        "FLASHATTENTION_DISABLE_BACKWARD": False,
-        "FLASHATTENTION_DISABLE_SM90": False,
-        "FLASHATTENTION_DISABLE_ARBITRARY": False,
-        "FLASHATTENTION_DISABLE_FP16": True,
-        "FLASHATTENTION_DISABLE_HDIM64": True,
-        "FLASHATTENTION_DISABLE_HDIM96": True,
-        "FLASHATTENTION_DISABLE_HDIM128": False,
-        "FLASHATTENTION_DISABLE_HDIM192": True,
-        "FLASHATTENTION_DISABLE_HDIM256": True,
-        "FLASHATTENTION_DISABLE_SOFTCAP": True,
-        "FLASHATTENTION_NUM_FUNC": [1],
-    }
-    fake_config.CONFIG = {"build_flags": build_flags}
-    fake_cutlass_package.flash_attn_interface = fake_interface
-    fake_cutlass_package.flash_attn_config = fake_config
-    monkeypatch.setitem(sys.modules, "flash_attn_cute.ffa_fa3", fake_cutlass_package)
-    monkeypatch.setitem(sys.modules, "flash_attn_cute.ffa_fa3.flash_attn_config", fake_config)
-    return build_flags
-
-
-def _set_fake_cuda_runtime(
-    monkeypatch,
-    *,
-    current_stack_size: int,
-    get_error: int = 0,
-    set_error: int = 0,
-    configured_stack_size: int | None = None,
-) -> list[tuple[object, int]]:
-    import sys
-
-    stack_limit = object()
-    set_calls = []
-    state = {"stack_size": current_stack_size}
-    runtime = SimpleNamespace(
-        cudaLimit=SimpleNamespace(cudaLimitStackSize=stack_limit),
-        cudaError_t=SimpleNamespace(cudaSuccess=0),
-    )
-    runtime.cudaDeviceGetLimit = lambda limit: (get_error, state["stack_size"])
-
-    def set_limit(limit, value):
-        set_calls.append((limit, value))
-        if set_error == 0:
-            state["stack_size"] = value if configured_stack_size is None else configured_stack_size
-        return (set_error,)
-
-    runtime.cudaDeviceSetLimit = set_limit
-    cuda_package = ModuleType("cuda")
-    cuda_package.__path__ = []
-    bindings_package = ModuleType("cuda.bindings")
-    bindings_package.runtime = runtime
-    cuda_package.bindings = bindings_package
-    monkeypatch.setitem(sys.modules, "cuda", cuda_package)
-    monkeypatch.setitem(sys.modules, "cuda.bindings", bindings_package)
-    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
-    return set_calls
 
 
 def test_default_magi_backend_resolves_cuda_platform(monkeypatch):
@@ -142,8 +68,8 @@ def test_default_magi_backend_lazily_calls_package_fa4_backend(monkeypatch):
     captured = {}
     fa4_attn_arg = object()
 
-    def fake_get_attn_arg(query, key, q_ranges, k_ranges, attn_type_map, metadata_head_dim=None):
-        captured["metadata_inputs"] = (query, key, q_ranges, k_ranges, attn_type_map, metadata_head_dim)
+    def fake_get_attn_arg(query, key, q_ranges, k_ranges, attn_type_map):
+        captured["metadata_inputs"] = (query, key, q_ranges, k_ranges, attn_type_map)
         return fa4_attn_arg
 
     def fake_apply(*args):
@@ -164,7 +90,7 @@ def test_default_magi_backend_lazily_calls_package_fa4_backend(monkeypatch):
     monkeypatch.setattr(magi_metadata, "get_or_prepare_attn_arg", fake_get_attn_arg)
     monkeypatch.setattr(magi_fa4, "get_or_prepare_attn_arg", fake_get_attn_arg)
     monkeypatch.setattr(magi_fa4._MagiFA4Function, "apply", fake_apply)
-    monkeypatch.setattr(magi_fa4, "prepare_kernel", lambda device: (magi_kernel.KERNEL_CUTE_JIT, None))
+    monkeypatch.setattr(magi_fa4, "prepare_kernel", lambda device: None)
     query = torch.randn(8, 4, 16)
     key = torch.randn(8, 2, 16)
     value = torch.randn(8, 2, 16)
@@ -189,7 +115,6 @@ def test_default_magi_backend_lazily_calls_package_fa4_backend(monkeypatch):
     assert captured["metadata_inputs"][2] is ranges
     assert captured["metadata_inputs"][3] is ranges
     assert captured["metadata_inputs"][4] is None
-    assert captured["metadata_inputs"][5] is None
     assert captured["apply_args"][0] is query
     assert captured["apply_args"][1] is key
     assert captured["apply_args"][2] is value
@@ -225,7 +150,7 @@ def test_default_magi_backend_attn_forward_meta_import_skips_query_device(monkey
     monkeypatch.setitem(sys.modules, "magi_attention", fake_package)
     monkeypatch.setitem(sys.modules, "magi_attention.api", fake_api)
     monkeypatch.setattr(torch.cuda, "device", fake_device)
-    monkeypatch.setattr(magi_fa4, "prepare_kernel", lambda device: (magi_kernel.KERNEL_CUTE_JIT, None))
+    monkeypatch.setattr(magi_fa4, "prepare_kernel", lambda device: None)
     monkeypatch.setattr(magi_fa4, "get_or_prepare_attn_arg", lambda *args: object())
     monkeypatch.setattr(magi_fa4._MagiFA4Function, "apply", lambda *args: ("output", "lse"))
     query = SimpleNamespace(device=torch.device("cuda:1"))
@@ -306,7 +231,7 @@ def test_magi_fa4_metadata_cache_reuses_only_matching_inputs(monkeypatch):
 
 
 def test_magi_fa4_range_bounds_are_not_rechecked_before_prepare(monkeypatch):
-    """Adapter validation and FA4 prepare share one cache, including CUTLASS head-dim buckets."""
+    """Adapter validation and FA4 preparation share one range-bound cache."""
     counts = _count_range_bound_reductions(monkeypatch)
     monkeypatch.setattr(magi_metadata, "_prepare_attn_arg", lambda *args: object())
     query = torch.randn(8, 4, 16)
@@ -322,7 +247,6 @@ def test_magi_fa4_range_bounds_are_not_rechecked_before_prepare(monkeypatch):
         q_ranges,
         k_ranges,
         attn_type_map,
-        metadata_head_dim=128,
     )
     second = magi_metadata.get_or_prepare_attn_arg(
         query,
@@ -330,7 +254,6 @@ def test_magi_fa4_range_bounds_are_not_rechecked_before_prepare(monkeypatch):
         q_ranges,
         k_ranges,
         attn_type_map,
-        metadata_head_dim=128,
     )
 
     assert first is second
@@ -399,7 +322,7 @@ def test_magi_fa4_metadata_preparation_uses_query_device(monkeypatch):
     key = SimpleNamespace(shape=(8, 2, 16))
     ranges = torch.tensor([[0, 8]], dtype=torch.int32)
 
-    attn_arg = magi_metadata._prepare_attn_arg(query, key, ranges, ranges, None, 16)
+    attn_arg = magi_metadata._prepare_attn_arg(query, key, ranges, ranges, None)
 
     assert isinstance(attn_arg, FakeFA4AttnArg)
     assert active_devices == []
@@ -485,9 +408,10 @@ def test_magi_fa4_autograd_detects_range_mutation(monkeypatch):
     [
         (80, magi_kernel.KERNEL_UNSUPPORTED),
         (89, magi_kernel.KERNEL_UNSUPPORTED),
-        (90, magi_kernel.KERNEL_CUTLASS),
-        (99, magi_kernel.KERNEL_CUTLASS),
+        (90, magi_kernel.KERNEL_UNSUPPORTED),
+        (99, magi_kernel.KERNEL_UNSUPPORTED),
         (100, magi_kernel.KERNEL_CUTE_JIT),
+        (110, magi_kernel.KERNEL_CUTE_JIT),
     ],
 )
 def test_magi_kernel_mode_follows_query_device(monkeypatch, compute_capability, expected_mode):
@@ -496,15 +420,16 @@ def test_magi_kernel_mode_follows_query_device(monkeypatch, compute_capability, 
     assert magi_kernel.get_kernel_mode(torch.device("cuda")) == expected_mode
 
 
-def test_magi_sm90_reports_cutlass_installer(monkeypatch):
-    monkeypatch.setattr(magi_kernel, "get_gpu_compute_capability", lambda device: 90)
-    _set_fake_cutlass_backend(monkeypatch, available=False)
+def test_magi_kernel_mode_rejects_rocm(monkeypatch):
+    monkeypatch.setattr(magi_kernel.torch.version, "hip", "test-rocm")
+    monkeypatch.setattr(magi_kernel, "get_gpu_compute_capability", lambda device: 100)
 
-    with pytest.raises(ImportError, match=r"install_magi_sm90\.sh"):
+    assert magi_kernel.get_kernel_mode(torch.device("cuda")) == magi_kernel.KERNEL_UNSUPPORTED
+    with pytest.raises(RuntimeError, match="does not support ROCm"):
         magi_kernel.prepare_kernel(torch.device("cuda"))
 
 
-def test_magi_sm100_plus_does_not_require_cutlass_backend(monkeypatch):
+def test_magi_sm100_prepare_is_cached(monkeypatch):
     calls = 0
 
     def fake_compute_capability(device):
@@ -513,122 +438,10 @@ def test_magi_sm100_plus_does_not_require_cutlass_backend(monkeypatch):
         return 100
 
     monkeypatch.setattr(magi_kernel, "get_gpu_compute_capability", fake_compute_capability)
-    _set_fake_cutlass_backend(monkeypatch, available=False)
 
-    magi_kernel.prepare_kernel(torch.device("cuda"))
-    magi_kernel.prepare_kernel(torch.device("cuda"))
-
+    assert magi_kernel.prepare_kernel(torch.device("cuda")) is None
+    assert magi_kernel.prepare_kernel(torch.device("cuda")) is None
     assert calls == 1
-
-
-def test_magi_sm90_prepares_cutlass_device_once(monkeypatch):
-    prepared = []
-    monkeypatch.setattr(magi_kernel, "get_gpu_compute_capability", lambda device: 90)
-    _set_fake_cutlass_backend(monkeypatch, available=True)
-    monkeypatch.setattr(magi_kernel, "_install_tile_size_compatibility", lambda: prepared.append("tile-size"))
-    monkeypatch.setattr(magi_kernel, "_ensure_cutlass_stack_size", lambda device: prepared.append(device))
-
-    for device in (torch.device("cuda:0"), torch.device("cuda:0"), torch.device("cuda:1"), torch.device("cuda:1")):
-        kernel_mode, build_flags = magi_kernel.prepare_kernel(device)
-        assert kernel_mode == magi_kernel.KERNEL_CUTLASS
-        assert build_flags is not None
-
-    assert prepared == ["tile-size", torch.device("cuda:0"), "tile-size", torch.device("cuda:1")]
-
-
-@pytest.mark.parametrize(
-    ("query", "softcap", "expected_message"),
-    [
-        (torch.empty(1, 1, 128, dtype=torch.float16), 0.0, "does not include FP16"),
-        (torch.empty(1, 1, 129, dtype=torch.bfloat16), 0.0, "head_dim=129"),
-        (torch.empty(1, 1, 128, dtype=torch.bfloat16), 30.0, "does not include softcap"),
-    ],
-)
-def test_magi_sm90_rejects_inputs_excluded_from_cutlass_build(monkeypatch, query, softcap, expected_message):
-    build_flags = _set_fake_cutlass_backend(monkeypatch, available=True)
-    assert build_flags is not None
-
-    with pytest.raises((TypeError, ValueError), match=expected_message):
-        magi_kernel.validate_cutlass_inputs(query, query, softcap, build_flags)
-
-
-def test_magi_sm90_accepts_bf16_inputs_in_compiled_head_dim_bucket(monkeypatch):
-    build_flags = _set_fake_cutlass_backend(monkeypatch, available=True)
-    assert build_flags is not None
-    query = torch.empty(1, 1, 64, dtype=torch.bfloat16)
-
-    assert magi_kernel.validate_cutlass_inputs(query, query, 0.0, build_flags) == 128
-
-
-@pytest.mark.parametrize(
-    "build_flag",
-    [
-        "FLASHATTENTION_DISABLE_BACKWARD",
-        "FLASHATTENTION_DISABLE_SM90",
-        "FLASHATTENTION_DISABLE_ARBITRARY",
-    ],
-)
-def test_magi_sm90_rejects_incompatible_cutlass_build(monkeypatch, build_flag):
-    _set_fake_cutlass_backend(monkeypatch, available=True)
-    config = sys.modules["flash_attn_cute.ffa_fa3.flash_attn_config"].CONFIG
-    del config["build_flags"][build_flag]
-    monkeypatch.setattr(magi_kernel, "get_gpu_compute_capability", lambda device: 90)
-
-    with pytest.raises(RuntimeError, match=build_flag):
-        magi_kernel.prepare_kernel(torch.device("cuda"))
-
-
-def test_magi_sm90_rejects_different_query_value_head_dims(monkeypatch):
-    build_flags = _set_fake_cutlass_backend(monkeypatch, available=True)
-    assert build_flags is not None
-    query = torch.empty(1, 1, 128, dtype=torch.bfloat16)
-    value = torch.empty(1, 1, 129, dtype=torch.bfloat16)
-
-    with pytest.raises(ValueError, match="same head dimension"):
-        magi_kernel.validate_cutlass_inputs(query, value, 0.0, build_flags)
-
-
-@pytest.mark.parametrize(
-    ("current_stack_size", "expected_set_calls"),
-    [
-        (1024, 1),
-        (magi_kernel._CUTLASS_STACK_SIZE, 0),
-    ],
-)
-def test_magi_sm90_configures_cutlass_stack_size(monkeypatch, current_stack_size, expected_set_calls):
-    set_calls = _set_fake_cuda_runtime(monkeypatch, current_stack_size=current_stack_size)
-
-    magi_kernel._ensure_cutlass_stack_size(torch.device("cuda:1"))
-
-    assert len(set_calls) == expected_set_calls
-    if expected_set_calls:
-        assert set_calls[0][1] == magi_kernel._CUTLASS_STACK_SIZE
-
-
-def test_magi_sm90_rejects_clamped_cutlass_stack_size(monkeypatch):
-    _set_fake_cuda_runtime(monkeypatch, current_stack_size=1024, configured_stack_size=4096)
-
-    with pytest.raises(RuntimeError, match="Failed to verify.*configured=4096"):
-        magi_kernel._ensure_cutlass_stack_size(torch.device("cuda"))
-
-
-@pytest.mark.parametrize(
-    ("get_error", "set_error", "expected_message"),
-    [
-        (1, 0, "Failed to query"),
-        (0, 1, "Failed to configure"),
-    ],
-)
-def test_magi_sm90_reports_cutlass_stack_limit_errors(monkeypatch, get_error, set_error, expected_message):
-    _set_fake_cuda_runtime(
-        monkeypatch,
-        current_stack_size=1024,
-        get_error=get_error,
-        set_error=set_error,
-    )
-
-    with pytest.raises(RuntimeError, match=expected_message):
-        magi_kernel._ensure_cutlass_stack_size(torch.device("cuda"))
 
 
 @pytest.mark.parametrize(
@@ -636,10 +449,11 @@ def test_magi_sm90_reports_cutlass_stack_limit_errors(monkeypatch, get_error, se
     [
         (torch.device("cpu"), 0, "cpu"),
         (torch.device("cuda"), 80, "SM80"),
+        (torch.device("cuda"), 90, "SM90"),
+        (torch.device("cuda"), 99, "SM99"),
     ],
 )
 def test_magi_unsupported_mode_fails_before_backend_call(monkeypatch, device, compute_capability, expected_hardware):
     monkeypatch.setattr(magi_kernel, "get_gpu_compute_capability", lambda device: compute_capability)
-    _set_fake_cutlass_backend(monkeypatch, available=False)
-    with pytest.raises(RuntimeError, match=rf"does not support {expected_hardware}"):
+    with pytest.raises(RuntimeError, match=rf"does not support {expected_hardware}.*SM100\+"):
         magi_kernel.prepare_kernel(device)

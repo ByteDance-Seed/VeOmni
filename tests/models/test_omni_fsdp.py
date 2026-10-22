@@ -19,14 +19,18 @@ import sys
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter, runner_device_count
 from tests.tools.launch_utils import find_free_port, run_bounded_process_group
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_torch_device
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+
+
+_SP_LAUNCH = LaunchSpec(nproc=4)
 
 
 _PIPELINE_SCRIPT = "tests/train_scripts/train_omni_fsdp_test.py"
 _SP_TOKENS_SCRIPT = "tests/train_scripts/omni_sp_consume_tokens_runner.py"
 _GRAD_CLIP_SCRIPT = "tests/train_scripts/omni_grad_clip_runner.py"
-_DEVICE_COUNT = get_torch_device().device_count() if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) else 0
+_DEVICE_COUNT = runner_device_count() if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) else 0
 
 
 def _run_torchrun_script(
@@ -56,6 +60,7 @@ def _run_torchrun_script(
         return json.load(f)
 
 
+@pytest.mark.launch_plan(provider=from_parameter("nproc"))
 @pytest.mark.parametrize("nproc", [1, 2])
 def test_omni_fsdp_pipeline(nproc, tmp_path):
     """Two separately FSDP2-wrapped models should train correctly end-to-end."""
@@ -80,6 +85,7 @@ def test_omni_fsdp_pipeline(nproc, tmp_path):
         assert opt_ok, f"step {i}: optimizer state empty"
 
 
+@pytest.mark.launch_plan(provider=_SP_LAUNCH)
 @pytest.mark.skipif(_DEVICE_COUNT < 4, reason="sp1 vs sp4 comparison requires at least 4 accelerators")
 def test_omni_sp1_vs_sp4_consume_tokens(tmp_path):
     """sp1 (dp=4) and sp4 (dp=1) must report identical per-module consume_tokens to the digit."""
@@ -88,13 +94,13 @@ def test_omni_sp1_vs_sp4_consume_tokens(tmp_path):
 
     sp1 = _run_torchrun_script(
         _SP_TOKENS_SCRIPT,
-        nproc=4,
+        nproc=_SP_LAUNCH.nproc,
         output_dir=sp1_dir,
         extra_args=["--ulysses-size=1"],
     )
     sp4 = _run_torchrun_script(
         _SP_TOKENS_SCRIPT,
-        nproc=4,
+        nproc=_SP_LAUNCH.nproc,
         output_dir=sp4_dir,
         extra_args=["--ulysses-size=4"],
     )
@@ -109,6 +115,7 @@ def test_omni_sp1_vs_sp4_consume_tokens(tmp_path):
         assert step_sp1["trace/llm_backbone/avg_seq_len"] == step_sp4["trace/llm_backbone/avg_seq_len"]
 
 
+@pytest.mark.launch_plan(provider=from_parameter("nproc"))
 @pytest.mark.parametrize(
     ("nproc", "dp_mode", "ulysses_size", "ep_size"),
     [

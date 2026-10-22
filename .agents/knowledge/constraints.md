@@ -246,10 +246,9 @@ Core files:
 
 ## Environment Reproducibility
 
-27. **Exact uv synchronization removes separately installed overlays**
-    - MagiAttention itself is the optional `--extra magi` extra (`uv sync --extra gpu --extra magi`).
-      The SM90 CUTLASS overlay is then installed by `scripts/kernel/install_magi_sm90.sh`.
-      Reinstall the overlay after a later exact `uv sync` before running MagiAttention on SM90.
+27. **MagiAttention is an SM100+ optional extra**
+    - MagiAttention requires `--extra gpu --extra magi` and NVIDIA SM100 or newer.
+      SM90 uses FlexAttention's FA4 backend instead.
 
 28. **In-place collective reductions in backward must own their gradient buffer**
     - Autograd can pass the same incoming gradient to multiple branches. `.contiguous()` does not copy an already contiguous tensor, so reducing that tensor in place can silently change a sibling branch's gradient and the caller's `grad_outputs`.
@@ -266,3 +265,32 @@ Core files:
 30. **Native initialization must survive meta materialization**
     - `to_empty()` discards constructor initialization; the random-init path then clears HF module flags and calls `model.init_weights()`. Native zero output/modulation weights and other special rules must be implemented in the model's `_init_weights` hook.
     - Transformers 5.16 can skip custom-code containers with no direct parameters. Attach owner-specific initialization recipes to their parameter-bearing leaves; container-only branches silently miss those rules. HunyuanVideo 1.5 regressions poison all materialized parameters before real initialization and verify both text projections, both block types, special zero/one values and native distributions.
+
+## FlexAttention
+
+Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__.py` owns dispatch/Ulysses, `_inputs.py` owns input handling, `_fa4.py` owns compiled execution, and `_fa4_sm90_compat.py` owns the pinned bounds shim. The mask builder remains in `attention/mask/flex.py`.
+
+30. **FLASH compilation uses tensor-derived bounds**
+    - BlockMask construction has a separate cached `torch.compile(create_block_mask)` using automatic dynamic generalization. Test the real public `cu_seqlens` path, not only attention with prebuilt masks or compile spies. Keep packed compilation enabled by default; a Python length argument alone does not prove unbounded recompilation. Explicit eager construction can allocate token-square intermediates; see [compiled masks](../../docs/transformers_v5/veomni_attention_interface.md#compiled-mask-construction).
+    - Always use `dynamic=True, fullgraph=True`, with no compile-mode parameter or internal static fallback. Derive bounds from normalized, post-Ulysses Q/K shapes inside the wrapper; preserve sparse buffers and `mask_mod`, and require exact equality with the caller's original bounds.
+    - Keep cache exhaustion explicit; do not raise global cache limits to handle variable lengths. Outer whole-model dynamic compilation and additional Python scalar captures remain unsupported; dtype/head/callback guards can still specialize.
+    - Prefer indexed per-token metadata buffers. The pinned CuteDSL lowering can also fail on zero-dimensional scalar-tensor captures; converting a Python scalar to a scalar tensor alone does not establish callback compatibility.
+    - See [dynamic compilation](../../docs/transformers_v5/veomni_attention_interface.md#dynamic-compilation) for the supported compile boundary and mask predicate design.
+
+30a. **Q/K/V layouts and visibility are explicit**
+    - Reject `output_attentions=True` at the shared Flex entry before Ulysses or backend selection. The second result is optional LSE, never attention weights; returning LSE from Triton does not satisfy an attention-weight request.
+    - Accept matching 3D `[T,H,D]` or 4D `[B,H,S,D]` inputs. Normalize 3D with views before validation, dispatch and Ulysses; never infer axes from sizes. Keep Q/K lengths independent and K/V lengths/heads consistent.
+    - BlockMask owns packed-document visibility. Restore output/LSE to the caller's layout after inverse exchange; see [input layouts and mask semantics](../../docs/transformers_v5/veomni_attention_interface.md#input-layouts-and-mask-semantics).
+
+30b. **Pinned FA4 auxiliary callbacks require bounds protection**
+    - Install the version/signature-gated `4.0.0b16` compatibility forwarder before compilation. Auxiliary metadata reads must be safe for padded tile positions; validate with allocator-disabled memcheck (`PYTORCH_NO_CUDA_MEMORY_CACHING=1`).
+    - Apply Q-only protection only on physically padded Q tiles (account for PackGQA). Check K completeness on every Q tile before either fast path. Q-only callback clamping requires a proven complete K tile; ragged/negative K tiles retain native full bounds. Never use the incoming false flag as proof of K bounds.
+    - Use separate JIT-cache namespaces and bump them when shader semantics change. Retain old cache objects and prepare both replacement caches before publishing installation.
+    - Native b16 omits broadcast strides from its forward cache key. Materialize zero-stride Q/K/V views after KV expansion, bump the cache namespace, and test mixed layouts through the same production cache. Automatic FLASH routing must retain Triton for unsupported sparse dimensions, missing full-block tables, architecture-mismatched BlockMask tiles (128×128 on SM90; 256×128 on SM100/110), and trainable score bias. Explicit backend selection retains native validation.
+    - See [FA4 partial-tile compatibility](../../docs/transformers_v5/veomni_attention_interface.md#fa4-partial-tile-compatibility) for the mechanism, hardware validation scope and upgrade requirements.
+
+30c. **Framework callbacks must preserve FLASH's scalar and index contracts**
+    - Sliding-window, softcap and offset callbacks use device buffers indexed by token positions, including uniform broadcast views. A constant `buffer[0]` index fails the pinned CuteDSL SSA conversion. Skip zero offsets entirely.
+    - Represent packed rows as metadata tensor dimensions; precompute flattened-coordinate arithmetic outside the callback. The pinned lowering rejects symbolic row-width arithmetic (`index_expr`), and even a dead integer comparison can leave a rejected capture. Preserve the caller's index dtype when forwarding mapped positions into another predicate (Int32 on FLASH).
+    - Cover the public builder and real forced FLASH outputs/QKV gradients/graph reuse, including changing scalar values, packed rows, cached offsets, default mask compilation and outer static compilation.
+    - Build masks with invocation-local predicates and explicit `create_block_mask` arguments. Never temporarily replace HF module helpers: overlapping exits can restore another invocation's device/length closure and affect native HF consumers. Preserve pinned HF padding/offset composition; test overlapping success/error paths and native HF calls during construction.

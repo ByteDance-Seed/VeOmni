@@ -955,20 +955,23 @@ class DeepseekV4Indexer(nn.Module):
         query_range_ends = None if packed_ranges is None else packed_ranges[1]
         # A local query row ``i`` is global row ``query_offset + i``; off the context
         # parallel path ``query_offset`` is zero and this is the arange it always was.
+        # Only the CANN indexer kernel switches layout when ``query_range_starts`` is
+        # ``None``; ``eager`` and ``tilelang`` always construct causal ranges when none
+        # are passed, so computing them directly from ``position_ids`` avoids a
+        # data-dependent ``torch.equal`` check (host sync + ``torch.compile`` graph break).
         if query_range_starts is None:
-            canonical_positions = (
-                (torch.arange(seq_len, device=position_ids.device) + query_offset).unsqueeze(0).expand_as(position_ids)
-            )
-            if not torch.equal(position_ids, canonical_positions):
+            if cp_enabled or getattr(self.veomni_dsa_indexer, "impl", None) != "cann":
                 query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
                 query_range_ends = ((position_ids[0] + 1) // self.compress_rate).to(torch.int32)
-        # Either sequence-parallel mode has to spell out each query's visible
-        # compressed interval, because the kernel's default derives it from the
-        # query's *row*, which is no longer its position.
-        if cp_enabled and query_range_starts is None:
-            query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
-            query_positions = torch.arange(seq_len, device=q.device, dtype=torch.int32) + query_offset
-            query_range_ends = (query_positions + 1) // self.compress_rate
+            else:
+                canonical_positions = (
+                    (torch.arange(seq_len, device=position_ids.device) + query_offset)
+                    .unsqueeze(0)
+                    .expand_as(position_ids)
+                )
+                if not torch.equal(position_ids, canonical_positions):
+                    query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
+                    query_range_ends = ((position_ids[0] + 1) // self.compress_rate).to(torch.int32)
         # Ulysses partitions the full-sequence queries here and stitches the
         # selection back together below; CP received them already partitioned and
         # wants the result per shard, so both halves fall away together. One flag
