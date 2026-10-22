@@ -1,0 +1,17 @@
+# Convert-time generation FSMs for LLaDA2.0-Uni, keyed by infer_type.
+infer_und:
+  initial: prompt_encode
+  states:
+    prompt_encode:
+      body:
+        - { from: llada2_uni_image_tokenizer, to: end }
+      transitions:
+        - { condition: { type: default }, next_state: diffuse }
+    diffuse:
+      body:
+        - { from: llada2_uni_text_encoder, to: llada2_uni_llm }
+        - { from: llada2_uni_llm,          to: llada2_uni_text_encoder }
+        - { from: llada2_uni_text_encoder, to: end }
+      transitions:
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
+        - { condition: { type: default }, next_state: diffuse }

@@ -1,0 +1,27 @@
+# Distributed FSDP2 inference overrides for LLaDA2.0-Uni-16B (I2T).
+llada2_uni_image_tokenizer:
+  model_path: llada2_uni_image_tokenizer
+  ops_implementation:
+    attn_implementation: sdpa
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+llada2_uni_text_encoder:
+  model_path: llada2_uni_text_encoder
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+llada2_uni_llm:
+  model_path: llada2_uni_llm
+  ops_implementation:
+    attn_implementation: sdpa
+    moe_implementation: fused_triton
+  accelerator:
+    ep_size: 8
+    extra_parallel_sizes: [8]
+    extra_parallel_names: ["ep"]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
