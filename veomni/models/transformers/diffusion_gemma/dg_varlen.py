@@ -363,7 +363,7 @@ def should_use_varlen_encoder(config, device: torch.device, dropout: float) -> b
     # carries that scar for the decoder. flex wants a `BlockMask` and would take
     # a dense boolean the same way.
     implementation = getattr(config, "_attn_implementation", "sdpa")
-    if implementation != "sdpa":
+    if implementation not in ("sdpa", "veomni_sdpa"):
         raise ValueError(
             f"a packed encoder row off CUDA falls back to a block-diagonal mask, which only sdpa "
             f"reads as this code builds it, but `attn_implementation` is {implementation!r}. eager adds "

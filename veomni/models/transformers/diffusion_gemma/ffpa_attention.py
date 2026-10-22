@@ -131,7 +131,7 @@ def _require_ffpa(config: "DiffusionGemmaTextConfig") -> None:
             "drops it again, since it is not in the lockfile -- or set `attn_ffpa: false` to "
             "run the global layers on sdpa."
         )
-    if config._attn_implementation != "sdpa":
+    if config._attn_implementation not in ("sdpa", "veomni_sdpa"):
         raise ValueError(
             f"`attn_ffpa` replaces sdpa, but `attn_implementation` is `{config._attn_implementation}`. "
             "Set `attn_ffpa: false` to keep that backend, or `attn_implementation: sdpa` to run "

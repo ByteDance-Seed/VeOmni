@@ -319,6 +319,10 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+_FLEX_ATTENTION_IMPLS = ("flex_attention", "veomni_flex_attention")
+_SDPA_ATTENTION_IMPLS = ("sdpa", "veomni_sdpa")
+
+
 def flex_tile_cap(head_dim: int, shared_memory_limit: int) -> dict[str, int | bool] | None:
     """Shrink flex_attention's tiles when `head_dim` is too wide for the device's shared memory.
 
@@ -619,7 +623,7 @@ class DiffusionGemmaEncoderTextAttention(nn.Module):
             self.config, self.head_dim, eager_attention_forward
         )
         # CHANGED: cap the flex_attention tile size for wide heads; see `_flex_kernel_options`.
-        if self.config._attn_implementation == "flex_attention":
+        if self.config._attn_implementation in _FLEX_ATTENTION_IMPLS:
             kwargs.setdefault("kernel_options", flex_kernel_options_for(self.head_dim, query_states.device))
             query_states, key_states, value_states = one_layout_for_flex(query_states, key_states, value_states)
 
@@ -864,7 +868,7 @@ class DiffusionGemmaDecoderTextAttention(nn.Module):
             self.config, self.head_dim, eager_attention_forward
         )
         # CHANGED: cap the flex_attention tile size for wide heads; see `_flex_kernel_options`.
-        if self.config._attn_implementation == "flex_attention":
+        if self.config._attn_implementation in _FLEX_ATTENTION_IMPLS:
             kwargs.setdefault("kernel_options", flex_kernel_options_for(self.head_dim, query_states.device))
             query_states, key_states, value_states = one_layout_for_flex(query_states, key_states, value_states)
 
@@ -1665,7 +1669,7 @@ class DiffusionGemmaEncoderTextModel(DiffusionGemmaPreTrainedModel):
                 "position_ids": position_ids,
             }
             # Create the masks
-            with uncompiled_block_masks(self.config._attn_implementation == "flex_attention"):
+            with uncompiled_block_masks(self.config._attn_implementation in _FLEX_ATTENTION_IMPLS):
                 causal_mask_mapping = {
                     "full_attention": create_causal_mask(**mask_kwargs),
                     "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
@@ -2003,7 +2007,7 @@ class DiffusionGemmaEncoderModel(DiffusionGemmaPreTrainedModel):
 
             mask_kwargs["block_sequence_ids"] = block_sequence_ids
 
-        with uncompiled_block_masks(config._attn_implementation == "flex_attention"):
+        with uncompiled_block_masks(config._attn_implementation in _FLEX_ATTENTION_IMPLS):
             return create_masks_for_generate(**mask_kwargs)
 
 
@@ -2321,7 +2325,11 @@ class DiffusionGemmaDecoderModel(DiffusionGemmaPreTrainedModel):
         # batches that happen to have no padding, so a padded batch and an unpadded one
         # would train different models. Inference never hits this because a static cache is
         # compileable and always materializes.
-        backend_applies_sliding_window = config._attn_implementation not in ("sdpa", "eager", "flex_attention")
+        backend_applies_sliding_window = config._attn_implementation not in (
+            *_SDPA_ATTENTION_IMPLS,
+            "eager",
+            *_FLEX_ATTENTION_IMPLS,
+        )
         has_sliding_layers = "sliding_attention" in (getattr(config, "layer_types", None) or ())
         if backend_applies_sliding_window or not has_sliding_layers:
             if decoder_attention_mask is None or (not past_key_values.is_compileable and decoder_attention_mask.all()):
@@ -2403,7 +2411,7 @@ class DiffusionGemmaDecoderModel(DiffusionGemmaPreTrainedModel):
                 dim=-1,
             )
 
-        if config._attn_implementation == "flex_attention":
+        if config._attn_implementation in _FLEX_ATTENTION_IMPLS:
             return {
                 "full_attention": _diffusion_decoder_block_mask(full_valid_keys, canvas_length),
                 "sliding_attention": _diffusion_decoder_block_mask(sliding_valid_keys, canvas_length),
@@ -2580,7 +2588,7 @@ class DiffusionGemmaModel(DiffusionGemmaPreTrainedModel):
         # with no key-validity tensor to read. Refuse here rather than let the first backward
         # find it 26B parameters into the run, and rather than quietly dropping one of the two
         # flags -- either downgrade would have the run report the other's speed.
-        if config._attn_implementation == "flex_attention":
+        if config._attn_implementation in _FLEX_ATTENTION_IMPLS:
             if getattr(config.text_config, "attn_dg_prefix", False):
                 raise ValueError(
                     "attn_dg_prefix and flex_attention cannot both be on: the decoder kernel derives "

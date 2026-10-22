@@ -1160,6 +1160,23 @@ class TestFFPAAttention:
         assert resolve_attention_interface(config, config.head_dim, None) is sdpa_attention_forward
         assert resolve_attention_interface(config, config.global_head_dim, None) is ffpa_attention_forward
 
+    def test_ffpa_accepts_veomni_sdpa_rewrite(self):
+        """`OpsImplementationConfig` rewrites `sdpa` to `veomni_sdpa` under `MODELING_BACKEND=veomni`,
+        so `ffpa_preflight` must accept `veomni_sdpa` alongside `sdpa`."""
+        pytest.importorskip("ffpa_attn")
+        from veomni.models.transformers.diffusion_gemma.ffpa_attention import (
+            ffpa_attention_forward,
+            ffpa_preflight,
+            resolve_attention_interface,
+        )
+
+        config = self._wide_config(attn_ffpa=True)
+        config._attn_implementation = "veomni_sdpa"
+        ffpa_preflight(config.text_config)
+        assert resolve_attention_interface(config.text_config, config.text_config.global_head_dim, None) is (
+            ffpa_attention_forward
+        )
+
     def test_asking_for_ffpa_on_another_backend_is_refused(self):
         """The flag means "instead of sdpa", so pairing it with eager is a contradiction.
 
