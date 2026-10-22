@@ -1,4 +1,6 @@
+import argparse
 import copy
+import gc
 import os
 import random
 import subprocess
@@ -12,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 import torch
+import torch.distributed as dist
 import yaml
 from tools import resolve_ops_overrides
 from torch.utils.data import DistributedSampler, IterableDataset
@@ -40,7 +43,7 @@ from veomni.data.dataset import (
     build_dataset,
     get_data_files,
 )
-from veomni.distributed.parallel_state import get_parallel_state
+from veomni.distributed.parallel_state import clear_parallel_state, get_parallel_state
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks import (
     Callback,
@@ -62,15 +65,26 @@ os.environ["NCCL_DEBUG"] = "OFF"
 
 
 class TrainerTest(BaseTrainer):
-    gt_data_list: List[Dict[str, Any]] = []
-    pred_data_list: List[Dict[str, Any]] = []
-    gt_epochs: List[int] = []
-    pred_epochs: List[int] = []
+    gt_data_list: List[Dict[str, Any]]
+    pred_data_list: List[Dict[str, Any]]
+    gt_epochs: List[int]
+    pred_epochs: List[int]
     golden_env_metrics: helper.EnvironMeter
     resume_dcp_path: str
 
     is_resume: bool = False
     start_save_data: bool = False
+
+    def __init__(self, args: VeOmniArguments):
+        self.gt_data_list = []
+        self.pred_data_list = []
+        self.gt_epochs = []
+        self.pred_epochs = []
+        self.golden_env_metrics = {}
+        self.resume_dcp_path = ""
+        self.is_resume = False
+        self.start_save_data = False
+        super().__init__(args)
 
     def _init_callbacks(self):
         self.environ_meter_callback = EnvironMeterCallback(self)
@@ -135,8 +149,9 @@ class TrainerTest(BaseTrainer):
         super().train()
 
     def destroy_distributed(self):
-        if self.is_resume:  # do not destroy distributed when gt train
-            super().destroy_distributed()
+        # Fused worker manages process-group teardown after all sub-scenarios complete.
+        if dist.is_initialized():
+            dist.barrier()
 
 
 class GlobalStateCallbackTest(GlobalStateCallback):
@@ -242,26 +257,18 @@ class CheckCallback(Callback):
             self.trainer.golden_env_metrics = copy.deepcopy(self.trainer.step_env_metrics)
 
 
-def main():
-    args: VeOmniArguments = parse_args(VeOmniArguments)
-    trainer = TrainerTest(args)
-    trainer.train()
-    assert trainer.args.train.checkpoint.load_path is not None
-    trainer.resume_train()
+TEST_DATASETS = ["mapping", "iterable"]
+DYN_BSZ = [True, False]
+_DATASET_SCENARIOS: tuple[tuple[str, bool], ...] = (
+    ("mapping", True),
+    ("iterable", True),
+    ("mapping", False),
+    ("iterable", False),
+)
 
 
-if __name__ == "__main__":
-    main()
-
-
-def build_command(dataset_type: str, dyn_bsz: bool, data_path: str):
-    port = find_free_port()
-
-    command = [
-        "torchrun",
-        "--nnodes=1",
-        f"--nproc_per_node={_CI_LAUNCH.nproc}",
-        f"--master_port={port}",
+def _scenario_argv(dataset_type: str, dyn_bsz: bool, data_path: str, output_dir: str) -> list[str]:
+    return [
         "tests/data/test_datasets.py",
         "--model.config_path=test",
         f"--data.train_path={data_path}",
@@ -277,21 +284,74 @@ def build_command(dataset_type: str, dyn_bsz: bool, data_path: str):
         "--model.accelerator.ulysses_size=2",
         "--train.bsz_warmup_ratio=0",
         "--data.dataloader.num_workers=1",
-        # Force pin_memory=False: on NPU the pin_memory background thread
-        # races with HCCL teardown (triggered inside destroy_distributed) and
-        # aborts the process with SIGABRT. The tests use DummyDataset so
-        # pin_memory provides no benefit anyway. Mirrors the fix in #639 for
-        # tests/data/test_multisource_dataset.py.
         "--data.dataloader.pin_memory=False",
         "--train.num_train_epochs=3",
-        "--train.checkpoint.output_dir=.tests/cache",
-        # Hardware-aware ops_implementation overrides. ``resolve_ops_overrides``
-        # emits NPU-supported per-op backends on NPU and ``[]`` on GPU (the
-        # dataclass defaults are already GPU-optimal). FakeModel is not
-        # registered, so ``model_name=None`` skips per-model eager fallbacks.
+        f"--train.checkpoint.output_dir={output_dir}",
         *resolve_ops_overrides(None),
     ]
-    return command
+
+
+def _run_single_dataset_scenario(args: VeOmniArguments) -> None:
+    trainer = TrainerTest(args)
+    trainer.train()
+    assert trainer.args.train.checkpoint.load_path is not None
+    trainer.resume_train()
+    del trainer
+    gc.collect()
+    if dist.is_initialized():
+        dist.barrier()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--suite-name", choices=["multisource", "native"], default=None)
+    parser.add_argument("--suite-data-path", default=None)
+    parser.add_argument("--reverse-scenarios", action="store_true")
+    cli_args, remaining_argv = parser.parse_known_args()
+
+    try:
+        if cli_args.suite_name is not None and cli_args.suite_data_path is not None:
+            scenarios = list(_DATASET_SCENARIOS)
+            reverse = cli_args.reverse_scenarios or os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1"
+            if reverse:
+                scenarios = list(reversed(scenarios))
+            for dataset_type, dyn_bsz in scenarios:
+                label = f"{cli_args.suite_name}_{dataset_type}_dyn{int(dyn_bsz)}"
+                output_dir = os.path.join(".tests/cache", label)
+                sys.argv = _scenario_argv(
+                    dataset_type=dataset_type,
+                    dyn_bsz=dyn_bsz,
+                    data_path=cli_args.suite_data_path,
+                    output_dir=output_dir,
+                )
+                args: VeOmniArguments = parse_args(VeOmniArguments)
+                _run_single_dataset_scenario(args)
+        else:
+            sys.argv = [sys.argv[0]] + remaining_argv
+            args = parse_args(VeOmniArguments)
+            _run_single_dataset_scenario(args)
+    finally:
+        if dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+        clear_parallel_state()
+
+
+if __name__ == "__main__":
+    main()
+
+
+def build_suite_command(suite_name: str, data_path: str) -> list[str]:
+    port = find_free_port()
+    return [
+        "torchrun",
+        "--nnodes=1",
+        f"--nproc_per_node={_CI_LAUNCH.nproc}",
+        f"--master_port={port}",
+        "tests/data/test_datasets.py",
+        f"--suite-name={suite_name}",
+        f"--suite-data-path={data_path}",
+    ]
 
 
 @pytest.fixture(scope="session")
@@ -333,28 +393,18 @@ def dummy_native_dataset_ci():
     del dummy_dataset
 
 
-# When tested under mapping datasets, each rank will see the same data from the upstream dataset but will only visit a chunk of it by StatefulDistributedSampler defined in build_native_dataloader. When the dataset is drained, the dataloader will re-create the iterator of the dataset. The random shuffle of the data by the sampler will be updated for each epoch by the StatefulDistributedSampler controlled by its seed, which is the same behavior as PyTorch's DistributedSampler
-# When tested under iterable datasets, each rank will get the same data from the upstream dataset, and the dataset is shuffled and splited into the small chunk which each rank visit. When it is drained, the dataloader will just re-create an iter of the dataset. The random shuffle of the data will be updated for each epoch by set_epoch method of the dataset controled by the seed passed in.
-TEST_DATASETS = ["mapping", "iterable"]
-DYN_BSZ = [True, False]
-
-
 @pytest.mark.launch_plan(provider=_CI_LAUNCH)
-@pytest.mark.parametrize("dataset_type", TEST_DATASETS)
-@pytest.mark.parametrize("dyn_bsz", DYN_BSZ)
-def test_multisource_dataset(dataset_type: str, dyn_bsz: bool, dummy_multisource_dataset_ci):
-    data_path = dummy_multisource_dataset_ci
-    command = build_command(dataset_type, dyn_bsz, data_path=data_path)
+def test_multisource_dataset(dummy_multisource_dataset_ci):
+    """Fused 4-rank DP2xSP2 worker covering mapping/iterable x dyn_bsz True/False on multisource dataset."""
+    command = build_suite_command("multisource", data_path=dummy_multisource_dataset_ci)
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 
 
 @pytest.mark.launch_plan(provider=_CI_LAUNCH)
-@pytest.mark.parametrize("dataset_type", TEST_DATASETS)
-@pytest.mark.parametrize("dyn_bsz", DYN_BSZ)
-def test_native_dataset(dataset_type: str, dyn_bsz: bool, dummy_native_dataset_ci):
-    data_path = dummy_native_dataset_ci
-    command = build_command(dataset_type, dyn_bsz, data_path=data_path)
+def test_native_dataset(dummy_native_dataset_ci):
+    """Fused 4-rank DP2xSP2 worker covering mapping/iterable x dyn_bsz True/False on native dataset."""
+    command = build_suite_command("native", data_path=dummy_native_dataset_ci)
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 

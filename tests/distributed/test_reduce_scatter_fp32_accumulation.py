@@ -982,17 +982,18 @@ def _run_transport_policy_fsdp2_gradients(fsdp_mesh, hsdp_mesh, device):
         reduce_scatter_module.FP32ReduceScatterWithLowPrecisionTransport = original_comm_class
 
 
+def _run_reduce_scatter_nccl_and_fsdp2_step() -> None:
+    steps = [_run_reduce_scatter_nccl, _run_fsdp2_optimizer_step]
+    if os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1":
+        steps = list(reversed(steps))
+    for step_fn in steps:
+        step_fn()
+        dist.barrier()
+
+
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="requires four CUDA devices")
 def test_reduce_scatter_fp32_accumulation_nccl():
     from ..tools.launch_utils import torchrun
 
-    torchrun(_run_reduce_scatter_nccl, world_size=_CI_ACCELERATOR_4.nproc)
-
-
-@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="requires four CUDA devices")
-def test_reduce_scatter_fp32_accumulation_fsdp2_step():
-    from ..tools.launch_utils import torchrun
-
-    torchrun(_run_fsdp2_optimizer_step, world_size=_CI_ACCELERATOR_4.nproc)
+    torchrun(_run_reduce_scatter_nccl_and_fsdp2_step, world_size=_CI_ACCELERATOR_4.nproc)
