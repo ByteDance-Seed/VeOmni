@@ -416,16 +416,6 @@ def test_seedomni_conversation_list_dyn_bsz_lengths_and_strategy():
     collated = SeedOmniCollator()(micro_batch)
     assert len(collated["conversation_list"]) == 2
 
-    # When a packed preprocessor writes top-level tensors while keeping conversation_list,
-    # canonical top-level tensor keys take precedence over raw item lengths.
-    packed_conv_sample = {
-        "conversation_list": [ConversationItem(type="text", value="x", role="assistant")],
-        "attention_mask": torch.ones(16, dtype=torch.long),
-        "labels": torch.tensor([1] * 12 + [IGNORE_INDEX] * 4, dtype=torch.long),
-    }
-    assert get_length_fn(packed_conv_sample) == 16
-    assert get_length_by_labels_fn(packed_conv_sample) == 12
-
 
 def test_text_batching_strategy_effective_count_mode():
     total_strategy = TextBatchingStrategy(token_micro_bsz=4, buffer_size=1)

@@ -21,13 +21,6 @@ raw data transforms, or request preprocessing.
    `{"conversation_list": conversation}` (and optionally the exact scalar
    `"_loss"` key).
 
-Janus and Qwen3-VL packed training (`packed/graph_train.yaml`) are an
-optional second path: during step 1 the text-encoder preprocessor writes
-packed tensors onto the sample/batch dict. Packed graph nodes
-(`pack_encode` / `pack_forward` / `pack_decode`) read those tensors and
-`masked_scatter` embeddings onto `packed_features`, while folding dummy
-FSDP-anchor images with `mean() * 0`.
-
 ## Preprocessor Contract
 
 `ModulePreprocessorBase` lives in `veomni/models/seed_omni/modules/module_processing_base.py`
@@ -36,8 +29,7 @@ FSDP-anchor images with `mean() * 0`.
 Rules:
 
 - Implement `preprocess_conversations(conversation_list, inference=False, **kwargs)`
-  to mutate `ConversationItem.value` and `meta` in place (or override `__call__`
-  when writing packed batch tensors).
+  to mutate `ConversationItem.value` and `meta` in place.
 - Keep preprocessors picklable, weight-free, and CPU-only (using tokenizer,
   image/video/audio processor, config values, and special token IDs) so they
   can run inside DataLoader workers.

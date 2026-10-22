@@ -221,12 +221,9 @@ class OmniProcessor:
         **generation_kwargs: Any,
     ) -> dict[str, Any]:
         """Run the module preprocessor chain on an existing ``conversation_list``."""
-        batch: dict[str, Any] = {"conversation_list": [conversation]}
+        batch = {"conversation_list": [conversation]}
         self.preprocess_batch(batch, inference=inference, **generation_kwargs)
-        out = dict(batch)
-        if "conversation_list" in out:
-            out["conversation_list"] = out["conversation_list"][0]
-        return out
+        return {"conversation_list": batch["conversation_list"][0]}
 
     def preprocess_batch(
         self,

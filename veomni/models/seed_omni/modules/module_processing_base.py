@@ -70,13 +70,12 @@ class ModulePreprocessorBase:
     * **CPU only.** Workers must not touch the training CUDA device; build CPU
       tensors (no ``device=``).  The main process's thin ``pre_forward`` does the
       single ``.to(device)``.
-    * **In-place mutation.** ``__call__`` receives the collator ``batch`` dict
-      (must contain ``conversation_list`` as ``list[list[ConversationItem]]``).
-      The default path mutates those items' ``value`` / ``meta`` in place, and
-      the thin ``pre_forward`` / ``generate`` re-selects them with the same
-      ``type`` / ``role`` / ``meta`` filter to read the heavy work back. A packed preprocessor may override
-      ``__call__`` and write tensors onto the same dict instead of walking
-      items.
+    * **In-place mutation.** ``__call__`` receives the ``batch`` dict
+      (must contain ``conversation_list`` as ``list[list[ConversationItem]]``)
+      and mutates those items' ``value`` / ``meta`` in place via
+      :meth:`preprocess_conversations`; the thin ``pre_forward`` / ``generate``
+      then re-selects them with the same ``type`` / ``role`` / ``meta`` filter
+      to read the heavy work back.
     * **Shared by training + inference.** Training runs it per sample inside
       ``seedomni_transform`` (DataLoader worker) before ``dyn_bsz`` and
       collation; inference runs it once over the request before the FSM. The

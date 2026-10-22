@@ -115,8 +115,6 @@ def batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, An
             return v.to(device, non_blocking=True)
         if isinstance(v, dict):
             return {k: _to_device(vv) for k, vv in v.items()}
-        if isinstance(v, list) and v and all(isinstance(elem, torch.Tensor) for elem in v):
-            return [elem.to(device, non_blocking=True) for elem in v]
         return v
 
     return {k: _to_device(v) for k, v in batch.items()}

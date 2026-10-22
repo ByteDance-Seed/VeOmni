@@ -43,8 +43,7 @@ from the routing table below.
   inference. Training runs it inside `data_transform` (`seedomni_transform`);
   inference runs it once before the FSM.
 - Modules communicate by mutating and returning the shared `conversation_list`
-  carrier (or, in Janus / Qwen3-VL packed training, by writing packed tensors
-  onto the collator `batch` dict and scattering embeddings in `pack_*` nodes).
+  carrier.
 - Training graphs are flat edge lists over `module[.method]` endpoints.
   `to: end` is the virtual sink. Execution order is derived by topo sort.
 - Generation graphs are FSMs. Each state body is an ordered inline edge list.

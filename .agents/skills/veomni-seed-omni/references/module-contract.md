@@ -41,8 +41,7 @@ modules/<family>/<submodule>/
   micro-batch (decode losses reduce over `ps.fsdp_group`; see constraint 2 in
   `.agents/knowledge/veomni-seed-omni.md`).
 - Mutate `ConversationItem` fields in place and return
-  `{"conversation_list": conversation}` (or write `packed_*` tensors on the
-  batch dict for packed graphs).
+  `{"conversation_list": conversation}`.
 - Keep tokenizers and processors inside the owning module's subfolder via
   `get_assets()` / `attach_module_assets`.
 - In training, every active node runs on every micro-batch: use per-sample

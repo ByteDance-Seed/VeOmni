@@ -116,21 +116,6 @@ def test_omni_processor_preprocess_mutates_existing_conversation():
     assert out["conversation_list"] is conversation
 
 
-def test_omni_processor_preprocess_preserves_extra_batch_keys():
-    class _ExtraKeyPreprocessor:
-        def __call__(self, batch, inference=False, **kwargs) -> None:
-            del kwargs
-            batch["packed_flag"] = not inference
-
-    processor = OmniProcessor({"a": _ExtraKeyPreprocessor()})
-    conversation = [ConversationItem(type="text", value="hi", role="user")]
-
-    out = processor.preprocess(conversation)
-
-    assert out["conversation_list"] is conversation
-    assert out["packed_flag"] is True
-
-
 def test_omni_processor_preprocess_batch_runs_with_inference_false():
     calls: list[tuple[str, bool]] = []
 
