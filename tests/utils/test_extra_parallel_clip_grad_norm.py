@@ -32,6 +32,8 @@ from veomni.utils.device import (
 
 _CI_LAUNCH = LaunchSpec(nproc=8)
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 # from veomni.optim.optimizer import build_optimizer
 

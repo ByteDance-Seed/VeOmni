@@ -35,6 +35,8 @@ _CI_CPU_4 = LaunchSpec(nproc=4, device="cpu")
 
 _CI_ACCELERATOR_4 = LaunchSpec(nproc=4, device="accelerator")
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("reduction_scale", [1.0, 0.5, 1.0 / 3.0])

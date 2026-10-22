@@ -79,6 +79,8 @@ from veomni.utils.constants import IGNORE_INDEX
 
 _CI_LAUNCH = LaunchSpec(nproc=2)
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 logger = helper.create_logger(__name__)
 

@@ -26,6 +26,7 @@ from typing import List, Optional
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.checkpoint.convert import (
     ConvertedCheckpointTensor,
     checkpoint_converter_fused_expert_target,
@@ -60,6 +61,9 @@ from veomni.models.transformers.qwen3_vl_moe.checkpoint_tensor_converter import 
     Qwen3VLMoeCheckpointTensorConverter,
     create_qwen3_vl_moe_checkpoint_tensor_converter,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +440,7 @@ class TestGlmMoeDsaConverter:
         finally:
             set_ops_config(previous)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
     def test_per_expert_checkpoint_loads_into_fused_experts(self, tmp_path, eager_ops):
         """The released GLM-5 layout: per-expert routed experts plus an unbuilt MTP layer."""
         from safetensors.torch import save_file
@@ -480,6 +485,11 @@ class TestGlmMoeDsaConverter:
         loaded = build_foundation_model(
             config_path=str(tmp_path), weights_path=None, torch_dtype="float32", init_device="cpu"
         )
+        from veomni.utils.device import IS_NPU_AVAILABLE
+
+        expected_suffix = "_npu" if IS_NPU_AVAILABLE else "_gpu"
+        assert type(model).__module__.endswith(expected_suffix)
+        assert type(loaded).__module__.endswith(expected_suffix)
         load_model_weights(loaded, str(tmp_path), init_device="cpu")
 
         loaded_state = loaded.state_dict()

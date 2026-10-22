@@ -7,8 +7,12 @@ import os
 import pytest
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools import training_utils
 from veomni.utils.device import MOE_TRITON_DEVICE_TYPES
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 @pytest.mark.parametrize("previous_backend", [None, "veomni"])

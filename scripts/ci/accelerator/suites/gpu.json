@@ -137,6 +137,8 @@
       "-s",
       "-x",
       "--ignore=tests/models/test_omni_fsdp.py",
+      "--ignore=tests/models/base/test_modify_init.py",
+      "--ignore=tests/models/transformers/test_generated_call_site_signatures.py",
       "tests/models"
     ]
   },
@@ -379,17 +381,8 @@
       "-x",
       "-m",
       "not benchmark",
+      "--ignore=tests/ops/base/test_op_documentation.py",
       "tests/ops"
-    ]
-  },
-  {
-    "name": "39-unit",
-    "suite": "unit",
-    "conditional": false,
-    "args": [
-      "-s",
-      "-x",
-      "tests/special_sanity/test_ops_architecture.py"
     ]
   },
   {

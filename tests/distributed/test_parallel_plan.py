@@ -18,8 +18,12 @@ import pytest
 import torch.nn as nn
 from torch.distributed.tensor import Shard
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.models.transformers.qwen3_5_moe.parallel_plan import get_parallel_plan as qwen3_5_moe_plan
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_every_planned_parameter_owner_is_a_para_module():

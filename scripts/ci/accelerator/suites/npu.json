@@ -76,6 +76,8 @@
       "-v",
       "-s",
       "-x",
+      "--ignore=tests/models/base/test_modify_init.py",
+      "--ignore=tests/models/transformers/test_generated_call_site_signatures.py",
       "tests/models"
     ]
   },
@@ -291,17 +293,8 @@
       "-x",
       "-m",
       "not benchmark",
+      "--ignore=tests/ops/base/test_op_documentation.py",
       "tests/ops"
-    ]
-  },
-  {
-    "name": "npu-unit-30",
-    "suite": "unit",
-    "args": [
-      "-v",
-      "-s",
-      "-x",
-      "tests/special_sanity/test_ops_architecture.py"
     ]
   },
   {

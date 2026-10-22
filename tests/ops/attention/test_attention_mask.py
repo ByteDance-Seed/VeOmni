@@ -28,6 +28,7 @@ from torch.nn.attention.flex_attention import BlockMask
 from transformers import PreTrainedConfig
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, create_causal_mask
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.attention.attention_cases import (
     dense_2d_mask,
     flex_2d_mask,
@@ -46,6 +47,9 @@ from veomni.ops.mask import (
     magi_attention_mask_builder,
     sdpa_attention_mask_builder,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_mask_builder_return_types():

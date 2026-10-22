@@ -7,6 +7,10 @@ on:
       - "patchgen-pkg/**"
       - "veomni/patchgen/**"
       - "veomni/models/transformers/**"
+      - "tests/models/base/test_modify_init.py"
+      - "tests/models/conftest.py"
+      - "tests/models/compare.py"
+      - "veomni/ops/**"
       - "pyproject.toml"
       - "uv.lock"
   push:
@@ -17,6 +21,10 @@ on:
       - "patchgen-pkg/**"
       - "veomni/patchgen/**"
       - "veomni/models/transformers/**"
+      - "tests/models/base/test_modify_init.py"
+      - "tests/models/conftest.py"
+      - "tests/models/compare.py"
+      - "veomni/ops/**"
       - "pyproject.toml"
       - "uv.lock"
 
@@ -51,3 +59,6 @@ jobs:
 
       - name: Check patchgen drift
         run: uv run --no-sync patchgen --check
+
+      - name: Run patchgen unit checks
+        run: uv run --no-sync pytest tests/models/base/test_modify_init.py

@@ -23,6 +23,7 @@ from operator import attrgetter
 import pytest
 from transformers import PretrainedConfig
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config, ops_config_scope, stamp_attn_implementation
 from tests.models.tiny_configs import (
     tiny_deepseek_v3_config as _tiny_deepseek_v3_config,
@@ -130,6 +131,43 @@ from veomni.models import (
 from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config
 from veomni.utils.device import IS_NPU_AVAILABLE
+
+
+_CPU_LAUNCH = LaunchSpec(device="cpu")
+_ACCELERATOR_LAUNCH = LaunchSpec(device="accelerator")
+pytestmark = pytest.mark.launch_plan(provider=_CPU_LAUNCH)
+
+# Families whose MODELING_REGISTRY entry selects between *_npu and *_gpu generated modules
+# based on IS_NPU_AVAILABLE.
+_NPU_GENERATED_FAMILIES = frozenset(
+    {
+        "deepseek_v3",
+        "deepseek_v4",
+        "glm_moe_dsa",
+        "qwen3",
+        "qwen3_5",
+        "qwen3_5_text",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+        "qwen3_moe",
+        "qwen3_omni_moe",
+        "qwen3_omni_moe_thinker",
+        "qwen3_omni_moe_text",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+        "seed_oss",
+    }
+)
+
+
+def _assert_expected_generated_module_source(model_type: str, model_cls: type) -> None:
+    if model_type not in _NPU_GENERATED_FAMILIES:
+        return
+    expected_suffix = "_npu" if IS_NPU_AVAILABLE else "_gpu"
+    assert model_cls.__module__.endswith(expected_suffix), (
+        f"Expected {model_type} ({model_cls.__name__}) to resolve from a *{expected_suffix} module, "
+        f"got {model_cls.__module__!r}"
+    )
 
 
 class _UnregisteredConfig(PretrainedConfig):
@@ -616,6 +654,7 @@ def test_build_foundation_model_requires_ops_config():
             build_foundation_model(_tiny_qwen3_config())
 
 
+@pytest.mark.launch_plan(provider=_ACCELERATOR_LAUNCH)
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
 def test_build_foundation_model_constructs_registered_model(model_case: _ModelCase):
     cfg = eager_ops_config()
@@ -628,6 +667,7 @@ def test_build_foundation_model_constructs_registered_model(model_case: _ModelCa
         )
         assert get_ops_config() is cfg
     assert model.__class__.__name__ == model_case.architectures[0]
+    _assert_expected_generated_module_source(model_case.model_type, type(model))
     for path, expected_op in _eager_ops(model_case):
         op = attrgetter(path)(model)
         assert isinstance(op, VeomniOp), path
@@ -661,6 +701,11 @@ def _op_bindings(model, selected_path):
     return bindings
 
 
+@pytest.mark.launch_plan(
+    provider=lambda context: (
+        _ACCELERATOR_LAUNCH if context.params["model_case"].model_type in _NPU_GENERATED_FAMILIES else _CPU_LAUNCH
+    )
+)
 @pytest.mark.parametrize(
     "model_case",
     [case for case in _MODEL_CASES if case.eager_ops],
@@ -685,7 +730,9 @@ def test_model_instances_keep_distinct_impls(model_case: _ModelCase, available_n
         if selected_op_name == "attention" and model_case.stamps_hf_attn:
             stamp_attn_implementation(model_config, config.attn_implementation)
         with ops_config_scope(config):
-            return get_model_class(model_config)(model_config)
+            model_cls = get_model_class(model_config)
+            _assert_expected_generated_module_source(model_case.model_type, model_cls)
+            return model_cls(model_config)
 
     eager = construct(eager_config)
     selected_op = attrgetter(selected_path)
@@ -715,11 +762,13 @@ def test_model_registry_entries(model_case: _ModelCase):
         assert model_case.processor_class_name in MODEL_PROCESSOR_REGISTRY.valid_keys()
 
 
+@pytest.mark.launch_plan(provider=_ACCELERATOR_LAUNCH)
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
 def test_get_model_class_returns_registered_architectures(model_case: _ModelCase):
     for architecture in model_case.architectures:
         model_cls = get_model_class(model_case.config_factory(architecture))
         assert model_cls.__name__ == architecture, architecture
+        _assert_expected_generated_module_source(model_case.model_type, model_cls)
 
 
 def test_get_model_config_uses_the_registered_dsv4_subclass(tmp_path):
