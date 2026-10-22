@@ -282,7 +282,7 @@ The pieces that complete this workflow are in place:
 runs the encoding run, and
 [`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L181)
 persists each conversation of the `conversation_list` that
-[`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L529)
+[`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L522)
 returns. The training graph must only mutate `ConversationItem` fields in
 place (for example `value` and `meta`); it must not replace the list, append
 items, or drop items. Structural changes belong in the processor / collator
@@ -317,13 +317,13 @@ generation graph names, e.g. an encoding run loads only the encoder. So
 checks it against the loaded modules
 ([`GenerationGraph.validate_modules`](../../../veomni/models/seed_omni/graphs/generation_graph.py#L312))
 at the start of
-[`OmniModel.generate`](../../../veomni/models/seed_omni/modeling_omni.py#L648).
+[`OmniModel.generate`](../../../veomni/models/seed_omni/modeling_omni.py#L641).
 A missing module or method still fails before the first request runs.
 
 ## Current scope
 
 - **Cached modules are not checkpointed.** They are frozen in both cache tasks,
-  and [fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L626),
+  and [fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L624),
   so a checkpoint never holds a meta module.
 - **Every cacheable module is read from the cache.** `offline_training` builds
   every module that mixes in `OfflineEncodingMixin` on meta; one run cannot

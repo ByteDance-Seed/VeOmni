@@ -301,7 +301,6 @@ class OmniModel(PreTrainedModel):
         read from the config like every other layer.
         """
 
-        from ...arguments import OpsImplementationConfig
         from ...ops.config import get_ops_config, set_ops_config
 
         base_ops = get_ops_config()
@@ -312,7 +311,6 @@ class OmniModel(PreTrainedModel):
                 module_path = OmniModuleConfig.resolve_path(checkpoint_root, name, entry.get("model_path"))
                 module_config = config._module_configs[name]
                 mod_cls = OMNI_MODEL_REGISTRY[module_config.model_type]()
-                module_ops = OpsImplementationConfig(**dict(module_config.ops_implementation or {}))
                 # Copy per module: HF pops keys such as ``torch_dtype`` out of the dict it is given.
                 # TODO: make it per module kwargs
                 module_kwargs = dict(kwargs)
@@ -320,7 +318,7 @@ class OmniModel(PreTrainedModel):
                 # Install this module's kernels for the duration of its own load, so
                 # a module's kernels do not depend on its position in
                 # ``config.module_names``.
-                set_ops_config(module_ops)
+                set_ops_config(module_config.ops_config)
                 if load_weights and config._hf_source is not None:
                     if os.path.normpath(module_path) != os.path.normpath(os.path.join(str(checkpoint_root), name)):
                         raise ValueError(

@@ -329,10 +329,8 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         args = self.args
         logger.info_rank0(f"ModuleRuntime '{self.module_name}': build module model")
-        from .....arguments import OpsImplementationConfig
         from .....models import build_foundation_model
 
-        ops = OpsImplementationConfig(**dict(getattr(self.module_config, "ops_implementation", None) or {}))
         acc = self.mesh_accelerator
         init_device = "meta" if self.reads_offline_cache else acc.init_device
         self.model = build_foundation_model(
@@ -340,7 +338,7 @@ class ModuleRuntime(VeOmniModelRuntime):
             weights_path=args.model_path if self.hf_source is None else None,
             torch_dtype="float32" if acc.fsdp_config.mixed_precision.enable else "bfloat16",
             init_device=init_device if self.hf_source is None else "meta",
-            ops_implementation=ops,
+            ops_implementation=self.module_config.ops_config,
         )
         if self.hf_source is not None:
             from ....checkpoint.weights import load_model_weights

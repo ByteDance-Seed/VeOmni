@@ -293,7 +293,7 @@ class TrainingMixin(TrainingModuleMixin):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        ce_impl = self.config.ops_implementation.get("cross_entropy_loss_implementation")
+        ce_impl = self.config.ops_config.cross_entropy_loss_implementation
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", ce_impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self._conversation_carrier: Any = None
