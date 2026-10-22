@@ -189,13 +189,7 @@ def apply_dcp_consolidation_patch():
                 output_stream.write(full_tensor_mv)
 
     def _parse_input_metadata_impl(input_files_data, output_files_data):
-        from safetensors.torch import _getdtype as _safetensors_getdtype
-
-        def _getdtype(dtype_str: str) -> torch.dtype:
-            # Older safetensors releases cannot name e8m0, which block-scaled checkpoints store.
-            if dtype_str == "F8_E8M0" and hasattr(torch, "float8_e8m0fnu"):
-                return torch.float8_e8m0fnu
-            return _safetensors_getdtype(dtype_str)
+        from safetensors.torch import _getdtype
 
         fqn_to_size_mapping = {}
 
