@@ -495,9 +495,6 @@ def get_length_by_labels_fn(sample: Any) -> int:
         if counted is not None:
             return counted
 
-    if "attention_mask" in sample or "input_ids" in sample:
-        return get_length_fn(sample)
-
     if "conversation_list" in sample:
         return _conversation_effective_length(sample["conversation_list"])
 

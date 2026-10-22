@@ -263,3 +263,8 @@ def test_packed_preprocessor_tensors_survive_transform_collator_and_batch_to_dev
     assert multi_batch["position_ids"].shape == (3, 1, 22)
     assert torch.equal(multi_batch["cu_seqlens"], torch.tensor([0, 16, 22], dtype=torch.int32))
     assert len(multi_batch["conversation_list"]) == 2
+
+    # Verify non-CPU device transfer moves every top-level packed tensor while leaving conversation_list items on CPU.
+    moved_batch = batch_to_device(collator([sample_a, sample_b]), torch.device("meta"))
+    for key in ("input_ids", "attention_mask", "labels", "position_ids", "cu_seqlens"):
+        assert moved_batch[key].device.type == "meta"
