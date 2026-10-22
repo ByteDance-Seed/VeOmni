@@ -19,7 +19,13 @@ per-module entries and a `modules:` YAML compose instead of shadow each other. I
 quietly runs the wrong kernel or the wrong parallelism — so they are pinned here.
 """
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.parser import _deep_update
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_a_key_named_with_nothing_under_it_keeps_what_is_there():

@@ -13,8 +13,14 @@ Usage:
 import unittest
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 import torch.nn as nn
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 # ---------------------------------------------------------------------------

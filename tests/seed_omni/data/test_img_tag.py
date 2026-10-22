@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.seed_omni.preprocess import conv_preprocess
 from veomni.data.seed_omni.seedomni_transform import _build_conversation_list
 from veomni.models.seed_omni.utils.conversation import (
@@ -30,6 +31,9 @@ from veomni.models.seed_omni.utils.conversation import (
     ConversationItem,
     iter_desired_items,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -626,3 +630,28 @@ def test_fetch_videos_decodes_repeated_ref_once_and_returns_independent_copies(m
     first.audio[0] = 7.0
     assert int(second.video[0, 0, 0, 0]) == 13
     assert float(second.audio[0]) == 1.0
+
+
+def test_multimodal_load_image_from_path_sets_http_timeout(monkeypatch) -> None:
+    import io
+    from types import SimpleNamespace
+
+    from PIL import Image
+
+    from veomni.data.multimodal import image_utils as mm_image_utils
+
+    buf = io.BytesIO()
+    Image.new("RGB", (2, 2), color=(10, 20, 30)).save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+    seen: dict = {}
+
+    def fake_get(url, **kwargs):
+        seen["url"] = url
+        seen["kwargs"] = kwargs
+        return SimpleNamespace(content=png_bytes, raise_for_status=lambda: None)
+
+    monkeypatch.setattr(mm_image_utils.requests, "get", fake_get)
+
+    img = mm_image_utils.load_image_from_path("https://example.com/test.png")
+    assert img.size == (2, 2)
+    assert seen == {"url": "https://example.com/test.png", "kwargs": {"timeout": (5, 30)}}

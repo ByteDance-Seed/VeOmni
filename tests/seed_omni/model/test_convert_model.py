@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni.configuration_omni import (
     DEFAULT_GENERATION_GRAPH_FILE,
     DEFAULT_TRAINING_GRAPH_FILE,
@@ -24,6 +25,9 @@ from veomni.models.seed_omni.utils.convert_registry import (
     convert_checkpoint,
     load_family_graphs,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _write_fake_omni_source(root: Path, *, hidden_size: int = 8) -> Path:

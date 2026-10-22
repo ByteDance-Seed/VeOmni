@@ -69,6 +69,8 @@
 #      Bind ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - method_override: Qwen4ExpForConditionalGeneration.forward
 #      Always call ForCausalLMLoss and load_balancing_loss VeomniOps
+#    - method_override: Qwen4ExpTextSparseMoeBlock.forward
+#      Call maybe_replay_indices for RL router replay
 #
 # ==============================================================================
 
@@ -138,6 +140,7 @@ from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils import logging
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
+from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 from veomni.utils.seqlen_pos_transform_utils import pos2culen
 
 
@@ -897,7 +900,9 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
         else:
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
-        if self.num_v_heads // self.num_k_heads > 1:
+        if self.num_v_heads // self.num_k_heads > 1 and not (
+            self.veomni_chunk_gated_delta_rule.impl == "flash_qla" and not use_precomputed_states
+        ):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
@@ -1506,6 +1511,12 @@ class Qwen4ExpTextTopKRouter(nn.Module):
         return router_logits, router_scores, router_indices
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen4ExpTextSparseMoeBlock
+# Methods patched: forward
+# ======================================================================
+
+
 class Qwen4ExpTextSparseMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1514,11 +1525,33 @@ class Qwen4ExpTextSparseMoeBlock(nn.Module):
         self.shared_expert = Qwen4ExpTextMLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    # ================================================================
+    # Patch: Qwen4ExpTextSparseMoeBlock.forward (MoE router replay)
+    # 1. When an RL framework has installed a
+    # replay manager via ``set_active_replay``, the manager may substitute
+    # ``selected_experts`` with previously recorded target indices. The
+    # manager's sole responsibility is choosing indices; all model-specific
+    # post-topk weight math (softmax recompute, gather, renorm, dtype cast)
+    # is replicated here so the cross-framework controller stays
+    # model-agnostic.
+    # ================================================================
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Replay expert indices while preserving native top-k weighting and local expert ops."""
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
         shared_expert_output = self.shared_expert(hidden_states_reshaped)
-        _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+        router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+        # --- Patch.1: Recompute weights for replayed indices from raw router logits. ---
+        # Match the native router's optional normalization and output dtype.
+        if get_active_replay() is not None:
+            target_dtype = routing_weights.dtype
+            routing_scores = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+            selected_experts = maybe_replay_indices(self.gate, routing_scores, selected_experts)
+            routing_weights = routing_scores.gather(1, selected_experts)
+            if self.gate.norm_topk_prob:
+                routing_weights = routing_weights / routing_weights.sum(-1, keepdim=True)
+            routing_weights = routing_weights.to(target_dtype)
+        # --- Patch.1 ---
         expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
 
         shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output

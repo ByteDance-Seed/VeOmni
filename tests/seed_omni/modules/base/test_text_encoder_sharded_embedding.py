@@ -4,8 +4,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni.modules.base.text_encoder.configuration import TextEncoderConfig
 from veomni.models.seed_omni.modules.base.text_encoder.modeling import TextEncoder
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 _VOCAB, _HIDDEN = 8, 4

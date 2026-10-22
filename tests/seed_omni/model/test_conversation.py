@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.seed_omni.utils.media_metadata import AudioMetadata
 from veomni.models.seed_omni.utils.conversation import (
     _IMG_TAG_KEY,
@@ -15,6 +17,9 @@ from veomni.models.seed_omni.utils.conversation import (
     maybe_merge_outputs,
     seal_outputs,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_build_conversation_text_only_yields_user_part():

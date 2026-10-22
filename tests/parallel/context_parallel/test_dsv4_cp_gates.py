@@ -34,9 +34,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed import parallel_state as parallel_state_module
 from veomni.models import auto as auto_module
 from veomni.models.auto import build_config, check_context_parallel_supported
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_gate_is_inert_when_no_parallel_state_was_installed(monkeypatch):

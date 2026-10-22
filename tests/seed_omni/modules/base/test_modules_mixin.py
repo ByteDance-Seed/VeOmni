@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.seed_omni.modules.helpers import load_from_omni, save_as_omni
 from veomni.models.seed_omni import (
     OMNI_ACCELERATED_MODEL_REGISTRY,
@@ -20,6 +21,9 @@ from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniM
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.tensor_utils import naflatten, unflatten
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _config_cls(model_type: str):

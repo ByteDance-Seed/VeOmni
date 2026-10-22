@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.omni_arguments_types import OmniGraphProfileArguments
 from veomni.models.seed_omni.accelerated import OmniModelRuntime
 from veomni.models.seed_omni.accelerated.utils.executor import (
@@ -28,6 +29,9 @@ from veomni.models.seed_omni.utils import graph_profiler
 from veomni.models.seed_omni.utils.graph_profiler import GraphProfiler
 from veomni.trainer.callbacks.omni_callbacks import GraphProfileCallback
 from veomni.trainer.omni.omni_trainer import OmniTrainer
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _fan_in_edges() -> list[dict]:
