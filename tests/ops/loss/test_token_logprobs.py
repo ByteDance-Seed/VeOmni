@@ -131,6 +131,94 @@ def test_token_logprobs_flash_attn_wrapper_contract(monkeypatch, batch_shape):
     assert torch.all(out[labels == IGNORE_INDEX] == 0.0)
 
 
+def test_token_logprobs_flash_attn_import_error_fallback_vs_strict(monkeypatch):
+    """Automatic ``impl=None`` falls back to ``eager`` on ``flash_attn`` ``ImportError``, while explicit ``impl='flash_attn'`` raises."""
+    import builtins
+
+    import veomni.models.loss_utils.chunk_topk_distill as ctkd
+    import veomni.ops.kernels.loss.token_logprobs.chunked as tlp_chunked
+
+    monkeypatch.setattr(VeomniOp, "_intern", {})
+    monkeypatch.setattr(cl, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+    monkeypatch.setattr(ctkd, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+
+    # Simulate a GPU host where OP_REGISTRY discovers flash_attn via find_spec,
+    # so VeomniOp("token_logprobs", "standard", None) selects the flash_attn row.
+    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cuda")
+    monkeypatch.setattr(
+        "veomni.ops.platform.requirement.GpuKernelRequirement.matches",
+        lambda self: True,
+    )
+    monkeypatch.setattr(
+        "veomni.ops.platform.requirement.GpuKernelRequirement.check",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        "veomni.ops.registry.is_package_available",
+        lambda pkg: True if pkg == "flash_attn.ops.triton.cross_entropy" else False,
+    )
+
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "flash_attn.ops.triton.cross_entropy" or name.startswith("flash_attn."):
+            raise ImportError("simulated flash_attn binary extension ABI mismatch")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.delitem(sys.modules, "flash_attn.ops.triton.cross_entropy", raising=False)
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    # Automatic selection (impl=None) on non-CPU device_type must fall back to eager.
+    auto_op = resolve_token_logprobs_op(None, device_type="cuda")
+    assert auto_op.impl == "eager"
+
+    # Explicit selection (impl="flash_attn") must strictly raise ImportError.
+    with pytest.raises(ImportError, match="ABI mismatch"):
+        resolve_token_logprobs_op("flash_attn", device_type="cuda")
+
+    # Verify both chunk_logprobs_function and chunk_topk_distill_function preserve
+    # the eager fallback for impl=None (even when device_type is treated as non-CPU)
+    # and raise ImportError for explicit impl="flash_attn".
+    orig_resolve = tlp_chunked.resolve_token_logprobs_op
+    monkeypatch.setattr(
+        cl,
+        "resolve_token_logprobs_op",
+        lambda impl=None, *, device_type=None: orig_resolve(impl, device_type="cuda"),
+    )
+    monkeypatch.setattr(
+        ctkd,
+        "resolve_token_logprobs_op",
+        lambda impl=None, *, device_type=None: orig_resolve(impl, device_type="cuda"),
+    )
+
+    torch.manual_seed(0)
+    h = torch.randn(2, 8, 4, requires_grad=True)
+    w = torch.randn(16, 4, requires_grad=True)
+    labels = torch.randint(0, 16, (2, 8))
+    teacher_logits = torch.randn(2, 8, 16).log_softmax(dim=-1)
+    teacher_topk_lp, teacher_topk_ids = teacher_logits.topk(3, dim=-1)
+
+    lp_auto, ent_auto = cl.chunk_logprobs_function(h, w, labels, chunk_size=4)
+    lp_eager, ent_eager = cl.chunk_logprobs_function(h, w, labels, chunk_size=4, impl="eager")
+    torch.testing.assert_close(lp_auto, lp_eager, rtol=0, atol=0)
+    torch.testing.assert_close(ent_auto, ent_eager, rtol=0, atol=0)
+
+    distill_auto = ctkd.chunk_topk_distill_function(h, w, labels, teacher_topk_ids, teacher_topk_lp, chunk_size=4)
+    distill_eager = ctkd.chunk_topk_distill_function(
+        h, w, labels, teacher_topk_ids, teacher_topk_lp, chunk_size=4, impl="eager"
+    )
+    for actual, expected in zip(distill_auto, distill_eager):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    with pytest.raises(ImportError, match="ABI mismatch"):
+        cl.chunk_logprobs_function(h, w, labels, chunk_size=4, impl="flash_attn")
+
+    with pytest.raises(ImportError, match="ABI mismatch"):
+        ctkd.chunk_topk_distill_function(
+            h, w, labels, teacher_topk_ids, teacher_topk_lp, chunk_size=4, impl="flash_attn"
+        )
+
+
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend NPU required")
 def test_npu_token_logprobs_matches_eager():
     """On Ascend NPU, default ``token_logprobs`` resolves to ``torch_npu`` and matches ``eager``."""
