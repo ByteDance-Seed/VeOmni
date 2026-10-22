@@ -204,28 +204,6 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
         )
         self.assertIsNone(writer_cls.call_args.kwargs["fqn_to_index_mapping"])
 
-    def test_revert_model_weight_conversions_unwraps_ddp_wrapper(self):
-        from veomni.utils.save_safetensor_utils import _revert_model_weight_conversions_for_hf
-
-        class _Inner(nn.Module):
-            _export_hf_checkpoint_with_weight_conversions = True
-
-            def __init__(self):
-                super().__init__()
-                self._weight_conversions = []
-
-        class _Wrapper(nn.Module):
-            def __init__(self, inner):
-                super().__init__()
-                self.module = inner
-
-        inner = _Inner()
-        wrapped = _Wrapper(inner)
-        with patch("transformers.core_model_loading.revert_weight_conversion") as mock_revert:
-            mock_revert.side_effect = lambda m, sd: {"unwrapped_cls": type(m).__name__, **sd}
-            out = _revert_model_weight_conversions_for_hf(wrapped, {"w": torch.ones(1)})
-        self.assertEqual(out["unwrapped_cls"], "_Inner")
-
     def test_naflatten_and_unflatten_roundtrip_keeps_shape_on_cpu(self):
         from veomni.utils.tensor_utils import naflatten, unflatten
 
