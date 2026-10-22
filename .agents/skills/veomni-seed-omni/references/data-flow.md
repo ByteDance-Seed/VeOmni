@@ -76,6 +76,48 @@ combination of modules.
   items it stands in for; read `item.is_dummy`, never a sentinel role.
 - Preprocessors that select *real* inputs skip `is_dummy` items.
 
+## Dynamic Batching (`dyn_bsz`) Contract
+
+When adding or modifying a SeedOmni model or module, follow these three rules so
+`train.dyn_bsz: true` (`count_mode: total` or `effective`) works out of the box:
+
+1. **Write `_OMNI_TOKEN_LEN` onto every `ConversationItem` in CPU preprocessors**:
+   - Import `_OMNI_TOKEN_LEN` from `veomni.models.seed_omni.utils.conversation`.
+   - **Text encoders**: `TextEncoderChatTemplate.tokenize` and `merge_text_embeds`
+     automatically set `item.meta[_OMNI_TOKEN_LEN]` and `item.meta["labels"]`.
+     If a model overrides `tokenize` or `merge_text_embeds` (e.g. `BagelChatTemplate`),
+     it must set `item.meta[_OMNI_TOKEN_LEN] = int(token_ids.numel())` and
+     `item.meta["labels"]` (`IGNORE_INDEX = -100` for masked positions).
+   - **Vision / audio / codec / VAE preprocessors (`ModulePreprocessorBase`)**:
+     In `preprocess_conversations`, set `item.meta[_OMNI_TOKEN_LEN]` on **every**
+     item (both real items and `is_dummy=True` placeholders) to the token count
+     that item contributes to the module/backbone sequence (e.g. merged ViT
+     tokens `(t * h * w) // (spatial_merge_size ** 2)`, downsampled grid +
+     delimiters, or VAE latent patch tokens).
+2. **Inject `is_dummy=True` placeholders per sample, never per batch**:
+   - Because `seedomni_transform` runs `OmniProcessor.preprocess(conversation_list)`
+     on each sample individually at the Dataset stage **before** `dyn_bsz` packs
+     samples into a micro-batch, `preprocess_conversations` only sees a single
+     sample (`len(conversation_list) == 1`) during training.
+   - Always check missing modalities **per sample** (`for sample in conversation_list:`)
+     and append the `is_dummy=True` placeholder (with `_OMNI_TOKEN_LEN` set in `meta`)
+     to that `sample` when `not inference`.
+   - In the module's GPU `pre_forward`, keep all selected items (real + `is_dummy=True`)
+     in the forward batch rather than dropping `is_dummy` items when another
+     sample in the micro-batch has real media. If independently preprocessed
+     samples can have different spatial shapes before `torch.stack`, pad them to
+     a common shape in `pre_forward` (e.g. `BagelVAE._pad_to_batch_size`).
+3. **How `total` and `effective` lengths are computed (`veomni/data/dataset.py`)**:
+   - `get_length_fn(sample)` (`count_mode="total"` and `physical_token_cap`):
+     sums `item.meta[_OMNI_TOKEN_LEN]` across **all** items in
+     `sample["conversation_list"]`, **including** `is_dummy=True` items (since
+     dummy items still execute the encoder forward and consume physical budget).
+   - `get_length_by_labels_fn(sample)` (`count_mode="effective"`):
+     skips `is_dummy=True` items; sums `(item.meta["labels"] != IGNORE_INDEX).sum()`
+     for `type == "text"` items, `item.meta[_OMNI_TOKEN_LEN]` for
+     `role == "assistant"` media items (generation targets), and `0` for
+     `role == "user"` media items (conditioning inputs).
+
 ## Training vs Inference
 
 - Training must keep every active graph node participating. Missing modality

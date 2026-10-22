@@ -21,7 +21,7 @@ Answer these before editing:
 
 - Which module owns the tokenizer or processor asset?
 - Which `type` / `role` / `meta` tags select this module's items, and who writes them?
-- Which module injects dummy items for training?
+- Which module injects per-sample `is_dummy=True` items for training, and what is each item's `_OMNI_TOKEN_LEN` for `dyn_bsz`?
 - Which graph call-sites use this module?
 - Does the module need a CPU preprocessor?
 - Does the module need a per-module parallel plan?

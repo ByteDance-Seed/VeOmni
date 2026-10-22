@@ -200,26 +200,40 @@ assistant-side placeholder.
 
 ## After transform: `conversation_list`
 
-`seedomni_transform` emits a per-sample list of
-:class:`~veomni.models.seed_omni.utils.conversation.ConversationItem`:
+`seedomni_transform` constructs a per-sample list of
+:class:`~veomni.models.seed_omni.utils.conversation.ConversationItem` and runs
+`OmniProcessor.preprocess(conversation_list)` in the Dataset stage (before
+dynamic batching and `SeedOmniCollator`):
 
 ```python
 ConversationItem(
     type="text" | "image",
-    value=str | torch.Tensor,  # (C, H, W) uint8 for images
+    value=torch.Tensor,  # token_ids for text; normalized patches/pixels for images
     role="user" | "assistant",  # no system row; fold that text into a turn
-    meta={},  # empty at the data boundary; modules fill input_ids / labels later
+    is_dummy=False | True,  # per-sample FSDP anchor injected when a modality is absent
+    meta={
+        "_omni_token_len": int,  # token length contributed by this item (used by dyn_bsz)
+        "labels": torch.Tensor,  # on text items (IGNORE_INDEX = -100 for masked spans)
+        ...,
+    },
 )
 ```
 
-Loss labels are set in the Janus text encoder during chat-template expand
-(``meta["loss_mask"]`` on rows that differ from ``int(role == "assistant")``,
-e.g. assistant prefix ``0``, boi/eoi/eos ``1``). Module-specific keys live in
-``meta`` and are written during forward.
+Because `OmniProcessor` runs inside `seedomni_transform`, each sample already
+carries `_omni_token_len`, `labels`, and any per-sample `is_dummy=True`
+placeholders when it reaches `DynamicBatchingSizeDataset` / `TextBatchingStrategy`:
 
-Modules read this list directly — chat template, tokenize, normalize, and
-patchify happen inside each SeedOmni module at forward time (see
-[Architecture](../design/architecture.md#3-training-flow)).
+- `dyn_bsz_count_mode: total` (and `physical_token_cap` via `get_length_fn`) sums
+  `meta["_omni_token_len"]` across **all** items in `conversation_list`,
+  **including** `is_dummy=True` placeholders.
+- `dyn_bsz_count_mode: effective` (`get_length_by_labels_fn`) skips
+  `is_dummy=True` items and sums `(meta["labels"] != -100).sum()` on text items
+  plus `meta["_omni_token_len"]` on `role == "assistant"` media items (`0` on
+  `role == "user"` media items).
+
+`SeedOmniCollator` then groups the selected per-sample dicts into a micro-batch
+`{"conversation_list": [sample_0, sample_1, ...]}` for `OmniModel.forward`
+(see [Architecture](../design/architecture.md#3-training-flow)).
 
 ## Janus multisource training
 

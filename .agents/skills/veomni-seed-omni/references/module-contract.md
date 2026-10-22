@@ -112,11 +112,22 @@ nothing → `[]`.
 | Text-only LLM module | `modules/qwen3/llm/` |
 | Vision-language LLM module | `modules/qwen3vl/llm/` |
 
-## Dummy And Missing Input Semantics
+## Dummy, Missing Input, And `dyn_bsz` Semantics
 
-- Training: active nodes must run. Use CPU-preprocessor dummies or module
-  dummy paths so FSDP/DDP collective order remains aligned.
-- Inference: missing optional input may return the unchanged carrier or `{}` if
+- **Per-sample CPU preprocessing**: `seedomni_transform` runs `OmniProcessor.preprocess`
+  per sample in the Dataset stage before `dyn_bsz` batching. Every module's
+  `ModulePreprocessorBase` / `TextEncoderChatTemplate` must:
+  1. Set `item.meta[_OMNI_TOKEN_LEN]` (from `veomni.models.seed_omni.utils.conversation`)
+     on every processed item (real and `is_dummy=True`), plus `item.meta["labels"]`
+     on text items, so `get_length_fn` (`total`, including dummy) and
+     `get_length_by_labels_fn` (`effective`, excluding dummy) can size samples
+     for `dyn_bsz`.
+  2. Inject `is_dummy=True` placeholders **per sample** (`for sample in conversation_list:`)
+     when `not inference` and a sample lacks that module's modality.
+- **Training GPU `pre_forward`**: active nodes must run on every micro-batch. Keep
+  both real and per-sample `is_dummy=True` items in `pre_forward` so FSDP/DDP
+  collective order stays aligned (dummy outputs are ignored or zero-anchored downstream).
+- **Inference**: missing optional input may return the unchanged carrier or `{}` if
   graph routing supports it for that call-site.
 - Backbones that consume dummy upstream outputs must preserve a gradient path
   when training requires it.
