@@ -16,9 +16,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
 
 
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 pytestmark = pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="SwiGLU-OAI fused MoE parity requires torch_npu")
 
 
@@ -186,10 +188,11 @@ def _npu_ep_forward_backward_worker():
         clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_npu_swiglu_oai_ep2_matches_eager_forward_backward():
     if torch.npu.device_count() < 2:
         pytest.skip("SwiGLU-OAI EP parity requires two NPU devices.")
 
     from tests.tools.launch_utils import torchrun
 
-    torchrun(_npu_ep_forward_backward_worker, world_size=2)
+    torchrun(_npu_ep_forward_backward_worker, world_size=_CI_ACCELERATOR_2.nproc)

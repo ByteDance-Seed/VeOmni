@@ -4,8 +4,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
 from veomni.utils.import_utils import is_fused_moe_available
+
+
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 
 def _skip_if_unsupported():
@@ -206,6 +210,7 @@ def _ep_forward_backward_worker():
         clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_triton_swiglu_oai_ep2_matches_eager_forward_backward():
     _skip_if_unsupported()
     if get_torch_device().device_count() < 2:
@@ -213,4 +218,4 @@ def test_triton_swiglu_oai_ep2_matches_eager_forward_backward():
 
     from tests.tools.launch_utils import torchrun
 
-    torchrun(_ep_forward_backward_worker, world_size=2)
+    torchrun(_ep_forward_backward_worker, world_size=_CI_ACCELERATOR_2.nproc)
