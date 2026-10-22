@@ -29,20 +29,24 @@ FSDP-anchor images with `mean() * 0`.
 
 ## Preprocessor Contract
 
-`ModulePreprocessorBase` lives in `veomni/models/seed_omni/modules/module_processing_base.py`.
+`ModulePreprocessorBase` lives in `veomni/models/seed_omni/modules/module_processing_base.py`
+(see `docs/seed_omni/mixins/module_preprocessor.md`).
 
 Rules:
 
+- Implement `preprocess_conversations(conversation_list, inference=False, **kwargs)`
+  to mutate `ConversationItem.value` and `meta` in place (or override `__call__`
+  when writing packed batch tensors).
 - Keep preprocessors picklable, weight-free, and CPU-only (using tokenizer,
   image/video/audio processor, config values, and special token IDs) so they
   can run inside DataLoader workers.
-- Mutate `batch["conversation_list"]` in place (or write packed tensors onto
-  `batch` for packed graphs).
 - Shared by training and inference:
   - Training: run by `SeedOmniCollator` inside DataLoader workers.
-  - Inference: run once by `OmniInferencer._preprocess_request` before the FSM.
+  - Inference: run once by `OmniInferencer` via `OmniProcessor` before the FSM.
 - Use `inference=True` for inference-only behavior (vision modules skip FSDP
-  dummy injection; text encoders append generation prompts when needed).
+  dummy injection; text encoders append generation prompts when needed); when
+  `inference=False` and a modality is absent from the micro-batch, attach a
+  single FSDP anchor row via `ModulePreprocessorBase.append_batch_anchor`.
 
 ## Item Routing
 
