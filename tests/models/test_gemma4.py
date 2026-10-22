@@ -25,6 +25,7 @@ from transformers.models.gemma4.configuration_gemma4 import Gemma4Config
 from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel as HFGemma4Audio
 from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration as HFGemma4
 
+from tests.ops.tol import EAGER_GRAD_ATOL, EAGER_GRAD_RTOL
 from tests.tools.gemma4_utils import make_gemma4_batch
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models import build_foundation_model
@@ -483,14 +484,19 @@ def test_gemma4_generated_children_and_packed_masks(monkeypatch):
 
 
 @pytest.mark.parametrize("backend", ["eager", "sdpa"])
-@pytest.mark.parametrize("vision_blocks", [False, True])
-def test_gemma4_packed_outputs_match_independent_sequences(backend, vision_blocks):
+@pytest.mark.parametrize("attention_mode", [None, "vision", "all"], ids=["causal", "vision", "all"])
+@pytest.mark.parametrize("text_only", [False, True], ids=["multimodal", "text"])
+def test_gemma4_packed_outputs_match_independent_sequences(backend, attention_mode, text_only):
     """Public packed builders isolate samples for both dense attention backends."""
-    config = _toy_config()
-    config.text_config.use_bidirectional_attention = "vision" if vision_blocks else None
-    model = VeOmniGemma4._from_config(config, attn_implementation=backend).eval()
+    config_dict = _toy_config().to_dict()
+    config_dict["text_config"]["use_bidirectional_attention"] = attention_mode
+    config_dict["text_config"]["sliding_window"] = 2
+    config = Gemma4Config.from_dict(config_dict)
+    model_cls = gemma4_modeling.Gemma4ForCausalLM if text_only else VeOmniGemma4
+    model_config = config.text_config if text_only else config
+    model = model_cls._from_config(model_config, attn_implementation=backend).eval()
     ids = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 10]])
-    token_types = torch.tensor([[0, 1, 1, 0, 0, 1, 1, 0]]) if vision_blocks else None
+    token_types = torch.tensor([[0, 1, 1, 0, 0, 1, 1, 0]]) if attention_mode == "vision" and not text_only else None
     with torch.no_grad():
         packed = model(
             input_ids=ids,
@@ -518,6 +524,7 @@ def test_gemma4_packed_outputs_match_independent_sequences(backend, vision_block
 @pytest.mark.parametrize("topk", [False, True], ids=["log_probs", "topk"])
 def test_gemma4_uncapped_auxiliary_outputs(monkeypatch, tmp_path, text_only, loss_implementation, topk):
     """Uncapped auxiliary outputs retain hidden states even for eager CE selection."""
+    torch.manual_seed(43)
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
     config = _toy_config()
     config.text_config.final_logit_softcapping = None
@@ -562,4 +569,34 @@ def test_gemma4_uncapped_auxiliary_outputs(monkeypatch, tmp_path, text_only, los
         aux.distillation_losses.sum().backward()
     else:
         aux.log_probs.sum().backward()
-    torch.testing.assert_close(model.lm_head.weight.grad, expected_gradient, atol=1e-6, rtol=1e-4)
+    torch.testing.assert_close(
+        model.lm_head.weight.grad, expected_gradient, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL
+    )
+
+
+@pytest.mark.parametrize("backend", ["eager", "sdpa", _FLEX_IMPLEMENTATION])
+@pytest.mark.parametrize("sliding", [False, True], ids=["full", "sliding"])
+def test_gemma4_packed_bidirectional_visibility(backend, sliding):
+    """All-mode masks retain both directions, inclusive windows and document isolation."""
+    config_dict = _toy_config().text_config.to_dict()
+    config_dict.update(use_bidirectional_attention="all", sliding_window=2)
+    config = gemma4_modeling.Gemma4TextConfig.from_dict(config_dict)
+    config._attn_implementation = backend
+    mask = gemma4_modeling._gemma4_create_mask(
+        config=config,
+        inputs_embeds=torch.zeros(1, 8, config.hidden_size),
+        attention_mask=None,
+        past_key_values=None,
+        cu_seq_lens_q=torch.tensor([0, 4, 8], dtype=torch.int32),
+        sliding=sliding,
+    )
+    positions = torch.arange(8)
+    expected = (positions[:, None] // 4) == (positions[None, :] // 4)
+    if sliding:
+        expected &= (positions[:, None] - positions[None, :]).abs() <= config.sliding_window
+    if isinstance(mask, BlockMask):
+        zero = torch.tensor(0)
+        visible = torch.stack([torch.stack([mask.mask_mod(zero, zero, q, k) for k in positions]) for q in positions])
+    else:
+        visible = mask[0, 0] if mask.dtype == torch.bool else mask[0, 0] == 0
+    torch.testing.assert_close(visible, expected)

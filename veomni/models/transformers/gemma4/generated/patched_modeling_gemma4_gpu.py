@@ -58,6 +58,7 @@ from transformers.integrations import use_experts_implementation
 # Additional imports for patches
 from transformers.masking_utils import (
     _preprocess_mask_arguments,
+    bidirectional_mask_function,
     blockwise_overlay,
     create_bidirectional_mask,
     create_causal_mask,
@@ -136,6 +137,22 @@ def _gemma4_create_mask(
         **kwargs,
     )
     q_len = inputs_embeds.shape[1]
+    if not getattr(config, "is_causal", True):
+        if sliding:
+            # Indexed bounds remain compatible with the Flex FLASH callback lowering.
+            window = torch.tensor([config.sliding_window], device=inputs_embeds.device).expand(
+                q_len * get_parallel_state().ulysses_size
+            )
+
+            def bidirectional_window(batch_idx, head_idx, q_idx, kv_idx):
+                return (q_idx - kv_idx).abs() <= window[q_idx]
+
+            common["mask_function"] = bidirectional_window
+        else:
+            common["mask_function"] = bidirectional_mask_function
+        # The sliding shape builder adds a one-sided overlay; supply the complete
+        # bidirectional predicate directly, then intersect packed boundaries.
+        return packed_causal_mask(q_len, q_len, **common)
     if sliding:
         return sliding_window_mask(q_len, q_len, sliding_window=config.sliding_window, **common)
     return packed_causal_mask(q_len, q_len, **common)

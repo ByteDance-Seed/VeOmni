@@ -12,6 +12,9 @@ Choose attention through `OpsImplementationConfig`, for example
 `veomni_flex_attention`. Packed full and sliding masks use the public
 `veomni.ops.mask` builders with `cu_seq_lens_q` boundaries. Packed attention
 does not support `past_key_values`; unpacked masks retain HF cache handling.
+With `use_bidirectional_attention="all"`, full attention remains bidirectional
+within each packed sample. Sliding attention preserves HF's inclusive, symmetric
+window on both sides of each token; document boundaries still apply.
 
 Each LM instance holds its own `VeomniOp("cross_entropy_loss", "standard", impl)`
 as `veomni_ce`. Training calls its `loss_function` wrapper so channel-loss

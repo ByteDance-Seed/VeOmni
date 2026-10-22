@@ -20,6 +20,7 @@ from functools import partial
 
 import torch
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.masking_utils import bidirectional_mask_function
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.gemma4.modeling_gemma4 import (
     Gemma4AudioModel,
@@ -53,7 +54,7 @@ config = PatchConfig(
 config.drop_import_names("create_causal_mask", "create_sliding_window_causal_mask")
 config.add_import(
     "transformers.masking_utils",
-    names=["create_causal_mask", "create_sliding_window_causal_mask"],
+    names=["bidirectional_mask_function", "create_causal_mask", "create_sliding_window_causal_mask"],
 )
 config.add_import(
     "veomni.utils.model_outputs",
@@ -102,6 +103,22 @@ def _gemma4_create_mask(
         **kwargs,
     )
     q_len = inputs_embeds.shape[1]
+    if not getattr(config, "is_causal", True):
+        if sliding:
+            # Indexed bounds remain compatible with the Flex FLASH callback lowering.
+            window = torch.tensor([config.sliding_window], device=inputs_embeds.device).expand(
+                q_len * get_parallel_state().ulysses_size
+            )
+
+            def bidirectional_window(batch_idx, head_idx, q_idx, kv_idx):
+                return (q_idx - kv_idx).abs() <= window[q_idx]
+
+            common["mask_function"] = bidirectional_window
+        else:
+            common["mask_function"] = bidirectional_mask_function
+        # The sliding shape builder adds a one-sided overlay; supply the complete
+        # bidirectional predicate directly, then intersect packed boundaries.
+        return packed_causal_mask(q_len, q_len, **common)
     if sliding:
         return sliding_window_mask(q_len, q_len, sliding_window=config.sliding_window, **common)
     return packed_causal_mask(q_len, q_len, **common)
