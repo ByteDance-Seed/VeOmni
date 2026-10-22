@@ -272,36 +272,14 @@ class ModuleRuntime(VeOmniModelRuntime):
             return super().__call__(*args, **kwargs)
 
     def _init_eager_inference(self) -> None:
-        """Single-process eager load via ``from_pretrained`` + ``device_map``.
-
-        ``fsdp_mode='eager'`` says only that this module skips the wrapper and
-        loads through plain HF modeling with a ``device_map``. It says nothing
-        about kernels, so this path resolves ``ops_implementation`` exactly as
-        the wrapped path does through ``build_foundation_model`` — otherwise a
-        purely parallelism-level choice would silently downgrade the module's
-        ops, and in a mixed run (Janus infers with ``janus_siglip`` eager
-        beside FSDP2 modules) two modules in one process would disagree about
-        which kernels the launcher asked for.
-        """
+        """Single-process eager load via ``from_pretrained`` + ``device_map``."""
         args = self.args
         assert self.is_eager
-        from dataclasses import asdict
-
         from ... import OMNI_MODEL_REGISTRY
 
         model_path = args.model_path
         model_type = self.module_config.model_type
         cls = OMNI_MODEL_REGISTRY[model_type]()
-        load_kwargs = {}
-        ops = args.ops_implementation
-        if ops is not None:
-            self.module_config.ops_implementation = {
-                **dict(self.module_config.ops_implementation or {}),
-                **{k: v for k, v in asdict(ops).items() if v is not None},
-            }
-            if ops.attn_implementation is not None:
-                self.module_config._attn_implementation = ops.attn_implementation
-                load_kwargs["attn_implementation"] = ops.attn_implementation
         if dist.is_initialized():
             device_map = {"": f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"}
         else:
@@ -320,7 +298,6 @@ class ModuleRuntime(VeOmniModelRuntime):
                 self.module_name,
                 device_map=device_map,
                 torch_dtype=torch.bfloat16,
-                attn_implementation=load_kwargs.get("attn_implementation"),
             ).eval()
             self.model_config = self.model.config
             self._build_model_assets()
@@ -334,7 +311,6 @@ class ModuleRuntime(VeOmniModelRuntime):
             config=self.module_config,
             torch_dtype=torch.bfloat16,
             device_map=device_map,
-            **load_kwargs,
         ).eval()
         self.model_config = self.model.config
         self._build_model_assets()
@@ -343,8 +319,8 @@ class ModuleRuntime(VeOmniModelRuntime):
         """Meta-init this module's sub-model from ``module_config``.
 
         The config comes from the composed :class:`OmniConfig`, which already
-        applied this module's ``model_config`` overwrites; :attr:`weights_path`
-        is read only for the weights.
+        applied this module's ``model_config`` and ``ops_implementation``
+        overwrites; :attr:`weights_path` is read only for the weights.
 
         Under an HF ``model_path`` the module is built on meta first so the
         :class:`~veomni.models.seed_omni.utils.hf_layout.HFSourceKeyConverter`
@@ -353,22 +329,10 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         args = self.args
         logger.info_rank0(f"ModuleRuntime '{self.module_name}': build module model")
-        from dataclasses import asdict
-
         from .....arguments import OpsImplementationConfig
         from .....models import build_foundation_model
 
-        ops = args.ops_implementation
-        if ops is not None:
-            self.module_config.ops_implementation = {
-                **dict(self.module_config.ops_implementation or {}),
-                **{k: v for k, v in asdict(ops).items() if v is not None},
-            }
-            if ops.attn_implementation is not None:
-                self.module_config._attn_implementation = ops.attn_implementation
-        else:
-            ops = OpsImplementationConfig(**dict(getattr(self.module_config, "ops_implementation", None) or {}))
-
+        ops = OpsImplementationConfig(**dict(getattr(self.module_config, "ops_implementation", None) or {}))
         acc = self.mesh_accelerator
         init_device = "meta" if self.reads_offline_cache else acc.init_device
         self.model = build_foundation_model(
