@@ -49,8 +49,10 @@
 #      Packed compressor path + Ulysses SP for DeepSeek-V4 sparse attention
 #    - function_replacement: eager_attention_forward
 #      Always call the local dsa_attention deepseek_v4 VeomniOp
+#    - method_override: DeepseekV4Model.__init__
+#      Build DSpark MTP draft stages when configured
 #    - method_override: DeepseekV4Model.forward
-#      Packed boundaries, SP-aware full-sequence masks, stateless indexer dispatch
+#      Packed boundaries, SP-aware full-sequence masks, stateless indexer dispatch, and DSpark MTP stages
 #    - class_replacement: DeepseekV4Experts
 #      Always call moe_experts VeomniOp on v5 gate_up_proj weights
 #    - method_override: DeepseekV4SparseMoeBlock.__init__
@@ -64,9 +66,9 @@
 #    - method_override: DeepseekV4HashRouter.forward
 #      Match the official DeepSeek-V4 FP32 hash-router projection
 #    - method_override: DeepseekV4ForCausalLM.__init__
-#      Bind ForCausalLMLoss and load_balancing_loss VeomniOps
+#      Bind ForCausalLMLoss, DSpark MTP chunk_loss, and load_balancing_loss VeomniOps
 #    - method_override: DeepseekV4ForCausalLM.forward
-#      Always call ForCausalLMLoss and load_balancing_loss VeomniOps
+#      Always call ForCausalLMLoss, DSpark MTP loss, and load_balancing_loss VeomniOps
 #    - method_override: DeepseekV4ForCausalLM.get_parallel_plan
 #      Register DeepseekV4 expert parallel plan for v5 generated modeling
 #
@@ -112,6 +114,7 @@ from veomni.distributed.sequence_parallel import (
     reduce_sequence_parallel_loss,
 )
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
+from veomni.models.transformers.deepseek_v4.dspark import build_dspark_blocks
 from veomni.models.transformers.deepseek_v4.indexer_loss import (
     _builds_indexer_kl,
     _indexer_loss_enabled,
@@ -2126,31 +2129,14 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] DeepseekV4Model
-# Methods patched: forward
+# Methods patched: __init__, forward
 # ======================================================================
 
 
 @auto_docstring
 class DeepseekV4Model(DeepseekV4PreTrainedModel):
-    def __init__(self, config: DeepseekV4Config):
-        super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [DeepseekV4DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = DeepseekV4RotaryEmbedding(config)
-        self.gradient_checkpointing = False
-        self.hc_head = DeepseekV4HyperHead(config)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
     # ================================================================
-    # Patch: DeepseekV4Model.forward
+    # Patch: DeepseekV4Model.__init__ & DeepseekV4Model.forward
     # 1. Prefer collator-provided packed_sequence_slices; derive them from
     #    cu_seq_lens_q only when that host metadata is missing.
     # 2. Keep use_cache=False forwards stateless so the TileLang indexer can run.
@@ -2159,7 +2145,38 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
     #    Build the sliding-window mask and packed compression metadata on the full
     #    sequence length so attention matches non-SP semantics after the all-gather
     #    inside ``DeepseekV4Attention``.
+    # 4. Build and run DSpark MTP draft stages when configured.
     # ================================================================
+    def __init__(self, config: "DeepseekV4Config"):
+        super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList(
+            [DeepseekV4DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.mtp = build_dspark_blocks(
+            config,
+            attention_cls=DeepseekV4Attention,
+            moe_cls=DeepseekV4SparseMoeBlock,
+            rms_norm_cls=DeepseekV4RMSNorm,
+            hyper_connection_cls=DeepseekV4HyperConnection,
+            hyper_head_cls=DeepseekV4HyperHead,
+        )
+        if getattr(config, "freeze_mtp", False):
+            self.mtp.requires_grad_(False)
+        self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = DeepseekV4RotaryEmbedding(config)
+        self.gradient_checkpointing = False
+        self.hc_head = DeepseekV4HyperHead(config)
+        if len(self.mtp) > 0:
+            self._no_split_modules = ["DeepseekV4DecoderLayer", "DeepseekV4DSparkBlock"]
+            self._keys_to_ignore_on_load_unexpected = []
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -2175,6 +2192,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
     ) -> MoeModelOutputWithIndexerKL:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        return_mtp_outputs = bool(kwargs.pop("return_mtp_outputs", False))
         # Stateless prefill/training must keep the cache absent: the TileLang
         # Lightning Indexer dispatch is intentionally cache-free, and creating a
         # DynamicCache here would silently force its eager decode fallback even
@@ -2297,6 +2315,20 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             "compress": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="compress"),
         }
 
+        run_mtp = len(self.mtp) > 0 and (
+            return_mtp_outputs or (self.training and any(p.requires_grad for p in self.mtp.parameters()))
+        )
+        if run_mtp:
+            target_ids = getattr(self.config, "dspark_target_layer_ids", None)
+            if not target_ids:
+                target_ids = list(range(max(0, self.config.num_hidden_layers - 3), self.config.num_hidden_layers))
+            draft_target_ids = list(target_ids)
+            draft_target_set = set(draft_target_ids)
+        else:
+            draft_target_ids = []
+            draft_target_set = set()
+        draft_inputs: dict[int, torch.Tensor] = {}
+
         indexer_kl_total = None
         indexer_uniform_total = None
         indexer_kl_layers = 0
@@ -2337,6 +2369,8 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 indexer_kl_layers += 1
             else:
                 hidden_states = layer_output
+            if run_mtp and layer.layer_idx in draft_target_set:
+                draft_inputs[layer.layer_idx] = hidden_states.mean(dim=2)
 
         # A model configured for the loss whose ``layer_types`` has no CSA entry would
         # otherwise accept the flag and train nothing.
@@ -2349,6 +2383,29 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             )
 
         hidden_states = self.norm(self.hc_head(hidden_states))
+
+        mtp_hidden_states = None
+        mtp_markov_bias = None
+        if run_mtp:
+            if any(idx not in draft_inputs for idx in draft_target_ids):
+                raise RuntimeError(
+                    f"DSpark MTP is active but target layers {draft_target_ids} were not all collected "
+                    f"(collected {sorted(draft_inputs)})."
+                )
+            draft_hiddens = [draft_inputs[idx] for idx in draft_target_ids]
+            mtp_streams = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
+            mtp_main: torch.Tensor | list[torch.Tensor] = torch.cat(draft_hiddens, dim=-1)
+            last_stage = len(self.mtp) - 1
+            for stage_idx, stage in enumerate(self.mtp):
+                mtp_streams, mtp_main, mtp_hidden_states, mtp_markov_bias = stage(
+                    mtp_streams,
+                    position_embeddings,
+                    position_ids,
+                    mtp_main,
+                    full_position_ids if sp_enabled else None,
+                    input_ids if stage_idx == last_stage else None,
+                )
+
         return MoeModelOutputWithIndexerKL(
             last_hidden_state=hidden_states,
             past_key_values=return_cache,
@@ -2358,6 +2415,8 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             if indexer_kl_total is not None
             else None,
             indexer_kl_layers=indexer_kl_layers if indexer_kl_total is not None else None,
+            mtp_hidden_states=mtp_hidden_states,
+            mtp_markov_bias=mtp_markov_bias,
         )
 
 
@@ -2456,6 +2515,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         self.num_experts_per_tok = config.num_experts_per_tok
         impl = resolve_op_impl("cross_entropy_loss_implementation")
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.veomni_mtp_ce = VeomniOp("cross_entropy_loss", "standard", "chunk_loss")
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.veomni_lb = VeomniOp(
             "load_balancing_loss",
@@ -2463,6 +2523,9 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             resolve_op_impl("load_balancing_loss_implementation"),
         )
         self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
+        if len(self.model.mtp) > 0:
+            self._no_split_modules = ["DeepseekV4DecoderLayer", "DeepseekV4DSparkBlock"]
+            self._keys_to_ignore_on_load_unexpected = []
         self.post_init()
 
     @can_return_tuple
@@ -2483,6 +2546,15 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
+        mtp_loss_coef = getattr(self.config, "mtp_loss_coef", 1.0)
+        if (
+            "return_mtp_outputs" not in kwargs
+            and labels is not None
+            and len(self.model.mtp) > 0
+            and mtp_loss_coef > 0
+            and not getattr(self.config, "freeze_mtp", False)
+        ):
+            kwargs = {**kwargs, "return_mtp_outputs": True}
 
         outputs: MoeModelOutputWithIndexerKL = self.model(
             input_ids=input_ids,
@@ -2556,6 +2628,43 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             if labels is not None:
                 aux_metrics["lm_loss_before_indexer_kl"] = loss.detach()
                 loss = loss + self.config.dsa_indexer_loss_coef * indexer_kl.to(loss.device)
+
+        if labels is not None and outputs.mtp_hidden_states is not None and mtp_loss_coef > 0:
+            if outputs.mtp_markov_bias is None:
+                raise RuntimeError(
+                    "DeepseekV4Model returned mtp_hidden_states without mtp_markov_bias; "
+                    "DSpark MTP training requires input_ids to compute the Markov residual."
+                )
+            mtp_hidden_states = outputs.mtp_hidden_states[:, slice_indices, :]
+            mtp_markov_bias = outputs.mtp_markov_bias[:, slice_indices, :]
+            sp_enabled = get_parallel_state().sp_enabled
+            raw_shift_labels = kwargs.get("shift_labels")
+            if raw_shift_labels is not None:
+                mtp_shift_labels = raw_shift_labels
+            elif sp_enabled:
+                mtp_shift_labels = labels
+            else:
+                mtp_shift_labels = F.pad(labels, (0, 1), value=-100)[..., 1:].contiguous()
+            if position_ids is None:
+                mtp_pos_ids = torch.arange(mtp_shift_labels.shape[-1], device=mtp_shift_labels.device).unsqueeze(0)
+            else:
+                mtp_pos_ids = position_ids
+            mtp_shift_labels = mtp_shift_labels.masked_fill(mtp_pos_ids.to(device=mtp_shift_labels.device) == 0, -100)
+            mtp_loss, _, _ = ForCausalLMLoss(
+                logits=None,
+                labels=None,
+                shift_labels=mtp_shift_labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=mtp_hidden_states,
+                weights=self.lm_head.weight,
+                logits_bias=mtp_markov_bias,
+                chunk_size=2048,
+                op=self.veomni_mtp_ce,
+            )
+            loss = loss + mtp_loss_coef * mtp_loss.to(loss.device)
+            if aux_metrics is None:
+                aux_metrics = {}
+            aux_metrics["mtp_loss"] = mtp_loss.detach()
 
         return MoeCausalLMOutputWithLogProbs(
             loss=loss,

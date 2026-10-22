@@ -35,6 +35,7 @@ class _Meta:
     has_weight: bool
     hidden_needs_grad: bool = True
     weight_needs_grad: bool = True
+    bias_needs_grad: bool = False
 
 
 def flatten_tokens(hidden: Tensor, labels: Tensor) -> tuple[Tensor, Tensor]:

@@ -136,3 +136,46 @@ def test_undeclared_is_not_the_same_as_absent(tmp_path: Path):
 
     assert not hasattr(UpstreamConfig.from_pretrained(tmp_path, dsa_indexer_loss=True), "dsa_indexer_loss")
     assert DeepseekV4Config.from_pretrained(tmp_path, dsa_indexer_loss=True).dsa_indexer_loss is True
+
+
+def test_dspark_mtp_config_fields_and_defaults():
+    config = DeepseekV4Config(num_hidden_layers=4, layer_types=["compressed_sparse_attention"] * 4)
+    assert config.dspark_block_size == 0
+    assert config.dspark_target_layer_ids == [1, 2, 3]
+    assert config.mtp_loss_coef == 1.0
+    assert config.freeze_mtp is False
+    assert config.moe_config_for_layer(0) == (config.n_routed_experts, config.num_experts_per_tok)
+    assert config.moe_config_for_layer(4) == (config.n_routed_experts, config.num_experts_per_tok)
+
+    custom = DeepseekV4Config(
+        num_hidden_layers=4,
+        compress_ratios=[0, 0, 4, 128, 0, 0, 0],
+        dspark_block_size=5,
+        dspark_n_routed_experts=2,
+        dspark_num_experts_per_tok=1,
+    )
+    assert custom.num_nextn_predict_layers == 3
+    assert custom.moe_config_for_layer(4) == (2, 1)
+
+
+@pytest.mark.parametrize("coef", [-1.0, float("nan"), float("inf")])
+def test_mtp_loss_coef_rejects_negative_and_non_finite(coef):
+    config = DeepseekV4Config(
+        num_hidden_layers=4,
+        layer_types=["compressed_sparse_attention"] * 4,
+        dspark_block_size=5,
+        mtp_loss_coef=coef,
+    )
+    with pytest.raises(ValueError, match="mtp_loss_coef"):
+        config.validate_build_prerequisites()
+
+
+def test_dspark_target_layer_ids_rejects_out_of_range_when_mtp_enabled():
+    config = DeepseekV4Config(
+        num_hidden_layers=4,
+        layer_types=["compressed_sparse_attention"] * 4,
+        dspark_block_size=5,
+        dspark_target_layer_ids=[2, 4],
+    )
+    with pytest.raises(ValueError, match="dspark_target_layer_ids"):
+        config.validate_build_prerequisites()

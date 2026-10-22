@@ -61,6 +61,7 @@ from .deepseek_v4_gpu_patch_gen_config import (
     deepseek_v4_mlp_forward_patched,
     deepseek_v4_mlp_init_patched,
     deepseek_v4_model_forward_patched,
+    deepseek_v4_model_init_patched,
     deepseek_v4_rms_norm_forward_patched,
     deepseek_v4_rms_norm_init_patched,
     deepseek_v4_rotary_embedding_forward_patched,
@@ -190,9 +191,14 @@ config.replace_function(
     description="Always call the local dsa_attention deepseek_v4 VeomniOp",
 )(deepseek_v4_eager_attention_forward_patched)
 config.override_method(
+    "DeepseekV4Model.__init__",
+    replacement=deepseek_v4_model_init_patched,
+    description="Build DSpark MTP draft stages when configured",
+)
+config.override_method(
     "DeepseekV4Model.forward",
     replacement=deepseek_v4_model_forward_patched,
-    description="Packed boundaries, SP-aware full-sequence masks, stateless indexer dispatch",
+    description="Packed boundaries, SP-aware full-sequence masks, stateless indexer dispatch, and DSpark MTP stages",
 )
 config.replace_class(
     "DeepseekV4Experts",
@@ -202,7 +208,7 @@ config.replace_class(
 config.override_method(
     "DeepseekV4ForCausalLM.__init__",
     replacement=deepseek_v4_forcausallm_init_patched,
-    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
+    description="Bind ForCausalLMLoss, DSpark MTP chunk_loss, and load_balancing_loss VeomniOps",
 )
 config.override_method(
     "DeepseekV4SparseMoeBlock.__init__",
@@ -213,7 +219,7 @@ config.override_method(
 config.override_method(
     "DeepseekV4ForCausalLM.forward",
     replacement=deepseek_v4_forcausallm_forward_patched,
-    description="Always call ForCausalLMLoss and load_balancing_loss VeomniOps",
+    description="Always call ForCausalLMLoss, DSpark MTP loss, and load_balancing_loss VeomniOps",
 )
 config.override_method(
     "DeepseekV4ForCausalLM.get_parallel_plan",
