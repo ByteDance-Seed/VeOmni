@@ -17,12 +17,14 @@ DEVICES = ["cpu", pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILA
 def _run(device, dtype, *, offload, recompute, frozen, all_ignored):
     torch.manual_seed(127)
     hidden = torch.randn(2, 23, 64).to(device=device, dtype=dtype).requires_grad_(frozen != "hidden")
-    weight = torch.randn(37, 64).to(device=device, dtype=dtype).requires_grad_(frozen != "weight")
-    labels = torch.randint(0, 37, (2, 23), device=device)
+    weight = torch.randn(137, 64).to(device=device, dtype=dtype).requires_grad_(frozen != "weight")
+    labels = torch.randint(0, 137, (2, 23), device=device)
     labels[:, 1:8] = -100
     if all_ignored:
         labels.fill_(-100)
     op = VeomniOp("cross_entropy_loss", "standard", "chunk_loss")
+    # Even the last (2 x 3) token chunk is eligible for the >1 KiB offload policy.
+    assert 2 * 3 * weight.size(0) * torch.float32.itemsize > 1024
     offloaded, restored = [], []
     contexts = (nullcontext(), nullcontext())
     if offload:
@@ -57,7 +59,7 @@ def _run(device, dtype, *, offload, recompute, frozen, all_ignored):
         loss.backward()
     if offload:
         assert offloaded and restored
-        assert all(len(shape) < 2 or shape[-1] != 37 for shape, _ in offloaded), (
+        assert all(len(shape) < 2 or shape[-1] != 137 for shape, _ in offloaded), (
             "Transient vocabulary logits escaped the chunk"
         )
         if device == "npu":
