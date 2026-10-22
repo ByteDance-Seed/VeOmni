@@ -187,22 +187,24 @@ def _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings):
         )
 
 
-def _require_varlen_attention(attention_implementation, *, num_segments, ulysses_enabled, attention_name):
-    """Reject a backend that would mix packed sequences or skip the Ulysses exchange.
+def _require_varlen_attention(attention_implementation, *, num_segments, ulysses_enabled, attention_name, causal):
+    """Reject a backend that would leak future tokens, mix packed sequences or skip the Ulysses exchange.
 
     MiniMax attention passes no mask, so only a varlen backend keeps packed
     sequences (media inputs or text samples) apart, and only the VeOmni
     ``veomni_*`` adapters run the Ulysses all-to-all; anything else silently
-    attends across sequences or within the local shard only.
+    attends across sequences or within the local shard only. ``causal``
+    attention (the dense language layers) needs the varlen backend even for a
+    single sequence: eager attention, for one, applies no causal mask itself.
     """
     varlen_backend = attention_implementation in VARLEN_ATTENTION_TYPES and (
         not ulysses_enabled or attention_implementation.startswith("veomni_")
     )
-    if not varlen_backend and (num_segments > 1 or ulysses_enabled):
+    if not varlen_backend and (causal or num_segments > 1 or ulysses_enabled):
+        requirement = "causal masking" if causal else "multiple packed sequences"
         raise ValueError(
             f"MiniMax M3 VL {attention_name} needs a varlen FlashAttention backend (flash_attention_2/3/4) for "
-            "multiple packed sequences, and its VeOmni veomni_* adapter under Ulysses, "
-            f"got {attention_implementation!r}."
+            f"{requirement}, and its VeOmni veomni_* adapter under Ulysses, got {attention_implementation!r}."
         )
 
 
@@ -1078,6 +1080,7 @@ class MiniMaxM3VLTextModel(MiniMaxM3VLPreTrainedModel):
                 num_segments=kwargs["cu_seq_lens_q"].numel() - 1,
                 ulysses_enabled=parallel_state.ulysses_enabled,
                 attention_name="dense language attention",
+                causal=True,
             )
         # --- Patch.2 ---
 
@@ -1376,6 +1379,7 @@ class MiniMaxM3VLVisionModel(MiniMaxM3VLPreTrainedModel):
             num_segments=len(grid_thw_list),
             ulysses_enabled=parallel_state.ulysses_enabled,
             attention_name="vision attention",
+            causal=False,
         )
 
         sp_pad_seq_len = 0

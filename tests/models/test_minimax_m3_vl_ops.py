@@ -177,15 +177,25 @@ def test_minimax_m3_vl_sparse_layers_never_bind_the_standard_attention(module_na
         ("eager", [0, 2, 5], False, True),
         ("eager", [0, 5], True, True),
         ("flash_attention_2", [0, 5], True, True),
-        ("eager", [0, 5], False, False),
+        ("eager", [0, 5], False, True),
+        ("sdpa", [0, 5], False, True),
+        ("flash_attention_2", [0, 5], False, False),
         ("veomni_flash_attention_2", [0, 2, 5], True, False),
     ],
-    ids=["eager_packed", "eager_ulysses", "non_sp_varlen_ulysses", "eager_single_sequence", "sp_varlen_ulysses"],
+    ids=[
+        "eager_packed",
+        "eager_ulysses",
+        "non_sp_varlen_ulysses",
+        "eager_single_sequence",
+        "sdpa_single_sequence",
+        "varlen_single_sequence",
+        "sp_varlen_ulysses",
+    ],
 )
 def test_minimax_m3_vl_dense_language_attention_requires_varlen_backend(
     module_name, attn_implementation, cu_seq_lens, ulysses_enabled, rejected, monkeypatch
 ):
-    """Without a mask, non-varlen dense attention would mix packed samples; non-VeOmni backends skip the Ulysses exchange."""
+    """Without a mask, non-varlen dense attention leaks future tokens or mixes packed samples; non-VeOmni backends skip the Ulysses exchange."""
     modeling = importlib.import_module(module_name)
     model = modeling.MiniMaxM3VLTextModel(_text_config(modeling, layer_types=["full_attention"])).eval()
     model.config._attn_implementation = attn_implementation
