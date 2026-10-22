@@ -13,7 +13,7 @@ Read these references before changing model code:
 - `.agents/skills/veomni-patchgen-model/SKILL.md`
 - `.agents/skills/veomni-new-op/SKILL.md`
 - `docs/design/patchgen.md`
-- `docs/design/kernel_selection.md`
+- `docs/design/op_selection.md`
 - `veomni/ops/README.md`
 - `.agents/knowledge/testing.md`
 

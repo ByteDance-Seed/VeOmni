@@ -73,11 +73,7 @@ def test_process_sample_gemma3_keeps_one_bos_and_assistant_label_boundary(monkey
         tokenizer=FakeTokenizer(),
         apply_chat_template=lambda messages, **_kwargs: " ".join(
             ["<bos>"]
-            + [
-                token
-                for message in messages
-                for token in (f"<{message['role']}>", message["content"][0]["text"])
-            ]
+            + [token for message in messages for token in (f"<{message['role']}>", message["content"][0]["text"])]
         ),
     )
     conversations = [
@@ -90,9 +86,7 @@ def test_process_sample_gemma3_keeps_one_bos_and_assistant_label_boundary(monkey
     result = process_sample_gemma3(
         sample={"conversations": []},
         processor=processor,
-        position_id_func=lambda input_ids, **_kwargs: {
-            "position_ids": torch.arange(input_ids.shape[-1]).unsqueeze(0)
-        },
+        position_id_func=lambda input_ids, **_kwargs: {"position_ids": torch.arange(input_ids.shape[-1]).unsqueeze(0)},
     )[0]
 
     assert token_calls == [False, False, False]
@@ -135,9 +129,7 @@ def test_process_sample_gemma3_handles_interleaved_tulu_sample_with_null_columns
             ],
         },
         processor=processor,
-        position_id_func=lambda input_ids, **_kwargs: {
-            "position_ids": torch.arange(input_ids.shape[-1]).unsqueeze(0)
-        },
+        position_id_func=lambda input_ids, **_kwargs: {"position_ids": torch.arange(input_ids.shape[-1]).unsqueeze(0)},
     )[0]
 
     assert fetched_images == []
