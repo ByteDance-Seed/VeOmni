@@ -52,7 +52,7 @@ from veomni.utils import helper
 from veomni.utils.helper import get_cache_dir
 
 
-_CI_LAUNCH = LaunchSpec(nproc=8)
+_CI_LAUNCH = LaunchSpec(nproc=4)
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
@@ -64,6 +64,8 @@ os.environ["NCCL_DEBUG"] = "OFF"
 class TrainerTest(BaseTrainer):
     gt_data_list: List[Dict[str, Any]] = []
     pred_data_list: List[Dict[str, Any]] = []
+    gt_epochs: List[int] = []
+    pred_epochs: List[int] = []
     golden_env_metrics: helper.EnvironMeter
     resume_dcp_path: str
 
@@ -144,7 +146,7 @@ class GlobalStateCallbackTest(GlobalStateCallback):
         pass
 
     def on_epoch_end(self, state: TrainerState, **kwargs):
-        if state.epoch == 1 and not self.trainer.is_resume:
+        if state.epoch == 0 and not self.trainer.is_resume:
             self.save_global_state(state)
             self.trainer.resume_dcp_path = os.path.join(
                 self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}"
@@ -189,11 +191,21 @@ class CheckCallback(Callback):
         if self.trainer.start_save_data:
             if not self.trainer.is_resume:
                 self.trainer.gt_data_list.append(micro_batches)
+                self.trainer.gt_epochs.append(state.epoch)
             else:
                 self.trainer.pred_data_list.append(micro_batches)
+                self.trainer.pred_epochs.append(state.epoch)
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         if self.trainer.is_resume:
+            assert len(self.trainer.gt_data_list) > 0, "Expected non-empty ground-truth batches after save point"
+            assert len(self.trainer.gt_data_list) == len(self.trainer.pred_data_list), (
+                f"Resumed batch count {len(self.trainer.pred_data_list)} != ground truth {len(self.trainer.gt_data_list)}"
+            )
+            assert self.trainer.gt_epochs == self.trainer.pred_epochs
+            assert set(self.trainer.pred_epochs) == {1, 2}, (
+                f"Expected resumed run to cover epochs 1 and 2 (crossing an epoch boundary), got {set(self.trainer.pred_epochs)}"
+            )
             compare_global_batch(self.trainer.gt_data_list, self.trainer.pred_data_list)
             compare_metrics(self.trainer.step_env_metrics, self.trainer.golden_env_metrics)
 
@@ -271,7 +283,7 @@ def build_command(dataset_type: str, dyn_bsz: bool, data_path: str):
         # pin_memory provides no benefit anyway. Mirrors the fix in #639 for
         # tests/data/test_multisource_dataset.py.
         "--data.dataloader.pin_memory=False",
-        "--train.num_train_epochs=5",
+        "--train.num_train_epochs=3",
         "--train.checkpoint.output_dir=.tests/cache",
         # Hardware-aware ops_implementation overrides. ``resolve_ops_overrides``
         # emits NPU-supported per-op backends on NPU and ``[]`` on GPU (the

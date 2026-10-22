@@ -24,7 +24,7 @@ try:
 except Exception as _:
     from checkpoint_verification_utils import verify_dcp_to_hf_conversion
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter
 from tests.checkpoints.utils import get_checkpoint_test_nproc
 from veomni.arguments import parse_args
 from veomni.checkpoint.layout import weights_dir
@@ -180,12 +180,13 @@ class CheckpointCallbackTest(CheckpointCallback):
     trainer: TrainerTest
 
     def on_step_end(self, state: TrainerState, **kwargs):
-        pass
-
-    def on_epoch_end(self, state: TrainerState, **kwargs):
-        if state.epoch == 0:
+        if state.global_step == 1:
             self.trainer.golden_model_sd = copy.deepcopy(self.trainer.model.state_dict())
             self.trainer.golden_optim_sd = copy.deepcopy(self.trainer.model.optimizer.state_dict())
+            flat_optim = flatten_dict(self.trainer.golden_optim_sd)
+            assert any("step" not in k and "param_groups" not in k for k in flat_optim), (
+                "Expected non-empty optimizer state before saving step-1 DCP checkpoint"
+            )
             self._save_dcp(state)
             # Two different paths: resume takes the step directory, while a
             # reader of raw shards wants the DCP directory inside it.
@@ -201,6 +202,9 @@ class CheckpointCallbackTest(CheckpointCallback):
                 self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}", "hf_ckpt"
             )
 
+    def on_epoch_end(self, state: TrainerState, **kwargs):
+        pass
+
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         pass
 
@@ -212,6 +216,10 @@ class CheckCallback(Callback):
     trainer: TrainerTest
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        assert state.global_step > self.trainer.dcp_global_step, (
+            f"Expected training to continue past saved step {self.trainer.dcp_global_step}, "
+            f"ended at step {state.global_step}"
+        )
         if self.trainer.args.train.global_rank == 0:
             # Verify HF checkpoint by comparing with DCP checkpoint
             logger.info("Verifying HF checkpoint conversion...")
@@ -220,6 +228,21 @@ class CheckCallback(Callback):
                 hf_checkpoint_dir=self.trainer.hf_weights_path,
                 safe_serialization=True,
             ), "HF checkpoint verification failed"
+
+        # Confirm post-save training mutated model weights before restoring step-1 DCP.
+        post_step2_sd = self.trainer.model.state_dict()
+        changed_params = [
+            k
+            for k, v in post_step2_sd.items()
+            if k in self.trainer.golden_model_sd
+            and not torch.equal(
+                v.to_local() if hasattr(v, "to_local") else v,
+                self.trainer.golden_model_sd[k].to_local()
+                if hasattr(self.trainer.golden_model_sd[k], "to_local")
+                else self.trainer.golden_model_sd[k],
+            )
+        ]
+        assert changed_params, "Expected step-2 optimizer update to mutate model weights after step-1 save"
 
         self.trainer.args.train.checkpoint.load_path = self.trainer.step_ckpt_path
         self.trainer.load()
@@ -242,13 +265,20 @@ if __name__ == "__main__":
     main()
 
 
-def _run_trainer_saveload_and_verify(model_name: str, ep_size: int, dp_replicate_size: Optional[int] = None):
+def _run_trainer_saveload_and_verify(
+    model_name: str,
+    ep_size: int,
+    nproc: int,
+    dp_replicate_size: Optional[int] = None,
+):
+    if nproc > min(get_checkpoint_test_nproc(), runner_device_count()):
+        pytest.skip(f"Requires nproc={nproc}, exceeds configured/available devices")
     # Every round-trip also exports HF weights, checks dtypes, and verifies both
     # direct export and the independent DCP-to-HF CLI conversion.
     exec_command = get_checkpoint_test_command(
-        model_name, ep_size, save_hf_weights=True, dp_replicate_size=dp_replicate_size
+        model_name, ep_size, save_hf_weights=True, dp_replicate_size=dp_replicate_size, nproc=nproc
     )
-    merge_command = get_merge_dcp_to_hf_command(model_name, ep_size, dp_replicate_size=dp_replicate_size)
+    merge_command = get_merge_dcp_to_hf_command(model_name, ep_size, dp_replicate_size=dp_replicate_size, nproc=nproc)
 
     exec_result = subprocess.run(exec_command, shell=True, check=True)
     assert exec_result.returncode == 0
@@ -257,59 +287,51 @@ def _run_trainer_saveload_and_verify(model_name: str, ep_size: int, dp_replicate
     assert merge_result.returncode == 0
 
     assert verify_dcp_to_hf_conversion(
-        dcp_checkpoint_dir=get_dcp_weights_dir(model_name, ep_size, dp_replicate_size),
-        hf_checkpoint_dir=get_hf_output_dir(model_name, ep_size, dp_replicate_size),
+        dcp_checkpoint_dir=get_dcp_weights_dir(model_name, ep_size, dp_replicate_size, nproc=nproc),
+        hf_checkpoint_dir=get_hf_output_dir(model_name, ep_size, dp_replicate_size, nproc=nproc),
         safe_serialization=True,
     ), (
-        f"Save and Load Checkpoint failed for `{model_name}` with ep_size `{ep_size}` "
-        f"and dp_replicate_size `{dp_replicate_size}`"
+        f"Save and Load Checkpoint failed for `{model_name}` with ep_size `{ep_size}`, "
+        f"nproc `{nproc}`, and dp_replicate_size `{dp_replicate_size}`"
     )
 
-    shutil.rmtree(get_output_dir(model_name, ep_size, dp_replicate_size))
+    shutil.rmtree(get_output_dir(model_name, ep_size, dp_replicate_size, nproc=nproc))
 
 
-# MoE save/load coverage.
-# deepseek_v4 is included for hash-MoE tid2eid + fused experts + mHC DCP resume.
-# CI L20-8 keeps the default nproc=8; local machines can override with
-# VEOMNI_CHECKPOINT_TEST_NPROC (ep sizes larger than nproc are skipped).
-TEST_MODELS = ["qwen3_moe", "deepseek_v3", "deepseek_v4"]
-TEST_EP_SIZES = [1, 4, 8]
+# MoE save/load coverage on 4 GPUs:
+# - qwen3_moe ep=1: 1D FSDP (no EP)
+# - qwen3_moe ep=2: 2D expert mesh (ep_fsdp=2, ep=2) with both axes active
+# - qwen3_moe ep=4: 2D expert mesh with degenerate FSDP axis (ep_fsdp=1, ep=4)
+# - deepseek_v3 ep=2: DeepSeek-V3 converter + 2D expert mesh (ep_fsdp=2, ep=2)
+# - deepseek_v4 ep=1: hash-MoE tid2eid + fused experts + mHC DCP resume
+_SAVELOAD_CASES = [
+    pytest.param("qwen3_moe", 1, 4, id="qwen3_moe-1"),
+    pytest.param("qwen3_moe", 2, 4, id="qwen3_moe-2"),
+    pytest.param("qwen3_moe", 4, 4, id="qwen3_moe-4"),
+    pytest.param("deepseek_v3", 2, 4, id="deepseek_v3-2"),
+    pytest.param("deepseek_v4", 1, 4, id="deepseek_v4-1"),
+]
 
 
-def _saveload_cases():
-    try:
-        from .utils import get_checkpoint_test_nproc
-    except Exception:
-        from utils import get_checkpoint_test_nproc
-
-    nproc = get_checkpoint_test_nproc()
-    cases = []
-    for model in TEST_MODELS:
-        # DeepSeek-V4 EP token dispatch is not yet covered by saveload (e2e also
-        # keeps max_ep_size=1). Exercise DCP resume + HF export at ep=1 only.
-        ep_sizes = [1] if model == "deepseek_v4" else TEST_EP_SIZES
-        for ep in ep_sizes:
-            if ep <= nproc:
-                cases.append((model, ep))
-    return cases
+@pytest.mark.launch_plan(provider=from_parameter("nproc"))
+@pytest.mark.parametrize("model_name,ep_size,nproc", _SAVELOAD_CASES)
+def test_trainer_saveload(model_name: str, ep_size: int, nproc: int):
+    _run_trainer_saveload_and_verify(model_name, ep_size, nproc=nproc)
 
 
-@pytest.mark.launch_plan(provider=lambda context: LaunchSpec(nproc=get_checkpoint_test_nproc()))
-@pytest.mark.parametrize("model_name,ep_size", _saveload_cases())
-def test_trainer_saveload(model_name: str, ep_size: int):
-    _run_trainer_saveload_and_verify(model_name, ep_size)
+# HSDP save/load coverage:
+# - nproc=8, ep=2, dp_replicate=2 -> 3D expert mesh (2, 2, 2), all three dims active (ep_fsdp > 1).
+# - nproc=4, ep=2, dp_replicate=2 -> 3D expert mesh (2, 1, 2), degenerate ep_fsdp=1 boundary.
+_HSDP_SAVELOAD_CASES = [
+    pytest.param(2, 8, id="ep2-8gpu"),
+    pytest.param(2, 4, id="ep2-4gpu"),
+]
 
 
-# HSDP save/load coverage on 8 GPUs: dp = (dp_replicate=2, dp_shard=4). This
-# makes the expert mesh 3D (ep_replicate, ep_fsdp, ep) and exercises the
-# 3-placement restore/drop path in the DCP checkpointer end-to-end (train ->
-# DCP save -> load -> compare golden state dicts, plus DCP->HF merge). Cases:
-#   * ep2: ep mesh (2, 2, 2) — all three dims active (ep_fsdp > 1).
-#   * ep4: ep mesh (2, 1, 4) — degenerate ep_fsdp.
-@pytest.mark.launch_plan(provider=lambda context: LaunchSpec(nproc=get_checkpoint_test_nproc()))
-@pytest.mark.parametrize("ep_size", [2, 4])
-def test_trainer_saveload_hsdp(ep_size: int):
-    _run_trainer_saveload_and_verify("qwen3_moe", ep_size, dp_replicate_size=2)
+@pytest.mark.launch_plan(provider=from_parameter("nproc"))
+@pytest.mark.parametrize("ep_size,nproc", _HSDP_SAVELOAD_CASES)
+def test_trainer_saveload_hsdp(ep_size: int, nproc: int):
+    _run_trainer_saveload_and_verify("qwen3_moe", ep_size, nproc=nproc, dp_replicate_size=2)
 
 
 @pytest.mark.launch_plan(provider=_CI_LAUNCH)
