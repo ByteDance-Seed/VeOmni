@@ -10,6 +10,12 @@ from pathlib import Path
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+_CI_SHARD_LAUNCH = LaunchSpec(nproc=2, device="cpu")
+
 
 PACKAGE = "_qwen38_optimizer_test"
 package = types.ModuleType(PACKAGE)
@@ -270,13 +276,14 @@ def _distributed_worker(rank, world, rendezvous, checkpoint_dir):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_SHARD_LAUNCH)
 def test_distributed_updates_and_dcp_resume(tmp_path):
     import torch.multiprocessing as mp
 
     mp.start_processes(
         _distributed_worker,
-        args=(2, str(tmp_path / "rdzv"), str(tmp_path / "dcp")),
-        nprocs=2,
+        args=(_CI_SHARD_LAUNCH.nproc, str(tmp_path / "rdzv"), str(tmp_path / "dcp")),
+        nprocs=_CI_SHARD_LAUNCH.nproc,
         join=True,
         start_method="fork",
     )
@@ -372,14 +379,15 @@ def _cold_process_worker(rank, world, rendezvous, path, phase):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_SHARD_LAUNCH)
 def test_fresh_process_dcp_next_update_is_exact(tmp_path):
     import torch.multiprocessing as mp
 
     for phase in ("save", "resume"):
         mp.start_processes(
             _cold_process_worker,
-            args=(2, str(tmp_path / f"rdzv-{phase}"), str(tmp_path / "checkpoint"), phase),
-            nprocs=2,
+            args=(_CI_SHARD_LAUNCH.nproc, str(tmp_path / f"rdzv-{phase}"), str(tmp_path / "checkpoint"), phase),
+            nprocs=_CI_SHARD_LAUNCH.nproc,
             join=True,
             start_method="fork",
         )
@@ -507,6 +515,11 @@ def _local_test(tensor):
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor.detach()
 
 
+def _ple_owner_launch(mode):
+    return LaunchSpec(nproc=4 if mode == "persistent" else 2, device="cpu")
+
+
+@pytest.mark.launch_plan(provider=lambda context: _ple_owner_launch(context.params["mode"]))
 @pytest.mark.parametrize("mode", ["single", "multi", "persistent"])
 def test_ple_asymmetric_owner_checkpoint_and_cold_resume(tmp_path, mode):
     import torch.multiprocessing as mp
@@ -515,13 +528,13 @@ def test_ple_asymmetric_owner_checkpoint_and_cold_resume(tmp_path, mode):
         mp.start_processes(
             _ple_asymmetric_worker,
             args=(
-                4 if mode == "persistent" else 2,
+                _ple_owner_launch(mode).nproc,
                 str(tmp_path / f"rdzv-{phase}"),
                 str(tmp_path / "checkpoint"),
                 phase,
                 mode,
             ),
-            nprocs=4 if mode == "persistent" else 2,
+            nprocs=_ple_owner_launch(mode).nproc,
             join=True,
             start_method="fork",
         )

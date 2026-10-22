@@ -1529,14 +1529,16 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises when the model resolves its kernel."
         },
     )
-    qsa_attention_implementation: Literal["eager", "tilelang"] = field(
+    qsa_attention_implementation: Literal["eager", "tilelang", "torch_npu"] = field(
         default="eager",
         metadata={
             "help": "Qwen4-Exp QSA sparse attention. 'eager' expands the compact global token "
             "selection to a dense mask and runs quadratic PyTorch attention (numerical reference). "
-            "'tilelang' gathers the selected K/V rows instead (requires tilelang, bf16, NVIDIA CUDA); "
-            "it covers training forward/backward only, no KV cache, and raises on an attention mask. "
-            "Nonzero attention dropout falls back to eager with a warning."
+            "'tilelang' gathers the selected K/V rows instead (requires tilelang, bf16, NVIDIA CUDA). "
+            "'torch_npu' prunes per-query-chunk KV intervals with an int8 scatter mask and runs "
+            "torch_npu.npu_fusion_attention (requires bf16, Ascend NPU). "
+            "Both fused backends cover training forward/backward only, no KV cache, and raise on an "
+            "attention mask. Nonzero attention dropout falls back to eager with a warning."
         },
     )
     dsa_indexer_implementation: Literal["eager", "cudnn", "cann", "tilelang"] = field(

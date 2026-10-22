@@ -21,7 +21,7 @@ If a field is not in this table, it is not an op-selection knob.
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+), `cann` (DeepSeek-V4, Ascend) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
-| QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
+| QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
@@ -181,6 +181,39 @@ not rebased for head-specific masks. See
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
 - Installation: `veomni/ops/install.py` — `apply_ops_patch()` / `apply_veomni_attention_patch()`
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
+
+### Qwen4-Exp QSA
+
+`qsa_attention_implementation` accepts `eager`, `tilelang`, and `torch_npu`.
+`eager` expands the compact token selection into the dense reference path and
+remains available across devices; `tilelang` gathers selected K/V rows without
+materializing the quadratic score tensor and requires NVIDIA CUDA and BF16
+inputs; `torch_npu` prunes per-query-chunk KV intervals with an `int8` scatter
+mask and runs `torch_npu.npu_fusion_attention` on Ascend NPUs.
+
+```yaml
+model:
+  ops_implementation:
+    qsa_attention_implementation: torch_npu   # Ascend NPU; use "tilelang" on NVIDIA CUDA
+```
+
+Its tensor contract mirrors the compact-index QSA path:
+
+- `query` is `[B, H_q, S, D]`, `key` and `value` are `[B, H_kv, S_kv, D]`,
+  and `selected_indices` is `[B, S, K]`. `H_q` must be divisible by `H_kv`,
+  and no KV heads are expanded in memory. Query, key, and value must be BF16
+  on the same device. Indices are `int32`/`int64` global KV positions. `-1` is
+  the only permitted padding or empty-row sentinel; every non-sentinel index
+  must remain in `[0, S_kv)`. `K` must be nonzero even when every row is empty.
+- The return value is `([B, S, H_q, D], None)`. In `torch_npu`, each query
+  block (`query_chunk_size=2048`) builds one contiguous KV interval, aligns its
+  bounds to 128 tokens without excluding a selected token, and constructs an
+  `int8` scatter mask for that interval. Attention remains dense inside each
+  interval; backward rebuilds the interval masks from saved softmax statistics
+  (`once_differentiable`), accumulates key/value gradients in FP32, and
+  explicitly zeros fully masked query rows and empty-batch KV gradients.
+- Both `tilelang` and `torch_npu` raise on an `attention_mask`, have no KV-cache
+  path, and fall back to `eager` with a one-time warning when `dropout > 0`.
 
 ### DeepSeek V4 DSA and mHC
 

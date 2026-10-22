@@ -29,6 +29,7 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM as HFDeepseekV4ForCausalLM
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import apply_rotary_pos_emb as hf_apply_rotary_pos_emb
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
@@ -573,22 +574,26 @@ def _run_deepseek_v4_ep_fixed_route_vjp(rank, world_size, init_file, seed):
     dist.destroy_process_group()
 
 
-def _has_four_nvidia_gpus() -> bool:
-    from veomni.utils.device import IS_CUDA_AVAILABLE, get_torch_device
+_EP_ORACLE_LAUNCH = LaunchSpec(nproc=4)
 
-    return bool(IS_CUDA_AVAILABLE and torch.version.hip is None and get_torch_device().device_count() >= 4)
+
+def _has_four_nvidia_gpus() -> bool:
+    from veomni.utils.device import IS_CUDA_AVAILABLE
+
+    return bool(IS_CUDA_AVAILABLE and torch.version.hip is None and runner_device_count() >= _EP_ORACLE_LAUNCH.nproc)
 
 
 @pytest.mark.skipif(
     not _has_four_nvidia_gpus(),
     reason="DeepSeek V4 EP expert oracle requires four NVIDIA CUDA devices",
 )
+@pytest.mark.launch_plan(provider=_EP_ORACLE_LAUNCH)
 @pytest.mark.parametrize("seed", [1, 2, 3])
 def test_deepseek_v4_expert_parallel_fixed_route_vjp_matches_fp32_reference(seed, tmp_path):
     """Check all-to-all output and four VJPs, unequal splits and duplicate slots."""
     torch.multiprocessing.spawn(
         _run_deepseek_v4_ep_fixed_route_vjp,
-        args=(4, str(tmp_path / "rendezvous"), seed),
-        nprocs=4,
+        args=(_EP_ORACLE_LAUNCH.nproc, str(tmp_path / "rendezvous"), seed),
+        nprocs=_EP_ORACLE_LAUNCH.nproc,
         join=True,
     )

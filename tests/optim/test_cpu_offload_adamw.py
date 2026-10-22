@@ -8,6 +8,7 @@ import torch
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.api import CheckpointException
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.checkpoint.dcp_checkpointer import (
     _ZERO_OPTIMIZER_STATE_MARKER,
     OptimizerState,
@@ -17,6 +18,14 @@ from veomni.checkpoint.dcp_checkpointer import (
 )
 from veomni.optim.cpu_offload_adamw import CPUOffloadAdamW
 from veomni.optim.master_fp32_adamw import FullFP32AdamW, MasterFP32AdamW
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+_CI_LAYOUT_LAUNCH = LaunchSpec(nproc=4, device="cpu")
+
+
+def _extra_parallel_launch(hsdp):
+    return LaunchSpec(nproc=8 if hsdp else 4, device="cpu")
 
 
 @pytest.mark.parametrize("offload", [False, True])
@@ -473,13 +482,14 @@ def _extra_parallel_resume_worker(rank, world, rendezvous, hsdp=False):
 
 
 @pytest.mark.parametrize("hsdp", [False, True])
+@pytest.mark.launch_plan(provider=lambda context: _extra_parallel_launch(context.params["hsdp"]))
 def test_extra_parallel_fsdp_state_resume_restores_parameter_mesh(tmp_path, hsdp):
     import torch.multiprocessing as mp
 
     mp.start_processes(
         _extra_parallel_resume_worker,
-        args=(8 if hsdp else 4, str(tmp_path / "rdzv"), hsdp),
-        nprocs=8 if hsdp else 4,
+        args=(_extra_parallel_launch(hsdp).nproc, str(tmp_path / "rdzv"), hsdp),
+        nprocs=_extra_parallel_launch(hsdp).nproc,
         join=True,
         start_method="fork",
     )
@@ -577,13 +587,14 @@ def _restore_fsdp_only_extra_parallel_worker(rank, world, rendezvous):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_LAYOUT_LAUNCH)
 def test_restore_fsdp_only_extra_parallel_uses_original_global_shape(tmp_path):
     import torch.multiprocessing as mp
 
     mp.start_processes(
         _restore_fsdp_only_extra_parallel_worker,
-        args=(4, str(tmp_path / "rdzv")),
-        nprocs=4,
+        args=(_CI_LAYOUT_LAUNCH.nproc, str(tmp_path / "rdzv")),
+        nprocs=_CI_LAYOUT_LAUNCH.nproc,
         join=True,
         start_method="fork",
     )
@@ -668,10 +679,11 @@ def _extra_parallel_dcp_resume_worker(rank, world, rendezvous, checkpoint, hsdp,
 @pytest.mark.parametrize("optimizer_kind", ["cpu_offload_adamw", "full_fp32_adamw"])
 @pytest.mark.parametrize("hsdp", [False, True])
 @pytest.mark.parametrize("same_dim", [False, True])
+@pytest.mark.launch_plan(provider=lambda context: _extra_parallel_launch(context.params["hsdp"]))
 def test_extra_parallel_dcp_resume_restores_parameter_layout(tmp_path, hsdp, optimizer_kind, same_dim):
     import torch.multiprocessing as mp
 
-    world = 8 if hsdp else 4
+    world = _extra_parallel_launch(hsdp).nproc
     mp.start_processes(
         _extra_parallel_dcp_resume_worker,
         args=(world, str(tmp_path / "rdzv"), str(tmp_path / "checkpoint"), hsdp, optimizer_kind, same_dim),

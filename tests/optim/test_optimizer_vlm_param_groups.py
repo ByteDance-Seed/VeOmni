@@ -10,11 +10,15 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.optim.optimizer import (
     build_optimizer,
     filter_empty_param_groups,
     restore_optimizer_param_group_defaults,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class _TinyModel(torch.nn.Module):

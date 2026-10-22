@@ -17,7 +17,8 @@ import pytest
 import torch
 import torch.distributed as c10d
 
-from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+from scripts.ci.accelerator.launch_plan import runner_device_count
+from veomni.utils.device import get_device_type, get_dist_comm_backend
 
 
 # A module-level `sys.exit(0)` here would raise SystemExit during collection and abort
@@ -96,7 +97,7 @@ class WanSelfAttentionUlyssesTest(SequenceParallelTest):
         c10d.all_gather(chunks, local_out.contiguous(), group=group)
         return torch.cat(chunks, dim=1)
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    @pytest.mark.skipif(runner_device_count() < 4, reason="device_count should be >= 4")
     def test_sync_path_matches_non_sp_reference(self):
         group = self._get_process_group()
         try:
@@ -137,7 +138,7 @@ class WanSelfAttentionUlyssesTest(SequenceParallelTest):
         finally:
             clear_parallel_state()
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    @pytest.mark.skipif(runner_device_count() < 4, reason="device_count should be >= 4")
     def test_sync_path_backward_matches_non_sp_reference(self):
         group = self._get_process_group()
         try:
@@ -176,7 +177,7 @@ class WanSelfAttentionUlyssesTest(SequenceParallelTest):
         finally:
             clear_parallel_state()
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    @pytest.mark.skipif(runner_device_count() < 4, reason="device_count should be >= 4")
     def test_sync_path_padded_seq_matches_non_sp_reference(self):
         group = self._get_process_group()
         try:
