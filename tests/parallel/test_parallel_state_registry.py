@@ -20,6 +20,7 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed import parallel_state as parallel_state_module
 from veomni.distributed.parallel_state import (
     _init_parallel_state,
@@ -31,6 +32,9 @@ from veomni.distributed.parallel_state import (
 )
 from veomni.distributed.sequence_parallel import comm as sp_comm
 from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
+
+
+_CI_CPU_4 = LaunchSpec(nproc=4, device="cpu")
 
 
 @pytest.fixture
@@ -115,9 +119,10 @@ def _check_mesh_rank_layout(rank, rendezvous):
         clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_4)
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="requires the CPU Gloo backend")
 def test_mesh_places_ulysses_inside_cp_without_enabling_combined_parallelism(tmp_path):
-    mp.spawn(_check_mesh_rank_layout, args=(str(tmp_path / "rendezvous"),), nprocs=4, join=True)
+    mp.spawn(_check_mesh_rank_layout, args=(str(tmp_path / "rendezvous"),), nprocs=_CI_CPU_4.nproc, join=True)
 
 
 def test_ulysses_group_resolves_only_from_current_parallel_state(single_rank_group):

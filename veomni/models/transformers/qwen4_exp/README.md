@@ -68,6 +68,9 @@ Known limitations:
   chunk gated-delta-rule kernels. GatedDeltaNet head counts must be divisible by
   the active `ulysses_size`/`cp_size`; QSA attention has no head-divisibility
   constraint because it keeps all query heads local and all-gathers only KV.
+  When `chunk_gated_delta_rule_implementation=flash_qla`, GatedDeltaNet
+  preserves grouped Q/K heads (`num_k_heads < num_v_heads`) directly into the
+  FlashQLA chunk kernel instead of expanding Q/K with `repeat_interleave`.
 - PLE n-gram history and its dilated convolution reset at explicit
   `cu_seq_lens_q` packed-sample boundaries. The halo-only fallback remains for
   direct component calls that do not provide packing metadata.
