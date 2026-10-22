@@ -24,8 +24,14 @@ import torch
 import torch.distributed as dist
 from transformers import AutoConfig
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import torchrun
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
+
+
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
+
+_CI_ACCELERATOR_4 = LaunchSpec(nproc=4, device="accelerator")
 
 
 pytestmark = [pytest.mark.qwen4_exp_ulysses]
@@ -272,22 +278,26 @@ def _run_ple_halo_equivalence(packed: bool = False, parallel_mode: str = "ulysse
         clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence():
-    torchrun(_run_ple_halo_equivalence, world_size=2)
+    torchrun(_run_ple_halo_equivalence, world_size=_CI_ACCELERATOR_2.nproc)
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence_sp4():
-    torchrun(_run_ple_halo_equivalence, world_size=4)
+    torchrun(_run_ple_halo_equivalence, world_size=_CI_ACCELERATOR_4.nproc)
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_packed_ple_hidden_halos_match_full_sequence():
-    torchrun(_run_ple_halo_equivalence, world_size=2, packed=True)
+    torchrun(_run_ple_halo_equivalence, world_size=_CI_ACCELERATOR_2.nproc, packed=True)
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence_cp():
     if get_device_type() == "npu":
         pytest.skip("Qwen4-Exp Context Parallelism is currently supported on GPU only.")
-    torchrun(_run_ple_halo_equivalence, 2, False, "cp")
+    torchrun(_run_ple_halo_equivalence, _CI_ACCELERATOR_2.nproc, False, "cp")
 
 
 def _run_qsa_equivalence(
@@ -430,25 +440,30 @@ def _run_qsa_equivalence(
         clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_compact_qsa_mqa_matches_full_sequence():
-    torchrun(_run_qsa_equivalence, world_size=2)
+    torchrun(_run_qsa_equivalence, world_size=_CI_ACCELERATOR_2.nproc)
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 def test_qwen4_exp_compact_qsa_mqa_matches_full_sequence_sp4():
-    torchrun(_run_qsa_equivalence, 4, 4, 1)
+    torchrun(_run_qsa_equivalence, _CI_ACCELERATOR_4.nproc, 4, 1)
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_compact_qsa_gqa_matches_full_sequence():
-    torchrun(_run_qsa_equivalence, 2, 4, 2)
+    torchrun(_run_qsa_equivalence, _CI_ACCELERATOR_2.nproc, 4, 2)
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_compact_qsa_cp_nondivisible_heads_matches_full_sequence():
-    torchrun(_run_qsa_equivalence, 2, 3, 1, "cp", "eager")
+    torchrun(_run_qsa_equivalence, _CI_ACCELERATOR_2.nproc, 3, 1, "cp", "eager")
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_compact_qsa_cp_tilelang_matches_full_sequence():
     pytest.importorskip("tilelang")
-    torchrun(_run_qsa_equivalence, 2, 4, 1, "cp", "tilelang")
+    torchrun(_run_qsa_equivalence, _CI_ACCELERATOR_2.nproc, 4, 1, "cp", "tilelang")
 
 
 @pytest.mark.parametrize("bsz", [1, 4])
@@ -614,16 +629,21 @@ def _run_gated_deltanet_equivalence(
         clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_gated_deltanet_gqa_matches_full_sequence():
-    torchrun(_run_gated_deltanet_equivalence, world_size=2, num_k_heads=2, num_v_heads=4)
+    torchrun(_run_gated_deltanet_equivalence, world_size=_CI_ACCELERATOR_2.nproc, num_k_heads=2, num_v_heads=4)
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 def test_qwen4_exp_gated_deltanet_matches_full_sequence_sp4():
-    torchrun(_run_gated_deltanet_equivalence, world_size=4)
+    torchrun(_run_gated_deltanet_equivalence, world_size=_CI_ACCELERATOR_4.nproc)
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_gated_deltanet_packed_varlen_matches_full_sequence():
-    torchrun(_run_gated_deltanet_equivalence, world_size=2, packed=True, num_k_heads=2, num_v_heads=4)
+    torchrun(
+        _run_gated_deltanet_equivalence, world_size=_CI_ACCELERATOR_2.nproc, packed=True, num_k_heads=2, num_v_heads=4
+    )
 
 
 @pytest.mark.parametrize(("num_k_heads", "num_v_heads"), [(3, 4), (4, 3)])
@@ -678,10 +698,11 @@ def _run_gated_deltanet_determinism(bsz: int, seq_len: int) -> None:
         clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 @pytest.mark.parametrize("bsz", [1, 4])
 @pytest.mark.parametrize("seq_len", [8, 2048])
 def test_qwen4_exp_gated_deltanet_forward_deterministic_sp(bsz: int, seq_len: int) -> None:
-    torchrun(_run_gated_deltanet_determinism, 2, bsz, seq_len)
+    torchrun(_run_gated_deltanet_determinism, _CI_ACCELERATOR_2.nproc, bsz, seq_len)
 
 
 @pytest.mark.parametrize("bsz", [1, 4])
@@ -804,8 +825,9 @@ def _run_text_model_equivalence() -> None:
         clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_packed_text_model_matches_full_sequence():
-    torchrun(_run_text_model_equivalence, world_size=2)
+    torchrun(_run_text_model_equivalence, world_size=_CI_ACCELERATOR_2.nproc)
 
 
 def _run_router_aux_loss_equivalence() -> None:
@@ -930,8 +952,9 @@ def _run_router_aux_loss_equivalence() -> None:
         clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_router_aux_loss_matches_mean_of_local_shards():
-    torchrun(_run_router_aux_loss_equivalence, world_size=2)
+    torchrun(_run_router_aux_loss_equivalence, world_size=_CI_ACCELERATOR_2.nproc)
 
 
 def _run_vlm_placeholder_equivalence(parallel_mode: str = "ulysses") -> None:
@@ -1072,12 +1095,14 @@ def _run_vlm_placeholder_equivalence(parallel_mode: str = "ulysses") -> None:
         clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence():
-    torchrun(_run_vlm_placeholder_equivalence, world_size=2)
+    torchrun(_run_vlm_placeholder_equivalence, world_size=_CI_ACCELERATOR_2.nproc)
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence_cp():
-    torchrun(_run_vlm_placeholder_equivalence, 2, "cp")
+    torchrun(_run_vlm_placeholder_equivalence, _CI_ACCELERATOR_2.nproc, "cp")
 
 
 def _run_vision_real_image_cp_non_fa_rejection() -> None:
@@ -1118,10 +1143,11 @@ def _run_vision_real_image_cp_non_fa_rejection() -> None:
         clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_vision_real_image_cp_rejects_non_flash_attention():
     if get_device_type() == "npu":
         pytest.skip("Qwen4-Exp Context Parallelism is currently supported on GPU only.")
-    torchrun(_run_vision_real_image_cp_non_fa_rejection, world_size=2)
+    torchrun(_run_vision_real_image_cp_non_fa_rejection, world_size=_CI_ACCELERATOR_2.nproc)
 
 
 @pytest.mark.parametrize(

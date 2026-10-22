@@ -23,9 +23,13 @@ from pathlib import Path
 import pytest
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config as UpstreamConfig
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
 from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from veomni.ops.config import get_ops_config, set_ops_config
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _config_asking_for_the_loss(coef: float = 1.0, **overrides) -> DeepseekV4Config:

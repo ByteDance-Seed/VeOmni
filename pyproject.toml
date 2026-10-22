@@ -404,6 +404,7 @@ line-ending = "auto"
 # is on sys.path. NPU CI still uses pytest 7.4, which already resolved `tests`.
 pythonpath = ["."]
 markers = [
+    "launch_plan(provider): shared process launch configuration used for case scheduling",
     "benchmark: marks tests as benchmark tests (deselect with '-m \"not benchmark\"')",
     "qwen3_5_ulysses: Qwen3.5 GatedDeltaNet Ulysses SP tests (run when ulysses or qwen3_5 code is touched)",
 ]

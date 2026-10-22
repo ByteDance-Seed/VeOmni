@@ -1,0 +1,625 @@
+[
+  {
+    "name": "01-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_ulysses.py"
+    ]
+  },
+  {
+    "name": "02-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_all_gather.py"
+    ]
+  },
+  {
+    "name": "03-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_slice_input_tensor.py"
+    ]
+  },
+  {
+    "name": "04-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_wan_ulysses_padding.py"
+    ]
+  },
+  {
+    "name": "05-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_wan_self_attn_ulysses.py"
+    ]
+  },
+  {
+    "name": "06-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_flux_joint_attn_ulysses.py"
+    ]
+  },
+  {
+    "name": "07-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_ltx2_ulysses.py"
+    ]
+  },
+  {
+    "name": "08-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_qwen4_exp_ulysses.py"
+    ]
+  },
+  {
+    "name": "09-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/encoder_data_balance/test_balance_reverse.py"
+    ]
+  },
+  {
+    "name": "10-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/encoder_data_balance/test_balance_sorting_algo.py"
+    ]
+  },
+  {
+    "name": "11-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/test_ddp_sp_grad_sync.py"
+    ]
+  },
+  {
+    "name": "12-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/test_parallel_state_registry.py"
+    ]
+  },
+  {
+    "name": "13-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/context_parallel"
+    ]
+  },
+  {
+    "name": "14-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "--ignore=tests/models/test_omni_fsdp.py",
+      "tests/models"
+    ]
+  },
+  {
+    "name": "15-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/arguments"
+    ]
+  },
+  {
+    "name": "16-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_vlm_trainer.py"
+    ]
+  },
+  {
+    "name": "17-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_aux_metrics.py"
+    ]
+  },
+  {
+    "name": "18-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_trainer_model_runtime.py"
+    ]
+  },
+  {
+    "name": "19-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_dit_microbatch.py"
+    ]
+  },
+  {
+    "name": "20-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/lora/test_vlm_lora.py"
+    ]
+  },
+  {
+    "name": "21-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/seed_omni"
+    ]
+  },
+  {
+    "name": "22-unit",
+    "suite": "unit",
+    "conditional": true,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses.py"
+    ]
+  },
+  {
+    "name": "23-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_extra_parallel_clip_grad_norm.py"
+    ]
+  },
+  {
+    "name": "24-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_rank0_load_and_broadcast_weights.py"
+    ]
+  },
+  {
+    "name": "25-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_moe_ep_sharded_load_matrix.py"
+    ]
+  },
+  {
+    "name": "26-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_ep_sharded_expert_stream_load.py"
+    ]
+  },
+  {
+    "name": "27-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/checkpoints/"
+    ]
+  },
+  {
+    "name": "28-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/distributed/test_async_offload_unit.py"
+    ]
+  },
+  {
+    "name": "29-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/distributed/test_reduce_loss.py"
+    ]
+  },
+  {
+    "name": "30-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/distributed/test_dummy_forward.py"
+    ]
+  },
+  {
+    "name": "31-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/distributed/test_hccl_premul_sum.py"
+    ]
+  },
+  {
+    "name": "32-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/distributed/test_emb_parallel.py"
+    ]
+  },
+  {
+    "name": "33-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/distributed/test_parallel_plan.py"
+    ]
+  },
+  {
+    "name": "34-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/distributed/test_reduce_scatter_fp32_accumulation.py"
+    ]
+  },
+  {
+    "name": "35-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/distributed/test_gradient_checkpointing.py"
+    ]
+  },
+  {
+    "name": "36-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/distributed/test_torch_compile.py"
+    ]
+  },
+  {
+    "name": "37-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/data"
+    ]
+  },
+  {
+    "name": "38-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "-m",
+      "not benchmark",
+      "tests/ops"
+    ]
+  },
+  {
+    "name": "39-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/special_sanity/test_ops_architecture.py"
+    ]
+  },
+  {
+    "name": "40-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_count_flops.py"
+    ]
+  },
+  {
+    "name": "41-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/tools/test_training_utils.py"
+    ]
+  },
+  {
+    "name": "42-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_hdfs_io.py"
+    ]
+  },
+  {
+    "name": "43-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_muon_unit.py"
+    ]
+  },
+  {
+    "name": "44-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/distributed/test_muon_zero_comm_shard.py"
+    ]
+  },
+  {
+    "name": "45-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_muon_fsdp2_parity.py"
+    ]
+  },
+  {
+    "name": "46-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_muon_fsdp2_smoke.py"
+    ]
+  },
+  {
+    "name": "47-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_optimizer_vlm_param_groups.py"
+    ]
+  },
+  {
+    "name": "48-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/lora/test_target_mapping.py"
+    ]
+  },
+  {
+    "name": "49-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/lora/test_qwen3_5_moe_lora.py"
+    ]
+  },
+  {
+    "name": "50-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/lora/test_dense_mlp_lora.py"
+    ]
+  },
+  {
+    "name": "51-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/lora/test_veomni_lora_moe_native.py"
+    ]
+  },
+  {
+    "name": "52-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/lora/test_lora_trainer_saveload.py"
+    ]
+  },
+  {
+    "name": "53-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/lora/test_moe_lora_eager.py"
+    ]
+  },
+  {
+    "name": "54-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/lora/test_moe_lora_trainer.py"
+    ]
+  },
+  {
+    "name": "55-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/lora/test_moe_lora_ep2.py"
+    ]
+  },
+  {
+    "name": "56-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/lora/test_moe_lora_ep_sharded_stream_load.py"
+    ]
+  },
+  {
+    "name": "ci-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/ci/"
+    ]
+  },
+  {
+    "name": "moe-router-replay-api-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_moe_router_replay_api.py"
+    ]
+  },
+  {
+    "name": "profiler-memory-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_profiler_memory.py"
+    ]
+  },
+  {
+    "name": "57-e2e",
+    "suite": "e2e",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/e2e/test_e2e_parallel.py"
+    ]
+  },
+  {
+    "name": "58-e2e",
+    "suite": "e2e",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/distributed/test_fsdp_equivalence.py"
+    ]
+  },
+  {
+    "name": "59-e2e",
+    "suite": "e2e",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/models/test_omni_fsdp.py"
+    ]
+  }
+]

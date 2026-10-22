@@ -27,6 +27,13 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 OPS_ROOT = Path(__file__).parents[3] / "veomni" / "ops"
 

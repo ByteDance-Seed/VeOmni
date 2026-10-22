@@ -905,7 +905,9 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
         else:
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
-        if self.num_v_heads // self.num_k_heads > 1:
+        if self.num_v_heads // self.num_k_heads > 1 and not (
+            self.veomni_chunk_gated_delta_rule.impl == "flash_qla" and not use_precomputed_states
+        ):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
