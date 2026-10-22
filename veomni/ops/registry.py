@@ -84,6 +84,14 @@ def _make_autograd_fn(raw_forward: Callable, raw_backward: Callable) -> Callable
                 raise TypeError("raw forward output must be a Tensor or a non-empty tuple of Tensors")
 
             ctx.output_is_tuple = isinstance(output, tuple)
+            if torch.compiler.is_compiling():
+                # Dynamo's AutogradFunctionApplyVariable appends every intermediate
+                # FX tensor node in ``forward`` after the declared outputs. If a
+                # trailing no-op op (such as ``.to(x.dtype)`` or ``.contiguous()``)
+                # returns the same Tensor object as an earlier intermediate node,
+                # C++ autograd overwrites the output's ``output_nr_`` with the
+                # intermediate slot and routes ``grad_output`` to an unused slot.
+                output = tuple(item.clone() for item in output) if ctx.output_is_tuple else output.clone()
             return output
 
         @staticmethod

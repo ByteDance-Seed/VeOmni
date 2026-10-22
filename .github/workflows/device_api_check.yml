@@ -23,6 +23,8 @@ jobs:
           fetch-depth: 0
           path: .
       - uses: actions/setup-python@v3
+        with:
+          python-version: ${{ matrix.python-version }}
       - name: Run device api usage normativity in VeOmni/tasks
         run: |
           python tests/special_sanity/check_device_api_usage.py -d tasks
@@ -34,5 +36,6 @@ jobs:
           python tests/special_sanity/check_device_api_usage.py -d tests
       - name: Run ops architecture guards
         run: |
+          python -m pip install "pytest>=6.0.0,<8.0"
           python -c "from tests.special_sanity.test_ops_architecture import test_active_tree_uses_ops_architecture_paths, test_model_entry_points_forward_ops_selection; test_active_tree_uses_ops_architecture_paths(); test_model_entry_points_forward_ops_selection()"
           python -c "from tests.ops.base.test_op_documentation import test_owned_op_modules_and_callables_have_docstrings; test_owned_op_modules_and_callables_have_docstrings()"

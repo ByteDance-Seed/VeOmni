@@ -108,6 +108,7 @@ seed_omni/usage/adding_a_model.md
 seed_omni/usage/hf_layout.md
 seed_omni/distributed/per_module_parallelism.md
 seed_omni/distributed/sequence_parallel.md
+seed_omni/mixins/module_preprocessor.md
 seed_omni/mixins/metric_meter.md
 seed_omni/mixins/offline_encoding.md
 ```
@@ -117,6 +118,7 @@ seed_omni/mixins/offline_encoding.md
 :caption: Design
 
 design/optimizer_cpu_offload.md
+design/ci_case_scheduling.md
 design/op_selection.md
 design/fused_moe_ops.md
 design/local_parallel_state.md
