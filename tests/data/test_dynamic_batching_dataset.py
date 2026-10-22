@@ -58,6 +58,7 @@ from utils import (
     setup_test_distributed,
 )
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
 from veomni.data.data_collator import MainCollator
@@ -74,6 +75,9 @@ from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks import Callback, EnvironMeterCallback, TrainerState
 from veomni.utils import helper
 from veomni.utils.constants import IGNORE_INDEX
+
+
+_CI_LAUNCH = LaunchSpec(nproc=2)
 
 
 logger = helper.create_logger(__name__)
@@ -530,6 +534,7 @@ def test_save_load_state_dict(save_by_idx):
     logger.info(f"test_save_load_state_dict (save_by_idx={save_by_idx}) passed!")
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.parametrize(
     "dataset_type,shuffle,save_by_idx,multi_sample_per_iteration",
     [
@@ -589,7 +594,7 @@ def build_command(dataset_type="iterable", shuffle=True, save_by_idx=True, multi
     command = [
         "torchrun",
         "--nnodes=1",
-        "--nproc_per_node=2",
+        f"--nproc_per_node={_CI_LAUNCH.nproc}",
         f"--master_port={port}",
         "tests/data/test_dynamic_batching_dataset.py",
         "--model.config_path=test",
