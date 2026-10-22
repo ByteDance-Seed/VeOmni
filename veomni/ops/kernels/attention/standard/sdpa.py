@@ -23,7 +23,10 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers.integrations.sdpa_attention import sdpa_attention_forward as hf_sdpa_attention_forward
 
 from .....distributed.parallel_state import get_parallel_state
-from ..helper import strip_sdpa_packed_metadata
+from ..helper import (
+    extract_packed_varlen_cu_seqlens,
+    packed_split_attention_forward,
+)
 from ..ulysses import (
     prepare_ulysses_qkv,
     restore_ulysses_output,
@@ -90,16 +93,19 @@ def sdpa_attention_forward(
     skip_ulysses: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Run Transformers SDPA with optional Ulysses exchange.
+    """Run Transformers SDPA with optional Ulysses exchange and packed-segment splitting.
 
     ``sliding_window`` is shared-signature metadata and is not forwarded. This
     row supports windowed visibility only when it is already encoded in
     ``attention_mask``. The SDPA API has no cumulative-length arguments, so
     packed/varlen metadata is dropped when it describes one segment per row
-    or a dense mask isolates the segments; otherwise it raises. ``softcap``
-    changes logits rather than visibility, so a mask cannot encode it; this
-    row rejects explicit softcapping rather than silently changing attention
-    semantics.
+    or a 3-D/4-D dense mask isolates the segments; when ``attention_mask`` is
+    ``None`` and ``batch_size == 1`` with multiple segments, ``query``, ``key``,
+    and ``value`` are split per segment along the sequence dimension after any
+    Ulysses gather and concatenated before Ulysses restore; otherwise it raises.
+    ``softcap`` changes logits rather than visibility, so a mask cannot encode
+    it; this row rejects explicit softcapping rather than silently changing
+    attention semantics.
 
     Calls with a dense bool / additive mask use memory-efficient SDPA so the
     mask stays valid. Unmasked calls keep PyTorch's default backend selection.
@@ -107,7 +113,11 @@ def sdpa_attention_forward(
     ``skip_ulysses`` opts a call out when it already gathered or its tokens
     are not on the SP mesh.
     """
-    kwargs = strip_sdpa_packed_metadata(kwargs, batch_size=query.shape[0], dense_mask=attention_mask)
+    kwargs, packed_cu_seqlens = extract_packed_varlen_cu_seqlens(
+        kwargs,
+        batch_size=query.shape[0],
+        attention_mask=attention_mask,
+    )
     del sliding_window
 
     if softcap is not None:
@@ -149,17 +159,33 @@ def sdpa_attention_forward(
             local_query_head_count=query.shape[1],
             group=parallel_state.ulysses_group,
         )
-    with sdpa_kernel(_SDPA_MASK_BACKENDS) if attention_mask is not None else nullcontext():
-        output, lse = hf_sdpa_attention_forward(
+
+    if packed_cu_seqlens is not None:
+        cu_seqlens_q, cu_seqlens_k = packed_cu_seqlens
+        output, lse = packed_split_attention_forward(
+            hf_sdpa_attention_forward,
             backend_module,
             query,
             key,
             value,
-            attention_mask,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
             dropout=dropout,
             scaling=scaling,
             **kwargs,
         )
+    else:
+        with sdpa_kernel(_SDPA_MASK_BACKENDS) if attention_mask is not None else nullcontext():
+            output, lse = hf_sdpa_attention_forward(
+                backend_module,
+                query,
+                key,
+                value,
+                attention_mask,
+                dropout=dropout,
+                scaling=scaling,
+                **kwargs,
+            )
 
     if ulysses_enabled:
         output = restore_ulysses_output(output, group=parallel_state.ulysses_group)
