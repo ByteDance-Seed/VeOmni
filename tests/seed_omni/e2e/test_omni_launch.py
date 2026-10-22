@@ -20,10 +20,14 @@ from pathlib import Path
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.checkpoint import layout
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_torch_device
+from veomni.utils.device import IS_CUDA_AVAILABLE
 
 from ...tools.launch_utils import find_free_port
+
+
+_CI_LAUNCH = LaunchSpec(nproc=2)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -33,7 +37,7 @@ MODULES = ("fake_module_a", "fake_module_b")
 NUM_SAMPLES = 8
 
 requires_two_cuda_devices = pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or get_torch_device().device_count() < 2,
+    not IS_CUDA_AVAILABLE or runner_device_count() < 2,
     reason="needs 2 CUDA devices: the fake launcher builds fake_module_a as DDP on cuda",
 )
 
@@ -123,9 +127,10 @@ def test_eager_inference_launch(fake_checkpoint, tmp_path):
 
 
 @requires_two_cuda_devices
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 def test_train_then_resume_launch(fake_checkpoint, fake_data, tmp_path):
     train_cmd = [
-        *_torchrun("tasks/omni/train_omni.py", nproc=2),
+        *_torchrun("tasks/omni/train_omni.py", nproc=_CI_LAUNCH.nproc),
         str(BASE_YAML),
         "--model.model_path",
         str(fake_checkpoint),
@@ -150,12 +155,16 @@ def test_train_then_resume_launch(fake_checkpoint, fake_data, tmp_path):
     _run([*train_cmd, "--train.checkpoint.load_path", "auto"])
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @requires_two_cuda_devices
 def test_distributed_inference_launch(fake_checkpoint, tmp_path):
     """Any non-eager module routes the request through ``OmniModelRuntime``, which traces the FSM."""
     _run(
         _infer_cmd(
-            _torchrun("tasks/omni/infer_omni.py", nproc=2), fake_checkpoint, "modules_infer_fsdp.yaml", tmp_path
+            _torchrun("tasks/omni/infer_omni.py", nproc=_CI_LAUNCH.nproc),
+            fake_checkpoint,
+            "modules_infer_fsdp.yaml",
+            tmp_path,
         )
     )
     trace = (tmp_path / "infer_gen" / "trace.txt").read_text(encoding="utf-8")

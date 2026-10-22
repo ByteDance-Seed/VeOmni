@@ -22,7 +22,13 @@ from importlib.machinery import ModuleSpec
 from pathlib import Path
 from types import ModuleType
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.utils.import_utils import is_package_available
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 REPO_ROOT = Path(__file__).parents[3]

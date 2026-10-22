@@ -56,6 +56,7 @@ class _ChunkObserver:
         self.chunks = []
 
     def evaluate(self, argnums, hidden, weight, labels, denom, ignore_index):
+        """Evaluate one training chunk and observe detached token losses if requested."""
         args = (hidden, weight, labels, denom, ignore_index)
         if self.consumer is None:
             if argnums:
@@ -82,6 +83,7 @@ class _ChunkObserver:
         return grads, loss
 
     def finish(self, split_dim):
+        """Deliver collected token losses and release their retained storage."""
         if self.consumer is not None:
             try:
                 self.consumer(torch.cat(self.chunks, dim=split_dim).detach())

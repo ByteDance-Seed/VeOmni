@@ -1,0 +1,417 @@
+[
+  {
+    "name": "npu-unit-01",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_ulysses.py"
+    ]
+  },
+  {
+    "name": "npu-unit-02",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_all_gather.py"
+    ]
+  },
+  {
+    "name": "npu-unit-03",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_slice_input_tensor.py"
+    ]
+  },
+  {
+    "name": "npu-unit-04",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/encoder_data_balance/test_balance_reverse.py"
+    ]
+  },
+  {
+    "name": "npu-unit-05",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/encoder_data_balance/test_balance_sorting_algo.py"
+    ]
+  },
+  {
+    "name": "npu-unit-06",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/test_ddp_sp_grad_sync.py"
+    ]
+  },
+  {
+    "name": "npu-unit-07",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/test_parallel_state_registry.py"
+    ]
+  },
+  {
+    "name": "npu-unit-08",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/models"
+    ]
+  },
+  {
+    "name": "npu-unit-09",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/arguments"
+    ]
+  },
+  {
+    "name": "npu-unit-10",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/trainer/test_vlm_trainer.py"
+    ]
+  },
+  {
+    "name": "npu-unit-11",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/trainer/test_aux_metrics.py"
+    ]
+  },
+  {
+    "name": "npu-unit-12",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/trainer/test_trainer_model_runtime.py"
+    ]
+  },
+  {
+    "name": "npu-unit-13",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/trainer/test_dit_microbatch.py"
+    ]
+  },
+  {
+    "name": "npu-unit-14",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/lora/test_vlm_lora.py"
+    ]
+  },
+  {
+    "name": "npu-unit-15",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/seed_omni"
+    ]
+  },
+  {
+    "name": "npu-unit-16",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_extra_parallel_clip_grad_norm.py"
+    ]
+  },
+  {
+    "name": "npu-unit-17",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_moe_ep_sharded_load_matrix.py"
+    ]
+  },
+  {
+    "name": "npu-unit-18",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_ep_sharded_expert_stream_load.py"
+    ]
+  },
+  {
+    "name": "npu-unit-19",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/checkpoints/"
+    ]
+  },
+  {
+    "name": "npu-unit-20",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_async_offload_unit.py"
+    ]
+  },
+  {
+    "name": "npu-unit-21",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_reduce_loss.py"
+    ]
+  },
+  {
+    "name": "npu-unit-22",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_dummy_forward.py"
+    ]
+  },
+  {
+    "name": "npu-unit-23",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_hccl_premul_sum.py"
+    ]
+  },
+  {
+    "name": "npu-unit-24",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_gradient_checkpointing.py"
+    ]
+  },
+  {
+    "name": "npu-unit-25",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_emb_parallel.py"
+    ]
+  },
+  {
+    "name": "npu-unit-26",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_parallel_plan.py"
+    ]
+  },
+  {
+    "name": "npu-unit-27",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/data"
+    ]
+  },
+  {
+    "name": "npu-unit-28",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/ops/gated_delta_rule/test_gdr_ascend_padding_mask.py"
+    ],
+    "env": {
+      "TRITON_ASCEND_ARCH": "Ascend910B4"
+    }
+  },
+  {
+    "name": "npu-unit-29",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "-m",
+      "not benchmark",
+      "tests/ops"
+    ]
+  },
+  {
+    "name": "npu-unit-30",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/special_sanity/test_ops_architecture.py"
+    ]
+  },
+  {
+    "name": "npu-unit-31",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_count_flops.py"
+    ]
+  },
+  {
+    "name": "npu-unit-32",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/tools/test_training_utils.py"
+    ]
+  },
+  {
+    "name": "npu-unit-33",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_hdfs_io.py"
+    ]
+  },
+  {
+    "name": "npu-unit-34",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/lora/test_lora_trainer_saveload.py"
+    ]
+  },
+  {
+    "name": "npu-unit-35",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/lora/test_qwen3_5_moe_lora.py"
+    ]
+  },
+  {
+    "name": "npu-unit-36",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/lora/test_moe_lora_ep_sharded_stream_load.py"
+    ]
+  },
+  {
+    "name": "ci-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/ci/"
+    ]
+  },
+  {
+    "name": "moe-router-replay-api-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_moe_router_replay_api.py"
+    ]
+  },
+  {
+    "name": "npu-e2e-01",
+    "suite": "e2e",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/e2e/test_e2e_parallel.py"
+    ]
+  },
+  {
+    "name": "npu-e2e-02",
+    "suite": "e2e",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_fsdp_equivalence.py"
+    ]
+  },
+  {
+    "name": "qwen38-channel_loss_callback-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_channel_loss_callback.py"
+    ]
+  }
+]

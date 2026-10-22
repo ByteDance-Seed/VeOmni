@@ -55,7 +55,7 @@ when the selected implementation runs.
 | `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `torch_npu`, `triton` (Triton-Ascend), `fla_npu` as supported by the family |
 | `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
-| `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA) |
+| `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
 
 DeepSeek-V4 `dsa_attention` takes the full-resolution and compressed KV
 separately, plus `position_ids` and the compressor's `CompressedCandidates`,
@@ -76,6 +76,10 @@ makes 16K-token training feasible. It raises on an attention mask and falls
 back to `eager` with a one-time warning for nonzero dropout. Its dK/dV backward
 uses KV-owned reduction over sorted reverse CSR tiles instead of floating-point
 atomic scatter, at the cost of sorting and a partial-gradient workspace.
+`torch_npu` prunes each query chunk's `[lo, hi)` KV interval (128-token
+aligned), builds a local boolean mask via `int8` scatter, and calls
+`torch_npu.npu_fusion_attention` / `npu_fusion_attention_grad` without forward
+replay.
 
 The registry is the source of truth for the exact rows available in a given
 revision:

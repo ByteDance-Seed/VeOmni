@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
 from veomni.distributed.parallel_state import ParallelState
 from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
@@ -33,6 +34,9 @@ from veomni.models.transformers.deepseek_v4.indexer_loss import (
 )
 from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.utils.model_outputs import MoeModelOutputWithIndexerKL
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 @contextmanager
