@@ -341,7 +341,7 @@ def build_omni_module_runtime_args(
     runtime_modules: dict[str, OmniModuleRuntimeArguments] = {}
     for name, override in modules_overrides.items():
         merged = deepcopy(base_dict)
-        for layer in (checkpoint_defaults.get(name, {}), inference_default, override):
+        for layer in (checkpoint_defaults.get(name, {}), inference_default, override or {}):
             _deep_update(merged, layer)
         runtime_modules[name] = _instantiate_recursive(OmniModuleRuntimeArguments, merged)
     return runtime_modules
