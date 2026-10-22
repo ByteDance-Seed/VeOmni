@@ -39,8 +39,8 @@ Shared bases live next to the families, not at the ``seed_omni/`` package root:
 Concrete modules: ``modules/<family>/<sub_module>/(configuration.py,
 modeling.py[, processing.py])``.  Each sub-module gets its own folder; the
 folder name carries the namespace so the inner files use short names rather
-than re-spelling ``<family>_<sub_module>`` per file.  Cross-family
-lightweight modules live under ``modules/base/<sub_module>/``.
+than re-spelling ``<family>_<sub_module>`` per file.  The shared
+word-token embedding + LM head module lives at ``modules/text_encoder/``.
 """
 
 from transformers import PretrainedConfig
@@ -115,8 +115,8 @@ def read_model_type(model_path: str) -> str:
     return model_type
 
 
-# Side-effect only: attach @register factories under base/ and fake_model/.
-from . import base, fake_model  # noqa: F401  E402
+# Side-effect only: attach @register factories under text_encoder/ and fake_model/.
+from . import fake_model, text_encoder  # noqa: F401  E402
 
 
 __all__ = [

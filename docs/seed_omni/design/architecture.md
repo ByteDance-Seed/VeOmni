@@ -87,10 +87,9 @@ training and distributed inference).
 **List `InferenceMixin` before `PretrainedOmniModule`.** `PretrainedOmniModule`
 provides default no-op `reset_local_inference_state` /
 `reset_global_inference_state` / `finalize` methods for modules without
-inference state, so placing `InferenceMixin` (or `SimpleArGenerationMixin` from
-`modules/base/llm_packing.py`) first in the base list ensures the module's
-implementations take precedence in the MRO, and `XxxAccelerated(VeOmniMixin, Xxx)`
-inherits them from `Xxx`.
+inference state, so placing `InferenceMixin` first in the base list ensures the
+module's implementations take precedence in the MRO, and
+`XxxAccelerated(VeOmniMixin, Xxx)` inherits them from `Xxx`.
 
 Training-graph hooks on the accelerated class, all optional with safe defaults:
 

@@ -23,10 +23,10 @@ from veomni.ops import VeomniOp
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.tensor_utils import naflatten, unflatten
 
-from .....mixins.base_mixin import BaseMixin
-from .....mixins.metric_meter_mixin import MetricMeterMixin
-from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from .....utils.conversation import ConversationItem
+from ....mixins.base_mixin import BaseMixin
+from ....mixins.metric_meter_mixin import MetricMeterMixin
+from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
+from ....utils.conversation import ConversationItem
 from ..chat_template import TextEncoderChatTemplate
 from ..configuration import TextEncoderConfig
 from ..modeling import TextEncoder, scatter_text_encoder_embeds
@@ -332,8 +332,8 @@ class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
     here. Concrete modules (janus / qwen3 / qwen3vl / bagel) subclass this and
     define ``XxxTextEncoderPreprocessor`` in their ``processing.py`` by
     subclassing
-    :class:`~veomni.models.seed_omni.modules.base.text_encoder.processing.TextEncoderPreprocessor`
-    and implementing :meth:`~veomni.models.seed_omni.modules.base.text_encoder.processing.TextEncoderPreprocessor.build_chat_template`
+    :class:`~veomni.models.seed_omni.modules.text_encoder.processing.TextEncoderPreprocessor`
+    and implementing :meth:`~veomni.models.seed_omni.modules.text_encoder.processing.TextEncoderPreprocessor.build_chat_template`
     with the module-local chat template.  Register via ``preprocessor_class`` on
     the family's HF-native ``modeling.py`` class (parallel to ``image_processor_class``
     on vision/codec modules) — :class:`~veomni.models.seed_omni.processing_omni.OmniProcessor`

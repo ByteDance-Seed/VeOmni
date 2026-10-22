@@ -96,7 +96,7 @@ def test_gate_rejects_combined_cp_and_ulysses_on_single_model_forward(monkeypatc
 
 
 def test_gate_allows_seed_omni_module_config_under_cp_and_hybrid_cp_sp(monkeypatch):
-    from veomni.models.seed_omni.modules.base.text_encoder.configuration import TextEncoderConfig
+    from veomni.models.seed_omni.modules.text_encoder.configuration import TextEncoderConfig
 
     monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(

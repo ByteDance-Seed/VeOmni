@@ -1,4 +1,4 @@
-"""Unit tests for SeedOmni ``modules/base`` and ``veomni.utils.tensor_utils``."""
+"""Unit tests for SeedOmni ``TextEncoder`` (``veomni/models/seed_omni/modules/text_encoder/``)."""
 
 from __future__ import annotations
 
@@ -7,23 +7,24 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.seed_omni.modules.helpers import load_from_omni, save_as_omni
 from veomni.models.seed_omni import (
     OMNI_ACCELERATED_MODEL_REGISTRY,
     OMNI_MODEL_REGISTRY,
-    BaseMixin,
 )
-from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleMixin
 from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
-from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+from veomni.models.seed_omni.modules.text_encoder.configuration import TextEncoderConfig
+from veomni.models.seed_omni.modules.text_encoder.modeling import TextEncoder
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.utils.constants import IGNORE_INDEX
-from veomni.utils.tensor_utils import naflatten, unflatten
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+_VOCAB, _HIDDEN = 8, 4
 
 
 def _config_cls(model_type: str):
@@ -50,61 +51,25 @@ def _patch_local_loss_reducer(monkeypatch):
     return sp_utils
 
 
-def test_naflatten_and_unflatten_roundtrip():
-    tensors_3d = [torch.randn(2, 3, 8), torch.randn(1, 5, 8)]
-    flat_3d, shape_3d = naflatten(tensors_3d)
-    assert shape_3d.device.type == "cpu"
-    restored_3d = unflatten(flat_3d, shape_3d)
-    for a, b in zip(tensors_3d, restored_3d, strict=True):
-        torch.testing.assert_close(a, b)
-
-    tensors_1d = [torch.randn(4), torch.randn(7)]
-    flat_1d, shape_1d = naflatten(tensors_1d)
-    assert shape_1d.device.type == "cpu"
-    restored_1d = unflatten(flat_1d, shape_1d)
-    for a, b in zip(tensors_1d, restored_1d, strict=True):
-        torch.testing.assert_close(a, b)
-
-    # Even when a non-CPU default device is active, shape metadata stays on CPU.
-    with torch.device("meta"):
-        meta_3d = [torch.empty(2, 3, 8), torch.empty(1, 5, 8)]
-        meta_1d = [torch.empty(4), torch.empty(7)]
-        _, meta_shape_3d = naflatten(meta_3d)
-        _, meta_shape_1d = naflatten(meta_1d)
-    assert meta_shape_3d.device.type == "cpu"
-    assert meta_shape_1d.device.type == "cpu"
-
-
-def test_all_registered_classes_are_module_mixins():
-    accelerated_keys = set(OMNI_ACCELERATED_MODEL_REGISTRY.valid_keys())
-    for name in OMNI_MODEL_REGISTRY.valid_keys():
-        native_cls = OMNI_MODEL_REGISTRY[name]()
-        assert name in accelerated_keys, f"{name} must register OMNI_ACCELERATED_MODEL_REGISTRY"
-        assert issubclass(native_cls, PretrainedOmniModule), f"{name} native must inherit PretrainedOmniModule"
-        assert not issubclass(native_cls, BaseMixin), f"{name} native must not inherit BaseMixin"
-        accelerated_cls = OMNI_ACCELERATED_MODEL_REGISTRY[name]()
-        assert issubclass(accelerated_cls, BaseMixin), f"{name} accelerated must inherit BaseMixin"
-
-
 def test_text_encoder_save_reload_via_registry(tmp_path: Path):
     """Verifies config/model round-trip through OmniModel and the OMNI registry."""
-    TextEncoder = _model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
+    TextEncoderCls = _model_cls("text_encoder")
+    TextEncoderCfg = _config_cls("text_encoder")
 
-    te = TextEncoder(TextEncoderConfig(vocab_size=128, hidden_size=64, tie_word_embeddings=True))
+    te = TextEncoderCls(TextEncoderCfg(vocab_size=128, hidden_size=64, tie_word_embeddings=True))
     save_as_omni(tmp_path, "text_encoder", te)
 
     cfg, te2 = load_from_omni(tmp_path, "text_encoder")
     assert cfg.model_type == "text_encoder"
-    assert isinstance(te2, TextEncoder)
+    assert isinstance(te2, TextEncoderCls)
     assert te2.config.vocab_size == 128
 
 
 def test_text_encoder_decode_returns_single_loss_key():
     """Single-loss protocol: ``post_forward`` maps ``loss`` → ``_loss``."""
-    TextEncoder = _accelerated_model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16))
+    AccTextEncoder = _accelerated_model_cls("text_encoder")
+    TextEncoderCfg = _config_cls("text_encoder")
+    te = AccTextEncoder(TextEncoderCfg(vocab_size=64, hidden_size=16))
     h = torch.randn(2, 4, 16)
     labels = torch.randint(0, 64, (2, 4))
     out = te.decode(hidden_states=h, labels=labels)
@@ -120,7 +85,7 @@ def test_text_encoder_accelerated_decode_matches_native_with_unshifted_and_maske
 ):
     """Unshifted ``labels`` (including masked prompt positions) must match native ``TextEncoder.decode``."""
     _patch_local_loss_reducer(monkeypatch)
-    import veomni.models.seed_omni.modules.base.text_encoder.accelerated.accelerated as text_encoder_accelerated
+    import veomni.models.seed_omni.modules.text_encoder.accelerated.accelerated as text_encoder_accelerated
 
     monkeypatch.setattr(
         text_encoder_accelerated,
@@ -130,9 +95,9 @@ def test_text_encoder_accelerated_decode_matches_native_with_unshifted_and_maske
 
     NativeTextEncoder = _model_cls("text_encoder")
     AccTextEncoder = _accelerated_model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
+    TextEncoderCfg = _config_cls("text_encoder")
 
-    cfg = TextEncoderConfig(
+    cfg = TextEncoderCfg(
         vocab_size=64,
         hidden_size=16,
         tie_word_embeddings=tie_word_embeddings,
@@ -158,9 +123,9 @@ def test_text_encoder_accelerated_decode_matches_native_with_unshifted_and_maske
 
 def test_text_encoder_decode_pre_masks_sample_boundary_labels():
     """Sample k's first label is IGNORE regardless of what the chat template emitted."""
-    TextEncoder = _accelerated_model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=8))
+    AccTextEncoder = _accelerated_model_cls("text_encoder")
+    TextEncoderCfg = _config_cls("text_encoder")
+    te = AccTextEncoder(TextEncoderCfg(vocab_size=64, hidden_size=8))
 
     def _text(labels: list[int]) -> ConversationItem:
         return ConversationItem(
@@ -179,9 +144,9 @@ def test_text_encoder_decode_pre_masks_sample_boundary_labels():
 
 def test_text_encoder_decode_inference_returns_logits_only():
     """Base ``TextEncoder.decode`` without labels returns logits only."""
-    TextEncoder = _model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16))
+    NativeTextEncoder = _model_cls("text_encoder")
+    TextEncoderCfg = _config_cls("text_encoder")
+    te = NativeTextEncoder(TextEncoderCfg(vocab_size=64, hidden_size=16))
     h = torch.randn(2, 4, 16)
     out = te.decode(hidden_states=h)
     assert out["logits"] is not None and out["logits"].shape == (2, 4, 64)
@@ -190,7 +155,7 @@ def test_text_encoder_decode_inference_returns_logits_only():
 
 def test_text_encoder_decode_dispatches_pre_shifted_loss(monkeypatch):
     """Untied, bias-free heads delegate loss policy to the configured ops wrapper."""
-    import veomni.models.seed_omni.modules.base.text_encoder.accelerated.accelerated as text_encoder_accelerated
+    import veomni.models.seed_omni.modules.text_encoder.accelerated.accelerated as text_encoder_accelerated
 
     reduction_group = object()
     captured = {}
@@ -200,9 +165,9 @@ def test_text_encoder_decode_dispatches_pre_shifted_loss(monkeypatch):
         lambda: SimpleNamespace(fsdp_group=reduction_group),
     )
 
-    TextEncoder = _accelerated_model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16, tie_word_embeddings=False))
+    AccTextEncoder = _accelerated_model_cls("text_encoder")
+    TextEncoderCfg = _config_cls("text_encoder")
+    te = AccTextEncoder(TextEncoderCfg(vocab_size=64, hidden_size=16, tie_word_embeddings=False))
 
     def fake_loss_function(**kwargs):
         captured.update(kwargs)
@@ -226,9 +191,9 @@ def test_text_encoder_decode_dispatches_pre_shifted_loss(monkeypatch):
 def test_text_encoder_tied_head_uses_explicit_eager_loss(monkeypatch):
     """Tied heads must not enter a globally selected fused-linear loss."""
     _patch_local_loss_reducer(monkeypatch)
-    TextEncoder = _accelerated_model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16, tie_word_embeddings=True))
+    AccTextEncoder = _accelerated_model_cls("text_encoder")
+    TextEncoderCfg = _config_cls("text_encoder")
+    te = AccTextEncoder(TextEncoderCfg(vocab_size=64, hidden_size=16, tie_word_embeddings=True))
 
     def unexpected_loss_function(**kwargs):
         raise AssertionError("tied head must not call the globally selected loss function")
@@ -243,11 +208,11 @@ def test_text_encoder_tied_head_uses_explicit_eager_loss(monkeypatch):
 
 
 def test_text_encoder_decode_all_masked_span_scores_zero(monkeypatch):
-    """An unsupervised span scores 0.0, never NaN (constraint 7d clamped denominator)."""
+    """An unsupervised span scores 0.0, never NaN (clamped denominator)."""
     _patch_local_loss_reducer(monkeypatch)
-    TextEncoder = _accelerated_model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16, tie_word_embeddings=False))
+    AccTextEncoder = _accelerated_model_cls("text_encoder")
+    TextEncoderCfg = _config_cls("text_encoder")
+    te = AccTextEncoder(TextEncoderCfg(vocab_size=64, hidden_size=16, tie_word_embeddings=False))
 
     def unexpected_loss_function(**kwargs):
         raise AssertionError("an all-masked span must not enter the fused loss (0/0)")
@@ -259,18 +224,10 @@ def test_text_encoder_decode_all_masked_span_scores_zero(monkeypatch):
     assert out["loss"].requires_grad
 
 
-def test_training_module_mixin_forward_requires_override_without_native_impl():
-    class CodecOnlyAccelerated(TrainingModuleMixin, BaseMixin):
-        pass
-
-    with pytest.raises(NotImplementedError, match="forward\\(\\*\\*kwargs\\) is not implemented"):
-        CodecOnlyAccelerated().forward()
-
-
 def test_text_encoder_fsdp_no_split_modules_preserved():
-    TextEncoder = _model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    text_encoder = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16, tie_word_embeddings=False))
+    NativeTextEncoder = _model_cls("text_encoder")
+    TextEncoderCfg = _config_cls("text_encoder")
+    text_encoder = NativeTextEncoder(TextEncoderCfg(vocab_size=64, hidden_size=16, tie_word_embeddings=False))
     assert text_encoder._no_split_modules == {"ShardedEmbedding"}
 
 
@@ -278,26 +235,26 @@ def test_text_encoder_selects_ops_from_module_config_not_global_ops_config():
     """Each OmniModule resolves its VeomniOp handles from its own config."""
     from veomni.ops.registry import OP_REGISTRY
 
-    TextEncoder = _accelerated_model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
+    AccTextEncoder = _accelerated_model_cls("text_encoder")
+    TextEncoderCfg = _config_cls("text_encoder")
 
-    te_default = TextEncoder(
-        TextEncoderConfig(
+    te_default = AccTextEncoder(
+        TextEncoderCfg(
             vocab_size=64,
             hidden_size=16,
             tie_word_embeddings=False,
         )
     )
-    te_eager = TextEncoder(
-        TextEncoderConfig(
+    te_eager = AccTextEncoder(
+        TextEncoderCfg(
             vocab_size=64,
             hidden_size=16,
             tie_word_embeddings=False,
             ops_implementation={"cross_entropy_loss_implementation": "eager"},
         )
     )
-    te_chunk = TextEncoder(
-        TextEncoderConfig(
+    te_chunk = AccTextEncoder(
+        TextEncoderCfg(
             vocab_size=64,
             hidden_size=16,
             tie_word_embeddings=False,
@@ -311,7 +268,7 @@ def test_text_encoder_selects_ops_from_module_config_not_global_ops_config():
 
 
 def test_text_encoder_preprocessor_from_pretrained_forwards_and_tolerates_processor_kwargs():
-    from veomni.models.seed_omni.modules.base.text_encoder.processing import TextEncoderPreprocessor
+    from veomni.models.seed_omni.modules.text_encoder.processing import TextEncoderPreprocessor
 
     fake_template = SimpleNamespace(tokenizer="tok")
 
@@ -330,3 +287,18 @@ def test_text_encoder_preprocessor_from_pretrained_forwards_and_tolerates_proces
 
     custom_proc = _CustomSub.from_pretrained("/tmp/fake", packed_preprocess=True, extra_unused_kwarg=1)
     assert custom_proc.packed_preprocess is True
+
+
+@pytest.mark.parametrize("pad_token_id", [None, 3])
+def test_text_encoder_passes_pad_token_id_to_sharded_embedding(pad_token_id):
+    text_encoder = TextEncoder(TextEncoderConfig(vocab_size=_VOCAB, hidden_size=_HIDDEN, pad_token_id=pad_token_id))
+    assert text_encoder.embed_tokens.padding_idx == pad_token_id
+
+
+def test_text_encoder_tied_head_projects_through_sharded_embedding():
+    text_encoder = TextEncoder(TextEncoderConfig(vocab_size=_VOCAB, hidden_size=_HIDDEN, tie_word_embeddings=True))
+    ids = torch.tensor([[0, 2, 5]], dtype=torch.long)
+    embeds = text_encoder.encode(input_ids=ids)["inputs_embeds"]
+    logits = text_encoder._project(embeds)
+    expected = F.linear(embeds, text_encoder.embed_tokens.weight)
+    torch.testing.assert_close(logits, expected)

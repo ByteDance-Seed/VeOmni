@@ -22,8 +22,8 @@ from transformers import PreTrainedTokenizerBase
 from veomni.distributed.emb_parallel import ShardedEmbedding
 from veomni.utils.tensor_utils import naflatten, unflatten
 
-from ....utils.conversation import ConversationItem, seal_outputs
-from ...module_modeling_base import PretrainedOmniModule
+from ...utils.conversation import ConversationItem, seal_outputs
+from ..module_modeling_base import PretrainedOmniModule
 from .chat_template import TextEncoderChatTemplate
 from .configuration import TextEncoderConfig
 
