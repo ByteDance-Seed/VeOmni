@@ -219,6 +219,7 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
             markov_rank = getattr(config, "dspark_markov_rank", 256)
             self.markov_head = DSparkMarkovHead(config.vocab_size, markov_rank)
             self.confidence_head = DSparkConfidenceHead(config.hidden_size + markov_rank)
+            self.confidence_head.requires_grad_(False)
 
     def project_main(self, draft_hiddens: list[torch.Tensor] | torch.Tensor) -> torch.Tensor:
         """``main_norm(main_proj(cat(target-layer hiddens)))`` -- stage 0 only."""
@@ -303,6 +304,7 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
             main_idxs = full_main_idxs.narrow(1, sp_rank * seq_len, seq_len)
         else:
             main_idxs = main_window_indices(position_ids, attn.sliding_window)
+        main_idxs = main_idxs.expand(batch, -1, -1)
 
         pool = torch.cat([main_kv, kv], dim=1)
         own_idxs = main_kv.shape[1] + torch.arange(seq_len, device=hidden_states.device, dtype=torch.int32)

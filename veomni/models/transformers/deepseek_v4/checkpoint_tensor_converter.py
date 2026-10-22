@@ -531,7 +531,7 @@ def convert_deepseek_v4_fqn_to_index_mapping(
     fqn_to_index_mapping: dict[str, int],
     *,
     target_model_prefix: str = "model.",
-    enable_mtp: bool = False,
+    enable_mtp: bool = True,
 ) -> dict[str, int]:
     """Align HF safetensors index keys with fused expert parameter names."""
     gate_up_shard_indices: dict[str, list[int]] = defaultdict(list)

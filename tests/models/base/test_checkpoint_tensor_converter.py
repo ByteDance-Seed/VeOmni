@@ -1173,13 +1173,16 @@ class TestDeepseekV4ConverterFactoryAndMapping:
             "layers.0.mlp.experts.down_proj": 3,
         }
 
-    def test_fqn_mapping_preserves_mtp_keys(self):
+    def test_fqn_mapping_converts_mtp_keys_by_default_and_preserves_when_disabled(self):
         mapping = {
             "mtp.0.attn.wkv.weight": 0,
             "model.mtp.0.attn.wkv.weight": 1,
         }
 
-        assert convert_deepseek_v4_fqn_to_index_mapping(mapping) == mapping
+        assert convert_deepseek_v4_fqn_to_index_mapping(mapping, enable_mtp=False) == mapping
+        assert convert_deepseek_v4_fqn_to_index_mapping(mapping) == {
+            "model.mtp.0.self_attn.kv_proj.weight": 1,
+        }
 
     @pytest.mark.parametrize(
         ("raw_name", "converted_name"),

@@ -157,6 +157,15 @@ def test_dspark_mtp_config_fields_and_defaults():
     assert custom.num_nextn_predict_layers == 3
     assert custom.moe_config_for_layer(4) == (2, 1)
 
+    # Verify from_dict override where dspark_block_size is passed as a kwarg override
+    # while compress_ratios is in the base dict (simulating YAML model_config override).
+    from_dict_cfg = DeepseekV4Config.from_dict(
+        {"num_hidden_layers": 4, "compress_ratios": [0, 0, 4, 128, 0, 0, 0]},
+        dspark_block_size=5,
+    )
+    assert from_dict_cfg.num_nextn_predict_layers == 3
+    assert from_dict_cfg.dspark_block_size == 5
+
 
 @pytest.mark.parametrize("coef", [-1.0, float("nan"), float("inf")])
 def test_mtp_loss_coef_rejects_negative_and_non_finite(coef):

@@ -2315,9 +2315,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             "compress": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="compress"),
         }
 
-        run_mtp = len(self.mtp) > 0 and (
-            return_mtp_outputs or (self.training and any(p.requires_grad for p in self.mtp.parameters()))
-        )
+        run_mtp = len(self.mtp) > 0 and return_mtp_outputs
         if run_mtp:
             target_ids = getattr(self.config, "dspark_target_layer_ids", None)
             if not target_ids:
@@ -2550,9 +2548,11 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         if (
             "return_mtp_outputs" not in kwargs
             and labels is not None
+            and not kwargs.get("return_log_probs", False)
             and len(self.model.mtp) > 0
             and mtp_loss_coef > 0
             and not getattr(self.config, "freeze_mtp", False)
+            and any(p.requires_grad for p in self.model.mtp.parameters())
         ):
             kwargs = {**kwargs, "return_mtp_outputs": True}
 
@@ -2587,13 +2587,27 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             logits = self.lm_head(hidden_states)
 
         aux_loss = None
-        if output_router_logits:
-            aux_loss = self.load_balancing_loss(
-                outputs.router_logits,
-                self.num_experts,
-                self.num_experts_per_tok,
-                attention_mask,
-            )
+        if output_router_logits and outputs.router_logits:
+            num_backbone_routed = sum(1 for layer_type in self.config.mlp_layer_types if layer_type == "moe")
+            backbone_router_logits = outputs.router_logits[:num_backbone_routed]
+            mtp_router_logits = outputs.router_logits[num_backbone_routed:]
+            if backbone_router_logits:
+                aux_loss = self.load_balancing_loss(
+                    backbone_router_logits,
+                    self.num_experts,
+                    self.num_experts_per_tok,
+                    attention_mask,
+                )
+            if mtp_router_logits:
+                mtp_num_experts = getattr(self.config, "dspark_n_routed_experts", None) or self.num_experts
+                mtp_top_k = getattr(self.config, "dspark_num_experts_per_tok", None) or self.num_experts_per_tok
+                mtp_aux_loss = self.load_balancing_loss(
+                    mtp_router_logits,
+                    mtp_num_experts,
+                    mtp_top_k,
+                    attention_mask,
+                )
+                aux_loss = mtp_aux_loss if aux_loss is None else aux_loss + mtp_aux_loss
             if isinstance(loss, torch.Tensor) and isinstance(aux_loss, torch.Tensor):
                 loss = loss + self.router_aux_loss_coef * aux_loss.to(loss.device)
 
@@ -2625,16 +2639,17 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
                 "indexer_kl_captured": 1.0
                 - indexer_kl_metric / indexer_uniform_metric.clamp_min(torch.finfo(torch.float32).tiny),
             }
-            if labels is not None:
+            if loss is not None:
                 aux_metrics["lm_loss_before_indexer_kl"] = loss.detach()
                 loss = loss + self.config.dsa_indexer_loss_coef * indexer_kl.to(loss.device)
 
-        if labels is not None and outputs.mtp_hidden_states is not None and mtp_loss_coef > 0:
+        if loss is not None and outputs.mtp_hidden_states is not None and mtp_loss_coef > 0:
             if outputs.mtp_markov_bias is None:
                 raise RuntimeError(
                     "DeepseekV4Model returned mtp_hidden_states without mtp_markov_bias; "
                     "DSpark MTP training requires input_ids to compute the Markov residual."
                 )
+            ignore_index = kwargs.get("ignore_index", -100)
             mtp_hidden_states = outputs.mtp_hidden_states[:, slice_indices, :]
             mtp_markov_bias = outputs.mtp_markov_bias[:, slice_indices, :]
             sp_enabled = get_parallel_state().sp_enabled
@@ -2644,12 +2659,14 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             elif sp_enabled:
                 mtp_shift_labels = labels
             else:
-                mtp_shift_labels = F.pad(labels, (0, 1), value=-100)[..., 1:].contiguous()
+                mtp_shift_labels = F.pad(labels, (0, 1), value=ignore_index)[..., 1:].contiguous()
             if position_ids is None:
                 mtp_pos_ids = torch.arange(mtp_shift_labels.shape[-1], device=mtp_shift_labels.device).unsqueeze(0)
             else:
                 mtp_pos_ids = position_ids
-            mtp_shift_labels = mtp_shift_labels.masked_fill(mtp_pos_ids.to(device=mtp_shift_labels.device) == 0, -100)
+            mtp_shift_labels = mtp_shift_labels.masked_fill(
+                mtp_pos_ids.to(device=mtp_shift_labels.device) == 0, ignore_index
+            )
             mtp_loss, _, _ = ForCausalLMLoss(
                 logits=None,
                 labels=None,
@@ -2659,6 +2676,8 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
                 weights=self.lm_head.weight,
                 logits_bias=mtp_markov_bias,
                 chunk_size=2048,
+                ignore_index=ignore_index,
+                loss_reduction_group=kwargs.get("loss_reduction_group"),
                 op=self.veomni_mtp_ce,
             )
             loss = loss + mtp_loss_coef * mtp_loss.to(loss.device)

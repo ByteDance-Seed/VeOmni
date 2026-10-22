@@ -618,7 +618,20 @@ def test_deepseek_v4_dspark_mtp_forward_backward_and_packed_isolation(num_mtp_la
     assert hasattr(model.model.mtp[0], "main_proj")
     assert hasattr(model.model.mtp[-1], "markov_head")
     assert hasattr(model.model.mtp[-1], "hc_head")
+    assert not model.model.mtp[-1].confidence_head.proj.weight.requires_grad
     assert model.model.mtp[0].mlp.experts.num_experts == 2
+
+    from veomni.optim.muon import split_muon_adamw_params
+
+    _, _, muon_names, adamw_names = split_muon_adamw_params(model)
+    assert any("markov_head.embed.weight" in n for n in adamw_names)
+    assert any("markov_head.head.weight" in n for n in adamw_names)
+    assert not any("markov_head" in n for n in muon_names)
+
+    # Without return_mtp_outputs=True, DeepseekV4Model.forward skips running MTP stages.
+    raw_model_out = model.model(input_ids=torch.randint(3, config.vocab_size, (1, 4)), use_cache=False)
+    assert raw_model_out.mtp_hidden_states is None
+    assert raw_model_out.mtp_markov_bias is None
 
     # Two packed samples of length 4 each: position_ids restarts at 0 at index 4.
     input_ids = torch.randint(3, config.vocab_size, (1, 8))
@@ -717,3 +730,33 @@ def test_deepseek_v4_dspark_packed_samples_do_not_attend_across_boundary():
     assert out_1.mtp_hidden_states is not None and out_2.mtp_hidden_states is not None
     assert not torch.allclose(out_1.mtp_hidden_states[:, :4], out_2.mtp_hidden_states[:, :4])
     torch.testing.assert_close(out_1.mtp_hidden_states[:, 4:], out_2.mtp_hidden_states[:, 4:], atol=1e-6, rtol=1e-6)
+
+
+def test_deepseek_v4_dspark_batch_gt_1_and_output_router_logits():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 2
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+    config.n_routed_experts = 8
+    config.dspark_n_routed_experts = 4
+    config.dspark_num_experts_per_tok = 1
+
+    model = _build_ours(config).train()
+    input_ids = torch.randint(3, config.vocab_size, (2, 6))
+    labels = input_ids.clone()
+
+    # position_ids=None with batch_size=2 exercises [1, S] broadcast position_ids in _packed_draft_attention,
+    # and output_router_logits=True exercises mixed expert counts between backbone (8) and MTP (4).
+    out = model(
+        input_ids=input_ids,
+        labels=labels,
+        output_router_logits=True,
+        use_cache=False,
+    )
+    assert out.loss is not None
+    assert out.aux_loss is not None and torch.isfinite(out.aux_loss)
+    assert out.aux_metrics is not None and "mtp_loss" in out.aux_metrics
+    out.loss.backward()
+    assert model.model.mtp[0].main_proj.weight.grad is not None

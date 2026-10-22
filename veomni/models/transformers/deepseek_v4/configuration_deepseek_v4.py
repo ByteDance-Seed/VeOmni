@@ -64,14 +64,14 @@ class DeepseekV4Config(_DeepseekV4Config):
     def __post_init__(self, **kwargs):
         legacy_compress_ratios = kwargs.get("compress_ratios")
         legacy_n_mtp_layers = kwargs.pop("n_mtp_layers", None)
+        explicit_num_nextn = "num_nextn_predict_layers" in kwargs
         super().__post_init__(**kwargs)
         if legacy_n_mtp_layers is not None:
             self.num_nextn_predict_layers = legacy_n_mtp_layers
         elif (
             legacy_compress_ratios is not None
             and len(legacy_compress_ratios) > self.num_hidden_layers
-            and self.dspark_block_size > 0
-            and self.num_nextn_predict_layers == 1
+            and not explicit_num_nextn
         ):
             # Released DeepSeek-V4-Flash checkpoints ship 43+3 entries in
             # ``compress_ratios`` (3 trailing zeros for ``mtp.0..2``) while leaving
