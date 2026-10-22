@@ -101,7 +101,15 @@ key_features/mtp.md
 :maxdepth: 1
 :caption: SeedOmni
 
+seed_omni/design/architecture.md
+seed_omni/design/media.md
+seed_omni/usage/training_and_inference.md
+seed_omni/usage/data_format.md
+seed_omni/usage/adding_a_model.md
 seed_omni/usage/hf_layout.md
+seed_omni/distributed/per_module_parallelism.md
+seed_omni/distributed/sequence_parallel.md
+seed_omni/mixins/module_preprocessor.md
 seed_omni/mixins/metric_meter.md
 seed_omni/mixins/offline_encoding.md
 ```
@@ -110,6 +118,7 @@ seed_omni/mixins/offline_encoding.md
 :maxdepth: 1
 :caption: Design
 
+design/ci_case_scheduling.md
 design/op_selection.md
 design/fused_moe_ops.md
 design/local_parallel_state.md

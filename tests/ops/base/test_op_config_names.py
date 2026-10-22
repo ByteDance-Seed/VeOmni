@@ -18,9 +18,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import OP_REGISTRY
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 REPO_ROOT = Path(__file__).parents[3]

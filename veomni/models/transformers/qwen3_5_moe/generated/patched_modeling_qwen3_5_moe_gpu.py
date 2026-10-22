@@ -774,7 +774,11 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         attention_mask: torch.Tensor | None = None,
         # Modification: plumb varlen sequence metadata to FLA kernels.
         cu_seq_lens_q: torch.Tensor | None = None,
+        # Modification: shared-prefix plan; the conv and the delta rule run on its compact row.
+        shared_prefix_plan=None,
     ):
+        if shared_prefix_plan is not None and get_parallel_state().sp_enabled:
+            raise NotImplementedError("Shared-prefix training does not support sequence parallelism yet.")
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
         # Set up dimensions for reshapes later
@@ -860,15 +864,27 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 )
             else:
                 conv_weight = self.conv1d.weight.squeeze(1)
-            mixed_qkv = self.veomni_causal_conv1d(
-                mixed_qkv,
-                conv_weight,
-                self.conv1d.bias,
-                cu_seq_lens_q,
-                activation=self.activation,
-                seq_idx=None,
-                backend="triton",
-            )
+            if shared_prefix_plan is not None:
+                # Modification: one varlen call; suffixes take the prefix tail as look-back context.
+                mixed_qkv = shared_prefix_plan.causal_conv1d(
+                    self.veomni_causal_conv1d,
+                    mixed_qkv,
+                    weight=conv_weight,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    seq_idx=None,
+                    backend="triton",
+                )
+            else:
+                mixed_qkv = self.veomni_causal_conv1d(
+                    mixed_qkv,
+                    conv_weight,
+                    self.conv1d.bias,
+                    cu_seq_lens_q,
+                    activation=self.activation,
+                    seq_idx=None,
+                    backend="triton",
+                )
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -909,22 +925,36 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         else:
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
-        if self.num_v_heads // self.num_k_heads > 1:
+        if self.num_v_heads // self.num_k_heads > 1 and not (
+            self.veomni_chunk_gated_delta_rule.impl == "flash_qla" and not use_precomputed_states
+        ):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         if not use_precomputed_states:
-            core_attn_out, last_recurrent_state = self.veomni_chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g,
-                beta,
-                None,
-                cu_seq_lens_q,
-                output_final_state=cache_params is not None,
-                use_qk_l2norm_in_kernel=True,
-            )
+            if shared_prefix_plan is not None:
+                if self.veomni_chunk_gated_delta_rule.impl == "eager":
+                    raise RuntimeError(
+                        "Shared-prefix training requires a varlen-capable chunk_gated_delta_rule backend. "
+                        "On GPU, set the implementation to 'fla' or 'flash_qla'; on NPU, set it to 'fla' or 'triton'."
+                    )
+                # Modification: two varlen calls; suffixes start from the prefix state at its last chunk boundary.
+                core_attn_out = shared_prefix_plan.gated_delta_rule(
+                    self.veomni_chunk_gated_delta_rule, query, key, value, g, beta, use_qk_l2norm_in_kernel=True
+                )
+                last_recurrent_state = None
+            else:
+                core_attn_out, last_recurrent_state = self.veomni_chunk_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    None,
+                    cu_seq_lens_q,
+                    output_final_state=cache_params is not None,
+                    use_qk_l2norm_in_kernel=True,
+                )
         else:
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
                 query,
@@ -2116,6 +2146,20 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
 
+        # Modification: shared-prefix training runs the decoder stack on a compact row in which
+        # every shared prefix appears once; the final hidden states are expanded back below.
+        shared_prefix_plan = kwargs.get("shared_prefix_plan", None)
+        if shared_prefix_plan is not None:
+            if get_parallel_state().sp_enabled:
+                raise NotImplementedError("Shared-prefix training does not support sequence parallelism yet.")
+            if return_mtp_context or use_cache or past_key_values is not None:
+                raise NotImplementedError("Shared-prefix training supports neither MTP nor KV cache.")
+            inputs_embeds = shared_prefix_plan.compact(inputs_embeds)
+            position_ids = shared_prefix_plan.compact(position_ids, dim=-1)
+            attention_mask = None
+            for key in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"):
+                kwargs.pop(key, None)
+
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
             text_position_ids = position_ids[0]
             position_ids = position_ids[1:]
@@ -2149,6 +2193,8 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
                 **kwargs,
             )
 
+        # Modification: under shared prefix the compact row is returned; the caller expands it (after the LM
+        # head where possible), and backward sums the copies of each shared row.
         hidden_states = self.norm(hidden_states)
 
         mtp_context = None

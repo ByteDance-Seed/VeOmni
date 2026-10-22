@@ -25,9 +25,13 @@ import torch.nn as nn
 from torch.distributed._tensor import Shard
 from torch.distributed.checkpoint import FileSystemReader
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.arguments import MixedPrecisionConfig
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.utils.device import get_torch_device
+
+
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 
 NUM_EXPERTS = 8
@@ -168,7 +172,8 @@ def _aliased_extra_parallel_worker(ep_size: int = 2):
     dist.barrier()
 
 
-@pytest.mark.skipif(get_torch_device().device_count() < 2, reason="needs 2 devices")
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
+@pytest.mark.skipif(runner_device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("ep_size", [1, 2], ids=["no_ep", "ep2"])
 def test_aliased_extra_parallel_parameters_survive_a_dcp_round_trip(ep_size: int):
     """The ``ep2`` arm is the regression.
@@ -178,4 +183,4 @@ def test_aliased_extra_parallel_parameters_survive_a_dcp_round_trip(ep_size: int
     """
     from ..tools.launch_utils import torchrun
 
-    torchrun(partial(_aliased_extra_parallel_worker, ep_size), world_size=2)
+    torchrun(partial(_aliased_extra_parallel_worker, ep_size), world_size=_CI_ACCELERATOR_2.nproc)

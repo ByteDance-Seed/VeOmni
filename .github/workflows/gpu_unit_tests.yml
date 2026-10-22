@@ -12,6 +12,8 @@ on:
     paths:
       - "**/*.py"
       - "!scripts/**/*.py"
+      - "scripts/ci/**"
+      - "tests/toy_config/**"
       - "configs/dit/qwen_image_edit_2511.yaml"
       - "configs/dit/qwen_image_sft.yaml"
       - "configs/dit/wan2.2_I2V_5B.yaml"
@@ -25,6 +27,8 @@ on:
     paths:
       - "**/*.py"
       - "!scripts/**/*.py"
+      - "scripts/ci/**"
+      - "tests/toy_config/**"
       - "configs/dit/qwen_image_edit_2511.yaml"
       - "configs/dit/qwen_image_sft.yaml"
       - "configs/dit/wan2.2_I2V_5B.yaml"
@@ -127,113 +131,13 @@ jobs:
       - name: Sync dependencies
         run: |
           uv sync --frozen --extra gpu --group dev
-      - name: Run parallel tests
-        # TODO: run all tests under tests/parallel/ulysses after we verify
-        #       tests/parallel/ulysses/test_ulysses_async.py still works
+      - name: Run GPU unit tests on eight GPUs
+        shell: bash
+        env:
+          QWEN3_5_ULYSSES: ${{ steps.changes.outputs.qwen3_5_ulysses }}
         run: |
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_slice_input_tensor.py
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_wan_ulysses_padding.py
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_wan_self_attn_ulysses.py
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_flux_joint_attn_ulysses.py
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_ltx2_ulysses.py
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_qwen4_exp_ulysses.py
-          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
-          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
-          uv run --frozen pytest -s -x tests/parallel/test_ddp_sp_grad_sync.py
-          uv run --frozen pytest -s -x tests/parallel/test_parallel_state_registry.py
-          uv run --frozen pytest -s -x tests/parallel/context_parallel
-      - name: Run models tests
-        run: |
-          uv run --frozen pytest -s -x tests/models
-          uv run --frozen pytest -s -x tests/arguments
-          uv run --frozen pytest -s -x tests/trainer/test_vlm_trainer.py
-          uv run --frozen pytest -s -x tests/trainer/test_aux_metrics.py
-          uv run --frozen pytest -s -x tests/trainer/test_trainer_model_runtime.py
-          uv run --frozen pytest -s -x tests/trainer/test_dit_microbatch.py
-          uv run --frozen pytest -s -x tests/lora/test_vlm_lora.py
-      - name: Run SeedOmni unit tests
-        run: |
-          uv run --frozen pytest -s -x tests/seed_omni
-      - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests
-        if: steps.changes.outputs.qwen3_5_ulysses == 'true'
-        run: |
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses.py
-      - name: Run fsdp2/extra_parallel+fsdp2 clip grad norm test
-        run: |
-          uv run --frozen pytest -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
-      - name: Run fsdp2 all ranks or rank0 load model weights
-        run: |
-          uv run --frozen pytest -s -x tests/utils/test_rank0_load_and_broadcast_weights.py
-      - name: Run MoE ep_sharded_stream_load matrix (non-PEFT)
-        # Fake EP MoE model: {plain, rank0 broadcast, ep_sharded} x {merged,
-        # per-expert} bit-identical load, per-rank expert stacking, and the bail
-        # for a converter that cannot stream.
-        run: |
-          uv run --frozen pytest -s -x tests/utils/test_moe_ep_sharded_load_matrix.py
-          uv run --frozen pytest -s -x tests/utils/test_ep_sharded_expert_stream_load.py
-      - name: Run checkpoint tests
-        run: |
-          uv run --frozen pytest -s -x tests/checkpoints/
-      - name: Run distributed tests
-        run: |
-          uv run --frozen pytest -s -x tests/distributed/test_async_offload_unit.py
-          uv run --frozen pytest -s -x tests/distributed/test_reduce_loss.py
-          uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
-          uv run --frozen pytest -s -x tests/distributed/test_hccl_premul_sum.py
-          uv run --frozen pytest -s -x tests/distributed/test_emb_parallel.py
-          uv run --frozen pytest -s -x tests/distributed/test_parallel_plan.py
-          uv run --frozen pytest -s -x tests/distributed/test_reduce_scatter_fp32_accumulation.py
-          uv run --frozen pytest -s -x tests/distributed/test_gradient_checkpointing.py
-          uv run --frozen pytest -s -x tests/distributed/test_torch_compile.py
-      - name: Run data tests
-        run: |
-          uv run --frozen pytest -s -x tests/data
-      - name: Run ops tests
-        run: |
-          uv run --frozen pytest -s -x -m "not benchmark" tests/ops
-      - name: Run ops architecture guards
-        run: |
-          uv run --frozen pytest -s -x tests/special_sanity/test_ops_architecture.py
-      - name: Run utils tests
-        # TODO: run all tests under tests/utils/ once all util tests are verified
-        run: |
-          uv run --frozen pytest -s -x tests/utils/test_count_flops.py
-          uv run --frozen pytest -s -x tests/tools/test_training_utils.py
-          uv run --frozen pytest -s -x tests/utils/test_hdfs_io.py
-      - name: Run Muon optimizer tests
-        run: |
-          uv run --frozen pytest -s -x tests/optim/test_muon_unit.py
-          uv run --frozen pytest -s -x tests/distributed/test_muon_zero_comm_shard.py
-          uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_parity.py
-          uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_smoke.py
-          uv run --frozen pytest -s -x tests/optim/test_optimizer_vlm_param_groups.py
-      - name: Run LoRA e2e tests
-        # peft ships under the `gpu` extra, so the earlier
-        # `uv sync --frozen --extra gpu --group dev` step is sufficient — no extra sync needed here.
-        # Coverage:
-        #   - lora_trainer_saveload: dense Qwen3 + linear LoRA save/load smoke test
-        #   - qwen3_5_moe_lora: CPU Qwen3.5-MoE (incl. MTP) fused-expert LoRA target mapping
-        #   - dense_mlp_lora: LoRA on dense swiglu_mlp projections matches merged weights
-        #     (eager + liger rows) and keeps the eager row bitwise at init
-        #   - veomni_lora_moe_native: CPU MoE-LoRA injection/save-load + init_lora_parameter
-        #     preserve/partial/fresh reset contract (catches to_empty clobber regressions)
-        #   - moe_lora_eager: wrapper layout + autograd parity (Mode 1 + Mode 2, all v5 MoE configs)
-        #   - moe_lora_trainer: production save/load/resume round-trip (DCP shard + HF adapter,
-        #     bit-exact LoRA reload, also covers linear LoRA on q_proj/v_proj since the
-        #     yaml enables both lora_modules and target_parameters)
-        #   - moe_lora_ep2: EP=1 vs EP=2 trainer-driven integration + per-step loss/grad_norm alignment
-        #   - moe_lora_ep_sharded_stream_load: PEFT ep_sharded_stream_load vs broadcast, bit-exact
-        #     post-load LoRA weights (independent + shared) on a fused-base Qwen3-MoE at EP=2
-        # Order: cheap unit tests first to fail fast, trainer/ep2 last (multi-subprocess, ~5-10 min each).
-        run: |
-          uv run --frozen pytest -s -x tests/lora/test_target_mapping.py
-          uv run --frozen pytest -s -x tests/lora/test_qwen3_5_moe_lora.py
-          uv run --frozen pytest -s -x tests/lora/test_dense_mlp_lora.py
-          uv run --frozen pytest -s -x tests/lora/test_veomni_lora_moe_native.py
-          uv run --frozen pytest -s -x tests/lora/test_lora_trainer_saveload.py
-          uv run --frozen pytest -s -x tests/lora/test_moe_lora_eager.py
-          uv run --frozen pytest -s -x tests/lora/test_moe_lora_trainer.py
-          uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep2.py
-          uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep_sharded_stream_load.py
+          extra_args=()
+          if [ "$QWEN3_5_ULYSSES" = "true" ]; then
+            extra_args+=(--include-conditional)
+          fi
+          uv run --frozen python -m scripts.ci.accelerator --backend cuda --suite unit "${extra_args[@]}"

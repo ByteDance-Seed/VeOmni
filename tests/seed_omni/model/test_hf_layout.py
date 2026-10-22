@@ -22,6 +22,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import PretrainedConfig
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.omni_arguments_types import OmniModuleRuntimeArguments, _validate_hf_view_modules
 from veomni.models.checkpoint.weights import _load_state_dict
 from veomni.models.seed_omni.configuration_omni import OmniConfig
@@ -38,6 +39,9 @@ from veomni.models.seed_omni.utils.hf_layout import (
     resolve_omni_checkpoint_root,
     save_hf_source_checkpoint,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 MODEL_TYPE = "fake_hf_omni"
