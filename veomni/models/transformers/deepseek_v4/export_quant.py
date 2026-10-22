@@ -31,12 +31,12 @@ def _require_tilelang_sm90() -> None:
 def fp4_act_quant(
     x: torch.Tensor,
     block_size: int = 32,
-    inplace: bool = False,
+    dequant: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     _require_tilelang_sm90()
     from veomni.ops.qat.quant import fp4_act_quant as impl
 
-    return impl(x, block_size, inplace)
+    return impl(x, block_size, dequant)
 
 
 def fp8_weight_quant(

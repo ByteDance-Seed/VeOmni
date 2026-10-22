@@ -30,7 +30,9 @@ from veomni.models.checkpoint.convert import (
     ConvertedCheckpointTensor,
     checkpoint_converter_fused_expert_target,
     get_checkpoint_tensor_converter,
+    get_fqn_to_index_mapping_converter,
     maybe_convert_checkpoint_tensor,
+    split_moe_params,
 )
 from veomni.models.transformers.deepseek_v3.checkpoint_tensor_converter import (
     DeepseekV3CheckpointTensorConverter,
@@ -41,7 +43,6 @@ from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
     _dequantize_scaled_weight,
     _get_fp4_e2m1_table,
     convert_deepseek_v4_checkpoint_key,
-    convert_deepseek_v4_fqn_to_index_mapping,
     create_deepseek_v4_checkpoint_tensor_converter,
 )
 from veomni.models.transformers.glm_moe_dsa.checkpoint_tensor_converter import (
@@ -640,9 +641,6 @@ class TestDeepseekV4ConverterConvert:
         assert result.name == target
         assert result.tensor is weight
         assert maybe_convert_checkpoint_tensor(target, result.tensor, converter).name == target
-        assert convert_deepseek_v4_fqn_to_index_mapping({source: 3}, target_model_prefix=target_model_prefix) == {
-            target: 3
-        }
         assert converter.finalize() == []
 
     @pytest.mark.parametrize("target_model_prefix", ["model.", ""])
@@ -681,20 +679,25 @@ class TestDeepseekV4ConverterConvert:
         ("expert_dtype", "scale_dtype"),
         [("fp8", torch.float32), ("fp4", torch.float8_e8m0fnu)],
     )
-    def test_fp8_export_rounds_scales_like_qat(self, monkeypatch, expert_dtype, scale_dtype):
+    @pytest.mark.parametrize("block_size", [128, 32])
+    def test_fp8_export_rounds_scales_like_qat_and_respects_block_size(
+        self, monkeypatch, expert_dtype, scale_dtype, block_size
+    ):
         from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
         from veomni.models.transformers.deepseek_v4 import export_quant
 
         origin = "layers.0.attn.wq_a.weight"
         weight = torch.randn(4, 8, dtype=torch.bfloat16)
-        calls: list[tuple[str | None, torch.dtype]] = []
+        calls: list[tuple[int, str | None, torch.dtype]] = []
 
         def fake_fp8_weight_quant(x, block_size, scale_fmt, scale_dtype):
-            calls.append((scale_fmt, scale_dtype))
+            calls.append((block_size, scale_fmt, scale_dtype))
             return x, torch.ones(1, dtype=scale_dtype)
 
         model = SimpleNamespace(
-            config=SimpleNamespace(expert_dtype=expert_dtype),
+            config=SimpleNamespace(
+                quantization_config={"weight_block_size": [block_size, block_size], "expert_dtype": expert_dtype},
+            ),
             _veomni_fqn_to_index_mapping={origin: 1, "layers.0.attn.wq_a.scale": 1},
         )
         target = module.convert_deepseek_v4_checkpoint_key(origin)
@@ -704,7 +707,98 @@ class TestDeepseekV4ConverterConvert:
         exported = dict(DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS).export_weights(model))
 
         assert set(exported) == {origin, "layers.0.attn.wq_a.scale"}
-        assert calls == [("ue8m0", scale_dtype)]
+        assert calls == [(block_size, "ue8m0", scale_dtype)]
+
+    def test_fp4_expert_export_uses_fp4_act_quant_and_fp8_for_shared(self, monkeypatch):
+        from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
+        from veomni.models.transformers.deepseek_v4 import export_quant
+
+        expert_origin = "layers.0.ffn.experts.0.w1.weight"
+        shared_origin = "layers.0.ffn.shared_experts.w1.weight"
+        expert_target = "model.layers.0.mlp.experts.0.gate_proj.weight"
+        shared_target = module.convert_deepseek_v4_checkpoint_key(shared_origin)
+        expert_param = torch.randn(4, 32, dtype=torch.float32)
+        shared_param = torch.randn(4, 32, dtype=torch.float32)
+
+        fp4_calls: list[tuple[torch.dtype, int]] = []
+        fp8_calls: list[tuple[torch.dtype, int, str | None, torch.dtype]] = []
+
+        def fake_fp4_act_quant(x, block_size=32, dequant=False):
+            assert dequant is False
+            fp4_calls.append((x.dtype, block_size))
+            packed = torch.ones((x.shape[0], x.shape[1] // 2), dtype=torch.uint8)
+            scale = torch.ones((x.shape[0], x.shape[1] // block_size), dtype=torch.float8_e8m0fnu)
+            return packed, scale
+
+        def fake_fp8_weight_quant(x, block_size, scale_fmt, scale_dtype):
+            fp8_calls.append((x.dtype, block_size, scale_fmt, scale_dtype))
+            q = torch.zeros_like(x, dtype=torch.float8_e4m3fn)
+            s = torch.ones((1, 1), dtype=scale_dtype)
+            return q, s
+
+        mapping = {
+            expert_origin: 1,
+            "layers.0.ffn.experts.0.w1.scale": 1,
+            shared_origin: 1,
+            "layers.0.ffn.shared_experts.w1.scale": 1,
+        }
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                expert_dtype="fp4",
+                quantization_config=SimpleNamespace(
+                    to_dict=lambda: {"weight_block_size": [32, 32], "expert_dtype": "fp4"}
+                ),
+            ),
+            _veomni_fqn_to_index_mapping=mapping,
+        )
+        monkeypatch.setattr(
+            module,
+            "export_weights",
+            lambda model: iter([(expert_target, expert_param), (shared_target, shared_param)]),
+        )
+        monkeypatch.setattr(export_quant, "fp4_act_quant", fake_fp4_act_quant)
+        monkeypatch.setattr(export_quant, "fp8_weight_quant", fake_fp8_weight_quant)
+
+        exported = dict(DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS).export_weights(model))
+
+        assert fp4_calls == [(torch.bfloat16, 32)]
+        assert fp8_calls == [(torch.bfloat16, 32, "ue8m0", torch.float8_e8m0fnu)]
+        assert exported[expert_origin].dtype == torch.int8
+        assert exported[expert_origin].shape == (4, 16)
+        assert exported["layers.0.ffn.experts.0.w1.scale"].dtype == torch.float8_e8m0fnu
+        assert exported[shared_origin].dtype == torch.float8_e4m3fn
+        assert exported["layers.0.ffn.shared_experts.w1.scale"].dtype == torch.float8_e8m0fnu
+
+    def test_unquantized_weights_cast_to_bf16_while_non_weight_params_stay_fp32(self, monkeypatch):
+        from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
+
+        raw_to_dtype = {
+            "embed.weight": torch.bfloat16,
+            "head.weight": torch.bfloat16,
+            "layers.0.attn_norm.weight": torch.bfloat16,
+            "layers.0.ffn.gate.weight": torch.bfloat16,
+            "layers.2.attn.indexer.weights_proj.weight": torch.bfloat16,
+            "layers.0.hc_attn_base": torch.float32,
+            "layers.0.attn.attn_sink": torch.float32,
+            "layers.0.ffn.gate.bias": torch.float32,
+        }
+        mapping = dict.fromkeys(raw_to_dtype, 1)
+        live_items = [
+            (module.convert_deepseek_v4_checkpoint_key(k), torch.ones(4, dtype=torch.float32)) for k in raw_to_dtype
+        ]
+        model = SimpleNamespace(
+            config=SimpleNamespace(),
+            _veomni_fqn_to_index_mapping=mapping,
+        )
+        monkeypatch.setattr(module, "export_weights", lambda model: iter(live_items))
+
+        exported = dict(DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS).export_weights(model))
+
+        assert set(exported) == set(raw_to_dtype)
+        for key, expected_dtype in raw_to_dtype.items():
+            assert exported[key].dtype == expected_dtype, (
+                f"{key}: got {exported[key].dtype}, expected {expected_dtype}"
+            )
 
     def test_dequantizes_block_scaled_fp8_weight(self):
         weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))
@@ -1123,63 +1217,26 @@ class TestDeepseekV4ConverterFactoryAndMapping:
         assert converter.num_experts == 8
         assert converter.target_model_prefix == ""
 
-    def test_fqn_mapping_accepts_raw_w_keys(self):
-        mapping = {
-            "model.layers.0.mlp.experts.0.w1.weight": 3,
-            "model.layers.0.mlp.experts.0.w2.weight": 4,
-            "model.layers.0.mlp.experts.0.w3.weight": 5,
-            "model.layers.0.self_attn.q_proj.weight": 7,
+    def test_deepseek_v4_models_do_not_register_fqn_to_index_mapping_converter(self):
+        from veomni.models.registry import MODELING_REGISTRY
+
+        causal_lm_cls = MODELING_REGISTRY["deepseek_v4"]("DeepseekV4ForCausalLM")
+        base_model_cls = MODELING_REGISTRY["deepseek_v4"]("DeepseekV4Model")
+        assert getattr(causal_lm_cls, "_convert_fqn_to_index_mapping", None) is None
+        assert getattr(base_model_cls, "_convert_fqn_to_index_mapping", None) is None
+        assert get_fqn_to_index_mapping_converter(causal_lm_cls.__new__(causal_lm_cls)) is None
+
+    def test_split_moe_params_splits_gate_up_and_down(self):
+        gate_up = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+        split_items = dict(split_moe_params("model.layers.0.mlp.experts.gate_up_proj", gate_up, ep_rank=1))
+        assert set(split_items) == {
+            "model.layers.0.mlp.experts.2.gate_proj.weight",
+            "model.layers.0.mlp.experts.3.gate_proj.weight",
+            "model.layers.0.mlp.experts.2.up_proj.weight",
+            "model.layers.0.mlp.experts.3.up_proj.weight",
         }
-        converted = convert_deepseek_v4_fqn_to_index_mapping(mapping)
-        assert converted == {
-            "model.layers.0.mlp.experts.gate_up_proj": 3,
-            "model.layers.0.mlp.experts.down_proj": 4,
-            "model.layers.0.self_attn.q_proj.weight": 7,
-        }
-
-    def test_fqn_mapping_converts_inference_checkpoint_keys(self):
-        mapping = {
-            "embed.weight": 0,
-            "layers.0.attn.wkv.weight": 1,
-            "layers.0.ffn.experts.0.w1.weight": 2,
-            "layers.0.ffn.experts.0.w2.weight": 3,
-            "layers.0.ffn.experts.0.w3.weight": 4,
-        }
-
-        converted = convert_deepseek_v4_fqn_to_index_mapping(mapping)
-
-        assert converted == {
-            "model.embed_tokens.weight": 0,
-            "model.layers.0.self_attn.kv_proj.weight": 1,
-            "model.layers.0.mlp.experts.gate_up_proj": 2,
-            "model.layers.0.mlp.experts.down_proj": 3,
-        }
-
-    def test_fqn_mapping_converts_inference_checkpoint_keys_for_base_model(self):
-        mapping = {
-            "embed.weight": 0,
-            "layers.0.attn.wkv.weight": 1,
-            "layers.0.ffn.experts.0.w1.weight": 2,
-            "layers.0.ffn.experts.0.w2.weight": 3,
-            "layers.0.ffn.experts.0.w3.weight": 4,
-        }
-
-        converted = convert_deepseek_v4_fqn_to_index_mapping(mapping, target_model_prefix="")
-
-        assert converted == {
-            "embed_tokens.weight": 0,
-            "layers.0.self_attn.kv_proj.weight": 1,
-            "layers.0.mlp.experts.gate_up_proj": 2,
-            "layers.0.mlp.experts.down_proj": 3,
-        }
-
-    def test_fqn_mapping_preserves_mtp_keys(self):
-        mapping = {
-            "mtp.0.attn.wkv.weight": 0,
-            "model.mtp.0.attn.wkv.weight": 1,
-        }
-
-        assert convert_deepseek_v4_fqn_to_index_mapping(mapping) == mapping
+        assert torch.equal(split_items["model.layers.0.mlp.experts.2.gate_proj.weight"], gate_up[0, :2])
+        assert torch.equal(split_items["model.layers.0.mlp.experts.3.up_proj.weight"], gate_up[1, 2:])
 
 
 # ---------------------------------------------------------------------------

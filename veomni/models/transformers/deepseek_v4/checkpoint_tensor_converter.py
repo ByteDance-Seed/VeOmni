@@ -41,7 +41,6 @@ VeOmni's runtime loader reads safetensor keys directly and does not run HF's
 from __future__ import annotations
 
 import re
-from collections import defaultdict
 from functools import lru_cache
 from typing import Generator
 
@@ -383,7 +382,12 @@ class DeepseekV4CheckpointTensorConverter:
     def export_weights(self, model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor]]:
         config = model.config
         fqn_to_index_mapping = model._veomni_fqn_to_index_mapping
-        expert_dtype = config.expert_dtype
+        quant_cfg = getattr(config, "quantization_config", None) or {}
+        if not isinstance(quant_cfg, dict):
+            quant_cfg = quant_cfg.to_dict() if hasattr(quant_cfg, "to_dict") else vars(quant_cfg)
+        weight_block_size = quant_cfg.get("weight_block_size", (128, 128))
+        fp8_block_size = int(weight_block_size[0])
+        expert_dtype = getattr(config, "expert_dtype", None) or quant_cfg.get("expert_dtype", "fp8")
         scale_fmt = "ue8m0"
         scale_dtype = torch.float8_e8m0fnu if expert_dtype == "fp4" else torch.float32
         # HF's renamings are not invertible (e.g. reversing ``.norm.`` -> ``.kv_norm.`` also rewrites the native
@@ -411,6 +415,8 @@ class DeepseekV4CheckpointTensorConverter:
                 scale_name = origin.removesuffix(".weight") + ".scale"
 
             if scale_name is None or scale_name not in fqn_to_index_mapping:
+                if origin.endswith(".weight") and param.dtype == torch.float32:
+                    param = param.to(torch.bfloat16)
                 export_weight_names.add(origin)
                 yield origin, param
                 continue
@@ -421,10 +427,12 @@ class DeepseekV4CheckpointTensorConverter:
 
             param = param.to(torch.bfloat16)
             if fp4_quantize:
-                weight, scale = fp4_act_quant(param, block_size=32, inplace=False)
+                weight, scale = fp4_act_quant(param, block_size=32)
                 weight = weight.view(torch.int8)
             else:
-                weight, scale = fp8_weight_quant(param, block_size=128, scale_fmt=scale_fmt, scale_dtype=scale_dtype)
+                weight, scale = fp8_weight_quant(
+                    param, block_size=fp8_block_size, scale_fmt=scale_fmt, scale_dtype=scale_dtype
+                )
 
             export_weight_names.add(origin)
             export_weight_names.add(scale_name)
@@ -458,34 +466,3 @@ def _get_deepseek_v4_target_model_prefix(model) -> str:
     if type(model).__name__.endswith("ForCausalLM"):
         return "model."
     return ""
-
-
-def convert_deepseek_v4_fqn_to_index_mapping(
-    fqn_to_index_mapping: dict[str, int], *, target_model_prefix: str = "model."
-) -> dict[str, int]:
-    """Align HF safetensors index keys with fused expert parameter names."""
-    gate_up_shard_indices: dict[str, list[int]] = defaultdict(list)
-    down_shard_indices: dict[str, list[int]] = defaultdict(list)
-    converted: dict[str, int] = {}
-
-    for fqn, shard_idx in fqn_to_index_mapping.items():
-        fqn = convert_deepseek_v4_checkpoint_key(fqn, target_model_prefix=target_model_prefix)
-        match = _EXPERT_PATTERN.match(fqn)
-        if not match:
-            converted[fqn] = shard_idx
-            continue
-
-        prefix, _expert_id, proj_name = match.groups()
-        proj_name = _PROJ_NAME_ALIASES.get(proj_name, proj_name)
-        if proj_name == "down_proj":
-            down_shard_indices[prefix].append(shard_idx)
-        else:
-            gate_up_shard_indices[prefix].append(shard_idx)
-
-    for prefix, indices in down_shard_indices.items():
-        converted[f"{prefix}.experts.down_proj"] = min(indices)
-
-    for prefix, indices in gate_up_shard_indices.items():
-        converted[f"{prefix}.experts.gate_up_proj"] = min(indices)
-
-    return converted

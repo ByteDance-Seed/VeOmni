@@ -155,6 +155,83 @@ class TestGetModelSaveState(unittest.TestCase):
     def test_empty_state_returns_empty(self):
         self.assertEqual(_call_get_model_save_state(self.model, {"k": 0}, {}), {})
 
+    def test_converter_export_weights_preserves_dtypes_and_filters_mapping(self):
+        """Models whose converter defines export_weights bypass ModelState and keep exact dtypes."""
+        from veomni.utils.save_safetensor_utils import get_model_save_state
+
+        exported_items = [
+            ("embed.weight", torch.ones(4, 4, dtype=torch.bfloat16)),
+            ("layers.0.attn.wq_a.weight", torch.zeros(4, 4, dtype=torch.float8_e4m3fn)),
+            ("layers.0.attn.wq_a.scale", torch.ones(1, 1, dtype=torch.float32)),
+            ("layers.0.ffn.experts.0.w1.weight", torch.ones(4, 2, dtype=torch.int8)),
+            ("layers.0.ffn.experts.0.w1.scale", torch.ones(4, 1, dtype=torch.float8_e8m0fnu)),
+            ("layers.0.hc_attn_base", torch.ones(4, dtype=torch.float32)),
+            ("unmapped.weight", torch.ones(2, dtype=torch.bfloat16)),
+        ]
+
+        class _ExportConverter:
+            def can_handle(self, name):
+                return True
+
+            def convert(self, name, tensor):
+                return None
+
+            def export_weights(self, m):
+                assert getattr(m, "_veomni_fqn_to_index_mapping", None) == mapping
+                yield from exported_items
+
+        model = _TinyModel()
+        model._create_checkpoint_tensor_converter = staticmethod(lambda m: _ExportConverter())
+        mapping = {k: 1 for k, _ in exported_items if k != "unmapped.weight"}
+
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.ModelState") as mock_ms,
+            patch(f"{_MOD}.dist", MagicMock(is_initialized=MagicMock(return_value=False))),
+        ):
+            result = get_model_save_state(model, mapping)
+
+        mock_ms.assert_not_called()
+        self.assertNotIn("unmapped.weight", result)
+        self.assertEqual(result["embed.weight"].dtype, torch.bfloat16)
+        self.assertEqual(result["layers.0.attn.wq_a.weight"].dtype, torch.float8_e4m3fn)
+        self.assertEqual(result["layers.0.attn.wq_a.scale"].dtype, torch.float32)
+        self.assertEqual(result["layers.0.ffn.experts.0.w1.weight"].dtype, torch.int8)
+        self.assertEqual(result["layers.0.ffn.experts.0.w1.scale"].dtype, torch.float8_e8m0fnu)
+        self.assertEqual(result["layers.0.hc_attn_base"].dtype, torch.float32)
+
+    def test_converter_export_weights_partitions_across_ranks_when_distributed(self):
+        from veomni.utils.save_safetensor_utils import get_model_save_state
+
+        exported_items = [
+            ("k_shard1", torch.ones(2, dtype=torch.bfloat16)),
+            ("k_shard2", torch.ones(2, dtype=torch.float32)),
+            ("k_shard3", torch.ones(2, dtype=torch.int8)),
+        ]
+        mapping = {"k_shard1": 1, "k_shard2": 2, "k_shard3": 3}
+
+        class _ExportConverter:
+            def can_handle(self, name):
+                return True
+
+            def convert(self, name, tensor):
+                return None
+
+            def export_weights(self, m):
+                yield from exported_items
+
+        model = _TinyModel()
+        model._create_checkpoint_tensor_converter = staticmethod(lambda m: _ExportConverter())
+
+        for rank, expected_keys in ((0, {"k_shard2"}), (1, {"k_shard1", "k_shard3"})):
+            mock_dist = MagicMock(
+                is_initialized=MagicMock(return_value=True),
+                get_rank=MagicMock(return_value=rank),
+                get_world_size=MagicMock(return_value=2),
+            )
+            with patch(f"{_MOD}.dist", mock_dist):
+                state = get_model_save_state(model, mapping)
+            self.assertEqual(set(state.keys()), expected_keys)
+
 
 # ===========================================================================
 # _save_hf_safetensor_distributed tests
@@ -286,6 +363,21 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
         self.assertEqual(int64_buffer_data.shape_in_file, [4, 4])
         self.assertEqual(int64_buffer_data.dtype_size, torch.empty((), dtype=torch.int64).element_size())
 
+        if hasattr(torch, "float8_e8m0fnu"):
+            e8m0_input = {
+                "shard_0": hf_module._InputFileData(
+                    metadata={
+                        "scale": {hf_module.SHAPE_KEY: [4, 2], hf_module.DTYPE_KEY: "F8_E8M0"},
+                        hf_module.DEFAULT_EXTRA_METADATA_KEY: {
+                            CUSTOM_METADATA_KEY: json.dumps({"scale": {hf_module.SAVED_OFFSETS_KEY: [0, 0]}})
+                        },
+                    }
+                ),
+            }
+            e8m0_output = {"model.safetensors": hf_module._OutputFileData(fqn_data={"scale": hf_module._FqnData()})}
+            hf_module._parse_input_metadata(e8m0_input, e8m0_output)
+            self.assertEqual(e8m0_output["model.safetensors"].fqn_data["scale"].dtype_size, 1)
+
     def test_model_assets_saved(self):
         fake = {"w": torch.randn(2, 2, dtype=torch.bfloat16)}
         assets = [MagicMock()]
@@ -297,6 +389,46 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
             fake,
         )
         save_assets.assert_called_once_with("/tmp/test", assets)
+
+    def test_mapping_filtered_against_global_keys_when_distributed(self):
+        """When save_state keys are partitioned across ranks, every rank must pass the global key union to writer."""
+        rank0_state = {"k_shard2": torch.ones(2, dtype=torch.bfloat16)}
+        mapping = {"k_shard1": 1, "k_shard2": 2, "mtp.0.weight": 3}
+
+        def fake_all_gather_object(output_list, obj):
+            output_list[0] = ["k_shard2"]
+            output_list[1] = ["k_shard1"]
+
+        mock_dist = MagicMock(
+            is_initialized=MagicMock(return_value=True),
+            get_world_size=MagicMock(return_value=2),
+            get_rank=MagicMock(return_value=0),
+            all_gather_object=MagicMock(side_effect=fake_all_gather_object),
+        )
+        mock_writer_cls = MagicMock()
+
+        with (
+            patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", mock_writer_cls),
+            patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
+            patch(f"{_MOD}.get_model_save_state", MagicMock(return_value=rank0_state)),
+            patch(f"{_MOD}.dcp", MagicMock(save=MagicMock())),
+            patch(f"{_MOD}.dist", mock_dist),
+            patch(f"{_MOD}.save_model_assets", MagicMock()),
+            patch(f"{_MOD}.helper", MagicMock()),
+            patch(f"{_MOD}.gc", MagicMock()),
+            patch(f"{_MOD}.synchronize", MagicMock()),
+        ):
+            from veomni.utils.save_safetensor_utils import _save_hf_safetensor_distributed
+
+            _save_hf_safetensor_distributed(
+                model=self.model,
+                save_path="/tmp/test",
+                fqn_to_index_mapping=mapping.copy(),
+                model_assets=None,
+            )
+
+        passed = mock_writer_cls.call_args.kwargs["fqn_to_index_mapping"]
+        self.assertEqual(passed, {"k_shard1": 1, "k_shard2": 2})
 
 
 # ===========================================================================
@@ -392,6 +524,29 @@ class TestLegacySaveModelWeights(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Unknown save dtype: not_a_dtype"):
             _get_shard_info({"ids": torch.arange(4)}, "not_a_dtype", 5_000_000_000, False)
+
+    def test_materialize_and_load_weights_caches_fqn_mapping_when_skipping_hf_load(self):
+        from veomni.distributed.torch_parallelize import _materialize_and_load_weights
+        from veomni.models.checkpoint import init_empty_weights
+
+        with init_empty_weights():
+            model = _TinyModel()
+        model.init_weights = lambda: None
+        mapping = {"embed_tokens.weight": 1, "linear.weight": 2}
+
+        _materialize_and_load_weights(
+            model,
+            weights_path="/tmp/nonexistent",
+            materialize_device="cpu",
+            should_skip_hf_weight_load=True,
+            is_peft_model=False,
+            adapter_path=None,
+            broadcast_from_rank0=False,
+            fqn_to_index_mapping=mapping,
+        )
+
+        self.assertEqual(getattr(model, "_veomni_fqn_to_index_mapping", None), mapping)
+        self.assertEqual(getattr(model, "_veomni_prepared_fqn_to_index_mapping", None), mapping)
 
 
 if __name__ == "__main__":

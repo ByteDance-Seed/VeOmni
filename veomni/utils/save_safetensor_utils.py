@@ -41,11 +41,51 @@ def get_model_save_state(
 ) -> Dict[str, torch.Tensor]:
     """Build a flat state dict suitable for HuggingFace safetensors saving.
 
+    If the model's checkpoint tensor converter defines ``export_weights(model)``,
+    delegates directly to it (so online RL weight export and HF checkpoint save share
+    the exact same key/dtype/quantization conversion) and partitions non-DTensor
+    outputs across ranks by shard index when distributed is initialized.
+
+    Otherwise:
     1. Extracts a flat state dict via ``ModelState`` (FQNs match HF weight_map keys).
     2. Casts float32 tensors to bfloat16 on copies (original model dtypes are preserved).
     3. Filters out tied weights not present in ``fqn_to_index_mapping``.
     """
+    from contextlib import nullcontext
+
     from veomni.checkpoint.dcp_checkpointer import ModelState
+    from veomni.distributed.parallel_state import use_parallel_state
+    from veomni.models.checkpoint import get_checkpoint_tensor_converter
+
+    converter = get_checkpoint_tensor_converter(model) if model is not None else None
+    if converter is not None and callable(getattr(converter, "export_weights", None)):
+        if getattr(model, "_veomni_fqn_to_index_mapping", None) is None and fqn_to_index_mapping is not None:
+            model._veomni_fqn_to_index_mapping = fqn_to_index_mapping
+        is_dist = dist.is_initialized()
+        rank = dist.get_rank() if is_dist else 0
+        world_size = dist.get_world_size() if is_dist else 1
+        save_state = {}
+        ps_ctx = use_parallel_state(parallel_state) if parallel_state is not None else nullcontext()
+        with ps_ctx:
+            for idx, (k, v) in enumerate(converter.export_weights(model)):
+                if fqn_to_index_mapping is not None and k not in fqn_to_index_mapping:
+                    logger.info_rank0(f"Skipping weight not in HF weight_map: {k}")
+                    continue
+                if is_dist:
+                    owner = (
+                        fqn_to_index_mapping[k] % world_size
+                        if (fqn_to_index_mapping is not None and k in fqn_to_index_mapping)
+                        else idx % world_size
+                    )
+                    if rank != owner:
+                        continue
+                save_state[k] = v.detach().cpu()
+        if fqn_to_index_mapping is None:
+            logger.warning_rank0(
+                "fqn_to_index_mapping is None, HuggingFaceStorageWriter will save "
+                "all model weights into a single safetensors file."
+            )
+        return save_state
 
     # Use flat state dict so DCP FQNs match the original HF weight_map keys
     # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
@@ -111,7 +151,13 @@ def _save_hf_safetensor_distributed(
     # weights, resulting in corrupted safetensors output.
     if fqn_to_index_mapping is not None:
         original_mapping_size = len(fqn_to_index_mapping)
-        fqn_to_index_mapping = {k: v for k, v in fqn_to_index_mapping.items() if k in save_state}
+        if dist.is_initialized():
+            gathered_keys = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered_keys, list(save_state.keys()))
+            global_keys = {k for rank_keys in gathered_keys if rank_keys is not None for k in rank_keys}
+        else:
+            global_keys = set(save_state.keys())
+        fqn_to_index_mapping = {k: v for k, v in fqn_to_index_mapping.items() if k in global_keys}
         if len(fqn_to_index_mapping) < original_mapping_size:
             logger.info_rank0(
                 f"Filtered fqn_to_index_mapping from {original_mapping_size} to {len(fqn_to_index_mapping)} keys "

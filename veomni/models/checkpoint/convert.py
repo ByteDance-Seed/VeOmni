@@ -348,7 +348,7 @@ def _map_moe_params_common(name, tensor, ep_rank):
         yield new_key, tensor[i].to(tensor.device, non_blocking=True)
 
 
-def _process_moe_params(name, tensor, ep_rank):
+def split_moe_params(name, tensor, ep_rank=0):
     if "gate_up_proj" in name:
         gate, up = tensor.chunk(2, dim=1)
         params = {
@@ -360,6 +360,9 @@ def _process_moe_params(name, tensor, ep_rank):
 
     for key, value in params.items():
         yield from _map_moe_params_common(key, value, ep_rank)
+
+
+_process_moe_params = split_moe_params
 
 
 def export_weights(model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -391,10 +394,10 @@ def export_weights(model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor]
             for src_ep_rank in range(ep_size):
                 tensor = unsharded_tensor if src_ep_rank == ep_rank else buffer
                 torch.distributed.broadcast(tensor, group_src=src_ep_rank, group=ps.ep_group)
-                yield from _process_moe_params(name, tensor, ep_rank=src_ep_rank)
+                yield from split_moe_params(name, tensor, ep_rank=src_ep_rank)
 
         else:
             if is_expert_layer:
-                yield from _process_moe_params(name, unsharded_tensor, ep_rank=0)
+                yield from split_moe_params(name, unsharded_tensor, ep_rank=0)
             else:
                 yield name, unsharded_tensor
