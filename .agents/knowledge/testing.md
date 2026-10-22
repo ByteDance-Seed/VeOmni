@@ -46,6 +46,12 @@ Explicit CPU plans reserve zero cards. See `docs/design/ci_case_scheduling.md`
 for the author API, defaults and mismatch rules, and `scripts/ci/accelerator/README.md` for
 local commands and result artifacts.
 
+A CPU launch plan isolates devices only when the accelerator runner executes
+the test. CPU-only launcher regressions must also isolate their subprocess
+environment before importing torch, so ordinary pytest on a GPU/NPU host does
+not choose an accelerator backend for CPU tensors. Architecture-specific
+kernel tests must check hardware eligibility before importing optional kernels.
+
 Distributed rendezvous must own its listener through worker startup. Use
 `tests.tools.launch_utils.spawn_with_rendezvous` for raw spawn workers (the
 endpoint is appended to their arguments; initialize with `store=endpoint.connect()`)

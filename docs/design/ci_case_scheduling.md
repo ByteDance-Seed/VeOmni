@@ -131,11 +131,14 @@ A parameterized launch uses the same parameter for planning and execution:
 
 ```python
 from scripts.ci.accelerator.launch_plan import from_parameter
+from tests.tools.launch_utils import spawn_with_rendezvous
 
 @pytest.mark.launch_plan(provider=from_parameter("cp_size"))
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_context_parallel(cp_size):
-    mp.spawn(check_context_parallel, args=(cp_size,), nprocs=cp_size)
+    # check_context_parallel(rank, cp_size, endpoint) initializes with
+    # store=endpoint.connect() on every rank.
+    spawn_with_rendezvous(check_context_parallel, args=(cp_size,), nprocs=cp_size)
 ```
 
 For CPU-only tests, use `LaunchSpec(device="cpu")`. For CPU distributed tests,

@@ -449,6 +449,7 @@ def _common_torchrun_sum(output):
     import torch
     import torch.distributed as dist
 
+    assert dist.get_backend() == "gloo"
     value = torch.tensor(dist.get_rank() + 1)
     dist.all_reduce(value)
     assert value.item() == 3
@@ -456,11 +457,28 @@ def _common_torchrun_sum(output):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_common_spawn_launcher_uses_live_store_instead_of_free_port(monkeypatch, tmp_path):
-    from tests.tools import launch_utils
+def test_common_spawn_launcher_uses_live_store_instead_of_free_port(tmp_path):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
 
-    monkeypatch.setattr(launch_utils, "find_free_port", lambda: pytest.fail("probe-close rendezvous was used"))
-    launch_utils.torchrun(_common_torchrun_sum, 2, str(tmp_path))
+    from scripts.ci.accelerator.launch_plan import RunnerCapabilities
+    from scripts.ci.accelerator.runtime.devices import child_environment
+
+    env = child_environment(RunnerCapabilities("cpu"), [])
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2]) + os.pathsep + env.get("PYTHONPATH", "")
+    script = (
+        "import sys\nfrom unittest.mock import patch\n"
+        "from tests.ci.test_accelerator import _common_torchrun_sum\n"
+        "from tests.tools import launch_utils\n"
+        "with patch.object(launch_utils, 'find_free_port', side_effect=AssertionError('probe-close rendezvous was used')):\n"
+        "    launch_utils.torchrun(_common_torchrun_sum, 2, sys.argv[1])\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)], env=env, capture_output=True, text=True, timeout=90
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
     assert sorted(path.name for path in tmp_path.iterdir()) == ["0", "1"]
 
 
