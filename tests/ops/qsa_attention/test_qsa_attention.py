@@ -23,7 +23,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import resolve_op
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 
@@ -60,6 +62,7 @@ def _selected_qsa_implementation(implementation):
         set_ops_config(previous)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_vendor_package_does_not_import_tilelang_eagerly():
     sys.modules.pop(_VENDOR_PACKAGE, None)
     before = "tilelang" in sys.modules
@@ -69,6 +72,7 @@ def test_vendor_package_does_not_import_tilelang_eagerly():
     assert ("tilelang" in sys.modules) is before
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_eager_full_causal_selection_matches_hf_eager_attention():
     from transformers.models.qwen4_exp.modeling_qwen4_exp import eager_attention_forward
 
@@ -89,6 +93,7 @@ def test_eager_full_causal_selection_matches_hf_eager_attention():
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_eager_empty_selection_row_is_zero():
     torch.manual_seed(0)
     query = torch.randn(1, 2, 4, 8)
@@ -327,6 +332,7 @@ def _causal_indices(seq_len):
     return torch.where(positions[None, :] <= positions[:, None], positions[None, :], -1)[None]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_tilelang_row_rejects_an_attention_mask():
     from veomni.ops.kernels.qsa_attention.standard import tilelang as tilelang_row
 
@@ -335,6 +341,7 @@ def test_tilelang_row_rejects_an_attention_mask():
         tilelang_row.wrapper(q, k, v, _causal_indices(4), scaling=0.25, attention_mask=torch.zeros(1, 1, 4, 4))
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_tilelang_row_dropout_falls_back_to_eager_with_warning(monkeypatch):
     from veomni.ops.kernels.qsa_attention.standard import tilelang as tilelang_row
 
@@ -425,7 +432,10 @@ def _npu_reference_forward(q, k, v, blocked, scale):
     scores = (q @ k.transpose(-1, -2)) * scale
     maximum = scores.masked_fill(blocked, -torch.inf).amax(-1, keepdim=True)
     maximum = maximum.masked_fill(~torch.isfinite(maximum), 0)
-    weights = torch.exp(scores - maximum).masked_fill(blocked, 0)
+    # CPU FP32 exp can lose accuracy on its first parallel call (observed with
+    # PyTorch 2.11). Stabilize the mock kernel's exponential only; attention
+    # matmuls, normalization and gradient accumulation retain the input dtype.
+    weights = torch.exp((scores - maximum).double()).to(scores.dtype).masked_fill(blocked, 0)
     denominator = weights.sum(-1, keepdim=True).clamp_min(1e-30)
     return (weights / denominator) @ v, maximum, denominator
 
@@ -433,7 +443,8 @@ def _npu_reference_forward(q, k, v, blocked, scale):
 def _npu_reference_backward(q, k, v, grad, blocked, output, maximum, denominator, scale):
     repeats = q.shape[1] // k.shape[1]
     kr, vr = k.repeat_interleave(repeats, 1), v.repeat_interleave(repeats, 1)
-    probabilities = torch.exp((q @ kr.transpose(-1, -2)) * scale - maximum).masked_fill(blocked, 0) / denominator
+    exponent = (q @ kr.transpose(-1, -2)) * scale - maximum
+    probabilities = torch.exp(exponent.double()).to(exponent.dtype).masked_fill(blocked, 0) / denominator
     ds = probabilities * ((grad @ vr.transpose(-1, -2)) - (grad * output).sum(-1, keepdim=True))
     dq = (ds @ kr) * scale
     dk = (ds.transpose(-1, -2) @ q) * scale
@@ -442,6 +453,7 @@ def _npu_reference_backward(q, k, v, grad, blocked, output, maximum, denominator
     return dq, dk.reshape(shape).sum(2), dv.reshape(shape).sum(2)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_torch_npu_pruned_gqa_output_gradients_and_saved_tensors(monkeypatch):
     from veomni.ops.kernels.qsa_attention.standard import torch_npu as npu_qsa
 
@@ -454,10 +466,10 @@ def test_torch_npu_pruned_gqa_output_gradients_and_saved_tensors(monkeypatch):
 
     monkeypatch.setattr(npu_qsa, "_forward", forward)
     monkeypatch.setattr(npu_qsa, "_backward", _npu_reference_backward)
-    q = torch.randn(2, 6, 257, 8, requires_grad=True)
-    k = torch.randn(2, 2, 769, 8, requires_grad=True)
+    q = torch.randn(2, 6, 257, 8, device="cpu", dtype=torch.float32, requires_grad=True)
+    k = torch.randn(2, 2, 769, 8, device="cpu", dtype=torch.float32, requires_grad=True)
     v = torch.randn_like(k, requires_grad=True)
-    indices = torch.randint(0, 127, (2, 257, 7))
+    indices = torch.randint(0, 127, (2, 257, 7), device=q.device)
     indices[:, 128:256] += 512
     indices[:, 0] = -1
     indices[:, -1] = -1
@@ -476,15 +488,41 @@ def test_torch_npu_pruned_gqa_output_gradients_and_saved_tensors(monkeypatch):
     assert calls == [128, 128, 1]  # Backward does not replay forward or gather KV.
     assert not any(dtype == torch.bool for dtype, _ in saved)
     allowed = ~npu_qsa._blocked_mask(indices, k.shape[2])
-    reference = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed, enable_gqa=True, scale=0.31)
-    expected = torch.autograd.grad(reference, (q, k, v), grad)
-    torch.testing.assert_close(result, reference, rtol=2e-5, atol=2e-6)
-    for actual, ref in zip(candidate, expected, strict=True):
-        torch.testing.assert_close(actual, ref, rtol=3e-5, atol=4e-6)
+    # Keep the candidate and its KV-gradient accumulation in FP32. The oracle
+    # uses independent FP64 leaves and explicit math SDPA, so CPU Flash kernel
+    # selection cannot change the reference arithmetic across CI hosts.
+    reference_inputs = tuple(tensor.detach().double().requires_grad_(True) for tensor in (q, k, v))
+    with sdpa_kernel(SDPBackend.MATH):
+        reference = F.scaled_dot_product_attention(*reference_inputs, attn_mask=allowed, enable_gqa=True, scale=0.31)
+        expected = torch.autograd.grad(reference, reference_inputs, grad.double())
+    diagnostics = (
+        f"CPU QSA seed=71, oracle=FP64 math SDPA, mock_exp=FP64, candidate={q.device}/{q.dtype}, "
+        f"qkv_shapes={[tuple(tensor.shape) for tensor in (q, k, v)]}, scale=0.31, chunk_size=128, "
+        f"torch={torch.__version__}, cpu={torch.backends.cpu.get_cpu_capability()}, "
+        f"threads={torch.get_num_threads()}, matmul_precision={torch.get_float32_matmul_precision()}"
+    )
+
+    def assert_aligned(name, actual, ref, rtol, atol):
+        def message(detail):
+            delta = (actual.double() - ref).abs()
+            flat_index = delta.reshape(-1).argmax().item()
+            return (
+                f"{name}: {detail}\n{diagnostics}\n"
+                f"max_abs_error={delta.max().item():.9g}, flat_index={flat_index}, "
+                f"actual={actual.reshape(-1)[flat_index].item():.9g}, "
+                f"reference={ref.reshape(-1)[flat_index].item():.9g}"
+            )
+
+        torch.testing.assert_close(actual.double(), ref, rtol=rtol, atol=atol, msg=message)
+
+    assert_aligned("output", result, reference, rtol=2e-5, atol=2e-6)
+    for name, actual, ref in zip(("dq", "dk", "dv"), candidate, expected, strict=True):
+        assert_aligned(name, actual, ref, rtol=3e-5, atol=4e-6)
     assert torch.count_nonzero(result[:, :, 0]) == 0
     assert torch.count_nonzero(result[:, :, -1]) == 0
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_torch_npu_ranges_cover_every_selected_index_with_partial_last_block():
     from veomni.ops.kernels.qsa_attention.standard import torch_npu as npu_qsa
 
@@ -497,6 +535,7 @@ def test_torch_npu_ranges_cover_every_selected_index_with_partial_last_block():
         assert torch.all((valid >= lo) & (valid < hi))
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_torch_npu_masked_rows_are_constant_zero_even_with_backend_residue(monkeypatch):
     from veomni.ops.kernels.qsa_attention.standard import torch_npu as npu_qsa
 
@@ -530,6 +569,7 @@ def test_torch_npu_masked_rows_are_constant_zero_even_with_backend_residue(monke
         assert torch.count_nonzero(gradient) == 0
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_torch_npu_int8_scatter_mask_matches_boolean_reference_exactly():
     from veomni.ops.kernels.qsa_attention.standard import torch_npu as npu_qsa
 
@@ -546,6 +586,7 @@ def test_torch_npu_int8_scatter_mask_matches_boolean_reference_exactly():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_torch_npu_row_rejects_an_attention_mask():
     from veomni.ops.kernels.qsa_attention.standard import torch_npu as npu_row
 
@@ -554,6 +595,7 @@ def test_torch_npu_row_rejects_an_attention_mask():
         npu_row.wrapper(q, k, v, _causal_indices(4), scaling=0.25, attention_mask=torch.zeros(1, 1, 4, 4))
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_torch_npu_row_dropout_falls_back_to_eager_with_warning(monkeypatch):
     from veomni.ops.kernels.qsa_attention.standard import torch_npu as npu_row
 
