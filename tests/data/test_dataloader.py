@@ -139,12 +139,12 @@ def test_build_dataloader_dyn_bsz_count_mode(
         assert isinstance(dl.batching_strategy, TextBatchingStrategy)
         assert dl.batching_strategy.buffer._get_length_fn is m_ds.get_length_by_labels_fn
         assert dl.batching_strategy.physical_token_cap == 48
-        assert dl.batching_strategy.buffer._get_physical_length_fn is m_ds.get_length_by_attention_mask_fn
+        assert dl.batching_strategy.buffer._get_physical_length_fn is m_ds.get_length_fn
     else:
         assert isinstance(dl.dataset, m_ds.DynamicBatchingSizeDataset)
         assert dl.dataset.get_length_fn is m_ds.get_length_by_labels_fn
         assert dl.dataset.physical_token_cap == 48
-        assert dl.dataset.get_physical_length_fn is m_ds.get_length_by_attention_mask_fn
+        assert dl.dataset.get_physical_length_fn is m_ds.get_length_fn
 
 
 def test_build_dataloader_dyn_bsz_physical_overflow_ratio(monkeypatch, dummy_dataset_ci):

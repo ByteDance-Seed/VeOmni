@@ -37,11 +37,13 @@ task at hand; do not read every reference by default.
 
 ## Current Baseline
 
-- Entry-time samples use `{"conversation_list": [...]}`. The SeedOmni collator
-  groups samples and runs ordered module CPU preprocessors before GPU forward.
+- Entry-time samples use `{"conversation_list": [...]}`. `seedomni_transform`
+  runs ordered module CPU preprocessors (`OmniProcessor`) per sample in the
+  Dataset stage, and `SeedOmniCollator` groups preprocessed samples into a
+  micro-batch before GPU forward.
 - `ModulePreprocessorBase` is a core data-flow contract, shared by training and
-  inference. Training runs it inside `SeedOmniCollator`; inference runs it once
-  before the FSM.
+  inference. Training runs it inside `data_transform` (`seedomni_transform`);
+  inference runs it once before the FSM.
 - Modules communicate by mutating/returning the shared `conversation_list`
   carrier, not by hidden edge payloads. Janus packed training is the
   exception: the text-encoder preprocessor writes packed tensors onto the

@@ -182,6 +182,7 @@ def _build_conversation_list(
 @DATA_TRANSFORM_REGISTRY.register("seedomni")
 def process_seedomni_example(
     example: dict[str, Any],
+    processor: Any = None,
     **kwargs,
 ) -> list[dict[str, Any]]:
     """SeedOmni transform — emit a single-key sample ``{"conversation_list": [...]}``.
@@ -206,6 +207,10 @@ def process_seedomni_example(
             ``{"image": [...], "video": [...], ...}``), so each list's length
             matches that modality's flattened turn count and
             ``_build_conversation_list`` can pair them in order.
+        processor: optional :class:`~veomni.models.seed_omni.processing_omni.OmniProcessor`
+            that runs every active module's CPU preprocessor (chat template,
+            tokenization, image/video patchification, per-sample dummy anchor,
+            and ``_omni_token_len`` metadata) on the constructed conversation.
         **kwargs: forwarded to ``conv_preprocess`` (e.g. ``generation_ratio``)
             and to every fetcher in :data:`~veomni.data.seed_omni.utils.media.MEDIA_FETCHERS`
             (``image_max_pixels`` / ``video_max_pixels`` / ``fps`` /
@@ -240,12 +245,15 @@ def process_seedomni_example(
     media = fetch_media(media_refs, f"process_seedomni_example: preprocessor for source {source!r}", kwargs)
 
     conversation_list = _build_conversation_list(constructed, media)
+    if processor is not None:
+        return [processor.preprocess(conversation_list)]
     return [{"conversation_list": conversation_list}]
 
 
 @DATA_TRANSFORM_REGISTRY.register("seedomni_cached")
 def process_seedomni_cached_example(
     example: dict[str, Any],
+    processor: Any = None,
     **kwargs,
 ) -> list[dict[str, Any]]:
     """Read a cached SeedOmni conversation carrier from a parquet row.
@@ -258,4 +266,6 @@ def process_seedomni_cached_example(
     conversation_list = example["conversation_list"]
     if isinstance(conversation_list, (bytes, bytearray)):
         conversation_list = pickle.loads(conversation_list)
+    if processor is not None:
+        return [processor.preprocess(conversation_list)]
     return [{"conversation_list": conversation_list}]

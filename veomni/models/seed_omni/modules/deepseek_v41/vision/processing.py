@@ -39,7 +39,7 @@ import torch
 from PIL import Image, ImageOps
 from transformers.image_processing_utils import BaseImageProcessor
 
-from ....utils.conversation import ConversationItem, iter_desired_items
+from ....utils.conversation import _OMNI_TOKEN_LEN, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from .configuration import DeepseekV41VisionEncoderConfig
 
@@ -232,36 +232,36 @@ class DeepseekV41VisionPreprocessor(ModulePreprocessorBase):
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
     ) -> None:
         del kwargs
-        saw_real_image = False
         for sample in conversation_list:
             items = [it for it in iter_desired_items([sample], types=["image"], roles=["user"]) if not it.is_dummy]
-            for item in items:
-                patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = self._image_processor.preprocess_one(item.value)
-                item.value = patches.to(dtype=self._dtype)
-                item.meta[_OMNI_VIT_GRID] = [n_vit_h, n_vit_w]
-                item.meta[_OMNI_TOKEN_TYPES] = image_token_types(n_llm_h, n_llm_w)
-                saw_real_image = True
-
-        if inference or saw_real_image:
-            return
-        if self._dummy_patches is None:
-            raise RuntimeError(
-                f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
-                "before training use (pure inference never reaches this branch)."
-            )
-        self.append_batch_anchor(
-            conversation_list,
-            ConversationItem(
-                type="image",
-                value=self._dummy_patches,
-                role="user",
-                is_dummy=True,
-                meta={
-                    _OMNI_VIT_GRID: list(self._dummy_grid),
-                    _OMNI_TOKEN_TYPES: self._dummy_types.clone(),
-                },
-            ),
-        )
+            if items:
+                for item in items:
+                    patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = self._image_processor.preprocess_one(item.value)
+                    item.value = patches.to(dtype=self._dtype)
+                    item.meta[_OMNI_VIT_GRID] = [n_vit_h, n_vit_w]
+                    token_types = image_token_types(n_llm_h, n_llm_w)
+                    item.meta[_OMNI_TOKEN_TYPES] = token_types
+                    item.meta[_OMNI_TOKEN_LEN] = int(token_types.numel())
+            elif not inference:
+                if self._dummy_patches is None:
+                    raise RuntimeError(
+                        f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
+                        "before training use (pure inference never reaches this branch)."
+                    )
+                dummy_types = self._dummy_types.clone()
+                sample.append(
+                    ConversationItem(
+                        type="image",
+                        value=self._dummy_patches.clone(),
+                        role="user",
+                        is_dummy=True,
+                        meta={
+                            _OMNI_VIT_GRID: list(self._dummy_grid),
+                            _OMNI_TOKEN_TYPES: dummy_types,
+                            _OMNI_TOKEN_LEN: int(dummy_types.numel()),
+                        },
+                    )
+                )
 
 
 __all__ = [

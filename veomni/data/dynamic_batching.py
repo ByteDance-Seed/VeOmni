@@ -20,6 +20,7 @@ from collections import deque
 from typing import Any, Callable, Dict, Generator, Iterator, Optional
 
 from ..utils import logging
+from .dataset import get_length_fn
 
 
 logger = logging.get_logger(__name__)
@@ -65,6 +66,8 @@ class DynBszBuffer:
         self._buffer.append(item)
         if self._get_length_fn is not None:
             length = self._get_length_fn(item)
+        elif "conversation_list" in item:
+            length = get_length_fn(item)
         else:
             if "attention_mask" not in item:
                 raise KeyError("Expected 'attention_mask' in item")
@@ -209,7 +212,10 @@ class TextBatchingStrategy(BaseBatchingStrategy):
         return effective_ready or physical_ready
 
     def put_item(self, item: Dict[str, Any]):
-        if item["input_ids"].shape[-1] <= 1:
+        if "input_ids" in item and item["input_ids"].shape[-1] <= 1:
+            print("WARNING: EMPTY STRING.")
+            return
+        if "conversation_list" in item and get_length_fn(item) <= 1:
             print("WARNING: EMPTY STRING.")
             return
         self.buffer.append(item)

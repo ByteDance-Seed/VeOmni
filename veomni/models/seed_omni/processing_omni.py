@@ -13,10 +13,7 @@ no model instance (weight-free, meta-device, or otherwise) is built or required.
 the class registered for its ``model_type`` and is the single code path backing
 both :meth:`OmniProcessor.from_pretrained` (checkpoint on disk) and callers that
 already hold a resolved config in memory (e.g. ``OmniTrainer`` builds its
-dataloader's collator this way, decoupled from ``self.model``). Callers that
-need a :class:`~veomni.data.seed_omni.collator.SeedOmniCollator` (e.g. ``OmniTrainer``)
-build one directly from a processor — that composition is theirs to own, not
-this module's.
+``data_transform`` processor this way, decoupled from ``self.model``).
 
 Usage::
 
@@ -220,7 +217,7 @@ class OmniProcessor:
         self,
         conversation: list[Any],
         *,
-        inference: bool = True,
+        inference: bool = False,
         **generation_kwargs: Any,
     ) -> dict[str, Any]:
         """Run the module preprocessor chain on an existing ``conversation_list``."""

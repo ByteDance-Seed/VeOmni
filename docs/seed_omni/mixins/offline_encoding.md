@@ -167,7 +167,7 @@ full.
   reports it.
 
 The data side needs no switch. The
-[`SeedOmniCollator`](../../../veomni/data/seed_omni/collator.py#L26) always runs every
+[`seedomni_transform`](../../../veomni/data/seed_omni/seedomni_transform.py) always runs every
 module's preprocessor, `seedomni_cached` included, so a preprocessor must leave
 items that already hold a cache artifact alone. BAGEL marks such items in
 `offline_encode`'s post-hook with

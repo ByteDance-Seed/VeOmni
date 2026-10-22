@@ -64,8 +64,6 @@ class TrainingMixin(TrainingModuleMixin):
     ) -> Dict[str, Any]:
         self._conversation_carrier = conversation_list
         items = list(iter_desired_items(conversation_list, types=["image"], roles=["user"]))
-        real_items = [item for item in items if not item.is_dummy]
-        items = real_items or items
         pixel_values, grids, token_types, slots = build_deepseek_v41_vit_batch(
             items, device=self.device, dtype=self.dtype
         )

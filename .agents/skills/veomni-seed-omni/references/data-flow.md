@@ -5,19 +5,18 @@ raw data transforms, or request preprocessing.
 
 ## Current Pipeline
 
-1. `seedomni_transform.py` emits one sample:
-   - `{"conversation_list": [ConversationItem, ...]}`
-   - It should stay model-agnostic. Do not put model chat templates or tokenizer
-     logic here.
-2. `SeedOmniCollator` groups samples:
-   - Input: list of per-sample dicts.
+1. `seedomni_transform.py` builds and preprocesses one sample:
+   - Constructs `{"conversation_list": [ConversationItem, ...]}` from raw data
+     and decoded media, then runs the bound `OmniProcessor` (built from active
+     graph modules via `OmniProcessor.from_config` in `OmniTrainer._build_data_transform`).
+   - Preprocessors run serially in module declaration order on each sample,
+     mutating `ConversationItem.value` and `meta` (including `_omni_token_len`
+     and `labels` for `dyn_bsz`, plus per-sample `is_dummy` anchors) in place.
+2. `SeedOmniCollator` groups preprocessed samples:
+   - Input: list of per-sample dicts (after optional `dyn_bsz` batching).
    - Output: `{"conversation_list": [[...], ...]}` plus aligned extra keys.
    - No tensor stacking, sequence padding, or SP slicing happens here.
-3. `SeedOmniCollator` always runs the bound `OmniProcessor`:
-   - Built from active graph modules (`OmniProcessor.from_config`).
-   - Preprocessors run serially in module declaration order.
-   - They mutate `ConversationItem.value` and `meta` in place.
-4. Module `pre_forward` becomes thin:
+3. Module `pre_forward` becomes thin:
    - Select items by `type`, `role`, and `meta` tags.
    - Stack/move prepared CPU tensors to the module device.
 5. Module forward/modeling runs GPU work and returns a dict.
@@ -48,7 +47,7 @@ Rules:
   onto the same `batch` dict instead of walking items.
 - It must not allocate CUDA tensors.
 - It is shared by training and inference:
-  - Training: run by `SeedOmniCollator` inside DataLoader workers.
+  - Training: run by `seedomni_transform` inside DataLoader workers.
   - Inference: run once by `OmniInferencer._preprocess_request` before the FSM.
 - User images arrive in a different form on each path: training items carry
   the `(3, H, W) uint8` tensor from `veomni/data/seed_omni/image_utils.py`
