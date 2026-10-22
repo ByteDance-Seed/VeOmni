@@ -13,6 +13,8 @@ import torch.nn as nn
 from packaging.version import Version
 from torch.distributed._tensor import DTensor, Shard
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.tools.launch_utils import find_free_port
 from veomni.arguments import ModelArguments, TrainingArguments, parse_args
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
@@ -26,6 +28,9 @@ from veomni.utils.device import (
     get_dist_comm_backend,
     get_torch_device,
 )
+
+
+_CI_LAUNCH = LaunchSpec(nproc=8)
 
 
 # from veomni.optim.optimizer import build_optimizer
@@ -266,7 +271,9 @@ def main():
         total_grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
 
         # check whether total grad norm meets our expectation
-        torch.testing.assert_close(total_grad_norm_pre_clip, expected=expected_total_grad_norm, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(
+            total_grad_norm_pre_clip.item(), expected=expected_total_grad_norm, atol=1e-6, rtol=1e-6
+        )
 
         # go through each param grad one-by-one after clipping to check whether their value meets our expectation
         clip_coeff = min(max_grad_norm / expected_total_grad_norm, 1.0)
@@ -293,8 +300,8 @@ def _run_clip_grad_norm_fsdp2_test(
     command = [
         "torchrun",
         "--nnodes=1",
-        "--nproc_per_node=8",
-        "--master_port=4321",
+        f"--nproc_per_node={_CI_LAUNCH.nproc}",
+        f"--master_port={find_free_port()}",
         "tests/utils/test_extra_parallel_clip_grad_norm.py",
         "--model.config_path=test",
         f"--model.accelerator.ep_size={ep_size}",
@@ -318,26 +325,31 @@ def _run_clip_grad_norm_fsdp2_test(
     assert result.returncode == 0
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_clip_grad_norm_fsdp2_no_extra_parallel(cpu_offload: bool):
     _run_clip_grad_norm_fsdp2_test(ep_size=1, emb_size=1, cpu_offload=cpu_offload)
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_clip_grad_norm_fsdp2_ep4(cpu_offload: bool):
     _run_clip_grad_norm_fsdp2_test(ep_size=4, emb_size=1, cpu_offload=cpu_offload)
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_clip_grad_norm_fsdp2_ep8(cpu_offload: bool):
     _run_clip_grad_norm_fsdp2_test(ep_size=8, emb_size=1, cpu_offload=cpu_offload)
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_clip_grad_norm_fsdp2_emb8(cpu_offload: bool):
     _run_clip_grad_norm_fsdp2_test(ep_size=1, emb_size=8, cpu_offload=cpu_offload)
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_clip_grad_norm_fsdp2_ep2_emb4(cpu_offload: bool):
     _run_clip_grad_norm_fsdp2_test(ep_size=2, emb_size=4, cpu_offload=cpu_offload)
@@ -354,11 +366,13 @@ def test_clip_grad_norm_fsdp2_ep2_emb4(cpu_offload: bool):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_clip_grad_norm_hsdp_no_extra_parallel(cpu_offload: bool):
     _run_clip_grad_norm_fsdp2_test(ep_size=1, emb_size=1, cpu_offload=cpu_offload, dp_replicate_size=2)
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(
     _torch_npu_version() and Version(_torch_npu_version()) < Version("2.9.0"),
     reason="torch_npu < 2.9.0 grad_norm with HSDP is buggy",
@@ -368,6 +382,7 @@ def test_clip_grad_norm_hsdp_ep4(cpu_offload: bool):
     _run_clip_grad_norm_fsdp2_test(ep_size=4, emb_size=1, cpu_offload=cpu_offload, dp_replicate_size=2)
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(
     _torch_npu_version() and Version(_torch_npu_version()) < Version("2.9.0"),
     reason="torch_npu < 2.9.0 grad_norm with HSDP is buggy",
@@ -377,6 +392,7 @@ def test_clip_grad_norm_hsdp_emb4(cpu_offload: bool):
     _run_clip_grad_norm_fsdp2_test(ep_size=1, emb_size=4, cpu_offload=cpu_offload, dp_replicate_size=2)
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(
     _torch_npu_version() and Version(_torch_npu_version()) < Version("2.9.0"),
     reason="torch_npu < 2.9.0 grad_norm with HSDP is buggy",

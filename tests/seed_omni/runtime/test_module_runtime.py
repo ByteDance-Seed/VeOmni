@@ -27,13 +27,18 @@ import pytest
 import torch.nn as nn
 from torch.utils.checkpoint import noop_context_fn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import GradientCheckpointingConfig
 from veomni.distributed import parallel_state
 from veomni.distributed.parallel_state import ParallelState, use_parallel_state
 from veomni.models.model_runtime import VeOmniModelRuntime
 from veomni.models.seed_omni.accelerated.omni_module import omni_module_runtime
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
+from veomni.models.seed_omni.mixins.offline_encoding_mixin import OfflineEncodingMixin
 from veomni.utils import recompute_utils
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _fsdp(scope: str, mode: str = "fsdp2") -> SimpleNamespace:
@@ -66,7 +71,7 @@ def test_omni_runtime_arguments_are_model_arguments():
 
 
 def test_module_checkpoint_manager_is_a_model_checkpoint_manager():
-    from veomni.models.checkpoint_manager import ModelCheckpointManager
+    from veomni.models.checkpoint import ModelCheckpointManager
     from veomni.models.seed_omni.utils.checkpoint import OmniModuleCheckpointManager
 
     assert issubclass(OmniModuleCheckpointManager, ModelCheckpointManager)
@@ -145,6 +150,141 @@ def test_build_model_uses_the_config_the_omni_config_loaded(monkeypatch):
 
     assert captured["config_path"] is runtime.module_config
     assert captured["weights_path"] == "/tmp/hf-model"
+
+
+class _CacheableModule(OfflineEncodingMixin, nn.Linear):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("training_task", "model_cls", "on_meta"),
+    [
+        ("offline_training", _CacheableModule, True),
+        ("offline_training", nn.Linear, False),
+        ("offline_embedding", _CacheableModule, False),
+        ("online_training", _CacheableModule, False),
+        (None, _CacheableModule, False),
+    ],
+)
+def test_only_a_cacheable_module_is_built_on_meta_for_offline_training(monkeypatch, training_task, model_cls, on_meta):
+    """``offline_training`` reads every module that mixes in ``OfflineEncodingMixin`` from the cache,
+    whichever of its methods the graph names; no other module and no other task does.
+
+    ``None`` stands for an inference build, which has no train args.
+    """
+    captured = {}
+
+    def fake_build_foundation_model(**kwargs):
+        captured.update(kwargs)
+        model = nn.Linear(2, 2)
+        model.config = SimpleNamespace()
+        return model
+
+    monkeypatch.setattr("veomni.models.build_foundation_model", fake_build_foundation_model)
+    monkeypatch.setattr("veomni.models.loader.get_model_class", lambda config: model_cls)
+    runtime = _offline_cache_runtime(training_task)
+
+    assert runtime.reads_offline_cache is on_meta
+    runtime._build_model()
+
+    assert captured["init_device"] == ("meta" if on_meta else "cpu")
+
+
+@pytest.mark.parametrize(("accelerated_cls", "on_meta"), [(_CacheableModule, True), (None, False)])
+def test_the_class_the_omni_registries_build_decides_the_meta_build(monkeypatch, accelerated_cls, on_meta):
+    """The real lookup prefers the accelerated class, so a marker there (as on BAGEL's VAE) is what counts."""
+    from veomni.models.seed_omni import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_MODEL_REGISTRY
+
+    monkeypatch.delenv("MODELING_BACKEND", raising=False)
+    model_type = "offline_cache_marker_test"
+    OMNI_MODEL_REGISTRY[model_type] = lambda: nn.Linear
+    if accelerated_cls is not None:
+        OMNI_ACCELERATED_MODEL_REGISTRY[model_type] = lambda: accelerated_cls
+    try:
+        runtime = _offline_cache_runtime("offline_training")
+        runtime.module_config = SimpleNamespace(model_type=model_type, architectures=None)
+        assert runtime.reads_offline_cache is on_meta
+    finally:
+        del OMNI_MODEL_REGISTRY[model_type]
+        if accelerated_cls is not None:
+            del OMNI_ACCELERATED_MODEL_REGISTRY[model_type]
+
+
+def test_a_cache_reading_module_is_frozen_and_never_wrapped_trained_or_saved(monkeypatch):
+    calls = []
+    for step in (
+        "setup",
+        "_freeze_model_module",
+        "_build_parallelized_model",
+        "_build_optimizer",
+        "build_checkpoint",
+    ):
+        monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, _step=step, **k: calls.append(_step))
+    monkeypatch.setattr(ModuleRuntime, "_build_model_assets", lambda self: None)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+
+    def fake_build_model(self):
+        self.model = nn.Linear(2, 2)
+
+    monkeypatch.setattr(ModuleRuntime, "_build_model", fake_build_model)
+    monkeypatch.setattr("veomni.models.loader.get_model_class", lambda config: _CacheableModule)
+    train = SimpleNamespace(training_task="offline_training", checkpoint=SimpleNamespace(load_path=None))
+
+    runtime = ModuleRuntime(
+        SimpleNamespace(accelerator=_fsdp("module")),
+        "vae",
+        module_config=SimpleNamespace(),
+        global_accelerator=_fsdp("module"),
+        train_args=train,
+    )
+
+    assert calls == ["setup"]
+    assert not any(p.requires_grad for p in runtime.model.parameters())
+
+
+def test_an_offline_embedding_run_loads_and_wraps_every_module_but_freezes_it(monkeypatch):
+    """It trains nothing, so the frozen module gets no optimizer and no checkpoint manager."""
+    calls = []
+    for step in ("setup", "_freeze_model_module", "_build_parallelized_model"):
+        monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, _step=step, **k: calls.append(_step))
+    monkeypatch.setattr(ModuleRuntime, "_build_model_assets", lambda self: None)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+    monkeypatch.setattr(ModuleRuntime, "_build_model", lambda self: setattr(self, "model", nn.Linear(2, 2)))
+    train = SimpleNamespace(training_task="offline_embedding", checkpoint=SimpleNamespace(load_path=None))
+
+    runtime = ModuleRuntime(
+        SimpleNamespace(accelerator=_fsdp("module")),
+        "llm",
+        module_config=SimpleNamespace(),
+        global_accelerator=_fsdp("module"),
+        train_args=train,
+    )
+
+    assert calls == [
+        "setup",
+        "_freeze_model_module",
+        "_build_parallelized_model",
+    ]
+    assert not runtime.has_trainable_parameters
+    assert runtime.optimizer is None
+    assert getattr(runtime, "checkpoint", None) is None
+
+
+def _offline_cache_runtime(training_task):
+    runtime = _unbuilt(
+        model_config=None,
+        ops_implementation=None,
+        accelerator=SimpleNamespace(
+            init_device="cpu",
+            fsdp_config=SimpleNamespace(
+                fsdp_mode="fsdp2", fsdp_scope="module", mixed_precision=SimpleNamespace(enable=False)
+            ),
+        ),
+    )
+    runtime.module_config = SimpleNamespace(model_type="fake")
+    if training_task is not None:
+        runtime.train_args = SimpleNamespace(training_task=training_task)
+    return runtime
 
 
 # The base declares these as class attributes defaulting to ``None``, so a test
@@ -249,11 +389,11 @@ def test_the_constructor_stores_training_args_where_the_base_reads_them(monkeypa
     ):
         monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, **k: None)
     monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
-    train = SimpleNamespace(checkpoint=SimpleNamespace(load_path=None))
+    train = SimpleNamespace(training_task="online_training", checkpoint=SimpleNamespace(load_path=None))
     args = SimpleNamespace(accelerator=_fsdp("module"))
 
     runtime = ModuleRuntime(
-        args, "vision_encoder", module_config=SimpleNamespace(), global_accelerator=_fsdp("module"), train=train
+        args, "vision_encoder", module_config=SimpleNamespace(), global_accelerator=_fsdp("module"), train_args=train
     )
 
     assert vars(runtime)["train_args"] is train

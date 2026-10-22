@@ -1,4 +1,4 @@
-"""``ConversationItem`` — the single carrier object of SeedOmni V2.
+"""``ConversationItem`` — the single carrier object of SeedOmni.
 
 The whole pipeline (training and inference) operates on one batched
 ``conversation_list`` (``list[list[ConversationItem]]`` for training, a flat
@@ -19,8 +19,9 @@ Each item is ``{type, value, role, is_dummy, meta}``:
   ``"audio"`` is a standalone sound item (speech in, or speech out once sealed).
   Sound carried *inside* a video clip is not an ``"audio"`` item — it rides on
   the video item's own ``value`` (``VideoInputs.audio``) so that one clip stays
-  one item and the backbone can interleave both streams on a shared timeline.
-  Either way its rate is stated the same way, in ``meta["audio_metadata"]``.
+  one item and the backbone can interleave both streams on a shared timeline;
+  see ``docs/seed_omni/design/media.md``. Either way its rate is stated the
+  same way, in ``meta["audio_metadata"]``.
 * ``value`` — polymorphic: raw content (``str`` / PIL image / pixel tensor /
   ``(samples,)`` waveform) before encoding, an ``(L, D)`` / ``(1, L, D)``
   embedding tensor after.

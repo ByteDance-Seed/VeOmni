@@ -20,6 +20,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed import torch_parallelize
 from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import (
@@ -27,9 +28,15 @@ from veomni.distributed.torch_parallelize import (
     parallelize_model_ddp,
     parallelize_model_fsdp2,
 )
-from veomni.models.module_utils import init_empty_weights
+from veomni.models.checkpoint.weights import init_empty_weights
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
+
+
+_CI_CPU_PROMOTION = LaunchSpec(nproc=4, device="cpu")
+
+
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 
 def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path):
@@ -202,12 +209,18 @@ class TestMultiOptimizerState:
             else:
                 assert expected_value == actual_value
 
+    @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
     def test_fsdp2_multi_optimizer_roundtrip(self, tmp_path):
         """Run the MultiOptimizer DCP round-trip across two real FSDP2 ranks."""
         from tests.tools.launch_utils import find_free_port
 
         os.environ["_TEST_MASTER_PORT"] = str(find_free_port())
-        mp.spawn(_fsdp2_multi_optimizer_worker, args=(2, tmp_path), nprocs=2, join=True)
+        mp.spawn(
+            _fsdp2_multi_optimizer_worker,
+            args=(_CI_ACCELERATOR_2.nproc, tmp_path),
+            nprocs=_CI_ACCELERATOR_2.nproc,
+            join=True,
+        )
 
     def test_multi_optimizer_sparse_state_excludes_synthetic(self, tmp_path):
         """A fresh sub-optimizer must not have synthetic state materialized in the checkpoint."""
@@ -853,6 +866,21 @@ class TestDdpMetaInit:
         monkeypatch.setattr(torch_parallelize, "DDP", lambda module, **kwargs: module)
 
         assert parallelize_model_ddp(nn.Linear(2, 2)) is not None
+
+    def test_loads_a_fully_frozen_model_without_a_ddp_wrap(self, wrap_ddp, monkeypatch):
+        """DDP rejects a module whose parameters all have ``requires_grad=False``."""
+        materialize = lambda model, *args, **kwargs: model.to_empty(device="cpu")  # noqa: E731
+        loader = MagicMock(side_effect=materialize)
+        monkeypatch.setattr(torch_parallelize, "load_model_weights", loader)
+        with init_empty_weights():
+            model = _MetaInitModel()
+        model.requires_grad_(False)
+
+        wrapped = wrap_ddp(model, weights_path="hf-path", init_device="meta")
+
+        assert wrapped is model
+        assert loader.call_args.args[1] == "hf-path"
+        assert not model.weight.is_meta
 
     def test_reports_parameters_the_loader_left_on_meta(self, wrap_ddp, monkeypatch):
         # A loader that fills nothing would otherwise fail inside DDP's
@@ -2608,6 +2636,17 @@ class TestResumeDiscovery:
 
         assert self._validate(step) == 10
 
+    @pytest.mark.parametrize(("model_state", "accepted"), [(False, True), (True, False)])
+    def test_a_cursor_only_step_is_accepted_only_when_its_manifest_says_so(self, tmp_path, model_state, accepted):
+        """An ``offline_embedding`` step has no ``model/`` at all, because every module is frozen.
+        Without the manifest's word, the same tree is a step whose shards never started."""
+        from veomni.checkpoint import layout
+
+        step = tmp_path / "global_step_10"
+        layout.write_manifest(str(step), global_step=10, world_size=1, model_state=model_state)
+
+        assert self._validate(step) == (10 if accepted else None)
+
     def test_a_legacy_step_is_accepted_by_its_own_marker(self, tmp_path):
         from veomni.checkpoint.legacy_v0_1_12 import marker_path
 
@@ -2682,6 +2721,7 @@ def _staged_promotion_worker(rank: int, world_size: int, base: str, scenario: st
     dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_PROMOTION)
 class TestPromotionAcrossRanks:
     """The promotion, run for real on four ranks over its own gloo group.
 
@@ -2698,7 +2738,12 @@ class TestPromotionAcrossRanks:
         base = str(tmp_path / scenario)
         os.makedirs(base, exist_ok=True)
         os.environ["_TEST_MASTER_PORT"] = str(find_free_port())
-        mp.spawn(_staged_promotion_worker, args=(4, base, scenario), nprocs=4, join=True)
+        mp.spawn(
+            _staged_promotion_worker,
+            args=(_CI_CPU_PROMOTION.nproc, base, scenario),
+            nprocs=_CI_CPU_PROMOTION.nproc,
+            join=True,
+        )
         return base, [open(os.path.join(base, f"outcome_{r}")).read() for r in range(4)]
 
     def test_promotion_completes_on_every_rank(self, tmp_path):

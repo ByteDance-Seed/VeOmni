@@ -28,7 +28,6 @@ gradients differ from the reference, so the parity check cannot pass vacuously.
 
 import argparse
 import os
-import random
 import subprocess
 from typing import Optional
 
@@ -37,7 +36,13 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
+from tests.tools.launch_utils import find_free_port
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+
+
+_CI_LAUNCH_2 = LaunchSpec(nproc=2)
+_CI_LAUNCH_4 = LaunchSpec(nproc=4)
 
 
 TOKENS_PER_RANK = 8  # per micro-batch
@@ -83,7 +88,7 @@ def main() -> None:
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, get_parallel_state
     from veomni.distributed.sequence_parallel.loss import reduce_sequence_parallel_loss
     from veomni.distributed.torch_parallelize import build_parallelize_model
-    from veomni.models.module_utils import init_empty_weights
+    from veomni.models.checkpoint.weights import init_empty_weights
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--ulysses-size", type=int, required=True)
@@ -176,7 +181,7 @@ def main() -> None:
 
     torch.testing.assert_close(
         grad_norm,
-        reference_norm.item(),
+        reference_norm,
         rtol=1e-4,
         atol=1e-6,
         msg=lambda message: f"[rank {rank}] grad norm differs from the sp=1 reference: {message}",
@@ -218,7 +223,7 @@ def _run_ddp_sp_grad_sync_test(
         f"--nproc_per_node={world_size}",
         # Fresh port per run: back-to-back torchrun launches otherwise collide
         # with the previous one's TIME_WAIT socket.
-        f"--master_port={29500 + random.randint(0, 200)}",
+        f"--master_port={find_free_port()}",
         "tests/parallel/test_ddp_sp_grad_sync.py",
         f"--ulysses-size={ulysses_size}",
         f"--micro-batches={micro_batches}",
@@ -228,34 +233,39 @@ def _run_ddp_sp_grad_sync_test(
     assert subprocess.run(command, check=True).returncode == 0
 
 
-@pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
+@pytest.mark.launch_plan(provider=_CI_LAUNCH_2)
+@pytest.mark.skipif(runner_device_count() < 2, reason="device_count should be >= 2")
 def test_ddp_sp2_grad_sync():
     """sp=2 over 2 ranks: ``dp_size == 1``, so DDP's own all-reduce does nothing."""
-    _run_ddp_sp_grad_sync_test(world_size=2, ulysses_size=2)
+    _run_ddp_sp_grad_sync_test(world_size=_CI_LAUNCH_2.nproc, ulysses_size=2)
 
 
-@pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+@pytest.mark.launch_plan(provider=_CI_LAUNCH_4)
+@pytest.mark.skipif(runner_device_count() < 4, reason="device_count should be >= 4")
 def test_ddp_sp4_grad_sync():
-    _run_ddp_sp_grad_sync_test(world_size=4, ulysses_size=4)
+    _run_ddp_sp_grad_sync_test(world_size=_CI_LAUNCH_4.nproc, ulysses_size=4)
 
 
-@pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+@pytest.mark.launch_plan(provider=_CI_LAUNCH_4)
+@pytest.mark.skipif(runner_device_count() < 4, reason="device_count should be >= 4")
 def test_ddp_dp2_sp2_grad_sync():
     """dp=2 x sp=2: the DDP all-reduce covers dp only; the sp half must still sync."""
-    _run_ddp_sp_grad_sync_test(world_size=4, ulysses_size=2)
+    _run_ddp_sp_grad_sync_test(world_size=_CI_LAUNCH_4.nproc, ulysses_size=2)
 
 
-@pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+@pytest.mark.launch_plan(provider=_CI_LAUNCH_4)
+@pytest.mark.skipif(runner_device_count() < 4, reason="device_count should be >= 4")
 def test_ddp_sp4_grad_sync_with_gradient_accumulation():
     """The trainer clips once per step, after several micro-batches have accumulated."""
-    _run_ddp_sp_grad_sync_test(world_size=4, ulysses_size=4, micro_batches=2)
+    _run_ddp_sp_grad_sync_test(world_size=_CI_LAUNCH_4.nproc, ulysses_size=4, micro_batches=2)
 
 
-@pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
+@pytest.mark.launch_plan(provider=_CI_LAUNCH_2)
+@pytest.mark.skipif(runner_device_count() < 2, reason="device_count should be >= 2")
 def test_ddp_sp2_grad_sync_from_meta_init():
     """``init_device`` defaults to meta, and only DDP's own materialize pass gets
     the module to a state its constructor accepts."""
-    _run_ddp_sp_grad_sync_test(world_size=2, ulysses_size=2, init_device="meta")
+    _run_ddp_sp_grad_sync_test(world_size=_CI_LAUNCH_2.nproc, ulysses_size=2, init_device="meta")
 
 
 if __name__ == "__main__":

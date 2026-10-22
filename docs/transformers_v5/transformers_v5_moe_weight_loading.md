@@ -8,12 +8,10 @@ This note documents VeOmni MoE weight-loading expectations under
 Transformers v5 introduced expert-dispatch integration points (`use_experts_implementation` and `ALL_EXPERTS_FUNCTIONS`).
 
 For VeOmni's qwen3_moe path, we use a simpler approach:
-- patch experts behavior in patchgen-generated modeling;
-- call `veomni.ops.fused_moe_forward(...)` explicitly in the patched forward;
-- gate the call on a module-level `OpSlot("moe_experts", "standard")` whose
-  `use_non_eager_impl` flag is bound from
-  `OpsImplementationConfig.moe_implementation` by `_bind_veomni_ops` at
-  model-build time.
+- patch experts behavior in `models` patchgen-generated modeling;
+- construct an instance-local `VeomniOp("moe_experts", "standard", impl)`;
+- always call that handle from the patched expert forward. The eager reference
+  is itself a registry row, so no separate module-global gate is needed.
 
 ## Survey: Qwen MoE Weight Formats
 
@@ -125,9 +123,18 @@ It reports each per-expert key's fused target and expert index
 own `E/ep` experts' tensors and stacks them straight into its local
 `[E/ep, ...]` slice. Per-expert keys of modules the model does not build, such
 as the Qwen3-Omni-MoE talker or the DeepSeek-V3 and GLM-5 MTP layers, are
-skipped without being read. A converter that does not implement both methods,
-for example DeepSeek-V4's, still makes the streaming loader raise
-`NotImplementedError`.
+skipped without being read. A converter that does not implement both methods
+still makes the streaming loader raise `NotImplementedError`.
+
+DeepSeek-V4's converter implements both methods for its `w1/w2/w3` expert keys,
+including the FP4 / FP8 `.scale` companion of each expert weight: a scale maps to
+the same expert as its weight, so each rank reads, dequantizes and stacks only
+its own experts. A converter that streams experts may also claim keys that are
+not ExtraParallel, such as DeepSeek-V4's renamed dense weights and its FP8
+attention weight + scale pairs. Every rank reads those whole and runs them
+through the converter before dispatch, as the whole-tensor loader does. A
+converter that emits an ExtraParallel parameter from such a key, rather than
+through `fused_expert_target`, raises `NotImplementedError`.
 
 ### Saving (VeOmni modeling -> checkpoint)
 
@@ -169,15 +176,18 @@ The script auto-detects the input format (fused `gate_up_proj` or legacy separat
 - HuggingFace `from_pretrained()`
 - Inference engines (vLLM, SGLang)
 
-## VeOmni Fused MoE Op Interface
+## VeOmni MoE Kernel Interface
 
-VeOmni fused MoE entrypoint:
-- `veomni.ops.kernels.moe.fused_moe_forward(...)`
+VeOmni models construct the entrypoint with:
+
+```python
+moe = VeomniOp("moe_experts", "standard", implementation)
+```
 
 Current signature supports both split and fused gate/up weights:
 
 ```python
-fused_moe_forward(
+moe(
     num_experts: int,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,

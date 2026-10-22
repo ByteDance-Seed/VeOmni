@@ -1,15 +1,17 @@
+"""Adapted from https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_qwenimage.py"""
+
 from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
 from math import prod
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import QwenImageTransformer2DModel as _QwenImageTransformer2DModel
-from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.transformers.transformer_qwenimage import (
     apply_rotary_emb_qwen,
@@ -18,6 +20,9 @@ from diffusers.models.transformers.transformer_qwenimage import (
 from diffusers.utils import apply_lora_scale
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
+
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
@@ -31,6 +36,25 @@ from .configuration_qwen_image_transformer import QWEN_IMAGE_INIT_SIGNATURE, Qwe
 
 
 logger = logging.get_logger(__name__)
+QWEN_IMAGE_ORIGINAL_FORWARD = _QwenImageTransformer2DModel.forward
+
+
+def apply_qwen_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Apply interleaved Qwen RoPE, accepting complex or real [S, D/2, 2] tables."""
+    if freqs.is_complex():
+        return apply_rotary_emb_qwen(x, freqs, use_real=False)
+    real, imag = x.float().unflatten(-1, (-1, 2)).unbind(-1)
+    cos, sin = freqs.float().unbind(-1)
+    cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+    return torch.stack((real * cos - imag * sin, real * sin + imag * cos), dim=-1).flatten(-2).to(x.dtype)
+
+
+def qwen_image_rotary_frequencies(pos_embed, img_shapes, text_seq_len, device):
+    """Keep complex position tables on CPU when the target is Ascend."""
+    if device.type == "npu":
+        frequencies = pos_embed(img_shapes, max_txt_seq_len=text_seq_len, device=torch.device("cpu"))
+        return tuple(torch.view_as_real(freq).contiguous().to(device) for freq in frequencies)
+    return pos_embed(img_shapes, max_txt_seq_len=text_seq_len, device=device)
 
 
 def _pad_seq(x: torch.Tensor, dim: int, pad_size: int, value: float = 0) -> torch.Tensor:
@@ -46,6 +70,80 @@ def _pad_seq(x: torch.Tensor, dim: int, pad_size: int, value: float = 0) -> torc
     return torch.cat([x, pad], dim=dim)
 
 
+_SDPA_ATTN_IMPLS = frozenset({"sdpa", "veomni_sdpa"})
+
+
+class QwenImageAttentionKernelModule:
+    """HF attention-interface view for joint Qwen-Image Q/K/V."""
+
+    def __init__(self, impl: str, attn):
+        target_dtype = attn.to_q.weight.dtype
+        if target_dtype == torch.float32:
+            target_dtype = torch.bfloat16
+        self.config = SimpleNamespace(
+            _attn_implementation=impl,
+            _pre_quantization_dtype=target_dtype,
+        )
+        self.is_causal = False
+        self.layer_idx = getattr(attn, "layer_idx", None)
+        self.num_key_value_groups = 1
+        self._attn = attn
+
+    def modules(self):
+        return self._attn.modules()
+
+
+def _hf_key_padding_mask(attention_mask: torch.Tensor | None) -> torch.Tensor | None:
+    """Expand the joint ``(B, S)`` keep-mask to HF ``(B, 1, 1, S)``."""
+    if attention_mask is None:
+        return None
+    if attention_mask.ndim == 2:
+        return attention_mask[:, None, None, :]
+    return attention_mask
+
+
+def _joint_keep_mask(
+    *,
+    batch_size: int,
+    image_seq_len: int,
+    txt_seq_len: int,
+    device: torch.device,
+    encoder_hidden_states_mask: torch.Tensor | None = None,
+    img_pad: int = 0,
+    txt_pad: int = 0,
+) -> torch.Tensor | None:
+    """Build a joint ``[text, image]`` keep-mask, or None when every token is valid.
+
+    A dense all-true mask still selects the SDPA fallback, so omit it unless SP
+    padding or the text mask actually drops tokens.
+    """
+    if encoder_hidden_states_mask is None:
+        text_mask = torch.ones((batch_size, txt_seq_len), dtype=torch.bool, device=device)
+        text_drops_tokens = False
+    else:
+        text_mask = encoder_hidden_states_mask.to(dtype=torch.bool)
+        text_drops_tokens = not bool(text_mask.all().item())
+    if img_pad == 0 and txt_pad == 0 and not text_drops_tokens:
+        return None
+    text_mask = _pad_seq(text_mask, dim=1, pad_size=txt_pad, value=False)
+    image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=device)
+    image_mask = _pad_seq(image_mask, dim=1, pad_size=img_pad, value=False)
+    return torch.cat([text_mask, image_mask], dim=1)
+
+
+def _prepare_qwen_attention_mask(attention_mask, query_length, device_type, batch_size):
+    """Materialize the query dimension required by Ascend FlashAttentionScore."""
+    if attention_mask is None or device_type != "npu":
+        return attention_mask
+    # Match Diffusers' [B, K] key-padding mask convention. A [Q, K] mask
+    # already has a query dimension and must retain its row-specific values.
+    if attention_mask.ndim == 2 and attention_mask.shape[0] == batch_size:
+        attention_mask = attention_mask[:, None, None, :]
+    if attention_mask.ndim == 4 and attention_mask.shape[-2] == 1:
+        attention_mask = attention_mask.expand(*attention_mask.shape[:-2], query_length, -1).contiguous()
+    return attention_mask
+
+
 class QwenImageSPAttnProcessor:
     """Joint dual-stream attention processor with Ulysses sequence parallelism.
 
@@ -57,14 +155,13 @@ class QwenImageSPAttnProcessor:
     attention mask stays valid without any reordering.
     """
 
-    _attention_backend = None
-    _parallel_config = None
-
     def __init__(self):
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError(
-                "QwenImageSPAttnProcessor requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0."
-            )
+        impl = resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
+        self.veomni_attn = VeomniOp("attention", "standard", impl)
+        self.veomni_attn_masked = (
+            self.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "veomni_sdpa")
+        )
+        self.config = SimpleNamespace(_attn_implementation=impl)
 
     def __call__(
         self,
@@ -118,10 +215,10 @@ class QwenImageSPAttnProcessor:
 
         if image_rotary_emb is not None:
             img_freqs, txt_freqs = image_rotary_emb
-            img_query = apply_rotary_emb_qwen(img_query, img_freqs, use_real=False)
-            img_key = apply_rotary_emb_qwen(img_key, img_freqs, use_real=False)
-            txt_query = apply_rotary_emb_qwen(txt_query, txt_freqs, use_real=False)
-            txt_key = apply_rotary_emb_qwen(txt_key, txt_freqs, use_real=False)
+            img_query = apply_qwen_rotary_emb(img_query, img_freqs)
+            img_key = apply_qwen_rotary_emb(img_key, img_freqs)
+            txt_query = apply_qwen_rotary_emb(txt_query, txt_freqs)
+            txt_key = apply_qwen_rotary_emb(txt_key, txt_freqs)
 
         # Full (post-gather) text length used to split the joint output.
         seq_txt = txt_query.shape[1]
@@ -131,16 +228,17 @@ class QwenImageSPAttnProcessor:
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
-        joint_hidden_states = dispatch_attention_fn(
-            joint_query,
-            joint_key,
-            joint_value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
+        handle = self.veomni_attn_masked if attention_mask is not None else self.veomni_attn
+        joint_hidden_states = handle(
+            QwenImageAttentionKernelModule(self.config._attn_implementation, attn),
+            joint_query.transpose(1, 2),
+            joint_key.transpose(1, 2),
+            joint_value.transpose(1, 2),
+            _hf_key_padding_mask(attention_mask),
+            dropout=0.0,
             is_causal=False,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
-        )
+            skip_ulysses=True,
+        )[0]
 
         # joint_hidden_states: (B, joint_seq, heads_local, head_dim)
         txt_attn_output = joint_hidden_states[:, :seq_txt]
@@ -198,8 +296,10 @@ def QwenImageTransformer2DModel_forward(
             device=timestep.device,
             dtype=torch.int,
         )
+        target_image_seq_len = prod(img_shapes[0][0])
     else:
         modulate_index = None
+        target_image_seq_len = None
 
     encoder_hidden_states = self.txt_norm(encoder_hidden_states)
     encoder_hidden_states = self.txt_in(encoder_hidden_states)
@@ -217,7 +317,7 @@ def QwenImageTransformer2DModel_forward(
         else self.time_text_embed(timestep, guidance, hidden_states, additional_t_cond)
     )
 
-    image_rotary_emb = self.pos_embed(img_shapes, max_txt_seq_len=text_seq_len, device=hidden_states.device)
+    image_rotary_emb = qwen_image_rotary_frequencies(self.pos_embed, img_shapes, text_seq_len, hidden_states.device)
 
     batch_size, image_seq_len = hidden_states.shape[:2]
     txt_seq_len_full = encoder_hidden_states.shape[1]
@@ -239,14 +339,19 @@ def QwenImageTransformer2DModel_forward(
         # Build the (padded) joint attention mask on FULL lengths so that, after
         # the per-stream all-to-all inside attention, padded positions on both
         # streams are masked out. Order matches the processor: [text, image].
-        if encoder_hidden_states_mask is not None:
-            text_mask = encoder_hidden_states_mask.to(torch.bool)
-        else:
-            text_mask = torch.ones((batch_size, txt_seq_len_full), dtype=torch.bool, device=hidden_states.device)
-        text_mask = _pad_seq(text_mask, dim=1, pad_size=txt_pad, value=False)
-        image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=hidden_states.device)
-        image_mask = _pad_seq(image_mask, dim=1, pad_size=img_pad, value=False)
-        block_attention_kwargs["attention_mask"] = torch.cat([text_mask, image_mask], dim=1)
+        # Omit the mask when nothing is padded and every text token is valid so
+        # a configured Flash/flex impl is not forced onto the SDPA fallback.
+        joint_mask = _joint_keep_mask(
+            batch_size=batch_size,
+            image_seq_len=image_seq_len,
+            txt_seq_len=txt_seq_len_full,
+            device=hidden_states.device,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+            img_pad=img_pad,
+            txt_pad=txt_pad,
+        )
+        if joint_mask is not None:
+            block_attention_kwargs["attention_mask"] = joint_mask
 
         # Pad streams + RoPE to a multiple of sp_size, then slice across ranks.
         hidden_states = _pad_seq(hidden_states, dim=1, pad_size=img_pad, value=0)
@@ -262,9 +367,26 @@ def QwenImageTransformer2DModel_forward(
         encoder_hidden_states = slice_input_tensor(encoder_hidden_states, dim=1, group=sp_group)
         if modulate_index is not None:
             modulate_index = slice_input_tensor(modulate_index, dim=1, group=sp_group)
-    elif encoder_hidden_states_mask is not None:
-        image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=hidden_states.device)
-        block_attention_kwargs["attention_mask"] = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
+    else:
+        joint_mask = _joint_keep_mask(
+            batch_size=batch_size,
+            image_seq_len=image_seq_len,
+            txt_seq_len=txt_seq_len_full,
+            device=hidden_states.device,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+        )
+        if joint_mask is not None:
+            block_attention_kwargs["attention_mask"] = joint_mask
+
+    if "attention_mask" in block_attention_kwargs:
+        joint_sequence_length = hidden_states.shape[1] + encoder_hidden_states.shape[1]
+        if sp_enabled:
+            joint_sequence_length *= sp_size
+        # Reuse one full-query mask across blocks instead of allocating one
+        # quadratic mask per layer. Include communication padding under SP.
+        block_attention_kwargs["attention_mask"] = _prepare_qwen_attention_mask(
+            block_attention_kwargs["attention_mask"], joint_sequence_length, hidden_states.device.type, batch_size
+        )
 
     for index_block, block in enumerate(self.transformer_blocks):
         if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -305,6 +427,10 @@ def QwenImageTransformer2DModel_forward(
         temb = temb.chunk(2, dim=0)[0]
     hidden_states = self.norm_out(hidden_states, temb)
     output = self.proj_out(hidden_states)
+    if self.zero_cond_t:
+        # The source-image tokens (modulated with timestep 0) only condition the
+        # target denoising; drop them so the prediction aligns with training_target.
+        output = output[:, :target_image_seq_len]
 
     if not return_dict:
         return (output,)
@@ -342,6 +468,10 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
     config_class = QwenImageTransformer2DModelConfig
     supports_gradient_checkpointing = True
     _no_split_modules = ["QwenImageTransformerBlock"]
+    # Joint attention runs VeOmni ``attention/standard`` SDPA, not HF's SDPA
+    # dispatch table. Still declare support so PreTrainedModel accepts
+    # ``attn_implementation=sdpa`` / ``veomni_sdpa`` at init.
+    _supports_sdpa = True
 
     def __init__(self, config: QwenImageTransformer2DModelConfig, **kwargs):
         PreTrainedModel.__init__(self, config, **kwargs)
@@ -444,6 +574,7 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
         guidance: torch.Tensor | list[torch.Tensor] | None = None,
         additional_t_cond: torch.Tensor | list[torch.Tensor] | None = None,
         latents: torch.Tensor | list[torch.Tensor] | None = None,
+        loss_weights: torch.Tensor | list[torch.Tensor] | None = None,
         return_dict: bool = True,
     ):
         if training_target is None:
@@ -470,6 +601,21 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
         mask_list = self._as_list(encoder_hidden_states_mask, sample_count)
         guidance_list = self._as_list(guidance, sample_count)
         additional_t_cond_list = self._as_list(additional_t_cond, sample_count)
+        weights_list = self._as_list(loss_weights, sample_count)
+        if not sample_count or any(
+            len(items) != sample_count
+            for items in (
+                timestep_list,
+                encoder_hidden_states_list,
+                target_list,
+                img_shapes_list,
+                mask_list,
+                guidance_list,
+                additional_t_cond_list,
+                weights_list,
+            )
+        ):
+            raise ValueError("Qwen-Image forward fields must have the same nonzero sample count.")
 
         per_sample_losses = []
         predictions = []
@@ -482,6 +628,7 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
             sample_mask,
             sample_guidance,
             sample_add_t_cond,
+            sample_weights,
         ) in zip(
             hidden_states_list,
             timestep_list,
@@ -491,6 +638,7 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
             mask_list,
             guidance_list,
             additional_t_cond_list,
+            weights_list,
         ):
             prediction = self.predict_noise(
                 hidden_states=sample_hs,
@@ -501,19 +649,28 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
                 guidance=sample_guidance,
                 additional_t_cond=sample_add_t_cond,
             )[0]
+            if prediction.shape != sample_target.shape:
+                raise ValueError("Qwen-Image prediction and training_target shapes must match exactly.")
             predictions.append(prediction)
             per_sample_loss = F.mse_loss(prediction.float(), sample_target.float(), reduction="none")
             per_sample_loss = per_sample_loss.view(per_sample_loss.shape[0], -1).mean(dim=1)
+            if sample_weights is not None:
+                sample_weights = torch.as_tensor(sample_weights, device=prediction.device, dtype=torch.float32)
+                if sample_weights.shape != per_sample_loss.shape:
+                    raise ValueError("Qwen-Image loss_weights must contain one weight per image.")
+                per_sample_loss = per_sample_loss * sample_weights
             per_sample_losses.append(per_sample_loss)
 
-        loss = torch.stack(per_sample_losses).mean()
+        loss = torch.cat(per_sample_losses).mean()
         return QwenImageModelOutput(loss={"mse_loss": loss}, predictions=predictions)
 
     def save_pretrained(self, path, **kwargs):
         hf_config = copy.deepcopy(self.config)
         self.config = self.config.to_diffuser_dict()
-        _QwenImageTransformer2DModel.save_pretrained(self, path, **kwargs)
-        self.config = hf_config
+        try:
+            _QwenImageTransformer2DModel.save_pretrained(self, path, **kwargs)
+        finally:
+            self.config = hf_config
 
     @classmethod
     def from_pretrained(cls, path, **kwargs):

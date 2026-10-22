@@ -80,6 +80,7 @@ import torch
 import torch.distributed as dist
 import yaml
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.checkpoint.layout import weights_dir
 from veomni.data import build_dummy_dataset
@@ -88,6 +89,9 @@ from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 from veomni.utils import helper
+
+
+_LORA_MAX_NPROC = 4
 
 
 _LORA_KEYS = ("lora_A", "lora_B")
@@ -371,8 +375,9 @@ def _build_and_save_toy_base(dest_dir: str) -> None:
     16 experts, 4 layers). Module-scoped means once per pytest invocation.
     """
     from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.models import build_foundation_model
     from veomni.utils import helper as _helper
+
+    from .utils import build_lora_test_model
 
     _helper.set_seed(42)
     ops = OpsImplementationConfig(
@@ -383,7 +388,7 @@ def _build_and_save_toy_base(dest_dir: str) -> None:
         swiglu_mlp_implementation="eager",
         rotary_pos_emb_implementation="eager",
     )
-    model = build_foundation_model(
+    model = build_lora_test_model(
         config_path=_TOY_CONFIG_PATH,
         weights_path=None,
         torch_dtype="bfloat16",
@@ -431,7 +436,7 @@ def torchrun_trainer(
     output_dir: str,
     *,
     extra_overrides: list[str] | None = None,
-    nproc: int = 4,
+    nproc: int = _LORA_MAX_NPROC,
 ) -> None:
     """Spawn this module under torchrun; raise on non-zero exit."""
     import subprocess
@@ -551,12 +556,12 @@ def _model_path_overrides(toy_base_dir: str) -> list[str]:
     ]
 
 
-def _gpu_count_or_skip(min_count: int = 1, max_count: int = 4) -> int:
+def _gpu_count_or_skip(min_count: int = 1, max_count: int = _LORA_MAX_NPROC) -> int:
     """Return the nproc to use for torchrun, or skip the test if no devices."""
     from veomni.utils.device import get_torch_device
 
     device = get_torch_device()
-    n = device.device_count() if device.is_available() else 0
+    n = runner_device_count() if device.is_available() else 0
     if n < min_count:
         pytest.skip(f"Requires at least {min_count} accelerator device(s); got {n}")
     return min(n, max_count)
@@ -632,6 +637,9 @@ def _assert_writer_artifacts_exist(writer_dir: str, mode: str, *, final_step: in
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.launch_plan(
+    provider=lambda context: LaunchSpec(nproc=max(1, min(len(context.capabilities.devices), _LORA_MAX_NPROC)))
+)
 @pytest.mark.parametrize("mode", ["independent", "shared"])
 def test_save_load_resume_round_trip(tmp_path, toy_base_dir, mode):
     """End-to-end save -> resume (DCP) -> resume (LoRA adapter) for one mode."""
