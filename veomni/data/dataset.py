@@ -456,12 +456,8 @@ def get_length_fn(sample: Any) -> int:
 
     if "attention_mask" in sample:
         return _sum_sequence_like(sample["attention_mask"])
-    if "packed_attention_mask" in sample:
-        return _sum_sequence_like(sample["packed_attention_mask"])
     if "input_ids" in sample:
         return _numel_sequence_like(sample["input_ids"])
-    if "packed_input_ids" in sample:
-        return _numel_sequence_like(sample["packed_input_ids"])
     if "conversation_list" in sample:
         return _conversation_total_length(sample["conversation_list"])
     return 1
@@ -494,13 +490,12 @@ def get_length_by_labels_fn(sample: Any) -> int:
     if not isinstance(sample, dict):
         return 1
 
-    for label_key in ("labels", "packed_labels"):
-        if label_key in sample:
-            counted = _count_supervised_labels(sample[label_key])
-            if counted is not None:
-                return counted
+    if "labels" in sample:
+        counted = _count_supervised_labels(sample["labels"])
+        if counted is not None:
+            return counted
 
-    if any(k in sample for k in ("attention_mask", "packed_attention_mask", "input_ids", "packed_input_ids")):
+    if "attention_mask" in sample or "input_ids" in sample:
         return get_length_fn(sample)
 
     if "conversation_list" in sample:

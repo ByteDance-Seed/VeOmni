@@ -211,7 +211,7 @@ class _DummyPackedPreprocessor(ModulePreprocessorBase):
         batch["attention_mask"] = torch.ones((1, total_len), dtype=torch.long)
         batch["labels"] = labels
         batch["position_ids"] = torch.arange(total_len, dtype=torch.long).view(1, -1).expand(3, 1, -1).contiguous()
-        batch["packed_cu_seqlens"] = torch.tensor([0, total_len], dtype=torch.int32)
+        batch["cu_seqlens"] = torch.tensor([0, total_len], dtype=torch.int32)
 
 
 def test_packed_preprocessor_tensors_survive_transform_collator_and_batch_to_device():
@@ -261,5 +261,5 @@ def test_packed_preprocessor_tensors_survive_transform_collator_and_batch_to_dev
     assert multi_batch["labels"].shape == (1, 22)
     assert isinstance(multi_batch["position_ids"], torch.Tensor)
     assert multi_batch["position_ids"].shape == (3, 1, 22)
-    assert torch.equal(multi_batch["packed_cu_seqlens"], torch.tensor([0, 16, 22], dtype=torch.int32))
+    assert torch.equal(multi_batch["cu_seqlens"], torch.tensor([0, 16, 22], dtype=torch.int32))
     assert len(multi_batch["conversation_list"]) == 2

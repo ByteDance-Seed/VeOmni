@@ -27,7 +27,7 @@ def _collate_tensor_field(key: str, values: Sequence[torch.Tensor]) -> torch.Ten
     first = values[0]
     if first.dim() == 0 and all(v.dim() == 0 for v in values):
         return torch.stack(list(values), dim=0)
-    if key in {"cu_seqlens", "packed_cu_seqlens"} and all(
+    if key in {"cu_seqlens", "cu_seq_lens_q", "cu_seq_lens_k"} and all(
         v.dim() == 1 and v.numel() >= 2 and int(v[0].item()) == 0 for v in values
     ):
         parts = [first]
@@ -43,7 +43,7 @@ def _collate_tensor_field(key: str, values: Sequence[torch.Tensor]) -> torch.Ten
             return torch.cat(list(values), dim=-1)
         if first.dim() == 3 and first.shape[:2] == (3, 1) and all(v.shape[:2] == (3, 1) for v in values):
             return torch.cat(list(values), dim=-1)
-        if key in {"position_ids", "packed_position_ids"} and all(v.shape[:-1] == first.shape[:-1] for v in values):
+        if key == "position_ids" and all(v.shape[:-1] == first.shape[:-1] for v in values):
             return torch.cat(list(values), dim=-1)
         if all(v.shape[1:] == first.shape[1:] for v in values):
             return torch.cat(list(values), dim=0)
