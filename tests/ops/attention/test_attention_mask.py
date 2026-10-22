@@ -121,6 +121,7 @@ def test_flash_like_hf_names_share_the_flash_mask_builder():
         "veomni_flash_attention_3",
         "veomni_flash_attention_3_hub",
         "veomni_flash_attention_4",
+        "veomni_flash_attention_aiter",
         "veomni_sage_attention",
     ):
         assert ALL_MASK_ATTENTION_FUNCTIONS[name] is flash_attention_mask_builder

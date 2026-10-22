@@ -1301,6 +1301,10 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
     "moe_implementation": frozenset({"fused_npu"}),
 }
 
+_AITER_ATTENTION_IMPLEMENTATIONS = frozenset(
+    {"aiter", "veomni_flash_attention_aiter", "veomni_flash_attention_aiter_with_sp"}
+)
+
 # MLU compatibility tables for ``_validate_implementations``.
 # ``fused_triton`` is the same group-gemm as on GPU; ``fused_mlu`` is Apex grouped-GEMM.
 _MLU_ALLOWED: Dict[str, frozenset] = {
@@ -1391,6 +1395,7 @@ class OpsImplementationConfig:
             "flash_attention_3_hub",
             "flash_attention_4",
             "flex_attention",
+            "aiter",
             "magi_attention",
             "sage_attention",
             "native-sparse",
@@ -1399,6 +1404,7 @@ class OpsImplementationConfig:
             "veomni_flash_attention_3",
             "veomni_flash_attention_3_hub",
             "veomni_flash_attention_4",
+            "veomni_flash_attention_aiter",
             "veomni_flex_attention",
             "veomni_magi_attention",
             "veomni_sage_attention",
@@ -1408,7 +1414,7 @@ class OpsImplementationConfig:
         default="flash_attention_2",
         metadata={
             "help": "Attention implementation. Short names (flash_attention_2, flex_attention, "
-            "magi_attention, sage_attention, sdpa) rewrite to the matching veomni_* adapter when "
+            "aiter, magi_attention, sage_attention, sdpa) rewrite to the matching veomni_* adapter when "
             "MODELING_BACKEND=veomni. Pass a veomni_* name to select that adapter directly."
         },
     )
@@ -1584,10 +1590,30 @@ class OpsImplementationConfig:
             raise ValueError(f"{implementation} requires MODELING_BACKEND=veomni.")
 
     @staticmethod
+    def validate_attention_backend(implementation: Optional[str]) -> None:
+        """Reject AITER where its VeOmni ROCm adapter cannot be installed."""
+        if implementation not in _AITER_ATTENTION_IMPLEMENTATIONS:
+            return
+
+        from ..utils.device import IS_NPU_AVAILABLE
+
+        if IS_NPU_AVAILABLE:
+            raise ValueError(f"{implementation} is not supported on Ascend NPU; AITER is an AMD ROCm-only backend.")
+        if get_env("MODELING_BACKEND") != "veomni":
+            raise ValueError(f"{implementation} requires MODELING_BACKEND=veomni.")
+        if implementation == "veomni_flash_attention_aiter_with_sp":
+            raise ValueError(
+                "veomni_flash_attention_aiter_with_sp is not a supported attention implementation; "
+                "use 'aiter' or 'veomni_flash_attention_aiter'."
+            )
+
+    @staticmethod
     def normalize_hub_attention_backend(implementation: Optional[str]) -> Optional[str]:
         """Validate Hub requests and resolve their registered VeOmni names."""
+        OpsImplementationConfig.validate_attention_backend(implementation)
         OpsImplementationConfig.validate_hub_attention_backend(implementation)
         return {
+            "aiter": "veomni_flash_attention_aiter",
             "flash_attention_2_hub": "veomni_flash_attention_2_hub",
             "flash_attention_3_hub": "veomni_flash_attention_3_hub",
         }.get(implementation, implementation)
@@ -1601,6 +1627,7 @@ class OpsImplementationConfig:
                 "flash_attention_3": "veomni_flash_attention_3",
                 "flash_attention_4": "veomni_flash_attention_4",
                 "flex_attention": "veomni_flex_attention",
+                "aiter": "veomni_flash_attention_aiter",
                 "magi_attention": "veomni_magi_attention",
                 "sage_attention": "veomni_sage_attention",
                 "sdpa": "veomni_sdpa",
