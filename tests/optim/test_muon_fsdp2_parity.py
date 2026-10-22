@@ -567,8 +567,148 @@ def _run_qwen3_moe(use_zero_comm: bool, *, init_dist: bool = True) -> None:
 
         dist.barrier()
     if init_dist:
-        dist.destroy_process_group()
-        clear_parallel_state()
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            clear_parallel_state()
+
+
+def _run_qwen3_moe_smoke(use_zero_comm: bool, *, init_dist: bool = True) -> None:
+    """Real builder/optimizer integration smoke path migrated from test_muon_fsdp2_smoke.py."""
+    from veomni.arguments.arguments_types import MixedPrecisionConfig, OpsImplementationConfig
+    from veomni.distributed.torch_parallelize import build_parallelize_model
+    from veomni.models import build_foundation_model
+    from veomni.optim import build_optimizer
+    from veomni.optim.optimizer import MultiOptimizer
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device_type = get_device_type()
+    if init_dist:
+        get_torch_device().set_device(f"{device_type}:{local_rank}")
+        dist.init_process_group(backend=get_dist_comm_backend())
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    assert world_size == 4, f"this test expects exactly 4 ranks, got {world_size}"
+
+    ps = _init_parallel_state(
+        dp_size=world_size,
+        dp_shard_size=world_size,
+        extra_parallel_sizes=(EP_SIZE,),
+        extra_parallel_placement_innermost=(False,),
+        extra_parallel_names=("ep",),
+        dp_mode="fsdp2",
+        name="muon_moe_ep2",
+    )
+    with use_parallel_state(ps):
+        assert get_parallel_state() is ps
+        device = torch.device(f"{device_type}:{local_rank}")
+        _seed_all(7777 + rank, device)
+
+        ops_cfg = OpsImplementationConfig(
+            attn_implementation="eager",
+            moe_implementation="fused_triton",
+            cross_entropy_loss_implementation="eager",
+            rms_norm_implementation="eager",
+            swiglu_mlp_implementation="eager",
+            rotary_pos_emb_implementation="eager",
+            load_balancing_loss_implementation="eager",
+        )
+        model = build_foundation_model(
+            config_path=QWEN3_MOE_TOY_CFG,
+            weights_path=None,
+            torch_dtype="bfloat16",
+            init_device="meta",
+            ops_implementation=ops_cfg,
+        )
+        model = build_parallelize_model(
+            model,
+            init_device="meta",
+            weights_path=None,
+            mixed_precision=MixedPrecisionConfig(enable=False),
+            enable_gradient_checkpointing=False,
+            basic_modules=[],
+            enable_reentrant=False,
+            enable_forward_prefetch=True,
+            broadcast_model_weights_from_rank0=False,
+            max_load_broadcast_size=int(1e9),
+            muon_expert_zero_comm=use_zero_comm,
+        )
+
+        expected_shard_dim = 0 if use_zero_comm else 1
+        sample_name = "model.layers.0.mlp.experts.gate_up_proj"
+        p = dict(model.named_parameters()).get(sample_name)
+        assert p is not None, f"expected param {sample_name} to exist on the toy Qwen3-MoE v5 model"
+        assert isinstance(p, DTensor), f"{sample_name} should be a DTensor under FSDP+EP, got {type(p)}"
+        shard_dims = [pl.dim for pl in p.placements if isinstance(pl, Shard)]
+        assert shard_dims == [expected_shard_dim], (
+            f"{sample_name}: expected Shard({expected_shard_dim}), got placements={p.placements}; "
+            f"use_zero_comm={use_zero_comm}"
+        )
+
+        optimizer = build_optimizer(
+            model,
+            lr=1e-4,
+            weight_decay=0.01,
+            fused=True,
+            optimizer_type="muon",
+            no_decay_modules=[],
+            no_decay_params=[],
+            muon_kwargs={
+                "lr": 2e-2,
+                "weight_decay": 0.0,
+                "momentum": 0.9,
+                "nesterov": True,
+                "ns_steps": 5,
+                "ns_coefficients": (3.4445, -4.7750, 2.0315),
+                "eps": 1e-7,
+                "adjust_lr_fn": "match_rms_adamw",
+            },
+        )
+        assert isinstance(optimizer, MultiOptimizer)
+        assert "muon_ep" in optimizer.optimizers_dict, (
+            f"expected muon_ep sub-optimizer for EP-resident expert weights; "
+            f"got optimizer keys: {sorted(optimizer.optimizers_dict.keys())}"
+        )
+
+        snap = {
+            name: (param.full_tensor() if isinstance(param, DTensor) else param).detach().cpu().clone()
+            for name, param in model.named_parameters()
+        }
+
+        inputs = torch.randint(0, 1000, (2, 8), device=device)
+        out = model(input_ids=inputs, labels=inputs)
+        loss = out.loss
+        assert loss is not None and torch.isfinite(loss), f"loss is None or not finite: {loss}"
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        moved = 0
+        for name, param in model.named_parameters():
+            new = (param.full_tensor() if isinstance(param, DTensor) else param).detach().cpu()
+            if not torch.equal(new, snap[name]):
+                moved += 1
+        assert moved > 0, "no parameter changed after a single optimizer step"
+
+        if rank == 0:
+            print(
+                f"[rank0] smoke OK (use_zero_comm={use_zero_comm}): "
+                f"loss={loss.item():.4f}, moved {moved}/{len(snap)} params"
+            )
+
+        del model, optimizer, snap, out, loss, inputs
+        device_backend = get_torch_device()
+        if hasattr(device_backend, "empty_cache"):
+            device_backend.empty_cache()
+        dist.barrier()
+
+    if init_dist:
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            clear_parallel_state()
 
 
 def _run_dense_all() -> None:
@@ -602,12 +742,17 @@ def _run_moe_all() -> None:
     device_type = get_device_type()
     get_torch_device().set_device(f"{device_type}:{local_rank}")
     dist.init_process_group(backend=get_dist_comm_backend())
-    backends = [False, True]
+    scenarios = [
+        lambda: _run_qwen3_moe(use_zero_comm=False, init_dist=False),
+        lambda: _run_qwen3_moe(use_zero_comm=True, init_dist=False),
+        lambda: _run_qwen3_moe_smoke(use_zero_comm=False, init_dist=False),
+        lambda: _run_qwen3_moe_smoke(use_zero_comm=True, init_dist=False),
+    ]
     if os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1":
-        backends = list(reversed(backends))
+        scenarios = list(reversed(scenarios))
     try:
-        for use_zero_comm in backends:
-            _run_qwen3_moe(use_zero_comm=use_zero_comm, init_dist=False)
+        for fn in scenarios:
+            fn()
         dist.barrier()
     finally:
         try:
@@ -682,6 +827,7 @@ if __name__ == "__main__":
             "dense_mixed_dtype",
             "dense_head_split",
             "moe",
+            "smoke",
         ],
         required=True,
     )
@@ -702,5 +848,7 @@ if __name__ == "__main__":
     elif args.mode == "dense_head_split":
         # up is [64, 32] and down is [32, 64], so 4 blocks divide both evenly.
         _run_dense(head_blocks=4)
+    elif args.mode == "smoke":
+        _run_qwen3_moe_smoke(use_zero_comm=bool(args.zero_comm))
     else:
         _run_qwen3_moe(use_zero_comm=bool(args.zero_comm))

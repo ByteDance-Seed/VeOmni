@@ -446,16 +446,6 @@
     ]
   },
   {
-    "name": "46-unit",
-    "suite": "unit",
-    "conditional": false,
-    "args": [
-      "-s",
-      "-x",
-      "tests/optim/test_muon_fsdp2_smoke.py"
-    ]
-  },
-  {
     "name": "47-unit",
     "suite": "unit",
     "conditional": false,
