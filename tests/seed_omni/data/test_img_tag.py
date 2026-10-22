@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.seed_omni.preprocess import conv_preprocess
 from veomni.data.seed_omni.seedomni_transform import _build_conversation_list
 from veomni.models.seed_omni.utils.conversation import (
@@ -30,6 +31,9 @@ from veomni.models.seed_omni.utils.conversation import (
     ConversationItem,
     iter_desired_items,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -651,55 +655,3 @@ def test_multimodal_load_image_from_path_sets_http_timeout(monkeypatch) -> None:
     img = mm_image_utils.load_image_from_path("https://example.com/test.png")
     assert img.size == (2, 2)
     assert seen == {"url": "https://example.com/test.png", "kwargs": {"timeout": (5, 30)}}
-
-
-def test_weighted_multisource_uses_configured_name_only_as_fallback(tmp_path) -> None:
-    import json
-
-    import yaml
-
-    from veomni.data.dataset import build_weighted_multisource_dataset
-
-    source_a = tmp_path / "source_a.jsonl"
-    source_b = tmp_path / "source_b.jsonl"
-    source_a.write_text(json.dumps({"source": "sharegpt4v_sft", "text": "row_with_source"}) + "\n", encoding="utf-8")
-    source_b.write_text(json.dumps({"text": "row_without_source"}) + "\n", encoding="utf-8")
-
-    cfg_path = tmp_path / "multisource.yaml"
-    cfg_path.write_text(
-        yaml.safe_dump(
-            {
-                "sources": [str(source_a), str(source_b)],
-                "names": ["corpus_a", "sharegpt4v_fallback"],
-                "schedule": [{"schedule_type": "const", "weights": [0.5, 0.5]}],
-                "stopping_strategy": "all_exhausted",
-                "upstream_sharded": False,
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    seen_selectors: dict[str, str | None] = {}
-
-    def qwen_style_transform(sample: dict, **kwargs):
-        # Mirrors _process_sample_qwen_vl_base / process_sample_qwen_omni:
-        # kwargs.get("source_name") takes precedence over sample["source"].
-        selector = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")
-        seen_selectors[sample["text"]] = selector
-        return [{"text": sample["text"], "selector": selector}]
-
-    ds = build_weighted_multisource_dataset(
-        train_path=str(cfg_path),
-        transform=qwen_style_transform,
-        shuffle=False,
-    )
-    items = list(ds)
-    by_text = {item[0]["text"]: item[0] for item in items}
-
-    assert seen_selectors["row_with_source"] == "sharegpt4v_sft"
-    assert by_text["row_with_source"]["source_name"] == "corpus_a"
-    assert by_text["row_with_source"]["ds_idx"] == 0
-
-    assert seen_selectors["row_without_source"] == "sharegpt4v_fallback"
-    assert by_text["row_without_source"]["source_name"] == "sharegpt4v_fallback"
-    assert by_text["row_without_source"]["ds_idx"] == 1

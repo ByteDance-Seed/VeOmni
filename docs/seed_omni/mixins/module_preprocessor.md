@@ -124,10 +124,10 @@ class VisionPreprocessor(ModulePreprocessorBase):
 ## Tests
 
 - [`tests/seed_omni/data/test_preprocessor.py`](../../../tests/seed_omni/data/test_preprocessor.py):
-  - [strict key alignment across collated samples](../../../tests/seed_omni/data/test_preprocessor.py#L48),
-  - [mixed-resolution images preserved unstacked and normalized per item](../../../tests/seed_omni/data/test_preprocessor.py#L58), and
-  - [`append_batch_anchor` attaches a single dummy anchor row when a modality is absent](../../../tests/seed_omni/data/test_preprocessor.py#L97).
+  - [strict key alignment across collated samples](../../../tests/seed_omni/data/test_preprocessor.py#L52),
+  - [mixed-resolution images preserved unstacked and normalized per item](../../../tests/seed_omni/data/test_preprocessor.py#L62), and
+  - [`append_batch_anchor` attaches a single dummy anchor row when a modality is absent](../../../tests/seed_omni/data/test_preprocessor.py#L101).
 - [`tests/seed_omni/model/test_processor.py`](../../../tests/seed_omni/model/test_processor.py):
-  - [preprocessors run in module order](../../../tests/seed_omni/model/test_processor.py#L31),
-  - [`model_config` and `processor_config` overrides reach `from_pretrained`](../../../tests/seed_omni/model/test_processor.py#L157), and
-  - [`bind_module_assets` copies missing assets idempotently](../../../tests/seed_omni/model/test_processor.py#L225).
+  - [preprocessors run in module order](../../../tests/seed_omni/model/test_processor.py#L36),
+  - [`model_config` and `processor_config` overrides reach `from_pretrained`](../../../tests/seed_omni/model/test_processor.py#L162), and
+  - [`bind_module_assets` copies missing assets idempotently](../../../tests/seed_omni/model/test_processor.py#L230).

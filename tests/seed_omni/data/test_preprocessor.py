@@ -7,6 +7,7 @@ import pickle
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.seed_omni.collator import SeedOmniCollator
 from veomni.models.seed_omni.modules.module_processing_base import ModulePreprocessorBase
 from veomni.models.seed_omni.processing_omni import OmniProcessor
@@ -15,6 +16,9 @@ from veomni.models.seed_omni.utils.conversation import (
     ConversationItem,
     iter_desired_items,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class _DummyImageNormalizePreprocessor(ModulePreprocessorBase):
