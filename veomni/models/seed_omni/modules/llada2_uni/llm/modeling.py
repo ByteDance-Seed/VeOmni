@@ -21,6 +21,7 @@ Directly composes the layers, norms, rotary embeddings, and fused MoE blocks of
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any, Dict, Optional
 
 import torch
@@ -89,14 +90,19 @@ class LladaUniBackbone(LLaDA2UniPreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(
-                hidden_states,
-                attention_mask=mask,
-                position_ids=position_ids,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-        return MoeModelOutputWithPast(last_hidden_state=self.norm(hidden_states))
+            layer_device = next(decoder_layer.parameters()).device
+            with torch.cuda.device(layer_device) if layer_device.type == "cuda" else nullcontext():
+                hidden_states = decoder_layer(
+                    hidden_states,
+                    attention_mask=mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+        norm_device = self.norm.weight.device
+        with torch.cuda.device(norm_device) if norm_device.type == "cuda" else nullcontext():
+            hidden_states = self.norm(hidden_states)
+        return MoeModelOutputWithPast(last_hidden_state=hidden_states)
 
 
 class InferenceMixin:

@@ -4,12 +4,16 @@ llada2_uni_image_tokenizer:
   ops_implementation:
     attn_implementation: sdpa
   accelerator:
+    gradient_checkpointing:
+      enable: false
     fsdp_config:
       fsdp_mode: fsdp2
 
 llada2_uni_text_encoder:
   model_path: llada2_uni_text_encoder
   accelerator:
+    gradient_checkpointing:
+      enable: false
     fsdp_config:
       fsdp_mode: fsdp2
 
