@@ -17,6 +17,7 @@ import math
 import os
 import random
 import traceback
+from collections.abc import Mapping
 from functools import partial
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 
@@ -1829,6 +1830,27 @@ def build_energon_dataset(
     return EnergonDataset(dataset, transform)
 
 
+def _transform_with_fallback_source_name(
+    transform: Callable,
+    sample: Any,
+    *,
+    source_name: Optional[str] = None,
+    **kwargs: Any,
+) -> Any:
+    """Use the multisource config's ``source_name`` only when ``sample`` lacks ``source`` / ``source_name``.
+
+    Transforms such as ``_process_sample_qwen_vl_base`` and ``process_sample_qwen_omni``
+    resolve ``kwargs.get("source_name") or sample.get("source") or sample.get("source_name")``,
+    so forwarding a display name like ``corpus_a`` unconditionally would override a row's
+    own preprocessor selector (e.g. ``sharegpt4v_sft``).
+    """
+    if isinstance(sample, Mapping):
+        row_source = sample.get("source") or sample.get("source_name")
+        if row_source:
+            source_name = row_source
+    return transform(sample, source_name=source_name, **kwargs)
+
+
 @DATASET_REGISTRY.register("veomni_weighted_multisource")
 def build_weighted_multisource_dataset(
     train_path: str,
@@ -1853,11 +1875,12 @@ def build_weighted_multisource_dataset(
     stopping_strategy = multisource_config.get("stopping_strategy", "first_exhausted")
     split_by_node = multisource_config.get("upstream_sharded", True)
 
+    child_transform = partial(_transform_with_fallback_source_name, transform) if transform is not None else None
     datasets = [
         build_iterable_dataset(
             train_path=source,
             seed=seed,
-            transform=transform,
+            transform=child_transform,
             source_name=source_names[idx] if source_names is not None else None,
             split_by_node=split_by_node,
             shuffle=shuffle,
