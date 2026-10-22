@@ -16,6 +16,7 @@ import veomni.data.data_loader as loader_module
 import veomni.models.model_runtime as runtime_module
 import veomni.trainer.base as base_module
 import veomni.trainer.dit_trainer as dit_module
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.dataset import MappingDataset
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.dit_trainer import (
@@ -28,6 +29,9 @@ from veomni.trainer.dit_trainer import (
     OfflineEmbeddingSaver,
     VeOmniDiTArguments,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _trainer(monkeypatch, task, micro_batch_size, dp_size=1, dp_rank=0, shuffle=True):

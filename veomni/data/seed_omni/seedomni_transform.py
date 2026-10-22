@@ -223,7 +223,7 @@ def process_seedomni_example(
     """
     # Non-destructive read — datasets often share dict references and a
     # subsequent ``__getitem__`` would otherwise see the key gone.
-    source = example.get("source_name", kwargs.get("source_name"))
+    source = kwargs.get("source_name") or example.get("source") or example.get("source_name")
     if source is None:
         raise KeyError(
             "process_seedomni_example: sample is missing 'source_name' (and no fallback "

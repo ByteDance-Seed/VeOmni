@@ -82,8 +82,8 @@ To avoid CI relies on network, we pre-download dataset on a NFS on the CI machin
 ### Ascend workspace runtime gate
 
 Both NPU workflows run `tests/tools/npu_preflight.py --expected-devices 8`
-after installing workspace dependencies; the e2e workflow repeats it after its
-second dependency sync. The check imports `torch_npu`, requires exactly eight
+after the final workspace dependency and Triton installation, before starting
+the shared accelerator case scheduler. The check imports `torch_npu`, requires exactly eight
 visible NPUs, and allocates, computes, synchronizes and reads back a tensor on
 each device. Missing packages, unavailable devices and execution failures abort
 the job instead of being treated as skipped hardware tests. This is a runtime

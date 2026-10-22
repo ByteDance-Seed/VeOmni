@@ -1,4 +1,3 @@
-import random
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,6 +9,8 @@ from safetensors.torch import save_file
 from torch import distributed as dist
 from torch import nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.tools.launch_utils import find_free_port
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import _init_parallel_state
@@ -17,6 +18,9 @@ from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models.checkpoint.weights import load_model_weights, rank0_load_and_broadcast_weights
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+
+
+_CI_LAUNCH = LaunchSpec(nproc=4)
 
 
 try:
@@ -399,14 +403,15 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
         clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed required")
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_load_dist_model_weights_matches_standard(tmp_path: Path, cpu_offload: bool) -> None:
     checkpoint_dir = tmp_path / "ckpt"
     weights_path = _write_checkpoint(checkpoint_dir, is_parallel=True)
 
-    world_size = 4
-    port = 12345 + random.randint(0, 100)
+    world_size = _CI_LAUNCH.nproc
+    port = find_free_port()
     command = [
         "torchrun",
         f"--nproc_per_node={world_size}",
@@ -566,6 +571,7 @@ def run_load_weights_test(args: Arguments) -> None:
         clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed required")
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_load_weights_no_scatter(tmp_path: Path, cpu_offload: bool) -> None:
@@ -580,8 +586,8 @@ def test_load_weights_no_scatter(tmp_path: Path, cpu_offload: bool) -> None:
     checkpoint_dir = tmp_path / "ckpt"
     weights_path = _write_checkpoint(checkpoint_dir, is_parallel=False)
 
-    world_size = 4
-    port = 12345 + random.randint(0, 100)
+    world_size = _CI_LAUNCH.nproc
+    port = find_free_port()
     command = [
         "torchrun",
         f"--nproc_per_node={world_size}",
