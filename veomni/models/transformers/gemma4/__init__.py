@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ...loader import MODELING_REGISTRY
+from ...registry import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("gemma4")

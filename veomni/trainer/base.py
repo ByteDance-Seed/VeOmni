@@ -60,7 +60,7 @@ from ..distributed.parallel_state import (
 )
 from ..distributed.torch_compile import mark_compile_step_begin
 from ..models.model_runtime import VeOmniModelRuntime
-from ..ops.batch_invariant_ops import set_batch_invariant_mode
+from ..ops.batch_invariant import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.device import (
     get_device_type,
@@ -437,6 +437,7 @@ class BaseTrainer(Stateful, ABC):
             dataset_name=args.data.dataset_name,
             transform=self.data_transform,
             seed=args.train.seed,
+            shuffle=args.data.dataloader.shuffle,
             **asdict(args.data),
         )
         dataset_length = None if not hasattr(self.train_dataset, "__len__") else len(self.train_dataset)

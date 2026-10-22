@@ -16,6 +16,7 @@
 
 from collections import UserDict
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 from transformers.cache_utils import Cache, DynamicCache
@@ -35,6 +36,10 @@ from transformers.models.gemma4.modeling_gemma4 import (
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
+from veomni.ops.mask import packed_causal_mask, sliding_window_mask
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 
@@ -47,23 +52,59 @@ config = PatchConfig(
 
 config.drop_import_names("create_causal_mask", "create_sliding_window_causal_mask")
 config.add_import(
-    "veomni.models.transformers.masking_utils",
+    "transformers.masking_utils",
     names=["create_causal_mask", "create_sliding_window_causal_mask"],
 )
 config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin"],
 )
-config.add_import("veomni.ops.kernels.cross_entropy", names=["ForCausalLMLoss"])
+config.add_import("functools", names=["partial"])
+config.add_import("veomni.models.loss_utils", names=["ForCausalLMLoss"])
+config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import("veomni.ops.config", names=["resolve_op_impl"])
+config.add_import("veomni.ops.mask", names=["packed_causal_mask", "sliding_window_mask"])
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
-config.add_post_import_block(
-    """
-    from veomni.ops.dispatch import OpSlot
-    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-    """
-)
 
-veomni_causal_lm_loss = None
+
+@config.add_helper
+def _gemma4_create_mask(
+    config,
+    inputs_embeds,
+    attention_mask,
+    past_key_values,
+    position_ids=None,
+    cu_seq_lens_q=None,
+    *,
+    sliding=False,
+    **kwargs,
+):
+    """Use public packed builders while retaining HF cache-aware unpacked masks."""
+    if cu_seq_lens_q is None:
+        builder = create_sliding_window_causal_mask if sliding else create_causal_mask
+        return builder(
+            config=config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+            **kwargs,
+        )
+    if past_key_values is not None:
+        raise ValueError("Packed Gemma 4 attention does not support past_key_values.")
+    common = dict(
+        impl=config._attn_implementation,
+        device=inputs_embeds.device,
+        batch_size=inputs_embeds.shape[0],
+        dtype=inputs_embeds.dtype,
+        attention_mask=attention_mask,
+        cu_seqlens=cu_seq_lens_q,
+        **kwargs,
+    )
+    q_len = inputs_embeds.shape[1]
+    if sliding:
+        return sliding_window_mask(q_len, q_len, sliding_window=config.sliding_window, **common)
+    return packed_causal_mask(q_len, q_len, **common)
 
 
 @config.override_method(
@@ -106,6 +147,10 @@ def gemma4_vision_forward_patched(
     pixel_position_ids: torch.LongTensor,
     **kwargs: Unpack[TransformersKwargs],
 ) -> BaseModelOutputWithPast:
+    """
+    pixel_position_ids (`torch.LongTensor`):
+        Two-dimensional patch coordinates; padded patches use (-1, -1).
+    """
     if get_parallel_state().ulysses_enabled:
         raise NotImplementedError("Gemma 4 vision does not support Ulysses sequence parallelism; use ulysses_size=1.")
 
@@ -215,7 +260,7 @@ def gemma4_create_masks_for_vision_model_patched(
         "cu_seq_lens_q": cu_seq_lens_q,
     }
 
-    full_mask = create_causal_mask(**mask_kwargs)
+    full_mask = _gemma4_create_mask(**mask_kwargs)
 
     early_exit, _, _, _, kv_length, _, kv_offset = _preprocess_mask_arguments(
         config=config,
@@ -232,7 +277,7 @@ def gemma4_create_masks_for_vision_model_patched(
             block_sequence_ids, attention_mask, kv_length, kv_offset
         )
 
-    sliding_mask = create_causal_mask(
+    sliding_mask = _gemma4_create_mask(
         **mask_kwargs,
         or_mask_function=blockwise_overlay(padded_block_sequence_ids),
         and_mask_function=sliding_window_overlay(config.sliding_window),
@@ -402,8 +447,8 @@ def gemma4_model_forward_patched(
         else:
             mask_kwargs["cu_seq_lens_q"] = kwargs.get("cu_seq_lens_q")
             causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+                "full_attention": _gemma4_create_mask(**mask_kwargs),
+                "sliding_attention": _gemma4_create_mask(sliding=True, **mask_kwargs),
             }
 
     outputs = self.language_model(
@@ -479,8 +524,8 @@ def gemma4_text_model_forward_patched(
             "cu_seq_lens_q": kwargs.get("cu_seq_lens_q"),
         }
         causal_mask_mapping = {
-            "full_attention": create_causal_mask(**mask_kwargs),
-            "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            "full_attention": _gemma4_create_mask(**mask_kwargs),
+            "sliding_attention": _gemma4_create_mask(sliding=True, **mask_kwargs),
         }
 
     hidden_states = inputs_embeds
@@ -564,8 +609,10 @@ def _gemma4_loss(
     if labels is not None:
         if final_logit_softcapping is not None and kwargs.get("return_log_probs", False):
             raise ValueError("Gemma 4 logit softcapping does not support return_log_probs=True.")
-        if veomni_causal_lm_loss.use_non_eager_impl and final_logit_softcapping is None:
-            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
+        if final_logit_softcapping is None and (
+            model.veomni_ce.impl != "eager" or kwargs.get("return_log_probs", False)
+        ):
+            loss, logits, fused_linear_aux = model.loss_function(
                 logits=None,
                 labels=labels,
                 vocab_size=vocab_size,
@@ -582,9 +629,9 @@ def _gemma4_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=vocab_size,
-                # Channel-loss logging must also consume the capped logits.
-                hidden_states=hidden_states if final_logit_softcapping is None else None,
-                weights=model.lm_head.weight if final_logit_softcapping is None else None,
+                # Consume these exact logits without a second LM-head projection.
+                hidden_states=None,
+                weights=None,
                 **kwargs,
             )
             if fused_linear_aux is not None:
@@ -605,8 +652,11 @@ def gemma4_causal_lm_init_patched(self, config: Gemma4TextConfig):
     self.model = Gemma4TextModel(config)
     self.vocab_size = config.vocab_size
     self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-    if config.final_logit_softcapping is not None:
-        self.loss_function = ForCausalLMLoss
+    impl = (
+        "eager" if config.final_logit_softcapping is not None else resolve_op_impl("cross_entropy_loss_implementation")
+    )
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
 
 
@@ -618,8 +668,13 @@ def gemma4_conditional_generation_init_patched(self, config: Gemma4Config):
     super().__init__(config)
     self.model = Gemma4Model(config)
     self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-    if config.text_config.final_logit_softcapping is not None:
-        self.loss_function = ForCausalLMLoss
+    impl = (
+        "eager"
+        if config.text_config.final_logit_softcapping is not None
+        else resolve_op_impl("cross_entropy_loss_implementation")
+    )
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
 
 

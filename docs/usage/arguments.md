@@ -161,9 +161,9 @@ own `safetensor_idx_path`.
 | safetensor_idx_path | `Optional[str]` | `None` | Path to `model.safetensors.index.json`. |
 | basic_modules | `Optional[List[str]]` | `[]` | Additional modules beyond `_no_split_modules` to shard in FSDP. |
 | lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
-| ops_implementation | `OpsImplementationConfig` | — | Attention / MoE kernel configuration. |
+| ops_implementation | `OpsImplementationConfig` | — | Attention / MoE op configuration. |
 | broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
-| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
+| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint (for an HF per-expert MoE checkpoint, only its own experts' tensors, when the model's checkpoint converter supports it, e.g. Qwen3-MoE / Qwen3.5-MoE / DeepSeek-V3 / GLM-5 / DeepSeek-V4, including DeepSeek-V4's FP4/FP8 experts). Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule for this model. |
 | accelerator | `AcceleratorConfig` | — | Parallelism, sharding, and placement for this model. |
 
@@ -181,29 +181,38 @@ model:
 
 ### OpsImplementationConfig
 
-`model.ops_implementation.*` — Attention, MoE, and fused kernel implementation.
+`model.ops_implementation.*` — Attention, MoE, and fused op implementation.
 
-Each `*_implementation` field selects the kernel backend for that operation.
+Each `*_implementation` field selects the op implementation for that operation.
 The type is `str` (not `Literal`) so third-party backends can be registered
 without modifying the config class.
 
-**Defaults are GPU-optimal** (Liger / Triton / fused_triton). On Ascend NPU,
-values that are still equal to the dataclass defaults automatically resolve as
-follows:
+**Defaults depend on the host and variant.** The seven general-purpose fields
+below default to `None` on `OpsImplementationConfig`, and `resolve_op` /
+`VeomniOp` selects the host default for each `(op, variant)` from
+`OP_REGISTRY.default_impl`:
 
-| GPU default field | NPU fallback |
-|---|---|
-| `rms_norm_implementation` | `npu` |
-| `rotary_pos_emb_implementation` | `npu` |
-| `rotary_pos_emb_vision_implementation` | `npu` |
-| `swiglu_mlp_implementation` | `eager` |
-| `load_balancing_loss_implementation` | `eager` |
-| `cross_entropy_loss_implementation` | `npu` |
-| `moe_implementation` | `fused_npu` |
+Default candidates are checked in registration order against both hardware
+and package requirements. If none is available, the fallback is explicitly
+`eager`. Explicit implementations remain strict and raise when unavailable,
+apart from the compatibility aliases documented below.
 
-Explicit non-default overrides are not rewritten; unsupported NPU values raise
-during validation. Qwen3.5's model-specific GatedDeltaNet fields are not in
-this global fallback table and must be set to `npu` explicitly on NPU.
+| Field | GPU | Ascend NPU | Cambricon MLU |
+|---|---|---|---|
+| `moe_implementation` | `fused_triton` | `fused_npu` | `fused_mlu` with Apex, else `fused_triton` |
+| `cross_entropy_loss_implementation` | `liger_kernel` | `chunk_loss` | `eager` |
+| `rms_norm_implementation` | `liger_kernel` | `torch_npu` (`eager` for `unweighted`) | `eager` |
+| `swiglu_mlp_implementation` | `liger_kernel` | `eager` | `eager` |
+| `rotary_pos_emb_implementation` | `liger_kernel` | `torch_npu` | `eager` |
+| `rotary_pos_emb_vision_implementation` | `liger_kernel` | `torch_npu` | `eager` |
+| `load_balancing_loss_implementation` | `triton` | `eager` | `eager` |
+
+Explicit values are never rewritten, including explicit GPU values on NPU.
+Unsupported NPU values such as `liger_kernel` or `fused_triton` raise during
+validation, so a GPU YAML that pins them must drop those keys or replace them
+for NPU runs. Qwen3.5's model-specific GatedDeltaNet fields are not in this
+table and must be set to their Ascend values (`torch_npu`, `triton`, or
+`fla_npu`) explicitly on NPU.
 
 NPU validation runs at two times:
 
@@ -212,31 +221,65 @@ NPU validation runs at two times:
   `swiglu_mlp`, `rotary_pos_emb`, `rotary_pos_emb_vision`,
   `load_balancing_loss`). Errors fire
   immediately with a model-agnostic allow-list.
-- **OpSlot-bind time** (`KERNEL_REGISTRY.resolve` via the kernel's
-  `HardwareRequirement`) for Qwen3.5-only ops (`rms_norm_gated`,
+- **Model-build time** (instance-local `VeomniOp` resolution via the
+  registry row's hardware requirement) for Qwen3.5-only ops (`rms_norm_gated`,
   `causal_conv1d`, `chunk_gated_delta_rule`). Validating these at config
   parse would force every NPU user to override them even when training
-  non-Qwen3.5 models, so the check fires only when Qwen3.5's patched
-  modeling is actually loaded. Qwen3.5 on NPU should select the `"npu"`
-  backend for these three operations.
+  non-Qwen3.5 models, so the check fires only when Qwen3.5 constructs its
+  local handles. Qwen3.5 on NPU should select the Ascend backend of each of
+  these three operations (`"torch_npu"`, `"triton"`, or `"fla_npu"`).
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation. Supported public values include `eager`, `sdpa`, `flash_attention_2/3/4`, `flash_attention_2_hub`, `flash_attention_3_hub`, `flex_attention`, `magi_attention`, and `native-sparse`. Under the VeOmni modeling backend, Flash, Flex, and Magi values resolve to SP-aware registry names. The opt-in Hub backends require `MODELING_BACKEND=veomni`, `kernels==0.16.0`, and a compatible version-1 artifact from `kernels-community/flash-attn2` or `kernels-community/flash-attn3`. Both short and normalized Hub names are rejected on Ascend NPU before HF preloading; dependency/download errors do not fall back to local kernels. Local FA2/FA3 remain the defaults. FlexAttention requires a model-provided native `BlockMask`; Ulysses currently requires it to be head-broadcast. MagiAttention requires the optional `--extra magi` install (`uv sync --extra gpu --extra magi`), a model-provided `MagiAttentionMask`, physical batch size 1, `cp_size == 1`, and zero attention dropout; it does not support KV-cache offsets. It uses the CUTLASS overlay on SM90 and CUTE DSL/JIT on SM100+. |
-| moe_implementation | `str` | `"fused_triton"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel; `eager` is the reference loop. A value still equal to the GPU default auto-resolves to `fused_npu` on NPU; explicit incompatible non-default overrides raise. |
-| cross_entropy_loss_implementation | `str` | `"liger_kernel"` | Cross-entropy loss. `liger_kernel` (default, GPU only) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `npu` is a back-compat alias for `chunk_loss`. `eager` is `F.cross_entropy`. |
-| rms_norm_implementation | `str` | `"liger_kernel"` | RMSNorm. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
-| swiglu_mlp_implementation | `str` | `"liger_kernel"` | SwiGLU MLP. Known values: `liger_kernel` (default, GPU only), `eager`. There is no NPU backend, so a value still equal to the default auto-resolves to `eager` on NPU. |
-| rotary_pos_emb_implementation | `str` | `"liger_kernel"` | Rotary pos emb. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (per-model: DeepSeek-V3, DeepSeek-V4, Wan; GPU only), `eager`. DeepSeek-V4 and Wan reject the `liger_kernel` default because their rotary layout is partial / non-standard, and DeepSeek-V4 also rejects `npu`; both raise at model registration, so their configs must pin `triton` or `eager`. |
-| rotary_pos_emb_vision_implementation | `str` | `"eager"` | Vision rotary positional embedding. Known values: `eager`, `npu`. |
-| load_balancing_loss_implementation | `str` | `"triton"` | MoE load-balancing loss. `triton` uses the fused CUDA kernel; `eager` is the pure-PyTorch reference. On NPU, config normalization maps every value equal to the default `triton` (including an explicit YAML value) to `eager`. |
-| rms_norm_gated_implementation | `str` | `"fla"` | Gated RMSNorm (Qwen3.5 GatedDeltaNet `self.norm`). Known values: `eager`, `fla` (FLA `FusedRMSNormGated`, GPU), `npu`. |
-| causal_conv1d_implementation | `str` | `"fla"` | Varlen depthwise causal conv1d (Qwen3.5 GatedDeltaNet pre-mixer). Known values: `eager`, `fla` (GPU), `npu` (requires `triton-ascend`). `eager` does not support the varlen path. |
-| chunk_gated_delta_rule_implementation | `str` | `"fla"` | Chunk gated delta-rule kernel for Qwen3.5 linear attention. Known values: `eager`, `fla` (GPU), `flash_qla` (Hopper SM90), `npu` (requires `triton-ascend`). `eager` does not support varlen training. |
-| dsa_indexer_implementation | `Literal["eager", "cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention top-k indexer implementation. `tilelang` selects the DeepSeek-V4 Lightning Indexer kernel and requires an SM90+ CUDA GPU. |
-| dsa_attention_implementation | `Literal["eager", "flashmla_cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention implementation. `tilelang` selects the DeepSeek-V4 sparse MQA kernel and requires an SM90+ CUDA GPU. |
-| mhc_implementation | `Literal["eager", "tilelang"]` | `"eager"` | DeepSeek V4 manifold-constrained Hyper-Connection implementation. `tilelang` enables the forward/backward path provided by the `tile-kernels` package and requires an SM90+ CUDA GPU. |
-| qat_implementation | `Literal["none", "fp8_blockwise"]` | `"none"` | DeepSeek V4 quantization-aware training recipe. Unlike the other fields this selects a quantization recipe rather than a kernel backend. `fp8_blockwise` fake-quantizes what FP8 inference rounds — linear operands (128x128 weight tiles, 1x128 activation blocks), the NoPE channels of every stored KV entry (1x64), both sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path (FP4 `1x32` groups when the checkpoint's `expert_dtype` is `fp4`, otherwise FP8 tiles) — and requires an SM90+ CUDA GPU. See `veomni/ops/qat/`. |
+| attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation. Supported public values include `eager`, `sdpa`, `flash_attention_2/3/4`, `flash_attention_2_hub`, `flash_attention_3_hub`, `flex_attention`, `magi_attention`, `sage_attention`, and `native-sparse`. Under the VeOmni modeling backend, Flash, Flex, Magi, Sage, and SDPA values rewrite to the matching `veomni_*` registry names. The opt-in Hub backends require `MODELING_BACKEND=veomni`, `kernels==0.16.0`, and a compatible version-1 artifact from `kernels-community/flash-attn2` or `kernels-community/flash-attn3`. Both short and normalized Hub names are rejected on Ascend NPU before HF preloading; dependency/download errors do not fall back to local kernels. Local FA2/FA3 remain the defaults. FlexAttention requires NVIDIA CUDA and a model-provided native `BlockMask`; Ulysses currently requires it to be head-broadcast. SM90+ selects FA4 when supported, with Triton fallback for unsupported inputs; the registered mask builder uses 256×128 blocks on SM100+ and 128×128 elsewhere. MagiAttention requires the optional `--extra magi` install (`uv sync --extra gpu --extra magi`), a model-provided `MagiAttentionMask`, physical batch size 1, `cp_size == 1`, and zero attention dropout; it does not support KV-cache offsets. It requires NVIDIA SM100+ and uses CUTE DSL/JIT. SageAttention is inference-only and does not take a dense mask. |
+| moe_implementation | `Optional[str]` | host default | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+ or MLU); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel; `fused_mlu` uses Apex grouped-GEMM on MLU; `eager` is the reference loop. Unset resolves to `fused_npu` on NPU, `fused_mlu` on MLU with Apex, and `fused_triton` otherwise; explicit incompatible values raise. |
+| cross_entropy_loss_implementation | `Optional[str]` | host default | Cross-entropy loss. `liger_kernel` (GPU default, GPU only) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `eager` is `F.cross_entropy`. |
+| rms_norm_implementation | `Optional[str]` | host default | RMSNorm. Known values: `liger_kernel` (GPU default, GPU only), `torch_npu` (NPU default for weighted variants; `unweighted` has no Ascend kernel and uses `eager`, including an explicit `torch_npu` for compatibility), `triton` (DeepSeek-V3 only; GPU only), `eager`. |
+| swiglu_mlp_implementation | `Optional[str]` | host default | SwiGLU MLP. Known values: `liger_kernel` (GPU default, GPU only), `eager`. There is no NPU backend, so unset resolves to `eager` on NPU. |
+| rotary_pos_emb_implementation | `Optional[str]` | host default | Rotary pos emb. Known values: `liger_kernel` (GPU default, GPU only), `torch_npu` (NPU default), `triton` (per-model: DeepSeek-V3, DeepSeek-V4, Wan; GPU only), `eager`. Variants without a default row (such as `deepseek_v4`, `wan`, `interleave`, `mrope`) resolve to `eager` when unset. |
+| rotary_pos_emb_vision_implementation | `Optional[str]` | host default | Independent implementation choice for the rank-3 vision layout of `rope/full`. Known values: `liger_kernel` (GPU default), `torch_npu` (NPU default), `eager` (MLU default). |
+| load_balancing_loss_implementation | `Optional[str]` | host default | MoE load-balancing loss. `triton` (GPU default) uses the fused GPU kernel; `eager` (NPU and MLU default) is the pure-PyTorch reference. |
+| rms_norm_gated_implementation | `str` | `"fla"` | Gated RMSNorm (Qwen3.5/Qwen4-Exp GatedDeltaNet `self.norm`). Known values: `eager`, `fla` (FLA `FusedRMSNormGated`; GPU, MLU, NPU), `torch_npu` (`npu_swiglu` for SiLU, eager gate multiply for sigmoid). |
+| causal_conv1d_implementation | `str` | `"fla"` | Varlen depthwise causal conv1d (Qwen3.5 GatedDeltaNet pre-mixer). Known values: `eager`, `fla` (GPU, MLU, NPU), `triton` (vendored Triton-Ascend; requires `triton-ascend`). `eager` does not support the varlen path. |
+| chunk_gated_delta_rule_implementation | `str` | `"fla"` | Chunk gated delta-rule kernel for Qwen3.5 linear attention. Known values: `eager`, `fla` (GPU, MLU, NPU), `flash_qla` (NVIDIA SM90-SM100), `triton` (vendored Triton-Ascend; requires `triton-ascend`), `fla_npu` (AscendC fused `torch.ops.npu.*`; requires `fla_npu` + `triton-ascend`). `eager` does not support varlen training. |
+| dsa_indexer_implementation | `Literal["eager", "cudnn", "cann", "tilelang"]` | `"eager"` | DeepSeek sparse-attention top-k indexer implementation. `tilelang` selects the DeepSeek-V4 Lightning Indexer kernel and requires an SM90+ CUDA GPU. `cann` selects the DeepSeek-V4 Ascend CANN Lightning Indexer and requires `cann_ops_transformer`; it covers unpacked and packed batches whose `position_ids` restart at 0 in every segment, without context or Ulysses parallelism or decode. |
+| dsa_attention_implementation | `Literal["eager", "flashmla_cudnn", "cann", "tilelang"]` | `"eager"` | DeepSeek sparse-attention implementation. `tilelang` selects the DeepSeek-V4 sparse MQA kernel and requires an SM90+ CUDA GPU. `cann` selects the DeepSeek-V4 Ascend CANN sparse FlashMLA and requires `cann_ops_transformer`; it covers the same unpacked and packed batches as the `cann` indexer, ignores `attention_mask` (so padded batches are unsupported), and runs layers that have no compressed rows in eager. |
+| mhc_implementation | `Literal["eager", "cann", "tilelang"]` | `"eager"` | DeepSeek V4 manifold-constrained Hyper-Connection implementation. `tilelang` enables the forward/backward path provided by the `tile-kernels` package and requires an SM90+ CUDA GPU. `cann` selects the Ascend CANN fused pre/post kernels with a PyTorch final-head collapse and requires BF16 activations and `cann_ops_transformer`. |
+| qsa_attention_implementation | `Literal["eager", "tilelang", "torch_npu"]` | `"eager"` | Qwen4-Exp QSA sparse attention over the indexer's compact global token selection. `eager` expands the selection to a dense mask and is the numerical reference. `tilelang` gathers the selected K/V rows without the quadratic score tensor and requires `tilelang`, BF16 inputs, and an NVIDIA CUDA GPU. `torch_npu` prunes per-query-chunk KV intervals with an int8 scatter mask and runs `torch_npu.npu_fusion_attention` on Ascend NPUs (BF16). Both fused backends raise on an attention mask, have no KV-cache path, and fall back to `eager` with a warning for nonzero attention dropout. |
+| qat_implementation | `Literal["none", "fp8_blockwise"]` | `"none"` | DeepSeek V4 quantization-aware training recipe. Unlike the other fields this selects a quantization recipe rather than an op-registry implementation. `fp8_blockwise` fake-quantizes what FP8 inference rounds — linear operands (128x128 weight tiles, 1x128 activation blocks), the NoPE channels of every stored KV entry (1x64), both sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path (FP4 `1x32` groups when the checkpoint's `expert_dtype` is `fp4`, otherwise FP8 tiles) — and requires an SM90+ CUDA GPU. See `veomni/ops/qat/`. |
+
+#### Deprecated values
+
+Values renamed by the move to instance-local `VeomniOp` handles still parse.
+`OpsImplementationConfig` resolves them to the current name and logs a
+deprecation warning. Set the new name explicitly; the old values will be removed
+in a future release.
+
+| Field | Deprecated value | Resolves to |
+|---|---|---|
+| `attn_implementation` | `veomni_<name>_with_sp` (FA2/FA3/FA4, their Hub forms, Flex, Magi) | `veomni_<name>`; Ulysses is applied inside the adapter |
+| `moe_implementation` | `fused` | `fused_quack` on GPU, `fused_npu` on Ascend NPU, `fused_mlu` (with Apex) or `fused_triton` on MLU |
+| `moe_implementation` | `fused_mlu_triton` | `fused_triton`, the same group-gemm kernel |
+| `cross_entropy_loss_implementation` | `npu` | `chunk_loss`; the former `npu` name never had a third-party NPU kernel |
+| `rms_norm_implementation`, `rotary_pos_emb_implementation`, `rotary_pos_emb_vision_implementation`, `rms_norm_gated_implementation` | `npu` | `torch_npu` |
+| `causal_conv1d_implementation`, `chunk_gated_delta_rule_implementation` | `npu` | `triton`, the vendored Triton-Ascend kernel |
+| `chunk_gated_delta_rule_implementation` | `npu_ascendc` | `fla_npu` |
+
+An implementation name says which implementation a row calls, not which device
+it runs on, so no value is named for the `npu` device alone. An Ascend row is
+`torch_npu`, `triton` for vendored Triton-Ascend, `cann` for
+`cann_ops_transformer`, or `fla_npu`. PyTorch math that only runs on NPU is
+`eager`; MoE keeps the `fused_npu` name.
+When `rms_norm_implementation` is left unset, each RMSNorm variant resolves its
+own host default from `OP_REGISTRY`: weighted variants select `torch_npu` on
+NPU while `unweighted` (Flux, LTX-2.3, DeepSeek-V4) selects `eager`.
+For compatibility, an explicit `torch_npu` (including the deprecated `npu`
+alias) also maps to `eager` for `unweighted`; it remains `torch_npu` for
+weighted variants. This mapping is logged once.
+
+`rms_norm_implementation: qwen3_5` is rejected at parse time. `qwen3_5` was the
+Qwen3.5 RMSNorm variant name, now `offset`, and never an implementation. Other
+unknown values fail at model build with the registered implementations listed.
 
 #### The Lightning Indexer KL objective (`dsa_indexer_loss`)
 
@@ -260,7 +303,7 @@ model:
 The two are fields of DeepSeek-V4's own config, beside the
 `output_router_logits` / `router_aux_loss_coef` pair that configures the model's
 other auxiliary objective — a training objective is a property of the model,
-while `ops_implementation` selects kernel backends. They are therefore
+while `ops_implementation` selects op implementations. They are therefore
 DeepSeek-V4-only by construction: no other model's config declares them.
 
 | Field | Type | Default | Description |
@@ -382,7 +425,8 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | prefetch_factor | `int` | `2` | Number of batches loaded in advance per worker. |
 | persistent_workers | `bool` | `False` | Keep DataLoader worker processes alive between iterator recreations. |
 | in_order | `bool` | `True` | Return worker-loaded batches in first-in, first-out order. Set `False` to avoid slow worker head-of-line blocking for uneven sample decode costs; checkpoint/resume ordering is not guaranteed in this mode. |
-| drop_last | `bool` | `True` | Whether to drop the last incomplete batch. |
+| drop_last | `bool` | `True` | Whether to drop the last incomplete batch. DiT `offline_embedding` forces `False`. |
+| shuffle | `bool` | `True` | Shuffle the training data. Mapping datasets shuffle the sampler order, reseeded from `train.seed` each epoch; iterable datasets (including iterable multisource sources) shuffle through a streaming buffer. Energon datasets ignore it. DiT `offline_embedding` forces `False`. |
 | pin_memory | `bool` | `True` | Whether to pin memory for the dataloader. |
 | worker_num_threads | `Optional[int]` | `None` | Number of PyTorch threads used by each DataLoader worker. |
 | use_background_prefetcher | `bool` | `False` | Enable background prefetching around the DataLoader. |
@@ -446,11 +490,11 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | lr_warmup_ratio | `float` | `0` | Ratio of learning rate warmup steps. |
 | lr_decay_style | `str` | `"constant"` | Learning rate scheduler (`"constant"`, `"linear"`, `"cosine"`). |
 | lr_decay_ratio | `float` | `1.0` | Ratio of learning rate decay steps. |
-| weight_decay | `float` | `0` | L2 regularization strength. |
+| weight_decay | `float` | `0` | Weight decay. AdamW applies it decoupled (`p *= 1 - lr * weight_decay` each step), outside the gradient. |
 | no_decay_modules | `List[str]` | `[]` | Modules excluded from weight decay (e.g. `RMSNorm`). |
 | no_decay_params | `List[str]` | `[]` | Parameters excluded from weight decay (e.g. `bias`). |
 | max_grad_norm | `float` | `1.0` | Gradient clipping norm. |
-| grad_clip_scope | `Literal["per_module", "global"]` | `"per_module"` | Which parameters `max_grad_norm` is computed over. `"per_module"` clips each module against its own norm; `"global"` would clip every module against one norm taken across all of them, but is not implemented yet and raises `NotImplementedError`. A single-model job has one module, so the two agree and only an omni model would see a difference. |
+| grad_clip_scope | `Literal["per_module", "global"]` | `"per_module"` | How OmniTrainer applies `max_grad_norm` across OmniModules. `"per_module"` clips each module independently; `"global"` measures each module unclipped then scales all modules by one coefficient. A single-model job has one module, so the two agree. |
 | betas | `Tuple[float, float]` | `(0.9, 0.95)` | AdamW betas (`beta1`, `beta2`). |
 | muon_lr | `Optional[float]` | `None` | Learning rate for Muon-managed 2-D/3-D weights. Unset: inherits `lr` under `match_rms_adamw`, else `25×lr` under `original`. |
 | muon_momentum | `float` | `0.95` | Momentum factor for Muon. |
@@ -531,10 +575,73 @@ distinct from the first emission.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| enable | `bool` | `True` | Enable gradient checkpointing. |
+| enable | `bool` | `True` | Enable gradient checkpointing. Master switch: with it off, the fields below have no effect. |
 | debug | `bool` | `False` | Enable [checkpoint debugging](https://docs.pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.set_checkpoint_debug_enabled). |
-| enable_reentrant | `bool` | `False` | Use reentrant gradient checkpointing. |
+| enable_reentrant | `bool` | `False` | Use reentrant gradient checkpointing. torch refuses it together with SAC, and it cannot carry a recompute context. |
 | early_stop | `bool` | `True` | Stop non-reentrant checkpoint recomputation as soon as all needed tensors are computed. PyTorch ignores this option when `enable_reentrant=True`. |
+| recompute_layers | `int` | `-1` | How many blocks recompute, counted from the end of the stack: `-1` = all, `N` = the last `N`, `0` = none. See [Layer-scoped recomputation](#layer-scoped-recomputation). |
+| selective_recompute_layers | `int` | `0` | How many of those blocks run selective activation checkpointing (SAC) instead, counted from the front of the recomputed range. Needs `enable_reentrant=False`. |
+| save_ops | `List[str]` | `[]` | Operators SAC keeps instead of recomputing, on top of the attention set it always keeps. Empty means that attention set alone. |
+
+#### Layer-scoped recomputation
+
+`recompute_layers`, `selective_recompute_layers` and `save_ops` pick *which*
+blocks recompute, without touching model code. The framework finds the stack
+itself, from `model.basic_modules` plus `model._no_split_modules` — the same
+class set FSDP2 shards on, so both agree on what a block is. Every
+`nn.ModuleList` / `nn.Sequential` holding at least two matching children is a
+candidate; candidates sharing a parent are folded into one sequence in
+registration order (Flux: `blocks` + `single_blocks` = 57 blocks, the order the
+model runs them). The parent that wins is the one named by a class in
+`model.basic_modules`, else the one holding trainable parameters, else the one
+with more blocks. Candidates under another parent — a vision tower beside the
+decoder — are reported and stay outside the counts, since one "last N blocks"
+cannot speak about two independent stacks. A model declaring neither list falls
+back to the `gradient_checkpointing` marker HF puts on checkpointed blocks.
+
+Counting is always from the end, so the recomputed range is the last
+`recompute_layers` blocks, and the blocks in front of it keep their activations
+— that is the dial: fewer recomputed blocks, more activation memory. Inside the
+range the first `selective_recompute_layers` blocks run SAC, keeping the
+operators named in `save_ops` (plus the attention set every SAC run keeps) and
+recomputing the rest; the blocks after them recompute in full. A count larger
+than the stack means the whole stack, and `recompute_layers: 0` keeps every
+block's activations while checkpointing stays on.
+
+When its context cannot be carried, SAC is dropped and the blocks in its range
+recompute in full, with a warning naming the reason:
+
+- `enable_reentrant=True` — torch takes no `context_fn` under reentrant
+  checkpointing.
+- Activation offload is on — the offload owns the checkpoint boundary.
+
+A third case is not about SAC but about reaching the blocks at all: a model that
+drives `torch.utils.checkpoint` itself (ltx2_3) leaves no entry point to
+replace, and the framework reports that the blocks are not covered.
+
+`torch.compile` together with SAC is allowed, and warns that the combination is
+unverified.
+
+The plan is logged once at rank 0, per layer: `stack=blocks+single_blocks (57
+blocks, folded blocks=19, single_blocks=38); blocks 0-9 SAC, 10-56 full
+recompute`.
+
+#### The runtime recompute context
+
+A model whose blocks run under their own parallel state (SeedOmni
+`ModuleRuntime`) needs that state current in the replayed forward too, and the
+recompute runs in backward, outside the `module_context` the forward was wrapped
+in. The runtime hook `VeOmniModelRuntime._recompute_context()` supplies it: the
+base returns `None` (torch's default context), while SeedOmni returns
+`partial(use_parallel_state, self.module_name)`. What it returns is built into
+the run's recompute policy, so the model's
+`gradient_checkpointing_enable(context_fn=...)` and every block the policy binds
+recompute inside the same context.
+
+Because reentrant checkpointing cannot carry a context at all, a runtime whose
+hook returns one rejects `enable=True` together with `enable_reentrant=True`
+(`ValueError` naming `enable_reentrant`) rather than recomputing with the wrong
+parallel state current.
 
 ### AcceleratorConfig
 
@@ -576,7 +683,8 @@ configured and never round-trip through a saved config.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| fsdp_mode | `Literal["ddp", "fsdp2", "eager"]` | `"fsdp2"` | Data parallel mode. `"eager"` is reserved for a future single-process `from_pretrained(device_map=...)` inference path that skips every wrapper; it is not implemented yet and raises `NotImplementedError`. |
+| fsdp_mode | `Literal["ddp", "fsdp2", "eager"]` | `"fsdp2"` | Data parallel mode. `"eager"` skips every wrapper for the single-process Omni inference path (`_init_eager_inference`). |
+| fsdp_scope | `Literal["module", "model"]` | `"module"` | SeedOmni: `"module"` wraps each OmniModule independently; `"model"` wraps the composed `OmniModel` once (one FSDP tree). Wrap targets are each child's `_no_split_modules` scoped as `{child}.{ClassName}`; leftover params unshard on `OmniModel.forward()`. Per-module DDP / ExtraParallel / `init_device` / SP-CP-TP-PP overlays are unused under `"model"` (module YAML is not rewritten); the top-level accelerator topology is used. |
 | reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |
@@ -757,6 +865,12 @@ implementations also differ. These timings measure collective latency, not model
 | activation_offload_modules | `List[str]` | `[]` | Optional module name patterns for async offload, overriding `_no_split_modules` auto-discovery. Supports segment-aware glob (`model.layers.*` matches direct children only) and `{*}` for sequential groups (`model.layers.{*}`). |
 | activation_offload_host_cache_limit_gb | `float` | `4.0` | Idle-cache cap of **one** host-buffer pool, in GB. The trainer applies offload once with this limit, so it is the cap for that call. Each extra `apply_async_activation_offload` given only this limit gets its own pool (caps add); pass the same `host_buffer_pool` to share one cap. Bounds the idle cache only — in-flight offloads may temporarily exceed it. Set to `0` to disable reuse. |
 
+SeedOmni (`OmniTrainer`) applies async activation offload per module, from each
+module's merged accelerator, under either `fsdp_scope`. Each module gets its own
+pool, so `activation_offload_host_cache_limit_gb` caps each module and the caps
+add. A module with no `_no_split_modules` (or none matching the patterns) fails
+closed; give it a per-module `offload_config.enable_async_activation: false`.
+
 Async activation offload is enabled for CUDA/NPU tensors only; CPU tensors pass
 through unchanged. Only private, dense, contiguous activations are swapped so
 shared-storage views are never resized. Host buffers are pooled, keyed by shape,
@@ -857,7 +971,6 @@ derived argument groups below.
 | --- | --- | --- | --- |
 | mm_configs | `Optional[Dict]` | `{}` | Multimodal input configuration. |
 | offline_embedding_save_dir | `Optional[str]` | `None` | Directory used to save offline embeddings. |
-| shuffle | `bool` | `True` | Shuffle the training dataset. |
 
 ### DiTTrainingArguments
 

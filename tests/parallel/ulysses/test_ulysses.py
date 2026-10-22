@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import create_block_mask
-from transformers.configuration_utils import PreTrainedConfig
 
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_dist_comm_backend, get_torch_device
 
@@ -19,19 +18,17 @@ if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backen
 
 import pytest
 import torch.distributed as dist
-from torch.testing._internal.common_utils import run_tests
 
-from veomni.distributed.sequence_parallel.comm import (
-    get_ulysses_sequence_parallel_group,
-    set_ulysses_sequence_parallel_group,
-)
+from tests.tools.common_utils import ieee_fp32_matmul
+from veomni.distributed.parallel_state import use_parallel_state
+from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
-from veomni.models.transformers.masking_utils import create_causal_mask
-from veomni.ops.kernels.attention import flash as flash_backend
-from veomni.ops.kernels.attention import flex as flex_backend
-from veomni.ops.kernels.attention import magi as magi_backend
-from veomni.ops.kernels.attention.magi import _fa4_cuda as magi_fa4_backend
+from veomni.ops.kernels.attention.standard import flash as flash_backend
+from veomni.ops.kernels.attention.standard import flex as flex_backend
+from veomni.ops.kernels.attention.standard import magi as magi_backend
+from veomni.ops.kernels.attention.standard.magi import _kernel as magi_kernel
+from veomni.ops.mask import MagiAttentionMask, flex_attention_mask_builder
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 
 from .attention import Attention
@@ -75,106 +72,108 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
 
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_self_attn(self):
-        self._get_process_group()
-        sp_group = get_ulysses_sequence_parallel_group()
-        full_input = self._get_input_data()
-        unpad_size = full_input.size(1)
-        part_input = slice_input_tensor(full_input, dim=1, group=sp_group)
-        full_input.requires_grad = True
-        part_input.requires_grad = True
+        with ieee_fp32_matmul():
+            self._get_process_group()
+            sp_group = get_ulysses_sequence_parallel_group()
+            full_input = self._get_input_data()
+            unpad_size = full_input.size(1)
+            part_input = slice_input_tensor(full_input, dim=1, group=sp_group)
+            full_input.requires_grad = True
+            part_input.requires_grad = True
 
-        # initialize attn module
-        attn_dp = Attention(
-            dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
-        ).to(get_device_type())
-        attn_sp = Attention(
-            dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
-        ).to(get_device_type())
-        attn_sp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
-        attn_dp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
+            # initialize attn module
+            attn_dp = Attention(
+                dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
+            ).to(get_device_type())
+            attn_sp = Attention(
+                dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
+            ).to(get_device_type())
+            attn_sp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
+            attn_dp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
 
-        loss_func = self._overlapping_grad
+            loss_func = self._overlapping_grad
 
-        # forward & backward for sp
-        sp_rst = attn_sp(part_input, unpad_size)
-        sp_full_rst = gather_outputs(
-            sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
-        )
-        loss_sp = loss_func(sp_rst)
-        loss_sp.backward()
-        attn_sp_o_grad = attn_sp.proj_o.weight.grad.detach().clone()
-        attn_sp_q_grad = attn_sp.q_proj.weight.grad.detach().clone()
-        part_input_grad = part_input.grad.detach().clone()
-        dist.all_reduce(attn_sp_o_grad)
-        dist.all_reduce(attn_sp_q_grad)
-        part_input_grad = sync_tensor(part_input_grad, 1)
-        part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
+            with use_parallel_state(self.sp_state):
+                sp_rst = attn_sp(part_input, unpad_size)
+                sp_full_rst = gather_outputs(
+                    sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
+                )
+                loss_sp = loss_func(sp_rst)
+                loss_sp.backward()
+                attn_sp_o_grad = attn_sp.proj_o.weight.grad.detach().clone()
+                attn_sp_q_grad = attn_sp.q_proj.weight.grad.detach().clone()
+                part_input_grad = part_input.grad.detach().clone()
+            dist.all_reduce(attn_sp_o_grad)
+            dist.all_reduce(attn_sp_q_grad)
+            part_input_grad = sync_tensor(part_input_grad, 1)
+            part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
-        # forward & backward for dp
-        set_ulysses_sequence_parallel_group(None)
-        dp_rst = attn_dp(full_input, unpad_size)
-        loss_dp = loss_func(dp_rst)
-        loss_dp.backward()
-        attn_dp_o_grad = attn_dp.proj_o.weight.grad.detach().clone()
-        attn_dp_q_grad = attn_dp.q_proj.weight.grad.detach().clone()
-        full_input_grad = full_input.grad.detach().clone()
+            with use_parallel_state(self.dp_state):
+                dp_rst = attn_dp(full_input, unpad_size)
+                loss_dp = loss_func(dp_rst)
+                loss_dp.backward()
+                attn_dp_o_grad = attn_dp.proj_o.weight.grad.detach().clone()
+                attn_dp_q_grad = attn_dp.q_proj.weight.grad.detach().clone()
+                full_input_grad = full_input.grad.detach().clone()
 
-        torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
-        torch.testing.assert_close(attn_dp_o_grad, attn_sp_o_grad, atol=1e-3, rtol=1e-4)
-        torch.testing.assert_close(attn_dp_q_grad, attn_sp_q_grad, atol=2e-3, rtol=1e-4)
-        torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
+            torch.testing.assert_close(attn_dp_o_grad, attn_sp_o_grad, atol=1e-3, rtol=1e-4)
+            torch.testing.assert_close(attn_dp_q_grad, attn_sp_q_grad, atol=2e-3, rtol=1e-4)
+            torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
 
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_self_attn_padding(self):
-        self._get_process_group()
-        sp_group = get_ulysses_sequence_parallel_group()
-        full_input = self._get_input_data_for_padding()
-        unpad_size = full_input.size(1)
-        part_input = slice_input_tensor(full_input, dim=1, group=sp_group)
-        full_input.requires_grad = True
-        part_input.requires_grad = True
+        with ieee_fp32_matmul():
+            self._get_process_group()
+            sp_group = get_ulysses_sequence_parallel_group()
+            full_input = self._get_input_data_for_padding()
+            unpad_size = full_input.size(1)
+            part_input = slice_input_tensor(full_input, dim=1, group=sp_group)
+            full_input.requires_grad = True
+            part_input.requires_grad = True
 
-        attn_dp = Attention(
-            dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
-        ).to(get_device_type())
-        attn_sp = Attention(
-            dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
-        ).to(get_device_type())
-        attn_sp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
-        attn_dp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
+            attn_dp = Attention(
+                dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
+            ).to(get_device_type())
+            attn_sp = Attention(
+                dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
+            ).to(get_device_type())
+            attn_sp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
+            attn_dp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
 
-        sp_rst = attn_sp(part_input, unpad_size)
-        sp_full_rst = gather_outputs(
-            sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
-        )
-        loss_sp = self._non_overlapping_grad(sp_rst)
-        loss_sp.backward()
-        attn_sp_o_grad = attn_sp.proj_o.weight.grad.detach().clone()
-        attn_sp_q_grad = attn_sp.q_proj.weight.grad.detach().clone()
-        part_input_grad = part_input.grad.detach().clone()
-        dist.all_reduce(attn_sp_o_grad)
-        dist.all_reduce(attn_sp_q_grad)
-        part_input_grad = sync_tensor(part_input_grad, 1)
-        part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
+            with use_parallel_state(self.sp_state):
+                sp_rst = attn_sp(part_input, unpad_size)
+                sp_full_rst = gather_outputs(
+                    sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
+                )
+                loss_sp = self._non_overlapping_grad(sp_rst)
+                loss_sp.backward()
+                attn_sp_o_grad = attn_sp.proj_o.weight.grad.detach().clone()
+                attn_sp_q_grad = attn_sp.q_proj.weight.grad.detach().clone()
+                part_input_grad = part_input.grad.detach().clone()
+            dist.all_reduce(attn_sp_o_grad)
+            dist.all_reduce(attn_sp_q_grad)
+            part_input_grad = sync_tensor(part_input_grad, 1)
+            part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
-        set_ulysses_sequence_parallel_group(None)
-        dp_rst = attn_dp(full_input, unpad_size)
-        loss_dp = self._non_overlapping_grad(dp_rst)
-        loss_dp.backward()
-        attn_dp_o_grad = attn_dp.proj_o.weight.grad.detach().clone()
-        attn_dp_q_grad = attn_dp.q_proj.weight.grad.detach().clone()
-        full_input_grad = full_input.grad.detach().clone()
+            with use_parallel_state(self.dp_state):
+                dp_rst = attn_dp(full_input, unpad_size)
+                loss_dp = self._non_overlapping_grad(dp_rst)
+                loss_dp.backward()
+                attn_dp_o_grad = attn_dp.proj_o.weight.grad.detach().clone()
+                attn_dp_q_grad = attn_dp.q_proj.weight.grad.detach().clone()
+                full_input_grad = full_input.grad.detach().clone()
 
-        torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
-        torch.testing.assert_close(attn_dp_o_grad, attn_sp_o_grad, atol=1e-4, rtol=1e-4)
-        torch.testing.assert_close(attn_dp_q_grad, attn_sp_q_grad, atol=2e-3, rtol=1e-4)
-        torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
+            torch.testing.assert_close(attn_dp_o_grad, attn_sp_o_grad, atol=1e-4, rtol=1e-4)
+            torch.testing.assert_close(attn_dp_q_grad, attn_sp_q_grad, atol=2e-3, rtol=1e-4)
+            torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
 
 
 class _FakeFlashAttentionModule(nn.Module):
     def __init__(self):
         super().__init__()
-        self.config = SimpleNamespace(_attn_implementation="veomni_flash_attention_2_with_sp")
+        self.config = SimpleNamespace(_attn_implementation="veomni_flash_attention_2")
         self.is_causal = False
         self.proj = nn.Linear(1, 1, bias=False)
 
@@ -188,7 +187,7 @@ class _FakeFlexAttentionModule(nn.Module):
 class _FakeMagiAttentionModule(nn.Module):
     def __init__(self):
         super().__init__()
-        self.config = SimpleNamespace(_attn_implementation="veomni_magi_attention_with_sp")
+        self.config = SimpleNamespace(_attn_implementation="veomni_magi_attention")
 
 
 _MAGI_PACKAGE_AVAILABLE = importlib.util.find_spec("magi_attention") is not None
@@ -198,9 +197,9 @@ def _build_magi_mask(mask_case: str, sequence_length: int, device: torch.device)
     if mask_case in {"causal", "full"}:
         ranges = torch.tensor([[0, sequence_length]], device=device, dtype=torch.int32)
         attn_type_map = torch.tensor([1], device=device, dtype=torch.int32) if mask_case == "causal" else None
-        return magi_backend.MagiAttentionMask(ranges, ranges.clone(), attn_type_map)
+        return MagiAttentionMask.from_ranges(ranges, ranges.clone(), attn_type_map)
 
-    if mask_case != "bagel_mixed":
+    if mask_case != "2d_mask":
         raise ValueError(f"Unsupported mask case: {mask_case}")
 
     modes = ("causal", "noise", "full", "causal")
@@ -226,10 +225,10 @@ def _build_magi_mask(mask_case: str, sequence_length: int, device: torch.device)
             clean_spans.append((span_start, span_end))
         span_start = span_end
 
-    return magi_backend.MagiAttentionMask(
-        q_ranges=torch.tensor(q_ranges, device=device, dtype=torch.int32),
-        k_ranges=torch.tensor(k_ranges, device=device, dtype=torch.int32),
-        attn_type_map=torch.tensor(attn_types, device=device, dtype=torch.int32),
+    return MagiAttentionMask.from_ranges(
+        torch.tensor(q_ranges, device=device, dtype=torch.int32),
+        torch.tensor(k_ranges, device=device, dtype=torch.int32),
+        torch.tensor(attn_types, device=device, dtype=torch.int32),
     )
 
 
@@ -277,7 +276,7 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
         reason="attention backend Ulysses parity requires at least 2 CUDA devices",
     )
     def test_flash_wrapper_matches_non_sp_oracle(self):
-        group, world_size, device, local_slice, baseline, local, output_gradient = self._build_qkv(
+        _, _, device, local_slice, baseline, local, output_gradient = self._build_qkv(
             sequence_length=8,
             head_dim=8,
             dtype=torch.float32,
@@ -285,18 +284,12 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
         )
         module = _FakeFlashAttentionModule().to(device)
         original_backend = flash_backend._flash_attention_forward
-        original_get_parallel_state = flash_backend.get_parallel_state
         try:
             flash_backend._flash_attention_forward = _sdpa_flash_oracle
-            flash_backend.get_parallel_state = lambda: SimpleNamespace(ulysses_enabled=False)
-            baseline_output, _ = flash_backend.flash_attention_forward(module, *baseline, attention_mask=None)
-
-            flash_backend.get_parallel_state = lambda: SimpleNamespace(
-                ulysses_enabled=True,
-                ulysses_group=group,
-                ulysses_size=world_size,
-            )
-            local_output, _ = flash_backend.flash_attention_forward(module, *local, attention_mask=None)
+            with use_parallel_state(self.dp_state):
+                baseline_output, _ = flash_backend.flash_attention_forward(module, *baseline, attention_mask=None)
+            with use_parallel_state(self.sp_state):
+                local_output, _ = flash_backend.flash_attention_forward(module, *local, attention_mask=None)
 
             torch.testing.assert_close(sync_tensor(local_output, dim=1), baseline_output, rtol=1e-5, atol=1e-6)
             baseline_output.backward(output_gradient)
@@ -304,14 +297,13 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
             self._assert_qkv_gradients(local, baseline)
         finally:
             flash_backend._flash_attention_forward = original_backend
-            flash_backend.get_parallel_state = original_get_parallel_state
 
     @pytest.mark.skipif(
         not IS_CUDA_AVAILABLE or get_torch_device().device_count() < 2,
         reason="FlexAttention Ulysses parity requires at least 2 CUDA devices",
     )
     def test_flex_wrapper_matches_non_sp_oracle(self):
-        group, world_size, device, local_slice, baseline, local, output_gradient = self._build_qkv(
+        group, _, device, local_slice, baseline, local, output_gradient = self._build_qkv(
             sequence_length=16,
             head_dim=16,
             dtype=torch.bfloat16,
@@ -334,11 +326,10 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
             KV_LEN=16,
             device=device,
             BLOCK_SIZE=128,
+            _compile=False,
         )
         module = _FakeFlexAttentionModule().to(device)
-        original_get_parallel_state = flex_backend.get_parallel_state
-        try:
-            flex_backend.get_parallel_state = lambda: SimpleNamespace(ulysses_enabled=False)
+        with use_parallel_state(self.dp_state):
             baseline_output, baseline_lse = flex_backend.flex_attention_forward(
                 module,
                 *baseline,
@@ -346,12 +337,7 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
                 kernel_options={"BACKEND": "TRITON"},
                 s_aux=head_auxiliary,
             )
-
-            flex_backend.get_parallel_state = lambda: SimpleNamespace(
-                ulysses_enabled=True,
-                ulysses_group=group,
-                ulysses_size=world_size,
-            )
+        with use_parallel_state(self.sp_state):
             local_output, local_lse = flex_backend.flex_attention_forward(
                 module,
                 *local,
@@ -360,13 +346,11 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
                 s_aux=head_auxiliary,
             )
 
-            torch.testing.assert_close(sync_tensor(local_output, dim=1), baseline_output, rtol=3e-2, atol=3e-2)
-            torch.testing.assert_close(sync_tensor(local_lse, dim=2), baseline_lse, rtol=3e-2, atol=3e-2)
-            baseline_output.backward(output_gradient)
-            local_output.backward(output_gradient[:, local_slice].contiguous())
-            self._assert_qkv_gradients(local, baseline)
-        finally:
-            flex_backend.get_parallel_state = original_get_parallel_state
+        torch.testing.assert_close(sync_tensor(local_output, dim=1), baseline_output, rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(sync_tensor(local_lse, dim=2), baseline_lse, rtol=3e-2, atol=3e-2)
+        baseline_output.backward(output_gradient)
+        local_output.backward(output_gradient[:, local_slice].contiguous())
+        self._assert_qkv_gradients(local, baseline)
 
     @pytest.mark.skipif(
         not IS_CUDA_AVAILABLE or get_torch_device().device_count() < 2,
@@ -380,20 +364,18 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
             dtype=torch.bfloat16,
             seed=9192,
         )
-        config = PreTrainedConfig()
-        config._attn_implementation = "veomni_flex_attention_with_sp"
         attention_mask = torch.ones(1, sequence_length, device=device, dtype=torch.long)
         cu_seq_lens_q = torch.tensor([0, 3, 8, 12, 16], device=device, dtype=torch.int32)
         module = _FakeFlexAttentionModule().to(device)
-        original_get_parallel_state = flex_backend.get_parallel_state
-        try:
-            flex_backend.get_parallel_state = lambda: SimpleNamespace(ulysses_enabled=False)
-            baseline_block_mask = create_causal_mask(
-                config=config,
-                inputs_embeds=torch.empty(1, sequence_length, 1, device=device),
+        with use_parallel_state(self.dp_state):
+            baseline_block_mask = flex_attention_mask_builder(
+                1,
+                sequence_length,
+                sequence_length,
                 attention_mask=attention_mask,
-                past_key_values=None,
-                cu_seq_lens_q=cu_seq_lens_q,
+                cu_seqlens=cu_seq_lens_q,
+                skip_ulysses=True,
+                device=device,
             )
             baseline_output, _ = flex_backend.flex_attention_forward(
                 module,
@@ -401,18 +383,15 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
                 baseline_block_mask,
                 kernel_options={"BACKEND": "TRITON"},
             )
-
-            flex_backend.get_parallel_state = lambda: SimpleNamespace(
-                ulysses_enabled=True,
-                ulysses_group=group,
-                ulysses_size=world_size,
-            )
-            local_block_mask = create_causal_mask(
-                config=config,
-                inputs_embeds=torch.empty(1, sequence_length // world_size, 1, device=device),
+        with use_parallel_state(self.sp_state):
+            local_block_mask = flex_attention_mask_builder(
+                1,
+                sequence_length // world_size,
+                sequence_length // world_size,
                 attention_mask=attention_mask,
-                past_key_values=None,
-                cu_seq_lens_q=cu_seq_lens_q,
+                cu_seqlens=cu_seq_lens_q,
+                skip_ulysses=False,
+                device=device,
             )
             local_output, _ = flex_backend.flex_attention_forward(
                 module,
@@ -421,19 +400,17 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
                 kernel_options={"BACKEND": "TRITON"},
             )
 
-            def index(value):
-                return torch.tensor(value, device=device)
+        def index(value):
+            return torch.tensor(value, device=device)
 
-            assert baseline_block_mask.shape == local_block_mask.shape == (1, 1, sequence_length, sequence_length)
-            assert not local_block_mask.mask_mod(index(0), index(0), index(8), index(7))
-            assert local_block_mask.mask_mod(index(0), index(0), index(7), index(3))
-            torch.testing.assert_close(sync_tensor(local_output, dim=1), baseline_output, rtol=3e-2, atol=3e-2)
+        assert baseline_block_mask.shape == local_block_mask.shape == (1, 1, sequence_length, sequence_length)
+        assert not local_block_mask.mask_mod(index(0), index(0), index(8), index(7))
+        assert local_block_mask.mask_mod(index(0), index(0), index(7), index(3))
+        torch.testing.assert_close(sync_tensor(local_output, dim=1), baseline_output, rtol=3e-2, atol=3e-2)
 
-            baseline_output.backward(output_gradient)
-            local_output.backward(output_gradient[:, local_slice].contiguous())
-            self._assert_qkv_gradients(local, baseline)
-        finally:
-            flex_backend.get_parallel_state = original_get_parallel_state
+        baseline_output.backward(output_gradient)
+        local_output.backward(output_gradient[:, local_slice].contiguous())
+        self._assert_qkv_gradients(local, baseline)
 
     @pytest.mark.skipif(
         not IS_CUDA_AVAILABLE or not _MAGI_PACKAGE_AVAILABLE or get_torch_device().device_count() < 2,
@@ -443,72 +420,59 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
         group = self._get_process_group()
         rank = dist.get_rank(group)
         device = torch.device(get_device_type(), rank)
-        kernel_mode = magi_fa4_backend._get_magi_kernel_mode(device)
-        if kernel_mode == magi_fa4_backend._MAGI_KERNEL_UNSUPPORTED:
+        kernel_mode = magi_kernel.get_kernel_mode(device)
+        if kernel_mode == magi_kernel.KERNEL_UNSUPPORTED:
             self.skipTest("MagiAttention does not support this GPU architecture")
         try:
-            magi_fa4_backend._prepare_default_magi_kernel(device)
+            magi_kernel.prepare_kernel(device)
         except (ImportError, RuntimeError) as error:
             self.skipTest(str(error))
 
-        original_get_parallel_state = magi_backend.get_parallel_state
-        try:
-            dtype = torch.bfloat16
-            for mask_idx, mask_case in enumerate(("causal", "full", "bagel_mixed")):
-                group, world_size, device, local_slice, baseline, local, output_gradient = self._build_qkv(
-                    sequence_length=128,
-                    head_dim=64,
-                    dtype=dtype,
-                    seed=9320 + mask_idx,
-                    group=group,
-                )
-                attention_mask = _build_magi_mask(mask_case, 128, device)
-                module = _FakeMagiAttentionModule().to(device)
+        dtype = torch.bfloat16
+        for mask_idx, mask_case in enumerate(("causal", "full", "2d_mask")):
+            _, _, device, local_slice, baseline, local, output_gradient = self._build_qkv(
+                sequence_length=128,
+                head_dim=64,
+                dtype=dtype,
+                seed=9320 + mask_idx,
+                group=group,
+            )
+            attention_mask = _build_magi_mask(mask_case, 128, device)
+            module = _FakeMagiAttentionModule().to(device)
 
-                magi_backend.get_parallel_state = lambda: SimpleNamespace(
-                    cp_size=1,
-                    ulysses_enabled=False,
-                )
+            with use_parallel_state(self.dp_state):
                 baseline_output, baseline_lse = magi_backend.magi_attention_forward(
                     module,
                     *baseline,
                     attention_mask,
                 )
-
-                magi_backend.get_parallel_state = lambda group=group, world_size=world_size: SimpleNamespace(
-                    cp_size=1,
-                    ulysses_enabled=True,
-                    ulysses_group=group,
-                    ulysses_size=world_size,
-                )
+            with use_parallel_state(self.sp_state):
                 local_output, local_lse = magi_backend.magi_attention_forward(
                     module,
                     *local,
                     attention_mask,
                 )
-                assert baseline_lse is not None
-                assert local_lse is not None
+            assert baseline_lse is not None
+            assert local_lse is not None
 
-                torch.testing.assert_close(
-                    sync_tensor(local_output, dim=1),
-                    baseline_output,
-                    rtol=3e-2,
-                    atol=3e-2,
-                    msg=lambda message, dtype=dtype, mask_case=mask_case: f"{dtype=} {mask_case=} output: {message}",
-                )
-                torch.testing.assert_close(
-                    sync_tensor(local_lse, dim=2),
-                    baseline_lse,
-                    rtol=3e-2,
-                    atol=3e-2,
-                    msg=lambda message, dtype=dtype, mask_case=mask_case: f"{dtype=} {mask_case=} LSE: {message}",
-                )
+            torch.testing.assert_close(
+                sync_tensor(local_output, dim=1),
+                baseline_output,
+                rtol=3e-2,
+                atol=3e-2,
+                msg=lambda message, dtype=dtype, mask_case=mask_case: f"{dtype=} {mask_case=} output: {message}",
+            )
+            torch.testing.assert_close(
+                sync_tensor(local_lse, dim=2),
+                baseline_lse,
+                rtol=3e-2,
+                atol=3e-2,
+                msg=lambda message, dtype=dtype, mask_case=mask_case: f"{dtype=} {mask_case=} LSE: {message}",
+            )
 
-                baseline_output.backward(output_gradient)
-                local_output.backward(output_gradient[:, local_slice].contiguous())
-                self._assert_qkv_gradients(local, baseline)
-        finally:
-            magi_backend.get_parallel_state = original_get_parallel_state
+            baseline_output.backward(output_gradient)
+            local_output.backward(output_gradient[:, local_slice].contiguous())
+            self._assert_qkv_gradients(local, baseline)
 
 
 if __name__ == "__main__":
@@ -518,4 +482,6 @@ if __name__ == "__main__":
 
     set_seed(seed=0, full_determinism=True)
     enable_high_precision_for_bf16()
+    from torch.testing._internal.common_utils import run_tests
+
     run_tests()

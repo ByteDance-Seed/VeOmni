@@ -20,24 +20,23 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config
 from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel as HFGemma4Audio
 from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration as HFGemma4
 
+from tests.tools.gemma4_utils import make_gemma4_batch
 from veomni.arguments.arguments_types import OpsImplementationConfig
-from veomni.models.auto import build_foundation_model
+from veomni.models import build_foundation_model
 from veomni.models.transformers.gemma4.generated import patched_modeling_gemma4_gpu as gemma4_modeling
 from veomni.models.transformers.gemma4.generated.patched_modeling_gemma4_gpu import (
     Gemma4ForConditionalGeneration as VeOmniGemma4,
 )
-from veomni.ops.kernels import attention as veomni_attention
 from veomni.trainer.callbacks.channel_loss_callback import ChannelLossComputer
-
-from ..tools.gemma4_utils import make_gemma4_batch
 
 
 _TOY_CONFIG = Path(__file__).parents[1] / "toy_config" / "gemma4_toy"
-_FLEX_IMPLEMENTATION = "veomni_flex_attention_with_sp"
+_FLEX_IMPLEMENTATION = "veomni_flex_attention"
 
 
 def _eager_ops_config(attn_implementation: str) -> OpsImplementationConfig:
@@ -298,11 +297,12 @@ def test_gemma4_training_loss_matches_capped_logits(monkeypatch, tmp_path, text_
 
 @pytest.mark.parametrize("text_only", [False, True], ids=["multimodal", "text"])
 @pytest.mark.parametrize("loss_implementation", ["eager", "chunk_loss"])
-def test_gemma4_softcapping_preserves_channel_loss(monkeypatch, tmp_path, text_only, loss_implementation):
-    """Channel totals observe the same capped logits as the training loss."""
+@pytest.mark.parametrize("softcap", [None, 30.0], ids=["uncapped", "softcapped"])
+def test_gemma4_softcapping_preserves_channel_loss(monkeypatch, tmp_path, text_only, loss_implementation, softcap):
+    """Channel totals observe the selected instance loss, including softcapping."""
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
     config = _toy_config()
-    config.text_config.final_logit_softcapping = 30.0
+    config.text_config.final_logit_softcapping = softcap
     if text_only:
         config = config.text_config
     config.save_pretrained(tmp_path)
@@ -328,9 +328,7 @@ def test_gemma4_softcapping_preserves_channel_loss(monkeypatch, tmp_path, text_o
 
         assert 42 in computer.step_totals
         loss_sum, token_count = computer.step_totals[42]
-        expected_sum = F.cross_entropy(
-            output.logits[:, :-1].reshape(-1, output.logits.shape[-1]), labels[:, 1:].reshape(-1), reduction="sum"
-        )
+        expected_sum = reference.loss.detach() * (labels[:, 1:] != -100).sum()
         assert token_count.item() == 6
         torch.testing.assert_close(loss_sum, expected_sum)
         torch.testing.assert_close(output.loss, reference.loss)
@@ -392,7 +390,7 @@ def test_gemma4_builds_pack_aware_full_and_sliding_masks(monkeypatch):
         return torch.zeros_like(query).transpose(1, 2), None
 
     monkeypatch.setitem(
-        veomni_attention._ATTENTION_FORWARD_DISPATCH,
+        ALL_ATTENTION_FUNCTIONS._global_mapping,
         _FLEX_IMPLEMENTATION,
         fake_flex_adapter,
     )
@@ -428,7 +426,7 @@ def test_gemma4_multimodal_masks_preserve_packed_boundaries(monkeypatch):
         return torch.zeros_like(query).transpose(1, 2), None
 
     monkeypatch.setitem(
-        veomni_attention._ATTENTION_FORWARD_DISPATCH,
+        ALL_ATTENTION_FUNCTIONS._global_mapping,
         _FLEX_IMPLEMENTATION,
         fake_flex_adapter,
     )
@@ -455,3 +453,113 @@ def test_gemma4_multimodal_masks_preserve_packed_boundaries(monkeypatch):
         assert isinstance(block_mask, BlockMask)
         assert not block_mask.mask_mod(zero, zero, torch.tensor(5), torch.tensor(1))
     assert captured["sliding_attention"].mask_mod(zero, zero, torch.tensor(1), torch.tensor(2))
+
+
+def test_gemma4_generated_children_and_packed_masks(monkeypatch):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    config = _toy_config()
+    model_class = VeOmniGemma4
+    model = model_class._from_config(config, attn_implementation="eager")
+
+    assert type(model.model.vision_tower).__module__ == model_class.__module__
+    assert type(model.model.audio_tower).__module__ == model_class.__module__
+    assert type(model.model.language_model).__module__ == model_class.__module__
+
+    modeling_module = gemma4_modeling
+    seen_cu_seq_lens = []
+
+    def capture_mask(**kwargs):
+        seen_cu_seq_lens.append(kwargs.get("cu_seq_lens_q"))
+        return None
+
+    monkeypatch.setattr(modeling_module, "_gemma4_create_mask", capture_mask)
+
+    input_ids = torch.tensor([[2, 7, 11, 13, 17, 1]])
+    cu_seq_lens_q = torch.tensor([0, 3, 6], dtype=torch.int32)
+    model(input_ids=input_ids, cu_seq_lens_q=cu_seq_lens_q, use_cache=False)
+
+    assert len(seen_cu_seq_lens) == 2
+    assert all(torch.equal(value, cu_seq_lens_q) for value in seen_cu_seq_lens)
+
+
+@pytest.mark.parametrize("backend", ["eager", "sdpa"])
+@pytest.mark.parametrize("vision_blocks", [False, True])
+def test_gemma4_packed_outputs_match_independent_sequences(backend, vision_blocks):
+    """Public packed builders isolate samples for both dense attention backends."""
+    config = _toy_config()
+    config.text_config.use_bidirectional_attention = "vision" if vision_blocks else None
+    model = VeOmniGemma4._from_config(config, attn_implementation=backend).eval()
+    ids = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 10]])
+    token_types = torch.tensor([[0, 1, 1, 0, 0, 1, 1, 0]]) if vision_blocks else None
+    with torch.no_grad():
+        packed = model(
+            input_ids=ids,
+            position_ids=torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]]),
+            cu_seq_lens_q=torch.tensor([0, 4, 8], dtype=torch.int32),
+            mm_token_type_ids=token_types,
+            use_cache=False,
+        ).logits
+        independent = torch.cat(
+            [
+                model(
+                    input_ids=ids[:, start : start + 4],
+                    mm_token_type_ids=token_types[:, start : start + 4] if token_types is not None else None,
+                    use_cache=False,
+                ).logits
+                for start in (0, 4)
+            ],
+            dim=1,
+        )
+    torch.testing.assert_close(packed, independent)
+
+
+@pytest.mark.parametrize("text_only", [False, True], ids=["multimodal", "text"])
+@pytest.mark.parametrize("loss_implementation", ["eager", "chunk_loss"])
+@pytest.mark.parametrize("topk", [False, True], ids=["log_probs", "topk"])
+def test_gemma4_uncapped_auxiliary_outputs(monkeypatch, tmp_path, text_only, loss_implementation, topk):
+    """Uncapped auxiliary outputs retain hidden states even for eager CE selection."""
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    config = _toy_config()
+    config.text_config.final_logit_softcapping = None
+    if text_only:
+        config = config.text_config
+    config.save_pretrained(tmp_path)
+    ops = _eager_ops_config("eager")
+    ops.cross_entropy_loss_implementation = loss_implementation
+    model = build_foundation_model(tmp_path, torch_dtype="float32", init_device="cpu", ops_implementation=ops)
+    input_ids = torch.tensor([[3, 4, 5, 6, 7, 8]])
+    labels = input_ids.clone()
+    labels[:, 3] = -100
+    logits = model(input_ids=input_ids, use_cache=False).logits
+    log_distribution = logits[:, :-1].float().log_softmax(-1)
+    targets = labels[:, 1:]
+    valid = targets != -100
+    expected_log_probs = log_distribution.gather(-1, targets.clamp_min(0).unsqueeze(-1)).squeeze(-1)
+    expected_entropy = -(log_distribution.exp() * log_distribution).sum(-1)
+    expected_log_probs = expected_log_probs.masked_fill(~valid, 0)
+    expected_entropy = expected_entropy.masked_fill(~valid, 0)
+    kwargs = {}
+    if topk:
+        teacher_log_probs = torch.randn_like(logits).log_softmax(-1)
+        teacher_values, teacher_ids = teacher_log_probs.topk(4, dim=-1)
+        kwargs = dict(teacher_topk_ids=teacher_ids, teacher_topk_log_probs=teacher_values)
+        student_values = log_distribution.gather(-1, teacher_ids[:, 1:])
+        expected_distill = (
+            (teacher_values[:, 1:].exp() * (teacher_values[:, 1:] - student_values)).sum(-1).masked_fill(~valid, 0)
+        )
+        objective = expected_distill.sum()
+    else:
+        objective = expected_log_probs.sum()
+    expected_gradient = torch.autograd.grad(objective, model.lm_head.weight)[0]
+    output = model(input_ids=input_ids, labels=labels, return_log_probs=True, chunk_size=2, use_cache=False, **kwargs)
+    assert output.loss is None
+    assert output.logits is None
+    aux = output.fused_linear_aux
+    torch.testing.assert_close(aux.log_probs, F.pad(expected_log_probs, (0, 1)))
+    torch.testing.assert_close(aux.entropy, F.pad(expected_entropy, (0, 1)))
+    if topk:
+        torch.testing.assert_close(aux.distillation_losses, F.pad(expected_distill, (0, 1)))
+        aux.distillation_losses.sum().backward()
+    else:
+        aux.log_probs.sum().backward()
+    torch.testing.assert_close(model.lm_head.weight.grad, expected_gradient, atol=1e-6, rtol=1e-4)
