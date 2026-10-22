@@ -22,6 +22,7 @@ from __future__ import annotations
 import inspect
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
     Qwen2_5OmniConfig as HFQwen2_5OmniConfig,
@@ -36,6 +37,7 @@ from transformers.models.qwen2_5_omni.processing_qwen2_5_omni import (
     Qwen2_5OmniProcessor as HFQwen2_5OmniProcessor,
 )
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
@@ -43,6 +45,9 @@ from tests.models.compare import (
     qwen_image_inputs,
 )
 from tests.models.tiny_configs import tiny_qwen2_5_omni_thinker_config as _tiny_thinker_config
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _build_ours(config: Qwen2_5OmniThinkerConfig, ops: SimpleNamespace | None = None):

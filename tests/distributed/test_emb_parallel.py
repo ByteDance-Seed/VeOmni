@@ -36,6 +36,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.emb_parallel import AllToAllEmbedding, ShardedEmbedding, VocabParallelLinear, sharded_embedding
 from veomni.utils.device import get_device_type
 
@@ -264,6 +265,7 @@ def _parity_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=lambda context: LaunchSpec(nproc=_WORLD, device="cpu"))
 def test_sharded_ops_match_dense_over_all_ranks(tmp_path):
     mp.spawn(_parity_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=_WORLD, join=True)
 
@@ -304,6 +306,7 @@ def _autocast_linear_rank_main(rank: int, rendezvous: str, out_dir: str) -> None
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=lambda context: LaunchSpec(nproc=_WORLD, device="cpu"))
 def test_sharded_linear_matches_dense_under_autocast_over_all_ranks(tmp_path):
     mp.spawn(_autocast_linear_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=_WORLD, join=True)
 
@@ -328,6 +331,7 @@ def _out_of_range_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=lambda context: LaunchSpec(nproc=_WORLD, device="cpu"))
 def test_an_out_of_range_id_on_one_rank_fails_every_rank(tmp_path):
     """The rank without a bad id must raise too, not block in the next collective."""
     mp.spawn(_out_of_range_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=_WORLD, join=True)
@@ -546,6 +550,7 @@ def _fsdp_rank_main(
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=lambda context: LaunchSpec(nproc=len(_FSDP_IDS), device="cpu"))
 @pytest.mark.parametrize(
     ("layout", "tied", "reshard", "separate"),
     [
