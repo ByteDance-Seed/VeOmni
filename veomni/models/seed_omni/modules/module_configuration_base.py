@@ -62,7 +62,7 @@ class OmniModuleConfig(PretrainedConfig):
         self.model_config = dict(model_config or {})
         self.processor_config = dict(processor_config or {})
         super().__init__(**kwargs)
-        self._set_ops_implementation(ops_implementation, set_attn="attn_implementation" not in kwargs)
+        self._set_ops_implementation(ops_implementation)
 
     @property
     def ops_config(self):
@@ -76,8 +76,6 @@ class OmniModuleConfig(PretrainedConfig):
     def _set_ops_implementation(
         self,
         ops_implementation: dict[str, Any] | Any | None,
-        *,
-        set_attn: bool = True,
     ) -> None:
         if ops_implementation is not None and is_dataclass(ops_implementation):
             self._ops_config = ops_implementation
@@ -85,11 +83,6 @@ class OmniModuleConfig(PretrainedConfig):
         else:
             self._ops_config = None
             self.ops_implementation = dict(ops_implementation or {})
-        if set_attn:
-            attn_implementation = self.ops_implementation.get("attn_implementation")
-            if attn_implementation is not None:
-                # HF selects the attention class from this attribute, not from ``ops_implementation``.
-                self._attn_implementation = attn_implementation
 
     def to_dict(self) -> dict[str, Any]:
         output = super().to_dict()
@@ -216,9 +209,6 @@ class OmniModuleConfig(PretrainedConfig):
         if base_ops or entry_ops:
             own = dict(getattr(self, "ops_implementation", None) or {})
             self._set_ops_implementation({**own, **(base_ops or {}), **(entry_ops or {})})
-        elif "attn_implementation" in (self.ops_implementation or {}):
-            # HF selects the attention class from this attribute, not from ``ops_implementation``.
-            self._attn_implementation = self.ops_implementation["attn_implementation"]
 
 
 __all__ = [
