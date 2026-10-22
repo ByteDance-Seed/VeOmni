@@ -63,8 +63,8 @@ not exact resource reservations. For example,
 [the CP eligibility marker](../../tests/parallel/context_parallel/test_deepseek_v4_cp.py#L920)
 checks a two-device minimum but launches either two or four workers according
 to its parameter. The
-[launcher defaults](../../tests/tools/launch_utils.py#L119) and
-[training command resolution](../../tests/tools/training_utils.py#L228) provide
+[launcher defaults](../../tests/tools/launch_utils.py#L149) and
+[training command resolution](../../tests/tools/training_utils.py#L226) provide
 shared plan inputs rather than a second quota definition.
 
 ## Writing new tests
@@ -82,7 +82,15 @@ shared plan inputs rather than a second quota definition.
   or concurrent relationships. Keep comparison and resume dependencies intact.
 - Do not choose a smaller `world_size` from the leased device count. The lease
   is chosen from the plan, not the other way around.
-- Use case-scoped output/rendezvous directories and the common port allocator.
+- Use case-scoped output/rendezvous directories and the shared launch helpers.
+  For `mp.spawn`, `spawn_with_rendezvous` appends a parent-owned endpoint to
+  worker arguments; pass `endpoint.connect()` as `store=` to process-group
+  initialization on every rank. After spawn returns its context, the parent
+  joins or terminates its workers before closing the server. Partial startup
+  failures before that return rely on the CI runner's enclosing process-scope
+  cleanup. Single-node torchrun uses `--standalone` with
+  agent Store sharing enabled. Do not probe and close a socket before binding
+  a distributed server: a registry cannot stop unrelated sockets taking it.
   Shared fixture caches must be immutable with locking, or isolated per case;
   one worker must not delete a dataset while another reads it. Keep temporary
   directory paths short enough for multiprocessing Unix sockets.
@@ -184,9 +192,14 @@ fits. CPU work has a separate concurrency limit. No historical timings are
 required or consumed. Measured case timings remain available as reporting
 artifacts. Results stay keyed by node ID, independent of completion order.
 
-Each worker receives its visible-device mapping and a unique rendezvous port
-before importing torch or the accelerator runtime. A run-scoped, locked port
-registry prevents reuse while another launch is preparing to bind. Common launchers validate actual `nproc`, node count, and child device visibility
+Each pytest worker receives its visible-device mapping before importing torch
+or the accelerator runtime. Its default env:// port uses the legacy run-scoped
+locked registry, which prevents cooperative reuse but does not hold an OS
+reservation. Distributed spawn launches instead own a live TCPStore from
+allocation through worker cleanup; standalone torchrun agents bind their own
+Stores atomically on port zero. Spawn lifecycle events are retained in each
+batch's `.rendezvous.jsonl` with the owner PID, case, launch ID and endpoint.
+Common launchers validate actual `nproc`, node count, and child device visibility
 against the plan and lease. Compare observed launch arguments with the baseline
 to verify backend and parallel-topology coverage. Release resources only after scoped
 cleanup of the launcher's process group and tracked descendants, including

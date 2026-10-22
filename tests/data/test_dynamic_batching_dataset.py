@@ -44,7 +44,6 @@ import numpy as np
 import pytest
 import torch
 from tools import resolve_ops_overrides
-from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
 from utils import (
     FakeModelRuntime,
@@ -589,13 +588,12 @@ def build_command(dataset_type="iterable", shuffle=True, save_by_idx=True, multi
     Returns:
         list: Command arguments for subprocess.run().
     """
-    port = find_free_port()
 
     command = [
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={_CI_LAUNCH.nproc}",
-        f"--master_port={port}",
+        "--standalone",
         "tests/data/test_dynamic_batching_dataset.py",
         "--model.config_path=test",
         "--data.train_path=None",

@@ -2,7 +2,7 @@
 
 import pytest
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -341,6 +341,259 @@ def test_rendezvous_allocator_does_not_reuse_a_pending_launch_port(monkeypatch, 
     registry = str(tmp_path / "ports.json")
     assert ports.find_free_port(registry) == 12345
     assert ports.find_free_port(registry) == 12346
+
+
+def test_live_rendezvous_reserves_the_socket_and_closes_on_error(monkeypatch, tmp_path):
+    import errno
+    import json
+    import os
+    import socket
+    from datetime import timedelta
+
+    import psutil
+
+    from scripts.ci.accelerator.runtime import ports
+
+    def reject_probe():
+        pytest.fail("A live rendezvous must not probe and close a free port")
+
+    monkeypatch.setattr(ports, "_free_port", reject_probe)
+    events = tmp_path / "rendezvous.jsonl"
+    monkeypatch.setenv("CI_RENDEZVOUS_EVENTS", str(events))
+    with pytest.raises(RuntimeError, match="caller failed"):
+        with ports.rendezvous_endpoint(timeout=timedelta(seconds=10)) as endpoint:
+            with socket.socket() as competitor:
+                with pytest.raises(OSError) as error:
+                    competitor.bind((endpoint.host, endpoint.port))
+                assert error.value.errno == errno.EADDRINUSE
+            client = endpoint.connect()
+            client.set("key", "value")
+            assert client.get("key") == b"value"
+            del client
+            raise RuntimeError("caller failed")
+
+    assert not any(
+        connection.status == psutil.CONN_LISTEN and connection.laddr.port == endpoint.port
+        for connection in psutil.Process().net_connections(kind="tcp")
+    )
+    rows = [json.loads(line) for line in events.read_text().splitlines()]
+    assert [row["action"] for row in rows] == ["ready", "closed"]
+    assert {row["pid"] for row in rows} == {os.getpid()}
+    assert len({row["launch_id"] for row in rows}) == 1
+
+
+def _rendezvous_sum_worker(rank, world_size, output, base, endpoint):
+    import json
+    import os
+    from datetime import timedelta
+    from pathlib import Path
+
+    import torch
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo", store=endpoint.connect(), rank=rank, world_size=world_size, timeout=timedelta(seconds=20)
+    )
+    try:
+        value = torch.tensor(base + rank)
+        dist.all_reduce(value)
+        assert value.item() == world_size * base + world_size * (world_size - 1) // 2
+        Path(output, f"rank-{rank}.json").write_text(json.dumps(dict(port=endpoint.port, pid=os.getpid())))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(
+    provider=CasePlan.concurrent(LaunchSpec(nproc=2, device="cpu"), LaunchSpec(nproc=2, device="cpu"))
+)
+def test_concurrent_spawn_rendezvous_are_isolated_and_join_before_release(monkeypatch, tmp_path):
+    import json
+    import socket
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import psutil
+
+    from tests.tools import launch_utils
+
+    original_spawn = launch_utils.mp.spawn
+    ready = threading.Barrier(2, timeout=30)
+
+    def spawn(func, args, **kwargs):
+        endpoint = args[-1]
+        with socket.socket() as competitor:
+            with pytest.raises(OSError):
+                competitor.bind((endpoint.host, endpoint.port))
+        ready.wait()
+        return original_spawn(func, args=args, **kwargs)
+
+    monkeypatch.setattr(launch_utils.mp, "spawn", spawn)
+
+    def run(index):
+        output = tmp_path / str(index)
+        output.mkdir()
+        launch_utils.spawn_with_rendezvous(_rendezvous_sum_worker, args=(2, str(output), 10 * index), nprocs=2)
+        return [json.loads(path.read_text()) for path in sorted(output.glob("rank-*.json"))]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first, second = list(executor.map(run, (1, 2)))
+    assert len(first) == len(second) == 2
+    assert {row["port"] for row in first}.isdisjoint(row["port"] for row in second)
+    assert all(not psutil.pid_exists(row["pid"]) for row in first + second)
+
+
+def _common_torchrun_sum(output):
+    import json
+    from pathlib import Path
+
+    import torch
+    import torch.distributed as dist
+
+    value = torch.tensor(dist.get_rank() + 1)
+    dist.all_reduce(value)
+    assert value.item() == 3
+    Path(output, str(dist.get_rank())).write_text(json.dumps(dict(backend=dist.get_backend(), value=value.item())))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_common_spawn_launcher_uses_live_store_instead_of_free_port(monkeypatch, tmp_path):
+    from tests.tools import launch_utils
+
+    monkeypatch.setattr(launch_utils, "find_free_port", lambda: pytest.fail("probe-close rendezvous was used"))
+    launch_utils.torchrun(_common_torchrun_sum, 2, str(tmp_path))
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["0", "1"]
+
+
+def _failing_rendezvous_worker(rank, endpoint):
+    from datetime import timedelta
+
+    store = endpoint.connect()
+    store.set(str(rank), "ready")
+    if rank == 0:
+        store.wait(["1"], timedelta(seconds=20))
+        raise RuntimeError("injected worker failure")
+    store.wait(["never-published"], timedelta(seconds=30))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_spawn_worker_failure_reaps_peers_and_closes_store(monkeypatch, tmp_path):
+    import json
+
+    import psutil
+    import torch.multiprocessing as mp
+
+    from tests.tools import launch_utils
+
+    original_spawn = mp.spawn
+    pids = []
+
+    def spawn(*args, **kwargs):
+        context = original_spawn(*args, **kwargs)
+        pids.extend(process.pid for process in context.processes)
+        return context
+
+    events = tmp_path / "rendezvous.jsonl"
+    monkeypatch.setenv("CI_RENDEZVOUS_EVENTS", str(events))
+    monkeypatch.setattr(mp, "spawn", spawn)
+    with pytest.raises(mp.ProcessRaisedException, match="injected worker failure"):
+        launch_utils.spawn_with_rendezvous(_failing_rendezvous_worker, nprocs=2)
+    assert len(pids) == 2 and all(not psutil.pid_exists(pid) for pid in pids)
+    rows = [json.loads(line) for line in events.read_text().splitlines()]
+    assert [row["action"] for row in rows] == ["ready", "closed"]
+    assert not any(
+        connection.status == psutil.CONN_LISTEN and connection.laddr.port == rows[0]["port"]
+        for connection in psutil.Process().net_connections(kind="tcp")
+    )
+
+
+def test_spawn_parent_interruption_reaps_workers_before_closing_store(monkeypatch):
+    import psutil
+
+    from tests.tools import launch_utils
+
+    class Worker:
+        alive = True
+        joined = False
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            pass  # An unresponsive worker still needs the bounded kill path.
+
+        def kill(self):
+            self.alive = False
+
+        def join(self, timeout):
+            self.joined = True
+
+    workers = [Worker(), Worker()]
+    endpoint = None
+
+    class Context:
+        processes = workers
+
+        def join(self):
+            raise KeyboardInterrupt
+
+    def spawn(func, args, **kwargs):
+        nonlocal endpoint
+        endpoint = args[-1]
+        return Context()
+
+    monkeypatch.setattr(launch_utils.mp, "spawn", spawn)
+    with pytest.raises(KeyboardInterrupt):
+        launch_utils.spawn_with_rendezvous(None, nprocs=2)
+    assert all(not worker.alive and worker.joined for worker in workers)
+    assert not any(
+        connection.status == psutil.CONN_LISTEN and connection.laddr.port == endpoint.port
+        for connection in psutil.Process().net_connections(kind="tcp")
+    )
+
+
+@pytest.mark.launch_plan(
+    provider=CasePlan.concurrent(LaunchSpec(nproc=2, device="cpu"), LaunchSpec(nproc=2, device="cpu"))
+)
+def test_concurrent_standalone_commands_keep_agent_store_alive(monkeypatch, tmp_path):
+    import json
+    import os
+    import subprocess
+    import sys
+    from concurrent.futures import ThreadPoolExecutor
+
+    from tests.tools.training_utils import build_torchrun_cmd
+
+    monkeypatch.setenv("TORCH_DISABLE_SHARE_RDZV_TCP_STORE", "0")
+    script = tmp_path / "worker.py"
+    script.write_text(
+        "import json,os\nfrom pathlib import Path\n"
+        "import torch\nimport torch.distributed as dist\n"
+        "dist.init_process_group('gloo')\n"
+        "assert os.environ['TORCHELASTIC_USE_AGENT_STORE'] == 'True'\n"
+        "value=torch.tensor(dist.get_rank()+1)\ndist.all_reduce(value)\nassert value.item()==3\n"
+        "Path(os.environ['OUTPUT'],str(dist.get_rank())).write_text(json.dumps(dict(port=os.environ['MASTER_PORT'])))\n"
+        "dist.destroy_process_group()\n"
+    )
+
+    def run(index):
+        output = tmp_path / str(index)
+        output.mkdir()
+        command = build_torchrun_cmd(str(script), "unused", "unused", "unused", str(output), nproc=2)
+        result = subprocess.run(
+            [sys.executable, "-m", "torch.distributed.run", *command[1:]],
+            env={**os.environ, "OUTPUT": str(output)},
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return [json.loads(path.read_text())["port"] for path in sorted(output.iterdir())]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first, second = list(executor.map(run, (1, 2)))
+    assert len(first) == len(second) == 2
+    assert len(set(first)) == len(set(second)) == 1
+    assert set(first).isdisjoint(second)
 
 
 def test_unittest_plan_reads_world_size_without_running_constructor(monkeypatch):
