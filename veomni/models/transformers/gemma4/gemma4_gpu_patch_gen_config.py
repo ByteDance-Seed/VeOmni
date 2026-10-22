@@ -103,7 +103,16 @@ def _gemma4_create_mask(
         **kwargs,
     )
     q_len = inputs_embeds.shape[1]
-    if not getattr(config, "is_causal", True):
+    # Flash keeps visibility in native causal/window kwargs and document
+    # boundaries in varlen metadata; only dense/Flex paths need predicates.
+    flash_backend = config._attn_implementation.removeprefix("veomni_") in (
+        "flash_attention_2",
+        "flash_attention_2_hub",
+        "flash_attention_3",
+        "flash_attention_3_hub",
+        "flash_attention_4",
+    )
+    if not getattr(config, "is_causal", True) and not flash_backend:
         if sliding:
             # Indexed bounds remain compatible with the Flex FLASH callback lowering.
             window = torch.tensor([config.sliding_window], device=inputs_embeds.device).expand(
@@ -120,8 +129,17 @@ def _gemma4_create_mask(
         # bidirectional predicate directly, then intersect packed boundaries.
         return packed_causal_mask(q_len, q_len, **common)
     if sliding:
-        return sliding_window_mask(q_len, q_len, sliding_window=config.sliding_window, **common)
-    return packed_causal_mask(q_len, q_len, **common)
+        mask = sliding_window_mask(q_len, q_len, sliding_window=config.sliding_window, **common)
+    else:
+        mask = packed_causal_mask(q_len, q_len, **common)
+    if flash_backend and mask is not None:
+        # HF unpadding replaces supplied cu lengths with row lengths, losing
+        # document boundaries. All-valid 2D masks have already become None.
+        raise ValueError(
+            "Packed Gemma 4 FlashAttention does not support padding masks; "
+            "remove padding before packing or use eager/SDPA/FlexAttention."
+        )
+    return mask
 
 
 @config.override_method(

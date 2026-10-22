@@ -13,8 +13,15 @@ Choose attention through `OpsImplementationConfig`, for example
 `veomni.ops.mask` builders with `cu_seq_lens_q` boundaries. Packed attention
 does not support `past_key_values`; unpacked masks retain HF cache handling.
 With `use_bidirectional_attention="all"`, full attention remains bidirectional
-within each packed sample. Sliding attention preserves HF's inclusive, symmetric
-window on both sides of each token; document boundaries still apply.
+within each packed sample. Eager/SDPA/Flex sliding attention preserves HF's
+inclusive, symmetric window on both sides of each token; document boundaries
+still apply. FlashAttention 2/3/4 and the FA2/FA3 Hub variants retain their
+native metadata path: the attention adapter receives the module's causal
+setting, sliding window and cumulative sequence lengths. No custom mask
+predicate is sent to Flash. Packed Flash inputs must be padding-free: `None`
+and all-valid 2D masks are accepted, but masks containing padding raise an
+error because HF unpadding would replace the supplied document boundaries.
+Unpacked Flash inputs retain normal padding-mask handling.
 
 Each LM instance holds its own `VeomniOp("cross_entropy_loss", "standard", impl)`
 as `veomni_ce`. Training calls its `loss_function` wrapper so channel-loss
@@ -42,6 +49,13 @@ channel-loss interception, audio visibility and dummy graph participation:
 pytest tests/models/test_gemma4.py -q
 pytest tests/models/base/test_auto_registry.py -k gemma4 -q
 ```
+
+CPU backend-dispatch tests exercise the real HF/VeOmni Flash adapters up to a
+stubbed kernel boundary, checking causal/window and varlen argument forwarding.
+Additional cases run the HF varlen dispatcher with stubbed vendor functions to
+check that supplied document offsets reach the selected kernel unchanged.
+They do not execute FlashAttention kernels or establish numerical/gradient
+parity on GPU. Real FA2/FA3/FA4 forward/backward validation remains pending.
 
 Actual asymmetric BF16 FSDP2 validation requires two CUDA GPUs:
 

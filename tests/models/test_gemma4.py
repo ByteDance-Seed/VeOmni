@@ -600,3 +600,170 @@ def test_gemma4_packed_bidirectional_visibility(backend, sliding):
     else:
         visible = mask[0, 0] if mask.dtype == torch.bool else mask[0, 0] == 0
     torch.testing.assert_close(visible, expected)
+
+
+_FLASH_IMPLEMENTATIONS = (
+    "flash_attention_2",
+    "flash_attention_3",
+    "flash_attention_4",
+    "veomni_flash_attention_2",
+    "veomni_flash_attention_3",
+    "veomni_flash_attention_4",
+    "veomni_flash_attention_2_hub",
+    "veomni_flash_attention_3_hub",
+)
+
+
+@pytest.mark.parametrize("backend", _FLASH_IMPLEMENTATIONS)
+@pytest.mark.parametrize("sliding", [False, True], ids=["full", "sliding"])
+@pytest.mark.parametrize("mask_kind", ["none", "all_valid", "padding"])
+@pytest.mark.parametrize("attention_mode", [None, "all"], ids=["causal", "bidirectional"])
+def test_gemma4_packed_flash_mask_contract(backend, sliding, mask_kind, attention_mode):
+    """Packed Flash normalizes all-valid masks and rejects unsafe mixed padding."""
+    config_dict = _toy_config().text_config.to_dict()
+    config_dict["use_bidirectional_attention"] = attention_mode
+    config = gemma4_modeling.Gemma4TextConfig.from_dict(config_dict)
+    config._attn_implementation = backend
+    attention_mask = torch.ones(1, 8, dtype=torch.long) if mask_kind != "none" else None
+    if mask_kind == "padding":
+        attention_mask[:, -1] = 0
+    mask_kwargs = dict(
+        config=config,
+        inputs_embeds=torch.zeros(1, 8, config.hidden_size),
+        attention_mask=attention_mask,
+        past_key_values=None,
+        cu_seq_lens_q=torch.tensor([0, 4, 8], dtype=torch.int32),
+        sliding=sliding,
+    )
+    if mask_kind == "padding":
+        with pytest.raises(ValueError, match="Packed Gemma 4 FlashAttention.*padding"):
+            gemma4_modeling._gemma4_create_mask(**mask_kwargs)
+    else:
+        assert gemma4_modeling._gemma4_create_mask(**mask_kwargs) is None
+
+
+@pytest.mark.parametrize("backend", _FLASH_IMPLEMENTATIONS)
+@pytest.mark.parametrize("attention_mode", [None, "all"], ids=["causal", "bidirectional"])
+@pytest.mark.parametrize("text_only", [False, True], ids=["multimodal", "text"])
+def test_gemma4_packed_flash_backend_dispatch(monkeypatch, backend, attention_mode, text_only):
+    """Real HF/VeOmni adapters receive causal/window and varlen arguments on CPU."""
+    from transformers.integrations import flash_attention as hf_flash_backend
+
+    from veomni.ops.kernels.attention.standard import flash as veomni_flash_backend
+
+    config_dict = _toy_config().to_dict()
+    config_dict["text_config"]["use_bidirectional_attention"] = attention_mode
+    config = Gemma4Config.from_dict(config_dict)
+    model_cls = gemma4_modeling.Gemma4ForCausalLM if text_only else VeOmniGemma4
+    model = model_cls._from_config(config.text_config if text_only else config, attn_implementation="eager").eval()
+    text_config = model.config if text_only else model.config.text_config
+    # Construct on CPU with eager, then select the real registered interface
+    # without invoking HF's CUDA/library availability checks at construction.
+    text_config._attn_implementation = backend
+    calls = []
+
+    def record_kernel_boundary(query, key, value, attention_mask, **kwargs):
+        calls.append((attention_mask, kwargs))
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(hf_flash_backend, "_flash_attention_forward", record_kernel_boundary)
+    monkeypatch.setattr(veomni_flash_backend, "_flash_attention_forward", record_kernel_boundary)
+    input_ids = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 10]])
+    cu_q = torch.tensor([0, 4, 8], dtype=torch.int32)
+    cu_k = cu_q.clone()
+    with torch.no_grad():
+        output = model(
+            input_ids=input_ids,
+            position_ids=torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]]),
+            cu_seq_lens_q=cu_q,
+            cu_seq_lens_k=cu_k,
+            max_length_q=4,
+            max_length_k=4,
+            use_cache=False,
+        )
+    assert output.logits.shape == (1, 8, text_config.vocab_size)
+    assert len(calls) == text_config.num_hidden_layers
+    expected_backend = {
+        "veomni_flash_attention_2": "flash_attention_2",
+        "veomni_flash_attention_3": "flash_attention_3",
+    }.get(backend, backend)
+    for (mask, call), layer_type in zip(calls, text_config.layer_types):
+        assert mask is None
+        assert call["is_causal"] is (attention_mode != "all")
+        assert call["sliding_window"] == (text_config.sliding_window if layer_type == "sliding_attention" else None)
+        assert call["cu_seq_lens_q"] is cu_q
+        assert call["cu_seq_lens_k"] is cu_k
+        assert call["max_length_q"] == call["max_length_k"] == 4
+        assert call["attn_implementation"] == expected_backend
+        assert "mask_function" not in call
+
+
+@pytest.mark.parametrize("attention_mode", [None, "all"], ids=["causal", "bidirectional"])
+@pytest.mark.parametrize("all_valid_mask", [False, True], ids=["no_mask", "all_valid"])
+def test_gemma4_packed_flash_offsets_reach_varlen_kernel(monkeypatch, attention_mode, all_valid_mask):
+    """The real HF dispatcher must retain document offsets at the vendor boundary."""
+    from transformers import modeling_flash_attention_utils as hf_flash_utils
+
+    config_dict = _toy_config().text_config.to_dict()
+    config_dict["use_bidirectional_attention"] = attention_mode
+    config = gemma4_modeling.Gemma4TextConfig.from_dict(config_dict)
+    config._attn_implementation = "flash_attention_2"
+    cu = torch.tensor([0, 4, 8], dtype=torch.int32)
+    mask = gemma4_modeling._gemma4_create_mask(
+        config=config,
+        inputs_embeds=torch.zeros(1, 8, config.hidden_size),
+        attention_mask=torch.ones(1, 8, dtype=torch.long) if all_valid_mask else None,
+        past_key_values=None,
+        cu_seq_lens_q=cu,
+    )
+    calls = []
+
+    def varlen_kernel(query, key, value, **kwargs):
+        calls.append(kwargs)
+        return query
+
+    def dense_kernel(*args, **kwargs):
+        pytest.fail("Packed inputs must select the varlen kernel")
+
+    def load_kernel(implementation):
+        assert implementation == "flash_attention_2"
+        return (dense_kernel, varlen_kernel, None, hf_flash_utils._pad_input, None), lambda **kwargs: {}
+
+    monkeypatch.setattr(hf_flash_utils, "lazy_import_flash_attention", load_kernel)
+    query = torch.randn(1, 8, 2, 4)
+    output = hf_flash_utils._flash_attention_forward(
+        query,
+        query,
+        query,
+        mask,
+        query_length=8,
+        is_causal=attention_mode != "all",
+        cu_seq_lens_q=cu,
+        cu_seq_lens_k=cu,
+        max_length_q=4,
+        max_length_k=4,
+        attn_implementation="flash_attention_2",
+    )
+    assert output.shape == query.shape
+    assert len(calls) == 1
+    assert calls[0]["cu_seqlens_q"] is cu
+    assert calls[0]["cu_seqlens_k"] is cu
+
+
+@pytest.mark.parametrize("backend", ["flash_attention_2", "veomni_flash_attention_2"])
+@pytest.mark.parametrize("sliding", [False, True])
+def test_gemma4_unpacked_flash_retains_padding(backend, sliding):
+    """The packed-only guard leaves ordinary HF Flash padding masks intact."""
+    config_dict = _toy_config().text_config.to_dict()
+    config_dict["use_bidirectional_attention"] = "all"
+    config = gemma4_modeling.Gemma4TextConfig.from_dict(config_dict)
+    config._attn_implementation = backend
+    padding = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 0]])
+    mask = gemma4_modeling._gemma4_create_mask(
+        config=config,
+        inputs_embeds=torch.zeros(1, 8, config.hidden_size),
+        attention_mask=padding,
+        past_key_values=None,
+        sliding=sliding,
+    )
+    torch.testing.assert_close(mask.bool(), padding.bool())
