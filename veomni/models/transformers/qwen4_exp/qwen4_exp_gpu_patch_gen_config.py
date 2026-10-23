@@ -267,9 +267,12 @@ def _qwen4_exp_sequence_parallel_state(parallel_state):
     ulysses_enabled = bool(getattr(parallel_state, "ulysses_enabled", False))
     cp_enabled = bool(getattr(parallel_state, "cp_enabled", False))
     if ulysses_enabled and cp_enabled:
-        raise NotImplementedError(
-            "Qwen4-Exp does not support simultaneous Ulysses and Context Parallelism (ulysses_size > 1 and cp_size > 1)."
-        )
+        if not getattr(parallel_state, "allow_hybrid_cp", False):
+            raise NotImplementedError("Combined Qwen4-Exp Ulysses/CP requires allow_hybrid_cp=True.")
+        # The collator slices contiguous sequence shards in unified SP rank
+        # order. QSA keeps those local queries and gathers KV over that group;
+        # GDN exchanges sequence for heads over the same complete group.
+        return True, parallel_state.sp_group, parallel_state.sp_rank, parallel_state.sp_size
     if cp_enabled:
         return True, parallel_state.cp_group, parallel_state.cp_rank, parallel_state.cp_size
     if ulysses_enabled:
@@ -306,7 +309,7 @@ def _qwen4_exp_vision_parallel_state(parallel_state):
         tp_size=parallel_state.tp_size,
         pp_size=parallel_state.pp_size,
         cp_size=1,
-        ulysses_size=parallel_state.cp_size,
+        ulysses_size=parallel_state.sp_size,
         dp_mode=parallel_state.dp_mode,
         device_type=parallel_state.device_type,
         include_sp_in_fsdp=parallel_state.include_sp_in_fsdp,

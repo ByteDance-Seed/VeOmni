@@ -26,7 +26,7 @@ from transformers import AutoConfig
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import torchrun
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_torch_device
 
 
 _CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
@@ -35,31 +35,36 @@ _CI_ACCELERATOR_4 = LaunchSpec(nproc=4, device="accelerator")
 
 
 pytestmark = [pytest.mark.qwen4_exp_ulysses]
+_CUDA_ONLY = pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="This reference case requires CUDA/FLA kernels")
 
-if not IS_CUDA_AVAILABLE:
-    pytest.skip("Qwen4-Exp Ulysses tests require CUDA", allow_module_level=True)
+if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE):
+    pytest.skip("Qwen4-Exp Ulysses tests require CUDA or Ascend", allow_module_level=True)
 
-_PATCHED_MODULE = "veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu"
+_PATCHED_MODULE = "veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_" + (
+    "npu" if get_device_type() == "npu" else "gpu"
+)
 _TOY_CONFIG = "tests/toy_config/qwen4_exp_toy"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
-try:
-    from fla.modules.convolution import causal_conv1d as _causal_conv1d_fn  # noqa: F401
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _chunk_gated_delta_rule_fn  # noqa: F401
-    from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func  # noqa: F401
-except ImportError:
-    pytest.skip("Qwen4-Exp Ulysses tests require FLA and FlashAttention kernels", allow_module_level=True)
+if get_device_type() == "cuda":
+    try:
+        from fla.modules.convolution import causal_conv1d as _causal_conv1d_fn  # noqa: F401
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _chunk_gated_delta_rule_fn  # noqa: F401
+        from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func  # noqa: F401
+    except ImportError:
+        pytest.skip("Qwen4-Exp Ulysses tests require FLA and FlashAttention kernels", allow_module_level=True)
 
 
 def _install_qwen4_exp_ops_config(qsa_attention_implementation: str = "eager") -> None:
-    """Install FLA GatedDeltaNet selections; every other op stays eager unless specified."""
+    """Install the device's native GDN kernels; NPU CI selects the hybrid cases."""
     from veomni.ops.config import set_ops_config
 
+    npu = get_device_type() == "npu"
     set_ops_config(
         SimpleNamespace(
-            rms_norm_gated_implementation="fla",
-            causal_conv1d_implementation="fla",
-            chunk_gated_delta_rule_implementation="fla",
+            rms_norm_gated_implementation="eager" if npu else "fla",
+            causal_conv1d_implementation="triton" if npu else "fla",
+            chunk_gated_delta_rule_implementation="triton" if npu else "fla",
             qsa_attention_implementation=qsa_attention_implementation,
         )
     )
@@ -278,21 +283,25 @@ def _run_ple_halo_equivalence(packed: bool = False, parallel_mode: str = "ulysse
         clear_parallel_state()
 
 
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence():
     torchrun(_run_ple_halo_equivalence, world_size=_CI_ACCELERATOR_2.nproc)
 
 
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence_sp4():
     torchrun(_run_ple_halo_equivalence, world_size=_CI_ACCELERATOR_4.nproc)
 
 
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_packed_ple_hidden_halos_match_full_sequence():
     torchrun(_run_ple_halo_equivalence, world_size=_CI_ACCELERATOR_2.nproc, packed=True)
 
 
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_ple_token_and_hidden_halos_match_full_sequence_cp():
     if get_device_type() == "npu":
@@ -316,8 +325,13 @@ def _run_qsa_equivalence(
     try:
         sp_state = _init_parallel_state(
             dp_size=1,
-            cp_size=world_size if parallel_mode == "cp" else 1,
-            ulysses_size=world_size if parallel_mode == "ulysses" else 1,
+            cp_size=2 if parallel_mode == "hybrid" else world_size if parallel_mode == "cp" else 1,
+            ulysses_size=world_size // 2
+            if parallel_mode == "hybrid"
+            else world_size
+            if parallel_mode == "ulysses"
+            else 1,
+            allow_hybrid_cp=parallel_mode == "hybrid",
             device_type=get_device_type(),
             name="sp",
         )
@@ -440,32 +454,44 @@ def _run_qsa_equivalence(
         clear_parallel_state()
 
 
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_compact_qsa_mqa_matches_full_sequence():
     torchrun(_run_qsa_equivalence, world_size=_CI_ACCELERATOR_2.nproc)
 
 
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 def test_qwen4_exp_compact_qsa_mqa_matches_full_sequence_sp4():
     torchrun(_run_qsa_equivalence, _CI_ACCELERATOR_4.nproc, 4, 1)
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
+def test_qwen4_exp_compact_qsa_hybrid_u2cp2_matches_full_sequence():
+    """Compare packed QSA outputs and all gradients under the unified four-rank group."""
+    torchrun(_run_qsa_equivalence, _CI_ACCELERATOR_4.nproc, 4, 1, "hybrid")
+
+
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_compact_qsa_gqa_matches_full_sequence():
     torchrun(_run_qsa_equivalence, _CI_ACCELERATOR_2.nproc, 4, 2)
 
 
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_compact_qsa_cp_nondivisible_heads_matches_full_sequence():
     torchrun(_run_qsa_equivalence, _CI_ACCELERATOR_2.nproc, 3, 1, "cp", "eager")
 
 
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_compact_qsa_cp_tilelang_matches_full_sequence():
     pytest.importorskip("tilelang")
     torchrun(_run_qsa_equivalence, _CI_ACCELERATOR_2.nproc, 4, 1, "cp", "tilelang")
 
 
+@_CUDA_ONLY
 @pytest.mark.parametrize("bsz", [1, 4])
 @pytest.mark.parametrize("seq_len", [5, 256])
 @pytest.mark.parametrize("num_k_heads,num_v_heads", [(2, 4), (16, 32)])
@@ -540,6 +566,7 @@ def _run_gated_deltanet_equivalence(
     packed: bool = False,
     num_k_heads: int | None = None,
     num_v_heads: int | None = None,
+    parallel_mode: str = "ulysses",
 ) -> None:
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
@@ -550,7 +577,9 @@ def _run_gated_deltanet_equivalence(
     try:
         sp_state = _init_parallel_state(
             dp_size=1,
-            ulysses_size=world_size,
+            cp_size=2 if parallel_mode == "hybrid" else 1,
+            ulysses_size=world_size // 2 if parallel_mode == "hybrid" else world_size,
+            allow_hybrid_cp=parallel_mode == "hybrid",
             device_type=get_device_type(),
             name="sp",
         )
@@ -570,16 +599,19 @@ def _run_gated_deltanet_equivalence(
             config.linear_num_value_heads = num_v_heads
         torch.manual_seed(43)
         _install_qwen4_exp_ops_config()
-        layer = qwen4_exp.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).float().to(device)
+        # Ascend's native GDN kernel rejects FP32 inputs. Keep CUDA's existing
+        # FP32 checks and exercise the actual BF16 training kernel on NPU.
+        dtype = torch.bfloat16 if get_device_type() == "npu" else torch.float32
+        layer = qwen4_exp.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).to(device=device, dtype=dtype)
         _broadcast_module(layer)
 
         local_seq_len = 4
         seq_len = local_seq_len * world_size
         boundaries = [0, local_seq_len - 1, seq_len] if packed else [0, seq_len]
         if rank == 0:
-            full_hidden = torch.randn(1, seq_len, config.hidden_size, device=device)
+            full_hidden = torch.randn(1, seq_len, config.hidden_size, device=device, dtype=dtype)
         else:
-            full_hidden = torch.empty(1, seq_len, config.hidden_size, device=device)
+            full_hidden = torch.empty(1, seq_len, config.hidden_size, device=device, dtype=dtype)
         dist.broadcast(full_hidden, src=0)
         cu_seq_lens = torch.tensor(boundaries, dtype=torch.int32, device=device)
 
@@ -613,32 +645,42 @@ def _run_gated_deltanet_equivalence(
         actual_output = _gather_sequence(actual_output.detach())
         actual_input_grad = _gather_sequence(local_hidden.grad.detach())
         if rank == 0:
-            torch.testing.assert_close(actual_output, expected_output, rtol=2e-5, atol=2e-5)
-            torch.testing.assert_close(actual_input_grad, expected_input_grad, rtol=3e-5, atol=3e-5)
+            output_tolerance = dict(rtol=2e-2, atol=2e-5) if dtype == torch.bfloat16 else dict(rtol=2e-5, atol=2e-5)
+            grad_tolerance = dict(rtol=2e-2, atol=3e-5) if dtype == torch.bfloat16 else dict(rtol=3e-5, atol=3e-5)
+            torch.testing.assert_close(actual_output, expected_output, **output_tolerance)
+            torch.testing.assert_close(actual_input_grad, expected_input_grad, **grad_tolerance)
             for name, parameter in layer.named_parameters():
                 expected_grad = expected_parameter_grads[name]
                 assert expected_grad is not None and parameter.grad is not None, f"Missing gradient for {name}"
                 torch.testing.assert_close(
                     parameter.grad,
                     expected_grad,
-                    rtol=3e-5,
-                    atol=3e-5,
+                    **grad_tolerance,
                     msg=lambda msg, parameter_name=name: f"{msg}\nGradient mismatch for {parameter_name}",
                 )
     finally:
         clear_parallel_state()
 
 
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_gated_deltanet_gqa_matches_full_sequence():
     torchrun(_run_gated_deltanet_equivalence, world_size=_CI_ACCELERATOR_2.nproc, num_k_heads=2, num_v_heads=4)
 
 
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 def test_qwen4_exp_gated_deltanet_matches_full_sequence_sp4():
     torchrun(_run_gated_deltanet_equivalence, world_size=_CI_ACCELERATOR_4.nproc)
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
+def test_qwen4_exp_gated_deltanet_hybrid_u2cp2_matches_full_sequence():
+    """Compare packed GDN outputs and all gradients under the unified four-rank group."""
+    torchrun(_run_gated_deltanet_equivalence, _CI_ACCELERATOR_4.nproc, True, 4, 8, "hybrid")
+
+
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_gated_deltanet_packed_varlen_matches_full_sequence():
     torchrun(
@@ -646,6 +688,7 @@ def test_qwen4_exp_gated_deltanet_packed_varlen_matches_full_sequence():
     )
 
 
+@_CUDA_ONLY
 @pytest.mark.parametrize(("num_k_heads", "num_v_heads"), [(3, 4), (4, 3)])
 def test_qwen4_exp_gated_deltanet_rejects_nondivisible_heads(num_k_heads, num_v_heads):
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
@@ -698,6 +741,7 @@ def _run_gated_deltanet_determinism(bsz: int, seq_len: int) -> None:
         clear_parallel_state()
 
 
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 @pytest.mark.parametrize("bsz", [1, 4])
 @pytest.mark.parametrize("seq_len", [8, 2048])
@@ -705,6 +749,7 @@ def test_qwen4_exp_gated_deltanet_forward_deterministic_sp(bsz: int, seq_len: in
     torchrun(_run_gated_deltanet_determinism, _CI_ACCELERATOR_2.nproc, bsz, seq_len)
 
 
+@_CUDA_ONLY
 @pytest.mark.parametrize("bsz", [1, 4])
 @pytest.mark.parametrize("seq_len", [8, 2048])
 def test_qwen4_exp_gated_deltanet_forward_deterministic_no_sp(bsz: int, seq_len: int) -> None:
@@ -825,6 +870,7 @@ def _run_text_model_equivalence() -> None:
         clear_parallel_state()
 
 
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_packed_text_model_matches_full_sequence():
     torchrun(_run_text_model_equivalence, world_size=_CI_ACCELERATOR_2.nproc)
@@ -952,6 +998,7 @@ def _run_router_aux_loss_equivalence() -> None:
         clear_parallel_state()
 
 
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_router_aux_loss_matches_mean_of_local_shards():
     torchrun(_run_router_aux_loss_equivalence, world_size=_CI_ACCELERATOR_2.nproc)
@@ -1095,11 +1142,13 @@ def _run_vlm_placeholder_equivalence(parallel_mode: str = "ulysses") -> None:
         clear_parallel_state()
 
 
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence():
     torchrun(_run_vlm_placeholder_equivalence, world_size=_CI_ACCELERATOR_2.nproc)
 
 
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_vlm_placeholder_crossing_shards_matches_full_sequence_cp():
     torchrun(_run_vlm_placeholder_equivalence, _CI_ACCELERATOR_2.nproc, "cp")
@@ -1143,6 +1192,7 @@ def _run_vision_real_image_cp_non_fa_rejection() -> None:
         clear_parallel_state()
 
 
+@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_vision_real_image_cp_rejects_non_flash_attention():
     if get_device_type() == "npu":
@@ -1150,6 +1200,7 @@ def test_qwen4_exp_vision_real_image_cp_rejects_non_flash_attention():
     torchrun(_run_vision_real_image_cp_non_fa_rejection, world_size=_CI_ACCELERATOR_2.nproc)
 
 
+@_CUDA_ONLY
 @pytest.mark.parametrize(
     "bad_mask",
     [
@@ -1189,6 +1240,7 @@ def test_qwen4_exp_text_attention_rejects_invalid_sp_attention_mask_before_colle
         attn(hidden_states, (cos, sin), attention_mask=bad_mask)
 
 
+@_CUDA_ONLY
 def test_qwen4_exp_vision_attention_projects_cp_state_to_ulysses_parallel_state() -> None:
     from veomni.distributed import parallel_state as parallel_state_module
     from veomni.distributed.parallel_state import (
