@@ -387,6 +387,71 @@ def test_cpu_dataloader_avoids_vendor_device_queries_and_restores_patch(monkeypa
         assert dataloader._MultiProcessingDataLoaderIter.__init__ is vendor_init
 
 
+@pytest.mark.parametrize("cpu", [False, True])
+@pytest.mark.parametrize("previously_disabled", [False, True])
+@pytest.mark.parametrize("fail_body", [False, True])
+def test_cpu_inductor_avoids_npu_registration_and_restores_policy(monkeypatch, cpu, previously_disabled, fail_body):
+    import sys
+    from types import SimpleNamespace
+
+    import torch
+    from torch._dynamo.exc import BackendCompilerFailed
+    from torch._dynamo.utils import counters
+
+    from scripts.ci.accelerator import pytest_plugin
+
+    class VendorRegistry:
+        _disabled_register = previously_disabled
+
+        @classmethod
+        def disable_register(cls):
+            cls._disabled_register = True
+
+        @classmethod
+        def register_inductor_npu(cls):
+            if not cls._disabled_register:
+                raise RuntimeError("Inductor queried hidden NPU")
+
+    original_call = torch._TorchCompileInductorWrapper.__call__
+
+    def vendor_call(self, model, inputs):
+        VendorRegistry.register_inductor_npu()
+        return original_call(self, model, inputs)
+
+    monkeypatch.setitem(sys.modules, "torch_npu.utils._dynamo", SimpleNamespace(_InductorNpuRegistry=VendorRegistry))
+    monkeypatch.setattr(torch._TorchCompileInductorWrapper, "__call__", vendor_call)
+    monkeypatch.delenv("CI_CASE_PROGRESS", raising=False)
+    plan = CasePlan.sequential(LaunchSpec(device="cpu" if cpu else "accelerator"))
+    item = SimpleNamespace(
+        nodeid="sample", config=SimpleNamespace(_ci_batch_cases={"sample": {"plan": plan.to_dict()}}, _ci_results={})
+    )
+    torch.compiler.reset()
+    protocol = pytest_plugin.pytest_runtest_protocol(item, None)
+    next(protocol)
+    try:
+        value = torch.arange(8, dtype=torch.float32, requires_grad=True)
+        compiled = torch.compile(lambda x: x.square() + 1, fullgraph=True)
+        if cpu or previously_disabled:
+            graphs = counters["stats"]["unique_graphs"]
+            torch.testing.assert_close(compiled(value), value.square() + 1)
+            compiled(value).sum().backward()
+            torch.testing.assert_close(value.grad, 2 * value.detach())
+            assert counters["stats"]["unique_graphs"] > graphs
+        else:
+            with pytest.raises(BackendCompilerFailed, match="Inductor queried hidden NPU"):
+                compiled(value)
+    finally:
+        try:
+            if fail_body:
+                with pytest.raises(RuntimeError, match="test body failed"):
+                    protocol.throw(RuntimeError("test body failed"))
+            else:
+                protocol.close()
+            assert VendorRegistry._disabled_register is previously_disabled
+        finally:
+            torch.compiler.reset()
+
+
 def test_case_workspaces_isolate_relative_checkpoints_and_caches(tmp_path):
     from scripts.ci.accelerator.runtime.workers import create_workspace
 

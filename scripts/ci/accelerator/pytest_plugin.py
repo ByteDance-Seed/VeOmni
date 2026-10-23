@@ -205,6 +205,7 @@ def pytest_runtest_protocol(item, nextitem):
     case = rows.get(item.nodeid)
     previous_device_type = None
     previous_dataloader_init = None
+    previous_npu_registration_disabled = None
     if case and all(spec.device == "cpu" for spec in CasePlan.from_dict(case["plan"]).launches):
         import torch.optim.optimizer as optimizer_module
         from torch.utils._foreach_utils import _get_foreach_kernels_supported_devices
@@ -230,9 +231,19 @@ def pytest_runtest_protocol(item, nextitem):
         ):
             previous_dataloader_init = dataloader._MultiProcessingDataLoaderIter.__init__
             dataloader._MultiProcessingDataLoaderIter.__init__ = npu_module.origin_mpdl_iter_init
+        # The vendor Inductor wrapper otherwise registers its NPU backend even
+        # when compiling CPU graphs. Keep real CPU compilation enabled while
+        # suppressing that registration, without importing the vendor package.
+        npu_dynamo = sys.modules.get("torch_npu.utils._dynamo")
+        npu_registry = getattr(npu_dynamo, "_InductorNpuRegistry", None)
+        if npu_registry is not None:
+            previous_npu_registration_disabled = npu_registry._disabled_register
+            npu_registry.disable_register()
     try:
         yield
     finally:
+        if previous_npu_registration_disabled is not None:
+            npu_registry._disabled_register = previous_npu_registration_disabled
         if previous_dataloader_init is not None:
             dataloader._MultiProcessingDataLoaderIter.__init__ = previous_dataloader_init
         if previous_device_type is not None:

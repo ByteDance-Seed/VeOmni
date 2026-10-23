@@ -29,6 +29,11 @@ with unconditional NPU synchronization/affinity calls, even for CPU datasets.
 CPU-planned cases temporarily use the vendor module's saved Torch constructor
 and restore the patch after teardown or failure. Only replace the known vendor
 wrapper; preserve unrelated constructor patches and all accelerator plans.
+The vendor Inductor wrapper also registers its NPU backend before compiling
+CPU graphs. CPU cases temporarily disable that registration through the loaded
+vendor registry and restore its prior disabled state after teardown or failure.
+Keep real CPU Inductor compilation and gradient checks enabled; do not replace
+compiled-mask coverage with eager execution to avoid hidden-device queries.
 A synthetic registered backend alone misses vendor monkeypatches: exercise
 the pinned wheel's optimizer patch in CPU isolation audits too.
 

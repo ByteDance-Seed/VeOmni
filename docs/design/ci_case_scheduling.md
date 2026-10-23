@@ -283,6 +283,10 @@ DataLoader iterator constructor. Its vendor wrapper otherwise queries NPU
 affinity before starting CPU workers. The worker replaces only that known
 wrapper and restores it after teardown or failure; unrelated constructor
 patches and accelerator cases retain their original behavior.
+CPU compilation also temporarily disables the loaded vendor registry's NPU
+Inductor registration, which otherwise queries a hidden device before compiling
+CPU graphs. The prior registration policy is restored after teardown or failure.
+This keeps actual CPU compilation enabled and leaves accelerator cases unchanged.
 
 Both unit and e2e suites consume the same planner/scheduler. Suite selection
 defines which cases run, and launch plans define their resource requirements.

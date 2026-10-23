@@ -123,6 +123,9 @@ For CPU cases, the worker also temporarily restores Torch's multi-worker
 DataLoader iterator constructor from the loaded torch_npu module. The vendor
 wrapper queries NPU affinity even for CPU data. Its original patch is restored
 after teardown or failure; accelerator cases keep the vendor constructor.
+The same CPU scope disables NPU backend registration by the loaded vendor
+Inductor registry, restoring its previous policy afterward. CPU graphs still
+compile with Inductor; accelerator cases keep normal NPU registration.
 
 ## Results and local commands
 
