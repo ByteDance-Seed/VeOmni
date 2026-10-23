@@ -871,6 +871,12 @@ class AcceleratorConfig:
             )
         assert self.tp_size == 1, "Tensor parallel size not supported yet."
         assert self.pp_size == 1, "Pipeline parallel size not supported yet."
+        if self.cp_size > 1 and self.ulysses_size > 1:
+            raise NotImplementedError(
+                "Context parallelism cannot be combined with Ulysses yet; "
+                f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
+                "Set ulysses_size=1 to use context parallelism."
+            )
 
         self.dp_size = self.world_size // non_dp_size
 

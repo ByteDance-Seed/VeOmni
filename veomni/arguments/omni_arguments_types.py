@@ -850,7 +850,16 @@ def _validate_omni_dp_size(
     top_accelerator: AcceleratorConfig,
     modules: dict[str, OmniModuleRuntimeArguments],
 ) -> None:
-    """Verify every distributed module and ``model.accelerator`` resolve to the same ``dp_size``."""
+    """Verify every distributed module and ``model.accelerator`` resolve to the same ``dp_size``.
+
+    Each module in a SeedOmni model may independently choose Ulysses SP (``ulysses_size``)
+    or Context Parallelism (``cp_size``), provided every distributed module and the outer
+    ``model.accelerator`` share the **same ``dp_size``** (and therefore the same
+    ``sp_size = cp_size * ulysses_size = world_size // dp_size`` with ``pp_size = tp_size = 1``).
+    Because ``ParallelState`` always orders its device mesh ``[pp, dp_replicate, dp_shard, cp, ulysses, tp]``,
+    matching ``dp_size`` guarantees identical ``dp_rank``, ``dp_group``, ``sp_group`` (replication group),
+    and ``fsdp_group`` across all modules and the outer trainer.
+    """
     distributed_modules = {
         name: mod_args for name, mod_args in modules.items() if mod_args.accelerator.fsdp_config.fsdp_mode != "eager"
     }

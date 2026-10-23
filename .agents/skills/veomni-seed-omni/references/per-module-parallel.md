@@ -6,10 +6,15 @@ version is `docs/seed_omni/distributed/per_module_parallelism.md`.
 
 ## Config Ownership
 
-- Top-level `accelerator` defines the default/global topology.
+- Top-level `accelerator` defines the default/global topology (`"base"`).
 - A module may override with its own `accelerator:` block in a modules YAML.
-- Same topology should reuse the global `ParallelState`.
-- Different topology gets a module-local `ParallelState`.
+- Each `ModuleRuntime` registers its `ParallelState` under `self.module_name` via
+  `init_parallel_state_from_config(accelerator, self.module_name)` and enters it
+  via `use_parallel_state(self.module_name)` (`ModuleRuntime._scoped()`); module
+  code must never rely on an unscoped ambient global `ParallelState`.
+- Identical-topology modules share the cached `ParallelState` / device-mesh
+  object in `_PARALLEL_STATE_CACHE` under their respective module names, while a
+  module with a different topology builds its own `ParallelState` and mesh.
 - `accelerator.fsdp_config.fsdp_scope: model` wraps the composed `OmniModel`
   once instead of each module. Module YAML is not rewritten: mesh, init
   device, and FSDP wrap knobs come from the top-level accelerator. Wrap
@@ -53,38 +58,45 @@ backbone:
 ## Sequence & Context Parallel (`ulysses_size` / `cp_size`)
 
 > SeedOmni requires every distributed module to share one **`dp_size`** (and
-> therefore one unified `sp_size = cp_size * ulysses_size = world_size // dp_size`),
-> while each module may independently choose Ulysses SP (`ulysses_size`), Context
-> Parallelism (`cp_size`), or hybrid `cp * sp`. Design and invariants:
+> therefore one unified `sp_size = cp_size * ulysses_size = world_size // dp_size`
+> with `pp_size = tp_size = 1`), while each module may independently choose
+> Ulysses SP (`ulysses_size = S, cp_size = 1`) or Context Parallelism
+> (`cp_size = S, ulysses_size = 1`). Combining `cp_size > 1` and `ulysses_size > 1`
+> on a single module is not supported yet. Design and invariants:
 > `docs/seed_omni/distributed/sequence_parallel.md`.
 
-`dp_size` is **uniform across all distributed modules**. You can set a uniform
-`model.accelerator.ulysses_size` (or `cp_size`), or override `ulysses_size` and
-`cp_size` per module in `modules_train.yaml` as long as `cp_size * ulysses_size`
-is identical across all distributed modules and `model.accelerator`. Because
-`_deep_update` merges keys individually, overriding `cp_size > 1` on a module
-when the base config has `ulysses_size > 1` (or vice versa) requires setting
-`ulysses_size: 1` (or `cp_size: 1`) if pure CP (or pure SP) is intended;
-`build_omni_model_runtime_args` enforces `_validate_omni_dp_size` to verify that
-all distributed modules and `model.accelerator` resolve to the same `dp_size`.
+`dp_size` is **uniform across all distributed modules** (`pp_size = tp_size = 1`).
+You can set a uniform `model.accelerator.ulysses_size` (or `cp_size`), or override
+`ulysses_size` and `cp_size` per module in `modules_train.yaml` as long as
+`cp_size * ulysses_size` is identical across all distributed modules and
+`model.accelerator`. Because `_deep_update` merges keys individually, overriding
+`cp_size > 1` on a module when the base config has `ulysses_size > 1` (or vice
+versa) requires setting `ulysses_size: 1` (or `cp_size: 1`) so the module does
+not enable both axes simultaneously (`AcceleratorConfig` / `ParallelState`
+rejects `cp_size > 1 and ulysses_size > 1`), and `build_omni_model_runtime_args`
+enforces `_validate_omni_dp_size` to verify that all distributed modules and
+`model.accelerator` resolve to the same `dp_size`.
 The dataloader is the standard `BaseTrainer` build-time sharded
 loader: it yields `dp_size = world / sp_size` **distinct** shards and
 **replicates** each shard across its `sp_group`, so every rank of an `sp_group`
 holds the SAME sample.
 
-A module with `sp_size = S > 1` runs classic single-pass Ulysses, with the SP
-slice/gather living INSIDE its own `pre_forward` / `post_forward` (no separate
-`sp_pre_forward` / `sp_post_forward` hooks — same shape as single-model
+A module with `sp_size = S > 1` runs single-pass sequence/context parallelism,
+with the slice/gather living INSIDE its own `pre_forward` / `post_forward` (no
+separate `sp_pre_forward` / `sp_post_forward` hooks — same shape as single-model
 SP):
 
     kwargs = module.pre_forward(**data)    # if sp_size>1: pad + slice replicated sample to 1/S
-    out    = module(**kwargs)              # ONE forward; attention all-to-alls over the SP group
+    out    = module(**kwargs)              # ONE forward; attention runs its configured SP/CP collective
     out    = module.post_forward(**out)    # if sp_size>1: gather_outputs → all-gather + strip pad; then SP-agnostic write-back
 
-Forward AND backward both peak at ≈ `1/S` — no loop, no per-sample checkpoint, no
-CPU offload. `gather_outputs` uses autograd-aware `_Gather`; its backward
-all-reduce over the SP group is cancelled by FSDP2's grad averaging over the
-`dp_shard_sp` mesh, so gradients match the non-SP baseline (constraints 7c/7d).
+During the module's forward and backward pass, intermediate layer activations scale
+as `≈ 1/S` of a full sample (no loop, no per-sample checkpoint, no CPU offload),
+while `post_forward`'s `gather_outputs` materializes the full-sequence module
+output on every SP rank before stripping padding. `gather_outputs` uses
+autograd-aware `_Gather`; its backward all-reduce over the SP group is cancelled
+by FSDP2's grad averaging over the `dp_shard_sp` mesh, so gradients match the
+non-SP baseline (`.agents/knowledge/veomni-seed-omni.md` §3).
 
 Primitives (`distributed/sequence_parallel`), each called from an
 `if get_parallel_state().sp_size > 1:` branch:
@@ -109,46 +121,48 @@ Which dim shards depends on the module's attention:
   `veomni_omni_module_clip_grad_norm` when `sp_size > 1`, and set
   `broadcast_buffers=False` under SP (constraint 7a).
 
-**Per-module group isolation.** Each module builds its OWN `ParallelState`/device
-mesh, so even at the same uniform SP size the modules hold distinct SP subgroup
-objects. This is safe because the SP/DP/CP process groups are
-**ParallelState-local**: the `comm.py` getters
-(`get_ulysses_sequence_parallel_group`, `get_unified_sequence_parallel_group`, …)
-resolve from `get_parallel_state().{ulysses,sp,cp,dp}_group` (the current state's
-device-mesh subgroup) — there are no group globals. Since `use_parallel_state`
-(via the graph's `module_context`) already scopes `_PARALLEL_STATE` per module for
-its forward and its grad-checkpoint recompute, the global attention integration
-(`veomni_flash_attention_2`, which only reaches the group through
-`get_ulysses_sequence_parallel_group()`) automatically all-to-alls over the
-scoped module's own group. No key bookkeeping. (No group-injection seam: SP unit
+**Per-module group isolation.** Each `ModuleRuntime` registers its `ParallelState`
+under `self.module_name` (reusing a cached `ParallelState` only when two modules
+have identical topology keys, and building a distinct mesh when their topologies
+differ). This is safe because the SP/DP/CP process groups are
+**ParallelState-local**: the `comm.py` getters (`get_ulysses_sequence_parallel_group`,
+`get_context_parallel_group`, `get_unified_sequence_parallel_group`,
+`get_data_parallel_group`) resolve from
+`get_parallel_state().{ulysses,cp,sp,dp}_group` (the current state's device-mesh
+subgroup) — there are no group globals. Since `use_parallel_state` (via the
+graph's `module_context` and `ModuleRuntime._recompute_context`) scopes
+`_PARALLEL_STATE` per module for its forward and grad-checkpoint recompute:
+- **Ulysses-enabled modules (`ulysses_size > 1`)**: `veomni_flash_attention_2`
+  reaches its all-to-all group through `get_ulysses_sequence_parallel_group()`,
+  automatically using the scoped module's Ulysses subgroup.
+- **CP-enabled modules (`cp_size > 1`)**: context-parallel attention reads the
+  scoped module's CP subgroup via `get_context_parallel_group()` /
+  `get_parallel_state().cp_group` (when `ulysses_size == 1`, `ulysses_group` is
+  `None`), while `pre_forward` / `post_forward` slice and gather over the
+  unified `sp_group` (`get_unified_sequence_parallel_group()`).
+No key bookkeeping is needed, and there is no group-injection seam: SP unit
 tests build a real state via `_init_parallel_state(dp_size=1, ulysses_size=world_size)`
-and toggle the no-SP path with `set_parallel_state(None)`.)
+and toggle the no-SP path with `set_parallel_state(None)`.
 
-**Nested-config gotcha:** an SP module whose real weights live in a nested HF
-config (e.g. `Qwen3VLVisionEncoderConfig.vision_config`,
-`Qwen3VLLlmConfig.text_config`) MUST declare `sub_configs = {"<name>": <Cfg>}` on
-the top-level config so transformers propagates `attn_implementation`
-(`veomni_flash_attention_2`) to the inner model. Without it the inner
-model silently falls back to SDPA — the Ulysses all-to-all lives in the
-flash-attention path, so SDPA leaves the sliced chunk ungathered while the
-cu_seqlens describe the full sequence (a `split_with_sizes` size mismatch).
+**Nested configs:** for an SP module whose weights live in a nested HF config
+(e.g. `Qwen3VLVisionEncoderConfig.vision_config`,
+`Qwen3VLLlmConfig.text_config`), declare `sub_configs = {"<name>": <Cfg>}` on
+the top-level config so `transformers` propagates `attn_implementation`
+(`veomni_flash_attention_2`) to the inner model.
 
 Metering must stash **pre-slice full-sample** seqlens in `pre_forward` (see
-`module-contract.md` + constraint 7e). All backbones (`qwen3/llm`, `janus/llama`,
+`module-contract.md` and `.agents/knowledge/veomni-seed-omni.md` §3). All backbones (`qwen3/llm`, `janus/llama`,
 `qwen3vl/llm`), the text encoder (`text_encoder`) and vision towers
 (`qwen3vl/vision`, `janus/siglip`, `janus/vqvae`) support `sp_size > 1`. The
-Qwen3-VL in-model backbone (`qwen3vl/llm`) slices the packed sequence INCLUDING
-DeepStack visual embeds + 3-row M-RoPE `position_ids`; since the sample is
-replicated (each rank self-describing), `visual_pos_masks` / per-layer DeepStack
-embeds are normalized to real tensors before the slice (no cross-rank
-reconciliation).
+Qwen3-VL in-model backbone (`qwen3vl/llm`) slices the packed sequence including
+DeepStack visual embeds and 3-row M-RoPE `position_ids` after normalizing
+`visual_pos_masks` and per-layer DeepStack embeds to tensors.
 
 ## Inference
 
 - Eager inference is the default for modules without a distributed accelerator.
 - A module needs distributed launch when its inference accelerator uses non-eager
   FSDP/DDP.
-- Under `torchrun`, eager full-replica modules should pin to the rank's device;
-  avoid `device_map="auto"` fanning every rank across all GPUs.
+- Under `torchrun`, pin eager full-replica modules to each rank's local device.
 - Keep separate module config files for eager and distributed inference when
   both modes are supported.

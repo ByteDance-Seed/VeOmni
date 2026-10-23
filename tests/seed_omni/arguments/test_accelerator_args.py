@@ -266,8 +266,8 @@ def test_build_omni_model_runtime_args_rejects_an_eager_module_under_the_compose
 
 def test_deep_update_merges_sp_and_cp_from_base_and_override(monkeypatch):
     """``build_omni_module_runtime_args`` merges module overrides onto ``global_args``
-    directly via ``_deep_update``, allowing a module to inherit one axis from base
-    or explicitly override both axes."""
+    directly via ``_deep_update``, allowing a module to inherit ``ulysses_size`` from
+    base or explicitly switch to ``cp_size`` by resetting ``ulysses_size=1``."""
     monkeypatch.setenv("WORLD_SIZE", "8")
     global_args = OmniModuleRuntimeArguments(
         model_path="/tmp/model",
@@ -279,25 +279,18 @@ def test_deep_update_merges_sp_and_cp_from_base_and_override(monkeypatch):
         {
             "pure_sp": {"model_path": "pure_sp"},
             "pure_cp": {"accelerator": {"cp_size": 4, "ulysses_size": 1}},
-            "hybrid_cp_sp": {"accelerator": {"cp_size": 2, "ulysses_size": 2}},
         },
     )
     assert (modules["pure_sp"].accelerator.cp_size, modules["pure_sp"].accelerator.ulysses_size) == (1, 4)
     assert (modules["pure_cp"].accelerator.cp_size, modules["pure_cp"].accelerator.ulysses_size) == (4, 1)
-    assert (modules["hybrid_cp_sp"].accelerator.cp_size, modules["hybrid_cp_sp"].accelerator.ulysses_size) == (2, 2)
-    assert (
-        modules["pure_sp"].accelerator.dp_size
-        == modules["pure_cp"].accelerator.dp_size
-        == modules["hybrid_cp_sp"].accelerator.dp_size
-        == 2
-    )
+    assert modules["pure_sp"].accelerator.dp_size == modules["pure_cp"].accelerator.dp_size == 2
 
 
-def test_deep_update_unreset_axis_caught_by_dp_size_validation(monkeypatch):
-    """When top-level ``model.accelerator`` sets ``ulysses_size=2`` (``dp_size=4`` on
-    ``WORLD_SIZE=8``) and a module overrides only ``cp_size=2`` without resetting
-    ``ulysses_size=1``, ``_deep_update`` merges both into ``(cp_size=2, ulysses_size=2)``
-    (``dp_size=2``), which ``_validate_omni_dp_size`` rejects."""
+def test_deep_update_unreset_axis_rejected_by_cp_ulysses_guard(monkeypatch):
+    """When top-level ``model.accelerator`` sets ``ulysses_size=2`` and a module
+    overrides only ``cp_size=2`` without resetting ``ulysses_size=1``, ``_deep_update``
+    merges both into ``(cp_size=2, ulysses_size=2)``, which ``AcceleratorConfig``
+    rejects because combined CP+Ulysses on a single module is not supported yet."""
     monkeypatch.setenv("WORLD_SIZE", "8")
     args = _fake_args(
         accelerator=AcceleratorConfig(ulysses_size=2),
@@ -306,25 +299,24 @@ def test_deep_update_unreset_axis_caught_by_dp_size_validation(monkeypatch):
             MODULE_B: {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2"}, "cp_size": 2}},
         },
     )
-    with pytest.raises(ValueError, match="All distributed SeedOmni modules must resolve to the same `dp_size`"):
+    with pytest.raises(NotImplementedError, match="Context parallelism cannot be combined with Ulysses yet"):
         build_omni_model_runtime_args(args)
 
 
-def test_build_omni_model_runtime_args_accepts_heterogeneous_sp_cp_with_matching_dp_size(monkeypatch):
-    """Modules may use SP (ulysses_size=4), CP (cp_size=4), or CP*SP (cp_size=2, ulysses_size=2)
-    as long as every distributed module and top-level ``model.accelerator`` resolve to the same ``dp_size``."""
+def test_build_omni_model_runtime_args_accepts_heterogeneous_sp_and_cp_with_matching_dp_size(monkeypatch):
+    """Modules may independently use Ulysses SP or Context Parallelism as long as all
+    distributed modules and ``model.accelerator`` resolve to the same ``dp_size``."""
     monkeypatch.setenv("WORLD_SIZE", "8")
     args = _fake_args(
         accelerator=AcceleratorConfig(ulysses_size=4),
         modules_override={
-            MODULE_A: {"accelerator": {"fsdp_config": {"fsdp_mode": "ddp"}, "cp_size": 2, "ulysses_size": 2}},
+            MODULE_A: {"accelerator": {"fsdp_config": {"fsdp_mode": "ddp"}, "ulysses_size": 4, "cp_size": 1}},
             MODULE_B: {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2"}, "cp_size": 4, "ulysses_size": 1}},
         },
     )
     runtime_args = build_omni_model_runtime_args(args)
     assert runtime_args.modules[MODULE_A].accelerator.dp_size == 2
     assert runtime_args.modules[MODULE_B].accelerator.dp_size == 2
-    assert runtime_args.accelerator.dp_size == 2
     assert args.train.global_batch_size == args.train.micro_batch_size * 2
 
 

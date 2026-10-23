@@ -41,6 +41,8 @@ class OmniModuleConfig(PretrainedConfig):
     composed model loads it.
     """
 
+    _supports_context_parallel: bool = False
+
     def __init__(
         self,
         model_path: str | None = None,
