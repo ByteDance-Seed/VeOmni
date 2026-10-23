@@ -610,7 +610,7 @@ class ChannelLossComputer:
                 int(status["segment_counts"][observation_idx]) for status in statuses
             ]
 
-        # No observer-owned tensor construction, conversion, or validation
+        # No observer-owned tensor allocation, conversion, or validation
         # is permitted in this loop. All buffers were materialized before the
         # preflight, so approved ranks execute an unconditional fixed sequence.
         for observation in pending_sp:
@@ -1552,15 +1552,16 @@ class ChannelLossComputer:
     ) -> None:
         if descriptor.group is None or descriptor.world <= 1:
             return
+        rows = max(max(observation.gathered_segment_counts, default=0), 1)
         try:
             dist.all_gather(
-                observation.gathered_loss_payloads,
-                observation.loss_payload,
+                [payload[:rows] for payload in observation.gathered_loss_payloads],
+                observation.loss_payload[:rows],
                 group=descriptor.group,
             )
             dist.all_gather(
-                observation.gathered_integer_payloads,
-                observation.integer_payload,
+                [payload[:rows] for payload in observation.gathered_integer_payloads],
+                observation.integer_payload[:rows],
                 group=descriptor.group,
             )
         except Exception as error:

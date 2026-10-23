@@ -1089,7 +1089,7 @@ def test_channel_loss_sp_keeps_zero_supervision_segment_before_tail_padding(monk
     ]
 
 
-def _ready_sp_observation(parallel_state, *, loss_sum=1.0):
+def _ready_sp_observation(parallel_state, *, loss_sum=1.0, payload_capacity=2):
     segment = {
         "batch_idx": 0,
         "sp_rank": 0,
@@ -1106,10 +1106,47 @@ def _ready_sp_observation(parallel_state, *, loss_sum=1.0):
         [segment],
         ["source-a"],
         device=torch.device("cpu"),
-        payload_capacity=2,
+        payload_capacity=payload_capacity,
         parallel_state=parallel_state,
         include_data_stats=True,
     )
+
+
+@pytest.mark.parametrize("segment_counts", [(1, 2), (0, 0)])
+def test_channel_loss_sp_payload_gathers_only_used_prefix(monkeypatch, segment_counts):
+    state = _test_parallel_state(sp_enabled=True, sp_size=2, sp_group=object())
+    observation = _ready_sp_observation(state, payload_capacity=128)
+    observation.gathered_segment_counts = list(segment_counts)
+    rows = max(max(segment_counts), 1)
+    calls = []
+    pairs = (
+        (observation.loss_payload, observation.gathered_loss_payloads),
+        (observation.integer_payload, observation.gathered_integer_payloads),
+    )
+    for _, buffers in pairs:
+        for buffer in buffers:
+            buffer.fill_(-99)
+
+    def gather(outputs, value, group):
+        source, buffers = pairs[len(calls)]
+        assert group is state.sp_group
+        assert value.shape == source[:rows].shape
+        assert value.is_contiguous() and value.data_ptr() == source.data_ptr()
+        assert len(outputs) == len(buffers)
+        for output, buffer in zip(outputs, buffers, strict=True):
+            assert output.shape == buffer[:rows].shape
+            assert output.is_contiguous() and output.data_ptr() == buffer.data_ptr()
+            output.copy_(value)
+        calls.append(value.shape)
+
+    monkeypatch.setattr(channel_loss_module.dist, "all_gather", gather)
+    ChannelLossComputer._gather_prepared_sp_payload(observation, observation.capture_descriptor)
+
+    assert len(calls) == 2
+    for source, buffers in pairs:
+        for buffer in buffers:
+            torch.testing.assert_close(buffer[:rows], source[:rows], rtol=0, atol=0)
+            assert torch.all(buffer[rows:] == -99)
 
 
 def test_channel_loss_sp_capture_reuses_cached_parallel_state_descriptor():
