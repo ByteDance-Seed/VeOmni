@@ -952,6 +952,49 @@ class TestDeepseekV4ConverterConvert:
                 fqn_to_index_mapping=scaled_mapping
             )
 
+        # On SM90+, preflight validation succeeds
+        monkeypatch.setattr(export_quant.torch.version, "hip", None, raising=False)
+        monkeypatch.setattr(export_quant, "get_gpu_compute_capability", lambda: 90)
+        validate_deepseek_v4_export_quant_support(scaled_mapping)
+        DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS).validate_export_support(
+            fqn_to_index_mapping=scaled_mapping
+        )
+
+    def test_checkpoint_manager_skips_sm90_preflight_on_legacy_save_routes(self, monkeypatch):
+        from veomni.models.checkpoint.manager import ModelCheckpointManager
+        from veomni.models.transformers.deepseek_v4 import export_quant
+        from veomni.utils import save_safetensor_utils
+
+        monkeypatch.setattr(export_quant, "IS_CUDA_AVAILABLE", True)
+        monkeypatch.setattr(export_quant, "get_gpu_compute_capability", lambda: 89)
+        monkeypatch.setattr("veomni.models.checkpoint.manager.build_checkpointer", lambda **kwargs: object())
+
+        scaled_mapping = {"layers.0.attn.wq_a.weight": 1, "layers.0.attn.wq_a.scale": 1}
+        model = SimpleNamespace(
+            config=SimpleNamespace(n_routed_experts=NUM_EXPERTS),
+            _create_checkpoint_tensor_converter=staticmethod(create_deepseek_v4_checkpoint_tensor_converter),
+        )
+        runtime = SimpleNamespace(
+            model=model,
+            train_args=SimpleNamespace(checkpoint=SimpleNamespace(manager="dcp", save_hf_weights=True)),
+            args=SimpleNamespace(
+                accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="fsdp2")),
+                lora_config=None,
+                fqn_to_index_mapping=scaled_mapping,
+            ),
+        )
+
+        # On NPU, save_hf_safetensor routes through the legacy BF16 path, so preflight must not fail
+        monkeypatch.setattr(save_safetensor_utils, "IS_NPU_AVAILABLE", True)
+        assert not save_safetensor_utils.should_use_distributed_hf_safetensor_save("dcp")
+        ModelCheckpointManager(runtime)
+
+        # On GPU with DCP, distributed save is active, so SM89 fails preflight
+        monkeypatch.setattr(save_safetensor_utils, "IS_NPU_AVAILABLE", False)
+        assert save_safetensor_utils.should_use_distributed_hf_safetensor_save("dcp")
+        with pytest.raises(RuntimeError, match="SM90 or later"):
+            ModelCheckpointManager(runtime)
+
     def test_dequantizes_block_scaled_fp8_weight(self):
         weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))
         scale = torch.tensor([[1.0, 2.0], [4.0, 8.0]])

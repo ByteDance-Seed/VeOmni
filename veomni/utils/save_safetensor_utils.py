@@ -249,6 +249,20 @@ def _save_hf_safetensor_legacy(
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_hf_safetensor_path} successfully!")
 
 
+def should_use_distributed_hf_safetensor_save(ckpt_manager: Optional[str]) -> bool:
+    """Return whether ``save_hf_safetensor`` routes through the distributed writer and converter export.
+
+    Disable the distributed ``HuggingFaceStorageWriter`` path on NPU. Under
+    HSDP replicate ranks independently cast fp32->bf16 on-device and write
+    per-rank safetensors files. When the casts are not bit-exact (~1 ULP on
+    Ascend 910B) the consolidation step bakes in whichever rank's data it
+    reads last, causing an intermittent mismatch against the fp32 DCP
+    checkpoint. Route through the legacy rank-0 path until the underlying
+    fp32->bf16 determinism issue is resolved in the NPU stack.
+    """
+    return is_torch_version_greater_than("2.9") and ckpt_manager == "dcp" and not IS_NPU_AVAILABLE
+
+
 def save_hf_safetensor(
     save_hf_safetensor_path: Optional[str] = None,
     ckpt_manager: Optional[str] = None,
@@ -291,14 +305,7 @@ def save_hf_safetensor(
     """
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
-    # Disable the distributed `HuggingFaceStorageWriter` path on NPU.  Under
-    # HSDP replicate ranks independently cast fp32->bf16 on-device and write
-    # per-rank safetensors files.  When the casts are not bit-exact (~1 ULP on
-    # Ascend 910B) the consolidation step bakes in whichever rank's data it
-    # reads last, causing an intermittent mismatch against the fp32 DCP
-    # checkpoint.  Route through the legacy rank-0 path until the underlying
-    # fp32->bf16 determinism issue is resolved in the NPU stack.
-    use_distributed = is_torch_version_greater_than("2.9") and ckpt_manager == "dcp" and not IS_NPU_AVAILABLE
+    use_distributed = should_use_distributed_hf_safetensor_save(ckpt_manager)
 
     # Ensure all GPU operations are complete before reading tensor data for saving
     synchronize()
