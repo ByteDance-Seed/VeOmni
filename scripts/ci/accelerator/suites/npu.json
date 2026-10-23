@@ -396,6 +396,17 @@
     ]
   },
   {
+    "name": "save-safetensor-utils-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_save_safetensor_utils.py"
+    ]
+  },
+  {
     "name": "npu-e2e-01",
     "suite": "e2e",
     "args": [

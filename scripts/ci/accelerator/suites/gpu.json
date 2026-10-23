@@ -603,6 +603,16 @@
     ]
   },
   {
+    "name": "save-safetensor-utils-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_save_safetensor_utils.py"
+    ]
+  },
+  {
     "name": "57-e2e",
     "suite": "e2e",
     "conditional": false,

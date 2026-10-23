@@ -93,16 +93,32 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
 
 
 def _has_extra_parallel_plan(model: nn.Module) -> bool:
-    """True when the model's parallel plan declares ExtraParallel-sharded tensors.
+    """True when the model's parallel plan shards tensors on an active ExtraParallel dimension.
 
     The question both ExtraParallel guards below actually need to ask. A plan is
     a property of the *model*, unlike ``ParallelState.any_extra_parallel_enabled``,
-    which only says an ep dim exists in the mesh — and a mesh dim is inherited by
-    every sub-module of a SeedOmni V2 config, including the ones that have no
-    experts.
+    which only says an ExtraParallel dim exists in the mesh — and a mesh dim is
+    inherited by every sub-module of a SeedOmni V2 config, including the ones that
+    have no experts or declare a different ExtraParallel axis (e.g. ``emb`` while
+    only ``ep`` is enabled).
     """
     plan = get_runtime_parallel_plan(model)
-    return plan is not None and bool(getattr(plan, "extra_parallel_plan", None))
+    extra_plan = getattr(plan, "extra_parallel_plan", None) if plan is not None else None
+    if not extra_plan:
+        return False
+    planned_dims = {para for para, entries in extra_plan.items() if entries}
+    if not planned_dims:
+        return False
+    parallel_state = get_parallel_state()
+    if hasattr(parallel_state, "extra_parallel_enabled") and getattr(
+        parallel_state, "any_extra_parallel_enabled", False
+    ):
+        return any(
+            parallel_state.extra_parallel_enabled(para)
+            for para in planned_dims
+            if para in getattr(parallel_state, "extra_parallel_sizes", ())
+        )
+    return True
 
 
 def _materialize_and_load_weights(
