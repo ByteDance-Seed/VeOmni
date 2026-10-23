@@ -32,13 +32,18 @@ def _ce_loss_func(
     num_items_in_batch: int | Tensor,
     ignore_index: int,
     logits_bias: Tensor | None = None,
+    logits_bias_weight: Tensor | None = None,
 ) -> Tensor:
-    """Per-chunk body: linear (+ optional logits_bias) then eager CE."""
+    """Per-chunk body: linear (+ optional full or factored logits_bias) then eager CE."""
     labels_flat = labels.reshape(-1)
     hidden_flat = hidden_states.reshape(-1, hidden_states.size(-1))
     logits = F.linear(hidden_flat, weight).float()
     if logits_bias is not None:
-        logits = logits + logits_bias.reshape(-1, logits_bias.size(-1)).float()
+        bias_flat = logits_bias.reshape(-1, logits_bias.size(-1))
+        if logits_bias_weight is not None:
+            logits = logits + F.linear(bias_flat, logits_bias_weight).float()
+        else:
+            logits = logits + bias_flat.float()
     return _eager.cross_entropy_from_logits(
         logits, labels_flat, ignore_index=ignore_index, num_items_in_batch=num_items_in_batch
     )
@@ -49,6 +54,7 @@ def forward(
     labels: Tensor,
     weight: Tensor,
     logits_bias: Tensor | None = None,
+    logits_bias_weight: Tensor | None = None,
     *,
     ignore_index: int = -100,
     num_items_in_batch: int | None = None,
@@ -63,23 +69,40 @@ def forward(
     the valid-token count. Unused ``V×H`` grads require both
     ``requires_grad`` and the caller's ``is_grad_enabled()``.
 
-    When ``logits_bias`` is provided (shaped ``hidden.shape[:-1] + (V,)``),
-    ``hidden``, ``labels``, and ``logits_bias`` are split into ``chunk_size``
-    slices along the sequence dimension, adding ``logits_bias`` to each
-    chunk's fp32 logits.
+    When ``logits_bias`` is provided, ``hidden``, ``labels``, and
+    ``logits_bias`` are split into ``chunk_size`` slices along the sequence
+    dimension. If ``logits_bias_weight`` (shape ``(V, rank)``) is also
+    provided, ``F.linear(bias_chunk, logits_bias_weight)`` is projected inside
+    each chunk so no full ``[B, S, V]`` bias tensor or gradient is
+    materialized; otherwise ``logits_bias`` has shape ``hidden.shape[:-1] + (V,)``
+    and is added directly to each chunk's fp32 logits.
     """
     if weight.numel() == 0:
         raise RuntimeError("chunk_loss requires a nonempty ``weight`` (fused-linear path)")
-    if logits_bias is not None and logits_bias.shape[:-1] != hidden.shape[:-1]:
-        raise ValueError(
-            f"logits_bias rows {tuple(logits_bias.shape[:-1])} do not match hidden_states rows "
-            f"{tuple(hidden.shape[:-1])}."
-        )
+    if logits_bias_weight is not None and logits_bias is None:
+        raise ValueError("logits_bias_weight requires logits_bias to be provided.")
+    if logits_bias is not None:
+        if logits_bias.shape[:-1] != hidden.shape[:-1]:
+            raise ValueError(
+                f"logits_bias rows {tuple(logits_bias.shape[:-1])} do not match hidden_states rows "
+                f"{tuple(hidden.shape[:-1])}."
+            )
+        if logits_bias_weight is not None:
+            if logits_bias_weight.ndim != 2 or logits_bias_weight.shape != (weight.shape[0], logits_bias.shape[-1]):
+                raise ValueError(
+                    f"logits_bias_weight shape {tuple(logits_bias_weight.shape)} must match "
+                    f"(vocab_size={weight.shape[0]}, rank={logits_bias.shape[-1]})."
+                )
+        elif logits_bias.shape[-1] != weight.shape[0]:
+            raise ValueError(
+                f"logits_bias last dim {logits_bias.shape[-1]} does not match vocab_size {weight.shape[0]}."
+            )
 
     compute_grads = torch.is_grad_enabled() if grad_enabled is None else grad_enabled
     hidden_needs_grad = _needs_input_grad(hidden, compute_grads)
     weight_needs_grad = _needs_input_grad(weight, compute_grads)
     bias_needs_grad = logits_bias is not None and _needs_input_grad(logits_bias, compute_grads)
+    bias_weight_needs_grad = logits_bias_weight is not None and _needs_input_grad(logits_bias_weight, compute_grads)
     hidden_token_count = hidden.shape[:-1].numel()
     label_token_count = labels.numel()
     if hidden_token_count != label_token_count:
@@ -90,10 +113,15 @@ def forward(
             torch.zeros_like(hidden) if hidden_needs_grad else hidden.new_empty(0),
             torch.zeros_like(weight) if weight_needs_grad else weight.new_empty(0),
             *((torch.zeros_like(logits_bias),) if bias_needs_grad and logits_bias is not None else ()),
+            *(
+                (torch.zeros_like(logits_bias_weight),)
+                if bias_weight_needs_grad and logits_bias_weight is not None
+                else ()
+            ),
         )
         return loss, SavedState(
             saved_tensors,
-            _Meta(True, hidden_needs_grad, weight_needs_grad, bias_needs_grad),
+            _Meta(True, hidden_needs_grad, weight_needs_grad, bias_needs_grad, bias_weight_needs_grad),
         )
 
     denom: int | Tensor
@@ -109,22 +137,32 @@ def forward(
         logits_bias.split(chunk_size, dim=split_dim) if logits_bias is not None else (None,) * len(hidden_chunks)
     )
     accumulated_loss = torch.zeros((), device=hidden.device, dtype=torch.float32)
-    if not (hidden_needs_grad or weight_needs_grad or bias_needs_grad):
+    if not (hidden_needs_grad or weight_needs_grad or bias_needs_grad or bias_weight_needs_grad):
         for hidden_chunk, label_chunk, bias_chunk in zip(hidden_chunks, label_chunks, bias_chunks, strict=True):
             accumulated_loss = accumulated_loss + _ce_loss_func(
-                hidden_chunk, weight, label_chunk, denom, ignore_index, bias_chunk
+                hidden_chunk, weight, label_chunk, denom, ignore_index, bias_chunk, logits_bias_weight
             )
         return accumulated_loss, SavedState(
             (hidden.new_empty(0), weight.new_empty(0)),
-            _Meta(True, False, False, False),
+            _Meta(True, False, False, False, False),
         )
 
     argnums = tuple(
-        idx for idx, flag in ((0, hidden_needs_grad), (1, weight_needs_grad), (5, bias_needs_grad)) if flag
+        idx
+        for idx, flag in (
+            (0, hidden_needs_grad),
+            (1, weight_needs_grad),
+            (5, bias_needs_grad),
+            (6, bias_weight_needs_grad),
+        )
+        if flag
     )
     grad_hidden = torch.empty_like(hidden) if hidden_needs_grad else None
     grad_weight = torch.zeros_like(weight) if weight_needs_grad else None
     grad_bias = torch.empty_like(logits_bias) if bias_needs_grad and logits_bias is not None else None
+    grad_bias_weight = (
+        torch.zeros_like(logits_bias_weight) if bias_weight_needs_grad and logits_bias_weight is not None else None
+    )
     grad_hidden_chunks = (
         grad_hidden.split(chunk_size, dim=split_dim) if grad_hidden is not None else (None,) * len(hidden_chunks)
     )
@@ -135,7 +173,15 @@ def forward(
         hidden_chunks, label_chunks, bias_chunks, grad_hidden_chunks, grad_bias_chunks, strict=True
     ):
         grads, chunk_loss = _grad_and_value(
-            _ce_loss_func, argnums, hidden_chunk, weight, label_chunk, denom, ignore_index, bias_chunk
+            _ce_loss_func,
+            argnums,
+            hidden_chunk,
+            weight,
+            label_chunk,
+            denom,
+            ignore_index,
+            bias_chunk,
+            logits_bias_weight,
         )
         accumulated_loss = accumulated_loss + chunk_loss
         grad_iter = iter(grads)
@@ -145,26 +191,35 @@ def forward(
             grad_weight.add_(next(grad_iter))
         if bias_needs_grad and grad_bias_chunk is not None:
             grad_bias_chunk.copy_(next(grad_iter))
+        if bias_weight_needs_grad and grad_bias_weight is not None:
+            grad_bias_weight.add_(next(grad_iter))
 
     saved_tensors = (
         grad_hidden if grad_hidden is not None else hidden.new_empty(0),
         grad_weight if grad_weight is not None else weight.new_empty(0),
-        *((grad_bias,) if grad_bias is not None else ()),
+        *((grad_bias,) if bias_needs_grad and grad_bias is not None else ()),
+        *((grad_bias_weight,) if bias_weight_needs_grad and grad_bias_weight is not None else ()),
     )
     return accumulated_loss, SavedState(
         saved_tensors,
-        _Meta(True, hidden_needs_grad, weight_needs_grad, bias_needs_grad),
+        _Meta(True, hidden_needs_grad, weight_needs_grad, bias_needs_grad, bias_weight_needs_grad),
     )
 
 
-def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, None, Tensor | None, Tensor | None]:
-    """Return ``(grad_hidden, None, grad_weight, grad_logits_bias)`` for the requested inputs."""
+def backward(
+    grad_output: Tensor, saved: SavedState
+) -> tuple[Tensor | None, None, Tensor | None, Tensor | None, Tensor | None]:
+    """Return ``(grad_hidden, None, grad_weight, grad_logits_bias, grad_logits_bias_weight)``."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
-    grad_hidden, grad_weight, *grad_bias = saved.tensors
+    grad_hidden, grad_weight, *rest = saved.tensors
+    rest_iter = iter(rest)
+    grad_bias = next(rest_iter) * grad_output if meta.bias_needs_grad else None
+    grad_bias_weight = next(rest_iter) * grad_output if meta.bias_weight_needs_grad else None
     return (
         grad_hidden * grad_output if meta.hidden_needs_grad else None,
         None,
         grad_weight * grad_output if meta.weight_needs_grad else None,
-        grad_bias[0] * grad_output if meta.bias_needs_grad else None,
+        grad_bias,
+        grad_bias_weight,
     )

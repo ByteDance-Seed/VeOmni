@@ -137,6 +137,10 @@ class DSparkMarkovHead(nn.Module):
         self.embed = nn.Embedding(vocab_size, rank)
         self.head = nn.Linear(rank, vocab_size, bias=False)
 
+    def encode(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(markov_embed, head_weight)`` so chunked CE can project per chunk without materializing ``[B, S, V]``."""
+        return self.embed(token_ids), self.head.weight.clone()
+
     def forward(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         embed = self.embed(token_ids)
         return self.head(embed), embed
@@ -373,7 +377,7 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
         full_position_ids: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """One teacher-forced packed DSpark stage."""
         main_x = self.project_main(main) if self.stage_id == 0 else main
         cos, sin = position_embeddings["main"] if isinstance(position_embeddings, dict) else position_embeddings
@@ -394,12 +398,12 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed))
         hidden_streams = self.veomni_mhc_post(mlp_out, hidden_streams, post, comb)
 
-        draft = markov_bias = None
+        draft = markov_embed = markov_head_weight = None
         if hasattr(self, "norm"):
             draft = self.collapse_draft(hidden_streams)
             if input_ids is not None:
-                markov_bias, _ = self.markov_head(input_ids)
-        return hidden_streams, main_x, draft, markov_bias
+                markov_embed, markov_head_weight = self.markov_head.encode(input_ids)
+        return hidden_streams, main_x, draft, markov_embed, markov_head_weight
 
 
 def build_dspark_blocks(

@@ -2143,7 +2143,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             hyper_connection_cls=DeepseekV4HyperConnection,
             hyper_head_cls=DeepseekV4HyperHead,
         )
-        if getattr(config, "freeze_mtp", False):
+        if getattr(config, "freeze_mtp", False) or getattr(config, "mtp_loss_coef", 1.0) <= 0:
             self.mtp.requires_grad_(False)
         self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
@@ -2362,7 +2362,8 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         hidden_states = self.norm(self.hc_head(hidden_states))
 
         mtp_hidden_states = None
-        mtp_markov_bias = None
+        mtp_markov_embed = None
+        mtp_markov_head_weight = None
         if run_mtp:
             if any(idx not in draft_inputs for idx in draft_target_ids):
                 raise RuntimeError(
@@ -2384,7 +2385,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 )
             last_stage = len(self.mtp) - 1
             for stage_idx, stage in enumerate(self.mtp):
-                mtp_streams, mtp_main, mtp_hidden_states, mtp_markov_bias = stage(
+                mtp_streams, mtp_main, mtp_hidden_states, mtp_markov_embed, mtp_markov_head_weight = stage(
                     mtp_streams,
                     position_embeddings,
                     position_ids,
@@ -2404,7 +2405,8 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             else None,
             indexer_kl_layers=indexer_kl_layers if indexer_kl_total is not None else None,
             mtp_hidden_states=mtp_hidden_states,
-            mtp_markov_bias=mtp_markov_bias,
+            mtp_markov_embed=mtp_markov_embed,
+            mtp_markov_head_weight=mtp_markov_head_weight,
         )
 
 
@@ -2633,14 +2635,20 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
                 loss = loss + self.config.dsa_indexer_loss_coef * indexer_kl.to(loss.device)
 
         if loss is not None and outputs.mtp_hidden_states is not None and mtp_loss_coef > 0:
-            if outputs.mtp_markov_bias is None:
+            has_factored_markov = outputs.mtp_markov_embed is not None and outputs.mtp_markov_head_weight is not None
+            if not has_factored_markov and outputs.mtp_markov_bias is None:
                 raise RuntimeError(
-                    "DeepseekV4Model returned mtp_hidden_states without mtp_markov_bias; "
+                    "DeepseekV4Model returned mtp_hidden_states without Markov residual inputs; "
                     "DSpark MTP training requires input_ids to compute the Markov residual."
                 )
             ignore_index = kwargs.get("ignore_index", -100)
             mtp_hidden_states = outputs.mtp_hidden_states[:, slice_indices, :]
-            mtp_markov_bias = outputs.mtp_markov_bias[:, slice_indices, :]
+            if has_factored_markov:
+                mtp_logits_bias = outputs.mtp_markov_embed[:, slice_indices, :]
+                mtp_logits_bias_weight = outputs.mtp_markov_head_weight
+            else:
+                mtp_logits_bias = outputs.mtp_markov_bias[:, slice_indices, :]
+                mtp_logits_bias_weight = None
             sp_enabled = get_parallel_state().sp_enabled
             raw_shift_labels = kwargs.get("shift_labels")
             derived_from_labels = raw_shift_labels is None and not sp_enabled
@@ -2690,7 +2698,8 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
                 num_items_in_batch=kwargs.get("num_items_in_batch"),
                 hidden_states=mtp_hidden_states,
                 weights=self.lm_head.weight,
-                logits_bias=mtp_markov_bias,
+                logits_bias=mtp_logits_bias,
+                logits_bias_weight=mtp_logits_bias_weight,
                 chunk_size=2048,
                 ignore_index=ignore_index,
                 loss_reduction_group=kwargs.get("loss_reduction_group"),
@@ -2700,6 +2709,15 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             if aux_metrics is None:
                 aux_metrics = {}
             aux_metrics["mtp_loss"] = mtp_loss.detach()
+        elif (
+            loss is not None
+            and self.training
+            and torch.is_grad_enabled()
+            and len(self.model.mtp) > 0
+            and any(p.requires_grad for p in self.model.mtp.parameters())
+        ):
+            mtp_zero = sum((p.sum() * 0.0 for p in self.model.mtp.parameters() if p.requires_grad), loss.new_zeros(()))
+            loss = loss + mtp_zero.to(device=loss.device, dtype=loss.dtype)
 
         return MoeCausalLMOutputWithLogProbs(
             loss=loss,
