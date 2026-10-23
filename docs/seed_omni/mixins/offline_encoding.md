@@ -6,7 +6,7 @@ afterwards. It is a marker: mixing it in is what makes a module cacheable, and
 it declares no method.
 
 - Mixin: [`OfflineEncodingMixin`](../../../veomni/models/seed_omni/mixins/offline_encoding_mixin.py#L20)
-- Run selector: [`train.training_task`](../../../veomni/arguments/omni_arguments_types.py#L671)
+- Run selector: [`train.training_task`](../../../veomni/arguments/omni_arguments_types.py#L701)
 - Meta build: [`ModuleRuntime.reads_offline_cache`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L216)
 
 ## Why cache a module's encoder
@@ -70,7 +70,7 @@ tasks:
 | `offline_embedding` | Reads raw `seedomni` data once (`train.num_train_epochs: 1`), runs the graph without autograd and writes each encoded conversation to `train.offline_cache_dir`, which it requires. Every module is frozen: no optimizer, no lr scheduler, no checkpoint manager. | Full load, frozen; the graph calls its offline-embedding method. |
 | `offline_training` | Trains from the cache, read back with `data.data_type: seedomni_cached`. | Built on meta, never loaded, and frozen; the graph calls its offline-training method. |
 
-`OmniArguments` ([`_validate_training_task_data`](../../../veomni/arguments/omni_arguments_types.py#L792)) rejects
+`OmniArguments` ([`_validate_training_task_data`](../../../veomni/arguments/omni_arguments_types.py#L822)) rejects
 a run whose `data.data_type` does not match: only `offline_training` reads
 `seedomni_cached`.
 
@@ -91,7 +91,7 @@ step is therefore only the cursor, and its manifest
 `train.checkpoint.load_path: auto` finds it like any other step. Give the
 encoding run and the training run separate `train.checkpoint.output_dir`s:
 `auto` resumes the newest complete step in the directory, and
-[`OmniTrainer.load`](../../../veomni/trainer/omni/omni_trainer.py#L394) refuses a
+[`OmniTrainer.load`](../../../veomni/trainer/omni/omni_trainer.py#L398) refuses a
 step whose manifest disagrees with the run on carrying model state. A resume of that
 task restores the dataloader cursor and the cache writer's position together,
 both through `GlobalStateCallback`:
@@ -141,7 +141,7 @@ full, or it is built on meta.
   gets an optimizer or a checkpoint manager, and
   [`OmniTrainer`](../../../veomni/trainer/omni/omni_trainer.py#L276) allows the
   empty optimizer. A `fsdp_mode: ddp` module is
-  [loaded but left unwrapped](../../../veomni/distributed/torch_parallelize.py#L963),
+  [loaded but left unwrapped](../../../veomni/distributed/torch_parallelize.py#L979),
   because DDP rejects a module with no parameter that requires grad.
 - **`online_training`.** The module is built like any other.
 
@@ -165,7 +165,7 @@ full.
   reports it.
 
 The data side needs no switch. The
-[`SeedOmniCollator`](../../../veomni/data/seed_omni/collator.py#L26) always runs
+[`seedomni_transform`](../../../veomni/data/seed_omni/seedomni_transform.py#L183) always runs
 every module's preprocessor, `seedomni_cached` included, so a preprocessor must
 leave items that already hold a cache artifact alone. The simplest way is to
 mark such items in the offline-embedding method's post-hook with a key in `item.meta` and
@@ -278,11 +278,11 @@ The result:
   because `online_process` still runs every step.
 
 The pieces that complete this workflow are in place:
-[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L568)
+[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L572)
 runs the encoding run, and
 [`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L181)
 persists each conversation of the `conversation_list` that
-[`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L529)
+[`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L511)
 returns. The training graph must only mutate `ConversationItem` fields in
 place (for example `value` and `meta`); it must not replace the list, append
 items, or drop items. Structural changes belong in the processor / collator
@@ -305,7 +305,7 @@ Ranks that share a `dp_rank` (SP, CP or
 TP peers) hold the same batch, so
 [only the first of them writes](../../../veomni/models/seed_omni/utils/offline_cache.py#L36).
 The training run reads the cache through the
-[`seedomni_cached`](../../../veomni/data/seed_omni/seedomni_transform.py#L246)
+[`seedomni_cached`](../../../veomni/data/seed_omni/seedomni_transform.py#L254)
 data transform. It unpickles each row, so point `data.train_path` only at a
 cache you trust.
 
@@ -317,7 +317,7 @@ generation graph names, e.g. an encoding run loads only the encoder. So
 checks it against the loaded modules
 ([`GenerationGraph.validate_modules`](../../../veomni/models/seed_omni/graphs/generation_graph.py#L312))
 at the start of
-[`OmniModel.generate`](../../../veomni/models/seed_omni/modeling_omni.py#L648).
+[`OmniModel.generate`](../../../veomni/models/seed_omni/modeling_omni.py#L630).
 A missing module or method still fails before the first request runs.
 
 ## Current scope
@@ -371,7 +371,7 @@ A missing module or method still fails before the first request runs.
 - [`tests/checkpoints/test_checkpoint_callback.py`](../../../tests/checkpoints/test_checkpoint_callback.py):
   [the writer's position is saved and restored with the cursor, and the cursor-only step is complete](../../../tests/checkpoints/test_checkpoint_callback.py#L632).
 - [`tests/checkpoints/test_dcp_checkpointer.py`](../../../tests/checkpoints/test_dcp_checkpointer.py):
-  [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2546).
+  [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2551).
 - [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
   [a step without an lr scheduler logs no lr](../../../tests/seed_omni/trainer/test_step_metrics_callback.py#L82).
 - [`tests/seed_omni/model/test_graph.py`](../../../tests/seed_omni/model/test_graph.py):

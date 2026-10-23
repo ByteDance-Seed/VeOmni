@@ -39,14 +39,13 @@ Assertions:
       streaming loader stacks only each rank's experts.
 
 Run directly (2 GPUs):
-    torchrun --nproc_per_node=2 --master_port=4331 \
+    torchrun --standalone --nproc_per_node=2 \
         tests/utils/test_moe_ep_sharded_load_matrix.py
 """
 
 from __future__ import annotations
 
 import os
-import random
 import subprocess
 import sys
 from pathlib import Path
@@ -342,12 +341,11 @@ _ACCEL = get_torch_device()
     reason="requires >= 2 accelerator devices (CUDA or NPU)",
 )
 def test_moe_ep_sharded_load_matrix(tmp_path):
-    port = 12345 + random.randint(0, 500)
     env = dict(os.environ, MOE_MATRIX_TMP=str(tmp_path))
     cmd = [
         "torchrun",
         f"--nproc_per_node={_CI_LAUNCH.nproc}",
-        f"--master_port={port}",
+        "--standalone",
         os.path.abspath(__file__),
     ]
     subprocess.run(cmd, check=True, env=env)
