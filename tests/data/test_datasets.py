@@ -29,7 +29,6 @@ from utils import (
 )
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from tests.tools.launch_utils import find_free_port
 from veomni.arguments import parse_args
 from veomni.data import dataset as dataset_module
 from veomni.data.data_collator import MainCollator
@@ -345,12 +344,11 @@ if __name__ == "__main__":
 
 
 def build_suite_command(suite_name: str, data_path: str) -> list[str]:
-    port = find_free_port()
     return [
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={_CI_LAUNCH.nproc}",
-        f"--master_port={port}",
+        "--standalone",
         "tests/data/test_datasets.py",
         f"--suite-name={suite_name}",
         f"--suite-data-path={data_path}",

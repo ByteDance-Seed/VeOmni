@@ -15,6 +15,12 @@ from veomni.utils.device import MOE_TRITON_DEVICE_TYPES
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
+def test_training_command_uses_agent_bound_rendezvous():
+    command = training_utils.build_torchrun_cmd("worker.py", "config", "weights", "data", "output", nproc=2)
+    assert "--standalone" in command
+    assert not any(arg.startswith(("--master_port", "--master-port")) for arg in command)
+
+
 @pytest.mark.parametrize("previous_backend", [None, "veomni"])
 def test_build_hf_reference_model_uses_models_and_restores_backend(monkeypatch, previous_backend):
     import veomni.models as models

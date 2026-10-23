@@ -8,7 +8,6 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tools import hf_local_or_remote, resolve_ops_overrides
-from tools.launch_utils import find_free_port
 
 from veomni.checkpoint.layout import weights_dir
 
@@ -84,7 +83,6 @@ def get_checkpoint_test_command(
     config_path = MODEL_CONFIGS[model_name]["config_path"]
     tokenizer_path = hf_local_or_remote(MODEL_CONFIGS[model_name]["tokenizer_path"])
     output_dir = get_output_dir(model_name, ep_size, dp_replicate_size, nproc=nproc)
-    port = find_free_port()
     if nproc is None:
         nproc = get_checkpoint_test_nproc()
     if ep_size > nproc:
@@ -94,7 +92,7 @@ def get_checkpoint_test_command(
     global_batch_size = nproc
 
     params = [
-        f"{sys.executable} -m torch.distributed.run --nnodes=1 --nproc_per_node={nproc} --master-port={port}",
+        f"{sys.executable} -m torch.distributed.run --nnodes=1 --nproc_per_node={nproc} --standalone",
         "tests/checkpoints/test_trainer_saveload.py",
         f"--model.config_path {config_path}",
         f"--model.tokenizer_path {tokenizer_path}",

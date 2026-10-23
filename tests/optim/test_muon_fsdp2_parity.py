@@ -30,7 +30,6 @@ from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
-from tests.tools.launch_utils import find_free_port
 from veomni.distributed.parallel_state import (
     _init_parallel_state,
     clear_parallel_state,
@@ -769,32 +768,25 @@ def _has_devices(n: int) -> bool:
         return False
 
 
-def _torchrun_cmd(nproc: int, port: int, mode: str, use_zero_comm: bool = False) -> list[str]:
+def _torchrun_cmd(nproc: int, mode: str, use_zero_comm: bool = False) -> list[str]:
     return [
         sys.executable,
         "-m",
         "torch.distributed.run",
         "--nnodes=1",
         f"--nproc_per_node={nproc}",
-        f"--master_port={port}",
+        "--standalone",
         os.path.abspath(__file__),
         f"--mode={mode}",
         f"--zero-comm={int(use_zero_comm)}",
     ]
 
 
-def _find_free_port() -> int:
-    # Torchrun executes this file directly, so imports from ``tests`` must stay
-    # on the pytest parent path.
-
-    return find_free_port()
-
-
 @pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_dense_parity_4gpu():
     """Fused 4-rank worker covering dense, empty-shards, 2D HSDP, mixed-dtype, and head-split."""
-    cmd = _torchrun_cmd(nproc=_CI_LAUNCH.nproc, port=_find_free_port(), mode="dense_all")
+    cmd = _torchrun_cmd(nproc=_CI_LAUNCH.nproc, mode="dense_all")
     env = os.environ.copy()
     env.setdefault("NCCL_DEBUG", "WARN")
     result = subprocess.run(cmd, env=env, check=True)
@@ -805,7 +797,7 @@ def test_dense_parity_4gpu():
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_qwen3_moe_parity_4gpu():
     """Fused 4-rank worker covering default Shard(1) all-gather and zero-comm Shard(0) backends."""
-    cmd = _torchrun_cmd(nproc=_CI_LAUNCH.nproc, port=_find_free_port(), mode="moe_all")
+    cmd = _torchrun_cmd(nproc=_CI_LAUNCH.nproc, mode="moe_all")
     env = os.environ.copy()
     env.setdefault("NCCL_DEBUG", "WARN")
     result = subprocess.run(cmd, env=env, check=True)

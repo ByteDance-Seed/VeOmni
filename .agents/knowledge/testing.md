@@ -46,6 +46,24 @@ Explicit CPU plans reserve zero cards. See `docs/design/ci_case_scheduling.md`
 for the author API, defaults and mismatch rules, and `scripts/ci/accelerator/README.md` for
 local commands and result artifacts.
 
+A CPU launch plan isolates devices only when the accelerator runner executes
+the test. CPU-only launcher regressions must also isolate their subprocess
+environment before importing torch, so ordinary pytest on a GPU/NPU host does
+not choose an accelerator backend for CPU tensors. Architecture-specific
+kernel tests must check hardware eligibility before importing optional kernels.
+
+Distributed rendezvous must own its listener through worker startup. Use
+`tests.tools.launch_utils.spawn_with_rendezvous` for raw spawn workers (the
+endpoint is appended to their arguments; initialize with `store=endpoint.connect()`)
+or the existing `torchrun` callable helper. Single-node torchrun commands use
+`--standalone`; CI keeps agent Store sharing enabled. `find_free_port()` only
+returns a number and its run registry only coordinates cooperating callers:
+probing, closing, then binding in a child still races with other sockets.
+After `mp.spawn` returns its context, the helper reaps workers before releasing
+the Store on failure, interruption and success. Partial startup failures before
+that return rely on the runner's enclosing process-scope cleanup. Never solve a bind race by retrying an entire
+training/checkpoint operation that may already have produced side effects.
+
 A test that passes locally is not necessarily a test CI runs. The entries below
 describe selections in `scripts/ci/accelerator/suites/gpu.json` and `npu.json`.
 

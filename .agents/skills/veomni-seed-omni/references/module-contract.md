@@ -41,12 +41,13 @@ modules/<family>/<submodule>/
   micro-batch (decode losses reduce over `ps.fsdp_group`; see constraint 2 in
   `.agents/knowledge/veomni-seed-omni.md`).
 - Mutate `ConversationItem` fields in place and return
-  `{"conversation_list": conversation}` (or write `packed_*` tensors on the
-  batch dict for packed graphs).
+  `{"conversation_list": conversation}`.
 - Keep tokenizers and processors inside the owning module's subfolder via
   `get_assets()` / `attach_module_assets`.
-- In training, every active node runs on every micro-batch: use CPU-preprocessor
-  dummies or `dummy_inputs()` + a `0.0` anchor when a modality is absent.
+- In training, every active node runs on every micro-batch: use per-sample
+  CPU-preprocessor dummies (with `_OMNI_TOKEN_LEN` set in `item.meta` so
+  `dyn_bsz` counts physical and effective tokens accurately) or `dummy_inputs()`
+  + a `0.0` anchor when a modality is absent.
 - For shared stateless carrier helpers called by both `modeling.py` and
   `accelerated/accelerated.py`, define plain module-level functions in
   `modeling.py` (or reuse `modules/base/llm_packing.py`).

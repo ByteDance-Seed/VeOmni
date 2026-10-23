@@ -17,7 +17,6 @@ from packaging.version import Version
 from torch.distributed._tensor import DTensor, Shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from tests.tools.launch_utils import find_free_port
 from veomni.arguments import ModelArguments, TrainingArguments
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
@@ -388,7 +387,7 @@ def _run_clip_grad_norm_suite(suite: str, nproc: int, reverse_scenarios: bool = 
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={nproc}",
-        f"--master_port={find_free_port()}",
+        "--standalone",
         "tests/utils/test_extra_parallel_clip_grad_norm.py",
         f"--suite={suite}",
     ]

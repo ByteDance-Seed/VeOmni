@@ -156,19 +156,14 @@ def _torchrun_capture(yaml_path: str, output_dir: str, extra_overrides: list[str
     EP slicing log lines (rank 0 only -- they're emitted by
     ``logger.info_rank0`` so duplicate-rank noise is already filtered).
     """
-    from ..tools.launch_utils import find_free_port
 
-    # ``find_free_port`` per-call (not a PID-derived constant) avoids
-    # "address in use" between back-to-back ``torchrun`` launches.
-    # ``test_moe_lora_ep_save_load_parallel_align`` alone fires four subprocesses
-    # per parametrise variant, and Linux's ``TIME_WAIT`` keeps the c10d
-    # store port held for ~60s after each one exits -- a stable PID port
-    # collides on the second launch.
+    # The agent binds its own rendezvous server rather than probing and
+    # releasing a port before the workers start.
     cmd = [
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={nproc}",
-        f"--master_port={find_free_port()}",
+        "--standalone",
         os.path.abspath(os.path.join(os.path.dirname(__file__), "test_moe_lora_trainer.py")),
         yaml_path,
         f"--train.checkpoint.output_dir={output_dir}",

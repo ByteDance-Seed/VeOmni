@@ -19,7 +19,6 @@ import torch
 import torch.distributed as dist
 import yaml
 from tools import resolve_ops_overrides
-from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
 from utils import (
     DummyDataset,
@@ -813,12 +812,11 @@ class TestLoadStateDictBoundary:
 
 
 def build_command():
-    port = find_free_port()
     command = [
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={_CI_LAUNCH.nproc}",
-        f"--master_port={port}",
+        "--standalone",
         "tests/data/test_multisource_dataset.py",
         "--model.config_path=test",
         "--data.train_path=None",
