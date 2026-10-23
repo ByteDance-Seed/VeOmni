@@ -55,19 +55,48 @@ class OmniModuleConfig(PretrainedConfig):
         self.model_path = model_path
         # Sparse: only what this location explicitly selected. A composed load
         # merges the file, the model's default, and the module entry per field.
-        if ops_implementation is not None and is_dataclass(ops_implementation):
-            self.ops_implementation = {k: v for k, v in asdict(ops_implementation).items() if v is not None}
-        else:
-            self.ops_implementation = dict(ops_implementation or {})
+        self.ops_implementation: dict[str, Any] = {}
+        self._ops_config: Any = None
         # Overrides the composed model applies to the module: hyperparameters
         # for the model, kwargs for the preprocessor.
         self.model_config = dict(model_config or {})
         self.processor_config = dict(processor_config or {})
         super().__init__(**kwargs)
-        if "attn_implementation" not in kwargs:
+        self._set_ops_implementation(
+            ops_implementation,
+            sync_attn_implementation="attn_implementation" not in kwargs,
+        )
+
+    @property
+    def ops_config(self):
+        """Resolved :class:`~veomni.arguments.OpsImplementationConfig` for this module."""
+        if self._ops_config is None:
+            from ....arguments import OpsImplementationConfig
+
+            self._ops_config = OpsImplementationConfig(**dict(self.ops_implementation or {}))
+        return self._ops_config
+
+    def _set_ops_implementation(
+        self,
+        ops_implementation: dict[str, Any] | Any | None,
+        *,
+        sync_attn_implementation: bool = True,
+    ) -> None:
+        if ops_implementation is not None and is_dataclass(ops_implementation):
+            self._ops_config = ops_implementation
+            self.ops_implementation = {k: v for k, v in asdict(ops_implementation).items() if v is not None}
+        else:
+            self._ops_config = None
+            self.ops_implementation = dict(ops_implementation or {})
+        if sync_attn_implementation:
             attn_implementation = self.ops_implementation.get("attn_implementation")
             if attn_implementation is not None:
                 self._attn_implementation = attn_implementation
+
+    def to_dict(self) -> dict[str, Any]:
+        output = super().to_dict()
+        output.pop("_ops_config", None)
+        return output
 
     def to_diff_dict(self) -> dict[str, Any]:
         """Drop the composed-model fields this config never set.
@@ -188,11 +217,7 @@ class OmniModuleConfig(PretrainedConfig):
             self.processor_config = {**current, **deepcopy(processor_config)}
         if base_ops or entry_ops:
             own = dict(getattr(self, "ops_implementation", None) or {})
-            self.ops_implementation = {**own, **(base_ops or {}), **(entry_ops or {})}
-        attn_implementation = dict(self.ops_implementation or {}).get("attn_implementation")
-        if attn_implementation is not None:
-            # HF selects the attention class from this attribute, not from ``ops_implementation``.
-            self._attn_implementation = attn_implementation
+            self._set_ops_implementation({**own, **(base_ops or {}), **(entry_ops or {})})
 
 
 __all__ = [

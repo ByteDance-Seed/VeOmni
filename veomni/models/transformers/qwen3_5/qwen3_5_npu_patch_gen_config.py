@@ -224,8 +224,12 @@ def qwen3_5_gated_deltanet_forward_patched(
     cu_seqlens_list: list[int] | None = None,
     chunk_indices: dict | None = None,
     chunk_indices_list: dict | None = None,
+    # Modification: shared-prefix plan; the conv and the delta rule run on its compact row.
+    shared_prefix_plan=None,
 ):
     """Run GatedDeltaNet with precomputed varlen metadata on Ascend NPU."""
+    if shared_prefix_plan is not None and get_parallel_state().sp_enabled:
+        raise NotImplementedError("Shared-prefix training does not support sequence parallelism yet.")
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
     # Set up dimensions for reshapes later
@@ -313,15 +317,27 @@ def qwen3_5_gated_deltanet_forward_patched(
             )
         else:
             conv_weight = self.conv1d.weight.squeeze(1)
-        mixed_qkv = self.veomni_causal_conv1d(
-            mixed_qkv,
-            conv_weight,
-            self.conv1d.bias,
-            cu_seq_lens_q,
-            activation=self.activation,
-            seq_idx=None,
-            backend="triton",
-        )
+        if shared_prefix_plan is not None:
+            # Modification: one varlen call; suffixes take the prefix tail as look-back context.
+            mixed_qkv = shared_prefix_plan.causal_conv1d(
+                self.veomni_causal_conv1d,
+                mixed_qkv,
+                weight=conv_weight,
+                bias=self.conv1d.bias,
+                activation=self.activation,
+                seq_idx=None,
+                backend="triton",
+            )
+        else:
+            mixed_qkv = self.veomni_causal_conv1d(
+                mixed_qkv,
+                conv_weight,
+                self.conv1d.bias,
+                cu_seq_lens_q,
+                activation=self.activation,
+                seq_idx=None,
+                backend="triton",
+            )
 
     query, key, value = torch.split(
         mixed_qkv,
@@ -352,20 +368,38 @@ def qwen3_5_gated_deltanet_forward_patched(
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
     if not use_precomputed_states:
-        core_attn_out, last_recurrent_state = self.veomni_chunk_gated_delta_rule(
-            query,
-            key,
-            value,
-            g,
-            beta,
-            None,
-            cu_seq_lens_q,
-            output_final_state=cache_params is not None,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens_list=cu_seqlens_list,
-            chunk_indices=chunk_indices,
-            chunk_indices_list=chunk_indices_list,
-        )
+        if shared_prefix_plan is not None:
+            if self.veomni_chunk_gated_delta_rule.impl == "eager":
+                raise RuntimeError(
+                    "Shared-prefix training requires a varlen-capable chunk_gated_delta_rule backend. "
+                    "On GPU, set the implementation to 'fla' or 'flash_qla'; on NPU, set it to 'fla' or 'triton'."
+                )
+            if self.veomni_chunk_gated_delta_rule.impl == "fla_npu":
+                raise NotImplementedError(
+                    "Shared-prefix training requires gradient propagation through recurrent state, "
+                    "which the 'fla_npu' backend does not support (it discards dht and returns dh0=None). "
+                    "Use the 'triton' backend on NPU, or unset text_config.shared_prefix_training."
+                )
+            # Modification: two varlen calls; suffixes start from the prefix state at its last chunk boundary.
+            core_attn_out = shared_prefix_plan.gated_delta_rule(
+                self.veomni_chunk_gated_delta_rule, query, key, value, g, beta, use_qk_l2norm_in_kernel=True
+            )
+            last_recurrent_state = None
+        else:
+            core_attn_out, last_recurrent_state = self.veomni_chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                None,
+                cu_seq_lens_q,
+                output_final_state=cache_params is not None,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens_list=cu_seqlens_list,
+                chunk_indices=chunk_indices,
+                chunk_indices_list=chunk_indices_list,
+            )
     else:
         core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
             query,
@@ -426,8 +460,10 @@ def qwen3_5_decoder_layer_forward_patched(
     hidden_states = self.input_layernorm(hidden_states)
 
     # Modification: read varlen metadata from kwargs and enforce it for linear-attention varlen kernels.
+    # A shared-prefix plan carries its own layouts and replaces cu_seq_lens_q.
+    shared_prefix_plan = kwargs.get("shared_prefix_plan", None)
     cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
-    assert cu_seq_lens_q is not None, (
+    assert cu_seq_lens_q is not None or shared_prefix_plan is not None, (
         "cu_seq_lens_q must be provided to support varlen Flash Linear Attention, varlen Conv1D,"
         "and to remove the full Flash Attention CPU-GPU sync."
     )
@@ -448,6 +484,7 @@ def qwen3_5_decoder_layer_forward_patched(
             cu_seqlens_list=linear_attn_cu_seqlens_list,
             chunk_indices=linear_attn_chunk_indices,
             chunk_indices_list=linear_attn_chunk_indices_list,
+            shared_prefix_plan=shared_prefix_plan,
         )
     elif self.block_type == "full_attention":
         # Self Attention. SDPA/eager reject GDN cu_seq_lens metadata.
@@ -518,6 +555,20 @@ def qwen3_5_text_model_forward_patched(
     elif position_ids.ndim == 2:
         position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
 
+    # Modification: shared-prefix training runs the decoder stack on a compact row in which
+    # every shared prefix appears once; the final hidden states are expanded back below.
+    shared_prefix_plan = kwargs.get("shared_prefix_plan", None)
+    if shared_prefix_plan is not None:
+        if get_parallel_state().sp_enabled:
+            raise NotImplementedError("Shared-prefix training does not support sequence parallelism yet.")
+        if return_mtp_context or use_cache or past_key_values is not None:
+            raise NotImplementedError("Shared-prefix training supports neither MTP nor KV cache.")
+        inputs_embeds = shared_prefix_plan.compact(inputs_embeds)
+        position_ids = shared_prefix_plan.compact(position_ids, dim=-1)
+        attention_mask = None
+        for key in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"):
+            kwargs.pop(key, None)
+
     if position_ids.ndim == 3 and position_ids.shape[0] == 4:
         text_position_ids = position_ids[0]
         position_ids = position_ids[1:]
@@ -574,6 +625,8 @@ def qwen3_5_text_model_forward_patched(
             **kwargs,
         )
 
+    # Modification: under shared prefix the compact row is returned; the caller expands it (after the LM
+    # head where possible), and backward sums the copies of each shared row.
     hidden_states = self.norm(hidden_states)
 
     mtp_context = None
@@ -764,15 +817,10 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
     # `**kwargs` to every block; the patched Qwen3_5VisionAttention.forward
     # picks it up via `vision_max_seqlen` and falls back to the original
     # recompute when the key is absent (so non-VeOmni callers keep working).
-    # Gate is two-pronged:
-    #   (a) `_VEOMNI_VISION_ATTENTION_PATCHED` — set per generated file. True
-    #       when Qwen3_5VisionAttention.forward is patched to consume
-    #       ``vision_max_seqlen``. GPU and NPU both register that consumer.
-    #   (b) `is_flash_attention_requested(self.config)` — only FA's
-    #       `flash_attn_varlen_func` benefits from the int hand-off; eager
-    #       and sdpa paths in the consumer pop+discard the kwarg, so the
-    #       host sync would be wasted.
-    if _VEOMNI_VISION_ATTENTION_PATCHED and is_flash_attention_requested(self.config):
+    # Gate: `_VEOMNI_VISION_ATTENTION_PATCHED` is set per generated file when
+    # Qwen3_5VisionAttention.forward is patched to consume ``vision_max_seqlen``.
+    # GPU and NPU both register that consumer.
+    if _VEOMNI_VISION_ATTENTION_PATCHED:
         if precomputed_max_seqlen is not None:
             # Collator-side max already accounts for sp-pad; use as-is.
             kwargs["vision_max_seqlen"] = precomputed_max_seqlen

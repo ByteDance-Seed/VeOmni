@@ -11,7 +11,7 @@ Use current Janus files instead of synthetic module examples.
 | Vision processor asset | `veomni/models/seed_omni/modules/janus/siglip/processing.py` |
 | Text encoder CPU preprocessing and FSM signals | `veomni/models/seed_omni/modules/janus/text_encoder/accelerated/accelerated.py` |
 | Text encoder chat template | `veomni/models/seed_omni/modules/janus/text_encoder/chat_template.py` |
-| Base text encoder shared behavior | `veomni/models/seed_omni/modules/base/text_encoder/` |
+| Base text encoder shared behavior | `veomni/models/seed_omni/modules/text_encoder/` |
 | AR backbone | `veomni/models/seed_omni/modules/janus/llama/` |
 | VQ codec encode/decode | `veomni/models/seed_omni/modules/janus/vqvae/` |
 | Packed training (CPU pack + mask scatter) | `veomni/models/seed_omni/modules/janus/packing.py` + per-module `accelerated/packed.py` |

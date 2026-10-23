@@ -2,7 +2,7 @@
 
 Each concrete text encoder keeps a thin ``processing.py`` that subclasses
 :class:`TextEncoderPreprocessor` and implements :meth:`build_chat_template`
-with its module-local :class:`~veomni.models.seed_omni.modules.base.text_encoder.chat_template.TextEncoderChatTemplate`
+with its module-local :class:`~veomni.models.seed_omni.modules.text_encoder.chat_template.TextEncoderChatTemplate`
 subclass.  Tokenize / merge / pack live on the base chat template; this worker
 only runs ``tokenize_conversation`` inside DataLoader workers (training) or
 before the generation FSM (inference).
@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ....utils.conversation import ConversationItem
-from ...module_processing_base import ModulePreprocessorBase
+from ...utils.conversation import ConversationItem
+from ..module_processing_base import ModulePreprocessorBase
 from .chat_template import TextEncoderChatTemplate
 
 
@@ -25,11 +25,12 @@ class TextEncoderPreprocessor(ModulePreprocessorBase):
     main process's thin ``encode_pre`` does the single ``.to(device)``.
 
     :meth:`bind_module_assets` also copies ``_tokenizer`` onto the model —
-    :class:`~veomni.models.seed_omni.modules.base.text_encoder.modeling.TextEncoder`
+    :class:`~veomni.models.seed_omni.modules.text_encoder.modeling.TextEncoder`
     decodes generated text via ``self._tokenizer``.
     """
 
-    def __init__(self, chat_template: TextEncoderChatTemplate) -> None:
+    def __init__(self, chat_template: TextEncoderChatTemplate, **kwargs: Any) -> None:
+        del kwargs
         self._chat_template = chat_template
         self._tokenizer = chat_template.tokenizer
 

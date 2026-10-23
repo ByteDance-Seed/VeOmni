@@ -4,7 +4,7 @@ import torch
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....utils.conversation import ConversationItem, maybe_merge_outputs
-from ...base.text_encoder.modeling import TextEncoder
+from ...text_encoder.modeling import TextEncoder
 from .configuration import JanusTextEncoderConfig
 from .processing import JanusTextEncoderPreprocessor
 

@@ -4,7 +4,7 @@ from typing import Any
 
 import torch
 
-from ....utils.conversation import ConversationItem, ItemRole, ItemType, ItemValue
+from ...utils.conversation import ConversationItem, ItemRole, ItemType, ItemValue
 
 
 @dataclass(frozen=True)

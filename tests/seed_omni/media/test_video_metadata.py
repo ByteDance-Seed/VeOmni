@@ -46,6 +46,7 @@ import pytest
 import torch
 from PIL import Image
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.seed_omni.utils import video as _video_module
 from veomni.data.seed_omni.utils.audio import fetch_audios
 from veomni.data.seed_omni.utils.video import (
@@ -59,6 +60,9 @@ from veomni.data.seed_omni.utils.video import (
 )
 from veomni.models.seed_omni.modules.qwen3vl.vision.processing import _OMNI_GRID
 from veomni.models.seed_omni.utils.conversation import ConversationItem
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _metadata_for(total_frames: int, source_fps: float, requested_fps: float, max_frames: int | None = None):

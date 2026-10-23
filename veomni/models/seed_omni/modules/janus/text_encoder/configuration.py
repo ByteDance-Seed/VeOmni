@@ -19,7 +19,7 @@ The framework reaches these emit methods via dedicated graph nodes
 (``emit_image_start`` / ``emit_image_end``) declared in the YAML.
 """
 
-from ...base.text_encoder.configuration import TextEncoderConfig
+from ...text_encoder.configuration import TextEncoderConfig
 
 
 class JanusTextEncoderConfig(TextEncoderConfig):

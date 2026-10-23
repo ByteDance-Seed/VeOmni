@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.omni_arguments_types import (
     OmniArguments,
     OmniDataArguments,
@@ -22,6 +23,9 @@ from veomni.arguments.omni_arguments_types import (
     build_omni_module_runtime_args,
 )
 from veomni.models.seed_omni.configuration_omni import OmniConfig
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 MODULE_A = "fake_module_a"

@@ -9,7 +9,7 @@ import torch
 from transformers import PreTrainedTokenizerBase
 
 from ....utils.conversation import ConversationItem
-from ...base.text_encoder.chat_template import ChatMarkers, TextEncoderChatTemplate
+from ...text_encoder.chat_template import ChatMarkers, TextEncoderChatTemplate
 from ..sources import BAGEL_CONTEXT_KEY, bagel_context
 from .processing import is_bagel_vision_marker
 

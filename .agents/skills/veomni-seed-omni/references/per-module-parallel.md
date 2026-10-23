@@ -135,7 +135,7 @@ cu_seqlens describe the full sequence (a `split_with_sizes` size mismatch).
 
 Metering must stash **pre-slice full-sample** seqlens in `pre_forward` (see
 `module-contract.md` + constraint 7e). All backbones (`qwen3/llm`, `janus/llama`,
-`qwen3vl/llm`), the text encoder (`base/text_encoder`) and vision towers
+`qwen3vl/llm`), the text encoder (`text_encoder`) and vision towers
 (`qwen3vl/vision`, `janus/siglip`, `janus/vqvae`) support `sp_size > 1`. The
 Qwen3-VL in-model backbone (`qwen3vl/llm`) slices the packed sequence INCLUDING
 DeepStack visual embeds + 3-row M-RoPE `position_ids`; since the sample is

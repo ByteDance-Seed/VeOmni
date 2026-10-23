@@ -9,6 +9,8 @@ import pytest
 import torch
 import yaml
 
+from scripts.ci.accelerator.launch_plan import runner_device_count
+
 
 try:
     from .checkpoint_verification_utils import verify_dcp_to_hf_conversion
@@ -22,6 +24,8 @@ try:
 except Exception as _:
     from checkpoint_verification_utils import verify_dcp_to_hf_conversion
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.checkpoints.utils import get_checkpoint_test_nproc
 from veomni.arguments import parse_args
 from veomni.checkpoint.layout import weights_dir
 from veomni.data import build_dummy_dataset
@@ -31,7 +35,10 @@ from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
 from veomni.utils import helper
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_torch_device
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+
+
+_CI_LAUNCH = LaunchSpec(nproc=2)
 
 
 os.environ["NCCL_DEBUG"] = "OFF"
@@ -236,7 +243,11 @@ if __name__ == "__main__":
 
 
 def _run_trainer_saveload_and_verify(model_name: str, ep_size: int, dp_replicate_size: Optional[int] = None):
-    exec_command = get_checkpoint_test_command(model_name, ep_size, dp_replicate_size=dp_replicate_size)
+    # Every round-trip also exports HF weights, checks dtypes, and verifies both
+    # direct export and the independent DCP-to-HF CLI conversion.
+    exec_command = get_checkpoint_test_command(
+        model_name, ep_size, save_hf_weights=True, dp_replicate_size=dp_replicate_size
+    )
     merge_command = get_merge_dcp_to_hf_command(model_name, ep_size, dp_replicate_size=dp_replicate_size)
 
     exec_result = subprocess.run(exec_command, shell=True, check=True)
@@ -255,14 +266,6 @@ def _run_trainer_saveload_and_verify(model_name: str, ep_size: int, dp_replicate
     )
 
     shutil.rmtree(get_output_dir(model_name, ep_size, dp_replicate_size))
-
-
-def _run_trainer_save_hf_safetensor(model_name: str, ep_size: int):
-    exec_command = get_checkpoint_test_command(model_name, ep_size, save_hf_weights=True)
-    exec_result = subprocess.run(exec_command, shell=True, check=True)
-    assert exec_result.returncode == 0
-
-    shutil.rmtree(get_output_dir(model_name, ep_size))
 
 
 # MoE save/load coverage.
@@ -291,6 +294,7 @@ def _saveload_cases():
     return cases
 
 
+@pytest.mark.launch_plan(provider=lambda context: LaunchSpec(nproc=get_checkpoint_test_nproc()))
 @pytest.mark.parametrize("model_name,ep_size", _saveload_cases())
 def test_trainer_saveload(model_name: str, ep_size: int):
     _run_trainer_saveload_and_verify(model_name, ep_size)
@@ -302,23 +306,19 @@ def test_trainer_saveload(model_name: str, ep_size: int):
 # DCP save -> load -> compare golden state dicts, plus DCP->HF merge). Cases:
 #   * ep2: ep mesh (2, 2, 2) — all three dims active (ep_fsdp > 1).
 #   * ep4: ep mesh (2, 1, 4) — degenerate ep_fsdp.
+@pytest.mark.launch_plan(provider=lambda context: LaunchSpec(nproc=get_checkpoint_test_nproc()))
 @pytest.mark.parametrize("ep_size", [2, 4])
 def test_trainer_saveload_hsdp(ep_size: int):
     _run_trainer_saveload_and_verify("qwen3_moe", ep_size, dp_replicate_size=2)
 
 
-@pytest.mark.parametrize("ep_size", TEST_EP_SIZES)
-def test_trainer_save_hf_safetensor(ep_size: int):
-    # only test save hf safetensor on qwen3_moe to save resources
-    _run_trainer_save_hf_safetensor("qwen3_moe", ep_size)
-
-
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(
-    not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) or get_torch_device().device_count() < 2,
+    not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) or runner_device_count() < 2,
     reason="requires at least 2 accelerator devices",
 )
 def test_frozen_omni_module_resume_loads_hf_weights(tmp_path):
-    from tests.tools.launch_utils import find_free_port, run_bounded_process_group
+    from tests.tools.launch_utils import run_bounded_process_group
 
     snapshot_dir = tmp_path / "frozen_module"
     output_dir = tmp_path / "output"
@@ -337,8 +337,8 @@ def test_frozen_omni_module_resume_loads_hf_weights(tmp_path):
         "-m",
         "torch.distributed.run",
         "--nnodes=1",
-        "--nproc_per_node=2",
-        f"--master-port={find_free_port()}",
+        f"--nproc_per_node={_CI_LAUNCH.nproc}",
+        "--standalone",
         "tests/checkpoints/omni_frozen_resume_runner.py",
         # `model.model_path` is the split-checkpoint ROOT; the runner resolves
         # `frozen_module` (the module name) as this module's subfolder under it.

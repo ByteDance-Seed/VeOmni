@@ -16,10 +16,11 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.distributed import torch_parallelize
 from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import (
@@ -32,20 +33,24 @@ from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
 
 
-def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path):
+_CI_CPU_PROMOTION = LaunchSpec(nproc=4, device="cpu")
+
+
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
+
+
+def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path, endpoint):
     """Worker for the FSDP2 MultiOptimizer DCP round-trip test."""
     from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState
     from veomni.optim.optimizer import MultiOptimizer
     from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(os.environ.get("_TEST_MASTER_PORT", "0"))
     device_type = get_device_type()
     backend = "gloo" if device_type == "cpu" else get_dist_comm_backend()
     device = torch.device("cpu" if device_type == "cpu" else f"{device_type}:{rank}")
     if device_type != "cpu":
         get_torch_device().set_device(device)
-    dist.init_process_group(backend, rank=rank, world_size=world_size)
+    dist.init_process_group(backend, store=endpoint.connect(), rank=rank, world_size=world_size)
 
     try:
         _init_parallel_state(dp_size=world_size, dp_mode="fsdp2")
@@ -202,12 +207,12 @@ class TestMultiOptimizerState:
             else:
                 assert expected_value == actual_value
 
+    @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
     def test_fsdp2_multi_optimizer_roundtrip(self, tmp_path):
         """Run the MultiOptimizer DCP round-trip across two real FSDP2 ranks."""
-        from tests.tools.launch_utils import find_free_port
-
-        os.environ["_TEST_MASTER_PORT"] = str(find_free_port())
-        mp.spawn(_fsdp2_multi_optimizer_worker, args=(2, tmp_path), nprocs=2, join=True)
+        spawn_with_rendezvous(
+            _fsdp2_multi_optimizer_worker, args=(_CI_ACCELERATOR_2.nproc, tmp_path), nprocs=_CI_ACCELERATOR_2.nproc
+        )
 
     def test_multi_optimizer_sparse_state_excludes_synthetic(self, tmp_path):
         """A fresh sub-optimizer must not have synthetic state materialized in the checkpoint."""
@@ -2584,17 +2589,15 @@ class TestResumeDiscovery:
         assert self._validate(step) is None
 
 
-def _staged_promotion_worker(rank: int, world_size: int, base: str, scenario: str) -> None:
+def _staged_promotion_worker(rank: int, world_size: int, base: str, scenario: str, endpoint) -> None:
     """One rank of the real promotion check; see ``TestPromotionAcrossRanks``."""
     import shutil
     import time
 
     from veomni.checkpoint import dcp_checkpointer as module
 
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = os.environ["_TEST_MASTER_PORT"]
     os.environ["LOCAL_RANK"] = str(rank)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=world_size)
 
     stage, final = os.path.join(base, "stage"), os.path.join(base, "final")
     if rank == 0:
@@ -2633,6 +2636,7 @@ def _staged_promotion_worker(rank: int, world_size: int, base: str, scenario: st
     dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_PROMOTION)
 class TestPromotionAcrossRanks:
     """The promotion, run for real on four ranks over its own gloo group.
 
@@ -2644,12 +2648,13 @@ class TestPromotionAcrossRanks:
     @staticmethod
     def _run(tmp_path, scenario):
         """Spawn four ranks for ``scenario`` and return each rank's outcome."""
-        from tests.tools.launch_utils import find_free_port
-
         base = str(tmp_path / scenario)
         os.makedirs(base, exist_ok=True)
-        os.environ["_TEST_MASTER_PORT"] = str(find_free_port())
-        mp.spawn(_staged_promotion_worker, args=(4, base, scenario), nprocs=4, join=True)
+        spawn_with_rendezvous(
+            _staged_promotion_worker,
+            args=(_CI_CPU_PROMOTION.nproc, base, scenario),
+            nprocs=_CI_CPU_PROMOTION.nproc,
+        )
         return base, [open(os.path.join(base, f"outcome_{r}")).read() for r in range(4)]
 
     def test_promotion_completes_on_every_rank(self, tmp_path):

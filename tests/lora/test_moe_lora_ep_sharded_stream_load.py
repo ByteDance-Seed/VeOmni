@@ -58,6 +58,8 @@ import shutil
 import pytest
 import yaml
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
 # Reuse the battle-tested trainer harness. The trainer subprocess entry
 # point + snapshot comparator + CLI helpers are shared; the base-model
 # fixture is *not* -- see ``fused_toy_base_dir`` below for why.
@@ -71,6 +73,9 @@ from .test_moe_lora_trainer import (
     _yaml_for_mode,
     toy_base_dir,  # noqa: F401  (pytest fixture, per-expert HF layout)
 )
+
+
+_CI_EP_LAUNCH = LaunchSpec(nproc=2)
 
 
 __all__ = [
@@ -224,6 +229,7 @@ def _make_adapter_resume_yaml(base_yaml: str, adapter_path: str, dest: str) -> s
     return dest
 
 
+@pytest.mark.launch_plan(provider=_CI_EP_LAUNCH)
 @pytest.mark.parametrize(
     "mode, base_layout", [("independent", "fused"), ("shared", "fused"), ("independent", "per_expert")]
 )
@@ -251,7 +257,7 @@ def test_peft_ep_sharded_stream_load_matches_broadcast(tmp_path, request, mode, 
     still EP-streamed. With the ``per_expert`` base the stream resumer stacks
     each rank's experts through the checkpoint converter.
     """
-    nproc = _gpu_count_or_skip(min_count=2, max_count=2)
+    nproc = _gpu_count_or_skip(min_count=_CI_EP_LAUNCH.nproc, max_count=_CI_EP_LAUNCH.nproc)
     yaml_path = _yaml_for_mode(mode)
     base_dir = request.getfixturevalue("fused_toy_base_dir" if base_layout == "fused" else "toy_base_dir")
     base_overrides = _fused_model_path_overrides(base_dir) + [

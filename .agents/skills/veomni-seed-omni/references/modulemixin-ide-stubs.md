@@ -173,7 +173,7 @@ module, mirror an adjacent example:
 |---------|----------------|
 | Vision encode helper | `janus/siglip` (`_encode_pixel_values`) |
 | AR backbone `forward` | `janus/llama`, `qwen3/llm`, `qwen3vl/llm` |
-| Text encoder `encode` / `_project` | `base/text_encoder` + family wrappers |
+| Text encoder `encode` / `_project` | `text_encoder` + family wrappers |
 | VAE codec | `bagel/vae` (`encode`, `decode`) |
 | Flow / velocity heads | `bagel/flow_connector` (`embed_latent`, `decode_velocity`) |
 | Packed inference | `bagel/qwen2_mot` (`forward_inference`) |

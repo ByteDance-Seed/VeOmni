@@ -53,7 +53,7 @@ module is wrapped and saved:
   Context Parallelism (`cp_size`), or hybrid `cp_size * ulysses_size`.
   `build_omni_model_runtime_args` validates that all distributed modules and
   `model.accelerator` share the same `dp_size`;
-  see [Sequence & Context Parallelism](sequence_parallel.md#2-why-all-modules-share-one-dp_size-and-one-sp_size--w--dp_size).
+  see [Sequence & Context Parallelism](sequence_parallel.md#2-why-all-modules-share-one-dp_size).
 - **The step.** One `loss.backward()` runs over the whole graph, followed by
   one optimizer step per module; gradient accumulation and the global batch are
   job-level settings.

@@ -22,7 +22,13 @@ from importlib.machinery import ModuleSpec
 from pathlib import Path
 from types import ModuleType
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.utils.import_utils import is_package_available
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 REPO_ROOT = Path(__file__).parents[3]
@@ -74,6 +80,13 @@ import veomni.ops.kernels.dsa.sparse_mqa_target
 import veomni.ops.kernels.dsa.vendor
 import veomni.ops.qat
 from veomni.ops import OP_REGISTRY
+from veomni.ops.kernels.moe_experts.shared import swiglu
+from veomni.distributed.moe import EPMergedFc1GroupGemm
+import torch
+
+gate = torch.tensor([[0.5, -1.0]])
+up = torch.tensor([[2.0, 3.0]])
+assert torch.equal(swiglu.merged_swiglu_forward(gate, up), torch.ops.aten.silu(gate) * up)
 
 assert "sageattention" not in {name.partition(".")[0] for name in attempted_optional_imports}
 assert not optional_roots.intersection(sys.modules)
@@ -85,6 +98,7 @@ for module in (
     "veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_target",
     "veomni.ops.kernels.moe_experts_lora.shared.triton",
     "veomni.ops.kernels.moe_experts_lora.independent.triton",
+    "veomni.ops.kernels.moe_experts.shared._triton_swiglu",
     "veomni.ops.qat.quant",
 ):
     assert module not in sys.modules
