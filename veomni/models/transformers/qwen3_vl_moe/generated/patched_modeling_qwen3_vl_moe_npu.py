@@ -462,6 +462,31 @@ class _Qwen3VLMoeFakeForPosID(SimpleNamespace):  # noqa: F821 SimpleNamespace de
         return Qwen3VLMoeModel.get_vision_position_ids(self, *args, **kwargs)  # noqa: F821 defined in generated modeling file
 
 
+def _sp_local_router_mask(attention_mask, cu_seq_lens_q):
+    """This rank's rows of the full 2D padding mask, aligned with its router-logit rows.
+
+    The collator pads ``attention_mask`` to the full sequence but never SP-slices it,
+    while every rank's MoE layers route only its own tokens. Under USP (cp>1) those
+    tokens follow the zig-zag layout of ``usp_zigzag_slice``; under Ulysses-only SP
+    they are one contiguous chunk.
+    """
+    ps = get_parallel_state()
+    if not torch.is_tensor(attention_mask) or attention_mask.dim() != 2 or not ps.sp_enabled:
+        return attention_mask
+    if ps.cp_enabled:
+        return usp_zigzag_slice(  # noqa: F821 imported in qwen3_vl's add_post_import_block
+            attention_mask,
+            cu_seq_lens_q.tolist() if cu_seq_lens_q is not None else None,
+            -1,
+            ps.cp_size,
+            ps.cp_rank,
+            ps.ulysses_size,
+            ps.ulysses_rank if ps.ulysses_enabled else 0,
+        )
+    chunk = attention_mask.size(-1) // ps.sp_size
+    return attention_mask.narrow(-1, ps.sp_rank * chunk, chunk)
+
+
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLMoeTextRMSNorm
 # Methods patched: forward
@@ -2536,7 +2561,9 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
     #    materializing full-vocab logits when labels is provided
     # 2. compute MoE aux_loss via upstream `load_balancing_loss_func` when
     #    `output_router_logits=True`; read config from `config.text_config`
-    #    since the VLM top-level wraps a nested text config
+    #    since the VLM top-level wraps a nested text config. Under SP the router
+    #    logits cover only this rank's tokens, so the padding mask is sliced to
+    #    the same rows (_sp_local_router_mask)
     # ================================================================
     @can_return_tuple
     @auto_docstring
@@ -2618,20 +2645,21 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
         # --- Patch.2 ---
         aux_loss = None
         if kwargs.get("output_router_logits", False):
+            router_mask = _sp_local_router_mask(attention_mask, kwargs.get("cu_seq_lens_q"))  # noqa: F821 defined via add_helper
             # Modification: OpSlot guard for load-balancing loss.
             if veomni_load_balancing_loss.use_non_eager_impl:
                 aux_loss = veomni_load_balancing_loss(
                     outputs.router_logits,
                     self.config.text_config.num_experts,
                     self.config.text_config.num_experts_per_tok,
-                    attention_mask,
+                    router_mask,
                 )
             else:
                 aux_loss = load_balancing_loss_func(
                     outputs.router_logits,
                     self.config.text_config.num_experts,
                     self.config.text_config.num_experts_per_tok,
-                    attention_mask,
+                    router_mask,
                 )
             if labels is not None and isinstance(aux_loss, torch.Tensor):
                 loss = loss + self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
