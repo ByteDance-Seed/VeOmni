@@ -44,6 +44,7 @@ from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
     _get_fp4_e2m1_table,
     convert_deepseek_v4_checkpoint_key,
     create_deepseek_v4_checkpoint_tensor_converter,
+    validate_deepseek_v4_export_quant_support,
 )
 from veomni.models.transformers.glm_moe_dsa.checkpoint_tensor_converter import (
     GlmMoeDsaCheckpointTensorConverter,
@@ -929,6 +930,27 @@ class TestDeepseekV4ConverterConvert:
 
         assert quantized_calls == [torch.Size([4, 4])]
         assert set(exported) == {"layers.0.attn.wq_a.weight", "layers.0.attn.wq_a.scale"}
+
+    def test_validate_deepseek_v4_export_quant_support_preflight(self, monkeypatch):
+        from veomni.models.transformers.deepseek_v4 import export_quant
+
+        monkeypatch.setattr(export_quant, "IS_CUDA_AVAILABLE", True)
+        monkeypatch.setattr(export_quant, "get_gpu_compute_capability", lambda: 89)
+
+        # Unquantized mapping (no .scale keys) succeeds on non-SM90
+        validate_deepseek_v4_export_quant_support({"layers.0.attn.wq_a.weight": 1, "embed.weight": 1})
+
+        # Mapping with .scale keys but skipped by should_quantize succeeds on non-SM90
+        scaled_mapping = {"layers.0.attn.wq_a.weight": 1, "layers.0.attn.wq_a.scale": 1}
+        validate_deepseek_v4_export_quant_support(scaled_mapping, should_quantize=lambda _origin: False)
+
+        # Mapping with active .scale keys fails preflight on non-SM90 before training/export
+        with pytest.raises(RuntimeError, match="SM90 or later"):
+            validate_deepseek_v4_export_quant_support(scaled_mapping)
+        with pytest.raises(RuntimeError, match="SM90 or later"):
+            DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS).validate_export_support(
+                fqn_to_index_mapping=scaled_mapping
+            )
 
     def test_dequantizes_block_scaled_fp8_weight(self):
         weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))

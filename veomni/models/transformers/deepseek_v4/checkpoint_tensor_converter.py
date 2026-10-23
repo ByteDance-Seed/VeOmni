@@ -41,6 +41,7 @@ VeOmni's runtime loader reads safetensor keys directly and does not run HF's
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from functools import lru_cache
 from typing import Callable, Generator
 
@@ -273,6 +274,41 @@ def _build_default_deepseek_v4_fqn_to_index_mapping(model, *, target_model_prefi
             _add_entry(origin_key, shape)
 
     return mapping
+
+
+def validate_deepseek_v4_export_quant_support(
+    fqn_to_index_mapping: Mapping[str, int] | None = None,
+    *,
+    model: torch.nn.Module | None = None,
+    target_model_prefix: str = "model.",
+    should_quantize: Callable[[str], bool] | None = None,
+) -> None:
+    """Validate that SM90+ TileLang quantization is available when ``.scale`` keys will be quantized on export."""
+    if fqn_to_index_mapping is None and model is not None:
+        fqn_to_index_mapping = getattr(model, "_veomni_fqn_to_index_mapping", None)
+        if fqn_to_index_mapping is None:
+            fqn_to_index_mapping = _build_default_deepseek_v4_fqn_to_index_mapping(
+                model, target_model_prefix=target_model_prefix
+            )
+    if not fqn_to_index_mapping:
+        return
+
+    needs_quant = False
+    for origin in fqn_to_index_mapping:
+        if _is_mtp_checkpoint_key(origin) or not origin.endswith(".weight"):
+            continue
+        scale_name = f"{origin.removesuffix('.weight')}.scale"
+        if scale_name not in fqn_to_index_mapping:
+            continue
+        if should_quantize is not None and not should_quantize(origin):
+            continue
+        needs_quant = True
+        break
+
+    if needs_quant:
+        from veomni.models.transformers.deepseek_v4.export_quant import _require_tilelang_sm90
+
+        _require_tilelang_sm90()
 
 
 @lru_cache(maxsize=None)
@@ -521,6 +557,21 @@ class DeepseekV4CheckpointTensorConverter:
             raise RuntimeError("DeepseekV4 checkpoint converter: incomplete checkpoint detected. " + "; ".join(errors))
         self._scaled_weight_buffer.clear()
         return finalized
+
+    def validate_export_support(
+        self,
+        model: torch.nn.Module | None = None,
+        *,
+        fqn_to_index_mapping: Mapping[str, int] | None = None,
+        should_quantize: Callable[[str], bool] | None = None,
+    ) -> None:
+        """Fail before training or export if quantized ``.scale`` export is requested on a non-SM90 device."""
+        validate_deepseek_v4_export_quant_support(
+            fqn_to_index_mapping,
+            model=model,
+            target_model_prefix=self.target_model_prefix,
+            should_quantize=should_quantize,
+        )
 
     def export_weights(
         self,
