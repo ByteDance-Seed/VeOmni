@@ -140,6 +140,7 @@ def qwen4_exp_text_mlp_forward_patched(self, x):
     return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
+config.add_import("veomni.models.transformers.qwen4_exp.qsa_metadata", names=["cached_host_metadata"])
 config.add_import("copy", names=["copy"])
 config.add_import("dataclasses", names=["dataclass"])
 config.add_import("functools", names=["partial"])
@@ -676,6 +677,8 @@ def qwen4_exp_qsa_indexer_forward_patched(
     _, group, rank, world_size = _qwen4_exp_sequence_parallel_state(parallel_state)
     batch_size, local_seq_len, _ = hidden_states.shape
     global_seq_len = local_seq_len * world_size
+    if global_seq_len + self.compress_ratio > torch.iinfo(torch.int32).max:
+        raise ValueError("Qwen4-Exp compact QSA token positions must fit int32, including compression padding.")
     if self.index_kv_heads != 1:
         raise ValueError(f"Qwen4-Exp compact QSA currently requires one indexer KV head; got {self.index_kv_heads}.")
     if self.compress_ratio > local_seq_len:
@@ -735,31 +738,11 @@ def qwen4_exp_qsa_indexer_forward_patched(
         segment_ids[batch_idx, start:end] = segment_id
         segment_starts[batch_idx, start:end] = start
 
-    blocks = [
-        (segment_id, batch_idx, start)
-        for segment_id, (batch_idx, segment_start, segment_end) in enumerate(segments)
-        for start in range(segment_start, segment_end - self.compress_ratio + 1, self.compress_ratio)
-    ]
-    owned_blocks = [block for block in blocks if block[2] // local_seq_len == rank]
-    gathered_blocks = [block for owner in range(world_size) for block in blocks if block[2] // local_seq_len == owner]
-    # --- Patch.3: Upload all host-derived block metadata in one flat H2D copy. ---
-    # The previous per-list ``torch.tensor(..., device=...)`` calls each blocked
-    # the host on a pageable copy once per full-attention layer; batching them
-    # into a single flat upload leaves one (unavoidable without a pinned
-    # staging buffer) copy for the whole indexer call.
-    count_list = [
-        sum(block_start // local_seq_len == owner for _, _, block_start in blocks) for owner in range(world_size)
-    ]
-    local_batch_id_list = [batch_idx for _, batch_idx, _ in owned_blocks]
-    local_block_start_list = [start for _, _, start in owned_blocks]
-    gathered_segment_id_list = [segment_id for segment_id, _, _ in gathered_blocks]
-    gathered_start_list = [start for _, _, start in gathered_blocks]
-    meta_sections = (
-        count_list,
-        local_batch_id_list,
-        local_block_start_list,
-        gathered_segment_id_list,
-        gathered_start_list,
+    blocks, owned_blocks, gathered_blocks, meta_sections = cached_host_metadata(
+        tuple(segments), self.compress_ratio, local_seq_len, rank, world_size
+    )
+    count_list, local_batch_id_list, local_block_start_list, gathered_segment_id_list, gathered_start_list = (
+        meta_sections
     )
     flat_meta = torch.tensor([value for section in meta_sections for value in section], dtype=torch.long).to(
         hidden_states.device
@@ -816,7 +799,7 @@ def qwen4_exp_qsa_indexer_forward_patched(
 
     if gathered_blocks:
         top_count = min(self.block_topk, len(gathered_blocks))
-        block_offsets = torch.arange(self.compress_ratio, device=hidden_states.device)
+        block_offsets = torch.arange(self.compress_ratio, dtype=torch.int32, device=hidden_states.device)
         elements_per_query = max(1, batch_size * len(gathered_blocks) * self.index_n_heads)
         query_chunk_size = max(1, min(local_seq_len, 16 * 1024 * 1024 // elements_per_query))
         selected_chunks = []
@@ -834,8 +817,12 @@ def qwen4_exp_qsa_indexer_forward_patched(
             )
             scores = scores.masked_fill(~visible, float("-inf"))
             top_blocks = scores.topk(top_count, dim=-1).indices
-            top_valid = visible.gather(-1, top_blocks)
-            selected_starts = block_starts[top_blocks]
+            top_valid = (
+                visible.to(torch.int8).gather(-1, top_blocks).bool()
+                if hidden_states.device.type == "npu"
+                else visible.gather(-1, top_blocks)
+            )
+            selected_starts = block_starts[top_blocks].to(torch.int32)
             selected_chunk = selected_starts[..., None] + block_offsets
             selected_chunks.append(selected_chunk.masked_fill(~top_valid[..., None], -1).flatten(-2))
         selected_local = torch.cat(selected_chunks, dim=1)
@@ -856,7 +843,7 @@ def qwen4_exp_qsa_indexer_forward_patched(
     )
     tail_offsets = torch.arange(self.compress_ratio - 1, device=hidden_states.device)
     tails = tail_start[..., None] + tail_offsets
-    tails = tails.masked_fill(tail_offsets[None, None] >= tail_count[..., None], -1)
+    tails = tails.to(torch.int32).masked_fill(tail_offsets[None, None] >= tail_count[..., None], -1)
 
     selected_local = torch.cat((selected_local, tails), dim=-1)
     if selected_local.shape[-1] < output_width:
