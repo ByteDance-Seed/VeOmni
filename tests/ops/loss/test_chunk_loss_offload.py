@@ -8,10 +8,14 @@ from torch.utils.checkpoint import checkpoint
 
 from veomni.distributed.offloading import OffloadPolicy, build_activation_offloading_context
 from veomni.ops import VeomniOp
-from veomni.utils.device import IS_NPU_AVAILABLE
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
-DEVICES = ["cpu", pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires native NPU"))]
+DEVICES = [
+    "cpu",
+    pytest.param("cuda", marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="requires CUDA")),
+    pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires native NPU")),
+]
 
 
 def _run(device, dtype, *, offload, recompute, frozen, all_ignored):
@@ -62,9 +66,9 @@ def _run(device, dtype, *, offload, recompute, frozen, all_ignored):
         assert all(len(shape) < 2 or shape[-1] != 137 for shape, _ in offloaded), (
             "Transient vocabulary logits escaped the chunk"
         )
-        if device == "npu":
-            assert any(source == "npu" for _, source in offloaded)
-            assert "npu" in restored
+        if device != "cpu":
+            assert any(source == device for _, source in offloaded)
+            assert device in restored
     return loss.detach(), hidden.grad, weight.grad
 
 
