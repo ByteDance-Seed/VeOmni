@@ -115,6 +115,13 @@ seed_omni/mixins/offline_encoding.md
 
 ```{toctree}
 :maxdepth: 1
+:caption: SeedOmni Models
+
+seed_omni/models/qwen3.md
+```
+
+```{toctree}
+:maxdepth: 1
 :caption: Design
 
 design/ci_case_scheduling.md
