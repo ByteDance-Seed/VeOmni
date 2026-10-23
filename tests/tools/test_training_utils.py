@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import sys
+from types import SimpleNamespace
 
 import pytest
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -122,3 +124,68 @@ def test_deepseek_v3_gpu_keeps_default_moe(monkeypatch):
     overrides = training_utils.resolve_ops_overrides("deepseek_v3")
 
     assert not any(flag.startswith("--model.ops_implementation.moe_implementation=") for flag in overrides)
+
+
+@pytest.mark.parametrize(
+    "fault", ["missing_package", "unavailable", "wrong_count", "compute_error", "bad_readback", None]
+)
+def test_npu_ci_preflight_fails_closed(monkeypatch, fault):
+    """Reject runtime failures and visit all eight devices on the success path."""
+    from tests.tools.npu_preflight import check_npu_runtime
+
+    visited = []
+    synchronized = []
+
+    class FakeTensor:
+        device = SimpleNamespace(type="npu")
+
+        def __init__(self, index):
+            """Track the device identity and scalar value for the fake runtime."""
+            self.index = index
+            self.value = 1.0
+
+        def add_(self, value):
+            """Model arithmetic or a device-specific execution failure."""
+            if fault == "compute_error" and self.index == 3:
+                raise RuntimeError("device execution failed")
+            self.value += value
+            return self
+
+        def mul_(self, value):
+            """Complete the preflight's arithmetic without real hardware."""
+            self.value *= value
+            return self
+
+        def item(self):
+            """Model either a correct readback or a nonfinite device result."""
+            return float("nan") if fault == "bad_readback" else self.value
+
+    backend = SimpleNamespace(
+        is_available=lambda: fault != "unavailable",
+        device_count=lambda: 7 if fault == "wrong_count" else 8,
+        set_device=visited.append,
+        synchronize=lambda: synchronized.append(visited[-1]),
+    )
+    fake_torch = SimpleNamespace(npu=backend, ones=lambda size, device: FakeTensor(int(device.split(":")[1])))
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch_npu", None if fault == "missing_package" else SimpleNamespace())
+    if fault == "missing_package":
+        with pytest.raises(ModuleNotFoundError, match="torch_npu"):
+            check_npu_runtime()
+    elif fault is not None:
+        with pytest.raises(RuntimeError):
+            check_npu_runtime()
+        if fault == "compute_error":
+            assert visited == [0, 1, 2, 3]
+    else:
+        assert check_npu_runtime() == 8
+        assert visited == synchronized == list(range(8))
+
+
+@pytest.mark.parametrize("count", [0, -1])
+def test_npu_ci_preflight_rejects_invalid_count(count):
+    """Validate the requested count before importing any native dependencies."""
+    from tests.tools.npu_preflight import check_npu_runtime
+
+    with pytest.raises(ValueError, match="must be positive"):
+        check_npu_runtime(count)
