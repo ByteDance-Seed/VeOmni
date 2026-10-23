@@ -55,7 +55,9 @@ def _get_vlm_visual_module(model):
 
     inner_model = getattr(model, "model", None)
     if inner_model is not None:
-        return getattr(inner_model, "visual", None)
+        # Qwen-VL names the tower ``visual``; MiniMax M3 VL names it ``vision_tower``.
+        visual = getattr(inner_model, "visual", None)
+        return visual if visual is not None else getattr(inner_model, "vision_tower", None)
 
     return None
 
@@ -197,7 +199,7 @@ class VLMModelRuntime(VeOmniModelRuntime):
         vit_params, other_params = [], []
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                if "visual" in name:
+                if "visual" in name or "vision_tower" in name:
                     vit_params.append(param)
                 else:
                     other_params.append(param)

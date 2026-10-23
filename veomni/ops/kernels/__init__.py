@@ -25,6 +25,7 @@ from . import gated_delta_rule as _gated_delta_rule  # noqa: F401
 from . import layer_norm as _layer_norm  # noqa: F401
 from . import loss as _loss  # noqa: F401
 from . import mhc as _mhc  # noqa: F401
+from . import minimax_sparse_attention as _minimax_sparse_attention  # noqa: F401
 from . import moe_experts as _moe_experts  # noqa: F401
 from . import moe_experts_lora as _moe_experts_lora  # noqa: F401
 from . import qsa_attention as _qsa_attention  # noqa: F401

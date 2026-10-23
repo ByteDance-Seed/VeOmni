@@ -52,6 +52,9 @@ from tests.models.tiny_configs import (
     tiny_minimax_h3_config as _tiny_minimax_h3_config,
 )
 from tests.models.tiny_configs import (
+    tiny_minimax_m3_vl_config as _tiny_minimax_m3_vl_config,
+)
+from tests.models.tiny_configs import (
     tiny_movqgan_config as _tiny_movqgan_config,
 )
 from tests.models.tiny_configs import (
@@ -286,6 +289,21 @@ _MODEL_CASES = (
             "LlamaForSequenceClassification",
             "LlamaModel",
         ),
+    ),
+    _ModelCase(
+        model_type="minimax_m3_vl",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.language_model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.language_model.layers.0.self_attn.veomni_msa_indexer", "minimax_sparse_attention"),
+            ("model.language_model.layers.0.self_attn.veomni_msa_attention", "minimax_sparse_attention"),
+            ("model.language_model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
+            ("model.vision_tower.layers.0.self_attn.veomni_attn", "attention"),
+        ),
+        config_factory=_tiny_minimax_m3_vl_config,
+        architectures=("MiniMaxM3SparseForConditionalGeneration",),
+        has_registered_config=True,
+        processor_class_name="MiniMaxM3VLProcessor",
     ),
     _ModelCase(
         model_type="movqgan",
