@@ -298,7 +298,7 @@
     ]
   },
   {
-    "name": "npu-unit-31",
+    "name": "npu-unit-30",
     "suite": "unit",
     "args": [
       "-v",
@@ -308,7 +308,7 @@
     ]
   },
   {
-    "name": "npu-unit-32",
+    "name": "npu-unit-31",
     "suite": "unit",
     "args": [
       "-v",
@@ -318,7 +318,7 @@
     ]
   },
   {
-    "name": "npu-unit-33",
+    "name": "npu-unit-32",
     "suite": "unit",
     "args": [
       "-v",
@@ -328,7 +328,7 @@
     ]
   },
   {
-    "name": "npu-unit-34",
+    "name": "npu-unit-33",
     "suite": "unit",
     "args": [
       "-v",
@@ -338,7 +338,7 @@
     ]
   },
   {
-    "name": "npu-unit-35",
+    "name": "npu-unit-34",
     "suite": "unit",
     "args": [
       "-v",
@@ -348,7 +348,7 @@
     ]
   },
   {
-    "name": "npu-unit-36",
+    "name": "npu-unit-35",
     "suite": "unit",
     "args": [
       "-v",
@@ -358,7 +358,7 @@
     ]
   },
   {
-    "name": "ci-unit",
+    "name": "npu-unit-36",
     "suite": "unit",
     "conditional": false,
     "args": [
@@ -368,7 +368,7 @@
     ]
   },
   {
-    "name": "moe-router-replay-api-unit",
+    "name": "npu-unit-37",
     "suite": "unit",
     "conditional": false,
     "args": [
@@ -379,7 +379,7 @@
     ]
   },
   {
-    "name": "npu-e2e-01",
+    "name": "npu-e2e-38",
     "suite": "e2e",
     "args": [
       "-v",
@@ -389,7 +389,7 @@
     ]
   },
   {
-    "name": "npu-e2e-02",
+    "name": "npu-e2e-39",
     "suite": "e2e",
     "args": [
       "-v",

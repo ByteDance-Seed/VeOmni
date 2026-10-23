@@ -548,8 +548,12 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, capsys,
     monkeypatch.setattr(runner, "run_process", run_process)
     if failure == "child_failure":
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    manifest = json.loads((Path(runner.__file__).parent / "suites/gpu.json").read_text())
+    ci_selection = next(row["name"] for row in manifest if any(arg.rstrip("/") == "tests/ci" for arg in row["args"]))
     monkeypatch.setattr(
-        sys, "argv", ["ci", "--suite", "unit", "--backend", "cpu", "--only", "ci-unit", "--output-dir", str(output)]
+        sys,
+        "argv",
+        ["ci", "--suite", "unit", "--backend", "cpu", "--only", ci_selection, "--output-dir", str(output)],
     )
     if failure in ("keep_going_failure", "cleanup_failure"):
         sys.argv.append("--keep-going")

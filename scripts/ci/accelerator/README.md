@@ -117,10 +117,13 @@ launches, source fingerprints and the suite's elapsed wall time. Sum of batch
 or case durations is not elapsed wall time when work overlaps. Measured timings,
 including `durations.json`, are reporting artifacts and are not scheduling inputs.
 
+Manifest selection numbers run consecutively from one across each file,
+including both unit and e2e entries. Keep the existing order when renumbering.
 Foreground case statuses use `[unit-09-case-0001][STATUS][devices=0,1,2,3] nodeid`
-(or `[e2e-57-case-0001]` and `[devices=cpu]`). The entry ID comes from the
-manifest: `09-unit` becomes `unit-09`, `npu-e2e-01` becomes `e2e-01`, and
-`ci-unit` becomes `unit-ci`. Each case gets a one-based, four-digit index within
+(or `[e2e-58-case-0001]` and `[devices=cpu]`). The entry ID comes from the
+manifest: `09-unit` becomes `unit-09`, `npu-e2e-38` becomes `e2e-38`, and
+the GPU CI planner selection `55-unit` becomes `unit-55`. Each case gets a
+one-based, four-digit index within
 its entry's collected inventory, including parameterized cases. This index is
 independent of batching, card-count sorting and parallel completion order.
 All batches from one entry share its entry ID; no batch number is shown.
