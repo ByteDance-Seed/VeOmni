@@ -20,7 +20,7 @@ import sys
 import pytest
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter, runner_device_count
-from tests.tools.launch_utils import find_free_port, run_bounded_process_group
+from tests.tools.launch_utils import run_bounded_process_group
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
@@ -41,7 +41,6 @@ def _run_torchrun_script(
     timeout: float = 180.0,
 ) -> dict:
     """Launch ``script`` under torchrun with bounded timeout and return its JSON results."""
-    port = find_free_port()
     env = {**os.environ, "OMNI_FSDP_OUTPUT_DIR": output_dir}
     cmd = [
         sys.executable,
@@ -49,7 +48,7 @@ def _run_torchrun_script(
         "torch.distributed.run",
         "--nnodes=1",
         f"--nproc_per_node={nproc}",
-        f"--master_port={port}",
+        "--standalone",
         script,
         *(extra_args or []),
     ]

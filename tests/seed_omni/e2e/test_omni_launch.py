@@ -24,8 +24,6 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.checkpoint import layout
 from veomni.utils.device import IS_CUDA_AVAILABLE
 
-from ...tools.launch_utils import find_free_port
-
 
 _CI_LAUNCH = LaunchSpec(nproc=2)
 
@@ -57,7 +55,7 @@ def _torchrun(script: str, nproc: int) -> list[str]:
         "torch.distributed.run",
         "--nnodes=1",
         f"--nproc_per_node={nproc}",
-        f"--master_port={find_free_port()}",
+        "--standalone",
         script,
     ]
 
