@@ -143,6 +143,7 @@ class VeOmniModelRuntime:
             self._build_model()
             self._freeze_model_module()
             self._build_parallelized_model()
+            self._apply_frozen_ple()
             self._build_optimizer()
         self._build_model_assets()
         self.build_checkpoint()
@@ -487,6 +488,30 @@ class VeOmniModelRuntime:
         )
         self.model.train()
 
+    def _apply_frozen_ple(self) -> None:
+        """Freeze PLE tables after parallelization and before the optimizer.
+
+        Parallelization can upcast parameters. Restore the requested table dtype
+        first, then drop ``requires_grad`` so ``build_optimizer`` leaves the
+        tables out of Adam. ``optimizer.step`` re-checks that they stay frozen.
+        """
+        self._frozen_ple_guard = None
+        if not getattr(self.train_args, "freeze_ple_embeddings", False):
+            return
+
+        from ..utils.device import get_device_type
+        from ..utils.model_utils import pretty_print_trainable_parameters
+        from .frozen_ple import FrozenPLEGuard, prepare_ple_storage
+
+        prepare_ple_storage(self.model, getattr(self.train_args, "frozen_ple_dtype", None))
+        self._frozen_ple_guard = FrozenPLEGuard(self.model, expected_device=get_device_type())
+        logger.info_rank0(
+            "Frozen PLE: %d tables, %.3f GiB local",
+            len(self._frozen_ple_guard.parameters),
+            self._frozen_ple_guard.local_bytes / 2**30,
+        )
+        pretty_print_trainable_parameters(self.model)
+
     def _setup_lora(self) -> None:
         """Wrap :attr:`model` with the PEFT-free :class:`veomni.lora.VeOmniLoraModel`.
 
@@ -607,6 +632,19 @@ class VeOmniModelRuntime:
             no_decay_params=opt.no_decay_params,
             optimizer_config=opt,
         )
+        guard = getattr(self, "_frozen_ple_guard", None)
+        if guard is not None:
+            guard.verify(self.model, self.optimizer)
+            original_step = self.optimizer.step
+            model = self.model
+            optimizer = self.optimizer
+
+            def step_and_verify(*args, **kwargs):
+                result = original_step(*args, **kwargs)
+                guard.verify(model, optimizer)
+                return result
+
+            self.optimizer.step = step_and_verify
 
     def _build_lr_scheduler(self, total_steps: int) -> None:
         """Build the lr-scheduler over ``total_steps``.
@@ -652,6 +690,18 @@ class VeOmniModelRuntime:
         above only ever asks the model to load itself.
         """
         self.checkpoint.load()
+        self._resync_frozen_ple_after_load()
+
+    def _resync_frozen_ple_after_load(self) -> None:
+        """Re-arm the frozen-PLE check after checkpoint weights have been copied in."""
+        guard = getattr(self, "_frozen_ple_guard", None)
+        if guard is None:
+            return
+
+        from .frozen_ple import prepare_ple_storage
+
+        prepare_ple_storage(self.model, getattr(self.train_args, "frozen_ple_dtype", None))
+        guard.note_restored(self.model)
 
     def save_dcp(self, state: "TrainerState") -> None:
         """Write this model's resumable checkpoint for ``state.global_step``."""
