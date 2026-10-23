@@ -101,7 +101,7 @@ This is the most complex update. torch versions are pinned in **multiple places*
      `extra-build-variables` entry where the build needs `MAX_JOBS` /
      compute-capability flags (all but `flash-attn-cute` today).
      A torch ABI bump may require bumping the git revs. These belong to the
-     optional `magi` extra and require SM90+; use `uv sync --extra gpu --extra magi`
+     optional `magi` extra and require SM100+; use `uv sync --extra gpu --extra magi`
      to install them. GPU CI runs `uv sync --extra gpu` without `magi`, so
      the SM89 L20 runners omit these source builds.
 4. Update `torchcodec` version if needed (compatibility note in pyproject.toml)
@@ -168,4 +168,3 @@ If `uv lock` fails due to version conflicts, check:
 - **Committing only pyproject.toml**: always commit `uv.lock` together. Docker builds use `--locked` which requires the lockfile to match.
 - **override-dependencies markers**: the `extra == 'gpu'` markers in overrides are critical. Removing them causes uv to download wrong torch variants from PyPI.
 - **Assuming build isolation is disabled**: there is no `no-build-isolation-package` block any more. Source builds instead get their toolchain from `[tool.uv.extra-build-dependencies]` (uv venvs are not seeded), and `torch` is passed with `match-runtime = true` where the extension links against it. If a source build fails on a missing `setuptools`/`torch`, add it there rather than reaching for `--no-build-isolation`.
-- **Overlay reinstall**: an exact `uv sync` removes the MagiAttention SM90 CUTLASS overlay installed by `scripts/kernel/install_magi_sm90.sh`. Reinstall it afterwards (see constraints, "Environment Reproducibility").

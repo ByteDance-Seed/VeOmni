@@ -133,11 +133,11 @@ class OptimizerConfig:
         default="per_module",
         metadata={
             "help": (
-                "Which parameters max_grad_norm is computed over. 'per_module' clips each "
-                "module against its own norm; 'global' clips every module against one norm "
-                "taken across all of them. A single-model job has one module, so the two "
-                "agree; 'global' only becomes meaningful once an omni model owns several, "
-                "and is not implemented yet."
+                "How OmniTrainer applies max_grad_norm across OmniModules. "
+                "'per_module' (default): clip each module to max_grad_norm independently, "
+                "then report sqrt(sum n_i^2). "
+                "'global': measure each module unclipped, total=sqrt(sum n_i^2), then scale "
+                "all modules by one coefficient (single-model / seedream gradient_clip_val semantics)."
             )
         },
     )
@@ -247,13 +247,6 @@ class OptimizerConfig:
             )
         },
     )
-
-    def __post_init__(self):
-        if self.grad_clip_scope == "global":
-            raise NotImplementedError(
-                "model.optimizer.grad_clip_scope='global' needs a clip that spans several "
-                "modules, which arrives with the omni module runtime. Use 'per_module'."
-            )
 
 
 @dataclass
@@ -1509,14 +1502,16 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises when the model resolves its kernel."
         },
     )
-    qsa_attention_implementation: Literal["eager", "tilelang"] = field(
+    qsa_attention_implementation: Literal["eager", "tilelang", "torch_npu"] = field(
         default="eager",
         metadata={
             "help": "Qwen4-Exp QSA sparse attention. 'eager' expands the compact global token "
             "selection to a dense mask and runs quadratic PyTorch attention (numerical reference). "
-            "'tilelang' gathers the selected K/V rows instead (requires tilelang, bf16, NVIDIA CUDA); "
-            "it covers training forward/backward only, no KV cache, and raises on an attention mask. "
-            "Nonzero attention dropout falls back to eager with a warning."
+            "'tilelang' gathers the selected K/V rows instead (requires tilelang, bf16, NVIDIA CUDA). "
+            "'torch_npu' prunes per-query-chunk KV intervals with an int8 scatter mask and runs "
+            "torch_npu.npu_fusion_attention (requires bf16, Ascend NPU). "
+            "Both fused backends cover training forward/backward only, no KV cache, and raise on an "
+            "attention mask. Nonzero attention dropout falls back to eager with a warning."
         },
     )
     dsa_indexer_implementation: Literal["eager", "cudnn", "cann", "tilelang"] = field(
