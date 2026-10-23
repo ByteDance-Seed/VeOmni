@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from contextlib import contextmanager
 from pathlib import Path
@@ -179,6 +180,7 @@ def test_dspark_mtp_config_fields_and_defaults():
     )
     assert from_dict_cfg.num_nextn_predict_layers == 3
     assert from_dict_cfg.dspark_block_size == 5
+    assert "_explicit_num_nextn_predict_layers" not in copy.deepcopy(from_dict_cfg).to_dict()
 
 
 @pytest.mark.parametrize("coef", [-1.0, float("nan"), float("inf")])

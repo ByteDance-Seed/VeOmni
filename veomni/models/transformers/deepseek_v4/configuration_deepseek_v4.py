@@ -63,7 +63,8 @@ class DeepseekV4Config(_DeepseekV4Config):
 
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
-        object.__setattr__(instance, "_explicit_num_nextn_predict_layers", "num_nextn_predict_layers" in kwargs)
+        if "num_nextn_predict_layers" in kwargs:
+            object.__setattr__(instance, "_explicit_num_nextn_predict_layers", True)
         return instance
 
     def __post_init__(self, **kwargs):
