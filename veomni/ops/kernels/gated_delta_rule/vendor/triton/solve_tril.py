@@ -218,7 +218,8 @@ def solve_tril_64x64_kernel(
 def solve_tril(
     A: torch.Tensor,
     cu_seqlens: Optional[torch.Tensor] = None,
-    output_dtype: torch.dtype = torch.float
+    output_dtype: torch.dtype = torch.float,
+    chunk_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Compute the inverse of the matrix I + A
@@ -243,7 +244,8 @@ def solve_tril(
     output_dtype = A.dtype if output_dtype is None else output_dtype
 
     B, T, H, BT = A.shape
-    chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+    if cu_seqlens is not None and chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
     Ai = torch.zeros_like(A, dtype=output_dtype)

@@ -553,7 +553,11 @@ def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
         output = query + 2 * key
         if head_first:
             output = output.transpose(1, 2).contiguous()
-        return g, output, query.new_empty(0), None
+        return (
+            (g, output, query.new_empty(0), None, query, query, value)
+            if head_first
+            else (g, output, query.new_empty(0), None)
+        )
 
     def fake_chunk_bwd(query, key, value, g, beta, a, scale, initial_state, grad_output, *args):
         del a, initial_state, args
@@ -622,7 +626,7 @@ def test_fla_npu_packed_backward_reuses_normalized_cu_seqlens(
     def fake_chunk_fwd(query, key, value, g, beta, scale, initial_state, output_final_state, cu_seqlens, *args):
         del key, value, beta, scale, initial_state, output_final_state, args
         observed["forward"] = cu_seqlens
-        return g, query.transpose(1, 2).contiguous(), query.new_empty(0), None
+        return g, query.transpose(1, 2).contiguous(), query.new_empty(0), None, query, query, query
 
     def fake_chunk_bwd(query, key, value, g, beta, a, scale, initial_state, grad_output, cu_seqlens, *args):
         del a, scale, initial_state, args
@@ -717,9 +721,9 @@ def test_chunk_gated_delta_rule_fla_matches_eager(device):
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="chunk_gated_delta_rule npu needs torch_npu")
-@pytest.mark.parametrize("impl", ("triton", "fla_npu"))
+@pytest.mark.parametrize("impl", ("triton", "fla_npu", "fla_npu_reuse"))
 def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl):
-    _require_npu_gdr_dependencies(ascendc=impl == "fla_npu")
+    _require_npu_gdr_dependencies(ascendc=impl in ("fla_npu", "fla_npu_reuse"))
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
     other = resolve_op("chunk_gated_delta_rule", "standard", impl).wrapper
     torch.manual_seed(19)
@@ -732,8 +736,9 @@ def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl):
 
     q_e, k_e, v_e, g_e, b_e = make_grad_leaves(q, k, v, g, beta)
     q_o, k_o, v_o, g_o, b_o = make_grad_leaves(q, k, v, g, beta)
-    out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, use_qk_l2norm_in_kernel=True)
-    out_o, _ = other(q_o, k_o, v_o, g_o, b_o, use_qk_l2norm_in_kernel=True)
+    cu = torch.tensor([0, 17, 64], dtype=torch.int64)
+    out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)
+    out_o, _ = other(q_o, k_o, v_o, g_o, b_o, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)
     torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
 
     grad_output = torch.randn_like(out_e)
@@ -1053,3 +1058,88 @@ def test_chunk_scaled_dot_kkt_fwd_requires_g_and_beta(module_path: str) -> None:
     assert by_name["g"] is None
     assert by_name["beta"] is None
     assert "requires g and beta" in source
+
+
+@pytest.mark.parametrize("reuse", (False, True))
+def test_fla_npu_saved_intermediates_policy(reuse, monkeypatch, _stub_npu_input_guard):
+    """Both rows share FP arithmetic but only the opt-in row retains W/H/value tensors."""
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu as m
+
+    values = [torch.ones(1, 4, 2, 8, dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
+    gate = torch.ones(1, 4, 2)
+    cached = tuple(torch.full((2,), i + 1.0) for i in range(3))
+
+    def fwd(q, k, v, g, *args):
+        return g, q.transpose(1, 2), q.new_empty(0), None, *cached
+
+    def bwd(q, k, v, g, beta, *args):
+        assert all(actual is expected for actual, expected in zip(args[-3:], cached if reuse else (None,) * 3))
+        return torch.ones_like(q), torch.ones_like(k), torch.ones_like(v), torch.zeros_like(beta), torch.zeros_like(g)
+
+    monkeypatch.setattr(m, "_chunk_fwd", fwd)
+    monkeypatch.setattr(m, "_chunk_bwd", bwd)
+    outputs, saved = m.forward(*values, gate, gate, _reuse_intermediates=reuse)
+    if reuse:
+        assert all(a is b for a, b in zip(saved.tensors[-3:], cached))
+    else:
+        assert all(t.numel() == 0 for t in saved.tensors[-3:])
+    grads = m.backward((torch.ones_like(outputs[0]), outputs[1]), saved)
+    assert all(torch.equal(g, torch.ones_like(v)) for g, v in zip(grads[:3], values))
+
+
+@pytest.mark.parametrize("heads", (1, 4, 16, 64))
+@pytest.mark.parametrize("chunk_size", (16, 64, 128))
+def test_fla_npu_metadata_covers_forward_and_reverse_tiles(heads, chunk_size):
+    """Both cumsum tile sizes must exist without device-derived metadata."""
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu as m
+
+    bounds = torch.tensor([0, 0, 129, 512], dtype=torch.int64)
+    _, tables, _ = m.precompute_varlen_metadata(bounds, heads, chunk_size, device="cpu")
+    for reverse in (False, True):
+        tile = max(chunk_size, 1 << (max(1, (1 << (11 if reverse else 12)) // heads) - 1).bit_length())
+        assert torch.equal(tables[str(tile)], m._prepare_chunk_indices(bounds, tile))
+
+
+def test_fla_npu_batched_upload_preserves_empty_and_mixed_dtypes():
+    """Batching must not promote user-supplied integer metadata."""
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu as m
+
+    tables = {"a": torch.tensor([[1, 2]], dtype=torch.int32), "b": torch.empty(0, 2, dtype=torch.int64), "c": None}
+    actual = m._upload_chunk_tables(tables, "cpu")
+    assert actual["c"] is None
+    for key in ("a", "b"):
+        assert actual[key].dtype == tables[key].dtype
+        assert actual[key].shape == tables[key].shape
+        assert torch.equal(actual[key], tables[key])
+
+
+def test_convolution_boundary_cache_inference_to_training():
+    """Inference warmup cannot cache tensors that autograd refuses to save."""
+    from veomni.ops.kernels.gated_delta_rule.causal_conv1d.standard.triton import _cached_boundary_tensor
+
+    _cached_boundary_tensor.cache_clear()
+    with torch.inference_mode():
+        warm = _cached_boundary_tensor((0, 17, 64), torch.int64, "cpu", 0)
+    actual = _cached_boundary_tensor((0, 17, 64), torch.int64, "cpu", 0)
+    assert actual is warm
+    assert not actual.is_inference()
+
+    class SaveBoundaries(torch.autograd.Function):
+        """Exercise the integer saved-tensor contract used by the registry."""
+
+        @staticmethod
+        def forward(ctx, x):
+            """Save a cached boundary tensor alongside trainable data."""
+            ctx.save_for_backward(actual)
+            return x.clone()
+
+        @staticmethod
+        def backward(ctx, grad):
+            """Reading a warmup entry must remain legal in training."""
+            assert torch.equal(ctx.saved_tensors[0], actual)
+            return grad
+
+    value = torch.ones(1, requires_grad=True)
+    SaveBoundaries.apply(value).sum().backward()
+    assert value.grad.item() == 1
+    _cached_boundary_tensor.cache_clear()
