@@ -24,7 +24,12 @@ Supported in this correctness stage:
   Explicit cu-seqlens isolate packed samples consistently for SP/CP=1 and SP/CP>1.
 - PLE n-gram token halos and differentiable dilated-convolution halos across
   Ulysses or context-parallel shard boundaries, while persistent PLE table
-  routing remains on the independent `ple_fsdp × ple` mesh.
+  routing remains on the independent `ple_fsdp × ple` mesh. Packed metadata is
+  computed once per model forward; n-gram histories reset at local sample
+  offsets, and convolution correction is bounded to the first
+  `(kernel_size - 1) * dilation` outputs of each sample in fixed-size chunks.
+  Interior tokens retain the original convolution and SP halo, with no added
+  collective or checkpoint parameter.
 - VeOmni fused cross-entropy and fused MoE dispatch, with sequence-local router
   logits and padding masks for auxiliary load-balancing loss.
 - Concurrent PLE and MoE expert parallelism: PLE tables use the persistent
@@ -68,6 +73,9 @@ Known limitations:
   chunk gated-delta-rule kernels. GatedDeltaNet head counts must be divisible by
   the active `ulysses_size`/`cp_size`; QSA attention has no head-divisibility
   constraint because it keeps all query heads local and all-gathers only KV.
+  When `chunk_gated_delta_rule_implementation=flash_qla`, GatedDeltaNet
+  preserves grouped Q/K heads (`num_k_heads < num_v_heads`) directly into the
+  FlashQLA chunk kernel instead of expanding Q/K with `repeat_interleave`.
 - PLE n-gram history and its dilated convolution reset at explicit
   `cu_seq_lens_q` packed-sample boundaries. The halo-only fallback remains for
   direct component calls that do not provide packing metadata.

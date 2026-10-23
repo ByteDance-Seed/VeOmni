@@ -14,6 +14,7 @@ from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler, WanImag
 from diffusers.models import normalization
 from diffusers.video_processor import VideoProcessor
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.async_offload import apply_async_activation_offload
 from veomni.models.diffusers.wan_t2v.wan_condition import modeling_wan_condition as condition_module
 from veomni.models.diffusers.wan_t2v.wan_condition.configuration_wan_condition import (
@@ -21,6 +22,9 @@ from veomni.models.diffusers.wan_t2v.wan_condition.configuration_wan_condition i
 )
 from veomni.models.diffusers.wan_t2v.wan_transformer import modeling_wan_transformer as transformer_module
 from veomni.models.diffusers.wan_t2v.wan_transformer.configuration_wan_transformer import WanTransformer3DModelConfig
+
+
+_CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
 
 
 @pytest.fixture
@@ -381,6 +385,9 @@ def _wan_sp_worker(rank, rendezvous):
             parallel_state.clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="requires CPU Gloo")
 def test_wan_sp_unpads_before_output_head(tmp_path):
-    torch.multiprocessing.spawn(_wan_sp_worker, args=(f"file://{tmp_path / 'rendezvous'}",), nprocs=2, join=True)
+    torch.multiprocessing.spawn(
+        _wan_sp_worker, args=(f"file://{tmp_path / 'rendezvous'}",), nprocs=_CI_CPU_2.nproc, join=True
+    )

@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni import EdgeDef, NodeDef
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.graphs.base import END
@@ -19,6 +20,9 @@ from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleM
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.module_configuration_base import OmniModuleConfig
 from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_from_endpoint_default_method():

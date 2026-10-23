@@ -70,22 +70,71 @@ functions and matching mask builders in the Transformers registries. Each ops
 row then uses the same Transformers interface lookup as the model-facing path.
 The `eager` row falls back to the modeling module's local
 `eager_attention_forward`, because Transformers does not register eager
-attention globally. The short `magi_attention` row deliberately resolves the
-`veomni_magi_attention` interface so its dependency and hardware requirements
-remain visible to the ops registry.
+attention globally. The short `flex_attention` and `magi_attention` rows resolve
+their `veomni_*` interfaces so they share the adapters' device and backend
+behavior when selected directly through the ops registry.
 
-The Magi default prepares an explicit `FA4AttnArg` and reuses it while the range tensors and attention shape remain unchanged, avoiding the upstream facade's repeated GPU-to-CPU range conversion in every transformer layer. VeOmni's FA4 autograd function passes that prepared argument directly to MagiAttention's lower-level `fa4_fwd` and `fa4_bwd` functions. SM90 uses the precompiled CUTLASS `ffa_fa3` backend, while SM100 and newer GPUs use the CUTE DSL/JIT backend. VeOmni prepares and validates the selected backend once per device.
+The Magi default prepares an explicit `FA4AttnArg` and reuses it while the range tensors and attention shape remain unchanged, avoiding the upstream facade's repeated GPU-to-CPU range conversion in every transformer layer. VeOmni's FA4 autograd function passes that prepared argument directly to MagiAttention's lower-level `fa4_fwd` and `fa4_bwd` functions. MagiAttention is available on NVIDIA SM100 and newer GPUs through CUTE DSL/JIT. VeOmni validates the query device once per device.
 
 All registered adapters use the Transformers attention-forward convention.
 Q/K/V inputs use `[batch, heads, sequence, head_dim]`; the returned attention
 output uses `[batch, sequence, heads, head_dim]`.
 
+For `sdpa`, `veomni_sdpa`, `eager` (with `is_causal=False`), and
+`veomni_sage_attention`, unmasked (`attention_mask=None`) batch-size-1 calls
+carrying multi-segment `cu_seqlens` (`cu_seq_lens_q`/`k` or `cu_seqlens_q`/`k`)
+are automatically split per segment inside the wrapper and concatenated back
+along the sequence dimension. In `veomni_sdpa` and `veomni_sage_attention`,
+this split happens after the Ulysses sequence-gather/head-scatter exchange so
+global `cu_seqlens` match the gathered sequence length. Single-segment metadata
+or calls already isolated by a 3D/4D dense `attention_mask` strip the packed
+metadata without splitting.
+
 ## FlexAttention mask contract
+
+The Flex implementation has four responsibilities. These are independent of
+Magi's adapter and do not change the model's mask predicate:
+
+| Responsibility | Implementation | Invariant |
+| --- | --- | --- |
+| Layout and SP | `standard/flex/_inputs.py`, `standard/flex/__init__.py` | Normalize THD/BHSD before exchange, restore the caller's output layout |
+| Backend routing | `standard/flex/__init__.py`: `resolve_flex_attention` | Select eligible FLASH calls; retain Triton and explicit backend behavior |
+| Variable-length FLASH | `standard/flex/_fa4.py` | Shape-derived Q/K bounds, one dynamic-only compile path, no dLSE |
+| Pinned FA4 compatibility | `standard/flex/_fa4_sm90_compat.py` | Protect auxiliary metadata before reads, with a versioned native JIT cache |
+
+Paths above are relative to `veomni/ops/kernels/attention/`. Adapter contracts
+live in `tests/ops/attention/test_flex_attention.py`; compatibility dispatch,
+installation and asymmetric Q/K regressions live in
+`tests/ops/attention/test_fa4_sm90_compat.py`.
+
+### Input layouts and mask semantics
 
 `flex_attention_forward` requires a native
 `torch.nn.attention.flex_attention.BlockMask`. The model owns visibility
 semantics and BlockMask construction; the generic op does not convert a dense
 mask or construct model-specific visibility rules.
+
+Flex additionally accepts 3D Q/K/V in `[tokens, heads, head_dim]` layout and
+returns `[tokens, heads, value_head_dim]`. All three inputs must have the same
+ndim. The adapter normalizes 3D inputs to `[1, heads, tokens, head_dim]` using
+views before Ulysses and backend selection. It does not infer axis order from
+sizes: `[heads, tokens, head_dim]` and 4D `[batch, tokens, heads, head_dim]` are
+not accepted layout conventions. Packed 3D inputs are one concatenated stream;
+the supplied BlockMask defines document isolation. Q and K lengths can differ,
+but K/V heads and lengths, Q/K head dimensions, and batch sizes must match.
+
+Both layouts use the same 4D kernel wrapper. FLASH mask bounds are checked
+against actual Q/K lengths after any Ulysses exchange, including already
+exchanged inputs supplied with `skip_ulysses=True`. Outputs are restored to the
+caller's layout after inverse exchange. When Triton returns LSE, it has shape
+`[heads, tokens]` for 3D input and `[batch, heads, sequence]` for 4D input; FLASH
+continues to return `None` for LSE.
+
+The second result is optional LSE, not attention weights. Flex rejects
+`output_attentions=True` before Ulysses communication or backend selection,
+whether the backend is automatic, FLASH, or Triton. Use eager attention when
+attention weights are required; omitting the option or passing `False` keeps
+the existing output contract.
 
 Transformers models may pass `sliding_window` metadata alongside a native
 BlockMask whose predicate already encodes the window. The adapter accepts but
@@ -93,6 +142,196 @@ does not use that integer metadata to reconstruct or alter visibility; the
 supplied BlockMask remains the sole mask authority. Calls without a native
 BlockMask are rejected. Dropout and remaining kernel validation are delegated
 to the pinned Transformers/PyTorch FlexAttention adapter.
+
+### Backend selection
+
+`veomni_flex_attention` stays one public NVIDIA GPU op. The adapter selects
+PyTorch's FLASH backend (CuteDSL wrapping FA4) on SM90 and newer when FA4 is
+installed. SM80 stays on Triton; unsupported FA4 dtypes and head dimensions
+also fall back to Triton. The registered mask builder uses 128×128 blocks
+through SM90 and 256×128 on SM100+, as required by the SM100 FA4 backend.
+Caller-provided `BlockMask` tiles must match these sizes for automatic FLASH
+selection; mismatched tiles stay on Triton without changing the mask.
+An explicit `kernel_options["BACKEND"]` wins. FLASH does not request LSE
+because that backend's backward rejects dLSE. Attention sinks (`s_aux`) need
+LSE renormalization, so they stay on Triton unless FLASH was forced, which
+is rejected.
+
+### Compiled mask construction
+
+`flex_attention_mask_builder` caches `torch.compile(create_block_mask)` and uses
+it by default, including for packed inputs with `cu_seqlens`. This compilation
+is separate from FLASH attention execution. It uses PyTorch's automatic dynamic
+generalization: an initial length specialization may be followed by a more
+general graph when lengths change. A cached callable can therefore own several
+graphs; caching the callable alone does not prove graph reuse.
+
+Packing by itself is not a reason to disable compilation. Changing document
+boundaries or segment counts changes metadata values, while the packed
+predicate consumes per-token tensors. Regression coverage exercises the public
+builder with changing lengths, segment layouts, batched flattened coordinates,
+and asymmetric Q/K, checks visibility and all sparse tables against references,
+and requires repeated inputs to reuse graphs within a limited compile budget.
+Arbitrary changes to predicate code or captured Python state can still
+specialize; these tests do not promise graph reuse for every custom predicate.
+
+Mask construction composes padding and offset predicates within each call and
+passes device, sequence lengths and block sizes directly to `create_block_mask`.
+It does not replace Transformers module helpers, so overlapping calls cannot
+leave another invocation's device or geometry installed for native HF callers.
+The padding composition retains the pinned HF all-valid fast path and right
+padding behavior for cached offsets.
+
+Use `compile_block_mask=False` for explicit eager construction. Both paths
+set the deprecated `_compile` flag to `False`; the compiled path uses the cached
+wrapper instead. Eager construction may materialize
+token-square intermediates, so it can cost substantially more memory on long
+sequences. Compare compilation cost, steady execution, and peak memory for the
+actual workload before selecting it as a fallback.
+
+With pinned PyTorch 2.11, compiled CPU construction with boolean padding and
+nonzero offsets can hit an Inductor `VecMask` C++ codegen error. Use
+`compile_block_mask=False` for CPU construction if this occurs. CUDA FLASH
+validation uses normal GPU codegen; the CPU limitation does not require
+disabling compiled mask construction on CUDA.
+
+### Dynamic compilation
+
+FLASH calls always compile a wrapper with `dynamic=True, fullgraph=True`;
+callers do not need a compile-mode parameter. Fixed and variable sequence
+lengths use the same implementation. Inside the wrapper, a shallow `BlockMask`
+takes its sequence lengths from Q/K tensor shapes, preserving all eight sparse
+buffers, `BLOCK_SIZE`, and `mask_mod`. Current FLASH lowering supports these
+shape-derived symbols, while dynamically captured Python integer lengths can
+be rejected.
+
+The adapter requires the original mask bounds to exactly match Q/K lengths
+before entering the wrapper. Logical/truncated bounds and special no-op masks
+with different bounds are rejected; build a mask for the actual Q/K lengths.
+This does not add padding or change visibility. The Transformers Triton path
+retains its existing compilation behavior.
+
+`fullgraph=True` makes cache exhaustion raise instead of falling back to eager
+dense attention. The dynamic wrapper supports attention within an eager caller.
+An outer `torch.compile(dynamic=True)` can change symbol provenance through the
+bounds check and remains unsupported; outer static compilation has a dedicated
+GPU regression. Additional Python scalar captures in custom mask/score callbacks
+are not normalized by this wrapper. Keep per-sample geometry in indexed metadata
+tensors; the pinned CuteDSL lowering can also reject zero-dimensional scalar-tensor
+captures, so replacing a Python scalar with a scalar tensor is not sufficient.
+Dtype, head dimensions and other guards can still produce specializations.
+
+Framework-generated sliding-window, softcap, and Q/K offset callbacks use
+indexed device metadata instead of captured Python scalars. Uniform values are
+stored once and broadcast as views; callbacks index them with token positions,
+because constant-index loads such as `buffer[0]` also fail in the pinned FLASH
+code generator. Zero offsets bypass the offset wrapper. Packed coordinates are
+precomputed as row-by-token metadata, avoiding symbolic row-width arithmetic
+inside the callback. These changes preserve causal/window visibility,
+cached suffix alignment, and softcap-before-bias ordering. They do not rewrite
+arbitrary user callbacks or change the explicit backend selection.
+Packed coordinate mapping preserves the caller's index dtype (Int32 on FLASH)
+before invoking nested predicates, so their metadata lookups remain valid.
+
+Keep `mask_mod` / `mask_function` a fixed predicate. Encode per-batch
+geometry in captured tensors such as document ids, span ids, or
+`cu_seqlens`, and reuse the same callable. Python constants inside the predicate
+can specialize static programs or become unsupported captures in dynamic FLASH.
+Baking a new split as `q < 256` can retrace or fail on new layouts. Tensor
+*values* can change without changing the predicate program.
+`flex_attention_mask_builder` compiles `create_block_mask` around
+whatever callable the caller passes. It does not rewrite a per-step range
+list into a stable predicate.
+
+A packed prefix-plus-causal mask can keep one callable and refresh two
+`int32 [S]` buffers each step:
+
+```python
+def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+    same_document = document_ids[q_idx] == document_ids[kv_idx]
+    causal = q_idx >= kv_idx
+    same_full_span = (full_span_ids[q_idx] >= 0) & (
+        full_span_ids[q_idx] == full_span_ids[kv_idx]
+    )
+    return same_document & (causal | same_full_span)
+```
+
+### FA4 partial-tile compatibility
+
+For pinned FA4 `4.0.0b16`, VeOmni installs a compatibility forwarder before
+compilation to protect auxiliary mask metadata on partial tiles. Later sparse
+KV blocks can disable sequence bounds checks even when the query tile contains
+padded rows. Masking scores after the callback cannot undo an out-of-bounds
+metadata read. Causal visibility expressed through a custom Flex callback still
+uses this native noncausal/nonlocal callback path.
+
+The forwarder handles native `mask_seqlen=False` calls with a custom mask and
+auxiliary tensors. It checks K completeness first for every Q tile, retaining
+full native protection for uncertain K indices. On complete K tiles, it adds
+Q-only protection only for physical Q padding. The physical Q extent is
+`seqlen_q * qhead_per_kvhead_packgqa`, rather than the logical token count alone.
+Both native boolean variants remain compile-time constants; runtime tile
+selection is uniform across the CTA.
+
+| Tile/call | Action |
+| --- | --- |
+| Native bounds already enabled, causal/local native path, or no auxiliary callback | Delegate unchanged; native backward keeps its existing protection |
+| Complete physical Q and complete K tile | Delegate unchanged after the K-completeness check |
+| Padded Q tile and proven complete K tile | Clamp invalid logical Q indices to zero before the callback; AND its result with Q validity |
+| Any Q tile with ragged/negative K tile or empty Q | Delegate with full native sequence bounds enabled |
+
+Q-only protection requires `seqlen_q > 0`, `n_block >= 0` and
+`(n_block + 1) * tile_n <= seqlen_k`. The incoming false flag alone is not proof
+that K is in range: the native sparse index lists are not validated for ordering.
+The fallback preserves full protection for those boundary cases. Native code
+already converts PackGQA physical rows to logical query/head indices before the
+callback; the Q-only callback must not divide the query index again. Its
+register-local temporary does not allocate a PyTorch tensor. Invalid Q rows
+remain masked to negative infinity, and valid-token visibility, mask buffers
+and callable semantics remain unchanged.
+
+The correction does not require sorted sparse indices for K safety. The
+ragged-K regression reorders sparse lists for both complete and padded Q tiles,
+checking outputs and gradients against a dense visibility oracle.
+
+Although installation runs when VeOmni's Flex adapter is imported, the forwarder
+replaces FA4's shared native method. Direct FA4 calls in the same process also
+receive the correction when they use the affected auxiliary callback path.
+Ordinary VeOmni `flash_attention_4` calls do not supply `mask_mod` or
+`aux_tensors`; their native causal/window/varlen paths do not trigger this defect.
+Standalone FA4 programs that do not import VeOmni do not receive this local fix.
+
+Corrected forward/backward kernels use a dedicated FA4 JIT-cache
+namespace because FA4's package-source fingerprint excludes the repository
+forwarder. The forwarder uses `veomni_sm90_aux_bounds_q_only_k_bounds_materialized_fwd` and
+`veomni_sm90_aux_bounds_q_only_k_bounds_materialized_bwd`. This prevents preexisting in-memory or
+persisted kernels from bypassing the correction. Use a new namespace whenever shader semantics
+change. Old cache objects remain referenced, and both replacement caches are
+prepared before installation is published; initialization failure can be retried.
+Restart the process after updating this layer; installation is idempotent, not a
+hot-reload upgrade of an already installed forwarder.
+
+Installation requires the exact pinned package version and expected signature,
+and safely skips missing optional dependencies. H20 validation covers THD/BHSD
+outputs and Q/K/V gradients, variable-length graph reuse, asymmetric Q/K,
+PackGQA and combined outer static compilation. Finite
+numerics and allocator-enabled memcheck alone cannot establish memory safety;
+use `PYTORCH_NO_CUDA_MEMORY_CACHING=1` for this check. The shared `apply_mask`
+method also serves SM80, which has not been hardware-tested here; SM100's
+separate method is not replaced. Re-evaluate the compatibility layer when
+upgrading FA4; skipping another version does not establish that it fixes the
+defect.
+
+FA4 b16's native forward cache omits Q/K/V zero-stride broadcast patterns.
+The adapter materializes broadcast views after KV expansion and before FLASH.
+Regression tests share the production cache across ordinary and singleton-KV
+expanded layouts, including an outer compiled caller. Native caches use a new
+namespace to exclude persisted kernels compiled before normalization.
+
+The correction adds no bounds buffer, extra kernel launch or synchronization.
+Q-only protection avoids unnecessary K index wrapping on complete K tiles.
+Boundary checks still add kernel instructions; public adapter tests establish
+correctness and memory safety, not end-to-end training throughput.
 
 ## MagiAttention mask and execution contract
 
@@ -108,7 +347,7 @@ MagiAttentionMask(
 
 Query and key ranges are paired half-open token intervals. When `attn_type_map` is present, values mean `0=full`, `1=causal`, `2=inverse causal`, and `3=bidirectional causal`; `None` means full attention for every range. The mask constructor validates tensor structure and static range/type values once. The caller or model-specific mask builder must also ensure that every range endpoint is within the actual post-SP query/key sequence lengths. The default backend converts the tensor metadata into a prepared `FA4AttnArg` and reuses it across layers while the mask and attention shape remain unchanged. The generic adapter does not infer ranges from dense masks or convert a FlexAttention `BlockMask`.
 
-The current adapter requires `cp_size == 1`, batch size 1, zero attention dropout, and NVIDIA SM90 or newer. It accepts SP1 or VeOmni Ulysses sequence parallelism, passes `scaling` as Magi's `softmax_scale`, and passes `softcap`. SM80 and older GPUs are unsupported.
+The current adapter requires `cp_size == 1`, batch size 1, zero attention dropout, and NVIDIA SM100 or newer. It accepts SP1 or VeOmni Ulysses sequence parallelism, passes `scaling` as Magi's `softmax_scale`, and passes `softcap`. SM90 and older GPUs are unsupported.
 
 ### Unified MagiAttention mask builder
 
@@ -128,39 +367,6 @@ The optional `magi` extra requires `gpu` (`veomni[gpu]`) and installs MagiAttent
 ```bash
 uv sync --extra gpu --extra magi --dev
 ```
-
-### Installing the SM90 CUTLASS overlay
-
-SM90 additionally requires a precompiled CUTLASS overlay. Install the verified default matrix after syncing the `gpu` and `magi` extras:
-
-```bash
-bash scripts/kernel/install_magi_sm90.sh
-```
-
-The default configuration enables BF16 and FP16 inputs, the hdim128 kernel bucket, arbitrary-mask forward and backward for nfunc 1, 3, and 5, `MAX_JOBS=2`, `NVCC_THREADS=4`, and NVCC `--split-compile=32`. The hdim128 bucket accepts input head dimensions up to 128, so models with head dimension 64 do not require the separate hdim64 specialization. Use `--dtype bf16` when FP16 runtime dispatch is unnecessary. FP8, softcap, split KV, paged KV, append KV, local attention, PackGQA, varlen, and cluster kernels are excluded from runtime dispatch because the current Magi adapter does not use them.
-
-Use `--print-config` to inspect the resolved build without checking CUDA or compiling. Selected settings can be overridden from the CLI:
-
-```bash
-# Inspect the verified default.
-bash scripts/kernel/install_magi_sm90.sh --print-config
-
-# Request additional upstream head-dimension buckets.
-bash scripts/kernel/install_magi_sm90.sh --dim 64,128,256
-
-# Customize mask functions, dtype coverage, and compiler concurrency.
-bash scripts/kernel/install_magi_sm90.sh \
-  --dim 128 \
-  --nfunc 1,3 \
-  --dtype bf16,fp16 \
-  --max-jobs 4 \
-  --nvcc-threads 2 \
-  --split-compile 16
-```
-
-Run the script with `--help` for the complete option list. The pinned upstream build always exposes BF16 and provides no corresponding disable flag, so `--dtype fp16` cannot produce a true FP16-only overlay and is rejected. The `--dtype` option controls runtime dtype exposure, but the upstream nfunc generator may still instantiate disabled dtype and feature combinations during compilation. Non-default matrices are forwarded to the pinned upstream build without claiming that they are supported. Dedicated hdim64 or hdim256 arbitrary kernels can fail CUDA 13 compilation with a PTX register-allocation error. In particular, `--dim 64,128,256` is a valid request but is not a verified configuration and does not fall back automatically if compilation fails.
-
-The overlay is intentionally installed after `uv sync --extra gpu --extra magi`. A later exact `uv sync` without `--extra magi` can remove it, so rerun the installer before using MagiAttention on SM90.
 
 Standalone `sliding_window` metadata is rejected because all visibility must already be encoded by the range mask. VeOmni's `_MagiFA4Function` passes the prepared argument to MagiAttention's `fa4_fwd` and reuses the same argument for `fa4_bwd`.
 
@@ -187,7 +393,9 @@ Before enabling `attn_implementation: flex_attention` for a new model:
 2. Preserve the model's complete visibility contract in a native `BlockMask`.
    Full attention, sliding windows, bidirectional regions, packed-sample
    boundaries, prefix rules, and cache offsets remain model-owned semantics;
-   the generic VeOmni FlexAttention adapter does not recreate them.
+   the generic VeOmni FlexAttention adapter does not recreate them. Prefer a
+   fixed `mask_mod` that gathers per-token metadata over a new Python-constant
+   closure on every batch.
 3. If VeOmni packing or Ulysses changes the mask inputs, replace the relevant
    Transformers mask-helper imports in the patchgen config and pass the
    required metadata through the generated model forward. Packed boundaries
@@ -248,3 +456,22 @@ active Ulysses group.
 This interface consumes model-provided masks and transports attention tensors.
 It does not define model-specific masking, data preprocessing, trainer
 scheduling, or FSDP policy.
+
+### FLASH eligibility and broadcast layouts
+
+Automatic FLASH selection retains Triton for unsupported sparse Q/V dimensions,
+BlockMasks without full-block tables, and trainable `position_bias`. The general sparse training path on SM90/SM100/SM110
+requires Q/K and V dimensions in `{32, 64, 96, 128}`. Larger dimensions may
+select incompatible native tile sizes or dedicated dense kernels. Automatic
+FLASH selection uses BF16/FP16 and excludes unvalidated architectures. Explicit FLASH requests retain native
+validation errors; trainable bias and attention sinks raise an early error.
+
+FA4 b16 forward does not key its compiled kernels by Q/K/V zero-stride broadcast
+patterns. The adapter materializes only broadcast Q/K/V views, including singleton
+KV expansion, before invoking FLASH. Ordinary non-broadcast tensors retain their
+layouts. Separate cache namespaces prevent reuse of kernels predating this fix.
+
+The K-completeness check and broadcast-view materialization preserve the public
+adapter's safety contract. Historical Bagel throughput figures do not measure
+these later safety refinements; this PR's regressions establish correctness and
+memory safety rather than a new end-to-end speedup.
