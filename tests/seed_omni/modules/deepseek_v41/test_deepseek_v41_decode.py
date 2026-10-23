@@ -208,3 +208,33 @@ def test_lse_is_base_two_like_the_kernel():
     # And it really is base two, not an accident of this input.
     natural = dense_lse * math.log(2.0)
     assert not torch.allclose(natural, kernel_lse, atol=1e-2)
+
+
+def test_v41_reuses_v4_dspark_and_export_primitives():
+    """V4.1 reuses V4's DSpark heads, window indices, dense_sparse_attn, and export helpers via reuse.py."""
+    from veomni.models.checkpoint.convert import split_moe_params
+    from veomni.models.seed_omni.modules.deepseek_v41 import dequant as v41_dequant
+    from veomni.models.seed_omni.modules.deepseek_v41 import export as v41_export
+    from veomni.models.seed_omni.modules.deepseek_v41.llm import decode as v41_decode
+    from veomni.models.seed_omni.modules.deepseek_v41.llm import dspark as v41_dspark
+    from veomni.models.seed_omni.modules.deepseek_v41.llm import reuse as v41_reuse
+    from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as v4_converter
+    from veomni.models.transformers.deepseek_v4 import dspark as v4_dspark
+
+    assert v41_reuse.dense_sparse_attn is v4_dspark.dense_sparse_attn
+    assert v41_decode.dense_sparse_attn is v4_dspark.dense_sparse_attn
+    assert v41_dspark.dense_sparse_attn is v4_dspark.dense_sparse_attn
+    assert v41_reuse.main_window_indices is v4_dspark.main_window_indices
+    assert v41_reuse.DSparkMarkovHead is v4_dspark.DSparkMarkovHead
+    assert v41_dspark.DSparkMarkovHead is v4_dspark.DSparkMarkovHead
+    assert v41_reuse.DSparkConfidenceHead is v4_dspark.DSparkConfidenceHead
+    assert v41_dspark.DSparkConfidenceHead is v4_dspark.DSparkConfidenceHead
+    assert v41_reuse.split_moe_params is split_moe_params
+    assert v41_export.split_moe_params is split_moe_params
+    assert (
+        v41_reuse.validate_deepseek_v4_export_quant_support is v4_converter.validate_deepseek_v4_export_quant_support
+    )
+    assert (
+        v41_export.validate_deepseek_v4_export_quant_support is v4_converter.validate_deepseek_v4_export_quant_support
+    )
+    assert v41_dequant.FP4_VALUES is v4_converter._FP4_E2M1_VALUES

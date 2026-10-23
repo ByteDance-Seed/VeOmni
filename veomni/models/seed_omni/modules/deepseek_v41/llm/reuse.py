@@ -32,6 +32,16 @@ not pinned that field. V4.1 rotates locally instead; see
 
 from typing import Any
 
+from ......models.checkpoint.convert import split_moe_params
+from ......models.transformers.deepseek_v4.checkpoint_tensor_converter import (
+    validate_deepseek_v4_export_quant_support,
+)
+from ......models.transformers.deepseek_v4.dspark import (
+    DSparkConfidenceHead,
+    DSparkMarkovHead,
+    dense_sparse_attn,
+    main_window_indices,
+)
 from ......ops import VeomniOp
 from ......ops.config import resolve_op_impl, resolve_qat_impl
 from ......utils.device import IS_NPU_AVAILABLE
@@ -110,11 +120,17 @@ DeepseekV4MLP = _generated.DeepseekV4MLP
 
 
 __all__ = [
+    "DSparkConfidenceHead",
+    "DSparkMarkovHead",
     "DeepseekV4Experts",
     "DeepseekV4GroupedLinear",
     "DeepseekV4MLP",
     "DeepseekV4RMSNorm",
     "DeepseekV4UnweightedRMSNorm",
+    "dense_sparse_attn",
+    "main_window_indices",
     "resolve_module_op_impl",
     "resolve_module_qat_impl",
+    "split_moe_params",
+    "validate_deepseek_v4_export_quant_support",
 ]

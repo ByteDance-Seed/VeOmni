@@ -44,6 +44,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from .....models.checkpoint.convert import split_moe_params
+from .....models.transformers.deepseek_v4.checkpoint_tensor_converter import (
+    validate_deepseek_v4_export_quant_support,
+)
 from .dequant import quant_fp4_blockwise, quant_fp8_blockwise
 from .llm.configuration import RELEASED_NUM_HIDDEN_LAYERS
 from .released_names import module_scale_name
@@ -199,4 +203,9 @@ def refuse_ngram_export(model: torch.nn.Module, state: dict[str, torch.Tensor]) 
     )
 
 
-__all__ = ["export_llm_state", "refuse_ngram_export"]
+__all__ = [
+    "export_llm_state",
+    "refuse_ngram_export",
+    "split_moe_params",
+    "validate_deepseek_v4_export_quant_support",
+]

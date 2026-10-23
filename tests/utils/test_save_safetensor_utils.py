@@ -675,6 +675,7 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
         with (
             patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", mock_writer_cls),
             patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
+            patch(f"{_CONSOLIDATE}.consolidate_safetensors_files_on_every_rank", MagicMock()),
             patch(f"{_MOD}.get_model_save_state", MagicMock(return_value=rank0_state)),
             patch(f"{_MOD}.dcp", MagicMock(save=MagicMock())),
             patch(f"{_MOD}.dist", mock_dist),

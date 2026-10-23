@@ -37,37 +37,18 @@ from .attention import (
     apply_interleaved_rope,
 )
 from .configuration import DeepseekV41LlmConfig
-from .decode import dense_sparse_attn
 from .mhc import DeepseekV41HyperConnection, mhc_collapse, mhc_expand, require_fp32_pre_mix
 from .moe import DeepseekV41SparseMoeBlock
 from .quantization import fake_quant_linear, round_window_kv
 from .quantized import DeepseekV41Linear, linear_quant_dtype
-from .reuse import DeepseekV4RMSNorm
+from .reuse import (
+    DeepseekV4RMSNorm,
+    DSparkConfidenceHead,
+    DSparkMarkovHead,
+    dense_sparse_attn,
+    main_window_indices,
+)
 from .sequence_shard import SequenceShard
-
-
-class DSparkMarkovHead(nn.Module):
-    """Rank-256 residual over the shared LM head, stored on the last MTP stage."""
-
-    def __init__(self, vocab_size: int, rank: int) -> None:
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, rank)
-        self.head = nn.Linear(rank, vocab_size, bias=False)
-
-    def forward(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        embed = self.embed(token_ids)
-        return self.head(embed), embed
-
-
-class DSparkConfidenceHead(nn.Module):
-    """Scalar confidence from the draft hidden concatenated with the Markov embed."""
-
-    def __init__(self, input_dim: int) -> None:
-        super().__init__()
-        self.proj = nn.Linear(input_dim, 1, bias=False)
-
-    def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:
-        return self.proj(torch.cat([hidden, markov_embed], dim=-1).float()).squeeze(-1)
 
 
 class DeepseekV41DSparkBlock(GradientCheckpointingLayer):
@@ -384,13 +365,7 @@ class DeepseekV41DSparkBlock(GradientCheckpointingLayer):
         ``offset > position_ids[q]`` would reach before the sample start, so
         packed ``position_ids`` restarting at zero doubles as the boundary mask.
         """
-        seq_len = position_ids.shape[1]
-        device = position_ids.device
-        width = min(self.self_attn.sliding_window, seq_len)
-        queries = torch.arange(seq_len, device=device, dtype=torch.int32)
-        offsets = torch.arange(width, 0, -1, device=device, dtype=torch.int32)
-        indices = (queries[None, :, None] - offsets[None, None, :]).expand(position_ids.shape[0], -1, -1)
-        return indices.masked_fill(offsets[None, None, :] > position_ids.to(torch.int32)[:, :, None], -1)
+        return main_window_indices(position_ids, self.self_attn.sliding_window)
 
     def collapse_draft(self, hidden_streams: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
         """Last-stage ``norm(hc_pre(stream))`` -- the tensor the shared LM head reads."""

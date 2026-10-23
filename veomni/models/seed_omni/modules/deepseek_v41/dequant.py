@@ -38,10 +38,15 @@ from typing import Sequence
 
 import torch
 
+from .....models.transformers.deepseek_v4.checkpoint_tensor_converter import (
+    _FP4_E2M1_VALUES,
+    _dequantize_scaled_weight,
+)
 
-#: e2m1 in bit order: 8 magnitudes, then the same 8 negated. From
-#: ``inference/convert.py``; ``tests`` asserts the two agree.
-FP4_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+#: e2m1 in bit order: 8 magnitudes, then the same 8 negated. Shared with
+#: ``veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter``.
+FP4_VALUES = _FP4_E2M1_VALUES
 
 
 def fp4_table(device: torch.device | None = None) -> torch.Tensor:
@@ -83,9 +88,7 @@ def dequant_fp8_blockwise(
             "block outside that set means the scale was read for the wrong tensor, which would rescale "
             "every block rather than fail."
         )
-    blocked = weight.unflatten(0, (-1, out_block)).unflatten(-1, (-1, in_block)).float()
-    blocked = blocked * scale[:, None, :, None].float()
-    return blocked.flatten(2, 3).flatten(0, 1).to(out_dtype)
+    return _dequantize_scaled_weight(weight, scale, packed_fp4=False).to(out_dtype)
 
 
 def dequant_fp4_blockwise(
@@ -105,18 +108,11 @@ def dequant_fp4_blockwise(
     if packed.ndim != 2:
         raise ValueError(f"expected a 2-D packed weight, got {tuple(packed.shape)}")
 
-    as_bytes = packed.view(torch.uint8)
-    low = as_bytes & 0x0F
-    high = (as_bytes >> 4) & 0x0F
-    table = fp4_table(packed.device)
-    values = torch.stack([table[low.long()], table[high.long()]], dim=-1).flatten(1)
-
-    out_dim, in_dim = values.shape
-    if scale.size(0) != out_dim or in_dim % scale.size(1):
+    out_dim = packed.size(0)
+    in_dim = packed.size(1) * 2
+    if scale.ndim != 2 or scale.size(0) != out_dim or in_dim % scale.size(1):
         raise ValueError(f"fp4 scale {tuple(scale.shape)} does not block the unpacked weight {(out_dim, in_dim)}")
-    in_block = in_dim // scale.size(1)
-    values = values.unflatten(-1, (-1, in_block)) * scale.float()[:, :, None]
-    return values.flatten(1).to(out_dtype)
+    return _dequantize_scaled_weight(packed.view(torch.int8), scale, packed_fp4=True).to(out_dtype)
 
 
 #: Largest finite magnitudes of the two element formats.

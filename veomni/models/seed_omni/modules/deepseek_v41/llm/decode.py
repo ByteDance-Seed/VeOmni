@@ -47,7 +47,6 @@ to one and is wrong by whatever mass the sink held.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -64,80 +63,12 @@ from .attention import (
 )
 from .mhc import expand_to_streams, identity_pre_mix, mhc_collapse, mhc_expand
 from .quantization import fake_quant_linear, round_compress_kv, round_index_act, round_window_kv
+from .reuse import dense_sparse_attn
 
 
 if TYPE_CHECKING:
     from .decoder_layer import DeepseekV41DecoderLayer
     from .modeling import DeepseekV41Backbone
-
-
-def dense_sparse_attn(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    attn_sink: torch.Tensor,
-    topk_idxs: torch.Tensor,
-    sm_scale: float | None = None,
-    return_lse: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Sparse MQA by gather-and-softmax, matching ``sparse_attn_tilelang``.
-
-    Args:
-        q: ``[B, S, H, D]``.
-        kv: ``[B, S_kv, D]`` -- one KV head shared by all ``H`` query heads, and
-            the same rows serve as keys and as values.
-        attn_sink: ``[H]`` fp32, an additive logit per head that takes softmax
-            mass without contributing a value.
-        topk_idxs: ``[B, S, topk]`` int32 into ``kv``'s row axis. Negative or
-            out-of-range entries are masked, which is how the window's
-            not-yet-filled slots and the indexer's misses both arrive.
-        sm_scale: softmax scale, defaulting to ``D ** -0.5``.
-        return_lse: also return the ``[B, S, H]`` fp32 log-sum-exp, sink
-            included. **Base two**, matching the kernel -- see below.
-
-    Returns:
-        ``[B, S, H, D]`` in ``q``'s dtype, and the LSE when asked for it.
-    """
-    if sm_scale is None:
-        sm_scale = q.shape[-1] ** -0.5
-
-    batch, kv_len = kv.shape[:2]
-    # Out-of-range is masked rather than rejected: the kernel treats any index it
-    # cannot read as a miss, and a decode step legitimately produces them from a
-    # window that is not yet full.
-    valid = (topk_idxs >= 0) & (topk_idxs < kv_len)
-    safe = topk_idxs.clamp(0, max(kv_len - 1, 0)).long()
-
-    # DSpark trains through this function. Gathering from a per-query expanded view
-    # of ``kv`` would make the backward allocate a ``[B, S, S_kv, D]`` zero buffer --
-    # 144 * S^2 bytes per rank under SP8 at the released head_dim -- whereas
-    # ``index_select`` on the flat pool backpropagates into ``[B * S_kv, D]``.
-    rows = safe + torch.arange(batch, device=kv.device).view(-1, 1, 1) * kv_len
-    gathered = kv.reshape(batch * kv_len, -1).index_select(0, rows.flatten()).view(*rows.shape, kv.shape[-1])
-
-    scores = torch.einsum("bmhd,bmkd->bmhk", q.float(), gathered.float()) * sm_scale
-    scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
-
-    # The sink is part of the softmax, so it belongs in the max the exponentials
-    # are shifted by. Shifting by the scores' max alone is stable for the output
-    # -- 0/inf is 0 -- but sends the LSE to +inf on a fully masked query, where
-    # that max is -inf: the shift then becomes exp(sink + 1e30). Folding the sink
-    # in leaves such a query with denominator 1 and LSE exactly the sink, which
-    # is what a query attending to nothing but the sink means.
-    shift = torch.maximum(scores.max(dim=-1).values, attn_sink.view(1, 1, -1))
-    exp_scores = (scores - shift.unsqueeze(-1)).exp()
-    numerator = torch.einsum("bmhk,bmkd->bmhd", exp_scores, gathered.float())
-    denominator = exp_scores.sum(-1) + (attn_sink.view(1, 1, -1) - shift).exp()
-
-    out = (numerator / denominator.unsqueeze(-1)).to(q.dtype)
-    if not return_lse:
-        return out
-    # The kernel exponentiates with exp2 and returns a base-two LSE; its wrapper
-    # documents the tensor only as "the log-sum-exp". Returning natural log here
-    # would be wrong by log2(e) = 1.4427 -- and wrong in a way that survives every
-    # check that does not compare against the kernel, since the consumer
-    # (``sparse_mqa_target_fwd``, for the indexer teacher) takes the LSE as a
-    # renormalizer and a uniformly scaled one still yields a distribution.
-    return out, ((shift + denominator.log()) / math.log(2.0)).float()
 
 
 @dataclass
