@@ -68,7 +68,9 @@ _CRITICAL_BUILTIN_ENTRIES = (
     ("dsa_indexer", "deepseek_v4", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
     ("dsa_indexer", "deepseek_v4", "cann", "npu", _NPU, ("cann_ops_transformer",)),
     ("mhc", "pre", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tile_kernels",)),
+    ("mhc", "pre", "cann", "npu", _NPU, ("cann_ops_transformer",)),
     ("mhc", "post", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tile_kernels",)),
+    ("mhc", "post", "cann", "npu", _NPU, ("cann_ops_transformer",)),
     ("mhc", "head", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tile_kernels",)),
     (
         "chunk_gated_delta_rule",
