@@ -45,6 +45,8 @@ from veomni.utils.helper import get_cache_dir
 
 _CI_LAUNCH = LaunchSpec(nproc=2)
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 logger = helper.create_logger(__name__)
 

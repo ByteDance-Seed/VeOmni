@@ -5,6 +5,7 @@ from typing import Any, Dict
 
 import torch
 
+from tests.tools.training_utils import dp_mean
 from veomni.arguments import parse_args
 from veomni.distributed.parallel_state import use_parallel_state
 from veomni.trainer.callbacks import Callback, TrainerState
@@ -31,9 +32,9 @@ class LogDictSaveCallback(Callback):
     def on_step_end(
         self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
     ) -> None:
-        self.log_dict["loss"].append(loss)
+        self.log_dict["loss"].append(dp_mean(loss, self.trainer))
         for key, value in loss_dict.items():
-            self.log_dict[key].append(value)
+            self.log_dict[key].append(dp_mean(value, self.trainer))
         self.log_dict["grad_norm"].append(float(grad_norm))
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
@@ -73,6 +74,67 @@ class TestDiTTrainer(DiTTrainer):
     def _build_data_transform(self) -> None:
         self.base.data_transform = process_dummy_example
 
+    def _run_extra_train_path(self, extra_train_path: str) -> None:
+        """Reuse the initialized process group and model to run a second dataset branch."""
+        from veomni.models.checkpoint.weights import load_model_weights
+
+        args = self.base.args
+        args.data.train_path = extra_train_path
+        args.train.checkpoint.output_dir = f"{args.train.checkpoint.output_dir}_padding"
+        self.base._log_callback.log_dict.clear()
+        self.base.state = TrainerState()
+        self.base.start_epoch = 0
+        self.base.start_step = 0
+
+        # Reload initial weights and reset optimizer/scheduler + RNG so the second
+        # dataset branch starts from the exact same initial state as a fresh launch.
+        from torch.distributed.tensor import distribute_tensor
+
+        from veomni.utils import helper
+        from veomni.utils.device import get_device_type
+
+        helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+        dtensor_to_cpu = args.model.accelerator.fsdp_config.offload
+        load_device = "cpu" if dtensor_to_cpu else get_device_type()
+        load_model_weights(
+            self.base.model.model,
+            args.model.model_path,
+            init_device=load_device,
+            dtensor_factory=distribute_tensor,
+            dtensor_to_cpu=dtensor_to_cpu,
+        )
+        self.base.model._build_optimizer()
+        self.base._build_lr_scheduler()
+
+        with use_parallel_state(self.base.model.parallel_state):
+            self._build_dataset()
+            self._build_dataloader()
+
+        for epoch in range(self.base.start_epoch, args.train.num_train_epochs):
+            if self.base.train_dataloader is not None and hasattr(self.base.train_dataloader, "set_epoch"):
+                self.base.train_dataloader.set_epoch(epoch)
+            self.base.state.epoch = epoch
+            self.on_epoch_begin()
+            if self.base.train_dataloader is not None:
+                from veomni.trainer.base import VeOmniIter
+
+                self.base.data_iterator = VeOmniIter(
+                    self.base.train_dataloader,
+                    use_background_prefetcher=args.data.dataloader.use_background_prefetcher,
+                )
+            else:
+                self.base.data_iterator = None
+            for _ in range(self.base.start_step, args.train_steps):
+                try:
+                    self.train_step(self.base.data_iterator)
+                except StopIteration:
+                    break
+            self.on_epoch_end()
+            self.base.start_step = 0
+            if args.data.dataloader.use_background_prefetcher and self.base.data_iterator is not None:
+                self.base.data_iterator.stop()
+        self.on_train_end()
+
     # ------------------------------------------------------------------
     # Skip condition model processing – batch is already model-ready.
     # ------------------------------------------------------------------
@@ -102,8 +164,30 @@ class TestDiTTrainer(DiTTrainer):
             aux_metrics=aux_metrics,
         )
 
+    def destroy_distributed(self):
+        if not getattr(self, "_defer_destroy", False):
+            self.base.destroy_distributed()
+
 
 if __name__ == "__main__":
+    import argparse
+    import sys
+
+    _extra_parser = argparse.ArgumentParser()
+    _extra_parser.add_argument("--extra_train_path", default=None)
+    _extra_args, _remaining = _extra_parser.parse_known_args()
+    sys.argv = [sys.argv[0]] + _remaining
+
     args: VeOmniDiTArguments = parse_args(VeOmniDiTArguments)
     trainer = TestDiTTrainer(args)
-    trainer.train()
+    if _extra_args.extra_train_path is not None:
+        orig_destroy = trainer.base.destroy_distributed
+        trainer.base.destroy_distributed = lambda: None
+        try:
+            trainer.train()
+            trainer._run_extra_train_path(_extra_args.extra_train_path)
+        finally:
+            trainer.base.destroy_distributed = orig_destroy
+            trainer.base.destroy_distributed()
+    else:
+        trainer.train()

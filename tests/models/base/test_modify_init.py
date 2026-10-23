@@ -19,8 +19,14 @@ from __future__ import annotations
 import ast
 import textwrap
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.patchgen.codegen import ModelingCodeGenerator
 from veomni.patchgen.patch_spec import Patch, PatchConfig, PatchType
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _bind_handle(original_init, self, *args, **kwargs):

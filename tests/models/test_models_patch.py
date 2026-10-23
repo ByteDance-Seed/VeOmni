@@ -183,16 +183,40 @@ def _skip_fa3(attn_impl: str) -> bool:
     return IS_NPU_AVAILABLE or not is_sm90_or_above()
 
 
-def prepare_model_modes(is_moe: bool) -> tuple[list[ModelMode], list[ModelMode]]:
-    hf_modes = [ModelMode("hf", attn) for attn in _HF_ATTN if not _skip_fa3(attn)]
-    moe_impls = ("eager", _FUSED_MOE_IMPL) if is_moe else ("eager",)
+_FA3_REPRESENTATIVE_CASES = {"llama3_1", "qwen3_vl", "deepseek_v3"}
+_FALLBACK_REPRESENTATIVE_CASES = {"llama3_1", "qwen3_vl_moe"}
+
+
+def prepare_model_modes(is_moe: bool, *, include_fa3: bool = False) -> tuple[list[ModelMode], list[ModelMode]]:
+    """Build HF baseline and VeOmni production modes.
+
+    Family parity covers eager FP32, while the low-precision oracle covers CUDA
+    and text backward. Keep BF16 packed fallback training comparisons in
+    ``_case_modes`` for representative dense and multimodal MoE models on both
+    GPU and NPU, alongside the production modes built here.
+    """
+    use_kernels_default = bool(IS_NPU_AVAILABLE or is_liger_kernel_available())
+    moe_impl = _FUSED_MOE_IMPL if is_moe else "eager"
+
+    hf_modes = [ModelMode("hf", "flash_attention_2")]
     veomni_modes = [
-        ModelMode("veomni", attn, moe_implementation=moe_impl, use_kernels=use_kernels)
-        for moe_impl in moe_impls
-        for attn in _VEOMNI_ATTN
-        if not _skip_fa3(attn)
-        for use_kernels in _USE_KERNELS
+        ModelMode(
+            "veomni",
+            "veomni_flash_attention_2",
+            moe_implementation=moe_impl,
+            use_kernels=use_kernels_default,
+        )
     ]
+    if include_fa3 and not _skip_fa3("veomni_flash_attention_3"):
+        hf_modes.append(ModelMode("hf", "flash_attention_3"))
+        veomni_modes.append(
+            ModelMode(
+                "veomni",
+                "veomni_flash_attention_3",
+                moe_implementation=moe_impl,
+                use_kernels=use_kernels_default,
+            )
+        )
     return hf_modes, veomni_modes
 
 
@@ -477,7 +501,14 @@ TEST_CASES = [
 
 
 def _case_modes(case_id: str, is_moe: bool) -> tuple[list[ModelMode], list[ModelMode]]:
-    hf_modes, veomni_modes = prepare_model_modes(is_moe=is_moe)
+    hf_modes, veomni_modes = prepare_model_modes(
+        is_moe=is_moe,
+        include_fa3=(case_id in _FA3_REPRESENTATIVE_CASES),
+    )
+    if case_id in _FALLBACK_REPRESENTATIVE_CASES:
+        fallback_mode = ModelMode("veomni", "veomni_flash_attention_2")
+        if fallback_mode not in veomni_modes:
+            veomni_modes.append(fallback_mode)
 
     if case_id == "qwen2_5_omni":
         if IS_NPU_AVAILABLE:

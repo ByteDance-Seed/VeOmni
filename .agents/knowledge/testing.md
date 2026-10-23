@@ -24,6 +24,21 @@ During that scope, optimizer foreach-capability queries use the canonical
 `torch.utils._foreach_utils` helper. torch_npu 2.10 replaces the optimizer's
 alias with a device-name lookup that initializes NPU even for CPU parameters.
 Restore the prior alias on exit, preserving explicit foreach/fused options.
+torch_npu 2.10 also replaces the multi-worker DataLoader iterator constructor
+with unconditional NPU synchronization/affinity calls, even for CPU datasets.
+CPU-planned cases temporarily use the vendor module's saved Torch constructor
+and restore the patch after teardown or failure. Only replace the known vendor
+wrapper; preserve unrelated constructor patches and all accelerator plans.
+The vendor Inductor wrapper also registers its NPU backend before compiling
+CPU graphs. CPU cases temporarily disable that registration through the loaded
+vendor registry and restore its prior disabled state after teardown or failure.
+Keep real CPU Inductor compilation and gradient checks enabled; do not replace
+compiled-mask coverage with eager execution to avoid hidden-device queries.
+CPU cases must also register Torch's built-in CPU device-op overrides when
+missing. torch_npu populates the override registry at import; Torch 2.10 then
+skips all built-ins because the registry is nonempty. Torch 2.11 repairs missing
+keys, so testing only that version misses the NPU CI failure. Preserve existing
+CPU/vendor entries and validate the pinned Torch version's startup state.
 A synthetic registered backend alone misses vendor monkeypatches: exercise
 the pinned wheel's optimizer patch in CPU isolation audits too.
 
@@ -77,7 +92,7 @@ describe selections in `scripts/ci/accelerator/suites/gpu.json` and `npu.json`.
 | `tests/parallel/context_parallel/` | whole directory, GPU manifest only (`suite: unit`) |
 | everything else | **one selection per file** in the appropriate GPU/NPU suite manifest |
 | `tests/e2e/test_e2e_parallel.py`, `tests/distributed/test_fsdp_equivalence.py` | GPU/NPU manifests (`suite: e2e`) |
-| `tests/models/test_omni_fsdp.py` | GPU manifest `59-e2e` (`suite: e2e`); NPU coverage remains in the models unit selection |
+| `tests/models/test_omni_fsdp.py` | GPU manifest `60-e2e` (`suite: e2e`); NPU coverage remains in the models unit selection |
 
 Consequences that cut both ways:
 
