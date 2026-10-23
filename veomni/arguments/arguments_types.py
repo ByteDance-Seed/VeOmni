@@ -1296,12 +1296,15 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
 
 # MLU compatibility tables for ``_validate_implementations``.
 # ``fused_triton`` is the same group-gemm as on GPU; ``fused_mlu`` is Apex grouped-GEMM.
+# ``liger_kernel`` rows resolve against the Cambricon MLU liger build, which keeps
+# the upstream ``liger_kernel.ops.*`` API; ``is_liger_kernel_mlu_available`` gates it.
 _MLU_ALLOWED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"liger_kernel"}),
     "rotary_pos_emb_implementation": frozenset({"liger_kernel"}),
+    "rotary_pos_emb_vision_implementation": frozenset({"liger_kernel"}),
     "swiglu_mlp_implementation": frozenset({"liger_kernel"}),
     "cross_entropy_loss_implementation": frozenset({"liger_kernel", "chunk_loss"}),
-    "moe_implementation": frozenset({"fused_mlu", "fused_mlu_triton"}),
+    "moe_implementation": frozenset({"fused_mlu", "fused_triton"}),
 }
 
 
@@ -1374,7 +1377,7 @@ class OpsImplementationConfig:
       is documented in the field metadata.
 
     Backends: ``"eager"`` (HF reference, always available),
-    ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"torch_npu"`` (Ascend),
+    ``"liger_kernel"`` (GPU, needs ``liger-kernel``), (MLU, needs the Cambricon liger build), ``"torch_npu"`` (Ascend),
     ``"triton"`` (CUDA ``triton``, or Triton-Ascend on NPU). Load-balancing loss has a CUDA Triton
     backend; its NPU default is ``"eager"``.
     """
@@ -1423,36 +1426,36 @@ class OpsImplementationConfig:
     cross_entropy_loss_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Cross-entropy loss. 'liger_kernel' (GPU; fused linear+CE — "
+            "help": "Cross-entropy loss. 'liger_kernel' (CUDA, MLU; fused linear+CE — "
             "requires VeOmni-patched modeling that passes hidden_states=/weights= to "
             "self.loss_function; unpatched HF models raise) | 'chunk_loss' (chunked "
             "F.linear+CE, hardware-agnostic) | 'eager' (PyTorch F.cross_entropy). "
-            "Unset: 'liger_kernel' on GPU, 'chunk_loss' on NPU, 'eager' on MLU."
+            "Unset: 'liger_kernel' on GPU/MLU, 'chunk_loss' on NPU, 'eager' otherwise."
         },
     )
     rms_norm_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "RMSNorm. 'liger_kernel' (GPU) | 'torch_npu' (Ascend; the unweighted "
+            "help": "RMSNorm. 'liger_kernel' (CUDA, MLU) | 'torch_npu' (Ascend; the unweighted "
             "variant has no Ascend kernel and uses 'eager') | "
             "'triton' (DeepSeek-V3 batch-invariant; GPU only) | 'eager'. "
-            "Unset: 'liger_kernel' on GPU, 'torch_npu' on NPU, 'eager' on MLU."
+            "Unset: 'liger_kernel' on GPU/MLU, 'torch_npu' on NPU, 'eager' otherwise."
         },
     )
     swiglu_mlp_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "SwiGLU MLP. 'liger_kernel' (GPU) | 'eager'. No NPU backend. "
-            "Unset: 'liger_kernel' on GPU, 'eager' on NPU and MLU."
+            "help": "SwiGLU MLP. 'liger_kernel' (CUDA, MLU) | 'eager'. No NPU backend. "
+            "Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU and 'eager' otherwise."
         },
     )
     rotary_pos_emb_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Rotary positional embedding. 'liger_kernel' (GPU) | "
+            "help": "Rotary positional embedding. 'liger_kernel' (CUDA, MLU) | "
             "'torch_npu' (Ascend) | 'triton' (per-model: DeepSeek-V3 deterministic, "
             "DeepSeek-V4 fused partial-interleaved, Wan; GPU only) | 'eager'. "
-            "Unset: 'liger_kernel' on GPU, 'torch_npu' on NPU, 'eager' on MLU."
+            "Unset: 'liger_kernel' on GPU/MLU, 'torch_npu' on NPU, 'eager' otherwise."
         },
     )
     rotary_pos_emb_vision_implementation: Optional[str] = field(
@@ -1460,7 +1463,7 @@ class OpsImplementationConfig:
         metadata={
             "help": "Rank-3 vision layout for full rotary positional embedding. "
             "Uses the same 'rope' op with an independent implementation choice: 'liger_kernel' | 'torch_npu' | 'eager'. "
-            "Unset: 'liger_kernel' on GPU, 'torch_npu' on NPU, 'eager' elsewhere."
+            "Unset: 'liger_kernel' on CUDA/MLU, 'torch_npu' on NPU, 'eager' elsewhere."
         },
     )
     load_balancing_loss_implementation: Optional[str] = field(
@@ -1654,6 +1657,7 @@ class OpsImplementationConfig:
         from ..utils.device import IS_NPU_AVAILABLE
         from ..utils.import_utils import (
             is_apex_mlu_available,
+            is_liger_kernel_mlu_available,
             is_torch_mlu_available,
         )
 
@@ -1681,6 +1685,12 @@ class OpsImplementationConfig:
             if on_mlu:
                 if value == "fused_mlu" and not is_apex_mlu_available():
                     raise ValueError("moe_implementation='fused_mlu' requires apex_mlu installed on Cambricon MLU.")
+                if value == "liger_kernel" and not is_liger_kernel_mlu_available():
+                    raise ValueError(
+                        f"{field_name}='liger_kernel' requires the Cambricon MLU liger_kernel build on MLU "
+                        "(upstream GPU liger-kernel does not run on MLU). Install the MLU liger_kernel wheel, "
+                        "set 'eager', or leave the field unset."
+                    )
                 if value not in mlu_ok:
                     allowed = sorted(mlu_ok | {"eager"})
                     raise ValueError(
