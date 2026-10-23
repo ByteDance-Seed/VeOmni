@@ -22,11 +22,11 @@ If a field is not in this table, it is not an op-selection knob.
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+), `cann` (DeepSeek-V4, Ascend) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
-| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (CUDA, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (CUDA, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (CUDA, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (CUDA, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `liger_kernel`, `torch_npu` | `"liger_kernel"` (CUDA, MLU), `"torch_npu"` (NPU) | Same `rope/full` op with an independent model-side implementation choice |
+| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `liger_kernel`, `torch_npu` | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Same `rope/full` op with an independent model-side implementation choice |
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `torch_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `triton` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `triton`, `fla_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
@@ -282,7 +282,7 @@ model:
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `liger_kernel` | Fused linear + CE raw forward/backward | `liger-kernel` package (CUDA, MLU) |
+| `liger_kernel` | Fused linear + CE raw forward/backward | `liger-kernel` package (GPU, MLU) |
 | `chunk_loss` | Chunked `F.linear` + CE with one global denominator | — |
 | `eager` | PyTorch `F.linear`/`F.cross_entropy` | — |
 
@@ -336,7 +336,7 @@ model:
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `liger_kernel` | Registered Liger RMSNorm row | `liger-kernel` package (CUDA, MLU) |
+| `liger_kernel` | Registered Liger RMSNorm row | `liger-kernel` package (GPU, MLU) |
 | `npu` | Registered `torch_npu.npu_rms_norm` row for `standard`, `offset`, and `deepseek_v4`; `unweighted` resolves `npu` to `eager` | `torch_npu` |
 | `triton` | Registered model-specific Triton row (for example DeepSeek-V3 batch-invariant RMSNorm) | `triton` |
 | `eager` | Registered PyTorch reference row | — |
@@ -349,7 +349,7 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `liger_kernel` | Registered Liger RoPE row | `liger-kernel` package (CUDA, MLU) |
+| `liger_kernel` | Registered Liger RoPE row | `liger-kernel` package (GPU, MLU) |
 | `npu` | Registered `torch_npu.npu_rotary_mul` row | `torch_npu` |
 | `triton` | Registered model-specific Triton row (DeepSeek-V3 deterministic RoPE, DeepSeek-V4 fused partial-interleaved RoPE, Wan DiT) | `triton` |
 | `eager` | Registered PyTorch reference row | — |
@@ -358,7 +358,7 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `liger_kernel` | Registered Liger SwiGLU row | `liger-kernel` package (CUDA, MLU) |
+| `liger_kernel` | Registered Liger SwiGLU row | `liger-kernel` package (GPU, MLU) |
 | `eager` | Registered PyTorch reference row | — |
 
 ### What gets patched
@@ -398,7 +398,7 @@ supported values are `triton` and `eager`.
 ## 4. Qwen3.5 GatedDeltaNet Ops
 
 Qwen3.5 exposes three additional model-specific op fields. They default to
-`fla`, which registers CUDA, MLU, and Ascend NPU rows. To use the vendored
+`fla`, which registers GPU, MLU, and Ascend NPU rows. To use the vendored
 Ascend kernels, select them explicitly:
 
 ```yaml
