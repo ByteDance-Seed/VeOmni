@@ -415,5 +415,24 @@
       "-x",
       "tests/distributed/test_fsdp_equivalence.py"
     ]
+  },
+  {
+    "name": "qwen38-token_accounting-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_token_accounting.py"
+    ]
+  },
+  {
+    "name": "helper-lora-flops-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_helper.py::test_environ_meter_passes_supported_lora_config"
+    ]
   }
 ]

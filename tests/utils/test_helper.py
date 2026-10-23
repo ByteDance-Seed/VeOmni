@@ -5,10 +5,12 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.distributed as dist
 from transformers import Qwen2Config
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments, parse_args
 from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.lora import VeOmniLoraConfig
@@ -19,6 +21,7 @@ from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torc
 logger = helper.create_logger(__name__)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_environ_meter_passes_supported_lora_config(monkeypatch):
     calls = []
 
@@ -39,7 +42,7 @@ def test_environ_meter_passes_supported_lora_config(monkeypatch):
     )
     fake_memory = SimpleNamespace(used=0, available=0, percent=0)
     monkeypatch.setattr(helper, "VeomniFlopsCounter", FakeFlopsCounter)
-    monkeypatch.setattr(helper.dist, "get_world_size", lambda: 1)
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda group=None: 1)
     monkeypatch.setattr(helper, "all_reduce", lambda values, **kwargs: values)
     monkeypatch.setattr(helper, "get_torch_device", lambda: fake_device)
     monkeypatch.setattr(helper.psutil, "virtual_memory", lambda: fake_memory)
