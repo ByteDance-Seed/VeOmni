@@ -48,6 +48,11 @@ from veomni.models.transformers.glm_moe_dsa.checkpoint_tensor_converter import (
     GlmMoeDsaCheckpointTensorConverter,
     create_glm_moe_dsa_checkpoint_tensor_converter,
 )
+from veomni.models.transformers.kimi_k3.checkpoint_tensor_converter import (
+    KimiK3CheckpointTensorConverter,
+    convert_kimi_k3_fqn_to_index_mapping,
+    create_kimi_k3_checkpoint_tensor_converter,
+)
 from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import (
     Qwen3MoeCheckpointTensorConverter,
     create_qwen3_moe_checkpoint_tensor_converter,
@@ -407,6 +412,152 @@ class TestQwen3MoeConverterFactory:
         converter = create_qwen3_moe_checkpoint_tensor_converter(model)
         assert isinstance(converter, Qwen3MoeCheckpointTensorConverter)
         assert converter.num_experts == 8
+
+
+def _make_kimi_k3_expert_key(layer: int, expert: int, proj: str) -> str:
+    return f"language_model.model.layers.{layer}.block_sparse_moe.experts.{expert}.{proj}.weight"
+
+
+def _make_kimi_k3_expert_tensor(proj: str, expert_id: int) -> torch.Tensor:
+    """Deterministic tensor for a Kimi K3 per-expert projection (w1/w3 gate/up, w2 down)."""
+    if proj == "w2":
+        shape = (HIDDEN_DIM, INTERMEDIATE_DIM)
+    else:
+        shape = (INTERMEDIATE_DIM, HIDDEN_DIM)
+    offset = {"w1": 0.0, "w3": 0.1, "w2": 0.2}[proj]
+    return torch.full(shape, expert_id + offset)
+
+
+class TestKimiK3ConverterCanHandle:
+    def setup_method(self):
+        self.converter = KimiK3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+
+    def test_matches_expert_keys(self):
+        assert self.converter.can_handle("language_model.model.layers.0.block_sparse_moe.experts.0.w1.weight")
+        assert self.converter.can_handle("language_model.model.layers.3.block_sparse_moe.experts.7.w3.weight")
+        assert self.converter.can_handle("language_model.model.layers.10.block_sparse_moe.experts.63.w2.weight")
+
+    def test_rejects_non_expert_keys(self):
+        assert not self.converter.can_handle("language_model.model.layers.0.self_attn.q_proj.weight")
+        assert not self.converter.can_handle("language_model.model.layers.0.block_sparse_moe.gate.weight")
+        assert not self.converter.can_handle("language_model.model.layers.0.block_sparse_moe.experts.gate_up_proj")
+        assert not self.converter.can_handle("model.vision_tower.patch_embed.proj.weight")
+
+
+class TestKimiK3ConverterConvert:
+    def _feed_all_experts(self, converter, layer: int, proj: str) -> List[Optional[ConvertedCheckpointTensor]]:
+        results = []
+        for expert_id in range(NUM_EXPERTS):
+            key = _make_kimi_k3_expert_key(layer, expert_id, proj)
+            tensor = _make_kimi_k3_expert_tensor(proj, expert_id)
+            results.append(converter.convert(key, tensor))
+        return results
+
+    def test_buffers_until_all_experts_collected(self):
+        converter = KimiK3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+        for expert_id in range(NUM_EXPERTS - 1):
+            key = _make_kimi_k3_expert_key(0, expert_id, "w2")
+            assert converter.convert(key, _make_kimi_k3_expert_tensor("w2", expert_id)) is None
+
+    def test_w2_emits_down_proj_after_all_experts(self):
+        converter = KimiK3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+        results = self._feed_all_experts(converter, layer=0, proj="w2")
+
+        assert all(r is None for r in results[:-1])
+        result = results[-1]
+        assert result is not None
+        assert result.name == "language_model.model.layers.0.block_sparse_moe.experts.down_proj"
+        assert result.tensor.shape == (NUM_EXPERTS, HIDDEN_DIM, INTERMEDIATE_DIM)
+        for expert_id in range(NUM_EXPERTS):
+            assert torch.equal(result.tensor[expert_id], _make_kimi_k3_expert_tensor("w2", expert_id))
+
+    def test_w1_w3_merged_into_gate_up_proj(self):
+        converter = KimiK3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+
+        w1_results = self._feed_all_experts(converter, layer=0, proj="w1")
+        assert all(r is None for r in w1_results)
+
+        w3_results = self._feed_all_experts(converter, layer=0, proj="w3")
+        assert all(r is None for r in w3_results[:-1])
+        result = w3_results[-1]
+        assert result is not None
+        assert result.name == "language_model.model.layers.0.block_sparse_moe.experts.gate_up_proj"
+        assert result.tensor.shape == (NUM_EXPERTS, 2 * INTERMEDIATE_DIM, HIDDEN_DIM)
+        for expert_id in range(NUM_EXPERTS):
+            assert torch.equal(
+                result.tensor[expert_id, :INTERMEDIATE_DIM], _make_kimi_k3_expert_tensor("w1", expert_id)
+            )
+            assert torch.equal(
+                result.tensor[expert_id, INTERMEDIATE_DIM:], _make_kimi_k3_expert_tensor("w3", expert_id)
+            )
+
+    def test_w3_before_w1_also_works(self):
+        converter = KimiK3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+
+        assert all(r is None for r in self._feed_all_experts(converter, layer=0, proj="w3"))
+        w1_results = self._feed_all_experts(converter, layer=0, proj="w1")
+        result = w1_results[-1]
+        assert result is not None
+        assert result.name == "language_model.model.layers.0.block_sparse_moe.experts.gate_up_proj"
+
+    def test_multiple_layers_independent(self):
+        converter = KimiK3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+        layer0_down = self._feed_all_experts(converter, layer=0, proj="w2")[-1]
+        layer1_down = self._feed_all_experts(converter, layer=1, proj="w2")[-1]
+        assert layer0_down.name != layer1_down.name
+        assert torch.equal(layer0_down.tensor[0], _make_kimi_k3_expert_tensor("w2", 0))
+
+    def test_non_expert_key_returns_none(self):
+        converter = KimiK3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+        assert converter.convert("language_model.model.layers.0.self_attn.q_proj.weight", torch.zeros(1)) is None
+
+
+class TestKimiK3ConverterFinalize:
+    def test_finalize_empty_when_all_flushed(self):
+        converter = KimiK3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+        assert converter.finalize() == []
+
+    def test_finalize_raises_on_incomplete_experts(self):
+        converter = KimiK3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+        converter.convert(_make_kimi_k3_expert_key(0, 0, "w2"), _make_kimi_k3_expert_tensor("w2", 0))
+        with pytest.raises(RuntimeError, match="^KimiK3 checkpoint converter: incomplete"):
+            converter.finalize()
+
+    def test_finalize_raises_on_unpaired_gate_up(self):
+        converter = KimiK3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+        for expert_id in range(NUM_EXPERTS):
+            converter.convert(
+                _make_kimi_k3_expert_key(0, expert_id, "w1"), _make_kimi_k3_expert_tensor("w1", expert_id)
+            )
+        with pytest.raises(RuntimeError, match="^KimiK3 checkpoint converter: incomplete"):
+            converter.finalize()
+
+
+class TestKimiK3ConverterFactoryAndMapping:
+    def test_factory_reads_text_config_expert_count(self):
+        model = SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace(num_experts=8)))
+        converter = create_kimi_k3_checkpoint_tensor_converter(model)
+        assert isinstance(converter, KimiK3CheckpointTensorConverter)
+        assert converter.num_experts == 8
+
+    def test_factory_falls_back_to_plain_config(self):
+        model = SimpleNamespace(config=SimpleNamespace(num_experts=6))
+        converter = create_kimi_k3_checkpoint_tensor_converter(model)
+        assert converter.num_experts == 6
+
+    def test_fqn_mapping_merges_expert_shards(self):
+        mapping = {
+            "language_model.model.layers.0.block_sparse_moe.experts.0.w1.weight": 0,
+            "language_model.model.layers.0.block_sparse_moe.experts.1.w1.weight": 1,
+            "language_model.model.layers.0.block_sparse_moe.experts.0.w3.weight": 2,
+            "language_model.model.layers.0.block_sparse_moe.experts.0.w2.weight": 3,
+            "language_model.model.layers.0.block_sparse_moe.experts.1.w2.weight": 4,
+            "language_model.model.layers.0.self_attn.q_proj.weight": 5,
+        }
+        converted = convert_kimi_k3_fqn_to_index_mapping(mapping)
+        assert converted["language_model.model.layers.0.block_sparse_moe.experts.gate_up_proj"] == 0
+        assert converted["language_model.model.layers.0.block_sparse_moe.experts.down_proj"] == 3
+        assert converted["language_model.model.layers.0.self_attn.q_proj.weight"] == 5
 
 
 class TestDeepseekV3ConverterFactory:

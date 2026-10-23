@@ -43,6 +43,12 @@ from tests.models.tiny_configs import (
     tiny_gpt_oss_config as _tiny_gpt_oss_config,
 )
 from tests.models.tiny_configs import (
+    tiny_kimi_k3_config as _tiny_kimi_k3_config,
+)
+from tests.models.tiny_configs import (
+    tiny_kimi_linear_config as _tiny_kimi_linear_config,
+)
+from tests.models.tiny_configs import (
     tiny_llama_config as _tiny_llama_config,
 )
 from tests.models.tiny_configs import (
@@ -268,6 +274,39 @@ _MODEL_CASES = (
         ),
         config_factory=_tiny_glm_moe_dsa_config,
         architectures=("GlmMoeDsaForCausalLM", "GlmMoeDsaModel"),
+    ),
+    _ModelCase(
+        model_type="kimi_k3",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("language_model.model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("language_model.model.layers.1.self_attn.veomni_chunk_kda", "chunk_kda"),
+            ("language_model.model.layers.1.block_sparse_moe.experts.veomni_moe", "moe_experts"),
+            (
+                "language_model.model.layers.1.block_sparse_moe.experts.act_fn.veomni_situ_and_mul",
+                "situ_and_mul",
+            ),
+        ),
+        # The kimi_k3 moe_experts variant (SituGLU) has no fused_triton row.
+        isolation_op_path="veomni_ce",
+        config_factory=_tiny_kimi_k3_config,
+        architectures=("KimiK3ForConditionalGeneration",),
+        has_registered_config=True,
+    ),
+    _ModelCase(
+        model_type="kimi_linear",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.layers.1.self_attn.veomni_chunk_kda", "chunk_kda"),
+            ("model.layers.1.block_sparse_moe.experts.veomni_moe", "moe_experts"),
+            ("model.layers.1.block_sparse_moe.experts.act_fn.veomni_situ_and_mul", "situ_and_mul"),
+        ),
+        # The kimi_k3 moe_experts variant (SituGLU) has no fused_triton row.
+        isolation_op_path="veomni_ce",
+        config_factory=_tiny_kimi_linear_config,
+        architectures=("KimiLinearForCausalLM",),
+        has_registered_config=True,
     ),
     _ModelCase(
         model_type="llama",

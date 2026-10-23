@@ -79,6 +79,7 @@ def build_native_dataloader(
     dyn_bsz: bool = True,
     dyn_bsz_runtime: Literal["main", "worker"] = "main",
     dyn_bsz_count_mode: Literal["total", "effective"] = "total",
+    dyn_bsz_length_fn: Optional[Callable] = None,  # model-provided length (overrides count mode)
     dyn_bsz_physical_overflow_ratio: float = 1.5,
     dyn_bsz_dataset_save_by_idx: bool = False,  # Whether to save dynamic-batching buffers by index for worker-side checkpoint/resume.
     dyn_bsz_buffer_size: int = 200,
@@ -175,7 +176,10 @@ def build_native_dataloader(
             f"bsz_warmup_init_mbtoken: {bsz_warmup_init_mbtoken}."
         )
         dyn_bsz_collate_fn = collate_fn
-        dyn_bsz_length_fn = get_length_fn_by_count_mode(dyn_bsz_count_mode)
+        # A model-provided length fn (e.g. multimodal models that expand modality
+        # placeholders inside the model) overrides the count-mode default.
+        if dyn_bsz_length_fn is None:
+            dyn_bsz_length_fn = get_length_fn_by_count_mode(dyn_bsz_count_mode)
         if dyn_bsz_count_mode == "effective":
             if dyn_bsz_physical_overflow_ratio < 1.0:
                 raise ValueError(

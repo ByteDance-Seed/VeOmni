@@ -30,6 +30,8 @@ from ...platform import (
 from ...registry import register_op
 from .gpt_oss import eager as gpt_oss_eager
 from .gpt_oss import quack as gpt_oss_quack
+from .kimi_k3 import eager as kimi_k3_eager
+from .kimi_k3 import fused_npu as kimi_k3_fused_npu
 from .standard import eager as standard_eager
 from .standard import mlu as standard_mlu
 from .standard import npu as standard_npu
@@ -118,4 +120,24 @@ register_op(
     wrapper=gpt_oss_quack.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("quack",),
+)
+
+
+register_op(
+    "moe_experts",
+    "kimi_k3",
+    "eager",
+    description="PyTorch routed SituGLU MoE experts (Kimi K3)",
+    wrapper=kimi_k3_eager.wrapper,
+)
+
+register_op(
+    "moe_experts",
+    "kimi_k3",
+    "fused_npu",
+    description="NPU group-GEMM situ fused MoE experts (Kimi K3 SituGLU, EP-aware)",
+    wrapper=kimi_k3_fused_npu.wrapper,
+    requirement=NpuKernelRequirement(),
+    requires=("triton",),
+    default=True,
 )
