@@ -793,3 +793,70 @@ def test_deepseek_v4_dspark_left_padding_mask_excludes_masked_tokens():
     assert out_a.aux_metrics is not None and out_b.aux_metrics is not None
     torch.testing.assert_close(out_a.aux_metrics["mtp_loss"], out_b.aux_metrics["mtp_loss"], atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(out_a.loss, out_b.loss, atol=1e-6, rtol=1e-6)
+
+
+def test_deepseek_v4_dspark_packed_unpacked_parity_beyond_sliding_window():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.sliding_window = 4
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 2
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+
+    model = _build_ours(config).eval()
+    input_ids = torch.randint(3, config.vocab_size, (1, 10))
+    position_ids = torch.arange(10, dtype=torch.long).unsqueeze(0)
+    labels = input_ids.clone()
+
+    with torch.no_grad():
+        unpacked_out = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            return_mtp_outputs=True,
+            use_cache=False,
+        )
+        packed_out = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            packed_sequence_slices=((0, 10),),
+            attention_mask_is_all_ones=True,
+            return_mtp_outputs=True,
+            use_cache=False,
+        )
+    assert unpacked_out.aux_metrics is not None and packed_out.aux_metrics is not None
+    torch.testing.assert_close(
+        unpacked_out.aux_metrics["mtp_loss"],
+        packed_out.aux_metrics["mtp_loss"],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    torch.testing.assert_close(unpacked_out.loss, packed_out.loss, atol=1e-5, rtol=1e-5)
+
+
+def test_deepseek_v4_dspark_presliced_shift_labels_with_logits_to_keep():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 1
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+
+    model = _build_ours(config).train()
+    input_ids = torch.randint(3, config.vocab_size, (1, 6))
+    labels = input_ids.clone()
+    logits_to_keep = torch.tensor([1, 3, 4], dtype=torch.long)
+    shift_labels = torch.tensor([[5, 6, 7]], dtype=torch.long)
+
+    out = model(
+        input_ids=input_ids,
+        labels=labels,
+        shift_labels=shift_labels,
+        logits_to_keep=logits_to_keep,
+        use_cache=False,
+    )
+    assert out.loss is not None
+    assert out.aux_metrics is not None and "mtp_loss" in out.aux_metrics
+    assert torch.isfinite(out.aux_metrics["mtp_loss"])

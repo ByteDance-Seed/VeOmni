@@ -2393,6 +2393,16 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             draft_hiddens = [draft_inputs[idx] for idx in draft_target_ids]
             mtp_streams = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
             mtp_main: torch.Tensor | list[torch.Tensor] = torch.cat(draft_hiddens, dim=-1)
+            if mask_free_sparse:
+                mtp_attention_mask = None
+            elif isinstance(attention_mask, dict):
+                mtp_attention_mask = next(iter(attention_mask.values()))
+            else:
+                mtp_attention_mask = attention_mask
+            if mtp_attention_mask is not None and mtp_attention_mask.ndim == 4 and "packed_sequence_slices" in kwargs:
+                mtp_attention_mask = isolate_packed_causal_mask_(
+                    mtp_attention_mask.clone(), kwargs["packed_sequence_slices"]
+                )
             last_stage = len(self.mtp) - 1
             for stage_idx, stage in enumerate(self.mtp):
                 mtp_streams, mtp_main, mtp_hidden_states, mtp_markov_bias = stage(
@@ -2402,7 +2412,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                     mtp_main,
                     full_position_ids if sp_enabled else None,
                     input_ids if stage_idx == last_stage else None,
-                    causal_mask,
+                    mtp_attention_mask,
                 )
 
         return MoeModelOutputWithIndexerKL(
@@ -2656,28 +2666,38 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             raw_shift_labels = kwargs.get("shift_labels")
             if raw_shift_labels is not None:
                 mtp_shift_labels = raw_shift_labels
+                slice_mtp_labels = mtp_shift_labels.shape[-1] != mtp_hidden_states.shape[1]
             elif sp_enabled:
                 mtp_shift_labels = labels
+                slice_mtp_labels = True
             else:
                 mtp_shift_labels = F.pad(labels, (0, 1), value=ignore_index)[..., 1:].contiguous()
+                slice_mtp_labels = True
+            if slice_mtp_labels:
+                mtp_shift_labels = mtp_shift_labels[..., slice_indices]
+
+            seq_len_for_pos = (
+                input_ids.shape[-1]
+                if input_ids is not None
+                else (labels.shape[-1] if labels is not None else outputs.mtp_hidden_states.shape[1])
+            )
             if position_ids is None:
-                mtp_pos_ids = torch.arange(labels.shape[-1], device=mtp_shift_labels.device).unsqueeze(0)
+                mtp_pos_ids = torch.arange(seq_len_for_pos, device=mtp_shift_labels.device).unsqueeze(0)
             else:
                 mtp_pos_ids = position_ids.to(device=mtp_shift_labels.device)
+            mtp_pos_ids = mtp_pos_ids[:, slice_indices]
             if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
                 valid_tokens = attention_mask.to(device=mtp_shift_labels.device, dtype=torch.bool)
                 has_prev_valid = F.pad(valid_tokens[:, :-1], (1, 0), value=False)
                 has_next_valid = F.pad(valid_tokens[:, 1:], (0, 1), value=False)
                 valid_mtp_pos = valid_tokens & has_prev_valid & has_next_valid
-                if sp_enabled and valid_mtp_pos.shape[1] != mtp_shift_labels.shape[1]:
+                if sp_enabled and valid_mtp_pos.shape[1] != outputs.mtp_hidden_states.shape[1]:
                     parallel_state = get_parallel_state()
                     sp_rank = parallel_state.cp_rank if parallel_state.cp_enabled else parallel_state.ulysses_rank
-                    valid_mtp_pos = valid_mtp_pos.narrow(
-                        1, sp_rank * mtp_shift_labels.shape[1], mtp_shift_labels.shape[1]
-                    )
+                    local_len = outputs.mtp_hidden_states.shape[1]
+                    valid_mtp_pos = valid_mtp_pos.narrow(1, sp_rank * local_len, local_len)
+                valid_mtp_pos = valid_mtp_pos[:, slice_indices]
                 mtp_shift_labels = mtp_shift_labels.masked_fill(~valid_mtp_pos, ignore_index)
-            mtp_pos_ids = mtp_pos_ids[:, slice_indices]
-            mtp_shift_labels = mtp_shift_labels[..., slice_indices]
             mtp_shift_labels = mtp_shift_labels.masked_fill(mtp_pos_ids == 0, ignore_index)
             mtp_ce_op = self.veomni_ce if getattr(self.veomni_ce, "impl", None) in ("chunk_loss", "eager") else None
             mtp_loss, _, _ = ForCausalLMLoss(

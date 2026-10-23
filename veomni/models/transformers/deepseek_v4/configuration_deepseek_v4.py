@@ -93,8 +93,16 @@ class DeepseekV4Config(_DeepseekV4Config):
     @classmethod
     def from_dict(cls, config_dict: dict[str, Any], **kwargs):
         config_dict = dict(config_dict)
+        on_disk_n = config_dict.get("num_hidden_layers", cls.num_hidden_layers)
+        on_disk_default_targets = (
+            list(range(max(0, on_disk_n - 3), on_disk_n)) if isinstance(on_disk_n, int) and on_disk_n > 0 else None
+        )
+        raw_on_disk_targets = config_dict.get("dspark_target_layer_ids")
+        used_default_targets = raw_on_disk_targets is None or (
+            isinstance(raw_on_disk_targets, (list, tuple)) and list(raw_on_disk_targets) == on_disk_default_targets
+        )
         compress_ratios = kwargs.get("compress_ratios", config_dict.get("compress_ratios"))
-        n_hidden = kwargs.get("num_hidden_layers", config_dict.get("num_hidden_layers", cls.num_hidden_layers))
+        n_hidden = kwargs.get("num_hidden_layers", on_disk_n)
         if (
             compress_ratios is not None
             and isinstance(n_hidden, int)
@@ -114,16 +122,18 @@ class DeepseekV4Config(_DeepseekV4Config):
         config = result[0] if isinstance(result, tuple) else result
         if "num_hidden_layers" in kwargs:
             if "layer_types" not in kwargs and config.layer_types is not None:
+                if len(config.layer_types) < config.num_hidden_layers:
+                    raise ValueError(
+                        "Pass layer_types explicitly when the num_hidden_layers override increases the layer count."
+                    )
                 config.layer_types = list(config.layer_types[: config.num_hidden_layers])
             if "mlp_layer_types" not in kwargs and config.mlp_layer_types is not None:
+                if len(config.mlp_layer_types) < config.num_hidden_layers:
+                    raise ValueError(
+                        "Pass mlp_layer_types explicitly when the num_hidden_layers override increases the layer count."
+                    )
                 config.mlp_layer_types = list(config.mlp_layer_types[: config.num_hidden_layers])
-            if "dspark_target_layer_ids" not in kwargs and (
-                config_dict.get("dspark_target_layer_ids") is None
-                or (
-                    config.dspark_target_layer_ids is not None
-                    and any(idx >= config.num_hidden_layers for idx in config.dspark_target_layer_ids)
-                )
-            ):
+            if "dspark_target_layer_ids" not in kwargs and used_default_targets:
                 config.dspark_target_layer_ids = (
                     list(range(max(0, config.num_hidden_layers - 3), config.num_hidden_layers))
                     if config.num_hidden_layers > 0

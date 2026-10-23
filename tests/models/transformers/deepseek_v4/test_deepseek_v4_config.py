@@ -210,6 +210,21 @@ def test_dspark_mtp_config_fields_and_defaults():
     assert shrunk_cfg.dspark_target_layer_ids == [0, 1]
     shrunk_cfg.validate_build_prerequisites()
 
+    # Non-default explicit dspark_target_layer_ids in config_dict is preserved so validation catches it.
+    custom_targets_dict = dict(on_disk_dict, dspark_target_layer_ids=[0, 2, 3])
+    shrunk_custom_targets = DeepseekV4Config.from_dict(
+        custom_targets_dict,
+        num_hidden_layers=2,
+        dspark_block_size=5,
+    )
+    assert shrunk_custom_targets.dspark_target_layer_ids == [0, 2, 3]
+    with pytest.raises(ValueError, match="dspark_target_layer_ids"):
+        shrunk_custom_targets.validate_build_prerequisites()
+
+    # Increasing num_hidden_layers via from_dict without explicit layer_types raises ValueError.
+    with pytest.raises(ValueError, match="Pass layer_types explicitly"):
+        DeepseekV4Config.from_dict(on_disk_dict, num_hidden_layers=6)
+
 
 @pytest.mark.parametrize("coef", [-1.0, float("nan"), float("inf")])
 def test_mtp_loss_coef_rejects_negative_and_non_finite(coef):
