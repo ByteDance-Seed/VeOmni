@@ -318,7 +318,9 @@ def test_causal_conv1d_fla_matches_eager(device):
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="causal_conv1d npu needs torch_npu")
-def test_causal_conv1d_npu_matches_eager_forward_and_backward():
+@pytest.mark.parametrize("dim", (256, 640))
+@pytest.mark.parametrize("packed", (False, True))
+def test_causal_conv1d_npu_matches_eager_forward_and_backward(dim, packed):
     _require_npu_gdr_dependencies()
     from veomni.ops.kernels.gated_delta_rule.vendor.triton.utils import is_arch35
 
@@ -328,24 +330,32 @@ def test_causal_conv1d_npu_matches_eager_forward_and_backward():
     eager = resolve_op("causal_conv1d", "standard", "eager").wrapper
     other = resolve_op("causal_conv1d", "standard", "triton").wrapper
     torch.manual_seed(13)
-    # Forward tiles the channel axis at 256 when there is no initial state.
-    batch, seq, dim, kernel = 2, 64, 256, 4
+    # 640 channels reproduces Qwen4-Exp's real U8CP2 GDN head shard.
+    batch, seq, kernel = (1, 128, 4) if packed else (2, 64, 4)
     x = torch.randn(batch, seq, dim, device="npu", dtype=torch.bfloat16)
     weight = torch.randn(dim, kernel, device="npu", dtype=torch.bfloat16)
     bias = torch.randn(dim, device="npu", dtype=torch.bfloat16)
 
-    x_e, w_e, b_e = make_grad_leaves(x, weight, bias)
+    # Independent segments must accumulate their shared-parameter gradients in
+    # high precision. Separate BF16 conv calls round each partial before adding,
+    # which can lose small cancellation residuals and falsely reject a more
+    # accurate fused FP32 reduction (notably for the packed 640-channel shard).
+    x_e, w_e, b_e = make_grad_leaves(*(tensor.cpu().double() for tensor in (x, weight, bias)))
     x_o, w_o, b_o = make_grad_leaves(x, weight, bias)
-    out_e = eager(x_e, w_e, b_e, activation="silu")
-    out_o = other(x_o, w_o, b_o, activation="silu")
-    torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
+    cu = torch.tensor([0, 61, 128], device="npu", dtype=torch.int32) if packed else None
+    if packed:
+        out_e = torch.cat([eager(chunk, w_e, b_e, activation="silu") for chunk in x_e.split((61, 67), dim=1)], dim=1)
+    else:
+        out_e = eager(x_e, w_e, b_e, activation="silu")
+    out_o = other(x_o, w_o, b_o, cu_seqlens=cu, activation="silu")
+    torch.testing.assert_close(out_o.float().cpu(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
 
-    grad_output = torch.randn_like(out_e)
-    out_e.backward(grad_output)
+    grad_output = torch.randn_like(out_o)
+    out_e.backward(grad_output.cpu().double())
     out_o.backward(grad_output)
     for actual, expected in zip((x_o, w_o, b_o), (x_e, w_e, b_e), strict=True):
         torch.testing.assert_close(
-            actual.grad.float(),
+            actual.grad.float().cpu(),
             expected.grad.float(),
             atol=GDN_FUSED_GRAD_ATOL,
             rtol=GDN_FUSED_GRAD_RTOL,
@@ -717,13 +727,16 @@ def test_chunk_gated_delta_rule_fla_matches_eager(device):
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="chunk_gated_delta_rule npu needs torch_npu")
-@pytest.mark.parametrize("impl", ("triton", "fla_npu"))
-def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl):
+@pytest.mark.parametrize(("impl", "dim"), (("triton", 64), ("triton", 128), ("fla_npu", 128), ("fla_npu", 256)))
+@pytest.mark.parametrize("packed", (False, True))
+def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl, dim, packed):
     _require_npu_gdr_dependencies(ascendc=impl == "fla_npu")
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
     other = resolve_op("chunk_gated_delta_rule", "standard", impl).wrapper
     torch.manual_seed(19)
-    batch, seq, heads, dim = 1, 64, 4, 64
+    # The Ascend910B v26.6 RecomputeWUFwd kernel supports V=128/256, not 64.
+    # Keep Triton padding coverage and both supported AscendC widths.
+    batch, seq, heads = 1, 128, 4
     q = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
     k = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
     v = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
@@ -732,8 +745,18 @@ def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl):
 
     q_e, k_e, v_e, g_e, b_e = make_grad_leaves(q, k, v, g, beta)
     q_o, k_o, v_o, g_o, b_o = make_grad_leaves(q, k, v, g, beta)
-    out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, use_qk_l2norm_in_kernel=True)
-    out_o, _ = other(q_o, k_o, v_o, g_o, b_o, use_qk_l2norm_in_kernel=True)
+    lengths = (61, 67) if packed else (seq,)
+    cu = (
+        torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], device="npu", dtype=torch.int32)
+        if packed
+        else None
+    )
+    # Independent eager calls reset recurrent state at each packed boundary.
+    segments = [tensor.split(lengths, dim=1) for tensor in (q_e, k_e, v_e, g_e, b_e)]
+    out_e = torch.cat(
+        [eager(*inputs, use_qk_l2norm_in_kernel=True)[0] for inputs in zip(*segments, strict=True)], dim=1
+    )
+    out_o, _ = other(q_o, k_o, v_o, g_o, b_o, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)
     torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
 
     grad_output = torch.randn_like(out_e)
