@@ -288,13 +288,13 @@ requirement, and optional-package requirements. When adding model-specific
 argument policy, test it in `tests/models` rather than duplicating it in
 the raw-kernel suite.
 
-### Optional Qwen4-Exp GDN projection exchange
+### GDN projection exchange
 
-Set `model.ops_implementation.coalesced_gdn_exchange: true` to concatenate the Q/K/V, beta and
-decay projections before the existing explicit-group Ulysses exchange. The packed
-width retains the Q/K-to-value head ratio; each peer packet is padded to 512 bytes
-and unpadded before interpreting the sequence. Backward performs the inverse
-permutation with no rescaling. This reduces five input collectives to one; output
-exchange, recurrence, packed boundaries and CP groups are unchanged. The option
-is off by default, and mixed projection dtypes use the existing five exchanges
-without casting. It does not remove GDN's head-divisibility constraint.
+Qwen4-Exp, Qwen3.5 and Qwen3.5-MoE automatically coalesce same-dtype Q/K/V,
+beta and decay projections before their explicit-group sequence exchange.
+Mixed projection dtypes retain five separate collectives without casting.
+The packed width retains the key/value head ratio. Peer packets are padded to
+512 bytes, then unpadded before interpreting the sequence; backward inverts the
+same permutation without rescaling. Output exchange, recurrence and packed
+boundaries are unchanged, and existing head-divisibility requirements remain.
+No `OpsImplementationConfig` flag is needed for this layout optimization.

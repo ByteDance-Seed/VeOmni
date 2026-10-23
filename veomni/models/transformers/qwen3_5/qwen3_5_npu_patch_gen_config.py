@@ -88,6 +88,7 @@ config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
+config.add_import("veomni.distributed.sequence_parallel.gdn_exchange", names=["coalesced_gather_aligned"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
@@ -274,15 +275,16 @@ def qwen3_5_gated_deltanet_forward_patched(
         k_proj = k_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         v_proj = v_proj.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
-        # All-to-all: gather full sequence, scatter heads -> [B, S_full, local_heads, head_dim]
-        q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-        k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-        v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-
         b = b.reshape(batch_size, seq_len, self.num_v_heads)
         a = a.reshape(batch_size, seq_len, self.num_v_heads)
-        b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
-        a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
+        if q_proj.dtype == k_proj.dtype == v_proj.dtype == b.dtype == a.dtype:
+            q_proj, k_proj, v_proj, b, a = coalesced_gather_aligned(q_proj, k_proj, v_proj, b, a, ulysses_group)
+        else:
+            q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+            k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+            v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+            b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
+            a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
 
         # Flatten heads back to channels and concat for conv1d: [B, S_full, local_dim]
         q_proj = q_proj.reshape(q_proj.shape[0], q_proj.shape[1], -1)

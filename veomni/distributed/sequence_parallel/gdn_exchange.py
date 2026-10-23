@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Opt-in coalesced GDN Ulysses exchange with explicit process-group ownership."""
+"""Coalesced GDN Ulysses exchange with explicit process-group ownership."""
 
 import torch
 import torch.distributed as dist
@@ -128,4 +128,6 @@ def coalesced_gather_aligned(q, k, v, beta, decay, group):
     if group is None:
         raise ValueError("An explicit sequence-parallel group is required")
     fused, layout = pack(q, k, v, beta, decay)
-    return tuple(value.contiguous() for value in unpack(_AlignedPackedAllToAll.apply(fused, group, True), layout))
+    q, k, v, beta, decay = unpack(_AlignedPackedAllToAll.apply(fused, group, True), layout)
+    # Projection slices feed the caller's concatenation; do not copy them first.
+    return q, k, v, beta.contiguous(), decay.contiguous()
