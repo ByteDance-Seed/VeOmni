@@ -26,10 +26,6 @@ from ....registry import SavedState
 from ..standard.eager import empty_output, linear, linear_backward
 
 
-_SQRT_2_OVER_PI = 0.7978845608028654
-_GELU_TANH_COEFF = 0.044715
-
-
 @dataclass(frozen=True)
 class _Meta:
     """Empty path and which biases were real tensors."""
@@ -47,17 +43,12 @@ def gelu_tanh_mul(gate: Tensor, up: Tensor) -> Tensor:
 
 
 def gelu_tanh_mul_backward(grad_hidden: Tensor, gate: Tensor, up: Tensor) -> tuple[Tensor, Tensor]:
-    """Return ``(grad_gate, grad_up)`` for ``gelu_pytorch_tanh(gate) * up``."""
+    """Return gate/up gradients with the same operation order as PyTorch autograd."""
     gelu_gate = F.gelu(gate, approximate="tanh")
     grad_up = grad_hidden * gelu_gate
-    gate_f = gate.float()
-    gate_sq = gate_f * gate_f
-    tanh_arg = _SQRT_2_OVER_PI * (gate_f + _GELU_TANH_COEFF * gate_f * gate_sq)
-    tanh_res = torch.tanh(tanh_arg)
-    dgelu = 0.5 * (1.0 + tanh_res) + 0.5 * gate_f * (1.0 - tanh_res * tanh_res) * (
-        _SQRT_2_OVER_PI * (1.0 + 3.0 * _GELU_TANH_COEFF * gate_sq)
-    )
-    grad_gate = grad_hidden * up * dgelu.to(dtype=gate.dtype)
+    # Match MulBackward followed by GeluBackward, including low-precision
+    # rounding of the upstream gradient before the activation derivative.
+    grad_gate = torch.ops.aten.gelu_backward(grad_hidden * up, gate, approximate="tanh")
     return grad_gate, grad_up
 
 
