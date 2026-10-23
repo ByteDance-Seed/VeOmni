@@ -129,11 +129,24 @@ def _randomize_lora_b(model: VeOmniLoraModel) -> None:
                 p.normal_(0.0, 0.02)
 
 
+_SHARED_LORA_PROBE_MODULES = tuple(
+    f"{projection}.lora_{factor}.default"
+    for projection in ("gate_proj", "up_proj", "down_proj")
+    for factor in ("A", "B")
+)
+
+
 class _SharedLoraAccumulationProbe(LoraSharedExperts):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         self._forward_calls = getattr(self, "_forward_calls", 0) + 1
         self._ensure_ep_grad_sync_hooks()
-        return self.gate_proj.lora_A["default"](x)
+        # Use each A/B independently: zero-initialized B must not mask A's
+        # gradient, and every parameter gets a distinct, linear oracle.
+        outputs = []
+        for coefficient, name in enumerate(_SHARED_LORA_PROBE_MODULES, start=1):
+            linear = self.get_submodule(name)
+            outputs.append(coefficient * linear(x[:, : linear.in_features]))
+        return tuple(outputs)
 
 
 def _shared_lora_ep_accumulation_worker(rank: int, checkpointed: bool, defer_reshard: bool, endpoint) -> None:
@@ -149,33 +162,58 @@ def _shared_lora_ep_accumulation_worker(rank: int, checkpointed: bool, defer_res
         experts = _SharedLoraAccumulationProbe(ToyExperts(), r=RANK, lora_alpha=8)
         fully_shard(experts, mesh=mesh["ep_fsdp"], shard_placement_fn=lambda param: Shard(1))
         experts.set_gradient_divide_factor(2)
-        weight = experts.gate_proj.lora_A["default"].weight
-        initial = weight.to_local().clone()
-        optimizer = torch.optim.SGD([weight], lr=0.1)
+        weights = {name: experts.get_submodule(name).weight for name in _SHARED_LORA_PROBE_MODULES}
+        assert {f"{name}.weight" for name in weights} == {
+            name for name, param in experts.named_parameters() if param.requires_grad
+        }
+        initial = {name: weight.to_local().detach().clone() for name, weight in weights.items()}
+        optimizer = torch.optim.SGD(weights.values(), lr=0.1)
         state = SimpleNamespace(ep_enabled=True, ep_group=mesh["ep"].get_group())
         forward_checks = []
         with mock.patch("veomni.lora.moe_layers.get_parallel_state", return_value=state):
-            # Two microbatches share one optimizer step. Each rank contributes
-            # (rank + 1) and 2 * (rank + 1), so the global gradient is 9.
+            # d(sum(c * linear(x)))/dW[i,j] = c * x[j]. The rank and
+            # microbatch factors sum to (1 + 2) * (1 + 2) = 9; FSDP's
+            # divide factor gives 4.5 * c * (j + 1) for every output row.
             for micro in (1, 2):
                 if defer_reshard:
                     experts.set_reshard_after_backward(micro == 2)
-                x = torch.full((1, HIDDEN), float(micro * (rank + 1)))
-                output = checkpoint(experts, x, use_reentrant=False) if checkpointed else experts(x)
-                forward_checks.append((output.sum().detach().clone(), (x @ initial.T).sum()))
-                output.sum().backward()
+                x = torch.arange(1, INTER + 1, dtype=torch.float32, device="cpu").unsqueeze(0)
+                x = x * micro * (rank + 1)
+                outputs = checkpoint(experts, x, use_reentrant=False) if checkpointed else experts(x)
+                for coefficient, (name, output) in enumerate(zip(weights, outputs), start=1):
+                    expected = coefficient * (x[:, : initial[name].shape[1]] @ initial[name].T)
+                    forward_checks.append((name, output.detach().clone(), expected))
+                sum(output.sum() for output in outputs).backward()
 
-        expected_grad = torch.full_like(initial, 4.5)  # FSDP divides the EP sum by world size.
-        actual_grad = weight.grad.to_local().detach().clone()
+        actual_grads = {name: weight.grad.to_local().detach().clone() for name, weight in weights.items()}
         optimizer.step()
-        replicas = [torch.empty_like(initial) for _ in range(2)]
-        dist.all_gather(replicas, weight.to_local(), group=state.ep_group)
-        for actual, expected in forward_checks:
-            torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+        replicas = {}
+        for name, weight in weights.items():
+            grad_replicas = [torch.empty_like(initial[name]) for _ in range(2)]
+            weight_replicas = [torch.empty_like(initial[name]) for _ in range(2)]
+            dist.all_gather(grad_replicas, actual_grads[name], group=state.ep_group)
+            dist.all_gather(weight_replicas, weight.to_local(), group=state.ep_group)
+            replicas[name] = (grad_replicas, weight_replicas)
+
+        # Complete every collective before asserting, including fault-injected
+        # runs where one parameter has missed its synchronization hook.
+        for name, actual, expected in forward_checks:
+            torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6, msg=name)
         assert experts._forward_calls == (4 if checkpointed else 2)
-        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
-        torch.testing.assert_close(weight.to_local(), initial - 0.1 * expected_grad, rtol=1e-6, atol=1e-7)
-        torch.testing.assert_close(replicas[0], replicas[1], rtol=0, atol=0)
+        for coefficient, (name, weight) in enumerate(weights.items(), start=1):
+            columns = torch.arange(1, initial[name].shape[1] + 1, dtype=torch.float32, device="cpu")
+            expected_grad = (4.5 * coefficient * columns).expand_as(initial[name])
+            torch.testing.assert_close(actual_grads[name], expected_grad, rtol=0, atol=0, msg=f"{name} gradient")
+            torch.testing.assert_close(
+                weight.to_local(), initial[name] - 0.1 * expected_grad, rtol=1e-6, atol=1e-7, msg=f"{name} update"
+            )
+            grad_replicas, weight_replicas = replicas[name]
+            torch.testing.assert_close(
+                grad_replicas[0], grad_replicas[1], rtol=0, atol=0, msg=f"{name} gradient replicas"
+            )
+            torch.testing.assert_close(
+                weight_replicas[0], weight_replicas[1], rtol=0, atol=0, msg=f"{name} weight replicas"
+            )
     finally:
         dist.destroy_process_group()
 
