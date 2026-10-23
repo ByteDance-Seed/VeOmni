@@ -30,11 +30,14 @@ Scope (v1)
   supported: under ExtraParallel the factory builds one ``SwapAdamW`` per
   parameter group inside a ``MultiOptimizer``. Validated on Ascend NPU + FSDP2.
 * Checkpoint save/load reads and writes the host buffers directly (see
-  ``state_dict`` / ``load_state_dict``).
-* The update kernel is ``torch._fused_adamw_`` on the accelerator (Ascend NPU
-  registers it), applied per param group within each swapped-in batch. On CPU
-  (unit tests) it falls back to plain elementwise AdamW math, which is
-  numerically equivalent.
+  ``state_dict`` / ``load_state_dict``). Resuming across a changed FSDP/EP
+  mesh (resharding) works through DCP's byte-level planning — an EP=4 → EP=2
+  resume at world 8 replayed bitwise in manual validation — but is not
+  covered by automated tests.
+* The update kernel is ``torch._fused_adamw_`` on CUDA and Ascend NPU, applied
+  per param group within each swapped-in batch. Other backends (CPU unit tests,
+  MLU, ...) take the plain elementwise AdamW path, which is numerically
+  equivalent.
 """
 
 from __future__ import annotations
@@ -50,6 +53,7 @@ from torch.optim.optimizer import Optimizer
 
 from ..utils import logging
 from ..utils.device import (
+    FUSED_ADAMW_DEVICE_TYPES,
     create_stream,
     get_current_stream,
     get_device_id,
@@ -97,9 +101,9 @@ class SwapAdamW(Optimizer):
         pin_memory: Pin the host-side state buffers. Improves transfer bandwidth
             at the cost of page-locked host memory.
         chunk_bytes: State bytes updated (and swapped out) per pipeline chunk.
-            The chunk boundary lets a chunk's swap-out overlap the next chunk's
-            swap-in; a byte budget keeps a chunk from being one huge parameter or
-            hundreds of tiny ones.
+            A batch is swapped in up front; the chunk boundary then lets one
+            chunk's swap-out overlap the next chunk's compute. A byte budget
+            keeps a chunk from being one huge parameter or hundreds of tiny ones.
     """
 
     def __init__(
@@ -115,6 +119,9 @@ class SwapAdamW(Optimizer):
         pin_memory: bool = True,
         chunk_bytes: int = 128 << 20,
     ) -> None:
+        # YAML resolves an exponent literal without a decimal point (``8e-1``) to
+        # a string; coerce before the range check.
+        mem_fraction_static = float(mem_fraction_static)
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if eps < 0.0:
@@ -130,14 +137,34 @@ class SwapAdamW(Optimizer):
         if chunk_bytes < 1:
             raise ValueError(f"chunk_bytes must be >= 1, got {chunk_bytes}")
 
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, amsgrad=amsgrad)
+        # The param-group key set must match stock ``torch.optim.AdamW`` exactly:
+        # DCP checkpoints one entry per group key, and a strict load requires the
+        # checkpoint to carry every key of the target optimizer, so a swap
+        # checkpoint must load into stock AdamW (and vice versa).
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            amsgrad=amsgrad,
+            maximize=False,
+            foreach=None,
+            capturable=False,
+            differentiable=False,
+            fused=None,
+            decoupled_weight_decay=True,
+        )
 
-        self.mem_fraction_static = float(mem_fraction_static)
-        self.pin_memory = bool(pin_memory)
+        self.mem_fraction_static = mem_fraction_static
+        # Resolve the backend before the pinning gate: pinning is only
+        # meaningful when an accelerator backend exists.
+        self._device_type = get_device_type()
+        # Pinned host buffers need an accelerator backend (``async_offload`` gates
+        # pinning the same way); a host with no accelerator cannot serve it.
+        self.pin_memory = bool(pin_memory) and self._device_type != "cpu"
         self.chunk_bytes = int(chunk_bytes)
 
         # Two copy streams so H2D and D2H overlap instead of serializing on one stream.
-        self._device_type = get_device_type()
         self._use_streams = self._device_type != "cpu"
         if self._use_streams:
             self._in_stream: Optional[Any] = create_stream()
@@ -147,10 +174,11 @@ class SwapAdamW(Optimizer):
             self._out_stream = None
 
         self._state_keys: Tuple[str, ...] = ("exp_avg", "exp_avg_sq") + (("max_exp_avg_sq",) if amsgrad else ())
-        # Use the native fused AdamW kernel on real accelerators (Ascend NPU
-        # registers ``torch._fused_adamw_``); keep the elementwise path on CPU so
-        # the optimizer stays unit-testable without an accelerator.
-        self._use_fused = self._use_streams and hasattr(torch, "_fused_adamw_")
+        # ``hasattr`` is always True on modern torch (the op schema is registered
+        # on every build), so gate on the backend explicitly: torch ships CUDA and
+        # CPU kernels and Ascend NPU registers its own; other backends (e.g. MLU)
+        # take the elementwise fallback.
+        self._use_fused = self._device_type in FUSED_ADAMW_DEVICE_TYPES and hasattr(torch, "_fused_adamw_")
         self._host_states: Dict[Tensor, Dict[str, Tensor]] = {}
         self._device_states: Dict[Tensor, Dict[str, Tensor]] = {}
         self._swap_in_events: Dict[Tensor, Any] = {}
@@ -163,10 +191,43 @@ class SwapAdamW(Optimizer):
         self._init_states()
 
     def add_param_group(self, param_group: dict) -> None:  # type: ignore[override]
+        # ``_state_keys`` (and therefore ``_param_bytes``) is fixed at
+        # construction; a group with a different ``amsgrad`` would need a third
+        # moment buffer and would make the swap budget under-count.
+        if isinstance(param_group, dict):
+            # An explicit ``None`` survives the base class's ``setdefault`` and is
+            # falsy, so normalize instead of skipping it.
+            requested = bool(param_group.get("amsgrad", self.defaults["amsgrad"]))
+            if requested != bool(self.defaults["amsgrad"]):
+                raise ValueError(
+                    "SwapAdamW cannot add a param group with amsgrad="
+                    f"{requested} (built with amsgrad={self.defaults['amsgrad']}): "
+                    "the moment-state layout is fixed at construction."
+                )
         super().add_param_group(param_group)
         self._init_states()
 
     # ------------------------------------------------------------------ build
+
+    def _alloc_host_buffer(self, local_shard: Tensor) -> Tensor:
+        """Zero-initialized host buffer for one state shard.
+
+        Page-locked host memory is a finite machine resource: on exhaustion the
+        optimizer degrades to pageable buffers once — the same fallback
+        ``async_offload`` uses — instead of failing the whole run at build time.
+        """
+        shape = tuple(local_shard.shape)
+        try:
+            return torch.zeros(shape, dtype=local_shard.dtype, device="cpu", pin_memory=self.pin_memory)
+        except RuntimeError:
+            if not self.pin_memory:
+                raise
+            logger.warning_rank0(
+                "Pinned host allocation for SwapAdamW states failed (page-locked memory "
+                "exhausted?); continuing with pageable host buffers."
+            )
+            self.pin_memory = False
+            return torch.zeros(shape, dtype=local_shard.dtype, device="cpu", pin_memory=False)
 
     def _init_states(self) -> None:
         """Move every parameter's moment state to host and free its device storage."""
@@ -181,16 +242,13 @@ class SwapAdamW(Optimizer):
                 for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
                     if key == "max_exp_avg_sq" and not amsgrad:
                         continue
-                    dtensor = torch.zeros_like(p)
+                    # Only shape/dtype/placements are taken from this DTensor; the
+                    # zero-filled storage is freed immediately below, so skip the
+                    # fill.
+                    dtensor = torch.empty_like(p)
                     self.state[p][key] = dtensor
                     local_shard = _to_local(dtensor)
-                    host_tensor = torch.zeros(
-                        tuple(local_shard.shape),
-                        dtype=local_shard.dtype,
-                        device="cpu",
-                        pin_memory=self.pin_memory,
-                    )
-                    host_state[key] = host_tensor
+                    host_state[key] = self._alloc_host_buffer(local_shard)
                     device_state[key] = local_shard
                     local_shard.untyped_storage().resize_(0)
 
@@ -237,6 +295,10 @@ class SwapAdamW(Optimizer):
         ``step`` is stored internally as a Python int but exported as a CPU
         tensor so DCP checkpoints stay compatible with stock AdamW (which also
         stores step as a tensor).
+
+        The host buffers are handed to DCP live (no copy here), but DCP's staging
+        stager deep-copies them before writing, so a save transiently needs about
+        twice the host optimizer-state memory (on top of the pinned buffers).
         """
         self._bind_host_states()
         state_dict = super().state_dict()
@@ -251,7 +313,9 @@ class SwapAdamW(Optimizer):
         The base implementation casts every value to ``param.device`` (moving the
         host buffers onto the accelerator), so the mapping is done here instead.
         State is aligned to the current parameters by param-group position, as the
-        base class does; param-group hyperparameters are merged from the checkpoint.
+        base class does; param-group hyperparameters are merged from the checkpoint,
+        except ``amsgrad``, which is structural and must match the construction-time
+        value.
         """
         groups = self.param_groups
         saved_groups = state_dict["param_groups"]
@@ -263,8 +327,17 @@ class SwapAdamW(Optimizer):
                 raise ValueError(
                     "loaded state dict contains a parameter group that doesn't match the optimizer's group"
                 )
+            saved_amsgrad = bool(saved_group.get("amsgrad", group["amsgrad"]))
+            if saved_amsgrad != bool(group["amsgrad"]):
+                raise ValueError(
+                    "Cannot load a checkpoint whose param group has amsgrad="
+                    f"{saved_amsgrad} into a SwapAdamW built with amsgrad={group['amsgrad']}: "
+                    "the moment-state layout is fixed at construction."
+                )
             id_map.update(zip(saved_group["params"], group["params"]))
-            group.update({k: v for k, v in saved_group.items() if k != "params"})
+            # ``amsgrad`` is structural (it decides whether a third moment buffer
+            # exists); keep the constructor's value rather than the checkpoint's.
+            group.update({k: v for k, v in saved_group.items() if k not in ("params", "amsgrad")})
         for key, value in state_dict["state"].items():
             param = id_map.get(key)
             if param is not None:
@@ -275,13 +348,19 @@ class SwapAdamW(Optimizer):
         if host_state is None:
             return
         for key, loaded in value.items():
+            if isinstance(loaded, DTensor):
+                loaded = _to_local(loaded)
             if key == "step":
-                if isinstance(loaded, DTensor):
-                    loaded = _to_local(loaded)
-                self.state[p]["step"] = int(loaded.item()) if isinstance(loaded, torch.Tensor) else int(loaded)
-            elif key in host_state and loaded is not None:
-                source = _to_local(loaded) if isinstance(loaded, DTensor) else loaded
-                host_state[key].copy_(source.to(host_state[key].device))
+                if isinstance(loaded, torch.Tensor):
+                    self.state[p]["step"] = int(loaded.item())
+                elif isinstance(loaded, (int, float)):
+                    self.state[p]["step"] = int(loaded)
+                # An empty dict marks a param absent from the checkpoint (the
+                # flattened loader reconstructs missing entries that way); keep
+                # the construction-time step 0 in that case.
+            elif key in host_state and isinstance(loaded, torch.Tensor):
+                # Same for the moments: leave the zero-initialized host buffer.
+                host_state[key].copy_(loaded.to(host_state[key].device))
 
     def swap_all_to_device(self) -> None:
         """Swap in every parameter's states to the device (used by the tests; DCP save reads host directly)."""
@@ -327,6 +406,12 @@ class SwapAdamW(Optimizer):
         return _INFINITE_BUDGET  # pragma: no cover
 
     def _batch_budget_bytes(self) -> int:
+        """Bytes of moment state swapped in per batch.
+
+        Only the moment states are budgeted: gradients and the elementwise path's
+        per-parameter temporaries (the negated grad for ``maximize``, ``denom``)
+        still need headroom, so keep the static fraction below 1.0.
+        """
         if not self._use_streams:
             return _INFINITE_BUDGET
         return max(int(self._device_free_bytes() * self.mem_fraction_static), 0)
@@ -386,7 +471,6 @@ class SwapAdamW(Optimizer):
         """
         self._release_pending_storages()
         stream_context = switch_to_specified_stream(self._in_stream) if self._use_streams else nullcontext()
-        start_index = index
         bytes_moved = 0
         budget = self._batch_budget_bytes()
         with stream_context:
@@ -394,16 +478,18 @@ class SwapAdamW(Optimizer):
                 param_bytes = self._param_bytes[params[index]]
                 if bytes_moved != 0 and bytes_moved + param_bytes > budget:
                     break
+                # bytes_moved == 0 marks the batch's first parameter: it must
+                # fit within the budget or the batch cannot start at all. Empty
+                # shards (uneven EP/FSDP sharding) move zero bytes and leave
+                # this check armed for the next real parameter.
+                if bytes_moved == 0 and param_bytes > budget:
+                    raise RuntimeError(
+                        "SwapAdamW could not fit any optimizer state on device. "
+                        "Increase optimizer.swap_mem_fraction_static or reduce the parameter size."
+                    )
                 self._swap_in_param(params[index])
                 bytes_moved += param_bytes
                 index += 1
-        # Progress is measured by index: empty shards (uneven EP/FSDP sharding)
-        # move zero bytes yet must still advance past the "could not fit" guard.
-        if index == start_index:
-            raise RuntimeError(
-                "SwapAdamW could not fit any optimizer state on device. "
-                "Increase optimizer.swap_mem_fraction_static or reduce the parameter size."
-            )
         return index
 
     def _bump_step(self, p: Tensor) -> int:

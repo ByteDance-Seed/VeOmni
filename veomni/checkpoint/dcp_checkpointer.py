@@ -277,7 +277,14 @@ class OptimizerState(Stateful):
 
     On save, only optimizer state that actually exists is persisted — params
     that never received a gradient (e.g. unused MoE experts, frozen LoRA
-    base weights) are simply absent from the checkpoint.
+    base weights) are simply absent from the checkpoint.  Optimizers that
+    pre-populate their state at construction (``SwapAdamW``) are the
+    exception: their state is never empty, so their checkpoints are dense
+    and never-stepped params carry zero moments and ``step`` 0 — fresh state,
+    as a newly built optimizer has it. A stock optimizer resumed through this
+    class instead ends an absent param at ``step`` 1 (the checkpoint
+    machinery's eager zero-grad initialization); a direct ``load_state_dict``
+    that omits the param leaves it stateless until its next ``step()``.
 
     On load, ``allow_partial_load=True`` is passed to the DCP load planner
     so missing optimizer entries are skipped.  For a fresh optimizer (the

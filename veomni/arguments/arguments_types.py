@@ -142,11 +142,11 @@ class OptimizerConfig:
         default="per_module",
         metadata={
             "help": (
-                "Which parameters max_grad_norm is computed over. 'per_module' clips each "
-                "module against its own norm; 'global' clips every module against one norm "
-                "taken across all of them. A single-model job has one module, so the two "
-                "agree; 'global' only becomes meaningful once an omni model owns several, "
-                "and is not implemented yet."
+                "How OmniTrainer applies max_grad_norm across OmniModules. "
+                "'per_module' (default): clip each module to max_grad_norm independently, "
+                "then report sqrt(sum n_i^2). "
+                "'global': measure each module unclipped, total=sqrt(sum n_i^2), then scale "
+                "all modules by one coefficient (single-model / seedream gradient_clip_val semantics)."
             )
         },
     )
@@ -277,11 +277,15 @@ class OptimizerConfig:
     )
 
     def __post_init__(self):
-        if self.grad_clip_scope == "global":
-            raise NotImplementedError(
-                "model.optimizer.grad_clip_scope='global' needs a clip that spans several "
-                "modules, which arrives with the omni module runtime. Use 'per_module'."
-            )
+        # YAML resolves an exponent literal without a decimal point (``8e-1``)
+        # to a string, so coerce before the range check (same reason as
+        # ``_collect_muon_kwargs`` does for ``muon_lr``).
+        if self.type == "adamw_swap":
+            self.swap_mem_fraction_static = float(self.swap_mem_fraction_static)
+            if not 0.0 < self.swap_mem_fraction_static <= 1.0:
+                raise ValueError(
+                    f"model.optimizer.swap_mem_fraction_static must be in (0, 1], got {self.swap_mem_fraction_static}"
+                )
 
 
 @dataclass
@@ -1895,6 +1899,13 @@ class ModelArguments(BaseModelArguments):
 
     def __post_init__(self):
         super().__post_init__()
+        # Both move training state to host; running them together would double
+        # the host footprint and fight over the accelerator. Reject at parse time.
+        if self.optimizer.type == "adamw_swap" and self.accelerator.fsdp_config.offload:
+            raise ValueError(
+                "model.optimizer.type='adamw_swap' cannot be combined with "
+                "model.accelerator.fsdp_config.offload; both move training state to host."
+            )
         # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
         # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
         # instead of silently ignoring the flag.

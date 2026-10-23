@@ -44,7 +44,17 @@ def rewrap_dtensor_local(
     arithmetic ``from_local`` uses), which is required when the target mesh differs
     from the source one. Pass them only when the global shape is known and the local
     may be unevenly sharded.
+
+    The mismatched-device branch wraps ``local`` in a storage-sharing
+    ``view_as`` view — no copy, no device move, no mutation — and any layout,
+    including non-contiguous strides, is preserved.
     """
+    if (shape is None) != (stride is None):
+        raise ValueError("shape and stride must be provided together")
+    if isinstance(local, DTensor):
+        raise TypeError("rewrap_dtensor_local expects a plain local tensor, got a DTensor")
+    if len(placements) != mesh.ndim:
+        raise ValueError(f"placements has {len(placements)} entries for a {mesh.ndim}-D mesh")
     if local.device.type == mesh.device_type:
         if shape is None or stride is None:
             return DTensor.from_local(local, device_mesh=mesh, placements=list(placements), run_check=False)

@@ -509,7 +509,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | muon_expert_zero_comm | `bool` | `False` | Use whole-expert `Shard(0)` when the FSDP+ExtraParallel topology permits zero-communication expert Muon updates. |
 | muon_ns_implementation | `Literal["std", "gram", "gram_quack"]` | `"gram_quack"` | Newton–Schulz backend: standard, pure-PyTorch Gram-NS, or Gram-NS with quack kernels (default; falls back to `gram` if unavailable). |
 | muon_gram_ns_reset_iterations | `List[int]` | `[2]` | Restart indices for Gram Newton–Schulz (ignored by `std`). |
-| swap_mem_fraction_static | `float` | `0.8` | With `type="adamw_swap"`, fraction of currently free device memory used to size one batch of optimizer states streamed from host to device. |
+| swap_mem_fraction_static | `float` | `0.8` | With `type="adamw_swap"`, fraction of currently free device memory used to size one batch of optimizer states streamed from host to device. The batch budget never exceeds free memory, so a single parameter whose states exceed it cannot be swapped in and `step()` raises. |
 | swap_pin_memory | `bool` | `True` | With `type="adamw_swap"`, pin the host-side optimizer state buffers. Disable if page-locked memory is scarce. |
 
 ### WandbConfig

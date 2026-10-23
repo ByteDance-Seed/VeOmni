@@ -483,6 +483,16 @@
     ]
   },
   {
+    "name": "swap-adamw-device-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_swap_adamw_device.py"
+    ]
+  },
+  {
     "name": "48-unit",
     "suite": "unit",
     "conditional": false,
@@ -600,6 +610,16 @@
       "-s",
       "-x",
       "tests/utils/test_profiler_memory.py"
+    ]
+  },
+  {
+    "name": "save-safetensor-utils-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_save_safetensor_utils.py"
     ]
   },
   {
