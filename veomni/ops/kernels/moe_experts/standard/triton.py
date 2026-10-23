@@ -24,6 +24,7 @@ import torch
 from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
+from ..shared import swiglu
 from ..shared.scatter import compute_expert_scatter_index, compute_max_expert_tokens
 from ..shared.swiglu import apply_swiglu_clamp
 
@@ -384,8 +385,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc1_1_output, fc1_2_output, swiglu_limit
         )
 
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-        fc1_activation = fc1_1_activation * fc1_2_output
+        fc1_activation = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output)
 
         reshaped_gate_weight = gate_weights.reshape(-1, 1)
         scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
