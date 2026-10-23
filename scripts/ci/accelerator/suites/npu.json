@@ -397,6 +397,16 @@
     ]
   },
   {
+    "name": "fsdp-cpu-offload-native-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_rank0_load_and_broadcast_weights.py::test_fsdp_cpu_offload_training_keeps_buffers_on_compute_device"
+    ]
+  },
+  {
     "name": "npu-e2e-01",
     "suite": "e2e",
     "args": [
