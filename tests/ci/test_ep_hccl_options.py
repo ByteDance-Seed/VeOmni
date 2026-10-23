@@ -61,7 +61,12 @@ def _native_ep_mesh_worker(rank, endpoint):
 
     def record_mesh(*args, **kwargs):
         """Record arguments without substituting the native mesh or backend."""
-        observed.append(kwargs.copy())
+        snapshot = kwargs.copy()
+        if kwargs.get("backend_override") is not None:
+            # init_device_mesh consumes this mapping with pop(). Keep the
+            # options objects, but snapshot the mapping before native setup.
+            snapshot["backend_override"] = dict(kwargs["backend_override"])
+        observed.append(snapshot)
         return original(*args, **kwargs)
 
     try:
