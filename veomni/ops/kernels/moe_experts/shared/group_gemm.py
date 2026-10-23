@@ -154,6 +154,30 @@ def activation_fwd(x: tl.tensor, ACTIVATION: tl.constexpr):
     return y.to(orig_dtype)
 
 
+@triton.jit
+def _same_nk_tile_prefix_kernel(cumsum_ptr, prefix_ptr, G: tl.constexpr, LANES: tl.constexpr):
+    """Prefix the number of 128-row tiles owned by each expert on-device."""
+    gids = tl.arange(0, LANES)
+    # Widen before ceil division so counts near INT32_MAX cannot wrap.
+    ends = tl.load(cumsum_ptr + gids, mask=gids < G, other=0).to(tl.int64)
+    starts = tl.load(cumsum_ptr + gids - 1, mask=(gids > 0) & (gids < G), other=0).to(tl.int64)
+    tiles = tl.where(gids < G, tl.cdiv(ends - starts, 128), 0)
+    tl.store(prefix_ptr + gids, tl.cumsum(tiles), mask=gids < G)
+
+
+def merged_same_nk_tile_prefix(cumsum_M: torch.Tensor, total_M: int) -> Optional[torch.Tensor]:
+    """Build an optional device schedule without reading expert counts on the host."""
+    G = cumsum_M.numel()
+    if cumsum_M.device.type != "cuda" or _GROUP_GEMM_BLOCK["BLOCK_M"] != 128 or not 0 < G <= 256 or total_M <= 0:
+        return None
+    assert cumsum_M.ndim == 1 and cumsum_M.is_contiguous()
+    assert cumsum_M.dtype in (torch.int32, torch.int64)
+    prefix = torch.empty_like(cumsum_M)
+    with get_torch_device().device(cumsum_M.device):
+        _same_nk_tile_prefix_kernel[(1,)](cumsum_M, prefix, G, triton.next_power_of_2(G))
+    return prefix
+
+
 @triton.heuristics(
     values={
         "N_ALIGNED": lambda args: args["N"] % args["BLOCK_N"] == 0,
@@ -168,8 +192,9 @@ def group_gemm_same_nk_kernel(
     c_ptr,
     act_ptr,
     cumsum_M,
+    tile_cumsum,
     max_M,
-    total_M,  # Used for generating algo. key only.
+    total_M,  # Total routed rows, also used for generating the algo. key.
     G: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
@@ -186,10 +211,31 @@ def group_gemm_same_nk_kernel(
     ACTIVATION: tl.constexpr,
     HAS_ACTIVATION: tl.constexpr,
     SAVE_ACTIVATION: tl.constexpr,
+    COMPACT_SCHEDULE: tl.constexpr,
 ):
     """Grouped GEMM over tokens (M) with shared N/K per expert."""
-    m, n = get_pid_mn(tl.program_id(axis=0), max_M, N, BLOCK_M, BLOCK_N, GROUP)
-    gid = tl.program_id(1).to(tl.uint64)
+    if COMPACT_SCHEDULE:
+        # Flatten both logical axes into grid.x, preserving the column range
+        # accepted by the original launch instead of adding a grid.y limit.
+        row_tiles = tl.cdiv(tl.cast(total_M, tl.int64), BLOCK_M) + G - 1
+        tile_id = tl.program_id(0) % row_tiles
+        n = tl.program_id(0) // row_tiles
+        if tile_id >= tl.load(tile_cumsum + G - 1):
+            return
+        lo = tl.full((), 0, tl.int32)
+        hi = tl.full((), G, tl.int32)
+        while lo < hi:
+            middle = (lo + hi) // 2
+            if tile_id < tl.load(tile_cumsum + middle):
+                hi = middle
+            else:
+                lo = middle + 1
+        gid = lo.to(tl.uint64)
+        previous_tiles = tl.load(tile_cumsum + gid - 1, mask=gid > 0, other=0)
+        m = tile_id - previous_tiles
+    else:
+        m, n = get_pid_mn(tl.program_id(axis=0), max_M, N, BLOCK_M, BLOCK_N, GROUP)
+        gid = tl.program_id(1).to(tl.uint64)
     gtid_start = tl.load(cumsum_M + gid - 1, mask=gid > 0, other=0)
     gtid_end = tl.load(cumsum_M + gid)
     m_size = (gtid_end - gtid_start).to(tl.uint64)
@@ -264,6 +310,7 @@ def group_gemm_same_nk(
     activation: Optional[ActivationType] = None,
     save_activation: bool = False,
     c: Optional[torch.Tensor] = None,
+    tile_cumsum: Optional[torch.Tensor] = None,
 ):
     """Grouped gemm for same nk
 
@@ -277,6 +324,7 @@ def group_gemm_same_nk(
     activation -- activation type if needed
     save_activation -- return the activation's input or not
     c -- which tensor accumulate to, c = c + ggemm(a, b)
+    tile_cumsum -- optional device prefix of per-expert 128-row tile counts
     """
     if transpose_b:
         G, N, K = b.shape
@@ -304,18 +352,26 @@ def group_gemm_same_nk(
     if save_activation:
         act = torch.empty_like(c)
 
+    if tile_cumsum is not None:
+        assert tile_cumsum.device == cumsum_M.device and tile_cumsum.shape == cumsum_M.shape
+        assert tile_cumsum.dtype == cumsum_M.dtype and tile_cumsum.is_contiguous()
+    use_compact = tile_cumsum is not None and _GROUP_GEMM_BLOCK["BLOCK_M"] == 128
+
+    def grid(meta):
+        """Bound the launch using shapes only, including when a prefix exists."""
+        if use_compact:
+            row_tiles = triton.cdiv(a.shape[0], meta["BLOCK_M"]) + G - 1
+            return (row_tiles * triton.cdiv(N, meta["BLOCK_N"]),)
+        return (triton.cdiv(max_M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]), G)
+
     with get_torch_device().device(a.device):
-        group_gemm_same_nk_kernel[
-            lambda x: (
-                triton.cdiv(max_M, x["BLOCK_M"]) * triton.cdiv(N, x["BLOCK_N"]),
-                x["G"],
-            )
-        ](
+        group_gemm_same_nk_kernel[grid](
             a_ptr=a,
             b_ptr=b,
             c_ptr=c,
             act_ptr=act if save_activation else None,
             cumsum_M=cumsum_M,
+            tile_cumsum=tile_cumsum,
             max_M=max_M,
             total_M=a.shape[0],
             G=G,
@@ -326,6 +382,7 @@ def group_gemm_same_nk(
             ACCUMULATE_TO_C=not c_is_none,
             ACTIVATION=activation,
             SAVE_ACTIVATION=save_activation,
+            COMPACT_SCHEDULE=use_compact,
             **_GROUP_GEMM_BLOCK,
         )
 
