@@ -66,7 +66,7 @@ def _call(impl: str, variant: str, hidden, routing, selected, fc1, fc2, loras, *
 
 _SHAPES = {
     "small": dict(B=32, H=64, I=96, E=4, top_k=2, r=8),
-    # qwen3_moe_toy expert dimensions: the kernel tiles see production-sized H and I.
+    # Explicit larger dimensions retain kernel-tile coverage independently of model fixtures.
     "qwen3_moe": dict(B=64, H=2048, I=768, E=16, top_k=2, r=16),
 }
 
@@ -464,3 +464,78 @@ def test_npu_ep_matches_nonep_single_rank(variant, _single_rank_dist):
         assert l2 <= _GRAD_L2REL_TOL, (
             f"[{variant}] {name}: NPU EP-vs-non-EP grad L2 rel {l2:.4%} > {_GRAD_L2REL_TOL:.2%}"
         )
+
+
+@pytest.mark.skipif(
+    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+    reason="triton moe_experts_lora needs a GPU + triton",
+)
+@pytest.mark.parametrize("variant", ["shared", "independent"])
+def test_zero_b_preserves_fused_base_output_and_vjp(variant):
+    """Zero-initialized LoRA B matrices must preserve the base fused MoE path."""
+    from veomni.ops.kernels.moe_experts.standard.triton import MergedFc1TritonFusedMoeExpertFunction
+    from veomni.ops.kernels.moe_experts_lora.independent.triton import (
+        MergedFc1IndependentTritonFusedLoRAMoeExpertFunction,
+    )
+    from veomni.ops.kernels.moe_experts_lora.shared.triton import (
+        MergedFc1TritonFusedLoRAMoeExpertFunction,
+    )
+
+    nonep_cls = (
+        MergedFc1TritonFusedLoRAMoeExpertFunction
+        if variant == "shared"
+        else MergedFc1IndependentTritonFusedLoRAMoeExpertFunction
+    )
+
+    dev = torch.device(get_device_type())
+    dtype = torch.bfloat16
+    B, H, I, E, top_k, r = 32, 64, 96, 4, 2, 8
+    scale_gate, scale_up, scale_down = 0.5, 0.5, 0.5
+
+    torch.manual_seed(0)
+    hidden_states = torch.randn(B, H, dtype=dtype, device=dev)
+    top_k_index = torch.randint(0, E, (B, top_k), device=dev)
+    top_k_weights = torch.softmax(torch.randn(B, top_k, dtype=torch.float32, device=dev), dim=-1).to(dtype)
+    gate_up_proj = (torch.randn(E, 2 * I, H, dtype=dtype, device=dev) * 0.05).detach()
+    down_proj = (torch.randn(E, H, I, dtype=dtype, device=dev) * 0.05).detach()
+    grad_out = torch.randn(B, H, dtype=dtype, device=dev)
+
+    hs_base = hidden_states.clone().detach().requires_grad_(True)
+    rw_base = top_k_weights.clone().detach().requires_grad_(True)
+    fc1_base = gate_up_proj.clone().detach().requires_grad_(True)
+    fc2_base = down_proj.clone().detach().requires_grad_(True)
+    out_base = MergedFc1TritonFusedMoeExpertFunction.apply(E, rw_base, top_k_index, hs_base, fc1_base, fc2_base, None)
+    out_base.backward(grad_out)
+
+    torch.manual_seed(123)
+    lora = _build_lora_leaves(variant, E=E, H=H, I=I, r=r, dtype=dtype, device=dev)
+    for key in ("lora_b_gate", "lora_b_up", "lora_b_down"):
+        lora[key] = torch.zeros_like(lora[key], requires_grad=True)
+
+    hs_lora = hidden_states.clone().detach().requires_grad_(True)
+    rw_lora = top_k_weights.clone().detach().requires_grad_(True)
+    fc1_lora = gate_up_proj.clone().detach().requires_grad_(True)
+    fc2_lora = down_proj.clone().detach().requires_grad_(True)
+    out_lora = nonep_cls.apply(
+        E,
+        rw_lora,
+        top_k_index,
+        hs_lora,
+        fc1_lora,
+        fc2_lora,
+        *(lora[k] for k in _LORA_KEYS),
+        scale_gate,
+        scale_up,
+        scale_down,
+    )
+    out_lora.backward(grad_out)
+
+    torch.testing.assert_close(out_lora, out_base, rtol=0, atol=0)
+    torch.testing.assert_close(hs_lora.grad, hs_base.grad, rtol=0, atol=0)
+    torch.testing.assert_close(rw_lora.grad, rw_base.grad, rtol=0, atol=0)
+    torch.testing.assert_close(fc1_lora.grad, fc1_base.grad, rtol=0, atol=0)
+    torch.testing.assert_close(fc2_lora.grad, fc2_base.grad, rtol=0, atol=0)
+    for key in ("lora_a_gate", "lora_a_up", "lora_a_down"):
+        assert torch.count_nonzero(lora[key].grad) == 0
+    for key in ("lora_b_gate", "lora_b_up", "lora_b_down"):
+        assert torch.isfinite(lora[key].grad).all() and torch.count_nonzero(lora[key].grad) > 0

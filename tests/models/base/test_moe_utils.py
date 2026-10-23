@@ -16,7 +16,13 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_merged_experts_act_fn_ep_keeps_empty_tokens_on_graph():

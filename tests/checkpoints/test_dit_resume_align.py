@@ -73,7 +73,11 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tools.data_generators import DummyDataset  # noqa: E402
-from tools.launch_utils import find_free_port  # noqa: E402
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+_CI_LAUNCH = LaunchSpec(nproc=2)
 
 
 TOTAL_STEPS = 6
@@ -319,8 +323,8 @@ def _run_trainer(run: str, train_path: str, weights_dir: str, load_path: str | N
         "-m",
         "torch.distributed.run",
         "--nnodes=1",
-        "--nproc_per_node=2",
-        f"--master-port={find_free_port()}",
+        f"--nproc_per_node={_CI_LAUNCH.nproc}",
+        "--standalone",
         os.path.abspath(__file__),
         "--model.config_path=tests/toy_config/wan_t2v_toy/config.json",
         f"--model.model_path={weights_dir}",
@@ -371,6 +375,7 @@ def _read_signatures(run: str) -> Dict[str, Dict[str, float]]:
         return json.load(handle)
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 def test_dit_resume_continues_noise_and_timestep_stream():
     """A resumed DiT run draws the same noise/timestep as the uninterrupted one."""
     from veomni.utils.device import get_device_type

@@ -282,7 +282,8 @@ def test_ltx_sdpa_flash_to_callable_collapses_to_veomni_sdpa():
     assert adapter.veomni_attn_masked is adapter.veomni_attn
 
 
-def test_ltx_non_sdpa_masked_falls_back_to_veomni_sdpa():
+def test_ltx_non_sdpa_masked_falls_back_to_veomni_sdpa(available_nvidia_ops):
+    # This checks handle selection only; no NVIDIA kernel runs on CPU/NPU hosts.
     assert AttentionFunction.FLASH_ATTENTION_3.value == "flash_attention_3"
     adapter = VeomniLTXAttention("flex_attention")
     assert adapter.veomni_attn.impl == "flex_attention"

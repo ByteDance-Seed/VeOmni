@@ -110,6 +110,23 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --train.checkpoint.output_dir ./exp/qwen3_5_35b_a3b_sft
 ```
 
+### FlashQLA GatedDeltaNet backend on Hopper/Blackwell GPUs
+
+On SM90-SM100 NVIDIA GPUs where `flash_qla` is installed, you can select the FlashQLA
+`chunk_gated_delta_rule` backend:
+
+```yaml
+model:
+  ops_implementation:
+    chunk_gated_delta_rule_implementation: flash_qla
+```
+
+When `chunk_gated_delta_rule_implementation: flash_qla` is active (and not in recurrent cache
+decode mode), Qwen3.5 and Qwen3.5-MoE pass grouped `query` and `key` heads
+(`num_k_heads < num_v_heads`) directly to `flash_qla` instead of materializing `repeat_interleave`
+copies before the kernel. Other backends (`fla`, `eager`, NPU `triton`, `fla_npu`) and recurrent
+decode paths keep the expanded Q/K layout.
+
 ## Start training on NPU
 
 Qwen3.5 runs on Ascend NPUs, but its GatedDeltaNet kernels are **not** auto-selected: all three

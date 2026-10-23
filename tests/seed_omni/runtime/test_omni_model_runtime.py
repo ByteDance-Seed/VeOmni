@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
     MultiLRScheduler,
     OmniModelRuntime,
@@ -28,6 +29,9 @@ from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleM
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.module_configuration_base import OmniModuleConfig
 from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class _StubConfig(OmniModuleConfig):
@@ -417,12 +421,14 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
     vae.reads_offline_cache = True
     vae.model = meta_module
     vae.args = SimpleNamespace(model_path="vae", lora_config=None)
+    vae.weights_path = "vae"
     vae.build_after_omni_model_wrap = MagicMock()
 
     llm = MagicMock()
     llm.reads_offline_cache = False
     llm.model = model.module_b
     llm.args = SimpleNamespace(model_path="llm", lora_config=None)
+    llm.weights_path = "llm"
     llm.skip_hf_weight_load = False
     llm.build_after_omni_model_wrap = MagicMock()
 

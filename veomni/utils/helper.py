@@ -458,7 +458,7 @@ class MultiSourceInfoTracker:
                     f"multi_source/step_consumed_tokens(M)/{self.names[ds_idx]}": global_counter[ds_idx].num_tokens
                     / 1e6,
                     f"multi_source/step_consumed_ratio/{self.names[ds_idx]}": global_counter[ds_idx].num_tokens
-                    / step_consumed_tokens,
+                    / max(step_consumed_tokens, 1),
                 }
             )
 
@@ -714,7 +714,13 @@ class ProfilerWithMem:
 
     def start(self):
         out = self._p.start()
-        get_torch_device().memory._record_memory_history()
+        memory = get_torch_device().memory
+        if get_device_type() == "cuda":
+            # Keep stacks for live allocations; recording every free traceback
+            # can crash profiler-enabled training during activation recomputation.
+            memory._record_memory_history(context="state")
+        else:
+            memory._record_memory_history()
         return out
 
     def stop(self):

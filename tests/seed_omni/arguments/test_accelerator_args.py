@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.arguments_types import (
     AcceleratorConfig,
     FSDPConfig,
@@ -36,6 +37,9 @@ from veomni.arguments.omni_arguments_types import (
     build_omni_module_runtime_args,
 )
 from veomni.models.model_runtime import VeOmniModelRuntime
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 MODULE_A = "fake_module_a"
@@ -224,7 +228,7 @@ def test_build_omni_model_runtime_args_for_inference_forces_eager_without_broadc
     eager default for it; `MODULE_A` pins `ddp` and keeps it.
     `broadcast_model_weights_from_rank0` is forced off alongside eager so the
     default does not inherit a rank0-broadcast load policy that cannot run
-    without a wrap (see `_resolve_default_accelerator`).
+    without a wrap (see `build_omni_module_runtime_args`).
     """
     args = _fake_args(modules_override={MODULE_B: {"accelerator": {"gradient_checkpointing": {"enable": False}}}})
     with veomni_caplog.at_level("WARNING"):
