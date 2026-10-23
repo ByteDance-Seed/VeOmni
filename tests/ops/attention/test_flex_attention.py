@@ -21,6 +21,8 @@ import copy
 import gc
 import importlib.util
 import inspect
+import json
+from importlib import metadata
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +30,7 @@ import torch
 from torch import nn
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, create_mask
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.attention.attention_cases import clone_qkv, dense_mask, flex_mask, math_sdpa_reference
 from tests.ops.attention.utils import UlyssesHelperRecorder
 from tests.ops.tol import (
@@ -965,6 +968,61 @@ def test_flex_rejects_invalid_qkv_before_exchange(monkeypatch, query_shape, key_
         )
 
 
+def _print_flex_cpu_layout_diagnostics(calls, *, cross_attention, phase):
+    """Compare saved intermediates only after the original assertion fails."""
+
+    def difference(left, right):
+        result = dict(left_shape=list(left.shape), right_shape=list(right.shape))
+        if left.shape != right.shape:
+            return result
+        result.update(equal=torch.equal(left, right), unequal_elements=(left != right).sum().item())
+        delta = (left.double() - right.double()).abs()
+        finite = torch.isfinite(left) & torch.isfinite(right)
+        result.update(
+            nonfinite_left=(~torch.isfinite(left)).sum().item(),
+            nonfinite_right=(~torch.isfinite(right)).sum().item(),
+            max_finite_abs_delta=delta[finite].max().item() if finite.any() else None,
+        )
+        # Keep output bounded, including when every element differs.
+        indices = (left != right).nonzero()[:5].tolist()
+        result["examples"] = [
+            dict(index=index, left=left[tuple(index)].item(), right=right[tuple(index)].item()) for index in indices
+        ]
+        return result
+
+    try:
+        torch_npu_version = metadata.version("torch-npu")
+    except metadata.PackageNotFoundError:
+        torch_npu_version = None
+    report = dict(
+        phase=phase,
+        cross_attention=cross_attention,
+        torch=torch.__version__,
+        torch_npu=torch_npu_version,
+        threads=torch.get_num_threads(),
+        interop_threads=torch.get_num_interop_threads(),
+        default_dtype=str(torch.get_default_dtype()),
+        cpu_capability=torch.backends.cpu.get_cpu_capability(),
+        inputs=[
+            {
+                name: dict(
+                    shape=list(call[name].shape),
+                    stride=list(call[name].stride()),
+                    dtype=str(call[name].dtype),
+                    device=str(call[name].device),
+                )
+                for name in ("query", "key", "value")
+            }
+            for call in calls
+        ],
+        thd_vs_bhsd={name: difference(calls[0][name], calls[1][name]) for name in calls[0]},
+        lse_vs_fp64_reduction=[
+            difference(call["lse"], torch.logsumexp(call["logits"].double(), dim=-1)) for call in calls
+        ],
+    )
+    print("[flex-cpu-diagnostics] " + json.dumps(report), flush=True)
+
+
 @pytest.mark.parametrize("cross_attention", [False, True])
 def test_flex_thd_matches_bhsd_outputs_lse_and_gradients_on_cpu(monkeypatch, cross_attention):
     """Use MATH as the kernel to isolate layout, packing, and autograd behavior."""
@@ -978,10 +1036,12 @@ def test_flex_thd_matches_bhsd_outputs_lse_and_gradients_on_cpu(monkeypatch, cro
         q_length = kv_length = 65
         mask, dense = _mixed_packed_mask(q_length, torch.device("cpu"))
 
+    calls = []
+
     def math_backend(module, query, key, value, attention_mask, **kwargs):
         assert query.ndim == key.ndim == value.ndim == 4
         assert attention_mask is mask
-        return math_sdpa_reference(query, key, value, dense, scaling=8**-0.5)
+        return math_sdpa_reference(query, key, value, dense, scaling=8**-0.5, intermediates=calls)
 
     monkeypatch.setattr(flex_backend, "_flex_attention_triton", math_backend)
     monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda **kwargs: False)
@@ -993,15 +1053,49 @@ def test_flex_thd_matches_bhsd_outputs_lse_and_gradients_on_cpu(monkeypatch, cro
     bhsd = [tensor.detach().transpose(0, 1).unsqueeze(0).requires_grad_() for tensor in thd]
     actual, lse = flex_backend.flex_attention_forward(_FakeAttentionModule(), *thd, mask)
     expected, expected_lse = flex_backend.flex_attention_forward(_FakeAttentionModule(), *bhsd, mask)
-    assert actual.shape == (q_length, 4, 16)
-    assert lse.shape == (4, q_length)
-    torch.testing.assert_close(actual, expected.squeeze(0))
-    torch.testing.assert_close(lse, expected_lse.squeeze(0))
-    gradient = torch.randn_like(actual)
-    actual_grads = torch.autograd.grad(actual, thd, gradient)
-    expected_grads = torch.autograd.grad(expected, bhsd, gradient.unsqueeze(0))
-    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-        torch.testing.assert_close(actual_grad, expected_grad.squeeze(0).transpose(0, 1))
+    phase = "shape"
+    try:
+        assert actual.shape == (q_length, 4, 16)
+        assert lse.shape == (4, q_length)
+        phase = "output"
+        torch.testing.assert_close(actual, expected.squeeze(0))
+        phase = "lse"
+        torch.testing.assert_close(lse, expected_lse.squeeze(0))
+        phase = "gradients"
+        gradient = torch.randn_like(actual)
+        actual_grads = torch.autograd.grad(actual, thd, gradient)
+        expected_grads = torch.autograd.grad(expected, bhsd, gradient.unsqueeze(0))
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad.squeeze(0).transpose(0, 1))
+    except AssertionError:
+        # Emit before pytest reports failure: CI may cancel the worker before teardown.
+        try:
+            _print_flex_cpu_layout_diagnostics(calls, cross_attention=cross_attention, phase=phase)
+        except Exception as exc:
+            print(f"[flex-cpu-diagnostics] Could not collect diagnostics: {exc!r}", flush=True)
+        raise
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_flex_cpu_failure_reports_equal_logits_and_lse_drift(monkeypatch, capsys):
+    original_logsumexp = torch.logsumexp
+    dtypes = []
+
+    def drift_on_second_call(tensor, *args, **kwargs):
+        dtypes.append(tensor.dtype)
+        result = original_logsumexp(tensor, *args, **kwargs)
+        return result + 0.01 if len(dtypes) == 2 else result
+
+    monkeypatch.setattr(torch, "logsumexp", drift_on_second_call)
+    with pytest.raises(AssertionError, match="Tensor-likes are not close"):
+        test_flex_thd_matches_bhsd_outputs_lse_and_gradients_on_cpu(monkeypatch, False)
+    line = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("[flex-cpu-diagnostics] "))
+    report = json.loads(line.removeprefix("[flex-cpu-diagnostics] "))
+    assert report["phase"] == "lse"
+    assert report["thd_vs_bhsd"]["logits"]["equal"]
+    assert not report["thd_vs_bhsd"]["lse"]["equal"]
+    assert report["lse_vs_fp64_reduction"][1]["max_finite_abs_delta"] > 0.009
+    assert dtypes == [torch.float32, torch.float32, torch.float64, torch.float64]
 
 
 @pytest.mark.skipif(not _FLEX_COMPILE_AVAILABLE, reason="HF FlexAttention needs triton for compilation")

@@ -197,6 +197,7 @@ def math_sdpa_reference(
     dense: torch.Tensor,
     *,
     scaling: float,
+    intermediates: list[dict[str, torch.Tensor]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     with sdpa_kernel(backends=[SDPBackend.MATH]):
         output = F.scaled_dot_product_attention(
@@ -212,7 +213,16 @@ def math_sdpa_reference(
     repeat_count = query.shape[1] // key.shape[1]
     expanded_key = key.repeat_interleave(repeat_count, dim=1)
     logits = torch.einsum("bhqd,bhkd->bhqk", query.float(), expanded_key.float()) * scaling
-    lse = torch.logsumexp(logits.masked_fill(~dense, -torch.inf), dim=-1)
+    masked_logits = logits.masked_fill(~dense, -torch.inf)
+    lse = torch.logsumexp(masked_logits, dim=-1)
+    if intermediates is not None:
+        # Retain the original results; recomputing them can hide a cold-call flake.
+        intermediates.append(
+            {
+                name: tensor.detach()
+                for name, tensor in dict(query=query, key=key, value=value, logits=masked_logits, lse=lse).items()
+            }
+        )
     return output, lse
 
 

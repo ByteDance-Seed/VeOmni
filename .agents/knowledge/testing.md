@@ -33,6 +33,12 @@ PyTorch 2.11 CPU FP32 `torch.exp` was observed to return inaccurate values on
 its first parallel call, reproducing the original 757-element CI mismatch.
 Keep the adapter's FP32 arithmetic and strict output/gradient tolerances; the
 independent FP64 SDPA oracle alone does not fix an inaccurate candidate mock.
+The Flex THD/BHSD CPU parity test retains its original QKV, masked logits and
+LSE. On assertion failure, `[flex-cpu-diagnostics]` reports input layouts,
+intermediate differences and an FP64 reduction of those saved logits. Keep
+extra numerical diagnostics after both original calls; recomputation or warm-up
+can hide the first-call failure. Emit diagnostics with flushing before reraising,
+since CI can cancel the worker before teardown runs.
 
 New functions/parameters already included by an existing selection need no
 manifest update. Check node-ID and pytest filters as well as file/directory

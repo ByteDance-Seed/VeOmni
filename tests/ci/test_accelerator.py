@@ -941,7 +941,7 @@ def test_pytest_failure_reports_before_slow_teardown_and_keeps_partial_outcome(t
     import sys
     import time
 
-    from scripts.ci.accelerator.reporting import BatchProgress, CaseFailure, RunReporter
+    from scripts.ci.accelerator.reporting import BatchProgress, CaseFailure, RunReporter, print_failure_log
     from scripts.ci.accelerator.runtime.workers import run_process
 
     test_file = tmp_path / "test_fails.py"
@@ -978,6 +978,8 @@ def test_pytest_failure_reports_before_slow_teardown_and_keeps_partial_outcome(t
     assert time.monotonic() - started < 20
     assert "assert 1 == 2" in capsys.readouterr().out
     assert "useful child diagnostic" in log_path.read_text()
+    print_failure_log(log_path, label="failed")
+    assert "useful child diagnostic" in capsys.readouterr().out
     assert progress.partial_results()["cases"][0]["outcome"] == "failed"
 
 
