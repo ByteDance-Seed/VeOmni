@@ -316,8 +316,13 @@ def _run_qsa_equivalence(
     try:
         sp_state = _init_parallel_state(
             dp_size=1,
-            cp_size=world_size if parallel_mode == "cp" else 1,
-            ulysses_size=world_size if parallel_mode == "ulysses" else 1,
+            cp_size=2 if parallel_mode == "hybrid" else world_size if parallel_mode == "cp" else 1,
+            ulysses_size=world_size // 2
+            if parallel_mode == "hybrid"
+            else world_size
+            if parallel_mode == "ulysses"
+            else 1,
+            allow_hybrid_cp=parallel_mode == "hybrid",
             device_type=get_device_type(),
             name="sp",
         )
@@ -450,6 +455,12 @@ def test_qwen4_exp_compact_qsa_mqa_matches_full_sequence_sp4():
     torchrun(_run_qsa_equivalence, _CI_ACCELERATOR_4.nproc, 4, 1)
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
+def test_qwen4_exp_compact_qsa_hybrid_u2cp2_matches_full_sequence():
+    """Compare packed QSA outputs and all gradients under the unified four-rank group."""
+    torchrun(_run_qsa_equivalence, _CI_ACCELERATOR_4.nproc, 4, 1, "hybrid")
+
+
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_compact_qsa_gqa_matches_full_sequence():
     torchrun(_run_qsa_equivalence, _CI_ACCELERATOR_2.nproc, 4, 2)
@@ -540,6 +551,7 @@ def _run_gated_deltanet_equivalence(
     packed: bool = False,
     num_k_heads: int | None = None,
     num_v_heads: int | None = None,
+    parallel_mode: str = "ulysses",
 ) -> None:
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
@@ -550,7 +562,9 @@ def _run_gated_deltanet_equivalence(
     try:
         sp_state = _init_parallel_state(
             dp_size=1,
-            ulysses_size=world_size,
+            cp_size=2 if parallel_mode == "hybrid" else 1,
+            ulysses_size=world_size // 2 if parallel_mode == "hybrid" else world_size,
+            allow_hybrid_cp=parallel_mode == "hybrid",
             device_type=get_device_type(),
             name="sp",
         )
@@ -637,6 +651,12 @@ def test_qwen4_exp_gated_deltanet_gqa_matches_full_sequence():
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
 def test_qwen4_exp_gated_deltanet_matches_full_sequence_sp4():
     torchrun(_run_gated_deltanet_equivalence, world_size=_CI_ACCELERATOR_4.nproc)
+
+
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
+def test_qwen4_exp_gated_deltanet_hybrid_u2cp2_matches_full_sequence():
+    """Compare packed GDN outputs and all gradients under the unified four-rank group."""
+    torchrun(_run_gated_deltanet_equivalence, _CI_ACCELERATOR_4.nproc, True, 4, 8, "hybrid")
 
 
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
