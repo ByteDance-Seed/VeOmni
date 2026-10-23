@@ -45,7 +45,7 @@ docker build -f docker/cuda/Dockerfile.cu130 \
 - Name the file `Dockerfile.<variant>` under the vendor directory, and keep the
   provenance comments above `FROM` (base image page, release notes, upstream
   torch-npu repo) so the pinned base can be traced.
-- The `gpu`, `npu` and `npu_aarch64` extras are mutually exclusive (see
+- The `gpu`, `rocm`, `npu` and `npu_aarch64` extras are mutually exclusive (see
   `[tool.uv].conflicts` in `pyproject.toml`), so each image selects exactly one
   instead of using `--all-extras`.
 - uv-based images pin uv through `COPY --from=ghcr.io/astral-sh/uv:<version>`;

@@ -249,6 +249,11 @@ Core files:
 27. **MagiAttention is an SM100+ optional extra**
     - MagiAttention requires `--extra gpu --extra magi` and NVIDIA SM100 or newer.
       SM90 uses FlexAttention's FA4 backend instead.
+      
+27a. **ROCm image re-syncs must preserve source-built kernels**
+    - The ROCm image (`docker/rocm/Dockerfile.ROCm7.14`) builds flash-attn and aiter
+      from source outside `uv.lock`; an exact sync removes them. Re-sync its venv with
+      `uv sync --active --inexact --frozen --extra rocm --dev`.
 
 28. **In-place collective reductions in backward must own their gradient buffer**
     - Autograd can pass the same incoming gradient to multiple branches. `.contiguous()` does not copy an already contiguous tensor, so reducing that tensor in place can silently change a sibling branch's gradient and the caller's `grad_outputs`.
