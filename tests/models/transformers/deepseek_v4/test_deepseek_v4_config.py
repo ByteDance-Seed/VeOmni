@@ -182,6 +182,34 @@ def test_dspark_mtp_config_fields_and_defaults():
     assert from_dict_cfg.dspark_block_size == 5
     assert "_explicit_num_nextn_predict_layers" not in copy.deepcopy(from_dict_cfg).to_dict()
 
+    # On-disk config.json with placeholder "num_nextn_predict_layers": 1 + 43+3 compress_ratios
+    # infers 3 stages unless the caller explicitly overrides num_nextn_predict_layers in kwargs.
+    on_disk_dict = {
+        "num_hidden_layers": 4,
+        "num_nextn_predict_layers": 1,
+        "compress_ratios": [0, 0, 4, 128, 0, 0, 0],
+        "dspark_target_layer_ids": [1, 2, 3],
+    }
+    inferred_from_disk = DeepseekV4Config.from_dict(on_disk_dict, dspark_block_size=5)
+    assert inferred_from_disk.num_nextn_predict_layers == 3
+
+    overridden_to_one = DeepseekV4Config.from_dict(
+        on_disk_dict,
+        dspark_block_size=5,
+        num_nextn_predict_layers=1,
+    )
+    assert overridden_to_one.num_nextn_predict_layers == 1
+
+    # Overriding num_hidden_layers via from_dict kwargs recomputes default dspark_target_layer_ids.
+    shrunk_cfg = DeepseekV4Config.from_dict(
+        on_disk_dict,
+        num_hidden_layers=2,
+        dspark_block_size=5,
+    )
+    assert shrunk_cfg.num_hidden_layers == 2
+    assert shrunk_cfg.dspark_target_layer_ids == [0, 1]
+    shrunk_cfg.validate_build_prerequisites()
+
 
 @pytest.mark.parametrize("coef", [-1.0, float("nan"), float("inf")])
 def test_mtp_loss_coef_rejects_negative_and_non_finite(coef):

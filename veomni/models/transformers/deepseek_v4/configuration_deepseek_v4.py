@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from typing import Any
 
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
     DeepseekV4Config as _DeepseekV4Config,
@@ -88,6 +89,47 @@ class DeepseekV4Config(_DeepseekV4Config):
             self.dspark_target_layer_ids = list(range(max(0, self.num_hidden_layers - 3), self.num_hidden_layers))
         elif self.dspark_target_layer_ids is not None:
             self.dspark_target_layer_ids = list(self.dspark_target_layer_ids)
+
+    @classmethod
+    def from_dict(cls, config_dict: dict[str, Any], **kwargs):
+        config_dict = dict(config_dict)
+        compress_ratios = kwargs.get("compress_ratios", config_dict.get("compress_ratios"))
+        n_hidden = kwargs.get("num_hidden_layers", config_dict.get("num_hidden_layers", cls.num_hidden_layers))
+        if (
+            compress_ratios is not None
+            and isinstance(n_hidden, int)
+            and len(compress_ratios) > n_hidden
+            and config_dict.get("num_nextn_predict_layers") == 1
+            and "num_nextn_predict_layers" not in kwargs
+            and "n_mtp_layers" not in config_dict
+            and "n_mtp_layers" not in kwargs
+        ):
+            # Released DeepSeek-V4-Flash config.json files store the upstream
+            # placeholder ``"num_nextn_predict_layers": 1`` alongside 43+3
+            # ``compress_ratios`` entries; strip the on-disk placeholder when the
+            # caller did not explicitly override ``num_nextn_predict_layers``.
+            config_dict.pop("num_nextn_predict_layers", None)
+
+        result = super().from_dict(config_dict, **kwargs)
+        config = result[0] if isinstance(result, tuple) else result
+        if "num_hidden_layers" in kwargs:
+            if "layer_types" not in kwargs and config.layer_types is not None:
+                config.layer_types = list(config.layer_types[: config.num_hidden_layers])
+            if "mlp_layer_types" not in kwargs and config.mlp_layer_types is not None:
+                config.mlp_layer_types = list(config.mlp_layer_types[: config.num_hidden_layers])
+            if "dspark_target_layer_ids" not in kwargs and (
+                config_dict.get("dspark_target_layer_ids") is None
+                or (
+                    config.dspark_target_layer_ids is not None
+                    and any(idx >= config.num_hidden_layers for idx in config.dspark_target_layer_ids)
+                )
+            ):
+                config.dspark_target_layer_ids = (
+                    list(range(max(0, config.num_hidden_layers - 3), config.num_hidden_layers))
+                    if config.num_hidden_layers > 0
+                    else None
+                )
+        return result
 
     def moe_config_for_layer(self, layer_idx: int) -> tuple[int, int]:
         """Return ``(n_routed_experts, num_experts_per_tok)`` for backbone or DSpark layer ``layer_idx``."""

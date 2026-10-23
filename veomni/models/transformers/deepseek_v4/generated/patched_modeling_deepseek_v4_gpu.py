@@ -2685,6 +2685,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
                 labels=None,
                 shift_labels=mtp_shift_labels,
                 vocab_size=self.config.vocab_size,
+                num_items_in_batch=kwargs.get("num_items_in_batch"),
                 hidden_states=mtp_hidden_states,
                 weights=self.lm_head.weight,
                 logits_bias=mtp_markov_bias,

@@ -2371,7 +2371,7 @@
              input_ids=input_ids,
              attention_mask=attention_mask,
              position_ids=position_ids,
-@@ -1471,26 +2568,137 @@
+@@ -1471,26 +2568,138 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -2506,6 +2506,7 @@
 +                labels=None,
 +                shift_labels=mtp_shift_labels,
 +                vocab_size=self.config.vocab_size,
++                num_items_in_batch=kwargs.get("num_items_in_batch"),
 +                hidden_states=mtp_hidden_states,
 +                weights=self.lm_head.weight,
 +                logits_bias=mtp_markov_bias,
@@ -2523,7 +2524,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1498,7 +2706,22 @@
+@@ -1498,7 +2707,22 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
