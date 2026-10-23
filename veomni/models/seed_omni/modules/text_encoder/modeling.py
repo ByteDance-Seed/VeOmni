@@ -253,7 +253,7 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
         if shift_labels is not None:
             flat_labels = shift_labels.view(-1)
             ce_sum = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
+                logits.view(-1, logits.size(-1)).float(),
                 flat_labels,
                 ignore_index=-100,
                 reduction="sum",
@@ -264,7 +264,7 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_targets = labels[..., 1:].contiguous()
             ce_sum = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_logits.view(-1, shift_logits.size(-1)).float(),
                 shift_targets.view(-1),
                 ignore_index=-100,
                 reduction="sum",

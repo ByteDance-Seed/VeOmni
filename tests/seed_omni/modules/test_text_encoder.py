@@ -142,6 +142,60 @@ def test_text_encoder_decode_pre_masks_sample_boundary_labels():
     assert conversation_list[1][0].meta["labels"].tolist() == [4, 5]
 
 
+@pytest.mark.parametrize("modality", ["image", "video", "audio"])
+def test_text_encoder_decode_pre_keeps_non_text_boundary_row(modality: str):
+    """Every non-text segment keeps its final row with a masked label so the
+    following text segment's first label shifts onto the media boundary row."""
+    AccTextEncoder = _accelerated_model_cls("text_encoder")
+    TextEncoderCfg = _config_cls("text_encoder")
+    te = AccTextEncoder(TextEncoderCfg(vocab_size=64, hidden_size=8))
+
+    prompt = ConversationItem(
+        type="text",
+        value=torch.full((2, 8), 1.0),
+        role="user",
+        meta={"labels": torch.tensor([IGNORE_INDEX, IGNORE_INDEX])},
+    )
+    media = ConversationItem(
+        type=modality,
+        value=torch.tensor([[2.0] * 8, [3.0] * 8, [4.0] * 8]),
+        role="user",
+    )
+    reply = ConversationItem(
+        type="text",
+        value=torch.tensor([[5.0] * 8, [6.0] * 8]),
+        role="assistant",
+        meta={"labels": torch.tensor([10, 11])},
+    )
+
+    out = te.decode_pre(conversation_list=[[prompt, media, reply]])
+    # Rows: 2 prompt + 1 media tail + 2 reply = 5 rows.
+    # Unshifted labels: [-100, -100, -100 (media), 10, 11] -> shifted: [-100, -100, 10, 11, -100].
+    # Thus row 2 (media[-1]) predicts label 10 (reply[0]), not row 1 (prompt[-1]).
+    assert out["hidden_states"].shape == (5, 8)
+    torch.testing.assert_close(out["hidden_states"][2], media.value[-1])
+    assert out["shift_labels"].tolist() == [IGNORE_INDEX, IGNORE_INDEX, 10, 11, IGNORE_INDEX]
+
+
+def test_text_encoder_native_decode_fp16_casts_logits_to_fp32():
+    """Native ``TextEncoder.decode`` casts logits to FP32 before ``reduction='sum'`` so
+    half-precision long sequences do not overflow to ``inf``."""
+    NativeTextEncoder = _model_cls("text_encoder")
+    TextEncoderCfg = _config_cls("text_encoder")
+    te = NativeTextEncoder(TextEncoderCfg(vocab_size=8, hidden_size=4, tie_word_embeddings=False)).half()
+    with torch.no_grad():
+        te.lm_head.weight.zero_()
+    h = torch.zeros(1, 40000, 4, dtype=torch.float16)
+    labels = torch.zeros(1, 40000, dtype=torch.long)
+
+    out_shift = te.decode(hidden_states=h, shift_labels=labels)
+    out_unshifted = te.decode(hidden_states=h, labels=labels)
+    assert out_shift["loss"].dtype == torch.float32
+    assert out_unshifted["loss"].dtype == torch.float32
+    assert torch.isfinite(out_shift["loss"])
+    assert torch.isfinite(out_unshifted["loss"])
+
+
 def test_text_encoder_decode_inference_returns_logits_only():
     """Base ``TextEncoder.decode`` without labels returns logits only."""
     NativeTextEncoder = _model_cls("text_encoder")

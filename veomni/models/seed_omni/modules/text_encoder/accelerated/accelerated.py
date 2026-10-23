@@ -143,11 +143,12 @@ class TrainingMixin(TrainingModuleMixin):
                     hidden_states_chunks.append(hidden_states)
                     label_chunks.append(labels)
                     decode_len += labels.shape[0]
-                elif part.type in ("image", "video"):
-                    # Vision segment carries projected patch embeds; keep one row
-                    # (no label) so the sequence stays aligned, like the backbone.
+                else:
+                    # Non-text segment (image, video, audio, ...) carries projected
+                    # media embeds; keep one row (no label) so the sequence stays
+                    # aligned with the backbone across causal label shifting.
                     hidden_states_chunks.append(hidden_states[-1:])
-                    label_chunks.append(torch.full((1,), -100, dtype=torch.long))
+                    label_chunks.append(torch.full((1,), IGNORE_INDEX, dtype=torch.long))
                     decode_len += 1
             if decode_len > sample_start:
                 sample_starts.append(sample_start)
