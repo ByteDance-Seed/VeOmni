@@ -3,6 +3,7 @@
 import copy
 import importlib.util
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -26,10 +27,151 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_
     MiniMaxH3DiTOutput,
 )
 from veomni.trainer.dit_trainer import DiTDataCollator
+from veomni.utils.device import IS_CUDA_AVAILABLE
 from veomni.utils.import_utils import is_torch_npu_available
 
 
 _CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
+
+
+@pytest.mark.parametrize("modality", ["audio", "video"])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_cudnn_env_keeps_vae_dispatch_independent(monkeypatch, modality):
+    """Construct both VAEs with the DiT option set without changing their attention."""
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_audio_vae import CausalAttention
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_video_vae import Attention
+
+    def layer_and_input():
+        """Use the official audio head dimension or a small video attention layer."""
+        if modality == "audio":
+            layer = CausalAttention(2048, 32, 8)
+            for bias in (layer.q_bias, layer.zero_k_bias, layer.v_bias):
+                torch.nn.init.zeros_(bias.weight)
+            return layer, torch.randn(1, 4, 2048)
+        return Attention(heads=2, dim_head=64), torch.randn(1, 4, 128)
+
+    monkeypatch.delenv("MINIMAX_H3_ATTENTION_IMPLEMENTATION", raising=False)
+    original, x = layer_and_input()
+    monkeypatch.setenv("MINIMAX_H3_ATTENTION_IMPLEMENTATION", "torch_cudnn")
+    configured, _ = layer_and_input()
+    configured.load_state_dict(original.state_dict())
+    assert configured.config._attn_implementation == original.config._attn_implementation
+    with torch.no_grad():
+        expected, actual = original(x), configured(x)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.parametrize("device,dtype", [("cpu", torch.bfloat16), ("cuda", torch.float32), ("npu", torch.float16)])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_explicit_cudnn_attention_rejects_unsupported_inputs(device, dtype):
+    """Fail before entering cuDNN for unsupported device or dtype metadata."""
+    q = SimpleNamespace(device=SimpleNamespace(type=device), dtype=dtype)
+    with pytest.raises(ValueError, match="requires CUDA FP16 or BF16"):
+        minimax_h3_dit._sdpa_backend_context(q, True)
+
+
+@pytest.mark.parametrize("raises", [False, True])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_explicit_cudnn_attention_restores_backend_flags(raises):
+    """Restore the caller's SDPA flags on normal return and on exceptions."""
+    q = SimpleNamespace(device=torch.device("cuda"), dtype=torch.bfloat16)
+
+    def flags():
+        """Read the four SDPA backend enablement flags."""
+        return (
+            torch.backends.cuda.flash_sdp_enabled(),
+            torch.backends.cuda.mem_efficient_sdp_enabled(),
+            torch.backends.cuda.math_sdp_enabled(),
+            torch.backends.cuda.cudnn_sdp_enabled(),
+        )
+
+    before = flags()
+    try:
+        with minimax_h3_dit._sdpa_backend_context(q, True):
+            assert flags() == (False, False, False, True)
+            if raises:
+                raise RuntimeError("attention failure")
+    except RuntimeError as error:
+        assert raises and str(error) == "attention failure"
+    assert flags() == before
+
+
+@pytest.mark.parametrize("selected", [None, "torch", "TORCH_CUDNN"])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_cudnn_selection_is_bound_to_each_dit_instance(monkeypatch, selected):
+    """Read the opt-in at construction without changing previously built models."""
+    monkeypatch.delenv("MINIMAX_H3_ATTENTION_IMPLEMENTATION", raising=False)
+    original = tiny_model()
+    if selected is not None:
+        monkeypatch.setenv("MINIMAX_H3_ATTENTION_IMPLEMENTATION", selected)
+    configured = tiny_model()
+    for model, enabled in ((original, False), (configured, selected == "TORCH_CUDNN")):
+        layers = [m for m in model.modules() if isinstance(m, minimax_h3_dit.MiniMaxH3Attention)]
+        assert len(layers) == 3
+        assert all(layer._use_cudnn_sdpa == enabled for layer in layers)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_dit_and_refiner_receive_explicit_cudnn_backend(monkeypatch, packed):
+    """Route all refiner and transformer segments through the selected SDPA context."""
+    from contextlib import nullcontext
+
+    monkeypatch.setenv("MINIMAX_H3_ATTENTION_IMPLEMENTATION", "torch_cudnn")
+    calls = []
+
+    def context(q, use_cudnn):
+        """Record routing while using CPU SDPA for this unit regression."""
+        calls.append(use_cudnn)
+        return nullcontext()
+
+    monkeypatch.setattr(minimax_h3_dit, "_sdpa_backend_context", context)
+    model = tiny_model()
+    samples = prepare(condition_model(), [raw_sample(), raw_sample()])
+    out = model(**(batch(samples) if packed else samples[0]))
+    sum(out.loss.values()).backward()
+    assert calls == [True] * (3 * (2 if packed else 1))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_cudnn_option_preserves_packed_flash_dispatch(monkeypatch):
+    """Keep the configured packed Flash path even when cuDNN SDPA is opted in."""
+    monkeypatch.setenv("MINIMAX_H3_ATTENTION_IMPLEMENTATION", "torch_cudnn")
+    layer = minimax_h3_dit.MiniMaxH3Attention(32, 2, 16, 1e-6)
+    layer.config._attn_implementation = "veomni_flash_attention_2"
+    q = torch.randn(4, 2, 16)
+    expected = torch.ones_like(q)
+    calls = []
+
+    def packed_attention(*args, **kwargs):
+        """Record entry to the packed Flash kernel path without requiring CUDA."""
+        calls.append(kwargs)
+        return expected
+
+    monkeypatch.setattr(layer, "_run_packed_attention", packed_attention)
+    bounds = minimax_h3_dit._PackedBounds(torch.tensor([0, 2, 4], dtype=torch.int32), (0, 2, 4))
+    actual = layer._attention(q, q, q, cu_seqlens=bounds, max_seqlen=2, valid_seqlen=4)
+    assert actual is expected and len(calls) == 1
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Requires CUDA cuDNN SDPA")
+def test_cudnn_dit_and_audio_vae_head_dim_256_on_cuda(monkeypatch):
+    """Exercise real BF16 cuDNN attention and the audio VAE's d256 attention."""
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_audio_vae import CausalAttention
+
+    device = torch.device("cuda")
+    monkeypatch.setenv("MINIMAX_H3_ATTENTION_IMPLEMENTATION", "torch_cudnn")
+    q = torch.randn(128, 2, 128, device=device, dtype=torch.bfloat16, requires_grad=True)
+    out = minimax_h3_dit._sdpa_varlen_attention(q, q, q, (0, 128), 128**-0.5, use_cudnn=True)
+    out.float().square().mean().backward()
+    assert torch.isfinite(out).all() and torch.isfinite(q.grad).all()
+    layer = CausalAttention(2048, 32, 8).to(device=device, dtype=torch.bfloat16)
+    for bias in (layer.q_bias, layer.zero_k_bias, layer.v_bias):
+        torch.nn.init.zeros_(bias.weight)
+    with torch.no_grad():
+        encoded = layer(torch.randn(1, 128, 2048, device=device, dtype=torch.bfloat16))
+    assert encoded.shape == (1, 128, 32) and torch.isfinite(encoded).all()
 
 
 def tiny_model(num_attention_heads=2):
@@ -578,6 +720,8 @@ def serial(model, samples):
 
 @pytest.fixture(autouse=True)
 def cpu_attention(monkeypatch):
+    """Isolate ops configuration and clear the CUDA-only opt-in for CPU tests."""
+    monkeypatch.delenv("MINIMAX_H3_ATTENTION_IMPLEMENTATION", raising=False)
     from veomni.ops.config import get_ops_config, set_ops_config
 
     monkeypatch.setattr(minimax_h3_dit, "get_ulysses_sequence_parallel_group", lambda: None)
@@ -1062,12 +1206,14 @@ def test_flash_backend_defers_kernel_until_first_forward(monkeypatch, multisampl
 
 @pytest.mark.parametrize("checkpointing", [False, True])
 def test_packed_sdpa_slices_with_host_bounds(monkeypatch, checkpointing):
+    """Keep packed segment bounds on the host with and without recomputation."""
     sdpa = minimax_h3_dit._sdpa_varlen_attention
     bounds = []
 
-    def record(q, k, v, cu_seqlens, softmax_scale, compatibility_mode=False):
+    def record(q, k, v, cu_seqlens, softmax_scale, compatibility_mode=False, *, use_cudnn=False):
+        """Record host segment bounds while preserving the SDPA backend option."""
         bounds.append(cu_seqlens)
-        return sdpa(q, k, v, cu_seqlens, softmax_scale, compatibility_mode)
+        return sdpa(q, k, v, cu_seqlens, softmax_scale, compatibility_mode, use_cudnn=use_cudnn)
 
     monkeypatch.setattr(minimax_h3_dit, "_sdpa_varlen_attention", record)
     raws = [raw_sample(3), raw_sample(7)]
