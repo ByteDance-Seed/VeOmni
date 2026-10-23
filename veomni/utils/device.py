@@ -114,9 +114,10 @@ def stream_synchronize() -> None:
 
 
 def empty_cache() -> None:
-    """Release the accelerator cache; CPU has no allocator cache API."""
-    if get_device_type() != "cpu":
-        get_torch_device().empty_cache()
+    """Release unused accelerator cache when the active device supports it."""
+    device = get_torch_device()
+    if hasattr(device, "empty_cache"):
+        device.empty_cache()
 
 
 def set_device(device: torch.types.Device) -> None:

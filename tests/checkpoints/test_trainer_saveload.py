@@ -318,7 +318,7 @@ def test_trainer_saveload_hsdp(ep_size: int):
     reason="requires at least 2 accelerator devices",
 )
 def test_frozen_omni_module_resume_loads_hf_weights(tmp_path):
-    from tests.tools.launch_utils import find_free_port, run_bounded_process_group
+    from tests.tools.launch_utils import run_bounded_process_group
 
     snapshot_dir = tmp_path / "frozen_module"
     output_dir = tmp_path / "output"
@@ -338,7 +338,7 @@ def test_frozen_omni_module_resume_loads_hf_weights(tmp_path):
         "torch.distributed.run",
         "--nnodes=1",
         f"--nproc_per_node={_CI_LAUNCH.nproc}",
-        f"--master-port={find_free_port()}",
+        "--standalone",
         "tests/checkpoints/omni_frozen_resume_runner.py",
         # `model.model_path` is the split-checkpoint ROOT; the runner resolves
         # `frozen_module` (the module name) as this module's subfolder under it.
