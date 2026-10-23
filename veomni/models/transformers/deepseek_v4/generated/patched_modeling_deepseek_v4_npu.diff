@@ -2368,7 +2368,7 @@
              input_ids=input_ids,
              attention_mask=attention_mask,
              position_ids=position_ids,
-@@ -1471,26 +2557,148 @@
+@@ -1471,26 +2557,151 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -2472,6 +2472,7 @@
 +            mtp_markov_bias = outputs.mtp_markov_bias[:, slice_indices, :]
 +            sp_enabled = get_parallel_state().sp_enabled
 +            raw_shift_labels = kwargs.get("shift_labels")
++            derived_from_labels = raw_shift_labels is None and not sp_enabled
 +            if raw_shift_labels is not None:
 +                mtp_shift_labels = raw_shift_labels
 +                slice_mtp_labels = mtp_shift_labels.shape[-1] != mtp_hidden_states.shape[1]
@@ -2497,8 +2498,10 @@
 +            if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
 +                valid_tokens = attention_mask.to(device=mtp_shift_labels.device, dtype=torch.bool)
 +                has_prev_valid = F.pad(valid_tokens[:, :-1], (1, 0), value=False)
-+                has_next_valid = F.pad(valid_tokens[:, 1:], (0, 1), value=False)
-+                valid_mtp_pos = valid_tokens & has_prev_valid & has_next_valid
++                valid_mtp_pos = valid_tokens & has_prev_valid
++                if derived_from_labels:
++                    has_next_valid = F.pad(valid_tokens[:, 1:], (0, 1), value=False)
++                    valid_mtp_pos = valid_mtp_pos & has_next_valid
 +                if sp_enabled and valid_mtp_pos.shape[1] != outputs.mtp_hidden_states.shape[1]:
 +                    parallel_state = get_parallel_state()
 +                    sp_rank = parallel_state.cp_rank if parallel_state.cp_enabled else parallel_state.ulysses_rank
@@ -2531,7 +2534,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1498,7 +2706,22 @@
+@@ -1498,7 +2709,22 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

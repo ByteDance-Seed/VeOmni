@@ -2664,6 +2664,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             mtp_markov_bias = outputs.mtp_markov_bias[:, slice_indices, :]
             sp_enabled = get_parallel_state().sp_enabled
             raw_shift_labels = kwargs.get("shift_labels")
+            derived_from_labels = raw_shift_labels is None and not sp_enabled
             if raw_shift_labels is not None:
                 mtp_shift_labels = raw_shift_labels
                 slice_mtp_labels = mtp_shift_labels.shape[-1] != mtp_hidden_states.shape[1]
@@ -2689,8 +2690,10 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
                 valid_tokens = attention_mask.to(device=mtp_shift_labels.device, dtype=torch.bool)
                 has_prev_valid = F.pad(valid_tokens[:, :-1], (1, 0), value=False)
-                has_next_valid = F.pad(valid_tokens[:, 1:], (0, 1), value=False)
-                valid_mtp_pos = valid_tokens & has_prev_valid & has_next_valid
+                valid_mtp_pos = valid_tokens & has_prev_valid
+                if derived_from_labels:
+                    has_next_valid = F.pad(valid_tokens[:, 1:], (0, 1), value=False)
+                    valid_mtp_pos = valid_mtp_pos & has_next_valid
                 if sp_enabled and valid_mtp_pos.shape[1] != outputs.mtp_hidden_states.shape[1]:
                     parallel_state = get_parallel_state()
                     sp_rank = parallel_state.cp_rank if parallel_state.cp_enabled else parallel_state.ulysses_rank

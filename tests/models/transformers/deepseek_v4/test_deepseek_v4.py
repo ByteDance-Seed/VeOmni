@@ -860,3 +860,36 @@ def test_deepseek_v4_dspark_presliced_shift_labels_with_logits_to_keep():
     assert out.loss is not None
     assert out.aux_metrics is not None and "mtp_loss" in out.aux_metrics
     assert torch.isfinite(out.aux_metrics["mtp_loss"])
+
+    # With logits_to_keep=1, a valid 1-token shift_labels, and an all-ones 2D attention_mask,
+    # the final row keeps its supervision and matches the attention_mask=None run.
+    model.zero_grad(set_to_none=True)
+    one_tok_shift = torch.tensor([[3]], dtype=torch.long)
+    all_ones_mask = torch.ones_like(input_ids)
+    with torch.no_grad():
+        no_mask_out = model(
+            input_ids=input_ids,
+            labels=labels,
+            shift_labels=one_tok_shift,
+            logits_to_keep=1,
+            use_cache=False,
+        )
+    masked_out = model(
+        input_ids=input_ids,
+        attention_mask=all_ones_mask,
+        labels=labels,
+        shift_labels=one_tok_shift,
+        logits_to_keep=1,
+        use_cache=False,
+    )
+    assert masked_out.aux_metrics is not None and no_mask_out.aux_metrics is not None
+    assert masked_out.aux_metrics["mtp_loss"].item() > 0
+    torch.testing.assert_close(
+        masked_out.aux_metrics["mtp_loss"],
+        no_mask_out.aux_metrics["mtp_loss"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    masked_out.loss.backward()
+    assert model.model.mtp[0].main_proj.weight.grad is not None
+    assert model.model.mtp[0].main_proj.weight.grad.count_nonzero() > 0
