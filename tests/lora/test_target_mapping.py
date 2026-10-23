@@ -18,8 +18,12 @@ import pytest
 import torch
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.lora.target_mapping import convert_fused_moe_lora_targets, resolve_fused_moe_lora_targets
 from veomni.lora.weight_loading import build_lora_key_overrides
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class _TargetParameterLoraModel(nn.Module):

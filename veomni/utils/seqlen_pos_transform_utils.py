@@ -35,6 +35,24 @@ def culen2len(cu_seqlens: "torch.Tensor") -> "torch.Tensor":
     return cu_seqlens.diff()
 
 
+def packed_sequence_slices_from_cu_seqlens(cu_seqlens: "torch.Tensor") -> tuple[tuple[int, int], ...]:
+    """Turn CPU cumulative lengths into half-open ``(start, end)`` slices.
+
+    Collators derive this on the host so packed model forwards do not need to
+    copy GPU ``cu_seq_lens`` back to Python. Passing a GPU tensor here would
+    synchronize the device, so that is rejected.
+    """
+    if cu_seqlens.device.type != "cpu":
+        raise ValueError(
+            "packed_sequence_slices_from_cu_seqlens requires CPU cu_seqlens; "
+            "a GPU tensor would synchronize the device."
+        )
+    if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+        raise ValueError(f"cu_seqlens must have shape [n_seg + 1], got {tuple(cu_seqlens.shape)}")
+    boundaries = cu_seqlens.tolist()
+    return tuple(zip(boundaries[:-1], boundaries[1:], strict=True))
+
+
 def pos2culen(position_ids: "torch.Tensor") -> "torch.Tensor":
     """
     Converts the position ids to cumulative sequence lengths.

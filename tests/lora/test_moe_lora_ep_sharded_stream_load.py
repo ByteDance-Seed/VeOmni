@@ -22,7 +22,7 @@ weights to the reference broadcast loader.
 What ``ep_sharded_stream_load`` does for a PEFT model
 -----------------------------------------------------
 ``load_model_weights_ep_sharded`` under ``is_peft_model=True`` (wired in
-``veomni/models/module_utils.py``):
+``veomni/models/checkpoint/weights.py``):
 
   * **Base experts** — the fused ``...experts.gate_up_proj`` /
     ``down_proj`` tensors are streamed from the base checkpoint straight
@@ -58,6 +58,8 @@ import shutil
 import pytest
 import yaml
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
 # Reuse the battle-tested trainer harness. The trainer subprocess entry
 # point + snapshot comparator + CLI helpers are shared; the base-model
 # fixture is *not* -- see ``fused_toy_base_dir`` below for why.
@@ -73,6 +75,9 @@ from .test_moe_lora_trainer import (
 )
 
 
+_CI_EP_LAUNCH = LaunchSpec(nproc=2)
+
+
 __all__ = [
     "fused_toy_base_dir",
     "test_peft_ep_sharded_stream_load_matches_broadcast",
@@ -80,9 +85,8 @@ __all__ = [
 
 
 # EP requires a fused MoE-LoRA kernel: the wrappers only implement the EP
-# dispatch on the fused path. The backend is device-specific — ``fused_triton``
-# on GPU, ``fused_npu`` on NPU (selecting the wrong one raises a hard error in
-# ``apply_veomni_fused_moe_patch``), so pick it from the active accelerator.
+# dispatch on the fused path. The backend is device-specific — ``triton``
+# on GPU, ``npu`` on NPU — so pick it from the active accelerator.
 def _fused_ops_override() -> str:
     from veomni.utils.import_utils import is_torch_npu_available
 
@@ -131,8 +135,9 @@ def _build_and_save_fused_toy_base(dest_dir: str) -> None:
     from safetensors.torch import save_file
 
     from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.models import build_foundation_model
     from veomni.utils import helper as _helper
+
+    from .utils import build_lora_test_model
 
     _helper.set_seed(42)
     ops = OpsImplementationConfig(
@@ -143,7 +148,7 @@ def _build_and_save_fused_toy_base(dest_dir: str) -> None:
         swiglu_mlp_implementation="eager",
         rotary_pos_emb_implementation="eager",
     )
-    model = build_foundation_model(
+    model = build_lora_test_model(
         config_path=_TOY_CONFIG_PATH,
         weights_path=None,
         torch_dtype="bfloat16",
@@ -224,6 +229,7 @@ def _make_adapter_resume_yaml(base_yaml: str, adapter_path: str, dest: str) -> s
     return dest
 
 
+@pytest.mark.launch_plan(provider=_CI_EP_LAUNCH)
 @pytest.mark.parametrize(
     "mode, base_layout", [("independent", "fused"), ("shared", "fused"), ("independent", "per_expert")]
 )
@@ -251,7 +257,7 @@ def test_peft_ep_sharded_stream_load_matches_broadcast(tmp_path, request, mode, 
     still EP-streamed. With the ``per_expert`` base the stream resumer stacks
     each rank's experts through the checkpoint converter.
     """
-    nproc = _gpu_count_or_skip(min_count=2, max_count=2)
+    nproc = _gpu_count_or_skip(min_count=_CI_EP_LAUNCH.nproc, max_count=_CI_EP_LAUNCH.nproc)
     yaml_path = _yaml_for_mode(mode)
     base_dir = request.getfixturevalue("fused_toy_base_dir" if base_layout == "fused" else "toy_base_dir")
     base_overrides = _fused_model_path_overrides(base_dir) + [

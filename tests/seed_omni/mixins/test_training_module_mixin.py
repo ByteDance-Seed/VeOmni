@@ -15,7 +15,11 @@
 import pytest
 from torch import nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleMixin
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class _Native(nn.Module):

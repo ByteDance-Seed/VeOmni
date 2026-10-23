@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.omni_arguments_types import (
     OmniArguments,
     OmniDataArguments,
@@ -21,6 +22,9 @@ from veomni.arguments.omni_arguments_types import (
     build_omni_module_runtime_args,
 )
 from veomni.models.seed_omni.configuration_omni import OmniConfig
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 MODULE_A = "fake_module_a"
@@ -76,6 +80,8 @@ def test_runtime_config_keeps_the_full_launcher_view():
 
     assert isinstance(runtime_cfg, OmniModelRuntimeArguments)
     assert runtime_cfg.model_path == "/tmp/fake_omni"
+    assert runtime_cfg.seed_omni_model_path == "/tmp/fake_omni"
+    assert runtime_cfg.resolved_model_path == "/tmp/fake_omni"
     module_a = runtime_cfg.modules[MODULE_A]
     assert module_a.accelerator.fsdp_config.fsdp_mode == "ddp"
     assert module_a.model_path.startswith("/tmp/fake_omni")

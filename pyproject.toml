@@ -35,7 +35,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Hardware extras gpu / npu / npu_aarch64 are mutually exclusive
-# (`[tool.uv].conflicts`). MagiAttention is optional NVIDIA SM90+ and
+# (`[tool.uv].conflicts`). MagiAttention is optional NVIDIA SM100+ and
 # requires gpu: `uv sync --extra gpu --extra magi`.
 dev = [
   "pre-commit>=4.0.0,<5.0",
@@ -54,7 +54,9 @@ gpu = [
   "nvidia-cutlass-dsl>=4.4.2",
   # cuDNN Frontend DSA kernels for DeepSeek sparse attention training. Avoid the
   # `cutedsl` extra because it pins nvidia-cutlass-dsl==4.5.0, which conflicts with FA4.
-  "nvidia-cudnn-frontend>=1.24.0",
+  # 1.27.0+ is required for SM90 backward: 1.25.0 calls atomicrmw() without res
+  # against nvidia-cutlass-dsl 4.5.x.
+  "nvidia-cudnn-frontend>=1.27.0",
   "cuda-python==13.0.3",
   # See `[tool.uv.sources]` — FA2 is x86_64-only; FA3 and FlashMLA support
   # x86_64/aarch64.
@@ -93,7 +95,7 @@ gpu = [
   "hf_transfer",
 ]
 
-# MagiAttention FFA (NVIDIA SM90+). Requires gpu via veomni[gpu]; conflicts with npu extras.
+# MagiAttention FFA (NVIDIA SM100+). Requires gpu via veomni[gpu]; conflicts with npu extras.
 magi = [
   "veomni[gpu]",
   # MagiAttention 1.1.1 imports debugpy unconditionally from
@@ -223,7 +225,7 @@ conflicts = [
 patchgen = { path = "patchgen-pkg", editable = true }
 magi-attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
 # MagiAttention upstream designates this contributor-maintained support branch
-# for its arbitrary-mask FA4 packages and SM90 ffa-fa3 overlay. Dao-AILab does
+# for its arbitrary-mask FA4 packages. Dao-AILab does
 # not publish equivalent packages.
 # Keep the immutable shared revision until an organization-owned source exists.
 create-block-mask-cuda = { git = "https://github.com/demonatic/flash-attention.git", rev = "ee1d15159cda6f3f97bfab9e487da146a8254970", subdirectory = "csrc/utils/create_block_mask" }
@@ -257,7 +259,7 @@ torchcodec = [
 #     Ampere/Ada/Hopper/Blackwell on NGC25.11 (cp312) and cp311 local dev.
 #   - FA3 cp310-abi3 sm90 (v0.0.5) — abi3 loads on cp310+. Non-Hopper users
 #     never import flash_attn_interface (lazy in
-#     veomni/ops/kernels/attention/__init__.py), so sm90-only is no-loss.
+#     veomni/ops/kernels/attention/standard/flash.py), so sm90-only is no-loss.
 # FA4 4.0.0b16 is resolved from PyPI.
 flash-attn = [
   { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn-2.8.4+20260608.cu130torch2110cxx11abitrue.bc58ab.sm80sm89sm90sm100-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'" },
@@ -329,11 +331,10 @@ magi-attention = ["setuptools>=78.1.1", "wheel", "packaging>=24.2", "ninja", "to
 magi-to-hstu-cuda = ["setuptools", "wheel", "packaging", "ninja", { requirement = "torch", match-runtime = true }]
 
 [tool.uv.extra-build-variables]
-# SM90 uses the separately installed CUTLASS FFA overlay, while SM100+ uses
-# CUTE DSL/JIT. Build their shared extensions for both architectures; CP
-# communication remains outside the CP1 scope.
-magi-attention = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "90,100", MAGI_ATTENTION_PREBUILD_FFA = "0", MAGI_ATTENTION_SKIP_MAGI_ATTN_COMM_BUILD = "1" }
-create-block-mask-cuda = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "90,100" }
+# MagiAttention uses CUTE DSL/JIT on SM100+. Build its extensions for the
+# supported architecture; CP communication remains outside the CP1 scope.
+magi-attention = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "100", MAGI_ATTENTION_PREBUILD_FFA = "0", MAGI_ATTENTION_SKIP_MAGI_ATTN_COMM_BUILD = "1" }
+create-block-mask-cuda = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "100" }
 magi-to-hstu-cuda = { MAX_JOBS = "8" }
 
 [tool.setuptools.dynamic]
@@ -363,13 +364,14 @@ veomni = ["**/*.txt"]
 [tool.patchgen]
 search_root = "veomni/models/transformers"
 package_prefix = "veomni.models.transformers"
-legacy_patches_prefix = "veomni.models.transformers.qwen3.patches"
 
 [tool.ruff]
 target-version = "py311"
 line-length = 119
 indent-width = 4
-extend-exclude = ["veomni/ops/kernels/gated_delta_rule/_ascend"]
+extend-exclude = [
+    "veomni/ops/kernels/gated_delta_rule/vendor",
+]
 
 [tool.ruff.lint]
 ignore = ["B905", "C901", "E501", "E741", "W605", "C408"]
@@ -377,12 +379,13 @@ select = ["B", "C", "E", "F", "I", "W"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401", "F403", "F811"]
-# Patch gen configs reference names from add_post_import_block (e.g. OpSlot
-# instances, rotate_half) that ruff can't resolve because they only exist as
+# Patch gen configs reference names from add_post_import_block (for example,
+# rotate_half) that ruff can't resolve because they only exist as
 # string literals until patchgen materializes them into the generated file.
-"veomni/models/transformers/**/generated/*.py" = ["E402", "B007"]
-"veomni/models/transformers/**/*_patch_gen_config.py" = ["F821"]
-"veomni/ops/kernels/gated_delta_rule/_ascend/**" = ["I001", "W291", "W292", "W293", "F401", "F811", "F841", "B028"]
+"veomni/models/**/generated/*.py" = ["E402", "B007"]
+"veomni/models/**/*_patch_gen_config.py" = ["F821"]
+"veomni/ops/kernels/gated_delta_rule/vendor/**" = ["I001", "W291", "W292", "W293", "F401", "F811", "F841", "B028"]
+"tests/models/test_qwen_image_precision.py" = ["F401", "F811"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2
@@ -396,7 +399,12 @@ skip-magic-trailing-comma = false
 line-ending = "auto"
 
 [tool.pytest.ini_options]
+# GPU CI images ship pytest 8, whose default importmode=prepend puts the test
+# directory ahead of the repo root. `from tests...` then fails unless the root
+# is on sys.path. NPU CI still uses pytest 7.4, which already resolved `tests`.
+pythonpath = ["."]
 markers = [
+    "launch_plan(provider): shared process launch configuration used for case scheduling",
     "benchmark: marks tests as benchmark tests (deselect with '-m \"not benchmark\"')",
     "qwen3_5_ulysses: Qwen3.5 GatedDeltaNet Ulysses SP tests (run when ulysses or qwen3_5 code is touched)",
 ]

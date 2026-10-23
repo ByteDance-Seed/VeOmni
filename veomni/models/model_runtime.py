@@ -36,7 +36,7 @@ from ..distributed.parallel_state import (
     get_parallel_state_by_name,
     use_parallel_state,
 )
-from ..utils import helper, logging
+from ..utils import helper, logging, recompute_utils
 
 
 if TYPE_CHECKING:
@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from ..arguments.arguments_types import AcceleratorConfig
     from ..data.chat_template import ChatTemplate
     from ..trainer.callbacks import TrainerState
-    from .checkpoint_manager import ModelCheckpointManager
+    from .checkpoint import ModelCheckpointManager
 
 logger = logging.get_logger(__name__)
 
@@ -77,7 +77,7 @@ class VeOmniModelRuntime:
     ``isinstance`` check, so the runtime owns every such boundary itself. Reading
     and writing checkpoints is one: :meth:`load`, :meth:`save_dcp` and
     :meth:`save_hf_or_lora` say *what* this model persists, the
-    :class:`~veomni.models.checkpoint_manager.ModelCheckpointManager` at
+    :class:`~veomni.models.checkpoint.ModelCheckpointManager` at
     :attr:`checkpoint` says *how*, and *when* stays in the trainer callbacks.
 
     Constructing one *builds* it — ``VeOmniModelRuntime(args)`` comes back with a
@@ -232,6 +232,11 @@ class VeOmniModelRuntime:
 
         return should_skip_hf_weight_load(self.train_args.checkpoint.load_path, self.args.lora_config)
 
+    @property
+    def weights_path(self) -> Optional[str]:
+        """Checkpoint the initial weights are read from."""
+        return self.args.model_path
+
     def _build_model(self) -> None:
         """Meta-init the model from its config via the registry-aware loader."""
         from .auto import build_foundation_model
@@ -353,6 +358,46 @@ class VeOmniModelRuntime:
                 host_cache_limit_bytes=int(offload_config.activation_offload_host_cache_limit_gb * 1024**3),
             )
 
+    def _recompute_context(self):
+        """The context every recomputation runs in; subclasses may override.
+
+        SeedOmni brings its module's ``ParallelState`` back for the recompute half
+        of a checkpointed block. Handing it to the policy (rather than arming
+        gradient checkpointing a second time) is what keeps the per-block
+        decisions applied by :func:`recompute_utils.apply_recompute_policy`.
+        """
+        return None
+
+    def _build_recompute_policy(self) -> "recompute_utils.RecomputePolicy":
+        """This run's recompute policy, from the accelerator config.
+
+        A runtime that requires a recompute context cannot run reentrant
+        checkpointing — torch takes no ``context_fn`` there — so the run would
+        recompute with the wrong parallel state current instead of failing. It is
+        rejected here rather than left to the first checkpointed block. With
+        checkpointing off there is no such call and ``enable_reentrant`` says
+        nothing, so the combination is only rejected while it can take effect.
+        """
+        gc_cfg = self.args.accelerator.gradient_checkpointing
+        if gc_cfg.enable and self._recompute_context() is not None and gc_cfg.enable_reentrant:
+            raise ValueError(
+                f"{type(self).__name__} recomputes inside its own context, which "
+                "model.accelerator.gradient_checkpointing.enable_reentrant=True cannot express: "
+                "reentrant checkpointing takes no context_fn. Set enable_reentrant=False."
+            )
+        return recompute_utils.build_policy(
+            enabled=gc_cfg.enable,
+            enable_reentrant=gc_cfg.enable_reentrant,
+            early_stop=gc_cfg.early_stop,
+            recompute_layers=gc_cfg.recompute_layers,
+            selective_recompute_layers=gc_cfg.selective_recompute_layers,
+            save_ops=gc_cfg.save_ops,
+            recompute_context=self._recompute_context(),
+            offload_active=self.args.accelerator.offload_config.enable_activation
+            or self.args.accelerator.offload_config.enable_async_activation,
+            compile_enabled=self.args.accelerator.torch_compile.enable,
+        )
+
     def _build_parallelized_model(self) -> None:
         """FSDP2/DDP-wrap the model and load its weights.
 
@@ -374,9 +419,7 @@ class VeOmniModelRuntime:
         # Customized parallelize model.
         customized_parallelize_model_function = getattr(self.model, "build_parallelize_model", None)
         if callable(customized_parallelize_model_function):
-            parallelized_model = customized_parallelize_model_function(
-                weights_path=self.args.model_path, args=self.args
-            )
+            parallelized_model = customized_parallelize_model_function(weights_path=self.weights_path, args=self.args)
             if parallelized_model is not None:
                 self.model = parallelized_model
                 self.model.train()
@@ -405,6 +448,11 @@ class VeOmniModelRuntime:
                 "skipping HF weight materialization before checkpoint restore."
             )
 
+        # Recomputation strategy for this run: which blocks at the end of the stack
+        # recompute, and how many of those run SAC.
+        gc_cfg = args.accelerator.gradient_checkpointing
+        recompute_policy = self._build_recompute_policy()
+
         from ..distributed import torch_parallelize
         from ..distributed.torch_compile import CompileConfig
 
@@ -414,14 +462,18 @@ class VeOmniModelRuntime:
         self.model = torch_parallelize.build_parallelize_model(
             self.model,
             init_device=args.accelerator.init_device,
-            weights_path=args.model_path,
+            weights_path=self.weights_path,
             should_skip_hf_weight_load=skip_hf_weight_load,
             enable_reshard_after_forward=args.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.accelerator.fsdp_config.mixed_precision,
-            enable_gradient_checkpointing=args.accelerator.gradient_checkpointing.enable,
-            basic_modules=list(set(getattr(self.model, "_no_split_modules", None) or []) | set(args.basic_modules)),
-            enable_reentrant=args.accelerator.gradient_checkpointing.enable_reentrant,
-            early_stop=args.accelerator.gradient_checkpointing.early_stop,
+            enable_gradient_checkpointing=gc_cfg.enable,
+            # Configured classes only, in configuration order: parallelize reads
+            # the model's own ``_no_split_modules`` itself, and recompute needs
+            # this list unmerged and ordered so it can rank the block stacks.
+            basic_modules=list(args.basic_modules or []),
+            recompute_policy=recompute_policy,
+            enable_reentrant=gc_cfg.enable_reentrant,
+            early_stop=gc_cfg.early_stop,
             enable_forward_prefetch=args.accelerator.fsdp_config.forward_prefetch,
             enable_fsdp_offload=args.accelerator.fsdp_config.offload,
             fsdp_offload_pin_memory=args.accelerator.fsdp_config.offload_pin_memory,
@@ -589,7 +641,7 @@ class VeOmniModelRuntime:
         Part of the build like every other step: a model that came back from
         construction unable to save itself would be half-built.
         """
-        from .checkpoint_manager import ModelCheckpointManager
+        from .checkpoint import ModelCheckpointManager
 
         self.checkpoint = ModelCheckpointManager(self)
 
@@ -622,7 +674,7 @@ class VeOmniModelRuntime:
         """Export this model in whichever format it was trained in.
 
         An in-flight async DCP must be on disk before conversion reads it, so
-        this drains first. ``_prepare_export`` waits again if it has to write
+        this drains first. ``prepare_export`` waits again if it has to write
         a DCP of its own.
         """
         self.checkpoint.wait_for_pending_save()
@@ -636,7 +688,7 @@ class VeOmniModelRuntime:
         """Write the tokenizer/processor/config sidecars that an export needs."""
         import torch.distributed as dist
 
-        from .module_utils import save_model_assets as write_model_assets
+        from .checkpoint.weights import save_model_assets as write_model_assets
 
         if self.train_args.global_rank == 0:
             write_model_assets(self.checkpoint.assets_dir(), self.model_assets)

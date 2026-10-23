@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.arguments_types import (
     AcceleratorConfig,
     FSDPConfig,
@@ -36,6 +37,9 @@ from veomni.arguments.omni_arguments_types import (
     build_omni_module_runtime_args,
 )
 from veomni.models.model_runtime import VeOmniModelRuntime
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 MODULE_A = "fake_module_a"

@@ -18,7 +18,7 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
     DeepseekV4Config as _DeepseekV4Config,
 )
 
-from ....utils import logging
+from veomni.utils import logging
 
 
 logger = logging.get_logger(__name__)
@@ -34,7 +34,7 @@ class DeepseekV4Config(_DeepseekV4Config):
     ``self.config``, and ``dsa_indexer_loss`` / ``dsa_indexer_loss_coef`` sit
     beside them and are read the same way. The neighbouring
     ``dsa_indexer_implementation`` / ``dsa_attention_implementation`` stay on
-    ``OpsImplementationConfig``, which is kernel selection and nothing else.
+    the ops config, which is implementation selection and nothing else.
 
     Being *declared* here is load-bearing rather than tidiness. Overrides from
     ``model.model_config`` reach the config as ``**kwargs`` to
@@ -63,14 +63,14 @@ class DeepseekV4Config(_DeepseekV4Config):
         DeepSeek-V4-Flash, which is the cost of learning from the first forward
         instead that three lines of YAML disagree with each other.
 
-        It lives on the config rather than in ``veomni/models/auto.py`` because
+        It lives on the config rather than in the generic builder because
         everything it knows is DeepSeek-V4's: two of its own fields, and which kernels
         those fields require. A generic model builder holding a list of model names is
         a list that the next model has to be remembered into. Here there is nothing to
         remember -- ``model.model_config`` is DeepSeek-V4's config precisely when the
         model is DeepSeek-V4.
 
-        What it needs from outside is ``OpsImplementationConfig``: the objective's
+        What it needs from outside is the installed ops config: the objective's
         student distribution is the TileLang indexer's per-slot scores and its teacher
         is the TileLang sparse attention's log-sum-exp, and those two are kernel
         selections rather than model fields. Read off the installed singleton, not
@@ -82,7 +82,7 @@ class DeepseekV4Config(_DeepseekV4Config):
         ``build_foundation_model``, such as a test building a model straight from
         ``_from_config``.
         """
-        from ....ops.config.singleton import get_ops_config
+        from veomni.ops.config import get_ops_config
 
         enabled = self.dsa_indexer_loss
         if not isinstance(enabled, bool):
@@ -132,8 +132,8 @@ class DeepseekV4Config(_DeepseekV4Config):
             )
             return
 
-        ops_config = get_ops_config()
-        if ops_config is None:
+        kernels_config = get_ops_config()
+        if kernels_config is None:
             return
 
         for field_name, reason in (
@@ -143,7 +143,7 @@ class DeepseekV4Config(_DeepseekV4Config):
                 "the teacher distribution is derived from the TileLang attention's log-sum-exp",
             ),
         ):
-            value = getattr(ops_config, field_name, None)
+            value = getattr(kernels_config, field_name, None)
             if value != "tilelang":
                 raise ValueError(
                     f"dsa_indexer_loss requires {field_name}='tilelang', got {value!r}: {reason}. "

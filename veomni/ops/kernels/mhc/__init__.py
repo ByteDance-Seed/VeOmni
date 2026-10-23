@@ -12,44 +12,112 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Registry entries for manifold-constrained Hyper-Connection kernels."""
+"""Manifold-constrained Hyper-Connection kernels used by DeepSeek-V4.
 
-from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
+Three independent variants share this package. They are not a compound
+kernel. Eager is the modeling math (regular autograd). ``tilelang`` is
+TileKernels on SM90+. ``post`` / ``tilelang`` is a raw pair; ``pre`` and
+``head`` keep an opaque wrapper because TileKernels owns that autograd.
+``cann`` is the Ascend CANN fused pre and post. CANN has no head kernel,
+so ``head`` / ``cann`` runs the eager math and lets one
+``mhc_implementation`` name cover all three variants.
+"""
 
-
-def _mhc_pre_tile_kernels_factory():
-    from .tile_kernels import mhc_pre_tile_kernels
-
-    return mhc_pre_tile_kernels
-
-
-def _mhc_post_tile_kernels_factory():
-    from .tile_kernels import mhc_post_tile_kernels
-
-    return mhc_post_tile_kernels
-
-
-def _mhc_head_tile_kernels_factory():
-    from .tile_kernels import mhc_head_tile_kernels
-
-    return mhc_head_tile_kernels
-
-
-for variant, factory, description in (
-    ("pre", _mhc_pre_tile_kernels_factory, "TileKernels DeepSeek V4 mHC pre/Sinkhorn/collapse"),
-    ("post", _mhc_post_tile_kernels_factory, "TileKernels DeepSeek V4 mHC residual post-mix"),
-    ("head", _mhc_head_tile_kernels_factory, "TileKernels DeepSeek V4 final mHC collapse"),
-):
-    KERNEL_REGISTRY.register(
-        KernelSpec(
-            name="tilelang",
-            op_name="mhc",
-            variant=variant,
-            factory=factory,
-            hardware=HardwareRequirement(device_type="gpu", min_compute_capability=90),
-            description=description,
-        )
-    )
+from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, NpuKernelRequirement
+from ...registry import register_op
+from .head import eager as head_eager
+from .head import tilelang as head_tilelang
+from .post import cann as post_cann
+from .post import eager as post_eager
+from .post import tilelang as post_tilelang
+from .pre import cann as pre_cann
+from .pre import eager as pre_eager
+from .pre import tilelang as pre_tilelang
 
 
-__all__ = []
+_TILELANG = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+_CANN = NpuKernelRequirement()
+
+register_op(
+    "mhc",
+    "pre",
+    "eager",
+    description="PyTorch DeepSeek-V4 mHC pre transform with Sinkhorn normalization and collapse",
+    wrapper=pre_eager.wrapper,
+)
+
+register_op(
+    "mhc",
+    "pre",
+    "tilelang",
+    description="TileKernels DeepSeek-V4 mHC pre transform with Sinkhorn normalization and collapse",
+    wrapper=pre_tilelang.wrapper,
+    requirement=_TILELANG,
+    requires=("tile_kernels",),
+)
+
+register_op(
+    "mhc",
+    "pre",
+    "cann",
+    description="Ascend CANN DeepSeek-V4 mHC pre transform with Sinkhorn normalization and collapse",
+    wrapper=pre_cann.wrapper,
+    requirement=_CANN,
+    requires=("cann_ops_transformer",),
+)
+
+register_op(
+    "mhc",
+    "post",
+    "eager",
+    description="PyTorch DeepSeek-V4 mHC residual post-mix",
+    wrapper=post_eager.wrapper,
+)
+
+register_op(
+    "mhc",
+    "post",
+    "tilelang",
+    post_tilelang.forward,
+    post_tilelang.backward,
+    description="TileKernels DeepSeek-V4 mHC residual post-mix",
+    requirement=_TILELANG,
+    requires=("tile_kernels",),
+)
+
+register_op(
+    "mhc",
+    "post",
+    "cann",
+    description="Ascend CANN DeepSeek-V4 mHC residual post-mix",
+    wrapper=post_cann.wrapper,
+    requirement=_CANN,
+    requires=("cann_ops_transformer",),
+)
+
+register_op(
+    "mhc",
+    "head",
+    "eager",
+    description="PyTorch DeepSeek-V4 final mHC collapse",
+    wrapper=head_eager.wrapper,
+)
+
+register_op(
+    "mhc",
+    "head",
+    "tilelang",
+    description="TileKernels DeepSeek-V4 final mHC collapse",
+    wrapper=head_tilelang.wrapper,
+    requirement=_TILELANG,
+    requires=("tile_kernels",),
+)
+
+register_op(
+    "mhc",
+    "head",
+    "cann",
+    description="PyTorch DeepSeek-V4 final mHC collapse for CANN builds (no CANN head kernel)",
+    wrapper=head_eager.wrapper,
+    requirement=_CANN,
+)

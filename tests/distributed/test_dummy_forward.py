@@ -16,8 +16,12 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import MixedPrecisionConfig
 from veomni.utils.device import empty_cache
+
+
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 
 _TEXT_SEQ_LEN = 64
@@ -134,15 +138,12 @@ def _omni_batch(*, rank, device, dtype, patch_size, is_qwen3_omni=False):
 
 def _asymmetric_forward_worker(model_type, config_path, batch_fn):
     """Rank 0 gets multimodal data, other ranks get text-only. Verifies no NCCL hang."""
-    from veomni import _apply_patches
     from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.distributed.torch_parallelize import build_parallelize_model
-    from veomni.models.auto import build_foundation_model
+    from veomni.models import build_foundation_model
     from veomni.utils.device import get_device_type
 
     from ..tools.training_utils import make_eager_ops_config
-
-    _apply_patches()
 
     # Tight NCCL timeout so a missing dummy_forward fails fast instead of hanging
     os.environ["NCCL_TIMEOUT"] = "120"
@@ -220,6 +221,7 @@ _vlm_cases = [
 ]
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 @pytest.mark.parametrize("model_type, config_path, batch_fn", _vlm_cases)
 def test_asymmetric_forward_vlm(model_type: str, config_path: str, batch_fn):
     """Verify no NCCL hang when some ranks lack image/video data under FSDP2."""
@@ -227,7 +229,7 @@ def test_asymmetric_forward_vlm(model_type: str, config_path: str, batch_fn):
 
     torchrun(
         partial(_asymmetric_forward_worker, model_type, config_path, batch_fn),
-        world_size=2,
+        world_size=_CI_ACCELERATOR_2.nproc,
     )
 
 
@@ -251,6 +253,7 @@ _omni_cases = [
 ]
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 @pytest.mark.parametrize("model_type, config_path, batch_fn", _omni_cases)
 def test_asymmetric_forward_omni(model_type: str, config_path: str, batch_fn):
     """Verify no NCCL hang when some ranks lack image/audio/video data under FSDP2."""
@@ -258,5 +261,5 @@ def test_asymmetric_forward_omni(model_type: str, config_path: str, batch_fn):
 
     torchrun(
         partial(_asymmetric_forward_worker, model_type, config_path, batch_fn),
-        world_size=2,
+        world_size=_CI_ACCELERATOR_2.nproc,
     )

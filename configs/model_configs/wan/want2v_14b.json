@@ -1,5 +1,5 @@
 {
-  "architectures": "WanModel",
+  "architectures": ["WanModel"],
   "_class_name": "WanModel",
   "_diffusers_version": "0.30.0",
   "dim": 5120,

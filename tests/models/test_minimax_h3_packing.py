@@ -1,8 +1,8 @@
 """Native H3 model-owned packing, without pretrained weights or encoders."""
 
 import copy
+import importlib.util
 from datetime import timedelta
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,13 +10,14 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.diffusers.minimax_h3.minimax_h3_condition.configuration_minimax_h3_condition import (
     MiniMaxH3ConditionModelConfig,
 )
 from veomni.models.diffusers.minimax_h3.minimax_h3_condition.modeling_minimax_h3_condition import (
     MiniMaxH3ConditionModel,
 )
-from veomni.models.diffusers.minimax_h3.minimax_h3_core import core, minimax_h3_dit, packed_sequence
+from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_dit, packed_sequence
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer import (
     MiniMaxH3DiTModelConfig,
 )
@@ -26,6 +27,9 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_
 )
 from veomni.trainer.dit_trainer import DiTDataCollator
 from veomni.utils.import_utils import is_torch_npu_available
+
+
+_CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
 
 
 def tiny_model(num_attention_heads=2):
@@ -139,7 +143,6 @@ def raw_sample(text_len=3, task="fl2va", refs=None, latent_t=2, latent_h=4, late
         audio_input_latents=torch.randn(2, 32, audio_t),
         prompt_embeds=torch.randn(text_len, 32),
         packed=pk,
-        use_gradient_checkpointing=False,
     )
     if pk["cond_rows"]:
         row[anchor_key] = torch.randn(pk["cond_rows"], 96)
@@ -575,9 +578,16 @@ def serial(model, samples):
 
 @pytest.fixture(autouse=True)
 def cpu_attention(monkeypatch):
-    monkeypatch.setattr(minimax_h3_dit, "IS_NPU_AVAILABLE", False)
-    monkeypatch.setattr(core, "ATTENTION_IMPLEMENTATION", "torch")
+    from veomni.ops.config import get_ops_config, set_ops_config
+
     monkeypatch.setattr(minimax_h3_dit, "get_ulysses_sequence_parallel_group", lambda: None)
+    # build_foundation_model installs process-global ops. Do not leak FA3 into later tests.
+    previous = get_ops_config()
+    set_ops_config(None)
+    try:
+        yield
+    finally:
+        set_ops_config(previous)
 
 
 @pytest.mark.parametrize("backend", ["eager", "sdpa"])
@@ -632,8 +642,8 @@ def test_packed_outputs_losses_and_gradients_match_serial(task, checkpointing):
     base = tiny_model()
     packed = copy.deepcopy(base)
     raws = [raw_sample(3, task), raw_sample(7, task)]
-    for row in raws:
-        row["use_gradient_checkpointing"] = checkpointing
+    if checkpointing:
+        packed.gradient_checkpointing_enable({"use_reentrant": False})  # the run's setting, through HF
     samples = prepare(condition_model(), raws)
     expected = serial(base, samples)
     entries = {id(block): 0 for block in packed.dit.blocks}
@@ -765,7 +775,7 @@ def test_accumulated_microbatches_weight_each_sample_like_single_sample():
 
 def test_unsupported_backend_fails_only_on_packed_forward():
     model = tiny_model()
-    model._configure_packed_attention("veomni_flash_attention_4_with_sp")  # what __init__ runs; must not raise
+    model._configure_packed_attention("veomni_flash_attention_4")  # what __init__ runs; must not raise
     samples = prepare(condition_model(), [raw_sample(3), raw_sample(5)])
     serial(model, samples)
     with pytest.raises(ValueError, match="Unsupported H3 packing backend"):
@@ -918,8 +928,6 @@ def test_sequence_parallel_padding_remains_forward_local(monkeypatch, task):
 def _check_sequence_parallel_gradients(rank, init_method, cases):
     dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=2, timeout=timedelta(seconds=60))
     try:
-        minimax_h3_dit.IS_NPU_AVAILABLE = False
-        core.ATTENTION_IMPLEMENTATION = "torch"
         minimax_h3_dit.get_ulysses_sequence_parallel_group = lambda: dist.group.WORLD
         for case, heads, state, sample, expected_loss, expected_grads in cases:
             model = tiny_model(heads)
@@ -936,6 +944,7 @@ def _check_sequence_parallel_gradients(rank, init_method, cases):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo required")
 def test_sequence_parallel_gradients_match_single_rank_after_sp_average(tmp_path):
     cases = []
@@ -948,44 +957,58 @@ def test_sequence_parallel_gradients_match_single_rank_after_sp_average(tmp_path
         loss.backward()
         grads = {name: param.grad.clone() for name, param in model.named_parameters()}
         cases.append((f"{task} heads={heads}", heads, model.state_dict(), sample, loss.detach(), grads))
-    mp.spawn(_check_sequence_parallel_gradients, args=((tmp_path / "rendezvous").as_uri(), cases), nprocs=2)
+    mp.spawn(
+        _check_sequence_parallel_gradients, args=((tmp_path / "rendezvous").as_uri(), cases), nprocs=_CI_CPU_2.nproc
+    )
 
 
-_NPU_REJECTS_HUB = pytest.mark.skipif(is_torch_npu_available(), reason="Hub attention is rejected on Ascend NPU.")
+_HUB_UNAVAILABLE = pytest.mark.skipif(
+    is_torch_npu_available() or importlib.util.find_spec("kernels") is None,
+    reason="Hub FlashAttention needs the kernels package and is rejected on Ascend NPU.",
+)
 
 
 @pytest.mark.parametrize(
     "backend",
     [
         "flash_attention_2",
-        pytest.param("flash_attention_2_hub", marks=_NPU_REJECTS_HUB),
+        pytest.param("flash_attention_2_hub", marks=_HUB_UNAVAILABLE),
         "flash_attention_3",
-        pytest.param("flash_attention_3_hub", marks=_NPU_REJECTS_HUB),
+        pytest.param("flash_attention_3_hub", marks=_HUB_UNAVAILABLE),
     ],
 )
 def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(monkeypatch, backend):
     from veomni.arguments import OpsImplementationConfig
     from veomni.models.auto import build_foundation_model
-    from veomni.ops.kernels.attention import flash
+    from veomni.models.diffusers.minimax_h3.minimax_h3_transformer import (
+        modeling_minimax_h3_transformer as h3_modeling,
+    )
 
-    calls, loads = [], []
+    calls = []
 
-    config = tiny_model().config
+    def wrapped(self, q, k, v, *, cu_seqlens, max_seqlen, valid_seqlen):
+        bounds = cu_seqlens.device if isinstance(cu_seqlens, minimax_h3_dit._PackedBounds) else cu_seqlens
+        if not torch.is_tensor(bounds):
+            bounds = torch.tensor(bounds, dtype=torch.int32)
+        calls.append(bounds.tolist())
+        return minimax_h3_dit._sdpa_varlen_attention(q, k, v, tuple(bounds.tolist()), self.softmax_scale, True)
 
-    def kernel(q, k, v, *, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, causal):
-        assert q.ndim == 3 and q.shape[1:] == (config.num_attention_heads, config.attention_head_dim)
-        assert q.is_contiguous() and k.shape == v.shape == q.shape
-        assert cu_seqlens_q.dtype == torch.int32 and cu_seqlens_k is cu_seqlens_q
-        assert cu_seqlens_q[-1] == q.shape[0] and max_seqlen_q == max_seqlen_k
-        assert not causal
-        calls.append(cu_seqlens_q.tolist())
-        return minimax_h3_dit._sdpa_varlen_attention(q, k, v, tuple(cu_seqlens_q.tolist()), softmax_scale, True)
+    def bind_packed_name(module, *, is_causal, impl=None):
+        # Only the name is bound, so this case never constructs a real FA backend. FA3 is CUDA SM90-only.
+        module.is_causal = is_causal
+        module.config._attn_implementation = impl
 
-    def loader(name):
-        loads.append(name)
-        return SimpleNamespace(flash_attn_varlen_func=kernel)
+    if backend.endswith("_hub"):
+        from veomni.ops import install
 
-    monkeypatch.setattr(flash, "_load_veomni_flash_kernel", loader)
+        # Model init preloads the kernel. Serve the locally installed build instead of a ~1 GB Hub download.
+        local = "veomni_" + backend.removesuffix("_hub")
+        monkeypatch.setattr(
+            install, "_load_hub_flash_kernel", lambda repo: install._load_veomni_local_flash_kernel(local)
+        )
+
+    monkeypatch.setattr(minimax_h3_dit.MiniMaxH3Attention, "_run_packed_attention", wrapped)
+    monkeypatch.setattr(h3_modeling, "bind_minimax_attention", bind_packed_name)
     ops = OpsImplementationConfig(
         attn_implementation=backend,
         rms_norm_implementation="eager",
@@ -1006,63 +1029,35 @@ def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(mon
     samples = prepare(condition_model(), raws)
     serial(model, samples)
     assert calls == []
-    loads.clear()  # Transformers may already have resolved the backend at construction.
     out = model(**batch(samples))
     sum(out.loss.values()).backward()
     assert calls[:2] == [[0, 3], [0, 7]]
     assert len(calls) == 4 and calls[2] == calls[3] and len(calls[2]) == 3
-    assert loads == [f"veomni_{backend}_with_sp"]
 
 
-def test_flash_backend_defers_packed_kernel_until_multisample_forward(monkeypatch):
-    import sys
-
-    from transformers import modeling_flash_attention_utils as hf_flash
-
-    from veomni.ops.kernels.attention import flash
+@pytest.mark.parametrize("multisample", [False, True])
+def test_flash_backend_defers_kernel_until_first_forward(monkeypatch, multisample):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_transformer import (
+        modeling_minimax_h3_transformer as h3_modeling,
+    )
 
     loads = []
 
-    def unavailable(name):
-        loads.append(name)
+    def unavailable(module, *, is_causal, impl=None):
+        loads.append(impl)
         raise ImportError("flash_attn unavailable")
 
-    def npu_attention(q, k, v, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None, max_seqlen_k=None):
-        raise AssertionError("construction must not run NPU attention")
-
-    # Mirror Ascend: Transformers resolves its native NPU FA before VeOmni's loader.
-    monkeypatch.setattr(flash, "_load_veomni_flash_kernel", unavailable)
-    monkeypatch.setattr(hf_flash, "is_flash_attn_2_available", lambda: False)
-    monkeypatch.setattr(hf_flash, "is_torch_npu_available", lambda: True)
-    for name in (
-        "_loaded_implementation",
-        "_flash_fn",
-        "_flash_varlen_fn",
-        "_flash_with_kvcache_fn",
-        "_pad_fn",
-        "_unpad_fn",
-        "_process_flash_kwargs_fn",
-    ):
-        monkeypatch.setattr(hf_flash, name, None if name == "_loaded_implementation" else getattr(hf_flash, name))
-    monkeypatch.setitem(
-        sys.modules,
-        "transformers.integrations.npu_flash_attention",
-        SimpleNamespace(
-            npu_flash_attn_func=npu_attention,
-            npu_flash_attn_varlen_func=npu_attention,
-            npu_flash_attn_with_kvcache=npu_attention,
-        ),
-    )
+    # github/main mocks `_load_veomni_flash_kernel`. Packed load is the bind.
+    monkeypatch.setattr(h3_modeling, "bind_minimax_attention", unavailable)
     config = tiny_model().config
-    config._attn_implementation = "veomni_flash_attention_2_with_sp"
+    config._attn_implementation = "veomni_flash_attention_2"
     model = MiniMaxH3DiTModel(config)
+    assert loads == []
     samples = prepare(condition_model(), [raw_sample(3), raw_sample(7)])
 
-    serial(model, samples[:1])
-    assert loads == []
     with pytest.raises(ImportError, match="flash_attn unavailable"):
-        model(**batch(samples))
-    assert loads == ["veomni_flash_attention_2_with_sp"]
+        model(**batch(samples)) if multisample else serial(model, samples[:1])
+    assert loads == ["veomni_flash_attention_2"]
 
 
 @pytest.mark.parametrize("checkpointing", [False, True])
@@ -1076,10 +1071,10 @@ def test_packed_sdpa_slices_with_host_bounds(monkeypatch, checkpointing):
 
     monkeypatch.setattr(minimax_h3_dit, "_sdpa_varlen_attention", record)
     raws = [raw_sample(3), raw_sample(7)]
-    for row in raws:
-        row["use_gradient_checkpointing"] = checkpointing
     samples = prepare(condition_model(), raws)
     model = tiny_model()
+    if checkpointing:
+        model.gradient_checkpointing_enable({"use_reentrant": False})
     reads = []
     tolist = torch.Tensor.tolist
     monkeypatch.setattr(torch.Tensor, "tolist", lambda self: reads.append(self.shape) or tolist(self))
@@ -1111,65 +1106,22 @@ def test_refiner_preserves_linear_row_counts_with_main_dit_packed(task):
     assert rows["main"] == [sum(sample["x"].shape[1] for sample in samples)]
 
 
-@pytest.mark.parametrize("offload", [True, [False, True]])
-def test_multisample_wrapper_rejects_checkpoint_offload(offload):
-    inputs = batch(prepare(condition_model(), [raw_sample(), raw_sample()]))
-    inputs["use_gradient_checkpointing_offload"] = offload
-    with pytest.raises(ValueError, match="checkpoint offload"):
-        tiny_model()(**inputs)
-
-
-@pytest.mark.parametrize("offload", [False, True])
-def test_inference_forwards_checkpoint_offload_to_core(offload):
-    from veomni.models.diffusers.minimax_h3.inference import model_fn_minimax_h3
-
-    row = raw_sample()
-    model = tiny_model()
-
-    def capture(module, args, kwargs):
-        assert kwargs["use_gradient_checkpointing_offload"] is offload
-        assert kwargs["packed_seq_params"]["cu_seqlens_host"] == tuple(row["packed"]["cu_seqlens"].tolist())
-        assert kwargs["refiner_packed_seq_params"]["cu_seqlens_host"] == (0, 3)
-        raise RuntimeError("inference offload forwarded")
-
-    handle = model.dit.register_forward_pre_hook(capture, with_kwargs=True)
-    try:
-        with pytest.raises(RuntimeError, match="inference offload forwarded"):
-            model_fn_minimax_h3(
-                model,
-                row["input_latents"],
-                row["audio_input_latents"],
-                row["packed"],
-                row["prompt_embeds"],
-                t_video=0.5,
-                t_audio=0.5,
-                keyframe_cond_anchor=row["keyframe_cond_anchor"],
-                use_gradient_checkpointing_offload=offload,
-            )
-    finally:
-        handle.remove()
-
-
-def test_condition_preserves_checkpoint_offload_for_model_validation():
+def test_a_legacy_sample_column_is_ignored():
+    """Caches written before recompute became configuration-only still load."""
     raws = [raw_sample(), raw_sample()]
     for row in raws:
+        row["use_gradient_checkpointing"] = True
         row["use_gradient_checkpointing_offload"] = True
     samples = prepare(condition_model(), raws)
-    assert all(sample["use_gradient_checkpointing_offload"] is True for sample in samples)
+    assert "use_gradient_checkpointing" not in samples[0]
+
     model = tiny_model()
-    with pytest.raises(ValueError, match="checkpoint offload"):
-        model(**batch(samples))
+    for sample in samples:  # the collated columns ride along from a stale cache
+        sample["use_gradient_checkpointing"] = True
 
-    def capture(module, args, kwargs):
-        assert kwargs["use_gradient_checkpointing_offload"] is True
-        raise RuntimeError("single-sample offload forwarded")
+    out = model(**batch(samples))
 
-    handle = model.dit.register_forward_pre_hook(capture, with_kwargs=True)
-    try:
-        with pytest.raises(RuntimeError, match="single-sample offload forwarded"):
-            model(**samples[0])
-    finally:
-        handle.remove()
+    assert set(out.loss) == {"mse_video", "mse_audio"}
 
 
 def test_invalid_precision_and_legacy_tail_fail_closed():
@@ -1191,9 +1143,8 @@ def test_invalid_precision_and_legacy_tail_fail_closed():
 
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 def test_h3_foundation_loader_preserves_official_fp32_islands(dtype):
+    from tests.tools.training_utils import make_eager_ops_config
     from veomni.models.auto import build_foundation_model
-
-    from ..tools.training_utils import make_eager_ops_config
 
     model = build_foundation_model(
         tiny_model().config, init_device="cpu", torch_dtype=dtype, ops_implementation=make_eager_ops_config()
@@ -1252,14 +1203,27 @@ def test_h3_rejects_rounded_inputs_and_fp32_island_lora():
         lora.get_base_model().get_ignore_modules_in_mixed_precision()
 
 
-def _run_h3_precision_fsdp(checkpointing, lora, weights_path):
+def test_h3_async_offload_auto_discovers_blocks_only():
+    from veomni.distributed.async_offload import apply_async_activation_offload
+
+    model = tiny_model()
+    apply_async_activation_offload(model, [])
+
+    assert model._no_split_modules == ["MiniMaxH3DiTBlock", "MiniMaxH3DiT"]
+    assert not hasattr(model.dit, "_veomni_offload_manager")
+    assert [block._veomni_offload_layer_idx for block in model.dit.blocks] == list(range(len(model.dit.blocks)))
+
+
+def _run_h3_precision_fsdp(checkpointing, lora, weights_path, offload=False):
     import os
 
     import torch.distributed as dist
     from safetensors.torch import save_file
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
+    from tests.tools.training_utils import make_eager_ops_config
     from veomni.arguments import AcceleratorConfig, MixedPrecisionConfig
+    from veomni.distributed.async_offload import apply_async_activation_offload
     from veomni.distributed.parallel_state import (
         clear_parallel_state,
         init_parallel_state_from_config,
@@ -1270,11 +1234,8 @@ def _run_h3_precision_fsdp(checkpointing, lora, weights_path):
     from veomni.models.auto import build_foundation_model
     from veomni.utils.device import get_device_type
 
-    from ..tools.training_utils import make_eager_ops_config
-
     os.environ["LOCAL_RANK"] = str(dist.get_rank())
     os.environ["WORLD_SIZE"] = str(dist.get_world_size())
-    core.ATTENTION_IMPLEMENTATION = "torch"
     device = torch.device(get_device_type(), dist.get_rank())
     init_parallel_state_from_config(AcceleratorConfig(), name="h3_precision")
     try:
@@ -1309,6 +1270,8 @@ def _run_h3_precision_fsdp(checkpointing, lora, weights_path):
                 for name, parameter in reference.named_parameters():
                     if "lora_" in name:
                         torch.nn.init.normal_(parameter, std=0.05)
+            if offload:
+                apply_async_activation_offload(model, [])
             weights = {name: value.detach().clone().to(device) for name, value in reference.state_dict().items()}
             model = build_parallelize_model(
                 model,
@@ -1316,7 +1279,7 @@ def _run_h3_precision_fsdp(checkpointing, lora, weights_path):
                 init_device="meta",
                 mixed_precision=MixedPrecisionConfig(enable=True, cast_forward_inputs=False),
                 is_peft_model=lora,
-                enable_gradient_checkpointing=False,
+                enable_gradient_checkpointing=checkpointing,
             )
             from torch.distributed.fsdp import FSDPModule
 
@@ -1381,7 +1344,10 @@ def _run_h3_precision_fsdp(checkpointing, lora, weights_path):
             for output in (single, one_element):
                 for prediction, baseline in zip(output.predictions, single_reference.predictions):
                     torch.testing.assert_close(prediction, baseline, rtol=0.02, atol=0.002)
+            forward_calls = len(time_dtypes)
             sum(single.loss.values()).backward()
+            if checkpointing:
+                assert len(time_dtypes) > forward_calls, "checkpointed blocks must recompute during backward"
             sum(single_reference.loss.values()).backward()
             grads, ref_grads = [], []
             ref_params = dict(reference.named_parameters())
@@ -1454,29 +1420,37 @@ def _run_h3_precision_fsdp(checkpointing, lora, weights_path):
         clear_parallel_state()
 
 
-def _run_h3_precision_gloo(rank, rendezvous, checkpointing, lora, weights_path):
+def _run_h3_precision_gloo(rank, rendezvous, checkpointing, lora, weights_path, offload):
     import torch.distributed as dist
 
     dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
     try:
-        _run_h3_precision_fsdp(checkpointing, lora, weights_path)
+        _run_h3_precision_fsdp(checkpointing, lora, weights_path, offload)
     finally:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("checkpointing", [False, True])
-@pytest.mark.parametrize("lora", [False, True])
-def test_h3_precision_through_production_fsdp(tmp_path, checkpointing, lora):
+def _h3_precision_launch(context):
+    """Reserve two CPU ranks locally or two accelerator cards in CI."""
+    device = "cpu" if context.capabilities.backend == "cpu" else "accelerator"
+    return LaunchSpec(nproc=2, device=device)
+
+
+@pytest.mark.launch_plan(provider=_h3_precision_launch)
+@pytest.mark.parametrize(
+    ("checkpointing", "lora", "offload"),
+    [(False, False, False), (True, False, False), (False, True, False), (True, True, False), (True, False, True)],
+)
+def test_h3_precision_through_production_fsdp(tmp_path, checkpointing, lora, offload):
     import torch.multiprocessing as mp
 
+    from tests.tools.launch_utils import torchrun
     from veomni.utils.device import get_device_type
-
-    from ..tools.launch_utils import torchrun
 
     if get_device_type() == "cpu":
         mp.spawn(
             _run_h3_precision_gloo,
-            args=(str(tmp_path / "rendezvous"), checkpointing, lora, str(tmp_path)),
+            args=(str(tmp_path / "rendezvous"), checkpointing, lora, str(tmp_path), offload),
             nprocs=2,
             join=True,
         )
@@ -1487,16 +1461,16 @@ def test_h3_precision_through_production_fsdp(tmp_path, checkpointing, lora):
             checkpointing=checkpointing,
             lora=lora,
             weights_path=str(tmp_path),
+            offload=offload,
         )
 
 
 @pytest.mark.parametrize("task", ["fl2va", "ref2va"])
 def test_h3_fp32_heads_support_multistep_bf16_anchors(task):
+    from tests.tools.training_utils import make_eager_ops_config
     from veomni.models.auto import build_foundation_model
     from veomni.models.diffusers.minimax_h3.inference import model_fn_minimax_h3
     from veomni.models.diffusers.minimax_h3.minimax_h3_core.flow_match_scheduler import FlowMatchScheduler
-
-    from ..tools.training_utils import make_eager_ops_config
 
     model = build_foundation_model(
         tiny_model().config, init_device="cpu", torch_dtype="bfloat16", ops_implementation=make_eager_ops_config()
