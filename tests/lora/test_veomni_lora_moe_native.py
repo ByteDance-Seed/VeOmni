@@ -42,6 +42,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.moe_layers import (
     LoraSharedExperts,
@@ -51,6 +53,10 @@ from veomni.lora.moe_layers import (
 )
 from veomni.lora.state_dict import get_lora_state_dict, load_adapter_state_dict
 from veomni.lora.weight_loading import init_lora_parameter, load_lora_weights
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+_CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
 
 
 torch.manual_seed(0)
@@ -130,14 +136,14 @@ class _SharedLoraAccumulationProbe(LoraSharedExperts):
         return self.gate_proj.lora_A["default"](x)
 
 
-def _shared_lora_ep_accumulation_worker(rank: int, rendezvous: str, checkpointed: bool, defer_reshard: bool) -> None:
+def _shared_lora_ep_accumulation_worker(rank: int, checkpointed: bool, defer_reshard: bool, endpoint) -> None:
     import torch.distributed as dist
     from torch.distributed._composable.fsdp import fully_shard
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor import Shard
     from torch.utils.checkpoint import checkpoint
 
-    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=_CI_CPU_2.nproc)
     try:
         mesh = init_device_mesh("cpu", (2, 1), mesh_dim_names=("ep", "ep_fsdp"))
         experts = _SharedLoraAccumulationProbe(ToyExperts(), r=RANK, lora_alpha=8)
@@ -148,7 +154,7 @@ def _shared_lora_ep_accumulation_worker(rank: int, rendezvous: str, checkpointed
         optimizer = torch.optim.SGD([weight], lr=0.1)
         state = SimpleNamespace(ep_enabled=True, ep_group=mesh["ep"].get_group())
         forward_checks = []
-        with mock.patch("veomni.distributed.parallel_state.get_parallel_state", return_value=state):
+        with mock.patch("veomni.lora.moe_layers.get_parallel_state", return_value=state):
             # Two microbatches share one optimizer step. Each rank contributes
             # (rank + 1) and 2 * (rank + 1), so the global gradient is 9.
             for micro in (1, 2):
@@ -174,13 +180,14 @@ def _shared_lora_ep_accumulation_worker(rank: int, rendezvous: str, checkpointed
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
 @pytest.mark.parametrize("checkpointed", [False, True])
 @pytest.mark.parametrize("defer_reshard", [False, True])
-def test_shared_lora_ep_gradient_accumulation(tmp_path, checkpointed, defer_reshard):
-    torch.multiprocessing.spawn(
+def test_shared_lora_ep_gradient_accumulation(checkpointed, defer_reshard):
+    spawn_with_rendezvous(
         _shared_lora_ep_accumulation_worker,
-        args=(str(tmp_path / "rendezvous"), checkpointed, defer_reshard),
-        nprocs=2,
+        args=(checkpointed, defer_reshard),
+        nprocs=_CI_CPU_2.nproc,
     )
 
 
