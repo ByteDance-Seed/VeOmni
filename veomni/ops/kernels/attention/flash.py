@@ -244,8 +244,14 @@ def flash_attention_forward(
     if is_causal is None:
         is_causal = module.is_causal
 
+    # ``skip_ulysses`` covers two cases. Tokens that are not on the SP mesh skip the
+    # ring too. A caller that already ran the Ulysses exchange itself (the Qwen3-VL
+    # async Ulysses projections) still holds a cp-sharded sequence, so it passes
+    # ``ulysses_pre_gathered=True`` to keep the ring over the cp group.
+    ulysses_pre_gathered = kwargs.pop("ulysses_pre_gathered", False)
     cp_state = get_parallel_state()
-    if getattr(cp_state, "cp_enabled", False) and not skip_ulysses:
+    use_ring = getattr(cp_state, "cp_enabled", False) and (not skip_ulysses or ulysses_pre_gathered)
+    if use_ring:
         if cp_state.cp_layout != "zigzag":
             raise NotImplementedError("USP flash attention requires cp_layout='zigzag'.")
         # Causal attention runs the zig-zag ring (text); bidirectional attention runs the
@@ -347,8 +353,7 @@ def flash_attention_forward(
     # causal attention. Both dense and packed (varlen) sequences are supported:
     # packed documents take the ``zigzag_ring_flash_attn_varlen_func`` path with
     # per-document LOCAL cu_seqlens derived from the FULL ``cu_seq_lens_q``.
-    cp_state = get_parallel_state()
-    if getattr(cp_state, "cp_enabled", False) and not skip_ulysses:
+    if use_ring:
         if target_dtype is not None:
             query, key, value = (tensor.to(target_dtype) for tensor in (query, key, value))
         from ....distributed.sequence_parallel.ring_attention import ring_attention

@@ -298,6 +298,11 @@ def _qwen3_vl_async_ulysses_attention_forward(
 
     query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
 
+    # The fused all-to-all above replaced only the Ulysses exchange: under USP the
+    # sequence is still sharded across cp, so attention must keep the ring.
+    if get_parallel_state().cp_enabled:
+        kwargs["ulysses_pre_gathered"] = True
+
     attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
         self.config._attn_implementation, eager_attention_forward
     )

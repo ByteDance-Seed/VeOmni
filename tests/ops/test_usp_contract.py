@@ -137,3 +137,40 @@ def test_npu_usp_model_gate(monkeypatch):
     auto.check_context_parallel_supported(SimpleNamespace(model_type="qwen3"), "veomni_flash_attention_2_with_sp")
     with pytest.raises(NotImplementedError, match="Ascend USP"):
         auto.check_context_parallel_supported(SimpleNamespace(model_type="qwen3"), "veomni_flash_attention_4_with_sp")
+
+
+@pytest.mark.parametrize("pre_gathered", [False, True])
+def test_skip_ulysses_keeps_ring_only_when_pre_gathered(monkeypatch, pre_gathered):
+    import veomni.distributed.sequence_parallel.ring_attention as ring_module
+
+    state = SimpleNamespace(
+        cp_enabled=True,
+        cp_layout="zigzag",
+        ulysses_enabled=True,
+        device_type="npu",
+        cp_group=None,
+        cp_size=2,
+        ulysses_size=2,
+    )
+    monkeypatch.setattr(flash, "get_parallel_state", lambda: state)
+    calls = []
+
+    def fake_ring(query, *args, **kwargs):
+        calls.append("ring")
+        return query
+
+    def fake_flash(query, *args, **kwargs):
+        calls.append("flash")
+        assert "ulysses_pre_gathered" not in kwargs
+        return query
+
+    monkeypatch.setattr(ring_module, "ring_attention", fake_ring)
+    monkeypatch.setattr(flash, "_flash_attention_forward", fake_flash)
+    module = SimpleNamespace(
+        config=SimpleNamespace(_attn_implementation="veomni_flash_attention_2_with_sp"), is_causal=True
+    )
+    q = torch.zeros(1, 2, 8, 4, dtype=torch.bfloat16)
+    kwargs = {"ulysses_pre_gathered": True} if pre_gathered else {}
+    flash.flash_attention_forward(module, q, q, q, None, skip_ulysses=True, **kwargs)
+    # Tokens off the SP mesh skip the ring; a pre-gathered Ulysses caller keeps it.
+    assert calls == (["ring"] if pre_gathered else ["flash"])
