@@ -398,8 +398,13 @@ def _conversation_total_length(conversation_list: Any) -> int:
             total += _sum_sequence_like(meta["attention_mask"])
             continue
         value = getattr(item, "value", None)
-        if isinstance(value, (torch.Tensor, np.ndarray, list, tuple)) and getattr(item, "type", None) == "text":
-            total += _numel_sequence_like(value)
+        if getattr(item, "type", None) == "text":
+            if isinstance(value, (torch.Tensor, np.ndarray, list, tuple)):
+                total += _numel_sequence_like(value)
+            elif isinstance(value, str):
+                total += len(value)
+    if total == 0 and conversation_list:
+        return len(conversation_list)
     return total
 
 
@@ -427,6 +432,8 @@ def _conversation_effective_length(conversation_list: Any) -> int:
                     total += int(token_len)
                 elif isinstance(getattr(item, "value", None), (torch.Tensor, np.ndarray, list, tuple)):
                     total += _numel_sequence_like(item.value)
+                elif isinstance(getattr(item, "value", None), str):
+                    total += len(item.value)
         elif item_role == "assistant":
             token_len = meta.get(_OMNI_TOKEN_LEN_KEY)
             if token_len is not None:
@@ -447,13 +454,23 @@ def get_length_fn(sample: Any) -> int:
     if not isinstance(sample, dict):
         return 1
 
-    if "conversation_list" in sample:
-        return _conversation_total_length(sample["conversation_list"])
     if "attention_mask" in sample:
         return _sum_sequence_like(sample["attention_mask"])
     if "input_ids" in sample:
         return _numel_sequence_like(sample["input_ids"])
+    if "conversation_list" in sample:
+        return _conversation_total_length(sample["conversation_list"])
     return 1
+
+
+def _count_supervised_labels(labels: Any) -> int | None:
+    if isinstance(labels, torch.Tensor):
+        return int((labels != IGNORE_INDEX).sum().item())
+    if isinstance(labels, np.ndarray):
+        return int((labels != IGNORE_INDEX).sum())
+    if isinstance(labels, list):
+        return sum(1 for label in labels if label != IGNORE_INDEX)
+    return None
 
 
 def get_length_by_labels_fn(sample: Any) -> int:
@@ -473,17 +490,13 @@ def get_length_by_labels_fn(sample: Any) -> int:
     if not isinstance(sample, dict):
         return 1
 
+    if "labels" in sample:
+        counted = _count_supervised_labels(sample["labels"])
+        if counted is not None:
+            return counted
+
     if "conversation_list" in sample:
         return _conversation_effective_length(sample["conversation_list"])
-
-    if "labels" in sample:
-        labels = sample["labels"]
-        if isinstance(labels, torch.Tensor):
-            return int((labels != IGNORE_INDEX).sum().item())
-        if isinstance(labels, np.ndarray):
-            return int((labels != IGNORE_INDEX).sum())
-        if isinstance(labels, list):
-            return sum(1 for label in labels if label != IGNORE_INDEX)
 
     return get_length_fn(sample)
 
@@ -833,25 +846,7 @@ class WeightedMultiSourceDataset(IterableDataset):
         Returns:
             Estimated token length as a float.
         """
-        if sample is None:
-            return 0
-        if isinstance(sample, list):
-            return float(sum(self._default_sample_token_len(item) for item in sample))
-        if not isinstance(sample, dict):
-            return 1.0
-        if "attention_mask" in sample:
-            attention_mask = sample["attention_mask"]
-            if isinstance(attention_mask, torch.Tensor):
-                return float(attention_mask.sum().item())
-            if isinstance(attention_mask, list):
-                return float(sum(attention_mask))
-        if "input_ids" in sample:
-            input_ids = sample["input_ids"]
-            if isinstance(input_ids, torch.Tensor):
-                return float(input_ids.numel())
-            if isinstance(input_ids, list):
-                return float(len(input_ids))
-        return 1.0
+        return float(get_length_fn(sample))
 
     def state_dict(self) -> dict:
         """Return a checkpointable state dict for this dataset."""
@@ -1389,14 +1384,14 @@ class DynamicBatchingSizeDataset(IterableDataset):
             physical_length = item[2] if len(item) > 2 else length
 
             if length + seq_length > self.micro_batch_seq_length:
-                if seq_length > 0:
+                if micro_batch:
                     continue
                 elif not self.force_generate_long_sequence:
                     # Usually it is impossible to reach this branch because too long samples would not be added to the buffer if force_generate_long_sequence is False.
                     continue
 
             if self.physical_token_cap is not None and physical_length + physical_seq_length > self.physical_token_cap:
-                if seq_length > 0:
+                if micro_batch:
                     continue
                 logger.warning(
                     f"Sample physical length {physical_length} exceeds physical token cap {self.physical_token_cap}; emitting it alone."
@@ -1903,7 +1898,7 @@ def build_weighted_multisource_dataset(
             train_path=source,
             seed=seed,
             transform=transform,
-            source_name=source_names[idx],
+            source_name=source_names[idx] if source_names is not None else None,
             split_by_node=split_by_node,
             shuffle=shuffle,
             dataset_repeat=bool(kwargs.get("dataset_repeat", False)),

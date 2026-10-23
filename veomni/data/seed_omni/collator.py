@@ -24,7 +24,7 @@ class SeedOmniCollator(DataCollator):
 
     Pairs with ``data_type: seedomni`` (see
     ``veomni/data/seed_omni/seedomni_transform.py``) which emits
-    per-sample ``{"conversation_list": [ConversationItem, ...]}`` after running
+    preprocessed per-sample ``{"conversation_list": [ConversationItem, ...]}`` after running
     each module's CPU preprocessor in ``data_transform``.
     This collator turns ``N`` such dicts into a single batched dict
     ``{"conversation_list": [[ConversationItem, ...], ...]}`` plus any extra
@@ -33,8 +33,11 @@ class SeedOmniCollator(DataCollator):
     No stacking, no padding, no sequence-parallel slicing — the SeedOmni design
     contract puts all of that inside model modules' ``pre_forward``,
     where each module knows which fields it owns and how to slice them.
-    The data layer's job stops at "list of per-sample dicts → dict of
-    per-sample lists".
+    Per-module CPU input preparation (chat template, tokenization, image/video
+    patchification, per-sample dummy anchors, and ``_omni_token_len`` metadata)
+    runs earlier in ``seedomni_transform`` via :class:`~veomni.models.seed_omni.processing_omni.OmniProcessor`,
+    so dynamic batching (``dyn_bsz``) can measure each sample's total and
+    effective token lengths before collation.
 
     The collator is intentionally **agnostic** about the exact set of
     keys present: any sample-level key is gathered into a list of length
@@ -52,8 +55,8 @@ class SeedOmniCollator(DataCollator):
 
         collator = SeedOmniCollator()
         batch = collator([
-            {"conversation_list": [{"type": "text", "value": <Tensor>, ...}]},
-            {"conversation_list": [{"type": "image", "value": <Tensor>, ...}]},
+            {"conversation_list": [ConversationItem(type="text", value=<Tensor>, ...)]},
+            {"conversation_list": [ConversationItem(type="image", value=<Tensor>, ...)]},
         ])
         # batch == {"conversation_list": [[ConversationItem(...)], ...]}
     """

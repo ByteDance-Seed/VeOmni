@@ -725,7 +725,16 @@ class ProfilerWithMem:
     def _set_recording(self, enabled: bool) -> None:
         if enabled == self._recording:
             return
-        get_torch_device().memory._record_memory_history(enabled="all" if enabled else None)
+        memory = get_torch_device().memory
+        if enabled and get_device_type() == "cuda":
+            try:
+                # Keep stacks for live allocations; recording every free traceback
+                # can crash profiler-enabled training during activation recomputation.
+                memory._record_memory_history(enabled="all", context="state")
+            except TypeError:
+                memory._record_memory_history(enabled="all")
+        else:
+            memory._record_memory_history(enabled="all" if enabled else None)
         self._recording = enabled
 
     def _follow_schedule(self) -> None:

@@ -193,6 +193,10 @@ def _materialize_and_load_weights(
         # Random init is unnecessary when the checkpoint will overwrite every parameter.
         if not should_skip_hf_weight_load:
             model.init_weights()
+        if fqn_to_index_mapping is not None:
+            from veomni.models.checkpoint.convert import prepare_fqn_to_index_mapping_for_model
+
+            prepare_fqn_to_index_mapping_for_model(model, fqn_to_index_mapping)
         return
 
     from torch.distributed.tensor import distribute_tensor

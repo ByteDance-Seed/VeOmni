@@ -16,6 +16,7 @@ import torch
 import yaml
 from transformers import PretrainedConfig
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni.configuration_omni import (
     DEFAULT_GENERATION_GRAPH_FILE,
     DEFAULT_TRAINING_GRAPH_FILE,
@@ -27,6 +28,9 @@ from veomni.models.seed_omni.modules.fake_model.fake_module_a.configuration impo
 from veomni.models.seed_omni.modules.fake_model.fake_module_a.modeling import FakeModuleA
 from veomni.models.seed_omni.modules.fake_model.fake_module_b.configuration import FakeModuleBConfig
 from veomni.models.seed_omni.modules.fake_model.fake_module_b.modeling import FakeModuleB
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 FAKE_A = "fake_module_a"

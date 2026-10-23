@@ -92,7 +92,7 @@ step is therefore only the cursor, and its manifest
 `train.checkpoint.load_path: auto` finds it like any other step. Give the
 encoding run and the training run separate `train.checkpoint.output_dir`s:
 `auto` resumes the newest complete step in the directory, and
-[`OmniTrainer.load`](../../../veomni/trainer/omni/omni_trainer.py#L394) refuses a
+[`OmniTrainer.load`](../../../veomni/trainer/omni/omni_trainer.py#L398) refuses a
 step whose manifest disagrees with the run on carrying model state. A resume of that
 task restores the dataloader cursor and the cache writer's position together,
 both through `GlobalStateCallback`:
@@ -285,7 +285,7 @@ The result:
   because `online_process` still runs every step.
 
 The pieces that complete this workflow are in place:
-[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L568)
+[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L572)
 runs the encoding run, and
 [`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L181)
 persists each conversation of the `conversation_list` that
@@ -313,7 +313,7 @@ Ranks that share a `dp_rank` (SP, CP or
 TP peers) hold the same batch, so
 [only the first of them writes](../../../veomni/models/seed_omni/utils/offline_cache.py#L36).
 The training run reads the cache through the
-[`seedomni_cached`](../../../veomni/data/seed_omni/seedomni_transform.py#L246)
+[`seedomni_cached`](../../../veomni/data/seed_omni/seedomni_transform.py#L254)
 data transform. It unpickles each row, so point `data.train_path` only at a
 cache you trust. See the
 [Bagel offline VAE cache](../models/bagel.md#32-offline-vae-posterior-cache-two-stages)

@@ -44,7 +44,6 @@ import numpy as np
 import pytest
 import torch
 from tools import resolve_ops_overrides
-from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
 from utils import (
     FakeModelRuntime,
@@ -58,6 +57,7 @@ from utils import (
     setup_test_distributed,
 )
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
 from veomni.data.data_collator import MainCollator
@@ -73,6 +73,9 @@ from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks import Callback, EnvironMeterCallback, TrainerState
 from veomni.utils import helper
 from veomni.utils.constants import IGNORE_INDEX
+
+
+_CI_LAUNCH = LaunchSpec(nproc=2)
 
 
 logger = helper.create_logger(__name__)
@@ -538,6 +541,45 @@ def test_dynamic_batching_size_dataset_effective_mode_honors_physical_cap():
     assert [sum(sample["attention_mask"].sum().item() for sample in batch) for batch in micro_batches] == [6, 8]
 
 
+def test_zero_effective_length_first_sample_still_enforces_physical_cap():
+    samples = [
+        _make_sample(token_id=1, total_tokens=6, effective_tokens=0),
+        _make_sample(token_id=2, total_tokens=6, effective_tokens=2),
+        _make_sample(token_id=3, total_tokens=2, effective_tokens=2),
+    ]
+
+    strategy = TextBatchingStrategy(
+        token_micro_bsz=4,
+        buffer_size=1,
+        get_length_fn=get_length_by_labels_fn,
+        physical_token_cap=8,
+        get_physical_length_fn=get_length_fn,
+    )
+    for sample in samples:
+        strategy.put_item(sample)
+    micro_batch = strategy.get_micro_batch(step=0)
+    assert [sample["input_ids"][0].item() for sample in micro_batch] == [1, 3]
+    assert sum(sample["attention_mask"].sum().item() for sample in micro_batch) == 8
+
+    class ZeroEffectiveFirstDataset(IterableDataset):
+        def __iter__(self):
+            yield from samples
+
+    dynamic_ds = DynamicBatchingSizeDataset(
+        dataset=ZeroEffectiveFirstDataset(),
+        micro_batch_seq_length=4,
+        ready_for_micro_batch_threshold=1,
+        dynamic_batching_collate_fn=lambda batch_samples: batch_samples,
+        get_length_fn=get_length_by_labels_fn,
+        physical_token_cap=8,
+        get_physical_length_fn=get_length_fn,
+        save_by_idx=False,
+    )
+    micro_batches = list(dynamic_ds)
+    assert [[sample["input_ids"][0].item() for sample in batch] for batch in micro_batches] == [[1], [2, 3]]
+    assert [sum(sample["attention_mask"].sum().item() for sample in batch) for batch in micro_batches] == [6, 8]
+
+
 @pytest.mark.parametrize("save_by_idx", [False, True])
 def test_save_load_state_dict(save_by_idx):
     """Unit test for DynamicBatchingSizeDataset state_dict and load_state_dict.
@@ -597,6 +639,7 @@ def test_save_load_state_dict(save_by_idx):
     logger.info(f"test_save_load_state_dict (save_by_idx={save_by_idx}) passed!")
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.parametrize(
     "dataset_type,shuffle,save_by_idx,multi_sample_per_iteration",
     [
@@ -651,13 +694,12 @@ def build_command(dataset_type="iterable", shuffle=True, save_by_idx=True, multi
     Returns:
         list: Command arguments for subprocess.run().
     """
-    port = find_free_port()
 
     command = [
         "torchrun",
         "--nnodes=1",
-        "--nproc_per_node=2",
-        f"--master_port={port}",
+        f"--nproc_per_node={_CI_LAUNCH.nproc}",
+        "--standalone",
         "tests/data/test_dynamic_batching_dataset.py",
         "--model.config_path=test",
         "--data.train_path=None",

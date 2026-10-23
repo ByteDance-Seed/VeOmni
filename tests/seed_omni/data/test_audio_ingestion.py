@@ -23,10 +23,14 @@ import numpy as np
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.seed_omni.preprocess import SEED_OMNI_PREPROCESSOR_REGISTRY, conv_preprocess
 from veomni.data.seed_omni.seedomni_transform import process_seedomni_example
 from veomni.data.seed_omni.utils import audio as audio_utils
 from veomni.data.seed_omni.utils.audio import AUDIO_METADATA_KEY, AudioMetadata, load_audio
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _wav_bytes(seconds: float, rate: int, channels: int = 1) -> bytes:

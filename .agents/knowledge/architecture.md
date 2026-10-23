@@ -110,6 +110,10 @@ veomni/
 └── utils/              Shared utilities (logging, device, constants, helpers)
 ```
 
+### FlexAttention package
+
+Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__.py` owns dispatch/Ulysses, `_inputs.py` owns input handling, `_fa4.py` owns compiled execution, and `_fa4_sm90_compat.py` owns the pinned bounds shim. The mask builder remains in `attention/mask/flex.py`.
+
 ## Trainer Hierarchy
 
 A training job splits in two. `VeOmniModelRuntime` (`veomni/models/model_runtime.py`) owns everything bound to *one* model; `BaseTrainer` *holds* one as `trainer.model` and adds everything bound to the *job*, of which there is exactly one. A single-model job is one runtime inside one trainer; a composed omni model is many runtimes under one orchestrator, which is why the trainer composes the runtime rather than inheriting it — `OmniTrainer` holds several and could not inherit them all.
@@ -462,6 +466,7 @@ configs/
 
 ```
 tests/
+├── ci/              CPU tests for CI planning, scheduling and launch validation
 ├── models/  Kernel-aware model loading, integration, and helper tests
 ├── ops/            Op registry contracts and per-family kernel tests
 ├── arguments/      Argument parsing and ops_implementation alias tests
@@ -504,13 +509,14 @@ tests/
 Distributed tests (`tests/parallel/`, `tests/distributed/`, `tests/e2e/`) may require multiple GPUs and use `torchrun` or `tests/tools/launch_utils.py`.
 
 **A passing local run does not mean CI runs it.**
-`.github/workflows/gpu_unit_tests.yml` and `npu_unit_tests.yml` enumerate most
-test files one by one. Only `tests/data` runs as a whole directory in both
-workflows; `tests/ops` and `tests/parallel/context_parallel` run wholesale on
-GPU only (the NPU job enumerates three named ops files). The e2e paths belong
-to `gpu_e2e_test.yml` / `npu_e2e_test.yml` instead. A new file anywhere else is
-invisible to CI until it is added to the workflow that owns its path, usually
-both unit workflows. See `.agents/knowledge/testing.md` before adding a test.
+`scripts/ci/accelerator/suites/gpu.json` and `suites/npu.json` enumerate unit/e2e selections.
+Both manifests collect `tests/ci`, `tests/data`, `tests/checkpoints`, `tests/models`, and
+`tests/ops` as whole directories; GPU also collects
+`tests/parallel/context_parallel`. Files outside directory selections need an
+entry in the appropriate suite manifest. Both accelerator backends use
+`scripts/ci/accelerator/runner.py`; launch plans reuse each case's actual
+`nproc/world_size` configuration. Do not add manual device quotas or per-file
+pytest workflow lines. See `.agents/knowledge/testing.md` before adding a test.
 
 ## Key Entry Points
 

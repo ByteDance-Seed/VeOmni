@@ -51,13 +51,22 @@ modules/<family>/<submodule>/
 - Use `@pre_forward("<method>")` and `@post_forward("<method>")` when one module
   has multiple graph call-sites.
 - Losses go out as one `_loss` dict per call-site, `{loss_name: scalar}`, with each
-  name ending in `_loss` (`ce_loss`, `mtp_loss`, …) and each value already reduced.
+  name ending in `_loss` (`ce_loss`, `mtp_loss`, …) and each value already reduced
+  (decode losses reduce over `ps.fsdp_group`; see constraint 2 in
+  `.agents/knowledge/veomni-seed-omni.md`).
   They log as `{module}.{method}.{loss_name}`; the training loss is their sum.
 - Module outputs should flow by mutating/returning `conversation_list` unless
   the current source file explicitly uses another supported carrier (Janus
   packed training writes `packed_*` tensors on the batch dict).
-- Tokenizers and processors are module-owned assets.
-- Do not add a top-level tokenizer path.
+- Tokenizers and processors are module-owned assets (`get_assets()` /
+  `attach_module_assets`). Do not add a top-level tokenizer path.
+- In training, every active node runs on every micro-batch: use per-sample
+  CPU-preprocessor dummies (with `_OMNI_TOKEN_LEN` set in `item.meta` so
+  `dyn_bsz` counts physical and effective tokens accurately) or `dummy_inputs()`
+  + a `0.0` anchor when a modality is absent.
+- For shared stateless carrier helpers called by both `modeling.py` and
+  `accelerated/accelerated.py`, define plain module-level functions in
+  `modeling.py` (or reuse `modules/base/llm_packing.py`).
 
 ## IDE type stubs (`accelerated/accelerated.py`)
 

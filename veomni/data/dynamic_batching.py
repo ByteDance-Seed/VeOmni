@@ -66,7 +66,7 @@ class DynBszBuffer:
         self._buffer.append(item)
         if self._get_length_fn is not None:
             length = self._get_length_fn(item)
-        elif "conversation_list" in item:
+        elif ("conversation_list" in item or "input_ids" in item) and "attention_mask" not in item:
             length = get_length_fn(item)
         else:
             if "attention_mask" not in item:
@@ -102,7 +102,7 @@ class DynBszBuffer:
             fits_physical_cap = physical_token_cap is None or (
                 physical_seq_len <= physical_token_cap - cum_physical_len
             )
-            first_forced_sample = force is True and cum_seq_len == 0
+            first_forced_sample = force is True and not samples
             if self.cur_idx not in self.del_idxs and (
                 first_forced_sample or (fits_effective_budget and fits_physical_cap)
             ):
@@ -215,7 +215,12 @@ class TextBatchingStrategy(BaseBatchingStrategy):
         if "input_ids" in item and item["input_ids"].shape[-1] <= 1:
             print("WARNING: EMPTY STRING.")
             return
-        if "conversation_list" in item and get_length_fn(item) <= 1:
+        if (
+            "conversation_list" in item
+            and not item["conversation_list"]
+            and "attention_mask" not in item
+            and "input_ids" not in item
+        ):
             print("WARNING: EMPTY STRING.")
             return
         self.buffer.append(item)

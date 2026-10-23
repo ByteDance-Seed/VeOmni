@@ -19,8 +19,8 @@ raw data transforms, or request preprocessing.
 3. Module `pre_forward` becomes thin:
    - Select items by `type`, `role`, and `meta` tags.
    - Stack/move prepared CPU tensors to the module device.
-5. Module forward/modeling runs GPU work and returns a dict.
-6. `post_forward` scatters outputs back to carrier items and returns
+4. Module forward/modeling runs GPU work and returns a dict.
+5. `post_forward` scatters outputs back to carrier items and returns
    `{"conversation_list": conversation}` and/or a `_loss` dict of scalar
    `*_loss` values.
 
@@ -36,7 +36,8 @@ vision tower.
 
 ## Preprocessor Contract
 
-`ModulePreprocessorBase` lives in `veomni/models/seed_omni/modules/module_processing_base.py`.
+`ModulePreprocessorBase` lives in `veomni/models/seed_omni/modules/module_processing_base.py`
+(see `docs/seed_omni/mixins/module_preprocessor.md`).
 
 Rules:
 

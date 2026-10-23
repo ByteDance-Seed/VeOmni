@@ -25,9 +25,13 @@ from torch import Tensor
 from transformers.loss.loss_utils import fixed_cross_entropy
 
 import veomni.models.loss_utils.cross_entropy_loss as loss_utils
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 from veomni.ops import VeomniOp
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 IGNORE_INDEX = -100

@@ -9,7 +9,13 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.omni_arguments_types import _resolve_model_path
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _resolved(root: str, module_path: str) -> str:

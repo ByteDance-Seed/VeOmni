@@ -207,8 +207,8 @@ dynamic batching and `SeedOmniCollator`):
 
 ```python
 ConversationItem(
-    type="text" | "image",
-    value=torch.Tensor,  # token_ids for text; normalized patches/pixels for images
+    type="text" | "image" | "video" | "audio",
+    value=torch.Tensor,  # token_ids for text; normalized patches/pixels/waveforms for media
     role="user" | "assistant",  # no system row; fold that text into a turn
     is_dummy=False | True,  # per-sample FSDP anchor injected when a modality is absent
     meta={

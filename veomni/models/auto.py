@@ -65,6 +65,7 @@ CONTEXT_PARALLEL_MODEL_TYPES = frozenset(
         "deepseek_v41_llm",
         "deepseek_v41_ngram",
         "deepseek_v41_text_encoder",
+        "qwen4_exp",
     }
 )
 
@@ -76,6 +77,8 @@ _VEOMNI_SP_ATTN = (
     "veomni_flash_attention_3",
     "veomni_flash_attention_3_hub",
     "veomni_flash_attention_4",
+    "veomni_sage_attention",
+    "veomni_sdpa",
 )
 
 
@@ -120,7 +123,7 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     model_type = getattr(config, "model_type", None)
     if model_type in CONTEXT_PARALLEL_MODEL_TYPES:
         state = get_parallel_state()
-        if state.ulysses_enabled:
+        if getattr(state, "ulysses_enabled", False):
             raise NotImplementedError(
                 f"Context parallelism cannot be combined with Ulysses for model type {model_type!r} yet; "
                 f"got cp_size={state.cp_size} with ulysses_size={state.ulysses_size}. "

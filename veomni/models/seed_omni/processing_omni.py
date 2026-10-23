@@ -96,7 +96,7 @@ class OmniProcessor:
         self.model.module_runtimes.items()}``), so it is already the exact
         config the live model was built with, overrides included. Call once,
         right after the training model finishes building
-        (:meth:`~veomni.trainer.omni.omni_trainer.OmniTrainer._build_collate_fn`
+        (:meth:`~veomni.trainer.omni.omni_trainer.OmniTrainer._build_data_transform`
         runs after ``_build_model_runtime``). Unnecessary for pure inference
         (``OmniInferencer``): the dummy branch is never exercised there.
         """
@@ -232,15 +232,15 @@ class OmniProcessor:
         inference: bool = False,
         **generation_kwargs: Any,
     ) -> None:
-        """Run the module preprocessor chain over a collated batch.
+        """Run the module preprocessor chain over a batch.
 
         ``batch`` must contain ``conversation_list`` as
-        ``list[list[ConversationItem]]``. Training collator passes the full
-        feature dict; :meth:`preprocess` builds ``{"conversation_list": [conversation]}``.
-        Packed Janus writes extra tensors onto this same dict.
+        ``list[list[ConversationItem]]``. :meth:`preprocess` builds
+        ``{"conversation_list": [conversation]}`` for per-sample dataset
+        transforms and single-request inference.
 
-        Training passes ``inference=False`` (default); single-request inference
-        uses :meth:`preprocess` / :meth:`__call__` with ``inference=True``.
+        Training uses ``inference=False`` (default); single-request inference
+        uses :meth:`__call__` with ``inference=True``.
         """
         for preprocessor in self._preprocessors.values():
             preprocessor(
