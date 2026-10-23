@@ -50,7 +50,6 @@ from transformers.modeling_outputs import (
     BaseModelOutputWithPooling,
     MoeModelOutputWithPast,
 )
-from transformers.modeling_utils import is_flash_attention_requested
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     BaseModelOutputWithDeepstackFeatures,
     Qwen3OmniMoeThinkerForConditionalGeneration,
@@ -68,7 +67,6 @@ from veomni.distributed.sequence_parallel import (
 )
 from veomni.distributed.sequence_parallel.ulysses import _Gather
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
@@ -110,7 +108,6 @@ config.add_import(
     ],
 )
 config.add_import("veomni.distributed.sequence_parallel.ulysses", names=["_Gather"])
-config.add_import("veomni.models.utils.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
@@ -621,11 +618,9 @@ def qwen3_omni_moe_get_rope_index_patched(
 
 # ================================================================
 # Patch: Qwen3OmniMoeVisionAttention.forward
-# 1. [SP] Dispatch via VARLEN_ATTENTION_TYPES (covers veomni_flash_attention_*
-#    custom names) instead of v5 upstream `is_flash_attention_requested`,
-#    which only recognizes HF built-in flash attention names. Without this
-#    dispatch the SP-appended cu_seqlens-padding entry would run through the
-#    non-varlen split branch and size-mismatch.
+# 1. Always route through the instance-local `self.veomni_attn` with packed
+#    `cu_seq_lens_q/k` metadata; non-FlashAttention backends split per segment
+#    inside the attention op wrapper (after any Ulysses all-to-all).
 # ================================================================
 @config.modify_init("Qwen3OmniMoeVisionAttention", description="Bind instance-local rope and attention VeomniOps")
 def qwen3_omni_moe_vision_attention_bind_ops(original_init, self, *args, **kwargs):
@@ -636,7 +631,7 @@ def qwen3_omni_moe_vision_attention_bind_ops(original_init, self, *args, **kwarg
 
 @config.override_method(
     "Qwen3OmniMoeVisionAttention.forward",
-    description="Route through VARLEN_ATTENTION_TYPES so veomni_flash_attention_* with cu_seqlens works",
+    description="Route packed cu_seqlens through the local attention VeomniOp",
 )
 def qwen3_omni_moe_vision_attention_forward_patched(
     self,
@@ -657,45 +652,24 @@ def qwen3_omni_moe_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = self.veomni_attn
-
     # --- Patch.1 ---
-    if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
-        if max_seqlen is None:
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-        attn_output, _ = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask=None,
-            scaling=self.scaling,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            cu_seq_lens_q=cu_seqlens,
-            cu_seq_lens_k=cu_seqlens,
-            max_length_q=max_seqlen,
-            max_length_k=max_seqlen,
-            is_causal=False,
-            **kwargs,
-        )
-    else:
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
-        attn_outputs = [
-            attention_interface(
-                self,
-                q,
-                k,
-                v,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                is_causal=False,
-                **kwargs,
-            )[0]
-            for q, k, v in zip(*splits)
-        ]
-        attn_output = torch.cat(attn_outputs, dim=1)
+    if max_seqlen is None:
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+    attn_output, _ = self.veomni_attn(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask=None,
+        scaling=self.scaling,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+        max_length_q=max_seqlen,
+        max_length_k=max_seqlen,
+        is_causal=False,
+        **kwargs,
+    )
     # --- Patch.1 ---
 
     attn_output = attn_output.reshape(seq_length, -1).contiguous()
@@ -1892,12 +1866,13 @@ def qwen3_omni_moe_audio_attention_bind_ops(original_init, self, *args, **kwargs
 
 @config.override_method(
     "Qwen3OmniMoeAudioAttention.forward",
-    description="Always call the local attention VeomniOp",
+    description="Route packed cu_seqlens through the local attention VeomniOp",
 )
 def qwen3_omni_moe_audio_attention_forward_patched(
     self,
     hidden_states: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    max_seqlen: int | None = None,
     **kwargs,
 ) -> torch.Tensor:
     seq_length, _ = hidden_states.size()
@@ -1910,43 +1885,23 @@ def qwen3_omni_moe_audio_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = self.veomni_attn
-
-    if is_flash_attention_requested(self.config):
+    if max_seqlen is None:
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-        attn_output, _ = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask=None,
-            scaling=self.scaling,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            cu_seq_lens_q=cu_seqlens,
-            cu_seq_lens_k=cu_seqlens,
-            max_length_q=max_seqlen,
-            max_length_k=max_seqlen,
-            is_causal=False,
-            **kwargs,
-        )
-    else:
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
-        attn_outputs = [
-            attention_interface(
-                self,
-                q,
-                k,
-                v,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                is_causal=False,
-                **kwargs,
-            )[0]
-            for q, k, v in zip(*splits)
-        ]
-        attn_output = torch.cat(attn_outputs, dim=1)
+    attn_output, _ = self.veomni_attn(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask=None,
+        scaling=self.scaling,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+        max_length_q=max_seqlen,
+        max_length_k=max_seqlen,
+        is_causal=False,
+        **kwargs,
+    )
 
     attn_output = attn_output.reshape(seq_length, -1).contiguous()
     attn_output = self.out_proj(attn_output)

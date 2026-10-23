@@ -35,14 +35,15 @@ from the routing table below.
 
 ## Current Baseline
 
-- Entry-time samples use `{"conversation_list": [...]}`. The SeedOmni collator
-  groups samples and runs ordered module CPU preprocessors before GPU forward.
+- Entry-time samples use `{"conversation_list": [...]}`. `seedomni_transform`
+  runs ordered module CPU preprocessors (`OmniProcessor`) per sample in the
+  Dataset stage, and `SeedOmniCollator` groups preprocessed samples into a
+  micro-batch before GPU forward.
 - `ModulePreprocessorBase` is a core data-flow contract, shared by training and
-  inference. Training runs it inside `SeedOmniCollator`; inference runs it once
-  before the FSM.
+  inference. Training runs it inside `data_transform` (`seedomni_transform`);
+  inference runs it once before the FSM.
 - Modules communicate by mutating and returning the shared `conversation_list`
-  carrier (or, in Janus / Qwen3-VL packed training, by writing packed tensors
-  onto the collator `batch` dict and scattering embeddings in `pack_*` nodes).
+  carrier.
 - Training graphs are flat edge lists over `module[.method]` endpoints.
   `to: end` is the virtual sink. Execution order is derived by topo sort.
 - Generation graphs are FSMs. Each state body is an ordered inline edge list.

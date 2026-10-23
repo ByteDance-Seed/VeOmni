@@ -38,7 +38,22 @@ from ...platform import (
     NvidiaGpuPlatform,
 )
 from ...registry import register_op
-from .helper import strip_sdpa_packed_metadata
+from .helper import (
+    extract_packed_varlen_cu_seqlens,
+    packed_split_attention_forward,
+)
+from .ulysses import should_apply_ulysses
+
+
+_RAW_NON_SP_IMPLS = frozenset(
+    {
+        "eager",
+        "sdpa",
+        "flash_attention_2",
+        "flash_attention_3",
+        "flash_attention_4",
+    }
+)
 
 
 def _module_eager_forward(module: torch.nn.Module) -> Callable | None:
@@ -71,8 +86,22 @@ def lookup(impl: str) -> Callable:
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Dispatch one attention call through the selected Transformers interface."""
-        if impl == "sdpa":
-            kwargs = strip_sdpa_packed_metadata(kwargs, batch_size=query.shape[0], dense_mask=attention_mask)
+        if impl in _RAW_NON_SP_IMPLS:
+            skip_ulysses = bool(kwargs.pop("skip_ulysses", False))
+            if kwargs.get("dsa_position_ids") is None and should_apply_ulysses(skip_ulysses=skip_ulysses):
+                raise ValueError(
+                    f"Attention implementation {impl!r} does not perform Ulysses sequence-parallel exchanges; "
+                    "use a 'veomni_*' attention implementation (such as 'veomni_sdpa') or pass skip_ulysses=True "
+                    "when Q/K/V are already gathered."
+                )
+
+        packed_cu_seqlens = None
+        if impl in ("sdpa", "eager"):
+            kwargs, packed_cu_seqlens = extract_packed_varlen_cu_seqlens(
+                kwargs,
+                batch_size=query.shape[0],
+                attention_mask=attention_mask,
+            )
 
         eager_default = _module_eager_forward(module)
         forward = ALL_ATTENTION_FUNCTIONS.get_interface(impl, eager_default)
@@ -80,6 +109,33 @@ def lookup(impl: str) -> Callable:
             raise KeyError(
                 f"attention impl {impl!r} is not registered and "
                 f"{type(module).__module__} has no eager_attention_forward"
+            )
+
+        if packed_cu_seqlens is not None:
+            if impl == "eager":
+                is_causal = kwargs.get("is_causal")
+                if is_causal is None:
+                    is_causal = bool(getattr(module, "is_causal", False))
+                if is_causal:
+                    raise ValueError(
+                        "Unmasked packed varlen 'eager' attention does not support is_causal=True because "
+                        "Transformers eager_attention_forward requires an explicit causal attention_mask. "
+                        "Build a 4D mask with packed_causal_mask or pass is_causal=False."
+                    )
+            cu_seqlens_q, cu_seqlens_k = packed_cu_seqlens
+            return packed_split_attention_forward(
+                forward,
+                module,
+                query,
+                key,
+                value,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                dropout=dropout,
+                scaling=scaling,
+                sliding_window=sliding_window,
+                softcap=softcap,
+                **kwargs,
             )
 
         return forward(

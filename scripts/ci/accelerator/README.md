@@ -76,9 +76,25 @@ the next dispatch check pauses admission of later accelerator batches until
 the head fits. CPU work has its own concurrency limit. Each batch has an
 isolated working directory and cache. Temporary directories use short paths
 under `/tmp` so DataLoader Unix socket names stay within the platform limit;
-they are cleaned up after the batch, or retained with failure artifacts. Rendezvous ports
-come from the shared launch helpers and a locked registry that prevents
-reuse by pending launches. Visibility is set before importing torch,
+they are cleaned up after the batch, or retained with failure artifacts.
+Distributed spawn helpers create a parent-owned TCPStore on port zero and
+keep it listening through worker execution and cleanup after spawn returns.
+Partial startup failures inside `mp.spawn` rely on the runner's enclosing
+process-scope cleanup. Every rank,
+including rank zero, connects to that Store rather than rebinding a probed
+port. Single-node torchrun commands use `--standalone`; their agents own the
+rendezvous and bootstrap Stores. CI keeps agent Store sharing enabled with
+`TORCH_DISABLE_SHARE_RDZV_TCP_STORE=0`.
+
+The legacy `find_free_port()` registry still prevents duplicate numbers among
+cooperating callers in one run, including default worker environments and
+remaining in-process env:// fixtures. It does not reserve an OS socket or
+coordinate other runs. New distributed launchers must use a live Store or
+standalone agent instead of probing and closing a socket before startup.
+Spawn endpoint ready/closed events include case ID, launch ID, owner PID and
+port in each batch's `.rendezvous.jsonl` artifact. This fixes rendezvous
+allocation races; Gloo/NCCL/HCCL transport sockets have their own lifecycles.
+Visibility is set before importing torch,
 and launch validation checks nproc and child device assignments against the
 case plan and lease. Every distributed launch starts fresh workers.
 
@@ -202,7 +218,7 @@ projection deliberately raises instead of guessing whether to transpose it.
 | `pytest_plugin.py` | Case inventory, launch validation and pytest results |
 | `runtime/devices.py` | GPU/NPU probing and child visibility |
 | `runtime/workers.py` | Workspaces, interruptible thread pools, subprocess timeouts and scoped cleanup |
-| `runtime/ports.py` | Run-scoped rendezvous port allocation |
+| `runtime/ports.py` | Live spawn rendezvous servers and legacy cooperative port allocation |
 | `suites/gpu.json`, `suites/npu.json` | Unit/e2e selections and environment settings |
 
 CPU scheduler tests live in `tests/ci/` and are selected by both manifests.

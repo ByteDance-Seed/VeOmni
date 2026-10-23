@@ -52,6 +52,8 @@ _VEOMNI_SP_ATTN = (
     "veomni_flash_attention_3",
     "veomni_flash_attention_3_hub",
     "veomni_flash_attention_4",
+    "veomni_sage_attention",
+    "veomni_sdpa",
 )
 
 

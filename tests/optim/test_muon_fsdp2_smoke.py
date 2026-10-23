@@ -26,7 +26,6 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
-from tests.tools.launch_utils import find_free_port
 from veomni.arguments.arguments_types import MixedPrecisionConfig
 from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -181,14 +180,14 @@ def _has_devices(n: int) -> bool:
         return False
 
 
-def _torchrun_cmd(nproc: int, port: int, use_zero_comm: bool) -> list[str]:
+def _torchrun_cmd(nproc: int, use_zero_comm: bool) -> list[str]:
     return [
         sys.executable,
         "-m",
         "torch.distributed.run",
         "--nnodes=1",
         f"--nproc_per_node={nproc}",
-        f"--master_port={port}",
+        "--standalone",
         os.path.abspath(__file__),
         f"--zero-comm={int(use_zero_comm)}",
     ]
@@ -197,7 +196,7 @@ def _torchrun_cmd(nproc: int, port: int, use_zero_comm: bool) -> list[str]:
 @pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_smoke_default_backend_4gpu():
-    cmd = _torchrun_cmd(nproc=_CI_LAUNCH.nproc, port=find_free_port(), use_zero_comm=False)
+    cmd = _torchrun_cmd(nproc=_CI_LAUNCH.nproc, use_zero_comm=False)
     env = os.environ.copy()
     env.setdefault("NCCL_DEBUG", "WARN")
     result = subprocess.run(cmd, env=env, check=True)
@@ -207,7 +206,7 @@ def test_smoke_default_backend_4gpu():
 @pytest.mark.launch_plan(provider=_CI_LAUNCH)
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_smoke_zero_comm_backend_4gpu():
-    cmd = _torchrun_cmd(nproc=_CI_LAUNCH.nproc, port=find_free_port(), use_zero_comm=True)
+    cmd = _torchrun_cmd(nproc=_CI_LAUNCH.nproc, use_zero_comm=True)
     env = os.environ.copy()
     env.setdefault("NCCL_DEBUG", "WARN")
     result = subprocess.run(cmd, env=env, check=True)

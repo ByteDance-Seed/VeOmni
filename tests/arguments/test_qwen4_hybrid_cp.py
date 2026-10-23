@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 import veomni.models.auto as auto
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import AcceleratorConfig
 
 
@@ -85,6 +86,7 @@ def _hybrid_mesh_worker(rank, rendezvous):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
 def test_hybrid_real_mesh_matches_contiguous_context_and_vision_layout(tmp_path):
     import torch.multiprocessing as mp
 
