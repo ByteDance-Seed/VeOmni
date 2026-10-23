@@ -52,8 +52,8 @@ def test_coalesced_exchange_exact_forward_backward():
     spawn_with_rendezvous(_worker, args=(4,), nprocs=4)
 
 
-def test_mixed_dtype_is_not_silently_cast():
-    """The model must use its separate-exchange fallback for mixed dtypes."""
+def test_pack_rejects_mixed_projection_dtypes():
+    """The packing helper rejects mixed dtypes without silently casting them."""
     q = torch.ones(1, 2, 4, 8)
     v = torch.ones(1, 2, 8, 4)
     beta = torch.ones(1, 2, 8, dtype=torch.bfloat16)
