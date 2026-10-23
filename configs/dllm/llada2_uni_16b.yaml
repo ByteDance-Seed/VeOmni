@@ -49,6 +49,7 @@ data:
 train:
   global_batch_size: 32
   micro_batch_size: 1
+  dyn_bsz: false
   num_train_epochs: 1
   checkpoint:
     output_dir: LLaDA2.0-Uni-sft

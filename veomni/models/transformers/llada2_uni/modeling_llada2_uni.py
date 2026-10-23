@@ -351,6 +351,11 @@ class LLaDA2UniModel(LLaDA2UniPreTrainedModel):
         # flash kernel on the vision sequence.
         self.visual = GlmImageVisionModel._from_config(config.vision_config, attn_implementation="sdpa")
         self.vqmodel = GlmImageVQVAE._from_config(config.vq_config)
+        # `get_image_tokens` calls `vqmodel.encode` once per image in a loop; keep
+        # `GlmImageVQVAEVectorQuantizer` in the root FSDP unit rather than wrapping it
+        # separately, which would run an all-gather per image and deadlock when ranks
+        # hold different numbers of images.
+        self.vqmodel._no_split_modules = []
         self.visual.requires_grad_(False)
         self.vqmodel.requires_grad_(False)
         self.gradient_checkpointing = False
