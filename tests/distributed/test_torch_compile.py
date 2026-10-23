@@ -48,11 +48,12 @@ def _run_merged_swiglu_compiled_first_case(entrypoint, dtype_name, swiglu_limit)
 
     assert "veomni.ops.kernels.moe_experts.shared._triton_swiglu" not in sys.modules
     torch.manual_seed(31)
+    device = get_device_type()
     dtype = getattr(torch, dtype_name)
     tokens, experts, hidden, intermediate, top_k = 23, 4, 64, 128, 2
 
     if entrypoint == "helper":
-        merged = torch.randn(tokens, 2 * intermediate, device="cuda", dtype=dtype)
+        merged = torch.randn(tokens, 2 * intermediate, device=device, dtype=dtype)
         gate, up = merged.chunk(2, dim=-1)
         gate, up, _, _ = swiglu.apply_swiglu_clamp(gate, up, swiglu_limit)
         gate_before, up_before = gate.clone(), up.clone()
@@ -63,23 +64,23 @@ def _run_merged_swiglu_compiled_first_case(entrypoint, dtype_name, swiglu_limit)
         torch.testing.assert_close(gate, gate_before, rtol=0, atol=0)
         torch.testing.assert_close(up, up_before, rtol=0, atol=0)
     else:
-        x = 0.4 * torch.randn(tokens, hidden, device="cuda", dtype=dtype)
-        w1 = 0.4 * torch.randn(experts, 2 * intermediate, hidden, device="cuda", dtype=dtype)
-        w2 = 0.1 * torch.randn(experts, hidden, intermediate, device="cuda", dtype=dtype)
+        x = 0.4 * torch.randn(tokens, hidden, device=device, dtype=dtype)
+        w1 = 0.4 * torch.randn(experts, 2 * intermediate, hidden, device=device, dtype=dtype)
+        w2 = 0.1 * torch.randn(experts, hidden, intermediate, device=device, dtype=dtype)
         if entrypoint == "ep":
-            cumsum = torch.tensor([6, 12, 18, tokens], device="cuda", dtype=torch.int32)
+            cumsum = torch.tensor([6, 12, 18, tokens], device=device, dtype=torch.int32)
             values = (x, w1, w2)
 
             def forward(hidden_states, fc1, fc2):
                 return EPMergedFc1GroupGemm.apply(hidden_states, cumsum, fc1, fc2, swiglu_limit)
 
         else:
-            logits = torch.randn(tokens, experts, device="cuda", dtype=torch.float32)
+            logits = torch.randn(tokens, experts, device=device, dtype=torch.float32)
             routing, selected = torch.topk(torch.softmax(logits, dim=-1), top_k, dim=-1)
             values = (x, routing.to(dtype), w1, w2)
             if entrypoint == "registry":
                 wrapper = resolve_op("moe_experts", "standard", "fused_triton").wrapper
-                empty = torch.empty(0, device="cuda", dtype=dtype)
+                empty = torch.empty(0, device=device, dtype=dtype)
 
                 def forward(hidden_states, weights, fc1, fc2):
                     return wrapper(
