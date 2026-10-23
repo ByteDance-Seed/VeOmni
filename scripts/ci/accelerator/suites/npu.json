@@ -415,5 +415,23 @@
       "-x",
       "tests/distributed/test_fsdp_equivalence.py"
     ]
+  },
+  {
+    "name": "qwen38-master_fp32_adamw-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_master_fp32_adamw.py"
+    ]
+  },
+  {
+    "name": "qwen38-cpu_offload_adamw-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_cpu_offload_adamw.py"
+    ]
   }
 ]

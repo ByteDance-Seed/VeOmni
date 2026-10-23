@@ -117,6 +117,7 @@ seed_omni/mixins/offline_encoding.md
 :maxdepth: 1
 :caption: Design
 
+design/optimizer_cpu_offload.md
 design/ci_case_scheduling.md
 design/op_selection.md
 design/fused_moe_ops.md

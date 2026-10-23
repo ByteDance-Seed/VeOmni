@@ -53,7 +53,7 @@ def get_model_save_state(
     """
     from contextlib import nullcontext
 
-    from veomni.checkpoint.dcp_checkpointer import ModelState
+    from veomni.checkpoint.dcp_checkpointer import _EXTRA_PARALLEL_LAYOUT_MARKER, ModelState
     from veomni.distributed.parallel_state import use_parallel_state
     from veomni.models.checkpoint import get_checkpoint_tensor_converter
 
@@ -132,6 +132,9 @@ def get_model_save_state(
     # so the original model parameters remain unchanged.
     converted_state = {}
     for k, v in save_state.items():
+        # This versions DCP placement metadata, not a HuggingFace model tensor.
+        if k == _EXTRA_PARALLEL_LAYOUT_MARKER:
+            continue
         if v.dtype == torch.float32:
             logger.info_rank0(f"Converting {k} from {v.dtype} to torch.bfloat16")
             converted_state[k] = v.to(torch.bfloat16)
