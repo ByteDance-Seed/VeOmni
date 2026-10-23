@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU single-process tests for the VeOmni-native dense LoRA stack (Phase 1).
+"""Single-process tests for the VeOmni-native dense LoRA stack (Phase 1).
 
-No distributed / GPU / HF-model build required — a tiny ``nn.Module`` exercises:
+The CPU cases require no distributed / GPU / HF-model build; a tiny ``nn.Module`` exercises:
 
 * ``VeOmniLoraConfig`` YAML <-> config <-> ``adapter_config.json`` round-trips.
 * Dense injection: PEFT-identical FQNs, trainable-only-LoRA, no-op-at-init.
@@ -24,6 +24,7 @@ No distributed / GPU / HF-model build required — a tiny ``nn.Module`` exercise
 
 ``test_peft_bidirectional_interop`` additionally asserts cross-compatibility
 with stock ``peft`` when it is installed (dev/test-only dependency).
+The adapter-bypass regression also runs on the runner-selected accelerator.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.layers import LoraLinear
 from veomni.lora.state_dict import get_lora_state_dict, load_adapter_state_dict
 from veomni.lora.weight_loading import load_lora_weights
+from veomni.utils.device import get_device_type
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -309,13 +311,25 @@ if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
 
 
-def test_disable_adapter_restores_nested_context_after_exception():
+@pytest.mark.parametrize(
+    "device_kind",
+    [
+        pytest.param("cpu", id="cpu"),
+        pytest.param(
+            "accelerator", id="accelerator", marks=pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+        ),
+    ],
+)
+def test_disable_adapter_restores_nested_context_after_exception(device_kind):
     """Reference inference bypasses nonzero adapters without changing weights."""
-    base = Toy()
+    device = "cpu" if device_kind == "cpu" else get_device_type()
+    if device_kind == "accelerator" and device == "cpu":
+        pytest.skip("Adapter bypass accelerator coverage requires an available accelerator")
+    base = Toy().to(device)
     reference = copy.deepcopy(base)
-    model = VeOmniLoraModel(base, _base_config())
+    model = VeOmniLoraModel(base, _base_config()).to(device)
     _randomize_lora_b(model)
-    x = torch.randn(3, 32)
+    x = torch.randn(3, 32, device=device)
     adapted = model(x).detach().clone()
     expected = reference(x).detach()
     assert not torch.equal(adapted, expected)
