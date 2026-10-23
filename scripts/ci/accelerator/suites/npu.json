@@ -379,7 +379,18 @@
     ]
   },
   {
-    "name": "npu-e2e-38",
+    "name": "npu-unit-38",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_save_safetensor_utils.py"
+    ]
+  },
+  {
+    "name": "npu-e2e-39",
     "suite": "e2e",
     "args": [
       "-v",
@@ -389,7 +400,7 @@
     ]
   },
   {
-    "name": "npu-e2e-39",
+    "name": "npu-e2e-40",
     "suite": "e2e",
     "args": [
       "-v",

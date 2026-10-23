@@ -576,13 +576,13 @@
     ]
   },
   {
-    "name": "58-e2e",
-    "suite": "e2e",
+    "name": "58-unit",
+    "suite": "unit",
     "conditional": false,
     "args": [
       "-s",
       "-x",
-      "tests/e2e/test_e2e_parallel.py"
+      "tests/utils/test_save_safetensor_utils.py"
     ]
   },
   {
@@ -592,11 +592,21 @@
     "args": [
       "-s",
       "-x",
-      "tests/distributed/test_fsdp_equivalence.py"
+      "tests/e2e/test_e2e_parallel.py"
     ]
   },
   {
     "name": "60-e2e",
+    "suite": "e2e",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/distributed/test_fsdp_equivalence.py"
+    ]
+  },
+  {
+    "name": "61-e2e",
     "suite": "e2e",
     "conditional": false,
     "args": [
