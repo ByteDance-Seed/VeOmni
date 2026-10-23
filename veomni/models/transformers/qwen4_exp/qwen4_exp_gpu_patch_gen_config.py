@@ -150,7 +150,6 @@ def qwen4_exp_text_mlp_forward_patched(self, x):
     return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
-config.add_import("veomni.distributed.sequence_parallel.gdn_exchange", names=["coalesced_gather_aligned"])
 config.add_import("copy", names=["copy"])
 config.add_import("dataclasses", names=["dataclass"])
 config.add_import("functools", names=["partial"])
@@ -173,6 +172,7 @@ config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_heads_scatter_seq", "gather_seq_scatter_heads"],
 )
+config.add_import("veomni.distributed.sequence_parallel.gdn_exchange", names=["coalesced_gather_aligned"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.config", names=["get_ops_config", "resolve_op_impl"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])

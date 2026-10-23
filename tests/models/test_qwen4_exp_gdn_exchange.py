@@ -79,3 +79,108 @@ def test_composite_config_reaches_registered_model(enabled):
     layers = [module for module in model.modules() if hasattr(module, "coalesced_gdn_exchange")]
     assert layers
     assert all(module.coalesced_gdn_exchange is enabled for module in layers)
+
+
+def _native_exchange_worker(rank, device_type, endpoint):
+    """Use actual NCCL/HCCL for packet parity and a packed text-model comparison."""
+    import importlib
+
+    from transformers import Qwen4ExpConfig
+
+    from tests.models.compare import ops_config_scope
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.utils.device import get_torch_device
+
+    device_module = get_torch_device()
+    device_module.set_device(rank)
+    device = torch.device(device_type, rank)
+    backend = "hccl" if device_type == "npu" else "nccl"
+    dist.init_process_group(backend, store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=180))
+    try:
+        torch.manual_seed(37 + rank)
+        shapes = [(2, 3, 4, 7)] * 2 + [(2, 3, 8, 5), (2, 3, 8), (2, 3, 8)]
+        values = [torch.randn(s, device=device, dtype=torch.bfloat16, requires_grad=True) for s in shapes]
+        actual = coalesced_gather_aligned(*values, dist.group.WORLD)
+        grads = []
+        for source, output in zip(values, actual):
+            peers = [torch.empty_like(source) for _ in range(2)]
+            dist.all_gather(peers, source.detach(), group=dist.group.WORLD)
+            assert torch.equal(output, torch.cat([p.chunk(2, 2)[rank] for p in peers], 1))
+            grads.append(torch.randn_like(output))
+        torch.autograd.backward(actual, grads)
+        for source, grad in zip(values, grads):
+            peers = [torch.empty_like(grad) for _ in range(2)]
+            dist.all_gather(peers, grad, group=dist.group.WORLD)
+            assert torch.equal(source.grad, torch.cat([p.chunk(2, 1)[rank] for p in peers], 2))
+
+        _init_parallel_state(ulysses_size=2, device_type=device_type)
+        module = importlib.import_module(
+            "veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_"
+            + ("npu" if device_type == "npu" else "gpu")
+        )
+        config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").text_config
+        config.num_hidden_layers = 1
+        config.layer_types = ["linear_attention"]
+        config.ple_layer_ids = []
+        config.use_cache = False
+        config._attn_implementation = "eager"
+        kernel = "triton" if device_type == "npu" else "fla"
+        models = []
+        for enabled in (False, True):
+            ops = make_eager_ops_config(
+                causal_conv1d_implementation=kernel, chunk_gated_delta_rule_implementation=kernel
+            )
+            ops.coalesced_gdn_exchange = enabled
+            with ops_config_scope(ops):
+                models.append(module.Qwen4ExpTextModel(config).to(device=device, dtype=torch.bfloat16))
+        models[1].load_state_dict(models[0].state_dict())
+        assert not models[0].layers[0].linear_attn.coalesced_gdn_exchange
+        assert models[1].layers[0].linear_attn.coalesced_gdn_exchange
+        torch.manual_seed(39)
+        ids = torch.randint(3, config.vocab_size, (1, 32), device=device)[:, rank * 16 : (rank + 1) * 16]
+        positions = torch.cat((torch.arange(13), torch.arange(19))).to(device)
+        positions = positions[rank * 16 : (rank + 1) * 16].view(1, 1, -1).expand(4, -1, -1)
+        bounds = torch.tensor([0, 13, 32], device=device, dtype=torch.int32)
+        outputs = []
+        coalesced_calls = []
+        original_exchange = module.coalesced_gather_aligned
+
+        def record_exchange(*args, **kwargs):
+            """Prove the enabled model actually enters the coalesced branch."""
+            coalesced_calls.append(True)
+            return original_exchange(*args, **kwargs)
+
+        module.coalesced_gather_aligned = record_exchange
+        for model in models:
+            output = model(
+                input_ids=ids, position_ids=positions, use_cache=False, cu_seq_lens_q=bounds, packed_seq_lens=(13, 19)
+            ).last_hidden_state
+            outputs.append(output.detach())
+            output.float().square().mean().backward()
+        module.coalesced_gather_aligned = original_exchange
+        assert len(coalesced_calls) == 1
+        torch.testing.assert_close(outputs[0], outputs[1], atol=1e-3, rtol=1e-3)
+        for (name, ref), (other_name, actual_param) in zip(models[0].named_parameters(), models[1].named_parameters()):
+            assert name == other_name
+            assert (ref.grad is None) == (actual_param.grad is None), name
+            if ref.grad is not None:
+                torch.testing.assert_close(actual_param.grad, ref.grad, atol=2e-2, rtol=2e-2, msg=name)
+    finally:
+        clear_parallel_state()
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
+def test_native_coalesced_exchange_and_packed_model():
+    """Native backend parity is separate from the CPU/Gloo qualification."""
+    from veomni.utils.device import get_device_type, get_torch_device
+
+    device = get_device_type()
+    if device not in ("cuda", "npu") or get_torch_device().device_count() < 2:
+        pytest.skip("Requires two native CUDA or Ascend devices")
+    if device == "cuda":
+        pytest.importorskip("fla")
+    else:
+        pytest.importorskip("triton")
+    spawn_with_rendezvous(_native_exchange_worker, args=(device,), nprocs=2)
