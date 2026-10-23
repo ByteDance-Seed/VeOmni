@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import sys
 from importlib import import_module
 from pathlib import Path
@@ -68,6 +69,15 @@ def _stub_npu_input_guard(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _require_npu_gdr_dependencies(*, ascendc: bool = False) -> None:
     """Skip real NPU numerics unless the optional GDR runtime is installed."""
+    if ascendc and os.environ.get("VEOMNI_REQUIRE_ASCENDC_TESTS") == "1":
+        try:
+            import fla_npu  # noqa: F401
+            from triton._C import libtriton
+
+            assert hasattr(libtriton, "ascend"), "Triton Ascend backend missing"
+        except (ImportError, AssertionError) as error:
+            pytest.fail(f"Required AscendC GDN CI dependency unavailable: {error}")
+        return
     pytest.importorskip("triton")
     try:
         from triton._C import libtriton
@@ -1179,3 +1189,42 @@ def test_convolution_boundary_cache_inference_to_training():
     SaveBoundaries.apply(value).sum().backward()
     assert value.grad.item() == 1
     _cached_boundary_tensor.cache_clear()
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Requires native AscendC GDN")
+@pytest.mark.parametrize("checkpointed", (False, True))
+def test_fla_npu_reuse_packed_checkpoint_parity(checkpointed):
+    """Compare retained states with recomputation under non-reentrant checkpointing."""
+    from torch.utils.checkpoint import checkpoint
+
+    _require_npu_gdr_dependencies(ascendc=True)
+    reference = resolve_op("chunk_gated_delta_rule", "standard", "fla_npu").wrapper
+    candidate = resolve_op("chunk_gated_delta_rule", "standard", "fla_npu_reuse").wrapper
+    torch.manual_seed(43)
+    q, k, v = [torch.randn(1, 64, 2, 64, device="npu", dtype=torch.bfloat16) for _ in range(3)]
+    g = -torch.rand(1, 64, 2, device="npu", dtype=torch.float32)
+    beta = torch.rand(1, 64, 2, device="npu", dtype=torch.bfloat16)
+    cu = torch.tensor([0, 17, 64], dtype=torch.int64)
+    gradient = torch.randn_like(q)
+    results = []
+    for operation in (reference, candidate):
+        leaves = make_grad_leaves(q, k, v, g, beta)
+
+        def forward(*values, operation=operation):
+            """Bind this graph to one op even if checkpoint replay is delayed."""
+            return operation(*values, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)[0]
+
+        output = checkpoint(forward, *leaves, use_reentrant=False) if checkpointed else forward(*leaves)
+        output.backward(gradient)
+        results.append((output.detach(), [x.grad.detach().clone() for x in leaves]))
+    torch.testing.assert_close(results[1][0], results[0][0], atol=0, rtol=0)
+    for actual, expected in zip(results[1][1], results[0][1], strict=True):
+        torch.testing.assert_close(actual, expected, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
+
+
+def test_ci_requires_ascendc_dependency_instead_of_skipping(monkeypatch):
+    """A missing native extension is a CI failure, not a green skip."""
+    monkeypatch.setenv("VEOMNI_REQUIRE_ASCENDC_TESTS", "1")
+    monkeypatch.setitem(sys.modules, "fla_npu", None)
+    with pytest.raises(pytest.fail.Exception, match="Required AscendC GDN CI dependency"):
+        _require_npu_gdr_dependencies(ascendc=True)
