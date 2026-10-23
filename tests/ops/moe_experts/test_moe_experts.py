@@ -619,6 +619,96 @@ def test_triton_split_and_merged_match_eager(swiglu_limit: float | None):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape", [(0, 257), (5, 257), (17, 768)])
+@pytest.mark.parametrize("swiglu_limit", [None, 1.0])
+def test_triton_merged_swiglu_preserves_staged_rounding(dtype, shape, swiglu_limit):
+    """Match materialized ATen SiLU for merged views and clamped inputs."""
+    require_nvidia_cuda("triton")
+    from veomni.ops.kernels.moe_experts.shared.swiglu import apply_swiglu_clamp, merged_swiglu_forward
+
+    torch.manual_seed(919)
+    rows, columns = shape
+    merged = torch.randn(rows, 2 * columns, device="cuda", dtype=dtype)
+    gate, up = apply_swiglu_clamp(*merged.chunk(2, dim=-1), swiglu_limit)[:2]
+    gate_before, up_before = gate.clone(), up.clone()
+    expected = torch.ops.aten.silu(gate) * up
+    actual = merged_swiglu_forward(gate, up)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(gate, gate_before, rtol=0, atol=0)
+    torch.testing.assert_close(up, up_before, rtol=0, atol=0)
+    assert actual.shape == shape and actual.dtype == dtype and actual.is_contiguous()
+    if rows:
+        single_rounding = (torch.ops.aten.silu(gate.float()) * up.float()).to(dtype)
+        assert (expected != single_rounding).any(), "Fixture must distinguish staged rounding"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("swiglu_limit", [None, 1.0])
+def test_triton_merged_swiglu_matches_unfused_forward_and_backward(monkeypatch, dtype, swiglu_limit):
+    """Compare the fused consumer with the unchanged staged pointwise path across non-EP and EP."""
+    require_nvidia_cuda("triton")
+    from veomni.ops.kernels.moe_experts.shared import swiglu
+    from veomni.ops.kernels.moe_experts.shared.ep import EPMergedFc1GroupGemm
+
+    torch.manual_seed(31)
+    tokens, experts, hidden, intermediate, top_k = 23, 4, 64, 128, 2
+    x = 0.4 * torch.randn(tokens, hidden, device="cuda", dtype=dtype)
+    gate, routes = _route(tokens, experts, top_k, "cuda", dtype)
+    w1 = 0.4 * torch.randn(experts, 2 * intermediate, hidden, device="cuda", dtype=dtype)
+    w2 = 0.1 * torch.randn(experts, hidden, intermediate, device="cuda", dtype=dtype)
+    fused = resolve_op("moe_experts", "standard", "fused_triton").wrapper
+    empty = _empty("cuda", dtype)
+    calls = []
+    original = swiglu.merged_swiglu_forward
+
+    def record(gate_input, up):
+        calls.append(gate_input.shape)
+        return original(gate_input, up)
+
+    def run():
+        inputs = [value.detach().clone().requires_grad_() for value in (x, gate, w1, w2)]
+        output = fused(
+            inputs[0],
+            inputs[1],
+            routes,
+            empty,
+            empty,
+            inputs[3],
+            inputs[2],
+            num_experts=experts,
+            swiglu_limit=swiglu_limit,
+        )
+        grads = torch.autograd.grad(output.float().square().mean(), inputs)
+        return output, grads
+
+    monkeypatch.setattr(swiglu, "merged_swiglu_forward", record)
+    actual, actual_grads = run()
+    assert calls == [(tokens * top_k, intermediate)]
+
+    cumsum = torch.tensor([6, 12, 18, tokens], device="cuda", dtype=torch.int32)
+    ep_inputs = [value.detach().clone().requires_grad_() for value in (x, w1, w2)]
+    ep_out = EPMergedFc1GroupGemm.apply(ep_inputs[0], cumsum, ep_inputs[1], ep_inputs[2], swiglu_limit)
+    ep_grads = torch.autograd.grad(ep_out.float().square().mean(), ep_inputs)
+    assert calls == [(tokens * top_k, intermediate), (tokens, intermediate)]
+
+    monkeypatch.setattr(swiglu, "merged_swiglu_forward", lambda gate_input, up: torch.ops.aten.silu(gate_input) * up)
+    expected, expected_grads = run()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        assert torch.isfinite(actual_grad).all()
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
+    ep_ref_inputs = [value.detach().clone().requires_grad_() for value in (x, w1, w2)]
+    ep_ref_out = EPMergedFc1GroupGemm.apply(ep_ref_inputs[0], cumsum, ep_ref_inputs[1], ep_ref_inputs[2], swiglu_limit)
+    ep_ref_grads = torch.autograd.grad(ep_ref_out.float().square().mean(), ep_ref_inputs)
+    torch.testing.assert_close(ep_out, ep_ref_out, rtol=0, atol=0)
+    for actual_grad, expected_grad in zip(ep_grads, ep_ref_grads):
+        assert torch.isfinite(actual_grad).all()
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "device_type",
     [
