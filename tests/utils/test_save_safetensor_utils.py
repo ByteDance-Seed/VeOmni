@@ -442,6 +442,47 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
         self.assertEqual(writer_cls.call_args.kwargs["fqn_to_index_mapping"], {"w": 1, "b": 2})
         self.assertFalse(writer_cls.call_args.kwargs["enable_consolidation"])
 
+    def test_none_mapping_gathers_rank_partitioned_save_state_across_ranks(self):
+        """When save_state is rank-partitioned and fqn_to_index_mapping is None, all ranks derive the same global mapping."""
+        from veomni.utils.save_safetensor_utils import _size_balanced_index_mapping
+
+        rank0_state = {
+            "w0.weight": torch.zeros(4, 4, dtype=torch.bfloat16),  # 32B
+            "w0.scale": torch.zeros(2, 2, dtype=torch.uint8),  # 4B
+            "w2.weight": torch.zeros(4, 4, dtype=torch.bfloat16),  # 32B
+        }
+        rank1_state = {
+            "w1.weight": torch.zeros(4, 4, dtype=torch.bfloat16),  # 32B
+            "w3.weight": torch.zeros(4, 4, dtype=torch.bfloat16),  # 32B
+            "w3.scale": torch.zeros(2, 2, dtype=torch.uint8),  # 4B
+        }
+        rank0_local = [(k, v.numel() * v.element_size()) for k, v in rank0_state.items()]
+        rank1_local = [(k, v.numel() * v.element_size()) for k, v in rank1_state.items()]
+
+        def fake_all_gather_object(output_list, obj):
+            output_list[0] = rank0_local
+            output_list[1] = rank1_local
+
+        mock_dist = MagicMock(
+            is_initialized=MagicMock(return_value=True),
+            get_world_size=MagicMock(return_value=2),
+            all_gather_object=MagicMock(side_effect=fake_all_gather_object),
+        )
+        with patch(f"{_MOD}.dist", mock_dist), patch(f"{_MOD}._MAX_SHARD_BYTES", 40):
+            mapping_rank0 = _size_balanced_index_mapping(rank0_state)
+            mapping_rank1 = _size_balanced_index_mapping(rank1_state)
+
+        expected = {
+            "w0.weight": 1,
+            "w0.scale": 1,
+            "w1.weight": 2,
+            "w2.weight": 3,
+            "w3.weight": 4,
+            "w3.scale": 4,
+        }
+        self.assertEqual(mapping_rank0, expected)
+        self.assertEqual(mapping_rank1, expected)
+
     def test_none_mapping_consolidates_into_several_loadable_files(self):
         import tempfile
         from pathlib import Path

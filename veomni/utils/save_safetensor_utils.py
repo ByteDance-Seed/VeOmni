@@ -202,11 +202,42 @@ _MAX_SHARD_BYTES = 5_000_000_000
 def _size_balanced_index_mapping(save_state: Dict[str, torch.Tensor]) -> Dict[str, int]:
     """1-based output file index per FQN, packing tensors in order into files of up to ``_MAX_SHARD_BYTES``.
 
-    Sizes are those of the full (unsharded) tensors, so every rank derives the same mapping.
+    Sizes are those of the full (unsharded) tensors, or gathered across ranks when ``save_state``
+    is rank-partitioned by ``converter.export_weights(model)``, so every rank derives the same mapping.
     """
+    local_sizes = [(fqn, tensor.numel() * tensor.element_size()) for fqn, tensor in save_state.items()]
+    ordered_sizes = local_sizes
+    if dist.is_initialized():
+        world_size = dist.get_world_size()
+        if isinstance(world_size, int) and world_size > 1:
+            gathered_sizes: List[Optional[List[tuple[str, int]]]] = [None] * world_size
+            dist.all_gather_object(gathered_sizes, local_sizes)
+            non_empty = [items for items in gathered_sizes if items is not None]
+            if non_empty:
+                first_keys = [k for k, _ in non_empty[0]]
+                if all([k for k, _ in items] == first_keys for items in non_empty):
+                    ordered_sizes = non_empty[0]
+                else:
+                    rank_groups: List[List[List[tuple[str, int]]]] = []
+                    for items in non_empty:
+                        groups: List[List[tuple[str, int]]] = []
+                        for fqn, size in items:
+                            if fqn.endswith(".scale") and groups:
+                                groups[-1].append((fqn, size))
+                            else:
+                                groups.append([(fqn, size)])
+                        rank_groups.append(groups)
+                    seen_sizes: Dict[str, int] = {}
+                    max_groups = max((len(groups) for groups in rank_groups), default=0)
+                    for group_idx in range(max_groups):
+                        for groups in rank_groups:
+                            if group_idx < len(groups):
+                                for fqn, size in groups[group_idx]:
+                                    seen_sizes.setdefault(fqn, size)
+                    ordered_sizes = list(seen_sizes.items())
+
     mapping, index, file_bytes = {}, 1, 0
-    for fqn, tensor in save_state.items():
-        size = tensor.numel() * tensor.element_size()
+    for fqn, size in ordered_sizes:
         if file_bytes and file_bytes + size > _MAX_SHARD_BYTES:
             index, file_bytes = index + 1, 0
         mapping[fqn] = index
