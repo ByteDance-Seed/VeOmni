@@ -184,15 +184,16 @@ def _skip_fa3(attn_impl: str) -> bool:
 
 
 _FA3_REPRESENTATIVE_CASES = {"llama3_1", "qwen3_vl", "deepseek_v3"}
+_FALLBACK_REPRESENTATIVE_CASES = {"llama3_1", "qwen3_vl_moe"}
 
 
 def prepare_model_modes(is_moe: bool, *, include_fa3: bool = False) -> tuple[list[ModelMode], list[ModelMode]]:
     """Build HF baseline and VeOmni production modes.
 
-    Eager / kernels-off combinations are already covered by family parity tests
-    (``tests/models/transformers/test_*.py``) and ``test_low_precision_oracle.py``.
-    Here each model compares the HF baseline against VeOmni's production kernel +
-    fused-MoE configuration, plus FA3 on representative models when on SM90+.
+    Family parity covers eager FP32, while the low-precision oracle covers CUDA
+    and text backward. Keep BF16 packed fallback training comparisons in
+    ``_case_modes`` for representative dense and multimodal MoE models on both
+    GPU and NPU, alongside the production modes built here.
     """
     use_kernels_default = bool(IS_NPU_AVAILABLE or is_liger_kernel_available())
     moe_impl = _FUSED_MOE_IMPL if is_moe else "eager"
@@ -504,6 +505,10 @@ def _case_modes(case_id: str, is_moe: bool) -> tuple[list[ModelMode], list[Model
         is_moe=is_moe,
         include_fa3=(case_id in _FA3_REPRESENTATIVE_CASES),
     )
+    if case_id in _FALLBACK_REPRESENTATIVE_CASES:
+        fallback_mode = ModelMode("veomni", "veomni_flash_attention_2")
+        if fallback_mode not in veomni_modes:
+            veomni_modes.append(fallback_mode)
 
     if case_id == "qwen2_5_omni":
         if IS_NPU_AVAILABLE:
