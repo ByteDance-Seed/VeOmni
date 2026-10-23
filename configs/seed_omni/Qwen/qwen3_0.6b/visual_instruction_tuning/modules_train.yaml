@@ -1,0 +1,15 @@
+qwen3vl_vision:
+  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct/qwen3vl_vision
+  model_config:
+    out_hidden_size: 1024
+    disable_deepstack: true
+    freeze: true
+qwen3_text_encoder:
+  model_path: qwen3_text_encoder
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+  model_config:
+    enable_image: true
+qwen3_llm:
+  model_path: qwen3_llm

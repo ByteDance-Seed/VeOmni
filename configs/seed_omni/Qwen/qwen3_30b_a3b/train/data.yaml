@@ -1,0 +1,10 @@
+sources:
+  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/mini_data
+names:
+  - tulu-3-sft-mixture
+schedule:
+  - schedule_type: const
+    weights: [1.0]
+level: token
+stopping_strategy: all_exhausted
+upstream_sharded: true
