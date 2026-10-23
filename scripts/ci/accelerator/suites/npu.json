@@ -30,6 +30,16 @@
     ]
   },
   {
+    "name": "npu-unit-03b",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_wan_t2v_ulysses.py"
+    ]
+  },
+  {
     "name": "npu-unit-04",
     "suite": "unit",
     "args": [
