@@ -232,18 +232,24 @@ class FluxJointAttention(torch.nn.Module):
         q, k = self.apply_rope(q, k, image_rotary_emb)
         hidden_states = flux_attention(self, q, k, v, attn_mask)
 
-        # Text and image were gathered separately, so scatter them back separately; a joint scatter
-        # would hand each rank a slice of the concatenated [text, image] sequence instead of its own tokens.
-        text_len = q_b.shape[2]
-        hidden_states_b, hidden_states_a = hidden_states[:, :, :text_len], hidden_states[:, :, text_len:]
         if get_parallel_state().ulysses_enabled:
-            hidden_states_b = gather_heads_scatter_seq(hidden_states_b, seq_dim=2, head_dim=1)
-            hidden_states_a = gather_heads_scatter_seq(hidden_states_a, seq_dim=2, head_dim=1)
+            # The output is [text_full, image_full]. Scatter each stream on its own so this
+            # rank gets back its own text and image shards, not a slice across the boundary.
+            txt_full_len = q_b.shape[2]
+            hidden_states = torch.cat(
+                [
+                    gather_heads_scatter_seq(hidden_states[:, :, :txt_full_len], seq_dim=2, head_dim=1),
+                    gather_heads_scatter_seq(hidden_states[:, :, txt_full_len:], seq_dim=2, head_dim=1),
+                ],
+                dim=2,
+            )
 
-        hidden_states_b = hidden_states_b.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
-        hidden_states_a = hidden_states_a.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
-        hidden_states_b = hidden_states_b.to(q.dtype)
-        hidden_states_a = hidden_states_a.to(q.dtype)
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
+        hidden_states = hidden_states.to(q.dtype)
+        hidden_states_b, hidden_states_a = (
+            hidden_states[:, : hidden_states_b.shape[1]],
+            hidden_states[:, hidden_states_b.shape[1] :],
+        )
         if ipadapter_kwargs_list is not None:
             hidden_states_a = interact_with_ipadapter(self, hidden_states_a, q_a, **ipadapter_kwargs_list)
 

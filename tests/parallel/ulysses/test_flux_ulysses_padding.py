@@ -28,11 +28,13 @@ from veomni.models.transformers.flux.modeling_flux import FluxModel
 from .utils import SequenceParallelTest
 
 
-# name: (latent H=W, prompt tokens). Flux patchifies 2x2, so image tokens = (H/2)^2.
+# name: (latent H=W, prompt tokens, entity prompts). Flux patchifies 2x2, so image tokens = (H/2)^2.
+# Entity prompts add a regional attention mask, which takes the padded-mask path.
 CASES = {
-    "divisible": (8, 4),
-    "odd_image": (6, 4),
-    "odd_image_and_text": (6, 5),
+    "divisible": (8, 4, 0),
+    "odd_image": (6, 4, 0),
+    "odd_image_and_text": (6, 5, 0),
+    "odd_with_entity_mask": (6, 5, 1),
 }
 
 
@@ -47,7 +49,7 @@ def _build_model(device):
     return model
 
 
-def _make_inputs(hw, txt, device):
+def _make_inputs(hw, txt, entities, device):
     gen = torch.Generator().manual_seed(1)
 
     def randn(*shape):
@@ -61,6 +63,11 @@ def _make_inputs(hw, txt, device):
         guidance=torch.full((1,), 3.5, device=device),
         text_ids=torch.zeros(1, txt, 3, device=device),
     )
+    if entities:
+        inputs["entity_prompt_emb"] = randn(1, entities, txt, 4096)
+        entity_masks = torch.zeros(1, entities, 1, hw, hw, device=device)
+        entity_masks[..., : hw // 2, :] = 1
+        inputs["entity_masks"] = entity_masks
     weight = torch.randn(1, 16, hw, hw, generator=gen).to(device)
     return inputs, weight
 
@@ -89,8 +96,8 @@ class FluxUlyssesPaddingTest(SequenceParallelTest):
         try:
             _init_parallel_state(dp_size=self.world_size, ulysses_size=1, device_type=get_device_type(), name=None)
             refs = {}
-            for name, (hw, txt) in CASES.items():
-                inputs, weight = _make_inputs(hw, txt, device)
+            for name, (hw, txt, entities) in CASES.items():
+                inputs, weight = _make_inputs(hw, txt, entities, device)
                 refs[name] = (inputs, weight, *_forward_backward(model, inputs, weight))
             clear_parallel_state()
 
