@@ -4,9 +4,12 @@ A SeedOmni job composes modules that differ by orders of magnitude in size: a
 few-million-parameter VAE or vision tower, a vocabulary-sized text encoder, a
 multi-billion-parameter backbone. Each module therefore chooses its own data
 parallel wrap and its own extra parallel groups, while the job as a whole shares
-one world, one data stream and one sequence parallel (SP) size. This page covers
+one world, one data stream and one `dp_size` (so one unified
+`sp_size = cp_size * ulysses_size = world_size // dp_size` with
+`pp_size = tp_size = 1`, where each module picks either Ulysses SP or Context
+Parallelism). This page covers
 what a module may choose, what it must share, and how the runtime keeps the
-modules apart. SP has its own page: [Sequence Parallelism](sequence_parallel.md).
+modules apart. SP and CP have their own page: [Sequence & Context Parallelism](sequence_parallel.md).
 
 ## 1. What a module can choose
 
@@ -22,6 +25,7 @@ A module's choices live in its block of the `modules` YAML, under
 | Eager (inference only) | `fsdp_config.fsdp_mode: eager` | A single-process replica with no mesh; rejected for training |
 | Embedding parallel | `extra_parallel_names: ["emb"]`, `extra_parallel_sizes: [N]`, `extra_parallel_placement_innermost: [false]` | A vocabulary-sharded text encoder; see [Sharded Embedding](../../key_features/sharded_embedding.md) |
 | Expert parallel | `ep_size: N`, `ep_outside: false` (shorthand for an `ep` extra parallel group) | A MoE backbone |
+| Sequence / Context parallel | `ulysses_size: U`, `cp_size: C` (one axis `> 1` per module, with `U * C = W / dp_size` and `pp_size = tp_size = 1` across all modules) | Ulysses SP on encoders/ViT, CP on long-context backbones |
 | Gradient checkpointing | `gradient_checkpointing.enable: false` | Off for cheap modules (text encoders, VAE, flow connector) |
 
 Two per-module properties are not accelerator settings but change how the
@@ -45,9 +49,16 @@ module is wrapped and saved:
   `base` parallel state derived from `model.accelerator`. Every module consumes
   the same micro-batch, so the data-parallel layout of the loader is the job's,
   not any module's.
-- **The SP size.** Set `model.accelerator.ulysses_size` at the top level so
-  every module inherits the same SP degree matching the shared dataloader; see
-  [Sequence Parallelism](sequence_parallel.md#2-why-one-sp-size-for-the-whole-graph).
+- **The `dp_size` (and unified `sp_size = cp_size * ulysses_size`).** With
+  `pp_size = tp_size = 1`, every distributed module and the top-level
+  `model.accelerator` must resolve to the same
+  `dp_size = world_size // (cp_size * ulysses_size)`. Within that shared
+  `sp_size`, each module may independently choose Ulysses SP (`ulysses_size = S, cp_size = 1`)
+  or Context Parallelism (`cp_size = S, ulysses_size = 1`); combining
+  `cp_size > 1` and `ulysses_size > 1` on a single module is not supported yet.
+  `build_omni_model_runtime_args` validates that all distributed modules and
+  `model.accelerator` share the same `dp_size`;
+  see [Sequence & Context Parallelism](sequence_parallel.md#2-why-all-modules-share-one-dp_size).
 - **The step.** One `loss.backward()` runs over the whole graph, followed by
   one optimizer step per module; gradient accumulation and the global batch are
   job-level settings.
