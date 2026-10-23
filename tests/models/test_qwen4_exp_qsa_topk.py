@@ -156,6 +156,7 @@ def _native_indexer_worker(rank, world_size, endpoint):
 
         length = 64 // world_size
         for lengths in ((3, 20, 41), (13, 51), (1, 63)):
+            bool_calls.clear()
             torch.manual_seed(41)
             full = torch.randn(2, 64, 6).to(device=device, dtype=torch.bfloat16)
             hidden = full[:, rank * length : (rank + 1) * length].contiguous()
@@ -173,7 +174,7 @@ def _native_indexer_worker(rank, world_size, endpoint):
                     reference = module.Qwen4ExpTextQSAIndexer.forward(
                         indexer, hidden, positions, None, None, cu, packed_seq_lens=packed_lengths
                     )
-            assert bool_calls, "The bool reference must exercise the NPU-only gather branch"
+            assert bool_calls, f"The bool reference must exercise the NPU-only gather branch for {lengths}"
             assert torch.equal(actual, reference)
             assert actual.dtype == torch.int32
             for batch in range(2):
