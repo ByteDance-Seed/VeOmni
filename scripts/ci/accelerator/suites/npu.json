@@ -386,6 +386,16 @@
     ]
   },
   {
+    "name": "native-dense-lora-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/lora/test_veomni_lora_native.py"
+    ]
+  },
+  {
     "name": "save-safetensor-utils-unit",
     "suite": "unit",
     "conditional": false,
