@@ -82,6 +82,8 @@ def main():
     env["OMP_NUM_THREADS"] = str(max(1, min(8, (os.cpu_count() or 8) // 8)))
     env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
     env["VEOMNI_GPU_TEST_PARALLEL"] = "0" if args.serial else "1"
+    # Single-node torchrun agents must keep their bootstrap Store alive too.
+    env["TORCH_DISABLE_SHARE_RDZV_TCP_STORE"] = "0"
     manifest_path = Path(__file__).parent / "suites" / ("npu.json" if caps.backend == "npu" else "gpu.json")
     manifest = json.loads(manifest_path.read_text())
     selected = [
@@ -184,6 +186,7 @@ def main():
             CACHE_DIR=str(workspace / "cache"),
             CI_TIMING_EVENTS=str(output / f"{name}.jsonl"),
             CI_LAUNCH_EVENTS=str(output / f"{name}.launches.jsonl"),
+            CI_RENDEZVOUS_EVENTS=str(output / f"{name}.rendezvous.jsonl"),
             CI_CASE_RESULTS=str(output / f"{name}.results.json"),
             CI_CASE_PROGRESS=str(output / f"{name}.progress.jsonl"),
         )

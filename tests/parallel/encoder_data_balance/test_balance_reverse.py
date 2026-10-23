@@ -8,7 +8,6 @@ import torch
 import torch.distributed as dist
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from tests.tools.launch_utils import find_free_port
 from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.utils.data_balance.data_balance import Qwen3VLEncoderDataBalance
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
@@ -91,7 +90,7 @@ def test_encoder_balance():
         f"--nproc-per-node={_CI_LAUNCH.nproc}",
         "--node-rank=0",
         "--master_addr=localhost",
-        f"--master_port={find_free_port()}",
+        "--standalone",
         "tests/parallel/encoder_data_balance/test_balance_reverse.py",
     ]
 

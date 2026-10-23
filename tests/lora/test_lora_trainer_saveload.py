@@ -287,8 +287,6 @@ def test_lora_trainer_saveload():
 
     from veomni.utils.device import get_torch_device
 
-    from ..tools.launch_utils import find_free_port
-
     torch_device = get_torch_device()
     device_count = runner_device_count() if torch_device.is_available() else 0
     if device_count < 1:
@@ -296,13 +294,12 @@ def test_lora_trainer_saveload():
 
     nproc = min(device_count, _LORA_MAX_NPROC)
     output_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "test_lora_saveload")
-    port = find_free_port()
 
     cmd = [
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={nproc}",
-        f"--master_port={port}",
+        "--standalone",
         __file__,
         "tests/lora/qwen3_toy_lora.yaml",  # positional config_file
         f"--train.checkpoint.output_dir={output_dir}",

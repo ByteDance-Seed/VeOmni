@@ -244,16 +244,21 @@ into the outer custom-autograd state.
 ## Process-wide integrations
 
 The `sdpa` and `veomni_sdpa` attention rows accept ordinary dense attention
-masks but do not expose a packed/varlen API, following the public
-[`torch.nn.functional.scaled_dot_product_attention` signature](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html),
-which has `attn_mask` but no `cu_seqlens` arguments. `packed_causal_mask`
-composes the segments into a dense block-diagonal mask for these
+masks, while the underlying
+[`torch.nn.functional.scaled_dot_product_attention` signature](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html)
+has `attn_mask` and no `cu_seqlens` arguments. `packed_causal_mask`
+composes segments into a dense block-diagonal mask for these
 implementations. Their attention calls and the VeOmni SDPA mask builder drop
 cumulative-length and varlen maximum-length metadata when it describes at most
-one segment per batch row, or when the call carries a 3-D/4-D dense mask.
-Several segments per row without such a mask raise, because SDPA would attend
-across samples. Opaque dense masks are not inspected to infer whether they
-encode sequence boundaries.
+one segment per batch row, or when the call carries a 3-D/4-D dense mask. When
+an `sdpa`, `veomni_sdpa`, `eager` (with `is_causal=False`), or
+`veomni_sage_attention` attention call has `attention_mask=None` and
+`batch_size == 1` with multiple segments, the wrapper splits `Q/K/V` along
+the sequence dimension by the segment lengths derived from `cu_seqlens` (after
+any Ulysses gather) and concatenates the per-segment outputs. Multi-segment
+metadata with a 2-D mask or `batch_size != 1` raises, as does multi-segment
+metadata passed to `sdpa_attention_mask_builder`. Opaque dense masks are not
+inspected to infer whether they encode sequence boundaries.
 
 The VeOmni SDPA mask builder only honors causal mask-elision hints for the
 canonical causal predicate with equal Q/K lengths and offsets. Bidirectional
