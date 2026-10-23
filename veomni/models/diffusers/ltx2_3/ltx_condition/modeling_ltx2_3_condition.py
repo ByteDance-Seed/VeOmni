@@ -71,6 +71,7 @@ def _load_embeddings_processor_weights(
     checkpoint_path: str,
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
+    strict: bool = False,
 ):
     """Load EmbeddingsProcessor weights from LTX-2 checkpoint with key remapping.
 
@@ -97,7 +98,7 @@ def _load_embeddings_processor_weights(
                     new_key = new_prefix + key[len(old_prefix) :]
                     processor_state_dict[new_key] = value.to(dtype)
                     break
-        missing, unexpected = embeddings_processor.load_state_dict(processor_state_dict, strict=False)
+        missing, unexpected = embeddings_processor.load_state_dict(processor_state_dict, strict=strict)
         if missing:
             logger.warning_rank0(f"EmbeddingsProcessor missing keys: {missing}")
         if unexpected:
@@ -122,7 +123,7 @@ def _load_embeddings_processor_weights(
             f"Expected keys starting with: {target_prefixes}"
         )
 
-    missing, unexpected = embeddings_processor.load_state_dict(processor_state_dict, strict=False)
+    missing, unexpected = embeddings_processor.load_state_dict(processor_state_dict, strict=strict)
     if missing:
         logger.warning_rank0(f"EmbeddingsProcessor missing keys: {missing}")
     if unexpected:
@@ -189,6 +190,7 @@ class LTXVideoConditionModel(PreTrainedModel):
         self._load_components()
 
     def _load_components(self):
+        """Load text connectors and the scheduler, adding the video encoder outside meta initialization."""
         base = self.config.base_model_path
         logger.info_rank0(f"Loading LTX-Video condition components from {base}.")
 
@@ -211,7 +213,13 @@ class LTXVideoConditionModel(PreTrainedModel):
         self.embeddings_processor = build_embeddings_processor(transformer_config, with_feature_extractor=False)
 
         load_device = torch.device("cpu") if self.meta_init else device
-        _load_embeddings_processor_weights(self.embeddings_processor, base, device=load_device, dtype=torch.bfloat16)
+        _load_embeddings_processor_weights(
+            self.embeddings_processor,
+            base,
+            device=load_device,
+            dtype=torch.bfloat16,
+            strict=_tc.get("use_keyframes_abs_pos_embedding", False),
+        )
 
         logger.info_rank0(
             f"VeOmni connector inner_dim={self.embeddings_processor.video_connector.inner_dim}, "

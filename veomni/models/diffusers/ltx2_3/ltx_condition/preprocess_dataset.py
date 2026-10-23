@@ -765,30 +765,41 @@ def compute_caption_embeddings(
     if dataloader is None:
         return
 
-    print("Loading Gemma text encoder...")
-    from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
-    from ltx_core.text_encoders.gemma import (
-        GEMMA_LLM_KEY_OPS,
-        GEMMA_MODEL_OPS,
-        GemmaTextEncoderConfigurator,
-        module_ops_from_gemma_root,
-    )
-    from ltx_core.utils import find_matching_file
+    if Path(gemma_model_path).suffix == ".safetensors":
+        if load_in_8bit:
+            raise ValueError("Packed LTX Gemma-4 preprocessing currently requires BF16 weights.")
+        from veomni.models.diffusers.ltx2_3.ltx_condition.ltx25 import (
+            PackedGemma4Encoder,
+            load_packed_feature_extractor,
+        )
 
-    gemma_model_folder = find_matching_file(str(gemma_model_path), "model*.safetensors").parent
-    gemma_weight_paths = [str(p) for p in gemma_model_folder.rglob("*.safetensors")]
+        text_encoder = PackedGemma4Encoder(gemma_model_path, dev, dtype, max_sequence_length)
+        feature_extractor = load_packed_feature_extractor(gemma_model_path, dev, dtype)
+    else:
+        print("Loading Gemma text encoder...")
+        from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from ltx_core.text_encoders.gemma import (
+            GEMMA_LLM_KEY_OPS,
+            GEMMA_MODEL_OPS,
+            GemmaTextEncoderConfigurator,
+            module_ops_from_gemma_root,
+        )
+        from ltx_core.utils import find_matching_file
 
-    text_encoder = SingleGPUModelBuilder(
-        model_path=tuple(gemma_weight_paths),
-        model_class_configurator=GemmaTextEncoderConfigurator,
-        model_sd_ops=GEMMA_LLM_KEY_OPS,
-        module_ops=(GEMMA_MODEL_OPS, *module_ops_from_gemma_root(str(gemma_model_path))),
-    ).build(device=dev, dtype=dtype)
-    text_encoder.eval()
+        gemma_model_folder = find_matching_file(str(gemma_model_path), "model*.safetensors").parent
+        gemma_weight_paths = [str(p) for p in gemma_model_folder.rglob("*.safetensors")]
 
-    print("Loading feature extractor from checkpoint...")
-    feature_extractor = load_feature_extractor(checkpoint_path, dev, dtype)
-    feature_extractor.eval()
+        text_encoder = SingleGPUModelBuilder(
+            model_path=tuple(gemma_weight_paths),
+            model_class_configurator=GemmaTextEncoderConfigurator,
+            model_sd_ops=GEMMA_LLM_KEY_OPS,
+            module_ops=(GEMMA_MODEL_OPS, *module_ops_from_gemma_root(str(gemma_model_path))),
+        ).build(device=dev, dtype=dtype)
+        text_encoder.eval()
+
+        print("Loading feature extractor from checkpoint...")
+        feature_extractor = load_feature_extractor(checkpoint_path, dev, dtype)
+        feature_extractor.eval()
 
     print(f"Processing captions in {len(dataloader):,} batches...")
 
@@ -1418,6 +1429,7 @@ def compute_video_latents(
     with_audio: bool = False,
     audio_output_dir: str | None = None,
     overwrite: bool = False,
+    audio_vae_path: str | None = None,
 ) -> None:
     """Encode videos through VAE and save latent representations.
 
@@ -1500,7 +1512,7 @@ def compute_video_latents(
             ).build(device=device, dtype=dtype)
 
         print("Loading audio VAE encoder...")
-        audio_vae_encoder = load_audio_encoder(checkpoint_path, device=dev, dtype=torch.float32)
+        audio_vae_encoder = load_audio_encoder(audio_vae_path or checkpoint_path, device=dev, dtype=torch.float32)
         audio_vae_encoder.eval()
 
         mel_device = dev if dev.type == get_device_type() else torch.device("cpu")
@@ -1916,6 +1928,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
 
 
 def main():
+    """Dispatch the requested offline caption, embedding, latent or cache-export stage."""
     parser = argparse.ArgumentParser(
         description="LTX-2 preprocessing pipeline: scene splitting, captioning, and latent computation",
     )
@@ -1965,7 +1978,12 @@ def main():
     sp_pre = subparsers.add_parser("preprocess", help="Compute text embeddings + VAE latents")
     sp_pre.add_argument("--dataset_file", type=str, required=True, help="Path to dataset CSV/JSON/JSONL")
     sp_pre.add_argument("--checkpoint_path", type=str, required=True, help="Path to LTX-2 checkpoint")
-    sp_pre.add_argument("--gemma_model_path", type=str, required=True, help="Path to Gemma3 model")
+    sp_pre.add_argument(
+        "--gemma_model_path", type=str, required=True, help="Gemma3 directory or LTX-2.5 packed Gemma4 BF16 file"
+    )
+    sp_pre.add_argument("--video_vae_path", type=str, default=None, help="Split-pack Conv VAE file")
+    sp_pre.add_argument("--audio_vae_path", type=str, default=None, help="Split-pack audio VAE file")
+    sp_pre.add_argument("--precomputed_dir", type=str, default=None, help="Version-specific output cache directory")
     sp_pre.add_argument("--resolution_buckets", type=str, required=True, help="WxHxF;WxHxF;...")
     sp_pre.add_argument("--caption_column", type=str, default="caption")
     sp_pre.add_argument("--media_column", type=str, default="media_path")
@@ -2071,7 +2089,16 @@ def main():
         buckets = parse_resolution_buckets(args.resolution_buckets)
 
         dataset_path = Path(args.dataset_file)
-        precomputed = dataset_path.parent / ".precomputed"
+        precomputed = Path(args.precomputed_dir) if args.precomputed_dir else dataset_path.parent / ".precomputed"
+        if Path(args.gemma_model_path).suffix == ".safetensors":
+            if not args.video_vae_path or (args.with_audio and not args.audio_vae_path):
+                raise ValueError(
+                    "LTX-2.5 split packs require explicit --video_vae_path and --audio_vae_path (with audio)."
+                )
+            if not args.precomputed_dir:
+                raise ValueError(
+                    "Use a fresh --precomputed_dir for LTX-2.5; LTX-2.3 cached features are incompatible."
+                )
 
         compute_caption_embeddings(
             dataset_file=args.dataset_file,
@@ -2091,7 +2118,8 @@ def main():
         compute_video_latents(
             dataset_file=args.dataset_file,
             output_dir=str(precomputed / "latents"),
-            checkpoint_path=args.checkpoint_path,
+            checkpoint_path=args.video_vae_path or args.checkpoint_path,
+            audio_vae_path=args.audio_vae_path,
             resolution_buckets=buckets,
             video_column=args.media_column,
             reshape_mode=args.reshape_mode,
@@ -2113,7 +2141,7 @@ def main():
             compute_video_latents(
                 dataset_file=args.dataset_file,
                 output_dir=str(reference_latents_dir),
-                checkpoint_path=args.checkpoint_path,
+                checkpoint_path=args.video_vae_path or args.checkpoint_path,
                 resolution_buckets=ref_buckets,
                 video_column=args.reference_column,
                 main_media_column=args.media_column,

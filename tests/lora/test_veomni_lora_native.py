@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU single-process tests for the VeOmni-native dense LoRA stack (Phase 1).
+"""Dense native LoRA contracts and a two-rank CPU-offload loading regression.
 
-No distributed / GPU / HF-model build required — a tiny ``nn.Module`` exercises:
+Most cases need no distributed / GPU / HF-model build; a tiny ``nn.Module`` exercises:
 
 * ``VeOmniLoraConfig`` YAML <-> config <-> ``adapter_config.json`` round-trips.
 * Dense injection: PEFT-identical FQNs, trainable-only-LoRA, no-op-at-init.
@@ -24,22 +24,35 @@ No distributed / GPU / HF-model build required — a tiny ``nn.Module`` exercise
 
 ``test_peft_bidirectional_interop`` additionally asserts cross-compatibility
 with stock ``peft`` when it is installed (dev/test-only dependency).
+The distributed loading test uses real NCCL/HCCL on accelerator hosts and
+Gloo on CPU; it exercises both ordinary parameters and CPU-resident DTensor shards.
 """
 
 from __future__ import annotations
 
 import copy
+from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
+from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from tests.tools.training_utils import unbuilt_runtime
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.layers import LoraLinear
-from veomni.lora.state_dict import get_lora_state_dict, load_adapter_state_dict
+from veomni.lora.state_dict import get_lora_state_dict, insert_adapter_name, load_adapter_state_dict
 from veomni.lora.weight_loading import load_lora_weights
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+_DISTRIBUTED_LOAD = LaunchSpec(nproc=2)
 
 
 torch.manual_seed(0)
@@ -71,6 +84,129 @@ def _randomize_lora_b(model: VeOmniLoraModel) -> None:
             if isinstance(module, LoraLinear):
                 for lin in module.lora_B.values():
                     lin.weight.normal_(0.0, 0.02)
+
+
+def test_offloaded_adapter_broadcast_uses_accelerator(monkeypatch):
+    """CPU offload must not send even the adapter-count scalar over NCCL on CPU."""
+    from veomni.lora import weight_loading
+    from veomni.models.checkpoint import weights
+
+    monkeypatch.setattr(weight_loading.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(weight_loading.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(weight_loading, "get_parallel_state", lambda: SimpleNamespace(global_rank=0))
+    monkeypatch.setattr(weights, "get_device_type", lambda: "cuda")
+    monkeypatch.setattr(weight_loading, "load_adapter_state_dict", lambda *args, **kwargs: {})
+    tensor_factory = torch.tensor
+    requested_devices = []
+
+    def allocate_count(*args, **kwargs):
+        """Record the requested communication device while allocating on CPU."""
+        requested_devices.append(torch.device(kwargs.pop("device")))
+        # Exercise the transport decision without requiring CUDA in this suite.
+        return tensor_factory(*args, device="cpu", **kwargs)
+
+    def broadcast_count(tensor, src):
+        """Verify the adapter-count collective uses the root rank and expected value."""
+        assert requested_devices[-1].type == "cuda", "NCCL cannot broadcast CPU tensors"
+        assert src == 0 and tensor.item() == 0
+
+    monkeypatch.setattr(weight_loading.torch, "tensor", allocate_count)
+    monkeypatch.setattr(weight_loading.dist, "broadcast", broadcast_count)
+    weight_loading.rank0_load_and_broadcast_lora_weights(nn.Identity(), "unused", init_device="cpu")
+    assert len(requested_devices) == 1
+
+
+def _check_offloaded_adapter_broadcast(rank, rendezvous, adapter_path, expected, sharded):
+    """Load nonempty native weights through real collectives on both ranks."""
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.lora.weight_loading import rank0_load_and_broadcast_lora_weights
+
+    torch.set_num_threads(1)
+    device_type = get_device_type()
+    if device_type != "cpu":
+        get_torch_device().set_device(rank)
+    backend = "gloo" if device_type == "cpu" else get_dist_comm_backend()
+    dist.init_process_group(backend, init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=60))
+    try:
+        state = _init_parallel_state(dp_size=2, device_type=device_type)
+        model = VeOmniLoraModel(Toy(), _base_config())
+        for name, value in expected.items():
+            param = model.get_parameter(name)
+            if sharded:
+                local = torch.full_like(value.chunk(2, dim=0)[rank], torch.nan)
+                tensor = DTensor.from_local(
+                    local,
+                    state.fsdp_mesh,
+                    [Shard(0)],
+                    run_check=False,
+                    shape=value.shape,
+                    stride=value.stride(),
+                ).to("cpu")
+                assert tensor.to_local().device.type == "cpu"
+                module_name, _, parameter_name = name.rpartition(".")
+                model.get_submodule(module_name).register_parameter(parameter_name, nn.Parameter(tensor))
+            else:
+                with torch.no_grad():
+                    param.fill_(torch.nan)
+
+        broadcast = dist.broadcast
+        payloads = []
+
+        def record_broadcast(tensor, *args, **kwargs):
+            """Observe transport tensors without replacing the real collective."""
+            assert tensor.device.type == device_type
+            result = broadcast(tensor, *args, **kwargs)
+            payloads.append(tensor.detach().cpu().clone())
+            return result
+
+        def shard_loaded_tensor(tensor, mesh, placements):
+            """Shard the received accelerator tensor before the loader offloads it."""
+            assert tensor.device.type == device_type
+            return distribute_tensor(tensor, mesh, placements)
+
+        pending = set(expected)
+        with patch.object(dist, "broadcast", record_broadcast):
+            rank0_load_and_broadcast_lora_weights(
+                model,
+                adapter_path if rank == 0 else adapter_path + "/must-not-read-on-peer",
+                init_device="cpu",
+                dtensor_factory=shard_loaded_tensor,
+                parameter_names_to_load=pending,
+            )
+        assert not pending
+        assert payloads[0].item() == len(expected)
+        for name, value in expected.items():
+            assert any(torch.equal(payload, value) for payload in payloads), name
+            param = model.get_parameter(name)
+            actual = param.to_local() if sharded else param
+            assert actual.device.type == "cpu"
+            reference = value.chunk(2, dim=0)[rank] if sharded else value
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0, msg=name)
+    finally:
+        dist.destroy_process_group()
+        clear_parallel_state()
+
+
+@pytest.mark.launch_plan(provider=_DISTRIBUTED_LOAD)
+@pytest.mark.parametrize("sharded", [False, True], ids=["dense", "dtensor"])
+def test_offloaded_nonempty_adapter_distributed(tmp_path, sharded):
+    """Verify rank-0 file loading, real broadcasts and exact CPU shard restoration."""
+    device_type = get_device_type()
+    if device_type == "cpu" and not dist.is_gloo_available():
+        pytest.skip("CPU distributed loading requires Gloo")
+    if device_type != "cpu" and runner_device_count() < _DISTRIBUTED_LOAD.nproc:
+        pytest.skip("Distributed loading requires two accelerators")
+    source = VeOmniLoraModel(Toy(), _base_config())
+    _randomize_lora_b(source)
+    adapter_path = str(tmp_path / "adapter")
+    source.save_pretrained(adapter_path)
+    expected = {insert_adapter_name(name, "default"): value for name, value in get_lora_state_dict(source).items()}
+    assert len(expected) == 4 and all(torch.count_nonzero(value) > 0 for value in expected.values())
+    mp.spawn(
+        _check_offloaded_adapter_broadcast,
+        args=((tmp_path / "rendezvous").as_uri(), adapter_path, expected, sharded),
+        nprocs=_DISTRIBUTED_LOAD.nproc,
+    )
 
 
 # ----------------------------------------------------------------------------
