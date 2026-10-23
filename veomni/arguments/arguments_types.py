@@ -1494,6 +1494,10 @@ class OpsImplementationConfig:
             "matching backend raises when the model resolves its kernel."
         },
     )
+    coalesced_gdn_exchange: bool = field(
+        default=False,
+        metadata={"help": "Opt-in Qwen4-Exp same-dtype GDN projection coalescing before Ulysses exchange."},
+    )
     chunk_gated_delta_rule_implementation: str = field(
         default="fla",
         metadata={

@@ -140,6 +140,7 @@ def qwen4_exp_text_mlp_forward_patched(self, x):
     return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
+config.add_import("veomni.distributed.sequence_parallel.gdn_exchange", names=["coalesced_gather_aligned"])
 config.add_import("copy", names=["copy"])
 config.add_import("dataclasses", names=["dataclass"])
 config.add_import("functools", names=["partial"])
@@ -163,7 +164,7 @@ config.add_import(
     names=["gather_heads_scatter_seq", "gather_seq_scatter_heads"],
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.config", names=["resolve_op_impl"])
+config.add_import("veomni.ops.config", names=["get_ops_config", "resolve_op_impl"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import("veomni.models.utils.moe_utils", names=["merged_experts_act_fn_forward"])
 config.add_import("veomni.models.loss_utils", names=["ForCausalLMLoss", "load_balancing_loss"])
@@ -319,6 +320,7 @@ def qwen4_exp_gated_deltanet_init_patched(self, config, layer_idx):
     self.key_dim = self.head_k_dim * self.num_k_heads
     self.value_dim = self.head_v_dim * self.num_v_heads
 
+    self.coalesced_gdn_exchange = getattr(get_ops_config(), "coalesced_gdn_exchange", False)
     self.conv_kernel_size = config.linear_conv_kernel_dim
     self.layer_idx = layer_idx
     self.activation = config.hidden_act
@@ -428,26 +430,36 @@ def qwen4_exp_gated_deltanet_forward_patched(
         local_value_dim = local_num_v_heads * self.head_v_dim
 
         q_proj, k_proj, v_proj = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-        q_proj = gather_seq_scatter_heads(
-            q_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim),
-            seq_dim=1,
-            head_dim=2,
-            group=sp_group,
-        )
-        k_proj = gather_seq_scatter_heads(
-            k_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim),
-            seq_dim=1,
-            head_dim=2,
-            group=sp_group,
-        )
-        v_proj = gather_seq_scatter_heads(
-            v_proj.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim),
-            seq_dim=1,
-            head_dim=2,
-            group=sp_group,
-        )
-        b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=sp_group)
-        a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=sp_group)
+        if self.coalesced_gdn_exchange and q_proj.dtype == k_proj.dtype == v_proj.dtype == b.dtype == a.dtype:
+            q_proj, k_proj, v_proj, b, a = coalesced_gather_aligned(
+                q_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim),
+                k_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim),
+                v_proj.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim),
+                b,
+                a,
+                sp_group,
+            )
+        else:
+            q_proj = gather_seq_scatter_heads(
+                q_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim),
+                seq_dim=1,
+                head_dim=2,
+                group=sp_group,
+            )
+            k_proj = gather_seq_scatter_heads(
+                k_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim),
+                seq_dim=1,
+                head_dim=2,
+                group=sp_group,
+            )
+            v_proj = gather_seq_scatter_heads(
+                v_proj.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim),
+                seq_dim=1,
+                head_dim=2,
+                group=sp_group,
+            )
+            b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=sp_group)
+            a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=sp_group)
         mixed_qkv = torch.cat(
             (
                 q_proj.flatten(2),

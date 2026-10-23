@@ -287,3 +287,14 @@ When adding a row, test its numerical contract, registration, hardware
 requirement, and optional-package requirements. When adding model-specific
 argument policy, test it in `tests/models` rather than duplicating it in
 the raw-kernel suite.
+
+### Optional Qwen4-Exp GDN projection exchange
+
+Set `model.ops_implementation.coalesced_gdn_exchange: true` to concatenate the Q/K/V, beta and
+decay projections before the existing explicit-group Ulysses exchange. The packed
+width retains the Q/K-to-value head ratio; each peer packet is padded to 512 bytes
+and unpadded before interpreting the sequence. Backward performs the inverse
+permutation with no rescaling. This reduces five input collectives to one; output
+exchange, recurrence, packed boundaries and CP groups are unchanged. The option
+is off by default, and mixed projection dtypes use the existing five exchanges
+without casting. It does not remove GDN's head-divisibility constraint.
