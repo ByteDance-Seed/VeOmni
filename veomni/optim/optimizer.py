@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -31,7 +32,10 @@ from torch.optim.optimizer import Optimizer
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
+from .cpu_offload_adamw import CPUOffloadAdamW, resolve_moment_dtype, select_cpu_offload_groups
+from .master_fp32_adamw import FullFP32AdamW, MasterFP32AdamW
 from .muon import DistributedMuon, infer_head_block_counts, split_muon_adamw_params
+from .qwen38_muon import Qwen38MuonAdamW, add_qwen38_plans
 
 
 if TYPE_CHECKING:
@@ -285,6 +289,15 @@ class AnyPrecisionAdamW(Optimizer):
                     p.data.addcdiv_(exp_avg, centered_variance, value=-step_size)
 
 
+def optimizer_state_dict_for_checkpoint(model, optimizer, *, for_load=False, flatten=False):
+    """Let optimizers prepare exact lazy-state buffers before PyTorch's getter."""
+    prepare = getattr(optimizer, "checkpoint_state", None)
+    with prepare(load=for_load) if prepare is not None else nullcontext():
+        return get_optimizer_state_dict(
+            model, optimizer, options=StateDictOptions(flatten_optimizer_state_dict=flatten)
+        )
+
+
 class MultiOptimizer(Optimizer, Stateful):
     """
     A container that handles multiple optimizers (for extra_parallel and non-extra_parallel parameters when extra_parallel+fsdp2 is enabled)
@@ -316,12 +329,14 @@ class MultiOptimizer(Optimizer, Stateful):
 
     def state_dict(
         self,
+        *,
+        for_load=True,
     ) -> Dict[str, Any]:
         # get the flatten state dict for multi-optimizer
         merged: Dict[str, Any] = {}
         for name in self.key_names:
             opt = self.optimizers_dict.get(name)
-            sd = get_optimizer_state_dict(self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True))
+            sd = optimizer_state_dict_for_checkpoint(self.model, opt, for_load=for_load, flatten=True)
             # check for key clashes before merging
             overlap = set(merged.keys()) & set(sd.keys())
             if overlap:
@@ -348,9 +363,9 @@ class MultiOptimizer(Optimizer, Stateful):
         merged: Dict[str, Any] = {}
         for name in self.key_names:
             opt = self.optimizers_dict.get(name)
-            if not opt.state:
+            if not opt.state and not getattr(opt, "checkpoint_save_requires_state", False):
                 continue
-            sd = get_optimizer_state_dict(self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True))
+            sd = optimizer_state_dict_for_checkpoint(self.model, opt, flatten=True)
             overlap = set(merged.keys()) & set(sd.keys())
             if overlap:
                 raise KeyError(
@@ -469,11 +484,14 @@ def build_optimizer(
     no_decay_params: Optional[List[str]] = None,
     muon_kwargs: Optional[Dict[str, Any]] = None,
     optimizer_config: Optional["OptimizerConfig"] = None,
+    cpu_offload_param_patterns: Optional[List[str]] = None,
+    cpu_offload_resident_moment_dtype: Optional[str] = None,
+    cpu_offload_cpu_moment_dtype: Optional[str] = None,
 ) -> "torch.optim.Optimizer":
     """Build the optimizer.
 
     ``optimizer_config`` lets callers hand over the whole ``OptimizerConfig`` so
-    that optimizer-specific knobs (currently Muon's ``muon_*`` fields) are read
+    that optimizer-specific knobs (Muon and CPU-offload precision fields) are read
     here rather than unpacked by every trainer. It does *not* supply ``lr``,
     ``weight_decay`` or the ``no_decay_*`` lists — those stay explicit arguments,
     because callers such as the VLM trainer drive the AdamW side from their own
@@ -507,9 +525,64 @@ def build_optimizer(
         if not param_groups:
             raise ValueError("All optimizer param groups are empty; no trainable parameters to optimize.")
 
+    cpu_offload_kwargs = {}
+    if optimizer_type in ("cpu_offload_adamw", "qwen38_muon"):
+        for key, override in (
+            ("resident_moment_dtype", cpu_offload_resident_moment_dtype),
+            ("cpu_moment_dtype", cpu_offload_cpu_moment_dtype),
+        ):
+            value = override if override is not None else getattr(optimizer_config, f"cpu_offload_{key}", "float32")
+            cpu_offload_kwargs[key] = resolve_moment_dtype(value)
+        patterns = cpu_offload_param_patterns
+        if patterns is None and optimizer_config is not None:
+            patterns = optimizer_config.cpu_offload_param_patterns
+        if param_groups is None:
+            param_groups = _make_param_groups_for_subset(
+                model, model.parameters(), weight_decay, no_decay_modules, no_decay_params
+            )
+        if optimizer_type == "qwen38_muon":
+            # VLM groups may specify only per-tower learning rates. Resolve the
+            # configured decay policy before validating trainable PLE tables.
+            resolved_groups = []
+            for group in param_groups:
+                if "weight_decay" in group:
+                    resolved_groups.append(group)
+                else:
+                    for decay_group in _make_param_groups_for_subset(
+                        model, group["params"], weight_decay, no_decay_modules, no_decay_params
+                    ):
+                        resolved_groups.append({**group, **decay_group})
+            param_groups = resolved_groups
+        param_groups = select_cpu_offload_groups(model, param_groups, patterns)
+        if optimizer_type == "qwen38_muon":
+            param_groups = add_qwen38_plans(model, param_groups)
+        selected = [p for group in param_groups if group["cpu_offload"] for p in group["params"]]
+        local_numel = sum(p.to_local().numel() if isinstance(p, DTensor) else p.numel() for p in selected)
+        logger.info_rank0(
+            "CPU optimizer offload: %d parameter tensors, %d local elements; CPU state %.3f GiB per rank; "
+            "master=float32, resident_moments=%s, cpu_moments=%s; compute weights and gradients remain resident.",
+            len(selected),
+            local_numel,
+            (4 + 2 * torch.empty((), dtype=cpu_offload_kwargs["cpu_moment_dtype"]).element_size())
+            * local_numel
+            / 2**30,
+            cpu_offload_kwargs["resident_moment_dtype"],
+            cpu_offload_kwargs["cpu_moment_dtype"],
+        )
+
     if _should_build_extra_parallel_aware(model):
         return build_extra_parallel_fsdp2_optimizer(
-            model, lr, betas, eps, weight_decay, fused, optimizer_type, param_groups, no_decay_modules, no_decay_params
+            model,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            fused,
+            optimizer_type,
+            param_groups,
+            no_decay_modules,
+            no_decay_params,
+            cpu_offload_kwargs=cpu_offload_kwargs,
         )
     if param_groups is None:
         decay_param_names = get_parameter_names(model, no_decay_modules, no_decay_params)
@@ -540,13 +613,18 @@ def build_optimizer(
         foreach = not fused
         fused = fused
         optim = AdamW(param_groups, lr, betas, eps, weight_decay, fused=fused, foreach=foreach)
+    elif optimizer_type == "qwen38_muon":
+        optim = Qwen38MuonAdamW(param_groups, lr, betas, eps, weight_decay, **cpu_offload_kwargs)
+    elif optimizer_type == "cpu_offload_adamw":
+        optim = CPUOffloadAdamW(param_groups, lr, betas, eps, weight_decay, **cpu_offload_kwargs)
+    elif optimizer_type == "full_fp32_adamw":
+        optim = FullFP32AdamW(param_groups, lr, betas, eps, weight_decay)
+    elif optimizer_type == "master_fp32_adamw":
+        optim = MasterFP32AdamW(param_groups, lr, betas, eps, weight_decay)
     elif optimizer_type == "anyprecision_adamw":
         optim = AnyPrecisionAdamW(param_groups, lr, betas, eps, weight_decay)
     else:
-        raise ValueError(
-            "Only adamw, anyprecision_adamw and muon are supported as optimizers; "
-            f"got optimizer_type={optimizer_type!r}."
-        )
+        raise ValueError(f"Unsupported optimizer selection; got optimizer_type={optimizer_type!r}.")
 
     return optim
 
@@ -782,6 +860,7 @@ def build_extra_parallel_fsdp2_optimizer(
     param_groups: Optional[List[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
+    cpu_offload_kwargs: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a MultiOptimizer instance when model is parallelized with ExtraParallel+FSDP2
@@ -914,6 +993,14 @@ def build_extra_parallel_fsdp2_optimizer(
             foreach = not fused
             _fused = fused
             return AdamW(groups, lr, betas, eps, weight_decay, fused=_fused, foreach=foreach)
+        elif optimizer_type == "qwen38_muon":
+            return Qwen38MuonAdamW(groups, lr, betas, eps, weight_decay, **(cpu_offload_kwargs or {}))
+        elif optimizer_type == "cpu_offload_adamw":
+            return CPUOffloadAdamW(groups, lr, betas, eps, weight_decay, **(cpu_offload_kwargs or {}))
+        elif optimizer_type == "full_fp32_adamw":
+            return FullFP32AdamW(groups, lr, betas, eps, weight_decay)
+        elif optimizer_type == "master_fp32_adamw":
+            return MasterFP32AdamW(groups, lr, betas, eps, weight_decay)
         elif optimizer_type == "anyprecision_adamw":
             return AnyPrecisionAdamW(groups, lr, betas, eps, weight_decay)
         else:
