@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ... import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
+from ... import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
 
 
 @OMNI_CONFIG_REGISTRY.register("fake_module_a")
@@ -27,3 +27,10 @@ def register_fake_module_a_modeling():
     from .modeling import FakeModuleA
 
     return FakeModuleA
+
+
+@OMNI_ACCELERATED_MODEL_REGISTRY.register("fake_module_a")
+def register_fake_module_a_accelerated_model():
+    from .accelerated import FakeModuleAAccelerated
+
+    return FakeModuleAAccelerated

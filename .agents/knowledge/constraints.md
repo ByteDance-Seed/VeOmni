@@ -4,14 +4,18 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
 
 ## Model Loading & Registry
 
-1. **Model registration must happen at import time**
-   - `MODELING_REGISTRY`, `MODEL_CONFIG_REGISTRY`, and `MODEL_PROCESSOR_REGISTRY` in `veomni/models/loader.py` are populated when model `__init__.py` files are imported.
+1. **Supported model registration must happen at import time**
+   - `MODELING_REGISTRY`, `MODEL_CONFIG_REGISTRY`, and `MODEL_PROCESSOR_REGISTRY` in `veomni/models/registry.py` are populated when model `__init__.py` files are imported.
    - Moving registrations into functions or delaying them breaks `build_foundation_model()`.
-   - All model `__init__.py` files must import and register their modeling classes at module level.
+   - Every model imported by `veomni/models/transformers/__init__.py` must
+     register its modeling classes at module level. Placeholder packages for
+     pending model migrations must not be imported there or exposed through the
+     public registry.
 
 2. **Model config `model_type` must match registry key**
    - The `model_type` field in a model's `config.json` is used as the lookup key in registries.
-   - Mismatches cause fallback to vanilla HuggingFace loading, which misses VeOmni patches (flash attention, sequence parallel).
+   - Mismatches fail explicitly under the VeOmni backend. Set `MODELING_BACKEND=hf`
+     only when loading the upstream HuggingFace class without VeOmni model kernels.
 
 3. **Patchgen-generated files must not be edited manually**
    - Files under `veomni/models/transformers/*/generated/` are created by the `patchgen` CLI (entry point installed by the `patchgen` package).
@@ -48,7 +52,7 @@ Core entry points:
    - Gradient clipping: `veomni/distributed/fsdp2/clip_grad_norm.py` — handles DTensor grads and ExtraParallel param groups.
 
 6. **Device mesh initialization (`init_parallel_state_from_config()`)**
-   - Builds a global `DeviceMesh` with named dimensions: `pp`, `dp_replicate`, `dp_shard`, `ulysses`, `cp`, `tp` (each included only if size > 1).
+   - Builds a global `DeviceMesh` with named dimensions: `pp`, `dp_replicate`, `dp_shard`, `cp`, `ulysses`, `tp` (`dp_shard` is always included; other dimensions only when size > 1). Ulysses follows CP so its ranks are adjacent when both axes are used.
    - Flattens subviews for common usage: `dp` (all data-parallel), `sp` (ulysses+cp), `dp_shard_sp` (FSDP shard × SP), `dp_sp` (for loss/grad sync across SP+DP).
    - For each ExtraParallel name (e.g. `ep`), builds a `[para_size × para_fsdp_size]` submesh via `init_para_mesh_matrix()`.
 
@@ -62,7 +66,8 @@ Core entry points:
    - Async variants in `async_ulysses*.py` for DiT and pipelined QKV/output projections.
    - Data slicing: `veomni/distributed/sequence_parallel/data.py` — `sp_pad_and_slice()`, `slice_input_tensor()`, `gather_outputs()`.
    - Loss reduction: `reduce_sequence_parallel_loss()` in `loss.py` aggregates across SP ranks (optional `group=` arg; defaults to the current state's unified SP group).
-   - Process groups: `comm.py` has NO group globals. Its getters (`get_ulysses_sequence_parallel_group`, `get_unified_sequence_parallel_group`, `get_context_parallel_group`, `get_data_parallel_group`) resolve from the *current* `ParallelState`'s device mesh (`get_parallel_state().{ulysses,sp,cp,dp}_group`) — exactly how `fsdp_group` already worked. `set_ulysses_sequence_parallel_group(group)` survives ONLY as a unit-test injection seam (`_ULYSSES_SP_GROUP_OVERRIDE`, `None` in production); no production code calls it. Meshless SP is unsupported — `ParallelState.__post_init__` raises if `sp_enabled and device_mesh is None`; always build via `init_parallel_state_from_config`.
+   - Gradient scale: the data-parallel gradient reduction averages over the SP ranks too (FSDP2 over `dp_shard_sp`, DDP over `dp_sp` at clip time), so each SP rank's backward must produce `sp_size ×` its share of the gradient. `ReduceLoss.backward` multiplies by `sp_world_size`. A model that gathers its output and computes a loss replicated on every SP rank must call `_Gather` with `sum_grad=True` (the `gather_outputs()` default) or `grad_scale=True, sum_grad=False`. Plain `sum_grad=False` silently scales every gradient by `1/sp_size` while the loss still matches (MiniMax H3 had this bug); compare SP gradients, not only losses, against a single-rank reference.
+   - Process groups: `comm.py` has NO group globals. Its getters (`get_ulysses_sequence_parallel_group`, `get_unified_sequence_parallel_group`, `get_context_parallel_group`, `get_data_parallel_group`) resolve from the *current* `ParallelState`'s device mesh (`get_parallel_state().{ulysses,sp,cp,dp}_group`) — exactly how `fsdp_group` already worked. There are no group setters, not even a test seam: SP unit tests build a real state with `_init_parallel_state`. Meshless SP is unsupported — `ParallelState.__post_init__` raises if `sp_enabled and device_mesh is None`; always build via `init_parallel_state_from_config`.
    - Local parallel state: `BaseTrainer._setup(args)` registers `"base"` **before** seed/determinism env vars (`NCCL_DETERMINISTIC`, etc.). Initialization caches by topology and registers under `name`; duplicate name → debug and return existing (`_setup` then `VeOmniModelRuntime.setup` both register `"base"` on a single-model job). Never store the ParallelState **object**: `VeOmniModelRuntime.parallel_state` is a by-name registry lookup on every access. Build and clip open `use_parallel_state(self.model_name)`. Run-time trainer ops open `use_parallel_state(self.model.parallel_state)` (forward, postforward, backward) so they do not hard-code `"base"`. Only the *name* is held on the runtime. `clear_parallel_state()` after `destroy_process_group()`. Tests that need a topology no job config can express call `_init_parallel_state` directly.
    - **Build scope**: `_setup(args)` registers `"base"`. `VeOmniModelRuntime.setup()` only registers this model's mesh; `__init__` then wraps meta-init, freeze, FSDP2/EP wrap + weight load, and optimizer in `use_parallel_state(self.model_name)`. A trainer must NOT open a build scope of its own or resequence those steps from outside: a model whose build differs subclasses the runtime.
    - **Run scope (per-op, not whole `train_step`)**: each ambient-dependent op wraps `use_parallel_state(<that model's parallel_state>)`. On the one-model trainer that is `self.model.parallel_state` around forward, `postforward`/`mean_global_loss`, and `loss.backward()`. A multi-model trainer overrides `forward_backward_step` and wraps each model's forward/reduce/backward itself (DPO: policy vs reference). Grad clipping is `VeOmniModelRuntime.clip_grad_norm()`. When an API takes explicit `group=`, pass `get_parallel_state_by_name(<that name>).sp_group` and skip ambient. Do not `(loss_a + loss_b).backward()` under one ambient state when A and B have different SP groups — Ulysses backward reads ambient `get_parallel_state()`.
@@ -84,11 +89,11 @@ Core entry points:
    - The gate is `param.is_meta`, not `init_device`. The flag states an intent the model builder is free to ignore — `tests/data/*` construct their model eagerly and leave the flag at its `meta` default — and materializing a model that already holds real weights discards them, or raises outright on a plain `nn.Module` with no `init_weights`. A model built under `cuda` arrives with weights already loaded (`empty_init=False` in `veomni/models/auto.py`) and must be left alone. `parallelize_model_fsdp2()` keeps its call unconditional because `arguments_types.py` asserts `init_device == "meta"` for fsdp2, so a real model cannot reach it.
    - `init_device == "cpu"` is refused for `ddp`, by an assert in `AcceleratorConfig._validate_init_device()` alongside the one that pins fsdp2 to `meta` — not in `parallelize_model_ddp()`. Parse time is the right place: every rank fails together, before a model is built or a snapshot read. It never worked for the wrap: `device_ids=[local_rank]` has been passed since the first commit, and torch rejects that together with a CPU module (`torch/nn/parallel/distributed.py`), so rank0's CPU replica cannot be wrapped while every other rank builds empty and skips the load (`veomni/models/loader.py`). It was FSDP1's `sync_module_states` recipe (rank0 reads, the wrapper broadcasts), dropped in #756; fsdp2 replaced it with `broadcast_model_weights_from_rank0`.
    - Dropping `"cpu"` from the field's `Literal` is *not* what enforces this, and no `Literal` in the arguments layer enforces anything. The parser turns it into argparse `choices`, which covers the CLI only; a YAML value goes straight to the dataclass constructor via `_instantiate_recursive()` (`veomni/arguments/parser.py`), and annotations are never checked at runtime. Any config value that must actually be rejected needs an explicit assert in `__post_init__`.
-   - Two other users of `"cpu"` are unaffected and must not be swept up in that: `build_foundation_model(init_device="cpu")` is a live public API (several tests build on CPU that way), and `materialize_device="cpu"` is how fsdp2 CPU offload reaches `load_model_weights()`. The `init_device` parameters in `veomni/models/module_utils.py` are fed by the latter, not by `model.accelerator.init_device`.
+   - Two other users of `"cpu"` are unaffected and must not be swept up in that: `build_foundation_model(init_device="cpu")` is a live public API (several tests build on CPU that way), and `materialize_device="cpu"` is how fsdp2 CPU offload reaches `load_model_weights()`. The `init_device` parameters in `veomni/models/checkpoint/weights.py` are fed by the latter, not by `model.accelerator.init_device`.
    - `should_skip_hf_weight_load` must be honoured here too: a distributed-checkpoint resume is about to overwrite every parameter, so reading the HF snapshot doubles peak memory, and the snapshot may not exist at all.
    - `broadcast_model_weights_from_rank0` is honoured here under both FSDP2 and DDP. `rank0_load_and_broadcast_weights()` broadcasts over the default (world) group from global rank0 (`dist.broadcast(..., src=0)`, no `group=`), which is what a DDP replica wants. It defaults to `True`.
    - After the load pass, `parallelize_model_ddp()` re-checks `param.is_meta` and raises with the offending parameter names. A loader that leaves one behind would otherwise surface inside DDP's constructor as `Tensor.item() cannot be called on meta tensors`, which names neither the parameter nor the cause.
-   - ExtraParallel is refused on the DDP path, keyed on **the model's plan** (`_has_extra_parallel_plan()`), not on `ParallelState.any_extra_parallel_enabled`. Only `parallelize_model_fsdp2()` applies the plan that shards expert weights, so DDP experts are whole and loading a sharded-expert config into them — previously prevented only by the meta crash — would silently produce full tensors. But the mesh alone does not identify such a model: a SeedOmni V2 sub-module's accelerator is `_deep_update(global, override)`, so a DDP vision tower inherits the backbone's ep dim while owning no experts, and refusing on the mesh would block it. The same predicate gates `ep_sharded_stream_load` in `_materialize_and_load_weights()`: a plan-less model skips the fast path with a log line (there was never one to take), while a model that *does* have a plan still lets the loader's `NotImplementedError` propagate, because that one means the checkpoint layout is unsupported — the distinction `tests/utils/test_moe_ep_sharded_load_matrix.py` pins for `nonmerged x ep_sharded`.
+   - ExtraParallel is refused on the DDP path, keyed on **the model's plan** (`_has_extra_parallel_plan()`), not on `ParallelState.any_extra_parallel_enabled`. Only `parallelize_model_fsdp2()` applies the plan that shards expert weights, so DDP experts are whole and loading a sharded-expert config into them — previously prevented only by the meta crash — would silently produce full tensors. But the mesh alone does not identify such a model: a SeedOmni V2 sub-module's accelerator is `_deep_update(global, override)`, so a DDP vision tower inherits the backbone's ep dim while owning no experts, and refusing on the mesh would block it. The same predicate gates `ep_sharded_stream_load` in `_materialize_and_load_weights()`: a plan-less model skips the fast path with a log line (there was never one to take), while a model that *does* have a plan still lets the loader's `NotImplementedError` propagate, because that one means the checkpoint layout is unsupported — the distinction `tests/utils/test_moe_ep_sharded_load_matrix.py` pins for `nonmerged x ep_sharded`. A per-expert checkpoint is supported only when the model's converter implements `fused_expert_target` + `for_expert_range` (each rank then reads and stacks just its own experts); a converter without them still raises.
 
 ### Expert Parallel (MoE)
 
@@ -98,6 +103,21 @@ Core entry points:
    - Expert computation: `EPGroupGemm` runs fused expert MLP on grouped tokens per rank.
    - Device mesh: `init_parallel_state_from_config()` builds `[ep × ep_fsdp]` submesh; accessed via `ParallelState.extra_parallel_mesh("ep")`, `ep_group`, `ep_rank`.
    - In FSDP2: expert modules get `fully_shard()` on the `ep_fsdp` submesh with `Shard(1)` placement so hidden-dim sharding composes with EP's dim-0 sharding.
+
+8a. **Persistent 2D ExtraParallel parameters require a complete 2D mesh**
+   - Persistent ExtraParallel parameters currently require a 2D `(<para>_fsdp, <para>)` mesh covering the complete world. HSDP replicas and FSDP CPU offload remain unsupported.
+   - There is currently no `sequence_parallel_persistent_names` plan field and no explicit SP allowlist or SP-specific rejection in `torch_parallelize.py`. Therefore this constraint must not be read as validation that persistent ExtraParallel parameters are safe for every SP model; adding another such model requires reviewing its optimizer, gradient, and checkpoint semantics under SP.
+   - Qwen4-Exp's `ple` dimension is currently the only persistent ExtraParallel use. Its lookup, gradient scaling, optimizer, and checkpoint paths operate over the complete flattened PLE mesh while inputs remain sequence-sharded.
+
+8b. **Qwen4-Exp QSA indices are global full-resolution token indices**
+   - `qsa_attention_implementation` selects blocks with local queries and globally gathered pooled keys, returning local `[B,L,K]` selections for each rank's query shard while `Qwen4ExpTextAttention` keeps `query_states` local (`[B,H_q,L,D]`) and all-gathers `key_states`/`value_states` (`[B,H_kv,S,D]`) over the active sequence- or context-parallel group.
+   - Index values address global full-resolution K/V directly; `-1` is the only invalid-slot sentinel. Do not rebase them by rank or lift them past a compressed-KV segment.
+   - Packed block boundaries come exclusively from global `cu_seq_lens_q`. Blocks must never cross a packed-sample boundary or be derived from an SP/CP shard boundary.
+   - Keep selections compact through distributed collection and KV all-gather. Unsupported layouts must fail before entering collectives.
+   - The eager backend deliberately expands the compact indices to an `[B,1,L,S]` mask and runs dense GQA. It is a numerical reference with quadratic memory/runtime scaling, not evidence that a fused backend implements gather semantics.
+
+8c. **Differentiable SP collectives must remain in every rank's autograd graph**
+   - Rank-local packed boundaries can make a gathered halo unused on some ranks. Preserve a zero-valued dependency on the gathered tensor so every rank executes the same backward collective sequence; otherwise a later all-reduce can be matched against another rank's gather backward and fail with inconsistent collective counts.
 
 ## Data Pipeline
 
@@ -123,8 +143,8 @@ Core files:
     - Multimodal models may have 3D position_ids `(B, dim, L)` — FA uses the first row `[:, 0, :]`.
 
 11. **Dynamic batching token counting must match `dyn_bsz_count_mode`**
-    - Default / legacy behavior (`train.dyn_bsz_count_mode="total"`) uses `attention_mask.sum()` as the length function in `DynamicBatchingSizeDataset` and `DynBszBuffer`.
-    - Optional effective-token mode (`"effective"`) uses `(labels != IGNORE_INDEX).sum()` when `labels` are present, and falls back to `attention_mask.sum()` otherwise.
+    - Default / legacy behavior (`train.dyn_bsz_count_mode="total"`) uses `get_length_fn` (`attention_mask.sum()` with `input_ids` fallback, or the sum of `item.meta["_omni_token_len"]` across all items—including `is_dummy=True` placeholders—for SeedOmni `conversation_list` samples) in `DynamicBatchingSizeDataset` and `DynBszBuffer`.
+    - Optional effective-token mode (`"effective"`) uses `get_length_by_labels_fn` (`(labels != IGNORE_INDEX).sum()` when `labels` are present, or non-dummy supervised text/assistant-media token lengths for SeedOmni `conversation_list` samples, falling back to `get_length_fn` otherwise).
     - With FA varlen, `attention_mask` is still expected to be all-ones over packed length; boundaries come from `position_ids` and `cu_seq_lens`.
     - When SP is enabled, `attention_mask` must use `sp_pad_value=1` (asserted in `MainCollator.__post_init__`).
     - In effective-token mode, dynamic batching still applies a hard physical-token cap of `micro_batch_size * max_seq_len` during micro-batch selection to avoid unbounded prompt-heavy batches; a single sample may still exceed the cap by itself and should be controlled by preprocessing.
@@ -200,7 +220,7 @@ Core files:
 
 22. **Non-CUDA accelerator code paths require guards**
     - There are three backends today: CUDA, Ascend NPU and Cambricon MLU. Guard vendor-specific code with `is_torch_npu_available()` / `IS_NPU_AVAILABLE` or `is_torch_mlu_available()` / `IS_MLU_AVAILABLE` (`veomni/utils/import_utils.py`, `veomni/utils/device.py`).
-    - NPU kernels live in `veomni/ops/kernels/{rms_norm,rotary}/npu.py` and `veomni/ops/platform/npu/`; the MLU kernel is `veomni/ops/kernels/moe/mlu_group_gemm.py`. They must not be imported on a host without that vendor's runtime.
+    - Vendor kernels live in their op family under `veomni/ops/kernels/`. The HCCL compatibility patch lives in `veomni/distributed/hccl_premul_sum.py`. Vendor-only dependencies must not be imported on hosts without that runtime.
     - Device-type sets, not `== "cuda"`, decide dispatch: `MOE_TRITON_DEVICE_TYPES` in `veomni/utils/device.py` is `("cuda", "mlu")` today. Adding a backend means auditing those sets, not just adding a branch.
 
 23. **Device-agnostic code must use `veomni.utils.device` helpers**
@@ -213,26 +233,59 @@ Core files:
    - `TextDPOTrainer` and `DiTTrainer` compose a `BaseTrainer` and override `forward_backward_step()`; they do not inherit the base implementation.
    - Lifecycle work added only inside `BaseTrainer.forward_backward_step()` is skipped by these trainers. Update every supported override or reject the unsupported trainer explicitly.
 
-25. **Module-level OpSlots are shared by every model instance**
-   - Modeling modules expose `OpSlot` objects such as `veomni_causal_lm_loss` as globals. Policy/reference models in DPO can therefore use the same slot.
-   - Temporary interception must use forward-scoped ownership and reference-counted dispatch. A closure bound to one model or callback can observe another model's forward and corrupt side-channel state.
+25. **Kernel handles belong to model instances**
+   - Modeling classes construct `VeomniOp` handles from the installed ops selection and store them on the instance. Do not introduce mutable module-level dispatch callables.
+   - Model-specific input normalization and loss policy stay in `models`; the registered wrapper remains a tensor-level contract shared by every consumer.
 
 26. **DCP full resume skips HF weight materialization**
     - When `train.checkpoint.load_path` is set and the run is not LoRA/PEFT, `BaseTrainer` / omni train pass `should_skip_hf_weight_load=True` into `build_parallelize_model`, which forwards it to `parallelize_model_fsdp2` / `parallelize_model_ddp`.
     - The model is materialized without an HF weight read; parameters are restored by DCP in `CheckpointCallback.on_train_begin`.
-    - Materialize through `_to_empty_preserving_nonpersistent_buffers()`, never bare `to_empty()`, on the random-init path as much as the resume path. `init_empty_weights()` patches `register_parameter` only, so a meta-built model holds *real* buffer values and `to_empty()` swaps every one for uninitialized memory. What restores them is narrower than it looks: DCP saves `state_dict()`, which omits `persistent=False`, and HF's `_init_weights` recomputes a rope table only for a module exposing `original_inv_freq` — which leaves Gemma3's per-layer-type `{type}_inv_freq`, its `embed_scale` and the Omni audio tower's sinusoidal `positional_embedding` with nothing behind them. A buffer built from a parameter is itself on meta, has no data to copy out of, and is skipped with a warning; no model registers one today. Note `veomni/models/module_utils.py` has the same unguarded pattern on the HF-load path.
+    - Materialize through `_to_empty_preserving_nonpersistent_buffers()`, never bare `to_empty()`, on the random-init path as much as the resume path. `init_empty_weights()` patches `register_parameter` only, so a meta-built model holds *real* buffer values and `to_empty()` swaps every one for uninitialized memory. What restores them is narrower than it looks: DCP saves `state_dict()`, which omits `persistent=False`, and HF's `_init_weights` recomputes a rope table only for a module exposing `original_inv_freq` — which leaves Gemma3's per-layer-type `{type}_inv_freq`, its `embed_scale` and the Omni audio tower's sinusoidal `positional_embedding` with nothing behind them. A buffer built from a parameter is itself on meta, has no data to copy out of, and is skipped with a warning; no model registers one today. The same rule applies to the HuggingFace-load path in `veomni/models/checkpoint/weights.py`.
     - LoRA/PEFT must not set `should_skip_hf_weight_load` (and `_materialize_and_load_weights()` raises if both are set): LoRA DCP is trainable-only and still needs the HF base from `model.model_path`.
     - After DCP load, `empty_cache()` is called to reduce first-step NCCL OOM risk from allocator fragmentation on near-OOM MoE jobs.
 
 ## Environment Reproducibility
 
-27. **Exact uv synchronization removes separately installed overlays**
-    - MagiAttention itself is the optional `--extra magi` extra (`uv sync --extra gpu --extra magi`).
-      The SM90 CUTLASS overlay is then installed by `scripts/kernel/install_magi_sm90.sh`.
-      Reinstall the overlay after a later exact `uv sync` before running MagiAttention on SM90.
+27. **MagiAttention is an SM100+ optional extra**
+    - MagiAttention requires `--extra gpu --extra magi` and NVIDIA SM100 or newer.
+      SM90 uses FlexAttention's FA4 backend instead.
 
 28. **In-place collective reductions in backward must own their gradient buffer**
     - Autograd can pass the same incoming gradient to multiple branches. `.contiguous()` does not copy an already contiguous tensor, so reducing that tensor in place can silently change a sibling branch's gradient and the caller's `grad_outputs`.
     - `_Gather.backward` uses NCCL reduce-scatter for nonempty real gradients with positive shard sizes. Equal shards use rank-major stacked tensor input to avoid the list API's internal flatten; uneven shards use the list path. Borrowed inputs require a separate output. Owned packed inputs may reuse the local rank's slice only where the old contiguous all-reduce result would also retain full storage; otherwise keep compact local storage. This avoids adding a local output allocation on top of a required full packing buffer. Other backends and complex/empty inputs retain an owned contiguous all-reduce buffer. `_GatherConcatSP.backward` also owns its in-place reduction buffer.
     - Collective selection must agree across ranks: negative-view flags and strides may differ by rank, so materialize them locally without changing the chosen collective. Preserve scaling before summation (FP16 overflow makes the order observable). The no-sum path scales only the local slice. Regression tests in `tests/parallel/ulysses/test_all_gather.py` cover shared gradients, edge cases, and local output storage with real Gloo/NCCL collectives where available.
     - A regression's reference collective must also use a contiguous buffer for NCCL. Make only the reference clone contiguous; preserve the layout of the actual incoming gradient so transposed, narrowed and expanded inputs remain covered.
+
+29. **Saved RoPE table metadata must stay stable across checkpoint recomputation**
+    - FSDP2 can cast fixed vision cos/sin tables to BF16 on the first block forward while non-reentrant checkpoint recomputation sees the original FP32 tables. Saving them unchanged makes checkpoint backward raise a metadata mismatch.
+    - Full RoPE eager and Liger adapters normalize fixed tables saved for backward to `q.dtype`, independently of the forward compute tables. Trainable tables retain the eager gradient path.
+    - Cover both table-dtype change directions and text/vision layouts in `tests/ops/rope/test_rope.py`. `tests/models/transformers/qwen/test_qwen2_vl.py` additionally runs the default Liger vision path with real two-rank FSDP2 and BF16 mixed precision.
+
+## FlexAttention
+
+Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__.py` owns dispatch/Ulysses, `_inputs.py` owns input handling, `_fa4.py` owns compiled execution, and `_fa4_sm90_compat.py` owns the pinned bounds shim. The mask builder remains in `attention/mask/flex.py`.
+
+30. **FLASH compilation uses tensor-derived bounds**
+    - BlockMask construction has a separate cached `torch.compile(create_block_mask)` using automatic dynamic generalization. Test the real public `cu_seqlens` path, not only attention with prebuilt masks or compile spies. Keep packed compilation enabled by default; a Python length argument alone does not prove unbounded recompilation. Explicit eager construction can allocate token-square intermediates; see [compiled masks](../../docs/transformers_v5/veomni_attention_interface.md#compiled-mask-construction).
+    - Always use `dynamic=True, fullgraph=True`, with no compile-mode parameter or internal static fallback. Derive bounds from normalized, post-Ulysses Q/K shapes inside the wrapper; preserve sparse buffers and `mask_mod`, and require exact equality with the caller's original bounds.
+    - Keep cache exhaustion explicit; do not raise global cache limits to handle variable lengths. Outer whole-model dynamic compilation and additional Python scalar captures remain unsupported; dtype/head/callback guards can still specialize.
+    - Prefer indexed per-token metadata buffers. The pinned CuteDSL lowering can also fail on zero-dimensional scalar-tensor captures; converting a Python scalar to a scalar tensor alone does not establish callback compatibility.
+    - See [dynamic compilation](../../docs/transformers_v5/veomni_attention_interface.md#dynamic-compilation) for the supported compile boundary and mask predicate design.
+
+30a. **Q/K/V layouts and visibility are explicit**
+    - Reject `output_attentions=True` at the shared Flex entry before Ulysses or backend selection. The second result is optional LSE, never attention weights; returning LSE from Triton does not satisfy an attention-weight request.
+    - Accept matching 3D `[T,H,D]` or 4D `[B,H,S,D]` inputs. Normalize 3D with views before validation, dispatch and Ulysses; never infer axes from sizes. Keep Q/K lengths independent and K/V lengths/heads consistent.
+    - BlockMask owns packed-document visibility. Restore output/LSE to the caller's layout after inverse exchange; see [input layouts and mask semantics](../../docs/transformers_v5/veomni_attention_interface.md#input-layouts-and-mask-semantics).
+
+30b. **Pinned FA4 auxiliary callbacks require bounds protection**
+    - Install the version/signature-gated `4.0.0b16` compatibility forwarder before compilation. Auxiliary metadata reads must be safe for padded tile positions; validate with allocator-disabled memcheck (`PYTORCH_NO_CUDA_MEMORY_CACHING=1`).
+    - Apply Q-only protection only on physically padded Q tiles (account for PackGQA). Check K completeness on every Q tile before either fast path. Q-only callback clamping requires a proven complete K tile; ragged/negative K tiles retain native full bounds. Never use the incoming false flag as proof of K bounds.
+    - Use separate JIT-cache namespaces and bump them when shader semantics change. Retain old cache objects and prepare both replacement caches before publishing installation.
+    - Native b16 omits broadcast strides from its forward cache key. Materialize zero-stride Q/K/V views after KV expansion, bump the cache namespace, and test mixed layouts through the same production cache. Automatic FLASH routing must retain Triton for unsupported sparse dimensions, missing full-block tables, architecture-mismatched BlockMask tiles (128×128 on SM90; 256×128 on SM100/110), and trainable score bias. Explicit backend selection retains native validation.
+    - See [FA4 partial-tile compatibility](../../docs/transformers_v5/veomni_attention_interface.md#fa4-partial-tile-compatibility) for the mechanism, hardware validation scope and upgrade requirements.
+
+30c. **Framework callbacks must preserve FLASH's scalar and index contracts**
+    - Sliding-window, softcap and offset callbacks use device buffers indexed by token positions, including uniform broadcast views. A constant `buffer[0]` index fails the pinned CuteDSL SSA conversion. Skip zero offsets entirely.
+    - Represent packed rows as metadata tensor dimensions; precompute flattened-coordinate arithmetic outside the callback. The pinned lowering rejects symbolic row-width arithmetic (`index_expr`), and even a dead integer comparison can leave a rejected capture. Preserve the caller's index dtype when forwarding mapped positions into another predicate (Int32 on FLASH).
+    - Cover the public builder and real forced FLASH outputs/QKV gradients/graph reuse, including changing scalar values, packed rows, cached offsets, default mask compilation and outer static compilation.
+    - Build masks with invocation-local predicates and explicit `create_block_mask` arguments. Never temporarily replace HF module helpers: overlapping exits can restore another invocation's device/length closure and affect native HF consumers. Preserve pinned HF padding/offset composition; test overlapping success/error paths and native HF calls during construction.

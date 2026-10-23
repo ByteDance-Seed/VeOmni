@@ -6,8 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from transformers import AutoConfig
 
 from veomni.arguments.arguments_types import (
     AcceleratorConfig,
@@ -21,7 +24,7 @@ from veomni.arguments.arguments_types import (
 from veomni.arguments.arguments_types import (
     TorchCompileConfig as ArgumentsTorchCompileConfig,
 )
-from veomni.distributed.parallel_state import use_parallel_state
+from veomni.distributed.parallel_state import ParallelState, use_parallel_state
 from veomni.distributed.torch_compile import (
     CompileConfig,
     compile_decoder_blocks,
@@ -30,6 +33,11 @@ from veomni.distributed.torch_compile import (
     validate_compile_runtime,
 )
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+
+
+def _non_sp_parallel_state() -> ParallelState:
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    return ParallelState(dp_size=world_size, dp_shard_size=world_size)
 
 
 def _model_args(**kwargs) -> ModelArguments:
@@ -241,7 +249,8 @@ def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
     config._attn_implementation = "eager"
 
     eager_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0)
-    compiled_layer = copy.deepcopy(eager_layer)
+    compiled_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0)
+    compiled_layer.load_state_dict(eager_layer.state_dict())
     if use_checkpoint:
         for layer in (eager_layer, compiled_layer):
             layer.gradient_checkpointing = True
@@ -255,7 +264,7 @@ def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
     position_embeddings = rotary_emb(hidden_states_eager, position_ids)
 
     # An explicit state avoids the logging fallback in get_parallel_state(), which Dynamo cannot trace fullgraph.
-    with use_parallel_state(SimpleNamespace(async_enabled=False)):
+    with use_parallel_state(_non_sp_parallel_state()):
         assert (
             compile_decoder_blocks(
                 compiled_model,
@@ -306,7 +315,8 @@ def test_qwen3_vl_compiled_decoder_matches_eager_packed_flash_attention():
     config._attn_implementation = "flash_attention_2"
 
     eager_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype)
-    compiled_layer = copy.deepcopy(eager_layer)
+    compiled_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype)
+    compiled_layer.load_state_dict(eager_layer.state_dict())
     compiled_model = ToyQwen3VLModel(compiled_layer)
     hidden_states_eager = torch.randn(1, 7, config.hidden_size, device=device, dtype=dtype, requires_grad=True)
     hidden_states_compiled = hidden_states_eager.detach().clone().requires_grad_(True)
@@ -320,7 +330,7 @@ def test_qwen3_vl_compiled_decoder_matches_eager_packed_flash_attention():
     }
 
     # An explicit state avoids the logging fallback in get_parallel_state(), which Dynamo cannot trace fullgraph.
-    with use_parallel_state(SimpleNamespace(async_enabled=False)):
+    with use_parallel_state(_non_sp_parallel_state()):
         assert (
             compile_decoder_blocks(
                 compiled_model,
@@ -454,8 +464,8 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
         on_step_begin=lambda **_: None,
         on_step_end=lambda **_: None,
     )
-    trainer.base._reset_async_activation_offload_if_enabled = (
-        lambda model: BaseTrainer._reset_async_activation_offload_if_enabled(trainer.base, model)
+    trainer.base._reset_async_activation_offload_if_enabled = lambda model: (
+        BaseTrainer._reset_async_activation_offload_if_enabled(trainer.base, model)
     )
 
     trainer.train_step(iter([[{}, {}]]))
@@ -685,3 +695,352 @@ def test_enable_compile_accepts_text_data_argument_subclass():
     )
 
     assert args.train.pad_to_length == 16
+
+
+def _deepseek_v4_fused_moe_ops_config():
+    from ..models.compare import eager_ops_config
+
+    ops = eager_ops_config()
+    ops.moe_implementation = "fused_triton"
+    return ops
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek V4 fused MoE kernel requires CUDA")
+@pytest.mark.parametrize("compile_backend", ["eager"])
+def test_deepseek_v4_fused_decoder_fullgraph_forward_backward_matches_eager(compile_backend):
+    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+        DeepseekV4ForCausalLM,
+    )
+
+    from ..models.compare import ops_config_scope
+
+    torch.manual_seed(0)
+    device = torch.device(get_device_type())
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config._attn_implementation = "eager"
+
+    with ops_config_scope(_deepseek_v4_fused_moe_ops_config()):
+        eager_model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
+        compiled_model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
+    compiled_model.load_state_dict(eager_model.state_dict())
+
+    inputs = torch.randint(0, config.vocab_size, (2, 16), device=device)
+
+    parallel_state = SimpleNamespace(
+        async_enabled=False,
+        cp_enabled=False,
+        ulysses_enabled=False,
+        sp_enabled=False,
+        ep_enabled=False,
+    )
+    with use_parallel_state(parallel_state):
+        assert (
+            compile_decoder_blocks(
+                compiled_model,
+                CompileConfig(enable=True, backend=compile_backend, fullgraph=True, dynamic=False),
+            )
+            == config.num_hidden_layers
+        )
+        eager_loss = eager_model(input_ids=inputs, labels=inputs, use_cache=False).loss
+        compiled_loss = compiled_model(input_ids=inputs, labels=inputs, use_cache=False).loss
+        eager_loss.backward()
+        compiled_loss.backward()
+
+    torch.testing.assert_close(compiled_loss, eager_loss, rtol=1e-4, atol=1e-4)
+    for (name, eager_param), (_, compiled_param) in zip(
+        eager_model.named_parameters(),
+        compiled_model.named_parameters(),
+        strict=True,
+    ):
+        if eager_param.grad is None and compiled_param.grad is None:
+            continue
+        assert eager_param.grad is not None and compiled_param.grad is not None, name
+        torch.testing.assert_close(compiled_param.grad, eager_param.grad, rtol=1e-3, atol=1e-3, msg=name)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek V4 fused MoE kernel requires CUDA")
+def test_deepseek_v4_inductor_fullgraph_executes_finite_optimizer_step():
+    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+        DeepseekV4ForCausalLM,
+    )
+
+    from ..models.compare import ops_config_scope
+
+    torch.manual_seed(0)
+    device = torch.device(get_device_type())
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config._attn_implementation = "eager"
+
+    with ops_config_scope(_deepseek_v4_fused_moe_ops_config()):
+        model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    batches = [
+        torch.randint(0, config.vocab_size, (2, 16), device=device),
+        torch.randint(0, config.vocab_size, (2, 16), device=device),
+    ]
+
+    parallel_state = SimpleNamespace(
+        async_enabled=False,
+        cp_enabled=False,
+        ulysses_enabled=False,
+        sp_enabled=False,
+        ep_enabled=False,
+    )
+    with use_parallel_state(parallel_state):
+        assert (
+            compile_decoder_blocks(
+                model,
+                CompileConfig(enable=True, backend="inductor", fullgraph=True, dynamic=False),
+            )
+            == config.num_hidden_layers
+        )
+        losses = []
+        for batch in batches:
+            optimizer.zero_grad(set_to_none=True)
+            loss = model(input_ids=batch, labels=batch, use_cache=False).loss
+            assert torch.isfinite(loss), f"non-finite DeepSeek V4 compiled loss: {loss}"
+            loss.backward()
+            grad_tensors = [param.grad for param in model.parameters() if param.grad is not None]
+            assert grad_tensors, "expected gradients after backward"
+            assert all(torch.isfinite(grad).all() for grad in grad_tensors)
+            optimizer.step()
+            losses.append(loss.detach())
+
+    assert all(torch.isfinite(loss) for loss in losses)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek V4 fused MoE kernel requires CUDA")
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_deepseek_v4_inductor_fixed_route_expert_vjp_matches_fp32_reference(seed):
+    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+        DeepseekV4ForCausalLM,
+    )
+    from veomni.ops import VeomniOp
+
+    from ..models.compare import ops_config_scope
+
+    torch.manual_seed(seed)
+    device = torch.device(get_device_type())
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+
+    with ops_config_scope(_deepseek_v4_fused_moe_ops_config()):
+        model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
+    experts = model.model.layers[2].mlp.experts
+
+    num_tokens = 12
+    x_init = torch.randn(num_tokens, config.hidden_size, device=device, dtype=torch.bfloat16)
+    logits = torch.randn(num_tokens, config.n_routed_experts, device=device, dtype=torch.float32)
+    weights, indices = torch.topk(torch.softmax(logits, dim=-1), k=config.num_experts_per_tok, dim=-1)
+    grad_out = torch.randn_like(x_init)
+
+    parallel_state = SimpleNamespace(
+        async_enabled=False,
+        cp_enabled=False,
+        ulysses_enabled=False,
+        sp_enabled=False,
+        ep_enabled=False,
+    )
+    with use_parallel_state(parallel_state):
+        compiled_experts = copy.deepcopy(experts)
+        compiled_fn = torch.compile(compiled_experts, backend="inductor", fullgraph=True, dynamic=False)
+        compiled_x = x_init.detach().clone().requires_grad_(True)
+        compiled_route = weights.detach().clone().requires_grad_(True)
+        compiled_out = compiled_fn(compiled_x, indices, compiled_route)
+        (compiled_out * grad_out).sum().backward()
+
+        eager_experts = copy.deepcopy(experts)
+        eager_x = x_init.detach().clone().requires_grad_(True)
+        eager_route = weights.detach().clone().requires_grad_(True)
+        eager_out = eager_experts(eager_x, indices, eager_route)
+        (eager_out * grad_out).sum().backward()
+
+    reference = copy.deepcopy(experts).float()
+    reference.veomni_moe = VeomniOp("moe_experts", "standard", "eager")
+    reference_x = x_init.detach().float().requires_grad_(True)
+    reference_route = weights.detach().float().requires_grad_(True)
+    precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        expected = reference(reference_x, indices, reference_route)
+        (expected * grad_out.float()).sum().backward()
+    finally:
+        torch.set_float32_matmul_precision(precision)
+
+    for actual, label in ((compiled_out, "compiled"), (eager_out, "eager")):
+        torch.testing.assert_close(actual.float(), expected, rtol=1e-2, atol=2e-2, msg=label)
+    torch.testing.assert_close(compiled_out, eager_out, rtol=1e-2, atol=2e-2)
+
+    for actual_grad, expected_grad, name in (
+        (compiled_x.grad, reference_x.grad, "hidden_states"),
+        (compiled_route.grad, reference_route.grad, "routing_weights"),
+        (compiled_experts.gate_up_proj.grad, reference.gate_up_proj.grad, "gate_up_proj"),
+        (compiled_experts.down_proj.grad, reference.down_proj.grad, "down_proj"),
+    ):
+        cosine = F.cosine_similarity(actual_grad.float().flatten(), expected_grad.flatten(), dim=0).item()
+        assert cosine > 0.999, f"{name} cosine={cosine:.6f}"
+        torch.testing.assert_close(actual_grad.float(), expected_grad, rtol=2e-2, atol=3e-2, msg=name)
+
+    for compiled_grad, eager_grad, name in (
+        (compiled_x.grad, eager_x.grad, "hidden_states"),
+        (compiled_route.grad, eager_route.grad, "routing_weights"),
+        (compiled_experts.gate_up_proj.grad, eager_experts.gate_up_proj.grad, "gate_up_proj"),
+        (compiled_experts.down_proj.grad, eager_experts.down_proj.grad, "down_proj"),
+    ):
+        torch.testing.assert_close(compiled_grad, eager_grad, rtol=1e-2, atol=2e-2, msg=name)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek V4 fused MoE kernel requires CUDA")
+@pytest.mark.parametrize("seed", [1, 2])
+def test_deepseek_v4_compiled_decoder_gradients_track_the_fp32_oracle(seed):
+    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+        DeepseekV4ForCausalLM,
+    )
+    from veomni.ops.batch_invariant import set_batch_invariant_mode
+
+    from ..models.compare import eager_ops_config, ops_config_scope
+
+    torch.manual_seed(seed)
+    device = torch.device(get_device_type())
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config._attn_implementation = "eager"
+
+    with ops_config_scope(eager_ops_config()):
+        oracle = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.float32)
+    with torch.no_grad():
+        for module in oracle.modules():
+            if hasattr(module, "tid2eid"):
+                table = module.tid2eid
+                tokens = torch.arange(table.shape[0], device=table.device).view(-1, 1)
+                slots = torch.arange(table.shape[1], device=table.device).view(1, -1)
+                table.copy_((tokens + slots) % module.num_experts)
+    base_state = {name: value.detach().cpu() for name, value in oracle.state_dict().items()}
+
+    def build_bf16_model():
+        with ops_config_scope(_deepseek_v4_fused_moe_ops_config()):
+            model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
+        model.load_state_dict(
+            {
+                name: value.to(device=device, dtype=torch.bfloat16 if value.is_floating_point() else value.dtype)
+                for name, value in base_state.items()
+            }
+        )
+        oracle.load_state_dict(
+            {
+                name: value.detach().to(
+                    device=device,
+                    dtype=torch.float32 if value.is_floating_point() else value.dtype,
+                )
+                for name, value in model.state_dict().items()
+            }
+        )
+        return model
+
+    eager_model = build_bf16_model()
+    compiled_model = build_bf16_model()
+    generator = torch.Generator(device="cpu").manual_seed(seed + 100)
+    inputs = torch.randint(0, config.vocab_size, (2, 16), generator=generator).to(device)
+
+    parallel_state = SimpleNamespace(
+        async_enabled=False,
+        cp_enabled=False,
+        ulysses_enabled=False,
+        sp_enabled=False,
+        ep_enabled=False,
+    )
+    precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        with use_parallel_state(parallel_state):
+            oracle_loss = oracle(input_ids=inputs, labels=inputs, use_cache=False).loss
+            oracle_loss.backward()
+    finally:
+        torch.set_float32_matmul_precision(precision)
+
+    with set_batch_invariant_mode(True):
+        with use_parallel_state(parallel_state):
+            assert (
+                compile_decoder_blocks(
+                    compiled_model,
+                    CompileConfig(enable=True, backend="inductor", fullgraph=True, dynamic=False),
+                )
+                == config.num_hidden_layers
+            )
+            eager_loss = eager_model(input_ids=inputs, labels=inputs, use_cache=False).loss
+            compiled_loss = compiled_model(input_ids=inputs, labels=inputs, use_cache=False).loss
+            eager_loss.backward()
+            compiled_loss.backward()
+
+    torch.testing.assert_close(eager_loss.float(), oracle_loss, rtol=5e-3, atol=1e-2)
+    torch.testing.assert_close(compiled_loss.float(), oracle_loss, rtol=5e-3, atol=1e-2)
+    torch.testing.assert_close(compiled_loss, eager_loss, rtol=1e-3, atol=2e-3)
+
+    oracle_grads = {name: param.grad for name, param in oracle.named_parameters() if param.grad is not None}
+    eager_grads = {name: param.grad for name, param in eager_model.named_parameters() if param.grad is not None}
+    compiled_grads = {name: param.grad for name, param in compiled_model.named_parameters() if param.grad is not None}
+    assert compiled_grads.keys() == eager_grads.keys() == oracle_grads.keys()
+
+    def total_cosine(grads):
+        dot = sum(
+            torch.sum(grads[name].float() * oracle_grads[name].float())
+            for name in oracle_grads
+            if "indexer.weights_proj" not in name
+        )
+        left = torch.sqrt(
+            sum(torch.sum(grads[name].float().square()) for name in oracle_grads if "indexer.weights_proj" not in name)
+        )
+        right = torch.sqrt(
+            sum(
+                torch.sum(oracle_grads[name].float().square())
+                for name in oracle_grads
+                if "indexer.weights_proj" not in name
+            )
+        )
+        return (dot / (left * right)).item()
+
+    eager_total_cosine = total_cosine(eager_grads)
+    compiled_total_cosine = total_cosine(compiled_grads)
+    assert eager_total_cosine > 0.995, f"eager total cosine={eager_total_cosine:.6f}"
+    assert compiled_total_cosine > 0.995, f"compiled total cosine={compiled_total_cosine:.6f}"
+    assert abs(compiled_total_cosine - eager_total_cosine) < 2e-3
+
+    for name, oracle_grad in oracle_grads.items():
+        if "indexer.weights_proj" in name or oracle_grad.norm().item() < 1e-4:
+            continue
+        eager_cos = F.cosine_similarity(eager_grads[name].float().flatten(), oracle_grad.flatten(), dim=0).item()
+        compiled_cos = F.cosine_similarity(
+            compiled_grads[name].float().flatten(),
+            oracle_grad.flatten(),
+            dim=0,
+        ).item()
+        assert compiled_cos > 0.97, f"{name}: compiled cosine={compiled_cos:.6f}, eager cosine={eager_cos:.6f}"
+        assert compiled_cos >= eager_cos - 5e-3, (
+            f"{name}: compiled cosine={compiled_cos:.6f} trailed eager cosine={eager_cos:.6f}"
+        )
+
+
+@pytest.mark.parametrize("compile_backend", ["eager", "inductor"])
+def test_deepseek_v4_rms_norm_compiled_backward_matches_eager(compile_backend):
+    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+        DeepseekV4RMSNorm,
+    )
+
+    from ..models.compare import eager_ops_config, ops_config_scope
+
+    torch.manual_seed(0)
+    with ops_config_scope(eager_ops_config()):
+        eager_norm = DeepseekV4RMSNorm(64)
+        compiled_norm = copy.deepcopy(eager_norm)
+
+    x_eager = torch.randn(2, 16, 64, dtype=torch.float32, requires_grad=True)
+    x_compiled = x_eager.detach().clone().requires_grad_(True)
+    grad_out = torch.randn(2, 16, 64, dtype=torch.float32)
+
+    eager_out = eager_norm(x_eager)
+    compiled_out = torch.compile(compiled_norm, backend=compile_backend, fullgraph=True, dynamic=False)(x_compiled)
+    eager_out.backward(grad_out)
+    compiled_out.backward(grad_out)
+
+    torch.testing.assert_close(compiled_out, eager_out, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(x_compiled.grad, x_eager.grad, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(compiled_norm.weight.grad, eager_norm.weight.grad, rtol=1e-5, atol=1e-5)

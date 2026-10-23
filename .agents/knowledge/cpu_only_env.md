@@ -16,7 +16,7 @@ Some hosted environments pre-run that sync in a startup script, in which case
 `PATH`, check `~/.local/bin`.
 
 Do not add `--extra magi` on a CPU-only host: MagiAttention source-builds CUDA
-extensions and is NVIDIA SM90+ only.
+extensions and is NVIDIA SM100+ only.
 
 ## What works CPU-only (use these to validate changes without hardware)
 
