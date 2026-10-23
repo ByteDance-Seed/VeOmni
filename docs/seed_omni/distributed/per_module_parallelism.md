@@ -22,6 +22,7 @@ A module's choices live in its block of the `modules` YAML, under
 | Eager (inference only) | `fsdp_config.fsdp_mode: eager` | A single-process replica with no mesh; rejected for training |
 | Embedding parallel | `extra_parallel_names: ["emb"]`, `extra_parallel_sizes: [N]`, `extra_parallel_placement_innermost: [false]` | A vocabulary-sharded text encoder; see [Sharded Embedding](../../key_features/sharded_embedding.md) |
 | Expert parallel | `ep_size: N`, `ep_outside: false` (shorthand for an `ep` extra parallel group) | A MoE backbone |
+| Sequence / Context parallel | `ulysses_size: U`, `cp_size: C` (must satisfy `U * C = W / dp_size` across all modules) | Ulysses SP on encoders/ViT, CP or `cp * sp` on long-context backbones |
 | Gradient checkpointing | `gradient_checkpointing.enable: false` | Off for cheap modules (text encoders, VAE, flow connector) |
 
 Two per-module properties are not accelerator settings but change how the
@@ -45,9 +46,14 @@ module is wrapped and saved:
   `base` parallel state derived from `model.accelerator`. Every module consumes
   the same micro-batch, so the data-parallel layout of the loader is the job's,
   not any module's.
-- **The SP size.** Set `model.accelerator.ulysses_size` at the top level so
-  every module inherits the same SP degree matching the shared dataloader; see
-  [Sequence Parallelism](sequence_parallel.md#2-why-one-sp-size-for-the-whole-graph).
+- **The `dp_size` (and unified `sp_size = cp_size * ulysses_size`).** Every
+  distributed module and the top-level `model.accelerator` must resolve to the
+  same `dp_size = world_size // (cp_size * ulysses_size)`. Within that shared
+  `sp_size`, each module may independently choose Ulysses SP (`ulysses_size`),
+  Context Parallelism (`cp_size`), or hybrid `cp_size * ulysses_size`.
+  `build_omni_model_runtime_args` validates that all distributed modules and
+  `model.accelerator` share the same `dp_size`;
+  see [Sequence & Context Parallelism](sequence_parallel.md#2-why-all-modules-share-one-dp_size).
 - **The step.** One `loss.backward()` runs over the whole graph, followed by
   one optimizer step per module; gradient accumulation and the global batch are
   job-level settings.
@@ -79,7 +85,7 @@ norm over the groups its wrap requires:
 - DDP with SP: gradients are first averaged over `fsdp_group`, which includes
   the SP ranks (constraint 7a in `.agents/knowledge/constraints.md`).
 
-`model.optimizer.grad_clip_scope` selects `per_module` (each module clipped to
+`train.optimizer.grad_clip_scope` selects `per_module` (each module clipped to
 `max_grad_norm` on its own, the default) or `global` (one coefficient for all
 modules). See [Arguments](../../usage/arguments.md).
 
@@ -91,9 +97,10 @@ checkpoint instead exports one flat `hf_ckpt/` in that checkpoint's layout
 
 **One FSDP2 tree instead.** `--model.accelerator.fsdp_config.fsdp_scope model`
 wraps the composed `OmniModel` once instead of each module. The mesh, init device
-and wrap settings come from the top-level FSDP2/DDP accelerator, the wrap
-targets are each child's `_no_split_modules` scoped as `{child}.{ClassName}`,
-and leftover parameters unshard in `OmniModel.forward()`.
+and wrap settings then come from the top-level accelerator, the wrap targets are
+each child's `_no_split_modules` scoped as `{child}.{ClassName}`, and leftover
+parameters unshard in `OmniModel.forward()`. It cannot be combined with eager
+modules.
 
 ## 4. Recipes in the repository
 
@@ -117,8 +124,8 @@ The `modules_train.yaml` beside each recipe's `base.yaml` under
 Inference resolves each module's wrap the same way, with eager as the default
 for modules that set nothing. A launch where every module is eager runs as one
 process; a launch with any FSDP2, DDP or extra-parallel module needs `torchrun`
-(`bash train.sh`). Under `torchrun`, eager replicas pin to each rank's local device. Recipes that
-support both keep two files, `infer/modules_infer_eager.yaml` and
-`infer/modules_infer_fsdp.yaml`.
+(`bash train.sh`). Under `torchrun`, eager replicas pin to the rank's own device
+rather than fanning out with `device_map="auto"`. Recipes that support both keep
+two files, `infer/modules_infer_eager.yaml` and `infer/modules_infer_fsdp.yaml`.
 The launch commands are in
 [Training and Inference](../usage/training_and_inference.md#5-inference).
