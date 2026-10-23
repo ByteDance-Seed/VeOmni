@@ -617,7 +617,8 @@ class BaseTrainer(Stateful, ABC):
 
         micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
         if getattr(self, "LOG_SAMPLE", True):
-            helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
+            if self.args.train.global_rank == 0:
+                helper.print_example(example=micro_batch, rank=0, print_tensor=False)
             self.LOG_SAMPLE = False
         return micro_batch
 
