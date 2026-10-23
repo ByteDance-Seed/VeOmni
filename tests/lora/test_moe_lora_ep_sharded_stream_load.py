@@ -370,8 +370,6 @@ def test_peft_ep_sharded_stream_load_matches_broadcast(
     tmp_path, _stream_load_assets_root, fused_toy_base_dir, seeded_lora_adapters_dir
 ):
     """Fused 2-rank worker comparing streaming vs broadcast PEFT MoE-LoRA load across all 3 layouts."""
-    from tests.tools.launch_utils import find_free_port
-
     nproc = _gpu_count_or_skip(min_count=_CI_EP_LAUNCH.nproc, max_count=_CI_EP_LAUNCH.nproc)
     work_dir = str(tmp_path / "stream_load_work")
     os.makedirs(work_dir, exist_ok=True)
@@ -381,7 +379,7 @@ def test_peft_ep_sharded_stream_load_matches_broadcast(
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={nproc}",
-        f"--master_port={find_free_port()}",
+        "--standalone",
         os.path.abspath(__file__),
         f"--work-dir={work_dir}",
         f"--fused-base-dir={fused_toy_base_dir}",
