@@ -29,6 +29,7 @@ if _MISSING_COMPONENTS:
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers import QwenImage21Transformer2DModel as DiffusersQwenImage21Transformer2DModel
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data import build_data_transform
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.state_dict import get_lora_state_dict
@@ -46,6 +47,9 @@ from veomni.models.diffusers.qwen_image21.qwen_image21_transformer.modeling_qwen
     QwenImage21Transformer2DModel,
 )
 from veomni.trainer.dit_trainer import DiTDataCollator
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _toy_model(in_channels=4):
@@ -323,6 +327,7 @@ class _FakeScheduler(FlowMatchEulerDiscreteScheduler):
         return super().scale_noise(*args, **kwargs)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Qwen-Image-2.1 condition preprocessing is GPU-only.")
 @pytest.mark.parametrize(("resolution", "latent_size"), [(512, 32), (1024, 64)])
 def test_qwen_image21_condition_uses_resolution_shifted_schedule(monkeypatch, resolution, latent_size):

@@ -150,5 +150,6 @@ jobs:
             "git+https://github.com/huggingface/diffusers.git@bdc2bea37a36038c44452811610489ea30ede229"
           .venv/bin/python -c \
             "from diffusers import AutoencoderKLQwenImage21, QwenImage21Pipeline, QwenImage21Transformer2DModel; from huggingface_hub import resolve_revision"
-          .venv/bin/python -m pytest -s -x \
-            tests/models/diffusers/test_qwen_image21.py tests/models/base/test_auto_registry.py
+          .venv/bin/python -m scripts.ci.accelerator --backend cuda --suite unit \
+            --only 14-unit --pytest-arg=-k --pytest-arg="qwen_image21 or test_auto_registry" \
+            --output-dir outputs/accelerator-ci/qwen-image21-upstream
