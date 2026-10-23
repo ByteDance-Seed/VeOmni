@@ -720,6 +720,42 @@ def test_chunk_gated_delta_rule_fla_matches_eager(device):
         )
 
 
+def _packed_eager_reference(eager, inputs, cu_seqlens):
+    """Reset eager recurrence per sample, retaining gradients through slices and cat."""
+    boundaries = cu_seqlens.tolist()
+    return torch.cat(
+        [
+            eager(
+                *(value[:, start:end] for value in inputs),
+                use_qk_l2norm_in_kernel=True,
+            )[0]
+            for start, end in zip(boundaries[:-1], boundaries[1:], strict=True)
+        ],
+        dim=1,
+    )
+
+
+def test_packed_eager_reference_keeps_gradients_and_isolates_samples():
+    """Exercise the native test's oracle on CPU, where eager refuses packed metadata."""
+    eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
+    torch.manual_seed(19)
+    q, k, v = [torch.randn(1, 11, 2, 4, requires_grad=True) for _ in range(3)]
+    g = (-torch.rand(1, 11, 2)).requires_grad_(True)
+    beta = torch.rand(1, 11, 2, requires_grad=True)
+    inputs = (q, k, v, g, beta)
+    cu = torch.tensor([0, 3, 11])
+    with pytest.raises(ValueError, match="does not support cu_seqlens"):
+        eager(*inputs, cu_seqlens=cu)
+    actual = _packed_eager_reference(eager, inputs, cu)
+    first = eager(*(value[:, :3] for value in inputs), use_qk_l2norm_in_kernel=True)[0]
+    second = eager(*(value[:, 3:] for value in inputs), use_qk_l2norm_in_kernel=True)[0]
+    torch.testing.assert_close(actual, torch.cat((first, second), dim=1), atol=0, rtol=0)
+    actual[:, :3].sum().backward()
+    for value in inputs:
+        assert torch.isfinite(value.grad).all()
+        assert torch.count_nonzero(value.grad[:, 3:]) == 0
+
+
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="chunk_gated_delta_rule npu needs torch_npu")
 @pytest.mark.parametrize("impl", ("triton", "fla_npu", "fla_npu_reuse"))
 def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl):
@@ -737,7 +773,7 @@ def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl):
     q_e, k_e, v_e, g_e, b_e = make_grad_leaves(q, k, v, g, beta)
     q_o, k_o, v_o, g_o, b_o = make_grad_leaves(q, k, v, g, beta)
     cu = torch.tensor([0, 17, 64], dtype=torch.int64)
-    out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)
+    out_e = _packed_eager_reference(eager, (q_e, k_e, v_e, g_e, b_e), cu)
     out_o, _ = other(q_o, k_o, v_o, g_o, b_o, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)
     torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
 
