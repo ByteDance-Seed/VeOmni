@@ -597,3 +597,299 @@ def test_deepseek_v4_expert_parallel_fixed_route_vjp_matches_fp32_reference(seed
         nprocs=_EP_ORACLE_LAUNCH.nproc,
         join=True,
     )
+
+
+@pytest.mark.parametrize("num_mtp_layers", [1, 3])
+def test_deepseek_v4_dspark_mtp_forward_backward_and_packed_isolation(num_mtp_layers: int):
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = num_mtp_layers
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+    config.dspark_n_routed_experts = 2
+    config.dspark_num_experts_per_tok = 1
+    config.mtp_loss_coef = 0.5
+
+    model = _build_ours(config).train()
+    assert len(model.model.mtp) == num_mtp_layers
+    assert "DeepseekV4DSparkBlock" in model._no_split_modules
+    assert not model._keys_to_ignore_on_load_unexpected
+    assert hasattr(model.model.mtp[0], "main_proj")
+    assert hasattr(model.model.mtp[-1], "markov_head")
+    assert hasattr(model.model.mtp[-1], "hc_head")
+    assert not model.model.mtp[-1].confidence_head.proj.weight.requires_grad
+    assert model.model.mtp[0].mlp.experts.num_experts == 2
+
+    from veomni.optim.muon import split_muon_adamw_params
+
+    _, _, muon_names, adamw_names = split_muon_adamw_params(model)
+    assert any("markov_head.embed.weight" in n for n in adamw_names)
+    assert any("markov_head.head.weight" in n for n in adamw_names)
+    assert not any("markov_head" in n for n in muon_names)
+
+    # Without return_mtp_outputs=True, DeepseekV4Model.forward skips running MTP stages.
+    raw_model_out = model.model(input_ids=torch.randint(3, config.vocab_size, (1, 4)), use_cache=False)
+    assert raw_model_out.mtp_hidden_states is None
+    assert raw_model_out.mtp_markov_bias is None
+
+    # Two packed samples of length 4 each: position_ids restarts at 0 at index 4.
+    input_ids = torch.randint(3, config.vocab_size, (1, 8))
+    position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]], dtype=torch.long)
+    labels = input_ids.clone()
+    labels[0, 4] = -100  # packed sample boundary
+
+    out = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        labels=labels,
+        packed_sequence_slices=((0, 4), (4, 8)),
+        attention_mask_is_all_ones=True,
+        use_cache=False,
+    )
+    assert out.loss is not None
+    assert out.aux_metrics is not None and "mtp_loss" in out.aux_metrics
+    mtp_loss = out.aux_metrics["mtp_loss"]
+    assert torch.isfinite(mtp_loss) and mtp_loss.item() > 0
+
+    # Compare against coef=0.0 baseline to verify loss == lm_loss + mtp_loss_coef * mtp_loss.
+    model.config.mtp_loss_coef = 0.0
+    with torch.no_grad():
+        base_out = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            packed_sequence_slices=((0, 4), (4, 8)),
+            attention_mask_is_all_ones=True,
+            use_cache=False,
+        )
+    model.config.mtp_loss_coef = 0.5
+    torch.testing.assert_close(out.loss.detach(), base_out.loss + 0.5 * mtp_loss, atol=1e-5, rtol=1e-5)
+
+    out.loss.backward()
+    for name, param in [
+        ("mtp.0.main_proj", model.model.mtp[0].main_proj.weight),
+        ("mtp.0.self_attn.kv_proj", model.model.mtp[0].self_attn.kv_proj.weight),
+        ("mtp.0.mlp.experts.down_proj", model.model.mtp[0].mlp.experts.down_proj),
+        ("mtp.-1.hc_head.hc_fn", model.model.mtp[-1].hc_head.hc_fn),
+        ("mtp.-1.markov_head.embed", model.model.mtp[-1].markov_head.embed.weight),
+        ("mtp.-1.markov_head.head", model.model.mtp[-1].markov_head.head.weight),
+        ("lm_head", model.lm_head.weight),
+    ]:
+        assert param.grad is not None, f"Missing gradient for {name}"
+        assert torch.isfinite(param.grad).all() and param.grad.count_nonzero() > 0, f"Zero/non-finite grad for {name}"
+
+
+def test_deepseek_v4_freeze_mtp_disables_mtp_grads_and_loss():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 1
+    config.freeze_mtp = True
+
+    model = _build_ours(config).train()
+    assert len(model.model.mtp) == 1
+    assert all(not p.requires_grad for p in model.model.mtp.parameters())
+
+    input_ids = torch.randint(3, config.vocab_size, (1, 6))
+    out = model(input_ids=input_ids, labels=input_ids.clone(), use_cache=False)
+    assert out.aux_metrics is None or "mtp_loss" not in out.aux_metrics
+
+
+def test_deepseek_v4_dspark_packed_samples_do_not_attend_across_boundary():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 2
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+
+    model = _build_ours(config).eval()
+    sample_a1 = torch.tensor([[4, 5, 6, 7]], dtype=torch.long)
+    sample_a2 = torch.tensor([[20, 21, 22, 23]], dtype=torch.long)
+    sample_b = torch.tensor([[10, 11, 12, 13]], dtype=torch.long)
+    position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]], dtype=torch.long)
+
+    with torch.no_grad():
+        out_1 = model.model(
+            input_ids=torch.cat([sample_a1, sample_b], dim=1),
+            position_ids=position_ids,
+            packed_sequence_slices=((0, 4), (4, 8)),
+            attention_mask_is_all_ones=True,
+            return_mtp_outputs=True,
+            use_cache=False,
+        )
+        out_2 = model.model(
+            input_ids=torch.cat([sample_a2, sample_b], dim=1),
+            position_ids=position_ids,
+            packed_sequence_slices=((0, 4), (4, 8)),
+            attention_mask_is_all_ones=True,
+            return_mtp_outputs=True,
+            use_cache=False,
+        )
+    assert out_1.mtp_hidden_states is not None and out_2.mtp_hidden_states is not None
+    assert not torch.allclose(out_1.mtp_hidden_states[:, :4], out_2.mtp_hidden_states[:, :4])
+    torch.testing.assert_close(out_1.mtp_hidden_states[:, 4:], out_2.mtp_hidden_states[:, 4:], atol=1e-6, rtol=1e-6)
+
+
+def test_deepseek_v4_dspark_batch_gt_1_and_output_router_logits():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 2
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+    config.n_routed_experts = 8
+    config.dspark_n_routed_experts = 4
+    config.dspark_num_experts_per_tok = 1
+
+    model = _build_ours(config).train()
+    input_ids = torch.randint(3, config.vocab_size, (2, 6))
+    labels = input_ids.clone()
+
+    # position_ids=None with batch_size=2 exercises [1, S] broadcast position_ids in _packed_draft_attention,
+    # and output_router_logits=True exercises mixed expert counts between backbone (8) and MTP (4).
+    out = model(
+        input_ids=input_ids,
+        labels=labels,
+        output_router_logits=True,
+        use_cache=False,
+    )
+    assert out.loss is not None
+    assert out.aux_loss is not None and torch.isfinite(out.aux_loss)
+    assert out.aux_metrics is not None and "mtp_loss" in out.aux_metrics
+    out.loss.backward()
+    assert model.model.mtp[0].main_proj.weight.grad is not None
+
+
+def test_deepseek_v4_dspark_left_padding_mask_excludes_masked_tokens():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.compress_rates = {"compressed_sparse_attention": 8, "heavily_compressed_attention": 16}
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 2
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+
+    model = _build_ours(config).train()
+    attention_mask = torch.tensor([[0, 1, 1, 1]], dtype=torch.long)
+    input_ids_a = torch.tensor([[4, 10, 11, 12]], dtype=torch.long)
+    input_ids_b = torch.tensor([[99, 10, 11, 12]], dtype=torch.long)
+    labels = torch.tensor([[-100, -100, 11, 12]], dtype=torch.long)
+
+    with torch.no_grad():
+        out_a = model(
+            input_ids=input_ids_a,
+            attention_mask=attention_mask,
+            labels=labels,
+            use_cache=False,
+        )
+        out_b = model(
+            input_ids=input_ids_b,
+            attention_mask=attention_mask,
+            labels=labels,
+            use_cache=False,
+        )
+    assert out_a.aux_metrics is not None and out_b.aux_metrics is not None
+    torch.testing.assert_close(out_a.aux_metrics["mtp_loss"], out_b.aux_metrics["mtp_loss"], atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(out_a.loss, out_b.loss, atol=1e-6, rtol=1e-6)
+
+
+def test_deepseek_v4_dspark_packed_unpacked_parity_beyond_sliding_window():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.sliding_window = 4
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 2
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+
+    model = _build_ours(config).eval()
+    input_ids = torch.randint(3, config.vocab_size, (1, 10))
+    position_ids = torch.arange(10, dtype=torch.long).unsqueeze(0)
+    labels = input_ids.clone()
+
+    with torch.no_grad():
+        unpacked_out = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            return_mtp_outputs=True,
+            use_cache=False,
+        )
+        packed_out = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            packed_sequence_slices=((0, 10),),
+            attention_mask_is_all_ones=True,
+            return_mtp_outputs=True,
+            use_cache=False,
+        )
+    assert unpacked_out.aux_metrics is not None and packed_out.aux_metrics is not None
+    torch.testing.assert_close(
+        unpacked_out.aux_metrics["mtp_loss"],
+        packed_out.aux_metrics["mtp_loss"],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    torch.testing.assert_close(unpacked_out.loss, packed_out.loss, atol=1e-5, rtol=1e-5)
+
+
+def test_deepseek_v4_dspark_presliced_shift_labels_with_logits_to_keep():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 1
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+
+    model = _build_ours(config).train()
+    input_ids = torch.randint(3, config.vocab_size, (1, 6))
+    labels = input_ids.clone()
+    logits_to_keep = torch.tensor([1, 3, 4], dtype=torch.long)
+    shift_labels = torch.tensor([[5, 6, 7]], dtype=torch.long)
+
+    out = model(
+        input_ids=input_ids,
+        labels=labels,
+        shift_labels=shift_labels,
+        logits_to_keep=logits_to_keep,
+        use_cache=False,
+    )
+    assert out.loss is not None
+    assert out.aux_metrics is not None and "mtp_loss" in out.aux_metrics
+    assert torch.isfinite(out.aux_metrics["mtp_loss"])
+
+    # With logits_to_keep=1, a valid 1-token shift_labels, and an all-ones 2D attention_mask,
+    # the final row keeps its supervision and matches the attention_mask=None run.
+    model.zero_grad(set_to_none=True)
+    one_tok_shift = torch.tensor([[3]], dtype=torch.long)
+    all_ones_mask = torch.ones_like(input_ids)
+    with torch.no_grad():
+        no_mask_out = model(
+            input_ids=input_ids,
+            labels=labels,
+            shift_labels=one_tok_shift,
+            logits_to_keep=1,
+            use_cache=False,
+        )
+    masked_out = model(
+        input_ids=input_ids,
+        attention_mask=all_ones_mask,
+        labels=labels,
+        shift_labels=one_tok_shift,
+        logits_to_keep=1,
+        use_cache=False,
+    )
+    assert masked_out.aux_metrics is not None and no_mask_out.aux_metrics is not None
+    assert masked_out.aux_metrics["mtp_loss"].item() > 0
+    torch.testing.assert_close(
+        masked_out.aux_metrics["mtp_loss"],
+        no_mask_out.aux_metrics["mtp_loss"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    masked_out.loss.backward()
+    assert model.model.mtp[0].main_proj.weight.grad is not None
+    assert model.model.mtp[0].main_proj.weight.grad.count_nonzero() > 0

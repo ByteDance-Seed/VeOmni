@@ -26,6 +26,7 @@ tensor converter). Conversion runs at save time (and is cached on the model afte
 load when an index mapping is supplied).
 """
 
+import inspect
 import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, Generator, List, Optional, Protocol, Tuple, Union
@@ -328,7 +329,12 @@ def maybe_convert_fqn_to_index_mapping(
         return fqn_to_index_mapping
 
     original_size = len(fqn_to_index_mapping)
-    converted = converter(fqn_to_index_mapping)
+    try:
+        params = inspect.signature(converter).parameters
+        accepts_model = "model" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):
+        accepts_model = False
+    converted = converter(fqn_to_index_mapping, model=model) if accepts_model else converter(fqn_to_index_mapping)
     if len(converted) != original_size:
         logger.info_rank0(
             f"Converted fqn_to_index_mapping for {type(model).__name__} ({original_size} -> {len(converted)} entries)."

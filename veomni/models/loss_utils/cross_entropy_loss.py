@@ -22,6 +22,7 @@ ignore_index, num_items_in_batch)``.
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import lru_cache
 from typing import Any
 
 from torch import Tensor, nn
@@ -38,6 +39,12 @@ from .chunk_topk_distill import chunk_topk_distill_function
 def _default_op() -> VeomniOp:
     """Return the default eager token-level cross-entropy op."""
     return VeomniOp("cross_entropy_loss", "standard", "eager")
+
+
+@lru_cache(maxsize=1)
+def _chunk_loss_op() -> VeomniOp:
+    """Return the chunked token-level cross-entropy op."""
+    return VeomniOp("cross_entropy_loss", "standard", "chunk_loss")
 
 
 def _select_hidden_weight(
@@ -182,19 +189,23 @@ def ForCausalLMLoss(
         )
         return None, None, FusedLinearAuxOutput(log_probs=log_probs, entropy=entropy)
 
-    token_op = op if op is not None else _default_op()
     if logits_bias is not None:
-        if getattr(token_op, "impl", None) != "chunk_loss" or hidden_states is None or weights is None:
-            raise NotImplementedError(
-                "logits_bias is only supported by cross_entropy_loss_implementation='chunk_loss' "
-                "on the fused hidden_states + weights path."
-            )
+        if hidden_states is None or weights is None:
+            raise NotImplementedError("logits_bias is only supported on the fused hidden_states + weights path.")
         if logits_bias.shape[:-1] != hidden_states.shape[:-1]:
             raise ValueError(
                 f"logits_bias rows {tuple(logits_bias.shape[:-1])} do not match hidden_states rows "
                 f"{tuple(hidden_states.shape[:-1])}."
             )
         logits_bias = logits_bias.reshape(-1, logits_bias.size(-1))
+        token_op = _chunk_loss_op() if op is None else op
+        if getattr(token_op, "impl", None) not in ("chunk_loss", "eager"):
+            raise NotImplementedError(
+                "logits_bias is only supported by cross_entropy_loss_implementation in ('chunk_loss', 'eager') "
+                "on the fused hidden_states + weights path."
+            )
+    else:
+        token_op = op if op is not None else _default_op()
 
     device = logits.device if logits is not None else hidden_states.device
     sp_enabled = get_parallel_state().sp_enabled

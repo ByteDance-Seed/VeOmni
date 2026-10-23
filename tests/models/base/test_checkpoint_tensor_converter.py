@@ -1441,6 +1441,135 @@ class TestDeepseekV4ConverterFactoryAndMapping:
         assert torch.equal(split_items["model.layers.0.mlp.experts.2.gate_proj.weight"], gate_up[0, :2])
         assert torch.equal(split_items["model.layers.0.mlp.experts.3.up_proj.weight"], gate_up[1, 2:])
 
+    @pytest.mark.parametrize(
+        ("raw_name", "converted_name"),
+        [
+            ("mtp.0.attn.wkv.weight", "model.mtp.0.self_attn.kv_proj.weight"),
+            ("mtp.0.attn.attn_sink", "model.mtp.0.self_attn.sinks"),
+            ("mtp.0.attn.q_norm.weight", "model.mtp.0.self_attn.q_a_norm.weight"),
+            ("mtp.0.attn_norm.weight", "model.mtp.0.input_layernorm.weight"),
+            ("mtp.0.ffn_norm.weight", "model.mtp.0.post_attention_layernorm.weight"),
+            ("mtp.0.hc_attn_fn", "model.mtp.0.attn_hc.fn"),
+            ("mtp.0.hc_ffn_base", "model.mtp.0.ffn_hc.base"),
+            ("mtp.0.main_proj.weight", "model.mtp.0.main_proj.weight"),
+            ("mtp.0.main_norm.weight", "model.mtp.0.main_norm.weight"),
+            ("mtp.2.hc_head_fn", "model.mtp.2.hc_head.hc_fn"),
+            ("mtp.2.hc_head_base", "model.mtp.2.hc_head.hc_base"),
+            ("mtp.2.hc_head_scale", "model.mtp.2.hc_head.hc_scale"),
+            ("mtp.2.markov_head.markov_w1.weight", "model.mtp.2.markov_head.embed.weight"),
+            ("mtp.2.markov_head.markov_w2.weight", "model.mtp.2.markov_head.head.weight"),
+            ("mtp.2.confidence_head.proj.weight", "model.mtp.2.confidence_head.proj.weight"),
+            ("mtp.2.norm.weight", "model.mtp.2.norm.weight"),
+        ],
+    )
+    def test_converts_mtp_keys_when_enabled(self, raw_name: str, converted_name: str):
+        assert convert_deepseek_v4_checkpoint_key(raw_name, enable_mtp=True) == converted_name
+
+    def test_mtp_enabled_converter_stacks_experts_and_dequants(self):
+        converter = DeepseekV4CheckpointTensorConverter(
+            num_experts=NUM_EXPERTS,
+            enable_mtp=True,
+            mtp_num_experts=2,
+        )
+        dispatched = {}
+        for proj in ("w1", "w3", "w2"):
+            logical_shape = (HIDDEN_DIM, INTERMEDIATE_DIM) if proj == "w2" else (INTERMEDIATE_DIM, HIDDEN_DIM)
+            packed_shape = (logical_shape[0], logical_shape[1] // 2)
+            for expert_id in range(2):
+                stem = f"mtp.0.ffn.experts.{expert_id}.{proj}"
+                packed = torch.full(packed_shape, 0x21, dtype=torch.uint8).view(torch.int8)
+                assert maybe_convert_checkpoint_tensor(f"{stem}.weight", packed, converter) is None
+                result = maybe_convert_checkpoint_tensor(f"{stem}.scale", torch.tensor(1.0), converter)
+                if result is not None:
+                    dispatched[result.name] = result.tensor
+
+        for raw_key in (
+            "mtp.0.main_proj.weight",
+            "mtp.2.hc_head_fn",
+            "mtp.2.markov_head.markov_w1.weight",
+            "mtp.2.markov_head.markov_w2.weight",
+            "mtp.2.norm.weight",
+        ):
+            res = maybe_convert_checkpoint_tensor(raw_key, torch.ones(2, 2), converter)
+            assert res is not None
+            dispatched[res.name] = res.tensor
+
+        assert converter.finalize() == []
+        assert dispatched["model.mtp.0.mlp.experts.gate_up_proj"].shape == (2, 2 * INTERMEDIATE_DIM, HIDDEN_DIM)
+        assert dispatched["model.mtp.0.mlp.experts.down_proj"].shape == (2, HIDDEN_DIM, INTERMEDIATE_DIM)
+        assert "model.mtp.0.main_proj.weight" in dispatched
+        assert "model.mtp.2.hc_head.hc_fn" in dispatched
+        assert "model.mtp.2.markov_head.embed.weight" in dispatched
+        assert "model.mtp.2.markov_head.head.weight" in dispatched
+        assert "model.mtp.2.norm.weight" in dispatched
+        assert converter.fused_expert_target("mtp.0.ffn.experts.1.w1.weight") == (
+            "model.mtp.0.mlp.experts.gate_up_proj",
+            1,
+        )
+
+    def test_factory_enables_mtp_when_model_has_mtp_stages(self):
+        model = SimpleNamespace(
+            config=SimpleNamespace(n_routed_experts=8, dspark_n_routed_experts=4),
+            model=SimpleNamespace(mtp=[object()]),
+            named_parameters=lambda: iter([("model.embed_tokens.weight", torch.nn.Parameter(torch.empty(1)))]),
+        )
+        converter = create_deepseek_v4_checkpoint_tensor_converter(model)
+        assert converter.enable_mtp is True
+        assert converter.num_experts == 8
+        assert converter.mtp_num_experts == 4
+
+        local = converter.for_expert_range(4, 4, mtp_start=2, mtp_num_local=2)
+        assert (local.expert_offset, local.num_experts) == (4, 4)
+        assert (local.mtp_expert_offset, local.mtp_num_experts) == (2, 2)
+        with pytest.raises(ValueError, match=r"expert 1 is outside this converter's range \[2, 4\)"):
+            local.convert("mtp.0.ffn.experts.1.w1.weight", torch.zeros(INTERMEDIATE_DIM, HIDDEN_DIM))
+
+    def test_export_weights_reverts_and_exports_mtp_parameters_when_enabled(self, monkeypatch):
+        from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
+
+        mapping = {
+            "model.mtp.0.mlp.experts.gate_up_proj": 1,
+            "model.mtp.0.mlp.experts.down_proj": 1,
+            "mtp.0.main_proj.weight": 1,
+            "mtp.0.hc_head_fn": 1,
+            "mtp.0.markov_head.markov_w1.weight": 1,
+            "mtp.0.markov_head.markov_w2.weight": 1,
+            "mtp.0.norm.weight": 1,
+        }
+        live_items = [
+            ("model.mtp.0.mlp.experts.0.gate_proj.weight", torch.ones(4, 4, dtype=torch.float32)),
+            ("model.mtp.0.mlp.experts.0.up_proj.weight", torch.ones(4, 4, dtype=torch.float32)),
+            ("model.mtp.0.mlp.experts.0.down_proj.weight", torch.ones(4, 4, dtype=torch.float32)),
+            ("model.mtp.0.mlp.experts.1.gate_proj.weight", torch.ones(4, 4, dtype=torch.float32)),
+            ("model.mtp.0.mlp.experts.1.up_proj.weight", torch.ones(4, 4, dtype=torch.float32)),
+            ("model.mtp.0.mlp.experts.1.down_proj.weight", torch.ones(4, 4, dtype=torch.float32)),
+            ("model.mtp.0.main_proj.weight", torch.ones(4, 4, dtype=torch.float32)),
+            ("model.mtp.0.hc_head.hc_fn", torch.ones(4, 4, dtype=torch.float32)),
+            ("model.mtp.0.markov_head.embed.weight", torch.ones(4, 4, dtype=torch.float32)),
+            ("model.mtp.0.markov_head.head.weight", torch.ones(4, 4, dtype=torch.float32)),
+            ("model.mtp.0.norm.weight", torch.ones(4, dtype=torch.float32)),
+        ]
+        model = SimpleNamespace(
+            config=SimpleNamespace(),
+            _veomni_fqn_to_index_mapping=mapping,
+        )
+        monkeypatch.setattr(module, "export_weights", lambda m: iter(live_items))
+
+        converter = DeepseekV4CheckpointTensorConverter(num_experts=4, enable_mtp=True, mtp_num_experts=2)
+        exported = dict(converter.export_weights(model))
+
+        expected_keys = {
+            *(f"mtp.0.ffn.experts.{e}.{w}.weight" for e in range(2) for w in ("w1", "w2", "w3")),
+            "mtp.0.main_proj.weight",
+            "mtp.0.hc_head_fn",
+            "mtp.0.markov_head.markov_w1.weight",
+            "mtp.0.markov_head.markov_w2.weight",
+            "mtp.0.norm.weight",
+        }
+        assert set(exported) == expected_keys
+        assert exported["mtp.0.markov_head.markov_w1.weight"].dtype == torch.bfloat16
+        assert exported["mtp.0.hc_head_fn"].dtype == torch.float32
+
 
 # ---------------------------------------------------------------------------
 # Tests for Qwen3VLMoeCheckpointTensorConverter

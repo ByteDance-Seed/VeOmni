@@ -64,9 +64,9 @@ def forward(
     ``requires_grad`` and the caller's ``is_grad_enabled()``.
 
     When ``logits_bias`` is provided (shaped ``hidden.shape[:-1] + (V,)``),
-    only supervised rows (``labels != ignore_index``) are projected,
-    ``chunk_size`` rows at a time, adding ``logits_bias`` to each chunk's
-    fp32 logits.
+    ``hidden``, ``labels``, and ``logits_bias`` are split into ``chunk_size``
+    slices along the sequence dimension, adding ``logits_bias`` to each
+    chunk's fp32 logits.
     """
     if weight.numel() == 0:
         raise RuntimeError("chunk_loss requires a nonempty ``weight`` (fused-linear path)")
@@ -102,110 +102,58 @@ def forward(
     else:
         denom = num_items_in_batch
 
-    if logits_bias is not None:
-        flat_hidden = hidden.reshape(-1, hidden.size(-1))
-        flat_bias = logits_bias.reshape(-1, logits_bias.size(-1))
-        flat_labels = labels.reshape(-1)
-        row_chunks = list(torch.split((flat_labels != ignore_index).nonzero().squeeze(-1), chunk_size))
-        accumulated_loss = torch.zeros((), device=hidden.device, dtype=torch.float32)
-        if not (hidden_needs_grad or weight_needs_grad or bias_needs_grad):
-            for rows in row_chunks:
-                if rows.numel() == 0:
-                    continue
-                accumulated_loss = accumulated_loss + _ce_loss_func(
-                    flat_hidden.index_select(0, rows),
-                    weight,
-                    flat_labels.index_select(0, rows),
-                    denom,
-                    ignore_index,
-                    flat_bias.index_select(0, rows),
-                )
-            return accumulated_loss, SavedState(
-                (hidden.new_empty(0), weight.new_empty(0)),
-                _Meta(True, False, False, False),
-            )
-
-        argnums = tuple(
-            idx for idx, flag in ((0, hidden_needs_grad), (1, weight_needs_grad), (5, bias_needs_grad)) if flag
-        )
-        grad_hidden = hidden.new_zeros(flat_hidden.shape) if hidden_needs_grad else None
-        grad_weight = torch.zeros_like(weight) if weight_needs_grad else None
-        grad_bias = logits_bias.new_zeros(flat_bias.shape) if bias_needs_grad else None
-        for rows in row_chunks:
-            if rows.numel() == 0:
-                continue
-            grads, chunk_loss = _grad_and_value(
-                _ce_loss_func,
-                argnums,
-                flat_hidden.index_select(0, rows),
-                weight,
-                flat_labels.index_select(0, rows),
-                denom,
-                ignore_index,
-                flat_bias.index_select(0, rows),
-            )
-            accumulated_loss = accumulated_loss + chunk_loss
-            grad_iter = iter(grads)
-            if hidden_needs_grad and grad_hidden is not None:
-                grad_hidden.index_copy_(0, rows, next(grad_iter))
-            if weight_needs_grad and grad_weight is not None:
-                grad_weight.add_(next(grad_iter))
-            if bias_needs_grad and grad_bias is not None:
-                grad_bias.index_copy_(0, rows, next(grad_iter))
-
-        saved_tensors = (
-            grad_hidden.view(hidden.shape) if grad_hidden is not None else hidden.new_empty(0),
-            grad_weight if grad_weight is not None else weight.new_empty(0),
-            *((grad_bias.view(logits_bias.shape),) if grad_bias is not None else ()),
-        )
-        return accumulated_loss, SavedState(
-            saved_tensors,
-            _Meta(True, hidden_needs_grad, weight_needs_grad, bias_needs_grad),
-        )
-
     split_dim = 1 if hidden.ndim >= 3 else 0
     hidden_chunks = hidden.split(chunk_size, dim=split_dim)
     label_chunks = labels.split(chunk_size, dim=split_dim)
+    bias_chunks = (
+        logits_bias.split(chunk_size, dim=split_dim) if logits_bias is not None else (None,) * len(hidden_chunks)
+    )
     accumulated_loss = torch.zeros((), device=hidden.device, dtype=torch.float32)
-    if not hidden_needs_grad and not weight_needs_grad:
-        for hidden_chunk, label_chunk in zip(hidden_chunks, label_chunks, strict=True):
-            accumulated_loss = accumulated_loss + _ce_loss_func(hidden_chunk, weight, label_chunk, denom, ignore_index)
+    if not (hidden_needs_grad or weight_needs_grad or bias_needs_grad):
+        for hidden_chunk, label_chunk, bias_chunk in zip(hidden_chunks, label_chunks, bias_chunks, strict=True):
+            accumulated_loss = accumulated_loss + _ce_loss_func(
+                hidden_chunk, weight, label_chunk, denom, ignore_index, bias_chunk
+            )
         return accumulated_loss, SavedState(
             (hidden.new_empty(0), weight.new_empty(0)),
             _Meta(True, False, False, False),
         )
 
-    if hidden_needs_grad and weight_needs_grad:
-        argnums = (0, 1)
-    elif hidden_needs_grad:
-        argnums = (0,)
-    else:
-        argnums = (1,)
+    argnums = tuple(
+        idx for idx, flag in ((0, hidden_needs_grad), (1, weight_needs_grad), (5, bias_needs_grad)) if flag
+    )
     grad_hidden = torch.empty_like(hidden) if hidden_needs_grad else None
     grad_weight = torch.zeros_like(weight) if weight_needs_grad else None
-    grad_chunks = grad_hidden.split(chunk_size, dim=split_dim) if hidden_needs_grad else (None,) * len(hidden_chunks)
-    for hidden_chunk, label_chunk, grad_chunk in zip(hidden_chunks, label_chunks, grad_chunks, strict=True):
+    grad_bias = torch.empty_like(logits_bias) if bias_needs_grad and logits_bias is not None else None
+    grad_hidden_chunks = (
+        grad_hidden.split(chunk_size, dim=split_dim) if grad_hidden is not None else (None,) * len(hidden_chunks)
+    )
+    grad_bias_chunks = (
+        grad_bias.split(chunk_size, dim=split_dim) if grad_bias is not None else (None,) * len(hidden_chunks)
+    )
+    for hidden_chunk, label_chunk, bias_chunk, grad_hidden_chunk, grad_bias_chunk in zip(
+        hidden_chunks, label_chunks, bias_chunks, grad_hidden_chunks, grad_bias_chunks, strict=True
+    ):
         grads, chunk_loss = _grad_and_value(
-            _ce_loss_func, argnums, hidden_chunk, weight, label_chunk, denom, ignore_index
+            _ce_loss_func, argnums, hidden_chunk, weight, label_chunk, denom, ignore_index, bias_chunk
         )
         accumulated_loss = accumulated_loss + chunk_loss
-        if hidden_needs_grad and weight_needs_grad:
-            chunk_grad_hidden, chunk_grad_weight = grads
-            grad_chunk.copy_(chunk_grad_hidden)
-            grad_weight.add_(chunk_grad_weight)
-        elif hidden_needs_grad:
-            (chunk_grad_hidden,) = grads
-            grad_chunk.copy_(chunk_grad_hidden)
-        else:
-            (chunk_grad_weight,) = grads
-            grad_weight.add_(chunk_grad_weight)
+        grad_iter = iter(grads)
+        if hidden_needs_grad and grad_hidden_chunk is not None:
+            grad_hidden_chunk.copy_(next(grad_iter))
+        if weight_needs_grad and grad_weight is not None:
+            grad_weight.add_(next(grad_iter))
+        if bias_needs_grad and grad_bias_chunk is not None:
+            grad_bias_chunk.copy_(next(grad_iter))
 
+    saved_tensors = (
+        grad_hidden if grad_hidden is not None else hidden.new_empty(0),
+        grad_weight if grad_weight is not None else weight.new_empty(0),
+        *((grad_bias,) if grad_bias is not None else ()),
+    )
     return accumulated_loss, SavedState(
-        (
-            grad_hidden if hidden_needs_grad else hidden.new_empty(0),
-            grad_weight if weight_needs_grad else weight.new_empty(0),
-        ),
-        _Meta(True, hidden_needs_grad, weight_needs_grad, False),
+        saved_tensors,
+        _Meta(True, hidden_needs_grad, weight_needs_grad, bias_needs_grad),
     )
 
 

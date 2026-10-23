@@ -206,12 +206,21 @@ class MoeModelOutputWithIndexerKL(MoeModelOutputWithPast):
             Number of CSA layers that contributed to the sums. The loss keeps the
             sum; the reported metric divides by this, so runs with different CSA
             layer counts are comparable.
+        mtp_hidden_states (`torch.FloatTensor`, *optional*):
+            Last-stage DSpark draft hidden states ``[B, S, hidden_size]`` after
+            ``hc_head`` collapse and ``norm``, ready for the shared LM head.
+        mtp_markov_bias (`torch.FloatTensor`, *optional*):
+            Rank-``dspark_markov_rank`` residual logits ``[B, S, vocab_size]``
+            produced by the last DSpark stage's ``markov_head`` on the input
+            token ids.
     """
 
     indexer_kl_total: Optional[torch.Tensor] = None
     indexer_uniform_total: Optional[torch.Tensor] = None
     indexer_query_tokens: Optional[int] = None
     indexer_kl_layers: Optional[int] = None
+    mtp_hidden_states: Optional[torch.FloatTensor] = None
+    mtp_markov_bias: Optional[torch.FloatTensor] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
