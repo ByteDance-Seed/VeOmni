@@ -7,14 +7,15 @@ This is *in addition to* the SKILL.md spine, not a replacement for it.
 ## Phase 2 additions
 
 - **MoE expert replacement** — `@config.replace_class("<M>Experts")` with
-  `gate_up_proj [E, 2*I, H]` + `down_proj [E, H, I]` + `fused_moe_forward(...)`
-  branching on `_moe_implementation in {"eager", "fused"}`. See qwen3_moe and
+  `gate_up_proj [E, 2*I, H]` + `down_proj [E, H, I]` and an instance-local
+  `VeomniOp("moe_experts", variant, resolve_op_impl("moe_implementation"))`. Always call that
+  handle; `eager` is a registered row, not a separate `ModuleList` fork or
+  `_moe_implementation in {"eager", "fused"}` branch. See qwen3_moe and
   qwen3_5_moe (the latter also removes the upstream `@use_experts_implementation`
-  decorator which would otherwise re-route around our fused path).
-- **MoE top-level init propagation** — v5 often wraps a text_config under a top
-  model. You must propagate `_moe_implementation` from `config` to
-  `config.text_config` *before* `super().__init__(config)`, via a
-  `@config.override_method("<M>Model.__init__")` patch (see qwen3_5_moe).
+  decorator which would otherwise re-route around the VeOmni path).
+- **MoE top-level init** — v5 often wraps a text_config under a top model.
+  Selection comes from `OpsImplementationConfig.moe_implementation` via
+  `resolve_op_impl("moe_implementation")`.
 - **MoE expert parallel plan** — `@config.override_method("<M>ForCausalLM.get_parallel_plan")`
   (or `ForConditionalGeneration.get_parallel_plan`) returning
   `parallel_plan.get_parallel_plan()`. `parallel_plan.py` shards the fused
@@ -67,14 +68,17 @@ Two authoritative sources:
   → subclass `PerExpertFusedCheckpointTensorConverter`
   (`veomni/models/_moe_per_expert_converter.py`), as
   `veomni/models/transformers/qwen3_moe/checkpoint_tensor_converter.py`
-  (also qwen3_omni_moe / deepseek_v3) does. Do not copy its stacking logic.
+  (also qwen3_omni_moe / deepseek_v3 / glm_moe_dsa) does. Do not copy its stacking logic.
   Its regex, `PER_EXPERT_SPLIT_TO_FUSED_PATTERN`, only matches *HF-side* keys,
   so a v5-saved fused-key checkpoint passes through the converter untouched —
-  no round-trip hazard. Subclassing also gives `ep_sharded_stream_load` support.
+  no round-trip hazard. Subclassing also gives `ep_sharded_stream_load` support
+  once the model has an EP parallel plan.
 - **HF ships per-expert keys under other names** (e.g. DeepSeek-V4's `w1/w2/w3`)
   → template = `veomni/models/transformers/deepseek_v4/checkpoint_tensor_converter.py`.
   A custom converter must implement `fused_expert_target` + `for_expert_range`
-  itself, or the streaming loader refuses the checkpoint.
+  itself, or the streaming loader refuses the checkpoint. Map every source key of
+  an expert (including a quantization scale) to that expert's fused target, so it
+  lands in the same rank's range-restricted converter.
 - **HF ships fused expert keys with same names as v5** (`*.mlp.experts.{gate_up_proj|down_proj}`
   at the module level, not per-expert) → template =
   `veomni/models/transformers/qwen3_vl_moe/checkpoint_tensor_converter.py`.
@@ -91,7 +95,7 @@ Two authoritative sources:
    `<M>CheckpointTensorConverter(num_experts=...)`.
 3. Map the HF index with
    `convert_per_expert_fqn_mapping_to_fused(mapping, PER_EXPERT_SPLIT_TO_FUSED_PATTERN)`
-   (`veomni/models/_moe_fused_weight_map.py`) and register it as
+   (`veomni/models/checkpoint/moe_map.py`) and register it as
    `_convert_fqn_to_index_mapping`, as `qwen3_moe` does.
 
 **Steps for other layouts (custom per-expert names, fused keys):**
@@ -182,9 +186,10 @@ tensors through and confirm they come out identical (no transpose applied).
   v5 may decorate `<M>Experts` with this, which routes to `grouped_mm` and
   bypasses our fused path. Use `@config.replace_class("<M>Experts")` (not
   `override_method`) so the decorator is dropped in the generated file.
-- **Forgetting to propagate `_moe_implementation` to `config.text_config`** in
-  VLM-MoE models — the submodel reads `config.text_config._moe_implementation`,
-  so override the top-level `__init__` to copy it down before `super().__init__(config)`.
+- **Branching experts on `_moe_implementation`** — do not keep
+  `_moe_implementation in {"eager", "fused"}` or call a public
+  `fused_moe_forward`. Construct `VeomniOp("moe_experts", ...)` from
+  `resolve_op_impl("moe_implementation")`.
 - **Registering converter on the wrong class tuple** — make sure `_create_checkpoint_tensor_converter`
   is attached to every concrete model class you import from `generated/`, not
   just `ForCausalLM`. Must use `staticmethod(...)`.
@@ -221,4 +226,4 @@ tensors through and confirm they come out identical (no transpose applied).
   `gate_proj`/`up_proj`/`down_proj` will raise
   `KeyError: '...experts.0.gate_proj.weight'`. Guard with a key-existence check,
   skip stacking when fused keys are already present, and cover both layouts in
-  `tests/models/test_checkpoint_tensor_converter.py`.
+  `tests/models/base/test_checkpoint_tensor_converter.py`.

@@ -3,12 +3,17 @@ import random
 import subprocess
 import sys
 
+import pytest
 import torch
 import torch.distributed as dist
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.utils.data_balance.data_balance import Qwen3VLEncoderDataBalance
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+
+
+_CI_LAUNCH = LaunchSpec(nproc=8)
 
 
 def construct_data():
@@ -75,16 +80,17 @@ def main():
     dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 def test_encoder_balance():
     command = [
         sys.executable,
         "-m",
         "torch.distributed.run",
         "--nnodes=1",
-        "--nproc-per-node=8",
+        f"--nproc-per-node={_CI_LAUNCH.nproc}",
         "--node-rank=0",
         "--master_addr=localhost",
-        "--master_port=12345",
+        "--standalone",
         "tests/parallel/encoder_data_balance/test_balance_reverse.py",
     ]
 

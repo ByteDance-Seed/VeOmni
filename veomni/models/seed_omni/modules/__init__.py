@@ -39,7 +39,8 @@ Shared bases live next to the families, not at the ``seed_omni/`` package root:
 Concrete modules: ``modules/<family>/<sub_module>/(configuration.py,
 modeling.py[, processing.py])``.  Each sub-module gets its own folder; the
 folder name carries the namespace so the inner files use short names rather
-than re-spelling ``<family>_<sub_module>`` per file.
+than re-spelling ``<family>_<sub_module>`` per file.  The shared
+word-token embedding + LM head module lives at ``modules/text_encoder/``.
 """
 
 from transformers import PretrainedConfig
@@ -71,7 +72,7 @@ def read_hf_model_type(model_path: str) -> str:
     declare custom ``model_type`` values (``module_A`` / ``module_B`` / …)
     that are NOT in HF's :data:`CONFIG_MAPPING`.  ``AutoConfig`` would raise
     on those families before we even get a chance to consult the registries;
-    reading the raw dict sidesteps that.  See :mod:`veomni.models.loader`
+    reading the raw dict sidesteps that.  See :mod:`veomni.models.registry`
     for the same pattern in the foundation-model loader.
     """
     config_dict, _ = PretrainedConfig.get_config_dict(model_path)
@@ -114,7 +115,8 @@ def read_model_type(model_path: str) -> str:
     return model_type
 
 
-from . import fake_model  # noqa: F401  E402
+# Side-effect only: attach @register factories under text_encoder/ and fake_model/.
+from . import fake_model, text_encoder  # noqa: F401  E402
 
 
 __all__ = [

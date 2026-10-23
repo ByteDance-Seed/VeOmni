@@ -9,8 +9,6 @@ This runs a small random-weight Flux (one joint block, one single block) with SP
 with Ulysses SP on, for divisible and non-divisible lengths, and checks the outputs and SP-reduced parameter grads match.
 """
 
-from unittest.mock import patch
-
 import pytest
 import torch
 import torch.distributed as c10d
@@ -24,7 +22,6 @@ if get_device_type() == "cpu" or not c10d.is_available() or not c10d.is_backend_
 from torch.testing._internal.common_utils import run_tests
 
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
-from veomni.models.transformers.flux import modeling_flux
 from veomni.models.transformers.flux.config_flux import FluxConfig
 from veomni.models.transformers.flux.modeling_flux import FluxModel
 
@@ -80,11 +77,8 @@ class FluxUlyssesPaddingTest(SequenceParallelTest):
     def world_size(self):
         return 2
 
-    # `flash_attention` takes the flash_attn_interface/flash_attn path whenever either is
-    # importable and no mask is given, which is the divisible case here. Those kernels only
-    # accept FP16/BF16, so this FP32 comparison has to run on SDPA.
-    @patch.object(modeling_flux, "FLASH_ATTN_3_AVAILABLE", False)
-    @patch.object(modeling_flux, "FLASH_ATTN_2_AVAILABLE", False)
+    # Flash kernels only accept FP16/BF16, so this FP32 comparison has to run on SDPA. With no
+    # ops config installed, `bind_flux_attention` binds `veomni_sdpa`.
     @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
     def test_matches_non_sp_reference(self):
         group = self._get_process_group()

@@ -14,6 +14,8 @@ reviews:
   review_status: true
   auto_review:
     enabled: true
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 5
     drafts: false
     base_branches:
       - ".*"
@@ -42,7 +44,7 @@ reviews:
     - path: "veomni/models/**"
       instructions: |
         Focus on model loading and patchgen.
-        - Do not request edits under veomni/models/transformers/*/generated/. Change patch_spec.py or modeling_*_patch.py instead.
+        - Do not request edits under veomni/models/transformers/*/generated/. Change the patchgen config instead.
         - Model registration must happen at import time.
         - config model_type must match the registry key.
         - New modeling must target transformers 5.16.1 and FSDP2.

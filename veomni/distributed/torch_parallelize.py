@@ -30,7 +30,7 @@ from torch.utils.checkpoint import noop_context_fn
 from ..arguments import MixedPrecisionConfig
 from ..arguments.arguments_types import validate_low_precision_reduce_scatter_comm
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
-from ..utils import logging
+from ..utils import logging, recompute_utils
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
 from .fsdp2.reduce_scatter import (
@@ -93,16 +93,32 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
 
 
 def _has_extra_parallel_plan(model: nn.Module) -> bool:
-    """True when the model's parallel plan declares ExtraParallel-sharded tensors.
+    """True when the model's parallel plan shards tensors on an active ExtraParallel dimension.
 
     The question both ExtraParallel guards below actually need to ask. A plan is
     a property of the *model*, unlike ``ParallelState.any_extra_parallel_enabled``,
-    which only says an ep dim exists in the mesh — and a mesh dim is inherited by
-    every sub-module of a SeedOmni V2 config, including the ones that have no
-    experts.
+    which only says an ExtraParallel dim exists in the mesh — and a mesh dim is
+    inherited by every sub-module of a SeedOmni V2 config, including the ones that
+    have no experts or declare a different ExtraParallel axis (e.g. ``emb`` while
+    only ``ep`` is enabled).
     """
     plan = get_runtime_parallel_plan(model)
-    return plan is not None and bool(getattr(plan, "extra_parallel_plan", None))
+    extra_plan = getattr(plan, "extra_parallel_plan", None) if plan is not None else None
+    if not extra_plan:
+        return False
+    planned_dims = {para for para, entries in extra_plan.items() if entries}
+    if not planned_dims:
+        return False
+    parallel_state = get_parallel_state()
+    if hasattr(parallel_state, "extra_parallel_enabled") and getattr(
+        parallel_state, "any_extra_parallel_enabled", False
+    ):
+        return any(
+            parallel_state.extra_parallel_enabled(para)
+            for para in planned_dims
+            if para in getattr(parallel_state, "extra_parallel_sizes", ())
+        )
+    return True
 
 
 def _materialize_and_load_weights(
@@ -192,6 +208,10 @@ def _materialize_and_load_weights(
         # Random init is unnecessary when the checkpoint will overwrite every parameter.
         if not should_skip_hf_weight_load:
             model.init_weights()
+        if fqn_to_index_mapping is not None:
+            from veomni.models.checkpoint.convert import prepare_fqn_to_index_mapping_for_model
+
+            prepare_fqn_to_index_mapping_for_model(model, fqn_to_index_mapping)
         return
 
     from torch.distributed.tensor import distribute_tensor
@@ -497,10 +517,6 @@ def parallelize_model_fsdp2(
         if persistent_extra_parallel_params:
             if parallel_state.dp_replicate_enabled:
                 raise NotImplementedError("Persistent ExtraParallel parameters do not support HSDP replicas yet.")
-            if parallel_state.sp_enabled:
-                raise NotImplementedError(
-                    "Persistent ExtraParallel parameters do not support sequence parallelism yet."
-                )
             for para in persistent_para_names:
                 para_mesh = parallel_state.extra_parallel_fsdp_device_mesh[para]
                 flat_mesh = parallel_state.extra_parallel_flat_device_mesh[para]
@@ -728,7 +744,7 @@ def parallelize_model_fsdp2(
     # TODO(https://github.com/ByteDance-Seed/VeOmni/issues/241):
     # NPU is missing PreSumMul ReduceOp. Need to remove this condition after the issue is resolved.
     if IS_NPU_AVAILABLE and parallel_state.any_extra_parallel_enabled:
-        from veomni.ops.platform.npu import apply_hccl_premul_sum_patch
+        from .hccl_premul_sum import apply_hccl_premul_sum_patch
 
         apply_hccl_premul_sum_patch()
 
@@ -909,7 +925,8 @@ def parallelize_model_ddp(
     does either — ``build_model`` returns an empty model and ``BaseTrainer`` has
     no load step of its own — so the wrap used to reach DDP's constructor with
     meta parameters and die there on ``Tensor.item()``. A model that arrives with
-    real weights already loaded must not be touched here.
+    real weights already loaded must not be touched here. A model with no
+    parameter that requires grad is loaded but returned unwrapped.
     """
     parallel_state = get_parallel_state()
 
@@ -960,6 +977,13 @@ def parallelize_model_ddp(
                 f"{unmaterialized[:5]}{'...' if len(unmaterialized) > 5 else ''}"
             )
 
+    # DDP's constructor rejects a module with no parameter that requires grad,
+    # and a frozen replica (e.g. every encoder of an ``offline_embedding`` run)
+    # has no gradient to all-reduce. Its weights are loaded above; skip the wrap.
+    if not any(param.requires_grad for param in model.parameters()):
+        logger.info_rank0("No parameter requires grad: loaded the weights without a DDP wrap.")
+        return model
+
     # ``broadcast_buffers=False`` because FSDP2 syncs no buffers at all, and a
     # module's buffer semantics must not change with the ``fsdp_mode`` a config
     # happened to pick. Nothing is lost: rank0's copy is either identical to the
@@ -980,6 +1004,7 @@ def build_parallelize_model(
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
+    recompute_policy: Optional[recompute_utils.RecomputePolicy] = None,
     muon_expert_zero_comm: bool = False,
     low_precision_reduce_scatter_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
@@ -996,6 +1021,8 @@ def build_parallelize_model(
             module's path; the composed wrap passes one path per child.
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
+        recompute_policy: Per-block recomputation strategy, bound after HF has
+            enabled gradient checkpointing and before FSDP2 shards the blocks.
     """
     parallel_state = get_parallel_state()
     if low_precision_reduce_scatter_comm is not False:
@@ -1019,9 +1046,20 @@ def build_parallelize_model(
         if use_reentrant:
             torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
 
+        # The entry points the policy does not bind keep whatever HF is given here,
+        # so the run's own recompute context has to be in it — otherwise a module
+        # whose blocks are not selected would recompute outside its scoping.
+        recompute_context_fn = kwargs.pop("recompute_context_fn", None)
+        if recompute_context_fn is None and recompute_policy is not None:
+            recompute_context_fn = recompute_utils.recompute_context_fn(recompute_policy.recompute_context)
+        if use_reentrant:
+            # ``checkpoint`` rejects any other ``context_fn`` when reentrant, and
+            # reentrant recomputation never enters one anyway.
+            recompute_context_fn = None
+
         gradient_checkpointing_kwargs = {
             "use_reentrant": use_reentrant,
-            "context_fn": kwargs.pop("recompute_context_fn", noop_context_fn),
+            "context_fn": recompute_context_fn or noop_context_fn,
         }
         if not use_reentrant:
             gradient_checkpointing_kwargs["early_stop"] = checkpoint_early_stop
@@ -1029,6 +1067,13 @@ def build_parallelize_model(
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
         )
+
+    # Layer selection and SAC are bound per block, after HF has set its own
+    # function on every checkpointing layer and before FSDP shards them. Runs
+    # outside the branch above: models whose block loops drive checkpointing
+    # themselves (MiniMax-H3) still need their blocks bound.
+    if recompute_policy is not None:
+        recompute_utils.apply_recompute_policy(model, recompute_policy, basic_modules=basic_modules)
 
     if parallel_state.tp_enabled:
         logger.info_rank0("Apply tensor parallel to the model.")

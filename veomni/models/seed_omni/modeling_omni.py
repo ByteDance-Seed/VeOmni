@@ -31,8 +31,9 @@ walk.  Stop when ``is_done()`` or ``max_new_tokens`` is reached.
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
+import torch
 import torch.distributed as dist
 import torch.nn as nn
 from transformers import PreTrainedModel
@@ -49,6 +50,10 @@ from .graphs.generation_graph import GenerationGraph
 from .graphs.training_graph import TrainingGraph
 from .modules import OMNI_MODEL_REGISTRY, PretrainedOmniModule
 from .modules.module_configuration_base import OmniModuleConfig
+
+
+if TYPE_CHECKING:
+    from .utils.hf_layout import HFSource
 
 
 logger = helper.create_logger(__name__)
@@ -163,12 +168,11 @@ class OmniModel(PreTrainedModel):
 
         # Convert may split modules before any DAG/FSM exists. Build each graph
         # only when the config has one; :meth:`forward` / :meth:`generate` report
-        # the absence at train / infer time. A present graph checks endpoints
-        # against these modules during its own construction.
+        # the absence at train / infer time. The training graph checks its
+        # endpoints against these modules here; the generation graph only before
+        # a request (:meth:`GenerationGraph.validate_modules`).
         self.training_graph = TrainingGraph(config.training_graph, modules=modules) if config.training_graph else None
-        self.generation_graph = (
-            GenerationGraph(config.generation_graph, modules=modules) if config.generation_graphs else None
-        )
+        self.generation_graph = GenerationGraph(config.generation_graph) if config.generation_graphs else None
 
         self._last_printed_state: str | None = None
         self._generated: list[dict[str, Any]] = []
@@ -222,7 +226,15 @@ class OmniModel(PreTrainedModel):
         ``model_config`` / ``processor_config``, and the top-level fields
         ``infer_type``, ``generation_kwargs``, ``training_graphs``,
         ``generation_graphs``, ``_module_entries``.
+
+        An upstream HF checkpoint whose ``model_type`` has a registered
+        :class:`~veomni.models.seed_omni.utils.hf_layout.OmniHFLayout` loads
+        directly: configs and assets from a weight-free split view of it,
+        weights from the checkpoint itself.
         """
+        from .utils.hf_layout import resolve_omni_checkpoint_root
+
+        pretrained_model_name_or_path = resolve_omni_checkpoint_root(pretrained_model_name_or_path)
         config = kwargs.pop("config", None)
         config_kwargs = {key: kwargs.pop(key) for key in list(kwargs) if key in _CONFIG_LOAD_KWARG_NAMES}
         config_overrides = {key: kwargs.pop(key) for key in list(kwargs) if key in _OMNI_CONFIG_OVERRIDE_KEYS}
@@ -286,42 +298,80 @@ class OmniModel(PreTrainedModel):
         ``kwargs`` are HF load options here (``torch_dtype``, ``device_map``,
         …). A caller's kernel selections were absorbed into ``config`` by
         :meth:`OmniConfig.apply_omni_kwargs` before this runs, so kernels are
-        read from the config like every other layer.
+        read from each module's own :class:`OmniModuleConfig` during
+        construction without relying on the process-global ops config.
         """
-
-        from ...arguments import OpsImplementationConfig
-        from ...ops import apply_ops_config
-        from ...ops.config.singleton import get_ops_config
-        from ..auto import bind_ops_to_modeling
-
-        base_ops = get_ops_config()
         modules: dict[str, PretrainedOmniModule] = {}
         for name in config.module_names:
             entry = config._module_entries[name]
             module_path = OmniModuleConfig.resolve_path(checkpoint_root, name, entry.get("model_path"))
             module_config = config._module_configs[name]
             mod_cls = OMNI_MODEL_REGISTRY[module_config.model_type]()
-            module_ops = OpsImplementationConfig(**dict(module_config.ops_implementation or {}))
             # Copy per module: HF pops keys such as ``torch_dtype`` out of the dict it is given.
             # TODO: make it per module kwargs
             module_kwargs = dict(kwargs)
 
-            # Install this module's kernels for the duration of its own load, so
-            # a module's kernels do not depend on its position in
-            # ``config.module_names``.
-            apply_ops_config(module_ops)
-
-            # After the ops config above was installed.
-            bind_ops_to_modeling(mod_cls)
-            if load_weights:
+            if load_weights and config._hf_source is not None:
+                if os.path.normpath(module_path) != os.path.normpath(os.path.join(str(checkpoint_root), name)):
+                    raise ValueError(
+                        f"Module {name!r} reads from {module_path!r}, but {checkpoint_root} is a view of the "
+                        f"HuggingFace `{config._hf_source.model_type}` checkpoint every module loads from."
+                    )
+                modules[name] = cls._load_module_from_hf_source(
+                    mod_cls, name, module_config, module_path, config._hf_source, module_kwargs
+                )
+            elif load_weights:
                 modules[name] = mod_cls.from_pretrained(module_path, config=module_config, **module_kwargs)
             else:
                 modules[name] = mod_cls._from_config(module_config, **cls._init_only_load_kwargs(module_kwargs))
-
-        # Don't leave the caller's config holding the last module's override.
-        if base_ops is not None:
-            apply_ops_config(base_ops)
         return modules
+
+    @staticmethod
+    def _load_module_from_hf_source(
+        mod_cls: type,
+        name: str,
+        module_config: OmniModuleConfig,
+        module_path: str,
+        source: HFSource,
+        load_kwargs: dict[str, Any],
+    ) -> PretrainedOmniModule:
+        """``from_pretrained`` for a module whose weights live in the upstream HF checkpoint.
+
+        Takes the same ``torch_dtype`` (or ``dtype``) / ``device_map`` /
+        ``max_memory`` / ``attn_implementation`` options; ``torch_dtype="auto"``
+        is the checkpoint's dtype, and ``device_map="auto"`` spreads the module
+        over the visible devices as HF does. Assets bind from the weight-free
+        view's subfolder.
+        """
+        from .modules.module_processing_base import bind_module_assets
+        from .utils.hf_layout import load_module_from_hf_source
+
+        load_kwargs = dict(load_kwargs)
+        device_map = load_kwargs.pop("device_map", None)
+        max_memory = load_kwargs.pop("max_memory", None)
+        torch_dtype = load_kwargs.pop("torch_dtype", None)
+        dtype = load_kwargs.pop("dtype", None)
+        torch_dtype = torch_dtype if torch_dtype is not None else dtype
+        attn_implementation = load_kwargs.pop("attn_implementation", None)
+        if load_kwargs:
+            raise ValueError(f"Loading from a HuggingFace checkpoint does not take {sorted(load_kwargs)}.")
+        if torch_dtype == "auto":
+            hf_config = source.layout.read_hf_config(source.path)
+            torch_dtype = getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype", None)
+        if isinstance(torch_dtype, str):
+            torch_dtype = getattr(torch, torch_dtype)
+        module = load_module_from_hf_source(
+            mod_cls,
+            module_config,
+            source,
+            name,
+            device_map=device_map,
+            max_memory=max_memory,
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+        )
+        bind_module_assets(module, checkpoint_path=module_path)
+        return module
 
     def _save_module_subdirectory(
         self,
@@ -477,6 +527,12 @@ class OmniModel(PreTrainedModel):
         collection and return value stay here. A runtime that wraps the modules
         passes one to unwrap them and scope each node to its module's mesh;
         without one each node runs as :meth:`_run_train_node`.
+
+        Returns the summed ``loss``, the per-node ``losses`` and the batch's
+        ``conversation_list`` as the nodes left it. Under FSDP2 mixed precision
+        every wrap unit's pre-forward casts its inputs with ``dataclasses.replace``,
+        so the nodes update copies of the caller's ``ConversationItem``\\ s: a caller
+        that needs what they wrote reads it from here.
         """
         del args, kwargs
         run_node = node_runner if node_runner is not None else self._run_train_node
@@ -494,7 +550,11 @@ class OmniModel(PreTrainedModel):
             loss = batch.pop(LOSS_KEY, None)
             if loss is not None:
                 self._losses[node.name] = loss
-        return {"loss": _sum_losses(self._losses), "losses": dict(self._losses)}
+        return {
+            "loss": _sum_losses(self._losses),
+            "losses": dict(self._losses),
+            "conversation_list": batch.get("conversation_list"),
+        }
 
     def reset(self) -> None:
         """Clear per-request inference runtime state."""
@@ -596,6 +656,7 @@ class OmniModel(PreTrainedModel):
                 "OmniModel.generate: this model has no generation graph. Pass `generation_graphs` "
                 f"(or place `{DEFAULT_GENERATION_GRAPH_FILE}` next to the checkpoint) to run inference."
             )
+        self.generation_graph.validate_modules({name: self.get_module(name) for name in self._module_names})
         ctx: dict[str, Any] = request
         generation_kwargs = self.resolve_generation_kwargs(generation_kwargs)
 

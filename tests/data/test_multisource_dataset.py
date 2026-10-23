@@ -1,12 +1,10 @@
 import argparse
 import copy
-import dataclasses
 import os
 import subprocess
 import sys
 import time
 from contextlib import nullcontext
-from dataclasses import field
 from functools import partial
 from typing import Any, Dict, List, Literal, cast
 from unittest.mock import patch
@@ -21,7 +19,6 @@ import torch
 import torch.distributed as dist
 import yaml
 from tools import resolve_ops_overrides
-from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
 from utils import (
     DummyDataset,
@@ -33,6 +30,7 @@ from utils import (
     setup_test_distributed,
 )
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
 from veomni.data.dataset import WeightedMultiSourceDataset
@@ -43,6 +41,9 @@ from veomni.utils import helper
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.helper import get_cache_dir
+
+
+_CI_LAUNCH = LaunchSpec(nproc=2)
 
 
 logger = helper.create_logger(__name__)
@@ -122,17 +123,9 @@ class TrainerTest(BaseTrainer):
 
         self.args.train.num_train_epochs = 3
 
-        # we have to add a shuffle field to the args because it does not have one,
-        # and we need it to control the behavior of HF datasets,
-        # because it is shuffled it will store samples in a buffer,
-        # and such a buffer will be en  which will be discarded during resuming,
-        # thus causing the resumed training to see different samples from the original training
-        shuffle_field = field(default=True)
-        shuffle_field.name = "shuffle"
-        shuffle_field.type = bool
-        shuffle_field._field_type = dataclasses._FIELD
-        self.args.data.__dataclass_fields__["shuffle"] = shuffle_field
-        self.args.data.shuffle = False
+        # The HF streaming shuffle buffer is not checkpointed, so a resumed run
+        # would see different samples from the original one.
+        self.args.data.dataloader.shuffle = False
         return device
 
     def _build_model_runtime(self):
@@ -817,12 +810,11 @@ class TestLoadStateDictBoundary:
 
 
 def build_command():
-    port = find_free_port()
     command = [
         "torchrun",
         "--nnodes=1",
-        "--nproc_per_node=2",
-        f"--master_port={port}",
+        f"--nproc_per_node={_CI_LAUNCH.nproc}",
+        "--standalone",
         "tests/data/test_multisource_dataset.py",
         "--model.config_path=test",
         "--data.train_path=None",
@@ -844,6 +836,7 @@ def build_command():
     return command
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 def test_multisource_dataset_chain():
     if sys.platform == "darwin":
         pytest.skip(f"torch_shm_manager not supported on macOS: executable={_torch_shm_manager_executable()}")

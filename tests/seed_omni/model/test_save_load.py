@@ -16,6 +16,7 @@ import torch
 import yaml
 from transformers import PretrainedConfig
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni.configuration_omni import (
     DEFAULT_GENERATION_GRAPH_FILE,
     DEFAULT_TRAINING_GRAPH_FILE,
@@ -27,6 +28,9 @@ from veomni.models.seed_omni.modules.fake_model.fake_module_a.configuration impo
 from veomni.models.seed_omni.modules.fake_model.fake_module_a.modeling import FakeModuleA
 from veomni.models.seed_omni.modules.fake_model.fake_module_b.configuration import FakeModuleBConfig
 from veomni.models.seed_omni.modules.fake_model.fake_module_b.modeling import FakeModuleB
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 FAKE_A = "fake_module_a"
@@ -272,6 +276,30 @@ def test_omni_model_from_pretrained_loads_the_fake_chain(tmp_path):
     assert torch.equal(loaded.get_module(FAKE_B).proj.weight, model.get_module(FAKE_B).proj.weight)
 
 
+@pytest.mark.parametrize("caller_has_ops", [False, True], ids=["no_base_ops", "base_ops"])
+def test_module_loading_restores_the_callers_ops_config(tmp_path, monkeypatch, caller_has_ops):
+    from veomni.arguments import OpsImplementationConfig
+    from veomni.ops.config import get_ops_config, set_ops_config
+
+    _build_omni_model().save_pretrained(tmp_path)
+    caller_ops = OpsImplementationConfig() if caller_has_ops else None
+    previous = get_ops_config()
+    set_ops_config(caller_ops)
+    try:
+        OmniModel.from_pretrained(tmp_path)
+        assert get_ops_config() is caller_ops
+
+        def fail_load(*args, **kwargs):
+            raise RuntimeError("module load failed")
+
+        monkeypatch.setattr(FakeModuleB, "from_pretrained", classmethod(fail_load))
+        with pytest.raises(RuntimeError, match="module load failed"):
+            OmniModel.from_pretrained(tmp_path)
+        assert get_ops_config() is caller_ops
+    finally:
+        set_ops_config(previous)
+
+
 def test_omni_model_from_pretrained_forwards_dtype_to_modules(tmp_path):
     _build_omni_model().save_pretrained(tmp_path)
 
@@ -297,8 +325,8 @@ def test_from_pretrained_takes_each_module_attention_from_the_checkpoint(tmp_pat
 
     loaded = OmniModel.from_pretrained(tmp_path)
 
-    assert loaded.get_module(FAKE_A).config._attn_implementation == "eager"
-    assert loaded.get_module(FAKE_B).config._attn_implementation == "sdpa"
+    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
+    assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "sdpa"
 
 
 def test_a_persisted_attention_wins_over_the_callers_load_kwarg(tmp_path):
@@ -318,8 +346,8 @@ def test_a_persisted_attention_wins_over_the_callers_load_kwarg(tmp_path):
 
     loaded = OmniModel.from_pretrained(tmp_path, attn_implementation="sdpa")
 
-    assert loaded.get_module(FAKE_A).config._attn_implementation == "eager"
-    assert loaded.get_module(FAKE_B).config._attn_implementation == "sdpa"
+    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
+    assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "sdpa"
 
 
 def test_kernel_layers_merge_per_field_across_the_model_and_the_module(tmp_path):
@@ -344,7 +372,7 @@ def test_kernel_layers_merge_per_field_across_the_model_and_the_module(tmp_path)
 
     loaded = OmniModel.from_pretrained(tmp_path)
 
-    assert loaded.get_module(FAKE_A).config._attn_implementation == "eager"
+    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
     assert loaded.config._module_configs[FAKE_A].ops_implementation["rms_norm_implementation"] == "eager"
     # The module that stated nothing still gets the model-level default.
     assert loaded.config._module_configs[FAKE_B].ops_implementation["rms_norm_implementation"] == "eager"
@@ -365,7 +393,7 @@ def test_a_module_scoped_kwarg_overrides_what_the_composition_states(tmp_path):
 
     loaded = OmniModel.from_pretrained(tmp_path, **{f"{FAKE_A}.attn_implementation": "eager"})
 
-    assert loaded.get_module(FAKE_A).config._attn_implementation == "eager"
+    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
 
 
 @pytest.mark.parametrize(
@@ -449,7 +477,7 @@ def test_a_kwarg_lands_on_the_layer_it_overrides_and_is_saved_there(tmp_path):
     _state_module_ops(tmp_path / FAKE_B, {"attn_implementation": "sdpa"})
 
     loaded = OmniModel.from_pretrained(tmp_path, **{f"{FAKE_A}.attn_implementation": "eager"})
-    assert loaded.get_module(FAKE_A).config._attn_implementation == "eager"
+    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
     # The slot keeps the caller's say. The loaded module config holds the resolved kernels.
     assert loaded.config._module_entries[FAKE_A]["ops_implementation"] == {"attn_implementation": "eager"}
     assert loaded.config._module_configs[FAKE_A].ops_implementation == {
@@ -470,7 +498,7 @@ def test_a_kwarg_lands_on_the_layer_it_overrides_and_is_saved_there(tmp_path):
     }
 
     reloaded = OmniModel.from_pretrained(resaved)
-    assert reloaded.get_module(FAKE_A).config._attn_implementation == "eager"
+    assert reloaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
     assert reloaded.config._module_configs[FAKE_B].ops_implementation == {
         "rms_norm_implementation": "eager",
         "attn_implementation": "sdpa",
@@ -499,8 +527,8 @@ def test_a_kernel_block_kwarg_merges_per_field_like_any_other_layer(tmp_path):
         "rms_norm_implementation": "eager",
         "attn_implementation": "sdpa",
     }
-    assert loaded.get_module(FAKE_A).config._attn_implementation == "sdpa"
-    assert loaded.get_module(FAKE_B).config._attn_implementation == "eager"
+    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "sdpa"
+    assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "eager"
 
 
 def test_resolving_the_config_first_loads_the_same_model(tmp_path):
@@ -527,8 +555,7 @@ def test_resolving_the_config_first_loads_the_same_model(tmp_path):
             == direct.config._module_configs[name].ops_implementation
         )
         assert (
-            from_config.get_module(name).config._attn_implementation
-            == direct.get_module(name).config._attn_implementation
+            from_config.get_module(name).config.ops_implementation == direct.get_module(name).config.ops_implementation
         )
 
 
@@ -944,7 +971,7 @@ def test_from_pretrained_rejects_missing_endpoint_method(tmp_path):
 
 
 def test_omni_model_rejects_missing_default_generate():
-    """Bare generation endpoints resolve to ``generate``; that method must exist when the FSM is built."""
+    """Bare generation endpoints resolve to ``generate``; that method must exist when a request runs."""
 
     class NoGenerate(FakeModuleA):
         generate = None
@@ -954,5 +981,6 @@ def test_omni_model_rejects_missing_default_generate():
         training_graphs={"default": [{"from": FAKE_A, "to": "end"}]},
         generation_graphs=_minimal_generation_graphs(module=FAKE_A),
     )
+    model = OmniModel(config, {FAKE_A: NoGenerate(FakeModuleAConfig())})
     with pytest.raises(ValueError, match=r"NoGenerate\.generate"):
-        OmniModel(config, {FAKE_A: NoGenerate(FakeModuleAConfig())})
+        model.generate({})

@@ -14,26 +14,30 @@ from typing import Dict, List, Optional
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.utils.device import get_device_type
 
-from .launch_utils import find_free_port
 
-
-# NPU ops_implementation overrides per model. The public
-# ``OpsImplementationConfig`` defaults are GPU-optimal (Liger / Triton) and
-# raise on NPU at config validation time, so every NPU test must override
-# every per-op field. ``_NPU_OPS_DEFAULTS`` is the baseline; entries in
+# NPU ops_implementation overrides per model. Every per-op field is pinned so
+# NPU tests do not depend on the host defaults. ``_NPU_OPS_DEFAULTS`` is the baseline; entries in
 # ``_NPU_PER_MODEL_OVERRIDES`` (DeepSeek-V3/V4, Qwen-VL family) pin
 # specific fields to ``eager`` where the model has no NPU kernel.
 _NPU_OPS_DEFAULTS: Dict[str, str] = {
     "attn_implementation": "flash_attention_2",
     "moe_implementation": "fused_npu",
     "cross_entropy_loss_implementation": "chunk_loss",
-    "rms_norm_implementation": "npu",
-    "rotary_pos_emb_implementation": "npu",
+    "rms_norm_implementation": "torch_npu",
+    "rotary_pos_emb_implementation": "torch_npu",
+    "rotary_pos_emb_vision_implementation": "torch_npu",
     "swiglu_mlp_implementation": "eager",  # no NPU backend
-    # NPU ships ``triton-ascend`` (not mainline ``triton``); the validator
-    # gates ``triton`` on ``is_package_available("triton")`` so the fused
-    # load-balancing-loss kernel would raise on the NPU runner. Pin to eager.
+    # The Triton load-balancing-loss row is CUDA-only, so NPU resolution rejects
+    # it even when ``triton-ascend`` is installed. Pin to eager.
     "load_balancing_loss_implementation": "eager",
+    # GatedDeltaNet trio (Qwen3.5, Qwen4-Exp). The dataclass default is ``fla``,
+    # whose package is GPU-only, and ``eager`` has no ``cu_seqlens`` path.
+    # ``torch_npu`` is the fused RMSNorm gate. ``triton`` is the vendored
+    # Triton-Ascend kernel and needs ``triton-ascend``, which the NPU workflows
+    # install. Models without a GatedDeltaNet never resolve these ops.
+    "rms_norm_gated_implementation": "torch_npu",
+    "causal_conv1d_implementation": "triton",
+    "chunk_gated_delta_rule_implementation": "triton",
 }
 
 _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
@@ -51,47 +55,32 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },
+    # GLM-MoE-DSA folds its DSA top-k selection into the attention mask, which
+    # flash attention cannot consume; the NPU build has no sparse DSA kernel.
+    "glm_moe_dsa": {"attn_implementation": "eager"},
     # Multimodal RoPE has no NPU backend in the Qwen-VL family.
     "qwen2vl": {"rotary_pos_emb_implementation": "eager"},
     "qwen25vl": {"rotary_pos_emb_implementation": "eager"},
-    # qwen2 / qwen3_moe / llama3.1 / qwen2_5_omni patchgen-generated modeling
-    # declares OpSlots for rotary_pos_emb and rms_norm but KERNEL_REGISTRY
-    # has no ``npu`` KernelSpec for either — only ``liger_kernel`` (GPU). Pin
-    # both to eager until NPU KernelSpecs are registered.
-    "qwen2": {
-        "rms_norm_implementation": "eager",
-        "rotary_pos_emb_implementation": "eager",
-    },
-    "qwen3_moe": {
-        "rms_norm_implementation": "eager",
-        "rotary_pos_emb_implementation": "eager",
-    },
-    "llama3.1": {
-        "rms_norm_implementation": "eager",
-        "rotary_pos_emb_implementation": "eager",
-    },
-    # qwen2_5_omni inherits the same KERNEL_REGISTRY gap; mm RoPE has no
-    # NPU backend either, so pinning both keeps the thinker text path on
-    # eager kernels on NPU.
-    "qwen2_5_omni": {
-        "rms_norm_implementation": "eager",
-        "rotary_pos_emb_implementation": "eager",
-    },
 }
 
 # GPU per-model overrides for models whose patched ops disable a default
 # backend. Wan uses FA2 in real DiT configs, while RoPE stays eager because
-# its ``rope_apply(x, **kwargs)`` signature is incompatible with the
-# registry-default Liger RoPE.
+# the ``rope/wan`` row has no Liger backend.
 _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "wan_t2v": {
         "attn_implementation": "flash_attention_2",
         "rotary_pos_emb_implementation": "eager",
     },
-    # Qwen-Image runs its dual-stream joint attention through diffusers' own
-    # attention dispatch (Ulysses SP is handled by QwenImageSPAttnProcessor, not
-    # the VeOmni FA2 op), so keep the VeOmni attn/rope ops on eager.
-    "qwen_image": {"attn_implementation": "eager", "rotary_pos_emb_implementation": "eager"},
+    # Qwen-Image joint attention is now VeOmni ``attention/standard``. The
+    # official path builds a ``(B, S)`` padding mask, so keep SDPA rather than
+    # FA. RoPE stays eager because this family has no fused rope row.
+    "qwen_image": {"attn_implementation": "sdpa", "rotary_pos_emb_implementation": "eager"},
+    # MiniMax H3 has no module-local eager attention. Packed DiT uses SDPA with
+    # a block-diagonal mask; production FA takes cu_seqlens once.
+    "minimax_h3": {"attn_implementation": "sdpa"},
+    # LTX has no module-local eager attention. The callable adapter binds
+    # ``attention/standard``; a mask falls back to SDPA.
+    "ltx2_3": {"attn_implementation": "sdpa"},
     # qwen3_5 / qwen3_5_moe peak GPU memory on the toy config is dominated
     # by the fused Liger cross-entropy kernel materializing the full
     # ``[B, S, V]`` logits buffer. Use ``chunk_loss`` instead: it
@@ -100,6 +89,10 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # L20 runners where another job is still holding part of the card.
     "qwen3_5": {"cross_entropy_loss_implementation": "chunk_loss"},
     "qwen3_5_moe": {"cross_entropy_loss_implementation": "chunk_loss"},
+    # Under the default dsa_attention_implementation=eager, GLM-MoE-DSA folds its
+    # DSA top-k selection into the attention mask, which flash attention cannot
+    # consume. The flashmla_cudnn kernel needs SM90+ and GLM-5-sized heads.
+    "glm_moe_dsa": {"attn_implementation": "eager"},
     # GPT-OSS intentionally does not register a Triton MoE backend because its
     # native interleaved gate/up training layout needs either eager reference
     # math or the dedicated SM90-only Quack path. Keep the shared helper on the
@@ -116,8 +109,8 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # configs/text/deepseek_v4.yaml so the fused partial-interleaved Triton
     # kernel is exercised under FSDP2, Ulysses SP and the TileLang paths rather
     # than only by the standalone kernel tests. MoE uses the GPU-default
-    # fused_triton backend, while weighted/unweighted RMSNorm and the
-    # shared-expert MLP use their default Liger OpSlots.
+    # triton backend, while weighted/unweighted RMSNorm and the
+    # shared-expert MLP use their default Liger kernels.
     "deepseek_v4": {
         "attn_implementation": "eager",
         "moe_implementation": "fused_triton",
@@ -138,7 +131,7 @@ def resolve_ops_overrides(model_name: Optional[str]) -> List[str]:
 
     On GPU returns per-model overrides for models whose patched ops disable a
     default backend (for example Wan's RoPE and DeepSeek-V4's eager-only
-    attention); empty otherwise — dataclass defaults are GPU-optimal. On NPU
+    attention); empty otherwise — the GPU host defaults are used. On NPU
     returns the NPU-supported backend per op, with per-model eager fallbacks for
     ops without an NPU kernel for that model.
     """
@@ -181,11 +174,6 @@ def make_npu_ops_config(model_name: Optional[str] = None, **overrides) -> OpsImp
     """
     merged = _npu_overrides(model_name)
     merged.update(overrides)
-    # Qwen3.5 GatedDeltaNet ops have no NPU kernel today — pin to eager so the
-    # config validates at parse time.
-    merged.setdefault("rms_norm_gated_implementation", "eager")
-    merged.setdefault("causal_conv1d_implementation", "eager")
-    merged.setdefault("chunk_gated_delta_rule_implementation", "eager")
     return OpsImplementationConfig(**merged)
 
 
@@ -260,7 +248,6 @@ def build_torchrun_cmd(
             NPU runs pick the right per-model eager fallbacks. ``None`` is
             fine for tests not tied to a specific model.
     """
-    port = find_free_port()
     if nproc is not None:
         n = nproc
     elif parallel_config is not None:
@@ -272,7 +259,7 @@ def build_torchrun_cmd(
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={n}",
-        f"--master_port={port}",
+        "--standalone",
         script,
         f"--model.config_path={config_path}",
         f"--data.train_path={train_path}",
@@ -318,20 +305,44 @@ def build_torchrun_cmd(
 # ---------------------------------------------------------------------------
 
 
+def build_hf_reference_model(config_path: str, *, torch_dtype: str, init_device: str):
+    """Build an upstream HF model through the models entry point.
+
+    Reference-weight materialization must work before a model family is added to
+    ``MODELING_REGISTRY``. Select the explicit HF backend for only this build and
+    restore the caller's environment afterwards; the VeOmni runtime keeps its
+    strict no-fallback registry behavior.
+    """
+    from veomni.models import build_foundation_model
+
+    previous_backend = os.environ.get("MODELING_BACKEND")
+    os.environ["MODELING_BACKEND"] = "hf"
+    try:
+        return build_foundation_model(
+            config_path=config_path,
+            weights_path=None,
+            torch_dtype=torch_dtype,
+            init_device=init_device,
+            ops_implementation=make_eager_ops_config(),
+        )
+    finally:
+        if previous_backend is None:
+            os.environ.pop("MODELING_BACKEND", None)
+        else:
+            os.environ["MODELING_BACKEND"] = previous_backend
+
+
 def materialize_weights(config_path: str, output_path: str, save_original_format: bool = True) -> None:
     """Build a model from toy config and save random weights to disk.
 
     This avoids downloading real model weights for CI tests.
     """
-    from veomni.models.auto import build_foundation_model
     from veomni.utils.device import empty_cache, get_device_type
 
-    model = build_foundation_model(
-        config_path=config_path,
-        weights_path=None,
+    model = build_hf_reference_model(
+        config_path,
         torch_dtype="float32",
         init_device=get_device_type(),
-        ops_implementation=make_eager_ops_config(),
     )
     model.save_pretrained(output_path, save_original_format=save_original_format)
     # The fp32 model can pin tens of GiB on the device (e.g. qwen3_5's full
