@@ -473,7 +473,8 @@ def build_optimizer(
     """Build the optimizer.
 
     ``optimizer_config`` lets callers hand over the whole ``OptimizerConfig`` so
-    that optimizer-specific knobs (currently Muon's ``muon_*`` fields) are read
+    that optimizer-specific knobs (currently Muon's ``muon_*`` fields and
+    ``adamw_swap``'s ``swap_mem_fraction_static``/``swap_pin_memory``) are read
     here rather than unpacked by every trainer. It does *not* supply ``lr``,
     ``weight_decay`` or the ``no_decay_*`` lists — those stay explicit arguments,
     because callers such as the VLM trainer drive the AdamW side from their own
@@ -509,7 +510,17 @@ def build_optimizer(
 
     if _should_build_extra_parallel_aware(model):
         return build_extra_parallel_fsdp2_optimizer(
-            model, lr, betas, eps, weight_decay, fused, optimizer_type, param_groups, no_decay_modules, no_decay_params
+            model,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            fused,
+            optimizer_type,
+            param_groups,
+            no_decay_modules,
+            no_decay_params,
+            optimizer_config=optimizer_config,
         )
     if param_groups is None:
         decay_param_names = get_parameter_names(model, no_decay_modules, no_decay_params)
@@ -540,11 +551,25 @@ def build_optimizer(
         foreach = not fused
         fused = fused
         optim = AdamW(param_groups, lr, betas, eps, weight_decay, fused=fused, foreach=foreach)
+    elif optimizer_type == "adamw_swap":
+        from .swap_adamw import SwapAdamW
+
+        mem_fraction_static = 0.8 if optimizer_config is None else optimizer_config.swap_mem_fraction_static
+        pin_memory = True if optimizer_config is None else optimizer_config.swap_pin_memory
+        optim = SwapAdamW(
+            param_groups,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            mem_fraction_static=mem_fraction_static,
+            pin_memory=pin_memory,
+        )
     elif optimizer_type == "anyprecision_adamw":
         optim = AnyPrecisionAdamW(param_groups, lr, betas, eps, weight_decay)
     else:
         raise ValueError(
-            "Only adamw, anyprecision_adamw and muon are supported as optimizers; "
+            "Only adamw, adamw_swap, anyprecision_adamw and muon are supported as optimizers; "
             f"got optimizer_type={optimizer_type!r}."
         )
 
@@ -782,6 +807,7 @@ def build_extra_parallel_fsdp2_optimizer(
     param_groups: Optional[List[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
+    optimizer_config: Optional["OptimizerConfig"] = None,
 ):
     """
     Build a MultiOptimizer instance when model is parallelized with ExtraParallel+FSDP2
@@ -908,16 +934,32 @@ def build_extra_parallel_fsdp2_optimizer(
             model, non_extra_parallel_params, weight_decay, no_decay_modules, no_decay_params
         )
 
+    # Each SwapAdamW leaf owns its own swap stream: the MultiOptimizer steps its
+    # leaves serially and every leaf drains its stream at the end of its own
+    # ``step``, so there is no cross-leaf copy to serialize.
+
     def _build(groups: Sequence[Dict[str, Any]]) -> Optimizer:
         if optimizer_type == "adamw":
             nonlocal fused
             foreach = not fused
             _fused = fused
             return AdamW(groups, lr, betas, eps, weight_decay, fused=_fused, foreach=foreach)
+        elif optimizer_type == "adamw_swap":
+            from .swap_adamw import SwapAdamW
+
+            return SwapAdamW(
+                groups,
+                lr=lr,
+                betas=betas,
+                eps=eps,
+                weight_decay=weight_decay,
+                mem_fraction_static=0.8 if optimizer_config is None else optimizer_config.swap_mem_fraction_static,
+                pin_memory=True if optimizer_config is None else optimizer_config.swap_pin_memory,
+            )
         elif optimizer_type == "anyprecision_adamw":
             return AnyPrecisionAdamW(groups, lr, betas, eps, weight_decay)
         else:
-            raise ValueError("Only adamw and anyprecision_adamw are supported as optimizers.")
+            raise ValueError("Only adamw, adamw_swap and anyprecision_adamw are supported as optimizers.")
 
     optimizer_dict: Dict[str, Optimizer] = {}
     for para in parallel_state.extra_parallel_names:

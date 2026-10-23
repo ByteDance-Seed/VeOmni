@@ -473,6 +473,26 @@
     ]
   },
   {
+    "name": "swap-adamw-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_swap_adamw.py"
+    ]
+  },
+  {
+    "name": "swap-adamw-device-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_swap_adamw_device.py"
+    ]
+  },
+  {
     "name": "48-unit",
     "suite": "unit",
     "conditional": false,

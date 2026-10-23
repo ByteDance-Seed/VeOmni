@@ -83,11 +83,20 @@ class OptimizerConfig:
     ``type="muon"`` builds a Muon + AdamW multi-optimizer: 2D hidden weights
     and 3D MoE expert stacks use Muon, while embeddings, lm_head, biases and
     norms use AdamW.
+
+    ``type="adamw_swap"`` builds an AdamW whose moment states live on host memory
+    and are streamed to the device in batches; see ``veomni.optim.swap_adamw``.
     """
 
-    type: Literal["adamw", "anyprecision_adamw", "muon"] = field(
+    type: Literal["adamw", "anyprecision_adamw", "muon", "adamw_swap"] = field(
         default="adamw",
-        metadata={"help": "Optimizer type. Default to adamw."},
+        metadata={
+            "help": (
+                "Optimizer type. Default to adamw. 'adamw_swap' keeps the AdamW moment states "
+                "on host memory and streams them to the device in batches to lower peak device "
+                "memory."
+            )
+        },
     )
     lr: float = field(
         default=5e-5,
@@ -144,6 +153,25 @@ class OptimizerConfig:
     betas: Tuple[float, float] = field(
         default=(0.9, 0.95),
         metadata={"help": "AdamW betas (beta1, beta2). Default (0.9, 0.95)."},
+    )
+    # ---- adamw_swap-specific (only consulted when type == "adamw_swap") ----
+    swap_mem_fraction_static: float = field(
+        default=0.8,
+        metadata={
+            "help": (
+                "With optimizer.type='adamw_swap', the fraction of currently free device memory "
+                "used to size one batch of optimizer states streamed from host to device."
+            )
+        },
+    )
+    swap_pin_memory: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "With optimizer.type='adamw_swap', pin the host-side optimizer state buffers. "
+                "Disable if page-locked memory is scarce."
+            )
+        },
     )
     # ---- Muon-specific (only consulted when type == "muon") ---------------
     muon_lr: Optional[float] = field(
@@ -247,6 +275,17 @@ class OptimizerConfig:
             )
         },
     )
+
+    def __post_init__(self):
+        # YAML resolves an exponent literal without a decimal point (``8e-1``)
+        # to a string, so coerce before the range check (same reason as
+        # ``_collect_muon_kwargs`` does for ``muon_lr``).
+        if self.type == "adamw_swap":
+            self.swap_mem_fraction_static = float(self.swap_mem_fraction_static)
+            if not 0.0 < self.swap_mem_fraction_static <= 1.0:
+                raise ValueError(
+                    f"model.optimizer.swap_mem_fraction_static must be in (0, 1], got {self.swap_mem_fraction_static}"
+                )
 
 
 @dataclass
@@ -1860,6 +1899,13 @@ class ModelArguments(BaseModelArguments):
 
     def __post_init__(self):
         super().__post_init__()
+        # Both move training state to host; running them together would double
+        # the host footprint and fight over the accelerator. Reject at parse time.
+        if self.optimizer.type == "adamw_swap" and self.accelerator.fsdp_config.offload:
+            raise ValueError(
+                "model.optimizer.type='adamw_swap' cannot be combined with "
+                "model.accelerator.fsdp_config.offload; both move training state to host."
+            )
         # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
         # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
         # instead of silently ignoring the flag.

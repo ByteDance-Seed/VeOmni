@@ -55,6 +55,10 @@ veomni/
 │   │                   via OptimizerConfig.muon_expert_zero_comm), Shard(d>0)
 │   │                   experts go through one all-to-all-gather over the
 │   │                   ep_fsdp mesh.
+│   ├── swap_adamw.py   SwapAdamW: AdamW whose moment states live on pinned
+│   │                   host memory and stream to the device in budget-sized
+│   │                   batches; per param group under FSDP+EP (MultiOptimizer
+│   │                   leaves). DCP reads/writes the host buffers directly.
 │   └── lr_scheduler.py LR scheduler construction
 ├── ops/                Tensor-native op registry and implementations
 │   ├── registry.py     OP_REGISTRY, OpEntry, register_op, resolve_op, VeomniOp

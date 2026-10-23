@@ -397,6 +397,28 @@
     ]
   },
   {
+    "name": "swap-adamw-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/optim/test_swap_adamw.py"
+    ]
+  },
+  {
+    "name": "swap-adamw-device-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/optim/test_swap_adamw_device.py"
+    ]
+  },
+  {
     "name": "npu-e2e-01",
     "suite": "e2e",
     "args": [
