@@ -452,6 +452,50 @@ def test_cpu_inductor_avoids_npu_registration_and_restores_policy(monkeypatch, c
             torch.compiler.reset()
 
 
+@pytest.mark.parametrize("cpu", [False, True])
+@pytest.mark.parametrize("existing_cpu", [False, True])
+def test_cpu_inductor_preserves_vendor_and_existing_cpu_overrides(monkeypatch, cpu, existing_cpu):
+    from types import SimpleNamespace
+
+    import torch
+    from torch._inductor.codegen import common
+    from torch._inductor.codegen.cpu_device_op_overrides import CpuDeviceOpOverrides
+
+    from scripts.ci.accelerator import pytest_plugin
+
+    npu_override = object()
+    cpu_override = CpuDeviceOpOverrides()
+    overrides = {"npu": npu_override}
+    if existing_cpu:
+        overrides["cpu"] = cpu_override
+    # torch_npu populates this registry at import. Torch 2.10 only imports its
+    # CPU entry when the whole registry is empty; Torch 2.11 repairs missing keys.
+    monkeypatch.setattr(common, "device_op_overrides_dict", overrides)
+    monkeypatch.delenv("CI_CASE_PROGRESS", raising=False)
+    plan = CasePlan.sequential(LaunchSpec(device="cpu" if cpu else "accelerator"))
+    item = SimpleNamespace(
+        nodeid="sample", config=SimpleNamespace(_ci_batch_cases={"sample": {"plan": plan.to_dict()}}, _ci_results={})
+    )
+    protocol = pytest_plugin.pytest_runtest_protocol(item, None)
+    next(protocol)
+    try:
+        assert overrides["npu"] is npu_override
+        if existing_cpu:
+            assert overrides["cpu"] is cpu_override
+        elif cpu:
+            assert isinstance(overrides.get("cpu"), CpuDeviceOpOverrides)
+        else:
+            assert "cpu" not in overrides
+        if cpu:
+            torch.compiler.reset()
+            value = torch.arange(8, dtype=torch.float32)
+            torch.testing.assert_close(torch.compile(lambda x: x + 1, fullgraph=True)(value), value + 1)
+    finally:
+        protocol.close()
+        torch.compiler.reset()
+    assert overrides["npu"] is npu_override
+
+
 def test_case_workspaces_isolate_relative_checkpoints_and_caches(tmp_path):
     from scripts.ci.accelerator.runtime.workers import create_workspace
 

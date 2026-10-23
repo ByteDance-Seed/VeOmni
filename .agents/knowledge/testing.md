@@ -34,6 +34,11 @@ CPU graphs. CPU cases temporarily disable that registration through the loaded
 vendor registry and restore its prior disabled state after teardown or failure.
 Keep real CPU Inductor compilation and gradient checks enabled; do not replace
 compiled-mask coverage with eager execution to avoid hidden-device queries.
+CPU cases must also register Torch's built-in CPU device-op overrides when
+missing. torch_npu populates the override registry at import; Torch 2.10 then
+skips all built-ins because the registry is nonempty. Torch 2.11 repairs missing
+keys, so testing only that version misses the NPU CI failure. Preserve existing
+CPU/vendor entries and validate the pinned Torch version's startup state.
 A synthetic registered backend alone misses vendor monkeypatches: exercise
 the pinned wheel's optimizer patch in CPU isolation audits too.
 

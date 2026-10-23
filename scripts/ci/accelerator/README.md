@@ -126,6 +126,9 @@ after teardown or failure; accelerator cases keep the vendor constructor.
 The same CPU scope disables NPU backend registration by the loaded vendor
 Inductor registry, restoring its previous policy afterward. CPU graphs still
 compile with Inductor; accelerator cases keep normal NPU registration.
+CPU cases initialize a missing built-in CPU device-op override as well. This
+handles Torch 2.10's partially populated registry after importing torch_npu,
+while preserving existing CPU and vendor overrides.
 
 ## Results and local commands
 

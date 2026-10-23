@@ -208,6 +208,7 @@ def pytest_runtest_protocol(item, nextitem):
     previous_npu_registration_disabled = None
     if case and all(spec.device == "cpu" for spec in CasePlan.from_dict(case["plan"]).launches):
         import torch.optim.optimizer as optimizer_module
+        from torch._inductor.codegen.common import device_op_overrides_dict, register_device_op_overrides
         from torch.utils._foreach_utils import _get_foreach_kernels_supported_devices
         from torch.utils.checkpoint import DefaultDeviceType
         from torch.utils.data import dataloader
@@ -222,6 +223,13 @@ def pytest_runtest_protocol(item, nextitem):
         # explicit foreach/fused settings retain their ordinary semantics.
         previous_foreach_query = optimizer_module._get_foreach_kernels_supported_devices
         optimizer_module._get_foreach_kernels_supported_devices = _get_foreach_kernels_supported_devices
+        # torch_npu eagerly registers its device override. Torch 2.10 then skips
+        # all built-in overrides because the registry is already nonempty.
+        # Register only the missing CPU entry, preserving existing vendor rows.
+        if "cpu" not in device_op_overrides_dict:
+            from torch._inductor.codegen.cpu_device_op_overrides import CpuDeviceOpOverrides
+
+            register_device_op_overrides("cpu", CpuDeviceOpOverrides())
         # torch_npu's DataLoader constructor queries NPU affinity even for CPU
         # inputs. Use its saved Torch constructor while devices are hidden,
         # without importing the vendor package or overriding unrelated patches.

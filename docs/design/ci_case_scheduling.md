@@ -287,6 +287,11 @@ CPU compilation also temporarily disables the loaded vendor registry's NPU
 Inductor registration, which otherwise queries a hidden device before compiling
 CPU graphs. The prior registration policy is restored after teardown or failure.
 This keeps actual CPU compilation enabled and leaves accelerator cases unchanged.
+The worker also initializes a missing built-in CPU device-op override. In Torch
+2.10, torch_npu's eager NPU entry makes the registry nonempty and prevents the
+ordinary lazy import of CPU overrides. Existing CPU and vendor entries are
+preserved; this is standard CPU backend initialization rather than a temporary
+replacement of an existing policy.
 
 Both unit and e2e suites consume the same planner/scheduler. Suite selection
 defines which cases run, and launch plans define their resource requirements.
