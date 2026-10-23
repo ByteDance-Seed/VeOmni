@@ -52,7 +52,7 @@ when the selected implementation runs.
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
-| `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `torch_npu`, `triton` (Triton-Ascend), `fla_npu` as supported by the family |
+| `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `torch_npu`, `triton` (Triton-Ascend), `fla_npu`, `fla_npu_reuse` as supported by the family |
 | `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
@@ -287,3 +287,15 @@ When adding a row, test its numerical contract, registration, hardware
 requirement, and optional-package requirements. When adding model-specific
 argument policy, test it in `tests/models` rather than duplicating it in
 the raw-kernel suite.
+
+### AscendC GDN activation reuse
+
+`chunk_gated_delta_rule_implementation: fla_npu_reuse` is an opt-in memory / compute
+tradeoff. It retains the forward W, H and updated-value tensors in autograd saved
+state, avoiding two AscendC forward stages in backward. The default `fla_npu` row
+still recomputes them. Both rows use the same arithmetic kernels and validation;
+checkpointing and saved-tensor hooks retain ownership of these activations.
+Variable-length integer tables are built from host boundaries and uploaded together,
+including the exact forward and reverse cumsum tile sizes. No floating state is cached
+across calls. Additional activation memory depends on heads, dimensions and length;
+measure the full training peak before enabling it on another profile.

@@ -51,7 +51,7 @@ def chunk_local_cumsum_scalar_kernel(
     ptr_o = tl.make_block_ptr(
         o + bos * H, (T, H), (H, 1), (i_block * BLOCK_T, 0), (BLOCK_T, H), (1, 0)
     )
-    b_s = tl.load(ptr_s, boundary_check=(0,)).to(tl.float32)
+    b_s = tl.load(ptr_s, boundary_check=(0,), padding_option="zero").to(tl.float32)
     b_s = tl.reshape(b_s, (N_CHUNKS, CHUNK_SIZE, H))
     b_s = tl.trans(b_s, (1, 0, 2))
     b_o = tl.cumsum(b_s, axis=0)
@@ -74,7 +74,8 @@ def chunk_local_cumsum_scalar(
     scale: float = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     head_first: bool = False,
-    output_dtype: Optional[torch.dtype] = torch.float
+    output_dtype: Optional[torch.dtype] = torch.float,
+    chunk_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
 
     B, T, H = g.shape
@@ -89,7 +90,8 @@ def chunk_local_cumsum_scalar(
     # 2. UB estimation varies directly with H.
     # 3. BT in reverse mode is smaller than in forward mode.
     BT = max(chunk_size, triton.next_power_of_2((1 << 11 if reverse else 1 << 12) // H))
-    chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+    if cu_seqlens is not None and chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     grid = (NT, B)
@@ -118,6 +120,7 @@ def chunk_local_cumsum(
     cu_seqlens: Optional[torch.Tensor] = None,
     head_first: bool = False,
     output_dtype: Optional[torch.dtype] = torch.float,
+    chunk_indices: Optional[torch.Tensor] = None,
     **kwargs
 ) -> torch.Tensor:
     if cu_seqlens is not None:
@@ -133,7 +136,8 @@ def chunk_local_cumsum(
             scale=scale,
             cu_seqlens=cu_seqlens,
             head_first=head_first,
-            output_dtype=output_dtype
+            output_dtype=output_dtype,
+            chunk_indices=chunk_indices,
         )
     else:
         raise ValueError(

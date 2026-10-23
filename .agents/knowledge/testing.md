@@ -109,7 +109,7 @@ kernel dependencies land differently, and each decides what a test can reach:
 | Package | Where it is | What it gates |
 |---------|-------------|---------------|
 | `triton-ascend` | installed by an explicit workflow step after the sync (`uv sync` prunes anything outside the lockfile, `uv run --frozen` does not) | the vendored Ascend Triton kernels — `causal_conv1d` and `chunk_gated_delta_rule` `triton`, MoE clamped SwiGLU |
-| `fla_npu` | image venv only; the workspace venv does not inherit it | `chunk_gated_delta_rule_implementation=fla_npu`, so that backend is untestable |
+| `fla_npu` | explicitly installed from the CI image into the workspace by `scripts/ci/install_image_fla_npu.py`, with matched TorchNPU post version | native packed `fla_npu` / `fla_npu_reuse` parity and checkpoint tests; missing dependencies fail under `VEOMNI_REQUIRE_ASCENDC_TESTS=1` |
 | `flash-linear-attention` | `gpu` extra only, so absent from both | the `fla` backends. Its `HardwareRequirement` lists `npu`, but the GatedDeltaNet docs say it raises on Ascend even when installed — treat `fla` as GPU-only |
 
 The runners are 910B (A2, non-arch35), so kernels gated behind `is_arch35()`
