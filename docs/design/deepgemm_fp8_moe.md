@@ -1,0 +1,159 @@
+# FP8 MoE training with DeepGEMM on Hopper and Blackwell
+
+`moe_implementation: fused_deepgemm_fp8` selects native FP8 grouped GEMMs for
+routed SwiGLU experts' forward, activation gradients (dgrad), and weight
+gradients (wgrad). It implements the existing `moe_experts/standard` contract
+and is opt-in. It does not require Transformer Engine.
+
+## Configuration
+
+For a model using the standard SwiGLU expert contract:
+
+```yaml
+model:
+  ops_implementation:
+    moe_implementation: fused_deepgemm_fp8
+    qat_implementation: none
+```
+
+The model's existing `VeomniOp` handle resolves the backend at construction.
+Other operators keep their configured implementations. The default MoE backend
+is unchanged. Use trainable BF16 expert parameters, or FSDP2 BF16 parameter
+mixed precision with FP32 master weights. A packed inference checkpoint must
+first pass through its model's existing dequantization/weight-loading path.
+
+Keep model-side QAT disabled for this native FP8 path. The backend receives
+already prepared tensors and cannot undo a fake-quantization pass performed
+by a model before dispatch. This setting is independent of rollout/export
+quantization.
+
+The mainline DeepSeek V4 expert module is covered by a real forward/backward
+integration test, using its existing merged weights and routing-score cast.
+This is operator integration, not full-model convergence validation.
+
+## Requirements and tensor contract
+
+- NVIDIA Hopper SM90 (H20/H100/H200) or Blackwell SM100 (GB200). Other
+  architectures fail explicitly at op resolution. This implementation uses
+  128-element/block FP8 quantization; it does not provide MXFP8-32 or FP4.
+  Use one CUDA device per process: the pinned DeepGEMM JIT caches device-bound
+  kernel handles without a device key, including the SM100 scale-packing kernel.
+  The backend rejects a second device explicitly. Forward and backward establish
+  the operand device context even when a different device is currently selected.
+  Standard one-worker-per-GPU EP/FSDP2 training satisfies this restriction. Other
+  DeepGEMM calls in the same process must also use that worker's device.
+- BF16 hidden states `[tokens, H]` and expert weights. Gate/up weights can be
+  merged `[E, 2*I, H]` or split into two `[E, I, H]` tensors; down weights are
+  `[E, H, I]`. Hidden size `H` and intermediate size `I` must be positive
+  multiples of 128. `E` is the local expert count when EP is enabled.
+- Routing weights and int64 expert ids have shape `[tokens, top_k]` and share
+  the hidden states' device. Routing weights retain the dtype supplied by the
+  model and are applied after the down projection; output and hidden gradients
+  are BF16. Standard model adapters may cast router scores before the op.
+- Uneven loads, empty experts, empty batches and repeated expert ids are
+  supported. The mainline EP dispatcher counts unique token/expert pairs and
+  combines repeated slot weights. `assume_distinct_experts` remains an accepted
+  contract hint; this backend does not require it.
+- First-order autograd and non-reentrant activation checkpointing are supported.
+  Full-graph `torch.compile` and CUDA graph capture are unsupported because
+  Hopper's K-grouped launch requires token counts on the host.
+- FSDP2 parameter communication and EP token all-to-all retain their configured
+  precision. This change does not add FP8 all-gather, quantized optimizer state,
+  or a persistent FP8 parameter cache.
+
+## Optional dependency
+
+DeepGEMM is deliberately outside the default GPU environment and is imported
+only when this implementation runs. The validated version is commit
+`5081f8513af57e61696de4f4f04b0e707ffb503e` (2.8.2), with PyTorch 2.11.0+cu130
+and Triton 3.6.0:
+
+```bash
+uv sync --extra gpu --dev --locked
+git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git /tmp/DeepGEMM
+git -C /tmp/DeepGEMM checkout 5081f8513af57e61696de4f4f04b0e707ffb503e
+git -C /tmp/DeepGEMM submodule update --init --recursive
+DG_FORCE_BUILD=1 DG_USE_LOCAL_VERSION=1 \
+  uv pip install --python .venv/bin/python --no-build-isolation /tmp/DeepGEMM
+```
+
+The upstream build requires the CUDA toolkit/compiler, a C++20 compiler and
+standard library (validated with GCC 13), and development headers including
+libdw. Preserve the host's CUDA compatibility library paths. An exact
+`uv sync` can prune this optional installation; install it again afterwards.
+Prebuilt wheels are being prepared in
+[verl-wheelhouse](https://github.com/verl-project/verl-wheelhouse/pull/33).
+Wheel dependencies will be added separately after that change is merged and
+the matching artifacts have been built and validated.
+Missing dependencies and unsupported devices raise instead of falling back to
+BF16. Merely importing `veomni.ops` does not import DeepGEMM or its Triton kernels.
+
+## Computation and memory
+
+All GEMM operands use E4M3 FP8. Hopper uses FP32 scales
+`max(amax, 1e-4) / 448`, without power-of-two rounding. Blackwell rounds these
+scales upward to powers of two **before** quantizing the payload, then lets
+DeepGEMM pack them as UE8M0. Rounding only scales at GEMM launch would silently
+change the represented values. The numerical recipes consequently differ
+between architectures; both are compared with their corresponding upstream
+quantizers and a common BF16 reference. For `Y = X @ W.T`,
+where `X` has shape `[T, H]`:
+
+| Operation | Activation/gradient quantization | Weight quantization |
+| --- | --- | --- |
+| Forward | `X`: 1×128 along hidden channels | 128×128 blocks |
+| Dgrad | `dY`: 1×128 along output channels | Transposed quantized square blocks |
+| Wgrad | `X` and `dY`: independent 128×1 groups along tokens | Not used |
+
+Wgrad operands are quantized from BF16 source tensors, not from a transpose of
+forward FP8 values. Each expert is padded independently to DeepGEMM's group alignment (128 tokens
+by default, a multiple of 128); scale
+groups never cross expert boundaries. Triton constructs packing metadata and
+quantized operands. DeepGEMM M-grouped GEMMs produce BF16 forward/dgrad results;
+its K-grouped GEMM accumulates wgrad in FP32. SM90 materializes an external FP32
+workspace before conversion; SM100 casts directly to BF16 in the GEMM epilogue
+with `c=None`. Gradients use the straight-through quantization approximation.
+
+The SM90 wgrad FP32 workspace has a 512 MiB target and is reused across batches of
+complete experts. A single expert larger than the target uses one expert's
+workspace. Each expert retains its full FP32 token reduction. On SM90, column operands concatenate transposed expert segments for the NT
+wgrad API. On SM100 they retain contiguous token-major `[sum_T,H]` storage
+and `[sum_T/128,H]` scales for the TN wgrad API. SM100 launches up to 128
+experts per call to satisfy the upstream scale-packing limit, without an
+external FP32 workspace, its initialization, or a separate output cast.
+Column operands are quantized once and sliced as views. Empty groups remain
+zero, including entirely empty chunks and the final partial chunk.
+
+Fused Triton SwiGLU forward/backward kernels save only the original BF16 gate/up
+projection and recompute pointwise values, preserving eager BF16 rounding and
+the inclusive clamp-boundary derivative. Forward-only FP8 weights and padded
+dgrad temporaries are released after their last use. Saved weight transposes
+belong to one invocation, so optimizer steps and FSDP resharding cannot leave a
+stale module-level quantized cache. FP8 GEMMs alone do not guarantee a lower
+whole-model memory peak.
+
+## Tests
+
+Run on Hopper or Blackwell SM100 with the optional dependency installed:
+
+```bash
+OMP_NUM_THREADS=4 PYTHONPATH=. .venv/bin/pytest -q \
+  tests/ops/moe_experts/ tests/ops/base/
+
+OMP_NUM_THREADS=4 PYTHONPATH=. .venv/bin/pytest -q \
+  tests/models/transformers/deepseek_v4/test_deepseek_v4.py \
+  -k deepgemm
+```
+
+Coverage includes quantizer parity with the pinned DeepGEMM helpers,
+forward/dgrad/wgrad numerical checks, SwiGLU/clamp gradients, empty and repeated
+routes, activation checkpointing, EP/FSDP2, and optimizer updates. Registry and
+lazy-import checks remain available without the optional GPU dependency.
+
+## Implementation entry points
+
+- [Registry](../../veomni/ops/kernels/moe_experts/__init__.py)
+- [Standard expert wrapper](../../veomni/ops/kernels/moe_experts/standard/deepgemm.py)
+- [Quantizers and training autograd](../../veomni/ops/kernels/moe_experts/shared/deepgemm_fp8.py)
+- [Numerical tests](../../tests/ops/moe_experts/test_deepgemm_fp8.py)
+- [Distributed tests](../../tests/ops/moe_experts/test_deepgemm_fp8_distributed.py)

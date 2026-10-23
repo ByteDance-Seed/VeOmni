@@ -48,6 +48,10 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # contexts and cuda.bindings.runtime for the per-device stack limit, which
     # has no device-agnostic equivalent.
     "veomni/ops/kernels/attention/standard/magi/",
+    # DeepGEMM is CUDA-only: these files select the SM90/SM100 recipe and
+    # establish operand-device contexts for its device-bound JIT kernels.
+    "veomni/ops/kernels/moe_experts/standard/deepgemm.py",
+    "veomni/ops/kernels/moe_experts/shared/deepgemm_fp8.py",
     # Kernel tests intentionally select and probe hardware-specific backends.
     "tests/ops/",
     "tests/special_sanity/check_device_api_usage.py",
