@@ -89,6 +89,40 @@ def _quantized_moe_reference(x, routing, selected, w1, w2, limit):
     return output
 
 
+def test_dynamic_routed_sizes_reuse_preparation_kernels():
+    """Changing token counts reuses row-quantization and SwiGLU binaries."""
+    from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import (
+        GroupedLayout,
+        RecomputedSwiGLU,
+        _row_quant_kernel,
+        _swiglu_kernel,
+        quantize_rows,
+    )
+
+    device = torch.cuda.current_device()
+    cache_sizes = None
+    for tokens in (129, 257, 385):
+        x = torch.randn(tokens, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        layout = GroupedLayout.from_counts(torch.tensor([tokens]), x.device)
+        q, scales = quantize_rows(x, layout)
+        restored = q[layout.unpad].float() * scales[layout.unpad].repeat_interleave(128, dim=1)
+        torch.testing.assert_close(restored, _quantized_rows(x.detach()), rtol=0, atol=0)
+        output = RecomputedSwiGLU.apply(x, None)
+        grad = torch.randn_like(output)
+        dx = torch.autograd.grad(output, x, grad)[0]
+        gate, up = x.chunk(2, dim=-1)
+        expected = F.silu(gate) * up
+        expected_dx = torch.autograd.grad(expected, x, grad)[0]
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        torch.testing.assert_close(dx, expected_dx, rtol=0.01, atol=0.015625)
+        # Inspect actual compiled binaries, not annotations on the Python signature.
+        current = tuple(len(kernel.device_caches[device][0]) for kernel in (_row_quant_kernel, _swiglu_kernel))
+        if cache_sizes is None:
+            cache_sizes = current
+        else:
+            assert current == cache_sizes, "Dynamic routed sizes created additional kernel specializations."
+
+
 @pytest.mark.parametrize("counts", [[0, 17, 129, 33], [128, 256, 0, 1]])
 def test_grouped_linear_quantization_axes(counts):
     from deep_gemm.testing import calc_diff

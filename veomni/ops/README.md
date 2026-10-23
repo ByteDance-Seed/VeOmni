@@ -109,8 +109,9 @@ uv sync --extra gpu --extra magi --dev
 ```
 
 The opt-in `fused_deepgemm_fp8` MoE backend uses native FP8 grouped GEMMs
-for forward, input gradients and weight gradients on Hopper and Blackwell SM100. Its public tensors
-remain BF16. Hopper uses a bounded FP32 wgrad workspace; SM100 writes BF16
+for forward, input gradients and weight gradients on Hopper and Blackwell SM100.
+Its hidden states and expert weights remain BF16; routing weights retain their
+supplied dtype. Hopper uses a bounded FP32 wgrad workspace; SM100 writes BF16
 gradients directly from the FP32 accumulator in the GEMM epilogue. Recomputing
 Triton SwiGLU limits temporary storage. See [FP8 MoE training](../../docs/design/deepgemm_fp8_moe.md)
 for dependency installation, configuration, precision and distributed coverage.

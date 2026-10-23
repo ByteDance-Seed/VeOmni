@@ -130,7 +130,7 @@ def _row_quant_kernel(
     SX0: tl.constexpr,
     SX1: tl.constexpr,
     H: tl.constexpr,
-    P: tl.constexpr,
+    P,
     BM: tl.constexpr,
     BK: tl.constexpr,
     USE_UE8M0: tl.constexpr,
@@ -338,7 +338,7 @@ def _weight_gradient(x, grad_output, layout, shape, dtype):
 
 @triton.jit
 def _swiglu_kernel(
-    X, Y, DY, DX, SIZE: tl.constexpr, I: tl.constexpr, LIMIT: tl.constexpr, BACKWARD: tl.constexpr, BLOCK: tl.constexpr
+    X, Y, DY, DX, SIZE, I: tl.constexpr, LIMIT: tl.constexpr, BACKWARD: tl.constexpr, BLOCK: tl.constexpr
 ):
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     source = offsets // I * (2 * I) + offsets % I

@@ -132,6 +132,11 @@ belong to one invocation, so optimizer steps and FSDP resharding cannot leave a
 stale module-level quantized cache. FP8 GEMMs alone do not guarantee a lower
 whole-model memory peak.
 
+Routed token counts remain runtime arguments to the row-quantization and
+SwiGLU kernels, so changing these counts does not create a new Triton binary
+for each value. Channel dimensions and tensor layouts still select specialized
+kernels.
+
 ## Tests
 
 Run on Hopper or Blackwell SM100 with the optional dependency installed:
