@@ -10,7 +10,6 @@ from torch import distributed as dist
 from torch import nn
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from tests.tools.launch_utils import find_free_port
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import _init_parallel_state
@@ -411,11 +410,10 @@ def test_load_dist_model_weights_matches_standard(tmp_path: Path, cpu_offload: b
     weights_path = _write_checkpoint(checkpoint_dir, is_parallel=True)
 
     world_size = _CI_LAUNCH.nproc
-    port = find_free_port()
     command = [
         "torchrun",
         f"--nproc_per_node={world_size}",
-        f"--master_port={port}",
+        "--standalone",
         "tests/utils/test_rank0_load_and_broadcast_weights.py",
         "--model.config_path=test",
         "--data.train_path=tests",
@@ -587,11 +585,10 @@ def test_load_weights_no_scatter(tmp_path: Path, cpu_offload: bool) -> None:
     weights_path = _write_checkpoint(checkpoint_dir, is_parallel=False)
 
     world_size = _CI_LAUNCH.nproc
-    port = find_free_port()
     command = [
         "torchrun",
         f"--nproc_per_node={world_size}",
-        f"--master_port={port}",
+        "--standalone",
         "tests/utils/test_rank0_load_and_broadcast_weights.py",
         "--model.config_path=test",
         "--data.train_path=tests",

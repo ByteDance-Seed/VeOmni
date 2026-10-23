@@ -14,8 +14,6 @@ from typing import Dict, List, Optional
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.utils.device import get_device_type
 
-from .launch_utils import find_free_port
-
 
 # NPU ops_implementation overrides per model. Every per-op field is pinned so
 # NPU tests do not depend on the host defaults. ``_NPU_OPS_DEFAULTS`` is the baseline; entries in
@@ -250,7 +248,6 @@ def build_torchrun_cmd(
             NPU runs pick the right per-model eager fallbacks. ``None`` is
             fine for tests not tied to a specific model.
     """
-    port = find_free_port()
     if nproc is not None:
         n = nproc
     elif parallel_config is not None:
@@ -262,7 +259,7 @@ def build_torchrun_cmd(
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={n}",
-        f"--master_port={port}",
+        "--standalone",
         script,
         f"--model.config_path={config_path}",
         f"--data.train_path={train_path}",
