@@ -7,10 +7,11 @@ injected through a single `media_pad` placeholder per image.
 
 This guide runs K3 end-to-end on Ascend NPUs through the standard VeOmni VLM
 trainer — `bash train.sh tasks/train_vlm.py <config>` — with no
-task-specific scripts. Verified on 8×910B3 with a 30-step full-parameter
-run: loss `13.5 → 9.3`, ~17 s/step, distributed checkpoint and resumable
-trainer state saved. The model package also runs on NVIDIA GPUs; see
-[Start training on GPU](#start-training-on-gpu).
+task-specific scripts. Verified on 8×910B3 with a 300-step full-parameter
+run (resumed from a step-10 distributed checkpoint): loss `13.7 → 4.4`,
+~15 s/step, distributed checkpoint and resumable trainer state saved.
+The model package is also built to run on NVIDIA GPUs (end-to-end
+verification in progress); see [Start training on GPU](#start-training-on-gpu).
 
 ## Install dependencies
 
@@ -107,7 +108,7 @@ bash train.sh tasks/train_vlm.py configs/multimodal/kimi_k3/kimi_k3_vl_ascendc.y
 ```
 
 Expected on 8×910B3: step-1 loss ≈ 13 (random init over the 163 840 vocab),
-~17 s/step steady state, checkpoints under `kimi_k3_sft/checkpoints/`
+~15 s/step steady state, checkpoints under `kimi_k3_sft/checkpoints/`
 (both the distributed model checkpoint and the resumable trainer state).
 
 ## Start training on GPU
@@ -132,10 +133,11 @@ bash train.sh tasks/train_vlm.py configs/multimodal/kimi_k3/kimi_k3_vl.yaml \
     --data.train_path configs/multimodal/data/k3_coco.yaml
 ```
 
-Verified on 8xA100-80G (cu130): step-1 loss ~ 13, ~5 s/step at SP=2 +
-FSDP2 with `ep_size: 1`; `ep_size: 2` works as well — the eager expert
-loop dispatches through the shared EP all-to-all, it just trades compute
-replication for less expert memory per rank.
+Not yet verified end-to-end in this guide — GPU parity runs against the
+NPU baseline are still in progress. Expected step-1 loss ≈ 13 (same random
+init over the 163 840 vocab). `ep_size: 2` routes the eager expert loop
+through the shared EP all-to-all — it trades compute replication for less
+expert memory per rank.
 
 ## Scale up
 
@@ -181,9 +183,13 @@ K3-specific behavior to know when writing configs or custom data pipelines:
    `attention_mask` count would overpack (~30 images into a 1024-token
    budget). The hook `get_dyn_bsz_length_fn` supplies the expanded length to
    the dynamic packer.
-3. **Labels shift is SP-aware** — `chunk_loss` consumes the SP collator's
-   pre-shifted labels when SP is on and shifts internally otherwise; both
-   paths align with no extra handling.
+ 3. **Labels shift is SP-aware** — the SP collator pre-shifts labels and the
+   non-SP path shifts inside the loss helper. The multimodal merge scatters
+   labels position-wise onto text slots only, so under SP the forward
+   **un-shifts before the merge** and applies exactly one causal shift to the
+   *merged* labels before slicing them back into shards (slice-pad slots read
+   `ignore_index`); shifting on the pre-merge row would strand the first
+   post-image supervision on a placeholder slot that the merge drops.
 4. **Selective recompute under EP** — under expert parallelism whole-layer
    checkpointing would replay the MoE alltoall collectives inside backward
    and desynchronize them (all-NaN gradients); K3 therefore checkpoints only

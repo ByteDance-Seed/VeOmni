@@ -19,6 +19,8 @@
 #      Always call the local situ_and_mul VeomniOp
 #    - method_override: KimiMoEGate.forward
 #      Drop the inference-only `assert not self.training` so routing runs in training mode
+#    - method_override: KimiDeltaAttention.__init__
+#      Bind the instance-local chunk_kda VeomniOp (replaces the vendored eager reference)
 #    - class_replacement: KimiBlockSparseMLP
 #      Use v5 gate_up_proj expert weights ([E, 2I, H] F.linear layout) and the instance-local moe_experts VeomniOp (kimi_k3 variant for SituGLU, standard otherwise).
 #    - class_replacement: KimiSparseMoeBlock
@@ -57,6 +59,7 @@ import os
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from functools import partial
+from math import sqrt
 from typing import Any, Optional
 
 import numpy as np
@@ -101,18 +104,10 @@ from veomni.ops.config import resolve_op_impl
 
 # Additional imports for patches
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
-
-
-# Additional import blocks for patches
-# --- Patch 12: chunk_kda dispatch through a lazily-resolved VeomniOp ---
-_k3_chunk_kda_op = None
-
-
-def chunk_kda(q, k, v, g, beta, **kwargs):
-    global _k3_chunk_kda_op
-    if _k3_chunk_kda_op is None:
-        _k3_chunk_kda_op = VeomniOp("chunk_kda", "kimi_k3", resolve_op_impl("chunk_kda_implementation"))
-    return _k3_chunk_kda_op(q=q, k=k, v=v, g=g, beta=beta, **kwargs)
+from veomni.utils.seqlen_pos_transform_utils import (
+    coalesce_tail_padding_cu_seqlens,
+    prepare_fa_kwargs_from_position_ids,
+)
 
 
 logger = logging.get_logger(__name__)
@@ -617,8 +612,23 @@ class KimiMLAAttention(nn.Module):
         return attn_output
 
 
+# ======================================================================
+# [MODIFIED CLASS] KimiDeltaAttention
+# Methods patched: __init__
+# ======================================================================
+
+
 class KimiDeltaAttention(nn.Module):
-    def __init__(self, config: KimiLinearConfig, layer_idx: int):
+    # KDA chunked linear attention (instance-local VeomniOp, fused AscendC kernel)
+
+    # Patch 12: the source binds the vendored eager ``chunk_kda`` reference onto
+    # each ``KimiDeltaAttention`` instance (``self.veomni_chunk_kda``) and calls it
+    # from both training paths. The override below rebinds that handle to a
+    # ``chunk_kda`` ``VeomniOp`` (``kimi_k3`` variant) resolved from the ops
+    # selection installed at model-build time, mirroring the rms_norm / situ_and_mul
+    # instance-local pattern. Signatures are kwarg-compatible; extra K3 args
+    # (``A_log``/``dt_bias``/``transpose_state_layout``) pass through.
+    def __init__(self, config: "KimiLinearConfig", layer_idx: int):
         super().__init__()
         self.config = config
         self.mode = "chunk"
@@ -676,6 +686,10 @@ class KimiDeltaAttention(nn.Module):
 
         self.o_norm = FusedRMSNormGated(self.head_dim, eps=config.rms_norm_eps, activation="sigmoid")
         self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
+        # Modification: rebind the source's eager ``chunk_kda`` reference to the
+        # ops-configured ``VeomniOp`` (instance-local kernel handle; the fused
+        # AscendC kernel when configured, the modeling reference otherwise).
+        self.veomni_chunk_kda = VeomniOp("chunk_kda", "kimi_k3", resolve_op_impl("chunk_kda_implementation"))
 
     def _forward_sp_head_shard(
         self,
@@ -795,7 +809,7 @@ class KimiDeltaAttention(nn.Module):
         v = rearrange(v, "... (h d) -> ... h d", d=Dh)
         g = rearrange(g, "... (h d) -> ... h d", d=Dh)
 
-        o, _ = chunk_kda(
+        o, _ = self.veomni_chunk_kda(
             q=q,
             k=k,
             v=v,
@@ -924,7 +938,7 @@ class KimiDeltaAttention(nn.Module):
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_dim)
 
         if mode == "chunk":
-            o, recurrent_state = chunk_kda(
+            o, recurrent_state = self.veomni_chunk_kda(
                 q=q,
                 k=k,
                 v=v,
@@ -1441,6 +1455,17 @@ class KimiPreTrainedModel(PreTrainedModel):
             module.gate_up_proj.data.normal_(mean=0.0, std=std)
             module.down_proj.data.normal_(mean=0.0, std=std)
             return
+        if isinstance(module, KimiMoEGate):
+            # Modification: the router is missed on every init path --
+            # ``reset_parameters`` re-inits only ``weight`` (and never runs under
+            # the FSDP2 meta flow anyway) while ``e_score_correction_bias`` is
+            # left as uninitialized ``torch.empty`` even on the eager path.
+            # Restore the construction default for the weight (kaiming, matching
+            # reset_parameters) and start the bias at zero (no auxiliary-loss-free
+            # correction at init).
+            nn.init.kaiming_uniform_(module.weight, a=sqrt(5))
+            module.e_score_correction_bias.data.zero_()
+            return
         if isinstance(module, KimiRMSNorm):
             # Modification: FSDP2 meta flow materializes with to_empty (all
             # zeros) and relies on init_weights() to re-initialize; the
@@ -1689,6 +1714,24 @@ class KimiLinearForCausalLM(KimiPreTrainedModel, GenerationMixin):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # Modification (packed varlen): forward the collator's FlashAttention
+        # kwargs into the inner model so packed-sample boundaries reach the
+        # attention layers. Without them a packed batch (all-ones attention mask)
+        # degrades to a single-sequence causal path and softmax attention / the
+        # recurrent KDA state leak across packed samples. The collator's
+        # ``linear_attn_cu_seq_lens_q`` is the tail-coalesced form the linear
+        # attention layers want, published under the ``cu_seqlens`` kwarg the KDA
+        # layers read. Nothing changes for non-packed batches (no kwargs present).
+        fa_kwargs = {}
+        for _fa_key in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"):
+            if _fa_key in kwargs:
+                fa_kwargs[_fa_key] = kwargs[_fa_key]
+        _linear_cu = kwargs.get("linear_attn_cu_seq_lens_q")
+        if _linear_cu is None:
+            _linear_cu = kwargs.get("cu_seq_lens_q")
+        if _linear_cu is not None:
+            fa_kwargs["cu_seqlens"] = _linear_cu
+
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1700,6 +1743,7 @@ class KimiLinearForCausalLM(KimiPreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            **fa_kwargs,
         )
 
         hidden_states = outputs[0]
@@ -2553,6 +2597,17 @@ class KimiK3PreTrainedModel(PreTrainedModel):
             module.gate_up_proj.data.normal_(mean=0.0, std=std)
             module.down_proj.data.normal_(mean=0.0, std=std)
             return
+        if isinstance(module, KimiMoEGate):
+            # Modification: the router is missed on every init path --
+            # ``reset_parameters`` re-inits only ``weight`` (and never runs under
+            # the FSDP2 meta flow anyway) while ``e_score_correction_bias`` is
+            # left as uninitialized ``torch.empty`` even on the eager path.
+            # Restore the construction default for the weight (kaiming, matching
+            # reset_parameters) and start the bias at zero (no auxiliary-loss-free
+            # correction at init).
+            nn.init.kaiming_uniform_(module.weight, a=sqrt(5))
+            module.e_score_correction_bias.data.zero_()
+            return
         if isinstance(module, KimiRMSNorm):
             # Modification: FSDP2 meta flow materializes with to_empty (all
             # zeros) and relies on init_weights() to re-initialize; the
@@ -2755,6 +2810,12 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
                 The attention mask.
             labels (:obj:`torch.Tensor` of shape :obj:`(batch_size, sequence_length)`, *optional*):
                 The labels.
+
+        Returns:
+            final_embedding, final_attention_mask, final_labels, position_ids, merged_first_positions
+                ``merged_first_positions`` maps every pre-merge slot to its merged
+                coordinate (first slot of the expanded span for media placeholders)
+                so packed-segment boundaries survive the expansion.
         """
         _, embed_dim = image_features[0].shape
         feature_lengths = [x.shape[0] for x in image_features]
@@ -2840,6 +2901,15 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
         final_attention_mask |= image_to_overwrite
         position_ids = (final_attention_mask.cumsum(-1) - 1).masked_fill_((final_attention_mask == 0), 1)
 
+        # Merged coordinate of every *pre-merge* slot: its own coordinate for
+        # text tokens, the first slot of the placeholder's expanded vision span
+        # for media placeholders. Callers use this to map pre-merge packed
+        # boundaries (``position_ids == 0``) into the merged sequence, which
+        # the continuous ``position_ids`` above cannot express.
+        merged_first_positions = torch.cumsum(_token_occupation_table, -1) - _token_occupation_table
+        if left_padding:
+            merged_first_positions += nb_image_pad[:, None]
+
         # 6. Mask out the embedding at padding positions, as we later use the past_key_value value to determine the non-attended tokens.
         batch_indices, pad_indices = torch.where(input_ids == pad_token_id)
         indices_to_mask = new_token_positions[batch_indices, pad_indices]
@@ -2849,7 +2919,13 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
         if labels is None:
             final_labels = None
 
-        return final_embedding, final_attention_mask, final_labels, position_ids
+        return (
+            final_embedding,
+            final_attention_mask,
+            final_labels,
+            position_ids,
+            merged_first_positions,
+        )
 
     def _extract_image_features(self, pixel_values: torch.Tensor, grid_thws: torch.Tensor) -> list[torch.Tensor]:
         """
@@ -2912,6 +2988,21 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
             if position_ids is not None:
                 position_ids = gather_outputs(position_ids, gather_dim=1, group=sp_group)
 
+        # Modification (SP label alignment): the SP collator pre-shifts labels
+        # (``[..., 1:]`` + tail pad) and ForCausalLMLoss then consumes them as-is
+        # under SP. K3's merge, however, scatters labels position-wise onto text
+        # slots only: a pre-shifted label sitting on a media placeholder slot is
+        # dropped and the first post-image text token's supervision would strand
+        # inside the IGNORE-filled vision span. Undo the pre-shift here so the
+        # merge scatters raw labels; the single causal shift is re-applied to the
+        # merged labels in the SP slicing block below (and stays inside the loss
+        # helper on the non-SP path), so every path applies exactly one shift.
+        if get_parallel_state().sp_enabled and labels is not None:
+            head = labels.new_full((labels.shape[0], 1), self.config.ignore_index)
+            labels = torch.cat([head, labels[..., :-1]], dim=1).contiguous()
+
+        pre_merge_position_ids = None
+        merged_first_positions = None
         if inputs_embeds is None:
             # 1. Extra the input embeddings
             inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -2923,12 +3014,15 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
                     image_features = self.mm_projector(image_features)
 
                 inputs_embeds = inputs_embeds.to(image_features[0].dtype)  # num_tokens, embed_dim
-                inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
-                    image_features,
-                    inputs_embeds,
-                    input_ids,
-                    attention_mask,
-                    labels,
+                pre_merge_position_ids = position_ids
+                inputs_embeds, attention_mask, labels, position_ids, merged_first_positions = (
+                    self._merge_input_ids_with_image_features(
+                        image_features,
+                        inputs_embeds,
+                        input_ids,
+                        attention_mask,
+                        labels,
+                    )
                 )
 
             # In case input_ids.shape[1] == 1 & pixel_values==None & past_key_values != None, we are in the case of
@@ -2964,6 +3058,81 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
                 attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
                 position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
 
+        # Modification (packed varlen): the merge recomputes position_ids as a
+        # continuous arange over the merged row, erasing the collator's
+        # ``position_ids == 0`` segment markers. Map every pre-merge boundary
+        # (packed-sample starts and SP tail pads) to its merged coordinate through
+        # the merge's occupation table, rebuild segment-aware position_ids, and
+        # refresh the FlashAttention cu_seq_lens kwargs: on an all-ones packed
+        # mask the softmax attention and the recurrent KDA state would otherwise
+        # run as one long sequence and leak across packed samples. The
+        # collator's pre-merge cu_seq_lens cannot be reused because the merge
+        # expands media placeholders. Padded batches (non-all-ones masks) keep
+        # the attention-mask path, matching the collator contract of publishing
+        # cu_seq_lens only for the all-ones packed form.
+        fa_kwargs = {}
+        # The collator precomputes the all-ones check host-side and publishes it
+        # as ``attention_mask_is_all_ones``; reading the flag avoids the per-step
+        # host-device sync of ``bool(attention_mask.all())``. The flag is None
+        # only when the mask sits on device without a host copy (or the caller
+        # hand-built the batch, e.g. tests) -- fall back to the device check.
+        _mask_all_ones = kwargs.get("attention_mask_is_all_ones")
+        if _mask_all_ones is None and attention_mask is not None:
+            _mask_all_ones = bool(attention_mask.all())
+        if (
+            merged_first_positions is not None
+            and pre_merge_position_ids is not None
+            and attention_mask is not None
+            and _mask_all_ones
+        ):
+            batch_size, merged_len = inputs_embeds.shape[:2]
+            boundary = pre_merge_position_ids == 0
+            row_offsets = torch.arange(batch_size, device=inputs_embeds.device) * merged_len
+            starts = (merged_first_positions + row_offsets.unsqueeze(1))[boundary]
+            is_start = torch.zeros(batch_size * merged_len, dtype=torch.bool, device=starts.device)
+            is_start[starts] = True
+            is_start[row_offsets] = True
+            coords = torch.arange(batch_size * merged_len, device=starts.device)
+            segment_start = coords.masked_fill(~is_start, 0).cummax(-1).values
+            position_ids = (coords - segment_start).view(batch_size, merged_len)
+            (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
+                position_ids
+            )
+            # Coalesce the trailing pad segments (one boundary per pad token)
+            # into a single tail segment: npu_fusion_attention rejects the
+            # uncoalesced per-token form (mirrors the collator-side helper). The
+            # pad count comes from the collator's published ``tail_padding_length``
+            # (set whenever it appends SP / pad-to-length tail pads) -- deriving
+            # it from trailing ``position_ids == 0`` would conflate real 1-token
+            # packed samples with pads and merge a genuine sample boundary.
+            tail_pads = int(kwargs.get("tail_padding_length", 0))
+            if tail_pads > 0:
+                cu_seq_lens_q = coalesce_tail_padding_cu_seqlens(cu_seq_lens_q, tail_pads)
+                cu_seq_lens_k = cu_seq_lens_q
+                seqlens = cu_seq_lens_q[1:] - cu_seq_lens_q[:-1]
+                max_length_q = int(seqlens.max().item()) if seqlens.numel() else 0
+                max_length_k = max_length_q
+            fa_kwargs["cu_seq_lens_q"] = cu_seq_lens_q
+            fa_kwargs["cu_seq_lens_k"] = cu_seq_lens_k
+            fa_kwargs["max_length_q"] = max_length_q
+            fa_kwargs["max_length_k"] = max_length_k
+            # The KDA layers and the veomni attention adapters read the varlen
+            # layout from this kwarg (full-sequence coordinates, matching the
+            # gathered sequences inside the layers).
+            fa_kwargs["cu_seqlens"] = cu_seq_lens_q
+        elif merged_first_positions is None:
+            # No merge ran (text-only batch): the collator's cu_seq_lens are
+            # still valid -- forward them (plus the coalesced linear-attention
+            # alias) exactly like KimiLinearForCausalLM.forward does.
+            for _fa_key in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"):
+                if _fa_key in kwargs:
+                    fa_kwargs[_fa_key] = kwargs[_fa_key]
+            _linear_cu = kwargs.get("linear_attn_cu_seq_lens_q")
+            if _linear_cu is None:
+                _linear_cu = kwargs.get("cu_seq_lens_q")
+            if _linear_cu is not None:
+                fa_kwargs["cu_seqlens"] = _linear_cu
+
         # Modification (SP): slice the merged embeds / labels back to
         # the local shard and hand the LM a full-sequence cache_position so
         # position ids and causal masks are built at full length (matching the
@@ -2973,13 +3142,47 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
             full_seq_len = inputs_embeds.shape[1]
             inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=sp_group)
             if labels is not None:
-                # Modification: VeOmni's ForCausalLMLoss skips its internal
-                # causal shift when sp_enabled (it expects dataloader-side pre-shift).
-                # K3 expands labels inside the merge, so the shift must happen here,
-                # on the full post-expansion labels, before slicing to shards.
+                # Modification: VeOmni's ForCausalLMLoss consumes labels as-is
+                # under SP (dataloader-side pre-shift contract). The pre-shift
+                # was undone before the merge (see the SP label alignment block
+                # above), so this shift is the single causal shift over the
+                # merged labels, applied before slicing to shards. The slice pads
+                # the label row to an even shard split; those pad slots must read
+                # as ignored, not as token 0.
                 labels = nn.functional.pad(labels, (0, 1), value=self.config.ignore_index)[..., 1:].contiguous()
-                labels = slice_input_tensor(labels, dim=1, group=sp_group)
+                labels = slice_input_tensor(labels, dim=1, group=sp_group, padding_value=self.config.ignore_index)
             cache_position = torch.arange(full_seq_len, device=inputs_embeds.device)
+            # Modification (SP, odd merged rows): slice_input_tensor pads the merged
+            # row to a multiple of sp_size so the shards split evenly. The collator
+            # cannot predict that padding target -- the merge expands media
+            # placeholders (+3 per image here), so an even pre-merge row can merge
+            # to an odd length. Those slice pads ride through the layers' SP
+            # re-gathers as trailing tokens past every cu boundary: the KDA short
+            # convs honor cu and drop them from q/k/v while the unconvolved gate
+            # keeps them, a shape mismatch the chunk kernel rejects. Extend the
+            # last cu segment to cover the slice pads (never append a new boundary)
+            # so every varlen consumer sees cu[-1] == padded length. Merging --
+            # rather than publishing a separate pad segment like the collator's
+            # tail-pad contract -- is deliberate: two adjacent trailing 1-token
+            # segments (collator tail pad + slice pad) make the AscendC chunk_kda
+            # kernel return non-finite values for earlier *real* segments, while a
+            # single trailing 1-token segment is fine. The pads sit after every
+            # real token, so causality keeps real outputs unchanged and the pad
+            # slots' outputs are discarded (their labels are ignore_index).
+            slice_pad = (-full_seq_len) % get_parallel_state().sp_size
+            if slice_pad:
+                for _cu_key in ("cu_seq_lens_q", "cu_seq_lens_k", "cu_seqlens"):
+                    _cu = fa_kwargs.get(_cu_key)
+                    if _cu is not None:
+                        fa_kwargs[_cu_key] = torch.cat([_cu[:-1], _cu[-1:] + slice_pad])
+                # The extended last segment can now be the longest one; bump the
+                # FA launch bound by the pad count (an upper bound -- the previous
+                # max may or may not have been the last segment -- which is always
+                # safe for a launch grid).
+                for _max_key in ("max_length_q", "max_length_k"):
+                    _max_len = fa_kwargs.get(_max_key)
+                    if _max_len is not None:
+                        fa_kwargs[_max_key] = _max_len + slice_pad
 
         # Modification: call the inner KimiLinearModel directly so the returned
         # BaseModelOutputWithPast[0] is reliably the last hidden state (the HF
@@ -2992,6 +3195,7 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             cache_position=cache_position,
+            **fa_kwargs,
         )
 
         hidden_states = outputs[0]
@@ -3119,7 +3323,10 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
 
         from veomni.data.data_transform import kimi_k3_expanded_length
 
-        merge = getattr(self.config, "merge_kernel_size", (2, 2)) or (2, 2)
+        # Modification: ``merge_kernel_size`` lives on the *vision* config (the
+        # MoonViT patch merger), not the top-level KimiK3Config -- reading it
+        # there always fell back to the (2, 2) default.
+        merge = getattr(self.config.vision_config, "merge_kernel_size", (2, 2)) or (2, 2)
         return partial(kimi_k3_expanded_length, int(merge[0]), int(merge[1]))
 
     def get_parallel_plan(self):

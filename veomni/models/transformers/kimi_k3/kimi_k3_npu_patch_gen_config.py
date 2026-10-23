@@ -26,6 +26,7 @@ the VeomniOp handles resolve per ops config).
 from veomni.models.transformers.kimi_k3.kimi_k3_gpu_patch_gen_config import (
     PatchedKimiK3Experts,
     PatchedKimiK3SparseMoeBlock,
+    kimi_delta_attention_init_patched,
     kimi_k3_for_conditional_generation_forward_patched,
     kimi_k3_for_conditional_generation_init_patched,
     kimi_k3_get_dyn_bsz_length_fn_patched,
@@ -105,6 +106,15 @@ config.override_method(
     "KimiMoEGate.forward",
     replacement=kimi_moe_gate_forward_patched,
     description="Drop the inference-only `assert not self.training` so routing runs in training mode",
+)
+
+# ── KDA chunked linear attention (instance-local VeomniOp) ───────────────────
+
+
+config.override_method(
+    "KimiDeltaAttention.__init__",
+    replacement=kimi_delta_attention_init_patched,
+    description="Bind the instance-local chunk_kda VeomniOp (replaces the vendored eager reference)",
 )
 
 # ── Routed experts / sparse MoE block ────────────────────────────────────────

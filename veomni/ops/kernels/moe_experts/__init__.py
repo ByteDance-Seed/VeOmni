@@ -138,5 +138,6 @@ register_op(
     description="NPU group-GEMM situ fused MoE experts (Kimi K3 SituGLU, EP-aware)",
     wrapper=kimi_k3_fused_npu.wrapper,
     requirement=NpuKernelRequirement(),
+    requires=("triton",),
     default=True,
 )

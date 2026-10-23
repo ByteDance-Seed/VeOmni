@@ -1499,7 +1499,7 @@ class OpsImplementationConfig:
         metadata={
             "help": "Kimi-K3 SituGLU activation (beta*tanh(gate/beta)*sigmoid(gate) * up). "
             "'eager' uses the modeling's own SituAndMul. "
-            "'npu' uses the vendored Triton-ascend fused kernel (requires triton-ascend, NPU)."
+            "'triton' uses the vendored Triton-ascend fused kernel (requires triton-ascend, NPU)."
         },
     )
     chunk_kda_implementation: str = field(

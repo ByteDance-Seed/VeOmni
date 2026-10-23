@@ -28,9 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
-import transformers
 from einops import rearrange
-from packaging import version
 from transformers.activations import ACT2FN, PytorchGELUTanh
 from transformers.cache_utils import Cache
 from transformers.configuration_utils import PretrainedConfig
@@ -74,8 +72,6 @@ from .kda_fallback import (
     tensor_cache,
 )
 
-
-assert version.parse(transformers.__version__) >= version.parse("4.56.0"), "Please upgrade transformers to >= 4.56.0"
 
 logger = logging.get_logger(__name__)
 
@@ -586,6 +582,11 @@ class KimiDeltaAttention(nn.Module):
 
         self.o_norm = FusedRMSNormGated(self.head_dim, eps=config.rms_norm_eps, activation="sigmoid")
         self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
+        # Chunked-KDA kernel handle, stored on the instance (VeOmni constraint:
+        # kernel handles belong to model instances). The source default is the
+        # vendored eager reference; generated modeling rebinds it to the
+        # ``chunk_kda`` VeomniOp resolved from the installed ops selection.
+        self.veomni_chunk_kda = chunk_kda
 
     def _forward_sp_head_shard(
         self,
@@ -706,7 +707,7 @@ class KimiDeltaAttention(nn.Module):
         v = rearrange(v, "... (h d) -> ... h d", d=Dh)
         g = rearrange(g, "... (h d) -> ... h d", d=Dh)
 
-        o, _ = chunk_kda(
+        o, _ = self.veomni_chunk_kda(
             q=q,
             k=k,
             v=v,
@@ -835,7 +836,7 @@ class KimiDeltaAttention(nn.Module):
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_dim)
 
         if mode == "chunk":
-            o, recurrent_state = chunk_kda(
+            o, recurrent_state = self.veomni_chunk_kda(
                 q=q,
                 k=k,
                 v=v,
@@ -2526,6 +2527,12 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
                 The attention mask.
             labels (:obj:`torch.Tensor` of shape :obj:`(batch_size, sequence_length)`, *optional*):
                 The labels.
+
+        Returns:
+            final_embedding, final_attention_mask, final_labels, position_ids, merged_first_positions
+                ``merged_first_positions`` maps every pre-merge slot to its merged
+                coordinate (first slot of the expanded span for media placeholders)
+                so packed-segment boundaries survive the expansion.
         """
         _, embed_dim = image_features[0].shape
         feature_lengths = [x.shape[0] for x in image_features]
@@ -2611,6 +2618,15 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
         final_attention_mask |= image_to_overwrite
         position_ids = (final_attention_mask.cumsum(-1) - 1).masked_fill_((final_attention_mask == 0), 1)
 
+        # Merged coordinate of every *pre-merge* slot: its own coordinate for
+        # text tokens, the first slot of the placeholder's expanded vision span
+        # for media placeholders. Callers use this to map pre-merge packed
+        # boundaries (``position_ids == 0``) into the merged sequence, which
+        # the continuous ``position_ids`` above cannot express.
+        merged_first_positions = torch.cumsum(_token_occupation_table, -1) - _token_occupation_table
+        if left_padding:
+            merged_first_positions += nb_image_pad[:, None]
+
         # 6. Mask out the embedding at padding positions, as we later use the past_key_value value to determine the non-attended tokens.
         batch_indices, pad_indices = torch.where(input_ids == pad_token_id)
         indices_to_mask = new_token_positions[batch_indices, pad_indices]
@@ -2620,7 +2636,13 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
         if labels is None:
             final_labels = None
 
-        return final_embedding, final_attention_mask, final_labels, position_ids
+        return (
+            final_embedding,
+            final_attention_mask,
+            final_labels,
+            position_ids,
+            merged_first_positions,
+        )
 
     def _extract_image_features(self, pixel_values: torch.Tensor, grid_thws: torch.Tensor) -> list[torch.Tensor]:
         """
@@ -2691,7 +2713,7 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
                 target_dtype = self.get_input_embeddings().weight.dtype
                 image_features = tuple(f.to(target_dtype) for f in image_features)
                 inputs_embeds = inputs_embeds.to(target_dtype)
-                inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
+                inputs_embeds, attention_mask, labels, position_ids, _ = self._merge_input_ids_with_image_features(
                     image_features,
                     inputs_embeds,
                     input_ids,

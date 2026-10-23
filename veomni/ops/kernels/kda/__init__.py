@@ -57,5 +57,6 @@ register_op(
     wrapper=_ascendc,
     description="Kimi K3 KDA chunked linear attention fused AscendC kernel (NPU)",
     requirement=NpuKernelRequirement(),
+    requires=("fla_npu", "triton_ascend_kernels"),
     default=True,
 )

@@ -1087,3 +1087,27 @@ def tiny_qwen3_vl_moe_config(
         video_token_id=VIDEO_TOKEN_ID,
         architectures=[architecture],
     )
+
+
+def tiny_kimi_k3_config(architecture: str = "KimiK3ForConditionalGeneration") -> PretrainedConfig:
+    """Load the Kimi K3 VLM toy config (``tests/toy_config/kimi_k3_toy``).
+
+    The vendored K3 config carries the full MoonViT3d vision section and a
+    hybrid KDA/MLA text stack; loading the checked-in toy config keeps the
+    factory in sync with the layout the bitwise-parity suites build.
+    """
+    from pathlib import Path
+
+    from veomni.models.transformers.kimi_k3.source.configuration_kimi_k3 import KimiK3Config
+
+    toy_dir = Path(__file__).resolve().parents[1] / "toy_config" / "kimi_k3_toy"
+    config = KimiK3Config.from_pretrained(str(toy_dir))
+    config.architectures = [architecture]
+    return config
+
+
+def tiny_kimi_linear_config(architecture: str = "KimiLinearForCausalLM") -> PretrainedConfig:
+    """Kimi K3 text stack standalone (the ``kimi_linear`` model type)."""
+    config = tiny_kimi_k3_config().text_config
+    config.architectures = [architecture]
+    return config
