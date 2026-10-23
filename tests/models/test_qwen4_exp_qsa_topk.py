@@ -121,6 +121,7 @@ def _native_indexer_worker(rank, world_size, endpoint):
     import torch.distributed as dist
 
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.models.transformers.qwen4_exp.qsa_metadata import prepare_qsa_metadata
     from veomni.utils.device import get_torch_device
 
     get_torch_device().set_device(rank)
@@ -166,9 +167,17 @@ def _native_indexer_worker(rank, world_size, endpoint):
             for count in packed_lengths:
                 bounds.append(bounds[-1] + count)
             cu = torch.tensor(bounds, device=device, dtype=torch.int32)
+            metadata = prepare_qsa_metadata(2, length, 4, rank, world_size, device, cu, packed_lengths)
             with torch.no_grad():
                 actual = module.Qwen4ExpTextQSAIndexer.forward(
-                    indexer, hidden, positions, None, None, cu, packed_seq_lens=packed_lengths
+                    indexer,
+                    hidden,
+                    positions,
+                    None,
+                    None,
+                    cu,
+                    packed_seq_lens=packed_lengths,
+                    qsa_metadata=metadata,
                 )
                 with patch.object(torch.Tensor, "gather", bool_reference):
                     reference = module.Qwen4ExpTextQSAIndexer.forward(

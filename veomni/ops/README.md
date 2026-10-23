@@ -287,13 +287,3 @@ When adding a row, test its numerical contract, registration, hardware
 requirement, and optional-package requirements. When adding model-specific
 argument policy, test it in `tests/models` rather than duplicating it in
 the raw-kernel suite.
-
-### Compact QSA indexing on Ascend
-
-The Qwen4-Exp indexer uses INT8 for NPU visibility gathers (the resulting mask is
-still boolean) and bounded INT32 position arithmetic. Neither top-k scores nor
-floating attention arithmetic change. Positions including compression padding
-must fit INT32, matching the existing output-index contract. A two-entry host-only
-LRU caches immutable block metadata keyed by the complete packed boundaries,
-compression ratio, local shard length and SP rank/group size. It never caches
-floating tensors or shares selections between packed samples.
