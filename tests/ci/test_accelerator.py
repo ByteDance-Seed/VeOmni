@@ -86,6 +86,31 @@ def test_launch_plan_parameters_use_owned_capacity(monkeypatch, tmp_path):
     assert from_parameter("cp_size")(context).nproc == 4
 
 
+@pytest.mark.parametrize("backend", ["cuda", "npu"])
+def test_e2e_alignment_preserves_fused_moe_training_paths(backend):
+    from scripts.ci.accelerator.launch_plan import RunnerCapabilities
+    from tests.e2e.utils import alignment_plan, prepare_exec_cmd
+
+    caps = RunnerCapabilities(backend, tuple("01234567"))
+    for model_name in ("gpt_oss", "qwen3_moe"):
+        options = dict(is_moe=True, model_name=model_name, min_sp_size=2 if model_name == "gpt_oss" else None)
+        commands = prepare_exec_cmd(
+            ["train_text_test"],
+            config_path="config",
+            model_path="weights",
+            train_path="data",
+            output_dir="outputs",
+            **options,
+        )
+        modes = {(cmd["parallel_config"].sp_size, cmd["parallel_config"].ep_size): cmd["nproc"] for _, cmd in commands}
+        assert modes[(2, 1)] == modes[(2, 2)] == (4 if model_name == "gpt_oss" else 8)
+        if model_name == "qwen3_moe":
+            assert modes[(1, 1)] == modes[(1, 2)] == 4
+        plan = alignment_plan(caps, **options)
+        assert plan.cards(caps) == max(modes.values())
+        assert all(len(group) == 1 for group in plan.groups)
+
+
 def test_npu_adapter_preserves_owned_host_slice_and_resets_ranks():
     import threading
 

@@ -256,7 +256,7 @@ deepseek_v4_text_smoke_test_cases = [
         True,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        2,  # min_sp_size: single SP2+EP2 smoke launch
+        2,  # min_sp_size: retain both non-EP Quack and EP grouped-GEMM training
         None,  # max_sp_size
         None,  # max_ep_size
         marks=_gpt_oss_fa4_quack_skip,
