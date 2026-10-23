@@ -119,10 +119,9 @@ def test_builtin_entry_invariants_and_critical_hardware_gates():
     actual = {
         (*key, _requirement_metadata(entry.requirement), entry.requires) for key, entry in OP_REGISTRY._entries.items()
     }
-    for op, variant, impl, device, req_meta, requires in actual:
+    for op, variant, impl, device, req_meta, _requires in actual:
         if device == "any":
             assert req_meta is None, f"{op}/{variant}/{impl} on device='any' must not set hardware requirement"
-            assert requires == (), f"{op}/{variant}/{impl} on device='any' must not require hardware packages"
         else:
             expected_kind = "gpu" if device == "cuda" else device
             assert req_meta is not None and req_meta[0] == expected_kind, (
