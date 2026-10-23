@@ -817,15 +817,10 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
     # `**kwargs` to every block; the patched Qwen3_5VisionAttention.forward
     # picks it up via `vision_max_seqlen` and falls back to the original
     # recompute when the key is absent (so non-VeOmni callers keep working).
-    # Gate is two-pronged:
-    #   (a) `_VEOMNI_VISION_ATTENTION_PATCHED` — set per generated file. True
-    #       when Qwen3_5VisionAttention.forward is patched to consume
-    #       ``vision_max_seqlen``. GPU and NPU both register that consumer.
-    #   (b) `is_flash_attention_requested(self.config)` — only FA's
-    #       `flash_attn_varlen_func` benefits from the int hand-off; eager
-    #       and sdpa paths in the consumer pop+discard the kwarg, so the
-    #       host sync would be wasted.
-    if _VEOMNI_VISION_ATTENTION_PATCHED and is_flash_attention_requested(self.config):
+    # Gate: `_VEOMNI_VISION_ATTENTION_PATCHED` is set per generated file when
+    # Qwen3_5VisionAttention.forward is patched to consume ``vision_max_seqlen``.
+    # GPU and NPU both register that consumer.
+    if _VEOMNI_VISION_ATTENTION_PATCHED:
         if precomputed_max_seqlen is not None:
             # Collator-side max already accounts for sp-pad; use as-is.
             kwargs["vision_max_seqlen"] = precomputed_max_seqlen

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
@@ -23,7 +24,7 @@ from veomni.arguments.arguments_types import (
 from veomni.arguments.arguments_types import (
     TorchCompileConfig as ArgumentsTorchCompileConfig,
 )
-from veomni.distributed.parallel_state import use_parallel_state
+from veomni.distributed.parallel_state import ParallelState, use_parallel_state
 from veomni.distributed.torch_compile import (
     CompileConfig,
     compile_decoder_blocks,
@@ -32,6 +33,11 @@ from veomni.distributed.torch_compile import (
     validate_compile_runtime,
 )
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+
+
+def _non_sp_parallel_state() -> ParallelState:
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    return ParallelState(dp_size=world_size, dp_shard_size=world_size)
 
 
 def _model_args(**kwargs) -> ModelArguments:
@@ -258,7 +264,7 @@ def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
     position_embeddings = rotary_emb(hidden_states_eager, position_ids)
 
     # An explicit state avoids the logging fallback in get_parallel_state(), which Dynamo cannot trace fullgraph.
-    with use_parallel_state(SimpleNamespace(async_enabled=False)):
+    with use_parallel_state(_non_sp_parallel_state()):
         assert (
             compile_decoder_blocks(
                 compiled_model,
@@ -324,7 +330,7 @@ def test_qwen3_vl_compiled_decoder_matches_eager_packed_flash_attention():
     }
 
     # An explicit state avoids the logging fallback in get_parallel_state(), which Dynamo cannot trace fullgraph.
-    with use_parallel_state(SimpleNamespace(async_enabled=False)):
+    with use_parallel_state(_non_sp_parallel_state()):
         assert (
             compile_decoder_blocks(
                 compiled_model,
