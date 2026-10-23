@@ -1842,6 +1842,11 @@ class Gemma4TextModel(Gemma4PreTrainedModel):
         if input_ids is not None and per_layer_inputs is not None:
             raise ValueError("You cannot specify per_layer_inputs if input_ids is provided")
 
+        if kwargs.get("cu_seq_lens_q") is not None:
+            if past_key_values is not None:
+                raise ValueError("Packed Gemma 4 attention does not support past_key_values.")
+            use_cache = False
+
         if input_ids is not None:
             inputs_embeds = self.embed_tokens(input_ids)
 

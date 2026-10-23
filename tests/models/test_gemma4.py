@@ -25,6 +25,7 @@ from transformers.models.gemma4.configuration_gemma4 import Gemma4Config
 from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel as HFGemma4Audio
 from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration as HFGemma4
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.tol import EAGER_GRAD_ATOL, EAGER_GRAD_RTOL
 from tests.tools.gemma4_utils import make_gemma4_batch
 from veomni.arguments.arguments_types import OpsImplementationConfig
@@ -38,6 +39,7 @@ from veomni.trainer.callbacks.channel_loss_callback import ChannelLossComputer
 
 _TOY_CONFIG = Path(__file__).parents[1] / "toy_config" / "gemma4_toy"
 _FLEX_IMPLEMENTATION = "veomni_flex_attention"
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _eager_ops_config(attn_implementation: str) -> OpsImplementationConfig:
@@ -481,6 +483,42 @@ def test_gemma4_generated_children_and_packed_masks(monkeypatch):
 
     assert len(seen_cu_seq_lens) == 2
     assert all(torch.equal(value, cu_seq_lens_q) for value in seen_cu_seq_lens)
+
+
+@pytest.mark.parametrize("text_only", [False, True], ids=["multimodal", "text"])
+@pytest.mark.parametrize("cache_kwargs", [{}, {"use_cache": True}], ids=["default_cache", "requested_cache"])
+def test_gemma4_packed_calls_do_not_create_cache(text_only, cache_kwargs):
+    """Packed public calls bypass automatic caching and retain no-cache logits."""
+    config = _toy_config()
+    model_cls = gemma4_modeling.Gemma4ForCausalLM if text_only else VeOmniGemma4
+    model = model_cls._from_config(config.text_config if text_only else config, attn_implementation="eager").eval()
+    inputs = dict(
+        input_ids=torch.tensor([[3, 4, 5, 6]]),
+        position_ids=torch.tensor([[0, 1, 0, 1]]),
+        cu_seq_lens_q=torch.tensor([0, 2, 4], dtype=torch.int32),
+    )
+    with torch.no_grad():
+        expected = model(**inputs, use_cache=False)
+        actual = model(**inputs, **cache_kwargs)
+        unpacked = model(input_ids=inputs["input_ids"])
+    torch.testing.assert_close(actual.logits, expected.logits)
+    assert actual.past_key_values is None
+    assert unpacked.past_key_values is not None
+
+
+@pytest.mark.parametrize("text_only", [False, True], ids=["multimodal", "text"])
+def test_gemma4_packed_calls_reject_supplied_cache(text_only):
+    """An explicit cache remains unsupported even when automatic caching is disabled."""
+    config = _toy_config()
+    model_cls = gemma4_modeling.Gemma4ForCausalLM if text_only else VeOmniGemma4
+    model = model_cls._from_config(config.text_config if text_only else config, attn_implementation="eager").eval()
+    with pytest.raises(ValueError, match="Packed Gemma 4 attention does not support past_key_values"):
+        model(
+            input_ids=torch.tensor([[3, 4, 5, 6]]),
+            cu_seq_lens_q=torch.tensor([0, 2, 4], dtype=torch.int32),
+            past_key_values=gemma4_modeling.DynamicCache(config=config.text_config),
+            use_cache=False,
+        )
 
 
 @pytest.mark.parametrize("backend", ["eager", "sdpa"])

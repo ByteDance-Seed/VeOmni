@@ -11,7 +11,8 @@ Choose attention through `OpsImplementationConfig`, for example
 `attn_implementation="flex_attention"`. The normalized HF interface name is
 `veomni_flex_attention`. Packed full and sliding masks use the public
 `veomni.ops.mask` builders with `cu_seq_lens_q` boundaries. Packed attention
-does not support `past_key_values`; unpacked masks retain HF cache handling.
+does not support supplied `past_key_values` and disables automatic cache
+creation, including when `use_cache=True`; unpacked masks retain HF cache handling.
 With `use_bidirectional_attention="all"`, full attention remains bidirectional
 within each packed sample. Eager/SDPA/Flex sliding attention preserves HF's
 inclusive, symmetric window on both sides of each token; document boundaries
@@ -27,9 +28,10 @@ Each LM instance holds its own `VeomniOp("cross_entropy_loss", "standard", impl)
 as `veomni_ce`. Training calls its `loss_function` wrapper so channel-loss
 callbacks can observe both eager and fused loss selections. An uncapped model
 retains the selected loss implementation. Logit softcapping forces eager loss
-on capped logits and materializes logits in memory. Capped models reject
-`return_log_probs=True`, including the top-k distillation path, since the
-auxiliary helpers would reproject uncapped logits.
+on capped logits and materializes logits in memory. When labels are supplied,
+capped models reject `return_log_probs=True`, including the top-k distillation
+path, since the auxiliary helpers would reproject uncapped logits. Calls
+without labels return capped logits.
 
 Audio uses a boolean local mask independently of the LM attention backend.
 Vision Ulysses is unsupported: use `ulysses_size=1` for models retaining the

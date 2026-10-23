@@ -61,9 +61,13 @@ import pytest
 import torch
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
 from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.utils.moe_router_replay import set_active_replay
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 _DEVICE = torch.device("cpu")
