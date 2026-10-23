@@ -543,10 +543,35 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 
 This is an observability-only side channel. It computes detached per-token CE
 from the model loss inputs, aggregates by packed-sequence source metadata, and
-adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics. It does
-not change the returned training loss or gradients. Fused-loss backends may
-recompute the LM-head projection on sampled steps, so the default interval is
-10 steps; set `interval=1` for per-step metrics. DiT trainers and
+adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics.
+Sampled steps also report `samples/<source-id>__<source>`,
+`input_tokens/<source-id>__<source>`, `label_tokens/<source-id>__<source>`, and
+`label_tokens_per_sample/<source-id>__<source>`. These four counters reuse the
+same packed-segment alignment and per-token observer capture as channel loss.
+Data counters describe the primary micro-batch labels once: auxiliary MTP
+objectives and repeated loss calls do not add samples, input tokens, or auxiliary
+targets to these counters. Channel CE continues to aggregate observed objectives;
+it is not the physical-data denominator. The callback supplies the primary labels
+from the device-resident micro-batch; strict mode rejects a forward whose observed
+loss calls cannot be matched to those labels.
+They add only compact integer reductions proportional to the number of sources;
+they do not launch another projection, full-vocabulary CE, or observer workspace.
+This side channel does not change the returned training loss or gradients.
+Observer-only CE failures are recorded before the shared capture preflight;
+they do not trigger another detached CE attempt. Non-strict mode skips invalid
+observations, while strict mode reports failures at the globally synchronized
+step end. Errors in the main training forward or loss still propagate normally. A failed
+forward discards pending observations without entering observer collectives.
+When `cross_entropy_loss_implementation` is `chunk_loss` (or its `npu` alias),
+the observer reuses the main loss projection, but the detached per-token CE
+still needs a chunk-sized full-vocabulary workspace. Other fused-loss backends,
+including the GPU default `liger_kernel`, may recompute the LM-head projection
+on sampled steps, so the default
+interval is 10 steps; set `interval=1` for per-step metrics. On memory-constrained
+profiles, `release_cache=true` synchronizes and releases the detached CE
+workspace after each sampled forward and before training backward. This does
+not change the objective or gradients, but adds synchronization and allocator
+churn. DiT trainers and
 `data.data_type="classification"` are not supported because they do not optimize
 a causal-LM objective. `BaseRLTrainer` is unsupported because it packs source
 alignment metadata after the common step lifecycle. In DPO training, only the policy-model forward is observed; the
@@ -567,6 +592,7 @@ distinct from the first emission.
 | token_count_metric_prefix | `str` | `"channel_tokens"` | Prefix for supervised token-count metrics. |
 | log_weighted_loss | `bool` | `True` | Log weighted loss metrics. |
 | log_token_count | `bool` | `True` | Log token-count metrics. |
+| release_cache | `bool` | `False` | Synchronize and release detached CE allocator cache after sampled forwards to lower memory carried into backward. |
 | strict | `bool` | `False` | Raise when source metadata is missing or cannot be aligned with packed segments; otherwise skip invalid batches. |
 
 ### GradientCheckpointingConfig
