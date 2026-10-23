@@ -244,12 +244,20 @@ def flash_attention_forward(
     if is_causal is None:
         is_causal = module.is_causal
 
+    # ``skip_ulysses`` covers two cases. Tokens that are not on the SP mesh skip the
+    # ring too. A caller that already ran the Ulysses exchange itself (the Qwen3-VL
+    # async Ulysses projections) still holds a cp-sharded sequence, so it passes
+    # ``ulysses_pre_gathered=True`` to keep the ring over the cp group.
+    ulysses_pre_gathered = kwargs.pop("ulysses_pre_gathered", False)
     cp_state = get_parallel_state()
-    if getattr(cp_state, "cp_enabled", False) and not skip_ulysses:
+    use_ring = getattr(cp_state, "cp_enabled", False) and (not skip_ulysses or ulysses_pre_gathered)
+    if use_ring:
         if cp_state.cp_layout != "zigzag":
             raise NotImplementedError("USP flash attention requires cp_layout='zigzag'.")
-        if not is_causal or attention_mask is not None:
-            raise NotImplementedError("USP requires causal attention without an explicit attention mask.")
+        # Causal attention runs the zig-zag ring (text); bidirectional attention runs the
+        # ViT ring, which assumes the per-vit-seq layout of ``ring_attention.layout.vit_usp_slice``.
+        if attention_mask is not None:
+            raise NotImplementedError("USP does not support an explicit attention mask.")
         if dropout or sliding_window is not None or softcap not in (None, 0.0) or kwargs.get("s_aux") is not None:
             raise NotImplementedError(
                 "USP does not support attention dropout, sliding windows, softcap, or attention sinks."
@@ -345,8 +353,7 @@ def flash_attention_forward(
     # causal attention. Both dense and packed (varlen) sequences are supported:
     # packed documents take the ``zigzag_ring_flash_attn_varlen_func`` path with
     # per-document LOCAL cu_seqlens derived from the FULL ``cu_seq_lens_q``.
-    cp_state = get_parallel_state()
-    if getattr(cp_state, "cp_enabled", False) and not skip_ulysses:
+    if use_ring:
         if target_dtype is not None:
             query, key, value = (tensor.to(target_dtype) for tensor in (query, key, value))
         from ....distributed.sequence_parallel.ring_attention import ring_attention
@@ -357,6 +364,7 @@ def flash_attention_forward(
             value,
             group=cp_state.cp_group,
             cp_size=cp_state.cp_size,
+            ulysses_size=cp_state.ulysses_size,
             device_type=cp_state.device_type,
             cu_seqlens=kwargs.get("cu_seq_lens_q"),
             attention_mask=attention_mask,

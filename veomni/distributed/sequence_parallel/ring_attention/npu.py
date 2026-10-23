@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ascend NPU zig-zag Ring Attention primitives for USP.
+"""Ascend NPU Ring Attention primitives for USP.
 
-The sequence and ring schedule match :mod:`ring_attention`. The local
+Two schedules are provided: balanced causal zig-zag Ring Attention for text,
+and bidirectional packed Ring Attention for ViT inputs whose vit seqs are split
+into per-rank shards (see ``layout.vit_usp_slice``). The local
 attention backend is ``torch_npu.npu_fusion_attention`` instead of a CUDA
 FlashAttention low-level kernel. NPU fusion attention exposes softmax maximum
 and sum tensors rather than log-sum-exp, so partial ring outputs are merged
@@ -24,6 +26,7 @@ with those statistics and saved for the explicit backward operator.
 from typing import Optional, Sequence, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
@@ -50,6 +53,8 @@ __all__ = [
     "packed_forward",
     "zigzag_ring_npu_flash_attn_func",
     "zigzag_ring_npu_flash_attn_varlen_func",
+    "ring_npu_flash_attn_varlen_func",
+    "bidirectional_packed_forward",
 ]
 
 
@@ -85,8 +90,10 @@ def _to_npu_actual_seq_len(actual_seq_len: Optional[ActualSeqLen]) -> Optional[l
         raise ValueError("actual_seq_len must be a non-empty 1-D sequence")
     if values[0].item() == 0:
         values = values[1:]
-    if values.numel() == 0 or (values <= 0).any() or (values[1:] < values[:-1]).any():
-        raise ValueError("actual_seq_len must contain positive, non-decreasing endpoints")
+    # Zero-length segments (repeated endpoints, including a leading 0) are allowed: the
+    # bidirectional ViT ring pairs per-rank shards and a shard may be empty on some rank.
+    if values.numel() == 0 or (values < 0).any() or (values[1:] < values[:-1]).any():
+        raise ValueError("actual_seq_len must contain non-negative, non-decreasing endpoints")
     return [int(value) for value in values.tolist()]
 
 
@@ -744,6 +751,191 @@ def zigzag_ring_npu_flash_attn_varlen_func(
     return _ZigzagRingNPUFlashAttentionVarlen.apply(group, q, k, v, cu_seqlens, dropout_p, softmax_scale, causal)
 
 
+# Bidirectional packed Ring Attention for ViT, adapted from yunchang
+# ``ring/ring_npu_flash_attn_varlen.py`` (Apache-2.0,
+# https://github.com/feifeibear/long-context-attention). yunchang shares one
+# local ``cu_seqlens`` across ring steps because every sequence is split evenly;
+# here every vit seq is split into per-rank shards of different lengths, so each
+# step pairs the local query offsets (``cu_seqlens_per_rank[rank]``) with the
+# key/value offsets of the source rank (``cu_seqlens_per_rank[src]``). Shard i of
+# the query always belongs to the same vit seq as shard i of the key/value.
+def _ring_npu_varlen_forward(
+    group: ProcessGroup,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_per_rank: Sequence[Sequence[int]],
+    softmax_scale: float,
+    dropout_p: float,
+) -> Tuple[Tensor, Tensor, Tensor, list[RNGState]]:
+    comm = RingComm(group)
+    out = softmax_max = softmax_sum = None
+    rng_states: list[RNGState] = [(0, 0, 0) for _ in range(comm.world_size)]
+
+    for step in range(comm.world_size):
+        if step + 1 != comm.world_size:
+            next_k = comm.send_recv(k)
+            next_v = comm.send_recv(v)
+            comm.commit()
+
+        src = (comm.rank - step) % comm.world_size
+        block_out, block_max, block_sum, rng_states[step] = _npu_fa_forward(
+            q,
+            k,
+            v,
+            input_layout="TND",
+            softmax_scale=softmax_scale,
+            dropout_p=dropout_p,
+            causal=False,
+            actual_seq_qlen=cu_seqlens_per_rank[comm.rank],
+            actual_seq_kvlen=cu_seqlens_per_rank[src],
+            softmax_layout="TND",
+        )
+        out, softmax_max, softmax_sum = update_npu_out_and_softmax_stats(
+            out, softmax_max, softmax_sum, block_out, block_max, block_sum
+        )
+
+        if step + 1 != comm.world_size:
+            comm.wait()
+            k, v = next_k, next_v
+
+    return out.to(q.dtype), softmax_max, softmax_sum, rng_states
+
+
+def _ring_npu_varlen_backward(
+    group: ProcessGroup,
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_max: Tensor,
+    softmax_sum: Tensor,
+    cu_seqlens_per_rank: Sequence[Sequence[int]],
+    rng_states: Sequence[RNGState],
+    softmax_scale: float,
+    dropout_p: float,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    kv_comm = RingComm(group)
+    d_kv_comm = RingComm(group)
+    dq = torch.zeros_like(q, dtype=torch.float32)
+    next_dk = next_dv = None
+
+    for step in range(kv_comm.world_size):
+        if step + 1 != kv_comm.world_size:
+            next_k = kv_comm.send_recv(k)
+            next_v = kv_comm.send_recv(v)
+            kv_comm.commit()
+
+        # dk/dv accumulate the grads of the K/V shard held at this step and travel
+        # around the ring with it, returning to the owner after the last step.
+        if step == 0:
+            dk = torch.zeros_like(k, dtype=torch.float32)
+            dv = torch.zeros_like(v, dtype=torch.float32)
+        else:
+            d_kv_comm.wait()
+            dk, dv = next_dk, next_dv
+
+        src = (kv_comm.rank - step) % kv_comm.world_size
+        block_dq, block_dk, block_dv = _npu_fa_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_max,
+            softmax_sum,
+            input_layout="TND",
+            softmax_scale=softmax_scale,
+            dropout_p=dropout_p,
+            causal=False,
+            rng_state=rng_states[step],
+            actual_seq_qlen=cu_seqlens_per_rank[kv_comm.rank],
+            actual_seq_kvlen=cu_seqlens_per_rank[src],
+            softmax_layout="TND",
+        )
+        dq += block_dq.float()
+        dk += block_dk.float()
+        dv += block_dv.float()
+
+        if step + 1 != kv_comm.world_size:
+            kv_comm.wait()
+            k, v = next_k, next_v
+
+        next_dk = d_kv_comm.send_recv(dk)
+        next_dv = d_kv_comm.send_recv(dv)
+        d_kv_comm.commit()
+
+    d_kv_comm.wait()
+    return dq.to(q.dtype), next_dk.to(k.dtype), next_dv.to(v.dtype)
+
+
+class _RingNPUFlashAttentionVarlen(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, group, q, k, v, cu_seqlens_per_rank, dropout_p, softmax_scale):
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** -0.5
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        out, softmax_max, softmax_sum, rng_states = _ring_npu_varlen_forward(
+            group, q, k, v, cu_seqlens_per_rank, softmax_scale, dropout_p
+        )
+        ctx.save_for_backward(q, k, v, out, softmax_max, softmax_sum)
+        ctx.group = group
+        ctx.cu_seqlens_per_rank = cu_seqlens_per_rank
+        ctx.rng_states = rng_states
+        ctx.dropout_p = dropout_p
+        ctx.softmax_scale = softmax_scale
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        q, k, v, out, softmax_max, softmax_sum = ctx.saved_tensors
+        dq, dk, dv = _ring_npu_varlen_backward(
+            ctx.group,
+            dout.contiguous(),
+            q,
+            k,
+            v,
+            out,
+            softmax_max,
+            softmax_sum,
+            ctx.cu_seqlens_per_rank,
+            ctx.rng_states,
+            ctx.softmax_scale,
+            ctx.dropout_p,
+        )
+        return None, dq, dk, dv, None, None, None
+
+
+def ring_npu_flash_attn_varlen_func(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_per_rank: Sequence[Sequence[int]],
+    softmax_scale: Optional[float] = None,
+    group: Optional[ProcessGroup] = None,
+    dropout_p: float = 0.0,
+) -> Tensor:
+    """Bidirectional packed Ring Attention for NPU ``(T, N, D)`` tensors.
+
+    ``cu_seqlens_per_rank[c]`` are the local packed offsets of cp rank ``c``; every rank has the
+    same number of segments (segment ``i`` belongs to the same sequence on every rank, possibly
+    with zero length) and the same total length.
+    """
+    _require_torch_npu()
+    group = get_context_parallel_group() if group is None else group
+    world_size = dist.get_world_size(group)
+    cu_seqlens_per_rank = tuple(tuple(int(value) for value in cu) for cu in cu_seqlens_per_rank)
+    if len(cu_seqlens_per_rank) != world_size:
+        raise ValueError(f"expected {world_size} cu_seqlens (one per cp rank), got {len(cu_seqlens_per_rank)}")
+    if len({len(cu) for cu in cu_seqlens_per_rank}) != 1 or any(cu[-1] != q.shape[0] for cu in cu_seqlens_per_rank):
+        raise ValueError(
+            "every cp rank's cu_seqlens must have the same number of segments and end at the local "
+            f"length {q.shape[0]}; got {cu_seqlens_per_rank}"
+        )
+    return _RingNPUFlashAttentionVarlen.apply(group, q, k, v, cu_seqlens_per_rank, dropout_p, softmax_scale)
+
+
 def forward(
     q: Tensor,
     k: Tensor,
@@ -785,6 +977,27 @@ def packed_forward(
         max_seqlen,
         softmax_scale=softmax_scale,
         causal=causal,
+        group=group,
+        dropout_p=dropout_p,
+    )
+
+
+def bidirectional_packed_forward(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_per_rank: Sequence[Sequence[int]],
+    softmax_scale: Optional[float] = None,
+    group: Optional[ProcessGroup] = None,
+    dropout_p: float = 0.0,
+) -> Tensor:
+    """Run bidirectional Ring Attention on packed NPU tensors (one ``cu_seqlens`` per cp rank)."""
+    return ring_npu_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_per_rank,
+        softmax_scale=softmax_scale,
         group=group,
         dropout_p=dropout_p,
     )

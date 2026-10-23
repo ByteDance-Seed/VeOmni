@@ -1,0 +1,63 @@
+# Qwen3-VL dense long-context SFT with USP (Unified Sequence Parallelism).
+#
+# USP composes Ulysses (all-to-all head/seq exchange) with Ring-Attention
+# (context parallel). The effective sequence-parallel size is
+# ``ulysses_size * cp_size``. See docs/key_features/ulysses.md (USP section).
+#
+# Constraints for the ``cp`` (ring) path with vision inputs (first version):
+#   * Ascend NPU, or CUDA with FlashAttention-2 (the FA4 ViT ring is not supported yet)
+#   * text: causal zig-zag ring; every packed document is padded to 2 * cp_size
+#   * ViT: bidirectional ring; every image / video temporal step is split into
+#     cp_size shards on spatial-merge granularity, no per-image padding needed
+#   * ulysses_size must divide the ViT head count (16); for the text KV heads it
+#     must divide them or be a multiple of them (KV heads are repeated)
+#   * max_seq_len must be divisible by 2 * ulysses_size * cp_size
+
+model:
+  model_path: Qwen/Qwen3-VL-8B-Instruct
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
+  accelerator:
+    gradient_checkpointing:
+      enable_reentrant: false
+    init_device: meta
+    ulysses_size: 4   # divides ViT heads (16) and text KV heads (8)
+    cp_size: 2        # ring attention; total SP size = 8
+    cp_layout: zigzag # USP Ring Attention (the default contiguous layout is model-specific CP)
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+data:
+  train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
+  data_type: conversation
+  chat_template: qwen3vl
+  max_seq_len: 32768
+  train_size: 80000000
+  mm_configs:
+    image_max_pixels: 602112 # 28 * 28 * 768
+    video_max_pixels: 602112 # 28 * 28 * 768
+    # Dynamic per-frame video resolution budget (official Qwen3-VL behavior).
+    # Formula: max_seq_len * (patch_size * merge_size)^2 * 0.9
+    # With max_seq_len=32768, patch=14, merge=2: 32768 * 28^2 * 0.9 ≈ 23121715
+    video_total_pixels: 23121715
+    max_frames: 64
+    fps: 2.0
+    use_audio_in_video: false
+
+train:
+  wandb:
+    enable: false
+    project: qwen3_vl_dense_usp
+    name: qwen3_vl_dense_usp
+  freeze_vit: false
+  num_train_epochs: 2
+  micro_batch_size: 1
+  global_batch_size: 16
+  max_steps: 500
+  checkpoint:
+    output_dir: qwen3_vl_dense_usp_sft
+    manager: dcp
+    save_hf_weights: false

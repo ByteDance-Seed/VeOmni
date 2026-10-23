@@ -27,6 +27,11 @@ into ``2 * cp_size`` blocks and rank ``r`` owns blocks ``r`` and
 matching data reordering lives in ``.layout.zigzag_reorder`` / ``.layout.zigzag_
 undo`` and is applied by the collator before slicing.
 
+Bidirectional (ViT) attention uses a different layout: every vit seq is split
+into per-rank shards (``.layout.vit_usp_slice``) and each ring step pairs the
+local query offsets with the source rank's key/value offsets
+(``ring_flash_attn_varlen_func``, FlashAttention-2 only).
+
 The Ulysses half (all-to-all head/seq exchange) is orthogonal: USP first does
 the Ulysses all-to-all over the ``ulysses`` group, then runs ring attention over
 the ``cp`` group on the resulting shard (see
@@ -35,9 +40,10 @@ the ``cp`` group on the resulting shard (see
 
 import inspect
 import os
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
@@ -109,9 +115,11 @@ __all__ = [
     "ring_flash_attn_func",
     "zigzag_ring_flash_attn_func",
     "zigzag_ring_flash_attn_varlen_func",
+    "ring_flash_attn_varlen_func",
     "update_out_and_lse",
     "forward",
     "packed_forward",
+    "bidirectional_packed_forward",
 ]
 
 
@@ -911,6 +919,177 @@ def zigzag_ring_flash_attn_varlen_func(
     return _ZigzagRingVarlenFlashAttn.apply(group, q, k, v, cu_seqlens, max_seqlen, softmax_scale)
 
 
+# --------------------------------------------------------------------------- #
+# Bidirectional packed Ring Attention for ViT (FA2 only for now).             #
+#                                                                             #
+# Adapted from yunchang ``ring/ring_flash_attn_varlen.py`` (Apache-2.0,         #
+# https://github.com/feifeibear/long-context-attention). yunchang shares one   #
+# local ``cu_seqlens`` across ring steps because every sequence is split       #
+# evenly; here every vit seq is split into per-rank shards of different        #
+# lengths (see ``.layout.vit_usp_slice``), so each step pairs the local query   #
+# offsets with the key/value offsets of the source rank. Shards may be empty:  #
+# FA2 returns ``lse=+inf`` for query rows whose key segment is empty, which the #
+# online-softmax merge would turn into a silent wrong result, so those lse are  #
+# rewritten to ``-inf`` (a no-op contribution) before merging. FA2 backward     #
+# already yields zero dq / dk / dv for empty segments.                         #
+# --------------------------------------------------------------------------- #
+def _ring_varlen_forward(group, q, k, v, cu_seqlens_per_rank, max_seqlens, softmax_scale):
+    comm = RingComm(group)
+    out = None
+    lse = None
+    next_kv = None
+
+    for step in range(comm.world_size):
+        if step + 1 != comm.world_size:
+            kv = torch.stack([k, v]).contiguous()
+            next_kv = comm.send_recv(kv)
+            comm.commit()
+
+        src = (comm.rank - step) % comm.world_size
+        block_out, block_lse = _fa_varlen_forward(
+            q,
+            k,
+            v,
+            cu_seqlens_per_rank[comm.rank],
+            cu_seqlens_per_rank[src],
+            max_seqlens[comm.rank],
+            max_seqlens[src],
+            softmax_scale,
+            False,
+        )
+        block_lse = block_lse.masked_fill(block_lse == float("inf"), float("-inf"))
+        if out is None:
+            # Step 0 pairs identical local shards, so every query row has keys.
+            out = block_out.to(torch.float32)
+            lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)  # (h, total) -> (total, h, 1)
+        else:
+            out, lse = _update_out_and_lse_varlen(out, lse, block_out, block_lse)
+
+        if step + 1 != comm.world_size:
+            comm.wait()
+            k, v = next_kv[0], next_kv[1]
+
+    out = out.to(q.dtype)
+    lse = lse.squeeze(dim=-1).transpose(0, 1).contiguous()  # (total, h, 1) -> (h, total)
+    return out, lse
+
+
+def _ring_varlen_backward(group, dout, q, k, v, out, lse, cu_seqlens_per_rank, max_seqlens, softmax_scale):
+    kv_comm = RingComm(group)
+    d_kv_comm = RingComm(group)
+    dq = torch.zeros_like(q, dtype=torch.float32)
+    next_kv = None
+    next_dkv = None
+
+    for step in range(kv_comm.world_size):
+        if step + 1 != kv_comm.world_size:
+            kv = torch.stack([k, v]).contiguous()
+            next_kv = kv_comm.send_recv(kv)
+            kv_comm.commit()
+
+        # ``dkv`` accumulates the grads of the K/V shard held at this step and
+        # travels around the ring with it, returning to its owner after the loop.
+        if step == 0:
+            dkv = torch.zeros((2, *k.shape), dtype=torch.float32, device=k.device)
+        else:
+            d_kv_comm.wait()
+            dkv = next_dkv
+
+        src = (kv_comm.rank - step) % kv_comm.world_size
+        block_dq = torch.empty_like(q)
+        block_dk = torch.empty_like(k)
+        block_dv = torch.empty_like(v)
+        _fa_varlen_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            block_dq,
+            block_dk,
+            block_dv,
+            cu_seqlens_per_rank[kv_comm.rank],
+            cu_seqlens_per_rank[src],
+            max_seqlens[kv_comm.rank],
+            max_seqlens[src],
+            softmax_scale,
+            False,
+        )
+        dq += block_dq
+        dkv[0] += block_dk
+        dkv[1] += block_dv
+
+        if step + 1 != kv_comm.world_size:
+            kv_comm.wait()
+            k, v = next_kv[0], next_kv[1]
+
+        next_dkv = d_kv_comm.send_recv(dkv)
+        d_kv_comm.commit()
+
+    d_kv_comm.wait()
+    return dq.to(q.dtype), next_dkv[0].to(k.dtype), next_dkv[1].to(v.dtype)
+
+
+class _RingVarlenFlashAttn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, group, q, k, v, cu_seqlens_per_rank, softmax_scale):
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** -0.5
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        max_seqlens = [max(end - start for start, end in zip(cu[:-1], cu[1:])) for cu in cu_seqlens_per_rank]
+        # One host-to-device copy per call for every rank's offsets; no device sync.
+        cu_tensor = torch.tensor(cu_seqlens_per_rank, dtype=torch.int32, pin_memory=q.is_cuda)
+        cu_tensor = cu_tensor.to(q.device, non_blocking=True)
+        out, lse = _ring_varlen_forward(group, q, k, v, cu_tensor, max_seqlens, softmax_scale)
+        ctx.save_for_backward(q, k, v, out, lse, cu_tensor)
+        ctx.group = group
+        ctx.max_seqlens = max_seqlens
+        ctx.softmax_scale = softmax_scale
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        q, k, v, out, lse, cu_tensor = ctx.saved_tensors
+        dq, dk, dv = _ring_varlen_backward(
+            ctx.group, dout.contiguous(), q, k, v, out, lse, cu_tensor, ctx.max_seqlens, ctx.softmax_scale
+        )
+        return None, dq, dk, dv, None, None
+
+
+def ring_flash_attn_varlen_func(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_per_rank: Sequence[Sequence[int]],
+    softmax_scale: Optional[float] = None,
+    group: Optional[ProcessGroup] = None,
+) -> Tensor:
+    """Bidirectional packed Ring Attention for CUDA ``(T, H, D)`` tensors (FA2).
+
+    ``cu_seqlens_per_rank[c]`` are the local packed offsets of cp rank ``c``; every rank has the
+    same number of segments (segment ``i`` belongs to the same sequence on every rank, possibly
+    with zero length) and the same total length.
+    """
+    if not _FA_AVAILABLE:
+        raise RuntimeError("ring_flash_attn_varlen_func requires the FlashAttention-2 backend.")
+    if FA_BACKEND != "fa2":
+        raise NotImplementedError(
+            f"bidirectional (ViT) ring attention only supports FlashAttention-2 for now, got {FA_BACKEND!r}"
+        )
+    group = get_context_parallel_group() if group is None else group
+    world_size = dist.get_world_size(group)
+    cu_seqlens_per_rank = [[int(value) for value in cu] for cu in cu_seqlens_per_rank]
+    if len(cu_seqlens_per_rank) != world_size:
+        raise ValueError(f"expected {world_size} cu_seqlens (one per cp rank), got {len(cu_seqlens_per_rank)}")
+    if len({len(cu) for cu in cu_seqlens_per_rank}) != 1 or any(cu[-1] != q.shape[0] for cu in cu_seqlens_per_rank):
+        raise ValueError(
+            "every cp rank's cu_seqlens must have the same number of segments and end at the local "
+            f"length {q.shape[0]}; got {cu_seqlens_per_rank}"
+        )
+    return _RingVarlenFlashAttn.apply(group, q, k, v, cu_seqlens_per_rank, softmax_scale)
+
+
 def forward(
     q: Tensor,
     k: Tensor,
@@ -950,3 +1129,17 @@ def packed_forward(
         causal=causal,
         group=group,
     )
+
+
+def bidirectional_packed_forward(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_per_rank: Sequence[Sequence[int]],
+    softmax_scale: Optional[float] = None,
+    group: Optional[ProcessGroup] = None,
+    dropout_p: float = 0.0,
+) -> Tensor:
+    """Run bidirectional Ring Attention on packed CUDA tensors (one ``cu_seqlens`` per cp rank)."""
+    del dropout_p  # The CUDA Ring backend currently preserves its zero-dropout behavior.
+    return ring_flash_attn_varlen_func(q, k, v, cu_seqlens_per_rank, softmax_scale=softmax_scale, group=group)

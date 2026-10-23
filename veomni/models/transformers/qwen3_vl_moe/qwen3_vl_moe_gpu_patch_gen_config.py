@@ -157,6 +157,32 @@ class _Qwen3VLMoeFakeForPosID(SimpleNamespace):  # noqa: F821 SimpleNamespace de
         return Qwen3VLMoeModel.get_vision_position_ids(self, *args, **kwargs)  # noqa: F821 defined in generated modeling file
 
 
+@config.add_helper
+def _sp_local_router_mask(attention_mask, cu_seq_lens_q):
+    """This rank's rows of the full 2D padding mask, aligned with its router-logit rows.
+
+    The collator pads ``attention_mask`` to the full sequence but never SP-slices it,
+    while every rank's MoE layers route only its own tokens. Under USP (cp>1) those
+    tokens follow the zig-zag layout of ``usp_zigzag_slice``; under Ulysses-only SP
+    they are one contiguous chunk.
+    """
+    ps = get_parallel_state()
+    if not torch.is_tensor(attention_mask) or attention_mask.dim() != 2 or not ps.sp_enabled:
+        return attention_mask
+    if ps.cp_enabled:
+        return usp_zigzag_slice(  # noqa: F821 imported in qwen3_vl's add_post_import_block
+            attention_mask,
+            cu_seq_lens_q.tolist() if cu_seq_lens_q is not None else None,
+            -1,
+            ps.cp_size,
+            ps.cp_rank,
+            ps.ulysses_size,
+            ps.ulysses_rank if ps.ulysses_enabled else 0,
+        )
+    chunk = attention_mask.size(-1) // ps.sp_size
+    return attention_mask.narrow(-1, ps.sp_rank * chunk, chunk)
+
+
 # ================================================================
 # Reused VLM patches from qwen3_vl (name_map rewrites Qwen3VL* -> Qwen3VLMoe*
 # inside the patch bodies so they target the sibling classes).
@@ -325,6 +351,8 @@ class PatchedQwen3VLMoeTextExperts(nn.Module):
 # return statement would silence the MoE load-balancing loss (router
 # collapse) since `Qwen3VLMoeForConditionalGeneration.forward` reads
 # `outputs.router_logits`.
+# Patch.7 (USP cp>1) mirrors the dense forward: keep inputs_embeds zig-zag
+# sliced and index the gathered ViT outputs per rank (_usp_merge_visual_embeds).
 # ================================================================
 @config.override_method(
     "Qwen3VLMoeModel.forward",
@@ -358,6 +386,13 @@ def qwen3_vl_moe_model_forward_patched(
     if inputs_embeds is None:
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
+    # --- Patch.7 ---
+    # USP context parallel (cp>1): text stays zig-zag sliced; visual tokens are
+    # gathered and indexed per rank instead of gathering the full sequence.
+    usp_cp = get_parallel_state().cp_enabled
+    has_visual = pixel_values is not None or pixel_values_videos is not None
+    # --- Patch.7 ---
+
     # --- Patch.2 ---
     image_mask = kwargs.pop("image_mask", None)
     video_mask = kwargs.pop("video_mask", None)
@@ -365,6 +400,13 @@ def qwen3_vl_moe_model_forward_patched(
     # language model. Derived from input_ids below when not supplied.
     mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
     if video_mask is None and image_mask is None:
+        # --- Patch.7 ---
+        if usp_cp and has_visual:
+            raise RuntimeError(
+                "Qwen3VLMoeModel.forward: context parallel (cp_size>1) requires the full image_mask / "
+                "video_mask from the VeOmni data pipeline."
+            )
+        # --- Patch.7 ---
         if get_parallel_state().sp_enabled:
             input_ids_list = [torch.zeros_like(input_ids) for _ in range(get_parallel_state().sp_size)]
             dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
@@ -381,8 +423,18 @@ def qwen3_vl_moe_model_forward_patched(
             flash_attn_kwargs[key] = kwargs.pop(key)
     # --- Patch.3 ---
 
+    # --- Patch.7 ---
+    # Document offsets of the full (padded) text sequence: the placeholder masks
+    # are zig-zag sliced with the same layout the collator used for input_ids.
+    doc_cu_seqlens = None
+    if usp_cp and has_visual:
+        if "cu_seq_lens_q" not in flash_attn_kwargs:
+            raise RuntimeError("Qwen3VLMoeModel.forward: context parallel (cp_size>1) requires cu_seq_lens_q.")
+        doc_cu_seqlens = flash_attn_kwargs["cu_seq_lens_q"].tolist()
+    # --- Patch.7 ---
+
     # --- Patch.1 ---
-    if get_parallel_state().sp_enabled:
+    if get_parallel_state().sp_enabled and not usp_cp:
         inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
     # --- Patch.1 ---
 
@@ -417,39 +469,54 @@ def qwen3_vl_moe_model_forward_patched(
         image_embeds = image_outputs.pooler_output
         deepstack_image_embeds = image_outputs.deepstack_features
 
-        # --- Patch.1 ---
-        if get_parallel_state().sp_enabled:
-            image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
-            deepstack_image_embeds = [
-                gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
-                for embed in deepstack_image_embeds
-            ]
-        # --- Patch.1 ---
+        if usp_cp:
+            # --- Patch.7 ---
+            image_grid_thw_list = image_vit_kwargs["vit_metadata"]["grid_thw_list"]
+            if image_grid_thw_list is None:
+                image_grid_thw_list = image_grid_thw.tolist()
+            inputs_embeds, deepstack_image_embeds, image_mask = _usp_merge_visual_embeds(  # noqa: F821 defined via add_helper
+                inputs_embeds,
+                image_embeds,
+                deepstack_image_embeds,
+                image_mask,
+                image_grid_thw_list,
+                doc_cu_seqlens,
+            )
+            # --- Patch.7 ---
+        else:
+            # --- Patch.1 ---
+            if get_parallel_state().sp_enabled:
+                image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
+                deepstack_image_embeds = [
+                    gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
+                    for embed in deepstack_image_embeds
+                ]
+            # --- Patch.1 ---
 
-        embeds_image_mask = (
-            image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
-        )
-        # `masked_scatter` consumes exactly `image_mask.sum()` leading rows; data collator pads
-        # vision sequence only at the end. No `image_embeds[:n]` slice needed → no
-        # `image_mask.sum().item()` host-device sync. Same for the deepstack list.
-        image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-        inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
+            embeds_image_mask = (
+                image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+            )
+            # `masked_scatter` consumes exactly `image_mask.sum()` leading rows; data collator pads
+            # vision sequence only at the end. No `image_embeds[:n]` slice needed → no
+            # `image_mask.sum().item()` host-device sync. Same for the deepstack list.
+            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 
-        # --- Patch.1 ---
-        if get_parallel_state().sp_enabled:
-            seq_len = image_mask.shape[1]
-            seq_per_rank = seq_len // get_parallel_state().sp_size
-            rank_start = get_parallel_state().sp_rank * seq_per_rank
-            rank_end = rank_start + seq_per_rank
+            # --- Patch.1 ---
+            if get_parallel_state().sp_enabled:
+                seq_len = image_mask.shape[1]
+                seq_per_rank = seq_len // get_parallel_state().sp_size
+                rank_start = get_parallel_state().sp_rank * seq_per_rank
+                rank_end = rank_start + seq_per_rank
 
-            deepstack_offset = image_mask[:, :rank_start].sum().item()
-            image_mask = image_mask[:, rank_start:rank_end]
-            deepstack_len = image_mask.sum().item()
+                deepstack_offset = image_mask[:, :rank_start].sum().item()
+                image_mask = image_mask[:, rank_start:rank_end]
+                deepstack_len = image_mask.sum().item()
 
-            deepstack_image_embeds = [
-                embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_image_embeds
-            ]
-        # --- Patch.1 ---
+                deepstack_image_embeds = [
+                    embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_image_embeds
+                ]
+            # --- Patch.1 ---
 
     elif get_parallel_state().fsdp_enabled:
         # --- Patch.4 ---
@@ -467,38 +534,53 @@ def qwen3_vl_moe_model_forward_patched(
         video_embeds = video_outputs.pooler_output
         deepstack_video_embeds = video_outputs.deepstack_features
 
-        # --- Patch.1 ---
-        if get_parallel_state().sp_enabled:
-            video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
-            deepstack_video_embeds = [
-                gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
-                for embed in deepstack_video_embeds
-            ]
-        # --- Patch.1 ---
+        if usp_cp:
+            # --- Patch.7 ---
+            video_grid_thw_list = video_vit_kwargs["vit_metadata"]["grid_thw_list"]
+            if video_grid_thw_list is None:
+                video_grid_thw_list = video_grid_thw.tolist()
+            inputs_embeds, deepstack_video_embeds, video_mask = _usp_merge_visual_embeds(  # noqa: F821 defined via add_helper
+                inputs_embeds,
+                video_embeds,
+                deepstack_video_embeds,
+                video_mask,
+                video_grid_thw_list,
+                doc_cu_seqlens,
+            )
+            # --- Patch.7 ---
+        else:
+            # --- Patch.1 ---
+            if get_parallel_state().sp_enabled:
+                video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
+                deepstack_video_embeds = [
+                    gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
+                    for embed in deepstack_video_embeds
+                ]
+            # --- Patch.1 ---
 
-        embeds_video_mask = (
-            video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
-        )
-        # Same as image branch above: drop the `[:n_video_tokens]` slice + the
-        # `.item()` sync.
-        video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-        inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
+            embeds_video_mask = (
+                video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+            )
+            # Same as image branch above: drop the `[:n_video_tokens]` slice + the
+            # `.item()` sync.
+            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 
-        # --- Patch.1 ---
-        if get_parallel_state().sp_enabled:
-            seq_len = video_mask.shape[1]
-            seq_per_rank = seq_len // get_parallel_state().sp_size
-            rank_start = get_parallel_state().sp_rank * seq_per_rank
-            rank_end = rank_start + seq_per_rank
+            # --- Patch.1 ---
+            if get_parallel_state().sp_enabled:
+                seq_len = video_mask.shape[1]
+                seq_per_rank = seq_len // get_parallel_state().sp_size
+                rank_start = get_parallel_state().sp_rank * seq_per_rank
+                rank_end = rank_start + seq_per_rank
 
-            deepstack_offset = video_mask[:, :rank_start].sum().item()
-            video_mask = video_mask[:, rank_start:rank_end]
-            deepstack_len = video_mask.sum().item()
+                deepstack_offset = video_mask[:, :rank_start].sum().item()
+                video_mask = video_mask[:, rank_start:rank_end]
+                deepstack_len = video_mask.sum().item()
 
-            deepstack_video_embeds = [
-                embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_video_embeds
-            ]
-        # --- Patch.1 ---
+                deepstack_video_embeds = [
+                    embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_video_embeds
+                ]
+            # --- Patch.1 ---
 
     elif get_parallel_state().fsdp_enabled:
         # --- Patch.4 ---
@@ -510,7 +592,7 @@ def qwen3_vl_moe_model_forward_patched(
         # --- Patch.4 ---
 
     # --- Patch.1 ---
-    if get_parallel_state().sp_enabled:
+    if get_parallel_state().sp_enabled and not usp_cp:
         inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
 
     # --- Patch.1 ---
@@ -524,7 +606,10 @@ def qwen3_vl_moe_model_forward_patched(
         image_mask_joint = image_mask[visual_pos_masks]
         video_mask_joint = video_mask[visual_pos_masks]
         for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds):
-            embed_joint = img_embed.new_zeros(visual_pos_masks.sum(), img_embed.shape[-1]).to(img_embed.device)
+            # Sum of the shapes instead of visual_pos_masks.sum(): same value, no host-device sync.
+            embed_joint = img_embed.new_zeros(img_embed.shape[0] + vid_embed.shape[0], img_embed.shape[-1]).to(
+                img_embed.device
+            )
             embed_joint[image_mask_joint, :] = img_embed
             embed_joint[video_mask_joint, :] = vid_embed
             deepstack_visual_embeds.append(embed_joint)
@@ -614,7 +699,9 @@ def qwen3_vl_moe_model_forward_patched(
 #    materializing full-vocab logits when labels is provided
 # 2. compute MoE aux_loss via upstream `load_balancing_loss_func` when
 #    `output_router_logits=True`; read config from `config.text_config`
-#    since the VLM top-level wraps a nested text config
+#    since the VLM top-level wraps a nested text config. Under SP the router
+#    logits cover only this rank's tokens, so the padding mask is sliced to
+#    the same rows (_sp_local_router_mask)
 # ================================================================
 @config.override_method(
     "Qwen3VLMoeForConditionalGeneration.forward",
@@ -698,20 +785,21 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
     # --- Patch.2 ---
     aux_loss = None
     if kwargs.get("output_router_logits", False):
+        router_mask = _sp_local_router_mask(attention_mask, kwargs.get("cu_seq_lens_q"))  # noqa: F821 defined via add_helper
         # Modification: OpSlot guard for load-balancing loss.
         if veomni_load_balancing_loss.use_non_eager_impl:
             aux_loss = veomni_load_balancing_loss(
                 outputs.router_logits,
                 self.config.text_config.num_experts,
                 self.config.text_config.num_experts_per_tok,
-                attention_mask,
+                router_mask,
             )
         else:
             aux_loss = load_balancing_loss_func(
                 outputs.router_logits,
                 self.config.text_config.num_experts,
                 self.config.text_config.num_experts_per_tok,
-                attention_mask,
+                router_mask,
             )
         if labels is not None and isinstance(aux_loss, torch.Tensor):
             loss = loss + self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)

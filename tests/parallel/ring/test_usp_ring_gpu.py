@@ -23,7 +23,11 @@ auto-selected via ``._ref``):
   * ``ZigzagRingVarlenWorld{2,4}Test`` — packed/varlen zig-zag ring vs full
     packed causal attention (world 2 and 4).
   * ``USPAttentionE2ETest`` — the real attention op (Ulysses all-to-all + ring)
-    for both dense and varlen, sharded cp-outer / ulysses-inner (world 4).
+    for both dense and varlen, sharded cp-outer / ulysses-inner (world 4), plus
+    the bidirectional ViT path sharded with ``vit_usp_slice``.
+  * ``test_fa2_varlen_zero_length_segments`` / ``BidirectionalRingVarlenWorld{2,4}Test``
+    — FA2 behaviour on empty varlen segments and the bidirectional (ViT) packed
+    ring against full bidirectional varlen attention (FA2 only).
 
 Each test skips unless enough GPUs and a flash-attn backend are available.
 """
@@ -48,13 +52,17 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.common_utils import run_tests
 
+import veomni.distributed.sequence_parallel.ring_attention.gpu as ring_gpu
 from veomni.distributed import parallel_state as PS
 from veomni.distributed.sequence_parallel.ring_attention import (
+    ring_flash_attn_varlen_func,
     zigzag_ring_flash_attn_func,
     zigzag_ring_flash_attn_varlen_func,
 )
 from veomni.distributed.sequence_parallel.ring_attention.layout import (
     local_cu_seqlens,
+    vit_cp_cu_seqlens,
+    vit_usp_slice,
     zigzag_reorder,
     zigzag_reorder_packed,
 )
@@ -66,6 +74,11 @@ from ._ref import FA_OK as _FA_OK
 
 ULYSSES = 2
 CP = 2
+# Bidirectional (ViT) ring attention is FlashAttention-2 only for now.
+_FA2_OK = ring_gpu.FA_BACKEND == "fa2"
+# vit seq lengths (multiples of the merger unit 4); two seqs have fewer merger units
+# than ranks, so some ranks hold empty shards in the middle of their cu_seqlens.
+_VIT_SEQLENS = [4, 360, 8, 124]
 
 
 # ── dense zig-zag ring attention ──────────────────────────────────────────────
@@ -240,6 +253,104 @@ class ZigzagRingVarlenWorld4Test(_ZigzagRingVarlenTest):
             self._run_case(check_repeatability=True)
 
 
+# ── bidirectional (ViT) packed ring, FA2 ──────────────────────────────
+@pytest.mark.skipif(not _FA2_OK, reason="FlashAttention-2 is required")
+@pytest.mark.skipif(get_torch_device().device_count() < 1, reason="a GPU is required")
+def test_fa2_varlen_zero_length_segments():
+    """Pin the FA2 contract the bidirectional ring relies on for empty shards."""
+    dev = get_device_type()
+    heads, dim = 4, 72  # Qwen3-VL ViT head_dim
+    scale = dim**-0.5
+    # seg0: empty Q, 4 K rows | seg1: 8 Q rows, empty K | seg2: 4 Q rows, 8 K rows
+    cu_q = torch.tensor([0, 0, 8, 12], dtype=torch.int32, device=dev)
+    cu_k = torch.tensor([0, 4, 4, 12], dtype=torch.int32, device=dev)
+    q, k, v, dout = (torch.randn(12, heads, dim, device=dev, dtype=torch.bfloat16) for _ in range(4))
+
+    out, lse = ring_gpu._fa_varlen_forward(q, k, v, cu_q, cu_k, 8, 8, scale, False)
+    assert torch.isfinite(out).all()
+    assert (out[0:8] == 0).all()
+    # Rows without keys report an infinite lse (+inf on the non-split path); the ring
+    # rewrites +inf to -inf before merging.
+    assert torch.isinf(lse[:, 0:8]).all()
+    scores = torch.einsum("qnd,knd->nqk", q[8:12].float(), k[4:12].float()) * scale
+    expected = torch.einsum("nqk,knd->qnd", torch.softmax(scores, -1), v[4:12].float()).to(out.dtype)
+    torch.testing.assert_close(out[8:12], expected, atol=2e-2, rtol=2e-2)
+
+    # Backward receives the merged (finite) lse from the ring.
+    merged_lse = lse.clone()
+    merged_lse[:, 0:8] = 0.0
+    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    ring_gpu._fa_varlen_backward(dout, q, k, v, out, merged_lse, dq, dk, dv, cu_q, cu_k, 8, 8, scale, False)
+    for grad in (dq, dk, dv):
+        assert torch.isfinite(grad).all()
+    assert (dq[0:8] == 0).all(), "queries without keys must get zero dq"
+    assert (dk[0:4] == 0).all() and (dv[0:4] == 0).all(), "keys without queries must get zero dk/dv"
+
+
+class _BidirectionalRingVarlenTest(MultiProcessTestCase):
+    def setUp(self):
+        super().setUp()
+        self._spawn_processes()
+
+    def _run_case(self):
+        store = dist.FileStore(self.file_name, self.world_size)
+        get_torch_device().set_device(self.rank)
+        c10d.init_process_group(get_dist_comm_backend(), store=store, rank=self.rank, world_size=self.world_size)
+        world = self.world_size
+        dev = torch.device(f"{get_device_type()}:{self.rank}")
+        h, d = 4, 72
+        total = sum(_VIT_SEQLENS)
+        scale = d**-0.5
+        global_cu = [0, *torch.tensor(_VIT_SEQLENS).cumsum(0).tolist()]
+
+        torch.manual_seed(0)
+        q, k, v, g = (torch.randn(total, h, d, device=dev, dtype=torch.bfloat16) for _ in range(4))
+        for t in (q, k, v, g):
+            dist.broadcast(t, 0)
+
+        qf, kf, vf = (t.clone().requires_grad_(True) for t in (q, k, v))
+        cu_dev = torch.tensor(global_cu, device=dev, dtype=torch.int32)
+        ref = ref_attn_varlen_func(qf, kf, vf, cu_dev, max(_VIT_SEQLENS), scale, causal=False)
+        ref.backward(g)
+
+        def shard(t, pad_value=0):
+            return vit_usp_slice(t, _VIT_SEQLENS, 0, world, self.rank, 1, 0, pad_value=pad_value)
+
+        cu_per_rank = [vit_cp_cu_seqlens(global_cu, world, c, 1) for c in range(world)]
+        lq, lk, lv = (shard(t).requires_grad_(True) for t in (q, k, v))
+        out = ring_flash_attn_varlen_func(lq, lk, lv, cu_per_rank, softmax_scale=scale, group=dist.group.WORLD)
+        out.backward(shard(g))
+
+        rows = shard(torch.arange(total, device=dev), pad_value=-1)
+        real = rows >= 0
+        torch.testing.assert_close(out[real], ref.detach()[rows[real]], atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(lq.grad[real], qf.grad[rows[real]], atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(lk.grad[real], kf.grad[rows[real]], atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(lv.grad[real], vf.grad[rows[real]], atol=3e-2, rtol=3e-2)
+
+
+class BidirectionalRingVarlenWorld2Test(_BidirectionalRingVarlenTest):
+    @property
+    def world_size(self):
+        return 2
+
+    @pytest.mark.skipif(not _FA2_OK, reason="FlashAttention-2 is required")
+    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
+    def test_bidirectional_ring_matches_full(self):
+        self._run_case()
+
+
+class BidirectionalRingVarlenWorld4Test(_BidirectionalRingVarlenTest):
+    @property
+    def world_size(self):
+        return 4
+
+    @pytest.mark.skipif(not _FA2_OK, reason="FlashAttention-2 is required")
+    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    def test_bidirectional_ring_matches_full(self):
+        self._run_case()
+
+
 # ── op-level USP end-to-end (Ulysses all-to-all + ring) ───────────────
 class _AttnModule(torch.nn.Module):
     """Minimal module exposing the attributes flash_attention_forward reads."""
@@ -401,6 +512,52 @@ class USPAttentionE2ETest(MultiProcessTestCase):
         )
         ref_local = self._usp_slice_varlen(ref, cu, mesh)
         torch.testing.assert_close(out, ref_local, atol=2e-2, rtol=2e-2)
+
+    @pytest.mark.skipif(not _FA2_OK, reason="FlashAttention-2 is required")
+    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    def test_usp_bidirectional_vit_matches_full(self):
+        from veomni.ops.kernels.attention import flash_attention_forward
+
+        state, mesh = self._init()
+        dev = get_device_type()
+        cp_rank, uly_rank = mesh.get_local_rank("cp"), mesh.get_local_rank("ulysses")
+        h, d = 4, 72
+        total = sum(_VIT_SEQLENS)
+        scale = d**-0.5
+        global_cu = [0, *torch.tensor(_VIT_SEQLENS).cumsum(0).tolist()]
+        q, k, v = (torch.randn(1, h, total, d, device=dev, dtype=torch.bfloat16) for _ in range(3))
+        for t in (q, k, v):
+            dist.broadcast(t, 0)
+
+        ref = ref_attn_varlen_func(
+            *(t.transpose(1, 2).reshape(total, h, d).contiguous() for t in (q, k, v)),
+            torch.tensor(global_cu, device=dev, dtype=torch.int32),
+            max(_VIT_SEQLENS),
+            scale,
+            causal=False,
+        )
+
+        def shard(full, dim, pad_value=0):
+            return vit_usp_slice(full, _VIT_SEQLENS, dim, CP, cp_rank, ULYSSES, uly_rank, pad_value=pad_value)
+
+        module = _AttnModule().to(dev)
+        module.is_causal = False
+        # The Qwen3-VL ViT keeps the global vit cu_seqlens on the host under cp>1.
+        host_cu = torch.tensor(global_cu, dtype=torch.int32)
+        out, _ = flash_attention_forward(
+            module,
+            shard(q, 2),
+            shard(k, 2),
+            shard(v, 2),
+            attention_mask=None,
+            scaling=scale,
+            cu_seq_lens_q=host_cu,
+            cu_seq_lens_k=host_cu,
+            is_causal=False,
+        )
+        rows = shard(torch.arange(total, device=dev), 0, pad_value=-1)
+        real = rows >= 0
+        torch.testing.assert_close(out.squeeze(0)[real], ref[rows[real]], atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":
