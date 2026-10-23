@@ -438,8 +438,8 @@ class LladaUniTextEncoder(TextEncoder):
                 for it in (conversation_list or [])
                 if it.type == "text" and it.role in ("user", "human", None)
             ).strip()
-        gh = (int(gk.get("image_h", 512)) // 2) // 16
-        gw = (int(gk.get("image_w", 512)) // 2) // 16
+        gh = (int(gk.get("image_h", 1024)) // 2) // 16
+        gw = (int(gk.get("image_w", 1024)) // 2) // 16
         n = gh * gw
 
         def t(s: str) -> List[int]:

@@ -21,3 +21,11 @@ llada2_uni_llm:
   accelerator:
     fsdp_config:
       fsdp_mode: eager
+
+llada2_uni_decoder:
+  model_path: llada2_uni_decoder
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: eager

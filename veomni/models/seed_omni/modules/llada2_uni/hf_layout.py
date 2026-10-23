@@ -25,6 +25,7 @@ from typing import Any
 from veomni.models.transformers.llada2_uni.configuration_llada2_uni import LLaDA2UniConfig
 
 from ...utils.hf_layout import OMNI_HF_LAYOUT_REGISTRY, OmniHFLayout, OmniHFModuleLayout
+from .decoder.configuration import LladaUniDecoderConfig
 from .image_tokenizer.configuration import LladaUniImageTokenizerConfig
 from .image_tokenizer.processing import LladaUniImageProcessor
 from .llm.configuration import LladaUniLlmConfig
@@ -39,6 +40,12 @@ def _load_tokenizer(model_path: str) -> dict[str, Any]:
 
 def _load_image_processor(model_path: str) -> dict[str, Any]:
     return {"image_processor": LladaUniImageProcessor.from_pretrained(model_path)}
+
+
+def _load_llada2_uni_config(model_path: str) -> LLaDA2UniConfig:
+    cfg = LLaDA2UniConfig.from_pretrained(model_path)
+    cfg._name_or_path = str(model_path)
+    return cfg
 
 
 LLADA2_UNI_HF_LAYOUT = OmniHFLayout(
@@ -75,12 +82,19 @@ LLADA2_UNI_HF_LAYOUT = OmniHFLayout(
             key_prefixes=(("model.", "language_model."),),
             build_config=lambda hf: LladaUniLlmConfig(text_config=hf.to_dict()),
         ),
+        "llada2_uni_decoder": OmniHFModuleLayout(
+            key_prefixes=(),
+            build_config=lambda hf: LladaUniDecoderConfig(
+                image_token_offset=hf.image_token_offset,
+                asset_dir=getattr(hf, "_name_or_path", None) or None,
+            ),
+        ),
     },
     graph_dir="configs/seed_omni/Llada2_uni/llada2_uni_16b",
     training_graphs="graph_train.yaml",
     generation_graphs="graph_infer.yaml",
     infer_type="infer_und",
-    load_hf_config=LLaDA2UniConfig.from_pretrained,
+    load_hf_config=_load_llada2_uni_config,
 )
 
 

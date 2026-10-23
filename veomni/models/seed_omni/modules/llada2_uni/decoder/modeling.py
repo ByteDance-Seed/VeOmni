@@ -20,7 +20,6 @@ import os
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
-import torch.nn as nn
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....utils.conversation import ConversationItem
@@ -80,8 +79,10 @@ class LladaUniDecoder(InferenceMixin, PretrainedOmniModule):
     def __init__(self, config: LladaUniDecoderConfig):
         super().__init__(config)
         self.config = config
-        self._anchor = nn.Parameter(torch.zeros(1), requires_grad=False)
-        self._asset_dir: Optional[str] = getattr(config, "_name_or_path", None) or None
+        self.register_buffer("_anchor", torch.zeros(1), persistent=False)
+        self._asset_dir: Optional[str] = (
+            getattr(config, "asset_dir", None) or getattr(config, "_name_or_path", None) or None
+        )
         self._custom_decode_fn: Optional[Callable[..., Any]] = None
         self.post_init()
 
@@ -96,15 +97,33 @@ class LladaUniDecoder(InferenceMixin, PretrainedOmniModule):
         self._asset_dir = path
 
     def _resolve_asset_dir(self) -> str:
-        asset_dir = self._asset_dir or getattr(self.config, "_name_or_path", None)
-        if not asset_dir or not os.path.isdir(os.path.join(asset_dir, "decoder")):
-            raise RuntimeError(
-                "LladaUniDecoder: cannot find decoder assets. Expected a directory containing "
-                "`decoder/`, `vae/`, `image_tokenizer/sigvq_embedding.pt` "
-                f"(got asset_dir={asset_dir!r}). Run the convert step and load the module from that dir, "
-                "or call `module.set_asset_dir(path)`."
-            )
-        return asset_dir
+        from ....utils.hf_layout import read_hf_source
+
+        candidates: List[str] = []
+        if self._asset_dir:
+            candidates.append(str(self._asset_dir))
+        cfg_asset_dir = getattr(self.config, "asset_dir", None)
+        if cfg_asset_dir:
+            candidates.append(str(cfg_asset_dir))
+        name_or_path = getattr(self.config, "_name_or_path", None)
+        if name_or_path:
+            path_str = str(name_or_path)
+            candidates.append(path_str)
+            parent = os.path.dirname(path_str)
+            if parent:
+                candidates.append(parent)
+                source = read_hf_source(parent) or read_hf_source(path_str)
+                if source is not None:
+                    candidates.append(source.path)
+        for candidate in candidates:
+            if candidate and os.path.isdir(os.path.join(candidate, "decoder")):
+                return candidate
+        raise RuntimeError(
+            "LladaUniDecoder: cannot find decoder assets. Expected a directory containing "
+            "`decoder/`, `vae/`, `image_tokenizer/sigvq_embedding.pt` "
+            f"(got asset_dir={self._asset_dir!r}, _name_or_path={name_or_path!r}). "
+            "Run the convert step and load the module from that dir, or call `module.set_asset_dir(path)`."
+        )
 
     @torch.inference_mode()
     def decode(self, vq_token_ids, h: int, w: int) -> Dict[str, Any]:
@@ -117,18 +136,29 @@ class LladaUniDecoder(InferenceMixin, PretrainedOmniModule):
             image = self._custom_decode_fn(codes, int(h), int(w))
             return {"image": image}
 
+        asset_dir = self._resolve_asset_dir()
+
+        import torch.distributed as dist
+        from PIL import Image
+
+        if dist.is_initialized() and dist.get_rank() != 0:
+            dist.barrier()
+            return {"image": Image.new("RGB", (int(w) * 16, int(h) * 16))}
+
         from veomni.models.transformers.llada2_uni_decoder import decode_vq_tokens
 
         image = decode_vq_tokens(
             codes,
             int(h),
             int(w),
-            self._resolve_asset_dir(),
+            asset_dir,
             self.device,
             resolution_multiplier=int(self.config.resolution_multiplier),
             num_steps=int(self.config.decoder_num_steps),
             decode_mode=str(self.config.decode_mode),
         )
+        if dist.is_initialized():
+            dist.barrier()
         return {"image": image}
 
     def forward(self, **kwargs) -> Dict[str, Any]:  # type: ignore[override]

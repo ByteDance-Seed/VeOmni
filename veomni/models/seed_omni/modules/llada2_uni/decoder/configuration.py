@@ -28,6 +28,7 @@ class LladaUniDecoderConfig(OmniModuleConfig):
         resolution_multiplier: int = 2,
         decoder_num_steps: int = 50,
         decode_mode: str = "normal",
+        asset_dir: str | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -35,6 +36,7 @@ class LladaUniDecoderConfig(OmniModuleConfig):
         self.resolution_multiplier = resolution_multiplier
         self.decoder_num_steps = decoder_num_steps
         self.decode_mode = decode_mode
+        self.asset_dir = asset_dir
 
 
 __all__ = ["LladaUniDecoderConfig"]
