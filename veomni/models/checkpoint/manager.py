@@ -89,7 +89,9 @@ class ModelCheckpointManager:
             ckpt_manager=self.config.manager,
             dist_backend=runtime.args.accelerator.fsdp_config.fsdp_mode,
         )
-        if self.config.save_hf_weights and not self.trainable_only:
+        if getattr(self.config, "save_hf_weights", False) and not bool(
+            getattr(self.runtime.args, "lora_config", None)
+        ):
             from .convert import get_checkpoint_tensor_converter
 
             model = getattr(runtime, "model", None)
