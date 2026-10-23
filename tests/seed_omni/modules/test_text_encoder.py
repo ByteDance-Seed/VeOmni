@@ -303,3 +303,40 @@ def test_text_encoder_tied_head_projects_through_sharded_embedding():
     logits = text_encoder._project(embeds)
     expected = F.linear(embeds, text_encoder.embed_tokens.weight)
     torch.testing.assert_close(logits, expected)
+
+
+def test_text_encoder_ddp_allowed_when_ep_enabled_and_emb_disabled(monkeypatch):
+    """A DDP TextEncoder with ``emb=1`` must not be rejected when the job mesh enables ``ep>1``."""
+    from veomni.distributed import torch_parallelize
+
+    AccTextEncoder = _accelerated_model_cls("text_encoder")
+    TextEncoderCfg = _config_cls("text_encoder")
+    te = AccTextEncoder(TextEncoderCfg(vocab_size=_VOCAB, hidden_size=_HIDDEN, tie_word_embeddings=False))
+    monkeypatch.setattr(torch_parallelize, "DDP", lambda module, **kwargs: module)
+
+    monkeypatch.setattr(
+        torch_parallelize,
+        "get_parallel_state",
+        lambda: SimpleNamespace(
+            local_rank=0,
+            dp_group=None,
+            any_extra_parallel_enabled=True,
+            extra_parallel_sizes={"ep": 4, "emb": 1},
+            extra_parallel_enabled=lambda para: para == "ep",
+        ),
+    )
+    assert torch_parallelize.parallelize_model_ddp(te) is te
+
+    monkeypatch.setattr(
+        torch_parallelize,
+        "get_parallel_state",
+        lambda: SimpleNamespace(
+            local_rank=0,
+            dp_group=None,
+            any_extra_parallel_enabled=True,
+            extra_parallel_sizes={"ep": 1, "emb": 2},
+            extra_parallel_enabled=lambda para: para == "emb",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="requires fsdp_mode='fsdp2'"):
+        torch_parallelize.parallelize_model_ddp(te)
