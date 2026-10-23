@@ -1173,14 +1173,23 @@ class TestDeepseekV4ConverterFactoryAndMapping:
             "layers.0.mlp.experts.down_proj": 3,
         }
 
-    def test_fqn_mapping_converts_mtp_keys_by_default_and_preserves_when_disabled(self):
+    def test_fqn_mapping_preserves_mtp_keys(self):
         mapping = {
             "mtp.0.attn.wkv.weight": 0,
             "model.mtp.0.attn.wkv.weight": 1,
         }
 
-        assert convert_deepseek_v4_fqn_to_index_mapping(mapping, enable_mtp=False) == mapping
-        assert convert_deepseek_v4_fqn_to_index_mapping(mapping) == {
+        assert convert_deepseek_v4_fqn_to_index_mapping(mapping) == mapping
+        assert convert_deepseek_v4_fqn_to_index_mapping(mapping, enable_mtp=True) == {
+            "model.mtp.0.self_attn.kv_proj.weight": 1,
+        }
+        assert (
+            convert_deepseek_v4_fqn_to_index_mapping(mapping, model=SimpleNamespace(model=SimpleNamespace(mtp=[])))
+            == mapping
+        )
+        assert convert_deepseek_v4_fqn_to_index_mapping(
+            mapping, model=SimpleNamespace(model=SimpleNamespace(mtp=[object()]))
+        ) == {
             "model.mtp.0.self_attn.kv_proj.weight": 1,
         }
 
@@ -1260,6 +1269,12 @@ class TestDeepseekV4ConverterFactoryAndMapping:
         assert converter.enable_mtp is True
         assert converter.num_experts == 8
         assert converter.mtp_num_experts == 4
+
+        local = converter.for_expert_range(4, 4, mtp_start=2, mtp_num_local=2)
+        assert (local.expert_offset, local.num_experts) == (4, 4)
+        assert (local.mtp_expert_offset, local.mtp_num_experts) == (2, 2)
+        with pytest.raises(ValueError, match=r"expert 1 is outside this converter's range \[2, 4\)"):
+            local.convert("mtp.0.ffn.experts.1.w1.weight", torch.zeros(INTERMEDIATE_DIM, HIDDEN_DIM))
 
 
 # ---------------------------------------------------------------------------

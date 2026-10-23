@@ -253,10 +253,12 @@ class DeepseekV4CheckpointTensorConverter:
         target_model_prefix: str = "model.",
         enable_mtp: bool = False,
         mtp_num_experts: int | None = None,
+        mtp_expert_offset: int | None = None,
     ):
         self.num_experts = num_experts
         self.mtp_num_experts = num_experts if mtp_num_experts is None else mtp_num_experts
         self.expert_offset = expert_offset
+        self.mtp_expert_offset = expert_offset if mtp_expert_offset is None else mtp_expert_offset
         self.target_model_prefix = target_model_prefix
         self.enable_mtp = enable_mtp
         # {(prefix, proj_name): {local_expert_id: tensor}}
@@ -273,8 +275,10 @@ class DeepseekV4CheckpointTensorConverter:
             enable_mtp=self.enable_mtp,
         )
 
-    def _expected_experts_for_prefix(self, prefix: str) -> int:
-        return self.mtp_num_experts if _is_mtp_expert_prefix(prefix) else self.num_experts
+    def _expert_range_for_prefix(self, prefix: str) -> tuple[int, int]:
+        if _is_mtp_expert_prefix(prefix):
+            return self.mtp_expert_offset, self.mtp_num_experts
+        return self.expert_offset, self.num_experts
 
     def can_handle(self, name: str) -> bool:
         if _is_mtp_checkpoint_key(name) and not self.enable_mtp:
@@ -306,18 +310,51 @@ class DeepseekV4CheckpointTensorConverter:
         fused_proj = "down_proj" if proj_name == "down_proj" else "gate_up_proj"
         return f"{prefix}.experts.{fused_proj}", int(expert_id_str)
 
-    def for_expert_range(self, start: int, num_local: int) -> DeepseekV4CheckpointTensorConverter:
-        max_experts = max(self.num_experts, self.mtp_num_experts) if self.enable_mtp else self.num_experts
-        if start < 0 or num_local <= 0 or start + num_local > max_experts:
+    def for_expert_range(
+        self,
+        start: int,
+        num_local: int,
+        *,
+        mtp_start: int | None = None,
+        mtp_num_local: int | None = None,
+    ) -> DeepseekV4CheckpointTensorConverter:
+        if mtp_start is None and mtp_num_local is None:
+            max_experts = max(self.num_experts, self.mtp_num_experts) if self.enable_mtp else self.num_experts
+            if start < 0 or num_local <= 0 or start + num_local > max_experts:
+                raise ValueError(
+                    f"Expert range [{start}, {start + num_local}) is outside this converter's {max_experts} experts."
+                )
+            return DeepseekV4CheckpointTensorConverter(
+                num_experts=num_local,
+                expert_offset=self.expert_offset + start,
+                target_model_prefix=self.target_model_prefix,
+                enable_mtp=self.enable_mtp,
+                mtp_num_experts=num_local,
+                mtp_expert_offset=self.mtp_expert_offset + start,
+            )
+
+        resolved_mtp_start = start if mtp_start is None else mtp_start
+        resolved_mtp_local = num_local if mtp_num_local is None else mtp_num_local
+        if start < 0 or num_local <= 0 or start + num_local > self.num_experts:
             raise ValueError(
-                f"Expert range [{start}, {start + num_local}) is outside this converter's {max_experts} experts."
+                f"Expert range [{start}, {start + num_local}) is outside this converter's {self.num_experts} experts."
+            )
+        if self.enable_mtp and (
+            resolved_mtp_start < 0
+            or resolved_mtp_local <= 0
+            or resolved_mtp_start + resolved_mtp_local > self.mtp_num_experts
+        ):
+            raise ValueError(
+                f"MTP expert range [{resolved_mtp_start}, {resolved_mtp_start + resolved_mtp_local}) "
+                f"is outside this converter's {self.mtp_num_experts} MTP experts."
             )
         return DeepseekV4CheckpointTensorConverter(
             num_experts=num_local,
             expert_offset=self.expert_offset + start,
             target_model_prefix=self.target_model_prefix,
             enable_mtp=self.enable_mtp,
-            mtp_num_experts=num_local,
+            mtp_num_experts=resolved_mtp_local,
+            mtp_expert_offset=self.mtp_expert_offset + resolved_mtp_start,
         )
 
     def convert(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
@@ -371,12 +408,12 @@ class DeepseekV4CheckpointTensorConverter:
 
         prefix, expert_id_str, proj_name = match.groups()
         proj_name = _PROJ_NAME_ALIASES.get(proj_name, proj_name)
-        expected_experts = self._expected_experts_for_prefix(prefix)
-        expert_id = int(expert_id_str) - self.expert_offset
+        expert_offset, expected_experts = self._expert_range_for_prefix(prefix)
+        expert_id = int(expert_id_str) - expert_offset
         if not 0 <= expert_id < expected_experts:
             raise ValueError(
                 f"{name}: expert {int(expert_id_str)} is outside this converter's range "
-                f"[{self.expert_offset}, {self.expert_offset + expected_experts})."
+                f"[{expert_offset}, {expert_offset + expected_experts})."
             )
         buf_key = (prefix, proj_name)
 
@@ -531,9 +568,17 @@ def convert_deepseek_v4_fqn_to_index_mapping(
     fqn_to_index_mapping: dict[str, int],
     *,
     target_model_prefix: str = "model.",
-    enable_mtp: bool = True,
+    enable_mtp: bool | None = None,
+    model: object | None = None,
 ) -> dict[str, int]:
     """Align HF safetensors index keys with fused expert parameter names."""
+    if enable_mtp is None:
+        if model is not None:
+            base_model = getattr(model, "model", model)
+            mtp_modules = getattr(base_model, "mtp", None)
+            enable_mtp = bool(mtp_modules is not None and len(mtp_modules) > 0)
+        else:
+            enable_mtp = False
     gate_up_shard_indices: dict[str, list[int]] = defaultdict(list)
     down_shard_indices: dict[str, list[int]] = defaultdict(list)
     converted: dict[str, int] = {}

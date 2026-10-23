@@ -61,10 +61,15 @@ class DeepseekV4Config(_DeepseekV4Config):
     mtp_loss_coef: float = 1.0
     freeze_mtp: bool = False
 
+    def __new__(cls, *args, **kwargs):
+        instance = super().__new__(cls)
+        object.__setattr__(instance, "_explicit_num_nextn_predict_layers", "num_nextn_predict_layers" in kwargs)
+        return instance
+
     def __post_init__(self, **kwargs):
+        explicit_num_nextn = bool(self.__dict__.pop("_explicit_num_nextn_predict_layers", False))
         legacy_compress_ratios = kwargs.get("compress_ratios")
         legacy_n_mtp_layers = kwargs.pop("n_mtp_layers", None)
-        explicit_num_nextn = "num_nextn_predict_layers" in kwargs
         super().__post_init__(**kwargs)
         if legacy_n_mtp_layers is not None:
             self.num_nextn_predict_layers = legacy_n_mtp_layers

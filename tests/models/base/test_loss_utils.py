@@ -395,7 +395,8 @@ def test_seqcls_validates_required_inputs(monkeypatch, kwargs, message):
         ForSequenceClassificationLoss(**kwargs)
 
 
-def test_chunk_loss_logits_bias_matches_reference_loss_and_grads(monkeypatch):
+@pytest.mark.parametrize("impl", ["chunk_loss", "eager", None])
+def test_chunk_loss_logits_bias_matches_reference_loss_and_grads(monkeypatch, impl):
     monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
     torch.manual_seed(42)
     shift_labels = torch.tensor([[IGNORE_INDEX, 2, 5, IGNORE_INDEX, 7, 1, 9]], dtype=torch.long)
@@ -410,7 +411,7 @@ def test_chunk_loss_logits_bias_matches_reference_loss_and_grads(monkeypatch):
     expected = fixed_cross_entropy(logits_ref, shift_labels.reshape(-1), ignore_index=IGNORE_INDEX)
     expected.backward()
 
-    op = VeomniOp("cross_entropy_loss", "standard", "chunk_loss")
+    op = None if impl is None else VeomniOp("cross_entropy_loss", "standard", impl)
     loss, out_logits, aux = ForCausalLMLoss(
         logits=None,
         labels=None,
@@ -473,7 +474,7 @@ def test_logits_bias_rejects_unsupported_op_and_mismatched_rows(monkeypatch):
             weights=weight,
             labels=labels,
             logits_bias=bias,
-            op=VeomniOp("cross_entropy_loss", "standard", "eager"),
+            op=SimpleNamespace(impl="liger_kernel"),
         )
 
     with pytest.raises(ValueError, match="logits_bias rows"):

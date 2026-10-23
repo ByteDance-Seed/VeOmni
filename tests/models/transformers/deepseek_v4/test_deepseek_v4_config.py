@@ -157,6 +157,20 @@ def test_dspark_mtp_config_fields_and_defaults():
     assert custom.num_nextn_predict_layers == 3
     assert custom.moe_config_for_layer(4) == (2, 1)
 
+    explicit_zero = DeepseekV4Config(
+        num_hidden_layers=4,
+        compress_ratios=[0, 0, 4, 128, 0, 0, 0],
+        num_nextn_predict_layers=0,
+    )
+    assert explicit_zero.num_nextn_predict_layers == 0
+
+    explicit_one = DeepseekV4Config(
+        num_hidden_layers=4,
+        compress_ratios=[0, 0, 4, 128, 0, 0, 0],
+        num_nextn_predict_layers=1,
+    )
+    assert explicit_one.num_nextn_predict_layers == 1
+
     # Verify from_dict override where dspark_block_size is passed as a kwarg override
     # while compress_ratios is in the base dict (simulating YAML model_config override).
     from_dict_cfg = DeepseekV4Config.from_dict(

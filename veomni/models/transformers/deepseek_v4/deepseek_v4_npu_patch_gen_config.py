@@ -208,7 +208,7 @@ config.replace_class(
 config.override_method(
     "DeepseekV4ForCausalLM.__init__",
     replacement=deepseek_v4_forcausallm_init_patched,
-    description="Bind ForCausalLMLoss, DSpark MTP chunk_loss, and load_balancing_loss VeomniOps",
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 config.override_method(
     "DeepseekV4SparseMoeBlock.__init__",

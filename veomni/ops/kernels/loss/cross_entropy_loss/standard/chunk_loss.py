@@ -64,9 +64,9 @@ def forward(
     ``requires_grad`` and the caller's ``is_grad_enabled()``.
 
     When ``logits_bias`` is provided (shaped ``hidden.shape[:-1] + (V,)``),
-    only supervised rows (``labels != ignore_index``) are projected,
-    ``chunk_size`` rows at a time, adding ``logits_bias`` to each chunk's
-    fp32 logits.
+    ``hidden``, ``labels``, and ``logits_bias`` are split into ``chunk_size``
+    slices along the sequence dimension, adding ``logits_bias`` to each
+    chunk's fp32 logits.
     """
     if weight.numel() == 0:
         raise RuntimeError("chunk_loss requires a nonempty ``weight`` (fused-linear path)")

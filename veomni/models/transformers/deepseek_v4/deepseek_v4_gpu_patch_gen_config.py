@@ -1659,6 +1659,7 @@ def deepseek_v4_model_forward_patched(
                 mtp_main,
                 full_position_ids if sp_enabled else None,
                 input_ids if stage_idx == last_stage else None,
+                causal_mask,
             )
 
     return MoeModelOutputWithIndexerKL(
@@ -1883,7 +1884,7 @@ def deepseek_v4_hash_router_forward_patched(
 # ================================================================
 @config.override_method(
     "DeepseekV4ForCausalLM.__init__",
-    description="Bind ForCausalLMLoss, DSpark MTP chunk_loss, and load_balancing_loss VeomniOps",
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 def deepseek_v4_forcausallm_init_patched(self, config):
     super().__init__(config)
@@ -1895,7 +1896,6 @@ def deepseek_v4_forcausallm_init_patched(self, config):
     self.num_experts_per_tok = config.num_experts_per_tok
     impl = resolve_op_impl("cross_entropy_loss_implementation")
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
-    self.veomni_mtp_ce = VeomniOp("cross_entropy_loss", "standard", "chunk_loss")
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.veomni_lb = VeomniOp(
         "load_balancing_loss",
@@ -2046,12 +2046,23 @@ def deepseek_v4_forcausallm_forward_patched(
         else:
             mtp_shift_labels = F.pad(labels, (0, 1), value=ignore_index)[..., 1:].contiguous()
         if position_ids is None:
-            mtp_pos_ids = torch.arange(mtp_shift_labels.shape[-1], device=mtp_shift_labels.device).unsqueeze(0)
+            mtp_pos_ids = torch.arange(labels.shape[-1], device=mtp_shift_labels.device).unsqueeze(0)
         else:
-            mtp_pos_ids = position_ids
-        mtp_shift_labels = mtp_shift_labels.masked_fill(
-            mtp_pos_ids.to(device=mtp_shift_labels.device) == 0, ignore_index
-        )
+            mtp_pos_ids = position_ids.to(device=mtp_shift_labels.device)
+        if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
+            valid_tokens = attention_mask.to(device=mtp_shift_labels.device, dtype=torch.bool)
+            has_prev_valid = F.pad(valid_tokens[:, :-1], (1, 0), value=False)
+            has_next_valid = F.pad(valid_tokens[:, 1:], (0, 1), value=False)
+            valid_mtp_pos = valid_tokens & has_prev_valid & has_next_valid
+            if sp_enabled and valid_mtp_pos.shape[1] != mtp_shift_labels.shape[1]:
+                parallel_state = get_parallel_state()
+                sp_rank = parallel_state.cp_rank if parallel_state.cp_enabled else parallel_state.ulysses_rank
+                valid_mtp_pos = valid_mtp_pos.narrow(1, sp_rank * mtp_shift_labels.shape[1], mtp_shift_labels.shape[1])
+            mtp_shift_labels = mtp_shift_labels.masked_fill(~valid_mtp_pos, ignore_index)
+        mtp_pos_ids = mtp_pos_ids[:, slice_indices]
+        mtp_shift_labels = mtp_shift_labels[..., slice_indices]
+        mtp_shift_labels = mtp_shift_labels.masked_fill(mtp_pos_ids == 0, ignore_index)
+        mtp_ce_op = self.veomni_ce if getattr(self.veomni_ce, "impl", None) in ("chunk_loss", "eager") else None
         mtp_loss, _, _ = ForCausalLMLoss(
             logits=None,
             labels=None,
@@ -2063,7 +2074,7 @@ def deepseek_v4_forcausallm_forward_patched(
             chunk_size=2048,
             ignore_index=ignore_index,
             loss_reduction_group=kwargs.get("loss_reduction_group"),
-            op=self.veomni_mtp_ce,
+            op=mtp_ce_op,
         )
         loss = loss + mtp_loss_coef * mtp_loss.to(loss.device)
         if aux_metrics is None:

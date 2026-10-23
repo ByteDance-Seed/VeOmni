@@ -760,3 +760,36 @@ def test_deepseek_v4_dspark_batch_gt_1_and_output_router_logits():
     assert out.aux_metrics is not None and "mtp_loss" in out.aux_metrics
     out.loss.backward()
     assert model.model.mtp[0].main_proj.weight.grad is not None
+
+
+def test_deepseek_v4_dspark_left_padding_mask_excludes_masked_tokens():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.compress_rates = {"compressed_sparse_attention": 8, "heavily_compressed_attention": 16}
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 2
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+
+    model = _build_ours(config).train()
+    attention_mask = torch.tensor([[0, 1, 1, 1]], dtype=torch.long)
+    input_ids_a = torch.tensor([[4, 10, 11, 12]], dtype=torch.long)
+    input_ids_b = torch.tensor([[99, 10, 11, 12]], dtype=torch.long)
+    labels = torch.tensor([[-100, -100, 11, 12]], dtype=torch.long)
+
+    with torch.no_grad():
+        out_a = model(
+            input_ids=input_ids_a,
+            attention_mask=attention_mask,
+            labels=labels,
+            use_cache=False,
+        )
+        out_b = model(
+            input_ids=input_ids_b,
+            attention_mask=attention_mask,
+            labels=labels,
+            use_cache=False,
+        )
+    assert out_a.aux_metrics is not None and out_b.aux_metrics is not None
+    torch.testing.assert_close(out_a.aux_metrics["mtp_loss"], out_b.aux_metrics["mtp_loss"], atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(out_a.loss, out_b.loss, atol=1e-6, rtol=1e-6)

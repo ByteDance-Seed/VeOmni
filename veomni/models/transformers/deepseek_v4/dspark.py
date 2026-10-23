@@ -34,6 +34,7 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl, resolve_qat_impl
+from veomni.ops.kernels.dsa.sparse_indices import mask_sparse_attention_indices
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_attn_tilelang
 from veomni.ops.qat import fp8_fake_quant_act_prefix, qat_linear
 from veomni.utils.device import IS_NPU_AVAILABLE
@@ -88,11 +89,17 @@ def dense_sparse_attn(
     return out, ((shift + denominator.log()) / math.log(2.0)).float()
 
 
-def main_window_indices(position_ids: torch.Tensor, sliding_window: int) -> torch.Tensor:
+def main_window_indices(
+    position_ids: torch.Tensor,
+    sliding_window: int,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     """``[B, S, min(sliding_window, S)]`` int32: main rows ``q-width .. q-1`` of the query's own sample.
 
     ``offset > position_ids[q]`` reaches before the sample start, so packed
     ``position_ids`` restarting at zero doubles as the sample-boundary mask.
+    When ``attention_mask`` (2D padding mask or 4D causal mask) is provided,
+    masked-out keys are also set to ``-1``.
     """
     seq_len = position_ids.shape[1]
     device = position_ids.device
@@ -100,7 +107,26 @@ def main_window_indices(position_ids: torch.Tensor, sliding_window: int) -> torc
     queries = torch.arange(seq_len, device=device, dtype=torch.int32)
     offsets = torch.arange(width, 0, -1, device=device, dtype=torch.int32)
     indices = (queries[None, :, None] - offsets[None, None, :]).expand(position_ids.shape[0], -1, -1)
-    return indices.masked_fill(offsets[None, None, :] > position_ids.to(torch.int32)[:, :, None], -1)
+    indices = indices.masked_fill(offsets[None, None, :] > position_ids.to(torch.int32)[:, :, None], -1)
+    if attention_mask is None:
+        return indices
+    if isinstance(attention_mask, dict):
+        attention_mask = next(iter(attention_mask.values()))
+    if attention_mask is None:
+        return indices
+    if attention_mask.ndim == 2:
+        allowed = attention_mask.to(device=device, dtype=torch.bool)
+        batch_size = max(indices.shape[0], allowed.shape[0])
+        indices = indices.expand(batch_size, -1, -1)
+        allowed = allowed.expand(batch_size, -1)
+        valid = (indices >= 0) & (indices < allowed.shape[-1])
+        safe = indices.clamp(min=0, max=max(allowed.shape[-1] - 1, 0)).to(torch.long)
+        key_allowed = allowed.unsqueeze(1).expand(-1, seq_len, -1).gather(-1, safe)
+        return indices.masked_fill(~valid | ~key_allowed, -1).contiguous()
+    if attention_mask.ndim == 4:
+        batch_size = max(indices.shape[0], attention_mask.shape[0])
+        return mask_sparse_attention_indices(attention_mask, indices.expand(batch_size, -1, -1))
+    raise ValueError(f"DSpark attention_mask must be 2D or 4D, got {attention_mask.ndim}D")
 
 
 class DSparkMarkovHead(nn.Module):
@@ -257,6 +283,7 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
         position_ids: torch.Tensor,
         main_x: torch.Tensor,
         full_position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Slot-0 ``DSparkAttention`` at every packed position.
 
@@ -300,10 +327,10 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
             if full_position_ids is None:
                 full_position_ids = gather_outputs(position_ids, gather_dim=-1, group=sp_group)
             main_kv = gather_outputs(main_kv, gather_dim=1, group=sp_group)
-            full_main_idxs = main_window_indices(full_position_ids, attn.sliding_window)
+            full_main_idxs = main_window_indices(full_position_ids, attn.sliding_window, attention_mask=attention_mask)
             main_idxs = full_main_idxs.narrow(1, sp_rank * seq_len, seq_len)
         else:
-            main_idxs = main_window_indices(position_ids, attn.sliding_window)
+            main_idxs = main_window_indices(position_ids, attn.sliding_window, attention_mask=attention_mask)
         main_idxs = main_idxs.expand(batch, -1, -1)
 
         pool = torch.cat([main_kv, kv], dim=1)
@@ -345,6 +372,7 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
         main: list[torch.Tensor] | torch.Tensor,
         full_position_ids: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """One teacher-forced packed DSpark stage."""
         main_x = self.project_main(main) if self.stage_id == 0 else main
@@ -358,6 +386,7 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
             position_ids,
             main_x,
             full_position_ids,
+            attention_mask=attention_mask,
         )
         hidden_streams = self.veomni_mhc_post(attn_out, hidden_streams, post, comb)
 
