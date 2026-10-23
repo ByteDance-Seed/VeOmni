@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni import EdgeDef, NodeDef
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.graphs.base import END
@@ -19,6 +20,9 @@ from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleM
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.module_configuration_base import OmniModuleConfig
 from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_from_endpoint_default_method():
@@ -119,23 +123,31 @@ def test_training_graph_rejects_missing_method():
         TrainingGraph([{"from": "a.encode", "to": "end"}], modules={"a": Mod()})
 
 
+_ONE_NODE_FSM = {
+    "initial": "run",
+    "states": {
+        "run": {
+            "body": [{"from": "a", "to": "end"}],
+            "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+        }
+    },
+}
+
+
 def test_generation_graph_rejects_missing_method():
     class Mod:
         pass
 
     with pytest.raises(ValueError, match=r"Mod\.generate"):
-        GenerationGraph(
-            {
-                "initial": "run",
-                "states": {
-                    "run": {
-                        "body": [{"from": "a", "to": "end"}],
-                        "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
-                    }
-                },
-            },
-            modules={"a": Mod()},
-        )
+        GenerationGraph(_ONE_NODE_FSM).validate_modules({"a": Mod()})
+
+
+def test_generation_graph_builds_without_the_modules_it_names():
+    """A training job may load only a subset (an ``offline_embedding`` run loads just the encoder)."""
+    graph = GenerationGraph(_ONE_NODE_FSM)
+
+    with pytest.raises(ValueError, match="not loaded: \\['a'\\]"):
+        graph.validate_modules({"vae": object()})
 
 
 def test_single_node_with_only_end_edge():
@@ -307,7 +319,51 @@ def test_omni_model_forward_runs_fake_module_chain():
 
     # Each Linear is ones-initialized, so a row of ones becomes 8, then 64.
     assert torch.allclose(batch["hidden"], torch.full((2, hidden_size), 64.0))
-    assert out == {"loss": None, "losses": {}}
+    assert out == {"loss": None, "losses": {}, "conversation_list": None}
+
+
+class _ItemEncodingModule(PretrainedOmniModule):
+    """Training stand-in that encodes each ``ConversationItem`` in place, as the offline-cache contract asks."""
+
+    config_class = _StubConfig
+
+    def __init__(self):
+        super().__init__(_StubConfig())
+
+    def forward(self, conversation_list=None, **kwargs):
+        del kwargs
+        for sample in conversation_list:
+            for item in sample:
+                item.value = item.value * 2
+        return {}
+
+
+def test_omni_model_forward_returns_the_items_the_graph_encoded_under_an_input_cast():
+    """FSDP2 mixed precision casts the root's inputs with ``dataclasses.replace``, so the graph encodes copies."""
+    from torch.distributed.utils import _apply_to_tensors
+
+    from veomni.models.seed_omni.utils.conversation import ConversationItem
+
+    config = OmniConfig(
+        _module_entries={"module_A": {"model_path": "module_A"}},
+        training_graphs={"default": [{"from": "module_A", "to": "end"}]},
+        generation_graphs=_minimal_generation_graphs(module="module_A"),
+    )
+    model = OmniModel(config, {"module_A": _ItemEncodingModule()})
+
+    def cast_inputs(module, args, kwargs):
+        to_bf16 = lambda t: t.to(torch.bfloat16)  # noqa: E731
+        return _apply_to_tensors(to_bf16, args), _apply_to_tensors(to_bf16, kwargs)
+
+    model.register_forward_pre_hook(cast_inputs, with_kwargs=True)
+    original = ConversationItem(type="image", value=torch.ones(2), role="user", meta={})
+
+    out = model({"conversation_list": [[original]]})
+
+    assert torch.equal(original.value, torch.ones(2))
+    encoded = out["conversation_list"][0][0]
+    assert encoded is not original
+    assert torch.equal(encoded.value, torch.full((2,), 2.0, dtype=torch.bfloat16))
 
 
 class _ArtefactModule(PretrainedOmniModule):

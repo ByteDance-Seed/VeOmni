@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -9,10 +10,15 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
+from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.omni.omni_trainer import OmniTrainer, cascade_module_reshard
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_the_export_stage_reaches_every_module_checkpoint_manager():
@@ -114,7 +120,126 @@ def test_the_trainer_refuses_a_model_with_nothing_to_train(monkeypatch):
         MagicMock(return_value=SimpleNamespace(optimizer=None)),
     )
     trainer = OmniTrainer.__new__(OmniTrainer)
-    trainer.args = SimpleNamespace(train=SimpleNamespace())
+    trainer.args = SimpleNamespace(train=SimpleNamespace(training_task="online_training"))
 
     with pytest.raises(ValueError, match="every module is frozen"):
         trainer._build_model_runtime()
+
+
+def test_an_offline_embedding_run_may_build_no_optimizer(monkeypatch):
+    """Every module is frozen in ``offline_embedding``, so it trains nothing by design."""
+    monkeypatch.setattr("veomni.trainer.omni.omni_trainer.build_omni_model_runtime_args", MagicMock())
+    built = SimpleNamespace(optimizer=None)
+    monkeypatch.setattr("veomni.trainer.omni.omni_trainer.build_omni_model_runtime", MagicMock(return_value=built))
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.args = SimpleNamespace(train=SimpleNamespace(training_task="offline_embedding"))
+
+    assert trainer._build_model_runtime() is built
+
+
+@pytest.mark.parametrize(("managers", "saves"), [((None, None), False), ((None, object()), True)])
+def test_a_trainer_saves_model_state_only_if_some_module_has_a_checkpoint_manager(managers, saves):
+    """``offline_embedding`` freezes every module, so none has a manager and a step is only the cursor."""
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.model = SimpleNamespace(
+        module_runtimes={f"m{i}": SimpleNamespace(checkpoint=manager) for i, manager in enumerate(managers)}
+    )
+
+    assert trainer.saves_model_state is saves
+
+
+@pytest.mark.parametrize(
+    ("step_has_model_state", "run_saves_model_state", "match"),
+    [(False, True, "holds no model state"), (True, False, "holds model state")],
+)
+def test_a_step_from_the_other_kind_of_run_is_refused_before_any_module_loads(
+    tmp_path, step_has_model_state, run_saves_model_state, match
+):
+    """``load_path: auto`` takes the newest complete step in ``output_dir``, so a training run sharing it with an
+    ``offline_embedding`` run would otherwise adopt a cursor-only step and fail on a missing module checkpoint."""
+    from veomni.checkpoint import layout
+
+    step = str(tmp_path / "global_step_10")
+    layout.write_manifest(step, global_step=10, world_size=1, model_state=step_has_model_state)
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.args = SimpleNamespace(train=SimpleNamespace(checkpoint=SimpleNamespace(load_path=step)))
+    manager = object() if run_saves_model_state else None
+    trainer.model = MagicMock(module_runtimes={"m": SimpleNamespace(checkpoint=manager)})
+
+    with pytest.raises(ValueError, match=match):
+        trainer.load()
+    trainer.model.load.assert_not_called()
+
+    layout.write_manifest(step, global_step=10, world_size=1, model_state=run_saves_model_state)
+    trainer.load()
+    trainer.model.load.assert_called_once_with()
+
+
+def test_the_offline_cache_writer_opens_after_the_trainer_state_is_restored(monkeypatch):
+    """``on_train_begin`` hands the writer its saved shard position; opening first would reject the resumed cache."""
+    monkeypatch.setattr("veomni.trainer.omni.omni_trainer.synchronize", MagicMock())
+    calls = []
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.args = SimpleNamespace(
+        train=SimpleNamespace(local_rank=0, num_train_epochs=0),
+        data=SimpleNamespace(dataloader=SimpleNamespace(use_background_prefetcher=False)),
+        train_steps=1,
+    )
+    trainer.start_step = trainer.start_epoch = 0
+    trainer.on_train_begin = lambda: calls.append("on_train_begin")
+    trainer.on_train_end = lambda: calls.append("on_train_end")
+    trainer.offline_cache_writer = MagicMock()
+    trainer.offline_cache_writer.open.side_effect = lambda: calls.append("open")
+    trainer.offline_cache_writer.finalize.side_effect = lambda: calls.append("finalize")
+    trainer.destroy_distributed = MagicMock()
+
+    trainer.train()
+
+    assert calls == ["on_train_begin", "open", "on_train_end", "finalize"]
+
+
+def test_offline_cache_step_writes_every_micro_batch_without_autograd():
+    """The writer gets the items ``forward`` returns: an FSDP2 input cast hands the graph copies to encode."""
+    grad_enabled = []
+
+    def forward(micro_batch):
+        grad_enabled.append(torch.is_grad_enabled())
+        copies = [
+            [dataclasses.replace(item, meta=dict(item.meta)) for item in s] for s in micro_batch["conversation_list"]
+        ]
+        for sample in copies:
+            for item in sample:
+                item.value = f"encoded-{item.value}"
+                item.meta["cache"] = "vae"
+        return {"loss": None, "losses": {}, "conversation_list": copies}
+
+    micro_batches = [
+        {"conversation_list": [[ConversationItem(type="image", value=name, role="user", meta={})]]}
+        for name in ("a", "b")
+    ]
+    items_before = [mb["conversation_list"][0][0] for mb in micro_batches]
+
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.model = SimpleNamespace(forward=forward)
+    trainer.args = SimpleNamespace(train=SimpleNamespace(enable_batch_invariant_mode=False))
+    trainer.model_fwd_context = nullcontext()
+    trainer.state = TrainerState(global_step=0)
+    trainer.offline_cache_writer = MagicMock()
+    trainer.on_step_begin = MagicMock()
+    trainer.on_step_end = MagicMock()
+    trainer.sync_before_train_step = MagicMock()
+    trainer.model_reshard = MagicMock()
+    trainer.preforward = lambda micro_batch: micro_batch
+
+    trainer.offline_cache_step(iter([micro_batches]))
+
+    assert grad_enabled == [False, False]
+    saved = [c.args[0] for c in trainer.offline_cache_writer.save_conversation_list.call_args_list]
+    assert [len(s) == 1 and len(s[0]) == 1 for s in saved] == [True, True]
+    assert [(item.value, item.meta) for item in items_before] == [("a", {}), ("b", {})]
+    assert [(s[0][0].value, s[0][0].meta) for s in saved] == [
+        ("encoded-a", {"cache": "vae"}),
+        ("encoded-b", {"cache": "vae"}),
+    ]
+    assert trainer.state.global_step == 1
+    trainer.on_step_end.assert_called_once_with(loss=0.0, loss_dict={}, grad_norm=0.0)

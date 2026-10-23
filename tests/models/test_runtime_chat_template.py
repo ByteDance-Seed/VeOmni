@@ -11,8 +11,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.chat_template import ChatTemplate, MultimodalChatTemplate
 from veomni.models.model_runtime import VeOmniModelRuntime
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 NATIVE_TEMPLATE = "{{ native }}"
