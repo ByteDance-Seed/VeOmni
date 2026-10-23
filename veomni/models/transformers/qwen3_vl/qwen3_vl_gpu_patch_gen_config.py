@@ -388,7 +388,7 @@ def _vit_gathered_token_index(vit_seqlens, cp_size, ulysses_size, merger_unit=4)
     row ids with the same layout recovers which patch every gathered row came from; padding rows
     are -1 and are never referenced.
     """
-    rows = torch.arange(sum(vit_seqlens))
+    rows = torch.arange(sum(vit_seqlens), device="cpu")
     gathered_rows = torch.cat(
         [
             vit_usp_slice(rows, vit_seqlens, 0, cp_size, cp_rank, ulysses_size, ulysses_rank, pad_value=-1)
@@ -797,6 +797,9 @@ def qwen3_vl_vision_forward_patched(
 
     # --- Patch.7 ---
     if get_parallel_state().cp_enabled:
+        # The ViT ring shards vit seqs on whole 2x2 merge windows (merger_unit=4).
+        if self.spatial_merge_size != 2:
+            raise NotImplementedError(f"USP ViT ring requires spatial_merge_size=2; got {self.spatial_merge_size}.")
         pos_embeds = _vit_cp_slice(pos_embeds, grid_thw_list)  # noqa: F821 defined via add_helper
     # --- Patch.7 ---
     # --- Patch.1 ---
@@ -894,6 +897,7 @@ def qwen3_vl_vision_forward_patched(
         cu_seqlens = torch.tensor(
             [0, *accumulate(_vit_seqlens_from_grid(grid_thw_list))],  # noqa: F821 defined via add_helper
             dtype=torch.int32,
+            device="cpu",
         )
     # --- Patch.7 ---
     # --- Patch.5 ---
@@ -1035,7 +1039,9 @@ def qwen3_vl_text_attention_forward_patched(
     **kwargs: Unpack[FlashAttentionKwargs],
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     # --- Patch.1 ---
-    if get_parallel_state().async_enabled:
+    # With ulysses_size == 1 there is no exchange to overlap, and the async helpers
+    # would fall back to the world group; the sync path (plus the ring under USP) is exact.
+    if get_parallel_state().async_enabled and get_parallel_state().ulysses_enabled:
         return _qwen3_vl_async_ulysses_attention_forward(  # noqa: F821 defined via add_post_import_block
             self,
             hidden_states=hidden_states,

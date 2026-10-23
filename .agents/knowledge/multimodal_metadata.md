@@ -195,9 +195,10 @@ per-rank slice in Model.forward.
 Under USP context parallelism (`cp_size > 1`) `SequenceParallelCollator` slices
 `pixel_values*` itself with the per-vit-seq ViT ring layout and passes
 `sp_pad = 0`, so `vit_*_cu_seqlens` hold the **global offsets of the real vit seqs
-only** (no pad tail). The ViT forward passes them to attention unchanged, and
-bidirectional ring attention derives every cp rank's local offsets (including
-each rank's tail pad segment) from them.
+only** (no pad tail). The ViT forward does not use the precomputed
+`cu_seqlens` / `max_seqlen` under cp: it rebuilds the same global offsets on the
+host from `grid_thw_list`, and bidirectional ring attention derives every cp
+rank's local offsets (including each rank's tail pad segment) from them.
 
 ## Backwards compatibility
 

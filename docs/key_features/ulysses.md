@@ -502,7 +502,7 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense_usp.
     `pixel_values_videos` with the Qwen3-VL rule (`[h·w] × t` vit seqs from
     `*_grid_thw`). Other VLMs are not supported with `cp_size > 1` yet.
   - ViT head count must be divisible by `ulysses_size`.
-  - Async Ulysses (`enable_async=True`) composes with USP: the Qwen3-VL text
+  - Async Ulysses (`enable_async=True`, `ulysses_size > 1`) composes with USP: the Qwen3-VL text
     attention runs its own fused all-to-all and calls attention with
     `skip_ulysses=True, ulysses_pre_gathered=True`, so the flash adapter skips
     its Ulysses exchange but still runs the ring over the `cp` group.
