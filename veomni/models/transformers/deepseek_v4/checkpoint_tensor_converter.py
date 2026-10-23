@@ -204,6 +204,7 @@ def _revert_deepseek_v4_checkpoint_key(name: str, *, target_model_prefix: str = 
 
 
 def _extract_quant_config(config) -> tuple[dict, int, str, bool]:
+    """Extract normalized quantization settings ``(quant_cfg, fp8_block_size, expert_dtype, has_quant)`` from *config*."""
     quant_cfg = getattr(config, "quantization_config", None) or {}
     if not isinstance(quant_cfg, dict):
         quant_cfg = quant_cfg.to_dict() if hasattr(quant_cfg, "to_dict") else vars(quant_cfg)
@@ -233,6 +234,7 @@ def _build_default_deepseek_v4_fqn_to_index_mapping(model, *, target_model_prefi
     mapping: dict[str, int] = {}
 
     def _add_entry(origin_key: str, shape: tuple[int, ...]) -> None:
+        """Record ``origin_key`` in the shard map and add its ``.scale`` key when quantizable."""
         mapping[origin_key] = 1
         if not has_quant or not _QUANTIZED_RELEASE_WEIGHT_PATTERN.fullmatch(origin_key) or len(shape) != 2:
             return
@@ -526,6 +528,7 @@ class DeepseekV4CheckpointTensorConverter:
         *,
         should_quantize: Callable[[str], bool] | None = None,
     ) -> Generator[tuple[str, torch.Tensor]]:
+        """Export model parameters in DeepSeek-V4 release format with FP8/FP4 quantization when applicable."""
         config = getattr(model, "config", None)
         fqn_to_index_mapping = getattr(model, "_veomni_fqn_to_index_mapping", None)
         if fqn_to_index_mapping is None:
@@ -592,7 +595,13 @@ class DeepseekV4CheckpointTensorConverter:
                 if not fqn_to_index_mapping:
                     origin = _revert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
                 else:
-                    logger.info_rank0(f"Skipping exported weight not in fqn_to_index_mapping: {name}")
+                    is_tied_head = name in ("lm_head.weight", "model.lm_head.weight") and bool(
+                        getattr(config, "tie_word_embeddings", False)
+                    )
+                    if is_tied_head:
+                        logger.info_rank0(f"Skipping tied weight not in fqn_to_index_mapping: {name}")
+                    else:
+                        logger.warning_rank0(f"Skipping exported weight not in fqn_to_index_mapping: {name}")
                     continue
 
             # 3. check if the weight needs to be quantized
@@ -646,6 +655,7 @@ def create_deepseek_v4_checkpoint_tensor_converter(model):
 
 
 def _get_deepseek_v4_target_model_prefix(model) -> str:
+    """Infer whether *model* uses the ``'model.'`` CausalLM prefix or bare base-model parameter names."""
     named_parameters = getattr(model, "named_parameters", None)
     if callable(named_parameters):
         for name, _ in named_parameters():

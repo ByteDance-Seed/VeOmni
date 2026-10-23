@@ -839,9 +839,13 @@ class TestDeepseekV4ConverterConvert:
 
         mapping = {"embed.weight": 1}
         model = SimpleNamespace(
-            config=SimpleNamespace(quantization_config={"weight_block_size": None}),
+            config=SimpleNamespace(tie_word_embeddings=True, quantization_config={"weight_block_size": None}),
             _veomni_fqn_to_index_mapping=mapping,
         )
+        info_logs: list[str] = []
+        warning_logs: list[str] = []
+        monkeypatch.setattr(module.logger, "info_rank0", lambda msg: info_logs.append(msg))
+        monkeypatch.setattr(module.logger, "warning_rank0", lambda msg: warning_logs.append(msg))
         monkeypatch.setattr(
             module,
             "export_weights",
@@ -849,6 +853,7 @@ class TestDeepseekV4ConverterConvert:
                 [
                     ("model.embed_tokens.weight", torch.ones(4, 4, dtype=torch.float32)),
                     ("lm_head.weight", torch.ones(4, 4, dtype=torch.float32)),
+                    ("model.unexpected.weight", torch.ones(4, 4, dtype=torch.float32)),
                 ]
             ),
         )
@@ -857,6 +862,8 @@ class TestDeepseekV4ConverterConvert:
 
         assert set(exported) == {"embed.weight"}
         assert exported["embed.weight"].dtype == torch.bfloat16
+        assert any("lm_head.weight" in msg for msg in info_logs)
+        assert any("model.unexpected.weight" in msg for msg in warning_logs)
 
     def test_export_weights_accepts_fused_expert_fqn_mapping(self, monkeypatch):
         from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module

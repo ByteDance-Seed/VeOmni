@@ -74,6 +74,7 @@ def get_model_save_state(
         use_shard_owner = effective_mapping is not None and len(set(effective_mapping.values())) > 1
 
         def _owner_rank(key: str, tensor_idx: int) -> int:
+            """Return the rank responsible for quantizing and holding ``key`` during distributed save."""
             if use_shard_owner and effective_mapping is not None and key in effective_mapping:
                 return effective_mapping[key] % world_size
             return tensor_idx % world_size
@@ -81,6 +82,7 @@ def get_model_save_state(
         quant_tensor_idx = 0
 
         def _should_quantize(origin: str) -> bool:
+            """Predicate passed to ``converter.export_weights`` so only the owner rank quantizes ``origin``."""
             nonlocal quant_tensor_idx
             idx = quant_tensor_idx
             quant_tensor_idx += 1

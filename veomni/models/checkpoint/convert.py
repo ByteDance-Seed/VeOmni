@@ -349,6 +349,7 @@ def _map_moe_params_common(name, tensor, ep_rank):
 
 
 def split_moe_params(name, tensor, ep_rank=0):
+    """Split a fused MoE expert tensor (``gate_up_proj`` or ``down_proj``) into per-expert ``(key, tensor)`` pairs."""
     if "gate_up_proj" in name:
         gate, up = tensor.chunk(2, dim=1)
         params = {

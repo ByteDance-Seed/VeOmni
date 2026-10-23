@@ -19,6 +19,7 @@ Utilities for verifying checkpoint conversions between DCP and HuggingFace forma
 
 import json
 import os
+from collections.abc import Iterable
 from typing import Dict, Optional
 
 import torch
@@ -218,10 +219,52 @@ def verify_hf_checkpoint_structure(hf_checkpoint_dir: str, safe_serialization: b
     return True
 
 
-def _is_deepseek_v4_release_checkpoint(state_dict: Dict[str, torch.Tensor]) -> bool:
-    if "embed.weight" in state_dict or "head.weight" in state_dict:
+def _list_hf_checkpoint_keys(hf_checkpoint_dir: str, safe_serialization: bool = True) -> set[str]:
+    """Read tensor key names from a HuggingFace checkpoint without loading full tensor payloads."""
+    if not os.path.exists(hf_checkpoint_dir):
+        raise FileNotFoundError(f"Checkpoint directory does not exist: {hf_checkpoint_dir}")
+
+    index_file = SAFE_WEIGHTS_INDEX_NAME if safe_serialization else WEIGHTS_INDEX_NAME
+    index_path = os.path.join(hf_checkpoint_dir, index_file)
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {})
+        if weight_map:
+            return set(weight_map.keys())
+
+    if safe_serialization:
+        if not SAFETENSORS_AVAILABLE:
+            raise ImportError("safetensors is not available. Please install it with: pip install safetensors")
+        from safetensors import safe_open
+
+        weight_files = [f for f in os.listdir(hf_checkpoint_dir) if f.endswith(".safetensors")]
+        if not weight_files:
+            raise FileNotFoundError(f"No safetensors files found in {hf_checkpoint_dir}")
+        keys: set[str] = set()
+        for file_name in weight_files:
+            file_path = os.path.join(hf_checkpoint_dir, file_name)
+            with safe_open(file_path, framework="pt", device="cpu") as f:
+                keys.update(f.keys())
+        return keys
+
+    weight_files = [f for f in os.listdir(hf_checkpoint_dir) if f.endswith(".bin")]
+    if not weight_files:
+        raise FileNotFoundError(f"No .bin weight files found in {hf_checkpoint_dir}")
+    keys = set()
+    for file_name in weight_files:
+        file_path = os.path.join(hf_checkpoint_dir, file_name)
+        state_dict = torch.load(file_path, map_location="cpu", weights_only=True, mmap=True)
+        keys.update(state_dict.keys())
+    return keys
+
+
+def _is_deepseek_v4_release_checkpoint(keys: Iterable[str]) -> bool:
+    """Return True if *keys* use DeepSeek-V4 release naming (e.g. ``embed.weight``, ``.attn.``, ``.ffn.``)."""
+    key_set = keys if isinstance(keys, (set, dict)) else set(keys)
+    if "embed.weight" in key_set or "head.weight" in key_set:
         return True
-    return any(k.startswith(("layers.", "model.layers.")) and (".attn." in k or ".ffn." in k) for k in state_dict)
+    return any(k.startswith(("layers.", "model.layers.")) and (".attn." in k or ".ffn." in k) for k in key_set)
 
 
 def _convert_deepseek_v4_release_checkpoint_for_verification(
@@ -406,8 +449,13 @@ def verify_dcp_to_hf_conversion(
     # Convert floating DCP tensors to bf16 to match HF export dtype, except when the
     # HF checkpoint is in DeepSeek-V4 release format where non-weight floating tensors
     # (hc_*, sinks, position_bias, e_score_correction_bias) stay in fp32.
-    loaded_hf_preview = load_hf_checkpoint(hf_checkpoint_dir, safe_serialization)
-    if _is_deepseek_v4_release_checkpoint(loaded_hf_preview):
+    try:
+        hf_keys = _list_hf_checkpoint_keys(hf_checkpoint_dir, safe_serialization)
+    except Exception as e:
+        logger.error(f"Failed to inspect HF checkpoint keys at {hf_checkpoint_dir}: {e}")
+        return False
+
+    if _is_deepseek_v4_release_checkpoint(hf_keys):
         logger.info("Passing raw DCP state dict for DeepSeek-V4 release-format verification...")
         return verify_hf_checkpoint(
             hf_checkpoint_dir=hf_checkpoint_dir,

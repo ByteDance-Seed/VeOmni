@@ -285,6 +285,66 @@ class TestGetModelSaveState(unittest.TestCase):
             {"layers.0.attn.wkv.weight", "layers.0.attn.wkv.scale"},
         )
 
+    def test_converter_export_weights_passes_should_quantize_with_multi_shard_mapping(self):
+        from veomni.utils.save_safetensor_utils import get_model_save_state
+
+        raw_origins = [
+            ("layers.0.attn.wq_a.weight", True),
+            ("layers.0.attn.wkv.weight", True),
+            ("layers.0.hc_attn_base", False),
+        ]
+        mapping = {
+            "layers.0.attn.wq_a.weight": 1,
+            "layers.0.attn.wq_a.scale": 1,
+            "layers.0.attn.wkv.weight": 2,
+            "layers.0.attn.wkv.scale": 2,
+            "layers.0.hc_attn_base": 2,
+        }
+        quant_calls_by_rank: dict[int, list[str]] = {0: [], 1: []}
+
+        class _QuantAwareConverter:
+            def can_handle(self, name):
+                return True
+
+            def convert(self, name, tensor):
+                return None
+
+            def export_weights(self, m, *, should_quantize=None):
+                for origin, is_quant in raw_origins:
+                    if should_quantize is not None and not should_quantize(origin):
+                        continue
+                    if is_quant:
+                        quant_calls_by_rank[current_rank].append(origin)
+                        yield origin, torch.zeros(2, 2, dtype=torch.float8_e4m3fn)
+                        yield f"{origin.removesuffix('.weight')}.scale", torch.ones(1, 1, dtype=torch.float32)
+                    else:
+                        yield origin, torch.ones(2, dtype=torch.float32)
+
+        model = _TinyModel()
+        model._create_checkpoint_tensor_converter = staticmethod(lambda m: _QuantAwareConverter())
+
+        states_by_rank = {}
+        for current_rank in (0, 1):
+            mock_dist = MagicMock(
+                is_initialized=MagicMock(return_value=True),
+                get_rank=MagicMock(return_value=current_rank),
+                get_world_size=MagicMock(return_value=2),
+            )
+            with patch(f"{_MOD}.dist", mock_dist):
+                states_by_rank[current_rank] = get_model_save_state(model, mapping)
+
+        # Rank 0 owns shard 2 (2 % 2 == 0 -> wkv + scale, hc_attn_base); Rank 1 owns shard 1 (1 % 2 == 1 -> wq_a + scale)
+        self.assertEqual(quant_calls_by_rank[0], ["layers.0.attn.wkv.weight"])
+        self.assertEqual(quant_calls_by_rank[1], ["layers.0.attn.wq_a.weight"])
+        self.assertEqual(
+            set(states_by_rank[0].keys()),
+            {"layers.0.attn.wkv.weight", "layers.0.attn.wkv.scale", "layers.0.hc_attn_base"},
+        )
+        self.assertEqual(
+            set(states_by_rank[1].keys()),
+            {"layers.0.attn.wq_a.weight", "layers.0.attn.wq_a.scale"},
+        )
+
     def test_verify_hf_checkpoint_weights_supports_deepseek_v4_release_format(self):
         import os
         import tempfile
@@ -316,6 +376,23 @@ class TestGetModelSaveState(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             save_file(hf_release_state, os.path.join(tmp_dir, "model.safetensors"))
             self.assertTrue(verify_hf_checkpoint_weights(tmp_dir, dcp_state, safe_serialization=True))
+
+        from tests.checkpoints.checkpoint_verification_utils import (
+            _list_hf_checkpoint_keys,
+            verify_dcp_to_hf_conversion,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_file(hf_release_state, os.path.join(tmp_dir, "model.safetensors"))
+            self.assertEqual(_list_hf_checkpoint_keys(tmp_dir, safe_serialization=True), set(hf_release_state.keys()))
+            with patch(
+                "tests.checkpoints.checkpoint_verification_utils.load_dcp_checkpoint",
+                return_value=dcp_state,
+            ):
+                self.assertTrue(verify_dcp_to_hf_conversion("/tmp/fake_dcp", tmp_dir, safe_serialization=True))
+                self.assertFalse(
+                    verify_dcp_to_hf_conversion("/tmp/fake_dcp", "/tmp/nonexistent_hf_dir", safe_serialization=True)
+                )
 
 
 # ===========================================================================
