@@ -276,11 +276,15 @@ class TrainingMixin(TrainingModuleMixin):
                     loss_reduction_group=fsdp_group,
                 )
         else:
-            logits = self._project(hidden_states)
+            # Project a single masked anchor row so FSDP2 / ShardedEmbedding
+            # collectives still fire without materializing full [T, V] logits.
+            anchor_hidden = hidden_states.reshape(-1, hidden_states.size(-1))[:1]
+            anchor_labels = target_labels.reshape(-1)[:1]
+            logits = self._project(anchor_hidden)
             loss, _, _ = ForCausalLMLoss(
                 logits=logits,
-                labels=target_labels,
-                shift_labels=shift_labels,
+                labels=anchor_labels,
+                shift_labels=anchor_labels,
                 vocab_size=self.config.vocab_size,
                 num_items_in_batch=num_supervised_tokens.clamp(min=1),
                 loss_reduction_group=fsdp_group,

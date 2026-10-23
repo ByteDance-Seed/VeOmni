@@ -222,6 +222,7 @@ def test_text_encoder_decode_all_masked_span_scores_zero(monkeypatch):
 
     assert float(out["loss"].detach()) == 0.0
     assert out["loss"].requires_grad
+    assert out["logits"].shape == (1, 64)
 
 
 def test_text_encoder_fsdp_no_split_modules_preserved():
