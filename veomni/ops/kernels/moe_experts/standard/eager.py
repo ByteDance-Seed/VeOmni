@@ -37,8 +37,9 @@ def wrapper(
     """Routed expert MLP. Empty ``fc1_*`` means that layout is unused.
 
     Matches Hugging Face's expert loop bitwise: ``fc2`` first, then the
-    routing weights in their own dtype. Fused rows scale the intermediate
-    before ``fc2`` instead, so they agree with this row only to rounding.
+    routing weights in their own dtype. Non-EP Triton and EP combine use this
+    post-``fc2`` routing-weight order as well; Quack still scales the
+    intermediate before ``fc2`` and agrees with this row only to rounding.
     Regular autograd, no custom backward. ``assume_distinct_experts`` only
     tightens the Triton grouped-GEMM launch bound, so it is unused here.
     """

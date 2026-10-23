@@ -33,21 +33,16 @@ for the full list.
 
 ### Optional MagiAttention extra
 
-MagiAttention is an optional NVIDIA SM90+ extra. It source-builds CUDA
-extensions, so omit it on Ampere/Ada (A100/L20) and CPU environments.
+MagiAttention is an optional NVIDIA SM100+ extra. It source-builds CUDA
+extensions, so omit it on older GPUs and CPU environments.
 Install it together with the `gpu` extra:
 
 ```bash
 uv sync --locked --extra gpu --extra magi
 ```
 
-MagiAttention uses CUTE DSL/JIT on SM100 and newer GPUs. SM90 GPUs require an additional CUTLASS overlay after the Magi extra is synced:
-
-```bash
-bash scripts/kernel/install_magi_sm90.sh
-```
-
-The verified default enables BF16/FP16 inputs, the hdim128 bucket, and nfunc 1/3/5. Use `--help` to inspect optional build overrides. A later exact `uv sync` without `--extra magi` can remove the overlay, so rerun the installer before using MagiAttention on SM90.
+MagiAttention uses CUTE DSL/JIT on SM100 and newer GPUs. On SM90, select
+FlexAttention instead; its FA4 backend is included in the `gpu` extra.
 
 > **Note**: video/audio processing also needs ffmpeg installed at the OS level:
 > ```bash

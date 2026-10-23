@@ -91,7 +91,7 @@ step is therefore only the cursor, and its manifest
 `train.checkpoint.load_path: auto` finds it like any other step. Give the
 encoding run and the training run separate `train.checkpoint.output_dir`s:
 `auto` resumes the newest complete step in the directory, and
-[`OmniTrainer.load`](../../../veomni/trainer/omni/omni_trainer.py#L394) refuses a
+[`OmniTrainer.load`](../../../veomni/trainer/omni/omni_trainer.py#L398) refuses a
 step whose manifest disagrees with the run on carrying model state. A resume of that
 task restores the dataloader cursor and the cache writer's position together,
 both through `GlobalStateCallback`:
@@ -165,7 +165,7 @@ full.
   reports it.
 
 The data side needs no switch. The
-[`SeedOmniCollator`](../../../veomni/data/seed_omni/collator.py#L26) always runs
+[`seedomni_transform`](../../../veomni/data/seed_omni/seedomni_transform.py#L183) always runs
 every module's preprocessor, `seedomni_cached` included, so a preprocessor must
 leave items that already hold a cache artifact alone. The simplest way is to
 mark such items in the offline-embedding method's post-hook with a key in `item.meta` and
@@ -278,7 +278,7 @@ The result:
   because `online_process` still runs every step.
 
 The pieces that complete this workflow are in place:
-[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L568)
+[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L572)
 runs the encoding run, and
 [`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L181)
 persists each conversation of the `conversation_list` that
@@ -305,7 +305,7 @@ Ranks that share a `dp_rank` (SP, CP or
 TP peers) hold the same batch, so
 [only the first of them writes](../../../veomni/models/seed_omni/utils/offline_cache.py#L36).
 The training run reads the cache through the
-[`seedomni_cached`](../../../veomni/data/seed_omni/seedomni_transform.py#L246)
+[`seedomni_cached`](../../../veomni/data/seed_omni/seedomni_transform.py#L254)
 data transform. It unpickles each row, so point `data.train_path` only at a
 cache you trust.
 
@@ -371,7 +371,7 @@ A missing module or method still fails before the first request runs.
 - [`tests/checkpoints/test_checkpoint_callback.py`](../../../tests/checkpoints/test_checkpoint_callback.py):
   [the writer's position is saved and restored with the cursor, and the cursor-only step is complete](../../../tests/checkpoints/test_checkpoint_callback.py#L632).
 - [`tests/checkpoints/test_dcp_checkpointer.py`](../../../tests/checkpoints/test_dcp_checkpointer.py):
-  [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2546).
+  [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2551).
 - [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
   [a step without an lr scheduler logs no lr](../../../tests/seed_omni/trainer/test_step_metrics_callback.py#L82).
 - [`tests/seed_omni/model/test_graph.py`](../../../tests/seed_omni/model/test_graph.py):

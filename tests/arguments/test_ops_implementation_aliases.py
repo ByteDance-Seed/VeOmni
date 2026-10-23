@@ -20,7 +20,11 @@ import pytest
 
 import veomni.utils.device as device
 import veomni.utils.import_utils as import_utils
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import OpsImplementationConfig, arguments_types
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 @pytest.fixture

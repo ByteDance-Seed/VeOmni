@@ -29,7 +29,7 @@ def test_dit_online_image_mode_preserves_alpha_only_when_requested(tmp_path, mon
         image = "https://example.com/transparent.png"
         monkeypatch.setattr(
             "veomni.data.multimodal.image_utils.requests.get",
-            lambda *args, **kwargs: SimpleNamespace(content=image_path.read_bytes()),
+            lambda *args, **kwargs: SimpleNamespace(content=image_path.read_bytes(), raise_for_status=lambda: None),
         )
     kwargs = {} if image_mode is None else {"image_mode": image_mode}
     transform = build_data_transform("dit_online", image_min_pixels=256, **kwargs)
