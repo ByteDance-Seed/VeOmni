@@ -99,6 +99,7 @@ Training-graph hooks on the accelerated class, all optional with safe defaults:
 | `pre_forward(method, **kwargs)` | training | prepare inputs (the conversation list, or packed tensors for Janus `pack_*` nodes) |
 | `post_forward(method, **outputs)` | training | write results back (the conversation list, or packed features / losses) |
 | `freeze_model()` | build | freeze a parameter subset |
+| `configure_optimizer(optimizer)` | build | adjust the module's param groups or register step hooks, before the lr scheduler is built and a checkpoint is loaded |
 | `get_parallel_plan()` | build | per-module FSDP / SP plan |
 | `get_assets()` | save | processors / tokenizers to checkpoint |
 | `dummy_inputs(...)` | training | zero placeholders that keep FSDP aligned |

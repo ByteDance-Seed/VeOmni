@@ -119,7 +119,7 @@ class VisionPreprocessor(ModulePreprocessorBase):
 | Function | Called by | Effect |
 |----------|-----------|--------|
 | [`ModulePreprocessorBase.__call__(batch, inference=False, **kwargs)`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L85) | [`OmniProcessor.preprocess_batch`](../../../veomni/models/seed_omni/processing_omni.py#L228) | Delegates `batch["conversation_list"]` to `preprocess_conversations` in `config.module_names` order. |
-| [`bind_module_assets(model, *, checkpoint_path=None, preprocessor=None, config_overrides=None)`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L128) | [`PretrainedOmniModule.from_pretrained`](../../../veomni/models/seed_omni/modules/module_modeling_base.py#L32) and [`ModuleRuntime._build_model_assets`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L354) | Copies CPU asset attributes (`_processor`, `_image_processor`, `_video_processor`, `_tokenizer`, `_chat_template`) from the preprocessor onto `model` if not already set, so `generate()` and HF checkpoint export can access them. |
+| [`bind_module_assets(model, *, checkpoint_path=None, preprocessor=None, config_overrides=None)`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L128) | [`PretrainedOmniModule.from_pretrained`](../../../veomni/models/seed_omni/modules/module_modeling_base.py#L36) and [`ModuleRuntime._build_model_assets`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L354) | Copies CPU asset attributes (`_processor`, `_image_processor`, `_video_processor`, `_tokenizer`, `_chat_template`) from the preprocessor onto `model` if not already set, so `generate()` and HF checkpoint export can access them. |
 
 ## Call flow
 
