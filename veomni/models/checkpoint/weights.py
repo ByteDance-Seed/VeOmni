@@ -1097,6 +1097,12 @@ def load_model_weights_ep_sharded(
         model, buffer_dict, parameter_names_to_load, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu
     )
 
+    fqn_to_index_mapping = kwargs.get("fqn_to_index_mapping")
+    if fqn_to_index_mapping is not None:
+        from veomni.models.checkpoint.convert import prepare_fqn_to_index_mapping_for_model
+
+        prepare_fqn_to_index_mapping_for_model(model, fqn_to_index_mapping)
+
 
 @torch.no_grad()
 def _stream_lora_adapter_ep_sharded(
