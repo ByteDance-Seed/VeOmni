@@ -395,13 +395,25 @@ def _tiny_gemma3_mlp(hidden_size: int = 64, intermediate_size: int = 128) -> Gem
     return Gemma3MLP(config)
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "device",
+    [
+        pytest.param("cpu", marks=pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))),
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.launch_plan(provider=LaunchSpec()),
+                pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="GeGLU CUDA rounding needs a GPU"),
+            ],
+        ),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("transposed", [False, True])
-def test_geglu_backward_matches_autograd_rounding(dtype, transposed):
+def test_geglu_backward_matches_autograd_rounding(dtype, transposed, device):
     """Preserve autograd's multiply-then-GELU-backward rounding, including views."""
     torch.manual_seed(31)
-    gate = (torch.randn(32, 64) * 2).to(dtype)
+    gate = (torch.randn(32, 64, device=device) * 2).to(dtype)
     up = torch.randn_like(gate)
     grad_output = torch.randn_like(gate)
     if transposed:
