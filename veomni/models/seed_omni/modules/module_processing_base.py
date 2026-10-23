@@ -70,20 +70,20 @@ class ModulePreprocessorBase:
     * **CPU only.** Workers must not touch the training CUDA device; build CPU
       tensors (no ``device=``).  The main process's thin ``pre_forward`` does the
       single ``.to(device)``.
-    * **In-place mutation.** ``__call__`` receives the collator ``batch`` dict
-      (must contain ``conversation_list`` as ``list[list[ConversationItem]]``).
-      The default path mutates those items' ``value`` / ``meta`` in place, and
-      the thin ``pre_forward`` / ``generate`` re-selects them with the same
-      ``type`` / ``role`` / ``meta`` filter to read the heavy work back. A packed preprocessor may override
-      ``__call__`` and write tensors onto the same dict instead of walking
-      items.
-    * **Shared by training + inference.** Training runs it inside a collator
-      (DataLoader worker); inference runs it once over the request before the
-      FSM. The ``inference`` flag flips train/infer-only behaviour.
+    * **In-place mutation.** ``__call__`` receives the ``batch`` dict
+      (must contain ``conversation_list`` as ``list[list[ConversationItem]]``)
+      and mutates those items' ``value`` / ``meta`` in place via
+      :meth:`preprocess_conversations`; the thin ``pre_forward`` / ``generate``
+      then re-selects them with the same ``type`` / ``role`` / ``meta`` filter
+      to read the heavy work back.
+    * **Shared by training + inference.** Training runs it per sample inside
+      ``seedomni_transform`` (DataLoader worker) before ``dyn_bsz`` and
+      collation; inference runs it once over the request before the FSM. The
+      ``inference`` flag flips train/infer-only behaviour.
     """
 
     def __call__(self, batch: dict[str, Any], inference: bool = False, **kwargs: Any) -> None:
-        """Run CPU prep on a collated ``batch`` dict (mutates it in place)."""
+        """Run CPU prep on a ``batch`` dict (mutates it in place)."""
         self.preprocess_conversations(batch["conversation_list"], inference=inference, **kwargs)
 
     def preprocess_conversations(
@@ -123,23 +123,6 @@ class ModulePreprocessorBase:
         """
         del config, dtype
         return None
-
-    @staticmethod
-    def append_batch_anchor(conversation_list: list[list[Any]], item: Any) -> None:
-        """Attach ``item`` as this micro-batch's single FSDP anchor row.
-
-        The anchor exists so a module whose real inputs are absent this step still
-        runs forward and backward, keeping its FSDP2 collectives in step with the
-        other ranks. One row does that: the module's graph hooks batch every row
-        their filter selects and flag the batch all-dummy, and every
-        downstream consumer filters dummies out. Appending one per *sample*
-        instead would put a full-size dummy image per sample through the tower —
-        on a batch with no real images for this module that was the single largest
-        term in the step (a 48-sample Janus T2I micro-batch spent more time in the
-        all-dummy SigLIP pass than in the language model).
-        """
-        if conversation_list:
-            conversation_list[0].append(item)
 
 
 def bind_module_assets(

@@ -16,11 +16,11 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.distributed import torch_parallelize
 from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import (
@@ -39,20 +39,18 @@ _CI_CPU_PROMOTION = LaunchSpec(nproc=4, device="cpu")
 _CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 
-def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path):
+def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path, endpoint):
     """Worker for the FSDP2 MultiOptimizer DCP round-trip test."""
     from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState
     from veomni.optim.optimizer import MultiOptimizer
     from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(os.environ.get("_TEST_MASTER_PORT", "0"))
     device_type = get_device_type()
     backend = "gloo" if device_type == "cpu" else get_dist_comm_backend()
     device = torch.device("cpu" if device_type == "cpu" else f"{device_type}:{rank}")
     if device_type != "cpu":
         get_torch_device().set_device(device)
-    dist.init_process_group(backend, rank=rank, world_size=world_size)
+    dist.init_process_group(backend, store=endpoint.connect(), rank=rank, world_size=world_size)
 
     try:
         _init_parallel_state(dp_size=world_size, dp_mode="fsdp2")
@@ -212,14 +210,8 @@ class TestMultiOptimizerState:
     @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
     def test_fsdp2_multi_optimizer_roundtrip(self, tmp_path):
         """Run the MultiOptimizer DCP round-trip across two real FSDP2 ranks."""
-        from tests.tools.launch_utils import find_free_port
-
-        os.environ["_TEST_MASTER_PORT"] = str(find_free_port())
-        mp.spawn(
-            _fsdp2_multi_optimizer_worker,
-            args=(_CI_ACCELERATOR_2.nproc, tmp_path),
-            nprocs=_CI_ACCELERATOR_2.nproc,
-            join=True,
+        spawn_with_rendezvous(
+            _fsdp2_multi_optimizer_worker, args=(_CI_ACCELERATOR_2.nproc, tmp_path), nprocs=_CI_ACCELERATOR_2.nproc
         )
 
     def test_multi_optimizer_sparse_state_excludes_synthetic(self, tmp_path):
@@ -265,6 +257,9 @@ class TestMultiOptimizerState:
 class TestSwapOptimizerState:
     """DCP save/load for ``SwapAdamW`` (host-resident state), plus stock<->swap
     interop, both through the flattened FQN-keyed optimizer state dict."""
+
+    # CPU-only: plain modules and DCP round-trips on tmp_path, no accelerator.
+    pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
     @staticmethod
     def _build_swap(seed: int):
@@ -341,6 +336,37 @@ class TestSwapOptimizerState:
             dst_state = dst_opt._host_states[param]
             torch.testing.assert_close(dst_state["exp_avg"], src_state["exp_avg"], atol=0.0, rtol=0.0)
             torch.testing.assert_close(dst_state["exp_avg_sq"], src_state["exp_avg_sq"], atol=0.0, rtol=0.0)
+
+    def test_stock_loads_swap_checkpoint(self, tmp_path):
+        """A checkpoint written by ``SwapAdamW`` loads into stock
+        ``torch.optim.AdamW`` (same flattened FQN layout and param-group keys)."""
+        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+
+        parallel_state = SimpleNamespace(dp_mode="fsdp2")
+        src_model, src_opt = self._build_swap(seed=0)
+        for step in range(3):
+            self._step(src_model, src_opt, seed=step)
+
+        dcp.save(
+            {"optimizer": OptimizerState(src_model, src_opt, parallel_state=parallel_state)},
+            checkpoint_id=tmp_path,
+        )
+
+        torch.manual_seed(1)
+        dst_model = nn.Linear(4, 4)
+        dst_opt = torch.optim.AdamW(dst_model.parameters(), lr=1e-2)
+        dcp.load(
+            {"optimizer": OptimizerState(dst_model, dst_opt, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+        )
+
+        src_params = dict(src_model.named_parameters())
+        for name, param in dst_model.named_parameters():
+            src_state = src_opt._host_states[src_params[name]]
+            dst_state = dst_opt.state[param]
+            torch.testing.assert_close(dst_state["exp_avg"], src_state["exp_avg"], atol=0.0, rtol=0.0)
+            torch.testing.assert_close(dst_state["exp_avg_sq"], src_state["exp_avg_sq"], atol=0.0, rtol=0.0)
+            assert int(dst_state["step"].item()) == int(src_opt.state[src_params[name]]["step"])
 
 
 @patch("veomni.checkpoint.dcp_checkpointer.get_parallel_state")
@@ -2672,17 +2698,15 @@ class TestResumeDiscovery:
         assert self._validate(step) is None
 
 
-def _staged_promotion_worker(rank: int, world_size: int, base: str, scenario: str) -> None:
+def _staged_promotion_worker(rank: int, world_size: int, base: str, scenario: str, endpoint) -> None:
     """One rank of the real promotion check; see ``TestPromotionAcrossRanks``."""
     import shutil
     import time
 
     from veomni.checkpoint import dcp_checkpointer as module
 
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = os.environ["_TEST_MASTER_PORT"]
     os.environ["LOCAL_RANK"] = str(rank)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=world_size)
 
     stage, final = os.path.join(base, "stage"), os.path.join(base, "final")
     if rank == 0:
@@ -2733,16 +2757,12 @@ class TestPromotionAcrossRanks:
     @staticmethod
     def _run(tmp_path, scenario):
         """Spawn four ranks for ``scenario`` and return each rank's outcome."""
-        from tests.tools.launch_utils import find_free_port
-
         base = str(tmp_path / scenario)
         os.makedirs(base, exist_ok=True)
-        os.environ["_TEST_MASTER_PORT"] = str(find_free_port())
-        mp.spawn(
+        spawn_with_rendezvous(
             _staged_promotion_worker,
             args=(_CI_CPU_PROMOTION.nproc, base, scenario),
             nprocs=_CI_CPU_PROMOTION.nproc,
-            join=True,
         )
         return base, [open(os.path.join(base, f"outcome_{r}")).read() for r in range(4)]
 

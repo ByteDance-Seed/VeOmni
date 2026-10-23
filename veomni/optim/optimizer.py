@@ -473,7 +473,8 @@ def build_optimizer(
     """Build the optimizer.
 
     ``optimizer_config`` lets callers hand over the whole ``OptimizerConfig`` so
-    that optimizer-specific knobs (currently Muon's ``muon_*`` fields) are read
+    that optimizer-specific knobs (currently Muon's ``muon_*`` fields and
+    ``adamw_swap``'s ``swap_mem_fraction_static``/``swap_pin_memory``) are read
     here rather than unpacked by every trainer. It does *not* supply ``lr``,
     ``weight_decay`` or the ``no_decay_*`` lists — those stay explicit arguments,
     because callers such as the VLM trainer drive the AdamW side from their own

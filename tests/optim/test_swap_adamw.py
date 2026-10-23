@@ -14,10 +14,11 @@
 
 """Single-process CPU parity tests for ``SwapAdamW``.
 
-The optimizer is exercised over one-rank ``Shard(0)`` DTensors (the layout FSDP2
-hands it) and compared step-by-step against ``torch.optim.AdamW`` running on the
-plain local tensors. This covers the swap/offload mechanics and the update math
-without needing an accelerator; the device-stream path is only taken on NPU.
+The optimizer is exercised over one-rank ``Shard(0)`` DTensors (a DTensor layout
+the optimizer sees under FSDP2/EP) and compared step-by-step against
+``torch.optim.AdamW`` running on the plain local tensors. This covers the
+swap/offload mechanics and the update math without needing an accelerator; the
+device-stream path is only taken on an accelerator host.
 """
 
 from __future__ import annotations
@@ -29,7 +30,12 @@ import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.optim.swap_adamw import SwapAdamW
+from veomni.utils.device import get_device_type
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 @pytest.fixture(scope="module")
@@ -55,6 +61,72 @@ def _swap_param(init: torch.Tensor, mesh) -> nn.Parameter:
 def _partition(local: torch.Tensor, mesh) -> DTensor:
     """Build a grad DTensor matching a one-rank ``Shard(0)`` parameter."""
     return _dtensor(local, mesh)
+
+
+def test_default_construction_resolves_device_dependent_pinning(cpu_mesh):
+    # Regression: the pin_memory gate reads the resolved device type, so a
+    # construction with all defaults must not raise (CPU -> pinning disabled).
+    param = _swap_param(torch.randn(4, 3), cpu_mesh)
+    opt = SwapAdamW([param])
+    on_accelerator = get_device_type() != "cpu"
+    assert opt.pin_memory is on_accelerator
+    assert opt._use_streams is on_accelerator
+
+
+def test_fused_matches_elementwise_on_cpu(cpu_mesh):
+    # ``_use_fused`` is the production path (CUDA/NPU); pinning it on CPU exercises
+    # the same ``torch._fused_adamw_`` call contract against the elementwise path.
+    torch.manual_seed(11)
+    shape = (6, 4)
+    init = torch.randn(shape)
+    fused_param = _swap_param(init, cpu_mesh)
+    eager_param = _swap_param(init, cpu_mesh)
+    fused_opt = SwapAdamW([fused_param], lr=1e-2, betas=(0.9, 0.95), pin_memory=False)
+    eager_opt = SwapAdamW([eager_param], lr=1e-2, betas=(0.9, 0.95), pin_memory=False)
+    fused_opt._use_fused = True
+    eager_opt._use_fused = False
+
+    for _ in range(3):
+        grad = torch.randn(shape)
+        fused_param.grad = _partition(grad.clone(), cpu_mesh)
+        eager_param.grad = _partition(grad.clone(), cpu_mesh)
+        fused_opt.step()
+        eager_opt.step()
+
+    torch.testing.assert_close(fused_param.to_local(), eager_param.to_local(), atol=1e-6, rtol=1e-6)
+    for key in ("exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(
+            fused_opt._host_states[fused_param][key],
+            eager_opt._host_states[eager_param][key],
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+
+def test_pinned_allocation_degrades_to_pageable(cpu_mesh, monkeypatch):
+    # Page-locked host memory is finite; exhaustion at build must degrade with
+    # a warning instead of killing the run (the async_offload fallback pattern).
+    real_zeros = torch.zeros
+
+    def failing_pinned_zeros(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            raise RuntimeError("simulated pinned-memory exhaustion")
+        return real_zeros(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "zeros", failing_pinned_zeros)
+    param = _swap_param(torch.randn(4, 3), cpu_mesh)
+    opt = SwapAdamW([param], pin_memory=False)
+    # Simulate the accelerator-side state: pinning requested, allocation fails.
+    opt.pin_memory = True
+    second = _swap_param(torch.randn(2, 3), cpu_mesh)
+    opt.add_param_group({"params": [second]})
+
+    # One-time degradation: the flag flips and the run continues on pageable buffers.
+    assert opt.pin_memory is False
+    assert torch.count_nonzero(opt._host_states[second]["exp_avg"]).item() == 0
+    second.grad = _partition(torch.randn(2, 3), cpu_mesh)
+    opt.step()
+    assert int(opt.state[second]["step"]) == 1
 
 
 def test_matches_torch_adamw_step_by_step(cpu_mesh):
@@ -255,6 +327,39 @@ def test_add_param_group_matches_eager_groups(cpu_mesh):
     assert int(swap_opt.state[par_b]["step"]) == 1
 
 
+def test_add_param_group_rejects_different_amsgrad(cpu_mesh):
+    # The moment-state layout (and the precomputed state byte sizes) is fixed at
+    # construction, so a group with a different amsgrad must be rejected.
+    first = _swap_param(torch.randn(4, 3), cpu_mesh)
+    second = _swap_param(torch.randn(4, 3), cpu_mesh)
+    opt = SwapAdamW([first], amsgrad=False, pin_memory=False)
+    with pytest.raises(ValueError, match="amsgrad"):
+        opt.add_param_group({"params": [second], "amsgrad": True})
+
+
+def test_load_state_dict_rejects_different_amsgrad(cpu_mesh):
+    src = _swap_param(torch.randn(4, 3), cpu_mesh)
+    dst = _swap_param(torch.randn(4, 3), cpu_mesh)
+    src_opt = SwapAdamW([src], amsgrad=True, pin_memory=False)
+    src.grad = _partition(torch.randn(4, 3), cpu_mesh)
+    src_opt.step()
+    state_dict = src_opt.state_dict()
+    dst_opt = SwapAdamW([dst], amsgrad=False, pin_memory=False)
+    with pytest.raises(ValueError, match="amsgrad"):
+        dst_opt.load_state_dict(state_dict)
+
+
+def test_load_state_dict_tolerates_missing_param_state(cpu_mesh):
+    # The flattened loader represents a param with no saved state as empty dicts
+    # (an unused MoE expert); loading keeps the zero state instead of crashing.
+    param = _swap_param(torch.randn(4, 3), cpu_mesh)
+    opt = SwapAdamW([param], pin_memory=False)
+    opt._load_param_state(param, {"exp_avg": {}, "exp_avg_sq": {}, "step": {}})
+    assert int(opt.state[param]["step"]) == 0
+    for key in ("exp_avg", "exp_avg_sq"):
+        assert torch.count_nonzero(opt._host_states[param][key]).item() == 0
+
+
 def test_multi_optimizer_steps_and_frees_storages(cpu_mesh):
     from veomni.optim.optimizer import MultiOptimizer
 
@@ -293,7 +398,9 @@ def test_state_dict_reads_from_host(cpu_mesh):
     for key in ("exp_avg", "exp_avg_sq"):
         holder = state[key]
         local = holder.to_local() if isinstance(holder, DTensor) else holder
-        assert local.device.type == "cpu", f"{key} should be read from host, got {local.device}"
+        assert local.data_ptr() == opt._host_states[param][key].data_ptr(), (
+            f"{key} should be read from the host buffer"
+        )
 
 
 def test_state_dict_load_state_dict_round_trip(cpu_mesh):
@@ -370,6 +477,28 @@ def test_device_free_bytes_falls_back_to_total_minus_allocated(monkeypatch):
     assert opt._device_free_bytes() == 56 << 30
 
 
+def test_could_not_fit_guard_raises_for_oversized_param(cpu_mesh, monkeypatch):
+    # A param whose states exceed the batch budget fails with an actionable
+    # error instead of a raw device OOM.
+    param = _swap_param(torch.randn(4, 3), cpu_mesh)
+    opt = SwapAdamW([param], lr=1e-2, pin_memory=False)
+    monkeypatch.setattr(opt, "_batch_budget_bytes", lambda: 8)
+    param.grad = _partition(torch.randn(4, 3), cpu_mesh)
+    with pytest.raises(RuntimeError, match="could not fit any optimizer state"):
+        opt.step()
+
+    # Empty shards (uneven EP/FSDP sharding) move zero bytes: they must not
+    # disarm the guard for the next real parameter (bytes_moved stays 0).
+    empty = _swap_param(torch.empty(0, 3), cpu_mesh)
+    real = _swap_param(torch.randn(4, 3), cpu_mesh)
+    opt = SwapAdamW([empty, real], lr=1e-2, pin_memory=False)
+    monkeypatch.setattr(opt, "_batch_budget_bytes", lambda: 0)
+    empty.grad = _partition(torch.empty(0, 3), cpu_mesh)
+    real.grad = _partition(torch.randn(4, 3), cpu_mesh)
+    with pytest.raises(RuntimeError, match="could not fit any optimizer state"):
+        opt.step()
+
+
 # ---------------------------------------------------------------------------
 # rewrap_dtensor_local (veomni.utils.dtensor_utils)
 # ---------------------------------------------------------------------------
@@ -406,6 +535,18 @@ def test_rewrap_dtensor_local_does_not_move_mismatched_local(cpu_mesh):
     assert isinstance(dt, DTensor)
     assert dt.to_local().device.type == "meta"
     assert tuple(dt.shape) == (5,)
+
+
+def test_rewrap_dtensor_local_preserves_non_contiguous_local(cpu_mesh):
+    """The mismatched-device branch is a storage-sharing view: an identity
+    ``view_as`` never requires contiguity, so strided locals keep their strides."""
+    from veomni.utils.dtensor_utils import rewrap_dtensor_local
+
+    local = torch.empty(4, 3, device="meta").t()  # shape (3, 4), stride (1, 3)
+    dt = rewrap_dtensor_local(local, mesh=cpu_mesh, placements=[Shard(0)])
+    assert dt.to_local().device.type == "meta"
+    assert tuple(dt.to_local().shape) == (3, 4)
+    assert dt.to_local().stride() == (1, 3)
 
 
 def test_async_save_snapshots_state_before_later_steps(cpu_mesh, tmp_path):

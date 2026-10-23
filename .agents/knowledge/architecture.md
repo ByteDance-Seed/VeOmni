@@ -46,10 +46,6 @@ veomni/
 │   ├── muon.py         DistributedMuon: DTensor-aware Muon for 2D dense and
 │   │                   3D MoE expert weights, plus the batched_newton_schulz
 │   │                   primitive (Keller-Jordan quintic NS over the trailing
-│   ├── swap_adamw.py   SwapAdamW: AdamW whose moment states live on pinned
-│   │                   host memory and stream to the device in budget-sized
-│   │                   batches; per param group under FSDP+EP (MultiOptimizer
-│   │                   leaves). DCP reads/writes the host buffers directly.
 │   │                   two dims; 2D path is byte-equivalent to
 │   │                   torch.optim._muon._zeropower_via_newtonschulz, 3D path
 │   │                   uses baddbmm so each slice keeps the same fused
@@ -59,6 +55,10 @@ veomni/
 │   │                   via OptimizerConfig.muon_expert_zero_comm), Shard(d>0)
 │   │                   experts go through one all-to-all-gather over the
 │   │                   ep_fsdp mesh.
+│   ├── swap_adamw.py   SwapAdamW: AdamW whose moment states live on pinned
+│   │                   host memory and stream to the device in budget-sized
+│   │                   batches; per param group under FSDP+EP (MultiOptimizer
+│   │                   leaves). DCP reads/writes the host buffers directly.
 │   └── lr_scheduler.py LR scheduler construction
 ├── ops/                Tensor-native op registry and implementations
 │   ├── registry.py     OP_REGISTRY, OpEntry, register_op, resolve_op, VeomniOp

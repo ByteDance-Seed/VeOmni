@@ -36,6 +36,8 @@ if IS_NPU_AVAILABLE:
     torch.npu.config.allow_internal_format = False
 
 MOE_TRITON_DEVICE_TYPES = ("cuda", "mlu")
+# Backends whose torch build registers a ``torch._fused_adamw_`` kernel.
+FUSED_ADAMW_DEVICE_TYPES = ("cuda", "npu")
 
 
 def get_device_type() -> str:
@@ -114,8 +116,10 @@ def stream_synchronize() -> None:
 
 
 def empty_cache() -> None:
-    """Execute torch empty cache operation."""
-    get_torch_device().empty_cache()
+    """Release unused accelerator cache when the active device supports it."""
+    device = get_torch_device()
+    if hasattr(device, "empty_cache"):
+        device.empty_cache()
 
 
 def set_device(device: torch.types.Device) -> None:

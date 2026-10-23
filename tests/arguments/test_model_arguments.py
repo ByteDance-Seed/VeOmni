@@ -17,7 +17,7 @@
 import pytest
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.arguments import ModelArguments
+from veomni.arguments import AcceleratorConfig, FSDPConfig, ModelArguments, OptimizerConfig
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -39,3 +39,20 @@ class TestWhereTheLoaderReadsTheConfigFrom:
 
     def test_the_tokenizer_follows_the_config_the_base_settled(self):
         assert ModelArguments(model_path="weights", config_path="cfg").tokenizer_path == "cfg"
+
+
+def test_swap_fraction_is_coerced_and_ranged():
+    # YAML resolves an exponent literal without a decimal point to a string; it
+    # must be coerced before the range check instead of raising TypeError.
+    assert OptimizerConfig(type="adamw_swap", swap_mem_fraction_static="8e-1").swap_mem_fraction_static == 0.8
+    with pytest.raises(ValueError, match="swap_mem_fraction_static"):
+        OptimizerConfig(type="adamw_swap", swap_mem_fraction_static=1.5)
+
+
+def test_swap_rejects_fsdp_cpu_offload():
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ModelArguments(
+            model_path="weights",
+            optimizer=OptimizerConfig(type="adamw_swap"),
+            accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(offload=True)),
+        )
