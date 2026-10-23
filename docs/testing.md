@@ -9,6 +9,7 @@ and provides guidance on which tests to add when onboarding a new model.
 
 ```
 tests/
+├── ci/                             # CPU tests for accelerator CI tooling
 ├── tools/                          # Shared test infrastructure (comparison, data gen, launch)
 ├── toy_config/                     # Minimal model configs for fast CI testing
 ├── testdata/                       # Sample images, audio, etc.
@@ -117,25 +118,38 @@ tests/
 
 | Category | Directory | GPU Req | Execution | Purpose |
 |---|---|---|---|---|
-| **Models** | `tests/models/` | 0-1 GPU | pytest | Registry/build contracts, model parity, and implementation selection |
-| **Ops** | `tests/ops/` | 0-1 GPU (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Registry contracts, hardware guards, numerical correctness, and performance |
-| **Data pipeline** | `tests/data/` | 0-1 GPU | pytest | Data loading, collation, preprocessing |
-| **Parallelism** | `tests/parallel/` | 4-8 GPUs | torchrun / pytest | SP, EP, data-balance primitives |
-| **Distributed runtime** | `tests/distributed/` | 0-2+ GPUs | pytest + torchrun | FSDP equivalence, dummy forward, gradient checkpointing, vocab-parallel embedding |
+| **Models** | `tests/models/` | 0-4 GPUs | pytest | Registry/build contracts, model parity, and implementation selection |
+| **Ops** | `tests/ops/` | 0-4 GPUs (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Registry contracts, hardware guards, numerical correctness, and performance |
+| **Data pipeline** | `tests/data/` | 0-8 GPUs | pytest + torchrun | Data loading, collation, preprocessing, and distributed resume |
+| **Parallelism** | `tests/parallel/` | 0-8 GPUs | torchrun / pytest | SP, EP, data-balance primitives |
+| **Distributed runtime** | `tests/distributed/` | 0-4 GPUs | pytest + torchrun | FSDP equivalence, dummy forward, gradient checkpointing, vocab-parallel embedding |
 | **SeedOmni** | `tests/seed_omni/` | 0; 2 for `e2e/` | pytest (+ torchrun for `e2e/`) | Multi-module OmniModel, runtimes, trainer, launcher, module mixins |
-| **E2E parallel** | `tests/e2e/` | 4+ GPUs | torchrun (subprocess) | SP/EP alignment across full training runs |
+| **E2E parallel** | `tests/e2e/` | Per-case launch plan (up to 8 GPUs) | torchrun (subprocess) | SP/EP alignment across full training runs |
 | **Checkpoints** | `tests/checkpoints/` | 0-8 GPUs | pytest + torchrun | Save/load, DCP→HF conversion |
 | **Utilities** | `tests/utils/` | 0-8 GPUs | pytest + torchrun | FLOPs, grad clipping, weight broadcast |
 | **Sanity** | `tests/special_sanity/` | 0 | script + pytest | Device API lint and op-architecture path guards |
 
-Unit CI does not run `pytest tests/`. `gpu_unit_tests.yml` and
-`npu_unit_tests.yml` collect `tests/ops/` (`not benchmark`), `tests/models/`,
-`tests/data/`, `tests/checkpoints/`, and `tests/arguments/` as directories.
-They also run `tests/special_sanity/test_ops_architecture.py`. Other files are
-listed one pytest invocation at a time. E2E jobs own
-`tests/e2e/test_e2e_parallel.py` and `tests/distributed/test_fsdp_equivalence.py`.
-A new file outside those directory collections is invisible to CI until a
-workflow line is added.
+Unit CI does not run `pytest tests/`. Suite selection is defined in the
+[GPU manifest](../scripts/ci/accelerator/suites/gpu.json) and
+[NPU manifest](../scripts/ci/accelerator/suites/npu.json), consumed by the
+[accelerator runner](../scripts/ci/accelerator/runner.py). Directory selections
+collect their children automatically; a file outside them must be added to its
+suite.
+
+The [case scheduling contract](design/ci_case_scheduling.md) defines planning
+from the actual `nproc/world_size` configuration, device isolation and GPU/NPU
+scheduling. The default launch plan uses one card of the selected accelerator
+backend on GPU/NPU runners, and CPU on CPU-only runners. Multi-card tests must
+expose their launch configuration; `skipif` describes eligibility, not a
+resource reservation. See [runner usage](../scripts/ci/accelerator/README.md) for commands
+and result artifacts. GPU/NPU unit and e2e workflows all use parallel dispatch
+with the same launch plans and scheduler core.
+
+Batches are ordered by required card count, largest first, and greedily assigned
+to free devices with smaller jobs filling remaining space. Fixed case weights
+(60 seconds for multi-card work, 2 seconds for single-card/CPU work) control
+batch size only. Measured timings are reporting artifacts; scheduling does not
+require historical timings.
 
 ---
 
@@ -372,7 +386,8 @@ four-rank run at step 1, eager and Inductor pre-clipping gradient norms agree to
 - FSDP2 always enabled, `nproc_per_node = sp_size * 4`
 - 2 epochs, 2 max_steps per run
 
-**Models**: All supported text, VLM, omni, and DiT models.
+**Models**: The text, VLM, omni, and DiT parameter tables in
+`tests/e2e/test_e2e_parallel.py` define coverage.
 
 **GPU**: 4+ GPUs (up to 8 for sp=2).
 
@@ -459,7 +474,139 @@ CPU, and multi-rank cases spawn CPU gloo ranks with `torch.multiprocessing`;
 
 ---
 
+## Registering Tests in CI
+
+Test selection is maintained in the
+[GPU suite manifest](../scripts/ci/accelerator/suites/gpu.json) and
+[NPU suite manifest](../scripts/ci/accelerator/suites/npu.json). Each manifest
+contains both `unit` and `e2e` selections. The runner collects those selections
+and schedules the resulting cases using their launch plans.
+
+Workflows configure runners, dependencies, triggers, job-wide environment and
+runner options. Keep test selections in the manifests so local runs and CI use
+the same collection source. Test-specific environment variables belong in a
+selection's optional `env` object. Device requirements belong in the test's
+launch plan.
+
+### When a manifest needs an update
+
+| Test change | Required registration |
+|---|---|
+| Add a function or parameter combination included by an existing selection | No manifest or workflow change |
+| Add a file inside a directory already collected by the relevant manifest | No manifest or workflow change |
+| Add a file outside existing collection scopes | Add a selection to each applicable backend manifest |
+| Add a new CI machine requirement, dependency setup or workflow trigger | Update the corresponding workflow as well |
+
+Check the complete selection arguments: a node ID or a `-k` filter can narrow
+collection within a file or directory. The existence of a manifest entry for
+that file does not guarantee that every new case is included. A launch-plan
+marker declares resources; it does not register a test with CI.
+
+For example, if a new `tests/e2e/test_my_model.py` file is outside the existing
+scopes, append an entry like this to `suites/gpu.json` (replace the illustrative
+file path with the actual new file):
+
+```json
+{
+  "name": "my-model-e2e",
+  "suite": "e2e",
+  "conditional": false,
+  "args": ["-s", "-x", "tests/e2e/test_my_model.py"]
+}
+```
+
+Use a unique `name` within each backend manifest. Set `suite` to `unit` or
+`e2e`; keep ordinary selections unconditional. Conditional selections require
+an explicit workflow gate and are enabled with `--include-conditional`.
+Preserve any required pytest flags or filters in `args`. Do not add a per-file
+pytest step to the workflow or a second selection for an already covered
+scope. Add the corresponding NPU selection when the test is intended to run
+on NPU, retaining its hardware/dependency guards.
+
+A function or parameter added to `tests/e2e/test_e2e_parallel.py` is collected
+by that file's existing GPU e2e selection; it does not need another JSON entry.
+For a new multi-card case, also expose the shared `nproc/world_size`
+configuration as a [launch plan](#launch-plans-for-new-tests).
+
+On a runner with the selected backend, check collection before execution:
+
+```sh
+uv run --frozen python -m scripts.ci.accelerator --backend cuda --suite e2e --only my-model-e2e --collect-only --output-dir outputs/accelerator-ci/my-model-collection
+```
+
+Use the selection name with `--only`. Inspect `inventory.json` for the expected
+parameterized node IDs, eligibility and resolved plans. Use a fresh output
+directory for each invocation. See the
+[accelerator README](../scripts/ci/accelerator/README.md) for the full runner
+interface and result files.
+
+---
+
+## Launch Plans for New Tests
+
+A test without an explicit launch plan uses one card of the runner's selected
+accelerator backend, or CPU on a CPU-only runner. Single-card tests may use this
+default. Declare a CPU plan for CPU-only work, including preprocessing, config
+validation, eager CPU references, and tests with mocked accelerator kernels.
+A backend name in a test function does not imply that it needs that hardware.
+The scheduler follows the launch plan; it does not infer device use from tensor
+factories or test names.
+
+```python
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_cpu_reference():
+    ...
+```
+
+For an entirely CPU-only module, use
+`pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))`.
+In mixed modules, mark individual CPU cases so optimized GPU/NPU kernel tests
+retain accelerator reservations. CPU workers hide accelerator devices and share
+the scheduler's separate CPU concurrency limit.
+
+CPU numerical checks should state their input dtype and device. An independent
+FP64 math reference can check an FP32 candidate without relying on automatic
+SDPA backend selection. Keep output and gradient tolerances explicit; changing
+a reference does not justify loosening the candidate's error bounds.
+For intermittent CPU numerical failures, reproduce in fresh processes as well
+as repeated calls: a first-call math error can disappear after warmup. Include
+the failing output/gradient name, seed, shapes, dtype, CPU and thread settings
+in assertion diagnostics. The QSA CPU mock evaluates exponentials in FP64 and
+casts back to FP32 to avoid a reproduced first-call CPU FP32 `exp` accuracy
+issue; its matrix products, normalization and gradient accumulation stay FP32.
+
+Multi-card tests must expose a plan derived from the same `nproc`, `world_size`,
+or parallel configuration used to launch their workers. A module, class, or
+fixture family may provide a shared plan. Parameterized tests resolve their
+plan for each parameter combination; they do not need entries in a device-quota
+table. A `skipif` marker alone does not declare a launch plan.
+
+Keep launch configuration independent of the number of cards currently free.
+An undersized plan is an error; it must not cause a smaller topology, a backend
+fallback, or a resource-induced skip. Use isolated output/cache paths and
+allocated rendezvous ports for concurrent cases. See the
+[test-author contract](design/ci_case_scheduling.md#writing-new-tests) for details.
+
+---
+
+The accelerator runner fails fast by default: the first failure stops dispatch
+and cancels running peers in the same suite/job, then waits for scoped process
+cleanup. Foreground output shows case progress, a 30-second heartbeat, failure
+tracebacks/log tails and a final summary. Use `--keep-going` to collect all
+failures. See [failure reporting](../scripts/ci/accelerator/README.md#results-and-local-commands)
+for full logs and partial-result artifacts.
+
 ## New Model Onboarding: Test Checklist
+
+Local tests and CI use the same canonical configs under `tests/toy_config/`.
+Reuse the [shared toy fixtures](../tests/toy_config/README.md) and preserve their
+model/input contracts; do not create CI-specific copies or switch configs based
+on the execution environment.
 
 When adding a new model to VeOmni, the following tests should be created or updated.
 See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_model.md) for step-by-step instructions.
@@ -527,8 +674,9 @@ pytest → family-specific eager parity test
 pytest → test_text_parallel_align(model_name, config, ...)
   → materialize_weights(config) → random weights on disk
   → DummyDataset(dataset_type) → parquet files
-  → for each (sp_size, ep_size):
-      prepare_exec_cmd() → torchrun command
+  → prepare_exec_cmd() → kwargs for each (sp_size, ep_size)
+  → dispatch independent modes on disjoint devices when GPU parallel mode is enabled
+      build_torchrun_cmd(**kwargs) → fresh torchrun command and rendezvous port
       subprocess.run(torchrun ... train_text_test.py ...)
         → TestTextTrainer.train() → log_dict.json
   → compare_multi_items(all_log_dicts, rtol, atol)
@@ -540,7 +688,7 @@ pytest → test_text_fsdp_equivalence(config, ...)
   → materialize_weights(config)
   → DummyDataset(text)
   → run_training_config(nproc=1, init_device=device)      # baseline
-  → run_training_config(nproc=2+, init_device=meta, fsdp2) # FSDP
+  → run_training_config(nproc=2, init_device=meta, fsdp2)  # fixed two-rank FSDP
   → compare_metrics(baseline_grad_norm, fsdp_grad_norm)
 ```
 

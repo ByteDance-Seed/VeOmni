@@ -35,11 +35,15 @@ import pytest
 import torch
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.training_utils import unbuilt_runtime
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.layers import LoraLinear
 from veomni.lora.state_dict import get_lora_state_dict, load_adapter_state_dict
 from veomni.lora.weight_loading import load_lora_weights
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 torch.manual_seed(0)

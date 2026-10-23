@@ -21,10 +21,10 @@ Use this reference to decide which files to trust before editing SeedOmni.
   - inference FSM execution, permissive routing, transition behavior.
 - `veomni/models/seed_omni/modeling_omni.py`
   - module construction, graph build, training/generation entrypoints.
-- `veomni/data/data_collator.py`
-  - `SeedOmniCollator` and ordered CPU preprocessor execution.
 - `veomni/data/seed_omni/seedomni_transform.py`
-  - current data transform that emits `conversation_list`.
+  - data transform that builds `conversation_list` and runs ordered CPU preprocessors (`OmniProcessor`).
+- `veomni/data/seed_omni/collator.py`
+  - `SeedOmniCollator` (pure list-grouping collator).
 
 ## Live Examples
 

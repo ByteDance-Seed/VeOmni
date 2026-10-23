@@ -20,6 +20,13 @@ import ast
 import re
 from pathlib import Path
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 REPO_ROOT = Path(__file__).parents[2]
 TEXT_SUFFIXES = {".md", ".py", ".toml", ".yaml", ".yml"}
