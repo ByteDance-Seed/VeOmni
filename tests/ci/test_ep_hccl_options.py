@@ -88,11 +88,17 @@ def _native_ep_mesh_worker(rank, endpoint):
         for call in observed:
             if "ep" not in call["mesh_dim_names"]:
                 assert not call.get("backend_override")
-        for group in (state.ep_group, state.extra_parallel_group("ple"), state.fsdp_group):
+        expected_parallel_ranks = [rank // 2 * 2, rank // 2 * 2 + 1]
+        for label, group, expected_ranks in (
+            ("ep", state.ep_group, expected_parallel_ranks),
+            ("ple", state.extra_parallel_group("ple"), expected_parallel_ranks),
+            ("fsdp", state.fsdp_group, [0, 1, 2, 3]),
+        ):
             ranks = dist.get_process_group_ranks(group)
+            assert ranks == expected_ranks, f"Unexpected {label} members on rank {rank}: {ranks}"
             value = torch.tensor(float(rank + 1), device=device)
             dist.all_reduce(value, group=group)
-            assert value.item() == sum(r + 1 for r in ranks)
+            assert value.item() == sum(r + 1 for r in expected_ranks)
     finally:
         ps.clear_parallel_state()
         dist.destroy_process_group()
