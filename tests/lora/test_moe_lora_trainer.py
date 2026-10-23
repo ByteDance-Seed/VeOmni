@@ -441,13 +441,11 @@ def torchrun_trainer(
     """Spawn this module under torchrun; raise on non-zero exit."""
     import subprocess
 
-    from ..tools.launch_utils import find_free_port
-
     cmd = [
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={nproc}",
-        f"--master_port={find_free_port()}",
+        "--standalone",
         __file__,
         yaml_path,
         f"--train.checkpoint.output_dir={output_dir}",
