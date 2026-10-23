@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -203,10 +204,12 @@ def pytest_runtest_protocol(item, nextitem):
     rows = getattr(item.config, "_ci_batch_cases", {})
     case = rows.get(item.nodeid)
     previous_device_type = None
+    previous_dataloader_init = None
     if case and all(spec.device == "cpu" for spec in CasePlan.from_dict(case["plan"]).launches):
         import torch.optim.optimizer as optimizer_module
         from torch.utils._foreach_utils import _get_foreach_kernels_supported_devices
         from torch.utils.checkpoint import DefaultDeviceType
+        from torch.utils.data import dataloader
 
         # CPU-only checkpoint inputs fall back to this global default. A
         # registered NPU backend can otherwise initialize hidden devices while
@@ -218,9 +221,20 @@ def pytest_runtest_protocol(item, nextitem):
         # explicit foreach/fused settings retain their ordinary semantics.
         previous_foreach_query = optimizer_module._get_foreach_kernels_supported_devices
         optimizer_module._get_foreach_kernels_supported_devices = _get_foreach_kernels_supported_devices
+        # torch_npu's DataLoader constructor queries NPU affinity even for CPU
+        # inputs. Use its saved Torch constructor while devices are hidden,
+        # without importing the vendor package or overriding unrelated patches.
+        npu_module = sys.modules.get("torch_npu.utils._module")
+        if npu_module is not None and dataloader._MultiProcessingDataLoaderIter.__init__ is getattr(
+            npu_module, "_mpdl_iter_init", None
+        ):
+            previous_dataloader_init = dataloader._MultiProcessingDataLoaderIter.__init__
+            dataloader._MultiProcessingDataLoaderIter.__init__ = npu_module.origin_mpdl_iter_init
     try:
         yield
     finally:
+        if previous_dataloader_init is not None:
+            dataloader._MultiProcessingDataLoaderIter.__init__ = previous_dataloader_init
         if previous_device_type is not None:
             optimizer_module._get_foreach_kernels_supported_devices = previous_foreach_query
             DefaultDeviceType.set_device_type(previous_device_type)

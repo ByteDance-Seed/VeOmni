@@ -24,6 +24,11 @@ During that scope, optimizer foreach-capability queries use the canonical
 `torch.utils._foreach_utils` helper. torch_npu 2.10 replaces the optimizer's
 alias with a device-name lookup that initializes NPU even for CPU parameters.
 Restore the prior alias on exit, preserving explicit foreach/fused options.
+torch_npu 2.10 also replaces the multi-worker DataLoader iterator constructor
+with unconditional NPU synchronization/affinity calls, even for CPU datasets.
+CPU-planned cases temporarily use the vendor module's saved Torch constructor
+and restore the patch after teardown or failure. Only replace the known vendor
+wrapper; preserve unrelated constructor patches and all accelerator plans.
 A synthetic registered backend alone misses vendor monkeypatches: exercise
 the pinned wheel's optimizer patch in CPU isolation audits too.
 

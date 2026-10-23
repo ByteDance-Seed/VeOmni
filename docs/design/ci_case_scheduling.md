@@ -278,6 +278,11 @@ defaults. The torch_npu optimizer override queries the NPU device name even
 when optimizer parameters are all CPU tensors. The worker restores that
 override after the case; explicit `foreach` and `fused` settings keep their
 normal Torch behavior, and accelerator cases retain the vendor policy.
+The same CPU scope temporarily uses torch_npu's saved Torch multi-worker
+DataLoader iterator constructor. Its vendor wrapper otherwise queries NPU
+affinity before starting CPU workers. The worker replaces only that known
+wrapper and restores it after teardown or failure; unrelated constructor
+patches and accelerator cases retain their original behavior.
 
 Both unit and e2e suites consume the same planner/scheduler. Suite selection
 defines which cases run, and launch plans define their resource requirements.

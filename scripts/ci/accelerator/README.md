@@ -119,6 +119,10 @@ CPU optimizer defaults use Torch's original capability helper during the same
 scope, so torch_npu's foreach policy does not initialize a hidden device.
 Explicit optimizer options are preserved, and the vendor helper is restored
 when the case ends.
+For CPU cases, the worker also temporarily restores Torch's multi-worker
+DataLoader iterator constructor from the loaded torch_npu module. The vendor
+wrapper queries NPU affinity even for CPU data. Its original patch is restored
+after teardown or failure; accelerator cases keep the vendor constructor.
 
 ## Results and local commands
 

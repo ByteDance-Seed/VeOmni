@@ -347,6 +347,46 @@ def test_cpu_optimizer_does_not_query_hidden_accelerator(monkeypatch, cpu, forea
     assert optimizer_module._get_foreach_kernels_supported_devices is vendor_device_query
 
 
+@pytest.mark.parametrize("cpu", [False, True])
+@pytest.mark.parametrize("fail_body", [False, True])
+def test_cpu_dataloader_avoids_vendor_device_queries_and_restores_patch(monkeypatch, cpu, fail_body):
+    import sys
+    from types import SimpleNamespace
+
+    from torch.utils.data import DataLoader, dataloader
+
+    from scripts.ci.accelerator import pytest_plugin
+
+    original_init = dataloader._MultiProcessingDataLoaderIter.__init__
+    device_queries = []
+
+    def vendor_init(self, *args, **kwargs):
+        # torch_npu 2.10 queries NPU affinity even for an all-CPU DataLoader.
+        device_queries.append("npu_affinity")
+        original_init(self, *args, **kwargs)
+
+    vendor = SimpleNamespace(_mpdl_iter_init=vendor_init, origin_mpdl_iter_init=original_init)
+    monkeypatch.setitem(sys.modules, "torch_npu.utils._module", vendor)
+    monkeypatch.setattr(dataloader._MultiProcessingDataLoaderIter, "__init__", vendor_init)
+    monkeypatch.delenv("CI_CASE_PROGRESS", raising=False)
+    plan = CasePlan.sequential(LaunchSpec(device="cpu" if cpu else "accelerator"))
+    item = SimpleNamespace(
+        nodeid="sample", config=SimpleNamespace(_ci_batch_cases={"sample": {"plan": plan.to_dict()}}, _ci_results={})
+    )
+    protocol = pytest_plugin.pytest_runtest_protocol(item, None)
+    next(protocol)
+    try:
+        assert list(DataLoader(list(range(8)), batch_size=None, num_workers=2)) == list(range(8))
+        assert device_queries == ([] if cpu else ["npu_affinity"])
+    finally:
+        if fail_body:
+            with pytest.raises(RuntimeError, match="test body failed"):
+                protocol.throw(RuntimeError("test body failed"))
+        else:
+            protocol.close()
+        assert dataloader._MultiProcessingDataLoaderIter.__init__ is vendor_init
+
+
 def test_case_workspaces_isolate_relative_checkpoints_and_caches(tmp_path):
     from scripts.ci.accelerator.runtime.workers import create_workspace
 
