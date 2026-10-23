@@ -102,13 +102,6 @@ class _WholeSetOnlyConverter:
         self.finalize = self._inner.finalize
 
 
-class _ClaimsFusedSlabConverter(Qwen3MoeCheckpointTensorConverter):
-    """Expert-streaming converter that also claims one fused ExtraParallel slab."""
-
-    def can_handle(self, name: str) -> bool:
-        return name == "model.layers.0.mlp.experts.gate_up_proj" or super().can_handle(name)
-
-
 def _write_checkpoint(path: Path) -> dict:
     generator = torch.Generator().manual_seed(0)
     state = {
@@ -219,37 +212,6 @@ def test_a_fusion_converter_without_expert_streaming_still_bails(monkeypatch, tm
 
     with pytest.raises(NotImplementedError, match="cannot stream it per expert"):
         _load_as_rank(monkeypatch, tmp_path, 0, _meta_model(_WholeSetOnlyConverter))
-
-
-def test_a_whole_tensor_extra_parallel_transform_is_refused_before_any_read(monkeypatch, tmp_path):
-    _write_checkpoint(tmp_path)
-    real_safe_open = checkpoint_weights.safe_open
-
-    class _NoReads:
-        def __init__(self, *args, **kwargs):
-            self._handle = real_safe_open(*args, **kwargs)
-
-        def __enter__(self):
-            handle = self._handle.__enter__()
-
-            class _Proxy:
-                def get_tensor(self, key):
-                    raise AssertionError(f"read {key} before refusing")
-
-                def __getattr__(self, attr):
-                    return getattr(handle, attr)
-
-            return _Proxy()
-
-        def __exit__(self, *exc):
-            return self._handle.__exit__(*exc)
-
-    monkeypatch.setattr(checkpoint_weights, "safe_open", _NoReads)
-    with pytest.raises(
-        NotImplementedError,
-        match=r"transforms ExtraParallel key 'model\.layers\.0\.mlp\.experts\.gate_up_proj'",
-    ):
-        _load_as_rank(monkeypatch, tmp_path, 0, _meta_model(_ClaimsFusedSlabConverter))
 
 
 @pytest.mark.parametrize("ep_rank", range(EP_SIZE))

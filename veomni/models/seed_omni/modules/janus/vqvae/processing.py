@@ -144,16 +144,16 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
                 f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
                 "before training use (pure inference never reaches this branch)."
             )
-        self.append_batch_anchor(
-            conversation_list,
-            ConversationItem(
-                type="image",
-                value=self._dummy_pixel_values,
-                role="assistant",
-                is_dummy=True,
-                meta={_IMG_TAG_KEY: "gen"},
-            ),
-        )
+        if conversation_list:
+            conversation_list[0].append(
+                ConversationItem(
+                    type="image",
+                    value=self._dummy_pixel_values,
+                    role="assistant",
+                    is_dummy=True,
+                    meta={_IMG_TAG_KEY: "gen"},
+                )
+            )
 
 
 __all__ = ["JanusVqvaeProcessor", "JanusVqvaePreprocessor"]

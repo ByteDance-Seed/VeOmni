@@ -39,13 +39,12 @@ checkpoint then works without an offline convert:
 from __future__ import annotations
 
 import atexit
-import functools
 import json
 import os
 import shutil
 import tempfile
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Callable
@@ -116,27 +115,11 @@ class OmniHFModuleLayout:
     HF assets from the checkpoint directory, keyed like
     :func:`~veomni.models.seed_omni.utils.convert_registry.attach_module_assets`
     (``tokenizer`` / ``processor`` / ``image_processor`` / ``video_processor``).
-
-    ``generated_tensors`` (optional) computes module tensors the checkpoint
-    does not store, from the checkpoint directory and the module config -- a
-    lookup table derived from the tokenizer, say. They load after the stored
-    weights, keyed by module name, and are not exported.
-
-    ``export_state`` (optional) turns the module's state dict, after its
-    weight conversions are reverted, into the form the checkpoint stores:
-    module keys that :meth:`OmniHFLayout.source_key` maps back, holding tensors
-    in the source's dtypes (requantized weights and their scales, per-expert
-    tensors split out of a fused one). Every rank calls it with the same
-    state; a tensor it returns as a plain tensor is written by the rank that
-    returns it, so a key must come from one rank only unless all ranks return
-    the same value.
     """
 
     key_prefixes: tuple[tuple[str, str], ...]
     build_config: Callable[[PretrainedConfig], OmniModuleConfig]
     build_assets: Callable[[str], dict[str, Any]] | None = None
-    generated_tensors: Callable[[str, OmniModuleConfig], dict[str, torch.Tensor]] | None = None
-    export_state: Callable[[torch.nn.Module, dict[str, torch.Tensor]], dict[str, torch.Tensor]] | None = None
 
 
 @dataclass(frozen=True)
@@ -168,41 +151,17 @@ class OmniHFLayout:
         rules = [
             (source, name, target) for name, module in self.modules.items() for source, target in module.key_prefixes
         ]
-        counts: dict[str, int] = {}
-        for source, _, _ in rules:
-            counts[source] = counts.get(source, 0) + 1
-        duplicated = sorted(source for source, count in counts.items() if count > 1)
+        sources = [source for source, _, _ in rules]
+        duplicated = sorted({source for source in sources if sources.count(source) > 1})
         if duplicated:
             raise ValueError(f"OmniHFLayout claims source prefixes {duplicated} for more than one module.")
         return sorted(rules, key=lambda rule: len(rule[0]), reverse=True)
 
-    @cached_property
-    def _source_index(self) -> tuple[tuple[int, dict[str, tuple[str, str]]], ...]:
-        """``((length, {source_prefix: (module, module_prefix)}), ...)``, longest first.
-
-        A layout may list thousands of full-key renames; looking a key's prefix
-        up per distinct prefix length keeps :meth:`route` independent of that.
-        """
-        by_length: dict[int, dict[str, tuple[str, str]]] = {}
-        for source, name, target in self._rules:
-            by_length.setdefault(len(source), {})[source] = (name, target)
-        return tuple(sorted(by_length.items(), reverse=True))
-
-    @cached_property
-    def _target_index(self) -> dict[str, tuple[tuple[int, dict[str, str]], ...]]:
-        """Per module, ``((length, {module_prefix: source_prefix}), ...)``, longest first."""
-        by_module: dict[str, dict[int, dict[str, str]]] = {}
-        for source, name, target in self._rules:
-            by_module.setdefault(name, {}).setdefault(len(target), {}).setdefault(target, source)
-        return {name: tuple(sorted(by_length.items(), reverse=True)) for name, by_length in by_module.items()}
-
     def route(self, source_key: str) -> tuple[str, str] | None:
         """``(module, module_key)`` owning ``source_key``, or ``None`` when no module claims it."""
-        for length, rules in self._source_index:
-            rule = rules.get(source_key[:length])
-            if rule is not None:
-                name, target = rule
-                return name, target + source_key[length:]
+        for source, name, target in self._rules:
+            if source_key.startswith(source):
+                return name, target + source_key[len(source) :]
         return None
 
     def source_key(self, module: str, module_key: str) -> str | None:
@@ -212,10 +171,10 @@ class OmniHFLayout:
         module and key, which rejects a module key that only looks like it
         belongs to a prefix another module claims more specifically.
         """
-        for length, rules in self._target_index.get(module, ()):
-            source = rules.get(module_key[:length])
-            if source is not None:
-                key = source + module_key[length:]
+        candidates = [(source, target) for source, name, target in self._rules if name == module]
+        for source, target in sorted(candidates, key=lambda rule: len(rule[1]), reverse=True):
+            if module_key.startswith(target):
+                key = source + module_key[len(target) :]
                 return key if self.route(key) == (module, module_key) else None
         return None
 
@@ -271,21 +230,13 @@ class HFSource:
 
     @property
     def layout(self) -> OmniHFLayout:
-        return get_hf_layout(self.model_type, self.path)
+        return get_hf_layout(self.model_type)
 
 
-@functools.lru_cache(maxsize=None)
-def get_hf_layout(model_type: str, source_path: str | None = None) -> OmniHFLayout:
-    """The layout registered for ``model_type``, built for the checkpoint at ``source_path``.
-
-    A registered factory takes the checkpoint directory (``None`` when there is
-    none to read), so a layout whose key map depends on the checkpoint -- a
-    per-layer rename needs the layer count -- can read its config. A layout
-    built for one path is reused for it.
-    """
+def get_hf_layout(model_type: str) -> OmniHFLayout:
     import veomni.models.seed_omni.modules  # noqa: F401  (registers every family's layout)
 
-    return OMNI_HF_LAYOUT_REGISTRY[model_type](source_path)
+    return OMNI_HF_LAYOUT_REGISTRY[model_type]()
 
 
 def has_hf_layout(model_type: str | None) -> bool:
@@ -384,13 +335,7 @@ class HFSourceKeyConverter:
     and handed to the module's own converter (``inner``); any other key belongs
     to a sibling module (or to none) and is skipped without being read. So is a
     ``tied_source_keys`` duplicate whose target the module does not have (it
-    ties that weight instead of storing it). ``generated`` yields the module's
-    :attr:`OmniHFModuleLayout.generated_tensors`, emitted at :meth:`finalize`.
-
-    A loader that must see module keys before converting -- the per-rank
-    streaming loader decides what to slice by the destination parameter --
-    renames with :meth:`module_key` itself and converts with ``inner``,
-    emitting this converter's :meth:`finalize`.
+    ties that weight instead of storing it).
     """
 
     def __init__(
@@ -399,17 +344,14 @@ class HFSourceKeyConverter:
         module_name: str,
         inner: CheckpointTensorConverter | None = None,
         absent_tied_keys: frozenset[str] = frozenset(),
-        generated: Callable[[], dict[str, torch.Tensor]] | None = None,
     ) -> None:
         self.layout = layout
         self.module_name = module_name
         self.inner = inner
         self.absent_tied_keys = absent_tied_keys
-        self.generated = generated
         self.skipped = 0
 
-    def module_key(self, name: str) -> str | None:
-        """The module key source key ``name`` loads into, or ``None`` when this module does not read it."""
+    def _target(self, name: str) -> str | None:
         if name in self.absent_tied_keys:
             return None
         routed = self.layout.route(name)
@@ -421,43 +363,35 @@ class HFSourceKeyConverter:
         return True
 
     def should_skip_without_loading(self, name: str) -> bool:
-        target = self.module_key(name)
+        target = self._target(name)
         return target is None or checkpoint_converter_should_skip_without_loading(self.inner, target)
 
     def record_skip_without_loading(self, name: str) -> None:
-        target = self.module_key(name)
+        target = self._target(name)
         if target is None:
             self.skipped += 1
         else:
             checkpoint_converter_record_skip_without_loading(self.inner, target)
 
     def convert(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
-        target = self.module_key(name)
+        target = self._target(name)
         if target is None:
             self.skipped += 1
             return None
         return maybe_convert_checkpoint_tensor(target, tensor, self.inner)
 
-    def generated_tensors(self) -> list[ConvertedCheckpointTensor]:
-        """The module tensors the checkpoint does not store, under module keys."""
-        if self.generated is None:
-            return []
-        return [ConvertedCheckpointTensor(name, tensor) for name, tensor in self.generated().items()]
-
     def finalize(self) -> list[ConvertedCheckpointTensor]:
-        results = list(self.inner.finalize()) if self.inner is not None else []
-        return results + self.generated_tensors()
+        return list(self.inner.finalize()) if self.inner is not None else []
 
     def is_dim0_zero_pad(self, name: str) -> bool:
-        target = self.module_key(name)
+        target = self._target(name)
         return target is not None and checkpoint_converter_is_dim0_zero_pad(self.inner, target)
 
     def fused_expert_target(self, name: str) -> tuple[str, int] | None:
-        target = self.module_key(name)
+        target = self._target(name)
         return None if target is None else checkpoint_converter_fused_expert_target(self.inner, target)
 
     def for_expert_range(self, start: int, num_local: int) -> HFSourceKeyConverter:
-        """A range-restricted copy. It emits no generated tensors: those are whole and come from the full converter."""
         return HFSourceKeyConverter(
             self.layout,
             self.module_name,
@@ -469,9 +403,9 @@ class HFSourceKeyConverter:
 def attach_hf_source_converter(model: torch.nn.Module, source: HFSource, module_name: str) -> None:
     """Make the VeOmni weight loaders read ``model`` (module ``module_name``) from ``source``.
 
-    Covers ``load_model_weights``, ``rank0_load_and_broadcast_weights`` and
-    ``load_model_weights_ep_sharded``, which renames with
-    :meth:`HFSourceKeyConverter.module_key` itself.
+    Covers ``load_model_weights`` and ``rank0_load_and_broadcast_weights``;
+    ``ep_sharded_stream_load`` does not apply the renames and is rejected for
+    an HF ``model_path`` up front.
 
     Installed on the instance, ahead of the class's own converter factory,
     which then sees the module's key names exactly as it would reading a split
@@ -494,21 +428,9 @@ def attach_hf_source_converter(model: torch.nn.Module, source: HFSource, module_
         if (routed := layout.route(key)) is not None and routed[0] == module_name and routed[1] not in module_keys
     )
 
-    module_layout = layout.modules[module_name]
-    module_config = model.config
-
-    def generated() -> dict[str, torch.Tensor]:
-        return module_layout.generated_tensors(source.path, module_config)
-
     def factory(live_model: torch.nn.Module) -> HFSourceKeyConverter:
         inner = inner_factory(live_model) if inner_factory is not None else None
-        return HFSourceKeyConverter(
-            layout,
-            module_name,
-            inner,
-            absent_tied,
-            generated if module_layout.generated_tensors is not None else None,
-        )
+        return HFSourceKeyConverter(layout, module_name, inner, absent_tied)
 
     model._create_checkpoint_tensor_converter = factory
 
@@ -708,35 +630,6 @@ _SAFETENSORS_DTYPES = {
 }
 
 
-_WIDENING_FLOAT_DTYPES = (torch.float64, torch.float32, torch.bfloat16, torch.float16)
-
-
-def _to_source_dtype(module: str, key: str, tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """``tensor`` cast to the source's ``dtype``; only casts between plain float dtypes are allowed.
-
-    A cast into a quantized storage dtype (fp8, packed int8) would write the
-    values without their scales -- a checkpoint that loads and is wrong. Such
-    a module must declare :attr:`OmniHFModuleLayout.export_state`.
-    """
-    if tensor.dtype == dtype:
-        return tensor
-    if tensor.dtype in _WIDENING_FLOAT_DTYPES and dtype in _WIDENING_FLOAT_DTYPES:
-        return tensor.to(dtype)
-    raise TypeError(
-        f"save_hf_source_checkpoint: module '{module}' exports {key!r} as {tensor.dtype}, but the source stores "
-        f"it as {dtype}. Casting would drop its quantization; the module layout must declare export_state."
-    )
-
-
-def _all_ranks_union(names: Iterable[str]) -> list[str]:
-    """``names`` from every rank, in first-seen order."""
-    if not dist.is_initialized() or dist.get_world_size() == 1:
-        return list(names)
-    gathered: list[list[str] | None] = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, list(names))
-    return list(dict.fromkeys(key for keys in gathered for key in keys or ()))
-
-
 def _read_source_tensors(
     source_path: str, weight_files: Mapping[str, str], keys: list[str]
 ) -> dict[str, torch.Tensor]:
@@ -785,19 +678,15 @@ def save_hf_source_checkpoint(
     """Write ``modules``' live weights back as one checkpoint in ``source``'s own layout.
 
     ``modules`` maps a layout module name to ``(model, parallel_state)``; all
-    ranks must call this. Each module's flat state dict goes through the
-    module's :attr:`OmniHFModuleLayout.export_state` when it declares one, is
-    renamed back to source keys through the layout's prefixes, and is cast to
-    the source dtype -- between float dtypes only; a cast into a quantized
-    dtype is refused. Every exported key must land on a source key of the same
-    shape, except a tied alias the source does not store: a module whose
-    checkpoint tensor converter renames or reshapes tensors, or that adds a
-    parameter the source lacks, loads from the source but cannot be written
-    back to it without an ``export_state``, so that raises instead of
-    exporting the stale source copy. Source keys no live module produced —
-    modules that stayed frozen, a sibling built on meta, or weights no module
-    claims — are copied from the source verbatim, spread over the ranks,
-    except a declared tied duplicate
+    ranks must call this. Each module's flat state dict is renamed back to
+    source keys through the layout's prefixes and cast to the source dtype.
+    Every live key must land on a source key of the same shape, except a tied
+    alias the source does not store: a module whose checkpoint tensor converter
+    renames or reshapes tensors, or that adds a parameter the source lacks,
+    loads from the source but cannot be written back to it, so that raises
+    instead of exporting the stale source copy. Source keys no live module produced — modules that stayed
+    frozen, a sibling built on meta, or weights no module claims — are copied
+    from the source verbatim, except a declared tied duplicate
     (:attr:`OmniHFLayout.tied_source_keys`), which takes its original's value.
     The result keeps the source's shard files and non-weight files, so it
     loads wherever the source does.
@@ -813,19 +702,11 @@ def save_hf_source_checkpoint(
     source_specs = source_tensor_specs(source.path, weight_files)
 
     save_state: dict[str, torch.Tensor] = {}
-    # Keys some rank produced. A module's export_state may hand a key to one
-    # rank only, so "produced" is decided across ranks, not from save_state.
-    produced: set[str] = set()
     for name, (model, parallel_state) in modules.items():
         module_state = ModelState(model, parallel_state=parallel_state).state_dict()
         tied = _tied_parameter_names(model)
-        export_state = layout.modules[name].export_state
-        exported_keys = list(module_state)
-        if export_state is not None:
-            module_state = export_state(model, module_state)
-            exported_keys = _all_ranks_union(module_state)
-        unmapped, reshaped, bad_dtypes = [], [], []
-        for key in exported_keys:
+        unmapped, reshaped = [], []
+        for key, tensor in module_state.items():
             source_key = layout.source_key(name, key)
             if source_key is None or source_key not in weight_files:
                 # A tied alias the source does not store (``tie_word_embeddings``
@@ -833,51 +714,32 @@ def save_hf_source_checkpoint(
                 if not any(layout.source_key(name, alias) in weight_files for alias in tied.get(key, ())):
                     unmapped.append(key)
                 continue
-            if source_key in produced:
+            if source_key in save_state:
                 raise ValueError(f"Source key {source_key!r} is produced by more than one module.")
-            produced.add(source_key)
-            if key not in module_state:
-                continue
-            tensor = module_state[key]
             dtype, shape = source_specs[source_key]
             if tuple(tensor.shape) != shape:
                 reshaped.append(f"{key} {tuple(tensor.shape)} vs {source_key} {shape}")
                 continue
-            try:
-                save_state[source_key] = _to_source_dtype(name, key, tensor, dtype)
-            except TypeError as exc:
-                bad_dtypes.append(str(exc))
-        if export_state is not None:
-            # An exported key may live on one rank only; every rank must agree to raise.
-            reshaped = _all_ranks_union(reshaped)
-            bad_dtypes = _all_ranks_union(bad_dtypes)
-        if bad_dtypes:
-            raise TypeError(bad_dtypes[0])
+            save_state[source_key] = tensor if tensor.dtype == dtype else tensor.to(dtype)
         if unmapped or reshaped:
             raise ValueError(
                 f"save_hf_source_checkpoint: module '{name}' cannot be written back in the `{source.model_type}` "
                 f"source layout. Keys with no source key: {unmapped}; keys whose shape differs from the source: "
                 f"{reshaped}. A module whose checkpoint tensor converter renames or reshapes tensors cannot export "
-                "to its upstream layout without an export_state; disable train.checkpoint.save_hf_weights, "
-                "or train from a split checkpoint."
+                "to its upstream layout; disable train.checkpoint.save_hf_weights, or train from a split checkpoint."
             )
 
     for key, original in layout.tied_source_keys.items():
-        if key in weight_files and key not in produced and original in produced:
-            produced.add(key)
-            if original in save_state:
-                save_state[key] = save_state[original].clone()
-    carried = [key for key in weight_files if key not in produced]
+        if key in weight_files and key not in save_state and original in save_state:
+            save_state[key] = save_state[original].clone()
+    carried = [key for key in weight_files if key not in save_state]
     if carried:
         logger.info_rank0(
             f"save_hf_source_checkpoint: copying {len(carried)} source tensor(s) no live module produced."
         )
-        # Spread the copy over the ranks: a frozen sibling module's weights can
-        # be most of the checkpoint, more than one process should hold.
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        mine = carried[rank::world_size]
-        save_state.update(_read_source_tensors(source.path, weight_files, mine))
+        rank0 = not dist.is_initialized() or dist.get_rank() == 0
+        if rank0:
+            save_state.update(_read_source_tensors(source.path, weight_files, carried))
 
     single_file = set(weight_files.values()) == {_SAFE_WEIGHTS_NAME}
     fqn_to_index_mapping = {

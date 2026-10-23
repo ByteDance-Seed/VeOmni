@@ -18,11 +18,9 @@ Examples
 Single-process eager (``build_omni_model_runtime_args(args, for_inference=True)``
 forces eager unless the ``modules:`` overlay pins another ``fsdp_mode``):
 
-    python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml \\
-        --model.model_config.infer_type vision_understanding \\
-        --infer.prompt "What is in this image?" \\
-        --infer.images /path/to/image.jpg \\
-        --infer.output_dir qwen3vl_out
+    python tasks/omni/infer_omni.py configs/seed_omni/fake_model/train/base.yaml \\
+        --model.model_config.modules configs/seed_omni/fake_model/infer/modules_infer_eager.yaml \\
+        --infer.prompt "hi"
 
 Media is decoded by the same fetchers the training transform uses, so a request
 carries the same metadata a training sample does (a clip's sampling rate, a
@@ -51,11 +49,9 @@ interleaves::
 
 Distributed inference (modules keep their DDP / FSDP2 wraps):
 
-    bash train.sh tasks/omni/infer_omni.py \\
-        configs/seed_omni/Janus/janus_1.3b/train/base.yaml \\
-        --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \\
-        --model.model_config.infer_type infer_gen \\
-        --infer.prompt "A cat on a windowsill"
+    bash train.sh tasks/omni/infer_omni.py configs/seed_omni/fake_model/train/base.yaml \\
+        --model.model_config.modules configs/seed_omni/fake_model/infer/modules_infer_fsdp.yaml \\
+        --infer.prompt "hi"
 """
 
 from veomni.arguments.omni_arguments_types import OmniArguments

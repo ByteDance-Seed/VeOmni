@@ -185,16 +185,16 @@ class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
                 f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
                 "before training use (pure inference never reaches this branch)."
             )
-        self.append_batch_anchor(
-            conversation_list,
-            ConversationItem(
-                type="image",
-                value=self._dummy_pixel_values,
-                role="user",
-                is_dummy=True,
-                meta={_OMNI_GRID: self._dummy_grid, _IMG_TAG_KEY: "und"},
-            ),
-        )
+        if conversation_list:
+            conversation_list[0].append(
+                ConversationItem(
+                    type="image",
+                    value=self._dummy_pixel_values,
+                    role="user",
+                    is_dummy=True,
+                    meta={_OMNI_GRID: self._dummy_grid, _IMG_TAG_KEY: "und"},
+                )
+            )
 
     def _store(self, items: list, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> None:
         _store_patches(items, pixel_values, grid_thw, self._dtype)

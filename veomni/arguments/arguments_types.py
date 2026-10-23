@@ -115,7 +115,7 @@ class OptimizerConfig:
     )
     weight_decay: float = field(
         default=0,
-        metadata={"help": "Weight decay. AdamW applies it decoupled, outside the gradient."},
+        metadata={"help": "L2 regularization strength."},
     )
     no_decay_modules: List[str] = field(
         default_factory=list,
@@ -859,8 +859,6 @@ class AcceleratorConfig:
         # "derive it", cp_size is always an explicit divisor of the world size.
         if self.cp_size < 1:
             raise ValueError(f"cp_size must be a positive integer; got {self.cp_size}.")
-        if self.ulysses_size < 1:
-            raise ValueError(f"ulysses_size must be a positive integer; got {self.ulysses_size}.")
 
         non_dp_size = self.pp_size * self.ulysses_size * self.cp_size * self.tp_size
         if self.world_size % non_dp_size != 0:
@@ -871,6 +869,12 @@ class AcceleratorConfig:
             )
         assert self.tp_size == 1, "Tensor parallel size not supported yet."
         assert self.pp_size == 1, "Pipeline parallel size not supported yet."
+        if self.cp_size > 1 and self.ulysses_size > 1:
+            raise NotImplementedError(
+                "Context parallelism cannot be combined with Ulysses yet; "
+                f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
+                "Set ulysses_size=1 to use context parallelism."
+            )
 
         self.dp_size = self.world_size // non_dp_size
 
@@ -1882,10 +1886,6 @@ class ModelArguments(BaseModelArguments):
                 )
 
 
-# Omni modules inherit this same training-unit shape.
-ModelRuntimeArguments = ModelArguments
-
-
 # ================================ Data Arguments ======================================
 #
 # Hierarchy:
@@ -1966,15 +1966,10 @@ class DataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal[
-        "plaintext",
-        "conversation",
-        "diffusion",
-        "classification",
-        "dpo",
-        "seedomni",
-        "seedomni_cached",
-    ] = field(default="conversation", metadata={"help": "Type of the training data."})
+    data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo"] = field(
+        default="conversation",
+        metadata={"help": "Type of the training data."},
+    )
     datasets_type: str = field(
         default="mapping",
         metadata={"help": "Type of the datasets."},
@@ -2031,11 +2026,6 @@ class DataArguments:
                 self.text_keys = "text"
             elif self.data_type == "dpo":
                 self.text_keys = "chosen"
-            elif self.data_type in {"seedomni", "seedomni_cached"}:
-                # SeedOmni modules own their own tokenization; the transform
-                # reads ``conversations`` / ``images`` columns directly and
-                # cached rows carry ``conversation_list`` directly. Leave it unset.
-                pass
             else:
                 raise ValueError(f"Unknown data type: {self.data_type}")
 

@@ -575,7 +575,7 @@ class TestMaterializeAndLoadDispatch:
             ({"ep_sharded_stream_load": True}, True, "ep_sharded"),
             # ``ep_sharded_stream_load`` is set once per run but this helper runs
             # once per model, so a model with no ExtraParallel plan -- every
-            # SeedOmni sub-module that owns no experts -- must fall through to
+            # SeedOmni V2 sub-module that owns no experts -- must fall through to
             # the loader it would have used anyway, not raise.
             ({"ep_sharded_stream_load": True}, False, "plain"),
         ],
@@ -590,9 +590,6 @@ class TestMaterializeAndLoadDispatch:
             should_skip_hf_weight_load=False,
             is_peft_model=False,
             adapter_path=None,
-            cpu_load_param_name=None,
-            max_load_broadcast_size=20.0,
-            fqn_to_index_mapping=None,
             **{"broadcast_from_rank0": False, **flags},
         )
 
@@ -629,9 +626,6 @@ class TestMaterializeAndLoadDispatch:
                 is_peft_model=True,
                 adapter_path=None,
                 broadcast_from_rank0=False,
-                cpu_load_param_name=None,
-                max_load_broadcast_size=20.0,
-                fqn_to_index_mapping=None,
             )
 
     def test_a_buffer_derived_from_a_parameter_is_warned_about_not_preserved(self, monkeypatch):
@@ -772,7 +766,7 @@ class TestDdpMetaInit:
             parallelize_model_ddp(nn.Linear(2, 2))
 
     def test_allows_a_plan_less_model_under_an_inherited_ep_mesh(self, monkeypatch):
-        """An ep dim in the mesh says nothing about *this* model. A SeedOmni
+        """An ep dim in the mesh says nothing about *this* model. A SeedOmni V2
         sub-module inherits the global accelerator's ep size whether or not it owns
         experts, so refusing on the mesh alone would block a DDP vision tower."""
         monkeypatch.setattr(

@@ -343,10 +343,10 @@ A missing module or method still fails before the first request runs.
 - [`tests/seed_omni/mixins/test_offline_encoding_mixin.py`](../../../tests/seed_omni/mixins/test_offline_encoding_mixin.py):
   [the mixin is a marker that names no method](../../../tests/seed_omni/mixins/test_offline_encoding_mixin.py#L64),
   and the hook slots dispatch through `TrainingModuleMixin`.
-- [`tests/seed_omni/arguments/test_offline_cache_args.py`](../../../tests/seed_omni/arguments/test_offline_cache_args.py):
+- [`tests/seed_omni/test_omni_offline_cache_args.py`](../../../tests/seed_omni/test_omni_offline_cache_args.py):
   `train.training_task` values, the `offline_cache_dir` requirement,
-  [one epoch for `offline_embedding`](../../../tests/seed_omni/arguments/test_offline_cache_args.py#L60) and
-  [the `data.data_type` match](../../../tests/seed_omni/arguments/test_offline_cache_args.py#L76).
+  [one epoch for `offline_embedding`](../../../tests/seed_omni/test_omni_offline_cache_args.py#L60) and
+  [the `data.data_type` match](../../../tests/seed_omni/test_omni_offline_cache_args.py#L76).
 - [`tests/seed_omni/runtime/test_module_runtime.py`](../../../tests/seed_omni/runtime/test_module_runtime.py):
   [only a cacheable module under `offline_training` is built on meta](../../../tests/seed_omni/runtime/test_module_runtime.py#L165),
   [the class the omni registries build is the one checked](../../../tests/seed_omni/runtime/test_module_runtime.py#L190),
@@ -355,13 +355,13 @@ A missing module or method still fails before the first request runs.
 - [`tests/seed_omni/runtime/test_omni_model_runtime.py`](../../../tests/seed_omni/runtime/test_omni_model_runtime.py):
   [under `fsdp_scope: model`, cache readers stay on meta outside the composed wrap](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L409), and
   [under a module-level input cast, a node's item edits reach the batch only from its hooks or its return](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L296).
-- [`tests/seed_omni/mixins/test_offline_cache_writer.py`](../../../tests/seed_omni/mixins/test_offline_cache_writer.py):
-  [the `seedomni_cached` transform](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L33), the
-  [writer round trip](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L51),
-  [one writer per `dp_rank`](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L225),
-  [a resumed writer keeps every row its cursor covers and drops the replayed ones](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L132),
-  [a finalized cache](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L160) or [another dp size](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L173) cannot be resumed into, and
-  [a shard only one rank sees fails every rank](../../../tests/seed_omni/mixins/test_offline_cache_writer.py#L311).
+- [`tests/seed_omni/test_offline_cache_writer.py`](../../../tests/seed_omni/test_offline_cache_writer.py):
+  [the `seedomni_cached` transform](../../../tests/seed_omni/test_offline_cache_writer.py#L33), the
+  [writer round trip](../../../tests/seed_omni/test_offline_cache_writer.py#L51),
+  [one writer per `dp_rank`](../../../tests/seed_omni/test_offline_cache_writer.py#L225),
+  [a resumed writer keeps every row its cursor covers and drops the replayed ones](../../../tests/seed_omni/test_offline_cache_writer.py#L132),
+  [a finalized cache](../../../tests/seed_omni/test_offline_cache_writer.py#L160) or [another dp size](../../../tests/seed_omni/test_offline_cache_writer.py#L173) cannot be resumed into, and
+  [a shard only one rank sees fails every rank](../../../tests/seed_omni/test_offline_cache_writer.py#L311).
 - [`tests/seed_omni/trainer/test_omni_trainer.py`](../../../tests/seed_omni/trainer/test_omni_trainer.py):
   [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L125),
   [it saves no model state](../../../tests/seed_omni/trainer/test_omni_trainer.py#L137),

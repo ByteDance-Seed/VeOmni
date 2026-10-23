@@ -169,10 +169,10 @@ def test_an_unsafe_infer_type_in_the_generation_sidecar_fails_the_load(tmp_path)
     _write_omni_checkpoint(tmp_path)
     sidecar = tmp_path / DEFAULT_GENERATION_GRAPH_FILE
     graphs = yaml.safe_load(sidecar.read_text(encoding="utf-8"))
-    graphs["generation/latest"] = graphs.pop("infer_und")
+    graphs["generation/v2"] = graphs.pop("infer_und")
     sidecar.write_text(yaml.safe_dump(graphs, sort_keys=False), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Invalid infer_type 'generation/latest'"):
+    with pytest.raises(ValueError, match="Invalid infer_type 'generation/v2'"):
         OmniConfig.from_pretrained(tmp_path)
 
 

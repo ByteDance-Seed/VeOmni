@@ -40,7 +40,6 @@ from .modules import (
     read_model_type,
 )
 from .processing_omni import OmniProcessor
-from .utils.conversation import build_conversation
 
 
 __all__ = [
@@ -55,7 +54,6 @@ __all__ = [
     "InferenceModuleMixin",
     "OfflineEncodingMixin",
     "MetricMeterMixin",
-    "build_conversation",
     "TrainingGraph",
     "GenerationGraph",
     "NodeDef",

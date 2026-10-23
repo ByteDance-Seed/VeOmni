@@ -147,11 +147,10 @@ build_omni_model_runtime_args()         OmniTrainer._setup()
 
 ## 3. Hard Constraints (SeedOmni)
 
-1. **SeedOmni SP + CP shares one `dp_size` (and therefore one `sp_size = cp_size * ulysses_size`), replicated data, single-pass per module**
-   - Each module may independently configure Ulysses SP (`ulysses_size`), Context Parallelism (`cp_size`), or hybrid `cp * sp` (`cp_size * ulysses_size`), **provided every distributed module and `model.accelerator` resolve to the same `dp_size`** (`_validate_omni_dp_size` in `build_omni_model_runtime_args`).
-   - Because `ParallelState` always orders its device mesh `[pp, dp_replicate, dp_shard, cp, ulysses, tp]`, any two modules with the same `dp_size` (and thus the same `sp_size = cp_size * ulysses_size = world_size // dp_size`) have the exact same `dp_rank`, `dp_group`, `sp_group`, and `fsdp_group` (`dp_sp`).
-   - The dataloader is the standard build-time sharded loader: it yields `dp_size = world / sp_size` **distinct** shards and **replicates** each shard across its `sp_group`, so every rank of an `sp_group` holds the same sample with identical tensor shapes and dtypes.
-   - A module with `sp_size = S > 1` pads and slices the replicated sample to its `1/S` shard inside `pre_forward` (`sp_pad` + `slice_input_tensor` or `sp_pad_and_slice`, rebuilding varlen/`cu_seqlens` over the full padded sequence first), runs its endpoint once, and all-gathers the output back to the full sample in `post_forward` (`gather_outputs`, then `narrow` off the SP pad).
+1. **SeedOmni SP is one shared size, replicated data, single-pass per module**
+   - Set `model.accelerator.ulysses_size` (CLI `--model.accelerator.ulysses_size`) on the global accelerator so every module inherits the same SP size through `build_omni_module_runtime_args`.
+   - The dataloader is the standard build-time sharded loader: it yields `dp_size = world / sp_size` **distinct** shards and **replicates** each shard across its SP group, so every rank of an SP group holds the same sample with identical tensor shapes and dtypes.
+   - A module with `sp_size = S > 1` pads and slices the replicated sample to its `1/S` shard inside `pre_forward` (`sp_pad` + `slice_input_tensor` or `sp_pad_and_slice`, rebuilding varlen/`cu_seqlens` over the full padded sequence first), runs the endpoint once (attention all-to-alls over the SP group internally), and all-gathers the output back to the full sample in `post_forward` (`gather_outputs`, then `narrow` off the SP pad).
    - **Gradient correctness:** `_Gather.backward` all-reduces (SUM) the grad over the SP group and takes this rank's shard; FSDP2's `÷|dp_shard_sp|` grad averaging cancels the `×sp` factor, yielding gradients identical to the non-SP baseline.
    - Design doc: `docs/seed_omni/distributed/sequence_parallel.md`.
 
@@ -165,7 +164,7 @@ build_omni_model_runtime_args()         OmniTrainer._setup()
 
 4. **SP / DP / CP groups resolve from the current `ParallelState`'s mesh (`ModuleRuntime` scoping)**
    - In `veomni/distributed/sequence_parallel/comm.py`, `get_ulysses_sequence_parallel_group`, `get_unified_sequence_parallel_group`, `get_context_parallel_group`, and `get_data_parallel_group` read `_current_state()` (`_PARALLEL_STATE.{ulysses,sp,cp,dp}_group`, returning `None` when uninitialized).
-   - Each `ModuleRuntime` registers its `ParallelState` under `self.module_name` via `init_parallel_state_from_config(accelerator, self.module_name)` and scopes build, forward (`OmniModelRuntime.module_context`), grad-checkpoint recompute (`ModuleRuntime._recompute_context`), optimizer/lr-scheduler build, and grad clipping (`mt.clip_grad_norm(max_norm)`) with `use_parallel_state(self.module_name)`, so `veomni_flash_attention_2` and SP slice/gather helpers automatically use the active module's own process groups.
+   - Each `ModuleRuntime` registers its `ParallelState` under `self.module_name` via `init_parallel_state_from_config(accelerator, self.module_name)` and scopes build, forward (`OmniModelRuntime.module_context`), grad-checkpoint recompute (`ModuleRuntime._recompute_context`), optimizer/lr-scheduler build, and grad clipping (`mt.clip_grad_norm(max_norm)`) with `use_parallel_state(self.module_name)`, so `veomni_flash_attention_2_with_sp` and SP slice/gather helpers automatically use the active module's own process groups.
 
 5. **Per-module DDP, ExtraParallel, and `fsdp_scope='model'` composed wrapping**
    - For DDP modules under SP, `veomni_omni_module_clip_grad_norm` all-reduces `p.grad` (with `SUM` then divide, selecting by `requires_grad` and zero-filling missing grads) over `fsdp_group` (`dp_sp`) when `sp_size > 1` before clipping, and `build_parallelize_model()` passes `broadcast_buffers=False` unconditionally (see constraint 7a in `.agents/knowledge/constraints.md`).

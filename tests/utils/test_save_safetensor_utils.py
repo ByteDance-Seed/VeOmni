@@ -204,39 +204,6 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
         )
         self.assertIsNone(writer_cls.call_args.kwargs["fqn_to_index_mapping"])
 
-    def test_consolidation_keeps_e8m0_block_scales(self):
-        """Block-scaled exports store their scales as e8m0, which older safetensors cannot name."""
-        import tempfile
-        from pathlib import Path
-
-        import torch.distributed.checkpoint as dcp
-        from safetensors.torch import load_file
-        from torch.distributed.checkpoint import HuggingFaceStorageWriter
-        from torch.distributed.checkpoint._consolidate_hf_safetensors import consolidate_safetensors_files
-
-        from veomni.checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
-
-        apply_dcp_consolidation_patch()
-        fake = {
-            "w.weight": torch.randn(4, 64).to(torch.float8_e4m3fn),
-            "w.scale": torch.randint(120, 135, (4, 2), dtype=torch.uint8).view(torch.float8_e8m0fnu),
-        }
-        with tempfile.TemporaryDirectory() as output_dir:
-            sharded = str(Path(output_dir) / "sharded")
-            mapping = dict.fromkeys(fake, 1)
-            dcp.save(
-                fake,
-                storage_writer=HuggingFaceStorageWriter(sharded, save_distributed=True, fqn_to_index_mapping=mapping),
-            )
-            consolidate_safetensors_files(sharded, output_dir, mapping)
-            loaded = {}
-            for file in Path(output_dir).glob("*.safetensors"):
-                loaded.update(load_file(file))
-
-        for key, value in fake.items():
-            self.assertEqual(loaded[key].dtype, value.dtype)
-            self.assertTrue(torch.equal(loaded[key].view(torch.uint8), value.view(torch.uint8)), key)
-
     def test_naflatten_and_unflatten_roundtrip_keeps_shape_on_cpu(self):
         from veomni.utils.tensor_utils import naflatten, unflatten
 

@@ -336,7 +336,7 @@ def test_build_runtime_args_keeps_model_path_and_sets_seed_omni_model_path(hf_ro
     )
 
     root, _ = hf_root
-    cfg = Path(__file__).resolve().parents[3] / "configs" / "seed_omni" / "Qwen" / "qwen3_0.6b" / "train"
+    cfg = Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Qwen" / "qwen3_0.6b" / "train"
     args = OmniArguments(
         model=OmniModelRuntimeArguments(
             model_path=str(root),

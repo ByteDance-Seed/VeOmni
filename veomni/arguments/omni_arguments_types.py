@@ -270,7 +270,6 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
     for module_args in modules.values():
         _validate_omni_accelerator(module_args.accelerator)
     _validate_composed_wrap(model_runtime.accelerator, modules)
-    _validate_omni_dp_size(model_runtime.accelerator, modules)
     training_graphs = _load_graph_map(train_graph)
     generation_graphs = _load_graph_map(infer_graph)
     if train_type is not None and train_type not in training_graphs:
@@ -843,48 +842,6 @@ def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, O
             "fsdp_scope='model' wraps the composed OmniModel once, so no module can be loaded "
             f"unwrapped; these use fsdp_mode='eager': {eager}. Run with fsdp_scope='module', or "
             "give them fsdp2 / ddp."
-        )
-
-
-def _validate_omni_dp_size(
-    top_accelerator: AcceleratorConfig,
-    modules: dict[str, OmniModuleRuntimeArguments],
-) -> None:
-    """Verify every distributed module and ``model.accelerator`` resolve to the same ``dp_size``."""
-    distributed_modules = {
-        name: mod_args for name, mod_args in modules.items() if mod_args.accelerator.fsdp_config.fsdp_mode != "eager"
-    }
-    if not distributed_modules:
-        return
-
-    dp_sizes = {name: mod_args.accelerator.dp_size for name, mod_args in distributed_modules.items()}
-    unique_dp_sizes = set(dp_sizes.values())
-    if len(unique_dp_sizes) > 1:
-        details = ", ".join(
-            f"{name}: dp_size={mod_args.accelerator.dp_size} "
-            f"(cp_size={mod_args.accelerator.cp_size}, ulysses_size={mod_args.accelerator.ulysses_size}, "
-            f"world_size={mod_args.accelerator.world_size})"
-            for name, mod_args in distributed_modules.items()
-        )
-        raise ValueError(
-            "All distributed SeedOmni modules must resolve to the same `dp_size` "
-            "(i.e. identical `cp_size * ulysses_size` for a given `world_size`), "
-            f"but got mismatched module topologies: {details}."
-        )
-
-    common_dp_size = next(iter(unique_dp_sizes))
-    if top_accelerator.dp_size != common_dp_size:
-        details = ", ".join(
-            f"{name}: dp_size={mod_args.accelerator.dp_size} "
-            f"(cp_size={mod_args.accelerator.cp_size}, ulysses_size={mod_args.accelerator.ulysses_size})"
-            for name, mod_args in distributed_modules.items()
-        )
-        raise ValueError(
-            f"Top-level `model.accelerator` resolved to dp_size={top_accelerator.dp_size} "
-            f"(cp_size={top_accelerator.cp_size}, ulysses_size={top_accelerator.ulysses_size}, "
-            f"world_size={top_accelerator.world_size}), which does not match the modules' "
-            f"dp_size={common_dp_size} ({details}). Ensure `model.accelerator` and all modules "
-            "resolve to the same `dp_size`."
         )
 
 

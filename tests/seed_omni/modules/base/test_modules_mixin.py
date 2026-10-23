@@ -901,5 +901,5 @@ def test_seed_omni_modules_select_ops_from_module_config_not_global_ops_config()
         vision_config={"hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 1, "num_attention_heads": 4},
         ops_implementation={"attn_implementation": "sdpa"},
     )
-    assert siglip_cfg._attn_implementation == "sdpa"
-    assert siglip_cfg.vision_config._attn_implementation == "sdpa"
+    assert siglip_cfg.ops_implementation["attn_implementation"] == "sdpa"
+    assert siglip_cfg.ops_config.attn_implementation == "veomni_sdpa"

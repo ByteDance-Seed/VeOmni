@@ -38,10 +38,9 @@ Under `veomni/models/seed_omni/modules/<family>/<sub>/`:
   `generate()` and its state. `InferenceMixin` must come **before**
   `PretrainedOmniModule` in the bases. The class must load and run under plain
   `from_pretrained` with no VeOmni import.
-- `accelerated/accelerated.py`: `TrainingMixin` and `VeOmniMixin` (no
-  `InferenceMixin`) plus IDE type stubs (below), and
-  `class XAccelerated(VeOmniMixin, X)`. The Janus modules under
-  `modules/janus/*/` are the reference pattern.
+- `accelerated/accelerated.py`: `TrainingMixin` and `VeOmniMixin` plus IDE type
+  stubs (below), and `class XAccelerated(VeOmniMixin, X)`. The Janus modules
+  under `modules/janus/*/` are the reference pattern.
 - `processing.py` (optional): when the module consumes raw images, audio or
   video.
 
@@ -49,33 +48,37 @@ Reuse the shared `TextEncoder` module in `modules/text_encoder/` where possible.
 
 ### IDE type stubs
 
-The `TrainingMixin` hooks call native modeling APIs through `self`, but the
-mixin does not contain them; they live on the `modeling.py` class, which is only
-mixed in at `XAccelerated(VeOmniMixin, X)`. Declare **only what the mixin's hooks
-use**, so static analysis can follow the calls:
+Because `TrainingMixin` hooks call native modeling APIs through `self` while the
+implementations live on the `modeling.py` class mixed in at
+`XAccelerated(VeOmniMixin, X)` (`VeOmniMixin` precedes `X` in the MRO), declare
+class-level attribute annotations directly on `TrainingMixin` and guard any
+typing-only method or property stubs with `if TYPE_CHECKING:`:
 
 ```python
+from typing import TYPE_CHECKING
+
+
 class TrainingMixin(TrainingModuleMixin):
     config: BagelFlowConnectorConfig
     device: torch.device
     dtype: torch.dtype
 
-    def embed_latent(
-        self,
-        latents: torch.Tensor,
-        position_ids: torch.LongTensor,
-        timesteps: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """IDE stub — implemented on :class:`BagelFlowConnector` in ``modeling.py``."""
-        ...
+    if TYPE_CHECKING:
+
+        def embed_latent(
+            self,
+            latents: torch.Tensor,
+            position_ids: torch.LongTensor,
+            timesteps: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            """IDE stub — implemented on :class:`BagelFlowConnector` in ``modeling.py``."""
+            ...
 ```
 
-- Signatures match `modeling.py` exactly; the body is always `...`.
-- Properties defined on `VeOmniMixin` in the same file use the docstring
+- Match signatures in `modeling.py` exactly and keep method/property stubs under
+  `if TYPE_CHECKING:` so runtime dispatch resolves `X`'s implementation.
+- For properties defined on `VeOmniMixin` in the same file, use the docstring
   ``IDE stub — see :class:`VeOmniMixin` below (``config.field``).``
-- Do not copy modeling logic into the mixin.
-- `generate()` and its helpers live on the native class and need no stub unless a
-  training hook calls them.
 
 `modules/bagel/flow_connector/accelerated/accelerated.py` shows the full
 convention.
@@ -137,7 +140,7 @@ If the model needs a new data source, add a preprocessor as described in
 
 ## 6. Validate
 
-1. Render the graphs with `scripts/seed_omni/visualize_graph.py`
+1. Inspect the graph trace and optionally profile per-node timing / memory
    ([Debugging the graph](training_and_inference.md#6-debugging-the-graph)).
 2. Run the unit tests: `pytest tests/seed_omni/`.
 3. Run a short train and inference end to end, then add a page under
@@ -145,10 +148,8 @@ If the model needs a new data source, add a preprocessor as described in
 
 Worked examples:
 
-- [Janus](../models/janus.md): multimodal understanding and generation
-  (SigLIP / VQVAE / LLaMA).
-- [Qwen3](../models/qwen3.md): minimal text-only split, plus visual instruction
-  tuning.
-- [Qwen3 MoE](../models/qwen3_moe.md): MoE backbone with expert parallelism.
-- [Qwen3-VL](../models/qwen3vl.md): vision-language split with per-module ViT.
-- [BAGEL](../models/bagel.md): MoT backbone with flow-matching image generation.
+- **Janus**: multimodal understanding and generation (SigLIP / VQVAE / LLaMA).
+- **Qwen3**: minimal text-only split, plus visual instruction tuning.
+- **Qwen3 MoE**: MoE backbone with expert parallelism.
+- **Qwen3-VL**: vision-language split with per-module ViT.
+- **BAGEL**: MoT backbone with flow-matching image generation.
