@@ -1,0 +1,73 @@
+# Native 480p T2V, dense attention, online frozen conditions.
+# Override the three data/model paths at launch; no automatic weight downloads.
+model:
+  model_path: ./weights/HunyuanVideo-1.5/transformer/480p_t2v
+  config_path: ./configs/model_configs/hunyuanvideo15/480p_t2v.json
+  condition_model_path: ./weights/HunyuanVideo-1.5
+  condition_model_cfg:
+    height: 480
+    width: 832
+    num_frames: 33
+    train_timestep_shift: 3.0
+    max_text_length: 1000
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: eager
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_warmup_ratio: 0.0
+    lr_decay_style: constant
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  accelerator:
+    init_device: meta
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    dp_replicate_size: 1
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+
+data:
+  train_path: ./data/tom_and_jerry/train.jsonl
+  source_name: Tom-and-Jerry-VideoGeneration-Dataset
+  datasets_type: mapping
+  data_type: diffusion
+  data_transform: dit_online
+  text_keys: prompt
+  max_seq_len: 32768
+  mm_configs:
+    fps: 8
+    min_frames: 33
+    max_frames: 33
+    frame_factor: 4
+    frame_factor_remainder: 1
+    video_max_pixels: 399360
+    video_min_pixels: 0
+  dataloader:
+    type: native
+    num_workers: 0
+    drop_last: true
+    pin_memory: false
+  shuffle: false
+
+train:
+  training_task: online_training
+  seed: 42
+  max_steps: 4
+  num_train_epochs: 1
+  global_batch_size: 1
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.0
+  checkpoint:
+    output_dir: ./outputs/hunyuanvideo15_t2v
+    manager: dcp
+    save_steps: 2
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false

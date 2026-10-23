@@ -783,3 +783,17 @@ def test_context_parallel_gate_is_inert_when_no_parallel_state_was_installed(mon
     monkeypatch.setattr(parallel_state_module.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(parallel_state_module.dist, "get_world_size", lambda: 2)
     check_context_parallel_supported(_tiny_qwen3_config())
+
+
+def test_hunyuanvideo15_registry(tmp_path, monkeypatch):
+    from veomni.models.diffusers.hunyuanvideo15.configuration_hunyuanvideo15 import HunyuanVideo15Config
+    from veomni.models.diffusers.hunyuanvideo15.modeling_hunyuanvideo15 import HunyuanVideo15Model
+
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    HunyuanVideo15Config().save_pretrained(tmp_path)
+    config = build_config(str(tmp_path))
+    assert isinstance(config, HunyuanVideo15Config)
+    assert get_model_class(config) is HunyuanVideo15Model
+    condition_config = MODEL_CONFIG_REGISTRY[config.condition_model_type]()
+    condition_model = MODELING_REGISTRY[config.condition_model_type]()
+    assert condition_model.config_class is condition_config
