@@ -74,12 +74,12 @@ def _native_exchange_worker(rank, device_type, family, mixed_dtype, endpoint):
     from tests.models.compare import ops_config_scope
     from tests.tools.training_utils import make_eager_ops_config
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
-    from veomni.utils.device import get_torch_device
+    from veomni.utils.device import get_dist_comm_backend, get_torch_device
 
     device_module = get_torch_device()
     device_module.set_device(rank)
     device = torch.device(device_type, rank)
-    backend = "hccl" if device_type == "npu" else "nccl"
+    backend = get_dist_comm_backend()
     dist.init_process_group(backend, store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=180))
     try:
         torch.manual_seed(37 + rank)
@@ -189,12 +189,12 @@ def _native_exchange_worker(rank, device_type, family, mixed_dtype, endpoint):
 @pytest.mark.parametrize("mixed_dtype", (False, True))
 def test_native_coalesced_exchange_and_packed_model(family, mixed_dtype):
     """Native backend parity is separate from the CPU/Gloo qualification."""
-    from veomni.utils.device import get_device_type, get_torch_device
+    from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_torch_device
 
     device = get_device_type()
-    if device not in ("cuda", "npu") or get_torch_device().device_count() < 2:
+    if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) or get_torch_device().device_count() < 2:
         pytest.skip("Requires two native CUDA or Ascend devices")
-    if device == "cuda":
+    if IS_CUDA_AVAILABLE:
         pytest.importorskip("fla")
     else:
         pytest.importorskip("triton")
