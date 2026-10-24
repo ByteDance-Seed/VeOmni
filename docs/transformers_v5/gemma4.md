@@ -23,6 +23,9 @@ predicate is sent to Flash. Packed Flash inputs must be padding-free: `None`
 and all-valid 2D masks are accepted, but masks containing padding raise an
 error because HF unpadding would replace the supplied document boundaries.
 Unpacked Flash inputs retain normal padding-mask handling.
+Packed multimodal calls with `use_bidirectional_attention="vision"` and
+`mm_token_type_ids` require eager/SDPA/FlexAttention. Flash backends reject
+the custom vision-block visibility mask.
 
 Each LM instance holds its own `VeomniOp("cross_entropy_loss", "standard", impl)`
 as `veomni_ce`. Training calls its `loss_function` wrapper so channel-loss
