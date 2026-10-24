@@ -19,13 +19,23 @@ from veomni.ops.kernels.moe_experts.standard.deepgemm import wrapper
 
 
 class _Experts(nn.Module):
-    def __init__(self, w1, w2, experts):
+    def __init__(self, w1, w2, experts, use_checkpoint=False):
         super().__init__()
         self.fc1 = nn.Parameter(w1.clone())
         self.fc2 = nn.Parameter(w2.clone())
         self.experts = experts
+        self.use_checkpoint = use_checkpoint
 
     def forward(self, x, routing, indices):
+        from torch.utils.checkpoint import checkpoint
+
+        # Checkpoint inside FSDP hooks so original and recomputed inputs share
+        # the same mixed-precision casts (including routing weights).
+        if self.use_checkpoint:
+            return checkpoint(self._forward, x, routing, indices, use_reentrant=False)
+        return self._forward(x, routing, indices)
+
+    def _forward(self, x, routing, indices):
         empty = x.new_empty(0)
         return wrapper(
             x,
@@ -41,7 +51,7 @@ class _Experts(nn.Module):
         )
 
 
-def _worker(rank, world, ep_size, use_fsdp, repeated, rendezvous):
+def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, rendezvous):
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
     from torch.distributed.tensor import Shard
 
@@ -65,7 +75,7 @@ def _worker(rank, world, ep_size, use_fsdp, repeated, rendezvous):
         w2 = (torch.randn(e, h, intermediate, device="cuda") * 0.03).bfloat16().float()
         expert_rank = state.ep_rank if ep_size > 1 else 0
         begin, end = expert_rank * e // ep_size, (expert_rank + 1) * e // ep_size
-        module = _Experts(w1[begin:end], w2[begin:end], e)
+        module = _Experts(w1[begin:end], w2[begin:end], e, use_checkpoint)
         if use_fsdp:
             mesh = (
                 state.extra_parallel_fsdp_device_mesh["ep"]["ep_fsdp"]
@@ -127,23 +137,25 @@ def _worker(rank, world, ep_size, use_fsdp, repeated, rendezvous):
 
 @pytest.mark.launch_plan(provider=from_parameter("world"))
 @pytest.mark.parametrize(
-    "world,ep_size,use_fsdp,repeated",
+    "world,ep_size,use_fsdp,repeated,use_checkpoint",
     [
         pytest.param(
             *case,
             marks=pytest.mark.skipif(runner_device_count() < case[0], reason=f"Requires {case[0]} GPUs."),
         )
         for case in (
-            (2, 2, False, False),
-            (2, 1, True, False),
-            (4, 2, True, False),
-            (4, 2, True, True),
-            (4, 4, False, True),
-            (8, 8, False, True),
+            (2, 2, False, False, False),
+            (2, 1, True, False, False),
+            (4, 2, True, False, False),
+            (4, 2, True, True, False),
+            (4, 4, False, True, False),
+            (8, 8, False, True, False),
+            (2, 1, True, False, True),
+            (4, 2, True, True, True),
         )
     ],
 )
-def test_distributed_fp8_experts(world, ep_size, use_fsdp, repeated, tmp_path):
+def test_distributed_fp8_experts(world, ep_size, use_fsdp, repeated, use_checkpoint, tmp_path):
     if not torch.cuda.is_available() or torch.version.hip is not None:
         pytest.skip("NVIDIA Hopper or Blackwell is required.")
     if torch.cuda.device_count() < world or any(
@@ -152,5 +164,8 @@ def test_distributed_fp8_experts(world, ep_size, use_fsdp, repeated, tmp_path):
         pytest.skip(f"Requires {world} Hopper/Blackwell GPUs.")
     pytest.importorskip("deep_gemm")
     mp.spawn(
-        _worker, args=(world, ep_size, use_fsdp, repeated, f"file://{tmp_path / 'rdzv'}"), nprocs=world, join=True
+        _worker,
+        args=(world, ep_size, use_fsdp, repeated, use_checkpoint, f"file://{tmp_path / 'rdzv'}"),
+        nprocs=world,
+        join=True,
     )

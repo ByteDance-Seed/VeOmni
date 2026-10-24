@@ -21,7 +21,7 @@ from triton.language.extra.cuda import libdevice
 
 # SM90 K-grouped GEMM requires FP32 output. Bound its temporary independently
 # of the local expert count; a single expert is the minimum indivisible unit.
-_WGRAD_WORKSPACE_BYTES = 512 * 1024**2
+_WGRAD_WORKSPACE_BYTES = 256 * 1024**2
 _PROCESS_DEVICE: int | None = None
 
 
@@ -172,7 +172,17 @@ def quantize_rows(x: torch.Tensor, layout: GroupedLayout) -> tuple[torch.Tensor,
 
 @triton.jit
 def _weight_quant_kernel(
-    W, Q, QT, S, ST, N: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr, USE_UE8M0: tl.constexpr
+    W,
+    Q,
+    QT,
+    S,
+    ST,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    USE_UE8M0: tl.constexpr,
+    STORE_NORMAL: tl.constexpr,
+    STORE_TRANSPOSE: tl.constexpr,
 ):
     mb, kb, expert = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     m = mb * BLOCK + tl.arange(0, BLOCK)
@@ -185,26 +195,32 @@ def _weight_quant_kernel(
     offsets = expert.to(tl.int64) * N * K + m[:, None] * K + k[None, :]
     w = tl.load(W + offsets).to(tl.float32)
     scale = _quant_scale(tl.max(tl.max(tl.abs(w), 1), 0), USE_UE8M0)
-    tl.store(Q + offsets, w / scale)
-    transposed = expert.to(tl.int64) * N * K + k[None, :] * N + m[:, None]
-    tl.store(QT + transposed, w / scale)
-    tl.store(S + (expert * (N // BLOCK) + mb) * (K // BLOCK) + kb, scale)
-    tl.store(ST + (expert * (K // BLOCK) + kb) * (N // BLOCK) + mb, scale)
+    if STORE_NORMAL:
+        tl.store(Q + offsets, w / scale)
+        tl.store(S + (expert * (N // BLOCK) + mb) * (K // BLOCK) + kb, scale)
+    if STORE_TRANSPOSE:
+        transposed = expert.to(tl.int64) * N * K + k[None, :] * N + m[:, None]
+        tl.store(QT + transposed, w / scale)
+        tl.store(ST + (expert * (K // BLOCK) + kb) * (N // BLOCK) + mb, scale)
 
 
 def quantize_weights(
-    w: torch.Tensor, *, use_ue8m0: bool | None = None
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize 128x128 weight tiles and emit both GEMM orientations in one pass."""
+    w: torch.Tensor, *, use_ue8m0: bool | None = None, store_normal: bool = True, store_transpose: bool = True
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    """Quantize 128x128 weight tiles into the requested GEMM orientations."""
+    if not (store_normal or store_transpose):
+        raise ValueError("At least one quantized weight orientation must be requested.")
     e, n, k = w.shape
-    q = torch.empty_like(w, dtype=torch.float8_e4m3fn)
-    qt = torch.empty((e, k, n), dtype=torch.float8_e4m3fn, device=w.device)
-    scales = torch.empty((e, n // 128, k // 128), dtype=torch.float32, device=w.device)
-    scales_t = torch.empty((e, k // 128, n // 128), dtype=torch.float32, device=w.device)
+    q = torch.empty_like(w, dtype=torch.float8_e4m3fn) if store_normal else None
+    qt = torch.empty((e, k, n), dtype=torch.float8_e4m3fn, device=w.device) if store_transpose else None
+    scales = torch.empty((e, n // 128, k // 128), dtype=torch.float32, device=w.device) if store_normal else None
+    scales_t = torch.empty((e, k // 128, n // 128), dtype=torch.float32, device=w.device) if store_transpose else None
     if use_ue8m0 is None:
         use_ue8m0 = _uses_ue8m0(w.device)
     with torch.cuda.device(w.device):
-        _weight_quant_kernel[(n // 128, k // 128, e)](w, q, qt, scales, scales_t, n, k, 128, use_ue8m0, num_warps=8)
+        _weight_quant_kernel[(n // 128, k // 128, e)](
+            w, q, qt, scales, scales_t, n, k, 128, use_ue8m0, store_normal, store_transpose, num_warps=8
+        )
     return q, scales, qt, scales_t
 
 
@@ -431,19 +447,21 @@ class GroupedLinear(torch.autograd.Function):
 
     Quantization uses a straight-through training approximation. Weight gradients
     accumulate in FP32: SM90 uses a bounded workspace, while SM100 casts directly
-    to the parameter dtype in the GEMM epilogue. Quantized weight copies belong
-    to this invocation only, so optimizer
-    updates and FSDP resharding cannot leave a module-level stale cache.
+    to the parameter dtype in the GEMM epilogue. Persistent BF16 parameters are
+    requantized for dgrad; temporary weights retain an invocation-local FP8
+    transpose instead. Neither path uses a module-level quantized cache.
     Higher-order gradients are unsupported.
     """
 
     @staticmethod
-    def forward(ctx, x, weight, layout):
+    def forward(ctx, x, weight, layout, recompute_weight=True):
         """Return BF16 output and save independently quantized token-axis inputs."""
         with torch.cuda.device(x.device):
             import deep_gemm
 
-            qw, sw, qwt, swt = quantize_weights(weight)
+            qw, sw, qwt, swt = quantize_weights(
+                weight, store_transpose=ctx.needs_input_grad[0] and not recompute_weight
+            )
             ctx.layout = layout
             ctx.weight_shape = weight.shape
             ctx.weight_dtype = weight.dtype
@@ -472,7 +490,11 @@ class GroupedLinear(torch.autograd.Function):
             qx, sx = None, None
             if ctx.needs_input_grad[1]:
                 qx, sx = quantize_columns(x, layout) if ctx.quantized_input else (x, None)
-            ctx.save_for_backward(qx, sx, qwt, swt)
+            # Existing BF16 parameters already occupy storage. Requantize them
+            # at dgrad rather than retaining an extra FP8 copy across forward.
+            # Callers retain FP8 instead for temporary BF16 weight copies.
+            source_weight = weight if ctx.needs_input_grad[0] and recompute_weight else None
+            ctx.save_for_backward(qx, sx, qwt, swt, source_weight)
             return unpadded
 
     @staticmethod
@@ -482,13 +504,15 @@ class GroupedLinear(torch.autograd.Function):
         with torch.cuda.device(grad_output.device):
             import deep_gemm
 
-            qx, sx, qwt, swt = ctx.saved_tensors
+            qx, sx, qwt, swt, source_weight = ctx.saved_tensors
             # Unlike clear_saved_tensors_on_access, this honors retain_graph.
             # Local references keep operands alive until their last use below.
             ctx.maybe_clear_saved_tensors()
             layout = ctx.layout
             dx = dw = None
             if ctx.needs_input_grad[0]:
+                if source_weight is not None:
+                    _, _, qwt, swt = quantize_weights(source_weight, store_normal=False)
                 padded_dx = torch.empty(
                     (layout.rows.numel(), ctx.input_shape[1]), device=grad_output.device, dtype=ctx.input_dtype
                 )
@@ -505,7 +529,7 @@ class GroupedLinear(torch.autograd.Function):
                 del padded_dx
             # Dgrad is the last consumer of the weight transpose. Do not overlap
             # it with wgrad's output, column operands and FP32 workspace.
-            del qwt, swt
+            del qwt, swt, source_weight
             if ctx.needs_input_grad[1]:
                 if ctx.quantized_input:
                     dw = _weight_gradient_quantized_input(
@@ -513,4 +537,4 @@ class GroupedLinear(torch.autograd.Function):
                     )
                 else:
                     dw = _weight_gradient(qx, grad_output, layout, ctx.weight_shape, ctx.weight_dtype)
-            return dx, dw, None
+            return dx, dw, None, None

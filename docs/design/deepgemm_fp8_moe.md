@@ -119,7 +119,7 @@ its K-grouped GEMM accumulates wgrad in FP32. SM90 materializes an external FP32
 workspace before conversion; SM100 casts directly to BF16 in the GEMM epilogue
 with `c=None`. Gradients use the straight-through quantization approximation.
 
-The SM90 wgrad FP32 workspace has a 512 MiB target and is reused across batches of
+The SM90 wgrad FP32 workspace has a 256 MiB target and is reused across batches of
 complete experts. A single expert larger than the target uses one expert's
 workspace. Each expert retains its full FP32 token reduction. On SM90, column operands concatenate transposed expert segments for the NT
 wgrad API. On SM100 they retain contiguous token-major `[sum_T,H]` storage
@@ -132,8 +132,14 @@ zero, including entirely empty chunks and the final partial chunk.
 Fused Triton SwiGLU forward/backward kernels save only the original BF16 gate/up
 projection and recompute pointwise values, preserving eager BF16 rounding and
 the inclusive clamp-boundary derivative. Forward-only FP8 weights and padded
-dgrad temporaries are released after their last use. Saved weight transposes
-are released after dgrad, before allocating wgrad operands and workspace, unless
+dgrad temporaries are released after their last use. For contiguous BF16
+`Parameter` inputs, forward saves a reference to the existing parameter and
+produces its FP8 transpose only during dgrad. FSDP2 still releases the parameter
+storage on reshard and repopulates it before backward. Other weight tensors
+(including casts, QAT outputs, split-weight concatenations and layout copies)
+retain an invocation-local FP8 transpose, avoiding retention of a larger BF16
+temporary. Only the required orientation is quantized at each stage. Weight
+transposes are released after dgrad, before allocating wgrad operands and workspace, unless
 the caller requests `retain_graph=True`. EP dispatch masks and local input
 references are released before combine. Saved weight transposes
 belong to one invocation, so optimizer steps and FSDP resharding cannot leave a

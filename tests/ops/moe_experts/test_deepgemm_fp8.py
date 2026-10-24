@@ -162,7 +162,8 @@ def test_grouped_linear_quantization_axes(counts):
 
 @pytest.mark.parametrize("input_grad,weight_grad", [(True, True), (True, False), (False, True)])
 @pytest.mark.parametrize("counts", [[511, 513], [1, 1, 1, 1]])
-def test_grouped_linear_compact_saved_state_and_retained_graph(input_grad, weight_grad, counts):
+@pytest.mark.parametrize("recompute_weight", [True, False])
+def test_grouped_linear_compact_saved_state_and_retained_graph(input_grad, weight_grad, counts, recompute_weight):
     """Saved state stays compact while frozen operands and repeated backward work."""
     from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import GroupedLayout, GroupedLinear
 
@@ -173,11 +174,13 @@ def test_grouped_linear_compact_saved_state_and_retained_graph(input_grad, weigh
 
     def pack(tensor):
         nonlocal saved_bytes
-        saved_bytes += tensor.numel() * tensor.element_size()
+        # An alias to a live source parameter adds no storage.
+        if tensor.data_ptr() != w.data_ptr():
+            saved_bytes += tensor.numel() * tensor.element_size()
         return tensor
 
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
-        y = GroupedLinear.apply(x, w, GroupedLayout.from_counts(torch.tensor(counts), x.device))
+        y = GroupedLinear.apply(x, w, GroupedLayout.from_counts(torch.tensor(counts), x.device), recompute_weight)
     # Include ragged-group alignment and scale metadata in the budget. Saving
     # the BF16 input as well as the FP8 weight transpose would exceed it.
     if sum(counts) > 128:
@@ -325,6 +328,14 @@ def test_quantizers_match_deepgemm_reference(use_ue8m0):
     qc, sc = quantize_columns(x, layout)
     w = torch.randn(len(counts), 384, 256, device="cuda", dtype=torch.bfloat16) * 0.02
     qw, sw, qwt, swt = quantize_weights(w, use_ue8m0=use_ue8m0)
+    # Single-orientation kernels must preserve the exact payload and scales.
+    normal = quantize_weights(w, use_ue8m0=use_ue8m0, store_transpose=False)
+    transposed = quantize_weights(w, use_ue8m0=use_ue8m0, store_normal=False)
+    assert normal[2:] == (None, None) and transposed[:2] == (None, None)
+    for actual, expected in zip(normal[:2] + transposed[2:], (qw, sw, qwt, swt)):
+        torch.testing.assert_close(actual.float(), expected.float(), atol=0, rtol=0)
+    with pytest.raises(ValueError):
+        quantize_weights(w, store_normal=False, store_transpose=False)
     source, target = 0, 0
     for expert, (n, p) in enumerate(zip(counts, layout.padded_counts)):
         expected_w, expected_s = per_block_cast_to_fp8(w[expert], use_ue8m0=use_ue8m0)
@@ -393,6 +404,53 @@ def test_full_moe_forward_backward(merged, limit, routing_dtype):
             _relative_error(actual, bf16, 0.085, f"BF16 {label}")
     assert torch.count_nonzero(results[0][-1][-1]) == 0
     assert torch.count_nonzero(results[0][-2][-1]) == 0
+
+
+@pytest.mark.parametrize("weight_kind", ["parameter", "cast", "split", "strided"])
+def test_weight_saved_state_avoids_temporary_bf16_storage(weight_kind):
+    from veomni.ops.kernels.moe_experts.standard.deepgemm import wrapper
+
+    torch.manual_seed(91)
+    x = torch.randn(131, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w1 = torch.nn.Parameter(torch.randn(2, 256, 256, device="cuda", dtype=torch.bfloat16) * 0.03)
+    w2 = torch.nn.Parameter(torch.randn(2, 256, 128, device="cuda", dtype=torch.bfloat16) * 0.03)
+    if weight_kind == "cast":
+        w1, w2 = [torch.nn.Parameter(w.float()) for w in (w1, w2)]
+        fc1, fc2 = w1.bfloat16(), w2.bfloat16()
+    elif weight_kind == "strided":
+        w1, w2 = [torch.nn.Parameter(w.transpose(1, 2).contiguous().transpose(1, 2)) for w in (w1, w2)]
+        fc1, fc2 = w1, w2
+    else:
+        fc1, fc2 = w1, w2
+    empty = x.new_empty(0)
+    a, b = fc1.chunk(2, dim=1) if weight_kind == "split" else (empty, empty)
+    saved = []
+
+    def pack(tensor):
+        saved.append((tensor.data_ptr(), tuple(tensor.shape), tensor.dtype))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        y = wrapper(
+            x,
+            torch.ones(131, 2, device="cuda") / 2,
+            torch.tensor([0, 1], device="cuda").expand(131, -1),
+            a,
+            b,
+            fc2,
+            empty if weight_kind == "split" else fc1,
+            num_experts=2,
+        )
+    # Real parameters can be referenced for dgrad. Temporary BF16 weight
+    # buffers must be replaced by the smaller invocation-local FP8 transpose.
+    for weight, shape, reuse in (
+        (fc1, (2, 256, 256), weight_kind == "parameter"),
+        (fc2, (2, 128, 256), weight_kind in ("parameter", "split")),
+    ):
+        assert any(ptr == weight.data_ptr() for ptr, _, _ in saved) == reuse
+        assert any(size == shape and dtype == torch.float8_e4m3fn for _, size, dtype in saved) != reuse
+    y.backward(torch.randn_like(y))
+    assert all(torch.isfinite(value.grad).all() for value in (x, w1, w2))
 
 
 def test_empty_moe_has_zero_gradients():

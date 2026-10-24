@@ -17,15 +17,17 @@ from torch import Tensor
 from .....distributed.parallel_state import get_parallel_state
 
 
-def _experts(x, counts, fc1, fc2, swiglu_limit):
+def _experts(x, counts, fc1, fc2, swiglu_limit, recompute_weights=(True, True)):
     from ..shared.deepgemm_fp8 import GroupedLayout, GroupedLinear, RecomputedSwiGLU
 
     layout = GroupedLayout.from_counts(counts, x.device)
-    projected = GroupedLinear.apply(x, fc1, layout)
-    return GroupedLinear.apply(RecomputedSwiGLU.apply(projected, swiglu_limit), fc2, layout)
+    projected = GroupedLinear.apply(x, fc1, layout, recompute_weights[0])
+    return GroupedLinear.apply(RecomputedSwiGLU.apply(projected, swiglu_limit), fc2, layout, recompute_weights[1])
 
 
-def _ep_forward(x, routing_weights, selected_experts, fc1, fc2, num_experts, swiglu_limit):
+def _ep_forward(
+    x, routing_weights, selected_experts, fc1, fc2, num_experts, swiglu_limit, recompute_weights=(True, True)
+):
     from .....distributed.moe import preprocess, token_pre_all2all, tokens_post_all2all
 
     ep_group = get_parallel_state().ep_group
@@ -43,7 +45,7 @@ def _ep_forward(x, routing_weights, selected_experts, fc1, fc2, num_experts, swi
     del expert_mask
     # Dispatch/collectives stay outside custom autograd Functions. Counts are
     # already on the CPU for the SM90 K-grouped GEMM launch metadata.
-    outputs = _experts(tokens, counts, fc1, fc2, swiglu_limit)
+    outputs = _experts(tokens, counts, fc1, fc2, swiglu_limit, recompute_weights)
     # The expert autograd nodes own their compact saved operands. Dispatch
     # inputs need not overlap the combine's permutation and FP32 accumulation.
     del tokens
@@ -121,11 +123,17 @@ def wrapper(
     for weight in (fc1, fc2_weight):
         if weight.dtype != torch.bfloat16 or weight.device != hidden_states.device:
             raise ValueError("FP8 MoE weights must be BF16 and on the same device as hidden_states.")
+    # Reuse only parameter storage: casts, QAT, concat and contiguous copies
+    # can otherwise keep a larger BF16 temporary alive than the FP8 cache.
+    # FSDP2 repopulates its unsharded Parameter before the backward hook.
+    recompute_weights = tuple(isinstance(w, torch.nn.Parameter) and w.is_contiguous() for w in (fc1, fc2_weight))
     fc1, fc2 = fc1.contiguous(), fc2_weight.contiguous()
     if get_parallel_state().ep_enabled:
         if e * get_parallel_state().ep_size != num_experts:
             raise ValueError("The EP-local expert weight count does not match num_experts / ep_size.")
-        return _ep_forward(hidden_states, routing_weights, selected_experts, fc1, fc2, num_experts, swiglu_limit)
+        return _ep_forward(
+            hidden_states, routing_weights, selected_experts, fc1, fc2, num_experts, swiglu_limit, recompute_weights
+        )
     if e != num_experts:
         raise ValueError("Expert weights must contain num_experts experts when EP is disabled.")
 
@@ -136,7 +144,7 @@ def wrapper(
     if counts.numel() != num_experts:
         raise ValueError("Expert indices must be less than num_experts.")
     x = hidden_states.index_select(0, token_indices)
-    y = _experts(x, counts, fc1, fc2, swiglu_limit)
+    y = _experts(x, counts, fc1, fc2, swiglu_limit, recompute_weights)
     weights = routing_weights.reshape(-1).index_select(0, order)
     weighted = (y * weights[:, None]).to(hidden_states.dtype)
     return torch.zeros_like(hidden_states).index_add(0, token_indices, weighted)
