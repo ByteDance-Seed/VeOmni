@@ -40,9 +40,13 @@ def _ep_forward(x, routing_weights, selected_experts, fc1, fc2, num_experts, swi
         per_rank_counts,
         ep_group,
     )
+    del expert_mask
     # Dispatch/collectives stay outside custom autograd Functions. Counts are
     # already on the CPU for the SM90 K-grouped GEMM launch metadata.
     outputs = _experts(tokens, counts, fc1, fc2, swiglu_limit)
+    # The expert autograd nodes own their compact saved operands. Dispatch
+    # inputs need not overlap the combine's permutation and FP32 accumulation.
+    del tokens
     combined = tokens_post_all2all(
         outputs,
         routing_weights,

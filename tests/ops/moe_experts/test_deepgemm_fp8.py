@@ -160,6 +160,39 @@ def test_grouped_linear_quantization_axes(counts):
         offset += n
 
 
+@pytest.mark.parametrize("input_grad,weight_grad", [(True, True), (True, False), (False, True)])
+@pytest.mark.parametrize("counts", [[511, 513], [1, 1, 1, 1]])
+def test_grouped_linear_compact_saved_state_and_retained_graph(input_grad, weight_grad, counts):
+    """Saved state stays compact while frozen operands and repeated backward work."""
+    from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import GroupedLayout, GroupedLinear
+
+    torch.manual_seed(57)
+    x = torch.randn(sum(counts), 256, device="cuda", dtype=torch.bfloat16).requires_grad_(input_grad)
+    w = (torch.randn(len(counts), 384, 256, device="cuda") * 0.04).bfloat16().requires_grad_(weight_grad)
+    saved_bytes = 0
+
+    def pack(tensor):
+        nonlocal saved_bytes
+        saved_bytes += tensor.numel() * tensor.element_size()
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        y = GroupedLinear.apply(x, w, GroupedLayout.from_counts(torch.tensor(counts), x.device))
+    # Include ragged-group alignment and scale metadata in the budget. Saving
+    # the BF16 input as well as the FP8 weight transpose would exceed it.
+    if sum(counts) > 128:
+        assert saved_bytes < 1.2 * (x.numel() + w.numel())
+    else:
+        # Padding tiny groups must not inflate saved activations beyond BF16.
+        assert saved_bytes < 1.01 * w.numel() + x.numel() * x.element_size()
+    g = torch.randn_like(y)
+    leaves = tuple(value for value in (x, w) if value.requires_grad)
+    first = torch.autograd.grad(y, leaves, g, retain_graph=True)
+    second = torch.autograd.grad(y, leaves, g)
+    for actual, expected in zip(second, first):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("limit", [None, 0.7, 1.0, 10.0])
 @pytest.mark.parametrize("strided", [False, True])
 def test_recomputed_swiglu_matches_eager_rounding(limit, strided):

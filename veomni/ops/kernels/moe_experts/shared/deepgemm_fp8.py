@@ -273,6 +273,10 @@ def quantize_columns(x: torch.Tensor, layout: GroupedLayout) -> tuple[torch.Tens
 
 
 def _weight_gradient(x, grad_output, layout, shape, dtype):
+    return _weight_gradient_quantized_input(*quantize_columns(x, layout), grad_output, layout, shape, dtype)
+
+
+def _weight_gradient_quantized_input(qb, sb, grad_output, layout, shape, dtype):
     """Write SM100 gradients directly; bound the mandatory SM90 FP32 workspace.
 
     Chunk only the expert dimension, never an expert's token reduction. The
@@ -282,11 +286,10 @@ def _weight_gradient(x, grad_output, layout, shape, dtype):
     import deep_gemm
 
     experts, n, k = shape
-    dw = torch.empty(shape, device=x.device, dtype=dtype)
+    dw = torch.empty(shape, device=grad_output.device, dtype=dtype)
     if not layout.rows.numel():
         return dw.zero_()
     qa, sa = quantize_columns(grad_output, layout)
-    qb, sb = quantize_columns(x, layout)
     if layout.use_ue8m0:
         # The SM100 scale-packing kernel supports at most 128 groups per call.
         begin = 0
@@ -312,7 +315,7 @@ def _weight_gradient(x, grad_output, layout, shape, dtype):
         return dw
 
     chunk_size = min(experts, max(1, _WGRAD_WORKSPACE_BYTES // (n * k * 4)))
-    workspace = torch.empty((chunk_size, n, k), device=x.device, dtype=torch.float32)
+    workspace = torch.empty((chunk_size, n, k), device=grad_output.device, dtype=torch.float32)
     begin = 0
     for expert in range(0, experts, chunk_size):
         end_expert = min(expert + chunk_size, experts)
@@ -436,7 +439,7 @@ class GroupedLinear(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, weight, layout):
-        """Return unpadded BF16 output and retain original activations for wgrad."""
+        """Return BF16 output and save independently quantized token-axis inputs."""
         with torch.cuda.device(x.device):
             import deep_gemm
 
@@ -444,7 +447,8 @@ class GroupedLinear(torch.autograd.Function):
             ctx.layout = layout
             ctx.weight_shape = weight.shape
             ctx.weight_dtype = weight.dtype
-            ctx.save_for_backward(x, qwt, swt)
+            ctx.input_shape = x.shape
+            ctx.input_dtype = x.dtype
             output = x.new_empty((layout.rows.numel(), weight.shape[1]))
             if output.shape[0]:
                 deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
@@ -456,7 +460,20 @@ class GroupedLinear(torch.autograd.Function):
                     disable_ue8m0_cast=not layout.use_ue8m0,
                 )
             del qw, sw
-            return output.index_select(0, layout.unpad)
+            unpadded = output.index_select(0, layout.unpad)
+            del output
+            # Wgrad needs token-axis quantization, not a transpose of the forward
+            # row quantization. Produce it from BF16 now so autograd need not
+            # retain that larger source activation until backward.
+            # Sparse expert groups can expand substantially when padded. Keep
+            # BF16 instead when it is smaller than the FP8 payload plus scales.
+            column_bytes = layout.rows.numel() * (x.shape[1] + 4 * (x.shape[1] // 128))
+            ctx.quantized_input = column_bytes < x.numel() * x.element_size()
+            qx, sx = None, None
+            if ctx.needs_input_grad[1]:
+                qx, sx = quantize_columns(x, layout) if ctx.quantized_input else (x, None)
+            ctx.save_for_backward(qx, sx, qwt, swt)
+            return unpadded
 
     @staticmethod
     @torch.autograd.function.once_differentiable
@@ -465,11 +482,16 @@ class GroupedLinear(torch.autograd.Function):
         with torch.cuda.device(grad_output.device):
             import deep_gemm
 
-            x, qwt, swt = ctx.saved_tensors
+            qx, sx, qwt, swt = ctx.saved_tensors
+            # Unlike clear_saved_tensors_on_access, this honors retain_graph.
+            # Local references keep operands alive until their last use below.
+            ctx.maybe_clear_saved_tensors()
             layout = ctx.layout
             dx = dw = None
             if ctx.needs_input_grad[0]:
-                padded_dx = x.new_empty((layout.rows.numel(), x.shape[1]))
+                padded_dx = torch.empty(
+                    (layout.rows.numel(), ctx.input_shape[1]), device=grad_output.device, dtype=ctx.input_dtype
+                )
                 if padded_dx.shape[0]:
                     deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
                         quantize_rows(grad_output, layout),
@@ -481,6 +503,14 @@ class GroupedLinear(torch.autograd.Function):
                     )
                 dx = padded_dx.index_select(0, layout.unpad)
                 del padded_dx
+            # Dgrad is the last consumer of the weight transpose. Do not overlap
+            # it with wgrad's output, column operands and FP32 workspace.
+            del qwt, swt
             if ctx.needs_input_grad[1]:
-                dw = _weight_gradient(x, grad_output, layout, ctx.weight_shape, ctx.weight_dtype)
+                if ctx.quantized_input:
+                    dw = _weight_gradient_quantized_input(
+                        qx, sx, grad_output, layout, ctx.weight_shape, ctx.weight_dtype
+                    )
+                else:
+                    dw = _weight_gradient(qx, grad_output, layout, ctx.weight_shape, ctx.weight_dtype)
             return dx, dw, None

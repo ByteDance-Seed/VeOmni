@@ -106,7 +106,12 @@ where `X` has shape `[T, H]`:
 | Wgrad | `X` and `dY`: independent 128×1 groups along tokens | Not used |
 
 Wgrad operands are quantized from BF16 source tensors, not from a transpose of
-forward FP8 values. Each expert is padded independently to DeepGEMM's group alignment (128 tokens
+forward FP8 values. The input's token-axis representation is created during
+forward and saved for wgrad when it is smaller than the BF16 source, allowing
+that source activation to be released when its other consumers finish. Sparse
+groups retain BF16 when token padding and FP32 scales would make FP8 larger,
+and quantize it during backward instead. Output gradients are quantized during backward.
+Each expert is padded independently to DeepGEMM's group alignment (128 tokens
 by default, a multiple of 128); scale
 groups never cross expert boundaries. Triton constructs packing metadata and
 quantized operands. DeepGEMM M-grouped GEMMs produce BF16 forward/dgrad results;
@@ -128,6 +133,9 @@ Fused Triton SwiGLU forward/backward kernels save only the original BF16 gate/up
 projection and recompute pointwise values, preserving eager BF16 rounding and
 the inclusive clamp-boundary derivative. Forward-only FP8 weights and padded
 dgrad temporaries are released after their last use. Saved weight transposes
+are released after dgrad, before allocating wgrad operands and workspace, unless
+the caller requests `retain_graph=True`. EP dispatch masks and local input
+references are released before combine. Saved weight transposes
 belong to one invocation, so optimizer steps and FSDP resharding cannot leave a
 stale module-level quantized cache. FP8 GEMMs alone do not guarantee a lower
 whole-model memory peak.
