@@ -33,12 +33,12 @@ from unittest.mock import patch
 import pytest
 import torch
 
-import veomni.trainer.diffusion_gemma_trainer as dg_trainer
+import veomni.trainer.dllm_trainer as dg_trainer
 from tests.models.test_diffusion_gemma_canvas_batching import _toy_model
 from veomni.data.data_collator import DiffusionGemmaCollator
 from veomni.models.transformers.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaConfig
 from veomni.models.transformers.diffusion_gemma.modeling_diffusion_gemma import expand_self_conditioning_mask
-from veomni.trainer.diffusion_gemma_trainer import DiffusionGemmaTrainer, diffusion_gemma_sample_cost
+from veomni.trainer.dllm_trainer import DllmTrainer, diffusion_gemma_sample_cost
 
 
 #: Ragged on both axes -- prompt length and canvas count -- which is the case
@@ -449,7 +449,7 @@ class TestTheStepDoesNotPadTheCanvasAxisUnderPacking:
             "_noisy_token_ids",
             "_decoder_sample_count",
         ):
-            setattr(trainer, name, MethodType(getattr(DiffusionGemmaTrainer, name), trainer))
+            setattr(trainer, name, MethodType(getattr(DllmTrainer, name), trainer))
         return trainer
 
     @staticmethod
@@ -556,6 +556,7 @@ class TestTheTrainerBuildsTheCollatorTheModeAsksFor:
                     )
                 ),
             ),
+            _is_canvas_model=True,
             _is_multimodal=multimodal,
         )
         # The real methods, not no-ops: what building the collator has to *say* about a
@@ -564,13 +565,13 @@ class TestTheTrainerBuildsTheCollatorTheModeAsksFor:
             "_warn_if_the_budget_unit_does_not_match_train_size",
             "_check_the_budget_can_hold_a_sample",
         ):
-            setattr(trainer, name, MethodType(getattr(DiffusionGemmaTrainer, name), trainer))
+            setattr(trainer, name, MethodType(getattr(DllmTrainer, name), trainer))
         return trainer
 
     @classmethod
     def build(cls, canvas_batching, multimodal=False, dyn_bsz=False, micro_batch_size=1, runtime="main"):
         trainer = cls.stub(canvas_batching, multimodal, dyn_bsz, micro_batch_size, runtime)
-        DiffusionGemmaTrainer._build_collate_fn(trainer)
+        DllmTrainer._build_collate_fn(trainer)
         return trainer.base
 
     @pytest.mark.parametrize(("mode", "packs"), [("serial", False), ("flat_seq", False), ("flat_seq_pack", True)])

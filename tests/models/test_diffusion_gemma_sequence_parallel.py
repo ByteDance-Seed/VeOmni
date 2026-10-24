@@ -296,8 +296,8 @@ class TestTheCollatorAlignsTheRow:
         from types import MethodType, SimpleNamespace
 
         from veomni.models.transformers.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaConfig
-        from veomni.trainer import diffusion_gemma_trainer as trainer_module
-        from veomni.trainer.diffusion_gemma_trainer import DiffusionGemmaTrainer
+        from veomni.trainer import dllm_trainer as trainer_module
+        from veomni.trainer.dllm_trainer import DllmTrainer
 
         trainer = SimpleNamespace(
             base=SimpleNamespace(
@@ -311,13 +311,14 @@ class TestTheCollatorAlignsTheRow:
                     )
                 ),
             ),
+            _is_canvas_model=True,
             _is_multimodal=False,
         )
         for name in ("_warn_if_the_budget_unit_does_not_match_train_size", "_check_the_budget_can_hold_a_sample"):
-            setattr(trainer, name, MethodType(getattr(DiffusionGemmaTrainer, name), trainer))
+            setattr(trainer, name, MethodType(getattr(DllmTrainer, name), trainer))
 
         with patch.object(trainer_module, "get_parallel_state", return_value=parallel_state(4)):
-            DiffusionGemmaTrainer._build_collate_fn(trainer)
+            DllmTrainer._build_collate_fn(trainer)
         assert trainer.base.collate_fn.sp_size == 4
 
     def test_the_collator_does_not_read_the_topology_itself(self):

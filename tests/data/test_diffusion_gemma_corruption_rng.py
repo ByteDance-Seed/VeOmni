@@ -56,14 +56,14 @@ class FakeChatTemplate:
 
 
 def build_trainer():
-    """A `DiffusionGemmaTrainer` with just enough state for `_build_data_transform`.
+    """A `DllmTrainer` with just enough state for `_build_data_transform`.
 
     Built with `__new__`, matching the trainer unit tests in
     `tests/models/test_diffusion_gemma.py`.
     """
-    DiffusionGemmaTrainer = pytest.importorskip("veomni.trainer.diffusion_gemma_trainer").DiffusionGemmaTrainer
+    DllmTrainer = pytest.importorskip("veomni.trainer.dllm_trainer").DllmTrainer
 
-    trainer = DiffusionGemmaTrainer.__new__(DiffusionGemmaTrainer)
+    trainer = DllmTrainer.__new__(DllmTrainer)
     text_config = SimpleNamespace(vocab_size=VOCAB_SIZE, pad_token_id=0, eos_token_id=EOS_TOKEN_ID)
     trainer.base = SimpleNamespace(
         args=SimpleNamespace(

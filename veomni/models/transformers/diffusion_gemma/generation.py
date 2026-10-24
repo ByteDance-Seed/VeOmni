@@ -28,7 +28,7 @@ differ in ways that are visible in the output:
   accepted in order of increasing entropy while their cumulative entropy stays under
   ``entropy_budget``. Easy canvases commit many positions per forward, hard ones few.
 * Every step feeds the model its own previous prediction (**self-conditioning**), the
-  same signal `DiffusionGemmaTrainer` shows the model during finetuning.
+  same signal `DllmTrainer` shows the model during finetuning.
 
 Only the canvas being denoised is in play at any moment: once committed, a canvas goes
 through the causal encoder into the KV cache and its tokens are final. That is what makes

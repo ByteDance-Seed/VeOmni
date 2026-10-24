@@ -495,7 +495,7 @@ def _postforward_worker():
     this by exactly `sp_size`.
     """
     from veomni.distributed.parallel_state import use_parallel_state
-    from veomni.trainer.diffusion_gemma_trainer import DiffusionGemmaTrainer
+    from veomni.trainer.dllm_trainer import DllmTrainer
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -509,9 +509,9 @@ def _postforward_worker():
             model = _build_model(device)
             batch = _build_row(model.config, device, sp_size=sp_size)
             outputs = model(**batch, use_cache=False)
-            trainer = DiffusionGemmaTrainer.__new__(DiffusionGemmaTrainer)
+            trainer = DllmTrainer.__new__(DllmTrainer)
             trainer.micro_batches_num_samples = trainer._supervised_sample_count(batch["loss_weight"])
-            loss, metrics = DiffusionGemmaTrainer.postforward(trainer, outputs, batch)
+            loss, metrics = DllmTrainer.postforward(trainer, outputs, batch)
             return float(loss.detach()), {k: float(v.detach()) for k, v in metrics.items()}
 
     # The reference arm still runs on two ranks, so its `fsdp_size` and its

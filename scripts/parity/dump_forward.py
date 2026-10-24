@@ -192,7 +192,7 @@ def run_veomni(
 
     conditioning = {}
     if self_conditioning:
-        # The two-pass scheme lives in `DiffusionGemmaTrainer.preforward` on this side,
+        # The two-pass scheme lives in `DllmTrainer.preforward` on this side,
         # not in the model, so it is restated here. Every sample is conditioned, which
         # is what `do_self_conditioning=True` asks NeMo for.
         with torch.no_grad():

@@ -68,9 +68,9 @@ def toy_runtime(model, **assets):
     """
     from veomni.distributed.clip_grad_norm import veomni_compute_grad_norm
     from veomni.distributed.parallel_state import get_parallel_state
-    from veomni.trainer.diffusion_gemma_trainer import DiffusionGemmaModelRuntime
+    from veomni.trainer.dllm_trainer import DllmModelRuntime
 
-    class _ToyRuntime(DiffusionGemmaModelRuntime):
+    class _ToyRuntime(DllmModelRuntime):
         @property
         def parallel_state(self):
             return get_parallel_state()
@@ -213,9 +213,9 @@ class TestModelAssets:
     def _runtime(self, model_path="/model"):
         from types import SimpleNamespace
 
-        from veomni.trainer.diffusion_gemma_trainer import DiffusionGemmaModelRuntime
+        from veomni.trainer.dllm_trainer import DllmModelRuntime
 
-        runtime = DiffusionGemmaModelRuntime.__new__(DiffusionGemmaModelRuntime)
+        runtime = DllmModelRuntime.__new__(DllmModelRuntime)
         runtime.args = SimpleNamespace(model_path=model_path, tokenizer_path="/tokenizer")
         runtime.model_config = DiffusionGemmaConfig.from_pretrained(TOY_CONFIG_PATH)
         return runtime
@@ -224,7 +224,7 @@ class TestModelAssets:
         from transformers import GenerationConfig
 
         from veomni.models import save_model_assets
-        from veomni.trainer.dllm_trainer import DllmModelRuntime
+        from veomni.models.model_runtime import VeOmniModelRuntime
 
         runtime = self._runtime()
         generation_config = GenerationConfig(max_new_tokens=17)
@@ -233,9 +233,9 @@ class TestModelAssets:
             self.tokenizer = None
             self.model_assets = [self.model_config]
 
-        monkeypatch.setattr(DllmModelRuntime, "_build_model_assets", build_base_assets)
+        monkeypatch.setattr(VeOmniModelRuntime, "_build_model_assets", build_base_assets)
         monkeypatch.setattr(
-            "veomni.trainer.diffusion_gemma_trainer.GenerationConfig.from_pretrained",
+            "veomni.trainer.dllm_trainer.GenerationConfig.from_pretrained",
             lambda *args, **_: generation_config if args[-1] == "/model" else None,
         )
 
@@ -248,7 +248,7 @@ class TestModelAssets:
     def test_missing_source_generation_config_falls_back_to_model_defaults(self, monkeypatch):
         from transformers import GenerationConfig
 
-        from veomni.trainer.dllm_trainer import DllmModelRuntime
+        from veomni.models.model_runtime import VeOmniModelRuntime
 
         runtime = self._runtime()
         derived = GenerationConfig(max_new_tokens=23)
@@ -260,13 +260,13 @@ class TestModelAssets:
         def missing(*_args, **_kwargs):
             raise OSError("missing generation config")
 
-        monkeypatch.setattr(DllmModelRuntime, "_build_model_assets", build_base_assets)
+        monkeypatch.setattr(VeOmniModelRuntime, "_build_model_assets", build_base_assets)
         monkeypatch.setattr(
-            "veomni.trainer.diffusion_gemma_trainer.GenerationConfig.from_pretrained",
+            "veomni.trainer.dllm_trainer.GenerationConfig.from_pretrained",
             missing,
         )
         monkeypatch.setattr(
-            "veomni.trainer.diffusion_gemma_trainer.GenerationConfig.from_model_config",
+            "veomni.trainer.dllm_trainer.GenerationConfig.from_model_config",
             lambda *args, **_: derived,
         )
 
@@ -277,7 +277,7 @@ class TestModelAssets:
     def test_random_init_derives_generation_config_without_loading_a_checkpoint(self, monkeypatch):
         from transformers import GenerationConfig
 
-        from veomni.trainer.dllm_trainer import DllmModelRuntime
+        from veomni.models.model_runtime import VeOmniModelRuntime
 
         runtime = self._runtime(model_path=None)
         derived = GenerationConfig(max_new_tokens=31)
@@ -289,13 +289,13 @@ class TestModelAssets:
         def unexpected_load(*_args, **_kwargs):
             raise AssertionError("random init must not load generation assets from a checkpoint")
 
-        monkeypatch.setattr(DllmModelRuntime, "_build_model_assets", build_base_assets)
+        monkeypatch.setattr(VeOmniModelRuntime, "_build_model_assets", build_base_assets)
         monkeypatch.setattr(
-            "veomni.trainer.diffusion_gemma_trainer.GenerationConfig.from_pretrained",
+            "veomni.trainer.dllm_trainer.GenerationConfig.from_pretrained",
             unexpected_load,
         )
         monkeypatch.setattr(
-            "veomni.trainer.diffusion_gemma_trainer.GenerationConfig.from_model_config",
+            "veomni.trainer.dllm_trainer.GenerationConfig.from_model_config",
             lambda *args, **_: derived,
         )
 
@@ -2029,9 +2029,9 @@ class TestCollator:
         assert int(batch["num_supervised_examples"]) == 2
 
     def test_example_sample_count_uses_the_collator_tally(self):
-        from veomni.trainer.diffusion_gemma_trainer import DiffusionGemmaTrainer
+        from veomni.trainer.dllm_trainer import DllmTrainer
 
-        trainer = DiffusionGemmaTrainer.__new__(DiffusionGemmaTrainer)
+        trainer = DllmTrainer.__new__(DllmTrainer)
         stacked = {
             "loss_weight": torch.ones(1, 3, 4),
             "num_supervised_examples": torch.tensor(1),
@@ -2041,7 +2041,7 @@ class TestCollator:
         assert trainer._example_sample_count({"loss_weight": torch.ones(3, 4)}) == 3
 
     def test_pad_decoder_canvases_aligns_a_short_rank_to_the_step_max(self):
-        from veomni.trainer.diffusion_gemma_trainer import pad_decoder_canvases
+        from veomni.trainer.dllm_trainer import pad_decoder_canvases
 
         single = {
             "decoder_input_ids": torch.ones(1, 4, dtype=torch.long),
@@ -2521,9 +2521,9 @@ class TestSelfConditioning:
         from types import SimpleNamespace
 
         from veomni.trainer.base import BaseTrainer
-        from veomni.trainer.diffusion_gemma_trainer import DiffusionGemmaTrainer
+        from veomni.trainer.dllm_trainer import DllmTrainer
 
-        trainer = DiffusionGemmaTrainer.__new__(DiffusionGemmaTrainer)
+        trainer = DllmTrainer.__new__(DllmTrainer)
         trainer.base = BaseTrainer.__new__(BaseTrainer)
         trainer.base.device = torch.device("cpu")
         trainer.base.LOG_SAMPLE = False
@@ -2930,10 +2930,12 @@ class TestLossNormalization:
     def _trainer(self):
         from types import SimpleNamespace
 
-        from veomni.trainer.diffusion_gemma_trainer import DiffusionGemmaTrainer
+        from veomni.trainer.dllm_trainer import DllmTrainer
 
-        trainer = DiffusionGemmaTrainer.__new__(DiffusionGemmaTrainer)
-        trainer.base = SimpleNamespace(model=SimpleNamespace(model_config=SimpleNamespace()))
+        trainer = DllmTrainer.__new__(DllmTrainer)
+        trainer.base = SimpleNamespace(
+            model=SimpleNamespace(model_config=SimpleNamespace(model_type="diffusion_gemma"))
+        )
         return trainer
 
     def test_zero_weight_samples_stay_out_of_the_denominator(self):
@@ -2971,9 +2973,9 @@ class TestComponentGradNorms:
     def _trainer(self, model):
         from types import SimpleNamespace
 
-        from veomni.trainer.diffusion_gemma_trainer import DiffusionGemmaTrainer
+        from veomni.trainer.dllm_trainer import DllmTrainer
 
-        trainer = DiffusionGemmaTrainer.__new__(DiffusionGemmaTrainer)
+        trainer = DllmTrainer.__new__(DllmTrainer)
         trainer.base = SimpleNamespace(model=toy_runtime(model))
         return trainer
 
@@ -3035,7 +3037,7 @@ class TestComponentGradNorms:
         micro-batch count is known before the first forward and is the same on every
         rank, rather than in the backward where it would need a collective to agree.
         """
-        from veomni.trainer.diffusion_gemma_trainer import DiffusionGemmaTrainer
+        from veomni.trainer.dllm_trainer import DllmTrainer
 
         model = build_toy_model().train()
         model.config.print_ar_df_norm = True
@@ -3043,17 +3045,17 @@ class TestComponentGradNorms:
         batch = build_toy_batch(model.config)
 
         with pytest.raises(ValueError, match="one micro-batch per step"):
-            DiffusionGemmaTrainer.on_micro_batches_ready(trainer, [batch, batch])
+            DllmTrainer.on_micro_batches_ready(trainer, [batch, batch])
 
     def test_one_micro_batch_is_accepted(self):
-        from veomni.trainer.diffusion_gemma_trainer import DiffusionGemmaTrainer
+        from veomni.trainer.dllm_trainer import DllmTrainer
 
         model = build_toy_model().train()
         model.config.print_ar_df_norm = True
         trainer = self._trainer(model)
         batch = build_toy_batch(model.config)
 
-        DiffusionGemmaTrainer.on_micro_batches_ready(trainer, [batch])
+        DllmTrainer.on_micro_batches_ready(trainer, [batch])
         assert trainer._remaining_micro_steps == 1
 
     def test_a_disabled_ar_term_logs_zero_grad(self):
@@ -3162,10 +3164,10 @@ class TestEncoderBudget:
     def _warn_count(self, **options):
         from unittest import mock
 
-        from veomni.trainer import diffusion_gemma_trainer
+        from veomni.trainer import dllm_trainer
 
-        with mock.patch.object(diffusion_gemma_trainer.logger, "warning") as warning:
-            diffusion_gemma_trainer.DiffusionGemmaTrainer._warn_if_the_encoder_budget_is_tight(options)
+        with mock.patch.object(dllm_trainer.logger, "warning") as warning:
+            dllm_trainer.DllmTrainer._warn_if_the_encoder_budget_is_tight(options)
         return warning.call_count
 
     def test_a_budget_the_canvases_would_swallow_is_flagged(self):

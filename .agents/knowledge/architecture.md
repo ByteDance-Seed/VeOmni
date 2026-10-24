@@ -79,8 +79,7 @@ veomni/
 │   ├── text_trainer.py TextTrainer: LLM SFT training
 │   ├── vlm_trainer.py  VLMTrainer: vision-language model training
 │   ├── dit_trainer.py  DitTrainer: diffusion transformer training
-│   ├── dllm_trainer.py DllmTrainer: discrete-diffusion LMs (LLaDA family)
-│   ├── diffusion_gemma_trainer.py  DiffusionGemmaTrainer: encoder-decoder canvas
+│   ├── dllm_trainer.py DllmTrainer: discrete-diffusion LMs (LLaDA family and DiffusionGemma)
 │   ├── text_dpo_trainer.py  DPO training for text models
 │   ├── base_rl_trainer.py   Base RL trainer for RLHF
 │   ├── omni/           SeedOmni orchestrators (not BaseTrainer subclasses):
@@ -117,7 +116,7 @@ BaseTrainer (ABC)                     job: data, train_step, loop, callbacks
 What holds a `BaseTrainer`:
 
 ```
-TextTrainer / VLMTrainer / DiTTrainer / TextDPOTrainer / DllmTrainer / DiffusionGemmaTrainer  compose `self.base`
+TextTrainer / VLMTrainer / DiTTrainer / TextDPOTrainer / DllmTrainer  compose `self.base`
 BaseRLTrainer (ABC)  subclasses BaseTrainer
 ├── (text RL)           -> tasks/train_text_rl.py
 └── (VLM RL)            -> tasks/train_vlm_rl.py
@@ -146,7 +145,7 @@ The template is not in `model_assets` and is not written onto the tokenizer: it 
 
 `model.processor_config` is forwarded as kwargs to `build_processor` the way `model_config` overrides the architecture. Pixel budgets belong in `data.mm_configs`, which resizes before the processor sees the image.
 
-So `self.model = self._build_model_runtime()` *is* the model build — a trainer never resequences those steps from outside, and needs no `use_parallel_state` scope around anything that follows. A model whose build differs subclasses the runtime and overrides the step that differs: `VLMModelRuntime` (encoder-aware build, tower freezing, separate ViT lr), `DiTModelRuntime` (frozen condition model; nothing to parallelize on an embedding-only run), `DllmModelRuntime` (rewires a text chat template onto the tokenizer when the checkpoint ships a processor; `after_weights_land` between load and optimizer), `DiffusionGemmaModelRuntime` (folds the per-expert scale, exports a generation config), and `DPOReferenceModelRuntime` (frozen eval replica under `"reference"`; init only builds the module, never optimizer / checkpoint). `TextDPOTrainer` owns both handles as `policy_model` (ParallelState `"policy"`) and `reference_model`. Callbacks bind to the DPO trainer; `.model` is the policy. The frozen reference always copies `model`; a custom reference-model config is not supported. Each is returned from `_build_policy_model_runtime()` / `_build_reference_model_runtime()`.
+So `self.model = self._build_model_runtime()` *is* the model build — a trainer never resequences those steps from outside, and needs no `use_parallel_state` scope around anything that follows. A model whose build differs subclasses the runtime and overrides the step that differs: `VLMModelRuntime` (encoder-aware build, tower freezing, separate ViT lr), `DiTModelRuntime` (frozen condition model; nothing to parallelize on an embedding-only run), `DllmModelRuntime` (rewires a text chat template onto the tokenizer when the checkpoint ships a processor; `after_weights_land` between load and optimizer; folds the per-expert scale and exports a generation config for canvas models), and `DPOReferenceModelRuntime` (frozen eval replica under `"reference"`; init only builds the module, never optimizer / checkpoint). `TextDPOTrainer` owns both handles as `policy_model` (ParallelState `"policy"`) and `reference_model`. Callbacks bind to the DPO trainer; `.model` is the policy. The frozen reference always copies `model`; a custom reference-model config is not supported. Each is returned from `_build_policy_model_runtime()` / `_build_reference_model_runtime()`.
 
 It is usable on its own, with no trainer at all (see `tests/models/test_model_runtime.py`). Construction takes this model's *own* arguments (`ModelArguments`), the `ParallelState` name to register under, and the job-wide `TrainingArguments` it still needs for checkpoint paths and the resume decision. Nothing has to find itself inside a larger config: a job composing several models hands each one its own slice, so a single-model trainer and a multi-module omni model share one build sequence.
 
@@ -329,7 +328,6 @@ both unit workflows. See `.agents/knowledge/testing.md` before adding a test.
 | VLM SFT | `tasks/train_vlm.py` | `VLMTrainer` |
 | VLM RL | `tasks/train_vlm_rl.py` | `BaseRLTrainer` |
 | DiT | `tasks/train_dit.py` | `DitTrainer` |
-| dLLM (LLaDA family) | `tasks/train_dllm.py` | `DllmTrainer` |
-| DiffusionGemma | `tasks/train_diffusion_gemma.py` | `DiffusionGemmaTrainer` |
+| dLLM (LLaDA family & DiffusionGemma) | `tasks/train_dllm.py` | `DllmTrainer` |
 | Inference (text) | `tasks/infer/infer_text.py` | N/A |
 | Inference (VLM) | `tasks/infer/infer_qwen2_vl.py` | N/A |

@@ -5,7 +5,7 @@ is an encoder-decoder **block-diffusion** MoE, not an autoregressive LM: the enc
 prefills the prompt (and optional images) and exports a KV cache; the decoder denoises
 a fixed-length canvas that is bidirectional over `[encoder cache | canvas]`.
 
-Launch with `tasks/train_diffusion_gemma.py`. Do not reuse `tasks/train_text.py` or
+Launch with `tasks/train_dllm.py`. Do not reuse `tasks/train_text.py` or
 `tasks/train_vlm.py` — those collators and losses are for causal LMs.
 
 Configs:
@@ -98,7 +98,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ### Text-only
 
 ```shell
-bash train.sh tasks/train_diffusion_gemma.py configs/text/diffusion_gemma.yaml \
+bash train.sh tasks/train_dllm.py configs/text/diffusion_gemma.yaml \
     --model.model_path ./diffusiongemma-26B-A4B-it \
     --data.train_path ./tulu-first2000.parquet \
     --model.accelerator.fsdp_config.fsdp_mode fsdp2 \
@@ -108,7 +108,7 @@ bash train.sh tasks/train_diffusion_gemma.py configs/text/diffusion_gemma.yaml \
 ### Text+image
 
 ```shell
-bash train.sh tasks/train_diffusion_gemma.py configs/multimodal/diffusion_gemma/diffusion_gemma_mm.yaml \
+bash train.sh tasks/train_dllm.py configs/multimodal/diffusion_gemma/diffusion_gemma_mm.yaml \
     --model.model_path ./diffusiongemma-26B-A4B-it \
     --data.train_path ./sharegpt4v_instruct_gpt4-vision_cap100k_coco.json \
     --data.text_keys conversations \

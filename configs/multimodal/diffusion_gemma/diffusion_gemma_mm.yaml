@@ -2,7 +2,7 @@
 #
 # Images are an encoder-only conditioning signal: the encoder prefills prompt text and
 # image soft tokens and exports its KV cache, while the canvas the decoder denoises
-# stays pure text. Launch with `tasks/train_diffusion_gemma.py`, the same entry point as
+# stays pure text. Launch with `tasks/train_dllm.py`, the same entry point as
 # the text-only run in `configs/text/diffusion_gemma.yaml`; `data.data_type` is what
 # selects the multimodal path.
 

@@ -3,7 +3,7 @@
 # DiffusionGemma is a uniform-state discrete diffusion LM, not an autoregressive one:
 # the encoder prefills the prompt and exports only its KV cache, and the decoder
 # denoises a fixed-length canvas that is bidirectional over `[cache | canvas]`.
-# Launch with `tasks/train_diffusion_gemma.py`, which wires the matching data
+# Launch with `tasks/train_dllm.py`, which wires the matching data
 # transform, batching collator and per-sample loss reduction. For text+image training
 # see `configs/multimodal/diffusion_gemma/diffusion_gemma_mm.yaml`, which uses the same
 # entry point and differs only in `data.data_type`.

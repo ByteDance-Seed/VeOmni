@@ -238,7 +238,7 @@ def _component_grad_norm_worker(ep_size: int = 2, return_logits: bool = True):
     from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.distributed.torch_parallelize import build_parallelize_model
     from veomni.models.auto import build_config, build_foundation_model
-    from veomni.trainer.diffusion_gemma_trainer import DiffusionGemmaTrainer
+    from veomni.trainer.dllm_trainer import DllmTrainer
     from veomni.utils.device import get_device_type
 
     from ..models.test_diffusion_gemma import build_toy_batch, toy_runtime
@@ -284,7 +284,7 @@ def _component_grad_norm_worker(ep_size: int = 2, return_logits: bool = True):
         basic_modules=[],
     )
 
-    trainer = DiffusionGemmaTrainer.__new__(DiffusionGemmaTrainer)
+    trainer = DllmTrainer.__new__(DllmTrainer)
     trainer.base = SimpleNamespace(model=toy_runtime(model))
 
     batch = {k: v.to(device) for k, v in build_toy_batch(config, batch_size=2, prompt_len=24).items()}

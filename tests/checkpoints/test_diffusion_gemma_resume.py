@@ -47,7 +47,7 @@ from veomni.models.transformers.diffusion_gemma import modeling_diffusion_gemma
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
-from veomni.trainer.diffusion_gemma_trainer import DiffusionGemmaTrainer
+from veomni.trainer.dllm_trainer import DllmTrainer
 
 
 TOTAL_STEPS = 6
@@ -140,7 +140,7 @@ class _Harness:
         base.train_dataloader = self.train_dataloader
         base.environ_meter = self.environ_meter
 
-        trainer = DiffusionGemmaTrainer.__new__(DiffusionGemmaTrainer)
+        trainer = DllmTrainer.__new__(DllmTrainer)
         trainer.base = base
         # The mask is attached inside `preforward` and the micro-batch is dropped before
         # `forward_backward_step` returns, so record it on the way through.

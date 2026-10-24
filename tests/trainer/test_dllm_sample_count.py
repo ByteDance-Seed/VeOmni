@@ -4,7 +4,6 @@ import pytest
 import torch
 
 from veomni.trainer import dllm_trainer
-from veomni.trainer.diffusion_gemma_trainer import DiffusionGemmaTrainer
 from veomni.trainer.dllm_trainer import DllmTrainer
 
 
@@ -136,7 +135,7 @@ def test_epoch_reaches_the_transform_holder():
 def test_diffusion_gemma_keeps_its_example_count():
     # the encoder `position_ids` can coincide in shape with the canvas `loss_weight`
     # and must not be read as its segment boundaries
-    trainer = DiffusionGemmaTrainer.__new__(DiffusionGemmaTrainer)
+    trainer = DllmTrainer.__new__(DllmTrainer)
     micro_batch = {
         "position_ids": torch.tensor([[0, 1, 0, 1]]),
         "loss_weight": torch.tensor([[1.0, 1.0, 1.0, 1.0]]),

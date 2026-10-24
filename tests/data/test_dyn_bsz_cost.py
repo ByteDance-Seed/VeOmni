@@ -29,7 +29,7 @@ import pytest
 import torch
 
 from veomni.data.dynamic_batching import DynBszBuffer
-from veomni.trainer.diffusion_gemma_trainer import diffusion_gemma_sample_cost
+from veomni.trainer.dllm_trainer import diffusion_gemma_sample_cost
 
 
 CANVAS = 256

@@ -148,7 +148,7 @@ def build_native_dataloader(
             sample is one sequence through one stack. A model that runs a second stack
             over tokens the first one also saw costs more than that per sample and has
             to say so here, or the budget stops converting to a step time --
-            ``DiffusionGemmaTrainer`` supplies one for that reason. Only valid with
+            ``DllmTrainer`` supplies one for that reason. Only valid with
             ``dyn_bsz_count_mode="total"``. Must be a module-level callable, since it is
             pickled into spawned workers and into the dataloader's ``state_dict``.
 
