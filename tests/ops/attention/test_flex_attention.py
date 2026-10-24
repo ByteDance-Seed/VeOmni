@@ -1460,3 +1460,40 @@ def test_flex_fa4_framework_scalars_with_compiled_mask_builder(case):
     finally:
         torch.compiler.reset()
         flex_backend._fa4._compiled_flex_attention_fa4.cache_clear()
+
+
+@pytest.mark.parametrize("explicit_num_stages,expected_num_stages", [(None, 1), (2, 2)])
+def test_flex_attention_limits_pipeline_depth_for_wide_heads(monkeypatch, explicit_num_stages, expected_num_stages):
+    captured = {}
+
+    def fake_flex_forward(module, query, key, value, attention_mask, **kwargs):
+        captured.update(kwargs)
+        return query.transpose(1, 2), None
+
+    monkeypatch.setattr(
+        flex_backend,
+        "get_parallel_state",
+        lambda: SimpleNamespace(ulysses_enabled=False),
+    )
+    monkeypatch.setattr(flex_backend, "_flex_attention_triton", fake_flex_forward)
+    block_mask = create_block_mask(
+        lambda batch, head, query, key: query >= key,
+        B=1,
+        H=None,
+        Q_LEN=2,
+        KV_LEN=2,
+        device="cpu",
+    )
+    kernel_options = {} if explicit_num_stages is None else {"num_stages": explicit_num_stages}
+
+    flex_backend.flex_attention_forward(
+        nn.Module(),
+        torch.zeros(1, 8, 2, 256),
+        torch.zeros(1, 1, 2, 256),
+        torch.zeros(1, 1, 2, 256),
+        block_mask,
+        kernel_options=kernel_options,
+    )
+
+    assert captured["kernel_options"]["BACKEND"] == "TRITON"
+    assert captured["kernel_options"]["num_stages"] == expected_num_stages
