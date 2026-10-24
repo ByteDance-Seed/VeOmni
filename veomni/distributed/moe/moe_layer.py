@@ -148,9 +148,11 @@ def dispatch_to_ep_class(
         num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
         ep_group=ep_state.ep_group,
     )
+    del expert_mask
     cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0).to(permute_tokens.device)
 
     final_permute_tokens = ep_class.apply(permute_tokens, cumsum, *ep_class_args)
+    del permute_tokens
 
     return tokens_post_all2all(
         expert_outputs=final_permute_tokens,
