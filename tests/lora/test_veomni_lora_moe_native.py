@@ -154,10 +154,13 @@ def _shared_lora_ep_accumulation_worker(rank: int, checkpointed: bool, defer_res
     from torch.distributed._composable.fsdp import fully_shard
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor import Shard
-    from torch.utils.checkpoint import checkpoint
+    from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
+    previous_device_type = DefaultDeviceType.get_device_type()
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=_CI_CPU_2.nproc)
     try:
+        # Spawned workers do not inherit the pytest parent's CPU device policy.
+        DefaultDeviceType.set_device_type("cpu")
         mesh = init_device_mesh("cpu", (2, 1), mesh_dim_names=("ep", "ep_fsdp"))
         experts = _SharedLoraAccumulationProbe(ToyExperts(), r=RANK, lora_alpha=8)
         fully_shard(experts, mesh=mesh["ep_fsdp"], shard_placement_fn=lambda param: Shard(1))
@@ -167,7 +170,7 @@ def _shared_lora_ep_accumulation_worker(rank: int, checkpointed: bool, defer_res
             name for name, param in experts.named_parameters() if param.requires_grad
         }
         initial = {name: weight.to_local().detach().clone() for name, weight in weights.items()}
-        optimizer = torch.optim.SGD(weights.values(), lr=0.1)
+        optimizer = torch.optim.SGD(weights.values(), lr=0.1, foreach=False)
         state = SimpleNamespace(ep_enabled=True, ep_group=mesh["ep"].get_group())
         forward_checks = []
         with mock.patch("veomni.lora.moe_layers.get_parallel_state", return_value=state):
@@ -215,6 +218,7 @@ def _shared_lora_ep_accumulation_worker(rank: int, checkpointed: bool, defer_res
                 weight_replicas[0], weight_replicas[1], rtol=0, atol=0, msg=f"{name} weight replicas"
             )
     finally:
+        DefaultDeviceType.set_device_type(previous_device_type)
         dist.destroy_process_group()
 
 
