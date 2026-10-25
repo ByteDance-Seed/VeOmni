@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """DeepSeek-V4 operator integration and Hugging Face parity tests.
 
@@ -20,6 +20,7 @@ Direct-import the generated class. Compare a toy CausalLM against Hugging Face.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -28,6 +29,7 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM as HFDeepseekV4ForCausalLM
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import apply_rotary_pos_emb as hf_apply_rotary_pos_emb
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
@@ -53,6 +55,14 @@ def _dsv4_cls():
 def _build_ours(config: DeepseekV4Config, ops: SimpleNamespace | None = None):
     with ops_config_scope(ops if ops is not None else eager_ops_config()):
         return _dsv4_cls()(config)
+
+
+@pytest.mark.parametrize("impl", ["liger_kernel", "npu"])
+def test_deepseek_v4_rope_rejects_impls_without_a_v4_kernel(impl):
+    ops = eager_ops_config()
+    ops.rotary_pos_emb_implementation = impl
+    with pytest.raises(KeyError, match=rf"'rope' variant='deepseek_v4' impl='{impl}'"):
+        _build_ours(_tiny_config(), ops)
 
 
 def test_deepseek_v4_shared_mlp_passes_swiglu_limit():
@@ -152,7 +162,8 @@ def test_deepseek_v4_attention_preserves_q_norm_and_rope_dtype_modes():
     assert not torch.equal(captured["query"], wrong_fp32_multiply)
 
 
-def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit():
+@pytest.mark.parametrize("impl", ["eager", "fused_triton"])
+def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
     config = _tiny_config()
     model = _build_ours(config)
     experts = model.model.layers[3].mlp.experts
@@ -169,13 +180,14 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit():
         captured["kwargs"] = kwargs
         return torch.zeros_like(hidden_states)
 
-    experts.veomni_moe = record
+    experts.veomni_moe = Mock(impl=impl, side_effect=record)
     actual = experts(hidden_states, selected_experts, top_k_weights)
     args = captured["args"]
     kwargs = captured["kwargs"]
 
     assert args[0] is hidden_states
-    torch.testing.assert_close(args[1], top_k_weights.to(hidden_states.dtype), rtol=0, atol=0)
+    expected_weights = top_k_weights if impl == "eager" else top_k_weights.to(hidden_states.dtype)
+    torch.testing.assert_close(args[1], expected_weights, rtol=0, atol=0)
     assert args[2] is selected_experts
     assert args[3].numel() == 0
     assert args[4].numel() == 0
@@ -232,8 +244,7 @@ def test_deepseek_v4_eager_matches_hf(seq_len):
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, seq_len))
-    # DSA + mHC ULP (~2e-7); not bitwise vs Hugging Face.
-    assert_eager_matches_hf(hf, ours, input_ids=input_ids)
+    assert_eager_matches_hf(hf, ours, input_ids=input_ids, logits_equal=True)
 
     if seq_len >= config.compress_rates["heavily_compressed_attention"]:
         # Every attention layer must train its compressor, not just match an unused branch.
@@ -260,11 +271,19 @@ def test_deepseek_v4_eager_matches_hf_aux_loss():
     torch.testing.assert_close(ours_out.loss, hf_out.loss, atol=1e-6, rtol=1e-6)
 
 
-class _FusedDsv4AttentionSpy:
-    impl = "tilelang"
+class _StopForward(Exception):
+    pass
+
+
+class _Dsv4AttentionRequestSpy:
+    """Stand-in ``dsa_attention`` op that records the request and stops the forward."""
+
+    def __init__(self) -> None:
+        self.kwargs: dict | None = None
 
     def __call__(self, *args, **kwargs):
-        raise AssertionError("fused DeepSeek-V4 attention should have raised before the kernel call")
+        self.kwargs = kwargs
+        raise _StopForward
 
 
 def test_deepseek_v4_eager_dropout_train_eval_seed_and_grads():
@@ -296,6 +315,28 @@ def test_deepseek_v4_eager_dropout_train_eval_seed_and_grads():
     assert any(grad is not None and grad.abs().sum() > 0 for grad in grads)
 
 
+def test_deepseek_v4_cached_decode_matches_hf():
+    # A decode query sits past the cached rows, so this is what pins the
+    # attention's ``query_offset`` and the compressors' decode candidates. The
+    # prefill is longer than the sliding window and every compression rate.
+    torch.manual_seed(0)
+    config = _tiny_config()
+    hf = HFDeepseekV4ForCausalLM(config).eval()
+    ours = _build_ours(config).eval()
+    ours.load_state_dict(hf.state_dict())
+    input_ids = torch.randint(3, config.vocab_size, (2, 22))
+    prefill, steps = input_ids[:, :19], input_ids[:, 19:]
+    with torch.no_grad():
+        hf_cache = hf(input_ids=prefill, use_cache=True).past_key_values
+        ours_cache = ours(input_ids=prefill, use_cache=True).past_key_values
+        for step in range(steps.shape[1]):
+            token = steps[:, step : step + 1]
+            hf_out = hf(input_ids=token, past_key_values=hf_cache, use_cache=True)
+            ours_out = ours(input_ids=token, past_key_values=ours_cache, use_cache=True)
+            torch.testing.assert_close(ours_out.logits, hf_out.logits, atol=1e-5, rtol=1e-5)
+            hf_cache, ours_cache = hf_out.past_key_values, ours_out.past_key_values
+
+
 def test_deepseek_v4_eager_output_attentions_matches_hf():
     torch.manual_seed(0)
     config = _tiny_config()
@@ -313,12 +354,16 @@ def test_deepseek_v4_eager_output_attentions_matches_hf():
         torch.testing.assert_close(ours_weights, hf_weights, atol=1e-4, rtol=1e-4)
 
 
-def test_deepseek_v4_fused_rejects_output_attentions():
+def test_deepseek_v4_output_attentions_reaches_the_op():
+    # Each implementation decides whether it can return weights; modeling only
+    # has to pass the request through.
     config = _tiny_config()
     model = _build_ours(config)
-    model.model.layers[0].self_attn.veomni_dsa_attention = _FusedDsv4AttentionSpy()
-    with pytest.raises(ValueError, match="output_attentions=True"):
+    spy = _Dsv4AttentionRequestSpy()
+    model.model.layers[0].self_attn.veomni_dsa_attention = spy
+    with pytest.raises(_StopForward):
         model(input_ids=torch.randint(3, config.vocab_size, (2, 8)), use_cache=False, output_attentions=True)
+    assert spy.kwargs["return_attn_weights"] is True
 
 
 def test_deepseek_v4_packed_public_entry_validates_cu_seqlens():
@@ -354,3 +399,201 @@ def test_deepseek_v4_packed_forward_uses_host_slices(monkeypatch):
             use_cache=False,
         )
     assert calls["from_cu"] == 0
+
+
+def test_deepseek_v4_duplicate_hash_routes_match_ep_dispatch_splits(monkeypatch):
+    import veomni.distributed.moe.moe_layer as moe
+
+    selected = torch.tensor([[0, 0], [0, 2], [3, 3]])
+    mask = F.one_hot(selected, num_classes=4).permute(2, 1, 0)
+    group = SimpleNamespace(size=lambda: 2)
+    monkeypatch.setattr(moe.dist, "get_rank", lambda _group: 0)
+
+    def gather(output, counts, group):
+        output.copy_(counts.expand(2, -1))
+
+    monkeypatch.setattr(moe.dist, "all_gather_into_tensor", gather)
+    inputs, outputs, counts, totals = moe.preprocess(mask, 4, group)
+    dispatched, _ = moe.permute(torch.ones(3, 2), mask.sum(dim=1))
+    assert inputs == [2, 2]
+    assert outputs == [2, 2]
+    assert sum(inputs) == dispatched.shape[0] == 4
+    torch.testing.assert_close(counts, torch.tensor([[2, 0], [2, 0]]))
+    torch.testing.assert_close(totals, torch.tensor([4, 0]))
+
+
+def _deepseek_v4_experts_reference(
+    num_experts: int,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    hidden_states: torch.Tensor,
+    gate_up_proj: torch.Tensor,
+    down_proj: torch.Tensor,
+    swiglu_limit: float | None,
+) -> torch.Tensor:
+    output = torch.zeros_like(hidden_states)
+    expert_mask = F.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
+    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+    for expert_idx in expert_hit:
+        idx = int(expert_idx[0].item())
+        top_k_pos, token_idx = torch.where(expert_mask[idx])
+        current_state = hidden_states[token_idx]
+        gate, up = F.linear(current_state, gate_up_proj[idx]).chunk(2, dim=-1)
+        if swiglu_limit is not None:
+            gate = gate.clamp(min=None, max=swiglu_limit)
+            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+        current_hidden_states = F.silu(gate) * up
+        current_hidden_states = F.linear(current_hidden_states, down_proj[idx])
+        current_hidden_states = current_hidden_states * routing_weights[token_idx, top_k_pos, None]
+        output.index_add_(0, token_idx, current_hidden_states.to(output.dtype))
+    return output
+
+
+def _run_deepseek_v4_ep_fixed_route_vjp(rank, world_size, init_file, seed):
+    import torch.distributed as dist
+
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.distributed.parallel_state import ParallelState, _init_parallel_state, use_parallel_state
+    from veomni.models import build_foundation_model
+    from veomni.ops.kernels.moe_experts.standard.triton import group_gemm_fused_moe_forward
+    from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+
+    device_type = get_device_type()
+    get_torch_device().set_device(rank)
+    dist.init_process_group(
+        get_dist_comm_backend(), init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    torch.manual_seed(seed)
+    torch.set_float32_matmul_precision("highest")
+    with use_parallel_state(ParallelState(dp_size=world_size, dp_shard_size=world_size)):
+        model = build_foundation_model(
+            config_path="tests/toy_config/deepseek_v4_toy",
+            weights_path=None,
+            torch_dtype="bfloat16",
+            init_device=device_type,
+            ops_implementation=make_eager_ops_config(moe_implementation="fused_triton"),
+        ).train()
+        with torch.no_grad():
+            for module in model.modules():
+                if hasattr(module, "tid2eid"):
+                    table = module.tid2eid
+                    table.copy_(
+                        (
+                            torch.arange(table.shape[0], device=table.device)[:, None]
+                            + torch.arange(table.shape[1], device=table.device)[None, :]
+                        )
+                        % module.num_experts
+                    )
+        expert = model.model.layers[3].mlp.experts
+        captured = {}
+
+        def capture(_module, args, kwargs, output):
+            for i, name in enumerate(("hidden_states", "top_k_index", "top_k_weights")):
+                captured[name] = (args[i] if len(args) > i else kwargs[name]).detach().clone()
+            output.register_hook(lambda grad: captured.update(cotangent=grad.detach().clone()))
+
+        handle = expert.register_forward_hook(capture, with_kwargs=True)
+        ids = torch.arange(64, device=device_type).view(1, 64)
+        model(input_ids=ids, labels=ids, use_cache=False).loss.backward()
+        handle.remove()
+    full_gate_up = expert.gate_up_proj.detach().clone()
+    full_down = expert.down_proj.detach().clone()
+    limit = expert.limit
+    del model
+    for value in (*captured.values(), full_gate_up, full_down):
+        dist.broadcast(value, src=0)
+    state = _init_parallel_state(
+        dp_size=world_size,
+        dp_shard_size=world_size,
+        device_type=device_type,
+        extra_parallel_sizes=(world_size,),
+        name=None,
+    )
+    local_experts = full_gate_up.shape[0] // world_size
+    expert_slice = slice(state.ep_rank * local_experts, (state.ep_rank + 1) * local_experts)
+    offsets = (0, 9, 24, 41, 64)
+    token_slice = slice(offsets[rank], offsets[rank + 1])
+    for duplicate_slots in (False, True):
+        indices = captured["top_k_index"].clone()
+        if duplicate_slots:
+            indices[::8, 1] = indices[::8, 0]
+        route_bits = captured["top_k_weights"].to(torch.bfloat16)
+        hidden = captured["hidden_states"][token_slice].detach().clone().requires_grad_()
+        route = route_bits[token_slice].detach().clone().requires_grad_()
+        gate_up = full_gate_up[expert_slice].detach().clone().requires_grad_()
+        down = full_down[expert_slice].detach().clone().requires_grad_()
+        with use_parallel_state(state):
+            output = group_gemm_fused_moe_forward(
+                num_experts=full_gate_up.shape[0],
+                routing_weights=route,
+                selected_experts=indices[token_slice],
+                hidden_states=hidden,
+                fc1_1_weight=None,
+                fc1_2_weight=None,
+                fc1_1_2_weight=gate_up,
+                fc2_weight=down,
+                swiglu_limit=limit,
+            )
+            output.backward(captured["cotangent"][token_slice])
+        ref_hidden = captured["hidden_states"].float().detach().requires_grad_()
+        ref_route = route_bits.float().detach().requires_grad_()
+        ref_gate_up = full_gate_up.float().detach().requires_grad_()
+        ref_down = full_down.float().detach().requires_grad_()
+        ref_output = _deepseek_v4_experts_reference(
+            num_experts=full_gate_up.shape[0],
+            routing_weights=ref_route,
+            selected_experts=indices,
+            hidden_states=ref_hidden,
+            gate_up_proj=ref_gate_up,
+            down_proj=ref_down,
+            swiglu_limit=limit,
+        )
+        ref_output.backward(captured["cotangent"].float())
+        pairs = {
+            "output": (output, ref_output[token_slice]),
+            "hidden_grad": (hidden.grad, ref_hidden.grad[token_slice]),
+            "route_grad": (route.grad, ref_route.grad[token_slice]),
+            # Global reference VJP sums cotangents from EVERY source rank.
+            # Direct EP has no FSDP gradient averaging to undo here.
+            "gate_up_grad": (gate_up.grad, ref_gate_up.grad[expert_slice]),
+            "down_grad": (down.grad, ref_down.grad[expert_slice]),
+        }
+        for name, (actual, expected) in pairs.items():
+            context = (seed, rank, duplicate_slots, name)
+            assert actual is not None and expected is not None, context
+            assert actual.shape == expected.shape, context
+            assert torch.isfinite(actual).all() and torch.isfinite(expected).all(), context
+            delta = actual.double() - expected.double()
+            relative_l2 = delta.norm() / expected.double().norm().clamp_min(1e-30)
+            # Same multi-stage BF16 rounding budget as the non-EP oracle;
+            # discovery seed0 is excluded from these held-out cases.
+            eps = torch.finfo(torch.bfloat16).eps
+            assert relative_l2 <= 2 * eps, (context, relative_l2.item())
+            assert delta.abs().max() <= 4 * eps * expected.double().abs().max(), context
+        dist.barrier()
+    dist.destroy_process_group()
+
+
+_EP_ORACLE_LAUNCH = LaunchSpec(nproc=4)
+
+
+def _has_four_nvidia_gpus() -> bool:
+    from veomni.utils.device import IS_CUDA_AVAILABLE
+
+    return bool(IS_CUDA_AVAILABLE and torch.version.hip is None and runner_device_count() >= _EP_ORACLE_LAUNCH.nproc)
+
+
+@pytest.mark.skipif(
+    not _has_four_nvidia_gpus(),
+    reason="DeepSeek V4 EP expert oracle requires four NVIDIA CUDA devices",
+)
+@pytest.mark.launch_plan(provider=_EP_ORACLE_LAUNCH)
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_deepseek_v4_expert_parallel_fixed_route_vjp_matches_fp32_reference(seed, tmp_path):
+    """Check all-to-all output and four VJPs, unequal splits and duplicate slots."""
+    torch.multiprocessing.spawn(
+        _run_deepseek_v4_ep_fixed_route_vjp,
+        args=(_EP_ORACLE_LAUNCH.nproc, str(tmp_path / "rendezvous"), seed),
+        nprocs=_EP_ORACLE_LAUNCH.nproc,
+        join=True,
+    )

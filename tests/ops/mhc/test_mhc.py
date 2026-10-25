@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""mHC eager vs HuggingFace DeepSeek-V4, and TileLang vs eager."""
+"""mHC eager vs HuggingFace DeepSeek-V4, and TileLang / CANN vs eager."""
 
 from __future__ import annotations
 
@@ -29,17 +29,22 @@ from tests.ops.tol import (
     EAGER_GRAD_ATOL,
     EAGER_GRAD_RTOL,
     EAGER_RTOL,
+    MHC_CANN_ATOL,
+    MHC_CANN_RTOL,
     MHC_FUSED_ATOL,
     MHC_FUSED_GRAD_COSINE,
     MHC_FUSED_RTOL,
 )
 from tests.ops.utils import assert_gradient_direction_and_scale, is_nvidia_cuda_available, make_grad_leaves
-from veomni.ops import resolve_op
+from veomni.ops import OP_REGISTRY, resolve_op
+from veomni.ops.kernels.mhc.pre import cann as pre_cann
+from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
 
 
 # Installed Transformers classes used as the mHC eager reference.
 
 _TILELANG_AVAILABLE = is_nvidia_cuda_available(min_cc=90) and importlib.util.find_spec("tile_kernels") is not None
+_CANN_AVAILABLE = IS_NPU_AVAILABLE and importlib.util.find_spec("cann_ops_transformer") is not None
 
 
 def _tiny_dsv4_config(
@@ -259,3 +264,66 @@ def test_mhc_tilelang_head_matches_eager():
             min_cosine=MHC_FUSED_GRAD_COSINE,
             norm_rtol=0.25,
         )
+
+
+def test_mhc_cann_pre_passes_fp32_parameters_in_kernel_order(monkeypatch: pytest.MonkeyPatch):
+    calls = []
+    monkeypatch.setattr(pre_cann, "npu_mhc_pre_sinkhorn", lambda *args: calls.append(args) or args[:3])
+    hc_mult, hidden = 4, 8
+    mix = (2 + hc_mult) * hc_mult
+    x = torch.randn(1, 3, hc_mult, hidden, dtype=torch.bfloat16)
+    fn = torch.randn(hc_mult * hidden, mix, dtype=torch.bfloat16).t()
+    scale = torch.randn(3, dtype=torch.bfloat16)
+    base = torch.randn(mix, dtype=torch.bfloat16)
+
+    pre_cann.wrapper(x, fn, scale, base, 1e-6, hc_mult, 20, 2e-3)
+
+    ((kernel_x, kernel_fn, kernel_scale, kernel_base, *scalars),) = calls
+    assert kernel_x is x
+    assert all(tensor.dtype == torch.float32 for tensor in (kernel_fn, kernel_scale, kernel_base))
+    assert kernel_fn.is_contiguous()
+    # The kernel takes hc_eps before norm_eps, the reverse of the op contract.
+    assert scalars == [hc_mult, 20, 2e-3, 1e-6]
+
+
+@pytest.mark.skipif(not _CANN_AVAILABLE, reason="CANN mHC requires Ascend NPU and cann_ops_transformer")
+def test_mhc_cann_pre_post_matches_eager():
+    torch.manual_seed(29)
+    device = get_device_type()
+    batch, seq_len, hc_mult, hidden = 1, 8, 4, 128
+    norm_eps, hc_eps, sinkhorn_iters = 1e-6, 1e-6, 20
+    mix = (2 + hc_mult) * hc_mult
+    x = torch.randn(batch, seq_len, hc_mult, hidden, device=device, dtype=torch.bfloat16)
+    fn = torch.randn(mix, hc_mult * hidden, device=device, dtype=torch.float32) * 0.01
+    scale = torch.randn(3, device=device, dtype=torch.float32) * 0.01
+    base = torch.randn(mix, device=device, dtype=torch.float32) * 0.01
+    eager_pre = resolve_op("mhc", "pre", "eager").wrapper
+    other_pre = resolve_op("mhc", "pre", "cann").wrapper
+    eager_post = resolve_op("mhc", "post", "eager").wrapper
+    other_post = resolve_op("mhc", "post", "cann").wrapper
+
+    x_o, fn_o, scale_o, base_o = make_grad_leaves(x, fn, scale, base)
+    x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
+    post_o, comb_o, collapsed_o = other_pre(x_o, fn_o, scale_o, base_o, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+    post_e, comb_e, collapsed_e = eager_pre(x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+    y_o = other_post(collapsed_o * 0.75, x_o, post_o, comb_o)
+    y_e = eager_post(collapsed_e * 0.75, x_e, post_e, comb_e)
+
+    for actual, expected in ((post_o, post_e), (comb_o, comb_e), (collapsed_o, collapsed_e), (y_o, y_e)):
+        torch.testing.assert_close(actual, expected, rtol=MHC_CANN_RTOL, atol=MHC_CANN_ATOL)
+
+    grad = torch.randn_like(y_o)
+    other_grads = torch.autograd.grad((y_o * grad).sum(), (x_o, fn_o, scale_o, base_o))
+    eager_grads = torch.autograd.grad((y_e * grad).sum(), (x_e, fn_e, scale_e, base_e))
+    for actual, expected in zip(other_grads, eager_grads, strict=True):
+        assert_gradient_direction_and_scale(
+            actual,
+            expected,
+            min_cosine=MHC_FUSED_GRAD_COSINE,
+            norm_rtol=0.25,
+        )
+
+
+def test_mhc_cann_head_is_the_eager_math():
+    cann_head = OP_REGISTRY._entries["mhc", "head", "cann", "npu"]
+    assert cann_head.wrapper is resolve_op("mhc", "head", "eager").wrapper

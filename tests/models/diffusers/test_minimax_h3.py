@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """MiniMax H3 registry, public prediction/loss, and RMSNorm numerical tests."""
 
@@ -247,7 +247,7 @@ def test_minimax_h3_flash2_bind_defers_until_packed_bounds():
     ops.attn_implementation = "flash_attention_2"
     with ops_config_scope(ops):
         attn = MiniMaxH3Attention(hidden_size=16, num_attention_heads=2, attention_head_dim=8, qk_norm_eps=1e-5)
-    assert attn.veomni_attn.impl == "sdpa"
+    assert attn.veomni_attn.impl == "veomni_sdpa"
     assert attn.veomni_rope.op == "rope"
     assert attn.veomni_rope.variant == "partial"
 
@@ -274,6 +274,53 @@ def test_minimax_h3_flash2_bind_defers_until_packed_bounds():
     assert captured["max_length_k"] == 4
     assert captured["cu_seq_lens_q"].tolist() == [0, 2, 6]
     assert captured["cu_seq_lens_k"].tolist() == [0, 2, 6]
+
+
+def _sdpa_backed_flash_handle(calls: list):
+    """Stand-in for a flash handle: records each call and computes it with unmasked SDPA."""
+
+    def record(_module, query, key, value, attention_mask=None, **kwargs):
+        calls.append({"length": query.shape[-2], "attention_mask": attention_mask, **kwargs})
+        out = F.scaled_dot_product_attention(query, key, value, scale=kwargs["scaling"])
+        return out.transpose(1, 2), None
+
+    return record
+
+
+@pytest.mark.parametrize("impl", ["veomni_flash_attention_2", "veomni_sage_attention"])
+def test_minimax_h3_single_sample_runs_configured_handle_per_segment(impl: str):
+    """Single-sample and Ulysses attention call the configured handle per segment, with no mask or varlen metadata."""
+    torch.manual_seed(0)
+    attn = _tiny_attention()
+    hidden = torch.randn(6, 16)
+    kwargs = dict(rope_cos=None, rope_sin=None, cu_seqlens=(0, 2, 6), max_seqlen=4, valid_seqlen=6)
+    reference = attn(hidden, **kwargs)
+
+    calls: list = []
+    attn.veomni_attn = _sdpa_backed_flash_handle(calls)
+    attn.config._attn_implementation = impl
+    out = attn(hidden, **kwargs)
+
+    assert [call["length"] for call in calls] == [2, 4]
+    assert all(call["attention_mask"] is None and "cu_seq_lens_q" not in call for call in calls)
+    torch.testing.assert_close(out, reference, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+
+def test_minimax_h3_packed_flash_zeroes_uncovered_rows():
+    """Rows past ``valid_seqlen`` (Ulysses padding) must be zero, not uninitialized memory."""
+    attn = _tiny_attention()
+    attn.veomni_attn = _sdpa_backed_flash_handle([])
+    attn.config._attn_implementation = "veomni_flash_attention_2"
+    q, k, v = torch.randn(3, 6, 2, 8).unbind(0)
+    previous = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)  # Fills uninitialized float memory with NaN.
+    try:
+        out = attn._run_packed_attention(
+            q, k, v, cu_seqlens=torch.tensor([0, 4], dtype=torch.int32), max_seqlen=4, valid_seqlen=4
+        )
+    finally:
+        torch.use_deterministic_algorithms(previous)
+    assert torch.equal(out[4:], torch.zeros_like(out[4:]))
 
 
 def test_minimax_h3_video_vae_attention_uses_partial_rope():

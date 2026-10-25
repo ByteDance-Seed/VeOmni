@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Documentation policy for VeOmni-owned op modules and callables.
 
@@ -26,6 +26,13 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 OPS_ROOT = Path(__file__).parents[3] / "veomni" / "ops"

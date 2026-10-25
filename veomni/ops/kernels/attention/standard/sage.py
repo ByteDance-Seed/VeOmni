@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """SageAttention adapter for ``veomni_sage_attention``.
 
@@ -24,6 +24,10 @@ from typing import Optional
 import torch
 
 from .....distributed.parallel_state import get_parallel_state
+from ..helper import (
+    extract_packed_varlen_cu_seqlens,
+    packed_split_attention_forward,
+)
 from ..ulysses import (
     prepare_ulysses_qkv,
     restore_ulysses_output,
@@ -34,13 +38,6 @@ from ..ulysses import (
 sageattn = None
 
 _UNSUPPORTED_ATTENTION_METADATA = (
-    "cu_seq_lens_q",
-    "cu_seq_lens_k",
-    "cu_seqlens",
-    "cu_seqlens_q",
-    "cu_seqlens_k",
-    "max_length_q",
-    "max_length_k",
     "indices",
     "s_aux",
 )
@@ -99,8 +96,11 @@ def sage_attention_forward(
     SM; it does not register backward. This adapter therefore refuses a
     training graph instead of returning a detached tensor. Use
     ``flash_attention_2`` / ``3`` / ``4`` when gradients are needed.
-    Packed, sparse, and auxiliary attention metadata is rejected because the
-    SageAttention call below cannot represent those visibility semantics.
+    Single-segment ``cu_seqlens`` metadata is dropped, and unmasked
+    ``batch_size == 1`` multi-segment ``cu_seqlens`` calls are split per
+    segment after any Ulysses gather and concatenated before Ulysses restore;
+    other packed, sparse, and auxiliary attention metadata is rejected because
+    the SageAttention call below cannot represent those visibility semantics.
     ``skip_ulysses`` opts a call out when it already gathered or its tokens
     are not on the SP mesh.
     """
@@ -124,6 +124,11 @@ def sage_attention_forward(
         raise ValueError("SageAttention does not support query/key/value tensors with zero dimensions.")
 
     _reject_unsupported_attention_metadata(kwargs)
+    kwargs, packed_cu_seqlens = extract_packed_varlen_cu_seqlens(
+        kwargs,
+        batch_size=query.shape[0],
+        attention_mask=attention_mask,
+    )
 
     sageattn_fn = _load_sageattn()
 
@@ -145,15 +150,52 @@ def sage_attention_forward(
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
-    output = sageattn_fn(
-        query,
-        key,
-        value,
-        tensor_layout="HND",
-        is_causal=is_causal,
-        sm_scale=scaling,
-    )
-    output = output.transpose(1, 2).contiguous()
+    if packed_cu_seqlens is not None:
+        cu_seqlens_q, cu_seqlens_k = packed_cu_seqlens
+
+        def _sage_segment_forward(
+            _module: torch.nn.Module,
+            q_chunk: torch.Tensor,
+            k_chunk: torch.Tensor,
+            v_chunk: torch.Tensor,
+            _attention_mask: Optional[torch.Tensor],
+            *,
+            dropout: float = 0.0,
+            scaling: Optional[float] = None,
+            **_extra_kwargs,
+        ) -> tuple[torch.Tensor, None]:
+            del _module, _attention_mask, dropout, _extra_kwargs
+            chunk_output = sageattn_fn(
+                q_chunk,
+                k_chunk,
+                v_chunk,
+                tensor_layout="HND",
+                is_causal=is_causal,
+                sm_scale=scaling,
+            )
+            return chunk_output.transpose(1, 2).contiguous(), None
+
+        output, _ = packed_split_attention_forward(
+            _sage_segment_forward,
+            module,
+            query,
+            key,
+            value,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            dropout=dropout,
+            scaling=scaling,
+        )
+    else:
+        output = sageattn_fn(
+            query,
+            key,
+            value,
+            tensor_layout="HND",
+            is_causal=is_causal,
+            sm_scale=scaling,
+        )
+        output = output.transpose(1, 2).contiguous()
 
     if ulysses_enabled:
         output = restore_ulysses_output(output, group=parallel_state.ulysses_group)

@@ -77,7 +77,8 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor, Te
         return torch.zeros_like(x), torch.zeros_like(weight), torch.zeros_like(bias)
 
     mean, invvar = optional_stats
-    return _get_fused_layer_norm_cuda().backward_affine(
+    # The CUDA extension returns a list. ``_OpFn.backward`` requires a tuple.
+    grads = _get_fused_layer_norm_cuda().backward_affine(
         grad_output.contiguous(),
         mean,
         invvar,
@@ -88,3 +89,4 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor, Te
         meta.eps,
         False,
     )
+    return tuple(grads)

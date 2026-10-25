@@ -107,6 +107,7 @@ config.add_import(
 )
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.ops.config",
     names=["resolve_op_impl"],
@@ -173,7 +174,7 @@ config.override_method(
 config.override_method(
     "Qwen3_5MoeMLP.forward",
     replacement=qwen3_5_moe_mlp_forward_patched,
-    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 
 # ── Construct generated vision / text towers ──────────────────────────────────

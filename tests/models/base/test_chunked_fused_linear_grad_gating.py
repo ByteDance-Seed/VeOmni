@@ -19,6 +19,10 @@ import torch
 
 import veomni.models.loss_utils.chunk_logprobs as cl
 import veomni.models.loss_utils.chunk_topk_distill as ctkd
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class _FakePS:

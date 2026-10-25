@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """CPU tests for installed ops-config resolution."""
 
@@ -64,7 +64,32 @@ def test_resolve_op_impl_reads_ops_config():
     assert resolve_op_impl("cross_entropy_loss_implementation") == "chunk_loss"
 
 
-def test_resolve_op_impl_remaps_npu_ce_alias():
-    set_ops_config(SimpleNamespace(cross_entropy_loss_implementation="npu"))
-    assert resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss") == "chunk_loss"
-    assert resolve_op_impl("cross_entropy_loss_implementation") == "npu"
+def test_resolve_op_impl_returns_none_for_unset_field_and_veomni_op_resolves_variant_default(monkeypatch):
+    from veomni.arguments import OpsImplementationConfig
+    from veomni.ops import VeomniOp
+
+    monkeypatch.setattr(VeomniOp, "_intern", {})
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "npu")
+    monkeypatch.setattr("veomni.ops.platform.requirement.IS_NPU_AVAILABLE", True)
+
+    cfg = OpsImplementationConfig()
+    with ops_config_scope(cfg):
+        assert resolve_op_impl("rms_norm_implementation") is None
+        assert VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation")).impl == "torch_npu"
+        assert VeomniOp("rms_norm", "unweighted", resolve_op_impl("rms_norm_implementation")).impl == "eager"
+
+
+@pytest.mark.parametrize("impl", [None, "torch_npu", "npu", "eager", "liger_kernel"])
+def test_resolve_op_impl_preserves_variant_scoped_npu_compatibility(impl):
+    with ops_config_scope(SimpleNamespace(rms_norm_implementation=impl)):
+        assert resolve_op_impl("rms_norm_implementation") == impl
+        assert resolve_op_impl("rms_norm_implementation", variant="standard") == impl
+        expected = "eager" if impl in ("torch_npu", "npu") else impl
+        resolved = resolve_op_impl("rms_norm_implementation", variant="unweighted")
+        assert resolved == expected
+        if expected == "eager":
+            from veomni.ops import VeomniOp
+
+            assert VeomniOp("rms_norm", "unweighted", resolved).impl == "eager"

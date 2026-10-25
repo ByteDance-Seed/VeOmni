@@ -117,15 +117,18 @@ class Qwen2_5OmniProcessor(_Qwen2_5OmniProcessor):
             image_grid_thw = iter([])
 
         if videos:
+            output_kwargs["videos_kwargs"]["return_metadata"] = True
             videos_inputs = self.video_processor(videos=videos, **output_kwargs["videos_kwargs"])
-
-            # --- Patch.2 ---
-            # TODO: fps parse from args
-            fps = output_kwargs["videos_kwargs"].get("fps", 2.0)
-            # --- Patch.2 ---
+            video_metadata = videos_inputs.pop("video_metadata")
 
             video_grid_thw = videos_inputs["video_grid_thw"]
-            second_per_grid_ts = [self.video_processor.temporal_patch_size / fps] * len(video_grid_thw)
+            # Preserve FPS-only calls when source metadata is unavailable.
+            fallback_fps = output_kwargs["videos_kwargs"].get("fps", 2.0)
+            second_per_grid_ts = [
+                self.video_processor.temporal_patch_size
+                / (metadata.sampled_fps if metadata.fps is not None else fallback_fps)
+                for metadata in video_metadata
+            ]
             videos_inputs["video_second_per_grid"] = second_per_grid_ts
 
             video_grid_thw = iter(video_grid_thw)
@@ -189,6 +192,8 @@ class Qwen2_5OmniProcessor(_Qwen2_5OmniProcessor):
                     image_seq_length = next(image_grid_thw).prod() // merge_length_image
                     sample = sample.replace(self.image_token, "<|image_placeholder|>" * image_seq_length, 1)
                 elif special_token == self.video_token:
+                    # Every video consumes its timing entry, including videos without audio.
+                    current_second_per_grid = next(video_second_per_grid)
                     # --- Patch.2 ---
                     audio_length = next(audio_lengths)
                     use_audio_in_video = audio_length != 0
@@ -203,12 +208,13 @@ class Qwen2_5OmniProcessor(_Qwen2_5OmniProcessor):
                         curr_video_grid_thw = next(video_grid_thw)
                         height = curr_video_grid_thw[1] // self.video_processor.merge_size
                         width = curr_video_grid_thw[2] // self.video_processor.merge_size
-                        video_token_indices = np.arange(curr_video_grid_thw[0]).reshape(-1, 1, 1)
+                        # Match the float32 timeline used by position precomputation.
+                        video_token_indices = np.arange(curr_video_grid_thw[0], dtype=np.float32).reshape(-1, 1, 1)
                         video_token_indices = np.broadcast_to(
                             video_token_indices, (video_token_indices.shape[0], height, width)
                         ).reshape(-1)
                         video_token_indices = (
-                            video_token_indices * next(video_second_per_grid) * position_id_per_seconds
+                            video_token_indices * np.float32(current_second_per_grid) * position_id_per_seconds
                         )
 
                         tokens_per_chunk = int(position_id_per_seconds * seconds_per_chunk)

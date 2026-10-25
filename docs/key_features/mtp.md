@@ -126,7 +126,7 @@ the MTP cross-entropy contribution.
 ### The MTP label row
 
 `ForCausalLMLoss` shifts labels by one internally when SP is disabled
-(`veomni/ops/kernels/cross_entropy/__init__.py`), so position `i` of the main head
+(`veomni/models/loss_utils/cross_entropy_loss.py`), so position `i` of the main head
 predicts `labels[i+1]`. MTP depth `d` instead needs `labels[i+d+2]`. The data
 transform therefore builds `mtp_labels` with shape `[batch, depth, sequence]`, and
 the model supplies it as an explicit `shift_labels=` argument that bypasses the
@@ -246,13 +246,21 @@ in its patch config:
    for Qwen3.5 that meant overriding the text model's `forward` to emit
    `mtp_context`.
 3. `__init__` overridden to construct the module under the FQN the checkpoint uses,
-   plus the SP/EP asserts.
+   plus the SP assert.
 4. Ensure the model's `ChatTemplate.encode_messages` constructs the MTP rows
    before packing. The shared `DEFAULT_DATA_COLLATE_INFO` already contains the
    `mtp_labels` packing rule.
 5. `forward` extended with an explicit `mtp_labels` parameter (never left in
    `**kwargs`, which would leak it into the attention and CE kernels) assigning
    the per-head dictionary to `output.loss`.
+6. For a MoE head, list the MTP experts in the `ep` plan (see
+   `veomni/models/transformers/qwen3_5_moe/parallel_plan.py`) and keep the MTP
+   layer class in `_no_split_modules`. `ParallelPlan` registers the parent of every
+   plan key for the `ep_fsdp` mesh, but the parallelizer pairs those modules only
+   under a wrap target. MTP experts outside a wrap target are still EP-sliced, but
+   FSDP2 shards them again over the regular mesh, so each rank gathers a mix of
+   other ranks' experts without any error (see
+   [Plan owners](./extra_parallel.md#plan-owners)).
 
 Note `config.modify_init()` looks like the natural fit for step 3 but is a **dead API**: `PatchType.INIT_MODIFICATION` has no implementation in patchgen's codegen, so
 the patch is silently dropped. Use `override_method("<Class>.__init__")`.

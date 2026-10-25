@@ -1,4 +1,4 @@
-# Copyright 2026 Bytedance Ltd. and/or its affiliates
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 Patch configuration for DeepseekV3 GPU VeomniOp replacements.
 
@@ -37,6 +37,7 @@ from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 from veomni.utils.moe_monitor import record_router_indices
@@ -50,6 +51,7 @@ config = PatchConfig(
 
 config.add_import("functools", names=["partial"])
 config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.ops.config",
     names=["resolve_op_impl"],
@@ -209,10 +211,10 @@ def deepseek_v3_mlp_init_patched(self, config, intermediate_size=None):
 
 @config.override_method(
     "DeepseekV3MLP.forward",
-    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 def deepseek_v3_mlp_forward_patched(self, x):
-    if self.config.hidden_act in {"silu", "swish"}:
+    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,
@@ -257,9 +259,11 @@ class PatchedDeepseekV3Experts(nn.Module):
                 self.num_experts,
             )
         unused = self.gate_up_proj.new_empty(0)
+        # Eager keeps the fp32 router weights so it stays bitwise with HF's expert loop.
+        routing_weights = top_k_weights if self.veomni_moe.impl == "eager" else top_k_weights.to(hidden_states.dtype)
         return self.veomni_moe(
             hidden_states,
-            top_k_weights.to(hidden_states.dtype),
+            routing_weights,
             top_k_index,
             unused,
             unused,
@@ -323,7 +327,7 @@ def deepseek_v3_forcausallm_init_patched(self, config):
     self.model = DeepseekV3Model(config)
     self.vocab_size = config.vocab_size
     self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    impl = resolve_op_impl("cross_entropy_loss_implementation")
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()

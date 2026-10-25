@@ -31,7 +31,7 @@ from veomni.models.loader import get_loader
 from veomni.models.registry import get_model_config, get_model_processor
 from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.utils import logging
-from veomni.utils.device import is_torch_npu_available
+from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 if TYPE_CHECKING:
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
-CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
+CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4", "qwen4_exp"})
 
 _VEOMNI_SP_ATTN = (
     "veomni_flex_attention",
@@ -52,6 +52,8 @@ _VEOMNI_SP_ATTN = (
     "veomni_flash_attention_3",
     "veomni_flash_attention_3_hub",
     "veomni_flash_attention_4",
+    "veomni_sage_attention",
+    "veomni_sdpa",
 )
 
 
@@ -89,7 +91,7 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     if not get_parallel_state().cp_enabled:
         return
 
-    if is_torch_npu_available():
+    if IS_NPU_AVAILABLE:
         raise NotImplementedError("Context parallelism is GPU-only in this release; set cp_size=1 on Ascend/NPU runs.")
 
     model_type = getattr(config, "model_type", None)
@@ -248,7 +250,7 @@ def build_foundation_model(
         init_device=init_device,
     )
 
-    if is_torch_npu_available():
+    if IS_NPU_AVAILABLE:
         logger.info_rank0(
             "We override the model’s forward method on NPU devices to ensure that the FA kwargs are on CPU, since the npu_fused_attention requires cpu FA kwargs"
         )

@@ -98,6 +98,36 @@ def _expected_segment(logits, labels, start, end):
     return losses[start : end + 1][valid].sum().item(), valid.sum().item()
 
 
+def test_channel_loss_uses_shift_labels_when_sequence_parallel_is_on():
+    torch.manual_seed(2)
+    logits = torch.randn(1, 3, 8)
+    labels = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    shift_labels = torch.tensor([[4, 5, 6]], dtype=torch.long)
+
+    def run(sp_enabled: bool, shift: torch.Tensor | None):
+        computer = ChannelLossComputer(parallel_state=SimpleNamespace(sp_enabled=sp_enabled))
+        computer._source_ids = [0]
+        computer._position_ids = None
+        result = computer._compute_channel_loss(
+            logits=logits,
+            labels=labels,
+            vocab_size=8,
+            hidden_states=None,
+            weights=None,
+            attention_mask=None,
+            shift_labels=shift,
+            ignore_index=IGNORE_INDEX,
+        )
+        return result[0]["loss_sum"], result[0]["token_count"]
+
+    with_shift = run(True, shift_labels)
+    without_sp = run(False, shift_labels)
+    without_shift = run(True, None)
+    torch.testing.assert_close(with_shift[0], without_sp[0])
+    assert with_shift[1] == without_sp[1] == 3
+    assert not torch.allclose(with_shift[0], without_shift[0])
+
+
 def test_channel_loss_computer_aggregates_packed_logits_by_source():
     torch.manual_seed(0)
     vocab_size = 32
@@ -210,14 +240,17 @@ def test_channel_loss_wrapper_forwards_original_call_unchanged():
 def test_channel_loss_extracts_fused_inputs_from_models_loss_partial():
     from veomni.models.loss_utils import ForCausalLMLoss
 
+    ce_calls = []
+
     def fake_ce(hidden_states, labels, weights, **kwargs):
+        ce_calls.append((hidden_states, weights))
         del labels, kwargs
         return hidden_states.sum() * 0 + weights.sum() * 0
 
     class DummyModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.loss_function = partial(ForCausalLMLoss, kernel=fake_ce)
+            self.loss_function = partial(ForCausalLMLoss, op=fake_ce)
 
     model = DummyModel()
     computer = ChannelLossComputer()
@@ -238,6 +271,8 @@ def test_channel_loss_extracts_fused_inputs_from_models_loss_partial():
                 weights=weights,
             )
 
+        assert len(ce_calls) == 1
+        assert ce_calls[0][1] is weights
         assert computer._result
         assert computer._result[0]["source_id"] == 0
         assert computer._result[0]["token_count"].item() == 2

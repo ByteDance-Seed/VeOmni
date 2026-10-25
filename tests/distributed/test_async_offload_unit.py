@@ -23,6 +23,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 from transformers.modeling_layers import GradientCheckpointingLayer
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.arguments_types import OffloadConfig
 from veomni.distributed.async_offload import (
     GetCnt,
@@ -37,6 +38,9 @@ from veomni.distributed.async_offload import (
     reset_async_activation_offload,
 )
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_torch_device
+
+
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 
 class _AsyncOffloadFSDPBlock(GradientCheckpointingLayer):
@@ -206,6 +210,15 @@ def test_async_offload_patch_is_confined_to_selected_instances_and_models():
     second_model = Toy()
     apply_async_activation_offload(first_model, ["selected"])
     apply_async_activation_offload(second_model, ["selected"])
+
+    patched_class = type(first_model.selected)
+    apply_async_activation_offload(first_model, ["selected"])
+    assert type(first_model.selected) is patched_class
+    value = torch.randn(2, 4, requires_grad=True)
+    output = first_model.selected(value)
+    torch.testing.assert_close(output, value * 2)
+    output.sum().backward()
+    torch.testing.assert_close(value.grad, torch.full_like(value, 2))
 
     assert type(first_model.selected) is not DecoderLayer
     assert type(first_model.unselected) is DecoderLayer
@@ -569,6 +582,7 @@ def _run_async_offload_base_trainer_fsdp2_gc():
     dist.barrier()
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 @pytest.mark.skipif(
     not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE),
     reason="CUDA or NPU is required for FSDP2 async-offload integration",
@@ -576,4 +590,4 @@ def _run_async_offload_base_trainer_fsdp2_gc():
 def test_async_offload_base_trainer_fsdp2_gc_integration():
     from ..tools.launch_utils import torchrun
 
-    torchrun(_run_async_offload_base_trainer_fsdp2_gc, world_size=2)
+    torchrun(_run_async_offload_base_trainer_fsdp2_gc, world_size=_CI_ACCELERATOR_2.nproc)

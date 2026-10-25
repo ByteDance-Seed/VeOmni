@@ -22,8 +22,8 @@ from tests.ops.tol import (
     MOE_EP_PRE_SM90_GRAD_FC1_RTOL,
     MOE_EP_PRE_SM90_GRAD_FC2_ATOL,
     MOE_EP_PRE_SM90_GRAD_FC2_RTOL,
-    MOE_EP_PRE_SM90_GRAD_HIDDEN_ATOL,
-    MOE_EP_PRE_SM90_GRAD_HIDDEN_RTOL,
+    MOE_EP_PRE_SM90_GRAD_ROUTING_ATOL,
+    MOE_EP_PRE_SM90_GRAD_ROUTING_RTOL,
     MOE_EP_SM90_ATOL,
     MOE_EP_SM90_GRAD_FC1_ATOL,
     MOE_EP_SM90_GRAD_FC1_RTOL,
@@ -109,25 +109,26 @@ def _ep_atol() -> float:
 
 
 def _ep_gradient_tolerances(swiglu_limit):
+    if swiglu_limit is not None:
+        hidden_tol = (MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL, MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL)
+    else:
+        hidden_tol = (MOE_FUSED_GRAD_HIDDEN_ATOL, MOE_FUSED_GRAD_HIDDEN_RTOL)
     if is_sm90_or_above():
         fc1_tol = (MOE_EP_SM90_GRAD_FC1_ATOL, MOE_EP_SM90_GRAD_FC1_RTOL)
         fc2_tol = (MOE_EP_SM90_GRAD_FC2_ATOL, MOE_EP_SM90_GRAD_FC2_RTOL)
-        if swiglu_limit is not None:
-            hidden_tol = (MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL, MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL)
-        else:
-            hidden_tol = (MOE_FUSED_GRAD_HIDDEN_ATOL, MOE_FUSED_GRAD_HIDDEN_RTOL)
+        routing_tol = hidden_tol
     else:
         fc1_tol = (MOE_EP_PRE_SM90_GRAD_FC1_ATOL, MOE_EP_PRE_SM90_GRAD_FC1_RTOL)
         fc2_tol = (MOE_EP_PRE_SM90_GRAD_FC2_ATOL, MOE_EP_PRE_SM90_GRAD_FC2_RTOL)
-        hidden_tol = (MOE_EP_PRE_SM90_GRAD_HIDDEN_ATOL, MOE_EP_PRE_SM90_GRAD_HIDDEN_RTOL)
-    return hidden_tol, fc1_tol, fc2_tol
+        routing_tol = (MOE_EP_PRE_SM90_GRAD_ROUTING_ATOL, MOE_EP_PRE_SM90_GRAD_ROUTING_RTOL)
+    return hidden_tol, routing_tol, fc1_tol, fc2_tol
 
 
-def _assert_ep_reference_grads(pairs, hidden_tol, fc1_tol, fc2_tol):
+def _assert_ep_reference_grads(pairs, hidden_tol, routing_tol, fc1_tol, fc2_tol):
     """Require useful reference signal, then compare with recorded error."""
     budgets = {
         "hidden gradient": hidden_tol,
-        "routing gradient": hidden_tol,
+        "routing gradient": routing_tol,
         "fc1 gradient": fc1_tol,
         "fc1_1 gradient": fc1_tol,
         "fc1_2 gradient": fc1_tol,
@@ -149,13 +150,14 @@ def test_ep_weight_grad_budgets_are_platform_specific():
     assert MOE_EP_SM90_GRAD_FC2_RTOL == 0
     assert MOE_EP_PRE_SM90_GRAD_FC1_RTOL == 0
     assert MOE_EP_PRE_SM90_GRAD_FC2_RTOL == 0
-    hidden_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(None)
+    hidden_tol, routing_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(None)
     assert fc1_tol[1] == 0
     assert fc2_tol[1] == 0
+    assert hidden_tol[0] == MOE_FUSED_GRAD_HIDDEN_ATOL
     if is_sm90_or_above():
-        assert hidden_tol[0] == MOE_FUSED_GRAD_HIDDEN_ATOL
+        assert routing_tol == hidden_tol
     else:
-        assert hidden_tol[0] == MOE_EP_PRE_SM90_GRAD_HIDDEN_ATOL
+        assert routing_tol[0] == MOE_EP_PRE_SM90_GRAD_ROUTING_ATOL
 
 
 @pytest.mark.parametrize("swiglu_limit", [None, 7.0, 10.0])
@@ -389,7 +391,7 @@ def test_ep_vs_non_ep(
     ep_raw2 = EPGroupGemm.apply(pt_ep, cumsum, fc1_1_ep, fc1_2_ep, fc2_ep, swiglu_limit)
     out_ep2 = _gather_tokens_autograd(ep_raw2, routing_ep, scatter_index)
     out_ep2.backward(grad_output)
-    hidden_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(swiglu_limit)
+    hidden_tol, routing_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(swiglu_limit)
     _assert_ep_reference_grads(
         (
             ("hidden gradient", hs_ep.grad, hs_eager.grad),
@@ -399,6 +401,7 @@ def test_ep_vs_non_ep(
             ("fc1_2 gradient", fc1_2_ep.grad, fc1_2_eager.grad),
         ),
         hidden_tol,
+        routing_tol,
         fc1_tol,
         fc2_tol,
     )
@@ -483,7 +486,7 @@ def test_ep_merged_vs_non_ep(
     ep_raw2 = EPMergedFc1GroupGemm.apply(pt_ep, cumsum, fc1_merged_ep, fc2_ep, swiglu_limit)
     out_ep2 = _gather_tokens_autograd(ep_raw2, routing_ep, scatter_index)
     out_ep2.backward(grad_output)
-    hidden_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(swiglu_limit)
+    hidden_tol, routing_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(swiglu_limit)
     _assert_ep_reference_grads(
         (
             ("hidden gradient", hs_ep.grad, hs_eager.grad),
@@ -492,6 +495,95 @@ def test_ep_merged_vs_non_ep(
             ("fc1 gradient", fc1_merged_ep.grad, torch.cat([fc1_1_eager.grad, fc1_2_eager.grad], dim=1)),
         ),
         hidden_tol,
+        routing_tol,
         fc1_tol,
         fc2_tol,
+    )
+
+
+@pytest.mark.parametrize("swiglu_limit", [None, 7.0])
+def test_fused_moe_routing_weights_match_ep_projection_order(swiglu_limit: float | None):
+    """Non-EP fused MoE should apply routing weights after fc2, matching EP."""
+    _skip_if_unsupported()
+    from veomni.ops.kernels.moe_experts.standard.triton import (
+        MergedFc1TritonFusedMoeExpertFunction,
+        TritonFusedMoeExpertFunction,
+    )
+
+    torch.manual_seed(0)
+    device = torch.device(get_device_type())
+    dtype = torch.bfloat16
+    num_tokens, num_experts, hidden_dim, ffn_dim, topk = 64, 8, 256, 128, 2
+    hidden_states = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+    router_logits = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
+    routing_weights, selected_experts = torch.topk(torch.softmax(router_logits, dim=-1), topk, dim=-1)
+    routing_weights = routing_weights.to(dtype)
+    fc1_1_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_2_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_1_2_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1).contiguous()
+    fc2_weight = 0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
+
+    scatter_output, cumsum, scatter_index = _scatter_tokens(hidden_states, selected_experts, num_experts)
+    grad_output = torch.randn_like(hidden_states)
+
+    hs_split = hidden_states.clone().detach().requires_grad_(True)
+    rw_split = routing_weights.clone().detach().requires_grad_(True)
+    fc1_1_split = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_split = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_split = fc2_weight.clone().detach().requires_grad_(True)
+    out_split = TritonFusedMoeExpertFunction.apply(
+        num_experts,
+        rw_split,
+        selected_experts,
+        hs_split,
+        fc1_1_split,
+        fc1_2_split,
+        fc2_split,
+        swiglu_limit,
+    )
+    out_split.backward(grad_output)
+
+    hs_merged = hidden_states.clone().detach().requires_grad_(True)
+    rw_merged = routing_weights.clone().detach().requires_grad_(True)
+    fc1_merged = fc1_1_2_weight.clone().detach().requires_grad_(True)
+    fc2_merged = fc2_weight.clone().detach().requires_grad_(True)
+    out_merged = MergedFc1TritonFusedMoeExpertFunction.apply(
+        num_experts,
+        rw_merged,
+        selected_experts,
+        hs_merged,
+        fc1_merged,
+        fc2_merged,
+        swiglu_limit,
+    )
+    out_merged.backward(grad_output)
+
+    hs_ep = hidden_states.clone().detach().requires_grad_(True)
+    rw_ep = routing_weights.clone().detach().requires_grad_(True)
+    pt_ep = _scatter_tokens_autograd(hs_ep, scatter_index)
+    fc1_ep = fc1_1_2_weight.clone().detach().requires_grad_(True)
+    fc2_ep = fc2_weight.clone().detach().requires_grad_(True)
+    ep_raw = EPMergedFc1GroupGemm.apply(pt_ep, cumsum, fc1_ep, fc2_ep, swiglu_limit)
+    out_ep = _gather_tokens_autograd(ep_raw, rw_ep, scatter_index)
+    out_ep.backward(grad_output)
+
+    torch.testing.assert_close(out_split, out_ep, rtol=0, atol=0)
+    torch.testing.assert_close(out_merged, out_ep, rtol=0, atol=0)
+    torch.testing.assert_close(rw_split.grad, rw_ep.grad, rtol=0, atol=0)
+    torch.testing.assert_close(rw_merged.grad, rw_ep.grad, rtol=0, atol=0)
+    torch.testing.assert_close(hs_merged.grad, hs_ep.grad, rtol=0, atol=0)
+    torch.testing.assert_close(fc1_merged.grad, fc1_ep.grad, rtol=0, atol=0)
+    torch.testing.assert_close(fc2_merged.grad, fc2_ep.grad, rtol=0, atol=0)
+    torch.testing.assert_close(
+        torch.cat([fc1_1_split.grad, fc1_2_split.grad], dim=1),
+        fc1_ep.grad,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(fc2_split.grad, fc2_ep.grad, rtol=0, atol=0)
+    torch.testing.assert_close(
+        hs_split.grad,
+        hs_ep.grad,
+        rtol=MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
+        atol=MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
     )
