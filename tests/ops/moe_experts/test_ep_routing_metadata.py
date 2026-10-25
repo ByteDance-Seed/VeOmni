@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Portable EP metadata/collective regressions; fused expert kernels are outside this suite."""
+"""CPU/Gloo and CUDA/NCCL EP routing regressions; fused expert kernels are outside this suite."""
 
 from datetime import timedelta
 from unittest.mock import patch
@@ -21,15 +21,19 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from scripts.ci.accelerator.launch_plan import from_parameter
+from scripts.ci.accelerator.launch_plan import from_parameter, runner_device_count
 from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.distributed.moe import preprocess, token_pre_all2all, tokens_post_all2all
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_torch_device
 
 
-def _routing_worker(rank, world_size, endpoint):
+def _routing_worker(rank, world_size, device_type, endpoint):
     torch.set_num_threads(1)
+    device = torch.device(device_type, rank) if device_type == "cuda" else torch.device("cpu")
+    if device_type == "cuda":
+        get_torch_device().set_device(device)
     dist.init_process_group(
-        "gloo",
+        "nccl" if device_type == "cuda" else "gloo",
         store=endpoint.connect(),
         rank=rank,
         world_size=world_size,
@@ -40,7 +44,9 @@ def _routing_worker(rank, world_size, endpoint):
             torch.manual_seed(10 + rank)
             tokens, experts = 5 + rank, 8
             selected = (
-                torch.randint(experts, (tokens, 2)) if case == "uneven" else torch.zeros(tokens, 2, dtype=torch.long)
+                torch.randint(experts, (tokens, 2), device=device)
+                if case == "uneven"
+                else torch.zeros(tokens, 2, dtype=torch.long, device=device)
             )
             selected[0] = 0  # repeated top-k expert counts as one dispatched row
             mask = torch.nn.functional.one_hot(selected, num_classes=experts).permute(2, 1, 0)
@@ -57,22 +63,22 @@ def _routing_worker(rank, world_size, endpoint):
             # timing claim; on CUDA these metadata handoffs must not multiply synchronization points per layer.
             with patch.object(torch.Tensor, "to", track_to):
                 inputs, outputs, counts, expert_counts = preprocess(mask, experts, dist.group.WORLD)
-            assert len(host_handoffs) <= 1, f"Routing metadata uses {len(host_handoffs)} separate host handoffs"
+            assert len(host_handoffs) == 1, f"Routing metadata uses {len(host_handoffs)} separate host handoffs"
             assert counts.device.type == expert_counts.device.type == "cpu"
             assert counts.shape == (world_size, experts // world_size)
             assert inputs == mask.any(dim=1).sum(dim=1).reshape(world_size, -1).sum(dim=1).tolist()
             assert outputs == counts.sum(dim=1).tolist()
             torch.testing.assert_close(expert_counts, counts.sum(dim=0), rtol=0, atol=0)
 
-            hidden = torch.randn(tokens, 4, requires_grad=True)
-            weights = torch.rand(tokens, 2, requires_grad=True)
+            hidden = torch.randn(tokens, 4, device=device, requires_grad=True)
+            weights = torch.rand(tokens, 2, device=device, requires_grad=True)
             reference_hidden = hidden.detach().clone().requires_grad_()
             reference_weights = weights.detach().clone().requires_grad_()
             permuted, routing_map, mapping, shape = token_pre_all2all(
                 hidden, mask, experts, inputs, outputs, counts, dist.group.WORLD
             )
             scales = torch.arange(rank * (experts // world_size) + 1, (rank + 1) * (experts // world_size) + 1)
-            scales = scales.repeat_interleave(expert_counts).to(permuted.dtype)
+            scales = scales.repeat_interleave(expert_counts).to(device=device, dtype=permuted.dtype)
             actual = tokens_post_all2all(
                 permuted * scales[:, None],
                 weights,
@@ -102,4 +108,23 @@ def _routing_worker(rank, world_size, endpoint):
 def test_ep_routing_metadata_roundtrip(world_size, monkeypatch):
     monkeypatch.setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-    spawn_with_rendezvous(_routing_worker, args=(world_size,), nprocs=world_size)
+    spawn_with_rendezvous(_routing_worker, args=(world_size, "cpu"), nprocs=world_size)
+
+
+@pytest.mark.launch_plan(provider=from_parameter("world_size"))
+@pytest.mark.parametrize(
+    "world_size",
+    [
+        pytest.param(
+            world_size,
+            marks=pytest.mark.skipif(
+                not IS_CUDA_AVAILABLE or not dist.is_nccl_available() or runner_device_count() < world_size,
+                reason=f"Requires NCCL and {world_size} CUDA devices",
+            ),
+        )
+        for world_size in (1, 2, 4)
+    ],
+)
+def test_ep_routing_metadata_cuda_roundtrip(world_size):
+    """Exercise device-to-host metadata readiness and real NCCL dispatch/return gradients."""
+    spawn_with_rendezvous(_routing_worker, args=(world_size, "cuda"), nprocs=world_size)
