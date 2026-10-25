@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """standard cross-entropy chunked impl."""
 
@@ -22,7 +22,7 @@ from torch import Tensor
 
 from .....registry import SavedState
 from . import eager as _eager
-from .eager import _Meta, _needs_input_grad
+from .eager import _grad_and_value, _Meta, _needs_input_grad
 
 
 def _ce_loss_func(
@@ -106,8 +106,8 @@ def forward(
     grad_weight = torch.zeros_like(weight) if weight_needs_grad else None
     grad_chunks = grad_hidden.split(chunk_size, dim=split_dim) if hidden_needs_grad else (None,) * len(hidden_chunks)
     for hidden_chunk, label_chunk, grad_chunk in zip(hidden_chunks, label_chunks, grad_chunks, strict=True):
-        grads, chunk_loss = torch.func.grad_and_value(_ce_loss_func, argnums=argnums)(
-            hidden_chunk, weight, label_chunk, denom, ignore_index
+        grads, chunk_loss = _grad_and_value(
+            _ce_loss_func, argnums, hidden_chunk, weight, label_chunk, denom, ignore_index
         )
         accumulated_loss = accumulated_loss + chunk_loss
         if hidden_needs_grad and weight_needs_grad:

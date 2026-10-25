@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Qwen3-VL-MoE registry hooks, auxiliary-loss, and multimodal parity tests.
 
@@ -98,8 +98,7 @@ def test_qwen3_vl_moe_eager_matches_hf_text_only():
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, 100, (2, 8))
-    # Merged-expert loop ULP (~1e-7); not bitwise vs Hugging Face.
-    assert_eager_matches_hf(hf, ours, input_ids=input_ids)
+    assert_eager_matches_hf(hf, ours, input_ids=input_ids, logits_equal=True)
 
 
 def test_qwen3_vl_moe_eager_matches_hf_image_and_text():
@@ -113,7 +112,7 @@ def test_qwen3_vl_moe_eager_matches_hf_image_and_text():
     image = qwen_image_inputs(config, input_ids)
     ids = image.pop("input_ids")
     labels = image.pop("labels")
-    # Merged-expert loop ULP (~1e-7); not bitwise vs Hugging Face.
+    # Vision embed / RoPE ULP (~2e-7); the text-only path above is bitwise.
     assert_eager_matches_hf(hf, ours, input_ids=ids, labels=labels, fwd_kwargs=image)
 
 

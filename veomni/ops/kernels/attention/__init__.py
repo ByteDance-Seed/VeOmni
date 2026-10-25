@@ -1,4 +1,4 @@
-# Copyright 2026 Bytedance Ltd. and/or its affiliates
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Attention family.
 
@@ -27,7 +27,9 @@ import torch
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ...platform import (
+    NVIDIA_GPU,
     NVIDIA_SM90_PLUS,
+    NVIDIA_SM100_PLUS,
     ROCM_GPU,
     GpuKernelRequirement,
     KernelRequirement,
@@ -36,7 +38,22 @@ from ...platform import (
     NvidiaGpuPlatform,
 )
 from ...registry import register_op
-from .helper import reject_sdpa_packed_metadata
+from .helper import (
+    extract_packed_varlen_cu_seqlens,
+    packed_split_attention_forward,
+)
+from .ulysses import should_apply_ulysses
+
+
+_RAW_NON_SP_IMPLS = frozenset(
+    {
+        "eager",
+        "sdpa",
+        "flash_attention_2",
+        "flash_attention_3",
+        "flash_attention_4",
+    }
+)
 
 
 def _module_eager_forward(module: torch.nn.Module) -> Callable | None:
@@ -69,8 +86,22 @@ def lookup(impl: str) -> Callable:
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Dispatch one attention call through the selected Transformers interface."""
-        if impl == "sdpa":
-            reject_sdpa_packed_metadata(kwargs)
+        if impl in _RAW_NON_SP_IMPLS:
+            skip_ulysses = bool(kwargs.pop("skip_ulysses", False))
+            if kwargs.get("dsa_position_ids") is None and should_apply_ulysses(skip_ulysses=skip_ulysses):
+                raise ValueError(
+                    f"Attention implementation {impl!r} does not perform Ulysses sequence-parallel exchanges; "
+                    "use a 'veomni_*' attention implementation (such as 'veomni_sdpa') or pass skip_ulysses=True "
+                    "when Q/K/V are already gathered."
+                )
+
+        packed_cu_seqlens = None
+        if impl in ("sdpa", "eager"):
+            kwargs, packed_cu_seqlens = extract_packed_varlen_cu_seqlens(
+                kwargs,
+                batch_size=query.shape[0],
+                attention_mask=attention_mask,
+            )
 
         eager_default = _module_eager_forward(module)
         forward = ALL_ATTENTION_FUNCTIONS.get_interface(impl, eager_default)
@@ -78,6 +109,33 @@ def lookup(impl: str) -> Callable:
             raise KeyError(
                 f"attention impl {impl!r} is not registered and "
                 f"{type(module).__module__} has no eager_attention_forward"
+            )
+
+        if packed_cu_seqlens is not None:
+            if impl == "eager":
+                is_causal = kwargs.get("is_causal")
+                if is_causal is None:
+                    is_causal = bool(getattr(module, "is_causal", False))
+                if is_causal:
+                    raise ValueError(
+                        "Unmasked packed varlen 'eager' attention does not support is_causal=True because "
+                        "Transformers eager_attention_forward requires an explicit causal attention_mask. "
+                        "Build a 4D mask with packed_causal_mask or pass is_causal=False."
+                    )
+            cu_seqlens_q, cu_seqlens_k = packed_cu_seqlens
+            return packed_split_attention_forward(
+                forward,
+                module,
+                query,
+                key,
+                value,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                dropout=dropout,
+                scaling=scaling,
+                sliding_window=sliding_window,
+                softcap=softcap,
+                **kwargs,
             )
 
         return forward(
@@ -119,10 +177,13 @@ _FA3_HUB_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
 _FA4_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
     (GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,)), ("flash_attn.cute",)),
 )
+_FLEX_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
+    (GpuKernelRequirement(platforms=(NVIDIA_GPU,)), ()),
+)
 _MAGI_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
     (
-        GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,)),
-        ("magi_attention", "flash_attn_cute", "cuda.bindings", "debugpy"),
+        GpuKernelRequirement(platforms=(NVIDIA_SM100_PLUS,)),
+        ("magi_attention", "flash_attn_cute", "debugpy"),
     ),
 )
 _SAGE_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
@@ -169,7 +230,12 @@ _register_attention(
     interface="veomni_flash_attention_3_hub",
 )
 _register_attention("flash_attention_4", "FlashAttention 4 through Transformers", rows=_FA4_ROWS)
-_register_attention("flex_attention", "PyTorch FlexAttention through Transformers")
+_register_attention(
+    "flex_attention",
+    "PyTorch FlexAttention short-name alias to the VeOmni adapter",
+    rows=_FLEX_ROWS,
+    interface="veomni_flex_attention",
+)
 _register_attention(
     "magi_attention",
     "MagiAttention short-name alias to the VeOmni adapter",
@@ -201,7 +267,11 @@ _register_attention(
     "VeOmni FlashAttention 4 adapter through Transformers",
     rows=_FA4_ROWS,
 )
-_register_attention("veomni_flex_attention", "VeOmni FlexAttention adapter through Transformers")
+_register_attention(
+    "veomni_flex_attention",
+    "VeOmni FlexAttention adapter; SM90+ FLASH / otherwise Triton",
+    rows=_FLEX_ROWS,
+)
 _register_attention(
     "veomni_magi_attention",
     "VeOmni MagiAttention adapter through Transformers",

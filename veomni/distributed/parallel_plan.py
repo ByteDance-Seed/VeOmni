@@ -63,10 +63,20 @@ class ParallelPlan:
         # API: only parameters already selected by ``extra_parallel_plan`` may
         # opt into the persistent complementary shard.
         self.extra_parallel_persistent_modules = extra_parallel_persistent_modules or {}
+        # Every planned parameter's owner must be wrapped on its para mesh: an owner left out
+        # would be re-sharded over the regular FSDP mesh, mixing different ranks' slices.
         self.extra_parallel_fsdp_no_shard_module = {
-            para_name: {".".join(list(plan.keys())[0].split(".")[:-1])}
+            para_name: {".".join(fqn.split(".")[:-1]) for fqn in plan}
             for para_name, plan in self.extra_parallel_plan.items()
         }
+        for para_name, owners in self.extra_parallel_fsdp_no_shard_module.items():
+            for outer in owners:
+                for inner in owners:
+                    if inner != outer and check_fqn_match(outer + ".*", inner):
+                        raise ValueError(
+                            f"{para_name} plan owners {outer!r} and {inner!r} are nested; each would become its own "
+                            f"{para_name}_fsdp unit, so put every planned parameter of one subtree under one module."
+                        )
 
     def apply(self, model: nn.Module, extra_parallel_fsdp_device_mesh: Dict[str, DeviceMesh]):
         """

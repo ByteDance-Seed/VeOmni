@@ -14,25 +14,30 @@ from typing import Dict, List, Optional
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.utils.device import get_device_type
 
-from .launch_utils import find_free_port
 
-
-# NPU ops_implementation overrides per model. The public
-# ``OpsImplementationConfig`` defaults are GPU-optimal (Liger / Triton / fused Triton MoE) and
-# raise on NPU at config validation time, so every NPU test must override
-# every per-op field. ``_NPU_OPS_DEFAULTS`` is the baseline; entries in
+# NPU ops_implementation overrides per model. Every per-op field is pinned so
+# NPU tests do not depend on the host defaults. ``_NPU_OPS_DEFAULTS`` is the baseline; entries in
 # ``_NPU_PER_MODEL_OVERRIDES`` (DeepSeek-V3/V4, Qwen-VL family) pin
 # specific fields to ``eager`` where the model has no NPU kernel.
 _NPU_OPS_DEFAULTS: Dict[str, str] = {
     "attn_implementation": "flash_attention_2",
     "moe_implementation": "fused_npu",
     "cross_entropy_loss_implementation": "chunk_loss",
-    "rms_norm_implementation": "npu",
-    "rotary_pos_emb_implementation": "npu",
+    "rms_norm_implementation": "torch_npu",
+    "rotary_pos_emb_implementation": "torch_npu",
+    "rotary_pos_emb_vision_implementation": "torch_npu",
     "swiglu_mlp_implementation": "eager",  # no NPU backend
     # The Triton load-balancing-loss row is CUDA-only, so NPU resolution rejects
     # it even when ``triton-ascend`` is installed. Pin to eager.
     "load_balancing_loss_implementation": "eager",
+    # GatedDeltaNet trio (Qwen3.5, Qwen4-Exp). The dataclass default is ``fla``,
+    # whose package is GPU-only, and ``eager`` has no ``cu_seqlens`` path.
+    # ``torch_npu`` is the fused RMSNorm gate. ``triton`` is the vendored
+    # Triton-Ascend kernel and needs ``triton-ascend``, which the NPU workflows
+    # install. Models without a GatedDeltaNet never resolve these ops.
+    "rms_norm_gated_implementation": "torch_npu",
+    "causal_conv1d_implementation": "triton",
+    "chunk_gated_delta_rule_implementation": "triton",
 }
 
 _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
@@ -44,12 +49,15 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "deepseek_v4": {
         # DeepSeek-V4 attention, RMSNorm, and partial RoPE remain eager-only on NPU.
         # The generic NPU rotary backend is incompatible with V4's partial layout.
-        # Routed experts keep npu; its clamp-aware activation uses Ascend
+        # Routed experts keep fused_npu; its clamp-aware activation uses Ascend
         # Triton when available and preserves the eager training fallback otherwise.
         "attn_implementation": "eager",
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },
+    # GLM-MoE-DSA folds its DSA top-k selection into the attention mask, which
+    # flash attention cannot consume; the NPU build has no sparse DSA kernel.
+    "glm_moe_dsa": {"attn_implementation": "eager"},
     # Multimodal RoPE has no NPU backend in the Qwen-VL family.
     "qwen2vl": {"rotary_pos_emb_implementation": "eager"},
     "qwen25vl": {"rotary_pos_emb_implementation": "eager"},
@@ -81,6 +89,10 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # L20 runners where another job is still holding part of the card.
     "qwen3_5": {"cross_entropy_loss_implementation": "chunk_loss"},
     "qwen3_5_moe": {"cross_entropy_loss_implementation": "chunk_loss"},
+    # Under the default dsa_attention_implementation=eager, GLM-MoE-DSA folds its
+    # DSA top-k selection into the attention mask, which flash attention cannot
+    # consume. The flashmla_cudnn kernel needs SM90+ and GLM-5-sized heads.
+    "glm_moe_dsa": {"attn_implementation": "eager"},
     # GPT-OSS intentionally does not register a Triton MoE backend because its
     # native interleaved gate/up training layout needs either eager reference
     # math or the dedicated SM90-only Quack path. Keep the shared helper on the
@@ -119,7 +131,7 @@ def resolve_ops_overrides(model_name: Optional[str]) -> List[str]:
 
     On GPU returns per-model overrides for models whose patched ops disable a
     default backend (for example Wan's RoPE and DeepSeek-V4's eager-only
-    attention); empty otherwise — dataclass defaults are GPU-optimal. On NPU
+    attention); empty otherwise — the GPU host defaults are used. On NPU
     returns the NPU-supported backend per op, with per-model eager fallbacks for
     ops without an NPU kernel for that model.
     """
@@ -162,11 +174,6 @@ def make_npu_ops_config(model_name: Optional[str] = None, **overrides) -> OpsImp
     """
     merged = _npu_overrides(model_name)
     merged.update(overrides)
-    # Qwen3.5 GatedDeltaNet ops have no NPU kernel today — pin to eager so the
-    # config validates at parse time.
-    merged.setdefault("rms_norm_gated_implementation", "eager")
-    merged.setdefault("causal_conv1d_implementation", "eager")
-    merged.setdefault("chunk_gated_delta_rule_implementation", "eager")
     return OpsImplementationConfig(**merged)
 
 
@@ -241,7 +248,6 @@ def build_torchrun_cmd(
             NPU runs pick the right per-model eager fallbacks. ``None`` is
             fine for tests not tied to a specific model.
     """
-    port = find_free_port()
     if nproc is not None:
         n = nproc
     elif parallel_config is not None:
@@ -253,7 +259,7 @@ def build_torchrun_cmd(
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={n}",
-        f"--master_port={port}",
+        "--standalone",
         script,
         f"--model.config_path={config_path}",
         f"--data.train_path={train_path}",

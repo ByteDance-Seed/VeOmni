@@ -13,12 +13,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from scripts.ci.accelerator.launch_plan import runner_device_count
 from tests.parallel.ulysses.utils import SequenceParallelTest, sync_tensor
+from veomni.distributed.parallel_state import use_parallel_state
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
-from veomni.distributed.sequence_parallel.comm import (
-    get_ulysses_sequence_parallel_group,
-    set_ulysses_sequence_parallel_group,
-)
+from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
 from veomni.ops import VeomniOp
@@ -222,7 +221,7 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
             pass
 
     @pytest.mark.skipif(
-        get_torch_device().device_count() < DIT_SP_WORLD_SIZE,
+        runner_device_count() < DIT_SP_WORLD_SIZE,
         reason=f"device_count should be >= {DIT_SP_WORLD_SIZE}",
     )
     @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses dit")
@@ -256,12 +255,13 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
 
         loss_func = self._overlapping_grad
 
-        sp_rst = attn_sp(part_input, unpad_size)
-        sp_full_rst = gather_outputs(
-            sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
-        )
-        loss_sp = loss_func(sp_rst)
-        loss_sp.backward()
+        with use_parallel_state(self.sp_state):
+            sp_rst = attn_sp(part_input, unpad_size)
+            sp_full_rst = gather_outputs(
+                sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
+            )
+            loss_sp = loss_func(sp_rst)
+            loss_sp.backward()
 
         attn_sp_o_grad = attn_sp.proj_o.weight.grad.detach().clone()
         attn_sp_q_grad = attn_sp.q_proj.weight.grad.detach().clone()
@@ -280,10 +280,10 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
         part_input_grad = sync_tensor(part_input_grad, 1)
         part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
-        set_ulysses_sequence_parallel_group(None)
-        dp_rst = attn_dp(full_input, unpad_size)
-        loss_dp = loss_func(dp_rst)
-        loss_dp.backward()
+        with use_parallel_state(self.dp_state):
+            dp_rst = attn_dp(full_input, unpad_size)
+            loss_dp = loss_func(dp_rst)
+            loss_dp.backward()
 
         attn_dp_o_grad = attn_dp.proj_o.weight.grad.detach().clone()
         attn_dp_q_grad = attn_dp.q_proj.weight.grad.detach().clone()
@@ -309,7 +309,7 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
         _assert_close_with_diagnostics("input.grad", full_input_grad, part_input_grad, atol=1e-4, rtol=1e-4)
 
     @pytest.mark.skipif(
-        get_torch_device().device_count() < DIT_SP_WORLD_SIZE,
+        runner_device_count() < DIT_SP_WORLD_SIZE,
         reason=f"device_count should be >= {DIT_SP_WORLD_SIZE}",
     )
     @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses dit")
@@ -343,12 +343,13 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
 
         loss_func = self._non_overlapping_grad
 
-        sp_rst = attn_sp(part_input, unpad_size)
-        sp_full_rst = gather_outputs(
-            sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
-        )
-        loss_sp = loss_func(sp_rst)
-        loss_sp.backward()
+        with use_parallel_state(self.sp_state):
+            sp_rst = attn_sp(part_input, unpad_size)
+            sp_full_rst = gather_outputs(
+                sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
+            )
+            loss_sp = loss_func(sp_rst)
+            loss_sp.backward()
 
         attn_sp_o_grad = attn_sp.proj_o.weight.grad.detach().clone()
         attn_sp_q_grad = attn_sp.q_proj.weight.grad.detach().clone()
@@ -367,10 +368,10 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
         part_input_grad = sync_tensor(part_input_grad, 1)
         part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
-        set_ulysses_sequence_parallel_group(None)
-        dp_rst = attn_dp(full_input, unpad_size)
-        loss_dp = loss_func(dp_rst)
-        loss_dp.backward()
+        with use_parallel_state(self.dp_state):
+            dp_rst = attn_dp(full_input, unpad_size)
+            loss_dp = loss_func(dp_rst)
+            loss_dp.backward()
 
         attn_dp_o_grad = attn_dp.proj_o.weight.grad.detach().clone()
         attn_dp_q_grad = attn_dp.q_proj.weight.grad.detach().clone()

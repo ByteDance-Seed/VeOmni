@@ -52,11 +52,20 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "tests/ops/",
     "tests/special_sanity/check_device_api_usage.py",
     "tests/tools/common_utils.py",
+    # CPU-only scheduler tests use literal CUDA/NPU backend names as fixtures
+    # to validate device leases and launch plans without accessing hardware.
+    "tests/ci/test_accelerator.py",
     # Implicit-CUDA-sync gate. Calls ``torch.cuda.{get,set}_sync_debug_mode``
     # directly because the API is intrinsically CUDA-only and has no
     # ``veomni.utils.device`` equivalent; the test is gated on
     # ``IS_CUDA_AVAILABLE`` so it skips on non-CUDA hosts.
     "tests/models/transformers/test_model_forward_no_implicit_sync.py",
+    # Precision and async-offload tests explicitly select CUDA/NPU devices by
+    # name to exercise accelerator-specific code paths; the literal "cuda" is
+    # a test fixture, not a production device-API call.
+    "tests/distributed/test_async_activation_offload.py",
+    "tests/models/test_qwen_image_precision.py",
+    "tests/precision/qwen_image.py",
     # Vendored Ascend Triton kernels for Qwen3.5 gated delta-rule (FLA + Huawei
     # port) are kept byte-identical to upstream; the FLA-origin code references
     # ``.cuda`` in fallback/util paths. Excluded wholesale, matching the ruff

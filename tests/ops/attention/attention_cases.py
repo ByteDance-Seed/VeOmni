@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Shared attention mask cases and the MATH SDPA numerical reference."""
 
@@ -21,13 +21,15 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
+from veomni.ops.kernels.attention.mask.flex import _flex_block_size
 from veomni.ops.mask import MagiAttentionMask
 
 
 def eager_create_block_mask(*args, **kwargs):
     """Build a BlockMask without compiling ``create_block_mask``.
 
-    Compiled ``create_block_mask`` belongs on magi-vs-flex, not this branch.
+    Tests keep this helper eager to isolate attention execution from mask
+    construction and its compilation cost.
     """
     kwargs["_compile"] = False
     return create_block_mask(*args, **kwargs)
@@ -87,21 +89,17 @@ def magi_2d_mask(sequence_length: int, device: torch.device | str) -> MagiAttent
 
 
 def flex_2d_mask(sequence_length: int, device: torch.device | str) -> BlockMask:
-    quarter = sequence_length // 4
+    # Keep per-sample geometry in indexed tensors, as required by dynamic FLASH.
+    # Avoid scalar-tensor loads too: the pinned CuteDSL lowering cannot emit them.
+    span_ids = torch.arange(sequence_length, device=device, dtype=torch.int32) // (sequence_length // 4)
 
     def mask_mod(batch_idx, head_idx, query_idx, key_idx):
-        first = (query_idx < quarter) & (key_idx <= query_idx)
-        noise = (query_idx >= quarter) & (query_idx < 2 * quarter) & (key_idx < 2 * quarter)
-        full = (
-            (query_idx >= 2 * quarter)
-            & (query_idx < 3 * quarter)
-            & ((key_idx < quarter) | ((key_idx >= 2 * quarter) & (key_idx < 3 * quarter)))
-        )
-        last = (query_idx >= 3 * quarter) & (
-            (key_idx < quarter)
-            | ((key_idx >= 2 * quarter) & (key_idx < 3 * quarter))
-            | ((key_idx >= 3 * quarter) & (key_idx <= query_idx))
-        )
+        query_span = span_ids[query_idx]
+        key_span = span_ids[key_idx]
+        first = (query_span == 0) & (key_idx <= query_idx)
+        noise = (query_span == 1) & (key_span <= 1)
+        full = (query_span == 2) & ((key_span == 0) | (key_span == 2))
+        last = (query_span == 3) & ((key_span == 0) | (key_span == 2) | ((key_span == 3) & (key_idx <= query_idx)))
         return first | noise | full | last
 
     return eager_create_block_mask(
@@ -111,7 +109,7 @@ def flex_2d_mask(sequence_length: int, device: torch.device | str) -> BlockMask:
         Q_LEN=sequence_length,
         KV_LEN=sequence_length,
         device=device,
-        BLOCK_SIZE=128,
+        BLOCK_SIZE=_flex_block_size(device),
     )
 
 
@@ -151,7 +149,7 @@ def flex_mask(mask_case: str, sequence_length: int, device: torch.device | str) 
             Q_LEN=sequence_length,
             KV_LEN=sequence_length,
             device=device,
-            BLOCK_SIZE=128,
+            BLOCK_SIZE=_flex_block_size(device),
         )
     if mask_case == "2d_mask":
         return flex_2d_mask(sequence_length, device)

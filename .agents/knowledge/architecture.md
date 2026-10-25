@@ -10,15 +10,18 @@ veomni/
 ├── checkpoint/         DCP-based distributed checkpoint save/load
 ├── data/               Data pipeline: datasets, collators, transforms, dynamic batching
 │   ├── multimodal/     Vision, audio, video preprocessing and chat templates
-│   └── diffusion/      Diffusion model data loading
+│   ├── diffusion/      Diffusion model data loading
+│   └── seed_omni/      SeedOmni preprocessing, transform, and collator
 ├── distributed/        All parallelism strategies
 │   ├── parallel_state.py   init_parallel_state_from_config(), ParallelState, mesh setup
 │   ├── torch_parallelize.py  build_parallelize_model(), parallelize_model_fsdp2()
 │   ├── parallel_plan.py    ParallelPlan for ExtraParallel (EP, embedding shard)
 │   ├── async_offload.py    Async activation offload (SwapTensor, OffloadManager, async_save_on_cpu)
+│   ├── emb_parallel/   ShardedEmbedding: vocab rows over the emb group, all-to-all lookup, tied projection
 │   ├── hccl_premul_sum.py  Idempotent HCCL PREMUL_SUM collective compatibility patch
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
+│   ├── context_parallel/  DeepSeek-V4 sparse-attention CP: window sharding and collectives
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
 ├── models/      Model loading, patchgen configs, and kernel-aware modeling
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
@@ -29,6 +32,9 @@ veomni/
 │   ├── checkpoint/     Weight I/O, tensor conversion, and ModelCheckpointManager
 │   ├── transformers/   Model classes/configs with instance-local VeomniOp handles
 │   ├── diffusers/      Diffusion model families
+│   ├── seed_omni/      SeedOmni V2 composed model: config/modeling/processing,
+│   │                   train/generation graphs, and per-module bases
+│   ├── utils/          Modeling-side attention helpers and non-VeomniOp MoE fallbacks
 │   └── loss_utils/     Model-facing CE, load-balancing, and chunked-loss policy
 ├── optim/              Optimizer and LR scheduler construction
 │   ├── optimizer.py    build_optimizer() factory + MultiOptimizer wrapper.
@@ -71,9 +77,20 @@ veomni/
 │   ├── dit_trainer.py  DitTrainer: diffusion transformer training
 │   ├── text_dpo_trainer.py  DPO training for text models
 │   ├── base_rl_trainer.py   Base RL trainer for RLHF
-│   └── callbacks/      Training callbacks (checkpoint, evaluate, trace, etc.)
+│   ├── omni/           SeedOmni orchestrators (not BaseTrainer subclasses):
+│   │                   OmniTrainer drives OmniModelRuntime's per-module
+│   │                   ModuleRuntimes; OmniInferencer runs the infer graph
+│   │                   (eager, or FSDP/DDP via the runtime). Launched by
+│   │                   tasks/omni/{train,infer}_omni.py
+│   └── callbacks/      Training callbacks (checkpoint, evaluate, trace, etc.;
+│                       omni_callbacks/ holds the step metrics and graph
+│                       profile callbacks)
 └── utils/              Shared utilities (logging, device, constants, helpers)
 ```
+
+### FlexAttention package
+
+Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__.py` owns dispatch/Ulysses, `_inputs.py` owns input handling, `_fa4.py` owns compiled execution, and `_fa4_sm90_compat.py` owns the pinned bounds shim. The mask builder remains in `attention/mask/flex.py`.
 
 ## Trainer Hierarchy
 
@@ -127,15 +144,15 @@ So `self.model = self._build_model_runtime()` *is* the model build — a trainer
 
 It is usable on its own, with no trainer at all (see `tests/models/test_model_runtime.py`). Construction takes this model's *own* arguments (`ModelArguments`), the `ParallelState` name to register under, and the job-wide `TrainingArguments` it still needs for checkpoint paths and the resume decision. Nothing has to find itself inside a larger config: a job composing several models hands each one its own slice, so a single-model trainer and a multi-module omni model share one build sequence.
 
-Checkpointing is split three ways, mirroring SeedOmni V2's `OmniModuleDcpCallback` -> `OmniTrainer.save_dcp` -> `OmniModelRuntime`:
+Checkpointing is split three ways; `OmniTrainer` uses the same `CheckpointCallback`, with `OmniModelRuntime` fanning each call out to its module runtimes:
 
 - **When** — `CheckpointCallback` (`veomni/trainer/callbacks/checkpoint_callback.py`). It owns the every-N-steps/epochs cadence for DCP, HF/LoRA, and the one-shot tokenizer/config sidecars, and calls nothing but the trainer / model handles.
 - **What** — `BaseTrainer.load()` / `save_dcp()` / `save_hf_or_lora()` / `save_model_assets()`, one line each, fanning out to `self.model.<same name>()`. A trainer holding a second model (a DPO reference, a distillation teacher) extends the fan-out here without the callbacks learning about it.
-- **How** — `VeOmniModelRuntime` forwards to its `ModelCheckpointManager`, which owns the *ordering* (drain async saves, `empty_cache` around the DCP write, barrier, then export) — the part previously duplicated between the V1 callbacks and V2's per-module manager. A multi-module model subclasses it and sets `module_name`; every path then nests one level deeper via `veomni/checkpoint/layout.py`.
+- **How** — `VeOmniModelRuntime` forwards to its `ModelCheckpointManager`, which owns the *ordering* (drain async saves, `empty_cache` around the DCP write, barrier, then export) — the part previously duplicated between the V1 callbacks and V2's per-module manager. The base's paths stop at the step directory; a multi-module model's subclass (`OmniModuleCheckpointManager`) overrides the path methods and `_checkpointer_kwargs()` to nest every artifact one level deeper under its module name via `veomni/checkpoint/layout.py`.
 
 Only this model's lr_scheduler travels with the DCP write (the checkpointer pickles `state_dict` into a single `model/lr_scheduler.pt`; rank 0 writes, every rank reads). Weights and optimizer are two DCP directories (`model/ckpt/`, `model/optimizer/`). Job-level state — the dataloader cursor, the rng, the meters — belongs to `GlobalStateCallback` (`veomni/trainer/callbacks/global_state_callback.py`) as `loader/rank_{N}.pt` and `extra_state/rank_{N}.pt`, because with several models in one job there is one such record but N model checkpoints. That callback also writes the step's `checkpoint_manifest.json`. VeOmni 0.1.12 `extra_state/` resume is `veomni/checkpoint/legacy_v0_1_12.py` (delete that file to drop it). On-disk layout: `docs/usage/checkpoint.md`.
 
-Those cursor files are written **per rank**, where V2 writes a single rank-0 `trainer_state.pt`. The cursor is rank-local by construction: iterable datasets are `split_dataset_by_node`-sharded on `dp_rank` (`veomni/data/dataset.py:1509`), the multisource sampler filters on `_global_sample_idx % dp_size == dp_rank` (`:596`), and Energon takes `dp_rank` in its `WorkerConfig` (`:1645`). Restoring one rank's cursor everywhere makes every rank resume on rank 0's shard — replaying that slice and skipping the rest. Only the map-style path is rank-agnostic, which is why the single-file version looks correct until an iterable dataset resumes.
+Those cursor files are written **per rank**, where V2 writes a single rank-0 `trainer_state.pt`. The cursor is rank-local by construction (all in `veomni/data/dataset.py`): `_shard_iterable` wraps iterable datasets in a `ShardedIterableDataset` on `dp_rank`, `WeightedMultiSourceDataset.__iter__` filters on `_global_sample_idx % dp_size == dp_rank`, and `build_energon_dataset` passes `dp_rank` to its `WorkerConfig`. Restoring one rank's cursor everywhere makes every rank resume on rank 0's shard — replaying that slice and skipping the rest. Only the map-style path is rank-agnostic, which is why the single-file version looks correct until an iterable dataset resumes.
 
 `BaseTrainer` adds the job-bound half:
 - `_build_dataloader()` -> data pipeline setup
@@ -144,7 +161,7 @@ Those cursor files are written **per rank**, where V2 writes a single rank-0 `tr
 
 Subclasses override specific methods (e.g., `compute_loss()`, custom data transforms) rather than the entire training loop. Note that `TextTrainer`, `VLMTrainer`, `DiTTrainer` and `TextDPOTrainer` *compose* a `BaseTrainer` in `self.base` rather than subclassing it, and drive the build steps one at a time (constraint 24).
 
-**Checkpointing**: `CheckpointCallback` owns cadence for DCP, HF/LoRA, and the one-shot tokenizer/config sidecars; `GlobalStateCallback` owns the job cursor; `BaseTrainer.load` / `save_dcp` / `save_hf_or_lora` / `save_model_assets` fan out to the model handle; `ModelCheckpointManager` (`veomni/models/checkpoint/manager.py`) owns DCP / HF / LoRA I/O, drain-async, `empty_cache`, barrier, and directory layout. The scheduler is a single `lr_scheduler.pt` next to the DCP shards; the job cursor is `trainer_state_rank_{R}.pt`. VeOmni 0.1.12 `extra_state/` resume is `veomni/checkpoint/legacy_v0_1_12.py` (delete that file to drop it). On-disk layout: `docs/usage/checkpoint.md`.
+**Checkpointing**: `CheckpointCallback` owns cadence for DCP, HF/LoRA, and the one-shot tokenizer/config sidecars; `GlobalStateCallback` owns the job cursor; `BaseTrainer.load` / `save_dcp` / `save_hf_or_lora` / `save_model_assets` fan out to the model handle; `ModelCheckpointManager` (`veomni/models/checkpoint/manager.py`) owns DCP / HF / LoRA I/O, drain-async, `empty_cache`, barrier, and directory layout. The scheduler is a single `lr_scheduler.pt` next to the DCP shards; the job cursor is `loader/rank_{N}.pt` plus `extra_state/rank_{N}.pt`. VeOmni 0.1.12 `extra_state/` resume is `veomni/checkpoint/legacy_v0_1_12.py` (delete that file to drop it). On-disk layout: `docs/usage/checkpoint.md`.
 
 **Parallel-state scoping**: `BaseTrainer._setup(args)` registers `"base"` via `init_parallel_state_from_config` before seed/determinism — it is a staticmethod because everything it does is job-level and runs before any model exists. A model then derives its own mesh in `VeOmniModelRuntime.setup()`; `VeOmniModelRuntime.__init__` scopes the mesh-dependent build to that mesh, so the trainer's remaining build steps need no scope of their own. Run time is **per-op**: `forward_backward_step` wraps `use_parallel_state(self.model.parallel_state)` around forward, postforward, and backward so none of them hard-code `"base"` (DPO wraps policy vs reference itself). `clip_grad_norm()` still wraps itself. The `parallel_state` property is a by-name registry lookup, never a stored state object, so the registry stays the single source of truth. See `.agents/knowledge/constraints.md` §7 and `docs/design/local_parallel_state.md`.
 
@@ -239,6 +256,8 @@ configs/
 │       └── <model>.yaml
 ├── dit/                    Diffusion model configs
 │   └── <model>.yaml
+├── seed_omni/              SeedOmni graph configs
+│   └── <model>/            (graph_{train,infer}.yaml + train/, infer/ graph and modules configs)
 └── model_configs/          Base model architecture configs
     └── <family>/
         └── <Model>.json    (HuggingFace-compatible config.json)
@@ -248,8 +267,11 @@ configs/
 
 ```
 tests/
+├── ci/              CPU tests for CI planning, scheduling and launch validation
 ├── models/  Kernel-aware model loading, integration, and helper tests
-├── kernels/        Registry contracts and per-family kernel tests
+├── ops/            Op registry contracts and per-family kernel tests
+├── arguments/      Argument parsing and ops_implementation alias tests
+├── seed_omni/      SeedOmni graph, runtime, trainer and e2e tests
 ├── data/           Data pipeline, collator, transform tests
 ├── parallel/       Distributed parallelism tests (ulysses, data balance)
 ├── distributed/    dummy forward, torch.compile, FSDP equivalence, grad ckpt
@@ -284,13 +306,14 @@ tests/
 Distributed tests (`tests/parallel/`, `tests/distributed/`, `tests/e2e/`) may require multiple GPUs and use `torchrun` or `tests/tools/launch_utils.py`.
 
 **A passing local run does not mean CI runs it.**
-`.github/workflows/gpu_unit_tests.yml` and `npu_unit_tests.yml` enumerate most
-test files one by one. Only `tests/data` runs as a whole directory in both
-workflows; `tests/ops` and `tests/parallel/context_parallel` run wholesale on
-GPU only (the NPU job enumerates three named ops files). The e2e paths belong
-to `gpu_e2e_test.yml` / `npu_e2e_test.yml` instead. A new file anywhere else is
-invisible to CI until it is added to the workflow that owns its path, usually
-both unit workflows. See `.agents/knowledge/testing.md` before adding a test.
+`scripts/ci/accelerator/suites/gpu.json` and `suites/npu.json` enumerate unit/e2e selections.
+Both manifests collect `tests/ci`, `tests/data`, `tests/checkpoints`, `tests/models`, and
+`tests/ops` as whole directories; GPU also collects
+`tests/parallel/context_parallel`. Files outside directory selections need an
+entry in the appropriate suite manifest. Both accelerator backends use
+`scripts/ci/accelerator/runner.py`; launch plans reuse each case's actual
+`nproc/world_size` configuration. Do not add manual device quotas or per-file
+pytest workflow lines. See `.agents/knowledge/testing.md` before adding a test.
 
 ## Key Entry Points
 

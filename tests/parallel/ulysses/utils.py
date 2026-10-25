@@ -5,7 +5,10 @@ import torch.distributed as c10d
 import torch.distributed as dist
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 
-from veomni.distributed.sequence_parallel import set_ulysses_sequence_parallel_group
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.pytest_plugin import validate_launch
+from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+from veomni.distributed.sequence_parallel import get_ulysses_sequence_parallel_group
 from veomni.utils.device import get_device_id, get_dist_comm_backend, get_torch_device
 
 
@@ -50,19 +53,31 @@ class CommonDistributedDataParallelTest:
 
 
 class SequenceParallelTest(CommonDistributedDataParallelTest, MultiProcessTestCase):
+    def ci_launch_plan(self):
+        return LaunchSpec(nproc=self.world_size)
+
     def setUp(self):
         super().setUp()
         # TORCH_NCCL_BLOCKING_WAIT overrides TORCH_NCCL_ASYNC_ERROR_HANDLING hence tests
         # that use TORCH_NCCL_BLOCKING_WAIT will test it as expected.
         os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
+        validate_launch(self.world_size)
         self._spawn_processes()
+
+    def tearDown(self):
+        clear_parallel_state()
+        super().tearDown()
 
     def _get_process_group(self):
         store = self._get_store()
         get_torch_device().set_device(self.rank)
         c10d.init_process_group(get_dist_comm_backend(), store=store, rank=self.rank, world_size=self.world_size)
-        group = c10d.distributed_c10d._get_default_group()
-        set_ulysses_sequence_parallel_group(group)
+        # Build both the Ulysses SP state and the non-SP (DP) reference state so
+        # tests can run either path under ``with use_parallel_state(...):``
+        # without mutating or clearing global state in the middle of a test.
+        self.sp_state = _init_parallel_state(dp_size=1, ulysses_size=self.world_size, name="sp")
+        self.dp_state = _init_parallel_state(dp_size=self.world_size, ulysses_size=1, name="dp")
+        group = get_ulysses_sequence_parallel_group()
         self.rank = dist.get_rank(group)
         return group
 

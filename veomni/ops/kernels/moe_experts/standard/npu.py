@@ -332,6 +332,9 @@ def npu_fused_moe_forward(
     assume_distinct_experts: bool = False,  # intentionally unused; see the del below
 ):
     """NPU fused MoE entry. Branches on EP."""
+    # Router scores stay float32. Cast before the fused scale so the NPU GEMM
+    # does not see an fp32 activation against bf16 weights.
+    routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     # ``assume_distinct_experts`` only tightens the grouped-GEMM ``max_M``
     # launch bound in the Triton backend. The NPU group GEMM has no such launch
     # bound to tighten, so the flag is a no-op here.

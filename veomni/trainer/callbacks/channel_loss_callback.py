@@ -315,12 +315,13 @@ class ChannelLossComputer:
         ignore_index: int,
     ) -> list[dict[str, Any]]:
         sp_enabled = bool(self.parallel_state.sp_enabled)
-        if sp_enabled:
-            effective_labels = labels
-        elif shift_labels is not None:
+        # Match ``ForCausalLMLoss``: a provided ``shift_labels`` wins, including under SP.
+        if shift_labels is not None:
             effective_labels = shift_labels
-        else:
+        elif not sp_enabled:
             effective_labels = F.pad(labels, (0, 1), value=ignore_index)[..., 1:].contiguous()
+        else:
+            effective_labels = labels
 
         labels_flat = effective_labels.reshape(-1)
         attention_mask_flat = _position_aligned_attention_mask_flat(
@@ -926,7 +927,7 @@ class ChannelLossCallback(Callback):
         state: TrainerState,
         loss: float,
         loss_dict: dict[str, float],
-        grad_norm: float,
+        grad_norm: float | torch.Tensor,
         **kwargs: Any,
     ) -> None:
         if not self._collect_step:

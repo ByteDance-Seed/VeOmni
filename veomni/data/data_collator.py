@@ -106,10 +106,13 @@ def add_flash_attention_kwargs_from_position_ids(
     host_cu = cu_seq_lens_q if cu_seq_lens_q.device.type == "cpu" else cu_seq_lens_q.detach().cpu()
     batch["packed_sequence_slices"] = packed_sequence_slices_from_cu_seqlens(host_cu)
     attention_mask = batch.get("attention_mask")
-    if isinstance(attention_mask, torch.Tensor) and attention_mask.device.type == "cpu":
+    if not isinstance(attention_mask, torch.Tensor):
+        batch["attention_mask_is_all_ones"] = True
+    elif attention_mask.device.type == "cpu":
         batch["attention_mask_is_all_ones"] = bool(attention_mask.all())
     else:
-        batch["attention_mask_is_all_ones"] = True
+        # ``None`` leaves the device-side check to the consumer.
+        batch["attention_mask_is_all_ones"] = None
 
     return cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k
 

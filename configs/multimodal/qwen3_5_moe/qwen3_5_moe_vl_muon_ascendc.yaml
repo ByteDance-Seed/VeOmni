@@ -2,14 +2,14 @@ model:
   model_path: Qwen/Qwen3.5-35B-A3B
   ops_implementation:
     attn_implementation: flash_attention_2
-    rms_norm_implementation: npu
-    rotary_pos_emb_implementation: npu
+    rms_norm_implementation: torch_npu
+    rotary_pos_emb_implementation: torch_npu
     cross_entropy_loss_implementation: chunk_loss
     swiglu_mlp_implementation: eager
     moe_implementation: fused_npu
-    rms_norm_gated_implementation: npu
-    causal_conv1d_implementation: npu
-    chunk_gated_delta_rule_implementation: npu_ascendc
+    rms_norm_gated_implementation: torch_npu
+    causal_conv1d_implementation: triton
+    chunk_gated_delta_rule_implementation: fla_npu
     load_balancing_loss_implementation: eager
   optimizer:
     type: muon

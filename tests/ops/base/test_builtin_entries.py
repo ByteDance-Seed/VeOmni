@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import OP_REGISTRY
 from veomni.ops.platform import (
     GpuKernelRequirement,
@@ -26,12 +29,17 @@ from veomni.ops.platform import (
 )
 
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
 _ANY = None
 _GPU = ("gpu", (("nvidia", None, None), ("rocm", None, None)))
 _GPU_SM70 = ("gpu", (("nvidia", 70, None), ("rocm", None, None)))
 _GPU_SM80 = ("gpu", (("nvidia", 80, None), ("rocm", None, None)))
+_GPU_NVIDIA = ("gpu", (("nvidia", None, None),))
 _GPU_NVIDIA_SM80 = ("gpu", (("nvidia", 80, None),))
 _GPU_NVIDIA_SM90 = ("gpu", (("nvidia", 90, None),))
+_GPU_NVIDIA_SM100 = ("gpu", (("nvidia", 100, None),))
 _GPU_NVIDIA_SM90_TO_SM100 = ("gpu", (("nvidia", 90, 100),))
 _NPU = ("npu", ())
 _MLU = ("mlu", ())
@@ -51,14 +59,14 @@ _BUILTIN_ENTRIES = (
     ("attention", "standard", "flash_attention_3", "cuda", _GPU_NVIDIA_SM90, ("flash_attn_interface",)),
     ("attention", "standard", "flash_attention_3_hub", "cuda", _GPU_NVIDIA_SM90, ("kernels",)),
     ("attention", "standard", "flash_attention_4", "cuda", _GPU_NVIDIA_SM90, ("flash_attn.cute",)),
-    ("attention", "standard", "flex_attention", "any", _ANY, ()),
+    ("attention", "standard", "flex_attention", "cuda", _GPU_NVIDIA, ()),
     (
         "attention",
         "standard",
         "magi_attention",
         "cuda",
-        _GPU_NVIDIA_SM90,
-        ("magi_attention", "flash_attn_cute", "cuda.bindings", "debugpy"),
+        _GPU_NVIDIA_SM100,
+        ("magi_attention", "flash_attn_cute", "debugpy"),
     ),
     ("attention", "standard", "veomni_flash_attention_2", "cuda", _GPU_SM80, ("flash_attn",)),
     ("attention", "standard", "veomni_flash_attention_2", "npu", _NPU, ()),
@@ -74,36 +82,41 @@ _BUILTIN_ENTRIES = (
     ),
     ("attention", "standard", "veomni_flash_attention_3_hub", "cuda", _GPU_NVIDIA_SM90, ("kernels",)),
     ("attention", "standard", "veomni_flash_attention_4", "cuda", _GPU_NVIDIA_SM90, ("flash_attn.cute",)),
-    ("attention", "standard", "veomni_flex_attention", "any", _ANY, ()),
+    ("attention", "standard", "veomni_flex_attention", "cuda", _GPU_NVIDIA, ()),
     (
         "attention",
         "standard",
         "veomni_magi_attention",
         "cuda",
-        _GPU_NVIDIA_SM90,
-        ("magi_attention", "flash_attn_cute", "cuda.bindings", "debugpy"),
+        _GPU_NVIDIA_SM100,
+        ("magi_attention", "flash_attn_cute", "debugpy"),
     ),
     ("attention", "standard", "veomni_sage_attention", "cuda", _GPU_NVIDIA_SM80, ("sageattention",)),
     ("attention", "standard", "veomni_sdpa", "any", _ANY, ()),
     ("dsa_attention", "deepseek_v4", "eager", "any", _ANY, ()),
     ("dsa_attention", "deepseek_v4", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
+    ("dsa_attention", "deepseek_v4", "cann", "npu", _NPU, ("cann_ops_transformer",)),
     ("dsa_attention", "glm", "eager", "any", _ANY, ()),
     ("dsa_attention", "glm", "flashmla_cudnn", "cuda", _GPU_NVIDIA_SM90, ("cudnn", "flash_mla")),
     ("dsa_indexer", "deepseek_v4", "eager", "any", _ANY, ()),
     ("dsa_indexer", "deepseek_v4", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
+    ("dsa_indexer", "deepseek_v4", "cann", "npu", _NPU, ("cann_ops_transformer",)),
     ("dsa_indexer", "glm", "eager", "any", _ANY, ()),
     ("dsa_indexer", "glm", "cudnn", "cuda", _GPU_NVIDIA_SM90, ("cudnn", "flash_mla")),
     ("rms_norm_gated", "standard", "eager", "any", _ANY, ()),
     ("rms_norm_gated", "standard", "fla", "cuda", _GPU, ("fla",)),
     ("rms_norm_gated", "standard", "fla", "mlu", _MLU, ("fla",)),
-    ("rms_norm_gated", "standard", "npu", "npu", _NPU, ()),
+    ("rms_norm_gated", "standard", "fla", "npu", _NPU, ("fla",)),
+    ("rms_norm_gated", "standard", "torch_npu", "npu", _NPU, ()),
     ("causal_conv1d", "standard", "eager", "any", _ANY, ()),
     ("causal_conv1d", "standard", "fla", "cuda", _GPU, ("fla",)),
     ("causal_conv1d", "standard", "fla", "mlu", _MLU, ("fla",)),
-    ("causal_conv1d", "standard", "npu", "npu", _NPU, ("triton",)),
+    ("causal_conv1d", "standard", "fla", "npu", _NPU, ("fla",)),
+    ("causal_conv1d", "standard", "triton", "npu", _NPU, ("triton",)),
     ("chunk_gated_delta_rule", "standard", "eager", "any", _ANY, ()),
     ("chunk_gated_delta_rule", "standard", "fla", "cuda", _GPU, ("fla",)),
     ("chunk_gated_delta_rule", "standard", "fla", "mlu", _MLU, ("fla",)),
+    ("chunk_gated_delta_rule", "standard", "fla", "npu", _NPU, ("fla",)),
     (
         "chunk_gated_delta_rule",
         "standard",
@@ -112,19 +125,26 @@ _BUILTIN_ENTRIES = (
         _GPU_NVIDIA_SM90_TO_SM100,
         ("flash_qla",),
     ),
-    ("chunk_gated_delta_rule", "standard", "npu", "npu", _NPU, ("triton",)),
-    ("chunk_gated_delta_rule", "standard", "npu_ascendc", "npu", _NPU, ("fla_npu", "triton")),
+    ("chunk_gated_delta_rule", "standard", "triton", "npu", _NPU, ("triton",)),
+    ("chunk_gated_delta_rule", "standard", "fla_npu", "npu", _NPU, ("fla_npu", "triton")),
     ("load_balancing_loss", "standard", "eager", "any", _ANY, ()),
     ("load_balancing_loss", "standard", "triton", "cuda", _GPU, ("triton",)),
     ("cross_entropy_loss", "standard", "eager", "any", _ANY, ()),
     ("cross_entropy_loss", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("cross_entropy_loss", "standard", "chunk_loss", "any", _ANY, ()),
+    ("cross_entropy_loss", "standard", "chunk_loss", "npu", _NPU, ()),
     ("mhc", "pre", "eager", "any", _ANY, ()),
     ("mhc", "pre", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tile_kernels",)),
+    ("mhc", "pre", "cann", "npu", _NPU, ("cann_ops_transformer",)),
     ("mhc", "post", "eager", "any", _ANY, ()),
     ("mhc", "post", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tile_kernels",)),
+    ("mhc", "post", "cann", "npu", _NPU, ("cann_ops_transformer",)),
     ("mhc", "head", "eager", "any", _ANY, ()),
     ("mhc", "head", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tile_kernels",)),
+    ("mhc", "head", "cann", "npu", _NPU, ()),
+    ("qsa_attention", "standard", "eager", "any", _ANY, ()),
+    ("qsa_attention", "standard", "tilelang", "cuda", _GPU_NVIDIA, ("tilelang",)),
+    ("qsa_attention", "standard", "torch_npu", "npu", _NPU, ()),
     ("moe_experts", "standard", "eager", "any", _ANY, ()),
     ("moe_experts", "standard", "fused_triton", "cuda", _GPU_SM70, ("triton",)),
     ("moe_experts", "standard", "fused_triton", "mlu", _MLU, ("triton",)),
@@ -143,28 +163,29 @@ _BUILTIN_ENTRIES = (
     ("layer_norm", "standard", "apex", "cuda", _GPU, ("fused_layer_norm_cuda",)),
     ("rms_norm", "standard", "eager", "any", _ANY, ()),
     ("rms_norm", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
-    ("rms_norm", "standard", "npu", "npu", _NPU, ()),
+    ("rms_norm", "standard", "torch_npu", "npu", _NPU, ()),
     ("rms_norm", "standard", "triton", "cuda", _GPU, ("triton",)),
     ("rms_norm", "deepseek_v4", "eager", "any", _ANY, ()),
     ("rms_norm", "deepseek_v4", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("rms_norm", "deepseek_v4", "torch_npu", "npu", _NPU, ()),
     ("rms_norm", "offset", "eager", "any", _ANY, ()),
     ("rms_norm", "offset", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
-    ("rms_norm", "offset", "npu", "npu", _NPU, ()),
+    ("rms_norm", "offset", "torch_npu", "npu", _NPU, ()),
     ("rms_norm", "unweighted", "eager", "any", _ANY, ()),
     ("rms_norm", "unweighted", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("rope", "full", "eager", "any", _ANY, ()),
     ("rope", "full", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
-    ("rope", "full", "npu", "npu", _NPU, ()),
+    ("rope", "full", "torch_npu", "npu", _NPU, ()),
     ("rope", "partial", "eager", "any", _ANY, ()),
     ("rope", "partial", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
-    ("rope", "partial", "npu", "npu", _NPU, ()),
+    ("rope", "partial", "torch_npu", "npu", _NPU, ()),
     ("rope", "interleave", "eager", "any", _ANY, ()),
     ("rope", "mrope", "eager", "any", _ANY, ()),
     ("rope", "deepseek_v4", "eager", "any", _ANY, ()),
     ("rope", "deepseek_v4", "triton", "cuda", _GPU, ("triton",)),
     ("rope", "wan", "eager", "any", _ANY, ()),
     ("rope", "wan", "triton", "cuda", _GPU, ("triton",)),
-    ("rope", "wan", "npu", "npu", _NPU, ()),
+    ("rope", "wan", "torch_npu", "npu", _NPU, ()),
     ("swiglu_mlp", "standard", "eager", "any", _ANY, ()),
     ("swiglu_mlp", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("swiglu_mlp", "geglu", "eager", "any", _ANY, ()),
@@ -202,3 +223,33 @@ def test_builtin_entry_catalog_is_exact():
 
     assert len(expected) == len(_BUILTIN_ENTRIES)
     assert actual == expected
+
+
+_BUILTIN_DEFAULT_ENTRIES = {
+    ("cross_entropy_loss", "standard", "liger_kernel", "cuda"),
+    ("cross_entropy_loss", "standard", "chunk_loss", "npu"),
+    ("load_balancing_loss", "standard", "triton", "cuda"),
+    ("moe_experts", "standard", "fused_triton", "cuda"),
+    ("moe_experts", "standard", "fused_mlu", "mlu"),
+    ("moe_experts", "standard", "fused_triton", "mlu"),
+    ("moe_experts", "standard", "fused_npu", "npu"),
+    ("rms_norm", "standard", "liger_kernel", "cuda"),
+    ("rms_norm", "standard", "torch_npu", "npu"),
+    ("rms_norm", "deepseek_v4", "liger_kernel", "cuda"),
+    ("rms_norm", "deepseek_v4", "torch_npu", "npu"),
+    ("rms_norm", "offset", "liger_kernel", "cuda"),
+    ("rms_norm", "offset", "torch_npu", "npu"),
+    ("rms_norm", "unweighted", "liger_kernel", "cuda"),
+    ("rope", "full", "liger_kernel", "cuda"),
+    ("rope", "full", "torch_npu", "npu"),
+    ("rope", "partial", "liger_kernel", "cuda"),
+    ("rope", "partial", "torch_npu", "npu"),
+    ("swiglu_mlp", "standard", "liger_kernel", "cuda"),
+    ("swiglu_mlp", "geglu", "liger_kernel", "cuda"),
+}
+
+
+def test_builtin_default_entries_are_exact():
+    """Only the intended device rows set default=True."""
+    actual = {key for key, entry in OP_REGISTRY._entries.items() if entry.default}
+    assert actual == _BUILTIN_DEFAULT_ENTRIES

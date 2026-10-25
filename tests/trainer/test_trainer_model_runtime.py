@@ -9,17 +9,23 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """The trainer composes a runtime; it does not inherit one."""
 
 from types import SimpleNamespace
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.training_utils import unbuilt_runtime
 from veomni.arguments import ModelArguments
 from veomni.models.model_runtime import VeOmniModelRuntime
 from veomni.trainer.base import BaseTrainer
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _train_args(load_path=None):

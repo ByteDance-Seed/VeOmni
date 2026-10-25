@@ -28,7 +28,7 @@ load when an index mapping is supplied).
 
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, Generator, List, Optional, Protocol, Union
+from typing import TYPE_CHECKING, Callable, Dict, Generator, List, Optional, Protocol, Tuple, Union
 
 import torch
 from torch import nn
@@ -115,19 +115,37 @@ class CheckpointTensorConverter(Protocol):
         without materializing its checkpoint tensor.
 
         This is intended for checkpoint-only subtrees that the live model does
-        not construct (for example an explicitly unsupported auxiliary head).
-        The regular loader still calls :meth:`convert` after reading the tensor;
-        streaming loaders may use this hook to avoid the read entirely.
-        Implementing this method is optional and a missing method means
-        ``False``.
+        not construct (for example an explicitly unsupported auxiliary head, or
+        a sibling module's weights in a shared checkpoint). Every loader then
+        calls :meth:`record_skip_without_loading` instead of reading the tensor
+        and calling :meth:`convert`. Implementing this method is optional and a
+        missing method means ``False``.
         """
         ...
 
     def record_skip_without_loading(self, name: str) -> None:
-        """Optional notification after a streaming loader skipped ``name``.
+        """Optional notification after a loader skipped ``name``.
 
         Converters can use this to retain their usual finalize-time accounting
         without forcing the tensor to be read. Implementing it is optional.
+        """
+        ...
+
+    def fused_expert_target(self, name: str) -> Optional[Tuple[str, int]]:
+        """Optional streaming capability: ``(fused_name, expert_index)`` when ``name`` is
+        one expert's tensor that this converter stacks into row ``expert_index`` (dim-0)
+        of the fused parameter ``fused_name``; ``None`` for any other key.
+
+        A per-rank dim-0 streaming loader uses it to read only the experts in its own
+        ``Shard(0)`` range. Must be implemented together with :meth:`for_expert_range`;
+        a missing method means the converter cannot be streamed.
+        """
+        ...
+
+    def for_expert_range(self, start: int, num_local: int) -> "CheckpointTensorConverter":
+        """Optional streaming capability: a fresh converter that accepts only experts
+        ``[start, start + num_local)`` and emits fused tensors of ``num_local`` rows, the
+        rank-local ``Shard(0)`` slice of what this converter emits for all experts.
         """
         ...
 
@@ -152,7 +170,7 @@ def checkpoint_converter_should_skip_without_loading(
     converter: Optional["CheckpointTensorConverter"],
     name: str,
 ) -> bool:
-    """Whether a streaming loader may discard ``name`` before reading it."""
+    """Whether a loader may discard ``name`` before reading it."""
     if converter is None or not converter.can_handle(name):
         return False
     fn = getattr(converter, "should_skip_without_loading", None)
@@ -163,12 +181,41 @@ def checkpoint_converter_record_skip_without_loading(
     converter: Optional["CheckpointTensorConverter"],
     name: str,
 ) -> None:
-    """Notify a converter that a tensor was skipped by a streaming loader."""
+    """Notify a converter that a loader skipped a tensor without reading it."""
     if converter is None:
         return
     fn = getattr(converter, "record_skip_without_loading", None)
     if callable(fn):
         fn(name)
+
+
+def checkpoint_converter_supports_expert_streaming(
+    converter: Optional["CheckpointTensorConverter"],
+) -> bool:
+    """Whether *converter* implements both per-expert streaming capabilities."""
+    if converter is None:
+        return False
+    return callable(getattr(converter, "fused_expert_target", None)) and callable(
+        getattr(converter, "for_expert_range", None)
+    )
+
+
+def checkpoint_converter_fused_expert_target(
+    converter: Optional["CheckpointTensorConverter"],
+    name: str,
+) -> Optional[Tuple[str, int]]:
+    """Safely query the optional :meth:`CheckpointTensorConverter.fused_expert_target`.
+
+    ``None`` unless *converter* claims ``name`` and implements both expert-streaming
+    capabilities (``fused_expert_target`` and ``for_expert_range``).
+    """
+    if (
+        converter is None
+        or not converter.can_handle(name)
+        or not checkpoint_converter_supports_expert_streaming(converter)
+    ):
+        return None
+    return converter.fused_expert_target(name)
 
 
 def get_checkpoint_tensor_converter(
@@ -301,7 +348,8 @@ def _map_moe_params_common(name, tensor, ep_rank):
         yield new_key, tensor[i].to(tensor.device, non_blocking=True)
 
 
-def _process_moe_params(name, tensor, ep_rank):
+def split_moe_params(name, tensor, ep_rank=0):
+    """Split a fused MoE expert tensor (``gate_up_proj`` or ``down_proj``) into per-expert ``(key, tensor)`` pairs."""
     if "gate_up_proj" in name:
         gate, up = tensor.chunk(2, dim=1)
         params = {
@@ -313,6 +361,9 @@ def _process_moe_params(name, tensor, ep_rank):
 
     for key, value in params.items():
         yield from _map_moe_params_common(key, value, ep_rank)
+
+
+_process_moe_params = split_moe_params
 
 
 def export_weights(model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -344,10 +395,10 @@ def export_weights(model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor]
             for src_ep_rank in range(ep_size):
                 tensor = unsharded_tensor if src_ep_rank == ep_rank else buffer
                 torch.distributed.broadcast(tensor, group_src=src_ep_rank, group=ps.ep_group)
-                yield from _process_moe_params(name, tensor, ep_rank=src_ep_rank)
+                yield from split_moe_params(name, tensor, ep_rank=src_ep_rank)
 
         else:
             if is_expert_layer:
-                yield from _process_moe_params(name, unsharded_tensor, ep_rank=0)
+                yield from split_moe_params(name, unsharded_tensor, ep_rank=0)
             else:
                 yield name, unsharded_tensor

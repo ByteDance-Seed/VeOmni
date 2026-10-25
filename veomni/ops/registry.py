@@ -84,6 +84,14 @@ def _make_autograd_fn(raw_forward: Callable, raw_backward: Callable) -> Callable
                 raise TypeError("raw forward output must be a Tensor or a non-empty tuple of Tensors")
 
             ctx.output_is_tuple = isinstance(output, tuple)
+            if torch.compiler.is_compiling():
+                # Dynamo's AutogradFunctionApplyVariable appends every intermediate
+                # FX tensor node in ``forward`` after the declared outputs. If a
+                # trailing no-op op (such as ``.to(x.dtype)`` or ``.contiguous()``)
+                # returns the same Tensor object as an earlier intermediate node,
+                # C++ autograd overwrites the output's ``output_nr_`` with the
+                # intermediate slot and routes ``grad_output`` to an unused slot.
+                output = tuple(item.clone() for item in output) if ctx.output_is_tuple else output.clone()
             return output
 
         @staticmethod
@@ -129,6 +137,8 @@ class OpEntry:
     or an opaque ``wrapper``. ``description`` records stable implementation
     semantics for discovery. Hardware ``requirement`` and software
     ``requires`` are optional and independently participate in resolution.
+    ``default`` marks device-specific rows that act as the host default for
+    ``(op, variant)`` in registration order.
     """
 
     op: str
@@ -140,6 +150,7 @@ class OpEntry:
     wrapper: Callable | None = None
     requirement: KernelRequirement | None = None
     requires: tuple[str, ...] = ()
+    default: bool = False
 
     def __post_init__(self) -> None:
         """Validate the raw/wrapper pairing and generate the wrapper if needed."""
@@ -151,6 +162,12 @@ class OpEntry:
             raise TypeError("requires must be a tuple of non-empty import package names")
         if len(set(self.requires)) != len(self.requires):
             raise ValueError("requires must not contain duplicate package names")
+        if not isinstance(self.default, bool):
+            raise TypeError("default must be a bool")
+        if self.default and self.requirement is None:
+            raise ValueError(
+                "default=True requires a device-specific requirement; eager is already the fallback default"
+            )
         if (self.forward is None) != (self.backward is None):
             raise ValueError("forward and backward must both be set or both be None")
         if self.forward is None and self.wrapper is None:
@@ -175,10 +192,23 @@ class OpRegistry:
         """Create an empty registry table."""
         self._entries: dict[tuple[str, str, str, str], OpEntry] = {}
 
+    def _requires_satisfied(self, entry: OpEntry) -> bool:
+        """Return whether software package requirements for ``entry`` are satisfied."""
+        from ..utils import import_utils
+
+        device = _entry_device(entry)
+        for package in entry.requires:
+            if device == "mlu" and package == "apex":
+                if not import_utils.is_apex_mlu_available():
+                    return False
+            elif not is_package_available(package):
+                return False
+        return True
+
     def _entry_is_available(self, entry: OpEntry) -> bool:
         """Return whether both hardware and software requirements are satisfied."""
         hardware_matches = entry.requirement is None or entry.requirement.matches()
-        return hardware_matches and all(is_package_available(package) for package in entry.requires)
+        return hardware_matches and self._requires_satisfied(entry)
 
     def register(self, entry: OpEntry) -> None:
         """Insert ``entry``. Duplicate ``(op, variant, impl, device)`` keys raise."""
@@ -201,16 +231,19 @@ class OpRegistry:
             return entry
         return self._entries.get((op, variant, impl, ANY_DEVICE))
 
-    def resolve(self, op: str, variant: str, impl: str) -> OpEntry:
+    def resolve(self, op: str, variant: str, impl: str | None = None) -> OpEntry:
         """Return the row for ``(op, variant, impl)`` on this device.
 
-        Looks up ``(op, variant, impl, current_device)``, then
-        ``ANY_DEVICE``. Unknown triples raise ``KeyError``. A row that
-        exists only for other devices, whose hardware ``requirement`` does
-        not match, or whose software ``requires`` are missing raises
-        ``RuntimeError``.
+        When ``impl`` is ``None``, selects ``self.default_impl(op, variant)``
+        for the active device first. Looks up
+        ``(op, variant, impl, current_device)``, then ``ANY_DEVICE``. Unknown
+        triples raise ``KeyError``. A row that exists only for other devices,
+        whose hardware ``requirement`` does not match, or whose software
+        ``requires`` are missing raises ``RuntimeError``.
         """
         device = get_device_type()
+        if impl is None:
+            impl = self.default_impl(op, variant, device=device)
         entry = self._select_entry(op, variant, impl, device)
         if entry is None:
             devices = [
@@ -223,7 +256,10 @@ class OpRegistry:
                     f"Op {op!r} variant={variant!r} impl={impl!r} "
                     f"is not registered for device {device!r} (have {sorted(devices)})"
                 )
-            raise KeyError(f"Unknown op {op!r} variant={variant!r} impl={impl!r}")
+            raise KeyError(
+                f"Unknown op {op!r} variant={variant!r} impl={impl!r} "
+                f"(registered impls: {self.list_registered(op, variant)})"
+            )
         if entry.requirement is not None:
             try:
                 entry.requirement.check()
@@ -276,6 +312,26 @@ class OpRegistry:
             if entry_op == op and entry_variant == variant
         ]
 
+    def default_impl(self, op: str, variant: str, *, device: str | None = None) -> str:
+        """Return the default impl name for ``(op, variant)`` on ``device``.
+
+        Checks ``default=True`` rows for ``device`` in registration order,
+        returning the first whose hardware and software requirements are
+        satisfied. Returns ``eager`` when no default candidate is available,
+        independent of registration order. Explicit implementations are
+        validated by ``resolve`` and never fall back.
+        """
+        if device is None:
+            device = get_device_type()
+        entries = self.list_entries(op, variant)
+        if not entries:
+            raise KeyError(f"Unknown op {op!r} variant={variant!r}")
+
+        for entry in entries:
+            if _entry_device(entry) == device and entry.default and self._entry_is_available(entry):
+                return entry.impl
+        return "eager"
+
 
 OP_REGISTRY = OpRegistry()
 
@@ -291,6 +347,7 @@ def register_op(
     wrapper: Callable | None = None,
     requirement: KernelRequirement | None = None,
     requires: tuple[str, ...] = (),
+    default: bool = False,
 ) -> None:
     """Register one row on ``OP_REGISTRY``.
 
@@ -299,7 +356,9 @@ def register_op(
     semantics rather than duplicating hardware constraints.
     ``requirement.device`` (or ``ANY_DEVICE``) is the fourth key.
     ``requires`` lists import package names checked without importing them.
-    ``resolve_op`` still takes the public triple.
+    ``default=True`` marks a device-specific row as a host default candidate
+    in registration order. ``resolve_op`` resolves ``impl=None`` through
+    ``default_impl(op, variant)``.
     """
     OP_REGISTRY.register(
         OpEntry(
@@ -312,11 +371,12 @@ def register_op(
             wrapper=wrapper,
             requirement=requirement,
             requires=requires,
+            default=default,
         )
     )
 
 
-def resolve_op(op: str, variant: str, impl: str) -> OpEntry:
+def resolve_op(op: str, variant: str, impl: str | None = None) -> OpEntry:
     """Look up ``(op, variant, impl)`` in ``OP_REGISTRY``."""
     return OP_REGISTRY.resolve(op, variant, impl)
 
@@ -324,28 +384,34 @@ def resolve_op(op: str, variant: str, impl: str) -> OpEntry:
 class VeomniOp:
     """Local handle for one ``(op, variant, impl)`` row.
 
-    Interned by triple. Always calls ``entry.wrapper``. Compound Functions
-    must use ``resolve_op(...).forward`` / ``.backward``, not this handle.
+    Interned by resolved triple. Always calls ``entry.wrapper``. Compound
+    Functions must use ``resolve_op(...).forward`` / ``.backward``, not this
+    handle.
     """
 
     _intern: dict[tuple[str, str, str], VeomniOp] = {}
 
-    def __new__(cls, op: str, variant: str, impl: str = "eager"):
+    def __new__(cls, op: str, variant: str, impl: str | None = None):
         """Return the interned handle for ``(op, variant, impl)``."""
-        cached = cls._intern.get((op, variant, impl))
+        if impl is not None:
+            cached = cls._intern.get((op, variant, impl))
+            if cached is not None:
+                return cached
+        entry = resolve_op(op, variant, impl)
+        cached = cls._intern.get((op, variant, entry.impl))
         if cached is not None:
             return cached
-        return super().__new__(cls)
+        instance = super().__new__(cls)
+        instance.op = op
+        instance.variant = variant
+        instance.impl = entry.impl
+        instance._entry = entry
+        cls._intern[(op, variant, entry.impl)] = instance
+        return instance
 
-    def __init__(self, op: str, variant: str, impl: str = "eager"):
+    def __init__(self, op: str, variant: str, impl: str | None = None):
         """Resolve the registry row and intern this handle."""
-        if getattr(self, "_entry", None) is not None:
-            return
-        self.op = op
-        self.variant = variant
-        self.impl = impl
-        self._entry = resolve_op(op, variant, impl)
-        type(self)._intern[(op, variant, impl)] = self
+        return None
 
     def __copy__(self):
         """Interned handles are identity-copied."""

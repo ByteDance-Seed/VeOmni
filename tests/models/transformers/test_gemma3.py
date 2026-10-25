@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Gemma 3 eager, soft-cap, packed, and FlexAttention numerical tests.
 
@@ -110,11 +110,14 @@ def test_gemma3_eager_matches_hf_softcap():
         )
 
 
-def test_gemma3_packed_eager_matches_independent_samples():
+@pytest.mark.parametrize("impl", ("eager", "sdpa", "veomni_sdpa"))
+def test_gemma3_packed_dense_matches_independent_samples(impl):
     """Packed ``cu_seq_lens_q`` uses ``packed_causal_mask`` / ``sliding_window_mask``."""
     torch.manual_seed(123)
     config = _tiny_config()
-    ours = _build_ours(config).eval()
+    ops = eager_ops_config()
+    ops.attn_implementation = impl
+    ours = _build_ours(config, ops).eval()
     first_input_ids = torch.tensor([[5, 6, 7]])
     second_input_ids = torch.tensor([[8, 9, 10, 11, 12]])
     packed_input_ids = torch.cat((first_input_ids, second_input_ids), dim=1)
@@ -146,7 +149,7 @@ def test_gemma3_packed_eager_matches_independent_samples():
     torch.testing.assert_close(packed_logits[:, 3:], second_logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
 
-def test_gemma3_routes_full_and_sliding_flex_masks(monkeypatch):
+def test_gemma3_routes_full_and_sliding_flex_masks(monkeypatch, available_nvidia_ops):
     captured = []
 
     def fake_flex(module, query, key, value, attention_mask, *, sliding_window=None, **kwargs):
@@ -276,7 +279,7 @@ def test_gemma3_packed_flex_matches_independent_samples_on_cuda():
         assert gradient.abs().max() > 0
 
 
-def test_gemma3_builds_global_pack_aware_flex_masks_with_ulysses(monkeypatch):
+def test_gemma3_builds_global_pack_aware_flex_masks_with_ulysses(monkeypatch, available_nvidia_ops):
     from veomni.ops.kernels.attention import ulysses
 
     captured = []

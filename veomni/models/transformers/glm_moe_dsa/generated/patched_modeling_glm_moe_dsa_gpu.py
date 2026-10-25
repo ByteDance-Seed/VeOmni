@@ -16,7 +16,15 @@
 #    - method_override: GlmMoeDsaMLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: GlmMoeDsaMLP.forward
-#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
+#    - class_replacement: GlmMoeDsaExperts
+#      Always call moe_experts VeomniOp on v5 gate_up_proj weights
+#    - method_override: GlmMoeDsaTopkRouter.forward
+#      Disable autocast around fp32 router linear for VeRL actor/rollout parity
+#    - method_override: GlmMoeDsaMoE.forward
+#      Report top-k indices to the MoE load-balance monitor
+#    - method_override: GlmMoeDsaForCausalLM.get_parallel_plan
+#      Register GlmMoeDsa expert parallel plan for v5 generated modeling
 #    - method_override: GlmMoeDsaIndexer.__init__
 #      Construct a local dsa_indexer glm VeomniOp
 #    - method_override: GlmMoeDsaIndexer.forward
@@ -24,13 +32,11 @@
 #    - method_override: GlmMoeDsaAttention.__init__
 #      Construct a local dsa_attention glm VeomniOp
 #    - method_override: GlmMoeDsaAttention.forward
-#      DSA consumes compressed K/V from past_key_values.update(), not module buffers
+#      Eager runs HF's expanded MLA; fused DSA consumes compressed K/V from past_key_values.update()
 #    - method_override: GlmMoeDsaForCausalLM.__init__
 #      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: GlmMoeDsaForCausalLM.forward
 #      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
-#    - method_override: GlmMoeDsaForCausalLM.get_parallel_plan
-#      Register GLM-MoE-DSA expert parallel plan for v5 generated modeling
 #
 # ==============================================================================
 
@@ -47,7 +53,6 @@ from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_experts_implementation
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
@@ -61,10 +66,13 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 
 from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, create_standard_causal_mask, translate_fused_dsa_mask
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
+from veomni.utils.moe_monitor import record_router_indices
 
 
 # Additional import blocks for patches
@@ -369,6 +377,17 @@ class GlmMoeDsaAttention(nn.Module):
             "glm",
             resolve_op_impl("dsa_attention_implementation"),
         )
+        self.veomni_attn = None
+        if self.veomni_dsa_attention.impl == "eager":
+            # Eager DSA folds the top-k selection into the attention mask, which
+            # only the eager and SDPA rows consume; any other row would silently
+            # run dense attention.
+            if config._attn_implementation not in ("eager", "sdpa", "veomni_sdpa"):
+                raise ValueError(
+                    "GLM-MoE-DSA with dsa_attention_implementation='eager' requires attn_implementation "
+                    f"'eager' or 'sdpa', got {config._attn_implementation!r}."
+                )
+            self.veomni_attn = VeomniOp("attention", "standard", config._attn_implementation)
 
     def expand_kv(self, kv_nope: torch.Tensor, k_rot: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Expands the compressed latents into key and value states. Args:
@@ -418,13 +437,24 @@ class GlmMoeDsaAttention(nn.Module):
 
         q_pe, k_pe = self.veomni_rope(q_pe, k_pe, cos, sin)
 
-        # DSA consumes MQA compressed latents. Keep them on the shared Cache object
-        # (BHSD, concat on seq) instead of module buffers so chunked prefill,
-        # independent requests, and reorder_cache share one lifecycle.
-        k_pe_states = k_pe
-        kv_states = k_compressed.unsqueeze(1)
-        if past_key_values is not None:
-            k_pe_states, kv_states = past_key_values.update(k_pe_states, kv_states, self.layer_idx)
+        eager_attention = self.veomni_dsa_attention.impl == "eager"
+        if eager_attention:
+            # Eager keeps Hugging Face's expanded MLA: kv_b_proj K/V on the cache and
+            # standard attention over the top-k mask, so it matches HF bitwise.
+            query_states = torch.cat((q_nope, q_pe), dim=-1)
+            key_states, value_states = self.expand_kv(
+                k_compressed.view(batch_size, 1, seq_length, self.kv_lora_rank), k_pe
+            )
+            if past_key_values is not None:
+                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+        else:
+            # Fused DSA consumes MQA compressed latents. Keep them on the shared Cache
+            # object (BHSD, concat on seq) instead of module buffers so chunked
+            # prefill, independent requests, and reorder_cache share one lifecycle.
+            k_pe_states = k_pe
+            kv_states = k_compressed.unsqueeze(1)
+            if past_key_values is not None:
+                k_pe_states, kv_states = past_key_values.update(k_pe_states, kv_states, self.layer_idx)
 
         if self.indexer is not None:
             indexer_mask = (
@@ -448,6 +478,35 @@ class GlmMoeDsaAttention(nn.Module):
                 raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")
             topk_indices = prev_topk_indices
 
+        if eager_attention:
+            # The indexer marks unselectable slots -1. Their keys are already causal-
+            # or padding-masked, so scatter them into a spare column and drop it.
+            kv_length = key_states.shape[2]
+            scatter_indices = torch.where(topk_indices < 0, kv_length, topk_indices).long()
+            index_mask = (
+                topk_indices.new_ones((batch_size, seq_length, kv_length + 1), dtype=torch.bool)
+                .scatter(-1, scatter_indices, False)[..., :kv_length]
+                .unsqueeze(1)
+            )
+            if attention_mask is None:
+                key_positions = torch.arange(key_states.shape[2], device=hidden_states.device)
+                index_mask = index_mask | (key_positions[None, None, None, :] > position_ids[:, None, :, None])
+                attention_mask = hidden_states.new_zeros((batch_size, 1, seq_length, key_states.shape[2]))
+            attention_mask = attention_mask.masked_fill(index_mask, torch.finfo(hidden_states.dtype).min)
+            attn_output, attn_weights = self.veomni_attn(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
+            attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
+            attn_output = self.o_proj(attn_output)
+            return attn_output, attn_weights, topk_indices
+
         kv_b_weight = self.kv_b_proj.weight.contiguous().view(
             self.num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
@@ -461,8 +520,7 @@ class GlmMoeDsaAttention(nn.Module):
         output_attentions = bool(kwargs.get("output_attentions", False)) or bool(
             getattr(self.config, "output_attentions", False)
         )
-        fused_attention = self.veomni_dsa_attention.impl != "eager"
-        if fused_attention and output_attentions:
+        if output_attentions:
             raise ValueError(
                 "flashmla_cudnn GLM sparse attention does not support output_attentions=True; "
                 "use the eager implementation."
@@ -471,11 +529,11 @@ class GlmMoeDsaAttention(nn.Module):
             attention_mask,
             q_len=seq_length,
             kv_len=k_pe_kernel.shape[1],
-            fused=fused_attention,
+            fused=True,
             what="flashmla_cudnn GLM sparse attention",
         )
         attention_dropout = 0.0 if not self.training else self.attention_dropout
-        attn_result = self.veomni_dsa_attention(
+        compressed_attn_output = self.veomni_dsa_attention(
             q_pe.transpose(1, 2).contiguous(),
             k_pe_kernel,
             kv_cache,
@@ -486,17 +544,11 @@ class GlmMoeDsaAttention(nn.Module):
             use_cache=past_key_values is not None,
             training=self.training,
             attention_dropout=attention_dropout,
-            return_attn_weights=output_attentions,
         )
-        if output_attentions:
-            compressed_attn_output, attn_weights = attn_result
-        else:
-            compressed_attn_output = attn_result
-            attn_weights = None
         attn_output = torch.einsum("bshr,hvr->bshv", compressed_attn_output, value_weight)
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights, topk_indices
+        return attn_output, None, topk_indices
 
 
 # ======================================================================
@@ -518,7 +570,7 @@ class GlmMoeDsaMLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"}:
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,
@@ -529,6 +581,12 @@ class GlmMoeDsaMLP(nn.Module):
                 self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
             )
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+# ======================================================================
+# [MODIFIED CLASS] GlmMoeDsaTopkRouter
+# Methods patched: forward
+# ======================================================================
 
 
 class GlmMoeDsaTopkRouter(nn.Module):
@@ -546,7 +604,8 @@ class GlmMoeDsaTopkRouter(nn.Module):
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.view(-1, self.hidden_dim)
-        router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
         scores = router_logits.sigmoid()
         scores_for_choice = scores + self.e_score_correction_bias
         group_scores = (
@@ -566,13 +625,17 @@ class GlmMoeDsaTopkRouter(nn.Module):
         topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
         topk_weights = scores.gather(1, topk_indices)
         if self.norm_topk_prob:
-            denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
-            topk_weights /= denominator
+            topk_weights /= topk_weights.sum(dim=-1, keepdim=True) + 1e-20
         topk_weights = topk_weights * self.routed_scaling_factor
         return router_logits, topk_weights, topk_indices
 
 
-@use_experts_implementation
+# ======================================================================
+# [PATCHED CLASS] GlmMoeDsaExperts
+# Original class replaced with: PatchedDeepseekV3Experts
+# Reason: Always call moe_experts VeomniOp on v5 gate_up_proj weights
+# Source: veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config
+# ======================================================================
 class GlmMoeDsaExperts(nn.Module):
     """Collection of expert weights stored as 3D tensors."""
 
@@ -584,6 +647,8 @@ class GlmMoeDsaExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
+        self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
 
     def forward(
         self,
@@ -591,25 +656,35 @@ class GlmMoeDsaExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        if not self.use_swiglu_mlp:
+            return merged_experts_act_fn_forward(
+                hidden_states,
+                top_k_index,
+                top_k_weights.to(hidden_states.dtype),
+                self.gate_up_proj,
+                self.down_proj,
+                self.act_fn,
+                self.num_experts,
+            )
+        unused = self.gate_up_proj.new_empty(0)
+        # Eager keeps the fp32 router weights so it stays bitwise with HF's expert loop.
+        routing_weights = top_k_weights if self.veomni_moe.impl == "eager" else top_k_weights.to(hidden_states.dtype)
+        return self.veomni_moe(
+            hidden_states,
+            routing_weights,
+            top_k_index,
+            unused,
+            unused,
+            self.down_proj,
+            self.gate_up_proj,
+            num_experts=self.num_experts,
+        )
 
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
-        return final_hidden_states
+# ======================================================================
+# [MODIFIED CLASS] GlmMoeDsaMoE
+# Methods patched: forward
+# ======================================================================
 
 
 class GlmMoeDsaMoE(nn.Module):
@@ -626,10 +701,11 @@ class GlmMoeDsaMoE(nn.Module):
             config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states):
         residuals = hidden_states
         orig_shape = hidden_states.shape
         _, topk_weights, topk_indices = self.gate(hidden_states)
+        record_router_indices(self.gate, topk_indices)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
         hidden_states = hidden_states + self.shared_experts(residuals)
@@ -793,7 +869,7 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] GlmMoeDsaForCausalLM
-# Methods patched: __init__, forward, get_parallel_plan
+# Methods patched: get_parallel_plan, __init__, forward
 # ======================================================================
 
 
@@ -809,7 +885,7 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
         self.model = GlmMoeDsaModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        impl = resolve_op_impl("cross_entropy_loss_implementation")
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()

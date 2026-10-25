@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """DeepSeek-V4 config fields and ``validate_build_prerequisites``."""
 
@@ -23,9 +23,13 @@ from pathlib import Path
 import pytest
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config as UpstreamConfig
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
 from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from veomni.ops.config import get_ops_config, set_ops_config
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _config_asking_for_the_loss(coef: float = 1.0, **overrides) -> DeepseekV4Config:

@@ -1,24 +1,13 @@
-# Copyright 2026 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
 """
 Patch configuration for GLM-MoE-DSA GPU VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models.transformers.glm_moe_dsa.glm_moe_dsa_gpu_patch_gen_config -o veomni/models/transformers/glm_moe_dsa/generated --diff
 
-Indexer and attention always call ``dsa_indexer`` / ``dsa_attention``
-``glm``. CausalLM uses ``ForCausalLMLoss``.
+The indexer always calls ``dsa_indexer`` ``glm``. With an eager
+``dsa_attention`` row, attention runs Hugging Face's expanded MLA through the
+standard ``attention`` op; fused rows call ``dsa_attention`` ``glm`` on the
+absorbed latents. CausalLM uses ``ForCausalLMLoss``.
 """
 
 from functools import partial
@@ -34,9 +23,16 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config import (
+    PatchedDeepseekV3Experts,
+    deepseek_v3_get_parallel_plan_patched,
+    deepseek_v3_moe_forward_patched,
+    deepseek_v3_topk_router_forward_patched,
+)
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, translate_fused_dsa_mask
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
     CausalLMOutputWithLogProbs,
@@ -57,6 +53,7 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.ops.config",
     names=["resolve_op_impl"],
@@ -65,6 +62,8 @@ config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
 )
+config.add_import("veomni.models.utils.moe_utils", names=["merged_experts_act_fn_forward"])
+config.add_import("veomni.utils.moe_monitor", names=["record_router_indices"])
 config.add_import(
     "veomni.ops.kernels.dsa.mask",
     names=["copy_dsa_mask_provenance", "create_standard_causal_mask", "translate_fused_dsa_mask"],
@@ -116,10 +115,10 @@ def glm_moe_dsa_mlp_init_patched(self, config, intermediate_size=None):
 
 @config.override_method(
     "GlmMoeDsaMLP.forward",
-    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 def glm_moe_dsa_mlp_forward_patched(self, x):
-    if self.config.hidden_act in {"silu", "swish"}:
+    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,
@@ -130,6 +129,36 @@ def glm_moe_dsa_mlp_forward_patched(self, x):
             self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
         )
     return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+# GLM-MoE-DSA's routed-expert block (TopkRouter / Experts / MoE) is the
+# DeepSeek-V3 block with renamed classes, so its MoE patches are shared.
+_DEEPSEEK_V3_NAME_MAP = {"DeepseekV3": "GlmMoeDsa"}
+
+config.replace_class(
+    "GlmMoeDsaExperts",
+    replacement=PatchedDeepseekV3Experts,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Always call moe_experts VeomniOp on v5 gate_up_proj weights",
+)
+config.override_method(
+    "GlmMoeDsaTopkRouter.forward",
+    replacement=deepseek_v3_topk_router_forward_patched,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Disable autocast around fp32 router linear for VeRL actor/rollout parity",
+)
+config.override_method(
+    "GlmMoeDsaMoE.forward",
+    replacement=deepseek_v3_moe_forward_patched,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Report top-k indices to the MoE load-balance monitor",
+)
+config.override_method(
+    "GlmMoeDsaForCausalLM.get_parallel_plan",
+    replacement=deepseek_v3_get_parallel_plan_patched,
+    name_map=_DEEPSEEK_V3_NAME_MAP,
+    description="Register GlmMoeDsa expert parallel plan for v5 generated modeling",
+)
 
 
 @config.override_method(
@@ -277,11 +306,22 @@ def glm_moe_dsa_attention_init_patched(self, config: GlmMoeDsaConfig, layer_idx:
         "glm",
         resolve_op_impl("dsa_attention_implementation"),
     )
+    self.veomni_attn = None
+    if self.veomni_dsa_attention.impl == "eager":
+        # Eager DSA folds the top-k selection into the attention mask, which
+        # only the eager and SDPA rows consume; any other row would silently
+        # run dense attention.
+        if config._attn_implementation not in ("eager", "sdpa", "veomni_sdpa"):
+            raise ValueError(
+                "GLM-MoE-DSA with dsa_attention_implementation='eager' requires attn_implementation "
+                f"'eager' or 'sdpa', got {config._attn_implementation!r}."
+            )
+        self.veomni_attn = VeomniOp("attention", "standard", config._attn_implementation)
 
 
 @config.override_method(
     "GlmMoeDsaAttention.forward",
-    description="DSA consumes compressed K/V from past_key_values.update(), not module buffers",
+    description="Eager runs HF's expanded MLA; fused DSA consumes compressed K/V from past_key_values.update()",
 )
 def glm_moe_dsa_attention_forward_patched(
     self,
@@ -312,13 +352,24 @@ def glm_moe_dsa_attention_forward_patched(
 
     q_pe, k_pe = self.veomni_rope(q_pe, k_pe, cos, sin)
 
-    # DSA consumes MQA compressed latents. Keep them on the shared Cache object
-    # (BHSD, concat on seq) instead of module buffers so chunked prefill,
-    # independent requests, and reorder_cache share one lifecycle.
-    k_pe_states = k_pe
-    kv_states = k_compressed.unsqueeze(1)
-    if past_key_values is not None:
-        k_pe_states, kv_states = past_key_values.update(k_pe_states, kv_states, self.layer_idx)
+    eager_attention = self.veomni_dsa_attention.impl == "eager"
+    if eager_attention:
+        # Eager keeps Hugging Face's expanded MLA: kv_b_proj K/V on the cache and
+        # standard attention over the top-k mask, so it matches HF bitwise.
+        query_states = torch.cat((q_nope, q_pe), dim=-1)
+        key_states, value_states = self.expand_kv(
+            k_compressed.view(batch_size, 1, seq_length, self.kv_lora_rank), k_pe
+        )
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+    else:
+        # Fused DSA consumes MQA compressed latents. Keep them on the shared Cache
+        # object (BHSD, concat on seq) instead of module buffers so chunked
+        # prefill, independent requests, and reorder_cache share one lifecycle.
+        k_pe_states = k_pe
+        kv_states = k_compressed.unsqueeze(1)
+        if past_key_values is not None:
+            k_pe_states, kv_states = past_key_values.update(k_pe_states, kv_states, self.layer_idx)
 
     if self.indexer is not None:
         indexer_mask = (
@@ -342,6 +393,35 @@ def glm_moe_dsa_attention_forward_patched(
             raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")
         topk_indices = prev_topk_indices
 
+    if eager_attention:
+        # The indexer marks unselectable slots -1. Their keys are already causal-
+        # or padding-masked, so scatter them into a spare column and drop it.
+        kv_length = key_states.shape[2]
+        scatter_indices = torch.where(topk_indices < 0, kv_length, topk_indices).long()
+        index_mask = (
+            topk_indices.new_ones((batch_size, seq_length, kv_length + 1), dtype=torch.bool)
+            .scatter(-1, scatter_indices, False)[..., :kv_length]
+            .unsqueeze(1)
+        )
+        if attention_mask is None:
+            key_positions = torch.arange(key_states.shape[2], device=hidden_states.device)
+            index_mask = index_mask | (key_positions[None, None, None, :] > position_ids[:, None, :, None])
+            attention_mask = hidden_states.new_zeros((batch_size, 1, seq_length, key_states.shape[2]))
+        attention_mask = attention_mask.masked_fill(index_mask, torch.finfo(hidden_states.dtype).min)
+        attn_output, attn_weights = self.veomni_attn(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
+        attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights, topk_indices
+
     kv_b_weight = self.kv_b_proj.weight.contiguous().view(
         self.num_heads,
         self.qk_nope_head_dim + self.v_head_dim,
@@ -355,8 +435,7 @@ def glm_moe_dsa_attention_forward_patched(
     output_attentions = bool(kwargs.get("output_attentions", False)) or bool(
         getattr(self.config, "output_attentions", False)
     )
-    fused_attention = self.veomni_dsa_attention.impl != "eager"
-    if fused_attention and output_attentions:
+    if output_attentions:
         raise ValueError(
             "flashmla_cudnn GLM sparse attention does not support output_attentions=True; "
             "use the eager implementation."
@@ -365,11 +444,11 @@ def glm_moe_dsa_attention_forward_patched(
         attention_mask,
         q_len=seq_length,
         kv_len=k_pe_kernel.shape[1],
-        fused=fused_attention,
+        fused=True,
         what="flashmla_cudnn GLM sparse attention",
     )
     attention_dropout = 0.0 if not self.training else self.attention_dropout
-    attn_result = self.veomni_dsa_attention(
+    compressed_attn_output = self.veomni_dsa_attention(
         q_pe.transpose(1, 2).contiguous(),
         k_pe_kernel,
         kv_cache,
@@ -380,17 +459,11 @@ def glm_moe_dsa_attention_forward_patched(
         use_cache=past_key_values is not None,
         training=self.training,
         attention_dropout=attention_dropout,
-        return_attn_weights=output_attentions,
     )
-    if output_attentions:
-        compressed_attn_output, attn_weights = attn_result
-    else:
-        compressed_attn_output = attn_result
-        attn_weights = None
     attn_output = torch.einsum("bshr,hvr->bshv", compressed_attn_output, value_weight)
     attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
     attn_output = self.o_proj(attn_output)
-    return attn_output, attn_weights, topk_indices
+    return attn_output, None, topk_indices
 
 
 @config.override_method(
@@ -402,7 +475,7 @@ def glm_moe_dsa_forcausallm_init_patched(self, config):
     self.model = GlmMoeDsaModel(config)
     self.vocab_size = config.vocab_size
     self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    impl = resolve_op_impl("cross_entropy_loss_implementation")
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
@@ -467,13 +540,3 @@ def glm_moe_dsa_forcausallm_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
     )
-
-
-@config.override_method(
-    "GlmMoeDsaForCausalLM.get_parallel_plan",
-    description="Register GLM-MoE-DSA expert parallel plan for v5 generated modeling",
-)
-def glm_moe_dsa_get_parallel_plan_patched(self):
-    from ..parallel_plan import get_parallel_plan as _get_parallel_plan
-
-    return _get_parallel_plan()
