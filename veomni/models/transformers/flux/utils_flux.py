@@ -272,10 +272,10 @@ _SDPA_ATTN_IMPLS = frozenset({"sdpa", "veomni_sdpa"})
 
 def bind_flux_attention(module: torch.nn.Module, impl: str | None = None) -> None:
     """Attach configured ``attention/standard`` plus a one-time SDPA mask fallback."""
-    impl = resolve_op_impl("attn_implementation") if impl is None else impl
+    impl = resolve_op_impl("attn_implementation", eager_as="veomni_sdpa") if impl is None else impl
     module.veomni_attn = VeomniOp("attention", "standard", impl)
     module.veomni_attn_masked = (
-        module.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "sdpa")
+        module.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "veomni_sdpa")
     )
     module.is_causal = False
     module.layer_idx = getattr(module, "layer_idx", None)

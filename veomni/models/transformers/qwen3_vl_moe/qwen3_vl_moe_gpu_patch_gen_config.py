@@ -188,7 +188,7 @@ config.override_method(
     "Qwen3VLMoeTextMLP.forward",
     replacement=qwen3_vl_text_mlp_forward_patched,
     name_map=_NAME_MAP,
-    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 config.modify_init(
     "Qwen3VLMoeVisionAttention",
@@ -635,7 +635,7 @@ def qwen3_vl_moe_for_conditional_generation_init_patched(self, config):
     super().__init__(config)
     self.model = Qwen3VLMoeModel(config)
     self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    impl = resolve_op_impl("cross_entropy_loss_implementation")
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.veomni_lb = VeomniOp(

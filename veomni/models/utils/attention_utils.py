@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Attention helpers for models."""
 
@@ -20,18 +20,6 @@ import torch
 from torch import Tensor
 
 
-VARLEN_ATTENTION_TYPES = (
-    "flash_attention_2",
-    "flash_attention_2_hub",
-    "flash_attention_3",
-    "flash_attention_3_hub",
-    "flash_attention_4",
-    "veomni_flash_attention_2",
-    "veomni_flash_attention_2_hub",
-    "veomni_flash_attention_3",
-    "veomni_flash_attention_3_hub",
-    "veomni_flash_attention_4",
-)
 PACKED_ATTENTION_METADATA_KEYS = frozenset(
     {
         "cu_seqlens",

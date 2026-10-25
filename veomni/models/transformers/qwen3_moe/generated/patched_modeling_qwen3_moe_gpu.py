@@ -16,7 +16,7 @@
 #    - method_override: Qwen3MoeMLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: Qwen3MoeMLP.forward
-#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - class_replacement: Qwen3MoeExperts
 #      Always call moe_experts VeomniOp on v5 gate_up_proj weights
 #    - method_override: Qwen3MoeTopKRouter.forward
@@ -79,6 +79,7 @@ from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationL
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
@@ -217,7 +218,7 @@ class Qwen3MoeMLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"}:
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,
@@ -694,7 +695,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
-        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        impl = resolve_op_impl("cross_entropy_loss_implementation")
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.veomni_lb = VeomniOp(
@@ -805,7 +806,7 @@ class Qwen3MoeForSequenceClassification(GenericForSequenceClassification, Qwen3M
         self.num_labels = config.num_labels
         self.model = Qwen3MoeModel(config)
         self.score = nn.Linear(config.get_text_config().hidden_size, self.num_labels, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        impl = resolve_op_impl("cross_entropy_loss_implementation")
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForSequenceClassificationLoss, op=self.veomni_ce)
         self.post_init()

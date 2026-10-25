@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """SageAttention adapter contract and numerical checks vs MATH SDPA."""
 
@@ -113,13 +113,6 @@ def test_sage_attention_rejects_dense_mask(monkeypatch):
 @pytest.mark.parametrize(
     ("name", "value"),
     (
-        ("cu_seq_lens_q", torch.tensor([0, 2, 4], dtype=torch.int32)),
-        ("cu_seq_lens_k", torch.tensor([0, 2, 4], dtype=torch.int32)),
-        ("cu_seqlens", torch.tensor([0, 2, 4], dtype=torch.int32)),
-        ("cu_seqlens_q", torch.tensor([0, 2, 4], dtype=torch.int32)),
-        ("cu_seqlens_k", torch.tensor([0, 2, 4], dtype=torch.int32)),
-        ("max_length_q", 2),
-        ("max_length_k", 2),
         ("indices", torch.tensor([[0, 1]], dtype=torch.int32)),
         ("s_aux", torch.ones(2)),
     ),
@@ -145,6 +138,92 @@ def test_sage_attention_rejects_unsupported_semantic_metadata(monkeypatch, name,
             query,
             attention_mask=None,
             **{name: value},
+        )
+
+
+def test_sage_attention_drops_single_segment_and_splits_packed_cu_seqlens(monkeypatch):
+    """SageAttention strips single-segment metadata and splits unmasked batch-1 multi-segment calls."""
+    calls = []
+
+    def fake_sage(query, key, value, tensor_layout="HND", is_causal=False, sm_scale=None):
+        calls.append((query.shape, is_causal, sm_scale))
+        scale = (query.shape[-1] ** -0.5) if sm_scale is None else sm_scale
+        scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+        if is_causal and query.shape[-2] > 1:
+            causal = torch.ones(query.shape[-2], key.shape[-2], dtype=torch.bool, device=query.device).tril()
+            scores = scores.masked_fill(~causal, torch.finfo(scores.dtype).min)
+        weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+        return torch.matmul(weights, value)
+
+    monkeypatch.setattr(sage_backend, "sageattn", fake_sage)
+    monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
+
+    q1 = torch.randn(1, 2, 4, 8)
+    # Single-segment metadata ([0, 4]) executes in a single call.
+    single_cu = torch.tensor([0, 4], dtype=torch.int32)
+    expected_single, _ = sage_backend.sage_attention_forward(_FakeAttentionModule(), q1, q1, q1, attention_mask=None)
+    calls.clear()
+    actual_single, _ = sage_backend.sage_attention_forward(
+        _FakeAttentionModule(),
+        q1,
+        q1,
+        q1,
+        attention_mask=None,
+        cu_seq_lens_q=single_cu,
+        cu_seq_lens_k=single_cu,
+        max_length_q=4,
+        max_length_k=4,
+    )
+    assert len(calls) == 1
+    torch.testing.assert_close(actual_single, expected_single, rtol=0, atol=0)
+
+    # Multi-segment metadata ([0, 2, 4]) splits per segment and isolates segments.
+    calls.clear()
+    multi_cu = torch.tensor([0, 2, 4], dtype=torch.int32)
+    q2 = q1.clone()
+    q2[:, :, 2:, :] += 10.0
+    out1, _ = sage_backend.sage_attention_forward(
+        _FakeAttentionModule(),
+        q1,
+        q1,
+        q1,
+        attention_mask=None,
+        cu_seq_lens_q=multi_cu,
+        cu_seq_lens_k=multi_cu,
+        max_length_q=2,
+        max_length_k=2,
+        is_causal=False,
+    )
+    out2, _ = sage_backend.sage_attention_forward(
+        _FakeAttentionModule(),
+        q2,
+        q2,
+        q2,
+        attention_mask=None,
+        cu_seq_lens_q=multi_cu,
+        cu_seq_lens_k=multi_cu,
+        max_length_q=2,
+        max_length_k=2,
+        is_causal=False,
+    )
+    assert [shape for shape, _, _ in calls[:2]] == [torch.Size([1, 2, 2, 8]), torch.Size([1, 2, 2, 8])]
+    torch.testing.assert_close(out1[:, :2], out2[:, :2], rtol=0, atol=0)
+
+    # Multi-segment with batch_size > 1 still fails closed before Ulysses or vendor kernel.
+    monkeypatch.setattr(
+        sage_backend,
+        "should_apply_ulysses",
+        lambda *, skip_ulysses=False: pytest.fail("unisolated multi-segment metadata must fail before Ulysses"),
+    )
+    batch2 = torch.randn(2, 2, 4, 8)
+    with pytest.raises(ValueError, match="several segments per row"):
+        sage_backend.sage_attention_forward(
+            _FakeAttentionModule(),
+            batch2,
+            batch2,
+            batch2,
+            attention_mask=None,
+            cu_seq_lens_q=torch.tensor([0, 2, 4, 8], dtype=torch.int32),
         )
 
 

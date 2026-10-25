@@ -159,9 +159,9 @@ implementations explicitly when running Qwen3.5:
 bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5/qwen3_5_vl.yaml \
     --model.model_path /app/ckpt/Qwen3.5-9B \
     --data.train_path ./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml \
-    --model.ops_implementation.rms_norm_gated_implementation npu \
-    --model.ops_implementation.causal_conv1d_implementation npu \
-    --model.ops_implementation.chunk_gated_delta_rule_implementation npu_ascendc \
+    --model.ops_implementation.rms_norm_gated_implementation torch_npu \
+    --model.ops_implementation.causal_conv1d_implementation triton \
+    --model.ops_implementation.chunk_gated_delta_rule_implementation fla_npu \
     --train.max_steps 20
 ```
 

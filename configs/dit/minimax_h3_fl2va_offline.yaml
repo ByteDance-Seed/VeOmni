@@ -33,7 +33,7 @@ model:
     audio_cond_noise_aug: 1.0
 
   ops_implementation:
-    attn_implementation: sdpa
+    attn_implementation: flash_attention_2
     rotary_pos_emb_implementation: eager
     rms_norm_implementation: eager
     swiglu_mlp_implementation: eager
@@ -55,6 +55,9 @@ model:
     ulysses_size: 1
     gradient_checkpointing:
       enable: true
+      # recompute_layers: 15  # blocks that recompute, counted from the last block: -1 = every block (default), 0 = none, above the model depth means every block
+      # selective_recompute_layers: 10  # of those, the blocks that run selective activation checkpointing (SAC), counted from the front of the range: 0 = off (default), above the range length means the whole range
+      # save_ops: ["attn"]  # operators SAC keeps instead of recomputing; default attn (the SDPA-like ops are MUST_SAVE, the rest recompute); [] means the same as attn
     fsdp_config:
       fsdp_mode: fsdp2
       mixed_precision:
@@ -77,7 +80,7 @@ data:
   text_keys: text
   dataloader:
     type: native
-    num_workers: 8
+    num_workers: 4
     drop_last: true
 
 # -----------------------------------------------------------------------------
@@ -86,14 +89,25 @@ data:
 train:
   training_task: offline_training
 
-  global_batch_size: 16
+  global_batch_size: 8
   micro_batch_size: 1
   dyn_bsz: false
 
   seed: 42
 
   num_train_epochs: 1
-  max_steps: 20
+  max_steps: 25
+
+  profile:
+      enable: false
+      start_step: 5
+      end_step: 7
+      trace_dir: "./profiling/trace"
+      record_shapes: true
+      profile_memory: true
+      with_stack: false
+      with_modules: false
+      rank0_only: true
 
   checkpoint:
     output_dir: output/minimax_h3_fl2va_offline

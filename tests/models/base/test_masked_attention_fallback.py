@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Masked attention binds SDPA when the requested impl has no mask path."""
 
@@ -18,7 +18,11 @@ from __future__ import annotations
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config, ops_config_scope
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _flux_joint_attention():
@@ -42,12 +46,12 @@ def _qwen_image_processor():
         pytest.param(_qwen_image_processor, id="qwen_image"),
     ),
 )
-def test_masked_attention_falls_back_to_sdpa(available_nvidia_ops, build):
+def test_masked_attention_falls_back_to_veomni_sdpa(available_nvidia_ops, build):
     ops = eager_ops_config()
     ops.attn_implementation = "flash_attention_2"
     with ops_config_scope(ops):
         module = build()
 
     assert module.veomni_attn.impl == "flash_attention_2"
-    assert module.veomni_attn_masked.impl == "sdpa"
+    assert module.veomni_attn_masked.impl == "veomni_sdpa"
     assert module.veomni_attn_masked is not module.veomni_attn

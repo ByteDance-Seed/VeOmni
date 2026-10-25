@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Install and registry contract for ``veomni_*`` attention names."""
 
@@ -26,11 +26,15 @@ from transformers.integrations.sdpa_attention import sdpa_attention_forward as h
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import OP_REGISTRY, VeomniOp
 from veomni.ops.install import _VEOMNI_HF_PATCHES, apply_veomni_attention_patch
 from veomni.ops.kernels.attention import lookup
 from veomni.ops.kernels.attention import ulysses as ulysses_backend
 from veomni.ops.kernels.attention.ulysses import should_apply_ulysses
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 _VEOMNI_FORWARDS = {name: forward for name, forward, _mask in _VEOMNI_HF_PATCHES}
@@ -105,17 +109,16 @@ def test_veomni_hf_patches_pair_attention_and_mask_without_overwriting_stock():
     assert "veomni_flash_attention_2" in OP_REGISTRY.list_registered("attention", "standard")
 
 
-def test_magi_short_name_uses_installed_veomni_interface(monkeypatch):
+@pytest.mark.parametrize("impl", ("flex_attention", "magi_attention"))
+def test_attention_short_name_uses_installed_veomni_interface(monkeypatch, impl):
     captured = {}
 
     def replacement(module, query, key, value, attention_mask, **kwargs):
         captured.update(module=module, query=query, kwargs=kwargs)
-        return query.transpose(1, 2), "magi-metadata"
+        return query.transpose(1, 2), f"{impl}-metadata"
 
-    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, "veomni_magi_attention", replacement)
-    wrapper = next(
-        entry.wrapper for entry in OP_REGISTRY.list_entries("attention", "standard") if entry.impl == "magi_attention"
-    )
+    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, f"veomni_{impl}", replacement)
+    wrapper = next(entry.wrapper for entry in OP_REGISTRY.list_entries("attention", "standard") if entry.impl == impl)
     module = SimpleNamespace(is_causal=True)
     query = torch.randn(2, 4, 3, 8)
 
@@ -125,7 +128,7 @@ def test_magi_short_name_uses_installed_veomni_interface(monkeypatch):
     assert captured["query"] is query
     assert captured["kwargs"]["scaling"] == 0.5
     torch.testing.assert_close(output, query.transpose(1, 2))
-    assert metadata == "magi-metadata"
+    assert metadata == f"{impl}-metadata"
 
 
 def test_apply_veomni_attention_patch_is_idempotent():
@@ -254,3 +257,60 @@ def test_ulysses_head_auxiliary_slices_global_vector_by_rank(monkeypatch):
         group=object(),
     )
     torch.testing.assert_close(sliced, torch.tensor([2, 3]))
+
+
+@pytest.mark.parametrize(
+    "impl",
+    ("eager", "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4"),
+)
+def test_lookup_raw_attention_rejects_active_ulysses_unless_skipped(monkeypatch, impl):
+    monkeypatch.setattr(
+        ulysses_backend,
+        "get_parallel_state",
+        lambda: SimpleNamespace(ulysses_size=2, async_enabled=False),
+    )
+    module = _EagerAttentionModule()
+    query = torch.randn(1, 4, 6, 8)
+    cu_seqlens = torch.tensor([0, 12], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="does not perform Ulysses sequence-parallel exchanges"):
+        lookup(impl)(module, query, query, query, None, cu_seq_lens_q=cu_seqlens, cu_seq_lens_k=cu_seqlens)
+
+    captured = {}
+
+    def fake_forward(mod, q, k, v, attention_mask, **kwargs):
+        captured["kwargs"] = kwargs
+        return q.transpose(1, 2), "ok"
+
+    if impl != "eager":
+        monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, impl, fake_forward)
+
+    output, metadata = lookup(impl)(
+        module,
+        query,
+        query,
+        query,
+        None,
+        skip_ulysses=True,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+    )
+    torch.testing.assert_close(output, query.transpose(1, 2))
+    assert metadata in ("eager-local", "ok")
+    if impl != "eager":
+        assert "skip_ulysses" not in captured["kwargs"]
+
+    # DeepSeek-V4's eager -> veomni_dsa_attention bridge already exchanges Q/KV before lookup("eager").
+    if impl == "eager":
+        dsa_out, dsa_meta = lookup("eager")(
+            module,
+            query,
+            query,
+            query,
+            None,
+            dsa_position_ids=torch.arange(6).unsqueeze(0),
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+        )
+        torch.testing.assert_close(dsa_out, query.transpose(1, 2))
+        assert dsa_meta == "eager-local"

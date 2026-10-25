@@ -149,6 +149,27 @@ class TestOpEntryValidation:
                 wrapper=lambda *args, **kwargs: None,
             )
 
+    def test_default_requires_bool_and_device_requirement(self):
+        with pytest.raises(TypeError, match="default must be a bool"):
+            OpEntry(
+                op="add",
+                variant="standard",
+                impl="fused",
+                description=_TEST_DESCRIPTION,
+                wrapper=lambda: None,
+                requirement=_GPU,
+                default=1,  # type: ignore[arg-type]
+            )
+        with pytest.raises(ValueError, match="default=True requires a device-specific requirement"):
+            OpEntry(
+                op="add",
+                variant="standard",
+                impl="eager",
+                description=_TEST_DESCRIPTION,
+                wrapper=lambda: None,
+                default=True,
+            )
+
 
 @pytest.mark.usefixtures("isolated_entries")
 class TestRegisterAndResolve:
@@ -401,6 +422,75 @@ class TestRegisterAndResolve:
         with pytest.raises(TypeError):
             entry.forward(x)
 
+    def test_default_impl_uses_registration_order_and_eager_fallback(self, monkeypatch):
+        register_op(
+            "add",
+            "standard",
+            "fast_first",
+            description="Primary GPU add",
+            wrapper=lambda x: x,
+            requirement=_GPU,
+            requires=("first_pkg",),
+            default=True,
+        )
+        register_op(
+            "add",
+            "standard",
+            "fast_second",
+            description="Secondary GPU add",
+            wrapper=lambda x: x,
+            requirement=_GPU,
+            requires=("second_pkg",),
+            default=True,
+        )
+        # The fallback is explicit, even when eager was registered last.
+        register_op("add", "standard", "eager", description="Eager add", wrapper=lambda x: x)
+        monkeypatch.setattr("veomni.ops.registry.is_package_available", lambda pkg: pkg == "first_pkg")
+        monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cuda")
+        monkeypatch.setattr("veomni.ops.platform.gpu.IS_CUDA_AVAILABLE", True)
+        assert OP_REGISTRY.default_impl("add", "standard", device="cuda") == "fast_first"
+        assert resolve_op("add", "standard", None).impl == "fast_first"
+
+        monkeypatch.setattr("veomni.ops.registry.is_package_available", lambda pkg: pkg == "second_pkg")
+        assert OP_REGISTRY.default_impl("add", "standard", device="cuda") == "fast_second"
+        assert resolve_op("add", "standard", None).impl == "fast_second"
+
+        monkeypatch.setattr("veomni.ops.registry.is_package_available", lambda pkg: False)
+        assert OP_REGISTRY.default_impl("add", "standard", device="cuda") == "eager"
+        assert resolve_op("add", "standard").impl == "eager"
+        with pytest.raises(RuntimeError, match="requires unavailable package"):
+            resolve_op("add", "standard", "fast_second")
+
+        # No device-specific default also falls back to eager.
+        monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "npu")
+        assert OP_REGISTRY.default_impl("add", "standard", device="npu") == "eager"
+        assert resolve_op("add", "standard", None).impl == "eager"
+
+        with pytest.raises(KeyError, match="Unknown op"):
+            OP_REGISTRY.default_impl("unknown", "standard", device="cuda")
+
+    def test_default_impl_skips_unsupported_gpu_architecture(self, monkeypatch):
+        register_op("add", "standard", "eager", description="Eager add", wrapper=lambda x: x)
+        for impl, min_cc in (("sm90", 90), ("sm70", 70)):
+            register_op(
+                "add",
+                "standard",
+                impl,
+                description=f"SM{min_cc}+ add",
+                wrapper=lambda x: x,
+                requirement=GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=min_cc),)),
+                default=True,
+            )
+        monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cuda")
+        monkeypatch.setattr("veomni.ops.platform.gpu.IS_CUDA_AVAILABLE", True)
+        monkeypatch.setattr("veomni.ops.platform.gpu.torch.version.hip", None)
+        for cc, expected in ((90, "sm90"), (80, "sm70"), (60, "eager")):
+            monkeypatch.setattr("veomni.ops.platform.gpu.get_gpu_compute_capability", lambda cc=cc: cc)
+            assert OP_REGISTRY.default_impl("add", "standard") == expected
+            assert resolve_op("add", "standard").impl == expected
+        with pytest.raises(RuntimeError, match="requirement is not satisfied"):
+            resolve_op("add", "standard", "sm90")
+
 
 @pytest.mark.usefixtures("isolated_entries")
 class TestGeneratedWrapper:
@@ -512,9 +602,25 @@ class TestVeomniOp:
         assert not torch.equal(eager(x, y, scale=1.0), double(x, y, scale=1.0))
         assert eager is not double
 
-    def test_intern_by_triple(self):
+    def test_intern_by_triple(self, monkeypatch):
         register_op("add", "standard", "eager", _add_forward, _add_backward, description=_TEST_DESCRIPTION)
-        assert VeomniOp("add", "standard") is VeomniOp("add", "standard", "eager")
+        register_op(
+            "add",
+            "standard",
+            "fast",
+            _add_forward,
+            _add_backward,
+            description=_TEST_DESCRIPTION,
+            requirement=_GPU,
+            default=True,
+        )
+        monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cuda")
+        monkeypatch.setattr("veomni.ops.platform.gpu.IS_CUDA_AVAILABLE", True)
+        default_handle = VeomniOp("add", "standard", None)
+        assert default_handle.impl == "fast"
+        assert default_handle is VeomniOp("add", "standard")
+        assert default_handle is VeomniOp("add", "standard", "fast")
+        assert default_handle is not VeomniOp("add", "standard", "eager")
 
     def test_copy_deepcopy_and_pickle_return_interned_handle(self):
         register_op("add", "standard", "eager", _add_forward, _add_backward, description=_TEST_DESCRIPTION)

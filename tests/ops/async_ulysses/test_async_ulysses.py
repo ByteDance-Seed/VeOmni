@@ -191,7 +191,7 @@ def _sequential_standard_qkv(
     key = F.linear(hidden, k_weight, k_bias).view(batch, -1, num_kv, head_dim)
     value = F.linear(hidden, v_weight, v_bias).view(batch, -1, num_kv, head_dim)
     if norm_type == "rmsnorm":
-        rms = VeomniOp("rms_norm", "standard")
+        rms = VeomniOp("rms_norm", "standard", "eager")
         query = rms(query, norm_q_weight, eps=eps)
         key = rms(key, norm_k_weight, eps=eps)
     return query, key, value
@@ -215,7 +215,7 @@ def _sequential_dit_qkv(
     key = F.linear(hidden, k_weight, k_bias)
     value = F.linear(hidden, v_weight, v_bias)
     if norm_type == "rmsnorm":
-        rms = VeomniOp("rms_norm", "standard")
+        rms = VeomniOp("rms_norm", "standard", "eager")
         query = rms(query, norm_q_weight, eps=eps)
         key = rms(key, norm_k_weight, eps=eps)
     return query, key, value

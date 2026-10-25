@@ -19,6 +19,7 @@ import torch
 
 from tests.ops.tol import ATTN_ATOL, ATTN_RTOL
 from tests.ops.utils import require_nvidia_cuda
+from veomni.ops.kernels.dsa.sparse_indices import CompressedCandidates
 from veomni.utils.device import get_device_type
 
 
@@ -311,11 +312,19 @@ def test_sparse_attn_returns_non_differentiable_lse():
     kv = torch.randn(b, 128, d, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
     sink = torch.randn(heads, device=DEVICE, dtype=torch.float32, requires_grad=True)
     topk = torch.randint(0, 128, (b, s, 64), device=DEVICE, dtype=torch.int32)
+    # No full-resolution rows means no sliding window, so ``topk`` is every slot.
+    positions = torch.zeros(b, s, dtype=torch.long, device=DEVICE)
+    contract = {
+        "sliding_window": 1,
+        "compress_ratio": 1,
+        "candidates": CompressedCandidates(topk_indices=topk),
+        "sm_scale": d**-0.5,
+    }
 
-    out_only = sparse_attn_tilelang(q, kv, sink, topk, d**-0.5)
-    out, lse = sparse_attn_tilelang(q, kv, sink, topk, d**-0.5, return_lse=True)
+    out_only = sparse_attn_tilelang(q, kv[:, :0], kv, sink, positions, **contract)
+    out, lse = sparse_attn_tilelang(q, kv[:, :0], kv, sink, positions, **contract, return_lse=True)
     _, eager_lse = VeomniOp("dsa_attention", "deepseek_v4", "eager")(
-        q.detach(), kv.detach(), sink.detach(), topk, d**-0.5, return_lse=True
+        q.detach(), kv.detach()[:, :0], kv.detach(), sink.detach(), positions, **contract, return_lse=True
     )
 
     torch.testing.assert_close(out_only, out)

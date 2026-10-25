@@ -168,8 +168,14 @@ def get_model_class(model_config: PretrainedConfig):
     model_type = model_config.model_type
     modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend != "hf":
+        # A module built here is a graph participant, so prefer the subclass
+        # that carries the graph hooks; the HF-native class is the fallback.
         _, omni_model_registry, _ = _omni_registries()
         if model_type in set(omni_model_registry.valid_keys()):
+            from .seed_omni.modules import OMNI_ACCELERATED_MODEL_REGISTRY
+
+            if model_type in set(OMNI_ACCELERATED_MODEL_REGISTRY.valid_keys()):
+                return OMNI_ACCELERATED_MODEL_REGISTRY[model_type]()
             return omni_model_registry[model_type]()
         if model_type not in MODELING_REGISTRY.valid_keys():
             raise_unsupported_veomni_modeling(model_type)

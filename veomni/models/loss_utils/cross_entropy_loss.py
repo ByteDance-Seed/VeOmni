@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Modeling helpers around token-level ``cross_entropy_loss``.
 
@@ -192,12 +192,16 @@ def ForCausalLMLoss(
     target = target.to(device)
 
     hidden, weight, out_logits = _select_hidden_weight(logits, hidden_states, weights)
+    token_kwargs: dict[str, Any] = {}
+    if getattr(token_op, "impl", None) == "chunk_loss":
+        token_kwargs["chunk_size"] = chunk_size
     loss = token_op(
         hidden,
         target,
         weight,
         ignore_index=ignore_index,
         num_items_in_batch=num_items_in_batch,
+        **token_kwargs,
     )
     loss = _maybe_reduce_loss(
         loss,

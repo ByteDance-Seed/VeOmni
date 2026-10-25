@@ -25,7 +25,7 @@ shift and SP reduction stay in the caller. ``chunk_logprobs`` / top-k
 distill are not this kernel.
 """
 
-from ...platform import GpuKernelRequirement
+from ...platform import GpuKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
 from .cross_entropy_loss.standard import chunk_loss as ce_chunk
 from .cross_entropy_loss.standard import eager as ce_eager
@@ -55,6 +55,7 @@ register_op(
     description="Triton token-level MoE load-balancing loss",
     requirement=_GPU,
     requires=("triton",),
+    default=True,
 )
 
 register_op(
@@ -75,6 +76,7 @@ register_op(
     description="Liger Kernel token-level cross-entropy loss",
     requirement=_GPU,
     requires=("liger_kernel",),
+    default=True,
 )
 
 register_op(
@@ -84,4 +86,15 @@ register_op(
     ce_chunk.forward,
     ce_chunk.backward,
     description="Chunked token-level cross-entropy loss",
+)
+
+register_op(
+    "cross_entropy_loss",
+    "standard",
+    "chunk_loss",
+    ce_chunk.forward,
+    ce_chunk.backward,
+    description="Chunked token-level cross-entropy loss",
+    requirement=NpuKernelRequirement(),
+    default=True,
 )

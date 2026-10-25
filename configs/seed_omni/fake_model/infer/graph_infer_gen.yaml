@@ -1,0 +1,12 @@
+# Launcher-style generation FSM: one state running the whole chain, then done.
+# The convert-time form of the same graph lives in ../graph_infer.yaml, keyed by
+# scenario; a launcher names the scenario in `model.model_config.infer_graph`.
+initial: run
+
+states:
+  run:
+    body:
+      - { from: fake_module_a, to: fake_module_b }
+      - { from: fake_module_b, to: end }
+    transitions:
+      - { condition: { type: default }, next_state: done }

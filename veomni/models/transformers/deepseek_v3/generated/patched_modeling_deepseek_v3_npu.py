@@ -74,6 +74,7 @@ from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 from veomni.utils.moe_monitor import record_router_indices
 
@@ -119,7 +120,6 @@ class DeepseekV3RMSNorm(nn.Module):
 
 class DeepseekV3RotaryEmbedding(nn.Module):
     # [modified __init__] Capture rotary freq impl at construct time
-    @deprecate_kwarg("device", version="5.18")
     @deprecate_kwarg("device", version="5.18")
     def __init__(self, config: DeepseekV3Config, device=None):
         super().__init__()
@@ -203,7 +203,7 @@ class DeepseekV3MLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"}:
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,
@@ -300,9 +300,11 @@ class DeepseekV3Experts(nn.Module):
                 self.num_experts,
             )
         unused = self.gate_up_proj.new_empty(0)
+        # Eager keeps the fp32 router weights so it stays bitwise with HF's expert loop.
+        routing_weights = top_k_weights if self.veomni_moe.impl == "eager" else top_k_weights.to(hidden_states.dtype)
         return self.veomni_moe(
             hidden_states,
-            top_k_weights.to(hidden_states.dtype),
+            routing_weights,
             top_k_index,
             unused,
             unused,
@@ -700,7 +702,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         self.model = DeepseekV3Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        impl = resolve_op_impl("cross_entropy_loss_implementation")
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()

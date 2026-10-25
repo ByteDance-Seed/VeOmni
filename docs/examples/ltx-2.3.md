@@ -136,9 +136,10 @@ audio-video attention, and to the Gemma text connectors of the condition model, 
 instance-local `attention/standard` `VeomniOp` when each model is built:
 
 - `sdpa`: PyTorch SDPA for every call, including masked ones.
-- `flash_attention_2` / `flash_attention_3` and `flash_attention_2_hub` /
-  `flash_attention_3_hub`: VeOmni's FlashAttention adapter with the local or Hugging
+- `veomni_flash_attention_2` / `veomni_flash_attention_3` and
+  `veomni_flash_attention_2_hub` / `veomni_flash_attention_3_hub`: VeOmni's FlashAttention adapter with the local or Hugging
   Face Hub kernel for unmasked calls. Queries must be BF16/FP16 (or run under autocast).
+- Plain `flash_attention_2` / `flash_attention_3` select Transformers' native interfaces.
 - LTX masks are additive biases that the adapter passes only to SDPA. With any other
   backend (including `flash_attention_4`, flex and sage) masked calls run through SDPA
   and a warning is logged once.
