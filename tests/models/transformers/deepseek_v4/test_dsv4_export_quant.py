@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DSV4 export quantization must reject non-SM90 before importing TileLang."""
+"""DSV4 export quantization must reject unsupported GPUs before importing TileLang."""
 
 from __future__ import annotations
 
@@ -42,12 +42,20 @@ def test_export_quant_does_not_import_tilelang_eagerly():
     assert _ACT_QUANT not in sys.modules
 
 
+def _fake_gpu(monkeypatch, hip, capability, arch):
+    from veomni.ops.platform import gpu
+
+    monkeypatch.setattr(gpu.torch.version, "hip", hip, raising=False)
+    monkeypatch.setattr(gpu, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(gpu, "get_gpu_compute_capability", lambda: capability)
+    monkeypatch.setattr(gpu, "get_rocm_gcn_arch", lambda: arch)
+
+
 def test_export_wrappers_reject_pre_sm90_before_import(monkeypatch):
     sys.modules.pop(_ACT_QUANT, None)
     import veomni.models.transformers.deepseek_v4.export_quant as quant
 
-    monkeypatch.setattr(quant, "IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr(quant, "get_gpu_compute_capability", lambda: 89)
+    _fake_gpu(monkeypatch, None, 89, None)
 
     with pytest.raises(RuntimeError, match="SM90 or later"):
         quant.fp4_act_quant(torch.empty(0))
@@ -56,16 +64,14 @@ def test_export_wrappers_reject_pre_sm90_before_import(monkeypatch):
     assert _ACT_QUANT not in sys.modules
 
 
-def test_export_wrappers_reject_rocm_before_import(monkeypatch):
+def test_export_wrappers_reject_unvalidated_rocm_arch_before_import(monkeypatch):
     sys.modules.pop(_ACT_QUANT, None)
     import veomni.models.transformers.deepseek_v4.export_quant as quant
 
-    monkeypatch.setattr(quant.torch.version, "hip", "6.0", raising=False)
-    monkeypatch.setattr(quant, "IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr(quant, "get_gpu_compute_capability", lambda: 90)
+    _fake_gpu(monkeypatch, "6.0", 0, "gfx90a")
 
-    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+    with pytest.raises(RuntimeError, match="gfx942/gfx950"):
         quant.fp4_act_quant(torch.empty(0))
-    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+    with pytest.raises(RuntimeError, match="gfx942/gfx950"):
         quant.fp8_weight_quant(torch.empty(0))
     assert _ACT_QUANT not in sys.modules

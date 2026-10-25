@@ -39,7 +39,7 @@ from veomni.models.transformers.deepseek_v4.generated import patched_modeling_de
 from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as modeling_npu
 from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config, set_ops_config
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
+from veomni.utils.device import get_device_type
 
 
 DEVICE = get_device_type()
@@ -110,10 +110,18 @@ _EXPECTED_ACT_QUANT = {
 
 def _require_tilelang_cuda():
     pytest.importorskip("tilelang")
-    if torch.version.hip is not None or not IS_CUDA_AVAILABLE:
-        pytest.skip("DeepSeek V4 TileLang kernels require an NVIDIA CUDA GPU")
-    if get_gpu_compute_capability() < 90:
-        pytest.skip("DeepSeek V4 TileLang kernels require SM90 or later")
+    from veomni.ops.qat._hardware import is_tilelang_gpu_supported
+
+    if not is_tilelang_gpu_supported():
+        pytest.skip("DeepSeek V4 TileLang kernels require an SM90+ NVIDIA CUDA GPU or an AMD gfx942/gfx950 GPU")
+
+
+def _require_tilelang_fp4():
+    _require_tilelang_cuda()
+    from veomni.ops.qat._hardware import is_tilelang_fp4_gpu_supported
+
+    if not is_tilelang_fp4_gpu_supported():
+        pytest.skip("The TileLang FP4 quantizer requires an SM90+ NVIDIA CUDA GPU")
 
 
 def _qat_impl(value):
@@ -320,6 +328,8 @@ def test_kv_helper_quantizes_the_nope_channels_and_spares_the_rope_tail(monkeypa
 @pytest.mark.parametrize("expert_dtype", ["fp4", "fp8"])
 def test_expert_weight_recipe_follows_the_checkpoint_dtype(monkeypatch, expert_dtype):
     """V4-Flash ships FP4 experts; the geometry differs, not just the width."""
+    if expert_dtype == "fp4":
+        _require_tilelang_fp4()
     _require_tilelang_cuda()
     from veomni.ops.qat import fp4_fake_quant_weight, fp8_fake_quant_stacked_weight
 
@@ -343,9 +353,46 @@ def test_expert_weight_recipe_is_a_passthrough_while_disabled(monkeypatch):
     assert modeling_gpu.veomni_qat_fake_quant_expert_weight(weight, "fp4") is weight
 
 
+@pytest.fixture
+def isolated_qat_hardware_gate():
+    """``require_tilelang_*`` cache their first success per process; keep a simulated GPU out of that cache."""
+    from veomni.ops.qat import _hardware
+
+    _hardware.require_tilelang_gpu.cache_clear()
+    _hardware.require_tilelang_fp4_gpu.cache_clear()
+    yield
+    _hardware.require_tilelang_gpu.cache_clear()
+    _hardware.require_tilelang_fp4_gpu.cache_clear()
+
+
+def test_fp4_expert_qat_is_rejected_at_model_setup_on_rocm(monkeypatch, isolated_qat_hardware_gate):
+    """gfx950 runs the FP8 recipe but not the NVIDIA-only FP4 quantizer, so V4-Flash's FP4
+    experts fail when the model is built rather than at their first forward."""
+    from veomni.ops.platform import gpu
+
+    monkeypatch.setattr(gpu.torch.version, "hip", "6.0", raising=False)
+    monkeypatch.setattr(gpu, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(gpu, "get_gpu_compute_capability", lambda: 0)
+    monkeypatch.setattr(gpu, "get_rocm_gcn_arch", lambda: "gfx950")
+    monkeypatch.setattr(modeling_gpu, "resolve_qat_impl", _qat_impl("fp8_blockwise"))
+    config = SimpleNamespace(
+        num_local_experts=2,
+        hidden_size=256,
+        intermediate_size=128,
+        hidden_act="silu",
+        swiglu_limit=7.0,
+        expert_dtype="fp4",
+    )
+
+    with pytest.raises(RuntimeError, match="FP4 quantizer"):
+        modeling_gpu.DeepseekV4Experts(config)
+    config.expert_dtype = "fp8"
+    assert modeling_gpu.DeepseekV4Experts(config).qat_implementation == "fp8_blockwise"
+
+
 def test_expert_weights_reach_the_fused_kernel_quantized(monkeypatch):
     """Pin what the fused kernel is handed, since QAT is applied outside it."""
-    _require_tilelang_cuda()
+    _require_tilelang_fp4()
     from veomni.ops.qat import fp4_fake_quant_weight, fp8_fake_quant_act
 
     monkeypatch.setattr(modeling_gpu, "resolve_qat_impl", _qat_impl("fp8_blockwise"))
@@ -417,7 +464,7 @@ def test_expert_weight_gradients_survive_the_straight_through_estimator():
     and writes gradients shaped like it, so the gradient has to travel back
     through the fake-quant node to land on the parameter.
     """
-    _require_tilelang_cuda()
+    _require_tilelang_fp4()
     config = SimpleNamespace(
         num_local_experts=2,
         hidden_size=256,

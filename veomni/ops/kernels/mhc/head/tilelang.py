@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""mHC head TileKernels adapter (SM90+)."""
+"""mHC head TileKernels adapter (SM90+ NVIDIA, gfx942/gfx950 AMD)."""
 
 from __future__ import annotations
 

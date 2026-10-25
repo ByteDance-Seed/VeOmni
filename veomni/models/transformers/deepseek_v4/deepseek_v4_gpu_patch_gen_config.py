@@ -75,6 +75,7 @@ from veomni.ops.qat import (
     fp8_fake_quant_stacked_weight,
     qat_linear,
 )
+from veomni.ops.qat._hardware import require_tilelang_fp4_gpu
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs, MoeModelOutputWithIndexerKL
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
@@ -126,6 +127,7 @@ config.add_import(
         "qat_linear",
     ],
 )
+config.add_import("veomni.ops.qat._hardware", names=["require_tilelang_fp4_gpu"])
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "load_balancing_loss"],
@@ -1724,6 +1726,9 @@ class PatchedDeepseekV4Experts(nn.Module):
         self.expert_dtype = getattr(config, "expert_dtype", "fp8")
         self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
         self.qat_implementation = resolve_qat_impl()
+        if self.qat_implementation != "none" and self.expert_dtype == "fp4":
+            # Reject hardware without the FP4 quantizer at model setup, not at the first expert forward.
+            require_tilelang_fp4_gpu()
 
     def forward(
         self,

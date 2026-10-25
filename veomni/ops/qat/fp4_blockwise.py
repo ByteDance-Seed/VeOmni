@@ -30,7 +30,7 @@ The quantization path requires a BF16 operand on an NVIDIA SM90 or later GPU.
 import torch
 from torch.distributed.tensor import DTensor
 
-from ._hardware import require_tilelang_sm90
+from ._hardware import require_tilelang_fp4_gpu
 
 
 __all__ = [
@@ -48,7 +48,7 @@ class _Fp4FakeQuantWeight(torch.autograd.Function):
     @staticmethod
     def forward(ctx, weight: torch.Tensor, block_size: int) -> torch.Tensor:
         """Return the quantize-dequantize round trip for ``weight``."""
-        require_tilelang_sm90()
+        require_tilelang_fp4_gpu()
         from .quant import fp4_act_quant
 
         return fp4_act_quant(weight.detach(), block_size, dequant=True)

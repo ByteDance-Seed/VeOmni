@@ -22,13 +22,13 @@ from __future__ import annotations
 
 import torch
 
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+from veomni.ops.qat._hardware import TILELANG_GPU_DESCRIPTION, is_tilelang_gpu_supported
 
 
-def _require_tilelang_sm90() -> None:
-    """Require the NVIDIA architecture supported by the TileLang target kernel."""
-    if torch.version.hip is not None or not IS_CUDA_AVAILABLE or get_gpu_compute_capability() < 90:
-        raise RuntimeError("DeepSeek V4 TileLang kernels require an SM90 or later NVIDIA CUDA GPU")
+def _require_tilelang_gpu() -> None:
+    """Require a GPU supported by the TileLang target kernel."""
+    if not is_tilelang_gpu_supported():
+        raise RuntimeError(f"DeepSeek V4 TileLang kernels require {TILELANG_GPU_DESCRIPTION}")
 
 
 def sparse_mqa_target_fwd(
@@ -44,7 +44,7 @@ def sparse_mqa_target_fwd(
     including the sliding window and the folded attention sink. The returned
     tensor is unnormalised; L1-normalise in the caller.
     """
-    _require_tilelang_sm90()
+    _require_tilelang_gpu()
     from .vendor.tilelang_sparse_mla_target import sparse_mqa_target_fwd_interface
 
     return sparse_mqa_target_fwd_interface(q, kv, topk_idxs, lse, sm_scale)
@@ -58,8 +58,8 @@ def sparse_attn_tilelang(
     sm_scale: float | None = None,
     return_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Sparse MQA over selected gathered KV entries via TileLang (SM90+ only)."""
-    _require_tilelang_sm90()
+    """Sparse MQA over selected gathered KV entries via TileLang."""
+    _require_tilelang_gpu()
     from .vendor.tilelang_sparse_mla import sparse_attn_tilelang as _impl
 
     return _impl(q, kv, attn_sink, topk_idxs, sm_scale=sm_scale, return_lse=return_lse)

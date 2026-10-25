@@ -43,6 +43,7 @@ from tests.ops.utils import (
     assert_gradient_direction_and_scale,
     cosine_similarity,
     is_nvidia_cuda_available,
+    is_tilelang_gpu_available,
     make_grad_leaves,
 )
 from veomni.ops import resolve_op
@@ -68,7 +69,7 @@ from veomni.utils.device import IS_CUDA_AVAILABLE
 
 # Installed Transformers implementations provide the DeepSeek-V4 and GLM eager references.
 
-_TILELANG_AVAILABLE = is_nvidia_cuda_available(min_cc=90) and importlib.util.find_spec("tilelang") is not None
+_TILELANG_AVAILABLE = is_tilelang_gpu_available() and importlib.util.find_spec("tilelang") is not None
 _GLM_FUSED_HARDWARE_AVAILABLE = is_nvidia_cuda_available(min_cc=90)
 
 
@@ -1201,7 +1202,9 @@ def test_dsa_attention_glm_eager_matches_official_hf_causal_plus_scatter():
         torch.testing.assert_close(actual, expected, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-@pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="DeepSeek V4 TileLang requires SM90+ NVIDIA CUDA")
+@pytest.mark.skipif(
+    not _TILELANG_AVAILABLE, reason="DeepSeek V4 TileLang requires SM90+ NVIDIA CUDA or AMD gfx942/gfx950"
+)
 def test_dsa_attention_tilelang_matches_eager():
     """TileLang sparse MQA matches eager, including repeated candidate slots."""
     torch.manual_seed(4)
@@ -1232,7 +1235,9 @@ def test_dsa_attention_tilelang_matches_eager():
     torch.testing.assert_close(sink_t.grad, sink_e.grad, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="DeepSeek V4 TileLang requires SM90+ NVIDIA CUDA")
+@pytest.mark.skipif(
+    not _TILELANG_AVAILABLE, reason="DeepSeek V4 TileLang requires SM90+ NVIDIA CUDA or AMD gfx942/gfx950"
+)
 def test_dsa_indexer_tilelang_matches_eager():
     """TileLang indexer matches the HF-aligned eager row."""
     torch.manual_seed(5)

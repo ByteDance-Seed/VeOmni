@@ -19,7 +19,7 @@ import inspect
 import pytest
 import torch
 
-from tests.ops.utils import cosine_similarity, require_nvidia_cuda
+from tests.ops.utils import cosine_similarity, require_tilelang_gpu
 from veomni.utils.device import get_device_type
 
 
@@ -35,7 +35,7 @@ def _indexer_reference(q, k, weights, topk_indices):
 
 
 def test_tilelang_indexer_non_power_of_two_topk_forward_backward():
-    require_nvidia_cuda("tilelang", min_cc=90)
+    require_tilelang_gpu("tilelang")
     from veomni.ops.kernels.dsa.vendor.tilelang_indexer import v4_lighting_indexer
 
     torch.manual_seed(0)
@@ -69,7 +69,7 @@ def test_tilelang_indexer_non_power_of_two_topk_forward_backward():
 
 
 def test_tilelang_indexer_packed_forward_backward():
-    require_nvidia_cuda("tilelang", min_cc=90)
+    require_tilelang_gpu("tilelang")
     from veomni.ops.kernels.dsa.vendor.tilelang_indexer import v4_lighting_indexer
 
     torch.manual_seed(4)
@@ -120,7 +120,7 @@ def test_tilelang_indexer_packed_forward_backward():
 
 
 def test_tilelang_indexer_rejects_unsupported_head_count():
-    require_nvidia_cuda("tilelang", min_cc=90)
+    require_tilelang_gpu("tilelang")
     from veomni.ops.kernels.dsa.vendor.tilelang_indexer import v4_lighting_indexer
 
     q = torch.empty(8, 1, 7, 128, device=DEVICE, dtype=torch.bfloat16)
@@ -146,8 +146,12 @@ def _sparse_attention_reference(q, kv, sinks, indices, scale):
 
 def test_tilelang_sparse_attention_forward_pipelines_the_gather_without_changing_output():
     """Pipelining the forward's sparse gather must stay legal, real, and exact."""
-    require_nvidia_cuda("tilelang", min_cc=90)
-    from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_fwd import sparse_mqa_fwd, sparse_mqa_fwd_interface
+    require_tilelang_gpu("tilelang")
+    from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_fwd import (
+        fit_forward_tiling,
+        sparse_mqa_fwd,
+        sparse_mqa_fwd_interface,
+    )
 
     torch.manual_seed(4)
     batch, seqlen, heads, dim, kv_len, topk = 1, 64, 8, 512, 128, 640
@@ -159,9 +163,14 @@ def test_tilelang_sparse_attention_forward_pipelines_the_gather_without_changing
     indices[..., 63::64] = kv_len
     scale = dim**-0.5
 
-    pipelined = sparse_mqa_fwd(heads, dim, topk, scale, num_stages=1)
-    serial = sparse_mqa_fwd(heads, dim, topk, scale, num_stages=0)
-    assert "cp_async_gs" in pipelined.get_kernel_source()
+    # The shipped tile on Hopper/gfx950; gfx942's 64 KB LDS needs a narrower gather block.
+    tiling = fit_forward_tiling(heads, dim, num_stages=1)
+    pipelined = sparse_mqa_fwd(heads, dim, topk, scale, num_stages=1, **tiling)
+    serial = sparse_mqa_fwd(heads, dim, topk, scale, num_stages=0, **tiling)
+    # TileLang's HIP backend does not lower this indexed gather to an async copy, so on
+    # ROCm a pipelined gather is only multi-buffered and there is no async copy to find.
+    if torch.version.hip is None:
+        assert "cp_async_gs" in pipelined.get_kernel_source()
     assert "cp_async_gs" not in serial.get_kernel_source()
 
     expected_out, expected_lse = serial(q, kv, sinks, indices)
@@ -169,16 +178,26 @@ def test_tilelang_sparse_attention_forward_pipelines_the_gather_without_changing
         pipelined(q, kv, sinks, indices),
         sparse_mqa_fwd_interface(q, kv, sinks, indices, scale, num_stages=1),
     ):
-        assert torch.equal(out, expected_out)
-        assert torch.equal(lse, expected_lse)
+        if torch.version.hip is None:
+            assert torch.equal(out, expected_out)
+            assert torch.equal(lse, expected_lse)
+        else:
+            # The interface pads 8 heads to 16, and on ROCm that kernel rounds differently
+            # from the 8-head one: on gfx950 the odd LSE lands one ulp apart, and on gfx942
+            # a few outputs land a bf16 ulp of the attended values (~2**-10) apart as well.
+            torch.testing.assert_close(out, expected_out, rtol=2**-7, atol=2**-10)
+            torch.testing.assert_close(lse, expected_lse, rtol=1e-6, atol=0)
+    # Pipelining alone changes no arithmetic, so the 8-head kernels agree exactly.
+    assert torch.equal(pipelined(q, kv, sinks, indices)[0], expected_out)
 
     wide_heads = 64
     wide_q = torch.randn(batch, seqlen, wide_heads, dim, device=DEVICE, dtype=torch.bfloat16)
     wide_sinks = torch.randn(wide_heads, device=DEVICE)
+    wide_tiling = fit_forward_tiling(wide_heads, dim, num_stages=1)
     deepest = None
     for depth in range(1, 9):
         try:
-            candidate = sparse_mqa_fwd(wide_heads, dim, topk, scale, num_stages=depth)
+            candidate = sparse_mqa_fwd(wide_heads, dim, topk, scale, num_stages=depth, **wide_tiling)
         except AssertionError as exc:
             assert "shared memory per block" in str(exc)
             break
@@ -189,6 +208,47 @@ def test_tilelang_sparse_attention_forward_pipelines_the_gather_without_changing
     assert deepest is not None, "the guard rejected even a single-stage gather"
     deep_out, _ = deepest(wide_q, kv, wide_sinks, indices)
     assert torch.isfinite(deep_out).all().item()
+
+
+@pytest.mark.parametrize(
+    ("smem", "fwd_16", "fwd_64", "bwd", "indexer", "target_16", "target_64"),
+    [
+        # Hopper's opt-in 227 KB and gfx950's 160 KB keep every shipped tile.
+        (232448, (64, 256, 64), (64, 256, 64), (32, 2, True), (256, 3), (64, 256, 16), (64, 256, 64)),
+        (163840, (64, 256, 64), (64, 256, 64), (32, 2, True), (256, 1), (64, 256, 16), (64, 256, 64)),
+        # gfx942's 64 KB LDS; the indexer-loss target sums 64 heads over two 32-head chunks.
+        (65536, (32, 128, 64), (32, 128, 16), (16, 4, False), (64, 1), (32, 128, 16), (16, 128, 32)),
+    ],
+    ids=("hopper", "gfx950", "gfx942"),
+)
+def test_tilelang_tilings_follow_the_shared_memory_budget(
+    monkeypatch, smem, fwd_16, fwd_64, bwd, indexer, target_16, target_64
+):
+    """The tile selection is pure arithmetic on the device limit, so pin it without a GPU.
+
+    The large budgets are the regression guard: a device that hosts the shipped tile
+    must compile exactly the kernel it did before the fallback existed.
+    """
+    pytest.importorskip("tilelang")
+    from veomni.ops.kernels.dsa.vendor import (
+        tilelang_indexer_fwd,
+        tilelang_sparse_mla_bwd,
+        tilelang_sparse_mla_fwd,
+        tilelang_sparse_mla_target,
+    )
+
+    for module in (tilelang_indexer_fwd, tilelang_sparse_mla_bwd, tilelang_sparse_mla_fwd, tilelang_sparse_mla_target):
+        monkeypatch.setattr(module, "get_max_shared_memory_per_block", lambda: smem)
+    for heads, expected in ((16, fwd_16), (64, fwd_64)):
+        tiling = tilelang_sparse_mla_fwd.fit_forward_tiling(heads, 512)
+        assert (tiling["block_I"], tiling["threads"], tiling["block_H"]) == expected
+    tiling = tilelang_sparse_mla_bwd.fit_backward_tiling(16, 512)
+    assert (tiling["block_size"], tiling["split_store"], tiling["stage_dq"]) == bwd
+    # V4's indexer: 64 heads of dim 128, so a 2-query Q tile of 128 rows, in bf16.
+    assert tilelang_indexer_fwd.fit_indexer_tiling(128, 128, 2) == indexer
+    for heads, expected in ((16, target_16), (64, target_64)):
+        tiling = tilelang_sparse_mla_target.fit_target_tiling(heads, 512)
+        assert (tiling["block_I"], tiling["threads"], tiling["head_chunk"]) == expected
 
 
 def test_tilelang_sparse_attention_forward_defaults_to_no_pipelining():
@@ -202,7 +262,7 @@ def test_tilelang_sparse_attention_forward_defaults_to_no_pipelining():
 
 
 def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
-    require_nvidia_cuda("tilelang", min_cc=90)
+    require_tilelang_gpu("tilelang")
     from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla import sparse_attn_tilelang
 
     torch.manual_seed(1)
@@ -265,7 +325,7 @@ def test_tilelang_sparse_attention_backward_matches_reference_on_wide_head_tile(
     and eight heads yields ``block_H=16`` and a 128-thread CTA. Thirty-two heads
     is the smallest case that reaches the 256-thread path.
     """
-    require_nvidia_cuda("tilelang", min_cc=90)
+    require_tilelang_gpu("tilelang")
     from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla import sparse_attn_tilelang
 
     torch.manual_seed(6)
@@ -292,7 +352,7 @@ def test_tilelang_sparse_attention_backward_matches_reference_on_wide_head_tile(
 
 
 def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monkeypatch):
-    require_nvidia_cuda("tilelang", min_cc=90)
+    require_tilelang_gpu("tilelang")
     from veomni.ops.kernels.dsa.vendor import tilelang_sparse_mla_bwd as sparse_mla_bwd
     from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla import sparse_attn_tilelang
 
@@ -300,9 +360,9 @@ def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monk
     requested_kv_lengths = []
     original_bwd = sparse_mla_bwd.bwd
 
-    def tracking_bwd(B, S, S_kv, *args, **kwargs):
+    def tracking_bwd(B, S_kv, *args, **kwargs):
         requested_kv_lengths.append(S_kv)
-        return original_bwd(B, S, S_kv, *args, **kwargs)
+        return original_bwd(B, S_kv, *args, **kwargs)
 
     monkeypatch.setattr(sparse_mla_bwd, "bwd", tracking_bwd)
 

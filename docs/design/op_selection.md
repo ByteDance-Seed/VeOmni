@@ -20,7 +20,7 @@ If a field is not in this table, it is not an op-selection knob.
 | Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `aiter`, `magi_attention`, `sage_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` rewrite + model `__init__` via `VeomniOp("attention", "standard", config._attn_implementation)` stored on the attention module |
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `triton` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
-| mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+), `cann` (DeepSeek-V4, Ascend) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
+| mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+ or gfx942/gfx950), `cann` (DeepSeek-V4, Ascend) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
@@ -32,10 +32,12 @@ If a field is not in this table, it is not an op-selection knob.
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `triton`, `fla_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU) | `"triton"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `deepgemm_fp8` (SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
-| QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Model `__init__` stores `self.qat_implementation`; patched helpers consume that bound recipe |
+| QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+ or gfx942/gfx950; FP4 experts SM90+ only) | `"none"` | Model `__init__` stores `self.qat_implementation`; patched helpers consume that bound recipe |
 
 `qat_implementation` has no per-model registry variants. `fp8_blockwise` is
-rejected at config-parse time on anything but an SM90+ NVIDIA CUDA GPU.
+rejected at config-parse time on anything but an SM90+ NVIDIA CUDA GPU or an
+AMD gfx942/gfx950 GPU. FP4 routed experts additionally require SM90+ NVIDIA and
+are rejected when the experts module is built.
 It also cannot be combined with `moe_implementation: deepgemm_fp8`; that
 backend requires `qat_implementation: none` because it already quantizes
 the expert GEMM operands. Conflicting selections raise at config-parse time.
@@ -251,9 +253,10 @@ model:
     mhc_implementation: tilelang
 ```
 
-All three `tilelang` paths require NVIDIA SM90 or later. `mhc_implementation` defaults
-to `eager` and never silently falls back after `tilelang` is selected. The mHC
-implementation is provided by the `tile-kernels` package.
+All three `tilelang` paths require NVIDIA SM90 or later, or AMD gfx942/gfx950.
+`mhc_implementation` defaults to `eager` and never silently falls back after
+`tilelang` is selected. The mHC implementation is provided by the
+`tile-kernels` package.
 TileKernels' training path supports forward and backward with BF16 activations
 and DeepSeek V4's `hc_mult=4` layout.
 
@@ -519,9 +522,10 @@ separate `ModuleList` fork. LoRA experts follow the wrapped module's
 unavailable on the device.
 
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
-SM90+ `tilelang` and Ascend `cann` indexer and attention implementations, plus
-ROCm `triton` attention. Its MoE path uses the independent
-`moe_implementation` selection and therefore defaults to `fused_triton` on GPU.
+`tilelang` (SM90+ NVIDIA or gfx942/gfx950 AMD) and Ascend `cann` indexer and
+attention implementations, plus ROCm `triton` attention. Its MoE path uses the
+independent `moe_implementation` selection and therefore defaults to
+`fused_triton` on GPU.
 The v4-specific patched experts path passes the merged `gate_up_proj` tensor
 directly to the local `VeomniOp` and forwards `swiglu_limit` so every
 supported fused backend preserves V4's clamped SwiGLU pre-activation semantics.

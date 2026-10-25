@@ -65,6 +65,28 @@ from veomni.models.transformers.qwen3_vl_moe.checkpoint_tensor_converter import 
 )
 
 
+@pytest.fixture
+def isolated_qat_hardware_gate():
+    """``require_tilelang_*`` cache their first success per process; keep a simulated GPU out of that cache."""
+    from veomni.ops.qat import _hardware
+
+    _hardware.require_tilelang_gpu.cache_clear()
+    _hardware.require_tilelang_fp4_gpu.cache_clear()
+    yield
+    _hardware.require_tilelang_gpu.cache_clear()
+    _hardware.require_tilelang_fp4_gpu.cache_clear()
+
+
+def _fake_gpu(monkeypatch, hip, capability, arch):
+    """Pretend the current GPU is an NVIDIA one of ``capability`` (``hip=None``) or a ROCm one of ``arch``."""
+    from veomni.ops.platform import gpu
+
+    monkeypatch.setattr(gpu.torch.version, "hip", hip, raising=False)
+    monkeypatch.setattr(gpu, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(gpu, "get_gpu_compute_capability", lambda: capability)
+    monkeypatch.setattr(gpu, "get_rocm_gcn_arch", lambda: arch)
+
+
 # ---------------------------------------------------------------------------
 # Tests for base protocol helpers
 # ---------------------------------------------------------------------------
@@ -986,11 +1008,8 @@ class TestDeepseekV4ConverterConvert:
         assert set(exported) == {"layers.0.attn.wq_a.weight", "layers.0.attn.wq_a.scale"}
 
     @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-    def test_validate_deepseek_v4_export_quant_support_preflight(self, monkeypatch):
-        from veomni.models.transformers.deepseek_v4 import export_quant
-
-        monkeypatch.setattr(export_quant, "IS_CUDA_AVAILABLE", True)
-        monkeypatch.setattr(export_quant, "get_gpu_compute_capability", lambda: 89)
+    def test_validate_deepseek_v4_export_quant_support_preflight(self, monkeypatch, isolated_qat_hardware_gate):
+        _fake_gpu(monkeypatch, None, 89, None)
 
         # Unquantized mapping (no .scale keys) succeeds on non-SM90
         validate_deepseek_v4_export_quant_support({"layers.0.attn.wq_a.weight": 1, "embed.weight": 1})
@@ -1008,21 +1027,29 @@ class TestDeepseekV4ConverterConvert:
             )
 
         # On SM90+, preflight validation succeeds
-        monkeypatch.setattr(export_quant.torch.version, "hip", None, raising=False)
-        monkeypatch.setattr(export_quant, "get_gpu_compute_capability", lambda: 90)
+        _fake_gpu(monkeypatch, None, 90, None)
         validate_deepseek_v4_export_quant_support(scaled_mapping)
         DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS).validate_export_support(
             fqn_to_index_mapping=scaled_mapping
         )
 
+        # On gfx950 the FP8 quantizers run, but routed experts exported as FP4 still need the FP4 quantizer
+        _fake_gpu(monkeypatch, "6.0", 0, "gfx950")
+        fp4_mapping = {**scaled_mapping, "layers.0.ffn.experts.0.w1.weight": 1, "layers.0.ffn.experts.0.w1.scale": 1}
+        validate_deepseek_v4_export_quant_support(fp4_mapping, expert_dtype="fp8")
+        with pytest.raises(RuntimeError, match="FP4 quantizer"):
+            validate_deepseek_v4_export_quant_support(fp4_mapping, expert_dtype="fp4")
+        # expert_dtype defaults to the model config's
+        model = SimpleNamespace(config=SimpleNamespace(expert_dtype="fp4"), _veomni_fqn_to_index_mapping=fp4_mapping)
+        with pytest.raises(RuntimeError, match="FP4 quantizer"):
+            DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS).validate_export_support(model)
+
     @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_checkpoint_manager_skips_sm90_preflight_on_legacy_save_routes(self, monkeypatch):
         from veomni.models.checkpoint.manager import ModelCheckpointManager
-        from veomni.models.transformers.deepseek_v4 import export_quant
         from veomni.utils import save_safetensor_utils
 
-        monkeypatch.setattr(export_quant, "IS_CUDA_AVAILABLE", True)
-        monkeypatch.setattr(export_quant, "get_gpu_compute_capability", lambda: 89)
+        _fake_gpu(monkeypatch, None, 89, None)
         monkeypatch.setattr("veomni.models.checkpoint.manager.build_checkpointer", lambda **kwargs: object())
 
         scaled_mapping = {"layers.0.attn.wq_a.weight": 1, "layers.0.attn.wq_a.scale": 1}
