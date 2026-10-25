@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Qwen2.5-VL text, image, and video Hugging Face parity tests.
 
@@ -31,6 +31,7 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLForConditionalGeneration as HFQwen2_5_VLForConditionalGeneration,
 )
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
@@ -39,6 +40,9 @@ from tests.models.compare import (
     qwen_video_inputs,
 )
 from tests.models.tiny_configs import tiny_qwen2_5_vl_config as _tiny_config
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _build_ours(config: Qwen2_5_VLConfig, ops: SimpleNamespace | None = None):

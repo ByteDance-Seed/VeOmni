@@ -20,10 +20,9 @@ from veomni.ops.config import resolve_op_impl
 
 from .core import (
     bind_minimax_attention,
-    gradient_checkpoint_forward,
     is_flash_attn_impl,
+    is_sdpa_attn_impl,
     minimax_attention,
-    packed_block_diag_mask,
 )
 
 
@@ -157,9 +156,9 @@ class MiniMaxH3Attention(nn.Module):
         self.k_norm = VeomniRMSNorm(attention_head_dim, eps=qk_norm_eps)
         self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
         # Packed FA is bound later. FA3/FA4 cannot be constructed on NPU or pre-SM90.
-        impl = resolve_op_impl("attn_implementation")
+        impl = resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
         if is_flash_attn_impl(impl):
-            impl = "sdpa"
+            impl = "veomni_sdpa"
         bind_minimax_attention(self, is_causal=False, impl=impl)
         # 3-axis rope is shorter than head_dim (96 vs 128 in production). q/k are [S, H, D].
         self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
@@ -174,44 +173,75 @@ class MiniMaxH3Attention(nn.Module):
         max_seqlen: int | None,
         valid_seqlen: int,
     ) -> torch.Tensor:
-        """One packed attention call. FA uses varlen kwargs; SDPA uses a block-diag mask."""
+        """One FlashAttention varlen call over the packed multi-sample sequence."""
         total = q.shape[0]
         query = q[:valid_seqlen].unsqueeze(0).transpose(1, 2)
         key = k[:valid_seqlen].unsqueeze(0).transpose(1, 2)
         value = v[:valid_seqlen].unsqueeze(0).transpose(1, 2)
         max_seqlen = valid_seqlen if max_seqlen is None else max_seqlen
-        if isinstance(cu_seqlens, _PackedBounds):
-            cu_seqlens = cu_seqlens.device
-        elif not isinstance(cu_seqlens, torch.Tensor):
+        if not isinstance(cu_seqlens, torch.Tensor):
             cu_seqlens = torch.tensor(cu_seqlens, device=query.device, dtype=torch.int32)
         cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32)
-        if is_flash_attn_impl(self.config._attn_implementation):
-            packed = minimax_attention(
-                self,
-                query,
-                key,
-                value,
-                scaling=self.softmax_scale,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
-                max_length_q=max_seqlen,
-                max_length_k=max_seqlen,
-            )
-        else:
-            packed = minimax_attention(
-                self,
-                query,
-                key,
-                value,
-                attention_mask=packed_block_diag_mask(cu_seqlens, valid_seqlen, query.device),
-                scaling=self.softmax_scale,
-            )
+        packed = minimax_attention(
+            self,
+            query,
+            key,
+            value,
+            scaling=self.softmax_scale,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+        )
         packed = packed.squeeze(0).transpose(0, 1)
         if packed.shape[0] == total:
             return packed
-        out = q.new_empty(total, q.shape[1], q.shape[2])
+        # Zero uncovered SP rows so discarded outputs cannot poison parameter gradients.
+        out = q.new_zeros(total, q.shape[1], q.shape[2])
         out[:valid_seqlen] = packed
         return out
+
+    def _segment_attention(self, q, k, v, *, cu_seqlens, compatibility_mode=False):
+        """Attend inside each segment with the bound handle; SDPA when SDPA is bound or for packed compatibility."""
+        if compatibility_mode or is_sdpa_attn_impl(self.config._attn_implementation):
+            return _sdpa_varlen_attention(
+                q,
+                k,
+                v,
+                cu_seqlens=cu_seqlens,
+                softmax_scale=self.softmax_scale,
+                compatibility_mode=compatibility_mode,
+            )
+        bounds = tuple(cu_seqlens.tolist()) if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
+        # Zero uncovered SP rows so discarded outputs cannot poison parameter gradients.
+        out = torch.zeros_like(q)
+        for start, stop in zip(bounds[:-1], bounds[1:]):
+            if stop == start:
+                continue
+            segment = minimax_attention(
+                self,
+                q[start:stop].transpose(0, 1).unsqueeze(0),
+                k[start:stop].transpose(0, 1).unsqueeze(0),
+                v[start:stop].transpose(0, 1).unsqueeze(0),
+                scaling=self.softmax_scale,
+            )
+            out[start:stop] = segment.squeeze(0).transpose(0, 1)
+        return out
+
+    def _attention(self, q, k, v, *, cu_seqlens, max_seqlen, valid_seqlen):
+        """Varlen flash for packed multi-sample bounds, per-segment attention otherwise."""
+        packed_attention = isinstance(cu_seqlens, _PackedBounds)
+        if packed_attention and is_flash_attn_impl(self.config._attn_implementation):
+            return self._run_packed_attention(
+                q, k, v, cu_seqlens=cu_seqlens.device, max_seqlen=max_seqlen, valid_seqlen=valid_seqlen
+            )
+        return self._segment_attention(
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens.host if packed_attention else cu_seqlens,
+            compatibility_mode=packed_attention,
+        )
 
     def forward(self, x, *, rope_cos, rope_sin, cu_seqlens, max_seqlen=None, valid_seqlen=None, use_ulysses=False):
         if valid_seqlen is None:
@@ -240,6 +270,7 @@ class MiniMaxH3Attention(nn.Module):
             out_blocks = []
             o_wait, o_prev = None, None
             for i, b in enumerate(blocks):
+                w_next = None
                 if i + 1 < nb:  # launch block i+1: transfers while block i computes
                     w_next = _all_to_all_single(blocks[i + 1], 1, 0, sp_group, async_op=True)
                 full = _AsyncA2A.apply(w, b, 1, 0, sp_group)  # [SEQ, 1, 3, d]: this rank's head of block i
@@ -247,7 +278,7 @@ class MiniMaxH3Attention(nn.Module):
                 k = self.k_norm(full[:, :, 1])
                 if rope_cos is not None:
                     q, k = self.veomni_rope(q, k, rope_cos, rope_sin)
-                o = self._run_packed_attention(
+                o = self._attention(
                     q,
                     k,
                     full[:, :, 2],
@@ -270,20 +301,7 @@ class MiniMaxH3Attention(nn.Module):
             k = self.k_norm(k)
             if rope_cos is not None:
                 q, k = self.veomni_rope(q, k, rope_cos, rope_sin)
-            packed_attention = isinstance(cu_seqlens, _PackedBounds)
-            if packed_attention and is_flash_attn_impl(self.config._attn_implementation):
-                out = self._run_packed_attention(
-                    q, k, v, cu_seqlens=cu_seqlens.device, max_seqlen=max_seqlen, valid_seqlen=valid_seqlen
-                )
-            else:
-                out = _sdpa_varlen_attention(
-                    q,
-                    k,
-                    v,
-                    cu_seqlens=cu_seqlens.host if packed_attention else cu_seqlens,
-                    softmax_scale=self.softmax_scale,
-                    compatibility_mode=packed_attention,
-                )
+            out = self._attention(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, valid_seqlen=valid_seqlen)
         out = out.reshape(total, self.num_heads * self.head_dim)
         return self.out_proj(out)
 
@@ -503,6 +521,10 @@ class MiniMaxH3DiT(nn.Module):
     ):
         super().__init__()
         self._block_offload_enabled = False
+        # HF's marker: ``gradient_checkpointing_enable()`` walks ``modules()`` and writes both
+        # this flag and ``_gradient_checkpointing_func`` here, so the block loop below reads the
+        # run's setting and the policy's per-block decisions without owning a strategy itself.
+        self.gradient_checkpointing = False
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_channels_latents = latents_dim
@@ -626,8 +648,6 @@ class MiniMaxH3DiT(nn.Module):
         img_pos_for_infer_output_info,
         packed_seq_params,
         refiner_packed_seq_params,
-        use_gradient_checkpointing=False,
-        use_gradient_checkpointing_offload=False,
         update_audio_mask=None,
         skip_mask_out_condition=False,
         packed_batch=False,
@@ -649,8 +669,8 @@ class MiniMaxH3DiT(nn.Module):
         sp_group = get_ulysses_sequence_parallel_group()
         sp_world = dist.get_world_size(sp_group) if sp_group is not None else 1
         sp_rank = dist.get_rank(sp_group) if sp_group is not None else 0
-        if packed_batch and (sp_world != 1 or self._block_offload_enabled or use_gradient_checkpointing_offload):
-            raise ValueError("H3 multi-sample packing does not support sequence parallelism or offload.")
+        if packed_batch and (sp_world != 1 or self._block_offload_enabled):
+            raise ValueError("H3 multi-sample packing does not support sequence parallelism or block offload.")
 
         cu_seqlens = packed_seq_params["cu_seqlens_q"].to(torch.int32)
         max_seqlen = int(packed_seq_params["max_seqlen_q"])
@@ -720,6 +740,18 @@ class MiniMaxH3DiT(nn.Module):
         # dropped by the index_select below.
         cu_seqlens = _PackedBounds(cu_seqlens.to(device), cu_host) if packed_batch else cu_host
         block_swap = self._block_swap if self._block_offload_enabled else 0
+        # Every block takes the same arguments; only the recompute decision differs, and
+        # the bound policy folds that into ``self._gradient_checkpointing_func``.
+        block_kwargs = {
+            "t_emb": t_emb,
+            "combined_indices": combined_indices,
+            "rope_cos": rope_cos,
+            "rope_sin": rope_sin,
+            "cu_seqlens": cu_seqlens,
+            "max_seqlen": max_seqlen,
+            "valid_seqlen": seq_len,
+            "use_ulysses": sp_world > 1,
+        }
         for i, block in enumerate(self.blocks):
             if self._block_offload_enabled:
                 if i == 0:
@@ -730,20 +762,10 @@ class MiniMaxH3DiT(nn.Module):
                         b.to("cpu")
                     for b in self.blocks[block_swap:]:
                         b.to(device)
-            hidden = gradient_checkpoint_forward(
-                block,
-                use_gradient_checkpointing,
-                use_gradient_checkpointing_offload,
-                hidden,
-                t_emb=t_emb,
-                combined_indices=combined_indices,
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                valid_seqlen=seq_len,
-                use_ulysses=sp_world > 1,
-            )
+            if self.gradient_checkpointing:
+                hidden = self._gradient_checkpointing_func(block, hidden, **block_kwargs)
+            else:
+                hidden = block(hidden, **block_kwargs)
 
         if self._block_offload_enabled:
             for b in self.blocks[block_swap:]:
@@ -754,11 +776,14 @@ class MiniMaxH3DiT(nn.Module):
         if sp_group is not None:
             # Rebuild the full packed sequence so the output position
             # index_select / update_mask below see the original layout. The
-            # backward splits without all-reduce (grad_scale=False,
-            # sum_grad=False): the downstream loss is replicated across the SP
-            # ranks, so a sum would multiply the gradient by the SP world size.
-            video_logits = _Gather.apply(sp_group, video_logits, 0, False, False)
-            audio_logits = _Gather.apply(sp_group, audio_logits, 0, False, False)
+            # downstream loss is replicated across the SP ranks, so the
+            # backward keeps this rank's slice of the full gradient without an
+            # all-reduce (sum_grad=False). The data-parallel gradient reduction
+            # (FSDP2 over dp_shard_sp, DDP over dp_sp) also averages over the
+            # SP ranks, so the slice is scaled by the SP world size
+            # (grad_scale=True) to compensate.
+            video_logits = _Gather.apply(sp_group, video_logits, 0, True, False)
+            audio_logits = _Gather.apply(sp_group, audio_logits, 0, True, False)
 
         video_logits = video_logits.index_select(0, infer_out_pos.to(device))
         audio_logits = audio_logits.index_select(0, audio_pos.to(device))

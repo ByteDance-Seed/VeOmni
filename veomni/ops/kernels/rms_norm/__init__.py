@@ -25,12 +25,13 @@ from ...platform import GpuKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
 from .deepseek_v4 import eager as deepseek_v4_eager
 from .deepseek_v4 import liger_kernel as deepseek_v4_liger
+from .deepseek_v4 import torch_npu as deepseek_v4_npu
 from .offset import eager as offset_eager
 from .offset import liger_kernel as offset_liger
-from .offset import npu as offset_npu
+from .offset import torch_npu as offset_npu
 from .standard import eager as standard_eager
 from .standard import liger_kernel as standard_liger
-from .standard import npu as standard_npu
+from .standard import torch_npu as standard_npu
 from .standard import triton as standard_triton
 from .unweighted import eager as unweighted_eager
 from .unweighted import liger_kernel as unweighted_liger
@@ -57,16 +58,18 @@ register_op(
     description="Liger Kernel standard RMSNorm with Llama-style casting",
     requirement=_GPU,
     requires=("liger_kernel",),
+    default=True,
 )
 
 register_op(
     "rms_norm",
     "standard",
-    "npu",
+    "torch_npu",
     standard_npu.forward,
     standard_npu.backward,
     description="torch_npu standard RMSNorm with Llama-style casting",
     requirement=NpuKernelRequirement(),
+    default=True,
 )
 
 register_op(
@@ -98,6 +101,18 @@ register_op(
     description="Liger Kernel DeepSeek-V4 RMSNorm with offset 0 and Gemma-style scaling",
     requirement=_GPU,
     requires=("liger_kernel",),
+    default=True,
+)
+
+register_op(
+    "rms_norm",
+    "deepseek_v4",
+    "torch_npu",
+    deepseek_v4_npu.forward,
+    deepseek_v4_npu.backward,
+    description="torch_npu DeepSeek-V4 RMSNorm with offset 0",
+    requirement=NpuKernelRequirement(),
+    default=True,
 )
 
 register_op(
@@ -118,16 +133,18 @@ register_op(
     description="Liger Kernel RMSNorm with offset-1 weights and Gemma-style scaling",
     requirement=_GPU,
     requires=("liger_kernel",),
+    default=True,
 )
 
 register_op(
     "rms_norm",
     "offset",
-    "npu",
+    "torch_npu",
     offset_npu.forward,
     offset_npu.backward,
     description="torch_npu RMSNorm with offset-1 weights and Gemma-style scaling",
     requirement=NpuKernelRequirement(),
+    default=True,
 )
 
 register_op(
@@ -148,4 +165,5 @@ register_op(
     description="Liger Kernel RMSNorm without an affine weight",
     requirement=_GPU,
     requires=("liger_kernel",),
+    default=True,
 )

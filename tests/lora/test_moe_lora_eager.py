@@ -251,7 +251,7 @@ def test_layout_validate_and_wrap(toy_dir: str, mode: str):
 
 @pytest.mark.parametrize("mode", _MODE_CASES)
 def test_wrapper_selects_op_impl(mode: str):
-    """Wrapper constructs ``moe_experts_lora`` from the ops config's ``moe_implementation``."""
+    """Wrapper constructs ``moe_experts_lora`` from the experts' ``moe_experts`` handle."""
     from veomni.ops.config import get_ops_config, set_ops_config
 
     model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
@@ -292,6 +292,93 @@ def test_wrapper_selects_op_impl(mode: str):
         assert wrapper_f.veomni_moe_lora.impl == "fused_triton"
     finally:
         set_ops_config(saved_cfg)
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_wrapper_follows_experts_handle_not_global_config(mode: str):
+    """A global config installed after model build must not change the wrapped experts' impl."""
+    from veomni.ops.config import get_ops_config, set_ops_config
+
+    model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
+    patterns = lora_cfg["target_parameters"]
+    sample_fqn, experts = find_first_matching_module(model, experts_module_globs(patterns))
+    assert experts.veomni_moe.impl == "eager"
+    saved_cfg = get_ops_config()
+    try:
+        set_ops_config(fused_triton_moe_ops())
+        _apply(
+            mode,
+            model,
+            target_parameter_patterns=patterns,
+            r=lora_cfg["rank"],
+            lora_alpha=lora_cfg["alpha"],
+            freeze_base_model=True,
+        )
+    finally:
+        set_ops_config(saved_cfg)
+    assert model.get_submodule(sample_fqn).veomni_moe_lora.impl == "eager"
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+@pytest.mark.parametrize("base_impl", ["fused_triton", "fused_quack"])
+def test_wrapper_uses_eager_when_lora_row_is_unavailable(monkeypatch, mode: str, base_impl: str):
+    from types import SimpleNamespace
+
+    from veomni.lora.moe_layers import _moe_lora_op
+    from veomni.ops import OP_REGISTRY
+
+    monkeypatch.setattr(OP_REGISTRY, "list_available", lambda op, variant: ["eager"])
+    base_layer = SimpleNamespace(veomni_moe=SimpleNamespace(impl=base_impl))
+
+    assert _moe_lora_op(base_layer, mode).impl == "eager"
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_wrapper_constructs_on_mocked_mlu_with_default_ops_config(monkeypatch, mode: str):
+    """MLU keeps the default ``fused_triton`` MoE row, but has no ``fused_triton`` MoE-LoRA row."""
+    pytest.importorskip("triton")
+    from transformers import Qwen3MoeConfig
+
+    from veomni.arguments import OpsImplementationConfig
+    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import Qwen3MoeExperts
+    from veomni.ops import OP_REGISTRY, VeomniOp
+    from veomni.ops.config import get_ops_config, set_ops_config
+
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: True)
+    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "mlu")
+    monkeypatch.setattr("veomni.ops.platform.requirement.IS_MLU_AVAILABLE", True)
+    # Handles are interned by triple; keep CUDA-resolved rows out and MLU-resolved rows in this test.
+    monkeypatch.setattr(VeomniOp, "_intern", {})
+
+    ops = OpsImplementationConfig()
+    assert ops.moe_implementation is None
+    assert "fused_triton" not in OP_REGISTRY.list_available("moe_experts_lora", mode)
+    with pytest.raises(RuntimeError, match="not registered for device 'mlu'"):
+        VeomniOp("moe_experts_lora", mode, "fused_triton")
+
+    config = Qwen3MoeConfig(hidden_size=16, moe_intermediate_size=8, num_experts=4, hidden_act="silu")
+    saved_cfg = get_ops_config()
+    set_ops_config(ops)
+    try:
+        experts = Qwen3MoeExperts(config)
+        assert experts.veomni_moe.impl == "fused_triton"
+        wrapper = _wrapper_cls(mode)(experts, r=2, lora_alpha=4)
+    finally:
+        set_ops_config(saved_cfg)
+    assert wrapper.veomni_moe_lora.impl == "eager"
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_wrapper_rejects_non_silu_experts(mode: str):
+    from transformers.activations import GELUActivation
+
+    model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
+    _, experts = find_first_matching_module(model, experts_module_globs(lora_cfg["target_parameters"]))
+    experts.act_fn = GELUActivation()
+
+    with pytest.raises(ValueError, match="only supports SiLU"):
+        _wrapper_cls(mode)(experts, r=lora_cfg["rank"], lora_alpha=lora_cfg["alpha"])
+    assert "gate_up_proj" in experts._parameters
 
 
 @pytest.mark.parametrize("mode", _MODE_CASES)
@@ -410,13 +497,16 @@ def test_gate_up_addmm_matches_nonzero_reference_and_gradients(device, dtype, rt
         torch.testing.assert_close(candidate_grad, reference_grad, rtol=rtol, atol=atol)
 
 
-def test_independent_scale_cache_tracks_loaded_state():
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_scale_cache_tracks_loaded_state(mode):
     """Loading the persistent scale buffer must also update the hot-path float cache."""
+    from veomni.checkpoint.dcp_checkpointer import ModelState
+
     model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
     patterns = lora_cfg["target_parameters"]
     sample_fqn, _ = find_first_matching_module(model, experts_module_globs(patterns))
     _apply(
-        "independent",
+        mode,
         model,
         target_parameter_patterns=patterns,
         r=lora_cfg["rank"],
@@ -432,14 +522,19 @@ def test_independent_scale_cache_tracks_loaded_state():
     assert wrapper._lora_scale_value == wrapper.lora_scaling.item()
     assert wrapper._lora_scale_value != loaded_scaling.item()
 
+    wrapper._lora_scale_value = 0.0
+    ModelState(wrapper).load_state_dict(wrapper.state_dict())
+    assert wrapper._lora_scale_value == wrapper.lora_scaling.item()
 
-def test_independent_scale_cache_load_is_meta_safe():
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_scale_cache_load_is_meta_safe(mode):
     """Scale cache loading must not read from an unmaterialized destination buffer."""
     model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
     patterns = lora_cfg["target_parameters"]
     sample_fqn, _ = find_first_matching_module(model, experts_module_globs(patterns))
     _apply(
-        "independent",
+        mode,
         model,
         target_parameter_patterns=patterns,
         r=lora_cfg["rank"],

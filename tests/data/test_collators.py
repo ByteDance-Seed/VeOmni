@@ -242,4 +242,25 @@ def test_packing_collator_clamps_linear_attn_tail_padding_length(monkeypatch, fe
     assert m._LINEAR_ATTN_TAIL_PADDING_LENGTH not in out
 
 
+@pytest.mark.parametrize(
+    ("attention_mask", "expected"),
+    [
+        (None, True),
+        (torch.tensor([[1, 1, 1, 1, 1]]), True),
+        (torch.tensor([[1, 1, 0, 1, 1]]), False),
+        (torch.ones(1, 5, dtype=torch.long, device="meta"), None),
+    ],
+)
+def test_attention_mask_is_all_ones_only_reports_checked_masks(attention_mask, expected):
+    from veomni.data.data_collator import add_flash_attention_kwargs_from_position_ids
+
+    batch = {"position_ids": torch.tensor([[0, 1, 2, 0, 1]])}
+    if attention_mask is not None:
+        batch["attention_mask"] = attention_mask
+
+    add_flash_attention_kwargs_from_position_ids(batch)
+
+    assert batch["attention_mask_is_all_ones"] is expected
+
+
 # TODO: add omni data ci test

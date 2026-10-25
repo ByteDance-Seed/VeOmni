@@ -18,9 +18,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import OP_REGISTRY
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 REPO_ROOT = Path(__file__).parents[3]
@@ -35,6 +40,7 @@ _FIELD_TO_OP = {
     "load_balancing_loss_implementation": "load_balancing_loss",
     "mhc_implementation": "mhc",
     "moe_implementation": "moe_experts",
+    "qsa_attention_implementation": "qsa_attention",
     "rms_norm_gated_implementation": "rms_norm_gated",
     "rms_norm_implementation": "rms_norm",
     "rotary_pos_emb_implementation": "rope",

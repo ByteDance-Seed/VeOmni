@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 Patch configuration for SeedOss GPU VeomniOp replacements.
 
@@ -33,6 +33,7 @@ from transformers.utils import TransformersKwargs
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
     CausalLMOutputWithLogProbs,
@@ -55,6 +56,7 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.ops.config",
     names=["resolve_op_impl"],
@@ -104,10 +106,10 @@ def seed_oss_mlp_init_patched(self, config):
 
 @config.override_method(
     "SeedOssMLP.forward",
-    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn, then residual dropout",
+    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules, then residual dropout",
 )
 def seed_oss_mlp_forward_patched(self, x):
-    if self.config.hidden_act in {"silu", "swish"}:
+    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
         down_proj = self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,
@@ -131,7 +133,7 @@ def seed_oss_forcausallm_init_patched(self, config):
     self.model = SeedOssModel(config)
     self.vocab_size = config.vocab_size
     self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    impl = resolve_op_impl("cross_entropy_loss_implementation")
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()

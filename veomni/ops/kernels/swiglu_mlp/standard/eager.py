@@ -60,11 +60,13 @@ def silu_mul(gate: Tensor, up: Tensor) -> Tensor:
 
 
 def silu_mul_backward(grad_hidden: Tensor, gate: Tensor, up: Tensor) -> tuple[Tensor, Tensor]:
-    """Return ``(grad_gate, grad_up)`` for ``silu(gate) * up``."""
-    sig = torch.sigmoid(gate)
-    silu_gate = gate * sig
-    grad_up = grad_hidden * silu_gate
-    grad_gate = grad_hidden * up * (silu_gate * (1 - sig) + sig)
+    """Return ``(grad_gate, grad_up)`` for ``silu(gate) * up``.
+
+    Uses autograd's op sequence (mul backward, then ``aten.silu_backward``) so
+    BF16 grads match Hugging Face's autograd MLP bitwise.
+    """
+    grad_up = grad_hidden * F.silu(gate)
+    grad_gate = torch.ops.aten.silu_backward(grad_hidden * up, gate)
     return grad_gate, grad_up
 
 

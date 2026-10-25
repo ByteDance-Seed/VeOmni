@@ -371,6 +371,8 @@ def test_expert_weights_reach_the_fused_kernel_quantized(monkeypatch):
     kernel_output = torch.randn(hidden_states.shape, device=DEVICE, dtype=torch.bfloat16)
 
     class _FakeMoe:
+        impl = "fused_triton"
+
         def __call__(
             self,
             hidden_states,

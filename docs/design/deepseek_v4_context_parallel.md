@@ -149,27 +149,25 @@ through the call in the first place. Unpadding is a deterministic index derived
 from `window_starts`, so the gather stays differentiable and the padding rows
 receive no gradient.
 
-**The query axis had to be separated from the KV geometry.** The sparse index
-builders read a single `seq_len` and used it for three roles that coincide under
+**The query axis had to be separated from the KV geometry.** Expanding the
+sparse contract into candidate slots needs three lengths that coincide under
 Ulysses and separate under CP: the number of query rows, the absolute
 full-resolution KV row of each sliding candidate, and the offset that lifts a
-compressed slot into the concatenated KV buffer. Under CP the first becomes `L`
-while the other two stay `S_global`, which is why
-`build_packed_sparse_attention_indices` and `build_sparse_attention_indices`
-take `query_offset` and `kv_full_len`. Both default to today's behaviour,
-because every non-CP caller keeps the old signature — so the type system cannot
-catch a missed call site. The same conflation was in the call site:
-`compressed_len` was computed as `kv.shape[-2] - q.shape[-2]`, which under CP
-evaluates to `S_global + C - L` instead of `C`, and is now carried explicitly
-from the compressor. This whole class of error is silent. Shapes stay
-self-consistent and the model attends to the wrong rows, so the mitigation is
-the parity test that compares each shard's built indices against the matching
-slice of the full-sequence build.
+compressed slot past the full-resolution rows. Under CP the first becomes `L`
+while the other two stay `S_global`. `dsa_attention` therefore takes the
+full-resolution and compressed KV as separate tensors, so both KV lengths are
+read off their own shapes, plus a `query_offset` that rebases a local query
+onto its global row. `query_offset` defaults to 0, which is right for every
+caller that is neither CP nor decode — so the type system cannot catch a missed
+call site. This whole class of error is silent. Shapes stay self-consistent and
+the model attends to the wrong rows, so the mitigation is the parity test that
+compares each shard's candidate slots against the matching slice of the
+full-sequence build.
 
 **Compressed slot values stay global; window token indices are rebased.** Two
 index spaces look alike and must not be confused. Attention and indexer indices
-— `topk_indices`, sliding-window indices, `range_starts` / `range_ends`,
-`block_bias` columns — address the *replicated* global KV, so their values are
+— `topk_indices`, sliding-window indices, `range_starts` / `range_ends` —
+address the *replicated* global KV, so their values are
 untouched under CP and the arrays are only sliced by query row. The compressor's
 `window_indices` address the rank's own `kv` / `gate` tensors and so are rebased
 by `cp_rank * L` **and** by the halo width, since they index

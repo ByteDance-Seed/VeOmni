@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.loss import reduce_sequence_parallel_loss
 from veomni.distributed.sequence_parallel.ulysses import _all_gather, _Gather
@@ -20,16 +21,19 @@ from veomni.utils.device import (
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 
 
+_GATHER_NPROC = 2
+
+
 _HAS_ACCELERATOR_BACKEND = (
     get_device_type() != "cpu" and dist.is_available() and dist.is_backend_available(get_dist_comm_backend())
 )
-_DEVICE_COUNT = get_torch_device().device_count() if _HAS_ACCELERATOR_BACKEND else 0
+_DEVICE_COUNT = runner_device_count() if _HAS_ACCELERATOR_BACKEND else 0
 _GATHER_BACKWARD_BACKENDS = [
     pytest.param("gloo", marks=pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo required")),
     pytest.param(
         dist.Backend.NCCL,
         marks=pytest.mark.skipif(
-            not IS_CUDA_AVAILABLE or not dist.is_nccl_available() or get_torch_device().device_count() < 2,
+            not IS_CUDA_AVAILABLE or not dist.is_nccl_available() or runner_device_count() < 2,
             reason="Two CUDA devices and NCCL required",
         ),
     ),
@@ -44,7 +48,7 @@ _SHARED_GRADIENT_BACKENDS = [
             or not get_torch_device().is_available()
             or not dist.is_available()
             or not dist.is_backend_available("hccl")
-            or get_torch_device().device_count() < 2,
+            or runner_device_count() < 2,
             reason="Two NPU devices and HCCL required",
         ),
     ),
@@ -125,7 +129,10 @@ class AllToAllCommTest(SequenceParallelTest):
         num_valid_tokens = torch.tensor(1.0, dtype=local_loss.dtype, device=local_loss.device)
         reduced_loss = reduce_sequence_parallel_loss(local_loss, num_valid_tokens)
         reduced_loss.backward()
-        return reduced_loss.item(), local_x.grad.item()
+        # ReduceLoss.backward pre-multiplies by sp_world_size so FSDP2/DDP's
+        # mean over the SP group lands on the true global gradient; divide by
+        # world_size here to mirror that reduction on the standalone shard.
+        return reduced_loss.item(), local_x.grad.item() / dist.get_world_size(group)
 
     @staticmethod
     def _run_loss_grad_ref(shard_values, rank):
@@ -195,12 +202,17 @@ def _check_gather_backward(rank, init_method, backend):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(
+    provider=lambda context: LaunchSpec(
+        nproc=_GATHER_NPROC, device="cpu" if context.params["backend"] == "gloo" else "accelerator"
+    )
+)
 @pytest.mark.parametrize("backend", _SHARED_GRADIENT_BACKENDS)
 def test_gather_backward_preserves_shared_gradients(tmp_path, backend):
     mp.spawn(
         _check_gather_backward,
         args=((tmp_path / "rendezvous").as_uri(), backend),
-        nprocs=2,
+        nprocs=_GATHER_NPROC,
     )
 
 
@@ -303,9 +315,14 @@ def _check_gather_backward_edges(rank, init_method, backend):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(
+    provider=lambda context: LaunchSpec(
+        nproc=_GATHER_NPROC, device="cpu" if context.params["backend"] == "gloo" else "accelerator"
+    )
+)
 @pytest.mark.parametrize("backend", _GATHER_BACKWARD_BACKENDS)
 def test_gather_backward_edge_cases(tmp_path, backend):
-    mp.spawn(_check_gather_backward_edges, args=((tmp_path / "rendezvous").as_uri(), backend), nprocs=2)
+    mp.spawn(_check_gather_backward_edges, args=((tmp_path / "rendezvous").as_uri(), backend), nprocs=_GATHER_NPROC)
 
 
 if __name__ == "__main__":

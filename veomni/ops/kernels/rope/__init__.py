@@ -28,14 +28,14 @@ from .deepseek_v4 import eager as dsv4_eager
 from .deepseek_v4 import triton as dsv4_triton
 from .full import eager as full_eager
 from .full import liger_kernel as full_liger
-from .full import npu as full_npu
+from .full import torch_npu as full_npu
 from .interleave import eager as interleave_eager
 from .mrope import eager as mrope_eager
 from .partial import eager as partial_eager
 from .partial import liger_kernel as partial_liger
-from .partial import npu as partial_npu
+from .partial import torch_npu as partial_npu
 from .wan import eager as wan_eager
-from .wan import npu as wan_npu
+from .wan import torch_npu as wan_npu
 from .wan import triton as wan_triton
 
 
@@ -57,19 +57,21 @@ register_op(
     "liger_kernel",
     full_liger.forward,
     full_liger.backward,
-    description="Liger Kernel rotary embedding over every channel with eager vision fallback",
+    description="Liger Kernel rotary embedding over every channel, including rank-3 vision layout",
     requirement=_GPU,
     requires=("liger_kernel",),
+    default=True,
 )
 
 register_op(
     "rope",
     "full",
-    "npu",
+    "torch_npu",
     full_npu.forward,
     full_npu.backward,
     description="torch_npu rotary embedding over every channel, including rank-3 vision layout",
     requirement=NpuKernelRequirement(),
+    default=True,
 )
 
 register_op(
@@ -90,16 +92,18 @@ register_op(
     description="Liger Kernel rotary embedding over a channel prefix with eager fallback",
     requirement=_GPU,
     requires=("liger_kernel",),
+    default=True,
 )
 
 register_op(
     "rope",
     "partial",
-    "npu",
+    "torch_npu",
     partial_npu.forward,
     partial_npu.backward,
     description="torch_npu rotary embedding over a channel prefix",
     requirement=NpuKernelRequirement(),
+    default=True,
 )
 
 register_op(
@@ -163,7 +167,7 @@ register_op(
 register_op(
     "rope",
     "wan",
-    "npu",
+    "torch_npu",
     wan_npu.forward,
     wan_npu.backward,
     description="torch_npu Wan rotary embedding using complex multiplication",

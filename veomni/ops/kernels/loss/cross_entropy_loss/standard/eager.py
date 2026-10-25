@@ -9,14 +9,17 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """standard cross-entropy eager math (HF ``fixed_cross_entropy``)."""
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -104,6 +107,37 @@ def _needs_input_grad(tensor: Tensor, grad_enabled: bool) -> bool:
     return bool(tensor.requires_grad and grad_enabled)
 
 
+@contextmanager
+def _suspend_saved_tensor_hooks() -> Iterator[None]:
+    """Pop saved-tensor hooks for one ``torch.func`` call, then push them back.
+
+    ``grad_and_value`` raises while a pack/unpack pair is installed. Sync
+    activation offload installs that pair for the whole forward. The outer
+    ``save_for_backward`` still runs after this block, so offload packs the
+    precomputed gradients rather than the ``V×H`` logits.
+    """
+    stack: list[tuple[Callable[..., Any], Callable[..., Tensor]]] = []
+    top = torch._C._autograd._top_saved_tensors_default_hooks(False)
+    while top is not None:
+        stack.append(top)
+        torch._C._autograd._pop_saved_tensors_default_hooks()
+        top = torch._C._autograd._top_saved_tensors_default_hooks(False)
+    try:
+        yield
+    finally:
+        for pack_hook, unpack_hook in reversed(stack):
+            torch._C._autograd._push_saved_tensors_default_hooks(pack_hook, unpack_hook)
+
+
+def _grad_and_value(
+    function: Callable[..., Tensor], argnums: tuple[int, ...], *args: Any
+) -> tuple[tuple[Tensor, ...], Tensor]:
+    """``torch.func.grad_and_value`` that tolerates an outer saved-tensor hook."""
+    with _suspend_saved_tensor_hooks():
+        grads, loss = torch.func.grad_and_value(function, argnums=argnums)(*args)
+    return grads, loss
+
+
 def forward(
     hidden: Tensor,
     labels: Tensor,
@@ -120,7 +154,8 @@ def forward(
     ``torch.func.grad_and_value`` builds its own graph and ignores ``no_grad``,
     so unused ``V×H`` grads require both ``requires_grad`` and the caller's
     ``is_grad_enabled()``. The generated wrapper passes that flag because
-    ``Function.forward`` itself always runs under ``no_grad``.
+    ``Function.forward`` itself always runs under ``no_grad``. The func call
+    suspends saved-tensor hooks so sync activation offload can stay installed.
     """
     has_weight = weight.numel() > 0
     compute_grads = torch.is_grad_enabled() if grad_enabled is None else grad_enabled
@@ -128,17 +163,17 @@ def forward(
     weight_needs_grad = has_weight and _needs_input_grad(weight, compute_grads)
     if has_weight:
         if hidden_needs_grad and weight_needs_grad:
-            (grad_hidden, grad_weight), loss = torch.func.grad_and_value(_loss_hidden_weight, argnums=(0, 1))(
-                hidden, weight, labels, ignore_index, num_items_in_batch
+            (grad_hidden, grad_weight), loss = _grad_and_value(
+                _loss_hidden_weight, (0, 1), hidden, weight, labels, ignore_index, num_items_in_batch
             )
         elif hidden_needs_grad:
-            (grad_hidden,), loss = torch.func.grad_and_value(_loss_hidden_weight, argnums=(0,))(
-                hidden, weight, labels, ignore_index, num_items_in_batch
+            (grad_hidden,), loss = _grad_and_value(
+                _loss_hidden_weight, (0,), hidden, weight, labels, ignore_index, num_items_in_batch
             )
             grad_weight = None
         elif weight_needs_grad:
-            (grad_weight,), loss = torch.func.grad_and_value(_loss_hidden_weight, argnums=(1,))(
-                hidden, weight, labels, ignore_index, num_items_in_batch
+            (grad_weight,), loss = _grad_and_value(
+                _loss_hidden_weight, (1,), hidden, weight, labels, ignore_index, num_items_in_batch
             )
             grad_hidden = None
         else:
@@ -154,9 +189,7 @@ def forward(
         )
 
     if hidden_needs_grad:
-        (grad_hidden,), loss = torch.func.grad_and_value(_loss_logits, argnums=(0,))(
-            hidden, labels, ignore_index, num_items_in_batch
-        )
+        (grad_hidden,), loss = _grad_and_value(_loss_logits, (0,), hidden, labels, ignore_index, num_items_in_batch)
     else:
         loss = _loss_logits(hidden, labels, ignore_index, num_items_in_batch)
         grad_hidden = None

@@ -409,7 +409,7 @@ def causal_conv1d_bwd_kernel(
                     b_dw = tl.sum(b_dy_shift * b_x, 0)
 
                     if USE_INITIAL_STATE:
-                        mask_head_rows = o_t < i_w
+                        mask_head_rows = (o_t < i_w) & (o_t < T_len)
 
                         b_dy_head = tl.load(
                             dy + bos * D + o_t[:, None] * D + o_d,
@@ -452,11 +452,12 @@ def causal_conv1d_bwd_kernel(
                     b_dh0_s = tl.zeros((BD,), dtype=tl.float32)
                     for i_t2 in tl.static_range(0, W - 1):
                         if i_t2 < i_w:
-                            dy0_row = tl.load(dy + bos * D + (i_t * BT + i_t2) * D + o_d, mask=m_d, other=0.0).to(
+                            m_dy0 = m_d & ((i_t * BT + i_t2) < T_len)
+                            dy0_row = tl.load(dy + bos * D + (i_t * BT + i_t2) * D + o_d, mask=m_dy0, other=0.0).to(
                                 tl.float32
                             )
                             if ACTIVATION == "swish" or ACTIVATION == "silu":  # pylint: disable=consider-using-in
-                                y0_row = tl.load(y + bos * D + (i_t * BT + i_t2) * D + o_d, mask=m_d, other=0.0).to(
+                                y0_row = tl.load(y + bos * D + (i_t * BT + i_t2) * D + o_d, mask=m_dy0, other=0.0).to(
                                     tl.float32
                                 )
                                 y0_s = tl.sigmoid(y0_row)
@@ -633,6 +634,20 @@ def causal_conv1d_bwd_impl(
     if initial_state is not None:
         BD = 32
         BT = min(8, triton.next_power_of_2(triton.cdiv(max(16, B * T), NUM_CORES)))
+        # dh0 below is split into cdiv(W, BT) slots and summed. The multi-slot
+        # path over-counts, so never tile narrower than the convolution window:
+        # that keeps cdiv(W, BT) == 1 and the single-slot path.
+        #
+        # Widening BT is only within the budget derived above while W <= 8, which
+        # is also the range that budget was derived for. Say so rather than
+        # silently exceeding it.
+        if W > 8:
+            raise NotImplementedError(
+                f"causal_conv1d backward with initial_state supports conv widths up to 8, got {W}. "
+                "Beyond that the tile needed to keep dh0 on its single-slot path no longer fits the "
+                "BT=8/BD=32 UB budget this branch is sized for."
+            )
+        BT = max(BT, triton.next_power_of_2(W))
     else:
         BD = 32
         BT = min(32, triton.next_power_of_2(triton.cdiv(max(16, B * T), NUM_CORES)))

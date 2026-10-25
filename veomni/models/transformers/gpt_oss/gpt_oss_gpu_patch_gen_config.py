@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 Patch configuration for GPT-OSS GPU VeomniOp replacements.
 
@@ -210,7 +210,7 @@ def gpt_oss_forcausallm_init_patched(self, config):
     self.router_aux_loss_coef = config.router_aux_loss_coef
     self.num_experts = config.num_local_experts
     self.num_experts_per_tok = config.num_experts_per_tok
-    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    impl = resolve_op_impl("cross_entropy_loss_implementation")
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.veomni_lb = VeomniOp(

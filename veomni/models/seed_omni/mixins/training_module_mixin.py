@@ -78,8 +78,11 @@ class TrainingModuleMixin:
         first concrete ``forward`` below this mixin in MRO so a stub here does
         not shadow HF-native implementations.
         """
-        for base in type(self).__mro__[1:]:
-            if base is TrainingModuleMixin or base is Module:
+        # Scan only past this mixin: a class above it whose ``forward`` calls
+        # ``super().forward()`` lands here and must not be dispatched to again.
+        mro = type(self).__mro__
+        for base in mro[mro.index(TrainingModuleMixin) + 1 :]:
+            if base is Module:
                 continue
             impl = base.__dict__.get("forward")
             if impl is None:

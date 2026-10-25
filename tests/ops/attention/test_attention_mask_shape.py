@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Shape mask APIs: ``causal_mask`` / ``sliding_window_mask`` / ``packed_causal_mask``."""
 
@@ -28,6 +28,7 @@ from transformers.masking_utils import (
 )
 
 from tests.ops.attention.attention_cases import flex_visible, materialize_magi_mask
+from veomni.ops.install import _VEOMNI_HF_PATCHES
 from veomni.ops.kernels.attention import ulysses as ulysses_mask
 from veomni.ops.kernels.attention.mask import flex as flex_mask
 from veomni.ops.kernels.attention.mask import magi as magi_mask
@@ -84,6 +85,30 @@ def test_shape_masks_treat_veomni_prefix_as_the_stock_name():
         flex_visible(causal_mask(4, 4, impl="flex_attention", device="cpu"), 4, 4),
         flex_visible(causal_mask(4, 4, impl="veomni_flex_attention", device="cpu"), 4, 4),
     )
+
+
+_SHAPE_APIS_REJECTED_BY_BACKEND = {
+    ("veomni_magi_attention", "sliding_window_mask"),
+    ("veomni_sage_attention", "packed_causal_mask"),
+    ("veomni_sage_attention", "sliding_window_mask"),
+}
+
+
+@pytest.mark.parametrize("impl", [name for name, _, _ in _VEOMNI_HF_PATCHES])
+def test_shape_masks_dispatch_every_registered_veomni_name(impl):
+    """Every registered ``veomni_*`` name reaches a backend branch in each shape API."""
+    calls = (
+        (causal_mask, {}),
+        (sliding_window_mask, {"sliding_window": 4}),
+        (packed_causal_mask, {"cu_seqlens": torch.tensor([0, 3, 8], dtype=torch.int32)}),
+    )
+    for api, kwargs in calls:
+        if (impl, api.__name__) in _SHAPE_APIS_REJECTED_BY_BACKEND:
+            with pytest.raises(ValueError) as error:
+                api(8, 8, impl=impl, device="cpu", **kwargs)
+            assert "unsupported attention impl" not in str(error.value)
+        else:
+            api(8, 8, impl=impl, device="cpu", **kwargs)
 
 
 def test_eager_causal_is_additive_like_hf():
@@ -154,20 +179,17 @@ def test_eager_packed_with_long_padding_mask_is_additive():
     torch.testing.assert_close(blocked, torch.full_like(blocked, torch.finfo(torch.float32).min))
 
 
-def test_sdpa_packed_shape_is_unsupported():
-    """SDPA rejects the packed API before looking at cached vs square lengths."""
-    with pytest.raises(ValueError, match="SDPA does not support packed_causal_mask"):
-        packed_causal_mask(
-            2,
-            4,
-            impl="sdpa",
-            device="cpu",
-            cu_seqlens=torch.tensor([0, 2]),
-            cu_seq_lens_k=torch.tensor([0, 4]),
-        )
+@pytest.mark.parametrize("impl", ("sdpa", "veomni_sdpa"))
+def test_sdpa_packed_shape_isolates_segments(impl):
+    shaped = packed_causal_mask(4, 4, impl=impl, device="cpu", cu_seqlens=torch.tensor([0, 2, 4]))
+    keep = torch.zeros(4, 4, dtype=torch.bool)
+    keep[:2, :2] = torch.tril(torch.ones(2, 2, dtype=torch.bool))
+    keep[2:, 2:] = torch.tril(torch.ones(2, 2, dtype=torch.bool))
+    assert shaped.dtype == torch.bool
+    torch.testing.assert_close(shaped[0, 0], keep)
 
 
-@pytest.mark.parametrize("impl", ("eager", "flex_attention", "magi_attention"))
+@pytest.mark.parametrize("impl", ("eager", "sdpa", "flex_attention", "magi_attention"))
 def test_packed_cached_uses_independent_query_and_key_segments(impl):
     """Cross-length packed masks align each query with its paired key segment."""
     expected = torch.tensor(
@@ -188,6 +210,8 @@ def test_packed_cached_uses_independent_query_and_key_segments(impl):
         )
         if impl == "eager":
             visible = shaped[0, 0] == 0
+        elif impl == "sdpa":
+            visible = shaped[0, 0]
         elif impl == "flex_attention":
             visible = flex_visible(shaped, 3, 6)
         else:
@@ -256,9 +280,9 @@ def test_packed_self_attention_reuses_shared_cu_seqlens(monkeypatch):
     real_validated = packed_mask._validated_cu_seqlens
     real_segment_ids = packed_mask._segment_ids
 
-    def counting_validated(cu_seqlens, length, device):
+    def counting_validated(cu_seqlens, length, device, batch_size=1):
         counts["validated"] += 1
-        return real_validated(cu_seqlens, length, device)
+        return real_validated(cu_seqlens, length, device, batch_size)
 
     def counting_segment_ids(cu_seqlens, length, device):
         counts["segment_ids"] += 1
@@ -286,6 +310,58 @@ def test_packed_self_attention_reuses_shared_cu_seqlens(monkeypatch):
     counts["validated"] = counts["segment_ids"] = 0
     packed_mask.packed_mask_function(cu_seqlens=shared, cu_seqlens_k=shared.clone(), **kwargs)
     assert counts == {"validated": 2, "segment_ids": 2}
+
+
+def _batch_visible(shaped, impl: str, batch_size: int, length: int) -> torch.Tensor:
+    if impl == "eager":
+        return shaped[:, 0] == 0
+    query_idx = torch.arange(length)
+    key_idx = torch.arange(length)
+    return torch.stack(
+        [shaped.mask_mod(batch_idx, 0, query_idx[:, None], key_idx[None, :]) for batch_idx in range(batch_size)]
+    )
+
+
+@pytest.mark.parametrize("impl", ("eager", "flex_attention"))
+def test_packed_mask_reads_batch_flattened_cu_seqlens(impl):
+    """(2, 8) packing stores [0, 8, 16]; each row keeps its own segments."""
+    shaped = packed_causal_mask(
+        8,
+        8,
+        impl=impl,
+        device="cpu",
+        cu_seqlens=torch.tensor([0, 8, 16]),
+        batch_size=2,
+    )
+    causal = torch.tril(torch.ones(8, 8, dtype=torch.bool))
+    torch.testing.assert_close(_batch_visible(shaped, impl, 2, 8), causal.expand(2, 8, 8))
+
+    mixed = packed_causal_mask(
+        8,
+        8,
+        impl=impl,
+        device="cpu",
+        cu_seqlens=torch.tensor([0, 3, 8, 16]),
+        batch_size=2,
+    )
+    mixed_visible = _batch_visible(mixed, impl, 2, 8)
+    row0 = torch.zeros(8, 8, dtype=torch.bool)
+    row0[:3, :3] = torch.tril(torch.ones(3, 3, dtype=torch.bool))
+    row0[3:, 3:] = torch.tril(torch.ones(5, 5, dtype=torch.bool))
+    torch.testing.assert_close(mixed_visible[0], row0)
+    torch.testing.assert_close(mixed_visible[1], causal)
+
+
+def test_packed_mask_rejects_flattened_segments_that_cross_rows():
+    with pytest.raises(ValueError, match="row boundary"):
+        packed_causal_mask(
+            8,
+            8,
+            impl="eager",
+            device="cpu",
+            cu_seqlens=torch.tensor([0, 12, 16]),
+            batch_size=2,
+        )
 
 
 def test_magi_packed_aligns_with_from_cu_seqlens():

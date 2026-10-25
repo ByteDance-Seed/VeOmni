@@ -20,6 +20,13 @@ import ast
 import re
 from pathlib import Path
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 REPO_ROOT = Path(__file__).parents[2]
 TEXT_SUFFIXES = {".md", ".py", ".toml", ".yaml", ".yml"}
@@ -57,11 +64,6 @@ _REMOVED_PACKAGES = re.compile(
     r"veomni[./]" + r"models_kernel(?:[./]|\b)|"
     r"tests/" + r"models_kernel(?:/|\b)"
 )
-_ALLOWED_REMOVED_PACKAGE_DOCS = frozenset(
-    {
-        Path("docs/design/opslot_to_veomniop.md"),
-    }
-)
 
 
 def test_active_tree_uses_ops_architecture_paths():
@@ -69,8 +71,6 @@ def test_active_tree_uses_ops_architecture_paths():
     stale: list[str] = []
     for path in _active_text_files():
         relative = path.relative_to(REPO_ROOT)
-        if relative in _ALLOWED_REMOVED_PACKAGE_DOCS:
-            continue
         text = path.read_text(encoding="utf-8")
         for line_number, line in enumerate(text.splitlines(), start=1):
             if _REMOVED_PACKAGES.search(line):

@@ -17,9 +17,10 @@ Copied from MindSpeed-MM. The verbatim kernels keep their upstream headers.
 Treat them as a drop-in vendor blob so they stay diff-able against upstream —
 do not hand-edit kernel logic.
 
-- ``triton/`` — original ``triton-ascend`` kernels for ``npu`` (chunk and conv)
-- ``triton_core/`` — newer generation used as glue around ``fla_npu``
-  ``torch.ops.npu.*`` on ``npu_ascendc``
+- ``triton/`` — original ``triton-ascend`` kernels for the ``triton`` rows
+  (chunk and conv)
+- ``triton_core/`` — newer generation used as glue around the ``fla_npu`` row's
+  ``torch.ops.npu.*`` kernels
 
 Imported lazily by the impls. Importing this package on a host without
 ``triton`` / ``fla_npu`` does not pull the kernels in.

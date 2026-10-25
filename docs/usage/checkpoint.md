@@ -3,7 +3,7 @@
 `train.checkpoint.output_dir` is the run root. Every per-step artifact lives
 under `output_dir/checkpoints/global_step_{N}/` (`train.checkpoint.save_path`);
 the model assets are written once to `output_dir/model_assets/`
-(`output_dir/model_assets/<module>/` in a [multi-module job](#multi-module-jobs-seedomni-v2)).
+(`output_dir/model_assets/<module>/` in a [multi-module job](#multi-module-jobs-seedomni)).
 
 ```
 checkpoints/global_step_{N}/
@@ -21,7 +21,7 @@ checkpoints/global_step_{N}/
 A step directory is split by *who owns the state*. `model/`, `loader/` and
 `extra_state/` are the resume tree — everything needed to continue training and
 nothing else. The two exports are inference artifacts that resume never reads.
-`<module>/` appears only in a [multi-module job](#multi-module-jobs-seedomni-v2).
+`<module>/` appears only in a [multi-module job](#multi-module-jobs-seedomni).
 
 ## What each path holds
 
@@ -31,15 +31,15 @@ nothing else. The two exports are inference artifacts that resume never reads.
 | `model/**/optimizer/` | Optimizer state. | All ranks, via DCP |
 | `model/**/lr_scheduler.pt` | `lr_scheduler.state_dict()`. | Rank 0 |
 | `loader/rank_{R}.pt` | Dataloader / sampler cursor. | Rank R |
-| `extra_state/rank_{R}.pt` | `global_step`, `environ_meter`, `channel_loss_callback`, `torch_rng_state`. | Rank R |
+| `extra_state/rank_{R}.pt` | `global_step`, `environ_meter`, `channel_loss_callback`, `offline_cache_writer` (SeedOmni `offline_embedding` only), `torch_rng_state`. | Rank R |
 | `hf_ckpt/` | `model*.safetensors`, its index, and the model assets. Written when `train.checkpoint.save_hf_weights` is set and the run is not LoRA. | Rank 0, after a collective gather |
 | `lora_ckpt/` | `adapter_config.json`, `adapter_model.safetensors`. Written instead of `hf_ckpt/` when `model.lora_config` is set. | Rank 0, after a collective gather |
-| `checkpoint_manifest.json` | Format version, `global_step`, world size. Trainer-level completion only. | Rank 0, last |
-| `model_assets/[<module>/]` | Each model's config / tokenizer / processor, once per run at train start. Nested like `hf_ckpt/`. | Rank 0 |
+| `checkpoint_manifest.json` | Format version, `global_step`, world size, and `model_state`: whether the step has a `model/` at all. Trainer-level completion only. | Rank 0, last |
+| `model_assets/[<module>/]` | Each model's config / tokenizer / processor, once per run at train start. Nested like `hf_ckpt/`; a SeedOmni run loaded from an upstream HF checkpoint writes both flat, in that checkpoint's layout ([Upstream Checkpoint Layout](../seed_omni/usage/hf_layout.md)). | Rank 0 |
 
 **Model assets** is whatever that model's runtime `model_assets` list carries, in type terms
 `Union[PretrainedConfig, GenerationConfig, PreTrainedTokenizer, ProcessorMixin]`
-(`veomni/models/module_utils.py`). Each is written by calling its own
+(`veomni/models/checkpoint/weights.py`). Each is written by calling its own
 `save_pretrained`, so the files that appear are whatever those objects emit —
 `config.json`, `generation_config.json`, then tokenizer files, processor files,
 or both. Do not read a fixed file list into these directories. Two modules
@@ -67,9 +67,9 @@ Three splits in the tree above are deliberate:
   is not what a LoRA run resumes from; see
   [LoRA checkpoints](../key_features/lora.md#4-checkpoint-saving).
 
-## Multi-module jobs (SeedOmni V2)
+## Multi-module jobs (SeedOmni)
 
-A V2 job trains several modules side by side, each with its own weights,
+A SeedOmni job trains several modules side by side, each with its own weights,
 optimizer, scheduler and accelerator config. Module names are the keys of
 `model.model_config.modules`, declared in a `modules_train.yaml`, and they become
 directory names verbatim. `model/`, the exports and `model_assets/` nest one
@@ -129,6 +129,14 @@ Resume discovery accepts a `global_step_{N}/` directory only when both halves
 are there, so a crash mid-save leaves a directory that is skipped rather than
 half-loaded.
 
+The one step with a single half is a run that saves no model state. SeedOmni's
+`offline_embedding` freezes every module, so no module has a checkpoint
+manager and the step has no `model/`. Its manifest records
+[`model_state: false`](../../veomni/checkpoint/layout.py#L259), and the manifest
+alone then marks the step complete. Without that field, the same tree would look
+like a step whose shards never started. A manifest written before the field
+existed counts as carrying model state.
+
 Rewriting a step — a restarted run reaching the same step again — deletes the
 markers first, so an interrupted rewrite cannot leave a stale one standing over
 new, partial data. Each half clears its own, right before it writes it back:
@@ -156,6 +164,11 @@ Checkpoints from older layouts have no manifest; discovery falls back to a
 `.metadata` at the step root, which is what marked those steps complete, but
 only while the step is still entirely pre-split. See
 [Resuming older checkpoints](#resuming-older-checkpoints).
+
+SeedOmni (`OmniTrainer`) writes both halves the same way: the model half through
+`ModelCheckpointManager`, one `model/<name>/` per module, and the trainer half
+through the shared `GlobalStateCallback`, so its steps carry the same per-rank
+`loader/` and `extra_state/` files and the same manifest.
 
 ## Staged and asynchronous saves
 
@@ -207,9 +220,9 @@ What those older shapes looked like:
 |-----|----------------|
 | 0.1.12 | Step root *was* the DCP directory (`.metadata` + fused `__{i}_{rank}.distcp`); `extra_state/extra_state_rank_{R}.pt` mixed the scheduler and the job cursor; the LoRA adapter went to `<output_dir>/global_step_{N}/`, a sibling of `checkpoints/` |
 | 0.2.x flat | The same, with the cursor split out into `trainer_state_rank_{R}.pt` and `extra_state_rank_{R}.pt` left holding the scheduler alone |
-| SeedOmni V2 modules | Nested per module, but one level too shallow: `global_step_{N}/<module>/` was the DCP directory *and* the HF export directory, so safetensors landed on top of the shards |
+| SeedOmni modules | Nested per module, but one level too shallow: `global_step_{N}/<module>/` was the DCP directory *and* the HF export directory, so safetensors landed on top of the shards |
 
-The same fallbacks resolve a V2 module checkpoint, because they are applied
+The same fallbacks resolve a SeedOmni module checkpoint, because they are applied
 *within* a module's directory: a module whose `model/<name>/` is absent falls
 back to `<name>/` at the step root.
 

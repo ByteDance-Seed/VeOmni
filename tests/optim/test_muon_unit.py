@@ -129,6 +129,7 @@ def _glm_dsa_attention_model() -> nn.Module:
     from veomni.models.transformers.glm_moe_dsa.generated import patched_modeling_glm_moe_dsa_gpu as modeling
 
     config = AutoConfig.from_pretrained(str(_TOY_CONFIG_ROOT / "glm_moe_dsa_toy"))
+    config._attn_implementation = "eager"
     torch.manual_seed(0)
     model = nn.Module()
     model.self_attn = modeling.GlmMoeDsaAttention(config, 0)

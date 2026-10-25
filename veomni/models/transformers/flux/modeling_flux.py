@@ -96,7 +96,9 @@ class RMSNorm(torch.nn.Module):
         else:
             self.weight = None
             variant = "unweighted"
-        self.veomni_rms_norm = VeomniOp("rms_norm", variant, resolve_op_impl("rms_norm_implementation"))
+        self.veomni_rms_norm = VeomniOp(
+            "rms_norm", variant, resolve_op_impl("rms_norm_implementation", variant=variant)
+        )
 
     def forward(self, hidden_states):
         """Apply the interned ``rms_norm`` handle."""
@@ -195,7 +197,16 @@ class FluxJointAttention(torch.nn.Module):
         hidden_states = flux_attention(self, q, k, v, attn_mask)
 
         if get_parallel_state().ulysses_enabled:
-            hidden_states = gather_heads_scatter_seq(hidden_states, seq_dim=2, head_dim=1)
+            # The output is [text_full, image_full]. Scatter each stream on its own so this
+            # rank gets back its own text and image shards, not a slice across the boundary.
+            txt_full_len = q_b.shape[2]
+            hidden_states = torch.cat(
+                [
+                    gather_heads_scatter_seq(hidden_states[:, :, :txt_full_len], seq_dim=2, head_dim=1),
+                    gather_heads_scatter_seq(hidden_states[:, :, txt_full_len:], seq_dim=2, head_dim=1),
+                ],
+                dim=2,
+            )
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
         hidden_states = hidden_states.to(q.dtype)

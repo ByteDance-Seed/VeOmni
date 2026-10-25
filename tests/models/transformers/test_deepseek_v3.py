@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """DeepSeek-V3 registry-hook and Hugging Face parity tests.
 
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM as HFDeepseekV3ForCausalLM
@@ -60,15 +61,21 @@ def test_deepseek_v3_eager_matches_hf():
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
-    # MLA + MoE expert-loop ULP (~1e-7); not bitwise vs Hugging Face.
-    assert_eager_matches_hf(hf, ours, input_ids=input_ids)
+    assert_eager_matches_hf(hf, ours, input_ids=input_ids, logits_equal=True)
 
 
-def test_deepseek_v3_experts_cast_router_scores_to_hidden_dtype():
+@pytest.mark.parametrize(
+    ("impl", "routing_dtype"),
+    [("eager", torch.float32), ("fused_triton", torch.bfloat16)],
+)
+def test_deepseek_v3_experts_routing_weight_dtype_follows_impl(impl: str, routing_dtype: torch.dtype):
+    """Eager keeps fp32 router scores like HF. Fused kernels get the activation dtype."""
     config = _tiny_config()
     model = _build_ours(config)
     experts = next(layer.mlp.experts for layer in model.model.layers if hasattr(layer.mlp, "experts"))
-    hidden_states = torch.linspace(-0.7, 0.8, steps=4 * config.hidden_size).reshape(4, config.hidden_size)
+    hidden_states = (
+        torch.linspace(-0.7, 0.8, steps=4 * config.hidden_size).reshape(4, config.hidden_size).to(torch.bfloat16)
+    )
     selected_experts = torch.tensor([[0, 1], [2, 0], [1, 2], [0, 2]], dtype=torch.long)
     top_k_weights = torch.tensor(
         [[0.7, 0.3], [0.6, 0.4], [0.55, 0.45], [0.8, 0.2]],
@@ -76,17 +83,21 @@ def test_deepseek_v3_experts_cast_router_scores_to_hidden_dtype():
     )
     captured = {}
 
-    def record(*args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        return torch.zeros_like(hidden_states)
+    class _RecordingOp:
+        def __call__(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return torch.zeros_like(hidden_states)
 
-    experts.veomni_moe = record
+    recording_op = _RecordingOp()
+    recording_op.impl = impl
+    experts.veomni_moe = recording_op
     actual = experts(hidden_states, selected_experts, top_k_weights)
     args = captured["args"]
 
     assert args[0] is hidden_states
-    torch.testing.assert_close(args[1], top_k_weights.to(hidden_states.dtype), rtol=0, atol=0)
+    assert args[1].dtype == routing_dtype
+    torch.testing.assert_close(args[1], top_k_weights.to(routing_dtype), rtol=0, atol=0)
     assert args[2] is selected_experts
     assert captured["kwargs"] == {"num_experts": experts.num_experts}
     torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)
