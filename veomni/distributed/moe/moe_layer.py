@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+from functools import lru_cache
 from typing import Any, Callable, Optional
 
 import torch
@@ -21,6 +22,16 @@ import torch.distributed as dist
 from ..parallel_state import get_parallel_state
 from .comm import all_to_all
 from .moe_utils import generate_weights_idx, permute, sort_chunks_by_idxs, unpermute
+
+
+@lru_cache(maxsize=128)
+def _expert_chunk_orders(num_experts: int, ep_size: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    num_local_experts = num_experts // ep_size
+    forward = tuple(
+        rank * num_local_experts + expert for expert in range(num_local_experts) for rank in range(ep_size)
+    )
+    backward = tuple(expert * ep_size + rank for rank in range(ep_size) for expert in range(num_local_experts))
+    return forward, backward
 
 
 def preprocess(
@@ -37,9 +48,6 @@ def preprocess(
     # tokens per expert so duplicate top-k/hash slots do not overstate split sizes.
     num_local_tokens_per_expert = expert_mask.any(dim=1).sum(dim=1)
 
-    # [ep_size] represent the number of sum tokens in each rank
-    input_splits = num_local_tokens_per_expert.reshape(ep_size, num_local_experts).sum(dim=1).tolist()
-
     # gather all the number of tokens per expert from all ep ranks
     # [ep_size, num_experts]
     num_global_tokens_per_expert = torch.zeros(
@@ -48,23 +56,19 @@ def preprocess(
         dtype=num_local_tokens_per_expert.dtype,
         device=num_local_tokens_per_expert.device,
     )
-    dist.all_gather_into_tensor(num_global_tokens_per_expert, num_local_tokens_per_expert, group=ep_group)
+    dist.all_gather_into_tensor(num_global_tokens_per_expert.view(-1), num_local_tokens_per_expert, group=ep_group)
 
     # [ep_size, num_local_experts]
     start_idx, end_idx = rank * num_local_experts, (rank + 1) * num_local_experts
     num_global_tokens_per_local_expert = num_global_tokens_per_expert[:, start_idx:end_idx].contiguous()
 
-    # [ep_size]
+    # Split lists and grouped-GEMM metadata all derive from these counts. Transfer them together after the collective;
+    # the blocking copy ensures every CPU consumer sees ready data without separate device synchronizations.
+    host_counts = torch.cat((num_local_tokens_per_expert, num_global_tokens_per_local_expert.reshape(-1))).to("cpu")
+    input_splits = host_counts[:num_experts].view(ep_size, num_local_experts).sum(dim=1).tolist()
+    num_global_tokens_per_local_expert = host_counts[num_experts:].view(ep_size, num_local_experts)
     output_splits = num_global_tokens_per_local_expert.sum(dim=1).tolist()
-
-    # [num_local_expert]
-    num_global_sum_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=0).to(
-        torch.device("cpu"), non_blocking=True
-    )
-
-    num_global_tokens_per_local_expert = num_global_tokens_per_local_expert.view(-1, num_local_experts).to(
-        torch.device("cpu"), non_blocking=True
-    )
+    num_global_sum_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=0)
 
     return input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert
 
@@ -88,8 +92,7 @@ def token_pre_all2all(
     global_permuted_hidden_states = all_to_all(ep_group, local_permuted_hidden_states, output_splits, input_splits)
 
     # group tokens together by expert
-    num_local_experts = num_experts // ep_group.size()
-    permute_order = torch.arange(num_experts).reshape(-1, num_local_experts).T.ravel().tolist()
+    permute_order, _ = _expert_chunk_orders(num_experts, ep_group.size())
     global_permuted_hidden_states = sort_chunks_by_idxs(
         global_permuted_hidden_states,
         num_global_tokens_per_local_expert.ravel(),
@@ -181,8 +184,7 @@ def tokens_post_all2all(
     ep_group: Optional[dist.ProcessGroup] = None,
 ) -> torch.Tensor:
     # group tokens together by expert
-    num_local_experts = num_experts // ep_group.size()
-    unpermute_order = torch.arange(num_experts).reshape(num_local_experts, -1).T.ravel().tolist()
+    _, unpermute_order = _expert_chunk_orders(num_experts, ep_group.size())
     expert_outputs = sort_chunks_by_idxs(
         expert_outputs,
         num_global_tokens_per_local_expert.T.ravel(),
