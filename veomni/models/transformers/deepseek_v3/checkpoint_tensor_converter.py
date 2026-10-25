@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """
 Runtime checkpoint tensor converter for DeepseekV3 MoE models.
@@ -30,21 +30,21 @@ at load time, eliminating the need for offline checkpoint merging.
 
 from typing import Dict
 
-from veomni.models.checkpoint.expert_fusion import PerExpertSplitToFusedConverter
-from veomni.models.checkpoint.moe_map import (
+from ..._moe_per_expert_converter import PerExpertFusedCheckpointTensorConverter
+from ...checkpoint.moe_map import (
     PER_EXPERT_SPLIT_TO_FUSED_PATTERN,
     convert_per_expert_fqn_mapping_to_fused,
 )
 
 
-_EXPERT_PATTERN = PER_EXPERT_SPLIT_TO_FUSED_PATTERN
+class DeepseekV3CheckpointTensorConverter(PerExpertFusedCheckpointTensorConverter):
+    """Per-expert -> fused converter for DeepseekV3.
 
+    ``num_experts`` is ``config.n_routed_experts`` (equal to
+    ``config.num_local_experts`` in v5 DeepseekV3).
+    """
 
-class DeepseekV3CheckpointTensorConverter(PerExpertSplitToFusedConverter):
-    """Converts per-expert split checkpoint keys to stacked & merged v5 format."""
-
-    family_name = "DeepseekV3"
-    expert_pattern = _EXPERT_PATTERN
+    model_name = "DeepseekV3"
 
 
 def create_deepseek_v3_checkpoint_tensor_converter(model):
@@ -56,4 +56,4 @@ def create_deepseek_v3_checkpoint_tensor_converter(model):
 
 def convert_deepseek_v3_fqn_to_index_mapping(fqn_to_index_mapping: Dict[str, int]) -> Dict[str, int]:
     """Align HF safetensors index keys with fused expert parameter names."""
-    return convert_per_expert_fqn_mapping_to_fused(fqn_to_index_mapping, _EXPERT_PATTERN)
+    return convert_per_expert_fqn_mapping_to_fused(fqn_to_index_mapping, PER_EXPERT_SPLIT_TO_FUSED_PATTERN)

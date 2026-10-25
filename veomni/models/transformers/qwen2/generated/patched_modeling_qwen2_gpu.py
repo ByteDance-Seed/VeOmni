@@ -16,7 +16,7 @@
 #    - method_override: Qwen2MLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: Qwen2MLP.forward
-#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - method_override: Qwen2Model.forward
 #      Support SP in Qwen2Model.forward
 #    - method_override: Qwen2ForCausalLM.__init__
@@ -73,6 +73,7 @@ from transformers.utils.output_capturing import capture_outputs
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -95,7 +96,7 @@ class Qwen2MLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"}:
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,
@@ -461,7 +462,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         self.model = Qwen2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        impl = resolve_op_impl("cross_entropy_loss_implementation")
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
@@ -532,7 +533,7 @@ class Qwen2ForSequenceClassification(GenericForSequenceClassification, Qwen2PreT
         self.num_labels = config.num_labels
         self.model = Qwen2Model(config)
         self.score = nn.Linear(config.get_text_config().hidden_size, self.num_labels, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        impl = resolve_op_impl("cross_entropy_loss_implementation")
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForSequenceClassificationLoss, op=self.veomni_ce)
         self.post_init()

@@ -45,7 +45,7 @@ Five call sites in three functions, because the objective changes return arities
    the rest.
 2. The CSA compressor routes them out through `CompressedCandidates.indexer_scores`.
 3. `DeepseekV4Attention.forward` asks the attention interface for the teacher over
-   the trailing compressed slice, computes the per-query KL and the
+   the indexer's own selection in the compressed KV, computes the per-query KL and the
    zero-information reference beside it, and returns both as 0-d sums over *local*
    query rows. It is also where the decision is made: it holds the model config, so
    it evaluates `_builds_indexer_kl` once for the layer and hands the answer *down*

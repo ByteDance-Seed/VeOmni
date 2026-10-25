@@ -150,6 +150,73 @@ image streams across SP ranks and gathers the image stream back before the
 output head, mirroring the Wan/Flux pattern. `num_attention_heads` must be
 divisible by `ulysses_size`.
 
+The `Qwen-Image` and `Qwen-Image-Edit` preprocessors preserve the raw record
+aliases (`prompt`/`text`/`caption`, `image_path`/`target_image`, and the Edit
+`source_image(s)`/`edit_image(s)` aliases). They normalize them to modality
+pairs, matching the shared multimodal data convention:
+
+```python
+# One Edit sample after preprocessing, before image loading:
+inputs = [("image", None), ("text", "Make the car red")]
+outputs = [("image", None)]
+images = ["source.png", "target.png"]
+videos = []
+```
+
+For multiple references, add an input image placeholder for each source and
+keep all source images before the single target image. Text-to-image samples
+have only the text input and target image. The generic `dit_online` transform
+loads this one image list; the Qwen condition model validates the placeholders
+and splits sources from the target. It resizes a separate copy of each source
+to the EditPlus 384×384 condition area for VL encoding, preserving aspect ratio
+and the reference pipeline's rounding and interpolation. The VAE path applies
+the configured `height`, `width`, and `image_resize_mode` to the originals.
+`configs/dit/qwen_image_edit_2511.yaml` enables this Edit-2511 path and its
+`zero_cond_t` modulation. Existing encoded Qwen caches are unchanged.
+
+### Wan I2V conditioning
+
+The non-expanded-timestep I2V path (Wan2.2 I2V-A14B) uses
+`model.condition_model_cfg.image_conditioning: true`. A local snapshot's
+`transformer/config.json` also enables this mode when `in_channels` differs
+from `out_channels`. TI2V-5B uses `expand_timesteps` instead; T2V uses neither.
+
+For channel-concatenated I2V, the condition model preprocesses the video once,
+keeps its first normalized image frame, fills subsequent image frames with
+zeros, and VAE-encodes that complete condition video. It stores the raw
+condition posterior in `image_latents` and the temporal mask in `mask` alongside
+the target posterior and text context. `process_condition` normalizes both
+posteriors, and the DiT concatenates `[noisy_target, mask, image_condition]`.
+Copying the first latent across time is not equivalent to encoding zero-valued
+image frames. Legacy I2V offline embeddings missing `image_latents` or `mask`
+must be regenerated; the code rejects them rather than synthesizing a condition.
+
+The frame count must be `1 + k * vae.config.scale_factor_temporal`. The A14B
+example sets `data.mm_configs.frame_factor: 4` and `frame_factor_remainder: 1`
+to enforce this during video sampling. These settings follow A14B's VAE and
+must be checked when switching snapshots.
+
+The encoded latent's temporal and spatial dimensions must each be divisible by
+the corresponding transformer `patch_size`. Predictions and training targets
+must have identical shapes; incompatible inputs raise an error instead of
+silently discarding supervised frames or image borders.
+
+Expanded-timestep TI2V-5B clamps the first latent frame to the clean condition
+and uses zero timesteps there. Its flow target remains `noise - latents`;
+`process_condition` sets `loss_start_frame=1` for each sample so the transformer
+averages MSE over subsequent frames only. A sample must contain at least one
+latent frame after the condition. T2V and channel-concatenated A14B use the
+default `loss_start_frame=0` and supervise the full target video. Existing
+TI2V-5B encoded caches retain their format; the loss boundary is set during
+`process_condition` for both online and offline training.
+
+Both Wan I2V examples enable gradient checkpointing and disable async activation
+offload. Wan invokes checkpointing outside `block.__call__`, whereas the current
+async offload implementation wraps `block.__call__`. Combining them nests the
+offload saved-tensor hooks inside the checkpoint hooks and suppresses
+recomputation. Keep `model.accelerator.offload_config.enable_async_activation`
+disabled until Wan's outer checkpoint boundary supports that integration.
+
 ### Config Bridge — `to_diffuser_dict()` and `to_dict()`
 
 `to_diffuser_dict()` uses Python's `inspect` module to extract exactly the

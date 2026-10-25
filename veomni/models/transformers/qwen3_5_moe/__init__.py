@@ -113,6 +113,9 @@ def register_qwen3_5_moe_modeling(architecture: str):
     Qwen3_5MoeModel._convert_lora_targets_to_parameters = staticmethod(
         _convert_qwen3_5_moe_model_lora_targets_to_parameters
     )
+    Qwen3_5MoeForCausalLM._convert_lora_targets_to_parameters = staticmethod(
+        _convert_qwen3_5_moe_causal_lora_targets_to_parameters
+    )
     for model_cls in (Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration):
         model_cls._create_checkpoint_tensor_converter = staticmethod(_create_qwen3_5_moe_checkpoint_tensor_converter)
         model_cls._convert_fqn_to_index_mapping = staticmethod(convert_qwen3_moe_fqn_to_index_mapping)
@@ -122,7 +125,7 @@ def register_qwen3_5_moe_modeling(architecture: str):
         return Qwen3_5MoeForConditionalGeneration
     if "Model" in architecture:
         return Qwen3_5MoeModel
-    return Qwen3_5MoeForConditionalGeneration
+    return Qwen3_5MoeForCausalLM
 
 
 @MODELING_REGISTRY.register("qwen3_5_moe_text")

@@ -256,7 +256,7 @@ def test_triton_matches_eager():
 def test_npu_matches_eager(variant: str):
     _fused_matches_eager(
         variant,
-        "npu",
+        "torch_npu",
         "npu",
         torch.bfloat16,
         atol=RMS_NPU_ATOL,
@@ -271,7 +271,7 @@ def test_npu_matches_eager(variant: str):
 def test_npu_standard_matches_eager_fp32():
     _fused_matches_eager(
         "standard",
-        "npu",
+        "torch_npu",
         "npu",
         torch.float32,
         atol=RMS_NPU_FP32_ATOL,
@@ -281,7 +281,7 @@ def test_npu_standard_matches_eager_fp32():
 
 def _npu_forward_only(variant: str, x: Tensor, weight: Tensor, eps: float) -> tuple[Tensor, Tensor]:
     eager = resolve_op("rms_norm", variant, "eager").wrapper
-    other = resolve_op("rms_norm", variant, "npu").wrapper
+    other = resolve_op("rms_norm", variant, "torch_npu").wrapper
     return eager(x, weight, eps=eps), other(x, weight, eps=eps)
 
 

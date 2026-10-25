@@ -666,6 +666,9 @@ def quack_gemm_fused_moe_forward(
 
     ``assume_distinct_experts`` is intentionally unused here; see below.
     """
+    # Router scores stay float32. Cast before the fused scale so CUTLASS does not
+    # see an fp32 activation against bf16 weights.
+    routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     # ``assume_distinct_experts`` only tightens the grouped-GEMM ``max_M``
     # launch bound in the Triton backend. Quack routes every expert through a
     # CUTLASS varlen GEMM from ``cu_seqlens_m``, so the flag is a no-op here.

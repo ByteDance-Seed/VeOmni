@@ -72,8 +72,8 @@ checkpoint round-trip tests; do not hide mismatches with `strict=False`.
 
 3. **Exception — non-transformers architectures.** Diffusion models under
    `veomni/models/diffusers/<model_name>/`, and the `flux` / `movqgan` / `wan`
-   directories, have no `generated/` output and no patchgen config: they patch
-   through `device_patch.py` or direct modeling. Copy the closest existing one
+   directories, have no `generated/` output and no patchgen config: their modeling
+   binds `VeomniOp` handles directly. Copy the closest existing one
    and skip to Phase 3.
 
 4. Reference existing parallel plans for guidance (e.g., `veomni/models/transformers/qwen3_moe/parallel_plan.py`). Come back here once the model loads and its registry and patch tests pass.

@@ -15,7 +15,7 @@
 import math
 import os
 import sys
-from dataclasses import MISSING, dataclass, field, fields
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar, Dict, List, Literal, Optional, Tuple
 
@@ -133,11 +133,11 @@ class OptimizerConfig:
         default="per_module",
         metadata={
             "help": (
-                "Which parameters max_grad_norm is computed over. 'per_module' clips each "
-                "module against its own norm; 'global' clips every module against one norm "
-                "taken across all of them. A single-model job has one module, so the two "
-                "agree; 'global' only becomes meaningful once an omni model owns several, "
-                "and is not implemented yet."
+                "How OmniTrainer applies max_grad_norm across OmniModules. "
+                "'per_module' (default): clip each module to max_grad_norm independently, "
+                "then report sqrt(sum n_i^2). "
+                "'global': measure each module unclipped, total=sqrt(sum n_i^2), then scale "
+                "all modules by one coefficient (single-model / seedream gradient_clip_val semantics)."
             )
         },
     )
@@ -247,13 +247,6 @@ class OptimizerConfig:
             )
         },
     )
-
-    def __post_init__(self):
-        if self.grad_clip_scope == "global":
-            raise NotImplementedError(
-                "model.optimizer.grad_clip_scope='global' needs a clip that spans several "
-                "modules, which arrives with the omni module runtime. Use 'per_module'."
-            )
 
 
 @dataclass
@@ -413,7 +406,12 @@ class GradientCheckpointingConfig:
 
     enable: bool = field(
         default=True,
-        metadata={"help": "Enable gradient checkpointing."},
+        metadata={
+            "help": (
+                "Enable gradient checkpointing. Master switch: with it off recompute_layers, "
+                "selective_recompute_layers and save_ops have no effect."
+            )
+        },
     )
     debug: bool = field(
         default=False,
@@ -423,7 +421,15 @@ class GradientCheckpointingConfig:
     )
     enable_reentrant: bool = field(
         default=False,
-        metadata={"help": "Use reentrant gradient checkpointing."},
+        metadata={
+            "help": (
+                "Use reentrant gradient checkpointing. Kept off by default, and not usable "
+                "on a model whose block loop passes its block arguments by keyword "
+                "(MiniMax-H3): reentrant checkpointing saves positional tensors only, so "
+                "the first recomputed block raises. torch also refuses "
+                "enable_reentrant=True together with SAC."
+            )
+        },
     )
     early_stop: bool = field(
         default=True,
@@ -434,6 +440,75 @@ class GradientCheckpointingConfig:
             )
         },
     )
+    recompute_layers: int = field(
+        default=-1,
+        metadata={
+            "help": (
+                "How many layers run recomputation while checkpointing is on, counted from the "
+                "last block: -1 (default) = every layer, N = the last N layers, 0 = "
+                "none. A value above the model depth means every layer. The layers in "
+                "front of that range keep their activations, so memory grows. Applies "
+                "to every model: the framework finds the block stack itself "
+                "(_no_split_modules / basic_modules) and folds sibling stacks into one "
+                "sequence. A model with several stacks (a VLM tower beside the decoder) "
+                "counts the trainable one, the one with more blocks if both train; list "
+                "a class in model.basic_modules to count that one instead. A model "
+                "calling torch.utils.checkpoint directly does not honour it and is "
+                "reported. Ignored when enable=False."
+            )
+        },
+    )
+    selective_recompute_layers: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "How many of those layers run selective activation checkpointing (SAC) — "
+                "keep the operators named in save_ops and recompute the rest — counted "
+                "from the front of the recomputed range, the rest of the range "
+                "recomputing in full. 0 (default) = SAC off, N = the first N, a value "
+                "above the length of that range means the whole range. Ignored when "
+                "enable=False, and needs enable_reentrant=False."
+            )
+        },
+    )
+    save_ops: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Operators SAC keeps (MUST_SAVE) instead of recomputing, on top of the "
+                "attention set it always keeps. Empty (default) or 'attn' = that "
+                "attention set. Any other entry is read as a literal operator string, "
+                "e.g. 'aten._scaled_dot_product_attention.default'. Only applies while "
+                "SAC is on."
+            )
+        },
+    )
+
+    def __post_init__(self) -> None:
+        # YAML values reach the dataclass untyped (the parser casts CLI args only),
+        # so a quoted count would otherwise fail much later, inside the policy build.
+        for name, minimum, expected in (
+            ("recompute_layers", -1, "a non-negative integer or -1"),
+            ("selective_recompute_layers", 0, "a non-negative integer"),
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(
+                    f"model.accelerator.gradient_checkpointing.{name} must be {expected}, "
+                    f"got {value!r} ({type(value).__name__})"
+                )
+        # A bare operator string would be iterated character by character by the op
+        # resolver (one warning per letter), so normalise it and reject anything
+        # that is not a sequence of names.
+        if self.save_ops is None:
+            self.save_ops = []
+        elif isinstance(self.save_ops, str):
+            self.save_ops = [self.save_ops]
+        elif not isinstance(self.save_ops, list):
+            raise ValueError(
+                "model.accelerator.gradient_checkpointing.save_ops must be a list of names, "
+                f"got {self.save_ops!r} ({type(self.save_ops).__name__})"
+            )
 
 
 @dataclass
@@ -543,9 +618,25 @@ class FSDPConfig:
         default="fsdp2",
         metadata={
             "help": (
-                "Data parallel mode. 'eager' is reserved for a future single-process "
-                "from_pretrained(device_map=...) inference path that skips every wrapper, "
-                "and currently raises."
+                "Data parallel mode. 'eager' skips every wrapper for the single-process "
+                "inference path an omni module takes via ModuleRuntime._init_eager_inference."
+            )
+        },
+    )
+    fsdp_scope: Literal["module", "model"] = field(
+        default="module",
+        metadata={
+            "help": (
+                "Where to apply the FSDP2/DDP wrap for a SeedOmni composed model. "
+                "'module' (default) wraps each omni module independently. 'model' wraps "
+                "the composed OmniModel once, so one FSDP tree spans every sub-module. "
+                "Wrap targets are each child's _no_split_modules scoped as "
+                "'{child}.{ClassName}'; leftover params unshard on OmniModel.forward. "
+                "Under 'model', per-module fsdp_mode / extra_parallel / init_device and "
+                "SP-CP-TP-PP overlays stay as written but no longer decide mesh, init or "
+                "wrap — the top-level accelerator does, and only its fsdp_scope counts. "
+                "Every module must defer to that one wrap, so a module on inference "
+                "fsdp_mode='eager' is rejected under 'model'."
             )
         },
     )
@@ -604,13 +695,8 @@ class FSDPConfig:
                 "switch to fsdp_mode='fsdp2' (with model.accelerator.init_device='meta'), "
                 "'ddp', or 'eager'."
             )
-        if self.fsdp_mode == "eager":
-            # Reserved rather than live: the parallelize path has no unwrapped branch,
-            # so accepting this silently would hand the model to DDP instead.
-            raise NotImplementedError(
-                "model.accelerator.fsdp_config.fsdp_mode='eager' is reserved for the "
-                "single-process inference path and is not wired up yet."
-            )
+        if self.fsdp_scope not in ("module", "model"):
+            raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
         validate_low_precision_reduce_scatter_comm(
             self.low_precision_reduce_scatter_comm, self.mixed_precision, fsdp_mode=self.fsdp_mode
         )
@@ -1184,39 +1270,28 @@ class TrainingArguments:
 #
 
 
-# NPU compatibility tables for ``_validate_implementations``. ``"eager"`` is
-# always allowed implicitly. A value not in ``_NPU_ALLOWED[field]`` raises on
-# NPU; a value in ``_NPU_REQUIRED[field]`` raises off NPU.
+# NPU compatibility tables for ``_validate_implementations``. ``"eager"`` and
+# unset (``None``) are always allowed implicitly. An explicit value not in
+# ``_NPU_ALLOWED[field]`` raises on NPU; a value in ``_NPU_REQUIRED[field]``
+# raises off NPU.
 #
 # Hardcoded rather than inferred from registry requirements because backend
-# names alone do not capture per-model compatibility. The NPU default
-# normalization step runs before this allow-list validation.
+# names alone do not capture per-model compatibility.
 _NPU_ALLOWED: Dict[str, frozenset] = {
-    "rms_norm_implementation": frozenset({"npu"}),
-    "rotary_pos_emb_implementation": frozenset({"npu"}),
-    "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
+    "rms_norm_implementation": frozenset({"torch_npu"}),
+    "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
+    "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
     "swiglu_mlp_implementation": frozenset(),
-    "load_balancing_loss_implementation": frozenset({"triton"}),
-    "cross_entropy_loss_implementation": frozenset({"chunk_loss", "npu"}),
+    "load_balancing_loss_implementation": frozenset(),
+    "cross_entropy_loss_implementation": frozenset({"chunk_loss"}),
     "moe_implementation": frozenset({"fused_npu"}),
 }
 
 _NPU_REQUIRED: Dict[str, frozenset] = {
-    "rms_norm_implementation": frozenset({"npu"}),
-    "rotary_pos_emb_implementation": frozenset({"npu"}),
-    "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
-    "cross_entropy_loss_implementation": frozenset({"npu"}),
+    "rms_norm_implementation": frozenset({"torch_npu"}),
+    "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
+    "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
     "moe_implementation": frozenset({"fused_npu"}),
-}
-
-_NPU_DEFAULT_FALLBACK: Dict[str, str] = {
-    "rms_norm_implementation": "npu",
-    "rotary_pos_emb_implementation": "npu",
-    "rotary_pos_emb_vision_implementation": "npu",
-    "swiglu_mlp_implementation": "eager",
-    "load_balancing_loss_implementation": "eager",
-    "cross_entropy_loss_implementation": "chunk_loss",
-    "moe_implementation": "fused_npu",
 }
 
 # MLU compatibility tables for ``_validate_implementations``.
@@ -1225,12 +1300,45 @@ _MLU_ALLOWED: Dict[str, frozenset] = {
     "moe_implementation": frozenset({"fused_mlu", "fused_triton"}),
 }
 
-_MLU_DEFAULT_FALLBACK: Dict[str, str] = {
-    "rms_norm_implementation": "eager",
-    "rotary_pos_emb_implementation": "eager",
-    "swiglu_mlp_implementation": "eager",
-    "load_balancing_loss_implementation": "eager",
-    "cross_entropy_loss_implementation": "eager",
+# Values renamed by the OpSlot -> VeomniOp migration. They still parse, resolve to
+# the new name with a warning, and are listed in docs/usage/arguments.md.
+_DEPRECATED_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, str]] = {
+    "attn_implementation": {
+        f"{name}_with_sp": name
+        for name in (
+            "veomni_flash_attention_2",
+            "veomni_flash_attention_2_hub",
+            "veomni_flash_attention_3",
+            "veomni_flash_attention_3_hub",
+            "veomni_flash_attention_4",
+            "veomni_flex_attention",
+            "veomni_magi_attention",
+        )
+    },
+    "moe_implementation": {"fused_mlu_triton": "fused_triton"},
+    # ``npu`` named the hardware rather than the kernel behind it. Each row now
+    # says which third-party kernel it calls; the old CE ``npu`` was ``chunk_loss``.
+    "cross_entropy_loss_implementation": {"npu": "chunk_loss"},
+    "rms_norm_implementation": {"npu": "torch_npu"},
+    "rotary_pos_emb_implementation": {"npu": "torch_npu"},
+    "rotary_pos_emb_vision_implementation": {"npu": "torch_npu"},
+    "rms_norm_gated_implementation": {"npu": "torch_npu"},
+    "causal_conv1d_implementation": {"npu": "triton"},
+    "chunk_gated_delta_rule_implementation": {"npu": "triton", "npu_ascendc": "fla_npu"},
+}
+
+# Compatibility aliases for explicit values on variants without that backend.
+# Unset values remain None and use the registry's per-variant default.
+_DEPRECATED_VARIANT_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, Dict[str, str]]] = {
+    "rms_norm_implementation": {"unweighted": {"torch_npu": "eager", "npu": "eager"}},
+}
+
+# Values that were never implementation names and have no implementation equivalent.
+_REJECTED_IMPLEMENTATION_VALUES: Dict[str, Dict[str, str]] = {
+    "rms_norm_implementation": {
+        "qwen3_5": "'qwen3_5' was the Qwen3.5 RMSNorm variant name (now 'offset'), not an implementation; "
+        "use one of 'liger_kernel', 'torch_npu', 'triton', or 'eager'.",
+    },
 }
 
 
@@ -1238,12 +1346,11 @@ _MLU_DEFAULT_FALLBACK: Dict[str, str] = {
 class OpsImplementationConfig:
     """model.ops_implementation.* — kernel backend selection per op.
 
-    Defaults are GPU-optimal (Liger / Triton / fused Triton MoE). On NPU, values
-    still equal to the dataclass defaults listed in ``_NPU_DEFAULT_FALLBACK``
-    are automatically mapped to NPU-compatible or eager implementations;
-    explicit non-default overrides are validated and unsupported values raise.
-    Per-op fields are ``str`` so third-party backends can register without
-    changing this dataclass.
+    The general-purpose kernel fields default to ``None`` and resolve to the
+    host default for each ``(op, variant)`` in ``resolve_op`` / ``VeomniOp``
+    via ``OP_REGISTRY.default_impl``. Explicit values are never rewritten; they
+    are validated and unsupported values raise. Per-op fields are ``str`` so
+    third-party backends can register without changing this dataclass.
 
     NPU validation runs at two times:
 
@@ -1256,16 +1363,15 @@ class OpsImplementationConfig:
       model-specific ops such as ``rms_norm_gated``, ``causal_conv1d``, and
       ``chunk_gated_delta_rule``. Keeping this compatibility check at the
       consuming model avoids forcing unrelated models to configure them.
-      All three ship both a GPU (``fla``) and an NPU (``npu``) backend; the
+      All three ship both a GPU (``fla``) and an NPU backend; the
       kernel's ``HardwareRequirement`` raises only when the requested value has
       no backend for the current hardware. The varlen (``dyn_bsz=True``) caveat
       is documented in the field metadata.
 
     Backends: ``"eager"`` (HF reference, always available),
-    ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"npu"`` (Ascend),
-    ``"triton"`` (CUDA ``triton``). Load-balancing loss has a CUDA Triton
-    backend; on NPU, values equal to the dataclass default are normalized to
-    ``"eager"`` before registry binding.
+    ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"torch_npu"`` (Ascend),
+    ``"triton"`` (CUDA ``triton``, or Triton-Ascend on NPU). Load-balancing loss has a CUDA Triton
+    backend; its NPU default is ``"eager"``.
     """
 
     attn_implementation: Optional[
@@ -1299,78 +1405,84 @@ class OpsImplementationConfig:
             "MODELING_BACKEND=veomni. Pass a veomni_* name to select that adapter directly."
         },
     )
-    moe_implementation: str = field(
-        default="fused_triton",
+    moe_implementation: Optional[str] = field(
+        default=None,
         metadata={
-            "help": "MoE experts forward. 'fused_triton' (default, GPU SM70+ or MLU) | "
+            "help": "MoE experts forward. 'fused_triton' (GPU SM70+ or MLU) | "
             "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | "
             "'fused_mlu' (MLU Apex grouped-GEMM) | 'eager'. "
-            "On NPU, a default-valued 'fused_triton' selection maps to 'fused_npu'; "
-            "incompatible non-default overrides raise."
+            "Unset: 'fused_triton' on GPU, 'fused_npu' on NPU, 'fused_mlu' on MLU with Apex "
+            "and 'fused_triton' otherwise."
         },
     )
-    cross_entropy_loss_implementation: str = field(
-        default="liger_kernel",
+    cross_entropy_loss_implementation: Optional[str] = field(
+        default=None,
         metadata={
-            "help": "Cross-entropy loss. 'liger_kernel' (default, GPU; fused linear+CE — "
+            "help": "Cross-entropy loss. 'liger_kernel' (GPU; fused linear+CE — "
             "requires VeOmni-patched modeling that passes hidden_states=/weights= to "
             "self.loss_function; unpatched HF models raise) | 'chunk_loss' (chunked "
-            "F.linear+CE, hardware-agnostic) | 'npu' (chunk_loss + torch_npu gate) | "
-            "'eager' (PyTorch F.cross_entropy)."
+            "F.linear+CE, hardware-agnostic) | 'eager' (PyTorch F.cross_entropy). "
+            "Unset: 'liger_kernel' on GPU, 'chunk_loss' on NPU, 'eager' on MLU."
         },
     )
-    rms_norm_implementation: str = field(
-        default="liger_kernel",
+    rms_norm_implementation: Optional[str] = field(
+        default=None,
         metadata={
-            "help": "RMSNorm. 'liger_kernel' (default, GPU) | 'npu' | "
-            "'triton' (DeepSeek-V3 batch-invariant; GPU only) | 'eager'."
+            "help": "RMSNorm. 'liger_kernel' (GPU) | 'torch_npu' (Ascend; the unweighted "
+            "variant has no Ascend kernel and uses 'eager') | "
+            "'triton' (DeepSeek-V3 batch-invariant; GPU only) | 'eager'. "
+            "Unset: 'liger_kernel' on GPU, 'torch_npu' on NPU, 'eager' on MLU."
         },
     )
-    swiglu_mlp_implementation: str = field(
-        default="liger_kernel",
+    swiglu_mlp_implementation: Optional[str] = field(
+        default=None,
         metadata={
-            "help": "SwiGLU MLP. 'liger_kernel' (default, GPU) | 'eager'. No NPU backend — NPU users must set 'eager'."
+            "help": "SwiGLU MLP. 'liger_kernel' (GPU) | 'eager'. No NPU backend. "
+            "Unset: 'liger_kernel' on GPU, 'eager' on NPU and MLU."
         },
     )
-    rotary_pos_emb_implementation: str = field(
-        default="liger_kernel",
+    rotary_pos_emb_implementation: Optional[str] = field(
+        default=None,
         metadata={
-            "help": "Rotary positional embedding. 'liger_kernel' (default, GPU) | "
-            "'npu' | 'triton' (per-model: DeepSeek-V3 deterministic, "
-            "DeepSeek-V4 fused partial-interleaved, Wan; GPU only) | 'eager'."
+            "help": "Rotary positional embedding. 'liger_kernel' (GPU) | "
+            "'torch_npu' (Ascend) | 'triton' (per-model: DeepSeek-V3 deterministic, "
+            "DeepSeek-V4 fused partial-interleaved, Wan; GPU only) | 'eager'. "
+            "Unset: 'liger_kernel' on GPU, 'torch_npu' on NPU, 'eager' on MLU."
         },
     )
-    rotary_pos_emb_vision_implementation: str = field(
-        default="eager",
+    rotary_pos_emb_vision_implementation: Optional[str] = field(
+        default=None,
         metadata={
             "help": "Rank-3 vision layout for full rotary positional embedding. "
-            "Uses the same 'rope' op with an independent implementation choice: 'npu' | 'eager' (default)."
+            "Uses the same 'rope' op with an independent implementation choice: 'liger_kernel' | 'torch_npu' | 'eager'. "
+            "Unset: 'liger_kernel' on GPU, 'torch_npu' on NPU, 'eager' elsewhere."
         },
     )
-    load_balancing_loss_implementation: str = field(
-        default="triton",
+    load_balancing_loss_implementation: Optional[str] = field(
+        default=None,
         metadata={
-            "help": "MoE load-balancing loss. 'triton' (default; needs 'triton' on CUDA) | 'eager'. "
-            "On NPU, config normalization maps the default 'triton' value to 'eager'."
+            "help": "MoE load-balancing loss. 'triton' (needs 'triton' on CUDA) | 'eager'. "
+            "Unset: 'triton' on GPU, 'eager' on NPU and MLU."
         },
     )
     rms_norm_gated_implementation: str = field(
         default="fla",
         metadata={
-            "help": "Gated RMSNorm implementation (Qwen3.5 GatedDeltaNet `self.norm`). "
+            "help": "Gated RMSNorm implementation (Qwen3.5/Qwen4-Exp GatedDeltaNet `self.norm`). "
             "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'eager' uses the HuggingFace Qwen3_5RMSNormGated. "
-            "'npu' uses the VeOmni NPUFusedRMSNormGated."
+            "'torch_npu' uses npu_rms_norm, fuses a SiLU gate with npu_swiglu (Qwen3.5), "
+            "and keeps the eager gate multiply for sigmoid (Qwen4-Exp's output_gate_type)."
         },
     )
     causal_conv1d_implementation: str = field(
         default="fla",
         metadata={
-            "help": "Varlen depthwise causal conv1d implementation (Qwen3.5 GatedDeltaNet pre-mixer). "
+            "help": "Varlen depthwise causal conv1d implementation (Qwen3.5/Qwen4-Exp GatedDeltaNet pre-mixer). "
             "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'eager' leaves causal_conv1d_fn unset; the varlen training path then raises "
             "because no torch fallback handles cu_seqlens. "
-            "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
+            "'triton' uses the vendored Triton-Ascend kernel (requires triton-ascend, NPU). "
             "Only affects varlen (dyn_bsz) training; a non-eager value on hardware without a "
             "matching backend raises when the model resolves its kernel."
         },
@@ -1378,31 +1490,53 @@ class OpsImplementationConfig:
     chunk_gated_delta_rule_implementation: str = field(
         default="fla",
         metadata={
-            "help": "Chunk gated delta-rule kernel for Qwen3.5 linear attention. "
+            "help": "Chunk gated delta-rule kernel for Qwen3.5/Qwen4-Exp linear attention. "
             "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'flash_qla' uses QwenLM FlashQLA (ships under the gpu extra, Hopper SM90 only — "
             "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
             "cu_seqlens; varlen training therefore raises at runtime. "
-            "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
-            "'npu_ascendc' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
+            "'triton' uses the vendored Triton-Ascend kernel (requires triton-ascend, NPU). "
+            "'fla_npu' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
             "delegates heavy GDN compute to torch.ops.npu.*). "
             "A non-eager value on hardware without a matching backend raises when the model resolves its kernel."
         },
     )
-    dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = field(
+    qsa_attention_implementation: Literal["eager", "tilelang", "torch_npu"] = field(
         default="eager",
-        metadata={"help": "DeepSeek sparse attention top-k indexer implementation: 'eager', 'cudnn', or 'tilelang'."},
+        metadata={
+            "help": "Qwen4-Exp QSA sparse attention. 'eager' expands the compact global token "
+            "selection to a dense mask and runs quadratic PyTorch attention (numerical reference). "
+            "'tilelang' gathers the selected K/V rows instead (requires tilelang, bf16, NVIDIA CUDA). "
+            "'torch_npu' prunes per-query-chunk KV intervals with an int8 scatter mask and runs "
+            "torch_npu.npu_fusion_attention (requires bf16, Ascend NPU). "
+            "Both fused backends cover training forward/backward only, no KV cache, and raise on an "
+            "attention mask. Nonzero attention dropout falls back to eager with a warning."
+        },
     )
-    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "tilelang"] = field(
+    dsa_indexer_implementation: Literal["eager", "cudnn", "cann", "tilelang"] = field(
         default="eager",
-        metadata={"help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', or 'tilelang'."},
+        metadata={
+            "help": "DeepSeek sparse attention top-k indexer implementation: 'eager', 'cudnn', 'cann', or "
+            "'tilelang'. 'cann' is the DeepSeek-V4 Ascend CANN Lightning Indexer (requires "
+            "cann_ops_transformer)."
+        },
     )
-    mhc_implementation: Literal["eager", "tilelang"] = field(
+    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "cann", "tilelang"] = field(
+        default="eager",
+        metadata={
+            "help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', 'cann', or "
+            "'tilelang'. 'cann' is the DeepSeek-V4 Ascend CANN sparse FlashMLA (requires "
+            "cann_ops_transformer)."
+        },
+    )
+    mhc_implementation: Literal["eager", "cann", "tilelang"] = field(
         default="eager",
         metadata={
             "help": "Manifold-constrained Hyper-Connection implementation. 'tilelang' enables the "
-            "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'eager' uses PyTorch."
+            "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'cann' enables the "
+            "Ascend CANN fused pre/post path with a PyTorch final-head collapse (requires NPU BF16 "
+            "and cann_ops_transformer); 'eager' uses PyTorch."
         },
     )
     qat_implementation: Literal["none", "fp8_blockwise"] = field(
@@ -1432,9 +1566,9 @@ class OpsImplementationConfig:
         ):
             return
 
-        from ..utils.import_utils import is_torch_npu_available
+        from ..utils.device import IS_NPU_AVAILABLE
 
-        if is_torch_npu_available():
+        if IS_NPU_AVAILABLE:
             raise ValueError(
                 f"{implementation} is not supported on Ascend NPU; "
                 "select a supported non-Hub attention backend instead."
@@ -1452,6 +1586,7 @@ class OpsImplementationConfig:
         }.get(implementation, implementation)
 
     def __post_init__(self):
+        self._apply_deprecated_aliases()
         self.attn_implementation = self.normalize_hub_attention_backend(self.attn_implementation)
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
@@ -1468,58 +1603,40 @@ class OpsImplementationConfig:
                 logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
 
-        self._apply_npu_default_fallback()
-        self._apply_mlu_default_fallback()
         self._validate_implementations()
 
-    def _apply_npu_default_fallback(self):
-        """Auto-resolve GPU-only defaults to NPU-compatible alternatives.
+    def _apply_deprecated_aliases(self) -> None:
+        """Resolve renamed implementation values and reject values that were never implementations."""
+        for field_name, messages in _REJECTED_IMPLEMENTATION_VALUES.items():
+            value = getattr(self, field_name)
+            if value in messages:
+                raise ValueError(f"{field_name}={value!r}: {messages[value]}")
 
-        When running on NPU, fields still at their GPU default are automatically
-        swapped to the NPU fallback from ``_NPU_DEFAULT_FALLBACK``. Explicit
-        user overrides (non-default values) are left untouched and will be
-        caught by ``_validate_implementations`` if unsupported.
-        """
-        from ..utils.import_utils import is_torch_npu_available
+        for field_name, aliases in _DEPRECATED_IMPLEMENTATION_ALIASES.items():
+            value = getattr(self, field_name)
+            if value in aliases:
+                self._warn_deprecated(field_name, value, aliases[value])
+                setattr(self, field_name, aliases[value])
 
-        if not is_torch_npu_available():
-            return
+        if self.moe_implementation == "fused":
+            from ..utils.device import IS_NPU_AVAILABLE
+            from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available
 
-        gpu_defaults = {f.name: f.default for f in fields(self) if f.default is not MISSING}
-        for field_name, npu_value in _NPU_DEFAULT_FALLBACK.items():
-            if field_name not in gpu_defaults:
-                continue
-            current = getattr(self, field_name)
-            if current == gpu_defaults[field_name]:
-                setattr(self, field_name, npu_value)
-                logger.info_rank0(
-                    f"{field_name}: auto-resolved GPU default {current!r} -> {npu_value!r} on Ascend NPU."
-                )
+            if IS_NPU_AVAILABLE:
+                resolved = "fused_npu"
+            elif is_torch_mlu_available():
+                resolved = "fused_mlu" if is_apex_mlu_available() else "fused_triton"
+            else:
+                resolved = "fused_quack"
+            self._warn_deprecated("moe_implementation", "fused", resolved)
+            self.moe_implementation = resolved
 
-    def _apply_mlu_default_fallback(self):
-        """Auto-resolve GPU-only defaults to MLU-compatible alternatives.
-
-        When running on MLU, fields still at their GPU default are silently
-        swapped to the MLU fallback from ``_MLU_DEFAULT_FALLBACK``. Explicit
-        user overrides (non-default values) are left untouched and will be
-        caught by ``_validate_implementations`` if unsupported.
-        """
-        from ..utils.import_utils import is_torch_mlu_available
-
-        if not is_torch_mlu_available():
-            return
-
-        gpu_defaults = {f.name: f.default for f in fields(self) if f.default is not MISSING}
-        for field_name, mlu_value in _MLU_DEFAULT_FALLBACK.items():
-            if field_name not in gpu_defaults:
-                continue
-
-            current = getattr(self, field_name)
-            if current == gpu_defaults[field_name]:
-                setattr(self, field_name, mlu_value)
-                logger.info_rank0(
-                    f"{field_name}: auto-resolved GPU default {current!r} -> {mlu_value!r} on Cambricon MLU."
-                )
+    @staticmethod
+    def _warn_deprecated(field_name: str, old: str, new: str) -> None:
+        logger.warning_rank0(
+            f"{field_name}={old!r} is deprecated and resolves to {new!r} on this host. "
+            f"Set {field_name}={new!r} explicitly; the old value will be removed in a future release."
+        )
 
     def _validate_implementations(self):
         """Fail fast on hardware/op mismatch at config-parse time.
@@ -1529,32 +1646,32 @@ class OpsImplementationConfig:
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
+        from ..utils.device import IS_NPU_AVAILABLE
         from ..utils.import_utils import (
             is_apex_mlu_available,
             is_torch_mlu_available,
-            is_torch_npu_available,
         )
 
-        on_npu = is_torch_npu_available()
+        on_npu = IS_NPU_AVAILABLE
         on_mlu = is_torch_mlu_available()
 
         for field_name, npu_ok in _NPU_ALLOWED.items():
             value = getattr(self, field_name)
-            if value == "eager":
+            if value is None or value == "eager":
                 continue
             if on_npu and value not in npu_ok:
                 allowed = sorted(npu_ok | {"eager"})
                 raise ValueError(
                     f"{field_name}={value!r} is not supported on Ascend NPU. "
-                    f"Set to one of {allowed}; 'eager' is the universal fallback "
-                    f"for ops with no NPU kernel for the current model."
+                    f"Set to one of {allowed}, or leave it unset for the NPU default; "
+                    f"'eager' is the universal fallback for ops with no NPU kernel for the current model."
                 )
             if not on_npu and value in _NPU_REQUIRED.get(field_name, frozenset()):
                 raise ValueError(f"{field_name}={value!r} requires Ascend NPU but none is available.")
 
         for field_name, mlu_ok in _MLU_ALLOWED.items():
             value = getattr(self, field_name)
-            if value == "eager":
+            if value is None or value == "eager":
                 continue
             if on_mlu:
                 if value == "fused_mlu" and not is_apex_mlu_available():
@@ -1755,9 +1872,12 @@ class ModelArguments(BaseModelArguments):
         extra_parallel_sizes = dict(zip(self.accelerator.extra_parallel_names, self.accelerator.extra_parallel_sizes))
         ple_size = extra_parallel_sizes.get("ple", 1)
         if ple_size > 1:
-            if self.accelerator.dp_shard_size % ple_size != 0:
+            effective_fsdp_shard_size = (
+                self.accelerator.dp_shard_size * self.accelerator.ulysses_size * self.accelerator.cp_size
+            )
+            if effective_fsdp_shard_size % ple_size != 0:
                 raise ValueError(
-                    f"PLE size ({ple_size}) must divide the FSDP shard size ({self.accelerator.dp_shard_size})."
+                    f"PLE size ({ple_size}) must divide the effective FSDP shard size ({effective_fsdp_shard_size})."
                 )
             if not self.ep_sharded_stream_load:
                 raise ValueError(
@@ -1805,6 +1925,13 @@ class DataloaderConfig:
     drop_last: bool = field(
         default=True,
         metadata={"help": "Whether to drop the last incomplete batch."},
+    )
+    shuffle: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to shuffle the training data: the sampler order of mapping datasets "
+            "(reseeded each epoch) and the streaming shuffle buffer of iterable datasets."
+        },
     )
     pin_memory: bool = field(
         default=True,

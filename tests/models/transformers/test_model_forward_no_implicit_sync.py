@@ -211,22 +211,11 @@ _ALG_ESSENTIAL_VL_GET_ROPE_INDEX = (
 _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     # qwen3_5_vl-sdpa: like qwen3_vl-fa2 below, the ViT forward consumes the
     # precomputed multimodal metadata (fast path) — so the ViT's own
-    # `.tolist()` + host-side cu_seqlens build do not appear here. What remains:
-    #  - Qwen3_5VisionAttention.forward: the non-FA varlen-attention branch
-    #    does `torch.split(t, lengths.tolist(), ...)`, an HF-verbatim D2H.
-    #    This is eager/SDPA-only — production qwen3_5-VL uses FA2 (the
-    #    `is_flash_attention_requested` branch, which hands cu_seqlens to
-    #    flash_attn_varlen_func directly, no `.tolist()`). This case is forced
-    #    onto SDPA only because FA2 NaNs on the toy config, so the sync is on
-    #    a path production bypasses → tagged HF-eager-only.
-    #  - get_rope_index: the HF-verbatim mrope algorithm (same as qwen3_vl).
+    # `.tolist()` + host-side cu_seqlens build do not appear here, and the
+    # single-segment SDPA wrapper drops single-segment `cu_seqlens` without
+    # splitting or `.tolist()`-syncing. What remains:
+    #  - get_rope_index / get_vision_position_ids: the HF-verbatim mrope algorithm.
     "qwen3_5_vl-sdpa": {
-        ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5VisionAttention.forward"): (
-            "HF-eager-only: the non-FA branch's `torch.split(t, lengths.tolist(), ...)` "
-            "varlen split is an HF-verbatim D2H. Production qwen3_5-VL uses FA2, which "
-            "passes cu_seqlens to flash_attn_varlen_func directly and bypasses this; the "
-            "case runs SDPA only because FA2 NaNs on the toy config."
-        ),
         ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5Model.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
         ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5Model.get_vision_position_ids"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
@@ -320,13 +309,7 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
 # allowlisted), it would be misleading to add these to ``_ALLOWED_SYNCS``;
 # the skip keeps the case visible in pytest output as a reminder. The
 # skip reason should name the offending functions and the follow-up.
-_PENDING_FIX_CASES: dict[str, str] = {
-    "qwen3_5_vl-sdpa": (
-        "qwen3_5 language forward requires cu_seq_lens_q, but veomni_sdpa rejects "
-        "packed/varlen kwargs after the SDPA packed-input guard. The case stays "
-        "SDPA because FA2 NaNs on the toy config."
-    ),
-}
+_PENDING_FIX_CASES: dict[str, str] = {}
 
 
 # Cases that have been wired to consume ``multimodal_metadata`` via the
@@ -922,29 +905,38 @@ def _is_minimax_h3_path(filename: str) -> bool:
 
 @pytest.mark.parametrize("attention", ["sdpa", "veomni_flash_attention_2"])
 @pytest.mark.parametrize("mode", ["single", "packed"])
-def test_no_implicit_sync_in_minimax_h3_forward_backward(mode, attention):
+@pytest.mark.parametrize("cfg_mode", ["off", "per_sample"])
+def test_no_implicit_sync_in_minimax_h3_forward_backward(mode, attention, cfg_mode):
     """No implicit CUDA sync from MiniMax H3 modeling during a training step."""
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
     if attention != "sdpa" and importlib.util.find_spec("flash_attn") is None:
         pytest.skip("flash_attn package not installed.")
 
-    from tests.models.test_minimax_h3_packing import attention_model, condition_model, raw_sample
+    from tests.models.test_minimax_h3_packing import (
+        attention_model,
+        cfg_condition,
+        cfg_raw,
+        condition_model,
+        raw_sample,
+    )
     from veomni.trainer.dit_trainer import DiTDataCollator
 
     fused = attention != "sdpa"
     dtype = torch.bfloat16 if fused else torch.float32
     device = get_device_type()
     torch.manual_seed(0)
-    # H3 binds attention from the ops selection, so the single-sample path also runs FA here.
     model = attention_model(attention).to(device=device, dtype=dtype)
-    raws = [raw_sample(3), raw_sample(5, "ref2va")][: 1 if mode == "single" else 2]
+    # Recompute the blocks through the run's own entry point, so the replayed forward is under test too.
+    model.gradient_checkpointing_enable({"use_reentrant": False})
+    make_sample = cfg_raw if cfg_mode == "per_sample" else raw_sample
+    raws = [make_sample(3, "fl2va"), make_sample(5, "ref2va")][: 1 if mode == "single" else 2]
     for row in raws:
-        row["use_gradient_checkpointing"] = True
         for key in ("input_latents", "audio_input_latents", "prompt_embeds"):
             row[key] = row[key].to(dtype)
+    condition = condition_model() if cfg_mode == "off" else cfg_condition()
     collated = _to_device_recursive(dict(DiTDataCollator()(raws)), device)
-    condition = condition_model().to(device)
+    condition = condition.to(device)
 
     def step():
         sum(model(**condition.process_condition(**collated)).loss.values()).backward()

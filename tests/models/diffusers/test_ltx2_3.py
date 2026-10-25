@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """LTX 2.3 registry, integration, and numerical parity tests."""
 
@@ -54,8 +54,14 @@ def _sdpa_ops_config() -> SimpleNamespace:
     return ops
 
 
-_OFFICIAL_ATTENTION_FORWARD = Attention.forward
+_VENDORED_ATTENTION_FORWARD = Attention.forward
 _OFFICIAL_LTX_MODEL_FORWARD = LTXModel.forward
+
+
+def _official_attention_forward(self, *args, sp_valid_length=None, sp_context_length=None, **kwargs):
+    # The shared transformer block always passes the Ulysses lengths. They stay None without SP.
+    assert sp_valid_length is None and sp_context_length is None
+    return _VENDORED_ATTENTION_FORWARD(self, *args, **kwargs)
 
 
 class _MathSDPAAttention:
@@ -138,7 +144,7 @@ def test_ltx2_3_eager_forward_and_backward_match_vendored_reference():
 
         def call(model):
             if model is official:
-                Attention.forward = _OFFICIAL_ATTENTION_FORWARD
+                Attention.forward = _official_attention_forward
                 LTXModel.forward = _OFFICIAL_LTX_MODEL_FORWARD
                 inputs = official_inputs
             else:
@@ -269,19 +275,29 @@ def test_ltx_automatic_to_callable_reads_ops_config():
     assert masked.veomni_attn_masked is masked.veomni_attn
 
 
-def test_ltx_sdpa_flash_to_callable_collapses_to_sdpa():
+def test_ltx_sdpa_flash_to_callable_collapses_to_veomni_sdpa():
     adapter = AttentionFunction.SDPA_FLASH.to_callable()
     assert isinstance(adapter, VeomniLTXAttention)
-    assert adapter.veomni_attn.impl == "sdpa"
+    assert adapter.veomni_attn.impl == "veomni_sdpa"
     assert adapter.veomni_attn_masked is adapter.veomni_attn
 
 
-def test_ltx_non_sdpa_masked_falls_back_to_sdpa():
+def test_ltx_non_sdpa_masked_falls_back_to_veomni_sdpa(available_nvidia_ops):
+    # This checks handle selection only; no NVIDIA kernel runs on CPU/NPU hosts.
     assert AttentionFunction.FLASH_ATTENTION_3.value == "flash_attention_3"
-    adapter = VeomniLTXAttention("eager")
-    assert adapter.veomni_attn.impl == "eager"
-    assert adapter.veomni_attn_masked.impl == "sdpa"
+    adapter = VeomniLTXAttention("flex_attention")
+    assert adapter.veomni_attn.impl == "flex_attention"
+    assert adapter.veomni_attn_masked.impl == "veomni_sdpa"
     assert adapter.veomni_attn_masked is not adapter.veomni_attn
+
+
+def test_ltx_automatic_eager_selects_veomni_sdpa():
+    with ops_config_scope(eager_ops_config()):
+        adapter = AttentionFunction.AUTOMATIC.to_callable()
+        masked = MaskedAttentionFunction.AUTOMATIC.to_callable()
+    assert adapter.veomni_attn.impl == "veomni_sdpa"
+    assert adapter.veomni_attn_masked is adapter.veomni_attn
+    assert masked.veomni_attn.impl == "veomni_sdpa"
 
 
 def test_ltx_adapter_expands_mask_and_skips_ulysses():

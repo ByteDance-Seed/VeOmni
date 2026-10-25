@@ -16,13 +16,13 @@ import os
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from .....utils import logging
 from ..minimax_h3_core.batch_packing import pack_samples
 from ..minimax_h3_core.minimax_h3_dit import MiniMaxH3DiT, unpack_audio, unpatchify_video
+from ..minimax_h3_core.training_objectives import cfg_calibrated_mse
 from .configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
 
 
@@ -47,7 +47,8 @@ class MiniMaxH3DiTModel(PreTrainedModel):
 
     def __init__(self, config: MiniMaxH3DiTModelConfig, **kwargs):
         super().__init__(config)
-        self.gradient_checkpointing = False  # enable HF-compatible GC attr
+        # HF's marker. The DiT declares its own, so the enable reaches its block loop too.
+        self.gradient_checkpointing = False
         self.dit = MiniMaxH3DiT(
             num_layers=config.num_layers,
             token_refiner_num_layers=config.token_refiner_num_layers,
@@ -77,13 +78,23 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             )
 
     def _forward_batch(self, samples):
-        if any(sample.get("use_gradient_checkpointing_offload", False) for sample in samples):
-            raise ValueError("H3 multi-sample packing does not support checkpoint offload.")
+        negatives = [sample.get("unconditional_inputs") for sample in samples]
+        negative_predictions = [None] * len(samples)
+        if any(negative is not None for negative in negatives):
+            if any(negative is None for negative in negatives):
+                raise ValueError("Packed H3 samples must consistently enable or disable CFG.")
+            # Negative first: no graph, same current model, never a frozen/EMA teacher.
+            with torch.no_grad():
+                negative_output = self._forward_batch(negatives)
+            negative_predictions = list(zip(*negative_output.predictions))
         packed_inputs, row_counts = pack_samples(samples)
         video, audio = self.dit(**packed_inputs, packed_batch=True)
         video_parts = video.split([v for v, _ in row_counts])
         audio_parts = audio.split([a for _, a in row_counts])
-        outputs = [self._finish_outputs(v, a, **sample) for sample, v, a in zip(samples, video_parts, audio_parts)]
+        outputs = [
+            self._finish_outputs(v, a, unconditional_predictions=negative, **sample)
+            for sample, v, a, negative in zip(samples, video_parts, audio_parts, negative_predictions)
+        ]
         if any((out.loss is None) != (outputs[0].loss is None) for out in outputs):
             raise ValueError("All H3 samples must consistently supply or omit training targets.")
         losses = None
@@ -113,8 +124,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         img_pos_for_infer_output_info=None,
         packed_seq_params=None,
         refiner_packed_seq_params=None,
-        use_gradient_checkpointing=False,
-        use_gradient_checkpointing_offload=False,
         training_target=None,
         training_target_audio=None,
         video_latent_shape=None,
@@ -147,8 +156,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
                 img_pos_for_infer_output_info=img_pos_for_infer_output_info,
                 packed_seq_params=packed_seq_params,
                 refiner_packed_seq_params=refiner_packed_seq_params,
-                use_gradient_checkpointing=use_gradient_checkpointing,
-                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                 training_target=training_target,
                 training_target_audio=training_target_audio,
                 video_latent_shape=video_latent_shape,
@@ -171,6 +178,11 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         cond_rows = kwargs.pop("cond_rows", 0)
         scheduler_video = kwargs.pop("scheduler_video", None)
         scheduler_audio = kwargs.pop("scheduler_audio", None)
+        negative_inputs = kwargs.pop("unconditional_inputs", None)
+        negative_predictions = None
+        if negative_inputs is not None:
+            with torch.no_grad():
+                negative_predictions = self.forward(**negative_inputs).predictions
 
         # Run DiT — skip_mask_out_condition=True, update_mask=None
         video_tokens, audio_tokens = self.dit(
@@ -188,8 +200,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             img_pos_for_infer_output_info=img_pos_for_infer_output_info,
             packed_seq_params=packed_seq_params,
             refiner_packed_seq_params=refiner_packed_seq_params,
-            use_gradient_checkpointing=use_gradient_checkpointing,
-            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             skip_mask_out_condition=skip_mask_out_condition,
         )
 
@@ -203,6 +213,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             training_target_audio=training_target_audio,
             scheduler_video=scheduler_video,
             scheduler_audio=scheduler_audio,
+            unconditional_predictions=negative_predictions,
             **kwargs,
         )
 
@@ -219,6 +230,9 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         scheduler_video=None,
         scheduler_audio=None,
         has_audio=True,
+        unconditional_predictions=None,
+        training_cfg_scales=(1.0, 1.0),
+        training_cfg_curvature_power=2.0,
         **kwargs,
     ):
         # Slice off condition rows (v_video_rows[cond_rows_count:])
@@ -242,8 +256,21 @@ class MiniMaxH3DiTModel(PreTrainedModel):
 
         loss = None
         if training_target is not None and training_target_audio is not None:
-            loss_video = F.mse_loss(video_pred.float(), training_target.float())
-            loss_audio = F.mse_loss(audio_pred.float(), training_target_audio.float())
+            negatives = unconditional_predictions if unconditional_predictions is not None else (None, None)
+            loss_video = cfg_calibrated_mse(
+                video_pred,
+                training_target,
+                unconditional=negatives[0],
+                scale=training_cfg_scales[0],
+                curvature_power=training_cfg_curvature_power,
+            )
+            loss_audio = cfg_calibrated_mse(
+                audio_pred,
+                training_target_audio,
+                unconditional=negatives[1],
+                scale=training_cfg_scales[1],
+                curvature_power=training_cfg_curvature_power,
+            )
 
             # Apply timestep-dependent training weights
             # t_video / t_audio passed directly from process_condition (t = 1 - sigma)

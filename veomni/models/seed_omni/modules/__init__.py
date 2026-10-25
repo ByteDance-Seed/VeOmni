@@ -16,6 +16,14 @@ These modules are **not** registered with HuggingFace ``AutoConfig`` /
 ``AutoModel`` — always resolve the class via ``OMNI_*_REGISTRY`` first,
 then call ``from_pretrained`` on that class.
 
+``OMNI_ACCELERATED_MODEL_REGISTRY`` maps the same ``model_type`` to the
+VeOmni-side subclass (``modules/<family>/<sub>/accelerated/``) that mixes the
+graph hooks (:class:`BaseMixin`, :class:`TrainingModuleMixin`,
+:class:`InferenceModuleMixin`) onto the HF-native class.
+:func:`veomni.models.loader.get_model_class` builds that subclass when one is
+registered, so a :class:`ModuleRuntime` gets a graph participant while bare
+``OmniModel.from_pretrained`` keeps the plain HF class.
+
 Factory functions registered on ``OMNI_*_REGISTRY`` lazy-import the
 concrete config / model / processor classes on first call — importing this
 package only wires up the registry table, it does not load modeling code.
@@ -31,7 +39,8 @@ Shared bases live next to the families, not at the ``seed_omni/`` package root:
 Concrete modules: ``modules/<family>/<sub_module>/(configuration.py,
 modeling.py[, processing.py])``.  Each sub-module gets its own folder; the
 folder name carries the namespace so the inner files use short names rather
-than re-spelling ``<family>_<sub_module>`` per file.
+than re-spelling ``<family>_<sub_module>`` per file.  The shared
+word-token embedding + LM head module lives at ``modules/text_encoder/``.
 """
 
 from transformers import PretrainedConfig
@@ -45,6 +54,7 @@ from .module_processing_base import MODULE_ASSET_ATTRS, ModulePreprocessorBase, 
 OMNI_CONFIG_REGISTRY = Registry("OmniConfig")
 OMNI_MODEL_REGISTRY = Registry("OmniModel")
 OMNI_PROCESSOR_REGISTRY = Registry("OmniProcessor")
+OMNI_ACCELERATED_MODEL_REGISTRY = Registry("OmniAcceleratedModel")
 
 
 def read_hf_model_type(model_path: str) -> str:
@@ -78,7 +88,7 @@ def read_model_type(model_path: str) -> str:
     Shared helper for any caller that needs to dispatch from a
     split-checkpoint subfolder to the matching module class —
     today that's :class:`OmniInferencer` (eager ``from_pretrained``) and
-    :meth:`OmniTrainer._build_model` (meta-init via
+    :meth:`OmniTrainer._build_model_runtime` (meta-init via
     :func:`build_foundation_model`).  Centralised here so both paths use
     the same registration gate and emit identical error messages.
 
@@ -105,11 +115,13 @@ def read_model_type(model_path: str) -> str:
     return model_type
 
 
-from . import fake_model  # noqa: F401  E402
+# Side-effect only: attach @register factories under text_encoder/ and fake_model/.
+from . import fake_model, text_encoder  # noqa: F401  E402
 
 
 __all__ = [
     "MODULE_ASSET_ATTRS",
+    "OMNI_ACCELERATED_MODEL_REGISTRY",
     "OMNI_CONFIG_REGISTRY",
     "OMNI_MODEL_REGISTRY",
     "OMNI_PROCESSOR_REGISTRY",

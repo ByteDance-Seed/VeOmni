@@ -18,7 +18,7 @@
 #    - method_override: Qwen3VLTextMLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: Qwen3VLTextMLP.forward
-#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - init_modification: Qwen3VLVisionAttention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3VLVisionAttention.forward
@@ -104,6 +104,7 @@ from veomni.models.loss_utils import ForCausalLMLoss
 # Additional imports for patches
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.model_outputs import (  # noqa: F401  surfaced for forward log_probs path
@@ -494,50 +495,27 @@ class Qwen3VLVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = self.veomni_attn
-
-        if is_flash_attention_requested(self.config):
-            # --- Patch.1 ---
-            # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-            # --- Patch.1 ---
-            # Vision tokens stay on the attention-internal sync Ulysses path
-            # even when text async is on. Do not pass skip_ulysses; cu_seqlens
-            # still describes the global packed sequence.
-            attn_output, _ = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
-                max_length_q=max_seqlen,
-                max_length_k=max_seqlen,
-                is_causal=False,
-                **kwargs,
-            )
-        else:
-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            splits = [
-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-            ]
-            attn_outputs = [
-                attention_interface(
-                    self,
-                    q,
-                    k,
-                    v,
-                    attention_mask=None,
-                    scaling=self.scaling,
-                    dropout=0.0 if not self.training else self.attention_dropout,
-                    is_causal=False,
-                    **kwargs,
-                )[0]
-                for q, k, v in zip(*splits)
-            ]
-            attn_output = torch.cat(attn_outputs, dim=1)
+        # --- Patch.1 ---
+        # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+        # --- Patch.1 ---
+        # Vision tokens stay on the attention-internal sync Ulysses path
+        # even when text async is on. Do not pass skip_ulysses; cu_seqlens
+        # still describes the global packed sequence.
+        attn_output, _ = self.veomni_attn(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask=None,
+            scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+            is_causal=False,
+            **kwargs,
+        )
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.proj(attn_output)
@@ -816,7 +794,7 @@ class Qwen3VLTextMLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"}:
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,
@@ -2060,7 +2038,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen3VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        impl = resolve_op_impl("cross_entropy_loss_implementation")
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()

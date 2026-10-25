@@ -90,6 +90,8 @@ import pytest
 import torch
 import yaml
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
 from .test_moe_lora_trainer import (
     LOG_DICT,
     SNAPSHOT_POST,
@@ -100,6 +102,9 @@ from .test_moe_lora_trainer import (
     _yaml_for_mode,
     toy_base_dir,  # re-exported pytest fixture; the import binds it into this module's namespace
 )
+
+
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 
 # Silence "imported but unused" for the fixture -- pytest discovers
@@ -150,19 +155,14 @@ def _torchrun_capture(yaml_path: str, output_dir: str, extra_overrides: list[str
     EP slicing log lines (rank 0 only -- they're emitted by
     ``logger.info_rank0`` so duplicate-rank noise is already filtered).
     """
-    from ..tools.launch_utils import find_free_port
 
-    # ``find_free_port`` per-call (not a PID-derived constant) avoids
-    # "address in use" between back-to-back ``torchrun`` launches.
-    # ``test_moe_lora_ep_save_load_parallel_align`` alone fires four subprocesses
-    # per parametrise variant, and Linux's ``TIME_WAIT`` keeps the c10d
-    # store port held for ~60s after each one exits -- a stable PID port
-    # collides on the second launch.
+    # The agent binds its own rendezvous server rather than probing and
+    # releasing a port before the workers start.
     cmd = [
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={nproc}",
-        f"--master_port={find_free_port()}",
+        "--standalone",
         os.path.abspath(os.path.join(os.path.dirname(__file__), "test_moe_lora_trainer.py")),
         yaml_path,
         f"--train.checkpoint.output_dir={output_dir}",
@@ -379,6 +379,7 @@ def _assert_metric_close(
 # ──────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 @pytest.mark.parametrize("mode", ["shared", "independent"])
 def test_ep2_trainer_integration(tmp_path, toy_base_dir, mode):
     """End-to-end EP=2 trainer run: assert plan-bridge + slice + DCP-consolidate.
@@ -409,7 +410,7 @@ def test_ep2_trainer_integration(tmp_path, toy_base_dir, mode):
     Value alignment is intentionally not asserted -- see module
     docstring for why per-rank meta-init makes that ill-defined.
     """
-    nproc = _gpu_count_or_skip(min_count=2, max_count=2)
+    nproc = _gpu_count_or_skip(min_count=_CI_ACCELERATOR_2.nproc, max_count=_CI_ACCELERATOR_2.nproc)
     yaml_path = _yaml_for_mode(mode)
     base_overrides = _model_path_overrides(toy_base_dir) + [_FUSED_OPS_OVERRIDE]
 
@@ -537,6 +538,7 @@ _ALIGN_MAX_STEPS = 4
 _DCP_SAVE_STEP = 2
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 @pytest.mark.parametrize("mode", ["shared", "independent"])
 def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     """EP=2 save + cross-EP adapter resume parity + EP=2 DCP round-trip parity.
@@ -650,7 +652,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     coverage would fail this while passing the integration test, and
     vice versa.
     """
-    nproc = _gpu_count_or_skip(min_count=2, max_count=2)
+    nproc = _gpu_count_or_skip(min_count=_CI_ACCELERATOR_2.nproc, max_count=_CI_ACCELERATOR_2.nproc)
     yaml_path = _yaml_for_mode(mode)
     base_overrides = _model_path_overrides(toy_base_dir) + [_FUSED_OPS_OVERRIDE]
 
@@ -891,10 +893,11 @@ def _reset_lora_under_ep_worker():
     )
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_independent_reset_lora_parameters_under_ep_shard():
     """Regression: ``LoraIndependentExperts.reset_lora_parameters`` must
     populate local storage when the LoRA-A weight is an EP-sharded
     ``DTensor[Shard(0)]``. See module docstring for context."""
     from ..tools.launch_utils import torchrun
 
-    torchrun(_reset_lora_under_ep_worker, world_size=2)
+    torchrun(_reset_lora_under_ep_worker, world_size=_CI_ACCELERATOR_2.nproc)
