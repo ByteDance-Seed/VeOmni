@@ -35,7 +35,7 @@ from tests.ops.tol import (
     MHC_FUSED_GRAD_COSINE,
     MHC_FUSED_RTOL,
 )
-from tests.ops.utils import assert_gradient_direction_and_scale, is_nvidia_cuda_available, make_grad_leaves
+from tests.ops.utils import assert_gradient_direction_and_scale, is_tilelang_gpu_available, make_grad_leaves
 from veomni.ops import OP_REGISTRY, resolve_op
 from veomni.ops.kernels.mhc.pre import cann as pre_cann
 from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
@@ -43,7 +43,7 @@ from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
 
 # Installed Transformers classes used as the mHC eager reference.
 
-_TILELANG_AVAILABLE = is_nvidia_cuda_available(min_cc=90) and importlib.util.find_spec("tile_kernels") is not None
+_TILELANG_AVAILABLE = is_tilelang_gpu_available() and importlib.util.find_spec("tile_kernels") is not None
 _CANN_AVAILABLE = IS_NPU_AVAILABLE and importlib.util.find_spec("cann_ops_transformer") is not None
 
 
@@ -189,7 +189,9 @@ def test_mhc_head_eager_matches_hf():
     assert torch.allclose(base_e.grad, head.hc_base.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-@pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="TileKernels mHC requires an SM90+ NVIDIA CUDA GPU")
+@pytest.mark.skipif(
+    not _TILELANG_AVAILABLE, reason="TileKernels mHC requires an SM90+ NVIDIA CUDA GPU or an AMD gfx942/gfx950 GPU"
+)
 def test_mhc_tilelang_pre_post_matches_eager():
     torch.manual_seed(17)
     device = torch.device("cuda")
@@ -235,7 +237,9 @@ def test_mhc_tilelang_pre_post_matches_eager():
         )
 
 
-@pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="TileKernels mHC requires an SM90+ NVIDIA CUDA GPU")
+@pytest.mark.skipif(
+    not _TILELANG_AVAILABLE, reason="TileKernels mHC requires an SM90+ NVIDIA CUDA GPU or an AMD gfx942/gfx950 GPU"
+)
 def test_mhc_tilelang_head_matches_eager():
     torch.manual_seed(23)
     device = torch.device("cuda")

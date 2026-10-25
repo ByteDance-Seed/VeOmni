@@ -25,9 +25,53 @@ import tilelang
 import torch
 from tilelang import language as T
 
+from veomni.utils.device import get_max_shared_memory_per_block
+
 
 # KV length granularity these kernels are specialized on; see sparse_mqa_bwd_interface.
 KV_BLOCK = 1024
+
+# Head tile of the backward CTA. On gfx950 a 64-head tile does not fit the 160 KB LDS
+# and the 32-head tile computes a wrong dKV, so ROCm splits heads into 16-wide tiles,
+# which the kernel already supports by accumulating dKV across tiles atomically.
+MAX_BLOCK_H = 16 if torch.version.hip is not None else 64
+
+
+def _smem_bytes(block_H, block_size, D, split_store, stage_dq):
+    """Shared memory the backward CTA requests, including TileLang's 2 KB of alignment."""
+    return (
+        2 * block_H * D * 2  # Q_shared, dO_shared
+        + block_size * D * 2  # KV_shared
+        + 2 * block_H * block_size * 2  # P_shared_cast, dP_shared_cast
+        + (block_H * D * 2 if stage_dq else 0)  # dQ_shared
+        + block_size // split_store * D * 4  # acc_dkv_shared
+        + 2048
+    )
+
+
+def fit_backward_tiling(H, D, block_size=32):
+    """Return the ``block_size``/``split_store``/``stage_dq`` of the largest tile that fits.
+
+    Hopper and gfx950 host the shipped tile (32-row KV block, dKV stored in two halves,
+    dQ staged through shared memory), which is returned unchanged. gfx942's 64 KB LDS
+    cannot: at D=512 the 16-head Q and dO tiles alone take 32 KB. There the KV block is
+    halved, dQ is stored straight from registers, and dKV is staged in the fewest rows
+    that fit -- each costs an extra atomic pass, not a different result.
+    """
+    smem_limit = get_max_shared_memory_per_block()
+    block_H = min(MAX_BLOCK_H, max(tilelang.math.next_power_of_2(H), 16))
+    shipped = {"block_size": block_size, "split_store": 2, "stage_dq": True}
+    # TileLang places dQ_shared in buffers that are dead after the main loop, so the shipped
+    # tile is judged without it (Hopper's 64-head tile only fits that way). The smaller
+    # tiles below count it in full, so a fallback never depends on that reuse.
+    if _smem_bytes(block_H, block_size, D, 2, stage_dq=False) <= smem_limit:
+        return shipped
+    for bs in (block_size, block_size // 2):
+        for stage_dq in (True, False):
+            for split_store in (2, 4, 8, 16, 32):
+                if split_store <= bs and _smem_bytes(block_H, bs, D, split_store, stage_dq) <= smem_limit:
+                    return {"block_size": bs, "split_store": split_store, "stage_dq": stage_dq}
+    return shipped
 
 
 def cta_threads(block_H, block_size):
@@ -139,11 +183,14 @@ def bwd(
     block_size=32,
     num_stages=0,
     threads=None,
+    split_store=2,
+    stage_dq=True,
     indices_dtype=T.int32,
     dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
     assert topk % block_size == 0, f"topk ({topk}) must be divisible by block_size ({block_size})"
+    assert block_size % split_store == 0, f"block_size ({block_size}) must be divisible by split_store ({split_store})"
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
 
@@ -166,7 +213,7 @@ def bwd(
     attn_sink_shape = [H]
 
     padded_H = max(tilelang.math.next_power_of_2(H), 16)
-    block_H = min(64, padded_H)
+    block_H = min(MAX_BLOCK_H, padded_H)
     assert padded_H % block_H == 0
     NH = padded_H // block_H
     BS = block_size
@@ -185,8 +232,6 @@ def bwd(
         f"threads ({threads}) exceeds the GEMM warp-tile bound {BS * block_H // 4} "
         f"for block_H={block_H}, block_size={BS}"
     )
-
-    split_store = 2
 
     @T.prim_func
     def sparse_mqa_bwd_kernel(
@@ -210,7 +255,8 @@ def bwd(
 
             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
             dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
-            dQ_shared = T.alloc_shared([block_H, D], dtype)
+            if stage_dq:
+                dQ_shared = T.alloc_shared([block_H, D], dtype)
 
             acc_p = T.alloc_fragment([block_H, BS], accum_dtype)
             acc_dp = T.alloc_fragment([block_H, BS], accum_dtype)
@@ -298,8 +344,11 @@ def bwd(
                             )
 
             # Store dQ
-            T.copy(acc_dq, dQ_shared)
-            T.copy(dQ_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, :D])
+            if stage_dq:
+                T.copy(acc_dq, dQ_shared)
+                T.copy(dQ_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, :D])
+            else:
+                T.copy(acc_dq, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, :D])
 
             # dAttnSink[h] = -sum_{b,s}( Delta[b,s,h] * p_sink[b,s,h] )
             # where p_sink = exp(attn_sink[h]) / Z = exp2(attn_sink[h]*log2e - LSE)
@@ -340,8 +389,9 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     assert unpadded_S_kv > 0, "kv must have at least one row"
     topk = topk_idxs.shape[-1]
 
+    tiling = fit_backward_tiling(H, D)
     # Pad topk to next multiple of block_size (kernel requires divisibility)
-    block_size = 32
+    block_size = tiling["block_size"]
     padded_topk = (topk + block_size - 1) // block_size * block_size
     if padded_topk != topk:
         pad = torch.full((B, S, padded_topk - topk), -1, device=topk_idxs.device, dtype=topk_idxs.dtype)
@@ -379,7 +429,7 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     S_kv = unpadded_S_kv + kv_pad
 
     preprocess_kernel = preprocess(B, padded_H, D)
-    bwd_kernel = bwd(B, S_kv, padded_H, D, topk, sm_scale)
+    bwd_kernel = bwd(B, S_kv, padded_H, D, topk, sm_scale, **tiling)
     postprocess_kernel = postprocess(B, S_kv, D)
 
     delta = preprocess_kernel(o, do)

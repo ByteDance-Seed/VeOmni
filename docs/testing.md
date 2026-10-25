@@ -119,7 +119,7 @@ tests/
 | Category | Directory | GPU Req | Execution | Purpose |
 |---|---|---|---|---|
 | **Models** | `tests/models/` | 0-4 GPUs | pytest | Registry/build contracts, model parity, and implementation selection |
-| **Ops** | `tests/ops/` | 0-4 GPUs (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Registry contracts, hardware guards, numerical correctness, and performance |
+| **Ops** | `tests/ops/` | 0-4 GPUs (SM90+ for Quack; SM90+ or gfx942/gfx950 for DeepSeek-V4 TileLang and mHC TileKernels) | pytest | Registry contracts, hardware guards, numerical correctness, and performance |
 | **Data pipeline** | `tests/data/` | 0-8 GPUs | pytest + torchrun | Data loading, collation, preprocessing, and distributed resume |
 | **Parallelism** | `tests/parallel/` | 0-8 GPUs | torchrun / pytest | SP, EP, data-balance primitives |
 | **Distributed runtime** | `tests/distributed/` | 0-4 GPUs | pytest + torchrun | FSDP equivalence, dummy forward, gradient checkpointing, vocab-parallel embedding |
@@ -213,14 +213,15 @@ Optimized operator numerics live under
 `tests/ops/`.
 
 DeepSeek-V4- and GLM-MoE-DSA-specific DSA checks live under `tests/ops/dsa/`; optimized numerical
-tests require TileLang on an SM90+ NVIDIA GPU, and the `cann` parity tests require an Ascend NPU
-with `cann_ops_transformer`. Its mHC kernel parity is covered by `tests/ops/mhc/test_mhc.py` and
-requires TileKernels on an SM90+ NVIDIA GPU or CANN on an Ascend NPU.
+tests require TileLang on an SM90+ NVIDIA GPU (DeepSeek-V4's also run on AMD gfx942/gfx950), and
+the `cann` parity tests require an Ascend NPU with `cann_ops_transformer`. Its mHC kernel parity is
+covered by `tests/ops/mhc/test_mhc.py` and requires TileKernels on an SM90+ NVIDIA GPU or an AMD
+gfx942/gfx950 GPU, or CANN on an Ascend NPU.
 
 DeepSeek-V4 expert-parallel training is exercised separately by
 `tests/e2e/test_e2e_parallel.py::test_deepseek_v4_expert_parallel_alignment`:
 four-rank FSDP2, SP=1, EP=1 versus EP=2, and two optimizer steps. This uses
-eager DSA/mHC with fused routed experts, so it does not qualify the SM90+
+eager DSA/mHC with fused routed experts, so it does not qualify the TileLang
 kernel paths. The CPU duplicate-hash-route regression verifies that EP split
 counts match unique token/expert dispatch pairs; repeated routing weights are
 summed when combining outputs.

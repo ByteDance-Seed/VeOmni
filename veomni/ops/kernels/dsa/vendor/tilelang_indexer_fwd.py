@@ -24,6 +24,8 @@ import tilelang
 import torch
 from tilelang import language as T
 
+from veomni.utils.device import get_max_shared_memory_per_block
+
 
 @tilelang.jit(
     pass_configs={
@@ -149,6 +151,26 @@ def _make_causal_cu_seqlens(seq_len_q, seq_len_kv, compress_ratio, device):
     return cu_seqlen_ks, cu_seqlen_ke
 
 
+def fit_indexer_tiling(q_rows, index_dim, element_size, block_n=256, num_stages=3):
+    """Return the ``(block_N, num_stages)`` of the deepest pipeline that fits this device.
+
+    Each pipeline stage holds its own K tile next to the single Q tile. Three stages
+    (224 KB at index_dim=128) fit Hopper's 227 KB but not the 160 KB LDS of gfx950, and
+    gfx942's 64 KB does not hold even one 256-row K tile, so stages go first and then
+    the K block halves. The 2 KB is TileLang's inter-buffer alignment; a larger margin
+    would cost Hopper its third stage.
+    """
+    budget = get_max_shared_memory_per_block() - 2 * 1024
+    while (q_rows + num_stages * block_n) * index_dim * element_size > budget:
+        if num_stages > 1:
+            num_stages -= 1
+        elif block_n > 64:
+            block_n //= 2
+        else:
+            break
+    return block_n, num_stages
+
+
 def indexer_fwd_interface(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits=True):
     """Forward interface matching GLM-5's API but for a single batch element.
 
@@ -165,7 +187,8 @@ def indexer_fwd_interface(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logi
     seq_len, heads, index_dim = q.shape
     seq_len_kv = kv.shape[0]
     block_q = 128 // heads
-    block_n = 256
+    block_n, num_stages = fit_indexer_tiling(block_q * heads, index_dim, q.element_size())
+
     padded_seq_len = (seq_len + block_q - 1) // block_q * block_q
     padded_seq_len_kv = (seq_len_kv + block_n - 1) // block_n * block_n
     if padded_seq_len != seq_len:
@@ -177,7 +200,9 @@ def indexer_fwd_interface(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logi
         kv = torch.cat([kv, kv.new_zeros(padded_seq_len_kv - seq_len_kv, index_dim)], dim=0)
 
     clean_logits_kernel = clean_logits_()
-    tl_indexer_fwd_kernel = tl_indexer_fwd_impl(heads=heads, index_dim=index_dim, block_N=block_n, block_Q=block_q)
+    tl_indexer_fwd_kernel = tl_indexer_fwd_impl(
+        heads=heads, index_dim=index_dim, block_N=block_n, num_stages=num_stages, block_Q=block_q
+    )
 
     logits = torch.empty([padded_seq_len, padded_seq_len_kv], device=q.device, dtype=torch.float32)
     tl_indexer_fwd_kernel(

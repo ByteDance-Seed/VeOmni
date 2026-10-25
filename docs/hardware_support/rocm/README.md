@@ -166,7 +166,8 @@ kernel-load and JIT cost (~550 s on a cold cache).
 
 Validated on 8×MI308X / ROCm 7.14. End-to-end training (FSDP2 sharding, Ulysses SP, expert parallel EP, VLM/Omni, DiT) works and aligns numerically. Known limitations:
 
-- **CUDA-only kernels** (FA3/FA4/Quack/FlashMLA/DSA, e.g. `gpt_oss`) fall back to triton/eager on ROCm, or are skipped. For attention specifically, `attn_implementation: aiter` is the ROCm-native alternative.
+- **CUDA-only kernels** (FA3/FA4/Quack/FlashMLA/GLM DSA, e.g. `gpt_oss`) fall back to triton/eager on ROCm, or are skipped. For attention specifically, `attn_implementation: aiter` is the ROCm-native alternative.
+- **DeepSeek-V4 TileLang kernels** (`tilelang` DSA indexer, attention and mHC, and `qat_implementation: fp8_blockwise`) run on gfx942/gfx950 only, and depend on HIP fixes that the pinned `tilelang` and `tile-kernels` do not have yet (e.g. the E8M0 type of [tile-ai/tilelang#3665](https://github.com/tile-ai/tilelang/pull/3665) and the mHC `pre_big_fuse` change of [deepseek-ai/TileKernels#43](https://github.com/deepseek-ai/TileKernels/pull/43)). FP4 routed experts (V4-Flash) remain NVIDIA-only.
 - **Attention sinks are not supported by `aiter`** — models that pass `s_aux` / `learnable_sink` (such as DeepSeek-V4; `gpt_oss` only declares FA3 Hub and FA4 as compatible flash implementations) raise rather than silently dropping the sinks. Use `eager` if they are required.
 - **`aiter` cannot train with an attention logits softcap.** Its varlen forward applies the cap, but its backward ignores it. VeOmni raises under autograd and permits the correct inference-only forward; use `eager` for training.
 - **`aiter` rejects a `window_size` tuple that is neither 2 nor 3 elements wide.** `None` is accepted and selects full attention.

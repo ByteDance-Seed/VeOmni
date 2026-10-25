@@ -351,8 +351,14 @@ def validate_deepseek_v4_export_quant_support(
     target_model_prefix: str = "model.",
     should_quantize: Callable[[str], bool] | None = None,
     enable_mtp: bool = False,
+    expert_dtype: str | None = None,
 ) -> None:
-    """Validate that SM90+ TileLang quantization is available when ``.scale`` keys will be quantized on export."""
+    """Validate that TileLang quantization is available when ``.scale`` keys will be quantized on export.
+
+    Routed experts exported as FP4 (``expert_dtype``, by default ``model.config``'s) also need the FP4 quantizer.
+    """
+    if expert_dtype is None and model is not None:
+        expert_dtype = _extract_quant_config(getattr(model, "config", None))[2]
     if fqn_to_index_mapping is None and model is not None:
         fqn_to_index_mapping = getattr(model, "_veomni_fqn_to_index_mapping", None)
         if fqn_to_index_mapping is None:
@@ -362,7 +368,7 @@ def validate_deepseek_v4_export_quant_support(
     if not fqn_to_index_mapping:
         return
 
-    needs_quant = False
+    needs_quant = needs_fp4 = False
     for origin in fqn_to_index_mapping:
         if (not enable_mtp and _is_mtp_checkpoint_key(origin)) or not origin.endswith(".weight"):
             continue
@@ -372,12 +378,18 @@ def validate_deepseek_v4_export_quant_support(
         if should_quantize is not None and not should_quantize(origin):
             continue
         needs_quant = True
-        break
+        needs_fp4 = expert_dtype == "fp4" and "ffn.experts." in origin
+        if needs_fp4 or expert_dtype != "fp4":
+            break
 
     if needs_quant:
-        from veomni.models.transformers.deepseek_v4.export_quant import _require_tilelang_sm90
+        from veomni.models.transformers.deepseek_v4.export_quant import _require_tilelang_gpu
 
-        _require_tilelang_sm90()
+        _require_tilelang_gpu()
+    if needs_fp4:
+        from veomni.ops.qat._hardware import require_tilelang_fp4_gpu
+
+        require_tilelang_fp4_gpu()
 
 
 @lru_cache(maxsize=None)
@@ -697,7 +709,7 @@ class DeepseekV4CheckpointTensorConverter:
         fqn_to_index_mapping: Mapping[str, int] | None = None,
         should_quantize: Callable[[str], bool] | None = None,
     ) -> None:
-        """Fail before training or export if quantized ``.scale`` export is requested on a non-SM90 device."""
+        """Fail before training or export if quantized ``.scale`` export is requested on an unsupported GPU."""
         validate_deepseek_v4_export_quant_support(
             fqn_to_index_mapping,
             model=model,
