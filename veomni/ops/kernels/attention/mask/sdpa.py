@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """HF-signature SDPA mask builder."""
 
@@ -28,8 +28,8 @@ from transformers.masking_utils import (
     sliding_window_overlay,
 )
 
-from ..helper import reject_sdpa_packed_metadata
-from ..ulysses import effective_sequence_lengths, should_apply_ulysses
+from ..helper import strip_sdpa_packed_metadata
+from ..ulysses import should_apply_ulysses, ulysses_mask_lengths
 from .packed import packed_mask_function
 
 
@@ -46,13 +46,14 @@ def sdpa_attention_mask_builder(
 ) -> Tensor | None:
     """HF-signature SDPA mask for ``sdpa`` / ``veomni_sdpa``.
 
-    Packed/varlen metadata is rejected, matching the SDPA attention API.
-    Dense masks and sliding-window/custom visibility remain supported.
-    Skip hints apply only to the matching canonical predicate. Causal skip
-    additionally requires equal Q/K lengths and offsets; composed predicates
-    always produce an explicit mask, even if skip hints are enabled.
+    Single-segment packed/varlen metadata is dropped. Several segments per
+    row raise; build them with ``packed_causal_mask``. Dense masks and
+    sliding-window/custom visibility remain supported. Skip hints apply only
+    to the matching canonical predicate. Causal skip additionally requires
+    equal Q/K lengths and offsets; composed predicates always produce an
+    explicit mask, even if skip hints are enabled.
     """
-    reject_sdpa_packed_metadata(kwargs)
+    kwargs = strip_sdpa_packed_metadata(kwargs, batch_size=batch_size, dense_mask=None)
     return _dense_attention_mask_builder(
         batch_size,
         q_length,
@@ -82,8 +83,9 @@ def _dense_attention_mask_builder(
     Expand Ulysses-local lengths only when the adapter would gather Q/K/V
     itself: ``ulysses_size > 1`` and not ``skip_ulysses``. Then call Transformers'
     ``sdpa`` builder. Cached decode (``q_length != kv_length``) cannot use
-    SDPA ``is_causal`` skip. Eager shape masks may additionally compose packed
-    boundaries; the public SDPA builder rejects that metadata before this call.
+    SDPA ``is_causal`` skip. Packed shape masks may additionally compose packed
+    boundaries; the public SDPA builder drops single-segment metadata and
+    rejects several segments before this call.
     Optional ``sliding_window`` composes onto ``mask_function``. Canonical
     causal/bidirectional masks need no explicit metadata under Ulysses;
     custom predicates do.
@@ -111,10 +113,10 @@ def _dense_attention_mask_builder(
             )
         if attention_mask is not None and attention_mask.ndim != 2:
             raise ValueError("SDPA with Ulysses requires a full-sequence 2D attention mask.")
-        full_q_length, full_kv_length = effective_sequence_lengths(
+        full_q_length, full_kv_length = ulysses_mask_lengths(
             q_length,
             kv_length,
-            skip_ulysses=skip_ulysses,
+            None if attention_mask is None else attention_mask.shape[-1],
         )
         if attention_mask is not None and attention_mask.shape[-1] != full_kv_length:
             raise ValueError(
@@ -137,6 +139,7 @@ def _dense_attention_mask_builder(
             cu_seqlens=cu_seqlens,
             cu_seqlens_k=cu_seqlens_k,
             device=device,
+            batch_size=batch_size,
         )
 
     # HF checks skip hints before evaluating mask_function. They are safe only

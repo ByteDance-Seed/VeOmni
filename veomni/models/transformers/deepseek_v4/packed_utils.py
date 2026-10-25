@@ -14,11 +14,12 @@
 
 """Packed-sequence helpers for DeepSeek V4 compressed attention."""
 
-from typing import Callable, NamedTuple
+from typing import Callable
 
 import torch
 
 from veomni.distributed.context_parallel import empty_compressed_rows, rebase_window_indices
+from veomni.ops.kernels.dsa.sparse_indices import CompressedCandidates
 from veomni.utils.device import get_torch_device
 from veomni.utils.seqlen_pos_transform_utils import packed_sequence_slices_from_cu_seqlens
 
@@ -96,9 +97,8 @@ def build_packed_compression_metadata(
     position_ids: torch.Tensor,
     sequence_slices: tuple[tuple[int, int], ...],
     compress_rates: tuple[int, ...],
-    block_bias_rates: tuple[int, ...] = (),
 ) -> dict[int, dict[str, torch.Tensor]]:
-    """Build reusable packed window indices, ranges, and masks once per forward.
+    """Build reusable packed window indices and causal ranges once per forward.
 
     ``reference`` supplies device and dtype only. Its shape is unused, so a
     scalar placeholder is enough; do not allocate a full hidden-state tensor.
@@ -127,20 +127,12 @@ def build_packed_compression_metadata(
             range_ends[start:end] = compressed_offset + visible_counts.to(torch.int32)
             compressed_offset += compressed_count
 
-        rate_metadata = {
+        metadata[compress_rate] = {
             "window_starts": window_starts,
             "window_indices": window_indices,
             "range_starts": range_starts,
             "range_ends": range_ends,
         }
-        if compress_rate in block_bias_rates:
-            entry_indices = torch.arange(compressed_offset, device=reference.device)
-            allowed = (entry_indices[None, :] >= range_starts[:, None]) & (
-                entry_indices[None, :] < range_ends[:, None]
-            )
-            block_bias = reference.new_full((1, 1, position_ids.shape[1], compressed_offset), float("-inf"))
-            rate_metadata["block_bias"] = block_bias.masked_fill(allowed[None, None, :, :], 0.0)
-        metadata[compress_rate] = rate_metadata
     return metadata
 
 
@@ -174,8 +166,6 @@ def shard_packed_compression_metadata(
     )
     local_metadata["range_starts"] = packed_metadata["range_starts"][queries]
     local_metadata["range_ends"] = packed_metadata["range_ends"][queries]
-    if "block_bias" in packed_metadata:
-        local_metadata["block_bias"] = packed_metadata["block_bias"][..., queries, :]
     return local_metadata
 
 
@@ -264,209 +254,6 @@ def packed_compressed_causal_ranges(
     return packed_metadata["range_starts"], packed_metadata["range_ends"]
 
 
-def packed_compressed_block_bias(
-    packed_metadata: dict[str, torch.Tensor],
-) -> torch.Tensor:
-    """Build a block-diagonal causal mask for packed compressed entries."""
-    return packed_metadata["block_bias"]
-
-
-def scatter_topk_block_bias(
-    compressed_kv: torch.Tensor,
-    top_k_indices: torch.Tensor,
-    batch_size: int,
-    seq_len: int,
-) -> torch.Tensor:
-    """Re-encode an indexer selection as an additive ``[B, 1, S, C]`` block bias."""
-    compressed_len = compressed_kv.shape[2]
-    valid = top_k_indices >= 0
-    safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
-    block_bias = compressed_kv.new_full((batch_size, 1, seq_len, compressed_len + 1), float("-inf"))
-    block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
-    return block_bias[..., :compressed_len]
-
-
-def build_sparse_attention_indices(
-    *,
-    batch_size: int,
-    seq_len: int,
-    sliding_window: int,
-    compressed_len: int,
-    compressed_indices: torch.Tensor | None,
-    device: torch.device,
-    query_offset: int = 0,
-    kv_full_len: int | None = None,
-) -> torch.Tensor:
-    """Build compact sliding-window and compressed-KV candidates.
-
-    ``seq_len`` counts query rows. Under context parallelism those are one shard
-    while the KV buffer stays global, so ``query_offset`` rebases each query onto
-    its absolute full-resolution row and ``kv_full_len`` is the offset that lifts
-    a compressed slot past the full-resolution rows. They default to the
-    single-shard case where both collapse back to ``seq_len``.
-    """
-    kv_full_len = seq_len if kv_full_len is None else kv_full_len
-    sliding_width = min(sliding_window, kv_full_len)
-    query_indices = torch.arange(seq_len, device=device, dtype=torch.int32) + query_offset
-    window_offsets = torch.arange(sliding_width - 1, -1, -1, device=device, dtype=torch.int32)
-    sliding_indices = query_indices[:, None] - window_offsets[None, :]
-    sliding_indices = sliding_indices.masked_fill(sliding_indices < 0, -1)
-    sliding_indices = sliding_indices.unsqueeze(0).expand(batch_size, -1, -1)
-
-    if compressed_len == 0:
-        return sliding_indices.contiguous()
-
-    if compressed_indices is None:
-        compressed_indices = torch.arange(compressed_len, device=device, dtype=torch.int32)
-        compressed_indices = compressed_indices.view(1, 1, -1).expand(batch_size, seq_len, -1)
-    else:
-        if compressed_indices.shape[:2] != (batch_size, seq_len):
-            raise ValueError(
-                "Compressed sparse indices must match the attention batch and sequence dimensions; "
-                f"got {tuple(compressed_indices.shape)} for batch={batch_size}, seq_len={seq_len}"
-            )
-        compressed_indices = compressed_indices.to(device=device, dtype=torch.int32)
-
-    compressed_indices = torch.where(
-        compressed_indices >= 0,
-        compressed_indices + kv_full_len,
-        torch.full_like(compressed_indices, -1),
-    )
-    return torch.cat((sliding_indices, compressed_indices), dim=-1).contiguous()
-
-
-class CompressedCandidates(NamedTuple):
-    """How a compressor exposes its visible compressed entries to the index builder.
-
-    Indexer-driven compressors select an explicit per-query set and already mark
-    misses with ``-1``; the heavily-compressed path instead stays a contiguous
-    ``[range_start, range_end)`` causal interval. At most one of the two is set.
-
-    ``indexer_scores`` rides alongside ``topk_indices`` rather than replacing it: the
-    indexer's score at each *selected* slot, which the indexer loss needs as the
-    student distribution and no index builder reads. It is ``None`` unless
-    ``dsa_indexer_loss`` is on, since the eager scorer has no scores to hand over and
-    the TileLang one would otherwise keep a tensor alive for nothing.
-    """
-
-    topk_indices: torch.Tensor | None = None
-    range_starts: torch.Tensor | None = None
-    range_ends: torch.Tensor | None = None
-    indexer_scores: torch.Tensor | None = None
-
-
-def _broadcast_query_ranges(bound: torch.Tensor, batch_size: int, seq_len: int) -> torch.Tensor:
-    """Normalize a per-query range bound to ``[batch, seq_len]``."""
-    if bound.ndim == 1:
-        bound = bound.unsqueeze(0)
-    if bound.shape[-1] != seq_len:
-        raise ValueError(f"Compressed range bounds must cover {seq_len} queries; got {tuple(bound.shape)}")
-    return bound.expand(batch_size, -1).to(torch.int32)
-
-
-def build_packed_sparse_attention_indices(
-    *,
-    position_ids: torch.Tensor,
-    sliding_window: int,
-    compressed_len: int,
-    candidates: CompressedCandidates | None,
-    query_offset: int = 0,
-    kv_full_len: int | None = None,
-) -> torch.Tensor:
-    """Build fully validated sparse candidates without materializing a dense mask.
-
-    The dense path derives validity by scanning an ``[B, 1, S, S + C]`` additive
-    mask, which costs O(S^2) memory and bandwidth on every layer. Every constraint
-    that mask encodes is already available in closed form:
-
-    * sliding causality and packed-sample isolation collapse into the single test
-      ``offset <= position_ids[q]``. ``position_ids`` restarts at zero on each
-      packed sample, so ``q - position_ids[q]`` is that sample's first token and
-      any larger offset would reach into the previous sample.
-    * compressed entries are either an explicit indexer selection that already
-      marks misses with ``-1``, or a contiguous ``[range_start, range_end)``
-      interval computed from the same metadata that built the block bias.
-
-    Callers must guarantee the padding mask is all ones over the packed length,
-    which the FlashAttention varlen collator does by construction -- boundaries
-    travel through ``position_ids`` and ``cu_seq_lens`` instead.
-
-    ``seq_len`` counts query rows only. Under context parallelism the queries are
-    one shard while the KV buffer stays global, so ``query_offset`` rebases a
-    local query onto its absolute full-resolution row and ``kv_full_len`` lifts a
-    compressed slot past the full-resolution rows. Conflating the two is silent:
-    the shapes stay self-consistent and attention simply reads the wrong rows.
-    """
-    if position_ids.ndim != 2:
-        raise ValueError(f"Packed sparse indices need [batch, seq_len] position ids; got {position_ids.ndim} dims")
-
-    batch_size, seq_len = position_ids.shape
-    kv_full_len = seq_len if kv_full_len is None else kv_full_len
-    device = position_ids.device
-    sliding_width = min(sliding_window, kv_full_len)
-    positions = position_ids.to(torch.int32)
-    query_indices = torch.arange(seq_len, device=device, dtype=torch.int32) + query_offset
-    window_offsets = torch.arange(sliding_width - 1, -1, -1, device=device, dtype=torch.int32)
-
-    sliding_indices = (query_indices[None, :, None] - window_offsets[None, None, :]).expand(batch_size, -1, -1)
-    sliding_indices = sliding_indices.masked_fill(window_offsets[None, None, :] > positions[:, :, None], -1)
-
-    if compressed_len == 0 or candidates is None:
-        return sliding_indices.contiguous()
-
-    if candidates.topk_indices is not None:
-        compressed_indices = candidates.topk_indices.to(device=device, dtype=torch.int32)
-        if compressed_indices.shape[:2] != (batch_size, seq_len):
-            raise ValueError(
-                "Compressed sparse indices must match the attention batch and sequence dimensions; "
-                f"got {tuple(compressed_indices.shape)} for batch={batch_size}, seq_len={seq_len}"
-            )
-        compressed_indices = torch.where(compressed_indices >= 0, compressed_indices + kv_full_len, -1)
-    elif candidates.range_starts is not None and candidates.range_ends is not None:
-        starts = _broadcast_query_ranges(candidates.range_starts, batch_size, seq_len)
-        ends = _broadcast_query_ranges(candidates.range_ends, batch_size, seq_len)
-        entry_indices = torch.arange(compressed_len, device=device, dtype=torch.int32)
-        visible = (entry_indices[None, None, :] >= starts[:, :, None]) & (
-            entry_indices[None, None, :] < ends[:, :, None]
-        )
-        compressed_indices = torch.where(visible, entry_indices[None, None, :] + kv_full_len, -1)
-    else:
-        return sliding_indices.contiguous()
-
-    return torch.cat((sliding_indices, compressed_indices), dim=-1).contiguous()
-
-
-def mask_sparse_attention_indices(
-    attention_mask: torch.Tensor,
-    sparse_indices: torch.Tensor,
-) -> torch.Tensor:
-    """Apply the canonical attention mask to compact sparse candidates."""
-    if attention_mask.ndim != 4 or sparse_indices.ndim != 3:
-        raise ValueError(
-            "Sparse attention mask/index ranks must be 4 and 3, respectively; "
-            f"got {attention_mask.ndim} and {sparse_indices.ndim}"
-        )
-    if attention_mask.shape[-2] != sparse_indices.shape[-2]:
-        raise ValueError(
-            "Sparse attention mask and indices must have the same query length; "
-            f"got {attention_mask.shape[-2]} and {sparse_indices.shape[-2]}"
-        )
-
-    allowed = attention_mask[:, 0] if attention_mask.dtype == torch.bool else attention_mask[:, 0] >= 0
-    if allowed.shape[0] == 1 and sparse_indices.shape[0] > 1:
-        allowed = allowed.expand(sparse_indices.shape[0], -1, -1)
-    if allowed.shape[0] != sparse_indices.shape[0]:
-        raise ValueError(
-            "Sparse attention mask and indices must have compatible batch sizes; "
-            f"got {allowed.shape[0]} and {sparse_indices.shape[0]}"
-        )
-
-    valid = (sparse_indices >= 0) & (sparse_indices < allowed.shape[-1])
-    safe_indices = sparse_indices.clamp(min=0, max=allowed.shape[-1] - 1).to(torch.long)
-    selected_valid = allowed.gather(-1, safe_indices)
-    return sparse_indices.to(torch.int32).masked_fill(~valid | ~selected_valid, -1).contiguous()
-
-
 def isolate_packed_causal_mask_(
     causal_mask: torch.Tensor | None,
     sequence_slices: tuple[tuple[int, int], ...],
@@ -483,15 +270,10 @@ def isolate_packed_causal_mask_(
 __all__ = [
     "CompressedCandidates",
     "build_packed_compression_metadata",
-    "build_packed_sparse_attention_indices",
-    "build_sparse_attention_indices",
     "compress_packed_windows",
     "ensure_unmasked_packed_attention",
     "isolate_packed_causal_mask_",
-    "mask_sparse_attention_indices",
-    "packed_compressed_block_bias",
     "packed_compressed_causal_ranges",
     "resolve_packed_sequence_slices",
-    "scatter_topk_block_bias",
     "shard_packed_compression_metadata",
 ]

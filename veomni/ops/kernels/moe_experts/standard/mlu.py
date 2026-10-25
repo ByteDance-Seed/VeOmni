@@ -213,6 +213,9 @@ def mlu_group_gemm_fused_moe_forward(
     ``assume_distinct_experts`` only tightens the Triton grouped-GEMM
     launch bound, so the flag is a no-op here.
     """
+    # Router scores stay float32. Cast before the fused scale so the MLU GEMM
+    # does not see an fp32 activation against bf16 weights.
+    routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     del assume_distinct_experts
     if get_parallel_state().ep_enabled:
         from .....distributed.moe import preprocess, token_pre_all2all, tokens_post_all2all

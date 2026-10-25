@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Pattern mask APIs dispatched by attention impl."""
 
@@ -37,7 +37,15 @@ from .sdpa import _dense_attention_mask_builder, sdpa_attention_mask_builder
 # full on every SM: the public dispatcher takes ``is_causal`` and no dense
 # ``attention_mask``. That is a Sage API fact, not a Wan leftover.
 # SDPA accepts dense masks but has no packed/varlen API.
-_FLASH = frozenset({"flash_attention_2", "flash_attention_3", "flash_attention_4"})
+_FLASH = frozenset(
+    {
+        "flash_attention_2",
+        "flash_attention_2_hub",
+        "flash_attention_3",
+        "flash_attention_3_hub",
+        "flash_attention_4",
+    }
+)
 _SAGE = frozenset({"sage_attention"})
 _FLASH_LIKE_CAUSAL = _FLASH | _SAGE
 _SDPA = frozenset({"sdpa"})
@@ -91,13 +99,19 @@ def _sdpa_or_eager_mask(
     sliding_window: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
 ):
-    """Build an SDPA boolean mask or convert it to eager additive form."""
+    """Build an SDPA boolean mask or convert it to eager additive form.
+
+    ``cu_seqlens`` composes packed isolation into the dense mask for both
+    backends; the public SDPA builder only accepts single-segment metadata.
+    """
     dtype = extra.pop("dtype", torch.float32)
     if sliding_window is not None:
         extra["sliding_window"] = sliding_window
     if cu_seqlens is not None:
         extra["cu_seqlens"] = cu_seqlens
-    builder = _dense_attention_mask_builder if backend in _EAGER else sdpa_attention_mask_builder
+    builder = (
+        _dense_attention_mask_builder if backend in _EAGER or cu_seqlens is not None else sdpa_attention_mask_builder
+    )
     mask = builder(
         batch_size,
         q_len,
@@ -258,17 +272,15 @@ def packed_causal_mask(
     """Packed causal mask from ``cu_seqlens``.
 
     Flash returns only optional 2D padding metadata; packed lengths stay in
-    kernel kwargs. Eager / Flex builders receive ``skip_ulysses``. Magi validates
-    ``cu_seqlens`` against the effective post-Ulysses sequence lengths. SDPA
-    rejects this API because it has no packed/varlen arguments.
+    kernel kwargs. SDPA / Eager / Flex builders receive ``skip_ulysses``; SDPA
+    and Eager compose the segments into a dense mask. Magi validates
+    ``cu_seqlens`` against the effective post-Ulysses sequence lengths.
     """
     backend = impl.removeprefix("veomni_")
     extra = _compose_or_and(kwargs)
     extra["skip_ulysses"] = skip_ulysses
     if backend in _SAGE:
         raise ValueError("veomni_sage_attention does not support packed_causal_mask")
-    if backend in _SDPA:
-        raise ValueError("SDPA does not support packed_causal_mask; use a packed-capable attention implementation.")
     if backend in _FLASH:
         _require_canonical_causal(backend, extra["mask_function"])
         return flash_attention_mask_builder(
@@ -278,7 +290,7 @@ def packed_causal_mask(
             q_offset=kv_len - q_len,
             **extra,
         )
-    if backend in _EAGER:
+    if backend in _SDPA or backend in _EAGER:
         return _sdpa_or_eager_mask(
             backend,
             batch_size,

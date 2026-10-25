@@ -423,7 +423,7 @@ def process_sample_qwen_omni(
     from .multimodal import conv_preprocess
     from .multimodal.audio_utils import fetch_audios
     from .multimodal.image_utils import fetch_images
-    from .multimodal.video_utils import fetch_videos
+    from .multimodal.video_utils import fetch_videos_metadata
 
     QWEN_OMNI_SYSTEM_MESSAGE = (
         "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
@@ -474,9 +474,9 @@ def process_sample_qwen_omni(
 
     videos = sample.get("videos", [])
     if videos:
-        videos, video_audios = fetch_videos(videos, **kwargs)
+        videos, video_metadata, video_audios, _ = fetch_videos_metadata(videos, **kwargs)
     else:
-        videos, video_audios = [], []
+        videos, video_metadata, video_audios = [], [], []
 
     audios = sample.get("audios", [])
     if audios:
@@ -499,6 +499,8 @@ def process_sample_qwen_omni(
         audios=audios,
         images=images,
         videos=videos,
+        video_metadata=video_metadata,
+        do_sample_frames=False,
         return_tensors="pt",
         padding=True,
     )

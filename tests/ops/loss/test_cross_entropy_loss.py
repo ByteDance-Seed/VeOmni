@@ -234,6 +234,72 @@ def test_ce_rows_skip_grads_under_no_grad(monkeypatch: pytest.MonkeyPatch, impl:
     assert torch.isfinite(loss).all()
 
 
+@pytest.mark.parametrize("impl", ("eager", "chunk_loss"))
+@pytest.mark.parametrize(
+    ("hidden_requires_grad", "weight_requires_grad"),
+    ((True, True), (True, False), (False, True)),
+    ids=("all-gradients", "frozen-weight", "frozen-hidden"),
+)
+def test_ce_matches_without_hooks_under_activation_offload(
+    impl: str, hidden_requires_grad: bool, weight_requires_grad: bool
+):
+    """Sync activation offload keeps saved-tensor hooks installed around forward."""
+    from veomni.distributed.offloading import build_activation_offloading_context
+
+    torch.manual_seed(6)
+    hidden = torch.randn(2, 4, 8, requires_grad=hidden_requires_grad)
+    weight = torch.randn(6, 8, requires_grad=weight_requires_grad)
+    labels = torch.randint(0, 6, (2, 4))
+    fn = resolve_op("cross_entropy_loss", "standard", impl).wrapper
+    fwd_context, _ = build_activation_offloading_context(enable_activation=True)
+
+    with fwd_context:
+        loss = fn(hidden, labels, weight)
+    if hidden_requires_grad or weight_requires_grad:
+        loss.backward()
+
+    hidden_ref = hidden.detach().clone().requires_grad_(hidden_requires_grad)
+    weight_ref = weight.detach().clone().requires_grad_(weight_requires_grad)
+    loss_ref = fn(hidden_ref, labels, weight_ref)
+    if hidden_requires_grad or weight_requires_grad:
+        loss_ref.backward()
+
+    torch.testing.assert_close(loss, loss_ref)
+    if hidden_requires_grad:
+        torch.testing.assert_close(hidden.grad, hidden_ref.grad)
+    else:
+        assert hidden.grad is None
+    if weight_requires_grad:
+        torch.testing.assert_close(weight.grad, weight_ref.grad)
+    else:
+        assert weight.grad is None
+
+
+def test_eager_offload_saves_precomputed_grads_not_logits():
+    """The hooked save is the reduced grad, not the ``[tokens, vocab]`` logits."""
+    from torch.autograd.graph import saved_tensors_hooks
+
+    packed: list[tuple[int, ...]] = []
+
+    def pack(tensor: Tensor) -> Tensor:
+        packed.append(tuple(tensor.shape))
+        return tensor.detach()
+
+    def unpack(tensor: Tensor) -> Tensor:
+        return tensor
+
+    torch.manual_seed(7)
+    hidden = torch.randn(2, 4, 8, requires_grad=True)
+    weight = torch.randn(6, 8, requires_grad=True)
+    labels = torch.randint(0, 6, (2, 4))
+    fn = resolve_op("cross_entropy_loss", "standard", "eager").wrapper
+    with saved_tensors_hooks(pack, unpack):
+        loss = fn(hidden, labels, weight)
+    assert packed == [(2, 4, 8), (6, 8)]
+    loss.backward()
+    assert hidden.grad is not None and weight.grad is not None
+
+
 def test_liger_adapter_detaches_vendor_inputs_when_grad_disabled(monkeypatch: pytest.MonkeyPatch):
     """Adapter contract: vendor sees detached inputs when the caller disables grads."""
     liger_ce = pytest.importorskip("liger_kernel.ops.fused_linear_cross_entropy")
@@ -546,6 +612,32 @@ def test_liger_matches_eager(
         else:
             assert eager_input.grad is None
             assert other_input.grad is None
+
+
+def test_for_causal_lm_loss_forwards_chunk_size_only_to_chunk_loss():
+    from veomni.models.loss_utils.cross_entropy_loss import ForCausalLMLoss
+
+    seen: dict[str, object] = {}
+
+    def token_op(hidden, labels, weight, *, ignore_index, num_items_in_batch=None, chunk_size=1024):
+        seen["chunk_size"] = chunk_size
+        seen["keys"] = "chunk_size"
+        return hidden.sum() * 0
+
+    token_op.impl = "chunk_loss"
+    hidden = torch.randn(2, 4, 8)
+    labels = torch.zeros(2, 4, dtype=torch.long)
+    weight = torch.randn(6, 8)
+    ForCausalLMLoss(hidden_states=hidden, labels=labels, weights=weight, op=token_op, chunk_size=3)
+    assert seen["chunk_size"] == 3
+
+    def eager_op(hidden, labels, weight, *, ignore_index, num_items_in_batch=None):
+        seen["eager"] = True
+        return hidden.sum() * 0
+
+    eager_op.impl = "eager"
+    ForCausalLMLoss(hidden_states=hidden, labels=labels, weights=weight, op=eager_op, chunk_size=3)
+    assert seen["eager"] is True
 
 
 @pytest.mark.parametrize(

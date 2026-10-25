@@ -1,4 +1,4 @@
-# Copyright 2026 Bytedance Ltd. and/or its affiliates
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ from .gpu import (
     NVIDIA_GPU,
     NVIDIA_SM70_PLUS,
     NVIDIA_SM90_PLUS,
+    NVIDIA_SM100_PLUS,
     ROCM_GPU,
     GpuPlatform,
     NvidiaGpuPlatform,
@@ -41,6 +42,7 @@ __all__ = [
     "NVIDIA_GPU",
     "NVIDIA_SM70_PLUS",
     "NVIDIA_SM90_PLUS",
+    "NVIDIA_SM100_PLUS",
     "NpuKernelRequirement",
     "NvidiaGpuPlatform",
     "ROCM_GPU",

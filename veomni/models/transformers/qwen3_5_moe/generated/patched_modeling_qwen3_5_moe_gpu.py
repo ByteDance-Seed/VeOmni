@@ -16,7 +16,7 @@
 #    - method_override: Qwen3_5MoeMLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: Qwen3_5MoeMLP.forward
-#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - method_override: Qwen3_5MoeModel.__init__
 #      Construct generated vision and text towers instead of upstream AutoModel classes
 #    - method_override: Qwen3_5MoeSparseMoeBlock.forward
@@ -118,7 +118,6 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import (
     accepts_precomputed_kwargs,
-    is_flash_attention_requested,
     maybe_autocast,
     merge_with_config_defaults,
 )
@@ -132,6 +131,7 @@ from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils import logging
 from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
@@ -773,7 +773,11 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         attention_mask: torch.Tensor | None = None,
         # Modification: plumb varlen sequence metadata to FLA kernels.
         cu_seq_lens_q: torch.Tensor | None = None,
+        # Modification: shared-prefix plan; the conv and the delta rule run on its compact row.
+        shared_prefix_plan=None,
     ):
+        if shared_prefix_plan is not None and get_parallel_state().sp_enabled:
+            raise NotImplementedError("Shared-prefix training does not support sequence parallelism yet.")
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
         # Set up dimensions for reshapes later
@@ -859,15 +863,27 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 )
             else:
                 conv_weight = self.conv1d.weight.squeeze(1)
-            mixed_qkv = self.veomni_causal_conv1d(
-                mixed_qkv,
-                conv_weight,
-                self.conv1d.bias,
-                cu_seq_lens_q,
-                activation=self.activation,
-                seq_idx=None,
-                backend="triton",
-            )
+            if shared_prefix_plan is not None:
+                # Modification: one varlen call; suffixes take the prefix tail as look-back context.
+                mixed_qkv = shared_prefix_plan.causal_conv1d(
+                    self.veomni_causal_conv1d,
+                    mixed_qkv,
+                    weight=conv_weight,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    seq_idx=None,
+                    backend="triton",
+                )
+            else:
+                mixed_qkv = self.veomni_causal_conv1d(
+                    mixed_qkv,
+                    conv_weight,
+                    self.conv1d.bias,
+                    cu_seq_lens_q,
+                    activation=self.activation,
+                    seq_idx=None,
+                    backend="triton",
+                )
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -908,22 +924,36 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         else:
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
-        if self.num_v_heads // self.num_k_heads > 1:
+        if self.num_v_heads // self.num_k_heads > 1 and not (
+            self.veomni_chunk_gated_delta_rule.impl == "flash_qla" and not use_precomputed_states
+        ):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         if not use_precomputed_states:
-            core_attn_out, last_recurrent_state = self.veomni_chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g,
-                beta,
-                None,
-                cu_seq_lens_q,
-                output_final_state=cache_params is not None,
-                use_qk_l2norm_in_kernel=True,
-            )
+            if shared_prefix_plan is not None:
+                if self.veomni_chunk_gated_delta_rule.impl == "eager":
+                    raise RuntimeError(
+                        "Shared-prefix training requires a varlen-capable chunk_gated_delta_rule backend. "
+                        "On GPU, set the implementation to 'fla' or 'flash_qla'; on NPU, set it to 'fla' or 'triton'."
+                    )
+                # Modification: two varlen calls; suffixes start from the prefix state at its last chunk boundary.
+                core_attn_out = shared_prefix_plan.gated_delta_rule(
+                    self.veomni_chunk_gated_delta_rule, query, key, value, g, beta, use_qk_l2norm_in_kernel=True
+                )
+                last_recurrent_state = None
+            else:
+                core_attn_out, last_recurrent_state = self.veomni_chunk_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    None,
+                    cu_seq_lens_q,
+                    output_final_state=cache_params is not None,
+                    use_qk_l2norm_in_kernel=True,
+                )
         else:
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
                 query,
@@ -1115,7 +1145,7 @@ class Qwen3_5MoeMLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"}:
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,
@@ -1548,54 +1578,28 @@ class Qwen3_5MoeVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        if is_flash_attention_requested(self.config):
-            # Modification: prefer the int max_seqlen pre-computed once in
-            # Qwen3_5VisionModel.forward (Patch.5). Fall back to the original
-            # GPU-side reduction so this method still works when the model forward
-            # has not been patched (e.g. external callers, unit tests).
-            max_seqlen = kwargs.pop("vision_max_seqlen", None)
-            if max_seqlen is None:
-                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-            attn_output, _ = self.veomni_attn(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
-                max_length_q=max_seqlen,
-                max_length_k=max_seqlen,
-                is_causal=False,
-                **kwargs,
-            )
-        else:
-            # Modification: drop `vision_max_seqlen` from kwargs before falling through
-            # to the non-FA path so it doesn't reach kernels that don't expect it.
-            kwargs.pop("vision_max_seqlen", None)
-            # Other implementations: Process each chunk separately
-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            splits = [
-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-            ]
-
-            attn_outputs = [
-                self.veomni_attn(
-                    self,
-                    q,
-                    k,
-                    v,
-                    attention_mask=None,
-                    scaling=self.scaling,
-                    dropout=0.0 if not self.training else self.attention_dropout,
-                    is_causal=False,
-                    **kwargs,
-                )[0]
-                for q, k, v in zip(*splits)
-            ]
-            attn_output = torch.cat(attn_outputs, dim=1)
+        # Modification: prefer the int max_seqlen pre-computed once in
+        # Qwen3_5VisionModel.forward (Patch.5). Fall back to the original
+        # GPU-side reduction so this method still works when the model forward
+        # has not been patched (e.g. external callers, unit tests).
+        max_seqlen = kwargs.pop("vision_max_seqlen", None)
+        if max_seqlen is None:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+        attn_output, _ = self.veomni_attn(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask=None,
+            scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+            is_causal=False,
+            **kwargs,
+        )
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.proj(attn_output)
@@ -1934,15 +1938,10 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
         # `**kwargs` to every block; the patched Qwen3_5VisionAttention.forward
         # picks it up via `vision_max_seqlen` and falls back to the original
         # recompute when the key is absent (so non-VeOmni callers keep working).
-        # Gate is two-pronged:
-        #   (a) `_VEOMNI_VISION_ATTENTION_PATCHED` — set per generated file. True
-        #       when Qwen3_5VisionAttention.forward is patched to consume
-        #       ``vision_max_seqlen``. GPU and NPU both register that consumer.
-        #   (b) `is_flash_attention_requested(self.config)` — only FA's
-        #       `flash_attn_varlen_func` benefits from the int hand-off; eager
-        #       and sdpa paths in the consumer pop+discard the kwarg, so the
-        #       host sync would be wasted.
-        if _VEOMNI_VISION_ATTENTION_PATCHED and is_flash_attention_requested(self.config):
+        # Gate: `_VEOMNI_VISION_ATTENTION_PATCHED` is set per generated file when
+        # Qwen3_5VisionAttention.forward is patched to consume ``vision_max_seqlen``.
+        # GPU and NPU both register that consumer.
+        if _VEOMNI_VISION_ATTENTION_PATCHED:
             if precomputed_max_seqlen is not None:
                 # Collator-side max already accounts for sp-pad; use as-is.
                 kwargs["vision_max_seqlen"] = precomputed_max_seqlen
@@ -2115,6 +2114,20 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
 
+        # Modification: shared-prefix training runs the decoder stack on a compact row in which
+        # every shared prefix appears once; the final hidden states are expanded back below.
+        shared_prefix_plan = kwargs.get("shared_prefix_plan", None)
+        if shared_prefix_plan is not None:
+            if get_parallel_state().sp_enabled:
+                raise NotImplementedError("Shared-prefix training does not support sequence parallelism yet.")
+            if return_mtp_context or use_cache or past_key_values is not None:
+                raise NotImplementedError("Shared-prefix training supports neither MTP nor KV cache.")
+            inputs_embeds = shared_prefix_plan.compact(inputs_embeds)
+            position_ids = shared_prefix_plan.compact(position_ids, dim=-1)
+            attention_mask = None
+            for key in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"):
+                kwargs.pop(key, None)
+
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
             text_position_ids = position_ids[0]
             position_ids = position_ids[1:]
@@ -2148,6 +2161,8 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
                 **kwargs,
             )
 
+        # Modification: under shared prefix the compact row is returned; the caller expands it (after the LM
+        # head where possible), and backward sums the copies of each shared row.
         hidden_states = self.norm(hidden_states)
 
         mtp_context = None
@@ -2776,7 +2791,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
-        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        impl = resolve_op_impl("cross_entropy_loss_implementation")
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.veomni_lb = VeomniOp(
@@ -2913,7 +2928,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         super().__init__(config)
         self.model = Qwen3_5MoeModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        impl = resolve_op_impl("cross_entropy_loss_implementation")
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.veomni_lb = VeomniOp(

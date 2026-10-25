@@ -19,7 +19,22 @@ from __future__ import annotations
 import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.ops.config import resolve_op_impl
+
+
+def _bound_dsa_impls(module) -> tuple[set[str], set[str]]:
+    """Return the ``(indexer, attention)`` impls bound on the DSA handles under ``module``.
+
+    ``module`` is a ``DeepseekV4Attention`` or the ``DeepseekV4Model`` holding them.
+    Only CSA layers own an indexer, so the indexer set is empty for other layers.
+    """
+    attentions = [layer.self_attn for layer in module.layers] if hasattr(module, "layers") else [module]
+    attention_impls = {attention.veomni_dsa_attention.impl for attention in attentions}
+    indexer_impls = {
+        attention.compressor.indexer.veomni_dsa_indexer.impl
+        for attention in attentions
+        if attention.layer_type == "compressed_sparse_attention"
+    }
+    return indexer_impls, attention_impls
 
 
 def _indexer_loss_enabled(module) -> bool:
@@ -76,12 +91,13 @@ def _indexer_loss_enabled(module) -> bool:
         return False
     if getattr(module.config, "dsa_indexer_loss_coef", 1.0) <= 0:
         return False
-    if resolve_op_impl("dsa_indexer_implementation") != "tilelang":
+    indexer_impls, attention_impls = _bound_dsa_impls(module)
+    if indexer_impls - {"tilelang"}:
         raise ValueError(
             "dsa_indexer_loss requires dsa_indexer_implementation='tilelang'; the eager "
             "indexer discards its scores, so the loss would have nothing to train against"
         )
-    if resolve_op_impl("dsa_attention_implementation") != "tilelang":
+    if attention_impls - {"tilelang"}:
         raise ValueError(
             "dsa_indexer_loss requires dsa_attention_implementation='tilelang'; the teacher "
             "distribution is derived from the TileLang attention LSE"
@@ -119,10 +135,11 @@ def _builds_indexer_kl(module) -> bool:
     the predicate reads, and because one evaluation per layer per forward is one fewer
     thing that can disagree with itself mid-call.
 
-    ``_indexer_loss_enabled`` comes first so that its refusals fire on every layer
-    type rather than only on the ones carrying an indexer: a model configured for
-    the loss but built without a single CSA layer would otherwise accept the flag
-    and train nothing. The layer type is what then keeps HCA and sliding layers on
+    ``_indexer_loss_enabled`` comes first so that its attention and parallel-state
+    refusals fire on every layer type rather than only on the ones carrying an
+    indexer: a model configured for the loss but built without a single CSA layer
+    would otherwise accept the flag and train nothing. The indexer refusal reads
+    the layer's own handle, so it fires on the CSA layers. The layer type is what then keeps HCA and sliding layers on
     their two-value return -- only a CSA layer carries a Lightning Indexer, so only
     it has a student to train, and the others' compressors hand back a perfectly
     ordinary ``CompressedCandidates`` carrying causal ranges instead of scores.

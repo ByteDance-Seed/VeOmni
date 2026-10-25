@@ -83,12 +83,15 @@ def tensor_cache(fn: Optional[Callable[..., torch.Tensor]] = None, *, maxsize: i
     return _make_wrapper
 
 
-@tensor_cache
+# VeOmni: cache sizes raised so that a few distinct cu_seqlens used in turn (shared-prefix training
+# runs the conv and two gated-delta-rule rounds with different layouts per layer) keep hitting the
+# cache; a miss costs a host sync (`.tolist()`) inside every sub-kernel.
+@tensor_cache(maxsize=8)
 def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
     return cu_seqlens[1:] - cu_seqlens[:-1]
 
 
-@tensor_cache(maxsize=3)
+@tensor_cache(maxsize=16)
 def prepare_chunk_indices(cu_seqlens: torch.LongTensor, chunk_size: int) -> torch.LongTensor:
     indices = torch.cat([torch.arange(n) for n in triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()])
     return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
@@ -238,7 +241,7 @@ def _cpu_device_warning():
     warnings.warn(('Triton is not supported on current platform, roll back to CPU.'), stacklevel=1)
 
 
-@tensor_cache
+@tensor_cache(maxsize=16)
 def prepare_chunk_offsets(cu_seqlens: torch.LongTensor, chunk_size: int) -> torch.LongTensor:
     return torch.cat([cu_seqlens.new_tensor([0]), triton.cdiv(prepare_lens(cu_seqlens), chunk_size)]).cumsum(-1)
 

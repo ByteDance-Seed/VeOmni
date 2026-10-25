@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Model-facing causal-LM and sequence-classification loss policy."""
 
@@ -25,9 +25,13 @@ from torch import Tensor
 from transformers.loss.loss_utils import fixed_cross_entropy
 
 import veomni.models.loss_utils.cross_entropy_loss as loss_utils
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 from veomni.ops import VeomniOp
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 IGNORE_INDEX = -100

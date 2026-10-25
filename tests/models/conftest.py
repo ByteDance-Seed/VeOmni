@@ -16,9 +16,10 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
-import torch.nn.functional as F
 
 from tests.models.compare import ops_config_scope
 from veomni.ops import VeomniOp
@@ -36,14 +37,36 @@ def preserve_ops_config():
 
 
 @pytest.fixture(autouse=True)
-def cpu_safe_diffusers_rms_norm(monkeypatch):
+def restore_modeling_backend():
+    """Undo ``MODELING_BACKEND`` writes so test order cannot change behaviour.
+
+    ``utils.set_environ_param`` flips the variable with a raw ``os.environ``
+    assignment mid-test (it has to outlive the model build inside the same test),
+    which otherwise persists for the whole pytest process. Every later test module
+    then reads the last case's backend — and under ``hf`` the veomni-only config
+    normalization (``flex_attention`` -> ``veomni_flex_attention_with_sp``) stops
+    happening, so unrelated suites fail only when run after this directory.
+    """
+    previous = os.environ.get("MODELING_BACKEND")
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("MODELING_BACKEND", None)
+        else:
+            os.environ["MODELING_BACKEND"] = previous
+
+
+@pytest.fixture(autouse=True)
+def cpu_safe_diffusers_rms_norm(monkeypatch, request):
     """Keep Diffusers RMSNorm on CPU math when tensors are not on NPU.
 
     Upstream ``RMSNorm.forward`` calls ``npu_rms_norm`` whenever torch_npu is
     importable, including CPU unit tests on Ascend hosts. Qwen-Image inherits
     that module as ``txt_norm``.
     """
-    if not IS_NPU_AVAILABLE:
+    # Indirect parametrization exercises the Ascend-host CPU path on any host.
+    if not IS_NPU_AVAILABLE and not getattr(request, "param", False):
         yield
         return
 
@@ -54,12 +77,20 @@ def cpu_safe_diffusers_rms_norm(monkeypatch):
     def forward(self, hidden_states):
         if hidden_states.device.type == "npu":
             return original(self, hidden_states)
+        # Preserve Diffusers' native CPU math, including mixed-dtype promotion.
+        # F.rms_norm keeps a BF16 input in BF16 even with an FP32 weight.
+        input_dtype = hidden_states.dtype
+        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
         weight = self.weight
-        if weight is not None and weight.dtype in (torch.float16, torch.bfloat16):
-            hidden_states = hidden_states.to(weight.dtype)
-        hidden_states = F.rms_norm(hidden_states, hidden_states.shape[-1:], weight, self.eps)
-        if self.bias is not None:
-            hidden_states = hidden_states + self.bias
+        if weight is not None:
+            if weight.dtype in (torch.float16, torch.bfloat16):
+                hidden_states = hidden_states.to(weight.dtype)
+            hidden_states = hidden_states * weight
+            if self.bias is not None:
+                hidden_states = hidden_states + self.bias
+        else:
+            hidden_states = hidden_states.to(input_dtype)
         return hidden_states
 
     monkeypatch.setattr(RMSNorm, "forward", forward)

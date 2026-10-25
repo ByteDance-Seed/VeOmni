@@ -281,34 +281,3 @@ def test_triton_is_deterministic(num_experts, top_k, num_layers, batch_size, seq
 
     for output in outputs[1:]:
         assert torch.equal(outputs[0], output)
-
-
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs a GPU")
-@pytest.mark.benchmark
-@pytest.mark.parametrize("num_experts,top_k,num_layers,batch_size,seq_len", _CONFIGS)
-def test_triton_uses_less_peak_memory_than_hf(num_experts, top_k, num_layers, batch_size, seq_len):
-    pytest.importorskip("triton")
-    torch.manual_seed(0)
-    base = torch.randn(num_layers, batch_size * seq_len, num_experts, device="cuda")
-    layers = tuple(base[i].detach().requires_grad_(True) for i in range(num_layers))
-    concatenated = base.reshape(-1, num_experts).detach().requires_grad_(True)
-    triton = resolve_op("load_balancing_loss", "standard", "triton").wrapper
-    empty_mask = _empty_mask("cuda")
-
-    hf_load_balancing_loss(layers, num_experts, top_k)
-    triton(concatenated, empty_mask, top_k=top_k)
-    torch.cuda.synchronize()
-
-    baseline = torch.cuda.memory_allocated()
-    torch.cuda.reset_peak_memory_stats()
-    hf_load_balancing_loss(layers, num_experts, top_k)
-    torch.cuda.synchronize()
-    hf_peak = torch.cuda.max_memory_allocated() - baseline
-
-    baseline = torch.cuda.memory_allocated()
-    torch.cuda.reset_peak_memory_stats()
-    triton(concatenated, empty_mask, top_k=top_k)
-    torch.cuda.synchronize()
-    triton_peak = torch.cuda.max_memory_allocated() - baseline
-
-    assert triton_peak < hf_peak

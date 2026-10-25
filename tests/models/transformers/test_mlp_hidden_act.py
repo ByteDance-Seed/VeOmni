@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """MLP hidden_act routing: silu/swish use swiglu_mlp, anything else uses act_fn."""
 
@@ -42,6 +42,10 @@ class _CallCounter:
     def __init__(self, inner):
         self.inner = inner
         self.calls = 0
+
+    @property
+    def impl(self):
+        return self.inner.impl
 
     def __call__(self, *args, **kwargs):
         self.calls += 1

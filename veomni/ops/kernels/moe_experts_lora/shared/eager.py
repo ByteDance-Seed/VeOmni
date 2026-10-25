@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """shared MoE-LoRA eager math. Regular autograd, no custom backward."""
 
@@ -56,8 +56,8 @@ def wrapper(
         gate_up = F.linear(current_state, fc1_1_2_weight[expert_idx]) + lora_x_gate_up[token_idx]
         gate, up = gate_up.chunk(2, dim=-1)
         mid = F.silu(gate) * up
-        mid = mid * routing_weights[token_idx, top_k_pos, None]
         lora_x_down = F.linear(F.linear(mid, lora_a_down), lora_b_down) * scale_down
         current_hidden_states = F.linear(mid, fc2_weight[expert_idx]) + lora_x_down
+        current_hidden_states = current_hidden_states * routing_weights[token_idx, top_k_pos, None]
         output.index_add_(0, token_idx, current_hidden_states.to(output.dtype))
     return output

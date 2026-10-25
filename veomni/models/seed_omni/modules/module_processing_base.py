@@ -70,18 +70,29 @@ class ModulePreprocessorBase:
     * **CPU only.** Workers must not touch the training CUDA device; build CPU
       tensors (no ``device=``).  The main process's thin ``pre_forward`` does the
       single ``.to(device)``.
-    * **In-place mutation.** ``__call__`` receives the collator ``batch`` dict
-      and mutates it in place. Subclasses decide which keys they read and write.
-    * **Shared by training + inference.** Training runs it inside a collator
-      (DataLoader worker); inference runs it once over the request before the
-      FSM. The ``inference`` flag flips train/infer-only behaviour.
+    * **In-place mutation.** ``__call__`` receives the ``batch`` dict
+      (must contain ``conversation_list`` as ``list[list[ConversationItem]]``)
+      and mutates those items' ``value`` / ``meta`` in place via
+      :meth:`preprocess_conversations`; the thin ``pre_forward`` / ``generate``
+      then re-selects them with the same ``type`` / ``role`` / ``meta`` filter
+      to read the heavy work back.
+    * **Shared by training + inference.** Training runs it per sample inside
+      ``seedomni_transform`` (DataLoader worker) before ``dyn_bsz`` and
+      collation; inference runs it once over the request before the FSM. The
+      ``inference`` flag flips train/infer-only behaviour.
     """
 
     def __call__(self, batch: dict[str, Any], inference: bool = False, **kwargs: Any) -> None:
-        """Run CPU prep on a collated ``batch`` dict (mutates it in place)."""
+        """Run CPU prep on a ``batch`` dict (mutates it in place)."""
+        self.preprocess_conversations(batch["conversation_list"], inference=inference, **kwargs)
+
+    def preprocess_conversations(
+        self, conversation_list: list[list[Any]], inference: bool = False, **kwargs: Any
+    ) -> None:
         raise NotImplementedError(
-            f"{type(self).__name__} must implement __call__(batch, inference=False, **kwargs) "
-            "and mutate the batch in place."
+            f"{type(self).__name__} must implement "
+            "preprocess_conversations(conversation_list, inference=False, **kwargs) "
+            "and mutate it in place."
         )
 
     @classmethod

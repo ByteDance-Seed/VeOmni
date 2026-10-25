@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import torch
 
+from . import swiglu
 from .swiglu import apply_swiglu_clamp
 
 
@@ -215,8 +216,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = apply_swiglu_clamp(
             fc1_1_output, fc1_2_output, swiglu_limit
         )
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-        fc1_result = fc1_1_activation * fc1_2_output
+        fc1_result = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output)
         fc2_output = group_gemm_same_nk(
             a=fc1_result,
             b=fc2_weight,

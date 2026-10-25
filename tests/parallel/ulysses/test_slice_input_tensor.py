@@ -1,7 +1,11 @@
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.sequence_parallel import data as sp_data
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class TestSliceInputTensor:

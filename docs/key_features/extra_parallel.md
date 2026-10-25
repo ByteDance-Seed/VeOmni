@@ -29,6 +29,8 @@ In VeOmni, experts module is defined as tensors of [E, H, I] (Expert number, hid
 
 Extra parallelism is applied on dim-0 (expert number, vocab size), while FSDP2 is applied on dim-1 instead of default dim-0 for more flexible parallelism setup. Otherwise, if we also choose dim-0 for FSDP2, Expert Parallel or Embed Parallel x FSDP2 size needs to be exact expert number or vocab size.
 
+The lookup of a vocab-sharded embedding is described in [sharded_embedding.md](./sharded_embedding.md).
+
 ## Usage
 
 > File: tests/utils/test_extra_parallel_clip_grad_norm.py
@@ -61,6 +63,22 @@ parallel_plan = ParallelPlan(
     }
 )
 ```
+
+### Plan owners
+
+Each plan key's parent module is that key's owner. `ParallelPlan.__init__` registers
+every distinct owner pattern in `extra_parallel_fsdp_no_shard_module[<name>]`, and the
+parallelizer wraps each matched owner as its own FSDP2 unit on that dimension's
+`<name>_fsdp` mesh. For the plan above, `model.layers.*.mlp.experts` is the `ep` owner.
+Do not set `extra_parallel_fsdp_no_shard_module` by hand.
+
+* Owners must not nest. A plan with both `decoder.weight` and `decoder.ngram.weight`
+  raises `ValueError`, because each owner would become its own unit.
+* Every owner must sit under a module whose class is listed in the model's
+  `_no_split_modules`. The parallelizer pairs owners only under those wrap targets.
+  An owner outside them is still sliced by the plan, but FSDP2 shards it again over
+  the regular mesh. Each rank then gathers a mix of other ranks' slices, and nothing
+  raises. A MoE MTP head is the usual case: see step 6 in [mtp.md](./mtp.md).
 
 
 

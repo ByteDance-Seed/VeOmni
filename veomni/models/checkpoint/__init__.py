@@ -9,8 +9,8 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing limitations
-# under the License.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Checkpoint convert protocol, fused-expert FQN helpers, and weight I/O."""
 
@@ -28,8 +28,8 @@ from .convert import (
     prepare_fqn_to_index_mapping_for_model,
     resolve_fqn_to_index_mapping_for_save,
     shard_index_from_filename,
+    split_moe_params,
 )
-from .expert_fusion import PerExpertSplitToFusedConverter
 from .manager import ModelCheckpointManager
 from .moe_map import (
     PER_EXPERT_SPLIT_TO_FUSED_PATTERN,
@@ -51,7 +51,6 @@ __all__ = [
     "FqnToIndexMappingConverter",
     "ModelCheckpointManager",
     "PER_EXPERT_SPLIT_TO_FUSED_PATTERN",
-    "PerExpertSplitToFusedConverter",
     "checkpoint_converter_is_dim0_zero_pad",
     "convert_per_expert_fqn_mapping_to_fused",
     "export_weights",
@@ -69,4 +68,5 @@ __all__ = [
     "save_model_assets",
     "save_model_weights",
     "shard_index_from_filename",
+    "split_moe_params",
 ]

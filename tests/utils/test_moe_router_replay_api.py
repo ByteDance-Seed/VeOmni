@@ -43,6 +43,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.utils import moe_router_replay
 from veomni.utils.moe_router_replay import (
     SUPPORTED_MOE_MODEL_TYPES,
@@ -51,6 +52,9 @@ from veomni.utils.moe_router_replay import (
     set_active_replay,
     validate_model_for_replay,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 @pytest.fixture(autouse=True)
@@ -247,6 +251,8 @@ _GENERATED_FILES = {
     _REPO_ROOT / "veomni/models/transformers/qwen3_moe/generated/patched_modeling_qwen3_moe_gpu.py": 1,
     _REPO_ROOT / "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_gpu.py": 1,
     _REPO_ROOT / "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_npu.py": 1,
+    _REPO_ROOT / "veomni/models/transformers/qwen4_exp/generated/patched_modeling_qwen4_exp_gpu.py": 1,
+    _REPO_ROOT / "veomni/models/transformers/qwen4_exp/generated/patched_modeling_qwen4_exp_npu.py": 1,
     # TopKRouter + HashRouter.
     _REPO_ROOT / "veomni/models/transformers/deepseek_v4/generated/patched_modeling_deepseek_v4_gpu.py": 2,
     _REPO_ROOT / "veomni/models/transformers/deepseek_v4/generated/patched_modeling_deepseek_v4_npu.py": 2,

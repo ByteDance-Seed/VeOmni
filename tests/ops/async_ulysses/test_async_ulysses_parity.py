@@ -7,12 +7,11 @@ import torch
 import torch.distributed as c10d
 import torch.distributed as dist
 
+from scripts.ci.accelerator.launch_plan import runner_device_count
 from tests.parallel.ulysses.attention import Attention
 from tests.parallel.ulysses.utils import SequenceParallelTest, sync_tensor
-from veomni.distributed.sequence_parallel.comm import (
-    get_ulysses_sequence_parallel_group,
-    set_ulysses_sequence_parallel_group,
-)
+from veomni.distributed.parallel_state import use_parallel_state
+from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
@@ -96,7 +95,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         t = torch.ones_like(output)
         return torch.sum(output * t)
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
+    @pytest.mark.skipif(runner_device_count() < 2, reason="device_count should be >= 2")
     @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses")
     def test_self_attn(self):
         self._get_process_group()
@@ -119,31 +118,32 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
 
         loss_func = self._overlapping_grad
 
-        sp_rst = attn_sp(part_input, unpad_size)
-        sp_full_rst = gather_outputs(
-            sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
-        )
-        loss_sp = loss_func(sp_rst)
-        loss_sp.backward()
-        attn_sp_grads = _parameter_gradients(attn_sp)
+        with use_parallel_state(self.sp_state):
+            sp_rst = attn_sp(part_input, unpad_size)
+            sp_full_rst = gather_outputs(
+                sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
+            )
+            loss_sp = loss_func(sp_rst)
+            loss_sp.backward()
+            attn_sp_grads = _parameter_gradients(attn_sp)
         part_input_grad = part_input.grad.detach().clone()
         for gradient in attn_sp_grads.values():
             dist.all_reduce(gradient)
         part_input_grad = sync_tensor(part_input_grad, 1)
         part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
-        set_ulysses_sequence_parallel_group(None)
-        dp_rst = attn_dp(full_input, unpad_size)
-        loss_dp = loss_func(dp_rst)
-        loss_dp.backward()
-        attn_dp_grads = _parameter_gradients(attn_dp)
+        with use_parallel_state(self.dp_state):
+            dp_rst = attn_dp(full_input, unpad_size)
+            loss_dp = loss_func(dp_rst)
+            loss_dp.backward()
+            attn_dp_grads = _parameter_gradients(attn_dp)
         full_input_grad = full_input.grad.detach().clone()
 
         torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
         _assert_parameter_gradients_close(attn_dp_grads, attn_sp_grads)
         torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
+    @pytest.mark.skipif(runner_device_count() < 2, reason="device_count should be >= 2")
     @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses")
     def test_self_attn_padding(self):
         self._get_process_group()
@@ -166,24 +166,25 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
 
         loss_func = self._non_overlapping_grad
 
-        sp_rst = attn_sp(part_input, unpad_size)
-        sp_full_rst = gather_outputs(
-            sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
-        )
-        loss_sp = loss_func(sp_rst)
-        loss_sp.backward()
-        attn_sp_grads = _parameter_gradients(attn_sp)
+        with use_parallel_state(self.sp_state):
+            sp_rst = attn_sp(part_input, unpad_size)
+            sp_full_rst = gather_outputs(
+                sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
+            )
+            loss_sp = loss_func(sp_rst)
+            loss_sp.backward()
+            attn_sp_grads = _parameter_gradients(attn_sp)
         part_input_grad = part_input.grad.detach().clone()
         for gradient in attn_sp_grads.values():
             dist.all_reduce(gradient)
         part_input_grad = sync_tensor(part_input_grad, 1)
         part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
-        set_ulysses_sequence_parallel_group(None)
-        dp_rst = attn_dp(full_input, unpad_size)
-        loss_dp = loss_func(dp_rst)
-        loss_dp.backward()
-        attn_dp_grads = _parameter_gradients(attn_dp)
+        with use_parallel_state(self.dp_state):
+            dp_rst = attn_dp(full_input, unpad_size)
+            loss_dp = loss_func(dp_rst)
+            loss_dp.backward()
+            attn_dp_grads = _parameter_gradients(attn_dp)
         full_input_grad = full_input.grad.detach().clone()
 
         torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
