@@ -121,12 +121,12 @@ def test_triton_swiglu_oai_moe_matches_eager_forward_backward(monkeypatch):
 def _ep_forward_backward_worker():
     import torch.distributed as dist
 
-    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
     from veomni.ops.kernels.moe_experts.standard import triton as group_gemm
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    init_parallel_state(
+    _init_parallel_state(
         dp_size=world_size,
         dp_shard_size=world_size,
         device_type=get_device_type(),

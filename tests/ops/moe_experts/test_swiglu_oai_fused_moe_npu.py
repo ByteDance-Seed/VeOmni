@@ -120,12 +120,12 @@ def test_npu_fused_moe_matches_eager_forward_backward(limit, alpha, monkeypatch)
 def _npu_ep_forward_backward_worker():
     import torch.distributed as dist
 
-    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
     from veomni.ops.kernels.moe_experts.standard import npu as npu_group_gemm
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    state = init_parallel_state(
+    state = _init_parallel_state(
         dp_size=world_size,
         dp_shard_size=world_size,
         device_type="npu",
