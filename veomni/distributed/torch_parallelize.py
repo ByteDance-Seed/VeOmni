@@ -30,6 +30,7 @@ from torch.utils.checkpoint import noop_context_fn
 from ..arguments import MixedPrecisionConfig
 from ..arguments.arguments_types import validate_low_precision_reduce_scatter_comm
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
+from ..models.checkpoint.weights import _get_buffer_aliases, _restore_buffer_aliases
 from ..utils import logging, recompute_utils
 from ..utils.device import IS_NPU_AVAILABLE, get_device_id, get_device_type
 from .checkpoint import CheckpointFunction
@@ -220,6 +221,7 @@ def _materialize_and_load_weights(
         skip_map = dict(module_skip_hf_weight_load or {})
         peft_map = dict(module_is_peft_model or {})
         adapter_map = dict(module_adapter_path or {})
+        buffer_aliases = _get_buffer_aliases(model)
         for name, path in weights_path.items():
             _materialize_and_load_weights(
                 children[name],
@@ -234,6 +236,7 @@ def _materialize_and_load_weights(
                 fqn_to_index_mapping=fqn_to_index_mapping,
                 ep_sharded_stream_load=ep_sharded_stream_load,
             )
+            _restore_buffer_aliases(model, buffer_aliases, source_prefix=f"{name}.")
         leftover_meta = [
             name
             for name, child in children.items()
