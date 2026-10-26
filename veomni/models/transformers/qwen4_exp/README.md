@@ -72,8 +72,10 @@ Known limitations:
   falls back to eager QSA and therefore loses the sparse kernel's memory
   advantage.
 - Ulysses/CP GatedDeltaNet requires non-eager, varlen-capable causal-conv and
-  chunk gated-delta-rule kernels. GatedDeltaNet head counts must be divisible by
-  the active `ulysses_size`/`cp_size`; QSA attention has no head-divisibility
+  chunk gated-delta-rule kernels. Both GatedDeltaNet key and value head counts
+  must be divisible by `ulysses_size` for Ulysses-only execution, by `cp_size`
+  for CP-only execution, and by `ulysses_size * cp_size` for combined execution.
+  QSA attention has no head-divisibility
   constraint because it keeps all query heads local and all-gathers only KV.
   When `chunk_gated_delta_rule_implementation=flash_qla`, GatedDeltaNet
   preserves grouped Q/K heads (`num_k_heads < num_v_heads`) directly into the
