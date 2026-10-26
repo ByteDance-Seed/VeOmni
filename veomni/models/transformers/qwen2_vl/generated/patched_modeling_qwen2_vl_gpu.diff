@@ -23,7 +23,7 @@
 +#    - init_modification: VisionAttention
 +#      Bind instance-local rope and attention VeomniOps
 +#    - method_override: VisionAttention.forward
-+#      Use VeOmni varlen attention types and precomputed max_seqlen to avoid per-layer cpu-gpu sync
++#      Use precomputed max_seqlen and route packed cu_seqlens through the local attention VeomniOp
 +#    - method_override: Qwen2VisionTransformerPretrainedModel.forward
 +#      VeOmni SP + Precompute max_seqlen and apply SP position-embedding slicing in vision forward
 +#    - method_override: Qwen2VisionTransformerPretrainedModel.dummy_forward
@@ -374,7 +374,7 @@
          **kwargs,
      ) -> torch.Tensor:
          seq_length = hidden_states.shape[0]
-@@ -366,19 +441,16 @@
+@@ -366,56 +441,28 @@
              self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
          )
          cos, sin = position_embeddings
@@ -388,29 +388,67 @@
 -        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
 -            self.config._attn_implementation, eager_attention_forward
 -        )
-+        attention_interface = self.veomni_attn
-
-         if is_flash_attention_requested(self.config):
+-
+-        if is_flash_attention_requested(self.config):
 -            # Flash Attention: Use cu_seqlens for variable length attention
 -            max_seqlen = get_max_seqlen(cu_seqlens, self.config, kwargs={"max_seqlen": max_seqlen})
-+            # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-             attn_output, _ = attention_interface(
-                 self,
-                 query_states,
-@@ -395,12 +467,10 @@
-                 **kwargs,
-             )
-         else:
+-            attn_output, _ = attention_interface(
+-                self,
+-                query_states,
+-                key_states,
+-                value_states,
+-                attention_mask=None,
+-                scaling=self.scaling,
+-                dropout=0.0 if not self.training else self.attention_dropout,
+-                cu_seq_lens_q=cu_seqlens,
+-                cu_seq_lens_k=cu_seqlens,
+-                max_length_q=max_seqlen,
+-                max_length_k=max_seqlen,
+-                is_causal=False,
+-                **kwargs,
+-            )
+-        else:
 -            # Other implementations: Process each chunk separately
-             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-             splits = [
-                 torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-             ]
+-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+-            splits = [
+-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
+-            ]
 -
-             attn_outputs = [
-                 attention_interface(
-                     self,
-@@ -449,10 +519,16 @@
+-            attn_outputs = [
+-                attention_interface(
+-                    self,
+-                    q,
+-                    k,
+-                    v,
+-                    attention_mask=None,
+-                    scaling=self.scaling,
+-                    dropout=0.0 if not self.training else self.attention_dropout,
+-                    is_causal=False,
+-                    **kwargs,
+-                )[0]
+-                for q, k, v in zip(*splits)
+-            ]
+-            attn_output = torch.cat(attn_outputs, dim=1)
++        # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
++        attn_output, _ = self.veomni_attn(
++            self,
++            query_states,
++            key_states,
++            value_states,
++            attention_mask=None,
++            scaling=self.scaling,
++            dropout=0.0 if not self.training else self.attention_dropout,
++            cu_seq_lens_q=cu_seqlens,
++            cu_seq_lens_k=cu_seqlens,
++            max_length_q=max_seqlen,
++            max_length_k=max_seqlen,
++            is_causal=False,
++            **kwargs,
++        )
+
+         attn_output = attn_output.reshape(seq_length, -1).contiguous()
+         attn_output = self.proj(attn_output)
+@@ -449,10 +496,16 @@
          return hidden_states
 
 
@@ -428,7 +466,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -460,10 +536,26 @@
+@@ -460,10 +513,26 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -457,7 +495,7 @@
 
 
  class Qwen2VLAttention(nn.Module):
-@@ -472,6 +564,7 @@
+@@ -472,6 +541,7 @@
      and "Generating Long Sequences with Sparse Transformers".
      """
 
@@ -465,7 +503,7 @@
      def __init__(self, config: Qwen2VLTextConfig, layer_idx: int | None = None):
          super().__init__()
          self.config = config
-@@ -504,6 +597,9 @@
+@@ -504,6 +574,9 @@
          self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
          self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
          self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
@@ -475,7 +513,7 @@
 
      def forward(
          self,
-@@ -516,6 +612,7 @@
+@@ -516,6 +589,7 @@
          position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
          **kwargs: Unpack[FlashAttentionKwargs],
      ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
@@ -483,7 +521,7 @@
          bsz, q_len, _ = hidden_states.size()
 
          query_states = self.q_proj(hidden_states)
-@@ -527,18 +624,18 @@
+@@ -527,18 +601,18 @@
          value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -509,7 +547,7 @@
              self,
              query_states,
              key_states,
-@@ -547,7 +644,7 @@
+@@ -547,7 +621,7 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -518,7 +556,7 @@
              **kwargs,
          )
 
-@@ -645,6 +742,12 @@
+@@ -645,6 +719,12 @@
              init.copy_(module.inv_freq, inv_freq)
 
 
@@ -531,7 +569,7 @@
  @auto_docstring
  class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
      config: Qwen2VLVisionConfig
-@@ -698,19 +801,86 @@
+@@ -698,19 +778,86 @@
      @capture_outputs
      @auto_docstring
      def forward(
@@ -623,7 +661,7 @@
 
          for blk in self.blocks:
              hidden_states = blk(
-@@ -727,6 +897,47 @@
+@@ -727,6 +874,47 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -671,7 +709,7 @@
 
 
  @auto_docstring
-@@ -842,6 +1053,12 @@
+@@ -842,6 +1030,12 @@
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
          )
@@ -684,7 +722,7 @@
 
 
  @auto_docstring
-@@ -1024,11 +1241,14 @@
+@@ -1024,11 +1218,14 @@
          video_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -703,7 +741,7 @@
 
          return vision_outputs
 
-@@ -1041,11 +1261,14 @@
+@@ -1041,11 +1238,14 @@
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -722,7 +760,7 @@
 
          return vision_outputs
 
-@@ -1149,33 +1372,128 @@
+@@ -1149,33 +1349,128 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -862,7 +900,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1185,6 +1503,10 @@
+@@ -1185,6 +1480,10 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -873,7 +911,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1193,15 +1515,27 @@
+@@ -1193,15 +1492,27 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -902,7 +940,7 @@
 
 
  class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
-@@ -1211,7 +1545,9 @@
+@@ -1211,7 +1522,9 @@
          super().__init__(config)
          self.model = Qwen2VLModel(config)
          self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
@@ -913,7 +951,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -1251,90 +1587,82 @@
+@@ -1251,90 +1564,82 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -1047,7 +1085,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -1514,5 +1842,51 @@
+@@ -1514,5 +1819,51 @@
 
          return input_ids, model_kwargs
 

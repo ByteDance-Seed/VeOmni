@@ -215,13 +215,22 @@ def _requirement_metadata(requirement):
 
 
 def test_builtin_entry_catalog_is_exact():
-    """Built-in rows expose the intended device, platform, and package metadata."""
+    """Verify every built-in row and its hardware/dependency metadata alongside structural invariants."""
+    assert OP_REGISTRY._entries, "OP_REGISTRY must not be empty"
     actual = {
         (*key, _requirement_metadata(entry.requirement), entry.requires) for key, entry in OP_REGISTRY._entries.items()
     }
-    expected = set(_BUILTIN_ENTRIES)
+    for op, variant, impl, device, req_meta, _requires in actual:
+        if device == "any":
+            assert req_meta is None, f"{op}/{variant}/{impl} on device='any' must not set hardware requirement"
+        else:
+            expected_kind = "gpu" if device == "cuda" else device
+            assert req_meta is not None and req_meta[0] == expected_kind, (
+                f"{op}/{variant}/{impl} on device={device!r} has mismatched requirement {req_meta}"
+            )
 
-    assert len(expected) == len(_BUILTIN_ENTRIES)
+    expected = set(_BUILTIN_ENTRIES)
+    assert len(expected) == len(_BUILTIN_ENTRIES), "Duplicate expected built-in rows"
     assert actual == expected
 
 

@@ -133,11 +133,11 @@ class OptimizerConfig:
         default="per_module",
         metadata={
             "help": (
-                "Which parameters max_grad_norm is computed over. 'per_module' clips each "
-                "module against its own norm; 'global' clips every module against one norm "
-                "taken across all of them. A single-model job has one module, so the two "
-                "agree; 'global' only becomes meaningful once an omni model owns several, "
-                "and is not implemented yet."
+                "How OmniTrainer applies max_grad_norm across OmniModules. "
+                "'per_module' (default): clip each module to max_grad_norm independently, "
+                "then report sqrt(sum n_i^2). "
+                "'global': measure each module unclipped, total=sqrt(sum n_i^2), then scale "
+                "all modules by one coefficient (single-model / seedream gradient_clip_val semantics)."
             )
         },
     )
@@ -247,13 +247,6 @@ class OptimizerConfig:
             )
         },
     )
-
-    def __post_init__(self):
-        if self.grad_clip_scope == "global":
-            raise NotImplementedError(
-                "model.optimizer.grad_clip_scope='global' needs a clip that spans several "
-                "modules, which arrives with the omni module runtime. Use 'per_module'."
-            )
 
 
 @dataclass
@@ -866,6 +859,8 @@ class AcceleratorConfig:
         # "derive it", cp_size is always an explicit divisor of the world size.
         if self.cp_size < 1:
             raise ValueError(f"cp_size must be a positive integer; got {self.cp_size}.")
+        if self.ulysses_size < 1:
+            raise ValueError(f"ulysses_size must be a positive integer; got {self.ulysses_size}.")
 
         non_dp_size = self.pp_size * self.ulysses_size * self.cp_size * self.tp_size
         if self.world_size % non_dp_size != 0:

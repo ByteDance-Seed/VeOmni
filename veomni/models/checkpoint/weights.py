@@ -813,8 +813,8 @@ def load_model_weights_ep_sharded(
     # (renames, FP8/FP4 weight+scale pairs). Those are streamed as whole tensors in the
     # main loop. A converter that claims a key but lacks expert-streaming capabilities
     # still needs the whole tensor set for every transform, so raise before materialising.
-    expert_converter = None
-    expert_range: Optional[Tuple[int, int]] = None
+    expert_converters: Dict[Tuple[int, int], CheckpointTensorConverter] = {}
+    range_for_target: Dict[str, Tuple[int, int]] = {}
     supports_expert_streaming = checkpoint_converter_supports_expert_streaming(converter)
     # Per-expert keys whose fused target the model does not build (e.g. a checkpoint's MTP
     # experts when MTP is off): unexpected keys, skipped without reading.
@@ -852,6 +852,7 @@ def load_model_weights_ep_sharded(
                 continue
             if fused_name not in num_experts_by_target:
                 start, num_local, num_experts_by_target[fused_name] = _local_expert_range(fused_name)
+                range_for_target[fused_name] = (start, num_local)
                 expert_ranges.setdefault((start, num_local), fused_name)
             counts = expert_key_counts.setdefault(fused_name, {})
             counts[target[1]] = counts.get(target[1], 0) + 1
@@ -873,14 +874,8 @@ def load_model_weights_ep_sharded(
                     f"ep_sharded_stream_load: incomplete checkpoint detected for '{fused_name}' "
                     f"({len(expected)} experts): " + "; ".join(problems) + "."
                 )
-        if len(expert_ranges) > 1:
-            raise NotImplementedError(
-                f"ep_sharded_stream_load: per-expert checkpoint keys map to fused experts with different "
-                f"local expert ranges {expert_ranges}; one converter range per rank is supported."
-            )
-        if expert_ranges:
-            expert_range = next(iter(expert_ranges))
-            expert_converter = converter.for_expert_range(*expert_range)
+        for rng in expert_ranges:
+            expert_converters[rng] = converter.for_expert_range(*rng)
 
     model.to_empty(device=init_device)
     dtensor_to_cpu = init_device == "cpu"
@@ -930,15 +925,15 @@ def load_model_weights_ep_sharded(
                     logger.info_rank0(f"Unexpected key in state dict: {name}.")
                     continue
                 expert_target = (
-                    checkpoint_converter_fused_expert_target(converter, bare_name)
-                    if expert_converter is not None
-                    else None
+                    checkpoint_converter_fused_expert_target(converter, bare_name) if expert_converters else None
                 )
                 if expert_target is not None:
-                    start, num_local = expert_range
+                    target_fused_name = _apply_peft_override(expert_target[0])
+                    start, num_local = range_for_target[target_fused_name]
                     if not start <= expert_target[1] < start + num_local:
                         n_remote_experts += 1
                         continue
+                    expert_converter = expert_converters[(start, num_local)]
                     converted = expert_converter.convert(bare_name, f.get_tensor(raw_name))
                     n_expert_reads += 1
                     if converted is not None:
@@ -1060,7 +1055,7 @@ def load_model_weights_ep_sharded(
         # whole-tensor loader does (typically logged as unexpected keys).
         for result in finalized:
             _dispatch_whole_converted(result, result.name)
-    if expert_converter is not None:
+    for expert_converter in expert_converters.values():
         # E.g. DeepSeek-V4 ``.scale`` keys left beside BF16 expert weights. These come
         # from this rank's experts only, so they may not be dispatched into the model
         # (other ranks would not do the same); unexpected keys are logged, as the
@@ -1101,6 +1096,12 @@ def load_model_weights_ep_sharded(
     post_process_after_weight_loading(
         model, buffer_dict, parameter_names_to_load, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu
     )
+
+    fqn_to_index_mapping = kwargs.get("fqn_to_index_mapping")
+    if fqn_to_index_mapping is not None:
+        from veomni.models.checkpoint.convert import prepare_fqn_to_index_mapping_for_model
+
+        prepare_fqn_to_index_mapping_for_model(model, fqn_to_index_mapping)
 
 
 @torch.no_grad()

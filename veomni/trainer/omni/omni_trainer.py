@@ -286,7 +286,24 @@ class OmniTrainer:
         self.model._build_lr_scheduler(self.args.train_steps * self.args.train.num_train_epochs)
 
     def _build_data_transform(self) -> None:
-        self.data_transform = build_data_transform(self.args.data.data_type, **self.args.data.mm_configs)
+        args: OmniArguments = self.args
+        processor = OmniProcessor.from_config(self.model.config, checkpoint_root=args.model.resolved_model_path)
+        # FSDP-anchor dummy tensors are only exercised by the training (inference=False)
+        # branch. The model runtime is already built, so every module's own
+        # resolved `ModuleRuntime.model_config` is sitting in memory — hand that
+        # straight to the processor instead of re-reading each module's config.json
+        # from disk. Mirrors the per-module load dtype resolved in
+        # ModuleRuntime.build_model; a single dtype is fine since these dummies
+        # get re-cast to each module's live self.dtype before reaching its forward.
+        dummy_dtype = torch.float32 if args.model.accelerator.fsdp_config.mixed_precision.enable else torch.bfloat16
+        module_configs = {name: rt.model_config for name, rt in self.model.module_runtimes.items()}
+        processor.bind_dummy_inputs(module_configs, dtype=dummy_dtype)
+        logger.info_rank0(f"SeedOmni data_transform with {len(processor)} worker-side CPU preprocessor(s).")
+        self.data_transform = build_data_transform(
+            args.data.data_type,
+            processor=processor,
+            **args.data.mm_configs,
+        )
 
     def _build_dataset(self) -> None:
         args: OmniArguments = self.args
@@ -304,20 +321,7 @@ class OmniTrainer:
         self.train_steps = args.train_steps
 
     def _build_collate_fn(self) -> None:
-        args: OmniArguments = self.args
-        processor = OmniProcessor.from_config(self.model.config, checkpoint_root=args.model.resolved_model_path)
-        # FSDP-anchor dummy tensors are only exercised by the training (inference=False)
-        # branch. The model runtime is already built, so every module's own
-        # resolved `ModuleRuntime.model_config` is sitting in memory — hand that
-        # straight to the processor instead of re-reading each module's config.json
-        # from disk. Mirrors the per-module load dtype resolved in
-        # ModuleRuntime.build_model; a single dtype is fine since these dummies
-        # get re-cast to each module's live self.dtype before reaching its forward.
-        dummy_dtype = torch.float32 if args.model.accelerator.fsdp_config.mixed_precision.enable else torch.bfloat16
-        module_configs = {name: rt.model_config for name, rt in self.model.module_runtimes.items()}
-        processor.bind_dummy_inputs(module_configs, dtype=dummy_dtype)
-        logger.info_rank0(f"SeedOmniCollator with {len(processor)} worker-side CPU preprocessor(s).")
-        self.collate_fn = SeedOmniCollator(processor=processor)
+        self.collate_fn = SeedOmniCollator()
 
     def _build_dataloader(self) -> None:
         args: OmniArguments = self.args

@@ -13,8 +13,14 @@ directory. Do not add per-file pytest workflow lines or manual device quotas.
 CPU-only parsing, preprocessing, eager references and mocked backend tests need
 an explicit CPU launch plan. Mark entire modules only when all cases are CPU-only;
 use individual case markers in files that also exercise accelerator kernels.
-The lightweight device-API workflow imports CPU-marked architecture/docstring
-tests directly, so it installs pytest even though it does not install Torch.
+The lightweight device-API workflow runs architecture, op-documentation and
+generated-call-site-signature tests with `pytest --noconftest`, without Torch.
+The patchgen workflow owns `test_modify_init.py`, using the standalone
+`patchgen` package and `pytest --noconftest` to avoid runtime fixture imports.
+Device-API acceptance also includes the three `check_device_api_usage.py`
+scans over `tasks`, `veomni`, and `tests`; the pytest guards alone do not cover
+that workflow. CPU tests checking device-name forwarding should use a mock
+backend sentinel when no real hardware API is involved.
 CPU-planned worker cases scope `torch.utils.checkpoint.DefaultDeviceType` to
 `cpu` and restore it afterward. On Ascend, CPU-only checkpoint inputs otherwise
 fall back to the registered NPU and AMP capability queries can initialize a
@@ -24,6 +30,24 @@ During that scope, optimizer foreach-capability queries use the canonical
 `torch.utils._foreach_utils` helper. torch_npu 2.10 replaces the optimizer's
 alias with a device-name lookup that initializes NPU even for CPU parameters.
 Restore the prior alias on exit, preserving explicit foreach/fused options.
+The restoration scope includes setup itself, so partial initialization failures
+also undo changes already applied. Unsupported vendor isolation interfaces
+raise an explicit error before the test runs.
+torch_npu 2.10 also replaces the multi-worker DataLoader iterator constructor
+with unconditional NPU synchronization/affinity calls, even for CPU datasets.
+CPU-planned cases temporarily use the vendor module's saved Torch constructor
+and restore the patch after teardown or failure. Only replace the known vendor
+wrapper; preserve unrelated constructor patches and all accelerator plans.
+The vendor Inductor wrapper also registers its NPU backend before compiling
+CPU graphs. CPU cases temporarily disable that registration through the loaded
+vendor registry and restore its prior disabled state after teardown or failure.
+Keep real CPU Inductor compilation and gradient checks enabled; do not replace
+compiled-mask coverage with eager execution to avoid hidden-device queries.
+CPU cases must also register Torch's built-in CPU device-op overrides when
+missing. torch_npu populates the override registry at import; Torch 2.10 then
+skips all built-ins because the registry is nonempty. Torch 2.11 repairs missing
+keys, so testing only that version misses the NPU CI failure. Preserve existing
+CPU/vendor entries and validate the pinned Torch version's startup state.
 A synthetic registered backend alone misses vendor monkeypatches: exercise
 the pinned wheel's optimizer patch in CPU isolation audits too.
 
@@ -46,6 +70,24 @@ Explicit CPU plans reserve zero cards. See `docs/design/ci_case_scheduling.md`
 for the author API, defaults and mismatch rules, and `scripts/ci/accelerator/README.md` for
 local commands and result artifacts.
 
+A CPU launch plan isolates devices only when the accelerator runner executes
+the test. CPU-only launcher regressions must also isolate their subprocess
+environment before importing torch, so ordinary pytest on a GPU/NPU host does
+not choose an accelerator backend for CPU tensors. Architecture-specific
+kernel tests must check hardware eligibility before importing optional kernels.
+
+Distributed rendezvous must own its listener through worker startup. Use
+`tests.tools.launch_utils.spawn_with_rendezvous` for raw spawn workers (the
+endpoint is appended to their arguments; initialize with `store=endpoint.connect()`)
+or the existing `torchrun` callable helper. Single-node torchrun commands use
+`--standalone`; CI keeps agent Store sharing enabled. `find_free_port()` only
+returns a number and its run registry only coordinates cooperating callers:
+probing, closing, then binding in a child still races with other sockets.
+After `mp.spawn` returns its context, the helper reaps workers before releasing
+the Store on failure, interruption and success. Partial startup failures before
+that return rely on the runner's enclosing process-scope cleanup. Never solve a bind race by retrying an entire
+training/checkpoint operation that may already have produced side effects.
+
 A test that passes locally is not necessarily a test CI runs. The entries below
 describe selections in `scripts/ci/accelerator/suites/gpu.json` and `npu.json`.
 
@@ -54,12 +96,12 @@ describe selections in `scripts/ci/accelerator/suites/gpu.json` and `npu.json`.
 | `tests/ci/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
 | `tests/data/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
 | `tests/checkpoints/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
-| `tests/ops/` | whole directory in both GPU/NPU manifests (`suite: unit`) |
-| `tests/models/` | unit selection in both manifests; GPU excludes `test_omni_fsdp.py`, NPU collects the whole directory |
+| `tests/ops/` | directory in both GPU/NPU unit manifests, excluding `base/test_op_documentation.py` (device-API workflow) |
+| `tests/models/` | unit selection in both manifests, excluding `base/test_modify_init.py` (patchgen workflow) and `transformers/test_generated_call_site_signatures.py` (device-API workflow); GPU additionally excludes `test_omni_fsdp.py` |
 | `tests/parallel/context_parallel/` | whole directory, GPU manifest only (`suite: unit`) |
 | everything else | **one selection per file** in the appropriate GPU/NPU suite manifest |
 | `tests/e2e/test_e2e_parallel.py`, `tests/distributed/test_fsdp_equivalence.py` | GPU/NPU manifests (`suite: e2e`) |
-| `tests/models/test_omni_fsdp.py` | GPU manifest `59-e2e` (`suite: e2e`); NPU coverage remains in the models unit selection |
+| `tests/models/test_omni_fsdp.py` | GPU manifest `61-e2e` (`suite: e2e`); NPU coverage remains in the models unit selection |
 
 Consequences that cut both ways:
 
