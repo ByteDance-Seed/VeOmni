@@ -54,6 +54,26 @@ class TestDiTModelRuntime(DiTModelRuntime):
     def _freeze_model_module(self) -> None:
         pass
 
+    def reset_for_dataset_branch(self) -> None:
+        """Reload initial weights and optimizer under this model's parallel state."""
+        from torch.distributed.tensor import distribute_tensor
+
+        from veomni.models.checkpoint.weights import load_model_weights
+        from veomni.utils import helper
+        from veomni.utils.device import get_device_type
+
+        helper.set_seed(self.train_args.seed, self.train_args.enable_full_determinism)
+        dtensor_to_cpu = self.args.accelerator.fsdp_config.offload
+        with use_parallel_state(self.parallel_state):
+            load_model_weights(
+                self.model,
+                self.args.model_path,
+                init_device="cpu" if dtensor_to_cpu else get_device_type(),
+                dtensor_factory=distribute_tensor,
+                dtensor_to_cpu=dtensor_to_cpu,
+            )
+            self._build_optimizer()
+
 
 class TestDiTTrainer(DiTTrainer):
     """DiTTrainer subclass for SP-alignment testing.
@@ -76,8 +96,6 @@ class TestDiTTrainer(DiTTrainer):
 
     def _run_extra_train_path(self, extra_train_path: str) -> None:
         """Reuse the initialized process group and model to run a second dataset branch."""
-        from veomni.models.checkpoint.weights import load_model_weights
-
         args = self.base.args
         args.data.train_path = extra_train_path
         args.train.checkpoint.output_dir = f"{args.train.checkpoint.output_dir}_padding"
@@ -86,54 +104,12 @@ class TestDiTTrainer(DiTTrainer):
         self.base.start_epoch = 0
         self.base.start_step = 0
 
-        # Reload initial weights and reset optimizer/scheduler + RNG so the second
-        # dataset branch starts from the exact same initial state as a fresh launch.
-        from torch.distributed.tensor import distribute_tensor
-
-        from veomni.utils import helper
-        from veomni.utils.device import get_device_type
-
-        helper.set_seed(args.train.seed, args.train.enable_full_determinism)
-        dtensor_to_cpu = args.model.accelerator.fsdp_config.offload
-        load_device = "cpu" if dtensor_to_cpu else get_device_type()
-        load_model_weights(
-            self.base.model.model,
-            args.model.model_path,
-            init_device=load_device,
-            dtensor_factory=distribute_tensor,
-            dtensor_to_cpu=dtensor_to_cpu,
-        )
-        self.base.model._build_optimizer()
-        self.base._build_lr_scheduler()
-
+        self.base.model.reset_for_dataset_branch()
         with use_parallel_state(self.base.model.parallel_state):
             self._build_dataset()
             self._build_dataloader()
-
-        for epoch in range(self.base.start_epoch, args.train.num_train_epochs):
-            if self.base.train_dataloader is not None and hasattr(self.base.train_dataloader, "set_epoch"):
-                self.base.train_dataloader.set_epoch(epoch)
-            self.base.state.epoch = epoch
-            self.on_epoch_begin()
-            if self.base.train_dataloader is not None:
-                from veomni.trainer.base import VeOmniIter
-
-                self.base.data_iterator = VeOmniIter(
-                    self.base.train_dataloader,
-                    use_background_prefetcher=args.data.dataloader.use_background_prefetcher,
-                )
-            else:
-                self.base.data_iterator = None
-            for _ in range(self.base.start_step, args.train_steps):
-                try:
-                    self.train_step(self.base.data_iterator)
-                except StopIteration:
-                    break
-            self.on_epoch_end()
-            self.base.start_step = 0
-            if args.data.dataloader.use_background_prefetcher and self.base.data_iterator is not None:
-                self.base.data_iterator.stop()
-        self.on_train_end()
+        self.base._build_lr_scheduler()
+        self.train()
 
     # ------------------------------------------------------------------
     # Skip condition model processing – batch is already model-ready.
@@ -163,10 +139,6 @@ class TestDiTTrainer(DiTTrainer):
             grad_norm=grad_norm or 0.0,
             aux_metrics=aux_metrics,
         )
-
-    def destroy_distributed(self):
-        if not getattr(self, "_defer_destroy", False):
-            self.base.destroy_distributed()
 
 
 if __name__ == "__main__":
