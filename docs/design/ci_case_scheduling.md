@@ -64,7 +64,7 @@ not exact resource reservations. For example,
 checks a two-device minimum but launches either two or four workers according
 to its parameter. The
 [launcher defaults](../../tests/tools/launch_utils.py#L149) and
-[training command resolution](../../tests/tools/training_utils.py#L226) provide
+[training command resolution](../../tests/tools/training_utils.py#L242) provide
 shared plan inputs rather than a second quota definition.
 
 ## Writing new tests
@@ -109,7 +109,7 @@ Use the `provider` keyword on `pytest.mark.launch_plan`. A provider is either a
 [CasePlan](../../scripts/ci/accelerator/launch_plan.py#L48), or a callable accepting a
 [PlanContext](../../scripts/ci/accelerator/launch_plan.py#L81) and returning one of those
 values. The planner calls it through
-[resolve_plan](../../scripts/ci/accelerator/pytest_plugin.py#L22). Using a keyword prevents pytest from interpreting a
+[resolve_plan](../../scripts/ci/accelerator/pytest_plugin.py#L23). Using a keyword prevents pytest from interpreting a
 callable provider as the test function being decorated.
 
 A fixed distributed launch keeps its process count in one place:
