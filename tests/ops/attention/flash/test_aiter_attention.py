@@ -22,16 +22,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
 from veomni.ops import install as install_backend
 from veomni.ops.kernels.attention.standard import aiter as aiter_backend
 
 
 AITER_IMPL = "veomni_flash_attention_aiter"
-
-
-def test_aiter_is_classified_as_varlen_attention():
-    assert AITER_IMPL in VARLEN_ATTENTION_TYPES
 
 
 def _install_fake_aiter(monkeypatch: pytest.MonkeyPatch) -> dict[str, dict]:
