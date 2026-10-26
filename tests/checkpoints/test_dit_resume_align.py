@@ -73,7 +73,6 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tools.data_generators import DummyDataset  # noqa: E402
-from tools.launch_utils import find_free_port  # noqa: E402
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 
@@ -325,7 +324,7 @@ def _run_trainer(run: str, train_path: str, weights_dir: str, load_path: str | N
         "torch.distributed.run",
         "--nnodes=1",
         f"--nproc_per_node={_CI_LAUNCH.nproc}",
-        f"--master-port={find_free_port()}",
+        "--standalone",
         os.path.abspath(__file__),
         "--model.config_path=tests/toy_config/wan_t2v_toy/config.json",
         f"--model.model_path={weights_dir}",

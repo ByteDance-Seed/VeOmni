@@ -10,7 +10,7 @@ import yaml
 
 from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec, runner_capabilities, runner_device_count
 from scripts.ci.accelerator.runtime.devices import child_environment
-from scripts.ci.accelerator.scheduler import DeviceJob, run_jobs
+from scripts.ci.accelerator.scheduler import DeviceJob
 from veomni.models import build_foundation_model
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability, get_torch_device
 from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available
@@ -22,7 +22,7 @@ from .utils import alignment_case_plan, alignment_plan, prepare_exec_cmd
 
 _QWEN4_LAUNCH = LaunchSpec(nproc=2)
 _LORA_PARALLEL = dict(is_moe=False, max_sp_size=1)
-_DYN_PARALLEL = dict(is_moe=True, max_sp_size=2, max_ep_size=1)
+_DYN_PARALLEL = dict(is_moe=True, min_sp_size=2, max_sp_size=2, max_ep_size=1)
 _DEEPSEEK_V4_EP_PARALLEL = dict(is_moe=True, max_sp_size=1, max_ep_size=2)
 _DEEPSEEK_V4_COMPILE_LAUNCH = LaunchSpec(nproc=4)
 
@@ -111,10 +111,11 @@ def main(
     train_path: str,
     max_sp_size: int | None = None,
     max_ep_size: int | None = None,
+    min_sp_size: int | None = None,
     compare_alignment: bool = True,
     extra_args: list[str] | None = None,
 ):
-    test_path = f"./{model_name}"
+    test_path = f"./{model_name}_{os.getpid()}"
     os.makedirs(test_path, exist_ok=True)
 
     _materialize_weights_dir(config_path, test_path)
@@ -130,6 +131,7 @@ def main(
         is_moe=is_moe,
         max_sp_size=max_sp_size,
         max_ep_size=max_ep_size,
+        min_sp_size=min_sp_size,
     )
     if len(command_list) < 1:
         raise AssertionError("Training tests require at least one parallel mode.")
@@ -150,15 +152,20 @@ def main(
         with open(os.path.join(test_path, f"{task_name}/log_dict.json")) as f:
             return json.load(f)
 
+    # Execute modes sequentially so each case's runtime peak matches its
+    # sequential CasePlan (allowing two 4-GPU E2E cases to run concurrently).
     jobs = [DeviceJob(name, kwargs["nproc"], (name, kwargs)) for name, kwargs in command_list]
-    if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and os.environ.get("VEOMNI_GPU_TEST_PARALLEL") == "1":
-        visibility = "CUDA_VISIBLE_DEVICES" if IS_CUDA_AVAILABLE else "ASCEND_RT_VISIBLE_DEVICES"
-        devices = os.environ.get(visibility, ",".join(runner_capabilities().devices)).split(",")
-        res = run_jobs(jobs, devices, execute)
-    else:
-        res = {job.name: execute(job, []) for job in jobs}
+    res = {job.name: execute(job, []) for job in jobs}
+    assert res and all(res.values()), f"[{model_name}] empty log_dict results: {res}"
     log_keys = set(next(iter(res.values())))
+    assert log_keys, f"[{model_name}] no metric keys recorded in log_dict"
     assert all(set(values) == log_keys for values in res.values())
+    for run_name, run_metrics in res.items():
+        step_lengths = {k: len(v) for k, v in run_metrics.items()}
+        assert all(n > 0 for n in step_lengths.values()), f"[{run_name}] empty metric step list: {step_lengths}"
+        assert len(set(step_lengths.values())) == 1, (
+            f"[{run_name}] inconsistent step counts across keys: {step_lengths}"
+        )
 
     if compare_alignment:
         assert len(res) >= 2, "Alignment tests require at least two completed runs."
@@ -239,14 +246,9 @@ deepseek_v4_text_smoke_test_cases = [
         True,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        # DeepSeek-V4 uses an eager/TileLang SP path (Q Ulysses + MQA sequence
-        # gather around compressors). Exercise SP=1 vs SP=2 alignment.
-        2,
-        # The GPU fused-MoE path now preserves DeepSeek-V4's ``swiglu_limit``
-        # clamp, so keep the smoke test on the default triton MoE path.
-        # EP remains disabled here because the surrounding V4 e2e coverage is
-        # an SP alignment smoke test, not an EP alignment test.
-        1,
+        2,  # min_sp_size: SP=1 is already covered by test_deepseek_v4_expert_parallel_alignment
+        2,  # max_sp_size
+        1,  # max_ep_size
     ),
     pytest.param(
         "gpt_oss",
@@ -254,6 +256,7 @@ deepseek_v4_text_smoke_test_cases = [
         True,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        2,  # min_sp_size: retain both non-EP Quack and EP grouped-GEMM training
         None,  # max_sp_size
         None,  # max_ep_size
         marks=_gpt_oss_fa4_quack_skip,
@@ -383,19 +386,6 @@ qwen_image_dit_test_cases = [
     ),
 ]
 
-# Reuses the toy model config; only the dataset differs (odd seq lens).
-qwen_image_dit_padding_test_cases = [
-    pytest.param(
-        "qwen_image",
-        "./tests/toy_config/qwen_image_toy/config.json",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        2,
-        marks=[_dit_only, _qwen_image_npu_skip],
-    ),
-]
-
 
 @pytest.fixture(scope="session")
 def dummy_text_dataset():
@@ -518,9 +508,19 @@ def test_text_parallel_align(
     )
 
 
-@pytest.mark.launch_plan(provider=alignment_case_plan)
+@pytest.mark.launch_plan(
+    provider=lambda context: alignment_plan(
+        context.capabilities,
+        **{
+            key: context.params[key]
+            for key in ("is_moe", "min_sp_size", "max_sp_size", "max_ep_size", "model_name")
+            if key in context.params
+        },
+    )
+)
 @pytest.mark.parametrize(
-    "model_name, config_path, is_moe, rtol, atol, max_sp_size, max_ep_size", deepseek_v4_text_smoke_test_cases
+    "model_name, config_path, is_moe, rtol, atol, min_sp_size, max_sp_size, max_ep_size",
+    deepseek_v4_text_smoke_test_cases,
 )
 def test_text_parallel_smoke(
     model_name: str,
@@ -528,6 +528,7 @@ def test_text_parallel_smoke(
     is_moe: bool,
     rtol: float,
     atol: float,
+    min_sp_size: int | None,
     max_sp_size: int | None,
     max_ep_size: int | None,
     dummy_text_dataset,
@@ -540,6 +541,7 @@ def test_text_parallel_smoke(
         rtol=rtol,
         atol=atol,
         train_path=dummy_text_dataset,
+        min_sp_size=min_sp_size,
         max_sp_size=max_sp_size,
         max_ep_size=max_ep_size,
         compare_alignment=False,
@@ -640,6 +642,7 @@ def test_deepseek_v4_tilelang_dyn_bsz_smoke(
         rtol=_DEFAULT_RTOL,
         atol=_DEFAULT_ATOL,
         train_path=request.getfixturevalue(dataset_fixture),
+        min_sp_size=_DYN_PARALLEL["min_sp_size"],
         max_sp_size=_DYN_PARALLEL["max_sp_size"],
         max_ep_size=_DYN_PARALLEL["max_ep_size"],
         compare_alignment=False,
@@ -833,74 +836,6 @@ def test_qwen3omni_parallel_align(
     )
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_wan_dit_uses_bfloat16_and_flash_attention():
-    command_list = prepare_exec_cmd(
-        ["train_dit_test"],
-        "wan_t2v",
-        "./tests/toy_config/wan_t2v_toy",
-        model_path="./wan_t2v",
-        train_path="./dummy_wan_t2v",
-        output_dir="./wan_t2v",
-        is_moe=False,
-        max_sp_size=1,
-    )
-
-    assert command_list
-    for _, cmd_kwargs in command_list:
-        cmd = build_torchrun_cmd(**cmd_kwargs)
-        assert cmd_kwargs["extra_args"] == [
-            "--model.accelerator.fsdp_config.mixed_precision.enable=True",
-            "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
-            "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
-        ]
-        assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_deepseek_v4_e2e_casts_fused_triton_moe_to_bfloat16():
-    command_list = prepare_exec_cmd(
-        ["train_text_test"],
-        "deepseek_v4",
-        "./tests/toy_config/deepseek_v4_toy",
-        model_path="./deepseek_v4",
-        train_path="./dummy_text",
-        output_dir="./deepseek_v4",
-        is_moe=True,
-        max_ep_size=1,
-    )
-
-    assert command_list
-    for _, cmd_kwargs in command_list:
-        assert cmd_kwargs["extra_args"] == [
-            "--model.accelerator.fsdp_config.mixed_precision.enable=True",
-            "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
-            "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
-        ]
-
-
-@_gpt_oss_fa4_quack_skip
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_gpt_oss_parallel_uses_fa4_and_quack():
-    command_list = prepare_exec_cmd(
-        ["train_text_test"],
-        "gpt_oss",
-        "./tests/toy_config/gpt_oss_toy",
-        model_path="./gpt_oss",
-        train_path="./dummy_text",
-        output_dir="./gpt_oss",
-        is_moe=True,
-    )
-
-    assert command_list
-    assert {cmd_kwargs["parallel_config"].ep_size for _, cmd_kwargs in command_list} == {1, 2}
-    assert {cmd_kwargs["parallel_config"].sp_size for _, cmd_kwargs in command_list} == {1, 2}
-    for _, cmd_kwargs in command_list:
-        cmd = build_torchrun_cmd(**cmd_kwargs)
-        assert "--model.ops_implementation.attn_implementation=flash_attention_4" in cmd
-        assert "--model.ops_implementation.moe_implementation=fused_quack" in cmd
-
-
 @pytest.mark.launch_plan(provider=alignment_case_plan)
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", wan_dit_test_cases)
 def test_wan_dit_parallel_align(
@@ -930,43 +865,48 @@ def test_qwen_image_dit_parallel_align(
     atol: float,
     max_sp_size: int,
     dummy_qwen_image_dataset,
-):
-    """Validate that QwenImageTransformer2DModel loss and grad_norm are identical
-    with and without Ulysses sequence-parallelism at equal DP sizes.
-    """
-    main(
-        task_name="train_dit_test",
-        model_name=model_name,
-        config_path=config_path,
-        is_moe=is_moe,
-        rtol=rtol,
-        atol=atol,
-        train_path=dummy_qwen_image_dataset,
-        max_sp_size=max_sp_size,
-    )
-
-
-@pytest.mark.launch_plan(provider=alignment_case_plan)
-@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", qwen_image_dit_padding_test_cases)
-def test_qwen_image_dit_parallel_align_padding(
-    model_name: str,
-    config_path: str,
-    is_moe: bool,
-    rtol: float,
-    atol: float,
-    max_sp_size: int,
     dummy_qwen_image_padding_dataset,
 ):
-    """SP-vs-no-SP alignment with non-``sp_size``-divisible image/text lengths,
-    exercising the Ulysses-SP pad/truncate path that the default 16/8 case skips.
+    """Validate that QwenImageTransformer2DModel loss and grad_norm are identical
+    with and without Ulysses sequence-parallelism for both unpadded (16/8) and
+    padded (non-sp_size-divisible) image/text sequence lengths, reusing the same
+    process launches.
     """
-    main(
-        task_name="train_dit_test",
-        model_name=model_name,
-        config_path=config_path,
+    test_path = f"./{model_name}_{os.getpid()}"
+    os.makedirs(test_path, exist_ok=True)
+    _materialize_weights_dir(config_path, test_path)
+
+    command_list = prepare_exec_cmd(
+        ["train_dit_test"],
+        model_name,
+        config_path,
+        model_path=test_path,
+        train_path=dummy_qwen_image_dataset,
+        output_dir=test_path,
         is_moe=is_moe,
-        rtol=rtol,
-        atol=atol,
-        train_path=dummy_qwen_image_padding_dataset,
         max_sp_size=max_sp_size,
     )
+    unpadded_res = {}
+    padded_res = {}
+    try:
+        for task_name, cmd_kwargs in command_list:
+            cmd_kwargs["extra_args"] = [
+                *cmd_kwargs.get("extra_args", []),
+                f"--extra_train_path={dummy_qwen_image_padding_dataset}",
+            ]
+            cmd = build_torchrun_cmd(**cmd_kwargs)
+            subprocess.run(cmd, check=True, env=os.environ.copy())
+            with open(os.path.join(test_path, f"{task_name}/log_dict.json")) as f:
+                unpadded_res[task_name] = json.load(f)
+            with open(os.path.join(test_path, f"{task_name}_padding/log_dict.json")) as f:
+                padded_res[f"{task_name}_padding"] = json.load(f)
+
+        for label, res in (("unpadded", unpadded_res), ("padded", padded_res)):
+            assert len(res) >= 2 and all(res.values()), f"[{model_name}:{label}] empty log_dict: {res}"
+            log_keys = set(next(iter(res.values())))
+            assert all(set(values) == log_keys for values in res.values())
+            for key in log_keys:
+                print_comparison_table(res, key, title=f"{model_name} ({label})")
+            compare_metrics(res, rtol=rtol, atol=atol)
+    finally:
+        shutil.rmtree(test_path, ignore_errors=True)

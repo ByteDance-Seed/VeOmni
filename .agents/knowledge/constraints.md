@@ -148,8 +148,8 @@ Core files:
     - Multimodal models may have 3D position_ids `(B, dim, L)` — FA uses the first row `[:, 0, :]`.
 
 11. **Dynamic batching token counting must match `dyn_bsz_count_mode`**
-    - Default / legacy behavior (`train.dyn_bsz_count_mode="total"`) uses `attention_mask.sum()` as the length function in `DynamicBatchingSizeDataset` and `DynBszBuffer`.
-    - Optional effective-token mode (`"effective"`) uses `(labels != IGNORE_INDEX).sum()` when `labels` are present, and falls back to `attention_mask.sum()` otherwise.
+    - Default / legacy behavior (`train.dyn_bsz_count_mode="total"`) uses `get_length_fn` (`attention_mask.sum()` with `input_ids` fallback, or the sum of `item.meta["_omni_token_len"]` across all items—including `is_dummy=True` placeholders—for SeedOmni `conversation_list` samples) in `DynamicBatchingSizeDataset` and `DynBszBuffer`.
+    - Optional effective-token mode (`"effective"`) uses `get_length_by_labels_fn` (`(labels != IGNORE_INDEX).sum()` when `labels` are present, or non-dummy supervised text/assistant-media token lengths for SeedOmni `conversation_list` samples, falling back to `get_length_fn` otherwise).
     - With FA varlen, `attention_mask` is still expected to be all-ones over packed length; boundaries come from `position_ids` and `cu_seq_lens`.
     - When SP is enabled, `attention_mask` must use `sp_pad_value=1` (asserted in `MainCollator.__post_init__`).
     - In effective-token mode, dynamic batching still applies a hard physical-token cap of `micro_batch_size * max_seq_len` during micro-batch selection to avoid unbounded prompt-heavy batches; a single sample may still exceed the cap by itself and should be controlled by preprocessing.
@@ -232,6 +232,7 @@ Core files:
 23. **Device-agnostic code must use `veomni.utils.device` helpers**
    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
    - Direct CUDA calls break NPU and MLU compatibility.
+   - The opt-in DeepGEMM FP8 MoE backend is CUDA-only and requires one CUDA device per process. The pinned DeepGEMM `5081f85` caches device-bound kernel handles without a device key; switching GPUs can fail with `CUDA_ERROR_INVALID_HANDLE` even on identical GPUs. `GroupedLayout.from_counts()` enforces this restriction and sets the operand device context before accessing DeepGEMM. Other DeepGEMM calls in the worker must use the same device. `OpsImplementationConfig` rejects `moe_implementation='deepgemm_fp8'` together with non-`none` QAT to prevent double quantization before expert GEMMs. Test non-current-device handling in a fresh spawned worker; standard one-worker-per-GPU EP/FSDP2 is supported.
 
 ## Trainer Extensions
 

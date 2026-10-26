@@ -28,10 +28,12 @@ from ...platform import (
     GpuKernelRequirement,
     MluKernelRequirement,
     NpuKernelRequirement,
+    NvidiaGpuPlatform,
 )
 from ...registry import register_op
 from .gpt_oss import eager as gpt_oss_eager
 from .gpt_oss import quack as gpt_oss_quack
+from .standard import deepgemm as standard_deepgemm
 from .standard import eager as standard_eager
 from .standard import mlu as standard_mlu
 from .standard import npu as standard_npu
@@ -95,6 +97,18 @@ register_op(
     wrapper=standard_quack.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("quack",),
+)
+
+register_op(
+    "moe_experts",
+    "standard",
+    "deepgemm_fp8",
+    description="DeepGEMM blockwise FP8 expert forward, input gradients and weight gradients",
+    wrapper=standard_deepgemm.wrapper,
+    requirement=GpuKernelRequirement(
+        platforms=(NvidiaGpuPlatform(min_cc=90, max_cc=90), NvidiaGpuPlatform(min_cc=100, max_cc=100)),
+    ),
+    requires=("deep_gemm", "triton"),
 )
 
 register_op(
