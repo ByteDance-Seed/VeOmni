@@ -2383,7 +2383,7 @@
              input_ids=input_ids,
              attention_mask=attention_mask,
              position_ids=position_ids,
-@@ -1471,26 +2580,167 @@
+@@ -1471,26 +2580,168 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -2556,6 +2556,7 @@
 +            and self.training
 +            and torch.is_grad_enabled()
 +            and len(self.model.mtp) > 0
++            and not any(hasattr(p, "to_local") for p in self.model.mtp.parameters())
 +            and any(p.requires_grad for p in self.model.mtp.parameters())
 +        ):
 +            mtp_zero = sum((p.sum() * 0.0 for p in self.model.mtp.parameters() if p.requires_grad), loss.new_zeros(()))
@@ -2565,7 +2566,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1498,7 +2748,22 @@
+@@ -1498,7 +2749,22 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

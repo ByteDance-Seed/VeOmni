@@ -965,6 +965,35 @@ def test_deepseek_v4_dspark_mtp_loss_coef_zero_ddp_two_iterations(monkeypatch):
             assert out.loss is not None
             assert out.aux_metrics is None or "mtp_loss" not in out.aux_metrics
             out.loss.backward()
+
+        # Case 3: Under FSDP2+EP, MTP dense and expert parameters live as DTensors on
+        # different meshes; skipping MTP with return_mtp_outputs=False must not sum
+        # DTensors across meshes.
+        from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard
+
+        mesh_1d = DeviceMesh("cpu", [0], mesh_dim_names=("dp_shard",))
+        mesh_2d = DeviceMesh("cpu", [[0]], mesh_dim_names=("ep_fsdp", "ep"))
+        dtensor_model = _build_ours(config_runtime_zero).train()
+        dtensor_model.config.mtp_loss_coef = 1.0
+        dtensor_model.model.mtp[0].main_proj.weight = torch.nn.Parameter(
+            DTensor.from_local(dtensor_model.model.mtp[0].main_proj.weight.detach(), mesh_1d, [Shard(0)])
+        )
+        dtensor_model.model.mtp[0].mlp.experts.gate_up_proj = torch.nn.Parameter(
+            DTensor.from_local(
+                dtensor_model.model.mtp[0].mlp.experts.gate_up_proj.detach(),
+                mesh_2d,
+                [Replicate(), Shard(0)],
+            )
+        )
+        out_dtensor = dtensor_model(
+            input_ids=input_ids,
+            labels=labels,
+            return_mtp_outputs=False,
+            use_cache=False,
+        )
+        assert out_dtensor.loss is not None
+        assert not isinstance(out_dtensor.loss, DTensor)
+        out_dtensor.loss.backward()
     finally:
         if not already_init and dist.is_initialized():
             dist.destroy_process_group()

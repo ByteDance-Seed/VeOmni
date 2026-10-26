@@ -2735,6 +2735,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             and self.training
             and torch.is_grad_enabled()
             and len(self.model.mtp) > 0
+            and not any(hasattr(p, "to_local") for p in self.model.mtp.parameters())
             and any(p.requires_grad for p in self.model.mtp.parameters())
         ):
             mtp_zero = sum((p.sum() * 0.0 for p in self.model.mtp.parameters() if p.requires_grad), loss.new_zeros(()))
