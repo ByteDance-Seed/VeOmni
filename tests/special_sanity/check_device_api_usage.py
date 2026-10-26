@@ -34,34 +34,47 @@ from pathlib import Path
 CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/utils/import_utils.py",
     "veomni/utils/device.py",
-    "veomni/ops/kernels/moe/_kernels/utils/benchmark_utils.py",
     "veomni/utils/helper.py",
     "veomni/distributed/torch_parallelize.py",
     "veomni/models/auto.py",
     "veomni/models/loader.py",
-    "veomni/models/module_utils.py",
+    "veomni/models/checkpoint/weights.py",
     "veomni/models/transformers/flux/encode_flux.py",
     "veomni/arguments/arguments_types.py",
-    "veomni/ops/kernels/moe/_kernels/utils/device.py",
+    # Declarative GPU platform detection; this is not kernel device management.
+    "veomni/ops/platform/gpu.py",
+    "veomni/ops/platform/requirement.py",
     # Magi FA4 is an intrinsically CUDA-only backend. It uses CUDA device
     # contexts and cuda.bindings.runtime for the per-device stack limit, which
     # has no device-agnostic equivalent.
-    "veomni/ops/kernels/attention/magi/_fa4_cuda.py",
-    # The consolidated Magi contract suite directly mocks the CUDA-only FA4
-    # backend and its runtime bindings.
-    "tests/ops/test_magi_attention_contract.py",
+    "veomni/ops/kernels/attention/standard/magi/",
+    # DeepGEMM is CUDA-only: these files select the SM90/SM100 recipe and
+    # establish operand-device contexts for its device-bound JIT kernels.
+    "veomni/ops/kernels/moe_experts/standard/deepgemm.py",
+    "veomni/ops/kernels/moe_experts/shared/deepgemm_fp8.py",
+    # Kernel tests intentionally select and probe hardware-specific backends.
+    "tests/ops/",
     "tests/special_sanity/check_device_api_usage.py",
     "tests/tools/common_utils.py",
+    # CPU-only scheduler tests use literal CUDA/NPU backend names as fixtures
+    # to validate device leases and launch plans without accessing hardware.
+    "tests/ci/test_accelerator.py",
     # Implicit-CUDA-sync gate. Calls ``torch.cuda.{get,set}_sync_debug_mode``
     # directly because the API is intrinsically CUDA-only and has no
     # ``veomni.utils.device`` equivalent; the test is gated on
     # ``IS_CUDA_AVAILABLE`` so it skips on non-CUDA hosts.
-    "tests/models/test_model_forward_no_implicit_sync.py",
+    "tests/models/transformers/test_model_forward_no_implicit_sync.py",
+    # Precision and async-offload tests explicitly select CUDA/NPU devices by
+    # name to exercise accelerator-specific code paths; the literal "cuda" is
+    # a test fixture, not a production device-API call.
+    "tests/distributed/test_async_activation_offload.py",
+    "tests/models/test_qwen_image_precision.py",
+    "tests/precision/qwen_image.py",
     # Vendored Ascend Triton kernels for Qwen3.5 gated delta-rule (FLA + Huawei
     # port) are kept byte-identical to upstream; the FLA-origin code references
     # ``.cuda`` in fallback/util paths. Excluded wholesale, matching the ruff
     # exclude in pyproject.toml.
-    "veomni/ops/kernels/gated_delta_rule/_ascend/",
+    "veomni/ops/kernels/gated_delta_rule/vendor/",
 ]
 
 # directory or file path must contain keyword "nccl"

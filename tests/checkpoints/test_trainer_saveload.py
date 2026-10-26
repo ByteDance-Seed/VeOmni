@@ -2,31 +2,43 @@ import copy
 import os
 import shutil
 import subprocess
+import sys
 from typing import Any, Dict, List, Optional
 
 import pytest
 import torch
 import yaml
 
+from scripts.ci.accelerator.launch_plan import runner_device_count
+
 
 try:
     from .checkpoint_verification_utils import verify_dcp_to_hf_conversion
     from .utils import (
-        get_checkpoint_dir,
         get_checkpoint_test_command,
+        get_dcp_weights_dir,
         get_hf_output_dir,
         get_merge_dcp_to_hf_command,
         get_output_dir,
     )
 except Exception as _:
     from checkpoint_verification_utils import verify_dcp_to_hf_conversion
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter
+from tests.checkpoints.utils import get_checkpoint_test_nproc
 from veomni.arguments import parse_args
+from veomni.checkpoint.layout import weights_dir
 from veomni.data import build_dummy_dataset
-from veomni.models.checkpoint_manager import ModelCheckpointManager
+from veomni.models.seed_omni.modules.fake_model.fake_module_a.configuration import FakeModuleAConfig
+from veomni.models.seed_omni.modules.fake_model.fake_module_a.modeling import FakeModuleA
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
 from veomni.utils import helper
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+
+
+_CI_LAUNCH = LaunchSpec(nproc=2)
 
 
 os.environ["NCCL_DEBUG"] = "OFF"
@@ -104,9 +116,6 @@ class TrainerTest(BaseTrainer):
     dcp_weights_path: str
     hf_weights_path: str
 
-    def _build_model_assets(self):
-        self.model_assets = [self.model_config]
-
     def _build_data_transform(self):
         pass
 
@@ -117,7 +126,6 @@ class TrainerTest(BaseTrainer):
         self.train_steps = args.train_steps
 
     def _init_callbacks(self):
-        self.checkpoint = ModelCheckpointManager(self)
         self.environ_meter_callback = EnvironMeterCallbackTest(self)
         self.checkpoint_callback = CheckpointCallbackTest(self)
         self.check_callback = CheckCallback(self)
@@ -172,16 +180,20 @@ class CheckpointCallbackTest(CheckpointCallback):
     trainer: TrainerTest
 
     def on_step_end(self, state: TrainerState, **kwargs):
-        pass
-
-    def on_epoch_end(self, state: TrainerState, **kwargs):
-        if state.epoch == 0:
+        if state.global_step == 1:
             self.trainer.golden_model_sd = copy.deepcopy(self.trainer.model.state_dict())
-            self.trainer.golden_optim_sd = copy.deepcopy(self.trainer.optimizer.state_dict())
+            self.trainer.golden_optim_sd = copy.deepcopy(self.trainer.model.optimizer.state_dict())
+            flat_optim = flatten_dict(self.trainer.golden_optim_sd)
+            assert any("step" not in k and "param_groups" not in k for k in flat_optim), (
+                "Expected non-empty optimizer state before saving step-1 DCP checkpoint"
+            )
             self._save_dcp(state)
-            self.trainer.dcp_weights_path = os.path.join(
+            # Two different paths: resume takes the step directory, while a
+            # reader of raw shards wants the DCP directory inside it.
+            self.trainer.step_ckpt_path = os.path.join(
                 self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}"
             )
+            self.trainer.dcp_weights_path = weights_dir(self.trainer.step_ckpt_path)
             self.trainer.dcp_global_step = state.global_step
             dtypes_before_hf_save = capture_param_dtypes(self.trainer.model)
             self._save_hf(state)
@@ -189,6 +201,9 @@ class CheckpointCallbackTest(CheckpointCallback):
             self.trainer.hf_weights_path = os.path.join(
                 self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}", "hf_ckpt"
             )
+
+    def on_epoch_end(self, state: TrainerState, **kwargs):
+        pass
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         pass
@@ -201,6 +216,10 @@ class CheckCallback(Callback):
     trainer: TrainerTest
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        assert state.global_step > self.trainer.dcp_global_step, (
+            f"Expected training to continue past saved step {self.trainer.dcp_global_step}, "
+            f"ended at step {state.global_step}"
+        )
         if self.trainer.args.train.global_rank == 0:
             # Verify HF checkpoint by comparing with DCP checkpoint
             logger.info("Verifying HF checkpoint conversion...")
@@ -210,7 +229,22 @@ class CheckCallback(Callback):
                 safe_serialization=True,
             ), "HF checkpoint verification failed"
 
-        self.trainer.args.train.checkpoint.load_path = self.trainer.dcp_weights_path
+        # Confirm post-save training mutated model weights before restoring step-1 DCP.
+        post_step2_sd = self.trainer.model.state_dict()
+        changed_params = [
+            k
+            for k, v in post_step2_sd.items()
+            if k in self.trainer.golden_model_sd
+            and not torch.equal(
+                v.to_local() if hasattr(v, "to_local") else v,
+                self.trainer.golden_model_sd[k].to_local()
+                if hasattr(self.trainer.golden_model_sd[k], "to_local")
+                else self.trainer.golden_model_sd[k],
+            )
+        ]
+        assert changed_params, "Expected step-2 optimizer update to mutate model weights after step-1 save"
+
+        self.trainer.args.train.checkpoint.load_path = self.trainer.step_ckpt_path
         self.trainer.load()
 
         tied_weights_keys = None
@@ -218,7 +252,7 @@ class CheckCallback(Callback):
             tied_weights_keys = self.trainer.model._tied_weights_keys
 
         check_state_dict(self.trainer.golden_model_sd, self.trainer.model.state_dict(), tied_weights_keys)
-        check_state_dict(self.trainer.golden_optim_sd, self.trainer.optimizer.state_dict(), need_flatten=True)
+        check_state_dict(self.trainer.golden_optim_sd, self.trainer.model.optimizer.state_dict(), need_flatten=True)
 
 
 def main():
@@ -231,9 +265,20 @@ if __name__ == "__main__":
     main()
 
 
-def _run_trainer_saveload_and_verify(model_name: str, ep_size: int, dp_replicate_size: Optional[int] = None):
-    exec_command = get_checkpoint_test_command(model_name, ep_size, dp_replicate_size=dp_replicate_size)
-    merge_command = get_merge_dcp_to_hf_command(model_name, ep_size, dp_replicate_size=dp_replicate_size)
+def _run_trainer_saveload_and_verify(
+    model_name: str,
+    ep_size: int,
+    nproc: int,
+    dp_replicate_size: Optional[int] = None,
+):
+    if nproc > min(get_checkpoint_test_nproc(), runner_device_count()):
+        pytest.skip(f"Requires nproc={nproc}, exceeds configured/available devices")
+    # Every round-trip also exports HF weights, checks dtypes, and verifies both
+    # direct export and the independent DCP-to-HF CLI conversion.
+    exec_command = get_checkpoint_test_command(
+        model_name, ep_size, save_hf_weights=True, dp_replicate_size=dp_replicate_size, nproc=nproc
+    )
+    merge_command = get_merge_dcp_to_hf_command(model_name, ep_size, dp_replicate_size=dp_replicate_size, nproc=nproc)
 
     exec_result = subprocess.run(exec_command, shell=True, check=True)
     assert exec_result.returncode == 0
@@ -242,68 +287,132 @@ def _run_trainer_saveload_and_verify(model_name: str, ep_size: int, dp_replicate
     assert merge_result.returncode == 0
 
     assert verify_dcp_to_hf_conversion(
-        dcp_checkpoint_dir=get_checkpoint_dir(model_name, ep_size, dp_replicate_size),
-        hf_checkpoint_dir=get_hf_output_dir(model_name, ep_size, dp_replicate_size),
+        dcp_checkpoint_dir=get_dcp_weights_dir(model_name, ep_size, dp_replicate_size, nproc=nproc),
+        hf_checkpoint_dir=get_hf_output_dir(model_name, ep_size, dp_replicate_size, nproc=nproc),
         safe_serialization=True,
     ), (
-        f"Save and Load Checkpoint failed for `{model_name}` with ep_size `{ep_size}` "
-        f"and dp_replicate_size `{dp_replicate_size}`"
+        f"Save and Load Checkpoint failed for `{model_name}` with ep_size `{ep_size}`, "
+        f"nproc `{nproc}`, and dp_replicate_size `{dp_replicate_size}`"
     )
 
-    shutil.rmtree(get_output_dir(model_name, ep_size, dp_replicate_size))
+    shutil.rmtree(get_output_dir(model_name, ep_size, dp_replicate_size, nproc=nproc))
 
 
-def _run_trainer_save_hf_safetensor(model_name: str, ep_size: int):
-    exec_command = get_checkpoint_test_command(model_name, ep_size, save_hf_weights=True)
-    exec_result = subprocess.run(exec_command, shell=True, check=True)
-    assert exec_result.returncode == 0
-
-    shutil.rmtree(get_output_dir(model_name, ep_size))
+def _exceeds_checkpoint_capacity(nproc: int) -> bool:
+    return not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) or nproc > min(
+        get_checkpoint_test_nproc(), runner_device_count()
+    )
 
 
-# MoE save/load coverage.
-# deepseek_v4 is included for hash-MoE tid2eid + fused experts + mHC DCP resume.
-# CI L20-8 keeps the default nproc=8; local machines can override with
-# VEOMNI_CHECKPOINT_TEST_NPROC (ep sizes larger than nproc are skipped).
-TEST_MODELS = ["qwen3_moe", "deepseek_v3", "deepseek_v4"]
-TEST_EP_SIZES = [1, 4, 8]
+def _saveload_nproc_skip_mark(nproc: int):
+    return pytest.mark.skipif(
+        f"_exceeds_checkpoint_capacity({nproc})",
+        reason=f"Requires nproc={nproc}, exceeds configured/available devices",
+    )
 
 
-def _saveload_cases():
-    try:
-        from .utils import get_checkpoint_test_nproc
-    except Exception:
-        from utils import get_checkpoint_test_nproc
-
-    nproc = get_checkpoint_test_nproc()
-    cases = []
-    for model in TEST_MODELS:
-        # DeepSeek-V4 EP token dispatch is not yet covered by saveload (e2e also
-        # keeps max_ep_size=1). Exercise DCP resume + HF export at ep=1 only.
-        ep_sizes = [1] if model == "deepseek_v4" else TEST_EP_SIZES
-        for ep in ep_sizes:
-            if ep <= nproc:
-                cases.append((model, ep))
-    return cases
+# MoE save/load coverage on 4 GPUs:
+# - qwen3_moe ep=1: 1D FSDP (no EP)
+# - qwen3_moe ep=2: 2D expert mesh (ep_fsdp=2, ep=2) with both axes active
+# - qwen3_moe ep=4: 2D expert mesh with degenerate FSDP axis (ep_fsdp=1, ep=4)
+# - deepseek_v3 ep=2: DeepSeek-V3 converter + 2D expert mesh (ep_fsdp=2, ep=2)
+# - deepseek_v4 ep=1: hash-MoE tid2eid + fused experts + mHC DCP resume
+_SAVELOAD_CASES = [
+    pytest.param("qwen3_moe", 1, 4, id="qwen3_moe-1", marks=_saveload_nproc_skip_mark(4)),
+    pytest.param("qwen3_moe", 2, 4, id="qwen3_moe-2", marks=_saveload_nproc_skip_mark(4)),
+    pytest.param("qwen3_moe", 4, 4, id="qwen3_moe-4", marks=_saveload_nproc_skip_mark(4)),
+    pytest.param("deepseek_v3", 2, 4, id="deepseek_v3-2", marks=_saveload_nproc_skip_mark(4)),
+    pytest.param("deepseek_v4", 1, 4, id="deepseek_v4-1", marks=_saveload_nproc_skip_mark(4)),
+]
 
 
-@pytest.mark.parametrize("model_name,ep_size", _saveload_cases())
-def test_trainer_saveload(model_name: str, ep_size: int):
-    _run_trainer_saveload_and_verify(model_name, ep_size)
+@pytest.mark.launch_plan(provider=from_parameter("nproc"))
+@pytest.mark.parametrize("model_name,ep_size,nproc", _SAVELOAD_CASES)
+def test_trainer_saveload(model_name: str, ep_size: int, nproc: int):
+    _run_trainer_saveload_and_verify(model_name, ep_size, nproc=nproc)
 
 
-# HSDP save/load coverage on 8 GPUs: dp = (dp_replicate=2, dp_shard=4). This
-# makes the expert mesh 3D (ep_replicate, ep_fsdp, ep) and exercises the
-# 3-placement restore/drop path in the DCP checkpointer end-to-end (train ->
-# DCP save -> load -> compare golden state dicts, plus DCP->HF merge). Cases:
-#   * ep2: ep mesh (2, 2, 2) — all three dims active (ep_fsdp > 1).
-#   * ep4: ep mesh (2, 1, 4) — degenerate ep_fsdp.
-@pytest.mark.parametrize("ep_size", [2, 4])
-def test_trainer_saveload_hsdp(ep_size: int):
-    _run_trainer_saveload_and_verify("qwen3_moe", ep_size, dp_replicate_size=2)
+# HSDP save/load coverage:
+# - nproc=8, ep=2, dp_replicate=2 -> 3D expert mesh (2, 2, 2), all three dims active (ep_fsdp > 1).
+# - nproc=4, ep=2, dp_replicate=2 -> 3D expert mesh (2, 1, 2), degenerate ep_fsdp=1 boundary.
+_HSDP_SAVELOAD_CASES = [
+    pytest.param(2, 8, id="ep2-8gpu", marks=_saveload_nproc_skip_mark(8)),
+    pytest.param(2, 4, id="ep2-4gpu", marks=_saveload_nproc_skip_mark(4)),
+]
 
 
-@pytest.mark.parametrize("ep_size", TEST_EP_SIZES)
-def test_trainer_save_hf_safetensor(ep_size: int):
-    # only test save hf safetensor on qwen3_moe to save resources
-    _run_trainer_save_hf_safetensor("qwen3_moe", ep_size)
+@pytest.mark.launch_plan(provider=from_parameter("nproc"))
+@pytest.mark.parametrize("ep_size,nproc", _HSDP_SAVELOAD_CASES)
+def test_trainer_saveload_hsdp(ep_size: int, nproc: int):
+    _run_trainer_saveload_and_verify("qwen3_moe", ep_size, nproc=nproc, dp_replicate_size=2)
+
+
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
+@pytest.mark.skipif(
+    not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) or runner_device_count() < 2,
+    reason="requires at least 2 accelerator devices",
+)
+def test_frozen_omni_module_resume_loads_hf_weights(tmp_path):
+    from tests.tools.launch_utils import run_bounded_process_group
+
+    snapshot_dir = tmp_path / "frozen_module"
+    output_dir = tmp_path / "output"
+    resume_root = output_dir / "checkpoints" / "global_step_1"
+    resume_root.mkdir(parents=True)
+
+    config = FakeModuleAConfig(hidden_size=64, freeze=True)
+    model = FakeModuleA(config)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(0.125)
+    model.save_pretrained(snapshot_dir)
+
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nnodes=1",
+        f"--nproc_per_node={_CI_LAUNCH.nproc}",
+        "--standalone",
+        "tests/checkpoints/omni_frozen_resume_runner.py",
+        # `model.model_path` is the split-checkpoint ROOT; the runner resolves
+        # `frozen_module` (the module name) as this module's subfolder under it.
+        "--model.model_path",
+        str(tmp_path),
+        "--model.ops_implementation.attn_implementation",
+        "eager",
+        "--model.ops_implementation.cross_entropy_loss_implementation",
+        "eager",
+        "--model.ops_implementation.rms_norm_implementation",
+        "eager",
+        "--model.ops_implementation.swiglu_mlp_implementation",
+        "eager",
+        "--model.ops_implementation.rotary_pos_emb_implementation",
+        "eager",
+        "--model.ops_implementation.load_balancing_loss_implementation",
+        "eager",
+        # SeedOmni keeps the parallel plan on `model.accelerator`, not `train.*`.
+        "--model.accelerator.fsdp_config.fsdp_mode",
+        "fsdp2",
+        "--model.accelerator.fsdp_config.forward_prefetch",
+        "False",
+        "--model.broadcast_model_weights_from_rank0",
+        "False",
+        "--model.accelerator.init_device",
+        "meta",
+        "--model.accelerator.gradient_checkpointing.enable",
+        "False",
+        "--data.train_path",
+        "dummy",
+        "--train.checkpoint.load_path",
+        str(resume_root),
+        "--train.checkpoint.output_dir",
+        str(output_dir),
+        "--train.checkpoint.manager",
+        "dcp",
+        "--train.global_batch_size",
+        "2",
+        "--train.micro_batch_size",
+        "1",
+    ]
+    run_bounded_process_group(command)

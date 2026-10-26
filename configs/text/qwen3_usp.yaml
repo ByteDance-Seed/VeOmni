@@ -3,7 +3,7 @@
 # USP composes Ulysses (all-to-all head/seq exchange) with Ring-Attention
 # (context parallel). The effective sequence-parallel size is
 # ``ulysses_size * cp_size``. Rule of thumb: set ``ulysses_size`` up to the
-# number of KV heads (cheap all-to-all, keep it within a high-bandwidth node),
+# number of KV heads to avoid replication (keep it within a high-bandwidth node),
 # then scale further with ``cp_size`` (ring attention is not bounded by head
 # count). See docs/key_features/ulysses.md (USP section).
 #

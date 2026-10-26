@@ -19,10 +19,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import AcceleratorConfig
 from veomni.models import auto
-from veomni.ops.kernels.attention import flash
+from veomni.ops.kernels.attention.standard import flash
 from veomni.trainer.text_dpo_trainer import TextDPOTrainer
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_usp_layout_is_explicit(monkeypatch):
@@ -37,18 +41,20 @@ def test_usp_layout_is_explicit(monkeypatch):
     "model_type,layout,backend,allowed",
     [
         ("deepseek_v4", "contiguous", "eager", True),
-        ("deepseek_v4", "zigzag", "veomni_flash_attention_2_with_sp", False),
-        ("qwen3", "contiguous", "veomni_flash_attention_2_with_sp", False),
-        ("qwen3", "zigzag", "veomni_flash_attention_2_with_sp", True),
-        ("qwen3", "zigzag", "veomni_flash_attention_4_with_sp", True),
-        ("qwen3", "zigzag", "veomni_flex_attention_with_sp", False),
-        ("qwen3_next", "zigzag", "veomni_flash_attention_2_with_sp", False),
+        ("deepseek_v4", "zigzag", "veomni_flash_attention_2", False),
+        ("qwen3", "contiguous", "veomni_flash_attention_2", False),
+        ("qwen3", "zigzag", "veomni_flash_attention_2", True),
+        ("qwen3", "zigzag", "veomni_flash_attention_4", True),
+        ("qwen3", "zigzag", "veomni_flex_attention", False),
+        ("qwen3_next", "zigzag", "veomni_flash_attention_2", False),
     ],
 )
 def test_cp_model_and_backend_gate(monkeypatch, model_type, layout, backend, allowed):
     monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
-    monkeypatch.setattr(auto, "is_torch_npu_available", lambda: False)
-    monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_layout=layout))
+    monkeypatch.setattr(auto, "IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr(
+        auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_layout=layout, device_type="cuda")
+    )
     config = SimpleNamespace(model_type=model_type, _attn_implementation=backend)
     if allowed:
         auto.check_context_parallel_supported(config)
@@ -61,6 +67,7 @@ def test_cp_model_and_backend_gate(monkeypatch, model_type, layout, backend, all
     "modifier",
     [
         {"dropout": 0.1},
+        {"deterministic": True},
         {"sliding_window": 4},
         {"softcap": 1.0},
         {"s_aux": torch.ones(2)},
@@ -75,11 +82,9 @@ def test_usp_rejects_attention_modifiers_before_collectives(monkeypatch, modifie
         pytest.fail("unsupported attention entered an Ulysses collective")
 
     monkeypatch.setattr(flash, "prepare_ulysses_qkv", forbidden)
-    module = SimpleNamespace(
-        config=SimpleNamespace(_attn_implementation="veomni_flash_attention_2_with_sp"), is_causal=True
-    )
+    module = SimpleNamespace(config=SimpleNamespace(_attn_implementation="veomni_flash_attention_2"), is_causal=True)
     q = torch.zeros(1, 2, 8, 4, dtype=torch.bfloat16)
-    with pytest.raises(NotImplementedError, match="does not support"):
+    with pytest.raises(NotImplementedError, match="not support"):
         flash.flash_attention_forward(module, q, q, q, None, **modifier)
 
 
@@ -113,3 +118,35 @@ def test_rl_rejects_zigzag_for_composed_trainers(monkeypatch):
     trainer = base_rl_trainer.BaseRLTrainer.__new__(base_rl_trainer.BaseRLTrainer)
     with pytest.raises(NotImplementedError, match="RL postprocessing"):
         trainer._build_preforward_postforward()
+
+
+def test_usp_rejects_upstream_modeling_backend(monkeypatch):
+    monkeypatch.setenv("MODELING_BACKEND", "hf")
+    monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_layout="zigzag"))
+    with pytest.raises(NotImplementedError, match="MODELING_BACKEND"):
+        auto.check_context_parallel_supported(SimpleNamespace(model_type="qwen3"), "flash_attention_2")
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_usp_rejects_deterministic_environment_before_collectives(monkeypatch, packed):
+    monkeypatch.setenv("FLASH_ATTENTION_DETERMINISTIC", "1")
+    monkeypatch.setattr(flash, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_layout="zigzag"))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("deterministic USP entered an Ulysses collective")
+
+    monkeypatch.setattr(flash, "prepare_ulysses_qkv", forbidden)
+    module = SimpleNamespace(config=SimpleNamespace(_attn_implementation="veomni_flash_attention_2"), is_causal=True)
+    q = torch.zeros(1, 2, 8, 4, dtype=torch.bfloat16)
+    kwargs = {"cu_seq_lens_q": torch.tensor([0, 8, 16], dtype=torch.int32)} if packed else {}
+    with pytest.raises(NotImplementedError, match="deterministic"):
+        flash.flash_attention_forward(module, q, q, q, None, **kwargs)
+
+
+def test_usp_rejects_sequence_classification(monkeypatch):
+    monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_layout="zigzag"))
+    config = SimpleNamespace(model_type="qwen3", architectures=["Qwen3ForSequenceClassification"])
+    with pytest.raises(NotImplementedError, match="Qwen3ForCausalLM"):
+        auto.check_context_parallel_supported(config, "veomni_flash_attention_2")

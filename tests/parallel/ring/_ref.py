@@ -37,8 +37,8 @@ FA_OK = FA_BACKEND is not None
 # Map the detected ring backend to the VeOmni SP attention implementation token
 # used by ``flash_attention_forward``.
 ATTN_IMPL_WITH_SP = {
-    "fa2": "veomni_flash_attention_2_with_sp",
-    "fa4": "veomni_flash_attention_4_with_sp",
+    "fa2": "veomni_flash_attention_2",
+    "fa4": "veomni_flash_attention_4",
 }.get(FA_BACKEND)
 
 

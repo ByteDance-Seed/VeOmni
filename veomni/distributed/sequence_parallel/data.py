@@ -146,7 +146,6 @@ def gather_outputs(
     return x
 
 
-# ── Per-module SP redistribution ────────────────────────────────────────────────
 #
 # The orchestrator runs with SP disabled, so every rank owns a DISTINCT DP-shard
 # sample. A module may declare a larger ``ulysses_size`` (its SP size); the SP
@@ -298,7 +297,6 @@ def sp_take_own_seq(full: Tensor, dim: int, seg_lengths: List[int], sp_rank: int
     return full.narrow(dim, offset, seg_lengths[sp_rank])
 
 
-# ── Zig-zag reordering for USP ring attention ──────────────────────────────
 #
 # Balanced causal ring attention (see ``ring_attention.zigzag_ring_flash_attn``)
 # requires the sequence to be laid out so that context-parallel rank ``r`` owns
@@ -356,7 +354,6 @@ def zigzag_undo(tensor: Tensor, dim: int, cp_size: int) -> Tensor:
     return torch.cat([blocks[inverse[i]].contiguous() for i in range(n_blocks)], dim=dim)
 
 
-# ── Per-document zig-zag reordering for USP varlen (packed) ring attention ──
 #
 # Packed sequences hold several documents concatenated along the sequence dim.
 # For balanced causal ring attention over ``cp`` each document must be
@@ -422,3 +419,34 @@ def local_cu_seqlens(cu_seqlens: "torch.Tensor", cp_size: int) -> "torch.Tensor"
         )
         local.append(local[-1] + seg_len // cp_size)
     return torch.tensor(local, dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+
+
+def prepare_usp_metadata(cu_seqlens: torch.Tensor, cp_size: int) -> dict:
+    """Build packed Ring offsets and half indices once on the collator's CPU.
+
+    Each document is aligned before splitting into two halves per CP rank.
+    Integer gather indices avoid dynamic boolean-index sizing on accelerators.
+    """
+    if cu_seqlens.device.type != "cpu":
+        raise ValueError("USP metadata must be precomputed on CPU before attention.")
+    if cp_size < 1:
+        raise ValueError("cp_size must be positive")
+    boundaries = cu_seqlens.tolist()
+    if len(boundaries) < 2 or boundaries[0] != 0:
+        raise ValueError("USP cu_seqlens must start at zero and contain a document")
+    lengths = [end - start for start, end in zip(boundaries, boundaries[1:])]
+    if any(length <= 0 or length % (2 * cp_size) for length in lengths):
+        raise ValueError("USP document lengths must be positive multiples of 2 * cp_size")
+    local_cu = cu_seqlens.to(torch.int32) // cp_size
+    local = local_cu.tolist()
+    halves = [[], []]
+    for start, end in zip(local, local[1:]):
+        middle = (start + end) // 2
+        halves[0].extend(range(start, middle))
+        halves[1].extend(range(middle, end))
+    return {
+        "usp_cu_seqlens": local_cu,
+        "usp_max_seqlen": max(lengths) // cp_size,
+        "usp_half0": torch.tensor(halves[0], dtype=torch.long),
+        "usp_half1": torch.tensor(halves[1], dtype=torch.long),
+    }

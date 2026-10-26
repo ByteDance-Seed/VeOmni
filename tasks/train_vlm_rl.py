@@ -13,38 +13,21 @@ class VLMRLTrainer(VLMTrainer):
         self.base = BaseRLTrainer.__new__(BaseRLTrainer)
         self.base.args = args
 
-        self.base._setup()  # registers ParallelState("base") before seed
+        self.base.device = self.base._setup(args)  # registers ParallelState("base") before seed
+        self.base.model = self._build_model_runtime()
 
-        # All build steps read the current ParallelState via ``get_parallel_state()``,
-        # so scope the whole build under this trainer's own state (see BaseTrainer).
-        with use_parallel_state("base"):
-            # rewrite build model to support data balancing
-            self._build_model()
-
-            # rewrite freeze_model_module to support freeze multimodal encoder, etc.
-            self._freeze_model_module()
-
-            # rewrite build_model_assets to support chat_template and processor for multimodal datasets
-            self._build_model_assets()
-
+        with use_parallel_state(self.base.model.parallel_state):
             # rewrite build_data_transform to support multimodal transform
             self._build_data_transform()
-
             self.base._build_dataset()
-
             # rewrite build_collate_fn to support multimodal collate_fn
             self._build_collate_fn()
-
             self.base._build_dataloader()
-            self.base._build_parallelized_model()
+        self.base._build_lr_scheduler()
+        self.base._build_training_context(self.base.model)
+        self.base._init_callbacks()
 
-            # rewrite build_optimizer to support different lr param groups
-            self._build_optimizer()
-
-            self.base._build_lr_scheduler()
-            self.base._build_training_context()
-            self.base._init_callbacks()
-
+        with use_parallel_state(self.base.model.parallel_state):
             self.base._build_preforward_postforward()
 
     def train(self):

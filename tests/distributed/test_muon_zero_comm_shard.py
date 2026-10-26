@@ -16,12 +16,17 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 from torch.distributed._tensor import Shard
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.torch_parallelize import _can_shard_extra_parallel_dim0
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 EP_PATTERN = "model.layers.*.mlp.experts.gate_up_proj"

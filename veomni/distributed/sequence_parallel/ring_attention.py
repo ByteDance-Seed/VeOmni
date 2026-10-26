@@ -30,7 +30,7 @@ undo`` and is applied by the collator before slicing.
 The Ulysses half (all-to-all head/seq exchange) is orthogonal: USP first does
 the Ulysses all-to-all over the ``ulysses`` group, then runs ring attention over
 the ``cp`` group on the resulting shard (see
-``veomni/ops/kernels/attention/__init__.py``).
+``veomni/ops/kernels/attention/standard/flash.py``).
 """
 
 import inspect
@@ -522,7 +522,7 @@ class _RingFlashAttn(torch.autograd.Function):
             dq, dk, dv = _zigzag_ring_backward(ctx.group, dout, q, k, v, out, lse, ctx.softmax_scale)
         else:
             dq, dk, dv = _ring_backward(ctx.group, dout, q, k, v, out, lse, ctx.softmax_scale, ctx.causal)
-        return None, dq, dk, dv, None, None, None
+        return None, dq, dk, dv, None, None, None, None, None
 
 
 def ring_flash_attn_func(
@@ -658,43 +658,6 @@ def _fa_varlen_backward(dout, q, k, v, out, lse, dq, dk, dv, cu_q, cu_k, max_q, 
     )
 
 
-def _varlen_half_index(cu_seqlens: Tensor, front: bool) -> Tensor:
-    """Boolean mask selecting each document's front / back half.
-
-    ``cu_seqlens`` are the LOCAL packed offsets; each document occupies
-    ``[cu[i], cu[i+1])`` and is split at its midpoint.
-    """
-    total = int(cu_seqlens[-1].item())
-    index = torch.zeros((total,), dtype=torch.bool, device=cu_seqlens.device)
-    for i in range(len(cu_seqlens) - 1):
-        start = int(cu_seqlens[i].item())
-        end = int(cu_seqlens[i + 1].item())
-        mid = (start + end) // 2
-        if front:
-            index[start:mid] = True
-        else:
-            index[mid:end] = True
-    return index
-
-
-def _varlen_half_lse(lse: Tensor, cu_seqlens: Tensor, front: bool) -> Tensor:
-    """Take each document's front / back half of a ``(h, total)`` LSE."""
-    h = lse.shape[0]
-    total_half = int(cu_seqlens[-1].item()) // 2
-    new_lse = torch.empty((h, total_half), dtype=lse.dtype, device=lse.device)
-    for i in range(len(cu_seqlens) - 1):
-        start = int(cu_seqlens[i].item())
-        end = int(cu_seqlens[i + 1].item())
-        seqlen = end - start
-        new_start, new_end = start // 2, end // 2
-        if front:
-            src_start, src_end = start, end - seqlen // 2
-        else:
-            src_start, src_end = start + seqlen // 2, end
-        new_lse[:, new_start:new_end] = lse[:, src_start:src_end]
-    return new_lse
-
-
 def _update_out_and_lse_varlen(out, lse, block_out, block_lse, index=None):
     """Online-softmax merge for varlen tensors.
 
@@ -778,7 +741,7 @@ def _zigzag_ring_varlen_backward(group, dout, q, k, v, out, lse, cu_seqlens, max
     dout1 = dout[half1]
     q1 = q[half1]
     out1 = out[half1]
-    lse1 = _varlen_half_lse(lse, cu_seqlens, front=False).contiguous()
+    lse1 = lse[:, half1].contiguous()
 
     dq = None
     dk = None
@@ -891,13 +854,11 @@ def _zigzag_ring_varlen_backward(group, dout, q, k, v, out, lse, cu_seqlens, max
 
 class _ZigzagRingVarlenFlashAttn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, group, q, k, v, cu_seqlens, max_seqlen, softmax_scale):
+    def forward(ctx, group, q, k, v, cu_seqlens, max_seqlen, softmax_scale, half0, half1):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** -0.5
         k = k.contiguous()
         v = v.contiguous()
-        half0 = _varlen_half_index(cu_seqlens, front=True)
-        half1 = _varlen_half_index(cu_seqlens, front=False)
         out, lse = _zigzag_ring_varlen_forward(group, q, k, v, cu_seqlens, max_seqlen, half0, half1, softmax_scale)
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens, half0, half1)
         ctx.group = group
@@ -911,7 +872,7 @@ class _ZigzagRingVarlenFlashAttn(torch.autograd.Function):
         dq, dk, dv = _zigzag_ring_varlen_backward(
             ctx.group, dout, q, k, v, out, lse, cu_seqlens, ctx.max_seqlen, half0, half1, ctx.softmax_scale
         )
-        return None, dq, dk, dv, None, None, None
+        return None, dq, dk, dv, None, None, None, None, None
 
 
 def zigzag_ring_flash_attn_varlen_func(
@@ -923,6 +884,7 @@ def zigzag_ring_flash_attn_varlen_func(
     softmax_scale: Optional[float] = None,
     causal: bool = True,
     group: Optional[ProcessGroup] = None,
+    half_indices: Optional[Tuple[Tensor, Tensor]] = None,
 ) -> Tensor:
     """Balanced (zig-zag) causal ring attention for packed (varlen) sequences.
 
@@ -936,4 +898,11 @@ def zigzag_ring_flash_attn_varlen_func(
         raise RuntimeError("zigzag_ring_flash_attn_varlen_func requires a flash-attn backend (FA2 or FA4).")
     assert causal, "zigzag ring attention is only defined for causal attention"
     group = get_context_parallel_group() if group is None else group
-    return _ZigzagRingVarlenFlashAttn.apply(group, q, k, v, cu_seqlens, max_seqlen, softmax_scale)
+    if half_indices is None:
+        # Direct kernel callers can prepare once themselves; production supplies
+        # collator metadata and never copies sequence lengths from the device.
+        from .data import prepare_usp_metadata
+
+        metadata = prepare_usp_metadata(cu_seqlens.cpu(), cp_size=1)
+        half_indices = (metadata["usp_half0"].to(q.device), metadata["usp_half1"].to(q.device))
+    return _ZigzagRingVarlenFlashAttn.apply(group, q, k, v, cu_seqlens, max_seqlen, softmax_scale, *half_indices)

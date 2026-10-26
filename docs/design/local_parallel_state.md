@@ -19,13 +19,12 @@ use different sequence-parallel groups while preserving the simple
 Registration maintains two independent mappings:
 
 - The **named registry** maps logical module names to states. Registering an
-  existing name logs a warning and returns the existing state.
+  existing name logs at debug and returns the existing state. Single-model
+  trainers do this on every run (`_setup` then `VeOmniModelRuntime.setup`
+  both register `"base"`).
 - The **topology cache** reuses a state when every topology-defining argument
   matches. Different names can therefore refer to the same state without
   creating duplicate process groups.
-
-Tests that need a topology no job config can express (a CPU mesh, or a rank
-layout unrelated to `WORLD_SIZE`) call `_init_parallel_state` directly.
 
 ## Basic usage
 
@@ -80,12 +79,17 @@ error.
 ## Trainer lifecycle
 
 Current built-in trainers register the main topology as `"base"` during
-`BaseTrainer._setup()`, which calls `init_parallel_state_from_config` before
-any model is built. Model, dataloader, optimizer, and scheduler construction
-run inside one `use_parallel_state("base")` build scope. At run time, only
-operations that depend on ambient groups are scoped: model forward,
-post-forward loss handling, backward, and gradient clipping. Callbacks retain
-their state explicitly rather than depending on an ambient scope.
+`BaseTrainer._setup()`, which runs before any model is built. That
+registration also makes `"base"` the global state, so the dataloader, scheduler
+and callbacks read it ambiently with no scope of their own. `VeOmniModelRuntime.setup()`
+only registers that model's mesh. The build scope is `VeOmniModelRuntime.__init__()`,
+which wraps meta-init, freeze, parallelize, and optimizer in
+`use_parallel_state(<its own name>)` — a no-op for a single-model job, and the
+mechanism by which sibling modules each build over their own mesh. At run time,
+`forward_backward_step` wraps `use_parallel_state(self.model.parallel_state)`
+around forward, post-forward, and backward so none of them hard-code a name.
+A job with several models overrides the step and wraps each model's
+forward/reduce/backward itself. Gradient clipping is owned by the runtime.
 
 When an API accepts an explicit process group, prefer passing the group from
 `get_parallel_state_by_name("base")` instead of opening a broader context.

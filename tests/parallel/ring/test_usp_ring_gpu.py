@@ -29,19 +29,19 @@ Each test skips unless enough GPUs and a flash-attn backend are available.
 """
 
 import os
-import sys
 
+import pytest
 import torch
 import torch.distributed as c10d
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.pytest_plugin import validate_launch
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
 if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
-    print("c10d NCCL not available, skipping tests", file=sys.stderr)
-    sys.exit(0)
+    pytest.skip("c10d backend unavailable", allow_module_level=True)
 
-import pytest
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.testing._internal.common_distributed import MultiProcessTestCase
@@ -50,6 +50,7 @@ from torch.testing._internal.common_utils import run_tests
 from veomni.distributed import parallel_state as PS
 from veomni.distributed.sequence_parallel.data import (
     local_cu_seqlens,
+    prepare_usp_metadata,
     zigzag_reorder,
     zigzag_reorder_varlen,
 )
@@ -67,7 +68,6 @@ ULYSSES = 2
 CP = 2
 
 
-# ── dense zig-zag ring attention ──────────────────────────────────────────────
 class ZigzagRingAttentionTest(SequenceParallelTest):
     def _shard(self, full, group):
         """Take this rank's zig-zag contiguous chunk (dim=1) of ``full``."""
@@ -124,10 +124,13 @@ class ZigzagRingAttentionTest(SequenceParallelTest):
         torch.testing.assert_close(vz.grad, ref_dv, atol=3e-2, rtol=2e-2)
 
 
-# ── packed / varlen zig-zag ring attention ────────────────────────────
 class _ZigzagRingVarlenTest(MultiProcessTestCase):
+    def ci_launch_plan(self):
+        return LaunchSpec(nproc=self.world_size)
+
     def setUp(self):
         super().setUp()
+        validate_launch(self.world_size)
         self._spawn_processes()
 
     def _init(self):
@@ -213,7 +216,6 @@ class ZigzagRingVarlenWorld4Test(_ZigzagRingVarlenTest):
         self._run_case()
 
 
-# ── op-level USP end-to-end (Ulysses all-to-all + ring) ───────────────
 class _AttnModule(torch.nn.Module):
     """Minimal module exposing the attributes flash_attention_forward reads."""
 
@@ -229,6 +231,9 @@ class _AttnModule(torch.nn.Module):
 
 
 class USPAttentionE2ETest(MultiProcessTestCase):
+    def ci_launch_plan(self):
+        return LaunchSpec(nproc=self.world_size)
+
     @property
     def world_size(self):
         return ULYSSES * CP
@@ -236,14 +241,15 @@ class USPAttentionE2ETest(MultiProcessTestCase):
     def setUp(self):
         super().setUp()
         os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
+        validate_launch(self.world_size)
         self._spawn_processes()
 
     def _init(self):
         store = dist.FileStore(self.file_name, self.world_size)
         get_torch_device().set_device(self.rank)
         c10d.init_process_group(get_dist_comm_backend(), store=store, rank=self.rank, world_size=self.world_size)
-        mesh = init_device_mesh(get_device_type(), (ULYSSES, CP), mesh_dim_names=("ulysses", "cp"))
-        mesh[("ulysses", "cp")]._flatten(mesh_dim_name="sp")
+        mesh = init_device_mesh(get_device_type(), (CP, ULYSSES), mesh_dim_names=("cp", "ulysses"))
+        mesh[("cp", "ulysses")]._flatten(mesh_dim_name="sp")
         state = PS.ParallelState(
             dp_size=1,
             dp_replicate_size=1,
@@ -272,7 +278,10 @@ class USPAttentionE2ETest(MultiProcessTestCase):
     @pytest.mark.skipif(not _FA_OK, reason="a flash-attn backend (FA2 or FA4) is required")
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_usp_matches_full_attention(self):
-        from veomni.ops.kernels.attention import flash_attention_forward
+        self._run_dense_case(kv_heads=8)
+
+    def _run_dense_case(self, kv_heads):
+        from veomni.ops.kernels.attention.standard.flash import flash_attention_forward
 
         state, mesh = self._init()
         dev = get_device_type()
@@ -282,10 +291,11 @@ class USPAttentionE2ETest(MultiProcessTestCase):
 
         # full (b, h, s, d) inputs (op transposes internally)
         q = torch.randn(b, h, seq, d, device=dev, dtype=torch.bfloat16)
-        k = torch.randn(b, h, seq, d, device=dev, dtype=torch.bfloat16)
-        v = torch.randn(b, h, seq, d, device=dev, dtype=torch.bfloat16)
+        k = torch.randn(b, kv_heads, seq, d, device=dev, dtype=torch.bfloat16)
+        v = torch.randn(b, kv_heads, seq, d, device=dev, dtype=torch.bfloat16)
         for t in (q, k, v):
             dist.broadcast(t, 0)
+            t.requires_grad_(True)
 
         # reference: single-device full causal attention (b, s, h, d layout)
         ref = ref_attn_func(
@@ -302,15 +312,21 @@ class USPAttentionE2ETest(MultiProcessTestCase):
             local_bshd = self._usp_slice(full_bshd, mesh)
             return local_bshd.transpose(1, 2).contiguous()
 
-        lq = shard_bhsd(q)
-        lk = shard_bhsd(k)
-        lv = shard_bhsd(v)
+        lq = shard_bhsd(q).requires_grad_(True)
+        lk = shard_bhsd(k).requires_grad_(True)
+        lv = shard_bhsd(v).requires_grad_(True)
 
         module = _AttnModule().to(dev)
         out, _ = flash_attention_forward(module, lq, lk, lv, attention_mask=None, scaling=scale)
         # out is (b, s_local, h, d)
         ref_local = self._usp_slice(ref, mesh)
         torch.testing.assert_close(out, ref_local, atol=2e-2, rtol=2e-2)
+        grad = torch.randn_like(ref)
+        dist.broadcast(grad, 0)
+        ref.backward(grad)
+        out.backward(self._usp_slice(grad, mesh))
+        for local, full in ((lq, q), (lk, k), (lv, v)):
+            torch.testing.assert_close(local.grad, shard_bhsd(full.grad), atol=3e-2, rtol=3e-2)
 
     def _usp_slice_varlen(self, full, cu, mesh):
         """Per-document zig-zag cp-outer + ulysses-inner slice (varlen layout)."""
@@ -325,7 +341,10 @@ class USPAttentionE2ETest(MultiProcessTestCase):
     @pytest.mark.skipif(not _FA_OK, reason="a flash-attn backend (FA2 or FA4) is required")
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_usp_varlen_matches_full(self):
-        from veomni.ops.kernels.attention import flash_attention_forward
+        self._run_varlen_case(kv_heads=8)
+
+    def _run_varlen_case(self, kv_heads):
+        from veomni.ops.kernels.attention.standard.flash import flash_attention_forward
 
         state, mesh = self._init()
         dev = get_device_type()
@@ -342,16 +361,17 @@ class USPAttentionE2ETest(MultiProcessTestCase):
         max_seqlen = max(doc_lens)
 
         q = torch.randn(b, h, seq, d, device=dev, dtype=torch.bfloat16)
-        k = torch.randn(b, h, seq, d, device=dev, dtype=torch.bfloat16)
-        v = torch.randn(b, h, seq, d, device=dev, dtype=torch.bfloat16)
+        k = torch.randn(b, kv_heads, seq, d, device=dev, dtype=torch.bfloat16)
+        v = torch.randn(b, kv_heads, seq, d, device=dev, dtype=torch.bfloat16)
         for t in (q, k, v):
             dist.broadcast(t, 0)
+            t.requires_grad_(True)
 
         # reference: single-device full packed varlen causal attention (b, s, h, d)
         ref = ref_attn_varlen_func(
             q.transpose(1, 2).reshape(seq, h, d).contiguous(),
-            k.transpose(1, 2).reshape(seq, h, d).contiguous(),
-            v.transpose(1, 2).reshape(seq, h, d).contiguous(),
+            k.transpose(1, 2).reshape(seq, kv_heads, d).contiguous(),
+            v.transpose(1, 2).reshape(seq, kv_heads, d).contiguous(),
             cu,
             max_seqlen,
             scale,
@@ -363,17 +383,35 @@ class USPAttentionE2ETest(MultiProcessTestCase):
             local_bshd = self._usp_slice_varlen(full_bshd, cu, mesh)
             return local_bshd.transpose(1, 2).contiguous()
 
-        lq = shard_bhsd(q)
-        lk = shard_bhsd(k)
-        lv = shard_bhsd(v)
+        lq = shard_bhsd(q).requires_grad_(True)
+        lk = shard_bhsd(k).requires_grad_(True)
+        lv = shard_bhsd(v).requires_grad_(True)
 
         module = _AttnModule().to(dev)
-        # The op derives LOCAL cu_seqlens from the GLOBAL cu_seq_lens_q kwarg.
+        # Match the CPU metadata prepared by the production collator.
+        metadata = prepare_usp_metadata(cu.cpu(), CP)
+        metadata = {k: v.to(dev) if torch.is_tensor(v) else v for k, v in metadata.items()}
         out, _ = flash_attention_forward(
-            module, lq, lk, lv, attention_mask=None, scaling=scale, cu_seq_lens_q=cu, cu_seq_lens_k=cu
+            module, lq, lk, lv, attention_mask=None, scaling=scale, cu_seq_lens_q=cu, cu_seq_lens_k=cu, **metadata
         )
         ref_local = self._usp_slice_varlen(ref, cu, mesh)
         torch.testing.assert_close(out, ref_local, atol=2e-2, rtol=2e-2)
+        grad = torch.randn_like(ref)
+        dist.broadcast(grad, 0)
+        ref.backward(grad)
+        out.backward(self._usp_slice_varlen(grad, cu, mesh))
+        for local, full in ((lq, q), (lk, k), (lv, v)):
+            torch.testing.assert_close(local.grad, shard_bhsd(full.grad), atol=3e-2, rtol=3e-2)
+
+    @pytest.mark.skipif(not _FA_OK, reason="a flash-attn backend is required")
+    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    def test_gqa_dense_matches_full(self):
+        self._run_dense_case(kv_heads=2)
+
+    @pytest.mark.skipif(not _FA_OK, reason="a flash-attn backend is required")
+    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    def test_mqa_packed_matches_full(self):
+        self._run_varlen_case(kv_heads=1)
 
 
 if __name__ == "__main__":

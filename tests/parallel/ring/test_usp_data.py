@@ -20,22 +20,26 @@ Consolidates the pure-CPU (no GPU / no distributed) USP data tests:
     reassembly, cu_seqlens derivation, and alignment error handling.
 """
 
-# ── zig-zag reorder helpers ───────────────────────────────────────────────────
 from dataclasses import dataclass
 
 import pytest
 import torch
 
 import veomni.data.data_collator as dc
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.data_collator import MainCollator, PackingCollator, SequenceParallelCollator
 from veomni.distributed.sequence_parallel.data import (
     local_cu_seqlens,
+    prepare_usp_metadata,
     zigzag_block_order,
     zigzag_reorder,
     zigzag_reorder_varlen,
     zigzag_undo,
 )
 from veomni.utils.constants import IGNORE_INDEX
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_block_order_cp2():
@@ -73,9 +77,6 @@ def test_reorder_requires_divisible_length():
     x = torch.randn(1, 7, 1)
     with pytest.raises(AssertionError):
         zigzag_reorder(x, dim=1, cp_size=2)
-
-
-# ── varlen (packed) per-document zig-zag ──────────────────────────────────────
 
 
 def test_reorder_varlen_shards_each_document_cp2():
@@ -116,9 +117,6 @@ def test_reorder_varlen_requires_divisible_document():
         zigzag_reorder_varlen(x, cu, dim=0, cp_size=2)
     with pytest.raises(AssertionError):
         local_cu_seqlens(cu, cp_size=2)
-
-
-# ── SequenceParallelCollator USP varlen slicing ───────────────────────────────
 
 
 @dataclass
@@ -284,3 +282,18 @@ def test_contiguous_cp_keeps_original_token_order(monkeypatch):
     tokens = torch.arange(16)
     assert torch.equal(collator.sp_slice("input_ids", tokens), tokens[:8])
     assert PackingCollator().cp_size == 1
+
+
+def test_usp_metadata_preserves_each_packed_document():
+    metadata = prepare_usp_metadata(torch.tensor([0, 12, 28, 32], dtype=torch.int32), cp_size=2)
+    assert metadata["usp_cu_seqlens"].tolist() == [0, 6, 14, 16]
+    assert metadata["usp_max_seqlen"] == 8
+    assert metadata["usp_half0"].tolist() == [0, 1, 2, 6, 7, 8, 9, 14]
+    assert metadata["usp_half1"].tolist() == [3, 4, 5, 10, 11, 12, 13, 15]
+    assert torch.cat((metadata["usp_half0"], metadata["usp_half1"])).sort().values.tolist() == list(range(16))
+
+
+@pytest.mark.parametrize("boundaries", [[0, 7], [0, 0, 8], [4, 8], [0]])
+def test_usp_metadata_rejects_invalid_documents(boundaries):
+    with pytest.raises(ValueError):
+        prepare_usp_metadata(torch.tensor(boundaries, dtype=torch.int32), cp_size=2)

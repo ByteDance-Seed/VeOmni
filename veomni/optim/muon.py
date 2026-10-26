@@ -83,6 +83,8 @@ _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
     "embed_tokens",
     "embedding",
     "lm_head",
+    "markov_head",
+    "confidence_head",
     "output_layer",
     "conv1d",
 )
