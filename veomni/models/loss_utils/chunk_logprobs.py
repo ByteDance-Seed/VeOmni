@@ -53,6 +53,49 @@ def _per_token_log_probs_from_logits(
 _per_token_entropy_from_logits = token_entropy_from_logits
 
 
+def _prepare_causal_chunk_inputs(
+    hidden_states: torch.Tensor,
+    labels: torch.Tensor,
+    shift_labels: Optional[torch.Tensor],
+    *,
+    sp_enabled: bool,
+    label_aligned_tensors: tuple[torch.Tensor, ...] = (),
+) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...], bool]:
+    """Align ``hidden_states``, ``labels``, and optional label-aligned tensors for causal prediction.
+
+    Three modes for choosing the per-position target (matching ``ForCausalLMLoss``):
+    1. Caller passes pre-shifted labels via ``shift_labels`` -> trust them and run
+       ``hidden_states`` unchanged. Output keeps the input's seq length.
+    2. SP enabled, ``shift_labels`` not provided -> ``SequenceParallelCollator`` has
+       already globally shifted ``labels``; do not shift again.
+    3. SP disabled, ``shift_labels`` not provided -> apply the causal
+       ``labels[..., 1:]`` / ``hidden_states[..., :-1, :]`` shift (plus
+       ``tensor[..., 1:, :]`` on any label-aligned auxiliary tensors) and mark the
+       outputs for a trailing zero pad so the returned shape matches ``labels``.
+    """
+    if shift_labels is not None:
+        return hidden_states, shift_labels, label_aligned_tensors, False
+    if sp_enabled:
+        return hidden_states, labels, label_aligned_tensors, False
+    return (
+        hidden_states[..., :-1, :].contiguous(),
+        labels[..., 1:].contiguous(),
+        tuple(tensor[..., 1:, :].contiguous() for tensor in label_aligned_tensors),
+        True,
+    )
+
+
+def _pad_causal_chunk_outputs(
+    outputs: tuple[torch.Tensor, ...],
+    *,
+    needs_trailing_pad: bool,
+) -> tuple[torch.Tensor, ...]:
+    """Pad each output tensor with one trailing ``0.0`` along the sequence dim when needed."""
+    if not needs_trailing_pad:
+        return outputs
+    return tuple(torch.nn.functional.pad(output, (0, 1), value=0.0) for output in outputs)
+
+
 def chunk_logprobs_function(
     hidden_states: torch.Tensor,
     weights: torch.Tensor,
@@ -110,26 +153,12 @@ def chunk_logprobs_function(
         Sign conventions match HF / verl — no negation needed at the
         call site.
     """
-    sp_enabled = get_parallel_state().sp_enabled
-
-    # Three modes for choosing the per-position target (matches the
-    # ``ForCausalLMLoss`` contract):
-    # 1. Caller passes pre-shifted labels via ``shift_labels`` -> trust them
-    #    and run hidden_states unchanged. Output keeps the input's seq length.
-    # 2. SP enabled, ``shift_labels`` not provided -> SequenceParallelCollator
-    #    has already globally shifted ``labels``; don't shift again.
-    # 3. SP disabled, ``shift_labels`` not provided -> apply the causal
-    #    ``labels[..., 1:]`` / ``hidden[..., :-1, :]`` shift here and pad
-    #    the trailing seq slot with 0 so the returned shape matches input
-    #    ``labels``.
-    used_explicit_shift = shift_labels is not None
-    if used_explicit_shift:
-        labels_shifted = shift_labels
-    elif sp_enabled:
-        labels_shifted = labels
-    else:
-        labels_shifted = labels[..., 1:].contiguous()
-        hidden_states = hidden_states[..., :-1, :].contiguous()
+    hidden_states, labels_shifted, _, needs_trailing_pad = _prepare_causal_chunk_inputs(
+        hidden_states,
+        labels,
+        shift_labels,
+        sp_enabled=get_parallel_state().sp_enabled,
+    )
 
     token_logprobs_fn = (
         op if op is not None else resolve_token_logprobs_op(impl, device_type=hidden_states.device.type)
@@ -144,13 +173,10 @@ def chunk_logprobs_function(
         token_logprobs_fn=token_logprobs_fn,
     )
 
-    if not sp_enabled and not used_explicit_shift:
-        # Pad with one zero at the right of the (last) seq dim so the
-        # returned tensors match the input ``labels`` shape. The
-        # padded slot corresponds to the final input token (no
-        # next-token target) — a no-op under any sane downstream mask.
-        log_probs = torch.nn.functional.pad(log_probs, (0, 1), value=0.0)
-        entropy = torch.nn.functional.pad(entropy, (0, 1), value=0.0)
+    log_probs, entropy = _pad_causal_chunk_outputs(
+        (log_probs, entropy),
+        needs_trailing_pad=needs_trailing_pad,
+    )
     return log_probs, entropy
 
 

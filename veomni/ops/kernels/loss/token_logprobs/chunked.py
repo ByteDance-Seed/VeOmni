@@ -36,6 +36,22 @@ from ....registry import VeomniOp
 from .standard.eager import token_entropy_from_logits
 
 
+def _verify_token_logprobs_backend(impl: str) -> None:
+    """Import-check the underlying vendor kernel for ``impl``.
+
+    ``OP_REGISTRY`` checks module discoverability via ``find_spec`` without
+    importing vendor packages. This helper verifies that the compiled extension
+    can actually be imported before committing to a non-eager row.
+    """
+    if impl == "flash_attn":
+        from flash_attn.ops.triton.cross_entropy import cross_entropy_loss  # noqa: F401
+    elif impl == "torch_npu":
+        import torch_npu
+
+        if not hasattr(torch_npu, "npu_cross_entropy_loss"):
+            raise ImportError("torch_npu.npu_cross_entropy_loss is not available")
+
+
 def resolve_token_logprobs_op(
     impl: str | None = None,
     *,
@@ -43,13 +59,27 @@ def resolve_token_logprobs_op(
 ) -> VeomniOp:
     """Resolve the active ``token_logprobs`` ``VeomniOp`` handle.
 
-    When ``impl`` is ``None`` and ``device_type == "cpu"``, selects the ``eager``
-    row directly so CPU tensors on a GPU or NPU host do not dispatch into an
-    accelerator-only kernel. An explicit ``impl`` is always resolved without
-    fallback.
+    When ``impl`` is ``None``:
+    - Selects ``"eager"`` directly when ``device_type == "cpu"`` so CPU tensors
+      on a GPU or NPU host do not dispatch into an accelerator-only kernel.
+    - Resolves the host default from ``OP_REGISTRY`` otherwise, falling back to
+      ``"eager"`` if the discoverable vendor module fails to import at runtime
+      (for example due to a binary extension ABI mismatch).
+
+    When ``impl`` is explicitly specified, resolution is strict and never falls
+    back on unmet requirements or runtime ``ImportError``.
     """
-    effective_impl = "eager" if (impl is None and device_type == "cpu") else impl
-    return VeomniOp("token_logprobs", "standard", effective_impl)
+    if impl is None and device_type == "cpu":
+        return VeomniOp("token_logprobs", "standard", "eager")
+    op = VeomniOp("token_logprobs", "standard", impl)
+    if impl is None:
+        try:
+            _verify_token_logprobs_backend(op.impl)
+        except ImportError:
+            return VeomniOp("token_logprobs", "standard", "eager")
+    else:
+        _verify_token_logprobs_backend(op.impl)
+    return op
 
 
 def resolve_token_logprobs_fn(

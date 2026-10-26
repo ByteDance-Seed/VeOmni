@@ -34,6 +34,8 @@ from veomni.ops.kernels.loss.token_logprobs.chunked import (
     resolve_token_logprobs_op,
 )
 
+from .chunk_logprobs import _pad_causal_chunk_outputs, _prepare_causal_chunk_inputs
+
 
 def chunk_topk_distill_function(
     hidden_states: torch.Tensor,
@@ -92,23 +94,18 @@ def chunk_topk_distill_function(
         flow gradients into ``hidden_states`` and ``weights`` through
         the closed-form backward.
     """
-    sp_enabled = get_parallel_state().sp_enabled
-
-    used_explicit_shift = shift_labels is not None
-    if used_explicit_shift:
-        labels_shifted = shift_labels
-    elif sp_enabled:
-        labels_shifted = labels
-    else:
-        labels_shifted = labels[..., 1:].contiguous()
-        hidden_states = hidden_states[..., :-1, :].contiguous()
-        # Teacher tensors are aligned to the label time-step, so apply the
-        # same causal shift on them. (The reason we slice ``[..., 1:, :]`` on
-        # hidden_states is that hidden_state[t-1] predicts label[t]; teacher
-        # logprobs at position t come pre-aligned with label[t], so we drop
-        # the leading-most slot to match the post-shift label length.)
-        teacher_topk_ids = teacher_topk_ids[..., 1:, :].contiguous()
-        teacher_topk_log_probs = teacher_topk_log_probs[..., 1:, :].contiguous()
+    (
+        hidden_states,
+        labels_shifted,
+        (teacher_topk_ids, teacher_topk_log_probs),
+        needs_trailing_pad,
+    ) = _prepare_causal_chunk_inputs(
+        hidden_states,
+        labels,
+        shift_labels,
+        sp_enabled=get_parallel_state().sp_enabled,
+        label_aligned_tensors=(teacher_topk_ids, teacher_topk_log_probs),
+    )
 
     token_logprobs_fn = (
         op if op is not None else resolve_token_logprobs_op(impl, device_type=hidden_states.device.type)
@@ -126,12 +123,10 @@ def chunk_topk_distill_function(
         token_logprobs_fn=token_logprobs_fn,
     )
 
-    if not sp_enabled and not used_explicit_shift:
-        log_probs = torch.nn.functional.pad(log_probs, (0, 1), value=0.0)
-        entropy = torch.nn.functional.pad(entropy, (0, 1), value=0.0)
-        distill = torch.nn.functional.pad(distill, (0, 1), value=0.0)
-        student_mass = torch.nn.functional.pad(student_mass, (0, 1), value=0.0)
-        teacher_mass = torch.nn.functional.pad(teacher_mass, (0, 1), value=0.0)
+    log_probs, entropy, distill, student_mass, teacher_mass = _pad_causal_chunk_outputs(
+        (log_probs, entropy, distill, student_mass, teacher_mass),
+        needs_trailing_pad=needs_trailing_pad,
+    )
     # ``apply`` attaches ``grad_fn`` even after the inner detach. Mass
     # outputs are metrics-only on every branch, including explicit shift
     # and sequence-parallel.
