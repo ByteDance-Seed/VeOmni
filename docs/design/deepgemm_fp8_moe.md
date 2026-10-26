@@ -22,10 +22,10 @@ is unchanged. Use trainable BF16 expert parameters, or FSDP2 BF16 parameter
 mixed precision with FP32 master weights. A packed inference checkpoint must
 first pass through its model's existing dequantization/weight-loading path.
 
-Keep model-side QAT disabled for this native FP8 path. The backend receives
-already prepared tensors and cannot undo a fake-quantization pass performed
-by a model before dispatch. This setting is independent of rollout/export
-quantization.
+`OpsImplementationConfig` rejects `deepgemm_fp8` combined with any
+`qat_implementation` other than `none` at config-parse time. DeepGEMM already
+quantizes its GEMM operands; model-side QAT would add a fake-quantization pass
+before dispatch. This setting is independent of rollout/export quantization.
 
 The mainline DeepSeek V4 expert module is covered by a real forward/backward
 integration test, using its existing merged weights and routing-score cast.

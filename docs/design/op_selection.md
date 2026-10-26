@@ -36,6 +36,9 @@ If a field is not in this table, it is not an op-selection knob.
 
 `qat_implementation` has no per-model registry variants. `fp8_blockwise` is
 rejected at config-parse time on anything but an SM90+ NVIDIA CUDA GPU.
+It also cannot be combined with `moe_implementation: deepgemm_fp8`; that
+backend requires `qat_implementation: none` because it already quantizes
+the expert GEMM operands. Conflicting selections raise at config-parse time.
 Constructed DeepSeek-V4 modules freeze the recipe on `self.qat_implementation`;
 changing the process-global ops config later does not retarget an existing
 instance.

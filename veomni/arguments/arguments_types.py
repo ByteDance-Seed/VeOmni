@@ -1551,7 +1551,7 @@ class OpsImplementationConfig:
             "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
             "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
             "recipe rather than an op-registry implementation, so it is not selected through "
-            "VeomniOp -- see veomni/ops/qat/."
+            "VeomniOp -- see veomni/ops/qat/. Must be 'none' when moe_implementation='deepgemm_fp8'."
         },
     )
 
@@ -1639,13 +1639,20 @@ class OpsImplementationConfig:
         )
 
     def _validate_implementations(self):
-        """Fail fast on hardware/op mismatch at config-parse time.
+        """Fail fast on incompatible selections and hardware/op mismatch at config-parse time.
 
         Only checks things cheaper to catch here than at model-build time.
         Package availability (liger / torch_npu) and model-specific backend
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
+        if self.moe_implementation == "deepgemm_fp8" and self.qat_implementation != "none":
+            raise ValueError(
+                "moe_implementation='deepgemm_fp8' cannot be combined with "
+                f"qat_implementation={self.qat_implementation!r}. Set qat_implementation='none'; "
+                "DeepGEMM already quantizes the expert GEMM operands."
+            )
+
         from ..utils.device import IS_NPU_AVAILABLE
         from ..utils.import_utils import (
             is_apex_mlu_available,
