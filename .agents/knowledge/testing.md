@@ -17,6 +17,10 @@ The lightweight device-API workflow runs architecture, op-documentation and
 generated-call-site-signature tests with `pytest --noconftest`, without Torch.
 The patchgen workflow owns `test_modify_init.py`, using the standalone
 `patchgen` package and `pytest --noconftest` to avoid runtime fixture imports.
+Device-API acceptance also includes the three `check_device_api_usage.py`
+scans over `tasks`, `veomni`, and `tests`; the pytest guards alone do not cover
+that workflow. CPU tests checking device-name forwarding should use a mock
+backend sentinel when no real hardware API is involved.
 CPU-planned worker cases scope `torch.utils.checkpoint.DefaultDeviceType` to
 `cpu` and restore it afterward. On Ascend, CPU-only checkpoint inputs otherwise
 fall back to the registered NPU and AMP capability queries can initialize a

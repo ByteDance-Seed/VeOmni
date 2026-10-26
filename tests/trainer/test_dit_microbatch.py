@@ -309,10 +309,11 @@ def test_fused_dit_branch_reloads_weights_and_optimizer_under_its_model_state(mo
     monkeypatch.setattr(weights_module, "load_model_weights", load)
     monkeypatch.setattr(runtime, "_build_optimizer", optimizer)
     monkeypatch.setattr("veomni.utils.helper.set_seed", lambda *args: None)
-    monkeypatch.setattr("veomni.utils.device.get_device_type", lambda: "cuda")
+    model_device = "test_accelerator"
+    monkeypatch.setattr("veomni.utils.device.get_device_type", lambda: model_device)
     runtime.reset_for_dataset_branch()
     assert not active_state
-    assert loaded[0]["init_device"] == ("cpu" if offload else "cuda")
+    assert loaded[0]["init_device"] == ("cpu" if offload else model_device)
     assert loaded[0]["dtensor_to_cpu"] is offload
 
 
