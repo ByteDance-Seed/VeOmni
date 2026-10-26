@@ -1,7 +1,10 @@
+import argparse
+import gc
 import importlib
 import importlib.metadata
 import importlib.util
 import math
+import os
 import subprocess
 from dataclasses import dataclass, field
 from unittest import mock
@@ -14,10 +17,15 @@ from packaging.version import Version
 from torch.distributed._tensor import DTensor, Shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.arguments import ModelArguments, TrainingArguments, parse_args
+from veomni.arguments import ModelArguments
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
-from veomni.distributed.parallel_state import _init_parallel_state
+from veomni.distributed.parallel_state import (
+    _init_parallel_state,
+    clear_parallel_state,
+    get_parallel_state,
+    use_parallel_state,
+)
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.optim import build_optimizer
 from veomni.utils import helper
@@ -29,7 +37,8 @@ from veomni.utils.device import (
 )
 
 
-_CI_LAUNCH = LaunchSpec(nproc=8)
+_CI_LAUNCH_4 = LaunchSpec(nproc=4)
+_CI_LAUNCH_8 = LaunchSpec(nproc=8)
 
 
 # from veomni.optim.optimizer import build_optimizer
@@ -42,12 +51,6 @@ def _torch_npu_version() -> str:
     if importlib.util.find_spec("torch_npu") is None:
         return None
     return str(importlib.metadata.version("torch_npu"))
-
-
-@dataclass
-class Argument:
-    model: "ModelArguments" = field(default_factory=ModelArguments)
-    train: "TrainingArguments" = field(default_factory=TrainingArguments)
 
 
 class ToyMoeAndEmbedModel(torch.nn.Module):
@@ -126,255 +129,282 @@ class ToyMoeExperts(torch.nn.Module):
         return self.experts.sum()
 
 
-def main():
-    dist.init_process_group(backend=get_dist_comm_backend())
-    args = parse_args(Argument)
+# (label, ep_size, emb_size, dp_replicate_size, cpu_offload[, extra_parallel_only])
+_FSDP2_4GPU_SCENARIOS: tuple[
+    tuple[str, int, int, int | None, bool] | tuple[str, int, int, int | None, bool, bool], ...
+] = (
+    ("fsdp2_no_extra_no_offload", 1, 1, None, False),
+    ("fsdp2_no_extra_cpu_offload", 1, 1, None, True),
+    ("fsdp2_ep2_no_offload", 2, 1, None, False),
+    ("fsdp2_ep2_cpu_offload", 2, 1, None, True),
+    ("fsdp2_ep4_no_offload", 4, 1, None, False),
+    ("fsdp2_ep4_cpu_offload", 4, 1, None, True),
+    ("fsdp2_emb4_no_offload", 1, 4, None, False),
+    ("fsdp2_emb4_cpu_offload", 1, 4, None, True),
+    ("fsdp2_ep2_emb2_no_offload", 2, 2, None, False),
+    ("fsdp2_ep2_emb2_cpu_offload", 2, 2, None, True),
+    ("fsdp2_ep2_emb4_no_offload", 2, 4, None, False),
+    ("fsdp2_ep2_emb4_cpu_offload", 2, 4, None, True),
+    ("extra_parallel_only_emb4", 1, 4, None, False, True),
+)
 
-    get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
-    _init_parallel_state(
-        dp_size=args.model.accelerator.dp_size,
-        dp_replicate_size=args.model.accelerator.dp_replicate_size,
-        dp_shard_size=args.model.accelerator.dp_shard_size,
-        tp_size=args.model.accelerator.tp_size,
-        pp_size=args.model.accelerator.pp_size,
-        cp_size=args.model.accelerator.cp_size,
-        ulysses_size=args.model.accelerator.ulysses_size,
-        extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes,
-        extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
-        extra_parallel_names=args.model.accelerator.extra_parallel_names,
-        dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
-    )
-
-    extra_parallel_only = args.model.accelerator.fsdp_config.extra_parallel_only
-    model = ToyMoeAndEmbedModel()
-    model = build_parallelize_model(
-        model,
-        extra_parallel_only=extra_parallel_only,
-        init_device=args.model.accelerator.init_device,
-        weights_path=None,
-        mixed_precision=args.model.accelerator.fsdp_config.mixed_precision,
-        enable_gradient_checkpointing=args.model.accelerator.gradient_checkpointing.enable,
-        enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,
-        basic_modules=[],
-        enable_reentrant=args.model.accelerator.gradient_checkpointing.enable_reentrant,
-        enable_forward_prefetch=args.model.accelerator.fsdp_config.forward_prefetch,
-        broadcast_model_weights_from_rank0=args.model.broadcast_model_weights_from_rank0,
-        max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size,
-    )
-
-    from veomni.distributed.parallel_state import get_parallel_state
-
-    ps = get_parallel_state()
-    fsdp_group = ps.fsdp_group
-    ep_group = ps.extra_parallel_group("ep") if ps.extra_parallel_enabled("ep") else None
-    emb_group = ps.extra_parallel_group("emb") if ps.extra_parallel_enabled("emb") else None
-
-    ep_fsdp_group = None
-    if ps.extra_parallel_group("ep") and ps.extra_parallel_fsdp_device_mesh["ep"] is not None:
-        ep_fsdp_group = ps.extra_parallel_fsdp_device_mesh["ep"]["ep_fsdp"].get_group()
-
-    emb_fsdp_group = None
-    if ps.extra_parallel_group("emb") and ps.extra_parallel_fsdp_device_mesh["emb"] is not None:
-        emb_fsdp_group = ps.extra_parallel_fsdp_device_mesh["emb"]["emb_fsdp"].get_group()
-
-    # build optimizer to register ep param groups when ep is enabled
-    _ = build_optimizer(
-        model,
-        lr=args.model.optimizer.lr,
-        weight_decay=args.model.optimizer.weight_decay,
-        fused=True,
-        optimizer_type=args.model.optimizer.type,
-        no_decay_modules=args.model.optimizer.no_decay_modules,
-        no_decay_params=args.model.optimizer.no_decay_params,
-    )
-    logger.info_rank0(
-        "group sizes - fsdp: %s, ep: %s, ep_fsdp: %s, emb: %s, emb_fsdp: %s",
-        dist.get_world_size(group=fsdp_group) if fsdp_group is not None else None,
-        dist.get_world_size(group=ep_group) if ep_group is not None else None,
-        dist.get_world_size(group=ep_fsdp_group) if ep_fsdp_group is not None else None,
-        dist.get_world_size(group=emb_group) if emb_group is not None else None,
-        dist.get_world_size(group=emb_fsdp_group) if emb_fsdp_group is not None else None,
-    )
-    device_type = get_device_type()
-    tensor_device = torch.device(f"{device_type}:{get_device_id()}")
-    max_grad_norm = args.model.optimizer.max_grad_norm
-
-    def check_model_param_grad_one_by_one(expected_grad, ep_expected_grad, emb_expected_grad, msg):
-        # check them one-by-one
-        for name, param in model.named_parameters():
-            grad = param.grad
-            if grad is None:
-                continue
-            grad_local = grad.to_local() if isinstance(grad, DTensor) else grad
-            logger.info_rank0(f"{msg}: the local grad for {name}: {grad_local}")
-            if name == "decoder.moe.experts":
-                torch.testing.assert_close(
-                    grad_local,
-                    torch.full_like(grad_local, ep_expected_grad),
-                    atol=1e-6,
-                    rtol=1e-6,
-                    msg=f"Gradient mismatch for {name}, which has local shape {grad_local.shape}, value {grad_local}, expected value {ep_expected_grad} ",
-                )
-            elif "embed_tokens" in name:
-                torch.testing.assert_close(
-                    grad_local,
-                    torch.full_like(grad_local, emb_expected_grad),
-                    atol=1e-6,
-                    rtol=1e-6,
-                    msg=f"Gradient mismatch for {name}, which has local shape {grad_local.shape}, value {grad_local}, expected value {emb_expected_grad} ",
-                )
-            else:
-                torch.testing.assert_close(
-                    grad_local,
-                    torch.full_like(grad_local, expected_grad),
-                    atol=1e-6,
-                    rtol=1e-6,
-                    msg=f"Gradient mismatch for {name}, which has local shape {grad_local.shape}, value {grad_local}, expected value {expected_grad} ",
-                )
-
-    total_grad_norm_pre_clip = None
-    for step in range(3):
-        inputs = torch.ones(1, 16, device=tensor_device)
-        loss = model(inputs)
-        loss.backward()
-
-        logger.info_rank0("manually checking the initial param grads before any clipping")
-        # On GPU, the local gard of each param after local backward is 1.0
-        # At loss.backward(), reduce scatter is triggered to **average** grad for the same param against different data input on each fsdp rank
-        # By default, this is achieved by dividing sum of param grad on each rank by fsdp size
-        # * For example, for pure FSDP2 on 8 GPUs,
-        #   * the local grad of each param after backward is  1.0 x 8 (every rank every param local grad is 1.0) / 8 (fsdp size)
-        #   * this is trasparent to dtensor, by inferring dtensor's fsdp size from its device mesh
-        # * When ep+fsdp2 is enabled, the divide factor for ep params should still be world size (num of data inputs)
-        #   * in implementation, since ep param in VeOmni can only see ep_fsdp dim, so we need to override its divide factor
-        #   * by applying set_gradient_divide_factor(world_size) for EP modules in torch_parallelize
-        # In general, the divide factor for each param should be its num of different input data, which is overall dp size
-
-        # In this test specifically, model forward is unrelated to inputs and the local grad is always 1
-        # Since the test toy MoE forward does not have all2all like real ones,
-        # the data of ep params would see have only ep_fsdp num
-        # * If there is no grad divide factor set, the default grad divide factor is ep_fsdp_size, the local grad after backward is still 1
-        # * Since we set grad divide factor to world_size (= fsdp_size = ep size * ep_fsdp_size), we expect grad here to be 1/ep_size
-        expected = 1.0
-        ep_expected = 1.0 / ps.extra_parallel_sizes["ep"]
-        emb_expected = 1.0 / ps.extra_parallel_sizes["emb"]
-        check_model_param_grad_one_by_one(
-            expected_grad=expected, ep_expected_grad=ep_expected, emb_expected_grad=emb_expected, msg="Before clipping"
-        )
-        if extra_parallel_only:
-            # Nothing has reduced the replicated params yet: give each rank a
-            # different grad whose mean is still 1, so the checks after clipping
-            # only pass if the clipper averaged them.
-            world_size = dist.get_world_size()
-            model.bias.grad.mul_(2.0 * dist.get_rank() / (world_size - 1))
-
-        # Every local param grad is 1.0 / ps.ep_size, model total norm should be sqrt(1 * non_ep_param_num + 1/ep_size^2 * ep_param_num)
-        expected_total_grad_norm = math.sqrt(
-            (64 * 16 + 64 * 16) * (1 / ps.extra_parallel_sizes["emb"] ** 2)
-            + 16
-            + 64 * 16
-            + (64 * 16 * 32) * (1 / ps.extra_parallel_sizes["ep"] ** 2)
-        )
-        total_grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
-
-        # check whether total grad norm meets our expectation
-        torch.testing.assert_close(
-            total_grad_norm_pre_clip.item(), expected=expected_total_grad_norm, atol=1e-6, rtol=1e-6
-        )
-
-        # go through each param grad one-by-one after clipping to check whether their value meets our expectation
-        clip_coeff = min(max_grad_norm / expected_total_grad_norm, 1.0)
-        ep_clip_coeff = 1.0 / ps.extra_parallel_sizes["ep"] * min(max_grad_norm / expected_total_grad_norm, 1.0)
-        emb_clip_coeff = 1.0 / ps.extra_parallel_sizes["emb"] * min(max_grad_norm / expected_total_grad_norm, 1.0)
-        logger.info_rank0("Checking model param grad one-by-one after clipping")
-        check_model_param_grad_one_by_one(
-            expected_grad=clip_coeff,
-            ep_expected_grad=ep_clip_coeff,
-            emb_expected_grad=emb_clip_coeff,
-            msg="After clipping",
-        )
-
-        logger.info_rank0(f"step: {step}, loss: {loss.item()}, grad_norm_pre_clip: {total_grad_norm_pre_clip}, ")
-        model.zero_grad()
-
-    dist.barrier()
-    dist.destroy_process_group()
+_HSDP_8GPU_SCENARIOS: tuple[tuple[str, int, int, int | None, bool], ...] = (
+    ("hsdp_no_extra_no_offload", 1, 1, 2, False),
+    ("hsdp_no_extra_cpu_offload", 1, 1, 2, True),
+    ("hsdp_ep4_no_offload", 4, 1, 2, False),
+    ("hsdp_ep4_cpu_offload", 4, 1, 2, True),
+    ("hsdp_emb4_no_offload", 1, 4, 2, False),
+    ("hsdp_emb4_cpu_offload", 1, 4, 2, True),
+    ("hsdp_ep2_emb4_no_offload", 2, 4, 2, False),
+    ("hsdp_ep2_emb4_cpu_offload", 2, 4, 2, True),
+)
 
 
-def _run_clip_grad_norm_fsdp2_test(
+def _hsdp_extra_parallel_buggy_on_npu() -> bool:
+    npu_ver = _torch_npu_version()
+    return bool(npu_ver and Version(npu_ver) < Version("2.9.0"))
+
+
+def _run_clip_scenario(
+    *,
+    label: str,
+    world_size: int,
     ep_size: int,
     emb_size: int,
+    dp_replicate_size: int | None,
     cpu_offload: bool,
-    dp_replicate_size: int | None = None,
     extra_parallel_only: bool = False,
 ) -> None:
+    dp_replicate = dp_replicate_size or 1
+    assert world_size % dp_replicate == 0
+    dp_shard = world_size // dp_replicate
+
+    state_name = f"clip_w{world_size}_rep{dp_replicate}_ep{ep_size}_emb{emb_size}"
+    ps = _init_parallel_state(
+        dp_size=world_size,
+        dp_replicate_size=dp_replicate,
+        dp_shard_size=dp_shard,
+        tp_size=1,
+        pp_size=1,
+        cp_size=1,
+        ulysses_size=1,
+        extra_parallel_sizes=(ep_size, emb_size),
+        extra_parallel_placement_innermost=(False, False),
+        extra_parallel_names=("ep", "emb"),
+        dp_mode="fsdp2",
+        name=state_name,
+    )
+
+    with use_parallel_state(ps):
+        assert get_parallel_state() is ps
+        model_args = ModelArguments(config_path="test")
+        torch.manual_seed(42)
+        model = ToyMoeAndEmbedModel()
+        model = build_parallelize_model(
+            model,
+            extra_parallel_only=extra_parallel_only,
+            init_device="meta",
+            weights_path=None,
+            mixed_precision=model_args.accelerator.fsdp_config.mixed_precision,
+            enable_gradient_checkpointing=False,
+            enable_fsdp_offload=cpu_offload,
+            basic_modules=[],
+            enable_reentrant=False,
+            enable_forward_prefetch=model_args.accelerator.fsdp_config.forward_prefetch,
+            broadcast_model_weights_from_rank0=False,
+            max_load_broadcast_size=model_args.accelerator.fsdp_config.max_load_broadcast_size,
+        )
+
+        fsdp_group = ps.fsdp_group
+        ep_group = ps.extra_parallel_group("ep") if ps.extra_parallel_enabled("ep") else None
+        emb_group = ps.extra_parallel_group("emb") if ps.extra_parallel_enabled("emb") else None
+
+        ep_fsdp_group = None
+        if ps.extra_parallel_group("ep") and ps.extra_parallel_fsdp_device_mesh["ep"] is not None:
+            ep_fsdp_group = ps.extra_parallel_fsdp_device_mesh["ep"]["ep_fsdp"].get_group()
+            assert dist.get_world_size(group=ep_fsdp_group) == dp_shard // ep_size, (
+                f"[{label}] expected ep_fsdp group size {dp_shard // ep_size}, got {dist.get_world_size(group=ep_fsdp_group)}"
+            )
+
+        emb_fsdp_group = None
+        if ps.extra_parallel_group("emb") and ps.extra_parallel_fsdp_device_mesh["emb"] is not None:
+            emb_fsdp_group = ps.extra_parallel_fsdp_device_mesh["emb"]["emb_fsdp"].get_group()
+            assert dist.get_world_size(group=emb_fsdp_group) == dp_shard // emb_size, (
+                f"[{label}] expected emb_fsdp group size {dp_shard // emb_size}, got {dist.get_world_size(group=emb_fsdp_group)}"
+            )
+            if emb_size == 2 and dp_shard == 4:
+                assert dist.get_world_size(group=emb_fsdp_group) == 2
+
+        # build optimizer to register ep param groups when ep is enabled
+        optimizer = build_optimizer(
+            model,
+            lr=model_args.optimizer.lr,
+            weight_decay=model_args.optimizer.weight_decay,
+            fused=True,
+            optimizer_type=model_args.optimizer.type,
+            no_decay_modules=model_args.optimizer.no_decay_modules,
+            no_decay_params=model_args.optimizer.no_decay_params,
+        )
+        logger.info_rank0(
+            "[%s] group sizes - fsdp: %s, ep: %s, ep_fsdp: %s, emb: %s, emb_fsdp: %s",
+            label,
+            dist.get_world_size(group=fsdp_group) if fsdp_group is not None else None,
+            dist.get_world_size(group=ep_group) if ep_group is not None else None,
+            dist.get_world_size(group=ep_fsdp_group) if ep_fsdp_group is not None else None,
+            dist.get_world_size(group=emb_group) if emb_group is not None else None,
+            dist.get_world_size(group=emb_fsdp_group) if emb_fsdp_group is not None else None,
+        )
+        device_type = get_device_type()
+        tensor_device = torch.device(f"{device_type}:{get_device_id()}")
+        max_grad_norm = model_args.optimizer.max_grad_norm
+
+        def check_model_param_grad_one_by_one(target_model, expected_grad, ep_expected_grad, emb_expected_grad, msg):
+            for name, param in target_model.named_parameters():
+                grad = param.grad
+                if grad is None:
+                    continue
+                grad_local = grad.to_local() if isinstance(grad, DTensor) else grad
+                if name == "decoder.moe.experts":
+                    torch.testing.assert_close(
+                        grad_local,
+                        torch.full_like(grad_local, ep_expected_grad),
+                        atol=1e-6,
+                        rtol=1e-6,
+                        msg=f"[{label}] ({msg}) Gradient mismatch for {name}, shape {grad_local.shape}, expected {ep_expected_grad}",
+                    )
+                elif "embed_tokens" in name:
+                    torch.testing.assert_close(
+                        grad_local,
+                        torch.full_like(grad_local, emb_expected_grad),
+                        atol=1e-6,
+                        rtol=1e-6,
+                        msg=f"[{label}] ({msg}) Gradient mismatch for {name}, shape {grad_local.shape}, expected {emb_expected_grad}",
+                    )
+                else:
+                    torch.testing.assert_close(
+                        grad_local,
+                        torch.full_like(grad_local, expected_grad),
+                        atol=1e-6,
+                        rtol=1e-6,
+                        msg=f"[{label}] ({msg}) Gradient mismatch for {name}, shape {grad_local.shape}, expected {expected_grad}",
+                    )
+
+        for step in range(2):
+            inputs = torch.ones(1, 16, device=tensor_device)
+            loss = model(inputs)
+            loss.backward()
+
+            expected = 1.0
+            ep_expected = 1.0 / ps.extra_parallel_sizes["ep"]
+            emb_expected = 1.0 / ps.extra_parallel_sizes["emb"]
+            check_model_param_grad_one_by_one(
+                model,
+                expected_grad=expected,
+                ep_expected_grad=ep_expected,
+                emb_expected_grad=emb_expected,
+                msg=f"Before clipping step={step}",
+            )
+            if extra_parallel_only:
+                # Nothing has reduced the replicated params yet: give each rank a
+                # different grad whose mean is still 1, so the checks after clipping
+                # only pass if the clipper averaged them.
+                model.bias.grad.mul_(2.0 * dist.get_rank() / (world_size - 1))
+
+            expected_total_grad_norm = math.sqrt(
+                (64 * 16 + 64 * 16) * (1 / ps.extra_parallel_sizes["emb"] ** 2)
+                + 16
+                + 64 * 16
+                + (64 * 16 * 32) * (1 / ps.extra_parallel_sizes["ep"] ** 2)
+            )
+            total_grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
+
+            torch.testing.assert_close(
+                total_grad_norm_pre_clip.item(),
+                expected=expected_total_grad_norm,
+                atol=1e-6,
+                rtol=1e-6,
+                msg=f"[{label}] step={step} total grad norm mismatch",
+            )
+
+            clip_coeff = min(max_grad_norm / expected_total_grad_norm, 1.0)
+            ep_clip_coeff = 1.0 / ps.extra_parallel_sizes["ep"] * clip_coeff
+            emb_clip_coeff = 1.0 / ps.extra_parallel_sizes["emb"] * clip_coeff
+            check_model_param_grad_one_by_one(
+                model,
+                expected_grad=clip_coeff,
+                ep_expected_grad=ep_clip_coeff,
+                emb_expected_grad=emb_clip_coeff,
+                msg=f"After clipping step={step}",
+            )
+            model.zero_grad()
+
+        del optimizer, model
+        gc.collect()
+        dist.barrier()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--suite", choices=["fsdp2_4gpu", "hsdp_8gpu"], required=True)
+    parser.add_argument("--reverse-scenarios", action="store_true")
+    cli_args = parser.parse_args()
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    get_torch_device().set_device(f"{get_device_type()}:{local_rank}")
+    dist.init_process_group(backend=get_dist_comm_backend())
+    world_size = dist.get_world_size()
+
+    if cli_args.suite == "fsdp2_4gpu":
+        scenarios = list(_FSDP2_4GPU_SCENARIOS)
+    else:
+        scenarios = [
+            s for s in _HSDP_8GPU_SCENARIOS if not (_hsdp_extra_parallel_buggy_on_npu() and (s[1] > 1 or s[2] > 1))
+        ]
+
+    reverse = cli_args.reverse_scenarios or os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1"
+    if reverse:
+        scenarios = list(reversed(scenarios))
+
+    try:
+        for scenario in scenarios:
+            label, ep_size, emb_size, dp_replicate_size, cpu_offload, *extra = scenario
+            _run_clip_scenario(
+                label=label,
+                world_size=world_size,
+                ep_size=ep_size,
+                emb_size=emb_size,
+                dp_replicate_size=dp_replicate_size,
+                cpu_offload=cpu_offload,
+                extra_parallel_only=bool(extra[0]) if extra else False,
+            )
+        dist.barrier()
+    finally:
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            clear_parallel_state()
+
+
+def _run_clip_grad_norm_suite(suite: str, nproc: int, reverse_scenarios: bool = False) -> None:
     command = [
         "torchrun",
         "--nnodes=1",
-        f"--nproc_per_node={_CI_LAUNCH.nproc}",
+        f"--nproc_per_node={nproc}",
         "--standalone",
         "tests/utils/test_extra_parallel_clip_grad_norm.py",
-        "--model.config_path=test",
-        f"--model.accelerator.ep_size={ep_size}",
-        "--model.accelerator.ep_outside=False",
-        f"--model.accelerator.extra_parallel_sizes={emb_size}",
-        "--model.accelerator.extra_parallel_placement_innermost=False",
-        "--model.accelerator.extra_parallel_names=emb",
-        "--model.accelerator.fsdp_config.fsdp_mode=fsdp2",
-        "--model.accelerator.init_device=meta",
-        "--train.checkpoint.output_dir='debug'",
+        f"--suite={suite}",
     ]
-    # HSDP: split the dp dim into (dp_replicate, dp_shard). dp_shard is inferred
-    # as dp_size // dp_replicate_size by the argument resolver. The expected
-    # total grad norm is identical to the pure-FSDP case: the clip reduces over
-    # the shard group only, so replicating over dp_replicate must NOT inflate it.
-    if dp_replicate_size is not None:
-        command.append(f"--model.accelerator.dp_replicate_size={dp_replicate_size}")
-    if cpu_offload:
-        command.append("--model.accelerator.fsdp_config.offload=True")
-    if extra_parallel_only:
-        command.append("--model.accelerator.fsdp_config.extra_parallel_only=True")
+    if reverse_scenarios:
+        command.append("--reverse-scenarios")
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 
 
-@pytest.mark.launch_plan(provider=_CI_LAUNCH)
-@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
-def test_clip_grad_norm_fsdp2_no_extra_parallel(cpu_offload: bool):
-    _run_clip_grad_norm_fsdp2_test(ep_size=1, emb_size=1, cpu_offload=cpu_offload)
-
-
-@pytest.mark.launch_plan(provider=_CI_LAUNCH)
-@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
-def test_clip_grad_norm_fsdp2_ep4(cpu_offload: bool):
-    _run_clip_grad_norm_fsdp2_test(ep_size=4, emb_size=1, cpu_offload=cpu_offload)
-
-
-@pytest.mark.launch_plan(provider=_CI_LAUNCH)
-@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
-def test_clip_grad_norm_fsdp2_ep8(cpu_offload: bool):
-    _run_clip_grad_norm_fsdp2_test(ep_size=8, emb_size=1, cpu_offload=cpu_offload)
-
-
-@pytest.mark.launch_plan(provider=_CI_LAUNCH)
-@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
-def test_clip_grad_norm_fsdp2_emb8(cpu_offload: bool):
-    _run_clip_grad_norm_fsdp2_test(ep_size=1, emb_size=8, cpu_offload=cpu_offload)
-
-
-@pytest.mark.launch_plan(provider=_CI_LAUNCH)
-@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
-def test_clip_grad_norm_fsdp2_ep2_emb4(cpu_offload: bool):
-    _run_clip_grad_norm_fsdp2_test(ep_size=2, emb_size=4, cpu_offload=cpu_offload)
-
-
-def test_clip_grad_norm_extra_parallel_only_emb8():
-    """Without the FSDP2 wrap, grads and norm must match the wrapped emb8 case.
-
-    The table grads are divided by the world size as FSDP would, the replicated
-    params are averaged, and the replicated norm is counted once, not per rank.
-    """
-    _run_clip_grad_norm_fsdp2_test(ep_size=1, emb_size=8, cpu_offload=False, extra_parallel_only=True)
+@pytest.mark.launch_plan(provider=_CI_LAUNCH_4)
+def test_clip_grad_norm_fsdp2_4gpu():
+    """Fused 4-rank FSDP2 worker covering no-extra, EP2, EP4, emb4, and EP2+emb4 across no_offload/cpu_offload."""
+    _run_clip_grad_norm_suite("fsdp2_4gpu", nproc=_CI_LAUNCH_4.nproc)
 
 
 # ---------------------------------------------------------------------------
@@ -388,40 +418,10 @@ def test_clip_grad_norm_extra_parallel_only_emb8():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.launch_plan(provider=_CI_LAUNCH)
-@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
-def test_clip_grad_norm_hsdp_no_extra_parallel(cpu_offload: bool):
-    _run_clip_grad_norm_fsdp2_test(ep_size=1, emb_size=1, cpu_offload=cpu_offload, dp_replicate_size=2)
-
-
-@pytest.mark.launch_plan(provider=_CI_LAUNCH)
-@pytest.mark.skipif(
-    _torch_npu_version() and Version(_torch_npu_version()) < Version("2.9.0"),
-    reason="torch_npu < 2.9.0 grad_norm with HSDP is buggy",
-)
-@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
-def test_clip_grad_norm_hsdp_ep4(cpu_offload: bool):
-    _run_clip_grad_norm_fsdp2_test(ep_size=4, emb_size=1, cpu_offload=cpu_offload, dp_replicate_size=2)
-
-
-@pytest.mark.launch_plan(provider=_CI_LAUNCH)
-@pytest.mark.skipif(
-    _torch_npu_version() and Version(_torch_npu_version()) < Version("2.9.0"),
-    reason="torch_npu < 2.9.0 grad_norm with HSDP is buggy",
-)
-@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
-def test_clip_grad_norm_hsdp_emb4(cpu_offload: bool):
-    _run_clip_grad_norm_fsdp2_test(ep_size=1, emb_size=4, cpu_offload=cpu_offload, dp_replicate_size=2)
-
-
-@pytest.mark.launch_plan(provider=_CI_LAUNCH)
-@pytest.mark.skipif(
-    _torch_npu_version() and Version(_torch_npu_version()) < Version("2.9.0"),
-    reason="torch_npu < 2.9.0 grad_norm with HSDP is buggy",
-)
-@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
-def test_clip_grad_norm_hsdp_ep2_emb4(cpu_offload: bool):
-    _run_clip_grad_norm_fsdp2_test(ep_size=2, emb_size=4, cpu_offload=cpu_offload, dp_replicate_size=2)
+@pytest.mark.launch_plan(provider=_CI_LAUNCH_8)
+def test_clip_grad_norm_hsdp_8gpu():
+    """Fused 8-rank HSDP worker covering (2, 4) no-extra, EP4, emb4, and EP2+emb4 across no_offload/cpu_offload."""
+    _run_clip_grad_norm_suite("hsdp_8gpu", nproc=_CI_LAUNCH_8.nproc)
 
 
 # ===========================================================================
@@ -492,6 +492,7 @@ def _param_with_grad(grad: torch.Tensor) -> nn.Parameter:
     return p
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("extra_names", [["ep"], ["ep", "emb"]])
 def test_inf_norm_with_replicated_bucket_does_not_crash(extra_names):
     """``norm_type=inf`` with both EP and EP-replicated buckets populated.
@@ -541,6 +542,7 @@ def test_inf_norm_with_replicated_bucket_does_not_crash(extra_names):
     )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_inf_norm_single_axis_no_replicated_still_works():
     """Sanity: the legacy K1+K2==1 happy path still passes after the fix.
 
@@ -566,6 +568,7 @@ def test_inf_norm_single_axis_no_replicated_still_works():
     assert total.item() == pytest.approx(6.0, abs=1e-6)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_persistent_extra_parallel_norm_reduces_once_over_flat_mesh():
     """A persistent 2D shard owns unique values and needs one flat-mesh reduction."""
     p_non = _param_with_grad(torch.tensor([12.0]))
@@ -603,6 +606,7 @@ def test_persistent_extra_parallel_norm_reduces_once_over_flat_mesh():
     assert persistent_calls[0][1] == [("ple_flat", "ple_flat_group")]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_persistent_ple_and_ep_norm_use_independent_reduction_groups():
     """PLE uses one flat reduction while ordinary EP uses EP-FSDP then EP."""
 
@@ -659,6 +663,7 @@ def test_persistent_ple_and_ep_norm_use_independent_reduction_groups():
     assert ep_calls[0][1] == [("ep_fsdp", "ep_fsdp_group"), ("ep", "ep_group")]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_omni_module_clip_grad_norm_extra_parallel_only_averages_replicated_grads_and_skips_fsdp_sum():
     """``veomni_omni_module_clip_grad_norm`` averages replicated grads on ``fsdp_group``
     and skips the ``fsdp`` norm reduction on ``non_extra_parallel`` when
