@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import math
 from contextlib import nullcontext
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Sequence
 
 import torch
 from torch import Tensor
@@ -110,7 +110,7 @@ class SwapAdamW(Optimizer):
         self,
         params,
         lr: float = 1e-3,
-        betas: Tuple[float, float] = (0.9, 0.95),
+        betas: tuple[float, float] = (0.9, 0.95),
         eps: float = 1e-8,
         weight_decay: float = 1e-2,
         amsgrad: bool = False,
@@ -167,23 +167,23 @@ class SwapAdamW(Optimizer):
         # Two copy streams so H2D and D2H overlap instead of serializing on one stream.
         self._use_streams = self._device_type != "cpu"
         if self._use_streams:
-            self._in_stream: Optional[Any] = create_stream()
-            self._out_stream: Optional[Any] = create_stream()
+            self._in_stream: Any | None = create_stream()
+            self._out_stream: Any | None = create_stream()
         else:
             self._in_stream = None
             self._out_stream = None
 
-        self._state_keys: Tuple[str, ...] = ("exp_avg", "exp_avg_sq") + (("max_exp_avg_sq",) if amsgrad else ())
+        self._state_keys: tuple[str, ...] = ("exp_avg", "exp_avg_sq") + (("max_exp_avg_sq",) if amsgrad else ())
         # ``hasattr`` is always True on modern torch (the op schema is registered
         # on every build), so gate on the backend explicitly: torch ships CUDA and
         # CPU kernels and Ascend NPU registers its own; other backends (e.g. MLU)
         # take the elementwise fallback.
         self._use_fused = self._device_type in FUSED_ADAMW_DEVICE_TYPES and hasattr(torch, "_fused_adamw_")
-        self._host_states: Dict[Tensor, Dict[str, Tensor]] = {}
-        self._device_states: Dict[Tensor, Dict[str, Tensor]] = {}
-        self._swap_in_events: Dict[Tensor, Any] = {}
+        self._host_states: dict[Tensor, dict[str, Tensor]] = {}
+        self._device_states: dict[Tensor, dict[str, Tensor]] = {}
+        self._swap_in_events: dict[Tensor, Any] = {}
         # Storages with an in-flight D2H on ``_out_stream``; freed only after the stream drains.
-        self._pending_free: List[Tensor] = []
+        self._pending_free: list[Tensor] = []
 
         # ``Optimizer.__init__`` routes every group through ``add_param_group``, which
         # builds the state, so the attributes above must exist before it runs.
@@ -237,8 +237,8 @@ class SwapAdamW(Optimizer):
                 if not p.requires_grad or p in self._host_states:
                     continue
 
-                host_state: Dict[str, Tensor] = {}
-                device_state: Dict[str, Tensor] = {}
+                host_state: dict[str, Tensor] = {}
+                device_state: dict[str, Tensor] = {}
                 for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
                     if key == "max_exp_avg_sq" and not amsgrad:
                         continue
@@ -259,8 +259,8 @@ class SwapAdamW(Optimizer):
 
         # Precompute per-step invariants: the param-to-group mapping and
         # per-param state sizes never change during training.
-        self._group_by_param: Dict[Tensor, Dict[str, Any]] = {}
-        self._param_bytes: Dict[Tensor, int] = {}
+        self._group_by_param: dict[Tensor, dict[str, Any]] = {}
+        self._param_bytes: dict[Tensor, int] = {}
         for group in self.param_groups:
             for p in group["params"]:
                 self._group_by_param[p] = group
@@ -497,7 +497,7 @@ class SwapAdamW(Optimizer):
         self.state[p]["step"] = step
         return step
 
-    def _update_param(self, p: Tensor, group: Dict[str, Any]) -> None:
+    def _update_param(self, p: Tensor, group: dict[str, Any]) -> None:
         local_p = _to_local(p)
         grad = _to_local(p.grad)
         if group.get("maximize", False):
@@ -530,10 +530,31 @@ class SwapAdamW(Optimizer):
 
         local_p.addcdiv_(exp_avg, denom, value=-lr / bias_correction1)
 
-    def _update_group_fused(self, params: Sequence[Tensor], group: Dict[str, Any]) -> None:
-        """Update a chunk of parameters that share one param group in a single fused call."""
+    def _update_group_fused(self, params: Sequence[Tensor], group: dict[str, Any]) -> None:
+        """Update a chunk with one fused call per local device and dtype.
+
+        torch's own fused path groups params/grads/moments/step by
+        ``(device, dtype)`` and issues one kernel call per group
+        (``torch/optim/adam.py::_fused_adam``); a chunk here can span dtypes,
+        so split it the same way.
+        """
         if not params:
             return
+        buckets: dict[tuple[torch.device, torch.dtype], list[Tensor]] = {}
+        for p in params:
+            local_p, local_g = _to_local(p), _to_local(p.grad)
+            if local_g.device != local_p.device or local_g.dtype != local_p.dtype:
+                raise RuntimeError(
+                    "SwapAdamW fused updates require each gradient to match its "
+                    f"parameter's device and dtype; got a {local_g.dtype} grad on "
+                    f"{local_g.device} for a {local_p.dtype} param on {local_p.device}."
+                )
+            buckets.setdefault((local_p.device, local_p.dtype), []).append(p)
+        for bucket in buckets.values():
+            self._fused_adamw_bucket(bucket, group)
+
+    def _fused_adamw_bucket(self, params: Sequence[Tensor], group: dict[str, Any]) -> None:
+        """Run one ``torch._fused_adamw_`` call over a same-device, same-dtype bucket."""
         amsgrad = bool(group["amsgrad"])
         beta1, beta2 = group["betas"]
         device = _to_local(params[0]).device
@@ -559,7 +580,7 @@ class SwapAdamW(Optimizer):
             maximize=group.get("maximize", False),
         )
 
-    def _update_chunk(self, params: Sequence[Tensor], group: Dict[str, Any]) -> None:
+    def _update_chunk(self, params: Sequence[Tensor], group: dict[str, Any]) -> None:
         """Update one chunk of parameters that share ``group``."""
         if self._use_fused:
             self._update_group_fused(params, group)
@@ -576,7 +597,7 @@ class SwapAdamW(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        active: List[Tensor] = []
+        active: list[Tensor] = []
         for param in self._group_by_param:
             if not param.requires_grad or param.grad is None:
                 continue

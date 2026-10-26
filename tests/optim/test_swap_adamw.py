@@ -103,6 +103,50 @@ def test_fused_matches_elementwise_on_cpu(cpu_mesh):
         )
 
 
+def test_mixed_dtype_group_fused_matches_torch(cpu_mesh, monkeypatch):
+    # One param group mixing fp32 and bf16 params must split into per-dtype
+    # fused calls (the torch._fused_adam grouping contract) and match stock
+    # elementwise AdamW step by step.
+    torch.manual_seed(12)
+    init_f, init_b = torch.randn(6, 4), torch.randn(5, 4)
+
+    ref_f, ref_b = nn.Parameter(init_f.clone()), nn.Parameter(init_b.clone().to(torch.bfloat16))
+    par_f = _swap_param(init_f, cpu_mesh)
+    par_b = nn.Parameter(_swap_param(init_b, cpu_mesh).to(torch.bfloat16))
+
+    ref_opt = torch.optim.AdamW([ref_f, ref_b], lr=1e-2, betas=(0.9, 0.95), foreach=False)
+    swap_opt = SwapAdamW([par_f, par_b], lr=1e-2, betas=(0.9, 0.95), pin_memory=False)
+    swap_opt._use_fused = True  # exercise the (device, dtype) bucketing in the fused path
+
+    # Pin the bucketing itself: torch's fused kernel also groups by dtype
+    # internally, so a mixed call would succeed and the parity checks alone
+    # would not catch a regression that drops the split.
+    fused_dtypes = []
+    real_fused = torch._fused_adamw_
+
+    def recording_fused(*args, **kwargs):
+        fused_dtypes.append({t.dtype for t in args[0]})
+        return real_fused(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "_fused_adamw_", recording_fused)
+
+    for _ in range(3):
+        grad_f, grad_b = torch.randn(6, 4), torch.randn(5, 4)
+        ref_f.grad, ref_b.grad = grad_f.clone(), grad_b.clone().to(torch.bfloat16)
+        par_f.grad = _partition(grad_f.clone(), cpu_mesh)
+        par_b.grad = _partition(grad_b.clone(), cpu_mesh).to(torch.bfloat16)
+        ref_opt.step()
+        swap_opt.step()
+
+    assert len(fused_dtypes) == 6, fused_dtypes
+    assert all(len(bucket) == 1 for bucket in fused_dtypes), fused_dtypes
+
+    torch.testing.assert_close(par_f.to_local(), ref_f.detach(), atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(par_b.to_local(), ref_b.detach(), atol=1e-2, rtol=1e-2)
+    for key in ("exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(swap_opt._host_states[par_f][key], ref_opt.state[ref_f][key], atol=1e-6, rtol=1e-6)
+
+
 def test_pinned_allocation_degrades_to_pageable(cpu_mesh, monkeypatch):
     # Page-locked host memory is finite; exhaustion at build must degrade with
     # a warning instead of killing the run (the async_offload fallback pattern).

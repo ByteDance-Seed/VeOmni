@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Sequence
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -30,8 +30,8 @@ def rewrap_dtensor_local(
     *,
     mesh: DeviceMesh,
     placements: Sequence,
-    shape: Optional[torch.Size] = None,
-    stride: Optional[tuple] = None,
+    shape: torch.Size | None = None,
+    stride: tuple | None = None,
 ) -> DTensor:
     """Wrap ``local`` as a DTensor on ``mesh`` without moving it to the device.
 
