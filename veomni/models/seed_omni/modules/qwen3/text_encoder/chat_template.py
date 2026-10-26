@@ -25,6 +25,14 @@ class Qwen3ChatMarkers:
     assistant_prefix: str = "<|im_start|>assistant\n"
 
 
+@dataclass(frozen=True)
+class Qwen3VLChatMarkers(Qwen3ChatMarkers):
+    """Wire-format ChatML markers with vision start/end delimiters."""
+
+    vision_start_token: str = "<|vision_start|>"
+    vision_end_token: str = "<|vision_end|>"
+
+
 class Qwen3ChatTemplate(TextEncoderChatTemplate):
     chat_markers: Qwen3ChatMarkers
 
@@ -80,4 +88,56 @@ class Qwen3ChatTemplate(TextEncoderChatTemplate):
         """Append the assistant generation prefix after a templated (turn-closed) prompt."""
         out = list(sample)
         out.append(self._build_conversation_item("text", self.chat_markers.assistant_prefix, "assistant", loss_mask=0))
+        return out
+
+
+class Qwen3VLChatTemplate(Qwen3ChatTemplate):
+    """Image/video-aware Qwen3 ChatML template (wraps media items in ``<|vision_start|> … <|vision_end|>``)."""
+
+    chat_markers: Qwen3VLChatMarkers
+
+    def __init__(self, tokenizer: Any):
+        super().__init__(tokenizer)
+        self.chat_markers = Qwen3VLChatMarkers()
+
+    def apply_chat_template(self, sample: list[ConversationItem]) -> list[ConversationItem]:
+        """Apply Qwen3-VL ChatML to a raw conversation (text + image + video)."""
+        markers = self.chat_markers
+        out: list[ConversationItem] = []
+        dummy_parts: list[ConversationItem] = []
+        prev_role: str | None = None
+
+        def close_turn(role: str) -> None:
+            out.append(
+                self._build_conversation_item(
+                    "text", markers.im_end_token + "\n", role, loss_mask=int(role == "assistant")
+                )
+            )
+
+        for item in sample:
+            role = item.role
+            if item.is_dummy:
+                dummy_parts.append(item)
+                continue
+
+            if role != prev_role:
+                if prev_role is not None:
+                    close_turn(prev_role)
+                out.append(
+                    self._build_conversation_item("text", markers.im_start_token + role + "\n", role, loss_mask=0)
+                )
+                prev_role = role
+
+            if item.type == "text":
+                out.append(self._build_conversation_item("text", str(item.value), role))
+            elif item.type in ("image", "video"):
+                out.append(self._build_conversation_item("text", markers.vision_start_token, role, loss_mask=0))
+                out.append(item)
+                out.append(self._build_conversation_item("text", markers.vision_end_token, role, loss_mask=0))
+            else:
+                raise ValueError(f"Qwen3-VL text encoder only supports text/image/video items, got {item.type!r}")
+
+        if prev_role is not None:
+            close_turn(prev_role)
+        out.extend(dummy_parts)
         return out
