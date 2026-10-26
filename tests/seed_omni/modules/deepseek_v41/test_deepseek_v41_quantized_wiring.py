@@ -302,6 +302,13 @@ class TestRoutedExperts:
         with pytest.raises(ValueError, match="different scale layout"):
             expert_quant_dtype(config)
 
+    def test_apply_gate_clamps_with_swiglu_limit_and_applies_act_fn(self):
+        config = make_config(swiglu_limit=5.0)
+        experts = DeepseekV41QuantizedExperts(config, quant_dtype=expert_quant_dtype(config))
+        gate_up = torch.tensor([[10.0, -10.0, 20.0, -20.0]], dtype=torch.float32)
+        expected = torch.nn.functional.silu(torch.tensor([[5.0, -10.0]])) * torch.tensor([[5.0, -5.0]])
+        torch.testing.assert_close(experts._apply_gate(gate_up), expected)
+
     @requires_sm90
     def test_the_routed_forward_matches_its_dequantized_slabs(self):
         """Routing, gating and weighting must survive the slabs going to 4 bits.

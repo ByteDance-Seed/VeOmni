@@ -472,6 +472,13 @@ class DeepseekV41QuantizedExperts(DeepseekV4Experts):
             requires_grad=False,
         )
 
+    def _apply_gate(self, gate_up: torch.Tensor) -> torch.Tensor:
+        """Apply the swiglu_limit clamp + act_fn * up on a packed ``[*, 2*I]`` GEMM output."""
+        gate, up = gate_up.chunk(2, dim=-1)
+        gate = gate.clamp(max=self.limit)
+        up = up.clamp(min=-self.limit, max=self.limit)
+        return self.act_fn(gate) * up
+
     def forward(
         self,
         hidden_states: torch.Tensor,
