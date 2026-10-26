@@ -33,7 +33,7 @@ import pytest
 import torch
 
 from veomni.models.seed_omni.modules.deepseek_v41.llm.decode import dense_sparse_attn
-from veomni.utils.device import IS_CUDA_AVAILABLE
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 def _kernel_available() -> bool:
@@ -52,7 +52,8 @@ requires_kernel = pytest.mark.skipif(
 )
 
 
-def _inputs(batch, seqlen, heads, dim, kv_len, topk, *, seed=0, device="cuda"):
+def _inputs(batch, seqlen, heads, dim, kv_len, topk, *, seed=0, device=None):
+    device = device or get_device_type()
     torch.manual_seed(seed)
     q = torch.randn(batch, seqlen, heads, dim, device=device, dtype=torch.bfloat16)
     kv = torch.randn(batch, kv_len, dim, device=device, dtype=torch.bfloat16)
@@ -99,8 +100,9 @@ def test_sink_is_not_silently_dropped():
 
     # A large sink takes most of the mass; a tiny one takes almost none. If the
     # sink were ignored the two would agree.
-    big = torch.full((heads,), 8.0, device="cuda", dtype=torch.float32)
-    small = torch.full((heads,), -8.0, device="cuda", dtype=torch.float32)
+    device = get_device_type()
+    big = torch.full((heads,), 8.0, device=device, dtype=torch.float32)
+    small = torch.full((heads,), -8.0, device=device, dtype=torch.float32)
 
     for sinks in (big, small):
         expected = sparse_attn_tilelang(q, kv, sinks, idxs, scale)
@@ -133,7 +135,7 @@ def test_a_fully_masked_query_falls_back_to_the_sink():
     """The first token of a sample sees no compressed group and no window past."""
     heads, dim, kv_len, topk = 4, 512, 32, 64
     q, kv, sinks, _ = _inputs(1, 3, heads, dim, kv_len, topk)
-    idxs = torch.full((1, 3, topk), -1, device="cuda", dtype=torch.int32)
+    idxs = torch.full((1, 3, topk), -1, device=get_device_type(), dtype=torch.int32)
 
     out, lse = dense_sparse_attn(q, kv, sinks, idxs, dim**-0.5, return_lse=True)
 

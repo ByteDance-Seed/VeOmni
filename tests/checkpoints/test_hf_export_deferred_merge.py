@@ -40,7 +40,7 @@ from torch.distributed.tensor import Replicate, Shard
 
 import veomni.utils.save_safetensor_utils as save_utils
 from veomni.checkpoint.layout import HF_PENDING_MERGE_FILENAME, HF_SHARDED_DIRNAME
-from veomni.models.module_utils import _resolve_safetensors_shards, _resolve_state_dict_iterators
+from veomni.models.checkpoint.weights import _resolve_safetensors_shards, _resolve_state_dict_iterators
 
 
 WORLD_SIZE = 4

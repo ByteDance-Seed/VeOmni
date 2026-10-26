@@ -172,7 +172,12 @@ class TrainingMixin(BaseTrainingMixin):
         materializes the supervised rows' logits.
         """
         num_supervised_tokens = (labels != IGNORE_INDEX).sum()
-        if not self.config.tie_word_embeddings and self.lm_head is not None and self.lm_head.bias is None:
+        if (
+            num_supervised_tokens > 0
+            and not self.config.tie_word_embeddings
+            and self.lm_head is not None
+            and self.lm_head.bias is None
+        ):
             loss, _, _ = ForCausalLMLoss(
                 logits=None,
                 labels=None,
@@ -190,6 +195,10 @@ class TrainingMixin(BaseTrainingMixin):
         if num_supervised_tokens > 0:
             supervised = labels != IGNORE_INDEX
             hidden_states, markov_bias, labels = hidden_states[supervised], markov_bias[supervised], labels[supervised]
+        else:
+            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))[:1]
+            markov_bias = markov_bias.reshape(-1, markov_bias.size(-1))[:1]
+            labels = labels.reshape(-1)[:1]
         loss, _, _ = ForCausalLMLoss(
             logits=self._project(hidden_states) + markov_bias,
             labels=None,

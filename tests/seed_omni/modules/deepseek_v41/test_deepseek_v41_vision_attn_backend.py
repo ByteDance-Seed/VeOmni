@@ -38,7 +38,7 @@ import textwrap
 import pytest
 import torch
 
-from veomni.utils.device import IS_CUDA_AVAILABLE
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 from veomni.utils.import_utils import is_flash_attn_2_available
 
 
@@ -97,8 +97,9 @@ def test_sdpa_fallback_matches_flash_attn_varlen(lengths):
     torch.manual_seed(0)
     n_heads, head_dim = 8, 64
     total = sum(lengths)
-    cu_seqlens = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], device="cuda", dtype=torch.int32)
-    q, k, v = (torch.randn(total, n_heads, head_dim, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+    device = get_device_type()
+    cu_seqlens = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], device=device, dtype=torch.int32)
+    q, k, v = (torch.randn(total, n_heads, head_dim, device=device, dtype=torch.bfloat16) for _ in range(3))
 
     expected = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max(lengths), max(lengths), causal=False)
     actual = _sdpa_varlen_attn(q, k, v, cu_seqlens)

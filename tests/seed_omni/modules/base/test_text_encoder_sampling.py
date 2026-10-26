@@ -26,6 +26,7 @@ import torch
 from veomni.arguments.omni_arguments_types import OmniInferArguments
 from veomni.distributed.moe.moe_utils import unpermute
 from veomni.models.seed_omni.modules.text_encoder.modeling import InferenceMixin
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 VOCAB = 32
@@ -139,7 +140,7 @@ def test_inference_full_determinism_is_opt_in():
     assert OmniInferArguments().enable_full_determinism is False
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="scatter_add_ only races on CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="scatter_add_ only races on CUDA")
 def test_combine_is_bitwise_reproducible_under_full_determinism():
     was_enabled = torch.are_deterministic_algorithms_enabled()
     was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
@@ -147,7 +148,7 @@ def test_combine_is_bitwise_reproducible_under_full_determinism():
     try:
         # topk > 1 is what puts repeated indices in the mapping; a hidden size in
         # the thousands is what gives the atomics enough contention to diverge.
-        operands = _combine_operands(num_tokens=256, num_experts=8, topk=6, hidden=2048, device="cuda")
+        operands = _combine_operands(num_tokens=256, num_experts=8, topk=6, hidden=2048, device=get_device_type())
         first = unpermute(*operands)
         for _ in range(4):
             assert torch.equal(unpermute(*operands), first)

@@ -11,9 +11,9 @@ not inherit it, so `curl https://huggingface.co` and `lark-cli` fail while the
 same commands succeed in the user's terminal.
 
 ```bash
-P='http://sys-proxy-rd-relay.byted.org:8118'
+P='<corporate-http-proxy-url>'
 export https_proxy="$P" http_proxy="$P" HTTPS_PROXY="$P" HTTP_PROXY="$P"
-export no_proxy='localhost,127.0.0.1,.byted.org' NO_PROXY='localhost,127.0.0.1,.byted.org'
+export no_proxy='localhost,127.0.0.1' NO_PROXY='localhost,127.0.0.1'
 ```
 
 DNS resolves without the proxy (NAT64 `64:ff9b::` addresses), so name lookup

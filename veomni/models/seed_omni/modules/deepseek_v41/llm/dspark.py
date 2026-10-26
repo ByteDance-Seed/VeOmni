@@ -30,6 +30,7 @@ import torch.nn as nn
 from transformers.modeling_layers import GradientCheckpointingLayer
 
 from ......ops.kernels.dsa.sparse_mqa_target import sparse_attn_tilelang
+from ......utils.device import get_gpu_compute_capability
 from .attention import (
     DeepseekV41Attention,
     DeepseekV41AttentionCache,
@@ -344,8 +345,9 @@ class DeepseekV41DSparkBlock(GradientCheckpointingLayer):
 
         # Same kernel as the backbone's training attention: the dense gather keeps
         # fp32 ``[B, S, topk, D]`` copies for backward and runs micro batch 4 out
-        # of memory on 256 x H20. CPU has no TileLang, and both compute the same.
-        if query.is_cuda:
+        # of memory on 256 x H20. CPU and pre-SM90 GPUs have no TileLang, and both
+        # compute the same.
+        if query.is_cuda and query.dtype == torch.bfloat16 and get_gpu_compute_capability() >= 90:
             output = sparse_attn_tilelang(
                 query.contiguous(),
                 pool.contiguous(),
