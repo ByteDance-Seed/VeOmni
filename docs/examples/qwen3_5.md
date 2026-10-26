@@ -170,13 +170,18 @@ arch22 or arch35 kernel path from the SoC, and this adapter uses the BF16 K=V=12
 chunk_size=64 contract both paths share. arch35 (`Ascend910_95` / `Ascend950`) runs end-to-end:
 the vendored `causal_conv1d` no longer refuses it (see above).
 
-The prebuilt NPU images on [quay.io](https://quay.io/repository/ascend/veomni?tab=tags) already
-bundle `fla_npu`:
+The following prebuilt NPU images on [quay.io](https://quay.io/repository/ascend/veomni?tab=tags)
+bundle the legacy `fla_npu` build from `c2e3d83f`, which does not provide the GDN API required
+by this adapter:
 
 - A2: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A2-ubuntu22.04-py3.11-veomni-latest`
 - A3: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A3-ubuntu22.04-py3.11-veomni-latest`
 
-To build on a bare host instead, build and install the `v26.10.0` wheel from the
+Before selecting the `fla_npu` backend in either image, replace its legacy package using the
+`v26.10.0` wheel installation steps below. Follow the same steps on a bare host or an A5
+system, selecting the matching SoC target. A compatible A5 image is not listed here.
+
+Build and install the `v26.10.0` wheel from the
 [`flash-linear-attention-npu`](https://github.com/flashserve/flash-linear-attention-npu) sources.
 The library does not install `torch`, `torch_npu` or `triton-ascend` for you; those must match
 your CANN and Python versions, and `FLA_NPU_SOC` must match the chip — A2 → `ascend910b`,
@@ -199,7 +204,7 @@ python -m pip install --force-reinstall --no-cache-dir --no-deps dist/*.whl
 
 # Verify the wheel registered its AscendC ops.
 python -c "import fla_npu; print('ok')"
-python -c "from fla_npu.ops import ascendc; print(hasattr(ascendc, 'chunk_fwd_o'))"
+python -c "from fla_npu.ops import ascendc; assert all(callable(getattr(ascendc, n, None)) for n in ('chunk_gated_delta_rule_fwd', 'chunk_gated_delta_rule_bwd')), 'Missing required fla_npu GDN API'"
 python scripts/check_packaged_wheel_api.py
 ```
 

@@ -331,6 +331,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         USE_FINAL_STATE_GRADIENT: tl.constexpr,
         IS_VARLEN: tl.constexpr,
 ):
+    """Accumulate state and value gradients using 64-wide key blocks."""
     T_all = T
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -534,6 +535,7 @@ def chunk_gated_delta_rule_bwd_dhu(
     chunk_indices: torch.LongTensor | None = None,
     use_exp2: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return chunk-state, optional initial-state, and updated value gradients."""
     B, T, H, K, V = *q.shape, do.shape[-1]
     # N: the actual number of sequences in the batch with either equal or variable lengths
     BT = 64
@@ -551,7 +553,7 @@ def chunk_gated_delta_rule_bwd_dhu(
     # the update through the decay multiplies below.  Finite garbage is annihilated by
     # the zero factors (results stay bit-identical), but NaN survives ``0 * NaN`` and
     # poisons the loop-carried accumulator -> grad_norm = NaN with profile.enable=true.
-    # See Qwen3.5-GDN_反传NaN_P3已修_20261022.md.
+    # Keep both buffers finite before launching the backward kernel.
     dh = q.new_zeros(B, NT, H, K, V)
     dh0 = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
     dv2 = torch.zeros_like(dv)

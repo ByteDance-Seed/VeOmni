@@ -416,6 +416,7 @@ def chunk_bwd_dqkwg(
     chunk_size: int = 64,
     scale: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute query, key, auxiliary-weight, and gate gradients for each chunk."""
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None

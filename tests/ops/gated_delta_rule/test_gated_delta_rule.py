@@ -717,35 +717,46 @@ def test_chunk_gated_delta_rule_fla_matches_eager(device):
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="chunk_gated_delta_rule npu needs torch_npu")
-@pytest.mark.parametrize("impl", ("triton", "fla_npu"))
-def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl):
+@pytest.mark.parametrize(
+    ("impl", "seq", "dim", "repeats"),
+    (
+        pytest.param("triton", 64, 64, 1, id="triton-small-head"),
+        pytest.param("triton", 77, 128, 3, id="triton-repeated-partial-chunk"),
+        pytest.param("fla_npu", 64, 128, 1, id="fla-npu-supported-head"),
+    ),
+)
+def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl, seq, dim, repeats):
+    """Cover small heads, repeated partial-chunk backwards, and the AscendC contract."""
     _require_npu_gdr_dependencies(ascendc=impl == "fla_npu")
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
     other = resolve_op("chunk_gated_delta_rule", "standard", impl).wrapper
     torch.manual_seed(19)
-    batch, seq, heads, dim = 1, 64, 4, 64
+    batch, heads = 1, 4
     q = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
     k = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
     v = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
     g = -torch.rand(batch, seq, heads, device="npu", dtype=torch.float32) * 0.5
     beta = torch.rand(batch, seq, heads, device="npu", dtype=torch.bfloat16)
 
-    q_e, k_e, v_e, g_e, b_e = make_grad_leaves(q, k, v, g, beta)
-    q_o, k_o, v_o, g_o, b_o = make_grad_leaves(q, k, v, g, beta)
-    out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, use_qk_l2norm_in_kernel=True)
-    out_o, _ = other(q_o, k_o, v_o, g_o, b_o, use_qk_l2norm_in_kernel=True)
-    torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
+    grad_output = torch.randn_like(v)
+    for _ in range(repeats):
+        q_e, k_e, v_e, g_e, b_e = make_grad_leaves(q, k, v, g, beta)
+        q_o, k_o, v_o, g_o, b_o = make_grad_leaves(q, k, v, g, beta)
+        out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, use_qk_l2norm_in_kernel=True)
+        out_o, _ = other(q_o, k_o, v_o, g_o, b_o, use_qk_l2norm_in_kernel=True)
+        assert torch.isfinite(out_o).all()
+        torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
 
-    grad_output = torch.randn_like(out_e)
-    out_e.backward(grad_output)
-    out_o.backward(grad_output)
-    for actual, expected in zip((q_o, k_o, v_o, g_o, b_o), (q_e, k_e, v_e, g_e, b_e), strict=True):
-        torch.testing.assert_close(
-            actual.grad.float(),
-            expected.grad.float(),
-            atol=GDN_CHUNK_GRAD_ATOL,
-            rtol=GDN_CHUNK_GRAD_RTOL,
-        )
+        out_e.backward(grad_output)
+        out_o.backward(grad_output)
+        for actual, expected in zip((q_o, k_o, v_o, g_o, b_o), (q_e, k_e, v_e, g_e, b_e), strict=True):
+            assert torch.isfinite(actual.grad).all()
+            torch.testing.assert_close(
+                actual.grad.float(),
+                expected.grad.float(),
+                atol=GDN_CHUNK_GRAD_ATOL,
+                rtol=GDN_CHUNK_GRAD_RTOL,
+            )
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="chunk_gated_delta_rule npu needs torch_npu")
@@ -957,6 +968,7 @@ def test_fla_npu_rejects_final_state_when_inputs_require_grad(
 
 
 def test_fla_npu_missing_fla_npu_raises_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Report a missing optional package through the current AscendC API loader."""
     import builtins
     import sys
 
@@ -970,10 +982,44 @@ def test_fla_npu_missing_fla_npu_raises_actionable(monkeypatch: pytest.MonkeyPat
         return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", _import)
-    sys.modules.pop("fla_npu", None)
+    monkeypatch.delitem(sys.modules, "fla_npu", raising=False)
 
     with pytest.raises(RuntimeError, match="fla_npu"):
-        m._ensure_fla_npu_registered()
+        m._get_gdn_ops()
+
+
+@pytest.mark.parametrize(
+    ("q_dim", "k_dim", "v_dim", "chunk_size"),
+    (
+        pytest.param(64, 128, 128, 64, id="unsupported-query-dim"),
+        pytest.param(128, 64, 128, 64, id="unsupported-key-dim"),
+        pytest.param(128, 128, 64, 64, id="unsupported-value-dim"),
+        pytest.param(128, 128, 128, 32, id="unsupported-chunk-size"),
+    ),
+)
+def test_fla_npu_rejects_unsupported_shape_before_loading_ops(
+    q_dim: int,
+    k_dim: int,
+    v_dim: int,
+    chunk_size: int,
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_npu_input_guard: None,
+) -> None:
+    """Reject unsupported Q/K/V dimensions and chunk sizes without an NPU runtime."""
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu as module
+
+    def unexpected_ops():
+        pytest.fail("Unsupported inputs reached the AscendC API loader")
+
+    monkeypatch.setattr(module, "_get_gdn_ops", unexpected_ops)
+    query = torch.zeros(1, 4, 2, q_dim, dtype=torch.bfloat16)
+    key = torch.zeros(1, 4, 2, k_dim, dtype=torch.bfloat16)
+    value = torch.zeros(1, 4, 2, v_dim, dtype=torch.bfloat16)
+    g = torch.zeros(1, 4, 2, dtype=torch.float32)
+    beta = torch.zeros(1, 4, 2, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="K=V=128 and chunk_size=64"):
+        module.forward(query, key, value, g, beta, chunk_size=chunk_size)
 
 
 @pytest.mark.parametrize(
