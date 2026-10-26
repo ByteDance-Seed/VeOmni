@@ -48,7 +48,7 @@ when the selected implementation runs.
 | `layer_norm` | `standard` | `eager`, `apex` (`fused_layer_norm_cuda`); nested by async Ulysses QKV when `norm_type="layernorm"` |
 | `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
 | `swiglu_mlp` | `standard`, `geglu` | `eager`, `liger_kernel` |
-| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `fused_npu`, `fused_mlu` as supported by the variant |
+| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `deepgemm_fp8` (standard, SM90/SM100), `fused_npu`, `fused_mlu` as supported by the variant |
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
@@ -107,6 +107,14 @@ and is optional; install it with:
 ```bash
 uv sync --extra gpu --extra magi --dev
 ```
+
+The opt-in `deepgemm_fp8` MoE backend uses native FP8 grouped GEMMs
+for forward, input gradients and weight gradients on Hopper and Blackwell SM100.
+Its hidden states and expert weights remain BF16; routing weights retain their
+supplied dtype. Hopper uses a bounded FP32 wgrad workspace; SM100 writes BF16
+gradients directly from the FP32 accumulator in the GEMM epilogue. Recomputing
+Triton SwiGLU limits temporary storage. See [FP8 MoE training](../../docs/design/deepgemm_fp8_moe.md)
+for dependency installation, configuration, precision and distributed coverage.
 
 ## Registering an op
 

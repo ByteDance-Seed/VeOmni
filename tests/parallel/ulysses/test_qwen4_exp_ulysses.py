@@ -707,13 +707,24 @@ def test_qwen4_exp_gated_deltanet_rejects_nondivisible_heads(num_k_heads, num_v_
         layer(hidden_states)
 
 
-def _run_gated_deltanet_determinism(bsz: int, seq_len: int) -> None:
+_QWEN4_EXP_DETERMINISM_SHAPES: tuple[tuple[int, int], ...] = (
+    (1, 8),
+    (4, 8),
+    (1, 2048),
+    (4, 2048),
+)
+
+
+def _run_gated_deltanet_determinism() -> None:
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 
     qwen4_exp = importlib.import_module(_PATCHED_MODULE)
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()
+    shapes = list(_QWEN4_EXP_DETERMINISM_SHAPES)
+    if os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1":
+        shapes = list(reversed(shapes))
     try:
         _init_parallel_state(
             dp_size=1,
@@ -722,31 +733,32 @@ def _run_gated_deltanet_determinism(bsz: int, seq_len: int) -> None:
             name=None,
         )
         _install_qwen4_exp_ops_config()
-        _set_deterministic()
         device = torch.device(get_device_type(), rank)
         config = AutoConfig.from_pretrained(_TOY_CONFIG).text_config
-        layer = qwen4_exp.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).float().to(device)
-        _broadcast_module(layer)
+        for bsz, seq_len in shapes:
+            _set_deterministic()
+            layer = qwen4_exp.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).float().to(device)
+            _broadcast_module(layer)
 
-        if rank == 0:
-            full_input = torch.randn(bsz, seq_len, config.hidden_size, device=device)
-        else:
-            full_input = torch.empty(bsz, seq_len, config.hidden_size, device=device)
-        dist.broadcast(full_input, src=0)
+            if rank == 0:
+                full_input = torch.randn(bsz, seq_len, config.hidden_size, device=device)
+            else:
+                full_input = torch.empty(bsz, seq_len, config.hidden_size, device=device)
+            dist.broadcast(full_input, src=0)
 
-        shard_len = seq_len // world_size
-        local_input = full_input[:, rank * shard_len : (rank + 1) * shard_len].contiguous()
-        _assert_forward_deterministic(layer, local_input)
+            shard_len = seq_len // world_size
+            local_input = full_input[:, rank * shard_len : (rank + 1) * shard_len].contiguous()
+            _assert_forward_deterministic(layer, local_input)
+            dist.barrier()
+        dist.barrier()
     finally:
         clear_parallel_state()
 
 
 @_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
-@pytest.mark.parametrize("bsz", [1, 4])
-@pytest.mark.parametrize("seq_len", [8, 2048])
-def test_qwen4_exp_gated_deltanet_forward_deterministic_sp(bsz: int, seq_len: int) -> None:
-    torchrun(_run_gated_deltanet_determinism, _CI_ACCELERATOR_2.nproc, bsz, seq_len)
+def test_qwen4_exp_gated_deltanet_forward_deterministic_sp() -> None:
+    torchrun(_run_gated_deltanet_determinism, _CI_ACCELERATOR_2.nproc)
 
 
 @_CUDA_ONLY

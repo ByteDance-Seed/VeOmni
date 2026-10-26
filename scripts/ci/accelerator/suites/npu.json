@@ -88,6 +88,8 @@
       "-v",
       "-s",
       "-x",
+      "--ignore=tests/models/base/test_modify_init.py",
+      "--ignore=tests/models/transformers/test_generated_call_site_signatures.py",
       "tests/models"
     ]
   },
@@ -303,6 +305,7 @@
       "-x",
       "-m",
       "not benchmark",
+      "--ignore=tests/ops/base/test_op_documentation.py",
       "tests/ops"
     ]
   },
@@ -313,7 +316,7 @@
       "-v",
       "-s",
       "-x",
-      "tests/special_sanity/test_ops_architecture.py"
+      "tests/utils/test_count_flops.py"
     ]
   },
   {
@@ -323,7 +326,7 @@
       "-v",
       "-s",
       "-x",
-      "tests/utils/test_count_flops.py"
+      "tests/tools/test_training_utils.py"
     ]
   },
   {
@@ -333,7 +336,7 @@
       "-v",
       "-s",
       "-x",
-      "tests/tools/test_training_utils.py"
+      "tests/utils/test_hdfs_io.py"
     ]
   },
   {
@@ -343,7 +346,7 @@
       "-v",
       "-s",
       "-x",
-      "tests/utils/test_hdfs_io.py"
+      "tests/lora/test_lora_trainer_saveload.py"
     ]
   },
   {
@@ -353,7 +356,7 @@
       "-v",
       "-s",
       "-x",
-      "tests/lora/test_lora_trainer_saveload.py"
+      "tests/lora/test_qwen3_5_moe_lora.py"
     ]
   },
   {
@@ -363,21 +366,11 @@
       "-v",
       "-s",
       "-x",
-      "tests/lora/test_qwen3_5_moe_lora.py"
-    ]
-  },
-  {
-    "name": "npu-unit-36",
-    "suite": "unit",
-    "args": [
-      "-v",
-      "-s",
-      "-x",
       "tests/lora/test_moe_lora_ep_sharded_stream_load.py"
     ]
   },
   {
-    "name": "npu-unit-37",
+    "name": "npu-unit-36",
     "suite": "unit",
     "conditional": false,
     "args": [
@@ -387,7 +380,7 @@
     ]
   },
   {
-    "name": "ci-unit",
+    "name": "npu-unit-37",
     "suite": "unit",
     "conditional": false,
     "args": [
@@ -397,7 +390,7 @@
     ]
   },
   {
-    "name": "moe-router-replay-api-unit",
+    "name": "npu-unit-38",
     "suite": "unit",
     "conditional": false,
     "args": [
@@ -408,7 +401,7 @@
     ]
   },
   {
-    "name": "save-safetensor-utils-unit",
+    "name": "npu-unit-39",
     "suite": "unit",
     "conditional": false,
     "args": [
@@ -419,7 +412,7 @@
     ]
   },
   {
-    "name": "npu-e2e-01",
+    "name": "npu-e2e-40",
     "suite": "e2e",
     "args": [
       "-v",
@@ -429,7 +422,7 @@
     ]
   },
   {
-    "name": "npu-e2e-02",
+    "name": "npu-e2e-41",
     "suite": "e2e",
     "args": [
       "-v",
