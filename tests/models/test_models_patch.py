@@ -152,9 +152,6 @@ _USE_KERNELS = [True, False] if IS_NPU_AVAILABLE or is_liger_kernel_available() 
 _LOAD_BALANCING_LOSS_IMPL = "triton" if IS_CUDA_AVAILABLE and is_package_available("triton") else "eager"
 _FUSED_MOE_IMPL = "fused_npu" if IS_NPU_AVAILABLE else "fused_triton"
 
-_HF_ATTN = ("flash_attention_2", "flash_attention_3")
-_VEOMNI_ATTN = ("veomni_flash_attention_2", "veomni_flash_attention_3")
-
 
 def _kernel_ops(model_type: str) -> dict[str, str]:
     """Config overrides for ``model_type`` when ``use_kernels=True`` (unset fields use ``OP_REGISTRY.default_impl``)."""
@@ -513,8 +510,6 @@ def _case_modes(case_id: str, is_moe: bool) -> tuple[list[ModelMode], list[Model
     if case_id == "qwen2_5_omni":
         if IS_NPU_AVAILABLE:
             pytest.skip("torch.kaiser_window in Token2WavBigVGANModel init is unsupported on NPU")
-        # Upstream qwen2_5_omni fails under FA3.
-        hf_modes = [mode for mode in hf_modes if mode.attn_implementation != "flash_attention_3"]
 
     if case_id == "deepseek_v4":
         # DeepSeek-V4 attention is eager-only (head_dim=512 exceeds FA's cap, SDPA has
@@ -543,8 +538,6 @@ def _case_modes(case_id: str, is_moe: bool) -> tuple[list[ModelMode], list[Model
     if case_id in ("qwen3_5", "qwen3_5_moe"):
         if IS_NPU_AVAILABLE:
             pytest.skip("Qwen3.5 GatedDeltaNet keeps the fla default, which this case does not run on NPU")
-        hf_modes = [mode for mode in hf_modes if mode.attn_implementation != "flash_attention_3"]
-        veomni_modes = [mode for mode in veomni_modes if mode.attn_implementation != "veomni_flash_attention_3"]
 
     return hf_modes, veomni_modes
 

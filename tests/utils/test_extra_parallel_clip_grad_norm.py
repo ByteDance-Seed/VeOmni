@@ -17,7 +17,7 @@ from packaging.version import Version
 from torch.distributed._tensor import DTensor, Shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.arguments import ModelArguments, TrainingArguments
+from veomni.arguments import ModelArguments
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import (
@@ -51,12 +51,6 @@ def _torch_npu_version() -> str:
     if importlib.util.find_spec("torch_npu") is None:
         return None
     return str(importlib.metadata.version("torch_npu"))
-
-
-@dataclass
-class Argument:
-    model: "ModelArguments" = field(default_factory=ModelArguments)
-    train: "TrainingArguments" = field(default_factory=TrainingArguments)
 
 
 class ToyMoeAndEmbedModel(torch.nn.Module):

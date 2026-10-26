@@ -106,7 +106,6 @@ def _fused_ops_override() -> str:
 # Seeder trains this many steps, then writes the HF adapter at the final
 # step. Kept tiny -- we only need a *non-trivial* adapter on disk, not a
 # converged one.
-_SEED_STEPS = 2
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -233,14 +232,6 @@ def fused_toy_base_dir(_stream_load_assets_root):
 @pytest.fixture(scope="module")
 def seeded_lora_adapters_dir(_stream_load_assets_root):
     return os.path.join(_stream_load_assets_root, "adapters")
-
-
-def _fused_model_path_overrides(fused_base: str) -> list[str]:
-    """Point ``model.model_path`` / ``config_path`` at the fused base dir."""
-    return [
-        f"--model.model_path={fused_base}",
-        f"--model.config_path={fused_base}",
-    ]
 
 
 def _make_adapter_resume_yaml(base_yaml: str, adapter_path: str, dest: str) -> str:
