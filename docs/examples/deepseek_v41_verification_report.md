@@ -21,8 +21,10 @@ All experiments were executed in **Group 356 (`Zhi-wh-h100`, `cluster_id: 8`, `c
 | **128-GPU Full** | **8-GPU Multimodal Inference Round-Trip on 128-GPU Exported Checkpoint** | 8 (Node 0) | `tasks/omni/infer_omni.py` loading `/mnt/hdfs/.../global_step_100/hf_ckpt` with `modules_infer_fsdp.yaml` | **Pass (`rc=0`, 40-layer FP8/FP4 generation)** | [0abc0b09f0eeb205 (trial 304282868)](https://seed.byteintl.net/development/instance/jobs/0abc0b09f0eeb205) | N/A (Inference stage in `304282868`) |
 | **8-GPU CP Alignment** | **Suite A: `BaseTrainer`-Aligned FSDP2 `text_encoder` (`cp=1` 10 steps & `cp=2` Step 1)** | 8 | Deterministic batch (`seed=42, shuffle=false, gbs=8, mbs=1`), `text_encoder` FSDP2 (`no emb`) | **Pass (`cp=1` 10/10; `cp=2` Step 1 exact match)** | [2304d1595f72d42c](https://seed.byteintl.net/development/instance/jobs/2304d1595f72d42c) / [0aa9829c2c54b033](https://seed.byteintl.net/development/instance/jobs/0aa9829c2c54b033) | [run_20261019_97fe4507](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261019_97fe4507) |
 | **8-GPU CP Alignment** | **Suite B: `emb=8, extra_parallel_only=true` `text_encoder` (`cp=1` 10 steps & `cp=2` Step 1)** | 8 | Deterministic batch (`seed=42, shuffle=false, gbs=8, mbs=1`), `_extra_parallel_only` grad-sync fix | **Pass (`cp=1` 10/10; `cp=2` Step 1 exact match)** | [65d2fbffbbf7a959](https://seed.byteintl.net/development/instance/jobs/65d2fbffbbf7a959) | [run_20261019_1210172e](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261019_1210172e) / [run_20261019_30fd740c](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261019_30fd740c) |
-| **8-GPU CP Alignment** | **Full `cp=1, 2, 4, 8` Multi-Step Suite (`VeomniOp` + `ViT Ulysses SP + LLM CP`, `f92839dc2`)** | 8 | `commit f92839dc2`, `vision.accelerator.ulysses_size=S, cp_size=1` + `llm.accelerator.cp_size=S` (`S=1,2,4,8`), Suite MM (Multimodal) + Suite A (`FSDP2 text_encoder`) + Suite B (`emb=8 text_encoder`) | Queued (`STARTED`, Priority `A1/40` in Group 356; superseded `6fd0c0aef891741e`) | [45245145371ac415 (trial 304385619)](https://seed.byteintl.net/development/instance/jobs/45245145371ac415) | Pending queue allocation |
-| **128-GPU Multimodal** | **200-Step Multimodal (`tulu` + `sharegpt4v`) Speed & Convergence Run (`f92839dc2`)** | 128 | `commit f92839dc2`, Local NVMe `/tmp/vdata`, `vision` trainable (`freeze: false`), `text_encoder` FSDP2 (`BaseTrainer`-aligned), `ep=128`, `VeomniOp` | Queued (`STARTED`, Priority `A1/40` in Group 356; superseded `5b0d624d30b5bfde`) | [f4be5c6acc57cc8b (trial 304385627)](https://seed.byteintl.net/development/instance/jobs/f4be5c6acc57cc8b) | Pending queue allocation |
+| **8-GPU CP Alignment** | **Full `cp=1, 2, 4, 8` Multi-Step Suite (`DeepSeek-V4.1-Flash-1017`, `VeomniOp` + `ViT Ulysses SP + LLM CP`)** | 8 | `commit 3e5ac5936`, `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`, `vision.accelerator.ulysses_size=S, cp_size=1` + `llm.accelerator.cp_size=S` (`S=1,2,4,8`), **12/12 runs (Suite MM Multimodal + Suite A `FSDP2 text_encoder` + Suite B `emb=8 text_encoder`, 10 steps each)** | **Pass (`rc=0`, 12/12 runs, 120/120 steps)** | [2ffef1a6ffbca0ae (trial 304706398)](https://seed.byteintl.net/development/instance/jobs/2ffef1a6ffbca0ae) | [run_20261026_85ec989d](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_85ec989d) .. [run_20261026_ddceb476](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_ddceb476) (all 12 in Section 6.2) |
+| **128-GPU Multimodal** | **200-Step Multimodal (`tulu` + `sharegpt4v`) Speed & Convergence + Single-Root FP8/FP4 Export (`DeepSeek-V4.1-Flash-1017`)** | 128 | `commit 3e5ac5936`, `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`, Local NVMe `/tmp/vdata`, `vision` trainable (`freeze: false`), `text_encoder` FSDP2 (`BaseTrainer`-aligned), `ep=128`, `save_hf_weights: true` | **Pass (`rc=0`, 200/200 steps + 48-shard export in `381.42s`)** | [fb4feeb3eb8b46aa (trial 304705201)](https://seed.byteintl.net/development/instance/jobs/fb4feeb3eb8b46aa) | [run_20261026_e61daeaa](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_e61daeaa) |
+| **8-GPU Inference Round-Trip** | **8-GPU 40-Layer FP8/FP4 Multimodal Inference on 128-GPU 200-Step Exported `DeepSeek-V4.1-Flash-1017` Checkpoint** | 8 | `commit 69f577234`, `infer_omni.py` loading `/mnt/hdfs/.../mm200/checkpoints/global_step_200/hf_ckpt` with `modules_infer_fsdp.yaml` | **Pass (`rc=0`, 40-layer + 3-MTP quantized generation)** | [63eecb31d32921a1 (trial 304714243)](https://seed.byteintl.net/development/instance/jobs/63eecb31d32921a1) | N/A (Inference / `reply.txt`) |
+| **8-GPU Long-Context** | **SP8 (`ViT Ulysses SP=8 + LLM CP=8`) Long-Context `4k–32k` (`DeepSeek-V4.1-Flash-1017`, 10 steps)** | 8 | `commit 69f577234`, `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`, `cp_size: 8`, `vision.ulysses_size: 8`, `max_seq_len: 32768`, `data_long_4k32k.yaml` | **Pass (`rc=0`, 10/10 steps)** | [d1648f5d525261ba (trial 304715334)](https://seed.byteintl.net/development/instance/jobs/d1648f5d525261ba) | [run_20261026_29b134ca](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_29b134ca) |
 
 ---
 
@@ -302,3 +304,100 @@ Executed the full `tests/seed_omni/modules/deepseek_v41/` test suite (22 test fi
     - `test_vit_sp_plus_llm_cp_config_resolves_uniform_dp_size`: Verifies `AcceleratorConfig` resolves uniform `dp_size` when `vision.accelerator.ulysses_size = S` and `llm.accelerator.cp_size = S`.
     - `test_v41_cp_allowlist_and_vision_ulysses_split`: Verifies `deepseek_v41_llm` is in the CP allowlist while `deepseek_v41_vision` uses Ulysses SP (`cp_size=1`).
     - `test_veomni_ops_bind_on_submodules`: Verifies all `VeomniOp` descriptors bind to their configured backends (`tilelang`, `liger_kernel`, `triton`, `flash_attention_2`) and `qat_impl="fp8_blockwise"`.
+
+---
+
+## 6. `DeepSeek-V4.1-Flash-1017` End-to-End Verification (`commits 3e5ac5936 .. 69f577234`)
+
+### 6.1 Architecture & Code Updates Merged Before Running `DeepSeek-V4.1-Flash-1017`
+
+1. **Checkpoint Verification (`/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`)**:
+   - `config.json`, `model.safetensors.index.json`, `tokenizer.json`, and all 48 safetensors shard tensor shapes/dtypes (`475.3 GB` total) are structurally identical to `DeepSeek-V4.1-Flash`, with updated post-trained weights.
+2. **Code Refactoring & Fixes on `szl.omniv2-deepseek-v4.1-flash` (`3e5ac5936 .. 69f577234`)**:
+   - **`17bde2f5c` & `3e5ac5936`**: Reused `deepseek_v4` DSpark (`DSparkMarkovHead`, `DSparkConfidenceHead`, `dense_sparse_attn`, `main_window_indices`) and FP8/FP4 dequant/export primitives (`_dequantize_scaled_weight`, `split_moe_params`, `validate_deepseek_v4_export_quant_support`), and fixed rank-partitioned `save_state` size gathering in `_size_balanced_index_mapping`.
+   - **`6ba73caa6` (`veomni/models/seed_omni/modules/deepseek_v41/llm/quantized.py`)**: Restored `_apply_gate` (`swiglu_limit` clamp + `act_fn(gate) * up`) on `DeepseekV41QuantizedExperts` after `PatchedDeepseekV4Experts` migrated to `self.veomni_moe`.
+   - **`69f577234` (`veomni/ops/kernels/swiglu_mlp/__init__.py`)**: Updated `has_plain_linear_projections(mlp)` to return `False` when any projection has `getattr(proj, "is_quantized", False) == True` (`DeepseekV41Linear` with FP8 weights), ensuring quantized shared experts dispatch through `DeepseekV41Linear.forward` (`quantized_matmul`) during inference rather than passing raw `float8_e4m3fn` weights into `F.linear`.
+   - **Unit Test Suite**: `pytest tests/seed_omni/modules/deepseek_v41/` passed **`413 passed, 17 skipped`**, and GPU binding verification (`veomniop_binding_check.log`) passed **`41/41` GPU tests** on 8×H100.
+
+---
+
+### 6.2 8-GPU `cp=1, 2, 4, 8` (`ViT Ulysses SP + LLM CP`) Multi-Step Alignment on `DeepSeek-V4.1-Flash-1017`
+
+- **Merlin Trial**: [2ffef1a6ffbca0ae (trial 304706398)](https://seed.byteintl.net/development/instance/jobs/2ffef1a6ffbca0ae)
+- **HDFS Logs**: `hdfs://harunaeubd/home/byte_data_seed_be1a/user/shizhelun/code/smoke_logs/dsv41_1017_cp_align_3e5ac5936/`
+- **Setup**:
+  - Model: `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`, `deepseek_v41_vision` trainable (`freeze: false`, `ulysses_size: S, cp_size: 1`), `deepseek_v41_llm` (`cp_size: S, ulysses_size: 1, ep_size: 8`, Muon `lr=1e-4, muon_lr=5e-4`, `gradient_checkpointing: true`).
+  - Fixed Global Batch: `global_batch_size: 8, micro_batch_size: 1, seed: 42, shuffle: false` (`S = 1, 2, 4, 8` -> `dp_size = 8, 4, 2, 1` and `gradient_accumulation_steps = 1, 2, 4, 8`).
+
+#### Table 6.2a: Suite MM — Multimodal Image+Text Overfit (`sharegpt4v`, `ViT Ulysses SP = S` + `LLM CP = S`)
+
+| Step | `S=1` (`vit_sp=1, llm_cp=1`) `total` / `ce` / `kl` (`grad_norm`) | `S=2` (`vit_sp=2, llm_cp=2`) `total` / `ce` / `kl` (`grad_norm`) | `S=4` (`vit_sp=4, llm_cp=4`) `total` / `ce` / `kl` (`grad_norm`) | `S=8` (`vit_sp=8, llm_cp=8`) `total` / `ce` / `kl` (`grad_norm`) |
+| :---: | :---: | :---: | :---: | :---: |
+| **WandB** | [run_20261026_85ec989d](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_85ec989d) | [run_20261026_5a5bfd0b](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_5a5bfd0b) | [run_20261026_a5b8d2f6](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_a5b8d2f6) | [run_20261026_07df2fc2](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_07df2fc2) |
+| **1** | **`15.82` / `15.74` / `0.08`** (`139.34`) | **`15.82` / `15.74` / `0.08`** (`139.45`) | **`15.79` / `15.71` / `0.08`** (`139.64`) | **`15.82` / `15.73` / `0.08`** (`139.56`) |
+| **2** | `9.41` / `9.35` / `0.07` (`69.98`) | `9.40` / `9.33` / `0.07` (`118.78`) | `9.38` / `9.31` / `0.07` (`69.64`) | `9.38` / `9.32` / `0.07` (`69.74`) |
+| **3** | `9.01` / `8.96` / `0.05` (`108.80`) | `8.68` / `8.63` / `0.05` (`109.86`) | `8.63` / `8.58` / `0.05` (`102.10`) | `8.75` / `8.70` / `0.05` (`100.66`) |
+| **4** | `7.93` / `7.89` / `0.05` (`49.00`) | `7.73` / `7.69` / `0.05` (`42.54`) | `7.64` / `7.60` / `0.05` (`42.90`) | `7.76` / `7.71` / `0.05` (`45.13`) |
+| **5** | `5.81` / `5.75` / `0.05` (`78.72`) | `6.01` / `5.96` / `0.05` (`101.12`) | `5.89` / `5.83` / `0.05` (`98.75`) | `5.98` / `5.92` / `0.05` (`103.19`) |
+| **6** | `4.05` / `3.98` / `0.07` (`36.55`) | `4.10` / `4.04` / `0.07` (`39.33`) | `3.99` / `3.92` / `0.07` (`34.21`) | `3.96` / `3.89` / `0.07` (`33.28`) |
+| **7** | `2.23` / `2.14` / `0.09` (`23.85`) | `2.50` / `2.41` / `0.09` (`35.52`) | `2.26` / `2.17` / `0.09` (`23.07`) | `2.26` / `2.16` / `0.10` (`31.97`) |
+| **8** | `1.17` / `1.06` / `0.11` (`16.15`) | `1.25` / `1.14` / `0.11` (`13.93`) | `1.12` / `1.01` / `0.11` (`13.57`) | `1.13` / `1.03` / `0.10` (`11.60`) |
+| **9** | `0.61` / `0.51` / `0.10` (`10.94`) | `0.58` / `0.47` / `0.11` (`8.84`) | `0.57` / `0.47` / `0.10` (`10.03`) | `0.56` / `0.45` / `0.10` (`8.64`) |
+| **10** | **`0.34003` / `0.22992` / `0.11011`** (`3.34355`) | **`0.34406` / `0.22796` / `0.11611`** (`3.71099`) | **`0.32676` / `0.21477` / `0.11198`** (`2.80507`) | **`0.32000` / `0.20628` / `0.11371`** (`2.68213`) |
+| **Peak VRAM** | **`70.90 GB`** | **`70.91 GB`** | **`70.91 GB`** | **`70.92 GB`** |
+
+#### Table 6.2b: Suite A (`FSDP2 text_encoder`) & Suite B (`emb=8, extra_parallel_only=true text_encoder`) Across `cp=1, 2, 4, 8`
+
+| Suite | `cp_size` (`vit_sp=S, llm_cp=S`) | Step 1 `total` / `ce` / `kl` | Step 1 `grad_norm` | Step 5 `total` / `ce` / `kl` | Step 9 `total` / `ce` / `kl` | Step 10 Final `total_loss` / `ce_loss` / `indexer_kl_loss` (`grad_norm`) | Peak VRAM | WandB Run |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+| **Suite A (`FSDP2 text_encoder`)** | **`cp = 1`** | **`17.34` / `17.28` / `0.06`** | **`88.00`** | `2.81` / `2.76` / `0.05` | `0.04` / `0.00` / `0.04` | **`0.04099` / `0.00023` / `0.04076`** (`0.24149`) | `70.90 GB` | [run_20261026_6cbb4272](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_6cbb4272) |
+| **Suite A (`FSDP2 text_encoder`)** | **`cp = 2`** | **`17.34` / `17.28` / `0.06`** | **`88.04`** | `2.67` / `2.62` / `0.05` | `0.04` / `0.00` / `0.04` | **`0.04199` / `0.00015` / `0.04184`** (`0.25963`) | `70.90 GB` | [run_20261026_97d57904](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_97d57904) |
+| **Suite A (`FSDP2 text_encoder`)** | **`cp = 4`** | **`17.34` / `17.28` / `0.06`** | **`88.06`** | `2.70` / `2.65` / `0.05` | `0.05` / `0.00` / `0.04` | **`0.04258` / `0.00017` / `0.04241`** (`0.26697`) | `70.90 GB` | [run_20261026_3530c14e](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_3530c14e) |
+| **Suite A (`FSDP2 text_encoder`)** | **`cp = 8`** | **`17.34` / `17.28` / `0.06`** | **`87.99`** | `2.68` / `2.63` / `0.05` | `0.04` / `0.00` / `0.04` | **`0.04132` / `0.00018` / `0.04114`** (`0.27188`) | `70.90 GB` | [run_20261026_f21aad8b](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_f21aad8b) |
+| **Suite B (`emb=8, extra_parallel_only`)** | **`cp = 1`** | **`17.34` / `17.28` / `0.06`** | **`87.60`** | `2.93` / `2.88` / `0.05` | `0.05` / `0.00` / `0.04` | **`0.04209` / `0.00033` / `0.04176`** (`0.25096`) | `73.98 GB` | [run_20261026_e0605972](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_e0605972) |
+| **Suite B (`emb=8, extra_parallel_only`)** | **`cp = 2`** | **`17.34` / `17.28` / `0.06`** | **`87.60`** | `2.70` / `2.66` / `0.05` | `0.05` / `0.00` / `0.04` | **`0.04186` / `0.00034` / `0.04152`** (`0.25375`) | `73.98 GB` | [run_20261026_f46bfc88](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_f46bfc88) |
+| **Suite B (`emb=8, extra_parallel_only`)** | **`cp = 4`** | **`17.34` / `17.28` / `0.06`** | **`87.59`** | `2.85` / `2.80` / `0.05` | `0.05` / `0.00` / `0.04` | **`0.04196` / `0.00033` / `0.04163`** (`0.26058`) | `73.98 GB` | [run_20261026_38070424](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_38070424) |
+| **Suite B (`emb=8, extra_parallel_only`)** | **`cp = 8`** | **`17.34` / `17.28` / `0.06`** | **`87.54`** | `2.87` / `2.82` / `0.05` | `0.05` / `0.00` / `0.04` | **`0.04289` / `0.00029` / `0.04260`** (`0.27490`) | `73.99 GB` | [run_20261026_ddceb476](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_ddceb476) |
+
+---
+
+### 6.3 128-GPU (`16 × 8 H100`) 200-Step Multimodal SFT (`tulu` + `sharegpt4v`), Single-Root FP8/FP4 Export, & 8-GPU Inference Round-Trip (`DeepSeek-V4.1-Flash-1017`)
+
+1. **128-GPU 200-Step Multimodal SFT Convergence & Speed**:
+   - **Merlin Trial**: [fb4feeb3eb8b46aa (trial 304705201)](https://seed.byteintl.net/development/instance/jobs/fb4feeb3eb8b46aa)
+   - **WandB Run**: [run_20261026_e61daeaa](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_e61daeaa) (`dsv41_1017_128gpu_200steps_mm_export`)
+   - **Configuration**:
+     - Model: `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017` (all 40 LLM layers, `ep_size: 128`, Muon `lr=1e-4, muon_lr=5e-4`; `deepseek_v41_vision` trainable `freeze: false`; `deepseek_v41_text_encoder` FSDP2; `deepseek_v41_ngram` frozen FP8 `emb=128`).
+     - Multimodal Data staged to local NVMe `/tmp/vdata` on all 16 nodes: `tulu-3-sft-mixture` (`60%` weight, `17,130` chunks / `6.88M` tokens consumed) + `sharegpt4v_cap_100k` (`40%` weight, `8,470` image-text chunks / `5.03M` tokens consumed), total **`25,600` samples (`11.91M` tokens)** across 200 steps.
+   - **Performance & Memory Metrics**:
+     - **Steady-State Step Time**: **`18.21s – 20.10s / step`** (200-step total wall time `1h21m53s`).
+     - **Peak Allocated VRAM**: **`67.86 GB`** (`70.44 GB` max WandB metric, `33.75 GB` cur after epoch 1 — `>9 GB` headroom on 80GB H100 even with trainable ViT and `sharegpt4v` multimodal images).
+   - **200-Step Loss Trajectory**:
+     - `total_loss`: **`2.00` (Step 2) / `1.87` (Step 1)** -> **`1.12` (Step 20)** -> **`1.26` (Step 100)** -> **`1.19` (Step 150)** -> **`1.40` (Step 200)**.
+     - `deepseek_v41_llm.forward.indexer_kl_loss`: **`0.78` (Step 1)** -> **`0.37` (Step 20)** -> **`0.15` (Step 100)** -> **`0.31` (Step 200)**.
+     - `deepseek_v41_text_encoder.decode.ce_loss`: **`1.24` (Step 2)** -> **`0.75` (Step 20)** -> **`0.94` (Step 150)** -> **`1.09` (Step 200)**.
+
+2. **128-GPU Single-Root FP8/FP4 Release Export (`save_hf_weights: true`)**:
+   - At Step 200, `save_hf_source_checkpoint` re-quantized all 40 trained `deepseek_v41_llm` layers to release FP8/FP4, exported the trained `deepseek_v41_vision` and `deepseek_v41_text_encoder` weights, and copied `2,405` frozen `ngram` + `mtp` source tensors into all **48 safetensors shards (`model-00001-of-00048.safetensors` .. `model-00048-of-00048.safetensors`) + `model.safetensors.index.json`** at `/mnt/hdfs/__MERLIN_USER_DIR__/dsv41_1017_128gpu_ckpt/mm200/checkpoints/global_step_200/hf_ckpt` in **`381.42s` (`6m21s`)**.
+
+3. **8-GPU Full 40-Layer + 3-MTP Multimodal Inference Round-Trip on Exported `DeepSeek-V4.1-Flash-1017` Checkpoint**:
+   - **Merlin Trial**: [63eecb31d32921a1 (trial 304714243)](https://seed.byteintl.net/development/instance/jobs/63eecb31d32921a1)
+   - **Command**: Loaded `/mnt/hdfs/__MERLIN_USER_DIR__/dsv41_1017_128gpu_ckpt/mm200/checkpoints/global_step_200/hf_ckpt` on 8 GPUs using `tasks/omni/infer_omni.py` and `modules_infer_fsdp.yaml` (`ep_sharded_stream_load: true`, keeping all 40 LLM layers + 3 MTP stages in quantized FP8/FP4 format).
+   - **Execution & Output**:
+     - Streamed all 48 shards in `2m48s` (`172` ExtraParallel-sliced, `1,263` dense, `86` buffer tensors/rank; stacked `11,808` local per-expert tensors across 40 LLM layers + 3 MTP stages).
+     - Executed `[FSM] step 0: prompt_encode` -> `[FSM] step 1: text_ar` -> `finalize: reply (162 chars)`.
+     - Generated output (`reply.txt`):
+       `</think>In the image, a woman is the main subject. She stands confidently in front of a series of large black panels. Her white hair contrasts with her black hat.`
+     - Exit code: **`0` (`INFER_RC=0`)**.
+
+---
+
+### 6.4 Long-Context `SP8` (`ViT Ulysses SP=8 + LLM CP=8`, `4k–32k` Sequence Length) on `DeepSeek-V4.1-Flash-1017`
+
+- **Merlin Trial**: [d1648f5d525261ba (trial 304715334)](https://seed.byteintl.net/development/instance/jobs/d1648f5d525261ba)
+- **WandB Run**: [run_20261026_29b134ca](https://seed.byteintl.net/experiment/tracking/detail?Id=project_20261015_f2ce96f6&selectedTrial=run_20261026_29b134ca) (`dsv41_1017_8gpu_sp8_vitsp8_long_4k32k`)
+- **Configuration**: `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`, `cp_size: 8` + `deepseek_v41_vision.accelerator.ulysses_size: 8, cp_size: 1`, `data_long_4k32k.yaml` (`max_seq_len: 32768`, avg sequence length `10,090.3` tokens/step), 10 steps.
+- **Result**: Completed all **10/10 steps (`rc=0`)** with peak allocated memory **`76.07 GB`**:
+  - Step 1: `total_loss: 15.51` (`ce_loss: 15.45, indexer_kl_loss: 0.06, grad_norm: 21.72`)
+  - Step 5: `total_loss: 14.23` (`ce_loss: 14.18, indexer_kl_loss: 0.06, grad_norm: 27.91`)
+  - Step 10: `total_loss: 14.93` (`ce_loss: 14.87, indexer_kl_loss: 0.05, grad_norm: 86.63`, step time `20.67s – 36.54s/it`).
