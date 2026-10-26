@@ -95,16 +95,12 @@ native class (`OmniModel.from_pretrained`, eager inference) and
 `OMNI_ACCELERATED_MODEL_REGISTRY` to the accelerated class (`ModuleRuntime`,
 training and distributed inference).
 
-**`InferenceMixin` goes first in the bases.** `PretrainedOmniModule` ships no-op
-`reset_local_inference_state` / `reset_global_inference_state` / `finalize`
-defaults (a safety net for modules without inference state; the FSM always calls
-`module.finalize(ctx=...)`). Python resolves the MRO left to right, so listing
-`PretrainedOmniModule` first would let those no-ops shadow the real
-implementations. The accelerated class needs no `InferenceMixin` of its own:
-`JanusLlamaAccelerated` inherits `JanusLlama`, which already has the real one
-ahead of `PretrainedOmniModule`. A few backbones (`qwen3/llm`, `qwen3_moe/llm`)
-share the family-wide `SimpleArGenerationMixin` (`modules/base/llm_packing.py`)
-instead, under the same ordering rule.
+**List `InferenceMixin` before `PretrainedOmniModule`.** `PretrainedOmniModule`
+provides default no-op `reset_local_inference_state` /
+`reset_global_inference_state` / `finalize` methods for modules without
+inference state, so placing `InferenceMixin` first in the base list ensures the
+module's implementations take precedence in the MRO, and
+`XxxAccelerated(VeOmniMixin, Xxx)` inherits them from `Xxx`.
 
 Training-graph hooks on the accelerated class, all optional with safe defaults:
 
@@ -114,7 +110,6 @@ Training-graph hooks on the accelerated class, all optional with safe defaults:
 | `pre_forward(method, **kwargs)` | training | prepare inputs (the conversation list, or packed tensors for Janus `pack_*` nodes) |
 | `post_forward(method, **outputs)` | training | write results back (the conversation list, or packed features / losses) |
 | `freeze_model()` | build | freeze a parameter subset |
-| `configure_optimizer(optimizer)` | build | adjust the module's param groups or register step hooks, before the lr scheduler is built and a checkpoint is loaded |
 | `get_parallel_plan()` | build | per-module FSDP / SP plan |
 | `get_assets()` | save | processors / tokenizers to checkpoint |
 | `dummy_inputs(...)` | training | zero placeholders that keep FSDP aligned |
@@ -132,8 +127,10 @@ CPU input preparation is a separate picklable worker class, not a mixin: a
 native class points `preprocessor_class` at a
 [Module CPU Preprocessor](../mixins/module_preprocessor.md)
 (`ModulePreprocessorBase`, run per sample by `OmniProcessor` in `seedomni_transform`
-for worker-side CPU input preparation, `_omni_token_len` tagging, and FSDP dummy
-anchors). Optional capabilities on the model itself are mixins on the accelerated class, each with its own page:
+during training for worker-side CPU input preparation, `_omni_token_len` tagging,
+and FSDP dummy anchors, and once per request with `inference=True` before the
+generation FSM during inference). Optional capabilities on the model itself are
+mixins on the accelerated class, each with its own page:
 [Metric Meter](../mixins/metric_meter.md) (per-module tokens and theoretical
 FLOPs; `OmniModel` has no single `model_type` to estimate FLOPs on) and
 [Offline Encoding](../mixins/offline_encoding.md) (cache a module's encoder

@@ -8,7 +8,7 @@ The ``model_type`` string is the lookup key used by
 
 from typing import Optional
 
-from ...module_configuration_base import OmniModuleConfig
+from ..module_configuration_base import OmniModuleConfig
 
 
 class TextEncoderConfig(OmniModuleConfig):

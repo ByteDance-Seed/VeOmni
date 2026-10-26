@@ -17,13 +17,13 @@ from veomni.distributed.parallel_state import get_parallel_state
 
 from .....mixins.training_module_mixin import post_forward, pre_forward
 from .....utils.conversation import ConversationItem
-from ....base.text_encoder.accelerated import (
+from ....qwen3vl.text_encoder.chat_template import Qwen3VLChatTemplate
+from ....text_encoder.accelerated import (
     TrainingMixin as BaseTrainingMixin,
 )
-from ....base.text_encoder.accelerated import (
+from ....text_encoder.accelerated import (
     VeOmniMixin as BaseVeOmniMixin,
 )
-from ....qwen3vl.text_encoder.chat_template import Qwen3VLChatTemplate
 from ..chat_template import Qwen3ChatTemplate
 from ..configuration import Qwen3TextEncoderConfig
 from ..modeling import Qwen3TextEncoder

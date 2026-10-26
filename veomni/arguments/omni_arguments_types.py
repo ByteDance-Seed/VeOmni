@@ -312,7 +312,6 @@ def build_omni_module_runtime_args(
     # it off alongside `fsdp_mode: eager` keeps the single-process eager-inference
     # default from inheriting a rank0-broadcast load policy that cannot run
     # without a wrap.
-    #
     # Mixed precision is off for the same reason it is on when training: it
     # exists to keep fp32 master weights for an optimizer, and inference has no
     # optimizer. Left on, it builds every module at float32 and calls
@@ -334,7 +333,7 @@ def build_omni_module_runtime_args(
     runtime_modules: dict[str, OmniModuleRuntimeArguments] = {}
     for name, override in modules_overrides.items():
         merged = deepcopy(base_dict)
-        for layer in (checkpoint_defaults.get(name, {}), inference_default, override):
+        for layer in (checkpoint_defaults.get(name, {}), inference_default, override or {}):
             _deep_update(merged, layer)
         runtime_modules[name] = _instantiate_recursive(OmniModuleRuntimeArguments, merged)
     return runtime_modules

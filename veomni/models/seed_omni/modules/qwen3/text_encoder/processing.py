@@ -5,9 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from .....auto import build_tokenizer
-from ...base.text_encoder.chat_template import TextEncoderChatTemplate
-from ...base.text_encoder.processing import TextEncoderPreprocessor
 from ...qwen3vl.text_encoder.chat_template import Qwen3VLChatTemplate
+from ...text_encoder.chat_template import TextEncoderChatTemplate
+from ...text_encoder.processing import TextEncoderPreprocessor
 from .chat_template import Qwen3ChatTemplate
 from .configuration import Qwen3TextEncoderConfig
 

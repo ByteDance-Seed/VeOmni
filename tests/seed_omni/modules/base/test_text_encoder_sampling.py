@@ -22,7 +22,7 @@ that produced it -- as a nested-list TypeError inside the tokenizer.
 
 import torch
 
-from veomni.models.seed_omni.modules.base.text_encoder.modeling import InferenceMixin
+from veomni.models.seed_omni.modules.text_encoder.modeling import InferenceMixin
 
 
 VOCAB = 32
@@ -81,7 +81,7 @@ class TestRanksAgree:
         """With a group, every rank returns rank 0's id rather than its own."""
         import torch.distributed as dist
 
-        from veomni.models.seed_omni.modules.base.text_encoder import modeling
+        from veomni.models.seed_omni.modules.text_encoder import modeling
 
         def fake_broadcast(tensor, src):
             assert src == 0
@@ -96,7 +96,7 @@ class TestRanksAgree:
 
     def test_both_branches_agree(self, monkeypatch):
         """Greedy is deterministic per rank but not across them: shards differ."""
-        from veomni.models.seed_omni.modules.base.text_encoder import modeling
+        from veomni.models.seed_omni.modules.text_encoder import modeling
 
         monkeypatch.setattr(modeling.dist, "is_available", lambda: True)
         monkeypatch.setattr(modeling.dist, "is_initialized", lambda: True)

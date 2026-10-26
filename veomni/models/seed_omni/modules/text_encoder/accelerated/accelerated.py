@@ -23,10 +23,10 @@ from veomni.ops import VeomniOp
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.tensor_utils import naflatten, unflatten
 
-from .....mixins.base_mixin import BaseMixin
-from .....mixins.metric_meter_mixin import MetricMeterMixin
-from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from .....utils.conversation import ConversationItem
+from ....mixins.base_mixin import BaseMixin
+from ....mixins.metric_meter_mixin import MetricMeterMixin
+from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
+from ....utils.conversation import ConversationItem
 from ..chat_template import TextEncoderChatTemplate
 from ..configuration import TextEncoderConfig
 from ..modeling import TextEncoder, scatter_text_encoder_embeds
@@ -143,11 +143,12 @@ class TrainingMixin(TrainingModuleMixin):
                     hidden_states_chunks.append(hidden_states)
                     label_chunks.append(labels)
                     decode_len += labels.shape[0]
-                elif part.type in ("image", "video"):
-                    # Vision segment carries projected patch embeds; keep one row
-                    # (no label) so the sequence stays aligned, like the backbone.
+                else:
+                    # Non-text segment (image, video, audio, ...) carries projected
+                    # media embeds; keep one row (no label) so the sequence stays
+                    # aligned with the backbone across causal label shifting.
                     hidden_states_chunks.append(hidden_states[-1:])
-                    label_chunks.append(torch.full((1,), -100, dtype=torch.long))
+                    label_chunks.append(torch.full((1,), IGNORE_INDEX, dtype=torch.long))
                     decode_len += 1
             if decode_len > sample_start:
                 sample_starts.append(sample_start)
@@ -223,11 +224,11 @@ class TrainingMixin(TrainingModuleMixin):
         this method used to call inline.
 
         (c) A span with no supervised token scores 0.0, matching the native
-        clamped denominator required by constraint 7d. A fused backend
-        normalizes by its own supervised-token count (Liger divides by
-        ``n_non_ignore`` with no way to clamp it; chunk_loss clamps its recount
-        at 1), so such a span is routed to the eager branch and given an
-        explicit denominator rather than relying on the backend.
+        clamped denominator required by `.agents/knowledge/veomni-seed-omni.md` (§3).
+        Every fused backend normalizes by its own supervised-token count with no way
+        to clamp it (Liger divides by ``n_non_ignore``, chunk_loss recounts the
+        labels), so such a span is routed to the eager branch and given an explicit
+        denominator instead of dividing 0 by 0.
 
         (d) ``IGNORE_INDEX`` rows are dropped before the linear. Liger fused
         linear+CE still GEMMs every remaining row (ignore only zeros the
@@ -237,11 +238,13 @@ class TrainingMixin(TrainingModuleMixin):
         """
         loss: torch.Tensor | None = None
         logits: torch.Tensor | None = None
-        # Whatever the loss will actually score, so the row filter of (d) and
-        # the (c) denominator agree with it. ``ForCausalLMLoss`` gives explicit
-        # ``shift_labels`` precedence over ``labels``, so a caller passing both
-        # would otherwise have its rows dropped, and its supervised tokens
-        # counted, against the unshifted tensor the loss then ignores.
+        if shift_labels is None and labels is not None:
+            # Causal shift before counting or filtering rows: position ``t``
+            # predicts ``labels[t + 1]``, so filtering on unshifted ``labels``
+            # would drop the last prompt position that predicts the first
+            # supervised assistant token and over-count column 0 in the
+            # denominator.
+            shift_labels = F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:].contiguous()
         target_labels = shift_labels if shift_labels is not None else labels
         fsdp_group = get_parallel_state().fsdp_group
         num_supervised_tokens = None if target_labels is None else (target_labels != IGNORE_INDEX).sum()
@@ -274,11 +277,15 @@ class TrainingMixin(TrainingModuleMixin):
                     loss_reduction_group=fsdp_group,
                 )
         else:
-            logits = self._project(hidden_states)
+            # Project a single masked anchor row so FSDP2 / ShardedEmbedding
+            # collectives still fire without materializing full [T, V] logits.
+            anchor_hidden = hidden_states.reshape(-1, hidden_states.size(-1))[:1]
+            anchor_labels = target_labels.reshape(-1)[:1]
+            logits = self._project(anchor_hidden)
             loss, _, _ = ForCausalLMLoss(
                 logits=logits,
-                labels=target_labels,
-                shift_labels=shift_labels,
+                labels=anchor_labels,
+                shift_labels=anchor_labels,
                 vocab_size=self.config.vocab_size,
                 num_items_in_batch=num_supervised_tokens.clamp(min=1),
                 loss_reduction_group=fsdp_group,
@@ -291,7 +298,7 @@ class TrainingMixin(TrainingModuleMixin):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        ce_impl = self.config.ops_implementation.get("cross_entropy_loss_implementation", "eager")
+        ce_impl = self.config.ops_config.cross_entropy_loss_implementation
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", ce_impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self._conversation_carrier: Any = None
@@ -330,8 +337,8 @@ class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
     here. Concrete modules (janus / qwen3 / qwen3vl / bagel) subclass this and
     define ``XxxTextEncoderPreprocessor`` in their ``processing.py`` by
     subclassing
-    :class:`~veomni.models.seed_omni.modules.base.text_encoder.processing.TextEncoderPreprocessor`
-    and implementing :meth:`~veomni.models.seed_omni.modules.base.text_encoder.processing.TextEncoderPreprocessor.build_chat_template`
+    :class:`~veomni.models.seed_omni.modules.text_encoder.processing.TextEncoderPreprocessor`
+    and implementing :meth:`~veomni.models.seed_omni.modules.text_encoder.processing.TextEncoderPreprocessor.build_chat_template`
     with the module-local chat template.  Register via ``preprocessor_class`` on
     the family's HF-native ``modeling.py`` class (parallel to ``image_processor_class``
     on vision/codec modules) — :class:`~veomni.models.seed_omni.processing_omni.OmniProcessor`

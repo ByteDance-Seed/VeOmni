@@ -13,8 +13,14 @@ Usage:
 import unittest
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 import torch.nn as nn
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +586,29 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
         for key, value in fake.items():
             self.assertEqual(loaded[key].dtype, value.dtype)
             self.assertTrue(torch.equal(loaded[key].view(torch.uint8), value.view(torch.uint8)), key)
+
+    def test_naflatten_and_unflatten_roundtrip_keeps_shape_on_cpu(self):
+        from veomni.utils.tensor_utils import naflatten, unflatten
+
+        tensors_3d = [torch.randn(2, 3, 8), torch.randn(1, 5, 8)]
+        flat_3d, shape_3d = naflatten(tensors_3d)
+        self.assertEqual(shape_3d.device.type, "cpu")
+        for a, b in zip(tensors_3d, unflatten(flat_3d, shape_3d), strict=True):
+            torch.testing.assert_close(a, b)
+
+        tensors_1d = [torch.randn(4), torch.randn(7)]
+        flat_1d, shape_1d = naflatten(tensors_1d)
+        self.assertEqual(shape_1d.device.type, "cpu")
+        for a, b in zip(tensors_1d, unflatten(flat_1d, shape_1d), strict=True):
+            torch.testing.assert_close(a, b)
+
+        with torch.device("meta"):
+            meta_3d = [torch.empty(2, 3, 8), torch.empty(1, 5, 8)]
+            meta_1d = [torch.empty(4), torch.empty(7)]
+            _, meta_shape_3d = naflatten(meta_3d)
+            _, meta_shape_1d = naflatten(meta_1d)
+        self.assertEqual(meta_shape_3d.device.type, "cpu")
+        self.assertEqual(meta_shape_1d.device.type, "cpu")
 
     def test_no_filtering_when_all_keys_match(self):
         fake = {"a": torch.randn(2, 2, dtype=torch.bfloat16), "b": torch.randn(2, 2, dtype=torch.bfloat16)}

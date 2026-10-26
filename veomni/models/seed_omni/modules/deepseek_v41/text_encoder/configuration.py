@@ -16,7 +16,7 @@
 
 from typing import Optional, Union
 
-from ...base.text_encoder.configuration import TextEncoderConfig
+from ...text_encoder.configuration import TextEncoderConfig
 
 
 class DeepseekV41TextEncoderConfig(TextEncoderConfig):

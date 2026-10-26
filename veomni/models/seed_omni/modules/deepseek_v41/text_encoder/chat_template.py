@@ -48,7 +48,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ....utils.conversation import ConversationItem
-from ...base.text_encoder.chat_template import TextEncoderChatTemplate
+from ...text_encoder.chat_template import TextEncoderChatTemplate
 
 
 BOS_TOKEN = "<｜begin▁of▁sentence｜>"

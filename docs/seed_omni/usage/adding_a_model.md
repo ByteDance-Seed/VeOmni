@@ -45,8 +45,7 @@ Under `veomni/models/seed_omni/modules/<family>/<sub>/`:
 - `processing.py` (optional): when the module consumes raw images, audio or
   video.
 
-Reuse the cross-family helpers in `modules/base/` where possible (text encoder,
-packing, LLM generation).
+Reuse the shared `TextEncoder` module in `modules/text_encoder/` where possible.
 
 ### IDE type stubs
 

@@ -147,7 +147,7 @@ def test_build_model_uses_the_config_the_omni_config_loaded(monkeypatch):
             ),
         ),
     )
-    runtime.module_config = SimpleNamespace(model_type="fake")
+    runtime.module_config = SimpleNamespace(model_type="fake", ops_config=None)
     runtime._build_model()
 
     assert captured["config_path"] is runtime.module_config
@@ -283,7 +283,7 @@ def _offline_cache_runtime(training_task):
             ),
         ),
     )
-    runtime.module_config = SimpleNamespace(model_type="fake")
+    runtime.module_config = SimpleNamespace(model_type="fake", ops_config=None)
     if training_task is not None:
         runtime.train_args = SimpleNamespace(training_task=training_task)
     return runtime

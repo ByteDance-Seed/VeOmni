@@ -395,82 +395,6 @@ def test_seqcls_validates_required_inputs(monkeypatch, kwargs, message):
         ForSequenceClassificationLoss(**kwargs)
 
 
-def _reference_loss_and_grads(hidden_states, weights, logits_bias, targets):
-    hidden_states = hidden_states.detach().clone().requires_grad_(True)
-    weights = weights.detach().clone().requires_grad_(True)
-    logits_bias = logits_bias.detach().clone().requires_grad_(True)
-    logits = F.linear(hidden_states, weights).float() + logits_bias.float()
-    loss = F.cross_entropy(logits.reshape(-1, weights.size(0)), targets.reshape(-1), ignore_index=IGNORE_INDEX)
-    loss.backward()
-    return loss, hidden_states.grad, weights.grad, logits_bias.grad
-
-
-@pytest.mark.parametrize("layout", ["shift_labels", "implicit_shift", "flat_rows"])
-def test_chunk_loss_logits_bias_matches_reference(monkeypatch, layout):
-    monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
-    torch.manual_seed(0)
-    vocab = 8
-    hidden_states = torch.randn(1, 7, 4, requires_grad=True)
-    weights = torch.randn(vocab, 4, requires_grad=True)
-    logits_bias = torch.randn(1, 7, vocab, requires_grad=True)
-    labels = torch.tensor([[1, 2, IGNORE_INDEX, 3, 4, 5, 6]])
-    op = VeomniOp("cross_entropy_loss", "standard", "chunk_loss")
-
-    if layout == "shift_labels":
-        call = {"hidden_states": hidden_states, "logits_bias": logits_bias, "shift_labels": labels}
-        expected = _reference_loss_and_grads(hidden_states, weights, logits_bias, labels)
-    elif layout == "implicit_shift":
-        call = {"hidden_states": hidden_states, "logits_bias": logits_bias}
-        reference_bias = logits_bias.detach().clone().requires_grad_(True)
-        loss, grad_h, grad_w, grad_b = _reference_loss_and_grads(
-            hidden_states[:, :-1], weights, reference_bias[:, :-1], labels[:, 1:]
-        )
-        pad = torch.zeros(1, 1, grad_h.size(-1))
-        expected = (
-            loss,
-            torch.cat([grad_h, pad], dim=1),
-            grad_w,
-            torch.cat([grad_b, torch.zeros(1, 1, vocab)], dim=1),
-        )
-    else:
-        call = {"hidden_states": hidden_states[0], "logits_bias": logits_bias[0], "shift_labels": labels[0]}
-        loss, grad_h, grad_w, grad_b = _reference_loss_and_grads(hidden_states[0], weights, logits_bias[0], labels[0])
-        expected = (loss, grad_h[None], grad_w, grad_b[None])
-
-    loss, _, _ = ForCausalLMLoss(weights=weights, labels=labels, chunk_size=3, op=op, **call)
-    loss.backward()
-
-    torch.testing.assert_close(loss, expected[0])
-    torch.testing.assert_close(hidden_states.grad, expected[1])
-    torch.testing.assert_close(weights.grad, expected[2])
-    torch.testing.assert_close(logits_bias.grad, expected[3])
-
-
-def test_chunk_loss_logits_bias_without_grad(monkeypatch):
-    monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
-    hidden_states = torch.randn(1, 5, 4, requires_grad=True)
-    weights = torch.randn(6, 4, requires_grad=True)
-    logits_bias = torch.randn(1, 5, 6)
-    labels = torch.tensor([[1, 2, IGNORE_INDEX, 3, 4]])
-    op = VeomniOp("cross_entropy_loss", "standard", "chunk_loss")
-
-    loss, _, _ = ForCausalLMLoss(
-        hidden_states=hidden_states,
-        weights=weights,
-        labels=labels,
-        chunk_size=2,
-        shift_labels=labels,
-        logits_bias=logits_bias,
-        op=op,
-    )
-    loss.backward()
-
-    expected, grad_h, grad_w, _ = _reference_loss_and_grads(hidden_states, weights, logits_bias, labels)
-    torch.testing.assert_close(loss, expected)
-    torch.testing.assert_close(hidden_states.grad, grad_h)
-    torch.testing.assert_close(weights.grad, grad_w)
-
-
 @pytest.mark.parametrize("impl", ["chunk_loss", "eager", None])
 def test_chunk_loss_logits_bias_matches_reference_loss_and_grads(monkeypatch, impl):
     monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
@@ -553,14 +477,6 @@ def test_logits_bias_rejects_unsupported_op_and_mismatched_rows(monkeypatch):
             op=SimpleNamespace(impl="liger_kernel"),
         )
 
-    with pytest.raises(NotImplementedError, match="logits_bias is only supported"):
-        ForCausalLMLoss(
-            logits=torch.randn(1, 3, 4),
-            labels=torch.tensor([[1, 2, 3]]),
-            vocab_size=4,
-            logits_bias=torch.randn(1, 3, 4),
-        )
-
     with pytest.raises(ValueError, match="logits_bias rows"):
         ForCausalLMLoss(
             hidden_states=hidden,
@@ -569,3 +485,69 @@ def test_logits_bias_rejects_unsupported_op_and_mismatched_rows(monkeypatch):
             logits_bias=torch.randn(1, 3, VOCAB),
             op=VeomniOp("cross_entropy_loss", "standard", "chunk_loss"),
         )
+
+    with pytest.raises(ValueError, match="logits_bias_weight requires logits_bias"):
+        ForCausalLMLoss(
+            hidden_states=hidden,
+            weights=weight,
+            labels=labels,
+            logits_bias_weight=torch.randn(VOCAB, 4),
+            op=VeomniOp("cross_entropy_loss", "standard", "chunk_loss"),
+        )
+
+    with pytest.raises(ValueError, match="logits_bias_weight shape"):
+        ForCausalLMLoss(
+            hidden_states=hidden,
+            weights=weight,
+            labels=labels,
+            logits_bias=torch.randn(1, 4, 4),
+            logits_bias_weight=torch.randn(VOCAB, 5),
+            op=VeomniOp("cross_entropy_loss", "standard", "chunk_loss"),
+        )
+
+
+@pytest.mark.parametrize("impl", ["chunk_loss", "eager", None])
+def test_factored_logits_bias_weight_matches_reference_loss_and_grads(monkeypatch, impl):
+    monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+    torch.manual_seed(42)
+    rank = 4
+    shift_labels = torch.tensor([[IGNORE_INDEX, 2, 5, IGNORE_INDEX, 7, 1, 9]], dtype=torch.long)
+    hidden = torch.randn(1, 7, HIDDEN, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(VOCAB, HIDDEN, dtype=torch.float32, requires_grad=True)
+    bias_embed = torch.randn(1, 7, rank, dtype=torch.float32, requires_grad=True)
+    bias_weight = torch.randn(VOCAB, rank, dtype=torch.float32, requires_grad=True)
+
+    hidden_ref = hidden.detach().clone().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    bias_embed_ref = bias_embed.detach().clone().requires_grad_(True)
+    bias_weight_ref = bias_weight.detach().clone().requires_grad_(True)
+    logits_ref = (
+        F.linear(hidden_ref.reshape(-1, HIDDEN), weight_ref).float()
+        + F.linear(bias_embed_ref.reshape(-1, rank), bias_weight_ref).float()
+    )
+    expected = fixed_cross_entropy(logits_ref, shift_labels.reshape(-1), ignore_index=IGNORE_INDEX)
+    expected.backward()
+
+    op = None if impl is None else VeomniOp("cross_entropy_loss", "standard", impl)
+    loss, out_logits, aux = ForCausalLMLoss(
+        logits=None,
+        labels=None,
+        shift_labels=shift_labels,
+        vocab_size=VOCAB,
+        hidden_states=hidden,
+        weights=weight,
+        logits_bias=bias_embed,
+        logits_bias_weight=bias_weight,
+        chunk_size=2,
+        ignore_index=IGNORE_INDEX,
+        op=op,
+    )
+    assert out_logits is None
+    assert aux is None
+    torch.testing.assert_close(loss, expected, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    loss.backward()
+    torch.testing.assert_close(hidden.grad, hidden_ref.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    torch.testing.assert_close(bias_embed.grad, bias_embed_ref.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    torch.testing.assert_close(bias_weight.grad, bias_weight_ref.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)

@@ -631,7 +631,23 @@ def test_deepseek_v4_dspark_mtp_forward_backward_and_packed_isolation(num_mtp_la
     # Without return_mtp_outputs=True, DeepseekV4Model.forward skips running MTP stages.
     raw_model_out = model.model(input_ids=torch.randint(3, config.vocab_size, (1, 4)), use_cache=False)
     assert raw_model_out.mtp_hidden_states is None
+    assert raw_model_out.mtp_markov_embed is None
+    assert raw_model_out.mtp_markov_head_weight is None
     assert raw_model_out.mtp_markov_bias is None
+
+    # With return_mtp_outputs=True, DeepseekV4Model.forward returns low-rank mtp_markov_embed
+    # and mtp_markov_head_weight without materializing a full [B, S, V] mtp_markov_bias.
+    with torch.no_grad():
+        mtp_model_out = model.model(
+            input_ids=torch.randint(3, config.vocab_size, (1, 4)),
+            return_mtp_outputs=True,
+            use_cache=False,
+        )
+    assert mtp_model_out.mtp_markov_embed is not None
+    assert mtp_model_out.mtp_markov_embed.shape == (1, 4, config.dspark_markov_rank)
+    assert mtp_model_out.mtp_markov_head_weight is not None
+    assert mtp_model_out.mtp_markov_head_weight.shape == (config.vocab_size, config.dspark_markov_rank)
+    assert mtp_model_out.mtp_markov_bias is None
 
     # Two packed samples of length 4 each: position_ids restarts at 0 at index 4.
     input_ids = torch.randint(3, config.vocab_size, (1, 8))
@@ -893,3 +909,91 @@ def test_deepseek_v4_dspark_presliced_shift_labels_with_logits_to_keep():
     masked_out.loss.backward()
     assert model.model.mtp[0].main_proj.weight.grad is not None
     assert model.model.mtp[0].main_proj.weight.grad.count_nonzero() > 0
+
+
+def test_deepseek_v4_dspark_mtp_loss_coef_zero_ddp_two_iterations(monkeypatch):
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    from tests.tools.launch_utils import find_free_port
+
+    already_init = dist.is_available() and dist.is_initialized()
+    if not already_init:
+        monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+        monkeypatch.setenv("MASTER_PORT", str(find_free_port()))
+        dist.init_process_group("gloo", rank=0, world_size=1)
+    try:
+        # Case 1: mtp_loss_coef=0.0 configured at model construction time freezes self.mtp
+        # so DDP (find_unused_parameters=False) runs multiple iterations cleanly.
+        config_init_zero = _tiny_config()
+        config_init_zero.layer_types = ["sliding_attention"] * config_init_zero.num_hidden_layers
+        config_init_zero.dspark_block_size = 5
+        config_init_zero.num_nextn_predict_layers = 1
+        config_init_zero.dspark_target_layer_ids = [1, 2, 3]
+        config_init_zero.dspark_markov_rank = 8
+        config_init_zero.mtp_loss_coef = 0.0
+
+        model_init_zero = _build_ours(config_init_zero).train()
+        assert len(model_init_zero.model.mtp) == 1
+        assert all(not p.requires_grad for p in model_init_zero.model.mtp.parameters())
+
+        ddp_init_zero = DDP(model_init_zero, find_unused_parameters=False)
+        input_ids = torch.randint(3, config_init_zero.vocab_size, (1, 6))
+        labels = input_ids.clone()
+        for _ in range(2):
+            ddp_init_zero.zero_grad(set_to_none=True)
+            out = ddp_init_zero(input_ids=input_ids, labels=labels, use_cache=False)
+            assert out.loss is not None
+            assert out.aux_metrics is None or "mtp_loss" not in out.aux_metrics
+            out.loss.backward()
+
+        # Case 2: mtp_loss_coef mutated to 0.0 after DDP wrap still completes two DDP iterations.
+        config_runtime_zero = _tiny_config()
+        config_runtime_zero.layer_types = ["sliding_attention"] * config_runtime_zero.num_hidden_layers
+        config_runtime_zero.dspark_block_size = 5
+        config_runtime_zero.num_nextn_predict_layers = 1
+        config_runtime_zero.dspark_target_layer_ids = [1, 2, 3]
+        config_runtime_zero.dspark_markov_rank = 8
+        config_runtime_zero.mtp_loss_coef = 1.0
+
+        model_runtime_zero = _build_ours(config_runtime_zero).train()
+        ddp_runtime_zero = DDP(model_runtime_zero, find_unused_parameters=False)
+        model_runtime_zero.config.mtp_loss_coef = 0.0
+        for _ in range(2):
+            ddp_runtime_zero.zero_grad(set_to_none=True)
+            out = ddp_runtime_zero(input_ids=input_ids, labels=labels, use_cache=False)
+            assert out.loss is not None
+            assert out.aux_metrics is None or "mtp_loss" not in out.aux_metrics
+            out.loss.backward()
+
+        # Case 3: Under FSDP2+EP, MTP dense and expert parameters live as DTensors on
+        # different meshes; skipping MTP with return_mtp_outputs=False must not sum
+        # DTensors across meshes.
+        from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard
+
+        mesh_1d = DeviceMesh("cpu", [0], mesh_dim_names=("dp_shard",))
+        mesh_2d = DeviceMesh("cpu", [[0]], mesh_dim_names=("ep_fsdp", "ep"))
+        dtensor_model = _build_ours(config_runtime_zero).train()
+        dtensor_model.config.mtp_loss_coef = 1.0
+        dtensor_model.model.mtp[0].main_proj.weight = torch.nn.Parameter(
+            DTensor.from_local(dtensor_model.model.mtp[0].main_proj.weight.detach(), mesh_1d, [Shard(0)])
+        )
+        dtensor_model.model.mtp[0].mlp.experts.gate_up_proj = torch.nn.Parameter(
+            DTensor.from_local(
+                dtensor_model.model.mtp[0].mlp.experts.gate_up_proj.detach(),
+                mesh_2d,
+                [Replicate(), Shard(0)],
+            )
+        )
+        out_dtensor = dtensor_model(
+            input_ids=input_ids,
+            labels=labels,
+            return_mtp_outputs=False,
+            use_cache=False,
+        )
+        assert out_dtensor.loss is not None
+        assert not isinstance(out_dtensor.loss, DTensor)
+        out_dtensor.loss.backward()
+    finally:
+        if not already_init and dist.is_initialized():
+            dist.destroy_process_group()

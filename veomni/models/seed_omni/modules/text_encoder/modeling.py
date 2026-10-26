@@ -23,8 +23,8 @@ from transformers import PreTrainedTokenizerBase
 from veomni.distributed.emb_parallel import ShardedEmbedding
 from veomni.utils.tensor_utils import naflatten, unflatten
 
-from ....utils.conversation import ConversationItem, seal_outputs
-from ...module_modeling_base import PretrainedOmniModule
+from ...utils.conversation import ConversationItem, seal_outputs
+from ..module_modeling_base import PretrainedOmniModule
 from .chat_template import TextEncoderChatTemplate
 from .configuration import TextEncoderConfig
 
@@ -140,24 +140,7 @@ class InferenceMixin:
         return self._agree_on_token(int(token.item()))
 
     def _agree_on_token(self, token_id: int) -> int:
-        """Return rank 0's token on every rank.
-
-        The generation FSM runs independently on each rank and its stop
-        condition is the sampled id, while the forward that feeds it is full
-        of collectives. So the ranks have to agree on the id: the first one to
-        sample EOS leaves the loop, and every other rank then blocks forever in
-        the next all-to-all waiting for a participant that has gone home.
-
-        That is observed, not hypothetical. ``set_seed`` runs before the model
-        is built, and under ep / emb each rank initialises differently shaped
-        shards -- drawing a different amount of randomness and leaving the
-        generators in different states by the time the first token is sampled.
-
-        Agreement by broadcast rather than by re-seeding, because seeding alone
-        would not be enough: identical sampling also needs identical logits
-        bit-for-bit, which a sharded forward does not owe anyone. One integer a
-        token is a rounding error against a decode step.
-        """
+        """Return rank 0's token on every rank."""
         if not dist.is_available() or not dist.is_initialized():
             return token_id
         agreed = torch.tensor([token_id], dtype=torch.long, device=self.device)
@@ -282,7 +265,7 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
         if shift_labels is not None:
             flat_labels = shift_labels.view(-1)
             ce_sum = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
+                logits.view(-1, logits.size(-1)).float(),
                 flat_labels,
                 ignore_index=-100,
                 reduction="sum",
@@ -293,7 +276,7 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_targets = labels[..., 1:].contiguous()
             ce_sum = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_logits.view(-1, shift_logits.size(-1)).float(),
                 shift_targets.view(-1),
                 ignore_index=-100,
                 reduction="sum",

@@ -1,7 +1,7 @@
 """Janus chat template as readable Python (mirrors ``chat_template.jinja``).
 
 :class:`JanusChatTemplate` subclasses
-:class:`~veomni.models.seed_omni.modules.base.text_encoder.chat_template.TextEncoderChatTemplate`
+:class:`~veomni.models.seed_omni.modules.text_encoder.chat_template.TextEncoderChatTemplate`
 and overrides only the Janus-specific templating:
 
 1. :meth:`JanusChatTemplate.apply_chat_template` — insert bos / (optional) system
@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ....utils.conversation import ConversationItem
-from ...base.text_encoder.chat_template import TextEncoderChatTemplate
+from ...text_encoder.chat_template import TextEncoderChatTemplate
 
 
 if TYPE_CHECKING:

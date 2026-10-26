@@ -138,9 +138,12 @@ def ForCausalLMLoss(
     log_prob_min_clamp = kwargs.pop("log_prob_min_clamp", None)
     chunk_size = kwargs.pop("chunk_size", 1024)
     logits_bias = kwargs.pop("logits_bias", None)
+    logits_bias_weight = kwargs.pop("logits_bias_weight", None)
 
     if hidden_states is None and logits is None:
         raise ValueError("hidden_states or logits must be provided.")
+    if logits_bias_weight is not None and logits_bias is None:
+        raise ValueError("logits_bias_weight requires logits_bias to be provided.")
 
     if return_log_probs:
         if logits_bias is not None:
@@ -197,6 +200,16 @@ def ForCausalLMLoss(
                 f"logits_bias rows {tuple(logits_bias.shape[:-1])} do not match hidden_states rows "
                 f"{tuple(hidden_states.shape[:-1])}."
             )
+        if logits_bias_weight is not None:
+            if logits_bias_weight.ndim != 2 or logits_bias_weight.shape != (weights.shape[0], logits_bias.shape[-1]):
+                raise ValueError(
+                    f"logits_bias_weight shape {tuple(logits_bias_weight.shape)} must match "
+                    f"(vocab_size={weights.shape[0]}, rank={logits_bias.shape[-1]})."
+                )
+        elif logits_bias.shape[-1] != weights.shape[0]:
+            raise ValueError(
+                f"logits_bias last dim {logits_bias.shape[-1]} does not match vocab_size {weights.shape[0]}."
+            )
         logits_bias = logits_bias.reshape(-1, logits_bias.size(-1))
         token_op = _chunk_loss_op() if op is None else op
         if getattr(token_op, "impl", None) not in ("chunk_loss", "eager"):
@@ -224,6 +237,8 @@ def ForCausalLMLoss(
         token_kwargs["chunk_size"] = chunk_size
     if logits_bias is not None:
         token_kwargs["logits_bias"] = logits_bias
+    if logits_bias_weight is not None:
+        token_kwargs["logits_bias_weight"] = logits_bias_weight
     loss = token_op(
         hidden,
         target,

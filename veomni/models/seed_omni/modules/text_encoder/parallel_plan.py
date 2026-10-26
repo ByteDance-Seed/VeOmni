@@ -1,6 +1,6 @@
 from torch.distributed._tensor import Shard
 
-from ......distributed.parallel_plan import ParallelPlan
+from .....distributed.parallel_plan import ParallelPlan
 
 
 def get_parallel_plan():

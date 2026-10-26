@@ -35,8 +35,8 @@ from veomni.utils.constants import IGNORE_INDEX
 
 from .....mixins.training_module_mixin import post_forward, pre_forward
 from .....utils.conversation import ConversationItem
-from ....base.text_encoder.accelerated import TrainingMixin as BaseTrainingMixin
-from ....base.text_encoder.accelerated import VeOmniMixin as BaseVeOmniMixin
+from ....text_encoder.accelerated import TrainingMixin as BaseTrainingMixin
+from ....text_encoder.accelerated import VeOmniMixin as BaseVeOmniMixin
 from ..chat_template import DeepseekV41ChatTemplate
 from ..configuration import DeepseekV41TextEncoderConfig
 from ..modeling import DeepseekV41TextEncoder

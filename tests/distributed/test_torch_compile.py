@@ -1,7 +1,11 @@
 import copy
+import os
+import subprocess
+import sys
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +37,123 @@ from veomni.distributed.torch_compile import (
     validate_compile_runtime,
 )
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+
+
+def _run_merged_swiglu_compiled_first_case(entrypoint, dtype_name, swiglu_limit):
+    """Exercise a cold fused activation in a fresh interpreter, before any eager call."""
+    from veomni.ops import resolve_op
+    from veomni.ops.kernels.moe_experts.shared import swiglu
+    from veomni.ops.kernels.moe_experts.shared.ep import EPMergedFc1GroupGemm
+    from veomni.ops.kernels.moe_experts.standard.triton import MergedFc1TritonFusedMoeExpertFunction
+
+    assert "veomni.ops.kernels.moe_experts.shared._triton_swiglu" not in sys.modules
+    torch.manual_seed(31)
+    device = get_device_type()
+    dtype = getattr(torch, dtype_name)
+    tokens, experts, hidden, intermediate, top_k = 23, 4, 64, 128, 2
+
+    if entrypoint == "helper":
+        merged = torch.randn(tokens, 2 * intermediate, device=device, dtype=dtype)
+        gate, up = merged.chunk(2, dim=-1)
+        gate, up, _, _ = swiglu.apply_swiglu_clamp(gate, up, swiglu_limit)
+        gate_before, up_before = gate.clone(), up.clone()
+        compiled = torch.compile(swiglu.merged_swiglu_forward, backend="inductor", fullgraph=True)
+        actual = compiled(gate, up)
+        expected = torch.ops.aten.silu(gate) * up
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(gate, gate_before, rtol=0, atol=0)
+        torch.testing.assert_close(up, up_before, rtol=0, atol=0)
+    else:
+        x = 0.4 * torch.randn(tokens, hidden, device=device, dtype=dtype)
+        w1 = 0.4 * torch.randn(experts, 2 * intermediate, hidden, device=device, dtype=dtype)
+        w2 = 0.1 * torch.randn(experts, hidden, intermediate, device=device, dtype=dtype)
+        if entrypoint == "ep":
+            cumsum = torch.tensor([6, 12, 18, tokens], device=device, dtype=torch.int32)
+            values = (x, w1, w2)
+
+            def forward(hidden_states, fc1, fc2):
+                return EPMergedFc1GroupGemm.apply(hidden_states, cumsum, fc1, fc2, swiglu_limit)
+
+        else:
+            logits = torch.randn(tokens, experts, device=device, dtype=torch.float32)
+            routing, selected = torch.topk(torch.softmax(logits, dim=-1), top_k, dim=-1)
+            values = (x, routing.to(dtype), w1, w2)
+            if entrypoint == "registry":
+                wrapper = resolve_op("moe_experts", "standard", "fused_triton").wrapper
+                empty = torch.empty(0, device=device, dtype=dtype)
+
+                def forward(hidden_states, weights, fc1, fc2):
+                    return wrapper(
+                        hidden_states,
+                        weights,
+                        selected,
+                        empty,
+                        empty,
+                        fc2,
+                        fc1,
+                        num_experts=experts,
+                        swiglu_limit=swiglu_limit,
+                    )
+
+            else:
+
+                def forward(hidden_states, weights, fc1, fc2):
+                    return MergedFc1TritonFusedMoeExpertFunction.apply(
+                        experts, weights, selected, hidden_states, fc1, fc2, swiglu_limit
+                    )
+
+        inputs = [value.detach().clone().requires_grad_() for value in values]
+        reference_inputs = [value.detach().clone() for value in values]
+        state = SimpleNamespace(ep_enabled=False, async_enabled=False)
+        with use_parallel_state(state):
+            compiled = torch.compile(forward, backend="inductor", fullgraph=True)
+            actual = compiled(*inputs)
+            grad_output = torch.randn_like(actual)
+            actual_grads = torch.autograd.grad(actual, inputs, grad_output)
+
+            # Run the reference only after compiled forward and backward finish.
+            original = swiglu.merged_swiglu_forward
+            swiglu.merged_swiglu_forward = lambda gate, up: torch.ops.aten.silu(gate) * up
+            try:
+                expected = forward(*reference_inputs)
+            finally:
+                swiglu.merged_swiglu_forward = original
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
+        assert torch.isfinite(actual).all()
+        # This regression covers cold initialization and backward execution.
+        # test_deepseek_v4_inductor_fixed_route_expert_vjp_matches_fp32_reference
+        # supplies the compiled numerical gradient oracle.
+        for grad, value in zip(actual_grads, inputs, strict=True):
+            assert grad.shape == value.shape and grad.dtype == value.dtype and grad.device == value.device
+            assert torch.isfinite(grad).all()
+            assert torch.count_nonzero(grad) > 0
+
+    assert "veomni.ops.kernels.moe_experts.shared._triton_swiglu" in sys.modules
+
+
+@pytest.mark.parametrize("entrypoint", ["helper", "non_ep", "ep", "registry"])
+@pytest.mark.parametrize("dtype_name,swiglu_limit", [("bfloat16", None), ("float16", 1.0)])
+def test_merged_swiglu_compiled_first_in_fresh_process(tmp_path, entrypoint, dtype_name, swiglu_limit):
+    """A first compiled call must work without an earlier eager kernel initialization."""
+    from tests.ops.utils import require_nvidia_cuda
+
+    require_nvidia_cuda("triton")
+    script = (
+        "import sys; "
+        "from tests.distributed.test_torch_compile import _run_merged_swiglu_compiled_first_case; "
+        "_run_merged_swiglu_compiled_first_case(sys.argv[1], sys.argv[2], "
+        "None if sys.argv[3] == 'None' else float(sys.argv[3]))"
+    )
+    env = os.environ.copy()
+    env["TORCHINDUCTOR_CACHE_DIR"] = str(tmp_path / "inductor")
+    env["TRITON_CACHE_DIR"] = str(tmp_path / "triton")
+    subprocess.run(
+        [sys.executable, "-c", script, entrypoint, dtype_name, str(swiglu_limit)],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        check=True,
+        timeout=300,
+    )
 
 
 def _non_sp_parallel_state() -> ParallelState:

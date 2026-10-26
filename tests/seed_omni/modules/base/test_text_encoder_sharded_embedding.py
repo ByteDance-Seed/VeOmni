@@ -20,11 +20,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from veomni.distributed.emb_parallel import sharded_embedding
-from veomni.models.seed_omni.modules.base.text_encoder.configuration import TextEncoderConfig
-from veomni.models.seed_omni.modules.base.text_encoder.modeling import TextEncoder
 from veomni.models.seed_omni.modules.qwen3.text_encoder.accelerated import Qwen3TextEncoderAccelerated
 from veomni.models.seed_omni.modules.qwen3.text_encoder.accelerated import accelerated as qwen3_accelerated
 from veomni.models.seed_omni.modules.qwen3.text_encoder.configuration import Qwen3TextEncoderConfig
+from veomni.models.seed_omni.modules.text_encoder.configuration import TextEncoderConfig
+from veomni.models.seed_omni.modules.text_encoder.modeling import TextEncoder
 
 
 _VOCAB, _HIDDEN = 8, 4

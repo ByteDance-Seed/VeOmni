@@ -209,10 +209,16 @@ class MoeModelOutputWithIndexerKL(MoeModelOutputWithPast):
         mtp_hidden_states (`torch.FloatTensor`, *optional*):
             Last-stage DSpark draft hidden states ``[B, S, hidden_size]`` after
             ``hc_head`` collapse and ``norm``, ready for the shared LM head.
+        mtp_markov_embed (`torch.FloatTensor`, *optional*):
+            Rank-``dspark_markov_rank`` token embeddings ``[B, S, dspark_markov_rank]``
+            produced by the last DSpark stage's ``markov_head.embed`` on the input
+            token ids for chunked Markov residual projection.
+        mtp_markov_head_weight (`torch.FloatTensor`, *optional*):
+            Vocabulary projection weight ``[vocab_size, dspark_markov_rank]`` of the
+            last DSpark stage's ``markov_head.head``.
         mtp_markov_bias (`torch.FloatTensor`, *optional*):
-            Rank-``dspark_markov_rank`` residual logits ``[B, S, vocab_size]``
-            produced by the last DSpark stage's ``markov_head`` on the input
-            token ids.
+            Optional pre-projected residual logits ``[B, S, vocab_size]`` when not
+            using the factored ``(mtp_markov_embed, mtp_markov_head_weight)`` path.
     """
 
     indexer_kl_total: Optional[torch.Tensor] = None
@@ -220,6 +226,8 @@ class MoeModelOutputWithIndexerKL(MoeModelOutputWithPast):
     indexer_query_tokens: Optional[int] = None
     indexer_kl_layers: Optional[int] = None
     mtp_hidden_states: Optional[torch.FloatTensor] = None
+    mtp_markov_embed: Optional[torch.FloatTensor] = None
+    mtp_markov_head_weight: Optional[torch.FloatTensor] = None
     mtp_markov_bias: Optional[torch.FloatTensor] = None
 
 

@@ -598,7 +598,7 @@ class TestDsparkTrainStep:
 
     def test_decode_dspark_ce_adds_the_markov_residual(self, monkeypatch):
         """Draft CE scores ``lm_head(h) + markov`` on the DSpark labels, logged apart from the main CE."""
-        from veomni.models.seed_omni.modules.base.text_encoder.accelerated.accelerated import (
+        from veomni.models.seed_omni.modules.text_encoder.accelerated.accelerated import (
             TrainingMixin as BaseTrainingMixin,
         )
 

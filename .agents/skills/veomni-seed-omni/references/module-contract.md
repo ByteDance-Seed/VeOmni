@@ -46,6 +46,19 @@ modules/<family>/<submodule>/
 
 ## Required Runtime Rules
 
+- **`modeling.py`**: pure HuggingFace-native, loadable with `from_pretrained` /
+  `AutoModel`. If inference-capable, list `InferenceMixin` **before**
+  `PretrainedOmniModule`: `class Xxx(InferenceMixin, PretrainedOmniModule)` so
+  its `generate()` / `reset_*` / `finalize` methods take precedence over
+  `PretrainedOmniModule`'s no-op defaults.
+- **`accelerated/accelerated.py`**: defines `TrainingMixin(TrainingModuleMixin)`,
+  optional `MeterMixin(MetricMeterMixin)`, `VeOmniMixin(BaseMixin,
+  TrainingMixin, MeterMixin)`, and `class XxxAccelerated(VeOmniMixin, Xxx)`.
+- **Registration** (`veomni/models/seed_omni/modules/__init__.py` at import
+  time, keyed by `config.model_type`): `OMNI_CONFIG_REGISTRY`,
+  `OMNI_MODEL_REGISTRY`, `OMNI_ACCELERATED_MODEL_REGISTRY`, and optional
+  `OMNI_PROCESSOR_REGISTRY`.
+
 - Methods return `dict[str, Any]`.
 - Training graph call-sites must implement `forward` or the referenced method.
 - Use `@pre_forward("<method>")` and `@post_forward("<method>")` when one module
@@ -66,7 +79,7 @@ modules/<family>/<submodule>/
   + a `0.0` anchor when a modality is absent.
 - For shared stateless carrier helpers called by both `modeling.py` and
   `accelerated/accelerated.py`, define plain module-level functions in
-  `modeling.py` (or reuse `modules/base/llm_packing.py`).
+  `modeling.py`.
 
 ## IDE type stubs (`accelerated/accelerated.py`)
 

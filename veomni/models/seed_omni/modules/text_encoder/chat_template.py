@@ -4,7 +4,7 @@ from typing import Any
 
 import torch
 
-from ....utils.conversation import _OMNI_TOKEN_LEN, ConversationItem, ItemRole, ItemType, ItemValue
+from ...utils.conversation import _OMNI_TOKEN_LEN, ConversationItem, ItemRole, ItemType, ItemValue
 
 
 @dataclass(frozen=True)
