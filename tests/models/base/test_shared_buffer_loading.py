@@ -84,6 +84,82 @@ class _BufferAliasConverter:
         return _BufferAliasConverter(self.layout)
 
 
+class _RandomInitSharedBuffers(_SharedBuffers):
+    def __init__(self, root_persistent, child_persistent, overwrite_buffer=False):
+        super().__init__(root_persistent, child_persistent)
+        self.register_buffer("standalone", torch.tensor([5.0, 8.0]))
+        self.overwrite_buffer = overwrite_buffer
+        self.init_calls = 0
+
+    def init_weights(self):
+        self.init_calls += 1
+        with torch.no_grad():
+            self.weight.copy_(torch.tensor([1.0, 2.0]))
+            if self.overwrite_buffer:
+                self.child.child_buffer.copy_(torch.tensor([31.0, 53.0]))
+
+
+@pytest.mark.parametrize("root_persistent,child_persistent", _PERSISTENCE)
+@pytest.mark.parametrize("overwrite_buffer", [False, True])
+def test_random_init_preserves_real_buffers(root_persistent, child_persistent, overwrite_buffer):
+    with weights.init_empty_weights():
+        model = _RandomInitSharedBuffers(root_persistent, child_persistent, overwrite_buffer)
+    _materialize_and_load_weights(
+        model,
+        None,
+        "cpu",
+        should_skip_hf_weight_load=False,
+        is_peft_model=False,
+        adapter_path=None,
+        broadcast_from_rank0=False,
+    )
+    expected = torch.tensor([31.0, 53.0] if overwrite_buffer else [7.0, 11.0])
+    assert model.init_calls == 1
+    assert model.root_buffer is model.child.child_buffer
+    assert torch.equal(model.root_buffer, expected)
+    assert torch.equal(model.standalone, torch.tensor([5.0, 8.0]))
+    assert torch.equal(model.weight, torch.tensor([1.0, 2.0]))
+
+
+@pytest.mark.parametrize("root_persistent,child_persistent", _PERSISTENCE)
+def test_resume_keeps_checkpoint_authority(monkeypatch, root_persistent, child_persistent):
+    with weights.init_empty_weights():
+        model = _RandomInitSharedBuffers(root_persistent, child_persistent)
+    to_empty = model.to_empty
+
+    def sentinel_to_empty(*, device):
+        result = to_empty(device=device)
+        for buffer in model.buffers():
+            buffer.fill_(-1234)
+        return result
+
+    monkeypatch.setattr(model, "to_empty", sentinel_to_empty)
+    _materialize_and_load_weights(
+        model,
+        "must-not-read-hf",
+        "cpu",
+        should_skip_hf_weight_load=True,
+        is_peft_model=False,
+        adapter_path=None,
+        broadcast_from_rank0=False,
+    )
+    expected = torch.full((2,), -1234.0) if root_persistent or child_persistent else torch.tensor([7.0, 11.0])
+    assert model.init_calls == 0
+    assert model.root_buffer is model.child.child_buffer
+    assert torch.equal(model.root_buffer, expected)
+    assert torch.equal(model.standalone, torch.full((2,), -1234.0))
+    checkpoint = {"weight": torch.tensor([1.0, 2.0]), "standalone": torch.tensor([42.0, 43.0])}
+    if root_persistent:
+        checkpoint["root_buffer"] = torch.tensor([21.0, 34.0])
+    if child_persistent:
+        checkpoint["child.child_buffer"] = torch.tensor([21.0, 34.0])
+    model.load_state_dict(checkpoint, strict=True)
+    expected = torch.tensor([21.0, 34.0] if root_persistent or child_persistent else [7.0, 11.0])
+    assert model.root_buffer is model.child.child_buffer
+    assert torch.equal(model.root_buffer, expected)
+    assert torch.equal(model.standalone, torch.tensor([42.0, 43.0]))
+
+
 def _write_checkpoint(directory, root_persistent, child_persistent, layout="direct"):
     directory.mkdir(exist_ok=True)
     payload = {"weight": torch.tensor([1.0, 2.0])}

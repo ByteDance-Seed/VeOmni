@@ -54,7 +54,9 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
         _reset_hf_initialized_flag(child)
 
 
-def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) -> None:
+def _to_empty_preserving_nonpersistent_buffers(
+    model: nn.Module, device: str, *, preserve_persistent_buffers: bool = False
+) -> None:
     """Materialize parameters while preserving buffer alias groups.
 
     ``Module.to_empty()`` replaces each registered buffer independently, which
@@ -69,6 +71,10 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
     registration, the checkpoint is authoritative and will populate the shared
     materialized tensor during the subsequent DCP load.
 
+    For random initialization, ``preserve_persistent_buffers=True`` preserves
+    all real buffer values instead: no checkpoint will restore them. The
+    subsequent ``init_weights()`` call can still overwrite these initial values.
+
     HF's ``_init_weights`` recomputes a rope table only for a module that
     exposes ``original_inv_freq``. Buffers outside that shape -- Gemma3's
     per-layer-type ``{type}_inv_freq`` and its ``embed_scale`` -- have nothing
@@ -76,7 +82,7 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
     """
 
     buffer_groups: dict[int, list[tuple[nn.Module, str]]] = {}
-    preserved_nonpersistent_buffers: dict[int, torch.Tensor] = {}
+    preserved_buffers: dict[int, torch.Tensor] = {}
     for module in model.modules():
         for name, buffer in module._buffers.items():
             if buffer is None:
@@ -87,7 +93,9 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
     for buffer_id, registrations in buffer_groups.items():
         module, name = registrations[0]
         buffer = module._buffers[name]
-        if not all(name in module._non_persistent_buffers_set for module, name in registrations):
+        if not preserve_persistent_buffers and not all(
+            name in module._non_persistent_buffers_set for module, name in registrations
+        ):
             continue
         if buffer.is_meta:
             # A buffer derived from a parameter (``self.weight.detach()``) is
@@ -95,18 +103,18 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
             # No model does this today; say so rather than let ``to_empty()``
             # leave uninitialized memory behind unannounced.
             logger.warning_rank0(
-                f"Non-persistent buffer {name!r} on {type(module).__name__} is on meta and cannot be "
+                f"Buffer {name!r} on {type(module).__name__} is on meta and cannot be "
                 "preserved across materialization; it will hold uninitialized memory unless init_weights() sets it."
             )
             continue
-        preserved_nonpersistent_buffers[buffer_id] = buffer.detach().clone()
+        preserved_buffers[buffer_id] = buffer.detach().clone()
 
     model.to_empty(device=device)
 
     for buffer_id, registrations in buffer_groups.items():
         module, name = registrations[0]
         canonical_buffer = module._buffers[name]
-        snapshot = preserved_nonpersistent_buffers.get(buffer_id)
+        snapshot = preserved_buffers.get(buffer_id)
         if snapshot is not None:
             canonical_buffer.copy_(snapshot.to(device=canonical_buffer.device, dtype=canonical_buffer.dtype))
         for module, name in registrations:
@@ -263,10 +271,11 @@ def _materialize_and_load_weights(
                 "Skipping pretrained weight load for checkpoint resume; "
                 "parameters will be restored from the distributed checkpoint."
             )
-        # Preserve non-persistent buffers on the random-init path too: HF's
-        # ``_init_weights`` recomputes only rope tables shaped the way it expects,
-        # so the rest would train on whatever ``to_empty()`` left behind.
-        _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
+        # Random init has no checkpoint to restore even persistent buffers;
+        # preserve their constructor values before calling model.init_weights().
+        _to_empty_preserving_nonpersistent_buffers(
+            model, materialize_device, preserve_persistent_buffers=not should_skip_hf_weight_load
+        )
         _reset_hf_initialized_flag(model)
         # Random init is unnecessary when the checkpoint will overwrite every parameter.
         if not should_skip_hf_weight_load:
