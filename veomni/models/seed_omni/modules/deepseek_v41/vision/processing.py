@@ -39,7 +39,7 @@ import torch
 from PIL import Image, ImageOps
 from transformers.image_processing_utils import BaseImageProcessor
 
-from ....utils.conversation import _OMNI_TOKEN_LEN, ConversationItem, iter_desired_items
+from ....utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
 from ...module_processing_base import ModulePreprocessorBase
 from .configuration import DeepseekV41VisionEncoderConfig
 
@@ -138,20 +138,35 @@ class DeepseekV41VisionImageProcessor(BaseImageProcessor):
         self.min_pixels = min_pixels
         self.max_wh_ratio = max_wh_ratio
 
-    def plan_grid(self, width: int, height: int) -> tuple[int, int, int, int]:
+    def plan_grid(
+        self,
+        width: int,
+        height: int,
+        *,
+        max_image_tokens: int | None = None,
+        min_pixels: int | None = None,
+    ) -> tuple[int, int, int, int]:
         """Resize plan for an image of this original size; a pure function of its arguments."""
         patch = self.patch_size
+        max_tokens = self.max_image_tokens if max_image_tokens is None else max_image_tokens
+        min_px = self.min_pixels if min_pixels is None else min_pixels
         if self.max_wh_ratio is not None and width > height * self.max_wh_ratio:
             width = int(height * self.max_wh_ratio)
-        if 0 < width * height < self.min_pixels:
-            scale = (self.min_pixels / (width * height)) ** 0.5
+        if 0 < width * height < min_px:
+            scale = (min_px / (width * height)) ** 0.5
             width = int(width * scale)
             height = int(height * scale)
         best_width = math.ceil(width / patch) * patch
         best_height = math.ceil(height / patch) * patch
-        return safe_resize(height, width, best_height, best_width, patch, self.downsample_ratio, self.max_image_tokens)
+        return safe_resize(height, width, best_height, best_width, patch, self.downsample_ratio, max_tokens)
 
-    def preprocess_one(self, image: Any) -> tuple[torch.Tensor, int, int, int, int]:
+    def preprocess_one(
+        self,
+        image: Any,
+        *,
+        max_image_tokens: int | None = None,
+        min_pixels: int | None = None,
+    ) -> tuple[torch.Tensor, int, int, int, int]:
         """One image -> ``(patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w)``.
 
         ``patches`` is ``(n_vit_h * n_vit_w, 3, patch, patch)`` in [-1, 1].
@@ -171,7 +186,12 @@ class DeepseekV41VisionImageProcessor(BaseImageProcessor):
         image = image.convert("RGB")
 
         patch = self.patch_size
-        n_llm_h, n_llm_w, best_height, best_width = self.plan_grid(image.width, image.height)
+        n_llm_h, n_llm_w, best_height, best_width = self.plan_grid(
+            image.width,
+            image.height,
+            max_image_tokens=max_image_tokens,
+            min_pixels=min_pixels,
+        )
         n_vit_h, n_vit_w = best_height // patch, best_width // patch
         if self.max_wh_ratio is not None and image.width >= self.max_wh_ratio * image.height:
             image = image.resize((best_width, best_height))
@@ -183,6 +203,25 @@ class DeepseekV41VisionImageProcessor(BaseImageProcessor):
         patches = pixels.reshape(3, n_vit_h, patch, n_vit_w, patch)
         patches = patches.permute(1, 3, 0, 2, 4).reshape(n_vit_h * n_vit_w, 3, patch, patch)
         return patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w
+
+
+def _extract_video_frames(value: Any, max_video_frames: int = 8) -> list[Any]:
+    """Unpack a ``VideoInputs``, 4D ``(T, 3, H, W)`` tensor, or frame list into at most ``max_video_frames`` frames."""
+    raw = getattr(value, "video", value)
+    if isinstance(raw, torch.Tensor):
+        if raw.dim() != 4 or raw.size(1) != 3 or raw.dtype != torch.uint8:
+            raise TypeError(f"expected a (T, 3, H, W) uint8 video tensor, got {raw.dtype} {tuple(raw.shape)}")
+        frames = [raw[t] for t in range(raw.size(0))]
+    elif isinstance(raw, (list, tuple)):
+        frames = list(raw)
+    else:
+        raise TypeError(
+            f"expected VideoInputs, 4D uint8 tensor, or frame sequence for video, got {type(value).__name__}"
+        )
+    if max_video_frames and len(frames) > max_video_frames:
+        indices = torch.linspace(0, len(frames) - 1, steps=max_video_frames).round().long().tolist()
+        frames = [frames[i] for i in indices]
+    return frames
 
 
 class DeepseekV41VisionPreprocessor(ModulePreprocessorBase):
@@ -228,21 +267,62 @@ class DeepseekV41VisionPreprocessor(ModulePreprocessorBase):
         self._dummy_grid = [ratio, ratio]
         self._dummy_types = image_token_types(1, 1)
 
+    def _patchify_item(
+        self,
+        item: ConversationItem,
+        *,
+        max_image_tokens: int | None = None,
+        min_pixels: int | None = None,
+    ) -> ConversationItem:
+        patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = self._image_processor.preprocess_one(
+            item.value,
+            max_image_tokens=max_image_tokens,
+            min_pixels=min_pixels,
+        )
+        item.value = patches.to(dtype=self._dtype)
+        item.meta[_OMNI_VIT_GRID] = [n_vit_h, n_vit_w]
+        token_types = image_token_types(n_llm_h, n_llm_w)
+        item.meta[_OMNI_TOKEN_TYPES] = token_types
+        item.meta[_OMNI_TOKEN_LEN] = int(token_types.numel())
+        return item
+
     def preprocess_conversations(
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
     ) -> None:
         del kwargs
         for sample in conversation_list:
-            items = [it for it in iter_desired_items([sample], types=["image"], roles=["user"]) if not it.is_dummy]
-            if items:
-                for item in items:
-                    patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = self._image_processor.preprocess_one(item.value)
-                    item.value = patches.to(dtype=self._dtype)
-                    item.meta[_OMNI_VIT_GRID] = [n_vit_h, n_vit_w]
-                    token_types = image_token_types(n_llm_h, n_llm_w)
-                    item.meta[_OMNI_TOKEN_TYPES] = token_types
-                    item.meta[_OMNI_TOKEN_LEN] = int(token_types.numel())
-            elif not inference:
+            expanded: list[ConversationItem] = []
+            has_visual = False
+            for item in sample:
+                if item.role == "user" and not item.is_dummy and item.type == "video":
+                    frames = _extract_video_frames(item.value)
+                    if frames:
+                        has_visual = True
+                        frame_max_tokens = max(64, self._image_processor.max_image_tokens // len(frames))
+                        frame_min_pixels = 0 if len(frames) > 1 else None
+                        base_meta = {k: v for k, v in (item.meta or {}).items() if k != "video_metadata"}
+                        for frame in frames:
+                            frame_item = ConversationItem(
+                                type="image",
+                                value=frame,
+                                role=item.role,
+                                meta=dict(base_meta),
+                            )
+                            expanded.append(
+                                self._patchify_item(
+                                    frame_item,
+                                    max_image_tokens=frame_max_tokens,
+                                    min_pixels=frame_min_pixels,
+                                )
+                            )
+                elif item.role == "user" and not item.is_dummy and item.type == "image":
+                    has_visual = True
+                    expanded.append(self._patchify_item(item))
+                else:
+                    expanded.append(item)
+            sample[:] = expanded
+
+            if not has_visual and not inference:
                 if self._dummy_patches is None:
                     raise RuntimeError(
                         f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "

@@ -44,6 +44,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.functional import scaled_dot_product_attention
+from transformers.modeling_layers import GradientCheckpointingLayer
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
@@ -232,7 +233,7 @@ class DeepseekV41VisionMLP(nn.Module):
         return self.w2(F.silu(gate) * up)
 
 
-class DeepseekV41VisionBlock(nn.Module):
+class DeepseekV41VisionBlock(GradientCheckpointingLayer):
     def __init__(self, config: DeepseekV41VisionEncoderConfig):
         super().__init__()
         rms_impl = config.ops_implementation.get("rms_norm_implementation", resolve_op_impl("rms_norm_implementation"))
@@ -258,6 +259,7 @@ class DeepseekV41ViT(nn.Module):
 
     def __init__(self, config: DeepseekV41VisionEncoderConfig):
         super().__init__()
+        self.gradient_checkpointing = False
         rms_impl = config.ops_implementation.get("rms_norm_implementation", resolve_op_impl("rms_norm_implementation"))
         self.patch_embed = DeepseekV41VisionPatchEmbed(config)
         self.blocks = nn.ModuleList([DeepseekV41VisionBlock(config) for _ in range(config.num_hidden_layers)])

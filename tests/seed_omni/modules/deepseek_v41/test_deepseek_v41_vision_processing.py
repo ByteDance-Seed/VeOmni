@@ -88,3 +88,72 @@ def test_preprocess_conversations_accepts_data_layer_images():
 def test_rejects_tensors_outside_the_data_layer_contract(bad):
     with pytest.raises(TypeError):
         _processor().preprocess_one(bad)
+
+
+def test_preprocess_conversations_expands_video_into_frame_images():
+    from veomni.data.seed_omni.utils.video import VideoInputs
+
+    frames = torch.randint(0, 256, (4, 3, 84, 84), dtype=torch.uint8)
+    video_item = ConversationItem(
+        type="video",
+        value=VideoInputs(video=frames),
+        role="user",
+        meta={"video_metadata": "sentinel"},
+    )
+    text_item = ConversationItem(type="text", value="Describe this video.", role="user")
+    sample = [video_item, text_item]
+
+    preprocessor = DeepseekV41VisionPreprocessor(_processor(), dtype=torch.bfloat16)
+    preprocessor.preprocess_conversations([sample])
+
+    assert len(sample) == 5
+    for frame_item in sample[:4]:
+        assert frame_item.type == "image"
+        assert frame_item.role == "user"
+        assert "video_metadata" not in frame_item.meta
+        assert frame_item.meta["_omni_token_len"] > 0
+        assert frame_item.value.dtype == torch.bfloat16
+    assert sample[4] is text_item
+
+
+def test_vision_encoder_gradient_checkpointing_matches_uncheckpointed():
+    from veomni.models.seed_omni.modules.deepseek_v41.vision.configuration import DeepseekV41VisionEncoderConfig
+    from veomni.models.seed_omni.modules.deepseek_v41.vision.modeling import (
+        DeepseekV41VisionEncoder,
+        build_deepseek_v41_vit_metadata,
+    )
+
+    torch.manual_seed(0)
+    cfg = DeepseekV41VisionEncoderConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        out_hidden_size=64,
+        patch_size=14,
+        downsample_ratio=3,
+        ops_implementation={"attn_implementation": "sdpa", "rms_norm_implementation": "eager"},
+    )
+    ref = DeepseekV41VisionEncoder(cfg).train()
+    gc_model = DeepseekV41VisionEncoder(cfg).train()
+    gc_model.load_state_dict(ref.state_dict())
+    gc_model.gradient_checkpointing_enable()
+    assert gc_model.vision.gradient_checkpointing is True
+    assert all(b.gradient_checkpointing is True for b in gc_model.vision.blocks)
+
+    patches = torch.randn(9, 3, 14, 14, requires_grad=True)
+    patches_gc = patches.detach().clone().requires_grad_(True)
+    grids = [[3, 3]]
+    types = [image_token_types(1, 1)]
+    meta = build_deepseek_v41_vit_metadata(grids, cfg.rope_dim, cfg.rope_theta, patches.device)
+
+    out_ref = ref(pixel_values=patches, grids=grids, token_types=types, vit_metadata=meta)["image_embeds"]
+    out_gc = gc_model(pixel_values=patches_gc, grids=grids, token_types=types, vit_metadata=meta)["image_embeds"]
+    torch.testing.assert_close(out_gc, out_ref, rtol=0, atol=0)
+
+    out_ref.sum().backward()
+    out_gc.sum().backward()
+    torch.testing.assert_close(patches_gc.grad, patches.grad, rtol=1e-5, atol=1e-5)
+    for (n1, p1), (n2, p2) in zip(ref.named_parameters(), gc_model.named_parameters()):
+        assert n1 == n2
+        torch.testing.assert_close(p2.grad, p1.grad, rtol=1e-5, atol=1e-5)

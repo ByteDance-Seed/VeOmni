@@ -147,6 +147,35 @@ def _frames_from_list(video: list) -> torch.Tensor:
     return torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()
 
 
+def _decode_video_with_av(
+    video: VideoInput,
+    fps: float,
+    max_frames: int | None,
+) -> tuple[torch.Tensor, float, int, list[int], float | None]:
+    """PyAV fallback when ``libtorchcodec`` shared libraries cannot be loaded."""
+    import av
+
+    source = BytesIO(video) if isinstance(video, (bytes, bytearray)) else video
+    with av.open(source) as container:
+        stream = container.streams.video[0]
+        rate = stream.average_rate or stream.base_rate
+        source_fps = float(rate) if rate else 0.0
+        if not source_fps:
+            raise ValueError(
+                "load_video: the container states no frame rate, so its frames have no times. Re-encode the "
+                "clip with timing metadata, or decode it to frames and declare `frames_fps`."
+            )
+        decoded = [f.to_ndarray(format="rgb24") for f in container.decode(video=0)]
+        if not decoded:
+            raise ValueError("load_video: video container decoded 0 frames.")
+        source_num_frames = len(decoded)
+        indices = _sample_frame_indices(source_num_frames, source_fps, fps, max_frames)
+        kept = np.stack([decoded[i] for i in indices], axis=0)  # (T, H, W, C)
+        frames = torch.from_numpy(kept).permute(0, 3, 1, 2).contiguous()
+        duration = float(stream.duration * stream.time_base) if (stream.duration and stream.time_base) else None
+    return frames, source_fps, source_num_frames, indices, duration
+
+
 def load_video(
     video: VideoInput,
     fps: float = 2.0,
@@ -194,23 +223,34 @@ def load_video(
                 "ffmpeg is not available; required to decode str/bytes video. Install ffmpeg "
                 "or feed pre-decoded frames (list of PIL / bytes)."
             )
-        from torchcodec.decoders import VideoDecoder
+        try:
+            from torchcodec.decoders import VideoDecoder
+        except (ImportError, RuntimeError, OSError):
+            VideoDecoder = None
 
-        decoder = VideoDecoder(video, device="cpu", num_ffmpeg_threads=0)
-        source_meta = decoder.metadata
-        source_fps = source_meta.average_fps
-        if not source_fps:
-            # torchcodec reports the rate as optional; without one the kept frames
-            # have no times and the sound has no clock to be placed on.
-            # ``VideoMetadata`` refuses it anyway — said here so the message
-            # names the clip's container, not the dataclass.
-            raise ValueError(
-                "load_video: the container states no frame rate, so its frames have no times. Re-encode the "
-                "clip with timing metadata, or decode it to frames and declare `frames_fps`."
+        if VideoDecoder is not None:
+            decoder = VideoDecoder(video, device="cpu", num_ffmpeg_threads=0)
+            source_meta = decoder.metadata
+            source_fps = source_meta.average_fps
+            if not source_fps:
+                # torchcodec reports the rate as optional; without one the kept frames
+                # have no times and the sound has no clock to be placed on.
+                # ``VideoMetadata`` refuses it anyway — said here so the message
+                # names the clip's container, not the dataclass.
+                raise ValueError(
+                    "load_video: the container states no frame rate, so its frames have no times. Re-encode the "
+                    "clip with timing metadata, or decode it to frames and declare `frames_fps`."
+                )
+            source_num_frames = max(1, source_meta.num_frames)
+            indices = _sample_frame_indices(source_num_frames, source_fps, fps, max_frames)
+            frames = decoder.get_frames_at(indices).data  # (T, C, H, W) uint8
+            video_duration = source_meta.duration_seconds or source_num_frames / source_fps
+        else:
+            frames, source_fps, source_num_frames, indices, duration = _decode_video_with_av(
+                video, fps=fps, max_frames=max_frames
             )
-        source_num_frames = max(1, source_meta.num_frames)
-        indices = _sample_frame_indices(source_num_frames, source_fps, fps, max_frames)
-        frames = decoder.get_frames_at(indices).data  # (T, C, H, W) uint8
+            video_duration = duration or source_num_frames / source_fps
+
         if use_audio_in_video:
             # The cap is an OOM bound, so it has to sit above the clip's real
             # length or it silently shortens the sound track while every video
@@ -218,7 +258,6 @@ def load_video(
             # the same clip and nothing says so. Fall back to the video's own
             # span (frames / rate) rather than a fixed guess when the container
             # does not state a duration.
-            video_duration = source_meta.duration_seconds or source_num_frames / source_fps
             max_audio_duration = video_duration + 1.0
             audio, audio_rate = extract_audio_from_video(video, max_duration_seconds=max_audio_duration)
             if audio is not None:
