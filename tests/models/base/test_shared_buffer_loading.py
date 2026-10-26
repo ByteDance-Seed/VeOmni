@@ -31,9 +31,10 @@ from veomni.distributed.parallel_state import _init_parallel_state, clear_parall
 from veomni.distributed.torch_parallelize import _materialize_and_load_weights, _move_model_buffers_to_device
 from veomni.models.checkpoint import weights
 from veomni.models.checkpoint.convert import ConvertedCheckpointTensor
+from veomni.utils.device import get_device_id, get_device_type, get_torch_device
 
 
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+_CPU_PLAN = LaunchSpec(device="cpu")
 _PERSISTENCE = [(True, False), (False, True), (False, False), (True, True)]
 
 
@@ -99,15 +100,13 @@ class _RandomInitSharedBuffers(_SharedBuffers):
                 self.child.child_buffer.copy_(torch.tensor([31.0, 53.0]))
 
 
-@pytest.mark.parametrize("root_persistent,child_persistent", _PERSISTENCE)
-@pytest.mark.parametrize("overwrite_buffer", [False, True])
-def test_random_init_preserves_real_buffers(root_persistent, child_persistent, overwrite_buffer):
+def _check_random_init(root_persistent, child_persistent, overwrite_buffer, device):
     with weights.init_empty_weights():
         model = _RandomInitSharedBuffers(root_persistent, child_persistent, overwrite_buffer)
     _materialize_and_load_weights(
         model,
         None,
-        "cpu",
+        str(device),
         should_skip_hf_weight_load=False,
         is_peft_model=False,
         adapter_path=None,
@@ -116,11 +115,33 @@ def test_random_init_preserves_real_buffers(root_persistent, child_persistent, o
     expected = torch.tensor([31.0, 53.0] if overwrite_buffer else [7.0, 11.0])
     assert model.init_calls == 1
     assert model.root_buffer is model.child.child_buffer
-    assert torch.equal(model.root_buffer, expected)
-    assert torch.equal(model.standalone, torch.tensor([5.0, 8.0]))
-    assert torch.equal(model.weight, torch.tensor([1.0, 2.0]))
+    assert torch.equal(model.root_buffer.cpu(), expected)
+    assert torch.equal(model.standalone.cpu(), torch.tensor([5.0, 8.0]))
+    assert torch.equal(model.weight.cpu(), torch.tensor([1.0, 2.0]))
+    assert model.optional is None
+    assert all(tensor.device == device for tensor in (*model.parameters(), *model.buffers()))
 
 
+@pytest.mark.launch_plan(provider=_CPU_PLAN)
+@pytest.mark.parametrize("root_persistent,child_persistent", _PERSISTENCE)
+@pytest.mark.parametrize("overwrite_buffer", [False, True])
+def test_random_init_preserves_real_buffers(root_persistent, child_persistent, overwrite_buffer):
+    _check_random_init(root_persistent, child_persistent, overwrite_buffer, torch.device("cpu"))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec())
+def test_random_init_materializes_buffers_on_accelerator():
+    device_type = get_device_type()
+    if device_type == "cpu":
+        pytest.skip("Requires an accelerator runtime")
+    assert get_torch_device().is_available(), "Selected accelerator runtime is unavailable"
+    device = torch.device(device_type, get_device_id())
+    for root_persistent, child_persistent in _PERSISTENCE:
+        for overwrite_buffer in (False, True):
+            _check_random_init(root_persistent, child_persistent, overwrite_buffer, device)
+
+
+@pytest.mark.launch_plan(provider=_CPU_PLAN)
 @pytest.mark.parametrize("root_persistent,child_persistent", _PERSISTENCE)
 def test_resume_keeps_checkpoint_authority(monkeypatch, root_persistent, child_persistent):
     with weights.init_empty_weights():
@@ -207,6 +228,7 @@ def cpu_group(tmp_path, monkeypatch):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CPU_PLAN)
 @pytest.mark.parametrize("root_persistent,child_persistent", _PERSISTENCE)
 @pytest.mark.parametrize("loader", ["plain", "rank0", "ep_sharded"])
 @pytest.mark.parametrize("layout", ["direct", "rename", "finalize"])
@@ -223,6 +245,7 @@ def test_hf_shared_buffer_values_and_identity(tmp_path, cpu_group, root_persiste
     _assert_shared_values(model, root_persistent, child_persistent)
 
 
+@pytest.mark.launch_plan(provider=_CPU_PLAN)
 @pytest.mark.parametrize("root_persistent,child_persistent", _PERSISTENCE)
 def test_hf_shared_dtensor_buffers_rebind_after_dispatch(tmp_path, cpu_group, root_persistent, child_persistent):
     _write_checkpoint(tmp_path, root_persistent, child_persistent)
@@ -234,6 +257,7 @@ def test_hf_shared_dtensor_buffers_rebind_after_dispatch(tmp_path, cpu_group, ro
     _assert_shared_values(model, root_persistent, child_persistent)
 
 
+@pytest.mark.launch_plan(provider=_CPU_PLAN)
 @pytest.mark.parametrize("first_persistent,second_persistent", _PERSISTENCE)
 @pytest.mark.parametrize("reverse", [False, True])
 def test_mapping_load_preserves_cross_child_buffers(tmp_path, first_persistent, second_persistent, reverse):
