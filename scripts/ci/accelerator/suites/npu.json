@@ -376,6 +376,16 @@
     ]
   },
   {
+    "name": "npu-unit-37",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/lora/test_veomni_lora_moe_native.py"
+    ]
+  },
+  {
     "name": "ci-unit",
     "suite": "unit",
     "conditional": false,
@@ -394,6 +404,17 @@
       "-s",
       "-x",
       "tests/utils/test_moe_router_replay_api.py"
+    ]
+  },
+  {
+    "name": "save-safetensor-utils-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_save_safetensor_utils.py"
     ]
   },
   {
