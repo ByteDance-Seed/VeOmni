@@ -111,6 +111,78 @@ def test_e2e_alignment_preserves_fused_moe_training_paths(backend):
         assert all(len(group) == 1 for group in plan.groups)
 
 
+def test_wan_dit_uses_bfloat16_and_flash_attention():
+    from tests.e2e.utils import prepare_exec_cmd
+    from tests.tools.training_utils import build_torchrun_cmd
+
+    command_list = prepare_exec_cmd(
+        ["train_dit_test"],
+        "wan_t2v",
+        "./tests/toy_config/wan_t2v_toy",
+        model_path="./wan_t2v",
+        train_path="./dummy_wan_t2v",
+        output_dir="./wan_t2v",
+        is_moe=False,
+        max_sp_size=1,
+    )
+
+    assert command_list
+    for _, cmd_kwargs in command_list:
+        cmd = build_torchrun_cmd(**cmd_kwargs)
+        assert cmd_kwargs["extra_args"] == [
+            "--model.accelerator.fsdp_config.mixed_precision.enable=True",
+            "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+            "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+        ]
+        assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
+
+
+def test_deepseek_v4_e2e_casts_fused_triton_moe_to_bfloat16():
+    from tests.e2e.utils import prepare_exec_cmd
+
+    command_list = prepare_exec_cmd(
+        ["train_text_test"],
+        "deepseek_v4",
+        "./tests/toy_config/deepseek_v4_toy",
+        model_path="./deepseek_v4",
+        train_path="./dummy_text",
+        output_dir="./deepseek_v4",
+        is_moe=True,
+        max_ep_size=1,
+    )
+
+    assert command_list
+    for _, cmd_kwargs in command_list:
+        assert cmd_kwargs["extra_args"] == [
+            "--model.accelerator.fsdp_config.mixed_precision.enable=True",
+            "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+            "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+        ]
+
+
+def test_gpt_oss_parallel_uses_fa4_and_quack():
+    from tests.e2e.utils import prepare_exec_cmd
+    from tests.tools.training_utils import build_torchrun_cmd
+
+    command_list = prepare_exec_cmd(
+        ["train_text_test"],
+        "gpt_oss",
+        "./tests/toy_config/gpt_oss_toy",
+        model_path="./gpt_oss",
+        train_path="./dummy_text",
+        output_dir="./gpt_oss",
+        is_moe=True,
+    )
+
+    assert command_list
+    assert {cmd_kwargs["parallel_config"].ep_size for _, cmd_kwargs in command_list} == {1, 2}
+    assert {cmd_kwargs["parallel_config"].sp_size for _, cmd_kwargs in command_list} == {1, 2}
+    for _, cmd_kwargs in command_list:
+        cmd = build_torchrun_cmd(**cmd_kwargs)
+        assert "--model.ops_implementation.attn_implementation=flash_attention_4" in cmd
+        assert "--model.ops_implementation.moe_implementation=fused_quack" in cmd
+
+
 def test_npu_adapter_preserves_owned_host_slice_and_resets_ranks():
     import threading
 
