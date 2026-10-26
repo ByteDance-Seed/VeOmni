@@ -290,3 +290,23 @@ Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__
     - Represent packed rows as metadata tensor dimensions; precompute flattened-coordinate arithmetic outside the callback. The pinned lowering rejects symbolic row-width arithmetic (`index_expr`), and even a dead integer comparison can leave a rejected capture. Preserve the caller's index dtype when forwarding mapped positions into another predicate (Int32 on FLASH).
     - Cover the public builder and real forced FLASH outputs/QKV gradients/graph reuse, including changing scalar values, packed rows, cached offsets, default mask compilation and outer static compilation.
     - Build masks with invocation-local predicates and explicit `create_block_mask` arguments. Never temporarily replace HF module helpers: overlapping exits can restore another invocation's device/length closure and affect native HF consumers. Preserve pinned HF padding/offset composition; test overlapping success/error paths and native HF calls during construction.
+
+## DeepGEMM FP8 all-gather
+
+- Native Torch 2.11 nonzero-dimension FSDP copy-out reshapes each extension
+  output using the parameter shard shape. Compact block scales must therefore
+  use their own all-gather; only the same-shaped FP8 payload goes through the
+  native extension output list. Do not add scales as a second output for Shard(1).
+- Weight shard boundaries must align to complete 128x128 blocks. Preserve
+  BF16 rounding before quantizing FP32 master shards to match BF16 parameter
+  all-gather numerics. Quantizing FP32 directly changes scales and rounding.
+- Install parameter extensions after materialization and before FSDP lazy
+  initialization. Normal full reshard uses `post_forward_mesh_info is mesh_info`;
+  a non-None post-forward mesh alone does not mean integer partial resharding.
+- Keep the FP8 container opaque outside DeepGEMM; optimizer and checkpoint
+  operations use the ordinary master shards. Do not move/replace wrapped
+  parameters after hook registration.
+- Transport and copy FP8 payloads as `uint8` views, restoring E4M3 views for
+  GEMM. The generic ATen float8-copy path can spend more time converting and
+  moving values than FP8 all-gather saves. Use the tiled byte transpose for
+  dgrad; square block scales transpose without requantization.

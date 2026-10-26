@@ -702,6 +702,7 @@ configured and never round-trip through a saved config.
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |
 | offload | `bool` | `False` | Enable CPU offload. |
 | offload_pin_memory | `bool` | `True` | Pin the CPU offload buffers, matching torch's `CPUOffloadPolicy` default. Set `False` to keep offloaded shards pageable, so a large-MoE job is not charged non-reclaimable Shmem. |
+| fp8_all_gather | `bool` | `False` | Gather DeepGEMM routed expert weights as E4M3 payloads and 128x128 block scales. Requires native FSDP2, BF16 mixed precision, block-aligned shards and no CPU offload. See [FP8 MoE](../design/deepgemm_fp8_moe.md#optional-fp8-parameter-all-gather). |
 | low_precision_reduce_scatter_comm | `bool` | `False` | Use `mixed_precision.param_dtype` (BF16 or FP16) for node-local FSDP2 ReduceScatter communication while keeping FP32 accumulation. See the precision and topology tables below. |
 | max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |

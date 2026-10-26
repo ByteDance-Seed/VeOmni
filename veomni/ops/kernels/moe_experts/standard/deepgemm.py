@@ -4,8 +4,8 @@
 """Hopper/Blackwell DeepGEMM FP8 routed experts, including training backward.
 
 The public tensor contract is the standard BF16 MoE interface. EP communication,
-routing and activations retain their existing precision. No FP8 parameter
-all-gather, persistent quantized parameters or Transformer Engine is involved.
+routing and activations retain their existing precision. FSDP may supply
+block-quantized expert weights directly through its optional FP8 all-gather.
 """
 
 from __future__ import annotations

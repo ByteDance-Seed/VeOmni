@@ -615,3 +615,17 @@ def _non_current_device_worker(rank):
         # Reject a second device before reaching upstream's invalid-handle error.
         with pytest.raises(RuntimeError, match="one CUDA device per process"):
             GroupedLayout.from_counts(torch.tensor([129]), torch.device(f"cuda:{rank}"))
+
+
+@pytest.mark.parametrize("shape", [(2, 256, 128), (4, 1280, 2560), (2, 4608, 5120)])
+def test_fp8_weight_transpose_preserves_every_byte(shape):
+    from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import transpose_fp8_weight
+
+    # Include all 256 bit patterns, including NaN encodings: a byte transpose
+    # must not decode, canonicalize or requantize even those payloads.
+    raw = torch.randint(0, 256, shape, device="cuda", dtype=torch.uint8)
+    scale = torch.randn((shape[0], shape[1] // 128, shape[2] // 128), device="cuda")
+    qt, st = transpose_fp8_weight(raw.view(torch.float8_e4m3fn), scale)
+    assert qt.is_contiguous() and st.is_contiguous()
+    torch.testing.assert_close(qt.view(torch.uint8), raw.transpose(1, 2), rtol=0, atol=0)
+    torch.testing.assert_close(st, scale.transpose(1, 2), rtol=0, atol=0)

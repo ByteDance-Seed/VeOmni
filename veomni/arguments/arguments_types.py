@@ -610,6 +610,20 @@ def validate_low_precision_reduce_scatter_comm(
     return True
 
 
+def validate_fp8_all_gather(enabled, mixed_precision, *, fsdp_mode="fsdp2", offload=False):
+    """Validate the opt-in DeepGEMM expert parameter transport policy."""
+    if not isinstance(enabled, bool):
+        raise ValueError("fp8_all_gather must be a boolean.")
+    if enabled and (
+        fsdp_mode != "fsdp2"
+        or offload
+        or mixed_precision is None
+        or not mixed_precision.enable
+        or mixed_precision.param_dtype != "bfloat16"
+    ):
+        raise ValueError("fp8_all_gather requires FSDP2, BF16 mixed precision and no CPU offload.")
+
+
 @dataclass
 class FSDPConfig:
     """model.accelerator.fsdp_config.* — FSDP sharding configuration."""
@@ -666,6 +680,12 @@ class FSDPConfig:
             )
         },
     )
+    fp8_all_gather: bool = field(
+        default=False,
+        metadata={
+            "help": "All-gather DeepGEMM routed expert weights as block FP8 plus scales. Requires FSDP2, BF16 mixed precision and block-aligned shards; no CPU offload."
+        },
+    )
     low_precision_reduce_scatter_comm: bool = field(
         default=False,
         metadata={
@@ -697,6 +717,9 @@ class FSDPConfig:
             )
         if self.fsdp_scope not in ("module", "model"):
             raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
+        validate_fp8_all_gather(
+            self.fp8_all_gather, self.mixed_precision, fsdp_mode=self.fsdp_mode, offload=self.offload
+        )
         validate_low_precision_reduce_scatter_comm(
             self.low_precision_reduce_scatter_comm, self.mixed_precision, fsdp_mode=self.fsdp_mode
         )

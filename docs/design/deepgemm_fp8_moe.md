@@ -63,9 +63,72 @@ This is operator integration, not full-model convergence validation.
 - First-order autograd and non-reentrant activation checkpointing are supported.
   Full-graph `torch.compile` and CUDA graph capture are unsupported because
   Hopper's K-grouped launch requires token counts on the host.
-- FSDP2 parameter communication and EP token all-to-all retain their configured
-  precision. This change does not add FP8 all-gather, quantized optimizer state,
-  or a persistent FP8 parameter cache.
+- Parameter all-gather uses its configured precision by default. The optional
+  FP8 transport below applies only to routed expert weights. EP token all-to-all,
+  gradients and optimizer state keep their configured precision.
+
+## Optional FP8 parameter all-gather
+
+```yaml
+model:
+  ops_implementation:
+    moe_implementation: deepgemm_fp8
+    qat_implementation: none
+  accelerator:
+    fsdp_config:
+      fp8_all_gather: true
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+```
+
+This opt-in path uses native Torch 2.11 FSDP2 extensions. It quantizes each
+local expert weight shard before communication, gathers E4M3 payloads and
+FP32 block scales, and passes them directly to DeepGEMM. Payload copies and
+transposes use byte views to avoid unnecessary float8 conversion kernels;
+the bits and quantization recipe are unchanged. Dense layers,
+routers, shared experts, EP token communication and gradient reduction are
+unaffected. Master parameter shards and optimizer/checkpoint state remain in
+their original precision. The quantizer rounds FP32 masters to BF16 inside
+the kernel, matching the default BF16 parameter all-gather's numerical recipe.
+
+For each 128x128 block, transport contains 16384 FP8 bytes plus a four-byte
+scale, compared with 32768 BF16 bytes: about half the parameter payload.
+Scales use separate small collectives because Torch 2.11's nonzero-dimension
+shard copy-out assumes every extension output has the parameter's shape.
+Extra collective launches and local quantization affect latency; this byte
+reduction is not a promise of a 2x training speedup.
+
+Forward consumes the gathered FP8 weight directly. Dgrad transposes its
+payload and its scale grid: square 128x128 blocks preserve their exact values
+under transpose. FSDP frees and repopulates payload/scale storage on reshard
+and unshard, including backward and activation recomputation. Local shards
+are requantized on every unshard, so optimizer updates cannot leave an
+across-step FP8 cache stale.
+
+Initial constraints:
+
+- Two merged expert weights `[E,2*I,H]` and `[E,H,I]`, selected by the actual
+  module's `veomni_moe.impl == "deepgemm_fp8"` handle.
+- BF16 FSDP mixed precision, CUDA, contiguous BF16/FP32 master shards.
+- Even sharding, with complete 128x128 blocks inside every shard. The default
+  EP FSDP `Shard(1)` layout must divide both `2*I` and `H` into multiples of
+  128. Unsupported shapes fail before the first training parameter all-gather.
+- No CPU offload, integer partial resharding, `torch.compile`, or CUDA graphs.
+  Register the hooks after wrapping and initial weight materialization, before
+  the first forward. In-place checkpoint loading is supported; replacing
+  parameters or moving the wrapped model after registration is unsupported.
+
+On eight GPUs, EP8 has expert FSDP size one and no expert all-gather to reduce.
+Use EP4 with FSDP size two to measure this path locally, or sixteen GPUs for
+EP8 with FSDP size two. Compare identical parallel layouts and include the
+all-gather and gradient reduction in the measured forward/backward step.
+
+The implementation is in
+[fp8_all_gather.py](../../veomni/distributed/fsdp2/fp8_all_gather.py), with a
+[weight container](../../veomni/ops/kernels/moe_experts/shared/fp8_weight.py)
+consumed by the existing grouped-linear autograd implementation.
 
 ## Installation
 

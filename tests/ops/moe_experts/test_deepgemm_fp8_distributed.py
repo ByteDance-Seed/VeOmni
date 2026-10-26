@@ -15,7 +15,7 @@ from scripts.ci.accelerator.launch_plan import from_parameter, runner_device_cou
 from tests.ops.moe_experts.reference import standard_ep_reference
 from tests.ops.moe_experts.test_deepgemm_fp8 import _relative_error
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
-from veomni.ops.kernels.moe_experts.standard.deepgemm import wrapper
+from veomni.ops import VeomniOp
 
 
 class _Experts(nn.Module):
@@ -23,6 +23,7 @@ class _Experts(nn.Module):
         super().__init__()
         self.fc1 = nn.Parameter(w1.clone())
         self.fc2 = nn.Parameter(w2.clone())
+        self.veomni_moe = VeomniOp("moe_experts", "standard", "deepgemm_fp8")
         self.experts = experts
         self.use_checkpoint = use_checkpoint
 
@@ -37,7 +38,7 @@ class _Experts(nn.Module):
 
     def _forward(self, x, routing, indices):
         empty = x.new_empty(0)
-        return wrapper(
+        return self.veomni_moe(
             x,
             routing,
             indices,
@@ -51,7 +52,7 @@ class _Experts(nn.Module):
         )
 
 
-def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, rendezvous):
+def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_gather, rendezvous):
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
     from torch.distributed.tensor import Shard
 
@@ -71,8 +72,8 @@ def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, rendezvous
             # one token row and combine both slot weights and their gradients.
             indices[:, ::2, 1] = indices[:, ::2, 0]
         grad = torch.randn_like(x) * 0.1
-        w1 = (torch.randn(e, 2 * intermediate, h, device="cuda") * 0.03).bfloat16().float()
-        w2 = (torch.randn(e, h, intermediate, device="cuda") * 0.03).bfloat16().float()
+        w1 = torch.randn(e, 2 * intermediate, h, device="cuda") * 0.03
+        w2 = torch.randn(e, h, intermediate, device="cuda") * 0.03
         expert_rank = state.ep_rank if ep_size > 1 else 0
         begin, end = expert_rank * e // ep_size, (expert_rank + 1) * e // ep_size
         module = _Experts(w1[begin:end], w2[begin:end], e, use_checkpoint)
@@ -91,11 +92,32 @@ def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, rendezvous
             )
             if ep_size > 1:
                 module.set_gradient_divide_factor(state.ep_gradient_divide_factor)
+        if fp8_all_gather:
+            from veomni.distributed.fsdp2.fp8_all_gather import register_deepgemm_fp8_all_gather
+
+            assert register_deepgemm_fp8_all_gather(module) == 2
+        expected_weights = []
+        if fp8_all_gather:
+            from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import quantize_weights
+            from veomni.ops.kernels.moe_experts.shared.fp8_weight import FP8ExpertWeight
+
+            def check_gathered_weights(mod, args):
+                for weight, (qdata, scale, _, _) in zip((mod.fc1, mod.fc2), expected_weights):
+                    assert isinstance(weight, FP8ExpertWeight)
+                    torch.testing.assert_close(weight.qdata.float(), qdata.float(), rtol=0, atol=0)
+                    torch.testing.assert_close(weight.scale, scale, rtol=0, atol=0)
+
+            module.register_forward_pre_hook(check_gathered_weights)
         opt = torch.optim.SGD(module.parameters(), lr=0.01)
         divisor = world if use_fsdp else 1
         for step in range(2):
             xi, ri = x[rank].clone().requires_grad_(), routing[rank].clone().requires_grad_()
             opt.zero_grad(set_to_none=True)
+            if fp8_all_gather:
+                expected_weights[:] = [
+                    quantize_weights(p.full_tensor().bfloat16(), store_transpose=False)
+                    for p in (module.fc1, module.fc2)
+                ]
             y = module(xi, ri, indices[rank])
             assert y.dtype == xi.dtype
             y.backward(grad[rank])
@@ -121,6 +143,13 @@ def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, rendezvous
                 if begin == 0:
                     assert torch.count_nonzero(actual[0]) == 0
             opt.step()
+            if fp8_all_gather:
+                # Normal state-dict copy/load must retain the extensions and
+                # store only high precision shards, never the transport wrapper.
+                saved = {name: value.detach().clone() for name, value in module.state_dict().items()}
+                assert all(value.dtype == torch.float32 for value in saved.values())
+                module.load_state_dict(saved)
+
             # Use the actual updated master weights for the next reference.
             # This isolates stale quantized-weight caches from optimizer drift.
             local = [p.full_tensor().detach() if use_fsdp else p.detach() for p in (module.fc1, module.fc2)]
@@ -137,25 +166,28 @@ def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, rendezvous
 
 @pytest.mark.launch_plan(provider=from_parameter("world"))
 @pytest.mark.parametrize(
-    "world,ep_size,use_fsdp,repeated,use_checkpoint",
+    "world,ep_size,use_fsdp,repeated,use_checkpoint,fp8_all_gather",
     [
         pytest.param(
             *case,
             marks=pytest.mark.skipif(runner_device_count() < case[0], reason=f"Requires {case[0]} GPUs."),
         )
         for case in (
-            (2, 2, False, False, False),
-            (2, 1, True, False, False),
-            (4, 2, True, False, False),
-            (4, 2, True, True, False),
-            (4, 4, False, True, False),
-            (8, 8, False, True, False),
-            (2, 1, True, False, True),
-            (4, 2, True, True, True),
+            (2, 2, False, False, False, False),
+            (2, 1, True, False, False, False),
+            (4, 2, True, False, False, False),
+            (4, 2, True, True, False, False),
+            (4, 4, False, True, False, False),
+            (8, 8, False, True, False, False),
+            (2, 1, True, False, True, False),
+            (4, 2, True, True, True, False),
+            (2, 1, True, False, False, True),
+            (4, 2, True, True, False, True),
+            (4, 2, True, True, True, True),
         )
     ],
 )
-def test_distributed_fp8_experts(world, ep_size, use_fsdp, repeated, use_checkpoint, tmp_path):
+def test_distributed_fp8_experts(world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_gather, tmp_path):
     if not torch.cuda.is_available() or torch.version.hip is not None:
         pytest.skip("NVIDIA Hopper or Blackwell is required.")
     if torch.cuda.device_count() < world or any(
@@ -165,7 +197,115 @@ def test_distributed_fp8_experts(world, ep_size, use_fsdp, repeated, use_checkpo
     pytest.importorskip("deep_gemm")
     mp.spawn(
         _worker,
-        args=(world, ep_size, use_fsdp, repeated, use_checkpoint, f"file://{tmp_path / 'rdzv'}"),
+        args=(world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_gather, f"file://{tmp_path / 'rdzv'}"),
         nprocs=world,
         join=True,
+    )
+
+
+class _MetaModel(nn.Module):
+    _no_split_modules = ["_Experts"]
+
+    def __init__(self):
+        super().__init__()
+        self.experts = _Experts(torch.empty(4, 256, 256), torch.empty(4, 256, 128), 4, use_checkpoint=True)
+
+    def get_parallel_plan(self):
+        from torch.distributed.tensor import Shard
+
+        from veomni.distributed.parallel_plan import ParallelPlan
+
+        return ParallelPlan({"ep": {"experts.fc1": Shard(0), "experts.fc2": Shard(0)}})
+
+    def init_weights(self):
+        with torch.no_grad():
+            for p in self.parameters():
+                p.to_local().normal_(std=0.03)
+
+    def forward(self, x, routing, indices):
+        return self.experts(x, routing, indices)
+
+
+def _builder_worker(rank, world, directory, rendezvous):
+    import torch.distributed.checkpoint as dcp
+
+    from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState
+    from veomni.distributed.torch_parallelize import build_parallelize_model
+    from veomni.ops.kernels.moe_experts.shared.fp8_weight import FP8ExpertWeight
+    from veomni.optim import build_optimizer
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl", init_method=rendezvous, rank=rank, world_size=world, timeout=timedelta(seconds=180)
+    )
+    try:
+        _init_parallel_state(dp_size=world, dp_shard_size=world, extra_parallel_sizes=(2,))
+        torch.manual_seed(401)
+        with torch.device("meta"):
+            model = _MetaModel()
+        model = build_parallelize_model(
+            model, init_device="meta", fp8_all_gather=True, enable_gradient_checkpointing=False
+        )
+        opt = build_optimizer(model, lr=1e-3)
+        x = torch.randn(127, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        routing = torch.rand(127, 2, device="cuda", requires_grad=True)
+        indices = torch.randint(0, 4, (127, 2), device="cuda")
+        expected = None
+        for step in range(3):
+            opt.zero_grad()
+            # Two accumulated microbatches, synchronizing only the last.
+            model.set_requires_gradient_sync(False)
+            model(x, routing, indices).float().square().mean().backward()
+            model.set_requires_gradient_sync(True)
+            y = model(x, routing, indices)
+            y.float().square().mean().backward()
+            for param in model.parameters():
+                assert param.dtype == torch.float32 and torch.isfinite(param.grad.to_local()).all()
+                assert not isinstance(param.to_local(), FP8ExpertWeight)
+            if expected is not None:
+                torch.testing.assert_close(y, expected, rtol=0, atol=0)
+            if step == 0:
+                opt.step()
+                saved_optim = {
+                    (group, param, key): value.detach().clone()
+                    for group, sub in opt.optimizers_dict.items()
+                    for param, state in sub.state.items()
+                    for key, value in state.items()
+                }
+                dcp.save(
+                    {"model": ModelState(model), "optimizer": OptimizerState(model, opt)}, checkpoint_id=directory
+                )
+            elif step == 1:
+                expected = y.detach().clone()
+                with torch.no_grad():
+                    for p in model.parameters():
+                        p.zero_()
+                for sub in opt.optimizers_dict.values():
+                    for values in sub.state.values():
+                        for value in values.values():
+                            value.add_(1)
+                dcp.load(
+                    {"model": ModelState(model), "optimizer": OptimizerState(model, opt, load=True)},
+                    checkpoint_id=directory,
+                )
+                for (group, param, key), expected_value in saved_optim.items():
+                    actual_value = opt.optimizers_dict[group].state[param][key]
+                    torch.testing.assert_close(actual_value, expected_value, rtol=0, atol=0)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+        clear_parallel_state()
+
+
+@pytest.mark.launch_plan(provider=from_parameter("world"))
+@pytest.mark.parametrize("world", [4])
+def test_fp8_all_gather_public_builder_checkpoint_and_accumulation(world, tmp_path):
+    """Cover meta materialization, EP/FSDP wiring, AdamW and real DCP reload."""
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world or torch.version.hip is not None:
+        pytest.skip("Requires four NVIDIA GPUs.")
+    if any(torch.cuda.get_device_capability(i) not in ((9, 0), (10, 0)) for i in range(world)):
+        pytest.skip("Requires Hopper/Blackwell.")
+    pytest.importorskip("deep_gemm")
+    mp.spawn(
+        _builder_worker, args=(world, str(tmp_path / "dcp"), f"file://{tmp_path / 'rdzv'}"), nprocs=world, join=True
     )
