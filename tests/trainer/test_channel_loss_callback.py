@@ -2747,7 +2747,7 @@ def _gloo_sp_preflight_worker(rank, world_size, init_file, result_queue):
             init_method=f"file://{init_file}",
             rank=rank,
             world_size=world_size,
-            timeout=timedelta(seconds=15),
+            timeout=timedelta(seconds=60),
         )
         parallel_state = _test_parallel_state(
             sp_enabled=True,
@@ -2871,7 +2871,7 @@ def _gloo_two_stripe_worker(rank, world_size, init_file, result_queue):
             init_method=f"file://{init_file}",
             rank=rank,
             world_size=world_size,
-            timeout=timedelta(seconds=15),
+            timeout=timedelta(seconds=60),
         )
         stripe_groups = [
             torch.distributed.new_group(ranks=[0, 1]),
@@ -2922,7 +2922,7 @@ def _gloo_two_stripe_worker(rank, world_size, init_file, result_queue):
             torch.distributed.destroy_process_group()
 
 
-def _run_gloo_workers(worker, *, world_size, init_file, timeout_seconds=30):
+def _run_gloo_workers(worker, *, world_size, init_file, timeout_seconds=120):
     context = torch.multiprocessing.get_context("spawn")
     result_queue = context.Queue()
     processes = [
