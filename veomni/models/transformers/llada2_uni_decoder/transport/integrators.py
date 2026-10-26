@@ -1,5 +1,4 @@
 import torch as th
-from torchdiffeq import odeint
 
 from .utils import get_lin_function, time_shift
 
@@ -118,6 +117,20 @@ class ode:
         if self.do_shift:
             mu = get_lin_function(y1=0.5, y2=1.15)(x.shape[1])
             t = time_shift(mu, 1.0, t)
+        if str(self.sampler_type).lower() == "euler":
+            cur = x
+            out = [cur]
+            for i in range(len(t) - 1):
+                dt = t[i + 1] - t[i]
+                vel = _fn(t[i], cur)
+                if isinstance(cur, tuple):
+                    cur = tuple(c + v * dt for c, v in zip(cur, vel))
+                else:
+                    cur = cur + vel * dt
+                out.append(cur)
+            return th.stack(out, dim=0) if not isinstance(x, tuple) else out
+        from torchdiffeq import odeint
+
         atol = [self.atol] * len(x) if isinstance(x, tuple) else [self.atol]
         rtol = [self.rtol] * len(x) if isinstance(x, tuple) else [self.rtol]
         samples = odeint(_fn, x, t, method=self.sampler_type, atol=atol, rtol=rtol)

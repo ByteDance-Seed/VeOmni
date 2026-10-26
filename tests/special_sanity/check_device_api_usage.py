@@ -48,6 +48,12 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # contexts and cuda.bindings.runtime for the per-device stack limit, which
     # has no device-agnostic equivalent.
     "veomni/ops/kernels/attention/standard/magi/",
+    # DiffusionGemma and LLaDA Triton kernels query per-SM shared memory limits
+    # (`shared_memory_per_block_optin`) and check CUDA tensor residence before
+    # launching NVIDIA Triton kernels.
+    "veomni/models/transformers/diffusion_gemma/",
+    "veomni/ops/kernels/dllm_hole_attention/triton_kernel.py",
+    "veomni/ops/kernels/wide_varlen_attention/triton_kernel.py",
     # Kernel tests intentionally select and probe hardware-specific backends.
     "tests/ops/",
     "tests/special_sanity/check_device_api_usage.py",
@@ -57,12 +63,19 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # ``veomni.utils.device`` equivalent; the test is gated on
     # ``IS_CUDA_AVAILABLE`` so it skips on non-CUDA hosts.
     "tests/models/transformers/test_model_forward_no_implicit_sync.py",
-    # Precision and async-offload tests explicitly select CUDA/NPU devices by
-    # name to exercise accelerator-specific code paths; the literal "cuda" is
+    # Precision, dLLM, and async-offload tests explicitly select CUDA/NPU devices
+    # by name to exercise accelerator-specific code paths; the literal "cuda" is
     # a test fixture, not a production device-API call.
     "tests/distributed/test_async_activation_offload.py",
+    "tests/distributed/test_diffusion_gemma_",
+    "tests/distributed/test_dllm_ulysses.py",
+    "tests/checkpoints/test_diffusion_gemma_resume.py",
+    "tests/optim/test_adafactor_fsdp2.py",
+    "tests/models/test_diffusion_gemma",
+    "tests/models/test_llada.py",
     "tests/models/test_qwen_image_precision.py",
     "tests/precision/qwen_image.py",
+    "tests/utils/test_full_determinism_attention.py",
     # Vendored Ascend Triton kernels for Qwen3.5 gated delta-rule (FLA + Huawei
     # port) are kept byte-identical to upstream; the FLA-origin code references
     # ``.cuda`` in fallback/util paths. Excluded wholesale, matching the ruff
@@ -73,6 +86,8 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
 # directory or file path must contain keyword "nccl"
 NCCL_KEYWORD_CHECK_WHITELIST = [
     "veomni/utils/device.py",
+    "tests/trainer/test_process_group_timeout.py",
+    "tests/optim/test_adafactor_fsdp2.py",
 ]
 
 SEARCH_WHITELIST = CUDA_KEYWORD_CHECK_WHITELIST + NCCL_KEYWORD_CHECK_WHITELIST

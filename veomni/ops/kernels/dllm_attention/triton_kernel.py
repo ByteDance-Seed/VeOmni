@@ -176,6 +176,7 @@ def draft_fwd_kernel(
     BLOCK_Q: tl.constexpr,
     BLOCK_KV: tl.constexpr,
 ):
+    """Triton forward kernel for packed DG_PREFIX attention."""
     DOT_DTYPE = tl.bfloat16
     off_z = tl.program_id(0)
     off_h = tl.program_id(1)
@@ -618,6 +619,7 @@ class DLMAttentionDraft(torch.autograd.Function):
         max_seqlen_k=None,
         sm_scale=None,
     ):
+        """Run packed DG_PREFIX attention forward pass."""
         if sm_scale is None:
             raise ValueError("DG_PREFIX requires explicit sm_scale=1.0 after Gemma q_norm")
         qk_scale = sm_scale * 1.44269504
@@ -721,6 +723,7 @@ class DLMAttentionDraft(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do, *args):
+        """Run packed DG_PREFIX attention backward pass."""
         q, k, v, o, L, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
 
         Q_TOTAL_TOKENS = ctx.Q_TOTAL_TOKENS

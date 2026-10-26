@@ -43,6 +43,7 @@ from veomni.models.transformers.llada_moe.checkpoint_tensor_converter import (
     LLaDAMoECheckpointTensorConverter,
     convert_llada_moe_fqn_to_index_mapping,
 )
+from veomni.utils.device import get_torch_device
 
 from ...module_modeling_base import PretrainedOmniModule
 from .configuration import LladaUniLlmConfig
@@ -89,9 +90,10 @@ class LladaUniBackbone(LLaDA2UniPreTrainedModel):
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
+        device_mod = get_torch_device()
         for decoder_layer in self.layers:
             layer_device = next(decoder_layer.parameters()).device
-            with torch.cuda.device(layer_device) if layer_device.type == "cuda" else nullcontext():
+            with device_mod.device(layer_device) if layer_device.type != "cpu" else nullcontext():
                 hidden_states = decoder_layer(
                     hidden_states,
                     attention_mask=mask,
@@ -100,7 +102,7 @@ class LladaUniBackbone(LLaDA2UniPreTrainedModel):
                     **kwargs,
                 )
         norm_device = self.norm.weight.device
-        with torch.cuda.device(norm_device) if norm_device.type == "cuda" else nullcontext():
+        with device_mod.device(norm_device) if norm_device.type != "cpu" else nullcontext():
             hidden_states = self.norm(hidden_states)
         return MoeModelOutputWithPast(last_hidden_state=hidden_states)
 

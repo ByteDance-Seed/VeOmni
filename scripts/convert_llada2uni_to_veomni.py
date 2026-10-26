@@ -202,6 +202,15 @@ def convert_checkpoint(src: str, dst: str, copy_tokenizer: bool = True) -> None:
             if fn.startswith(("tokenizer", "special_tokens", "generation_config", "vocab", "merges", "chat_template")):
                 shutil.copy2(os.path.join(src, fn), os.path.join(dst, fn))
                 print(f"[aux] copied {fn}")
+    for sub in ("decoder", "decoder-turbo", "vae"):
+        src_sub = os.path.join(src, sub)
+        if os.path.exists(src_sub):
+            _symlink(src_sub, os.path.join(dst, sub))
+    sigvq_src = os.path.join(image_tokenizer_dir, "sigvq_embedding.pt")
+    if os.path.exists(sigvq_src):
+        dst_img_tok = os.path.join(dst, "image_tokenizer")
+        os.makedirs(dst_img_tok, exist_ok=True)
+        _symlink(sigvq_src, os.path.join(dst_img_tok, "sigvq_embedding.pt"))
     print(f"\nDone. Converted checkpoint at: {dst}")
 
 

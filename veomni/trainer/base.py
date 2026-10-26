@@ -96,7 +96,7 @@ def _init_process_group() -> None:
     backend = get_dist_comm_backend()
     kwargs: dict[str, Any] = {"backend": backend}
     timeout_seconds = os.getenv("NCCL_TIMEOUT")
-    if backend == "nccl" and timeout_seconds is not None:
+    if is_nccl_backend(backend) and timeout_seconds is not None:
         try:
             timeout_value = int(timeout_seconds)
         except ValueError as error:

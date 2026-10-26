@@ -520,13 +520,20 @@ def load_module_from_hf_source(
     if len(devices) == 1:
         target_device = devices.pop()
         if not source.layout.modules[module_name].key_prefixes:
-            return model.to_empty(device=target_device)
+            from ....checkpoint.weights import _to_empty_preserving_nonpersistent_buffers
+
+            return _to_empty_preserving_nonpersistent_buffers(model, target_device)
         load_model_weights(model, source.path, init_device=target_device)
         return model
 
     from accelerate import dispatch_model
 
-    load_model_weights(model, source.path, init_device="cpu")
+    if not source.layout.modules[module_name].key_prefixes:
+        from ....checkpoint.weights import _to_empty_preserving_nonpersistent_buffers
+
+        model = _to_empty_preserving_nonpersistent_buffers(model, "cpu")
+    else:
+        load_model_weights(model, source.path, init_device="cpu")
     dispatch_model(
         model,
         device_map=device_map,

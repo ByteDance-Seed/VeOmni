@@ -143,10 +143,10 @@ the way DiffusionGemma runs its encoder and decoder on one transformer stack, ha
 restore the tie itself, because `to_empty()` clones every tensor and sharding rebinds
 each sharded parameter to a new object. Two hooks do it:
 
-- **`retie_shared_weights(cls, model) -> int`**, a classmethod the model class *may
+- **`retie_shared_weights(self) -> int`**, an instance method the model class *may
   define*. It re-points every alias at the canonical parameter and returns how many it
   re-tied. The framework calls it through `retie_model_shared_weights` in
-  [module_utils.py](../../../veomni/models/module_utils.py) every time the model is
+  [weights.py](../../../veomni/models/checkpoint/weights.py) every time the model is
   materialized: after the HF weight load (`post_process_after_weight_loading`), and on
   the random-init and checkpoint-resume paths of `_materialize_and_load_weights` in
   [torch_parallelize.py](../../../veomni/distributed/torch_parallelize.py), before

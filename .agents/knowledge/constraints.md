@@ -27,7 +27,7 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
      default dependency group in `pyproject.toml`.
    - The legacy v4 path was removed; modeling under
      `veomni/models/transformers/<m>/` is patchgen-generated except
-     `diffusion_gemma`, which is vendored (see constraint 29). The VeOmni
+     `diffusion_gemma` and `llada*`, which are vendored (see constraint 31). The VeOmni
      registry overrides HuggingFace's built-in `diffusion_gemma`.
    - `is_transformers_version_greater_or_equal_to()` from
      `veomni/utils/import_utils.py` is retained only for forward-looking

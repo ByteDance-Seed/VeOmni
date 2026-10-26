@@ -597,8 +597,11 @@ def _schedule(
 
 
 class _HoleAttention(torch.autograd.Function):
+    """Autograd function for DiffusionGemma hole attention over clean cache and noisy canvas."""
+
     @staticmethod
     def forward(ctx, query, clean_key, clean_value, noise_key, noise_value, clean_lo, clean_hi, sm_scale):
+        """Run hole attention forward pass."""
         batch, nheads_q, seqlen_q, headdim = query.shape
         nheads_kv = clean_key.shape[1]
         clean_length = clean_key.shape[2]
@@ -659,6 +662,7 @@ class _HoleAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Run hole attention backward pass."""
         query, clean_key, clean_value, noise_key, noise_value, clean_lo, clean_hi, out, lse = ctx.saved_tensors
         batch, nheads_q, seqlen_q, headdim = query.shape
         nheads_kv = clean_key.shape[1]

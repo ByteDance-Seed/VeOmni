@@ -139,9 +139,11 @@ jobs:
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_flux_joint_attn_ulysses.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_ltx2_ulysses.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_qwen4_exp_ulysses.py
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_sum_over_shards.py
           uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
           uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
           uv run --frozen pytest -s -x tests/parallel/test_ddp_sp_grad_sync.py
+          uv run --frozen pytest -s -x tests/parallel/test_parallel_plan_post_shard.py
           uv run --frozen pytest -s -x tests/parallel/test_parallel_state_registry.py
           uv run --frozen pytest -s -x tests/parallel/context_parallel
       - name: Run models tests
@@ -152,7 +154,8 @@ jobs:
           uv run --frozen pytest -s -x tests/trainer/test_aux_metrics.py
           uv run --frozen pytest -s -x tests/trainer/test_trainer_model_runtime.py
           uv run --frozen pytest -s -x tests/trainer/test_dit_microbatch.py
-          uv run --frozen pytest -s -x tests/trainer/test_dllm_sample_count.py tests/trainer/test_dllm_nonfinite.py tests/trainer/test_trace_callback.py
+          uv run --frozen pytest -s -x tests/trainer/test_dllm_sample_count.py tests/trainer/test_dllm_nonfinite.py tests/trainer/test_trace_callback.py tests/trainer/test_process_group_timeout.py
+          uv run --frozen pytest -s -x tests/utils/test_dllm_loss_reduce.py tests/utils/test_full_determinism_attention.py
           uv run --frozen pytest -s -x tests/lora/test_vlm_lora.py
       - name: Run SeedOmni unit tests
         run: |

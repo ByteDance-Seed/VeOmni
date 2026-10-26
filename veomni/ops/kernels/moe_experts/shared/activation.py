@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Shared activation helpers and Triton elementwise kernels for fused MoE experts."""
+
 import math
 from enum import Enum
 
@@ -23,6 +25,8 @@ from .....utils.device import get_torch_device
 
 
 class ActivationType(str, Enum):
+    """Supported activation function names for fused MoE kernels."""
+
     GELU = "gelu"
     GELU_NEW = "gelu_new"  # gelu with tanh approximation
     SILU = "silu"
@@ -54,6 +58,7 @@ def normalize_activation(activation: str | ActivationType) -> str:
 
 @triton.jit
 def activation_fwd(x: tl.tensor, ACTIVATION: tl.constexpr):
+    """Evaluate the selected activation function inside a Triton kernel."""
     orig_dtype = x.dtype
     x = x.to(tl.float32)
     if ACTIVATION == "gelu":
@@ -69,6 +74,7 @@ def activation_fwd(x: tl.tensor, ACTIVATION: tl.constexpr):
 
 @triton.jit
 def activation_bwd(dy: tl.tensor, x: tl.tensor, ACTIVATION: tl.constexpr):
+    """Evaluate the selected activation derivative inside a Triton kernel."""
     orig_dtype = dy.dtype
     x = x.to(tl.float32)
     dy = dy.to(tl.float32)
@@ -197,6 +203,7 @@ _gaussian_pdf_normalization = tl.constexpr(1.0 / math.sqrt(2 * math.pi))
 
 @triton.jit
 def tanh(x):
+    """Compute hyperbolic tangent via scaled sigmoid."""
     # Tanh is just a scaled sigmoid
     return 2 * tl.sigmoid(2 * x) - 1
 
@@ -210,6 +217,7 @@ def gelu(x):
 
 @triton.jit
 def gelu_grad(x):
+    """Derivative of exact GELU."""
     x = x.to(tl.float32)
     cdf = 0.5 * (1.0 + tl.erf(x * _sqrt1_2))
     pdf = tl.exp(-0.5 * x * x) * _gaussian_pdf_normalization
@@ -228,6 +236,7 @@ def gelu_new(x):
 
 @triton.jit
 def gelu_new_grad(x):
+    """Derivative of tanh-approximated GELU."""
     # CREDITS: Fast implementation proposed in
     # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/model/fused_bias_gelu.py#L30
     x = x.to(tl.float32)
@@ -244,6 +253,7 @@ def silu(x):
 
 @triton.jit
 def silu_grad(x):
+    """Derivative of SiLU (Swish)."""
     x = x.to(tl.float32)
     f = tl.sigmoid(x)
     return f + x * (f - f * f)

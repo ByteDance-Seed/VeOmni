@@ -11,6 +11,8 @@ from safetensors.torch import load_file
 from torchvision.transforms.functional import to_pil_image
 from tqdm import tqdm
 
+from veomni.utils.device import empty_cache
+
 from .decoder_model import ZImageTransformer2DModel
 from .sigvq import SigVQ
 from .transport import Sampler, create_transport
@@ -100,7 +102,7 @@ def decode_vq_tokens(token_ids, h, w, model_path, device, resolution_multiplier=
     # SigVQ is no longer needed — release immediately
     del extractor
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache()
 
     # ---------- Stage 2: Diffusion ODE sampling ----------
     config_path = os.path.join(decoder_dir, "config.json")
@@ -151,7 +153,7 @@ def decode_vq_tokens(token_ids, h, w, model_path, device, resolution_multiplier=
     # Diffusion model is done — release before loading VAE
     del diff_model, cap_pos, cap_neg, model_fn
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache()
 
     # ---------- Stage 3: VAE decode ----------
     vae = AutoencoderKL.from_pretrained(vae_dir, torch_dtype=dtype).to(device).eval()
@@ -162,6 +164,6 @@ def decode_vq_tokens(token_ids, h, w, model_path, device, resolution_multiplier=
 
     del vae
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache()
 
     return to_pil_image(px[0].float())

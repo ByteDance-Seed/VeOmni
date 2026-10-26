@@ -173,12 +173,21 @@ def prepare_llada2_uni_sample_training(
         ids = torch.cat(id_chunks, dim=0)
         labels = torch.cat(label_chunks, dim=0)
 
-    # Reuse `veomni.data.data_transform.apply_dllm_masking` on CPU, then move to device.
+    # Reuse `veomni.data.data_transform.apply_dllm_masking` on CPU with a deterministic
+    # per-sample generator so DP/SP ranks do not depend on the ambient process RNG.
+    from veomni.data.data_transform import diffusion_gemma_noise_generator, diffusion_gemma_sample_key
+
+    ids_cpu = ids.cpu()
+    generator = diffusion_gemma_noise_generator(
+        diffusion_gemma_sample_key(0, 0, ids_cpu),
+        0,
+    )
     corrupted_ids, masked_labels, loss_weight = apply_dllm_masking(
-        ids.cpu(),
+        ids_cpu,
         labels.cpu(),
         mask_token_id=int(config.mask_token_id),
         mask_eps=float(config.mask_eps),
+        generator=generator,
     )
     merged_item = ConversationItem(
         type="text",

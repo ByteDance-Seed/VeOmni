@@ -31,6 +31,7 @@ from ..data.data_collator import DataCollateInfo, MainCollator, PackingCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel.loss import sum_over_ulysses_shards
+from ..distributed.torch_compile import mark_compile_step_begin
 from ..models.model_runtime import VeOmniModelRuntime
 from ..models.transformers.diffusion_gemma import align_nemo
 from ..ops.batch_invariant import set_batch_invariant_mode
@@ -292,6 +293,10 @@ class DllmTrainer:
     _self_conditioning_micro_step: int = 0
 
     def __init__(self, args: VeOmniArguments):
+        if args.train.channel_loss.enable:
+            raise ValueError(
+                "train.channel_loss is only supported by causal-LM trainers; DllmTrainer uses diffusion objectives."
+            )
         # BaseTrainer.__init__ is NOT called here; we call its private
         # helpers one-by-one so the sequence is explicit.
         self.base = BaseTrainer.__new__(BaseTrainer)
@@ -1080,6 +1085,7 @@ class DllmTrainer:
             self.on_micro_batches_ready(micro_batches)
         num_micro_steps = len(micro_batches)
         for micro_step, micro_batch in enumerate(micro_batches):
+            mark_compile_step_begin(getattr(runtime, "_veomni_compile_uses_cuda_graphs", False))
             self.base.model_reshard(micro_step, num_micro_steps)
             self.base._configure_hsdp_allreduce(micro_step, num_micro_steps)
             loss: torch.Tensor

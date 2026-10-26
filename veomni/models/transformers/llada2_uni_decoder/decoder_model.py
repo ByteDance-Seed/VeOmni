@@ -63,7 +63,7 @@ class TimestepEmbedder(nn.Module):
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast(device_type=t.device.type, enabled=False):
             half = dim // 2
             freqs = torch.exp(
                 -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
@@ -125,7 +125,7 @@ class ZSingleStreamAttnProcessor:
 
         # Apply RoPE
         def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-            with torch.amp.autocast("cuda", enabled=False):
+            with torch.amp.autocast(device_type=x_in.device.type, enabled=False):
                 x = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
                 freqs_cis = freqs_cis.unsqueeze(2)
                 x_out = torch.view_as_real(x * freqs_cis).flatten(3)

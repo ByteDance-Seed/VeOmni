@@ -24,6 +24,7 @@ Supports both:
 
 from __future__ import annotations
 
+import os
 import tempfile
 from typing import Any
 
@@ -37,7 +38,11 @@ def convert_llada2_uni_from_raw(model_path: str, **kwargs: Any) -> dict[str, Any
 
     with tempfile.TemporaryDirectory(prefix="llada2_uni_veomni_") as veomni_dir:
         convert_raw_to_veomni(model_path, veomni_dir, copy_tokenizer=True)
-        return convert_with_hf_layout(veomni_dir, **kwargs)
+        result = convert_with_hf_layout(veomni_dir, **kwargs)
+        decoder = result.get("module_models", {}).get("llada2_uni_decoder")
+        if decoder is not None and hasattr(decoder, "config"):
+            decoder.config.asset_dir = os.path.abspath(model_path)
+        return result
 
 
 @OMNI_CONVERT_REGISTRY.register("llada2_moe")

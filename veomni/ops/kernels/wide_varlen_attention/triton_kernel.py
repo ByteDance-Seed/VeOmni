@@ -506,8 +506,11 @@ def _varlen_bwd_dkdv_kernel(
 
 
 class _WideVarlenAttention(torch.autograd.Function):
+    """Autograd function for wide head-dimension variable-length causal attention."""
+
     @staticmethod
     def forward(ctx, query, key, value, cu_seqlens, max_seqlen, sm_scale):
+        """Run wide varlen attention forward pass."""
         nheads_q, total_tokens, headdim = query.shape[1], query.shape[2], query.shape[3]
         nheads_kv = key.shape[1]
         segments = cu_seqlens.numel() - 1
@@ -572,6 +575,7 @@ class _WideVarlenAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Run wide variable-length attention backward pass."""
         query, key, value, cu_seqlens, out, lse = ctx.saved_tensors
         nheads_q, total_tokens, headdim = query.shape[1], query.shape[2], query.shape[3]
         nheads_kv = key.shape[1]
