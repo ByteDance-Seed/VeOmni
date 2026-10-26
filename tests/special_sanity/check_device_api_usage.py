@@ -65,6 +65,9 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # a test fixture, not a production device-API call.
     "tests/distributed/test_async_activation_offload.py",
     "tests/models/test_qwen_image_precision.py",
+    # Native float8 tests deliberately select CUDA/NCCL after an SM89+ guard;
+    # CPU cases use backend-name fixtures to verify rejection on other devices.
+    "tests/models/test_float8_training.py",
     "tests/precision/qwen_image.py",
     # Vendored Ascend Triton kernels for Qwen3.5 gated delta-rule (FLA + Huawei
     # port) are kept byte-identical to upstream; the FLA-origin code references

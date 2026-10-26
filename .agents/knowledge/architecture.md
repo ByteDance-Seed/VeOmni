@@ -15,6 +15,7 @@ veomni/
 ├── distributed/        All parallelism strategies
 │   ├── parallel_state.py   init_parallel_state_from_config(), ParallelState, mesh setup
 │   ├── torch_parallelize.py  build_parallelize_model(), parallelize_model_fsdp2()
+│   ├── float8.py       Opt-in torchao tensorwise Linear compute before FSDP2 wrapping
 │   ├── parallel_plan.py    ParallelPlan for ExtraParallel (EP, embedding shard)
 │   ├── async_offload.py    Async activation offload (SwapTensor, OffloadManager, async_save_on_cpu)
 │   ├── emb_parallel/   ShardedEmbedding: vocab rows over the emb group, all-to-all lookup, tied projection

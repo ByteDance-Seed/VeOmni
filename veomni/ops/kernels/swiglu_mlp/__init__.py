@@ -35,10 +35,11 @@ _GPU = GpuKernelRequirement()
 def has_plain_linear_projections(mlp: nn.Module) -> bool:
     """Whether ``swiglu_mlp`` may read ``mlp``'s projection weights directly.
 
-    A wrapped projection such as ``LoraLinear`` has no ``weight`` and must run
-    its own forward, so the MLP has to call the projection modules instead.
+    Wrappers and Linear subclasses can implement extra computation in forward
+    (for example LoRA or float8 GEMMs), even when they expose a weight tensor.
+    They must run their own forward rather than the weight-only fused path.
     """
-    return all(isinstance(getattr(mlp, name), nn.Linear) for name in ("gate_proj", "up_proj", "down_proj"))
+    return all(type(getattr(mlp, name)) is nn.Linear for name in ("gate_proj", "up_proj", "down_proj"))
 
 
 register_op(

@@ -37,6 +37,7 @@ pyproject.toml
 │   │                  + FA3 / FlashMLA wheels on both architectures
 │   │                  + FA4 / FlashQLA (pure-Python PyPI wheels)
 │   │                  + liger-kernel + FLA + quack + TileLang/TileKernels + DLPack ext
+│   │                  + torchao (optional-compute tensorwise float8 backend)
 │   │                  + diffusers / av / librosa / soundfile / ftfy / peft
 │   │                  + megatron-energon (optional dataset format)
 │   ├── magi         Optional NVIDIA SM100+ MagiAttention FFA (combine with gpu):

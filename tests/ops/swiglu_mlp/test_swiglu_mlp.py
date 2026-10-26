@@ -25,6 +25,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Exper
 from transformers.models.gemma3.modeling_gemma3 import Gemma3MLP
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.tol import (
     EAGER_ATOL,
     EAGER_GRAD_ATOL,
@@ -36,6 +37,7 @@ from tests.ops.tol import (
     SWIGLU_FUSED_RTOL,
 )
 from veomni.ops import resolve_op
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.ops.kernels.swiglu_mlp.geglu import liger_kernel as geglu_liger
 from veomni.ops.kernels.swiglu_mlp.standard import liger_kernel as standard_liger
 from veomni.ops.registry import OpEntry
@@ -78,6 +80,18 @@ def _copy_linear(src: nn.Linear) -> nn.Linear:
     dst = nn.Linear(src.in_features, src.out_features, bias=src.bias is not None)
     dst.load_state_dict(src.state_dict())
     return dst
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_linear_subclasses_keep_their_projection_forward():
+    class OffsetLinear(nn.Linear):
+        def forward(self, inputs):
+            return super().forward(inputs) + 1
+
+    mlp = _tiny_qwen3_mlp()
+    assert has_plain_linear_projections(mlp)
+    mlp.up_proj = OffsetLinear(64, 128, bias=False)
+    assert not has_plain_linear_projections(mlp)
 
 
 def test_eager_matches_hf():
