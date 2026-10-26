@@ -461,6 +461,9 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         if USE_G:
             b_dh1 *= bg_last_exp
             b_q = b_q * b_g_exp[None, :]
+            # Re-establish zero padding after FP32 promotion and gating on Ascend.
+            # A non-finite padded q lane poisons dot even when the matching do is zero.
+            b_q = tl.where((i_t * BT + tl.arange(0, BT) < T)[None, :], b_q, 0.0)
         if USE_GK:
             b_dh1 *= tl.exp(b_gk_last1[:, None])
         b_dh1 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
@@ -472,6 +475,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             if USE_G:
                 b_dh2 *= bg_last_exp
                 b_q = b_q * b_g_exp[None, :]
+                b_q = tl.where((i_t * BT + tl.arange(0, BT) < T)[None, :], b_q, 0.0)
             if USE_GK:
                 b_dh2 *= tl.exp(b_gk_last2[:, None])
             b_dh2 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
@@ -483,6 +487,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             if USE_G:
                 b_dh3 *= bg_last_exp
                 b_q = b_q * b_g_exp[None, :]
+                b_q = tl.where((i_t * BT + tl.arange(0, BT) < T)[None, :], b_q, 0.0)
             if USE_GK:
                 b_dh3 *= tl.exp(b_gk_last3[:, None])
             b_dh3 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
@@ -494,6 +499,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             if USE_G:
                 b_dh4 *= bg_last_exp
                 b_q = b_q * b_g_exp[None, :]
+                b_q = tl.where((i_t * BT + tl.arange(0, BT) < T)[None, :], b_q, 0.0)
             if USE_GK:
                 b_dh4 *= tl.exp(b_gk_last4[:, None])
             b_dh4 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
@@ -540,11 +546,33 @@ def chunk_gated_delta_rule_bwd_dhu(
     else:
         N, NT, chunk_offsets = len(cu_seqlens) - 1, len(chunk_indices), prepare_chunk_offsets(cu_seqlens, BT)
 
-    dh = q.new_empty(B, NT, H, K, V)
+    # ``dh`` / ``dv2`` must not be left uninitialised: the tile stores of this kernel
+    # are lowered as read-modify-write on Ascend and the previous content takes part in
+    # the update through the decay multiplies below.  Finite garbage is annihilated by
+    # the zero factors (results stay bit-identical), but NaN survives ``0 * NaN`` and
+    # poisons the loop-carried accumulator -> grad_norm = NaN with profile.enable=true.
+    # See Qwen3.5-GDN_反传NaN_P3已修_20261022.md.
+    dh = q.new_zeros(B, NT, H, K, V)
     dh0 = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
-    dv2 = torch.empty_like(dv)
+    dv2 = torch.zeros_like(dv)
 
-    BV = 128
+    # Width of the value tile. Each 64-wide key block keeps its own
+    # ``[64, BV]`` float32 dh accumulator, and the chunk update materialises
+    # two more ``[BT, BV]`` float32 values (a ``tl.dot`` result and the gated
+    # dv), so the live float32 footprint grows with ``K / 64 * BV``.
+    #
+    # With K = V = 128 the wider tiles make this kernel produce NaNs in dh/dv2
+    # on Ascend: BV = 128 fails from the second backward call onwards (the
+    # autotune warm-up run masks it on the first call), and BV = 64 still
+    # reproduces it.  The failure is independent of the autotune config and of
+    # the output buffer contents, but depends on the allocation pattern, which
+    # points at a Triton-Ascend codegen/UB problem rather than the math.
+    # BV = 32 is clean over 20 repeated backwards that are bit-identical, it
+    # costs ~0.1 ms on a ~1 ms kernel, and it is the value used by the other
+    # Ascend port of this kernel
+    # (mindspeed/ops/triton/triton_950/chunk_delta_h.py).  Do not raise it
+    # without re-running the repeated-backward check on K = V = 128.
+    BV = 32
 
     g = g.permute(0, 2, 1).contiguous()
 

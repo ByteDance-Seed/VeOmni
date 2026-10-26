@@ -14,9 +14,11 @@
 
 """standard chunk_gated_delta_rule AscendC pair.
 
-Heavy compute is ``torch.ops.npu.*`` from ``fla_npu``. Glue around those
-kernels lives in ``vendor/triton_core`` and ``vendor/triton``.
-The kernel contract is FLA ``[B, T, H, D]``; the fused ``torch.ops.npu``
+Uses the stable ``fla_npu.ops.ascendc`` GDN forward/backward pair on A3/A5.
+The library selects arch22/arch35; this adapter uses their common BF16,
+K=V=128, chunk_size=64 contract. Forward can use the Phase6 fused kernel;
+backward is a composite ACLNN executor, not a single fused kernel.
+The kernel contract is FLA ``[B, T, H, D]``; the fused ``fla_npu.ops.ascendc``
 path wants ``[B, H, T, D]``.
 """
 
@@ -230,24 +232,30 @@ def _chunk_list(
     return chunk_indices_list.get(str(chunk_size))
 
 
-def _ensure_fla_npu_registered() -> None:
-    """Import ``fla_npu`` for its ``torch.ops.npu.*`` GDN op registration.
-
-    Deferred off module top so ``precompute_varlen_metadata`` and the other
-    fla_npu-free helpers can load on NPU images that only install ``fla_npu``
-    for this backend. Idempotent: Python caches the module in ``sys.modules``.
-    """
+def _get_gdn_ops():
+    """Load the stable AscendC API without legacy dispatcher registration."""
     try:
-        import fla_npu  # noqa: F401
-    except ModuleNotFoundError as error:
-        if error.name != "fla_npu":
-            raise
+        from fla_npu.ops import ascendc
+    except ImportError as error:
         raise RuntimeError(
-            "chunk_gated_delta_rule 'fla_npu' backend requires the 'fla_npu' package, "
-            "which is not installed. Install fla_npu manually on NPU "
-            "(https://github.com/flashserve/flash-linear-attention-npu), or set "
-            "chunk_gated_delta_rule_implementation to 'triton' (vendored Triton-Ascend) or 'eager'."
+            "The fla_npu backend requires an installed A3/A5 fla_npu build with "
+            "fla_npu.ops.ascendc.chunk_gated_delta_rule_fwd and "
+            "chunk_gated_delta_rule_bwd. Check the package and CANN environment."
         ) from error
+    for name in ("chunk_gated_delta_rule_fwd", "chunk_gated_delta_rule_bwd"):
+        if not callable(getattr(ascendc, name, None)):
+            raise RuntimeError(f"Installed fla_npu is missing the stable GDN entry {name}.")
+    return ascendc
+
+
+def _validate_gdn_contract(q: Tensor, k: Tensor, v: Tensor, chunk_size: int, initial_state: Tensor | None):
+    """Reject inputs outside the common A3/A5 complete forward/backward domain."""
+    if any(x.dtype != torch.bfloat16 for x in (q, k, v)):
+        raise ValueError("fla_npu GDN on A3/A5 requires bfloat16 q/k/v.")
+    if any(x.shape[-1] != 128 for x in (q, k, v)) or chunk_size != 64:
+        raise ValueError("fla_npu GDN on A3/A5 requires K=V=128 and chunk_size=64.")
+    if initial_state is not None and initial_state.dtype != torch.bfloat16:
+        raise ValueError("fla_npu GDN on A3/A5 requires a bfloat16 initial_state.")
 
 
 def _chunk_fwd(
@@ -265,85 +273,36 @@ def _chunk_fwd(
     chunk_indices_list: dict[str, list[int] | None] | None,
     chunk_size: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
-    """Run the AscendC forward stages and return backward intermediates."""
-    _ensure_fla_npu_registered()
-
-    from ...vendor.triton.cumsum import chunk_local_cumsum
-    from ...vendor.triton.utils import is_arch35
-    from ...vendor.triton_core.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-
-    if is_arch35():
-        from ...vendor.triton_core.solve_tril import solve_tril
-    else:
-        from ...vendor.triton.solve_tril import solve_tril
-
-    g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens, head_first=False)
-    a = chunk_scaled_dot_kkt_fwd(
-        k=k,
-        g=g,
-        beta=beta,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=_chunk_tensor(chunk_indices, chunk_size),
-        chunk_size=chunk_size,
-        output_dtype=torch.float32,
-    )
-    if is_arch35():
-        a = solve_tril(
-            A=a,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=_chunk_tensor(chunk_indices, chunk_size),
-            output_dtype=k.dtype,
-        )
-    else:
-        a = solve_tril(A=a, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
-
-    g = g.transpose(1, 2).contiguous()
-    beta = beta.transpose(1, 2).contiguous().float()
-    a = a.transpose(1, 2).contiguous()
-    w, u = torch.ops.npu.npu_recompute_w_u_fwd(
+    """Run GDN with head-first QKV and sequence-major gates/output."""
+    _validate_gdn_contract(q, k, v, chunk_size, initial_state)
+    ops = _get_gdn_ops()
+    # Keep normalization outside the kernel and natural-exponent gates on both
+    # architectures. disable_recompute exports the two backward intermediates.
+    output, final_state, g_cum, a, _, _, _, _, _, _ = ops.chunk_gated_delta_rule_fwd(
+        q,
         k,
         v,
-        beta,
-        a,
-        chunk_size,
-        g=g,
-        gk=None,
-        cu_seqlens=cu_seqlens_list,
-        chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
-    )
-    h, v_new, final_state = torch.ops.npu.npu_chunk_gated_delta_rule_fwd_h(
-        k,
-        w,
-        u,
-        g=g,
-        gk=None,
+        g.contiguous(),
+        beta.contiguous(),
         initial_state=initial_state,
         output_final_state=output_final_state,
         chunk_size=chunk_size,
-        save_new_value=True,
         cu_seqlens=cu_seqlens_list,
         chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
+        scale=scale,
+        layout="BNSD",
         use_exp2=False,
-        transpose_state_layout=False,
+        use_qk_l2norm_in_kernel=False,
+        use_gate_in_kernel=False,
+        use_beta_sigmoid_in_kernel=False,
+        disable_recompute=True,
+        return_intermediate_states=False,
+        state_v_first=False,
     )
-    if not output_final_state:
-        final_state = None
-    output = torch.ops.npu.npu_chunk_fwd_o(
-        q,
-        k,
-        v_new,
-        h,
-        scale,
-        g=g,
-        g_gamma=None,
-        cu_seqlens=cu_seqlens_list,
-        chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
-        chunk_size=chunk_size,
-        transpose_state_layout=False,
-    )
-    g = g.transpose(1, 2).contiguous()
-    output = output.transpose(1, 2).contiguous()
-    return g, output, a, final_state
+    if g_cum is None or a is None:
+        raise RuntimeError("fla_npu GDN forward did not export g_cumsum/A with disable_recompute=True.")
+    # The stable API already returns output and cumulative gates in BSND/BSN.
+    return g_cum, output, a, final_state if output_final_state else None
 
 
 def _chunk_bwd(
@@ -362,126 +321,30 @@ def _chunk_bwd(
     chunk_indices_list: dict[str, list[int] | None] | None,
     chunk_size: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Run the AscendC backward stages for the chunked recurrence."""
-    _ensure_fla_npu_registered()
-
-    from ...vendor.triton.cumsum import chunk_local_cumsum
-
-    g = g.transpose(1, 2).contiguous()
-    beta = beta.transpose(1, 2).contiguous().float()
-    w, u = torch.ops.npu.npu_recompute_w_u_fwd(
+    """Consume saved cumulative gates/A and return gradients of raw inputs."""
+    ops = _get_gdn_ops()
+    grad_q, grad_k, grad_v, grad_beta, grad_g, _, _, _ = ops.chunk_gated_delta_rule_bwd(
+        q,
         k,
         v,
-        beta,
+        g,
+        beta.contiguous(),
         a,
-        chunk_size,
-        g=g,
-        gk=None,
+        grad_output.contiguous(),
+        scale,
+        chunk_size=chunk_size,
         cu_seqlens=cu_seqlens_list,
         chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
-    )
-    grad_output = grad_output.transpose(1, 2).contiguous()
-    h, v_new, _ = torch.ops.npu.npu_chunk_gated_delta_rule_fwd_h(
-        k,
-        w,
-        u,
-        g=g,
-        gk=None,
         initial_state=initial_state,
-        output_final_state=False,
-        chunk_size=chunk_size,
-        save_new_value=True,
-        cu_seqlens=cu_seqlens_list,
-        chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
-        use_exp2=False,
-        transpose_state_layout=False,
-    )
-    grad_v = torch.ops.npu.npu_chunk_bwd_dv_local(
-        q,
-        k,
-        grad_output,
-        g,
-        scale,
-        chunk_size,
-        g_gamma=None,
-        A=a,
-        cu_seqlens=cu_seqlens_list,
-        chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
-    )
-    _dh, _dh0, grad_v = torch.ops.npu.npu_chunk_gated_delta_rule_bwd_dhu(
-        q,
-        k,
-        w,
-        grad_output,
-        grad_v,
-        scale,
-        chunk_size,
-        g=g,
-        gK=None,
-        h0=None,
         dht=None,
-        cu_seqlens=cu_seqlens_list,
-        chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
+        layout="BNSD",
         use_exp2=False,
-        transpose_state_layout=False,
+        use_qk_l2norm_in_kernel=False,
+        use_gate_in_kernel=False,
+        use_beta_sigmoid_in_kernel=False,
+        state_v_first=False,
     )
-    grad_q, grad_k, grad_w, grad_g = torch.ops.npu.npu_chunk_bwd_dqkwg(
-        q,
-        k,
-        v_new,
-        g,
-        h,
-        grad_output,
-        _dh,
-        grad_v,
-        chunk_size,
-        cu_seqlens=cu_seqlens_list,
-        chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
-        w=None,
-        g_gamma=None,
-        scale=scale,
-        use_exp2=False,
-        transpose_state_layout=False,
-    )
-    grad_a = torch.ops.npu.npu_prepare_wy_repr_bwd_da(
-        k,
-        v,
-        beta.float(),
-        a,
-        grad_w,
-        grad_v,
-        g.float(),
-        chunk_size=chunk_size,
-        cu_seqlens=cu_seqlens_list,
-        chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
-    )
-    grad_k2, grad_v, grad_beta, grad_g2 = torch.ops.npu.npu_prepare_wy_repr_bwd_full(
-        k,
-        v,
-        beta,
-        a,
-        grad_a,
-        grad_w,
-        grad_v,
-        g,
-        chunk_size,
-        cu_seqlens=cu_seqlens_list,
-        chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
-    )
-    grad_beta = grad_beta.transpose(1, 2).contiguous()
-    grad_g2 = grad_g2.transpose(1, 2).contiguous()
-    grad_g = grad_g.transpose(1, 2).contiguous()
-    grad_k.add_(grad_k2)
-    grad_g.add_(grad_g2)
-    if grad_g.dtype != torch.float32:
-        raise ValueError(f"dg current type is {grad_g.dtype}, should be float32")
-    grad_g = chunk_local_cumsum(
-        grad_g,
-        chunk_size=chunk_size,
-        reverse=True,
-        cu_seqlens=cu_seqlens,
-        head_first=False,
-    )
+    # dG is already with respect to the raw gate: do not reverse-cumsum again.
     return grad_q, grad_k, grad_v, grad_beta, grad_g
 
 
@@ -505,8 +368,8 @@ def forward(
     """AscendC fused chunk gated delta rule. Layout is FLA ``[B, T, H, D]``.
 
     Empty or omitted *initial_state* / *cu_seqlens* are unused. Unused final
-    state is an empty tensor so the registry output stays tensors-only. The
-    fused backward does not produce ``dh0`` or consume ``dht``. Trainable
+    state is an empty tensor so the registry output stays tensors-only. This
+    adapter does not expose ``dh0`` or consume ``dht``. Trainable
     ``initial_state`` and ``output_final_state=True`` with trainable inputs
     are rejected. Extra NPU varlen tables are accepted; missing keys are
     filled from ``cu_seqlens``.
@@ -528,7 +391,7 @@ def forward(
             f"v current type is {value_h.dtype}; they should be equal"
         )
     if query_h.dtype == torch.float32:
-        raise ValueError("chunk_gated_delta_rule fla_npu does not support float32. Please use float16/bfloat16.")
+        raise ValueError("chunk_gated_delta_rule fla_npu does not support float32. Please use bfloat16.")
     if beta.ndim != 3 or g.ndim != 3:
         raise ValueError("g and beta must be rank-3 tensors with shape [B, T, H].")
     if query_h.ndim != 4 or key_h.ndim != 4 or value_h.ndim != 4:
@@ -541,21 +404,21 @@ def forward(
         raise ValueError(
             f"Expected q/k/v in [B, T, H, D] and g/beta in [B, T, H]; got q={tuple(query.shape)}, g={tuple(g.shape)}."
         )
-    if chunk_size != 2 ** (chunk_size.bit_length() - 1):
+    if chunk_size <= 0 or chunk_size & (chunk_size - 1):
         raise ValueError(f"chunk_size must be a power of 2, got {chunk_size}.")
 
     initial_opt = optional_tensor(initial_state)
     if initial_opt is not None and initial_opt.requires_grad:
         raise NotImplementedError(
             "fla_npu chunk_gated_delta_rule cannot differentiate initial_state "
-            "(the AscendC backward returns no dh0, same as MindSpeed-MM). Detach "
+            "(this adapter does not expose state gradients). Detach "
             "initial_state, or use the 'triton' backend if you need that gradient."
         )
     inputs_need_grad = any(tensor.requires_grad for tensor in (query, key, value, g, beta))
     if output_final_state and inputs_need_grad:
         raise NotImplementedError(
             "fla_npu chunk_gated_delta_rule cannot differentiate the final state "
-            "(the AscendC backward drops dht). Set output_final_state=False, or use "
+            "(this adapter does not pass dht). Set output_final_state=False, or use "
             "the 'triton' backend if you need a final-state loss."
         )
 

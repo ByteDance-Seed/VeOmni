@@ -142,18 +142,17 @@ See the [triton-ascend quick-start](https://github.com/triton-lang/triton-ascend
 for the compatibility matrix and troubleshooting. Keep CANN, `torch_npu`,
 and `triton-ascend` on a mutually compatible release set.
 
-> **arch35 limitation:** the vendored `causal_conv1d` refuses to run on arch35 NPUs
-> (`Ascend910_95` / `Ascend950`) — its `is_arch35()` guard raises `NotImplementedError`
-> rather than mis-computing. Validated on `Ascend910B2C`. arch35 support would need to come
-> from upstream MindSpeed-MM.
+> **arch35:** the vendored `causal_conv1d` runs on arch35 NPUs (`Ascend910_95` /
+> `Ascend950`); the old `is_arch35()` guard that raised `NotImplementedError` is gone.
+> Validated on `Ascend910B2C` and A5 (`Ascend950DT`).
 
 ### `fla_npu` — AscendC fused backend (`chunk_gated_delta_rule` only)
 
 `fla_npu` is a second NPU backend for `chunk_gated_delta_rule` that delegates the heavy GDN
 compute to the external [`fla_npu`](https://github.com/flashserve/flash-linear-attention-npu)
-package (registered as `torch.ops.npu.*` fused ops); only the Triton glue stays vendored under
-`veomni/ops/kernels/gated_delta_rule/vendor/triton_core`. It coexists with `triton` (pure vendored
-Triton-Ascend), which remains the fallback.
+operator library, driven through its stable Python entry `fla_npu.ops.ascendc`; only the Triton
+glue stays vendored under `veomni/ops/kernels/gated_delta_rule/vendor/triton_core`. It coexists
+with `triton` (pure vendored Triton-Ascend), which remains the fallback.
 Set only `chunk_gated_delta_rule` to `fla_npu`; keep `rms_norm_gated` on `torch_npu` and
 `causal_conv1d` on `triton`:
 
@@ -165,10 +164,11 @@ model:
     chunk_gated_delta_rule_implementation: fla_npu
 ```
 
-`fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It supports Ascend
-910B (A2) / 910_93 (A3), both non-arch35 chips where the `solve_tril` step runs the vendored
-Triton kernel (the arch35 native path is gated behind `is_arch35()`). arch35 (`Ascend910_95` /
-`Ascend950`) is not supported end-to-end: the vendored `causal_conv1d` raises there (see above).
+`fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It covers the A2
+(`ascend910b`), A3 (`ascend910_93`) and A5 / arch35 (`ascend950`) targets; the library picks the
+arch22 or arch35 kernel path from the SoC, and this adapter uses the BF16 K=V=128,
+chunk_size=64 contract both paths share. arch35 (`Ascend910_95` / `Ascend950`) runs end-to-end:
+the vendored `causal_conv1d` no longer refuses it (see above).
 
 The prebuilt NPU images on [quay.io](https://quay.io/repository/ascend/veomni?tab=tags) already
 bundle `fla_npu`:
@@ -176,26 +176,48 @@ bundle `fla_npu`:
 - A2: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A2-ubuntu22.04-py3.11-veomni-latest`
 - A3: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A3-ubuntu22.04-py3.11-veomni-latest`
 
-To build on a bare host instead, install from the
-[`flash-linear-attention-npu`](https://github.com/flashserve/flash-linear-attention-npu) sources:
+To build on a bare host instead, build and install the `v26.10.0` wheel from the
+[`flash-linear-attention-npu`](https://github.com/flashserve/flash-linear-attention-npu) sources.
+The library does not install `torch`, `torch_npu` or `triton-ascend` for you; those must match
+your CANN and Python versions, and `FLA_NPU_SOC` must match the chip — A2 → `ascend910b`,
+A3 → `ascend910_93`, A5 → `ascend950`.
 
 ```bash
+# CANN first: A2/A3 need >= 8.5.2, A5 needs >= 9.0.0. Re-source it in every new shell.
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+
 git clone https://github.com/flashserve/flash-linear-attention-npu
 cd flash-linear-attention-npu
-git checkout c2e3d83f
+git checkout v26.10.0
 
-source /usr/local/Ascend/cann/set_env.sh          # source your actual CANN path
+# Build dependencies of the operator library only.
+python -m pip install -r requirements.txt
+python scripts/check_npu_env.py           # add --build-only on a host without an NPU
 
-# --soc must match the chip: {ascend910b, ascend910_93, ascend950}
-bash build.sh --soc=ascend910b --pkg --vendor_name=fla_npu
-bash build_out/fla-npu_*.run
-cd torch_custom/fla_npu/ && bash build.sh
+FLA_NPU_SOC=ascend910b python scripts/build_wheel.py
+python -m pip install --force-reinstall --no-cache-dir --no-deps dist/*.whl
 
-pip list | grep fla_npu   # verify it is installed
+# Verify the wheel registered its AscendC ops.
+python -c "import fla_npu; print('ok')"
+python -c "from fla_npu.ops import ascendc; print(hasattr(ascendc, 'chunk_fwd_o'))"
+python scripts/check_packaged_wheel_api.py
 ```
 
-If the `fla_npu` package is missing when `chunk_gated_delta_rule_implementation: fla_npu` is selected, the backend raises an actionable error when
-the model constructs its `VeomniOp` handle (pointing back to the install step or to `triton` / `eager`).
+`--no-deps` is required: without it pip re-resolves `torch` and can replace the Ascend
+`torch_npu` stack with a CUDA build. The wheel embeds the AscendC operators, so no run package
+(`build.sh --pkg`), no install into `$ASCEND_OPP_PATH/vendors` and no separate
+`torch_custom/fla_npu` build are needed any more.
+
+Coming from `v26.6.0` or earlier, uninstall the old package and delete its leftovers under
+`site-packages` (`fla_npu/`, `custom_aclnn_extension_lib*.so`, any self-built `libopapi.so`)
+before running the steps above. The call entry moved from `torch.ops.npu.*` / `torch_npu.ops.*`
+to `fla_npu.ops.ascendc`, and the legacy `torch.ops.npu.*` path is no longer enabled by default;
+`FLA_NPU_INCREMENTAL_BUILD`, `FLA_NPU_SKIP_RUN_BUILD` and `FLA_NPU_SKIP_RUN_INSTALL` were
+removed with it.
+
+If the `fla_npu` package is missing when `chunk_gated_delta_rule_implementation: fla_npu` is
+selected, the backend raises an actionable error when the model constructs its `VeomniOp` handle
+(pointing back to the install step or to `triton` / `eager`).
 
 ### Qwen3.5-9B VL Training
 

@@ -375,10 +375,10 @@ model:
 The Ascend gated RMSNorm uses `torch_npu`. The Ascend causal Conv1D and gated
 delta-rule implementations are vendored MindSpeed-MM Triton kernels named
 `triton` and additionally require `triton-ascend`. The gated delta rule has a
-second Ascend backend, `fla_npu`, an AscendC fused `torch.ops.npu.*` path that
-requires a manual `fla_npu` install. Registrations live in
-`veomni/ops/kernels/gated_delta_rule/__init__.py`; field defaults and allowed
-values are documented by `OpsImplementationConfig`.
+second Ascend backend, `fla_npu`, an AscendC fused path called through
+`fla_npu.ops.ascendc` that requires a manual `fla_npu` install. Registrations
+live in `veomni/ops/kernels/gated_delta_rule/__init__.py`; field defaults and
+allowed values are documented by `OpsImplementationConfig`.
 
 ---
 

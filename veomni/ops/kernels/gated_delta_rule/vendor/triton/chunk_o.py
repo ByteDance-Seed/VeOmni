@@ -422,6 +422,13 @@ def chunk_bwd_dqkwg(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     BK = 128 if cu_seqlens is None else 64
+    if K < BK:
+        # A key tile wider than K makes the kernel emit NaN in ``dg`` (seen on
+        # K = 64, V = 64, dense input; K >= BK, including partial last blocks
+        # such as K = 192 with BK = 128, is fine).  Clamp the tile to the
+        # largest power of two that fits in K instead of relying on the
+        # out-of-bounds masking of the K dimension.
+        BK = 1 << (K.bit_length() - 1)
     BV = 64
     NK = triton.cdiv(K, BK)
     dq = torch.empty_like(q)
