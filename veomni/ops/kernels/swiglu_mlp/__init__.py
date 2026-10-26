@@ -36,9 +36,15 @@ def has_plain_linear_projections(mlp: nn.Module) -> bool:
     """Whether ``swiglu_mlp`` may read ``mlp``'s projection weights directly.
 
     A wrapped projection such as ``LoraLinear`` has no ``weight`` and must run
-    its own forward, so the MLP has to call the projection modules instead.
+    its own forward, and a quantized projection (e.g. ``DeepseekV41Linear`` with
+    ``is_quantized=True``) stores FP8 weights + scales that require its own
+    ``quantized_matmul`` forward rather than a plain ``F.linear``.
     """
-    return all(isinstance(getattr(mlp, name), nn.Linear) for name in ("gate_proj", "up_proj", "down_proj"))
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        proj = getattr(mlp, name)
+        if not isinstance(proj, nn.Linear) or getattr(proj, "is_quantized", False):
+            return False
+    return True
 
 
 register_op(

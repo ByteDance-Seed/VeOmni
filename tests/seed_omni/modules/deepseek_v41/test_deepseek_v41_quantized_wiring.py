@@ -261,6 +261,15 @@ class TestSharedExpert:
         for name in ("gate_proj", "up_proj", "down_proj"):
             assert getattr(plain, name).weight.shape == getattr(quantized, name).weight.shape
 
+    def test_quantized_shared_expert_bypasses_plain_linear_swiglu_fusion(self):
+        from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+
+        config = make_config(weight_quantization=RELEASED_QUANTIZATION)
+        plain = DeepseekV41SharedExpert(make_config())
+        quantized = DeepseekV41SharedExpert(config, quant_dtype=linear_quant_dtype(config))
+        assert has_plain_linear_projections(plain)
+        assert not has_plain_linear_projections(quantized)
+
 
 class TestRoutedExperts:
     """The fp4 slabs -- the bulk of the parameters, and the only 4-bit weights."""
