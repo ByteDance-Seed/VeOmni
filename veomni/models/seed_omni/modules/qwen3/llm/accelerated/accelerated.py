@@ -11,7 +11,6 @@ import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad
-from veomni.ops.mask import packed_causal_mask, sliding_window_mask
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
 from veomni.utils.tensor_utils import unflatten
 
@@ -86,7 +85,6 @@ class TrainingMixin(TrainingModuleMixin):
             (cu_q, cu_k), (max_q, max_k) = prepare_fa_kwargs_from_position_ids(pids)
             embeds = slice_input_tensor(embeds, dim=1, padding=False, group=group)
             pids = slice_input_tensor(pids, dim=1, padding=False, group=group)
-            mask = self._build_packed_attention_mask(embeds, mask, cu_q, cu_k)
             return dict(
                 inputs_embeds=embeds,
                 attention_mask=mask,
@@ -96,7 +94,6 @@ class TrainingMixin(TrainingModuleMixin):
                 max_length_q=max_q,
                 max_length_k=max_k,
             )
-        attention_mask = self._build_packed_attention_mask(inputs_embeds, attention_mask, cu_seq_lens_q, cu_seq_lens_k)
         return dict(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -107,42 +104,6 @@ class TrainingMixin(TrainingModuleMixin):
             max_length_k=max_length_k,
             **kwargs,
         )
-
-    def _build_packed_attention_mask(
-        self,
-        inputs_embeds: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-        cu_seq_lens_q: torch.Tensor,
-        cu_seq_lens_k: torch.Tensor,
-    ) -> torch.Tensor | dict[str, torch.Tensor | None] | None:
-        """Build a sample-isolating packed causal mask for the configured attention backend."""
-        attn_impl = (
-            getattr(self.config.text_config, "_attn_implementation", None)
-            or getattr(self.config, "_attn_implementation", None)
-            or "sdpa"
-        )
-        q_len = inputs_embeds.size(1)
-        packed_kwargs: dict[str, Any] = {
-            "impl": attn_impl,
-            "device": inputs_embeds.device,
-            "cu_seqlens": cu_seq_lens_q,
-            "cu_seq_lens_k": cu_seq_lens_k,
-            "batch_size": inputs_embeds.size(0),
-            "dtype": inputs_embeds.dtype,
-            "attention_mask": attention_mask,
-        }
-        full_mask = packed_causal_mask(q_len, q_len, **packed_kwargs)
-        if getattr(self.language_model, "has_sliding_layers", False):
-            return {
-                "full_attention": full_mask,
-                "sliding_attention": sliding_window_mask(
-                    q_len,
-                    q_len,
-                    sliding_window=self.config.text_config.sliding_window,
-                    **packed_kwargs,
-                ),
-            }
-        return full_mask
 
     @post_forward("forward")
     def forward_post(self, **outputs: Any) -> Dict[str, Any]:
