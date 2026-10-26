@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.transformers.deepseek_v4.packed_utils import (
     build_packed_compression_metadata,
     ensure_unmasked_packed_attention,
@@ -29,6 +30,7 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_de
 from veomni.utils.seqlen_pos_transform_utils import packed_sequence_slices_from_cu_seqlens
 
 
+_CPU_LAUNCH = LaunchSpec(device="cpu")
 SEQ_LEN = 64
 CP_SIZE = 4
 LOCAL_LEN = SEQ_LEN // CP_SIZE
@@ -39,6 +41,7 @@ def _packed_position_ids() -> torch.Tensor:
     return torch.cat([torch.arange(38), torch.arange(SEQ_LEN - 38)]).view(1, SEQ_LEN)
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_packed_compression_metadata_ignores_reference_shape():
     """A scalar reference must match a full hidden placeholder."""
     position_ids = _packed_position_ids()
@@ -64,6 +67,7 @@ def test_packed_compression_metadata_ignores_reference_shape():
         assert from_scalar[key].device == from_full[key].device
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_packed_sequence_slices_from_cpu_cu_seqlens():
     slices = packed_sequence_slices_from_cu_seqlens(torch.tensor([0, 3, 8], dtype=torch.int32))
     assert slices == ((0, 3), (3, 8))
@@ -76,6 +80,7 @@ def test_packed_sequence_slices_from_cu_seqlens_rejects_gpu_tensor():
         packed_sequence_slices_from_cu_seqlens(torch.tensor([0, 8], device=get_device_type(), dtype=torch.int32))
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_resolve_packed_sequence_slices_prefers_host_slices(monkeypatch):
     calls = {"from_cu": 0}
     real = packed_sequence_slices_from_cu_seqlens
@@ -101,20 +106,24 @@ def test_resolve_packed_sequence_slices_copies_missing_gpu_cu_seqlens():
     assert resolve_packed_sequence_slices(None, cu_seq_lens_q, 8) == ((0, 4), (4, 8))
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_resolve_packed_sequence_slices_rejects_short_span():
     with pytest.raises(ValueError, match="must span the full sequence"):
         resolve_packed_sequence_slices(((0, 4),), None, 8)
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_ensure_unmasked_packed_attention_trusts_collator_flag():
     ensure_unmasked_packed_attention(torch.zeros(1, 4), attention_mask_is_all_ones=True)
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_ensure_unmasked_packed_attention_rejects_false_flag():
     with pytest.raises(ValueError, match="masked-out"):
         ensure_unmasked_packed_attention(torch.ones(1, 4), attention_mask_is_all_ones=False)
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_ensure_unmasked_packed_attention_checks_cpu_mask():
     with pytest.raises(ValueError, match="masked-out"):
         ensure_unmasked_packed_attention(torch.tensor([[1, 0]]), attention_mask_is_all_ones=None)
@@ -133,6 +142,7 @@ def test_ensure_unmasked_packed_attention_skips_gpu_mask_outside_debug():
         device_module.set_sync_debug_mode(previous)
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_shard_packed_compression_metadata_keeps_global_compressed_slots():
     reference = torch.zeros(1, SEQ_LEN, 4)
     position_ids = _packed_position_ids()

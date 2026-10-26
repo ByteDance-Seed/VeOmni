@@ -20,8 +20,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config, ops_config_scope
 from veomni.ops.config import get_ops_config, resolve_op_impl, set_ops_config
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 @pytest.mark.parametrize("initially_configured", [False, True], ids=["none", "existing-config"])

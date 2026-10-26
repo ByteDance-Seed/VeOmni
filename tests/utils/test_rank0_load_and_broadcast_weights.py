@@ -1,3 +1,4 @@
+import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,7 +15,12 @@ from torch.distributed.device_mesh import DeviceMesh
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 from veomni.distributed.parallel_plan import ParallelPlan
-from veomni.distributed.parallel_state import _init_parallel_state
+from veomni.distributed.parallel_state import (
+    _init_parallel_state,
+    clear_parallel_state,
+    get_parallel_state,
+    use_parallel_state,
+)
 from veomni.distributed.torch_parallelize import _move_model_buffers_to_device, build_parallelize_model
 from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights, rank0_load_and_broadcast_weights
 from veomni.utils import helper
@@ -39,9 +45,11 @@ logger = helper.create_logger(__name__)
 @dataclass
 class BroadcastTestArguments:
     weights_path: str = ""
+    parallel_weights_path: str = ""
+    standard_weights_path: str = ""
     device_type: str = get_device_type()
-    backend: str = ""
-    mode: str = "broadcast"  # "broadcast" | "load_weights" | "offload_training"
+    backend: str = field(default_factory=get_dist_comm_backend)
+    mode: str = "broadcast"  # "broadcast" | "load_weights" | "all" | "offload_training"
 
 
 @dataclass
@@ -178,24 +186,6 @@ class ToyModel(torch.nn.Module):
         self.linear3.bias.data.fill_(2.0)
 
 
-class ToyBufferModel(torch.nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.linear = nn.Linear(4, 2)
-        self.register_buffer("offset", torch.tensor([0.25, -0.5]))
-        self.register_buffer("scale", torch.tensor(0.75), persistent=False)
-        self.config = SimpleNamespace(tie_word_embeddings=False)
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.linear(inputs) * self.scale + self.offset
-
-    def init_weights(self) -> None:
-        nn.init.xavier_uniform_(self.linear.weight)
-        self.linear.bias.data.fill_(0.125)
-        self.offset.copy_(torch.tensor([0.25, -0.5], device=self.offset.device))
-        self.scale.fill_(0.75)
-
-
 def _write_checkpoint(checkpoint_dir: Path, is_parallel: bool) -> str:
     torch.manual_seed(0)
     if is_parallel:
@@ -209,15 +199,6 @@ def _write_checkpoint(checkpoint_dir: Path, is_parallel: bool) -> str:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Saving checkpoint to {checkpoint_dir}")
     save_file(state_dict, str(checkpoint_dir / "model.safetensors"))
-    return str(checkpoint_dir)
-
-
-def _write_buffer_checkpoint(checkpoint_dir: Path) -> str:
-    torch.manual_seed(2026)
-    model = ToyBufferModel()
-    model.init_weights()
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    save_file(model.state_dict(), str(checkpoint_dir / "model.safetensors"))
     return str(checkpoint_dir)
 
 
@@ -241,6 +222,400 @@ def _assert_model_parameters_on_device(model: nn.Module, expected_device_type: s
         assert local_param.device.type == expected_device_type, (
             f"Expected {name} to be on {expected_device_type}, got {local_param.device.type}."
         )
+
+
+def _check_rank0_broadcast(args: Arguments, weights_path: Path, *, cpu_offload: bool) -> None:
+    if not weights_path.exists():
+        raise ValueError("`weights_path` must point to an existing directory.")
+
+    dtensor_factory = distribute_tensor if distribute_tensor is not None else None
+    if dtensor_factory is None:
+        raise RuntimeError("torch.distributed.tensor.distribute_tensor is required for fsdp2 weight loading test")
+    load_device = "cpu" if cpu_offload else get_device_type()
+
+    rank0_load_model = ToyMoeAndEmbedModel()
+    all_rank_load_model = ToyMoeAndEmbedModel()
+
+    # 1.1 rank0_load_model init with no weights_path
+    rank0_load_model = build_parallelize_model(
+        rank0_load_model,
+        weights_path=None,
+        init_device=args.model.accelerator.init_device,
+        mixed_precision=args.model.accelerator.fsdp_config.mixed_precision,
+        enable_gradient_checkpointing=False,
+        enable_fsdp_offload=cpu_offload,
+        basic_modules=[],
+        broadcast_model_weights_from_rank0=True,
+    )
+
+    cpu_load_param_name = None
+    if hasattr(rank0_load_model, "get_parallel_plan"):
+        cpu_load_param_name = getattr(rank0_load_model.get_parallel_plan(), "cpu_load_param_name", None)
+
+    # 1.2 rank0_load_model load from weights_path
+    rank0_load_and_broadcast_weights(
+        rank0_load_model,
+        str(weights_path),
+        init_device=load_device,
+        dtensor_factory=dtensor_factory,
+        cpu_load_param_name=cpu_load_param_name,
+        max_load_broadcast_size=0.0,
+    )
+
+    # 2.1 all_rank_load_model init with no weights_path
+    all_rank_load_model = build_parallelize_model(
+        all_rank_load_model,
+        weights_path=None,
+        init_device=args.model.accelerator.init_device,
+        mixed_precision=args.model.accelerator.fsdp_config.mixed_precision,
+        enable_gradient_checkpointing=False,
+        enable_fsdp_offload=cpu_offload,
+        basic_modules=[],
+        broadcast_model_weights_from_rank0=False,
+    )
+
+    # 2.2 all_rank_load_model load from weights_path
+    load_model_weights(
+        all_rank_load_model,
+        str(weights_path),
+        init_device=load_device,
+        dtensor_factory=dtensor_factory,
+    )
+    if cpu_offload:
+        _assert_model_parameters_on_device(rank0_load_model, "cpu")
+        _assert_model_parameters_on_device(all_rank_load_model, "cpu")
+    torch.testing.assert_close(
+        rank0_load_model.get_input_embeddings().weight,
+        all_rank_load_model.get_input_embeddings().weight,
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        rank0_load_model.get_output_embeddings().weight,
+        all_rank_load_model.get_output_embeddings().weight,
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        rank0_load_model.linear1.weight,
+        all_rank_load_model.linear1.weight,
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        rank0_load_model.linear1.bias,
+        all_rank_load_model.linear1.bias,
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        rank0_load_model.linear2.weight,
+        all_rank_load_model.linear2.weight,
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        rank0_load_model.buffer,
+        all_rank_load_model.buffer,
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        rank0_load_model.linear3.weight,
+        all_rank_load_model.linear3.weight,
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        rank0_load_model.linear3.bias,
+        all_rank_load_model.linear3.bias,
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        rank0_load_model.extra_embed_tokens.weight,
+        all_rank_load_model.extra_embed_tokens.weight,
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        rank0_load_model.decoder.moe.experts,
+        all_rank_load_model.decoder.moe.experts,
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        rank0_load_model.decoder.extra_embed_tokens.weight,
+        all_rank_load_model.decoder.extra_embed_tokens.weight,
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    assert (
+        all_rank_load_model.get_input_embeddings().weight.data_ptr()
+        == all_rank_load_model.get_output_embeddings().weight.data_ptr()
+    )
+
+    del rank0_load_model, all_rank_load_model
+    dist.barrier()
+
+
+def _check_load_weights_no_scatter(args: Arguments, weights_path: Path, *, cpu_offload: bool) -> None:
+    if not weights_path.exists():
+        raise ValueError("`weights_path` must point to an existing directory.")
+
+    fsdp_model = build_parallelize_model(
+        ToyModel(),
+        weights_path=str(weights_path),
+        init_device=args.model.accelerator.init_device,
+        mixed_precision=args.model.accelerator.fsdp_config.mixed_precision,
+        enable_gradient_checkpointing=False,
+        enable_fsdp_offload=cpu_offload,
+        basic_modules=[],
+    )
+
+    reference_model = ToyModel().to(get_device_type())
+    load_model_weights(reference_model, str(weights_path), init_device=get_device_type())
+    reference_model = reference_model.cpu()
+
+    if cpu_offload:
+        _assert_model_parameters_on_device(fsdp_model, "cpu")
+
+    torch.testing.assert_close(
+        _clone_to_cpu(fsdp_model.get_input_embeddings().weight),
+        reference_model.get_input_embeddings().weight.detach().cpu(),
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        _clone_to_cpu(fsdp_model.get_output_embeddings().weight),
+        reference_model.get_output_embeddings().weight.detach().cpu(),
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        _clone_to_cpu(fsdp_model.linear1.weight),
+        reference_model.linear1.weight.detach().cpu(),
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        _clone_to_cpu(fsdp_model.linear1.bias),
+        reference_model.linear1.bias.detach().cpu(),
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        _clone_to_cpu(fsdp_model.linear2.weight),
+        reference_model.linear2.weight.detach().cpu(),
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        _clone_to_cpu(fsdp_model.buffer),
+        reference_model.buffer.detach().cpu(),
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        _clone_to_cpu(fsdp_model.linear3.weight),
+        reference_model.linear3.weight.detach().cpu(),
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        _clone_to_cpu(fsdp_model.linear3.bias),
+        reference_model.linear3.bias.detach().cpu(),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    assert fsdp_model.get_input_embeddings().weight is fsdp_model.get_output_embeddings().weight
+
+    del fsdp_model, reference_model
+    dist.barrier()
+
+
+def run_rank0_broadcast_test(args: Arguments) -> None:
+    weights_path = Path(args.test.weights_path)
+    get_torch_device().set_device(args.train.local_rank)
+    dist.init_process_group(backend=args.test.backend)
+    ps = _init_parallel_state(
+        dp_size=args.model.accelerator.dp_size,
+        dp_replicate_size=args.model.accelerator.dp_replicate_size,
+        dp_shard_size=args.model.accelerator.dp_shard_size,
+        tp_size=args.model.accelerator.tp_size,
+        pp_size=args.model.accelerator.pp_size,
+        cp_size=args.model.accelerator.cp_size,
+        ulysses_size=args.model.accelerator.ulysses_size,
+        extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes,
+        extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
+        extra_parallel_names=args.model.accelerator.extra_parallel_names,
+        dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
+        name="broadcast",
+    )
+    try:
+        with use_parallel_state(ps):
+            _check_rank0_broadcast(args, weights_path, cpu_offload=args.model.accelerator.fsdp_config.offload)
+    finally:
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            clear_parallel_state()
+
+
+def run_load_weights_test(args: Arguments) -> None:
+    weights_path = Path(args.test.weights_path)
+    get_torch_device().set_device(args.train.local_rank)
+    dist.init_process_group(backend=args.test.backend)
+    ps = _init_parallel_state(
+        dp_size=args.model.accelerator.dp_size,
+        dp_replicate_size=args.model.accelerator.dp_replicate_size,
+        dp_shard_size=args.model.accelerator.dp_shard_size,
+        tp_size=args.model.accelerator.tp_size,
+        pp_size=args.model.accelerator.pp_size,
+        cp_size=args.model.accelerator.cp_size,
+        ulysses_size=args.model.accelerator.ulysses_size,
+        extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes,
+        extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
+        extra_parallel_names=args.model.accelerator.extra_parallel_names,
+        dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
+        name="load_weights",
+    )
+    try:
+        with use_parallel_state(ps):
+            _check_load_weights_no_scatter(args, weights_path, cpu_offload=args.model.accelerator.fsdp_config.offload)
+    finally:
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            clear_parallel_state()
+
+
+def run_all_tests(args: Arguments) -> None:
+    parallel_weights_path = Path(args.test.parallel_weights_path)
+    standard_weights_path = Path(args.test.standard_weights_path)
+
+    get_torch_device().set_device(args.train.local_rank)
+    dist.init_process_group(backend=args.test.backend)
+    world_size = dist.get_world_size()
+
+    ps_broadcast = _init_parallel_state(
+        dp_size=world_size,
+        dp_shard_size=world_size,
+        extra_parallel_sizes=(2, 2),
+        extra_parallel_placement_innermost=(False, False),
+        extra_parallel_names=("ep", "emb"),
+        dp_mode="fsdp2",
+        name="broadcast_ep2_emb2",
+    )
+    ps_load_weights = _init_parallel_state(
+        dp_size=world_size,
+        dp_shard_size=world_size,
+        extra_parallel_sizes=(1,),
+        extra_parallel_placement_innermost=(False,),
+        extra_parallel_names=("ep",),
+        dp_mode="fsdp2",
+        name="load_weights_no_extra",
+    )
+
+    scenarios = [
+        (
+            "broadcast_no_offload",
+            ps_broadcast,
+            lambda: _check_rank0_broadcast(args, parallel_weights_path, cpu_offload=False),
+        ),
+        (
+            "broadcast_cpu_offload",
+            ps_broadcast,
+            lambda: _check_rank0_broadcast(args, parallel_weights_path, cpu_offload=True),
+        ),
+        (
+            "load_weights_no_offload",
+            ps_load_weights,
+            lambda: _check_load_weights_no_scatter(args, standard_weights_path, cpu_offload=False),
+        ),
+        (
+            "load_weights_cpu_offload",
+            ps_load_weights,
+            lambda: _check_load_weights_no_scatter(args, standard_weights_path, cpu_offload=True),
+        ),
+    ]
+    if os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1":
+        scenarios = list(reversed(scenarios))
+
+    try:
+        for label, ps, fn in scenarios:
+            with use_parallel_state(ps):
+                assert get_parallel_state() is ps, f"[{label}] unexpected parallel state"
+                fn()
+        dist.barrier()
+    finally:
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            clear_parallel_state()
+
+
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed required")
+def test_load_dist_model_weights_matches_standard(tmp_path: Path) -> None:
+    """Fused 4-rank worker covering broadcast (EP2+emb2) and load_weights (no scatter) across no_offload/cpu_offload."""
+    parallel_weights_path = _write_checkpoint(tmp_path / "ckpt_parallel", is_parallel=True)
+    standard_weights_path = _write_checkpoint(tmp_path / "ckpt_standard", is_parallel=False)
+
+    world_size = _CI_LAUNCH.nproc
+    command = [
+        "torchrun",
+        f"--nproc_per_node={world_size}",
+        "--standalone",
+        "tests/utils/test_rank0_load_and_broadcast_weights.py",
+        "--model.config_path=test",
+        "--data.train_path=tests",
+        "--train.checkpoint.output_dir=.tests/cache",
+        "--model.accelerator.fsdp_config.fsdp_mode=fsdp2",
+        "--model.accelerator.init_device=meta",
+        "--model.accelerator.fsdp_config.mixed_precision.enable=False",
+        "--model.accelerator.gradient_checkpointing.enable=False",
+        f"--test.parallel_weights_path={parallel_weights_path}",
+        f"--test.standard_weights_path={standard_weights_path}",
+        f"--test.device_type={get_device_type()}",
+        f"--test.backend={get_dist_comm_backend()}",
+        "--test.mode=all",
+    ]
+
+    result = subprocess.run(command, check=True)
+    assert result.returncode == 0
+
+
+class ToyBufferModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(4, 2)
+        self.register_buffer("offset", torch.tensor([0.25, -0.5]))
+        self.register_buffer("scale", torch.tensor(0.75), persistent=False)
+        self.config = SimpleNamespace(tie_word_embeddings=False)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.linear(inputs) * self.scale + self.offset
+
+    def init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.linear.weight)
+        self.linear.bias.data.fill_(0.125)
+        self.offset.copy_(torch.tensor([0.25, -0.5], device=self.offset.device))
+        self.scale.fill_(0.75)
+
+
+def _write_buffer_checkpoint(checkpoint_dir: Path) -> str:
+    torch.manual_seed(2026)
+    model = ToyBufferModel()
+    model.init_weights()
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    save_file(model.state_dict(), str(checkpoint_dir / "model.safetensors"))
+    return str(checkpoint_dir)
 
 
 def _assert_model_buffers_on_device(model: nn.Module, expected_device_type: str) -> None:
@@ -280,6 +655,7 @@ def _assert_optimizer_moments_on_device(optimizer: torch.optim.Optimizer, expect
     assert moment_count > 0, "Expected at least one optimizer moment tensor."
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_move_model_buffers_to_device_preserves_parameters_and_persistence() -> None:
     model = nn.Sequential(nn.Linear(2, 2))
     model.register_buffer("persistent_buffer", torch.ones(2))
@@ -303,6 +679,7 @@ def test_move_model_buffers_to_device_preserves_parameters_and_persistence() -> 
     assert "runtime_buffer_alias" not in model.state_dict()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.skipif(DTensor is None, reason="DTensor required")
 def test_move_model_buffers_to_device_preserves_dtensor_aliases(tmp_path: Path) -> None:
     if dist.is_initialized():
@@ -464,423 +841,6 @@ def run_fsdp_cpu_offload_training_test(args: Arguments) -> None:
         clear_parallel_state()
 
 
-def run_rank0_broadcast_test(args: Arguments) -> None:
-    weights_path = Path(args.test.weights_path)
-    if not weights_path.exists():
-        raise ValueError("`--test.weights_path` must point to an existing directory.")
-
-    get_torch_device().set_device(args.train.local_rank)
-    dist.init_process_group(backend=args.test.backend or get_dist_comm_backend())
-
-    _init_parallel_state(
-        dp_size=args.model.accelerator.dp_size,
-        dp_replicate_size=args.model.accelerator.dp_replicate_size,
-        dp_shard_size=args.model.accelerator.dp_shard_size,
-        tp_size=args.model.accelerator.tp_size,
-        pp_size=args.model.accelerator.pp_size,
-        cp_size=args.model.accelerator.cp_size,
-        ulysses_size=args.model.accelerator.ulysses_size,
-        extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes,
-        extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
-        extra_parallel_names=args.model.accelerator.extra_parallel_names,
-        dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
-    )
-
-    dtensor_factory = distribute_tensor if distribute_tensor is not None else None
-    if dtensor_factory is None:
-        raise RuntimeError("torch.distributed.tensor.distribute_tensor is required for fsdp2 weight loading test")
-    dtensor_to_cpu = args.model.accelerator.fsdp_config.offload
-    load_device = "cpu" if dtensor_to_cpu else get_device_type()
-
-    try:
-        rank0_load_model = ToyMoeAndEmbedModel()
-        all_rank_load_model = ToyMoeAndEmbedModel()
-        """
-        model before parallelize:
-        ToyMoeAndEmbedModel(
-            (input_embed_tokens): ToyEmbed()
-            (output_embed_tokens): ToyEmbed()
-            (linear1): Linear(in_features=4, out_features=3, bias=True)
-            (linear2): Linear(in_features=3, out_features=2, bias=False)
-            (linear3): Linear(in_features=2, out_features=1, bias=True)
-            (extra_embed_tokens): ToyEmbed()
-            (decoder): ToyMoeAndEmbedDecoderLayer(
-                (extra_embed_tokens): ToyEmbed()
-                (moe): ToyMoeExperts()
-            )
-        )
-
-        model after parallelize:
-        FSDPToyMoeAndEmbedModel(
-            (input_embed_tokens): FSDPToyEmbed()
-            (output_embed_tokens): FSDPToyEmbed()
-            (linear1): Linear(in_features=4, out_features=3, bias=True)
-            (linear2): Linear(in_features=3, out_features=2, bias=False)
-            (linear3): Linear(in_features=2, out_features=1, bias=True)
-            (extra_embed_tokens): FSDPToyEmbed()
-            (decoder): FSDPToyMoeAndEmbedDecoderLayer(
-                (extra_embed_tokens): FSDPToyEmbed()
-                (moe): FSDPToyMoeExperts()
-            )
-        )
-        """
-
-        # 1.1 rank0_load_model init with no weights_path
-        rank0_load_model = build_parallelize_model(
-            rank0_load_model,
-            weights_path=None,
-            init_device=args.model.accelerator.init_device,
-            mixed_precision=args.model.accelerator.fsdp_config.mixed_precision,
-            enable_gradient_checkpointing=False,
-            enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,
-            basic_modules=[],
-            broadcast_model_weights_from_rank0=True,
-        )
-
-        cpu_load_param_name = None
-        if hasattr(rank0_load_model, "get_parallel_plan"):
-            cpu_load_param_name = getattr(rank0_load_model.get_parallel_plan(), "cpu_load_param_name", None)
-
-        # 1.2 rank0_load_model load from weights_path
-        rank0_load_and_broadcast_weights(
-            rank0_load_model,
-            str(weights_path),
-            init_device=load_device,
-            dtensor_factory=dtensor_factory,
-            cpu_load_param_name=cpu_load_param_name,
-            max_load_broadcast_size=0.0,
-        )
-
-        # 2.1 all_rank_load_model init with no weights_path
-        all_rank_load_model = build_parallelize_model(
-            all_rank_load_model,
-            weights_path=None,
-            init_device=args.model.accelerator.init_device,
-            mixed_precision=args.model.accelerator.fsdp_config.mixed_precision,
-            enable_gradient_checkpointing=False,
-            enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,
-            basic_modules=[],
-            broadcast_model_weights_from_rank0=False,
-        )
-
-        # 2.2 all_rank_load_model load from weights_path
-        load_model_weights(
-            all_rank_load_model,
-            str(weights_path),
-            init_device=load_device,
-            dtensor_factory=dtensor_factory,
-        )
-        if dtensor_to_cpu:
-            _assert_model_parameters_on_device(rank0_load_model, "cpu")
-            _assert_model_parameters_on_device(all_rank_load_model, "cpu")
-        torch.testing.assert_close(
-            rank0_load_model.get_input_embeddings().weight,
-            all_rank_load_model.get_input_embeddings().weight,
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            rank0_load_model.get_output_embeddings().weight,
-            all_rank_load_model.get_output_embeddings().weight,
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            rank0_load_model.linear1.weight,
-            all_rank_load_model.linear1.weight,
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            rank0_load_model.linear1.bias,
-            all_rank_load_model.linear1.bias,
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            rank0_load_model.linear2.weight,
-            all_rank_load_model.linear2.weight,
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            rank0_load_model.buffer,
-            all_rank_load_model.buffer,
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            rank0_load_model.linear3.weight,
-            all_rank_load_model.linear3.weight,
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            rank0_load_model.linear3.bias,
-            all_rank_load_model.linear3.bias,
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            rank0_load_model.extra_embed_tokens.weight,
-            all_rank_load_model.extra_embed_tokens.weight,
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            rank0_load_model.decoder.moe.experts,
-            all_rank_load_model.decoder.moe.experts,
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            rank0_load_model.decoder.extra_embed_tokens.weight,
-            all_rank_load_model.decoder.extra_embed_tokens.weight,
-            atol=0.0,
-            rtol=0.0,
-        )
-
-        assert (
-            all_rank_load_model.get_input_embeddings().weight.data_ptr()
-            == all_rank_load_model.get_output_embeddings().weight.data_ptr()
-        )
-
-        dist.barrier()
-    finally:
-        dist.destroy_process_group()
-        from veomni.distributed.parallel_state import clear_parallel_state
-
-        clear_parallel_state()
-
-
-@pytest.mark.launch_plan(provider=_CI_LAUNCH)
-@pytest.mark.skipif(
-    not dist.is_available() or get_device_type() == "cpu",
-    reason=(
-        "FSDP2 weight-loading compares compute-device buffers after torchrun; "
-        "CPU coverage is in test_dcp_checkpointer.py "
-        "(test_cpu_offload_dcp_resume_restores_persistent_and_nonpersistent_buffers)"
-    ),
-)
-@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
-def test_load_dist_model_weights_matches_standard(tmp_path: Path, cpu_offload: bool) -> None:
-    """Run the accelerator-only subprocess path; CPU buffer semantics are covered
-    by ``test_cpu_offload_dcp_resume_restores_persistent_and_nonpersistent_buffers``.
-    """
-    checkpoint_dir = tmp_path / "ckpt"
-    weights_path = _write_checkpoint(checkpoint_dir, is_parallel=True)
-
-    world_size = _CI_LAUNCH.nproc
-    command = [
-        "torchrun",
-        f"--nproc_per_node={world_size}",
-        "--standalone",
-        "tests/utils/test_rank0_load_and_broadcast_weights.py",
-        "--model.config_path=test",
-        "--data.train_path=tests",
-        "--train.checkpoint.output_dir=.tests/cache",
-        "--model.accelerator.fsdp_config.fsdp_mode=fsdp2",
-        "--model.accelerator.init_device=meta",
-        "--model.accelerator.fsdp_config.mixed_precision.enable=False",
-        "--model.accelerator.gradient_checkpointing.enable=False",
-        "--model.broadcast_model_weights_from_rank0=True",
-        "--model.accelerator.ep_size=2",
-        "--model.accelerator.ep_outside=False",
-        "--model.accelerator.extra_parallel_sizes=2",
-        "--model.accelerator.extra_parallel_placement_innermost=False",
-        "--model.accelerator.extra_parallel_names=emb",
-        f"--test.weights_path={weights_path}",
-        f"--test.device_type={get_device_type()}",
-        f"--test.backend={get_dist_comm_backend()}",
-        "--test.mode=broadcast",
-    ]
-    if cpu_offload:
-        command.append("--model.accelerator.fsdp_config.offload=True")
-
-    result = subprocess.run(command, check=True)
-    assert result.returncode == 0
-
-
-def run_load_weights_test(args: Arguments) -> None:
-    """
-    Worker entrypoint for test_load_weights_no_scatter.
-
-    Verifies that load_model_weights (which now passes src_data_rank=None to
-    distribute_tensor) produces bit-for-bit identical parameters to a reference
-    single-rank load. This is the code path fixed in:
-    https://github.com/ByteDance-Seed/VeOmni/issues/637
-    """
-    weights_path = Path(args.test.weights_path)
-    if not weights_path.exists():
-        raise ValueError("`--test.weights_path` must point to an existing directory.")
-
-    get_torch_device().set_device(args.train.local_rank)
-    dist.init_process_group(backend=args.test.backend or get_dist_comm_backend())
-
-    _init_parallel_state(
-        dp_size=args.model.accelerator.dp_size,
-        dp_replicate_size=args.model.accelerator.dp_replicate_size,
-        dp_shard_size=args.model.accelerator.dp_shard_size,
-        tp_size=args.model.accelerator.tp_size,
-        pp_size=args.model.accelerator.pp_size,
-        cp_size=args.model.accelerator.cp_size,
-        ulysses_size=args.model.accelerator.ulysses_size,
-        extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes,
-        extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
-        extra_parallel_names=args.model.accelerator.extra_parallel_names,
-        dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
-    )
-
-    try:
-        # build_parallelize_model with weights_path triggers load_model_weights
-        # (the every-rank-reads-from-disk path, fixed in issue #637).
-        fsdp_model = build_parallelize_model(
-            ToyModel(),
-            weights_path=str(weights_path),
-            init_device=args.model.accelerator.init_device,
-            mixed_precision=args.model.accelerator.fsdp_config.mixed_precision,
-            enable_gradient_checkpointing=False,
-            enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,
-            basic_modules=[],
-        )
-        """
-        fsdp_model:
-        FSDPToyModel(
-            (input_embed_tokens): ToyEmbed()
-            (output_embed_tokens): ToyEmbed()
-            (linear1): Linear(in_features=4, out_features=3, bias=True)
-            (linear2): Linear(in_features=3, out_features=2, bias=False)
-            (linear3): Linear(in_features=2, out_features=1, bias=True)
-        )
-
-        reference_model:
-        ToyModel(
-            (input_embed_tokens): ToyEmbed()
-            (output_embed_tokens): ToyEmbed()
-            (linear1): Linear(in_features=4, out_features=3, bias=True)
-            (linear2): Linear(in_features=3, out_features=2, bias=False)
-            (linear3): Linear(in_features=2, out_features=1, bias=True)
-        )
-
-        """
-
-        reference_model = ToyModel().to(get_device_type())
-        load_model_weights(reference_model, str(weights_path), init_device=get_device_type())
-        reference_model = reference_model.cpu()
-
-        if args.model.accelerator.fsdp_config.offload:
-            _assert_model_parameters_on_device(fsdp_model, "cpu")
-
-        torch.testing.assert_close(
-            _clone_to_cpu(fsdp_model.get_input_embeddings().weight),
-            reference_model.get_input_embeddings().weight.detach().cpu(),
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            _clone_to_cpu(fsdp_model.get_output_embeddings().weight),
-            reference_model.get_output_embeddings().weight.detach().cpu(),
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            _clone_to_cpu(fsdp_model.linear1.weight),
-            reference_model.linear1.weight.detach().cpu(),
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            _clone_to_cpu(fsdp_model.linear1.bias),
-            reference_model.linear1.bias.detach().cpu(),
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            _clone_to_cpu(fsdp_model.linear2.weight),
-            reference_model.linear2.weight.detach().cpu(),
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            _clone_to_cpu(fsdp_model.buffer),
-            reference_model.buffer.detach().cpu(),
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            _clone_to_cpu(fsdp_model.linear3.weight),
-            reference_model.linear3.weight.detach().cpu(),
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            _clone_to_cpu(fsdp_model.linear3.bias),
-            reference_model.linear3.bias.detach().cpu(),
-            atol=0.0,
-            rtol=0.0,
-        )
-
-        assert fsdp_model.get_input_embeddings().weight is fsdp_model.get_output_embeddings().weight
-
-        dist.barrier()
-    finally:
-        dist.destroy_process_group()
-        from veomni.distributed.parallel_state import clear_parallel_state
-
-        clear_parallel_state()
-
-
-@pytest.mark.launch_plan(provider=_CI_LAUNCH)
-@pytest.mark.skipif(
-    not dist.is_available() or get_device_type() == "cpu",
-    reason=(
-        "Issue 637 FSDP2 all-ranks-read path needs an accelerator; "
-        "CPU checkpoint coverage is in test_dcp_checkpointer.py"
-    ),
-)
-@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
-def test_load_weights_no_scatter(tmp_path: Path, cpu_offload: bool) -> None:
-    """
-    Regression test for https://github.com/ByteDance-Seed/VeOmni/issues/637.
-
-    This launches FSDP2 with an accelerator because CPU-only FSDP2 does not
-    exercise the device-residency behavior. The CPU checkpoint path has a
-    separate regression test in ``tests/checkpoints/test_dcp_checkpointer.py``.
-
-    Ensures load_model_weights with src_data_rank=None (all-ranks-read path)
-    loads bit-for-bit correct parameters into an FSDP2 model.
-    The rank0_load_and_broadcast_weights path is tested separately in
-    test_load_dist_model_weights_matches_standard.
-    """
-    checkpoint_dir = tmp_path / "ckpt"
-    weights_path = _write_checkpoint(checkpoint_dir, is_parallel=False)
-
-    world_size = _CI_LAUNCH.nproc
-    command = [
-        "torchrun",
-        f"--nproc_per_node={world_size}",
-        "--standalone",
-        "tests/utils/test_rank0_load_and_broadcast_weights.py",
-        "--model.config_path=test",
-        "--data.train_path=tests",
-        "--train.checkpoint.output_dir=.tests/cache",
-        "--model.accelerator.fsdp_config.fsdp_mode=fsdp2",
-        "--model.accelerator.init_device=meta",
-        "--model.accelerator.fsdp_config.mixed_precision.enable=False",
-        "--model.accelerator.gradient_checkpointing.enable=False",
-        "--model.broadcast_model_weights_from_rank0=False",
-        f"--test.weights_path={weights_path}",
-        f"--test.device_type={get_device_type()}",
-        f"--test.backend={get_dist_comm_backend()}",
-        "--test.mode=load_weights",
-    ]
-    if cpu_offload:
-        command.append("--model.accelerator.fsdp_config.offload=True")
-
-    result = subprocess.run(command, check=True)
-    assert result.returncode == 0
-
-
 @pytest.mark.launch_plan(provider=_CI_OFFLOAD_LAUNCH)
 @pytest.mark.skipif(
     not dist.is_available() or get_device_type() == "cpu",
@@ -920,9 +880,12 @@ def test_fsdp_cpu_offload_training_keeps_buffers_on_compute_device(tmp_path: Pat
 
 if __name__ == "__main__":
     args = parse_args(Arguments)
-    if getattr(args.test, "mode", "broadcast") == "offload_training":
+    mode = getattr(args.test, "mode", "broadcast")
+    if mode == "offload_training":
         run_fsdp_cpu_offload_training_test(args)
-    elif getattr(args.test, "mode", "broadcast") == "load_weights":
+    elif mode == "all":
+        run_all_tests(args)
+    elif mode == "load_weights":
         run_load_weights_test(args)
     else:
         run_rank0_broadcast_test(args)

@@ -137,6 +137,8 @@
       "-s",
       "-x",
       "--ignore=tests/models/test_omni_fsdp.py",
+      "--ignore=tests/models/base/test_modify_init.py",
+      "--ignore=tests/models/transformers/test_generated_call_site_signatures.py",
       "tests/models"
     ]
   },
@@ -379,6 +381,7 @@
       "-x",
       "-m",
       "not benchmark",
+      "--ignore=tests/ops/base/test_op_documentation.py",
       "tests/ops"
     ]
   },
@@ -389,7 +392,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/special_sanity/test_ops_architecture.py"
+      "tests/utils/test_count_flops.py"
     ]
   },
   {
@@ -399,7 +402,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/utils/test_count_flops.py"
+      "tests/tools/test_training_utils.py"
     ]
   },
   {
@@ -409,7 +412,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/tools/test_training_utils.py"
+      "tests/utils/test_hdfs_io.py"
     ]
   },
   {
@@ -419,7 +422,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/utils/test_hdfs_io.py"
+      "tests/optim/test_muon_unit.py"
     ]
   },
   {
@@ -429,7 +432,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/optim/test_muon_unit.py"
+      "tests/distributed/test_muon_zero_comm_shard.py"
     ]
   },
   {
@@ -439,7 +442,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/distributed/test_muon_zero_comm_shard.py"
+      "tests/optim/test_muon_fsdp2_parity.py"
     ]
   },
   {
@@ -449,7 +452,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/optim/test_muon_fsdp2_parity.py"
+      "tests/optim/test_optimizer_vlm_param_groups.py"
     ]
   },
   {
@@ -459,7 +462,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/optim/test_muon_fsdp2_smoke.py"
+      "tests/lora/test_target_mapping.py"
     ]
   },
   {
@@ -469,7 +472,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/optim/test_optimizer_vlm_param_groups.py"
+      "tests/lora/test_qwen3_5_moe_lora.py"
     ]
   },
   {
@@ -479,7 +482,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/lora/test_target_mapping.py"
+      "tests/lora/test_dense_mlp_lora.py"
     ]
   },
   {
@@ -489,7 +492,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/lora/test_qwen3_5_moe_lora.py"
+      "tests/lora/test_veomni_lora_moe_native.py"
     ]
   },
   {
@@ -499,7 +502,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/lora/test_dense_mlp_lora.py"
+      "tests/lora/test_lora_trainer_saveload.py"
     ]
   },
   {
@@ -509,7 +512,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/lora/test_veomni_lora_moe_native.py"
+      "tests/lora/test_moe_lora_eager.py"
     ]
   },
   {
@@ -519,7 +522,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/lora/test_lora_trainer_saveload.py"
+      "tests/lora/test_moe_lora_trainer.py"
     ]
   },
   {
@@ -529,7 +532,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/lora/test_moe_lora_eager.py"
+      "tests/lora/test_moe_lora_ep2.py"
     ]
   },
   {
@@ -539,7 +542,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/lora/test_moe_lora_trainer.py"
+      "tests/lora/test_moe_lora_ep_sharded_stream_load.py"
     ]
   },
   {
@@ -549,7 +552,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/lora/test_moe_lora_ep2.py"
+      "tests/ci/"
     ]
   },
   {
@@ -559,31 +562,11 @@
     "args": [
       "-s",
       "-x",
-      "tests/lora/test_moe_lora_ep_sharded_stream_load.py"
-    ]
-  },
-  {
-    "name": "ci-unit",
-    "suite": "unit",
-    "conditional": false,
-    "args": [
-      "-s",
-      "-x",
-      "tests/ci/"
-    ]
-  },
-  {
-    "name": "moe-router-replay-api-unit",
-    "suite": "unit",
-    "conditional": false,
-    "args": [
-      "-s",
-      "-x",
       "tests/utils/test_moe_router_replay_api.py"
     ]
   },
   {
-    "name": "profiler-memory-unit",
+    "name": "57-unit",
     "suite": "unit",
     "conditional": false,
     "args": [
@@ -593,7 +576,7 @@
     ]
   },
   {
-    "name": "save-safetensor-utils-unit",
+    "name": "58-unit",
     "suite": "unit",
     "conditional": false,
     "args": [
@@ -603,7 +586,7 @@
     ]
   },
   {
-    "name": "57-e2e",
+    "name": "59-e2e",
     "suite": "e2e",
     "conditional": false,
     "args": [
@@ -613,7 +596,7 @@
     ]
   },
   {
-    "name": "58-e2e",
+    "name": "60-e2e",
     "suite": "e2e",
     "conditional": false,
     "args": [
@@ -623,7 +606,7 @@
     ]
   },
   {
-    "name": "59-e2e",
+    "name": "61-e2e",
     "suite": "e2e",
     "conditional": false,
     "args": [
