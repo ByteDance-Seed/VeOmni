@@ -496,6 +496,75 @@ def test_cpu_inductor_preserves_vendor_and_existing_cpu_overrides(monkeypatch, c
     assert overrides["npu"] is npu_override
 
 
+@pytest.mark.parametrize(
+    "failure", ["foreach_lookup", "cpu_codegen", "dataloader_original", "registry_policy", "registry_disable"]
+)
+def test_cpu_isolation_restores_state_when_setup_fails(monkeypatch, failure):
+    import sys
+    from types import SimpleNamespace
+
+    import torch.optim.optimizer as optimizer_module
+    from torch._inductor.codegen import common
+    from torch.utils.checkpoint import DefaultDeviceType
+    from torch.utils.data import dataloader
+
+    from scripts.ci.accelerator import pytest_plugin
+
+    original_device = DefaultDeviceType.get_device_type()
+    original_foreach = optimizer_module._get_foreach_kernels_supported_devices
+    original_init = dataloader._MultiProcessingDataLoaderIter.__init__
+
+    def vendor_init(*args, **kwargs):
+        raise AssertionError("hidden accelerator queried")
+
+    class VendorRegistry:
+        _disabled_register = False
+
+        @classmethod
+        def disable_register(cls):
+            cls._disabled_register = True
+            if failure == "registry_disable":
+                raise RuntimeError("vendor setup failed")
+
+    vendor = SimpleNamespace(_mpdl_iter_init=vendor_init, origin_mpdl_iter_init=original_init)
+    monkeypatch.setitem(sys.modules, "torch_npu.utils._module", vendor)
+    monkeypatch.setitem(sys.modules, "torch_npu.utils._dynamo", SimpleNamespace(_InductorNpuRegistry=VendorRegistry))
+    monkeypatch.setattr(dataloader._MultiProcessingDataLoaderIter, "__init__", vendor_init)
+    monkeypatch.delenv("CI_CASE_PROGRESS", raising=False)
+    if failure == "foreach_lookup":
+        monkeypatch.delattr(optimizer_module, "_get_foreach_kernels_supported_devices")
+    elif failure == "cpu_codegen":
+        monkeypatch.setattr(common, "device_op_overrides_dict", {})
+
+        def fail_codegen(*args):
+            raise RuntimeError("CPU codegen setup failed")
+
+        monkeypatch.setattr(common, "register_device_op_overrides", fail_codegen)
+    elif failure == "dataloader_original":
+        del vendor.origin_mpdl_iter_init
+    elif failure == "registry_policy":
+        del VendorRegistry._disabled_register
+
+    plan = CasePlan.sequential(LaunchSpec(device="cpu"))
+    item = SimpleNamespace(
+        nodeid="sample", config=SimpleNamespace(_ci_batch_cases={"sample": {"plan": plan.to_dict()}}, _ci_results={})
+    )
+    protocol = pytest_plugin.pytest_runtest_protocol(item, None)
+    expected_error = AttributeError if failure == "foreach_lookup" else RuntimeError
+    with pytest.raises(expected_error):
+        next(protocol)
+    assert DefaultDeviceType.get_device_type() == original_device
+    if failure == "foreach_lookup":
+        assert not hasattr(optimizer_module, "_get_foreach_kernels_supported_devices")
+    else:
+        assert optimizer_module._get_foreach_kernels_supported_devices is original_foreach
+    assert dataloader._MultiProcessingDataLoaderIter.__init__ is vendor_init
+    if failure == "registry_policy":
+        assert not hasattr(VendorRegistry, "_disabled_register")
+    else:
+        assert VendorRegistry._disabled_register is False
+
+
 def test_case_workspaces_isolate_relative_checkpoints_and_caches(tmp_path):
     from scripts.ci.accelerator.runtime.workers import create_workspace
 
