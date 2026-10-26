@@ -198,3 +198,61 @@ def test_qwen3_loss_matches_with_padded_packed_input(monkeypatch):
         padded_loss = forward(padded).loss
 
     torch.testing.assert_close(padded_loss, unpadded_loss, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("impl", ("eager", "sdpa", "veomni_sdpa"))
+def test_qwen3_packed_dense_matches_independent_samples(impl):
+    """Packed ``cu_seq_lens_q`` isolates samples under dense attention backends."""
+    import copy
+
+    torch.manual_seed(123)
+    config = _tiny_config()
+    config._attn_implementation = impl
+    ops = eager_ops_config()
+    ops.attn_implementation = impl
+    ours = _build_qwen3(config, ops).eval()
+    ours_sep = copy.deepcopy(ours).eval()
+
+    first_input_ids = torch.tensor([[5, 6, 7]])
+    second_input_ids = torch.tensor([[8, 9, 10, 11, 12]])
+    packed_input_ids = torch.cat((first_input_ids, second_input_ids), dim=1)
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+
+    packed_logits = ours(
+        input_ids=packed_input_ids,
+        attention_mask=torch.ones_like(packed_input_ids),
+        position_ids=torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]]),
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+        use_cache=False,
+    ).logits
+    first_logits = ours_sep(
+        input_ids=first_input_ids,
+        attention_mask=torch.ones_like(first_input_ids),
+        position_ids=torch.arange(3).unsqueeze(0),
+        cu_seq_lens_q=torch.tensor([0, 3], dtype=torch.int32),
+        cu_seq_lens_k=torch.tensor([0, 3], dtype=torch.int32),
+        use_cache=False,
+    ).logits
+    second_logits = ours_sep(
+        input_ids=second_input_ids,
+        attention_mask=torch.ones_like(second_input_ids),
+        position_ids=torch.arange(5).unsqueeze(0),
+        cu_seq_lens_q=torch.tensor([0, 5], dtype=torch.int32),
+        cu_seq_lens_k=torch.tensor([0, 5], dtype=torch.int32),
+        use_cache=False,
+    ).logits
+
+    torch.testing.assert_close(packed_logits[:, :3], first_logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    torch.testing.assert_close(packed_logits[:, 3:], second_logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    w1 = torch.randn_like(first_logits)
+    w2 = torch.randn_like(second_logits)
+    ((packed_logits[:, :3] * w1).sum() + (packed_logits[:, 3:] * w2).sum()).backward()
+    ((first_logits * w1).sum() + (second_logits * w2).sum()).backward()
+
+    for (name, p_packed), (_, p_sep) in zip(ours.named_parameters(), ours_sep.named_parameters(), strict=True):
+        if p_sep.grad is None:
+            assert p_packed.grad is None, name
+            continue
+        torch.testing.assert_close(p_packed.grad, p_sep.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL, msg=name)
