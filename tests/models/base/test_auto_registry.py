@@ -135,7 +135,6 @@ from veomni.utils.device import IS_NPU_AVAILABLE
 
 _CPU_LAUNCH = LaunchSpec(device="cpu")
 _ACCELERATOR_LAUNCH = LaunchSpec(device="accelerator")
-pytestmark = pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 
 # Families whose MODELING_REGISTRY entry selects between *_npu and *_gpu generated modules
 # based on IS_NPU_AVAILABLE.
@@ -636,11 +635,13 @@ _MODEL_CASES = (
 )
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_get_model_class_unknown_type_raises():
     with pytest.raises(RuntimeError, match="unregistered_test_model.*not registered in veomni.models"):
         get_model_class(_UnregisteredConfig())
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_get_model_class_hf_backend(monkeypatch):
     monkeypatch.setenv("MODELING_BACKEND", "hf")
     from transformers import AutoModelForCausalLM
@@ -648,6 +649,7 @@ def test_get_model_class_hf_backend(monkeypatch):
     assert get_model_class(_tiny_qwen3_config()) is AutoModelForCausalLM
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_build_foundation_model_requires_ops_config():
     with ops_config_scope(None):
         with pytest.raises(ValueError, match="ops_implementation"):
@@ -752,6 +754,7 @@ def test_model_instances_keep_distinct_impls(model_case: _ModelCase, available_n
     assert get_ops_config() is previous
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
 def test_model_registry_entries(model_case: _ModelCase):
     assert (model_case.model_type in MODEL_CONFIG_REGISTRY.valid_keys()) is model_case.has_registered_config
@@ -771,6 +774,7 @@ def test_get_model_class_returns_registered_architectures(model_case: _ModelCase
         _assert_expected_generated_module_source(model_case.model_type, model_cls)
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_get_model_config_uses_the_registered_dsv4_subclass(tmp_path):
     from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config as UpstreamConfig
 
@@ -789,6 +793,7 @@ def test_get_model_config_uses_the_registered_dsv4_subclass(tmp_path):
     assert type(build_config(str(tmp_path), dsa_indexer_loss=True)) is DeepseekV4Config
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_a_config_that_cannot_ask_for_the_objective_is_left_alone():
     from transformers import AutoConfig
 
@@ -798,6 +803,7 @@ def test_a_config_that_cannot_ask_for_the_objective_is_left_alone():
     check_model_build_prerequisites(other)
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_the_generic_hook_reaches_the_model_that_implements_it():
     from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
@@ -813,6 +819,7 @@ def test_the_generic_hook_reaches_the_model_that_implements_it():
             check_model_build_prerequisites(config)
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_context_parallel_is_refused_on_npu(monkeypatch: pytest.MonkeyPatch):
     from types import SimpleNamespace
 
@@ -825,6 +832,7 @@ def test_context_parallel_is_refused_on_npu(monkeypatch: pytest.MonkeyPatch):
         check_context_parallel_supported(_tiny_qwen3_config())
 
 
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_context_parallel_gate_is_inert_when_no_parallel_state_was_installed(monkeypatch: pytest.MonkeyPatch):
     from veomni.distributed import parallel_state as parallel_state_module
 

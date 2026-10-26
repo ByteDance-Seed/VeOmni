@@ -40,8 +40,6 @@ from veomni.utils.device import (
 _CI_LAUNCH_4 = LaunchSpec(nproc=4)
 _CI_LAUNCH_8 = LaunchSpec(nproc=8)
 
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-
 
 # from veomni.optim.optimizer import build_optimizer
 
@@ -488,6 +486,7 @@ def _param_with_grad(grad: torch.Tensor) -> nn.Parameter:
     return p
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("extra_names", [["ep"], ["ep", "emb"]])
 def test_inf_norm_with_replicated_bucket_does_not_crash(extra_names):
     """``norm_type=inf`` with both EP and EP-replicated buckets populated.
@@ -537,6 +536,7 @@ def test_inf_norm_with_replicated_bucket_does_not_crash(extra_names):
     )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_inf_norm_single_axis_no_replicated_still_works():
     """Sanity: the legacy K1+K2==1 happy path still passes after the fix.
 
@@ -562,6 +562,7 @@ def test_inf_norm_single_axis_no_replicated_still_works():
     assert total.item() == pytest.approx(6.0, abs=1e-6)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_persistent_extra_parallel_norm_reduces_once_over_flat_mesh():
     """A persistent 2D shard owns unique values and needs one flat-mesh reduction."""
     p_non = _param_with_grad(torch.tensor([12.0]))
@@ -599,6 +600,7 @@ def test_persistent_extra_parallel_norm_reduces_once_over_flat_mesh():
     assert persistent_calls[0][1] == [("ple_flat", "ple_flat_group")]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_persistent_ple_and_ep_norm_use_independent_reduction_groups():
     """PLE uses one flat reduction while ordinary EP uses EP-FSDP then EP."""
 

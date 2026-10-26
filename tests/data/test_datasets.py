@@ -56,8 +56,6 @@ from veomni.utils.helper import get_cache_dir
 
 _CI_LAUNCH = LaunchSpec(nproc=4)
 
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-
 
 logger = helper.create_logger(__name__)
 os.environ["NCCL_DEBUG"] = "OFF"
@@ -433,6 +431,7 @@ def _assert_batch_stream_equal(got_batches, want_batches):
                 assert torch.equal(got[key], want[key]), f"mismatch in {key}"
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("shuffle", [False, True])
 @pytest.mark.parametrize("num_replicas", [1, 2, 4])
 @pytest.mark.parametrize("epoch", [0, 3])
@@ -476,6 +475,7 @@ def _build_wrapper_pipeline(num_workers, save_by_idx):
     return DistributedDataloader(dynamic_ds, batch_size=1, num_workers=num_workers, collate_fn=_wrapper_take_first)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_map_style_sampler_wrapper_resume():
     """Checkpoint resume preserves the full worker-side dynamic-batching pipeline."""
     for num_workers in (0, 2):
@@ -547,6 +547,7 @@ def test_map_style_sampler_wrapper_resume():
             _assert_batch_stream_equal(materialized_next_epoch_batches, full_next_epoch_batches)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_map_style_sampler_wrapper_rejects_incompatible_resume_state():
     """Restoring a different sampler configuration must fail instead of changing the sample stream."""
     source = _MapStyleSamplerWrapper(
@@ -580,6 +581,7 @@ def _read_cycle(dataset, cycle):
     return [dataset[index] for index in range(start, start + len(dataset))]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_mapping_dataset_overlength_indices_are_deterministic():
     first = MappingDataset(list(range(8)), seed=17)
     second = MappingDataset(list(range(8)), seed=17)
@@ -591,6 +593,7 @@ def test_mapping_dataset_overlength_indices_are_deterministic():
     assert [second[index] for index in (12, 8, 15, 9)] == [expected[index] for index in (4, 0, 7, 1)]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_mapping_dataset_preserves_python_negative_index_semantics():
     dataset = MappingDataset(list(range(8)), seed=17)
     assert dataset[-1] == 7
@@ -598,6 +601,7 @@ def test_mapping_dataset_preserves_python_negative_index_semantics():
         dataset[-9]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_mapping_dataset_cycle_is_reproducible_after_restart():
     uninterrupted = MappingDataset(list(range(8)), seed=9)
     expected = _read_cycle(uninterrupted, 2)
@@ -606,6 +610,7 @@ def test_mapping_dataset_cycle_is_reproducible_after_restart():
     assert [resumed[index] for index in range(19, 24)] == expected[3:]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_mapping_dataset_mapping_is_independent_of_cycle_access_order():
     dataset = MappingDataset(list(range(8)), seed=9)
     expected = {index: dataset[index] for index in range(8, 32)}
@@ -614,6 +619,7 @@ def test_mapping_dataset_mapping_is_independent_of_cycle_access_order():
         assert dataset[index] == expected[index]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_empty_mapping_dataset_raises_index_error():
     dataset = MappingDataset([], seed=9)
     with pytest.raises(IndexError, match="empty dataset"):
@@ -622,6 +628,7 @@ def test_empty_mapping_dataset_raises_index_error():
         dataset[-1]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_mapping_dataset_seed_controls_overlength_order_without_global_rng_side_effect():
     first = MappingDataset(list(range(8)), seed=3)
     second = MappingDataset(list(range(8)), seed=4)
@@ -634,6 +641,7 @@ def test_mapping_dataset_seed_controls_overlength_order_without_global_rng_side_
     assert random.random() == expected
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_build_mapping_dataset_forwards_seed(monkeypatch):
     monkeypatch.setattr(dataset_module, "get_data_files", lambda _: (["unused.jsonl"], "json"))
     monkeypatch.setattr(dataset_module, "load_dataset", lambda *args, **kwargs: list(range(8)))
@@ -644,12 +652,14 @@ def test_build_mapping_dataset_forwards_seed(monkeypatch):
     assert _read_cycle(first, 1) != _read_cycle(second, 1)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_overlength_read_does_not_change_first_cycle_order():
     dataset = MappingDataset(list(range(8)), seed=3)
     dataset[len(dataset)]
     assert _read_cycle(dataset, 0) == list(range(8))
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_interleaved_mapping_dataset_uses_same_deterministic_mapping():
     data = [{"value": index, "ds_idx": index % 2} for index in range(8)]
 
@@ -673,6 +683,7 @@ class _ListStream(IterableDataset):
         self.epoch = epoch
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_get_data_files_skips_non_table_artifacts(tmp_path):
     nested = tmp_path / "rank0"
     nested.mkdir()
@@ -686,6 +697,7 @@ def test_get_data_files_skips_non_table_artifacts(tmp_path):
     assert files == [str(parquet_path)]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_get_data_files_rejects_mixed_table_types(tmp_path):
     (tmp_path / "a.csv").write_text("x\n1\n")
     (tmp_path / "b.json").write_text("{}\n")
@@ -693,12 +705,14 @@ def test_get_data_files_rejects_mixed_table_types(tmp_path):
         get_data_files(str(tmp_path))
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_get_data_files_empty_directory_errors(tmp_path):
     (tmp_path / "readme.md").write_text("not data")
     with pytest.raises(FileNotFoundError, match="No supported data files"):
         get_data_files(str(tmp_path))
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_iterable_drop_last_equalizes_ranks():
     source = list(range(15))
     ranks = [
@@ -708,16 +722,19 @@ def test_iterable_drop_last_equalizes_ranks():
     assert [items[0] for items in ranks] == list(range(8))
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_iterable_one_pass_does_not_replay():
     stream = ShardedIterableDataset(_ListStream([0, 1]), repeat=False)
     assert list(stream) == [0, 1]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_iterable_repeat_replays_until_consumed():
     stream = ShardedIterableDataset(_ListStream([0, 1]), repeat=True)
     assert list(islice(stream, 5)) == [0, 1, 0, 1, 0]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_iterable_repeat_drops_incomplete_round_before_replay():
     source = [0, 1, 2]
     ranks = [
@@ -728,6 +745,7 @@ def test_iterable_repeat_drops_incomplete_round_before_replay():
     assert ranks[1] == [1, 1, 1, 1]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_iterable_repeat_exits_when_source_shorter_than_dp():
     ranks = [
         list(islice(ShardedIterableDataset(_ListStream([0]), dp_rank=rank, dp_size=2, repeat=True), 4))
@@ -736,6 +754,7 @@ def test_iterable_repeat_exits_when_source_shorter_than_dp():
     assert ranks == [[], []]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_iterable_repeat_advances_inner_epoch():
     inner = _ListStream(["a"])
     stream = ShardedIterableDataset(inner, repeat=True, seed=10)
@@ -744,6 +763,7 @@ def test_iterable_repeat_advances_inner_epoch():
     assert inner.epochs == [13, 14]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_iterable_hf_dataset_keeps_every_row_with_multiple_workers():
     """A wrapped HF dataset shards itself across workers; we must not drop its rows."""
     from datasets import Dataset as HFDataset
@@ -756,6 +776,7 @@ def test_iterable_hf_dataset_keeps_every_row_with_multiple_workers():
         assert sorted(rows) == list(range(48)), f"num_workers={num_workers}: got {len(rows)} rows"
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_iterable_hf_dataset_still_shards_across_dp_ranks():
     from datasets import Dataset as HFDataset
     from torch.utils.data import DataLoader
@@ -769,6 +790,7 @@ def test_iterable_hf_dataset_still_shards_across_dp_ranks():
     assert sorted(ranks[0] + ranks[1]) == list(range(48))
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_iterable_hf_dataset_repeat_passes_do_not_overlap_across_workers(tmp_path):
     """Per-pass set_epoch must not race on HF's shared-memory epoch across workers."""
     import pyarrow as pa

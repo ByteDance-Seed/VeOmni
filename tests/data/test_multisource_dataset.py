@@ -45,8 +45,6 @@ from veomni.utils.helper import get_cache_dir
 
 _CI_LAUNCH = LaunchSpec(nproc=2)
 
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-
 
 logger = helper.create_logger(__name__)
 
@@ -404,6 +402,7 @@ def _make_simple_dataset(
     )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_state_dict_structure():
     ds1 = MockIterableDataset([{"input_ids": [1, 2]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [3, 4, 5]}], name="b")
@@ -424,6 +423,7 @@ def test_state_dict_structure():
     assert sorted(state["runtime"]["exhausted"].keys()) == ["id_a", "id_b"]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_exhausted_state_save_restore_and_elastic():
     """Test exhausted state save/restore with elastic source add/remove scenarios."""
     # Scenario 1: Basic save and restore
@@ -476,6 +476,7 @@ def test_exhausted_state_save_restore_and_elastic():
     assert dataset_removed._exhausted == [True]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_exhausted_state_backward_compatible():
     """Test that loading old checkpoint without exhausted field defaults to all False."""
     ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
@@ -502,6 +503,7 @@ def test_exhausted_state_backward_compatible():
     assert dataset._exhausted == [False, False]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_elastic_load_add_source():
     ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [2]}], name="b")
@@ -522,6 +524,7 @@ def test_elastic_load_add_source():
     assert ds1.state_dict()["consumed"] >= 1
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_elastic_load_remove_source():
     ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [2]}], name="b")
@@ -541,6 +544,7 @@ def test_elastic_load_remove_source():
     assert ds1.state_dict()["consumed"] >= 1
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_elastic_load_strict_policy():
     ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [2]}], name="b")
@@ -559,6 +563,7 @@ def test_elastic_load_strict_policy():
         dataset_new.load_state_dict(state, reconcile_policy="strict")
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_stopping_strategy_first_exhausted():
     ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [2]}], name="b")
@@ -576,6 +581,7 @@ def test_stopping_strategy_first_exhausted():
         dataset._next_sample(0)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_stopping_strategy_all_exhausted():
     ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [2]}], name="b")
@@ -593,6 +599,7 @@ def test_stopping_strategy_all_exhausted():
     assert second["input_ids"] == [1]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_stopping_strategy_never_exhausted():
     ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [2]}], name="b")
@@ -610,6 +617,7 @@ def test_stopping_strategy_never_exhausted():
     assert second["input_ids"] == [1]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_determinism_with_seed():
     data_a = [{"input_ids": [i]} for i in range(10)]
     data_b = [{"input_ids": [i]} for i in range(10, 20)]
@@ -639,6 +647,7 @@ def test_determinism_with_seed():
         assert sample1["ds_idx"] == sample2["ds_idx"]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_level_token_weighting():
     ds1 = MockIterableDataset([{"input_ids": [1, 2, 3, 4]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [5]}], name="b")
@@ -655,6 +664,7 @@ def test_level_token_weighting():
     assert weights[1] == 0.8
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
@@ -708,6 +718,7 @@ def test_init_validation(kwargs, match):
         WeightedMultiSourceDataset(**kwargs, seed=42)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize(
     ("sample", "expected"),
     [
@@ -727,18 +738,21 @@ def test_default_sample_token_len(sample, expected):
 
 
 class TestLoadStateDictBoundary:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_missing_topology(self):
         ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
         dataset = _make_simple_dataset(datasets=[ds1], weights=[1.0], source_ids=["id_a"])
         with pytest.raises(ValueError, match="state_dict missing required keys"):
             dataset.load_state_dict({"runtime": {}})
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_missing_runtime(self):
         ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
         dataset = _make_simple_dataset(datasets=[ds1], weights=[1.0], source_ids=["id_a"])
         with pytest.raises(ValueError, match="state_dict missing required keys"):
             dataset.load_state_dict({"topology": {}})
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_missing_source_ids_in_topology(self):
         ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
         dataset = _make_simple_dataset(datasets=[ds1], weights=[1.0], source_ids=["id_a"])
@@ -754,6 +768,7 @@ class TestLoadStateDictBoundary:
         with pytest.raises(ValueError, match="state_dict missing topology.source_ids"):
             dataset.load_state_dict(state)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_avg_len_not_dict(self):
         ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
         dataset = _make_simple_dataset(datasets=[ds1], weights=[1.0], source_ids=["id_a"])
@@ -769,6 +784,7 @@ class TestLoadStateDictBoundary:
         with pytest.raises(ValueError, match="must be dicts keyed by source_id"):
             dataset.load_state_dict(state)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_dataset_states_not_dict(self):
         ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
         dataset = _make_simple_dataset(datasets=[ds1], weights=[1.0], source_ids=["id_a"])
@@ -784,6 +800,7 @@ class TestLoadStateDictBoundary:
         with pytest.raises(ValueError, match="must be a dict keyed by source_id"):
             dataset.load_state_dict(state)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_warn_only_policy(self):
         ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
         ds2 = MockIterableDataset([{"input_ids": [2]}], name="b")

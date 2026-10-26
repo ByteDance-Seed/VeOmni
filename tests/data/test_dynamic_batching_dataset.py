@@ -79,8 +79,6 @@ from veomni.utils.constants import IGNORE_INDEX
 
 _CI_LAUNCH = LaunchSpec(nproc=2)
 
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-
 
 logger = helper.create_logger(__name__)
 
@@ -133,6 +131,7 @@ def setup_dynamic_batching_dataset():
 
 
 # Unit tests (can run without distributed setup)
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize(
     "shuffle,seed",
     [
@@ -231,6 +230,7 @@ def test_dynamic_batching_basic(shuffle, seed):
     logger.info(f"test_dynamic_batching_basic (shuffle={shuffle}) passed! Produced {batch_count} batches")
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_last_batch_on_dataset_end(setup_dynamic_batching_dataset):
     """Test that remaining buffer items are yielded when dataset ends.
 
@@ -279,6 +279,7 @@ def test_last_batch_on_dataset_end(setup_dynamic_batching_dataset):
     )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_dynamic_batching_without_get_item():
     """Test DynamicBatchingSizeDataset initialization without get_item provided.
 
@@ -305,6 +306,7 @@ def test_dynamic_batching_without_get_item():
         )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_get_length_fn_by_count_mode():
     sample = _make_sample(token_id=7, total_tokens=5, effective_tokens=3)
 
@@ -352,6 +354,7 @@ def test_get_length_fn_by_count_mode():
         get_length_fn_by_count_mode("bad-mode")
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_seedomni_conversation_list_dyn_bsz_lengths_and_strategy():
     from veomni.data.seed_omni.collator import SeedOmniCollator
     from veomni.models.seed_omni.utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
@@ -420,6 +423,7 @@ def test_seedomni_conversation_list_dyn_bsz_lengths_and_strategy():
     assert len(collated["conversation_list"]) == 2
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_text_batching_strategy_effective_count_mode():
     total_strategy = TextBatchingStrategy(token_micro_bsz=4, buffer_size=1)
     effective_strategy = TextBatchingStrategy(
@@ -441,6 +445,7 @@ def test_text_batching_strategy_effective_count_mode():
     assert sum(batch_sample["attention_mask"].sum().item() for batch_sample in effective_batch) == 8
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_text_batching_strategy_effective_mode_can_overflow_total_budget_with_larger_physical_cap():
     strategy = TextBatchingStrategy(
         token_micro_bsz=4,
@@ -465,6 +470,7 @@ def test_text_batching_strategy_effective_mode_can_overflow_total_budget_with_la
     assert sum(sample["attention_mask"].sum().item() for sample in micro_batch) == 6
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_text_batching_strategy_effective_mode_honors_physical_cap():
     strategy = TextBatchingStrategy(
         token_micro_bsz=4,
@@ -490,6 +496,7 @@ def test_text_batching_strategy_effective_mode_honors_physical_cap():
     assert strategy.buffer.all_physical_token_cnt == 6
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_dynamic_batching_size_dataset_effective_mode_can_overflow_total_budget_with_larger_physical_cap():
     class PromptHeavyDataset(IterableDataset):
         def __iter__(self):
@@ -516,6 +523,7 @@ def test_dynamic_batching_size_dataset_effective_mode_can_overflow_total_budget_
     assert [sum(sample["attention_mask"].sum().item() for sample in batch) for batch in micro_batches] == [6, 3]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_dynamic_batching_size_dataset_effective_mode_honors_physical_cap():
     class PromptHeavyDataset(IterableDataset):
         def __iter__(self):
@@ -542,6 +550,7 @@ def test_dynamic_batching_size_dataset_effective_mode_honors_physical_cap():
     assert [sum(sample["attention_mask"].sum().item() for sample in batch) for batch in micro_batches] == [6, 8]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_zero_effective_length_first_sample_still_enforces_physical_cap():
     samples = [
         _make_sample(token_id=1, total_tokens=6, effective_tokens=0),
@@ -581,6 +590,7 @@ def test_zero_effective_length_first_sample_still_enforces_physical_cap():
     assert [sum(sample["attention_mask"].sum().item() for sample in batch) for batch in micro_batches] == [6, 8]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("save_by_idx", [False, True])
 def test_save_load_state_dict(save_by_idx):
     """Unit test for DynamicBatchingSizeDataset state_dict and load_state_dict.

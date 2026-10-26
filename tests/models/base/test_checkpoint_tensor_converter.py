@@ -65,9 +65,6 @@ from veomni.models.transformers.qwen3_vl_moe.checkpoint_tensor_converter import 
 )
 
 
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-
-
 # ---------------------------------------------------------------------------
 # Tests for base protocol helpers
 # ---------------------------------------------------------------------------
@@ -87,10 +84,12 @@ class _DummyConverter:
 
 
 class TestGetCheckpointTensorConverter:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_returns_none_when_no_factory(self):
         model = torch.nn.Linear(4, 4)
         assert get_checkpoint_tensor_converter(model) is None
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_returns_converter_from_factory(self):
         model = torch.nn.Linear(4, 4)
         model._create_checkpoint_tensor_converter = staticmethod(lambda m: _DummyConverter())
@@ -98,16 +97,19 @@ class TestGetCheckpointTensorConverter:
         assert converter is not None
         assert converter.can_handle("handle_me.foo")
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_ignores_non_callable_factory(self):
         model = torch.nn.Linear(4, 4)
         model._create_checkpoint_tensor_converter = "not_callable"
         assert get_checkpoint_tensor_converter(model) is None
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_ignores_factory_returning_none(self):
         model = torch.nn.Linear(4, 4)
         model._create_checkpoint_tensor_converter = staticmethod(lambda m: None)
         assert get_checkpoint_tensor_converter(model) is None
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_ignores_invalid_converter(self):
         model = torch.nn.Linear(4, 4)
         model._create_checkpoint_tensor_converter = staticmethod(lambda m: object())
@@ -115,6 +117,7 @@ class TestGetCheckpointTensorConverter:
 
 
 class TestMaybeConvertCheckpointTensor:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_passthrough_when_no_converter(self):
         t = torch.randn(2, 3)
         result = maybe_convert_checkpoint_tensor("foo", t, converter=None)
@@ -122,6 +125,7 @@ class TestMaybeConvertCheckpointTensor:
         assert result.name == "foo"
         assert torch.equal(result.tensor, t)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_passthrough_when_converter_cannot_handle(self):
         t = torch.randn(2, 3)
         converter = _DummyConverter()
@@ -129,6 +133,7 @@ class TestMaybeConvertCheckpointTensor:
         assert result is not None
         assert result.name == "other_key"
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_converts_when_converter_handles(self):
         t = torch.randn(2, 3)
         converter = _DummyConverter()
@@ -166,11 +171,13 @@ class TestQwen3MoeConverterCanHandle:
     def setup_method(self):
         self.converter = Qwen3MoeCheckpointTensorConverter(num_experts=NUM_EXPERTS)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_matches_expert_keys(self):
         assert self.converter.can_handle("model.layers.0.mlp.experts.0.gate_proj.weight")
         assert self.converter.can_handle("model.layers.3.mlp.experts.7.up_proj.weight")
         assert self.converter.can_handle("model.layers.10.mlp.experts.63.down_proj.weight")
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_rejects_non_expert_keys(self):
         assert not self.converter.can_handle("model.layers.0.self_attn.q_proj.weight")
         assert not self.converter.can_handle("model.layers.0.mlp.gate.weight")
@@ -188,6 +195,7 @@ class TestQwen3MoeConverterConvert:
             results.append(converter.convert(key, tensor))
         return results
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_buffers_until_all_experts_collected(self):
         converter = Qwen3MoeCheckpointTensorConverter(num_experts=NUM_EXPERTS)
         # Feed first N-1 experts — should all return None
@@ -196,6 +204,7 @@ class TestQwen3MoeConverterConvert:
             result = converter.convert(key, _make_expert_tensor("down_proj", expert_id))
             assert result is None, f"Expected None for expert {expert_id}, got {result}"
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_down_proj_emitted_after_all_experts(self):
         converter = Qwen3MoeCheckpointTensorConverter(num_experts=NUM_EXPERTS)
         results = self._feed_all_experts(converter, layer=0, proj="down_proj")
@@ -212,6 +221,7 @@ class TestQwen3MoeConverterConvert:
             expected = _make_expert_tensor("down_proj", expert_id)
             assert torch.equal(result.tensor[expert_id], expected)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_gate_up_merged_after_both_collected(self):
         converter = Qwen3MoeCheckpointTensorConverter(num_experts=NUM_EXPERTS)
 
@@ -234,6 +244,7 @@ class TestQwen3MoeConverterConvert:
             assert torch.equal(result.tensor[expert_id, :INTERMEDIATE_DIM, :], gate_expected)
             assert torch.equal(result.tensor[expert_id, INTERMEDIATE_DIM:, :], up_expected)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_up_before_gate_also_works(self):
         """gate_up merge should work regardless of which proj arrives first."""
         converter = Qwen3MoeCheckpointTensorConverter(num_experts=NUM_EXPERTS)
@@ -254,6 +265,7 @@ class TestQwen3MoeConverterConvert:
             assert torch.equal(result.tensor[expert_id, :INTERMEDIATE_DIM, :], gate_expected)
             assert torch.equal(result.tensor[expert_id, INTERMEDIATE_DIM:, :], up_expected)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_experts_out_of_order(self):
         """Experts can arrive in any order (e.g. from different shards)."""
         converter = Qwen3MoeCheckpointTensorConverter(num_experts=NUM_EXPERTS)
@@ -271,6 +283,7 @@ class TestQwen3MoeConverterConvert:
             expected = _make_expert_tensor("down_proj", expert_id)
             assert torch.equal(result.tensor[expert_id], expected)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_multiple_layers_independent(self):
         """Different layers are tracked independently."""
         converter = Qwen3MoeCheckpointTensorConverter(num_experts=NUM_EXPERTS)
@@ -291,6 +304,7 @@ class TestQwen3MoeConverterConvert:
                 assert r1 is not None
                 assert r1.name == "model.layers.1.mlp.experts.down_proj"
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_non_expert_key_returns_none(self):
         converter = Qwen3MoeCheckpointTensorConverter(num_experts=NUM_EXPERTS)
         result = converter.convert("model.layers.0.self_attn.q_proj.weight", torch.randn(4, 4))
@@ -298,6 +312,7 @@ class TestQwen3MoeConverterConvert:
 
 
 class TestQwen3MoeConverterFinalize:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_finalize_empty_when_all_flushed(self):
         converter = Qwen3MoeCheckpointTensorConverter(num_experts=NUM_EXPERTS)
 
@@ -310,6 +325,7 @@ class TestQwen3MoeConverterFinalize:
         results = converter.finalize()
         assert results == []
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_finalize_raises_on_incomplete_experts(self):
         converter = Qwen3MoeCheckpointTensorConverter(num_experts=NUM_EXPERTS)
         # Feed only 2 of 4 experts
@@ -321,6 +337,7 @@ class TestQwen3MoeConverterFinalize:
         with pytest.raises(RuntimeError, match="incomplete checkpoint detected"):
             converter.finalize()
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_finalize_raises_on_unpaired_gate_up(self):
         converter = Qwen3MoeCheckpointTensorConverter(num_experts=NUM_EXPERTS)
         # Feed all gate_proj but no up_proj — stacked buffer will be non-empty
@@ -346,6 +363,7 @@ _PER_EXPERT_CONVERTERS = pytest.mark.parametrize(
 
 @_PER_EXPERT_CONVERTERS
 class TestPerExpertConverterExpertRange:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_fused_expert_target_names_the_fused_param_and_expert_row(self, converter_cls):
         converter = converter_cls(num_experts=4)
         assert converter.fused_expert_target("model.layers.0.mlp.experts.3.up_proj.weight") == (
@@ -358,6 +376,7 @@ class TestPerExpertConverterExpertRange:
         )
         assert converter.fused_expert_target("model.layers.0.mlp.experts.gate_up_proj") is None
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_helper_requires_both_expert_streaming_capabilities(self, converter_cls):
         converter = converter_cls(num_experts=4)
         name = "model.layers.0.mlp.experts.3.up_proj.weight"
@@ -373,6 +392,7 @@ class TestPerExpertConverterExpertRange:
         assert checkpoint_converter_fused_expert_target(_TargetOnly(), name) is None
         assert checkpoint_converter_fused_expert_target(None, name) is None
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_range_converter_stacks_only_its_experts_as_local_rows(self, converter_cls):
         local = converter_cls(num_experts=4).for_expert_range(2, 2)
         assert type(local) is converter_cls
@@ -385,21 +405,25 @@ class TestPerExpertConverterExpertRange:
         torch.testing.assert_close(converted.tensor, torch.stack([tensors[2], tensors[3]]))
         assert local.finalize() == []
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_range_converter_rejects_experts_outside_its_range(self, converter_cls):
         local = converter_cls(num_experts=4).for_expert_range(2, 2)
         with pytest.raises(ValueError, match="outside this converter's range"):
             local.convert("model.layers.0.mlp.experts.1.down_proj.weight", torch.zeros(1, 2))
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_range_must_fit_in_the_converter(self, converter_cls):
         with pytest.raises(ValueError, match="outside this converter's 4 experts"):
             converter_cls(num_experts=4).for_expert_range(3, 2)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_fp8_experts_raise_instead_of_loading_unscaled(self, converter_cls):
         converter = converter_cls(num_experts=4)
         fp8 = torch.zeros(1, 2).to(torch.float8_e4m3fn)
         with pytest.raises(ValueError, match="does not dequantize"):
             converter.convert("model.layers.0.mlp.experts.0.down_proj.weight", fp8)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_incomplete_checkpoint_error_names_the_model(self, converter_cls):
         converter = converter_cls(num_experts=4)
         converter.convert("model.layers.0.mlp.experts.0.down_proj.weight", torch.zeros(1, 2))
@@ -408,6 +432,7 @@ class TestPerExpertConverterExpertRange:
 
 
 class TestQwen3MoeConverterFactory:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_factory_creates_converter(self):
         model = SimpleNamespace(config=SimpleNamespace(num_experts=8))
         converter = create_qwen3_moe_checkpoint_tensor_converter(model)
@@ -416,6 +441,7 @@ class TestQwen3MoeConverterFactory:
 
 
 class TestDeepseekV3ConverterFactory:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_factory_reads_routed_expert_count(self):
         model = SimpleNamespace(config=SimpleNamespace(n_routed_experts=8))
         converter = create_deepseek_v3_checkpoint_tensor_converter(model)
@@ -424,6 +450,7 @@ class TestDeepseekV3ConverterFactory:
 
 
 class TestGlmMoeDsaConverter:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_factory_reads_routed_expert_count(self):
         model = SimpleNamespace(config=SimpleNamespace(n_routed_experts=8))
         converter = create_glm_moe_dsa_checkpoint_tensor_converter(model)
@@ -503,6 +530,7 @@ class TestGlmMoeDsaConverter:
 class TestQwen3MoeConverterIntegration:
     """Simulate a realistic checkpoint loading flow through maybe_convert_checkpoint_tensor."""
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_full_layer_conversion(self):
         converter = Qwen3MoeCheckpointTensorConverter(num_experts=NUM_EXPERTS)
 
@@ -587,6 +615,7 @@ class TestDeepseekV4ConverterCanHandle:
     def setup_method(self):
         self.converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     @pytest.mark.parametrize(
         "proj",
         ["w1", "w2", "w3", "gate_proj", "up_proj", "down_proj"],
@@ -594,25 +623,31 @@ class TestDeepseekV4ConverterCanHandle:
     def test_matches_raw_and_renamed_expert_keys(self, proj: str):
         assert self.converter.can_handle(_make_deepseek_v4_expert_key(0, 1, proj))
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_matches_scale_keys_for_fp8_scale_pairs(self):
         assert self.converter.can_handle("model.layers.0.attn.wkv.scale")
         assert self.converter.can_handle("model.layers.0.attn.wkv.weight_scale_inv")
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_prefixed_raw_weight_keys_are_name_handled(self):
         assert self.converter.can_handle("model.layers.0.attn.wkv.weight")
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_matches_quantized_weight_tensors(self):
         weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))
         assert self.converter.can_handle_tensor("model.layers.0.attn.wkv.weight", weight)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_matches_raw_inference_checkpoint_names(self):
         assert self.converter.can_handle("embed.weight")
         assert self.converter.can_handle("layers.0.attn.wkv.scale")
         assert self.converter.can_handle_tensor("layers.0.attn.wkv.weight", torch.ones(4, 4))
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_rejects_non_tensor_keys(self):
         assert not self.converter.can_handle("model.layers.0.mlp.experts.gate_up_proj")
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     @pytest.mark.parametrize("model_prefix", ("", "model."))
     def test_ignores_mtp_checkpoint_keys(self, model_prefix: str):
         stem = f"{model_prefix}mtp.0.attn.wkv"
@@ -627,6 +662,7 @@ class TestDeepseekV4ConverterCanHandle:
 
 
 class TestDeepseekV4ConverterConvert:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     @pytest.mark.parametrize("target_model_prefix", ["model.", ""])
     @pytest.mark.parametrize("source_model_prefix", ["model.", ""])
     @pytest.mark.parametrize(
@@ -654,6 +690,7 @@ class TestDeepseekV4ConverterConvert:
         assert maybe_convert_checkpoint_tensor(target, result.tensor, converter).name == target
         assert converter.finalize() == []
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     @pytest.mark.parametrize("target_model_prefix", ["model.", ""])
     @pytest.mark.parametrize(
         "source",
@@ -686,6 +723,7 @@ class TestDeepseekV4ConverterConvert:
         assert restored.name == target
         assert torch.equal(restored.tensor, weight)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     @pytest.mark.parametrize(
         ("expert_dtype", "scale_dtype"),
         [("fp8", torch.float32), ("fp4", torch.float8_e8m0fnu)],
@@ -720,6 +758,7 @@ class TestDeepseekV4ConverterConvert:
         assert set(exported) == {origin, "layers.0.attn.wq_a.scale"}
         assert calls == [(block_size, "ue8m0", scale_dtype)]
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_fp4_expert_export_uses_fp4_act_quant_and_fp8_for_shared(self, monkeypatch):
         from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
         from veomni.models.transformers.deepseek_v4 import export_quant
@@ -780,6 +819,7 @@ class TestDeepseekV4ConverterConvert:
         assert exported[shared_origin].dtype == torch.float8_e4m3fn
         assert exported["layers.0.ffn.shared_experts.w1.scale"].dtype == torch.float8_e8m0fnu
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_unquantized_weights_cast_to_bf16_while_non_weight_params_stay_fp32(self, monkeypatch):
         from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
 
@@ -811,6 +851,7 @@ class TestDeepseekV4ConverterConvert:
                 f"{key}: got {exported[key].dtype}, expected {expected_dtype}"
             )
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_export_weights_synthesizes_release_mapping_when_none(self):
         from tests.models.tiny_configs import tiny_deepseek_v4_config
         from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
@@ -845,6 +886,7 @@ class TestDeepseekV4ConverterConvert:
         assert "layers.0.attn.compressor.wkv.scale" not in quant_mapping
         assert "layers.3.attn.indexer.weights_proj.scale" not in quant_mapping
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_export_weights_skips_unmapped_tied_weights_and_handles_none_block_size(self, monkeypatch):
         from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
 
@@ -876,6 +918,7 @@ class TestDeepseekV4ConverterConvert:
         assert any("lm_head.weight" in msg for msg in info_logs)
         assert any("model.unexpected.weight" in msg for msg in warning_logs)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_export_weights_accepts_fused_expert_fqn_mapping(self, monkeypatch):
         from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
 
@@ -899,6 +942,7 @@ class TestDeepseekV4ConverterConvert:
         expected_keys = {f"layers.0.ffn.experts.{e}.{w}.weight" for e in range(2) for w in ("w1", "w2", "w3")}
         assert set(exported) == expected_keys
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_export_weights_should_quantize_skips_non_owner_quantization(self, monkeypatch):
         from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
         from veomni.models.transformers.deepseek_v4 import export_quant
@@ -941,6 +985,7 @@ class TestDeepseekV4ConverterConvert:
         assert quantized_calls == [torch.Size([4, 4])]
         assert set(exported) == {"layers.0.attn.wq_a.weight", "layers.0.attn.wq_a.scale"}
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_validate_deepseek_v4_export_quant_support_preflight(self, monkeypatch):
         from veomni.models.transformers.deepseek_v4 import export_quant
 
@@ -970,6 +1015,7 @@ class TestDeepseekV4ConverterConvert:
             fqn_to_index_mapping=scaled_mapping
         )
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_checkpoint_manager_skips_sm90_preflight_on_legacy_save_routes(self, monkeypatch):
         from veomni.models.checkpoint.manager import ModelCheckpointManager
         from veomni.models.transformers.deepseek_v4 import export_quant
@@ -1005,12 +1051,14 @@ class TestDeepseekV4ConverterConvert:
         with pytest.raises(RuntimeError, match="SM90 or later"):
             ModelCheckpointManager(runtime)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_dequantizes_block_scaled_fp8_weight(self):
         weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))
         scale = torch.tensor([[1.0, 2.0], [4.0, 8.0]])
         expected = weight.float().view(2, 2, 2, 2).mul(scale.view(2, 1, 2, 1)).reshape(4, 4)
         assert torch.equal(_dequantize_scaled_weight(weight, scale), expected)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_dequantizes_packed_fp4_expert_weight(self):
         # Each int8 byte stores two E2M1 values, low nibble first. 0x21 maps
         # to [0.5, 1.0]. DeepSeek applies one E8M0 scale per 32 FP4 values.
@@ -1023,6 +1071,7 @@ class TestDeepseekV4ConverterConvert:
         assert result.shape == (1, 64)
         assert torch.equal(result, expected)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_reuses_fp4_lookup_table(self):
         _get_fp4_e2m1_table.cache_clear()
         try:
@@ -1032,6 +1081,7 @@ class TestDeepseekV4ConverterConvert:
         finally:
             _get_fp4_e2m1_table.cache_clear()
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_dequantizes_conventional_int8_weight_without_unpacking(self):
         weight = torch.arange(16, dtype=torch.int8).reshape(4, 4)
         scale = torch.tensor([[1.0, 2.0], [4.0, 8.0]])
@@ -1042,6 +1092,7 @@ class TestDeepseekV4ConverterConvert:
         assert result.shape == weight.shape
         assert torch.equal(result, expected)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     @pytest.mark.parametrize(
         ("raw_name", "converted_name"),
         [
@@ -1095,6 +1146,7 @@ class TestDeepseekV4ConverterConvert:
     def test_converts_deepseek_inference_checkpoint_names(self, raw_name: str, converted_name: str):
         assert convert_deepseek_v4_checkpoint_key(raw_name) == converted_name
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     @pytest.mark.parametrize(
         ("raw_name", "converted_name"),
         [
@@ -1112,6 +1164,7 @@ class TestDeepseekV4ConverterConvert:
     def test_converts_deepseek_inference_checkpoint_names_for_base_model(self, raw_name: str, converted_name: str):
         assert convert_deepseek_v4_checkpoint_key(raw_name, target_model_prefix="") == converted_name
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_raw_inference_fp8_pair_emits_hf_name(self):
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))
@@ -1124,6 +1177,7 @@ class TestDeepseekV4ConverterConvert:
         assert result.name == "model.layers.0.self_attn.kv_proj.weight"
         assert torch.equal(result.tensor, weight.float())
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_raw_inference_fp8_pair_emits_base_model_name(self):
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS, target_model_prefix="")
         weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))
@@ -1136,6 +1190,7 @@ class TestDeepseekV4ConverterConvert:
         assert result.name == "layers.0.self_attn.kv_proj.weight"
         assert torch.equal(result.tensor, weight.float())
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_fp8_weight_scale_pair_emits_dequantized_weight(self):
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         weight_name = "model.layers.0.attn.wkv.weight"
@@ -1152,6 +1207,7 @@ class TestDeepseekV4ConverterConvert:
         assert torch.equal(result.tensor, _dequantize_scaled_weight(weight, scale))
         assert converter.finalize() == []
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_fp8_scale_can_arrive_before_weight(self):
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         weight_name = "model.layers.0.attn.wkv.weight"
@@ -1168,6 +1224,7 @@ class TestDeepseekV4ConverterConvert:
         assert torch.equal(result.tensor, _dequantize_scaled_weight(weight, scale))
         assert converter.finalize() == []
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_fp8_weight_scale_inv_suffix_emits_dequantized_weight(self):
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         weight_name = "model.layers.0.attn.wkv.weight"
@@ -1184,6 +1241,7 @@ class TestDeepseekV4ConverterConvert:
         assert torch.equal(result.tensor, _dequantize_scaled_weight(weight, scale))
         assert converter.finalize() == []
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_scalar_scale_pairs_with_fp8_weight(self):
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         weight_name = "model.layers.0.attn.wkv.weight"
@@ -1200,6 +1258,7 @@ class TestDeepseekV4ConverterConvert:
         assert torch.equal(result.tensor, weight.float() * scale)
         assert converter.finalize() == []
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_legitimate_scale_parameter_passes_through(self):
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         tensor = torch.ones(3)
@@ -1208,6 +1267,7 @@ class TestDeepseekV4ConverterConvert:
         assert result.name == "model.layers.0.input_layernorm.scale"
         assert result.tensor is tensor
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_2d_scale_without_quantized_weight_passes_through_on_finalize(self):
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         tensor = torch.ones(2, 2)
@@ -1217,6 +1277,7 @@ class TestDeepseekV4ConverterConvert:
         assert finalized[0].name == "model.layers.0.some_module.scale"
         assert finalized[0].tensor is tensor
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_quantized_weight_without_scale_errors(self):
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         weight_name = "model.layers.0.attn.wkv.weight"
@@ -1225,6 +1286,7 @@ class TestDeepseekV4ConverterConvert:
         with pytest.raises(RuntimeError, match="missing scale"):
             converter.finalize()
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_raw_w_keys_convert_to_fused_expert_layout(self):
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         dispatched = {}
@@ -1267,6 +1329,7 @@ class TestDeepseekV4ConverterConvert:
             assert torch.equal(gate_up[expert_id, INTERMEDIATE_DIM:, :], up_expected)
             assert torch.equal(down[expert_id], down_expected)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_fp8_expert_weights_are_dequantized_before_fusing(self):
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         dispatched = {}
@@ -1300,6 +1363,7 @@ class TestDeepseekV4ConverterConvert:
             assert torch.equal(down[expert_id], down_expected)
         assert converter.finalize() == []
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     @pytest.mark.parametrize("model_prefix", ("", "model."))
     def test_raw_inference_fp4_experts_are_unpacked_before_fusing(self, model_prefix: str):
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
@@ -1330,6 +1394,7 @@ class TestDeepseekV4ConverterConvert:
         expected_values = torch.tensor([0.5, 1.0] * (HIDDEN_DIM // 2))
         assert torch.equal(dispatched["model.layers.0.mlp.experts.gate_up_proj"][0, 0], expected_values)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_renamed_keys_still_convert(self):
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         emitted = []
@@ -1348,6 +1413,7 @@ class TestDeepseekV4ConverterConvert:
 
 
 class TestDeepseekV4ConverterExpertStreaming:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     @pytest.mark.parametrize(
         ("name", "target"),
         [
@@ -1366,6 +1432,7 @@ class TestDeepseekV4ConverterExpertStreaming:
         if target is not None:
             assert checkpoint_converter_fused_expert_target(converter, name) == target
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_for_expert_range_stacks_only_its_fp8_experts(self):
         fp8_dtype = getattr(torch, "float8_e4m3fn", None)
         if fp8_dtype is None:
@@ -1391,17 +1458,20 @@ class TestDeepseekV4ConverterExpertStreaming:
             assert torch.equal(down[row], want)
         assert emitted["layers.0.mlp.experts.gate_up_proj"].shape == (2, 2 * INTERMEDIATE_DIM, HIDDEN_DIM)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_a_range_converter_rejects_other_experts(self):
         local = DeepseekV4CheckpointTensorConverter(num_experts=4).for_expert_range(2, 2)
         with pytest.raises(ValueError, match=r"expert 1 is outside this converter's range \[2, 4\)"):
             local.convert("layers.0.ffn.experts.1.w1.weight", torch.zeros(INTERMEDIATE_DIM, HIDDEN_DIM))
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_for_expert_range_rejects_an_out_of_bounds_range(self):
         with pytest.raises(ValueError, match="outside this converter's 4 experts"):
             DeepseekV4CheckpointTensorConverter(num_experts=4).for_expert_range(3, 2)
 
 
 class TestDeepseekV4ConverterFactoryAndMapping:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_factory_creates_converter(self):
         model = SimpleNamespace(
             config=SimpleNamespace(n_routed_experts=8),
@@ -1412,6 +1482,7 @@ class TestDeepseekV4ConverterFactoryAndMapping:
         assert converter.num_experts == 8
         assert converter.target_model_prefix == "model."
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_factory_creates_base_model_converter(self):
         model = SimpleNamespace(
             config=SimpleNamespace(n_routed_experts=8),
@@ -1422,6 +1493,7 @@ class TestDeepseekV4ConverterFactoryAndMapping:
         assert converter.num_experts == 8
         assert converter.target_model_prefix == ""
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_deepseek_v4_models_do_not_register_fqn_to_index_mapping_converter(self):
         from veomni.models.registry import MODELING_REGISTRY
 
@@ -1431,6 +1503,7 @@ class TestDeepseekV4ConverterFactoryAndMapping:
         assert getattr(base_model_cls, "_convert_fqn_to_index_mapping", None) is None
         assert get_fqn_to_index_mapping_converter(causal_lm_cls.__new__(causal_lm_cls)) is None
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_split_moe_params_splits_gate_up_and_down(self):
         gate_up = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
         split_items = dict(split_moe_params("model.layers.0.mlp.experts.gate_up_proj", gate_up, ep_rank=1))
@@ -1478,12 +1551,14 @@ class TestQwen3VLMoeConverterCanHandle:
             intermediate_size=VLMOE_INTERMEDIATE,
         )
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_matches_fused_keys(self):
         assert self.converter.can_handle("model.language_model.layers.0.mlp.experts.gate_up_proj")
         assert self.converter.can_handle("model.language_model.layers.10.mlp.experts.down_proj")
         # Also matches text-only prefix (for Qwen3VLMoeTextModel standalone).
         assert self.converter.can_handle("model.layers.3.mlp.experts.gate_up_proj")
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_rejects_other_keys(self):
         assert not self.converter.can_handle("model.language_model.layers.0.self_attn.q_proj.weight")
         # Per-expert keys (the qwen3_moe HF layout) must NOT match here.
@@ -1499,6 +1574,7 @@ class TestQwen3VLMoeConverterConvert:
             intermediate_size=VLMOE_INTERMEDIATE,
         )
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_hf_gate_up_proj_is_transposed(self):
         key, tensor = _vlmoe_hf_gate_up()
         result = self.converter.convert(key, tensor)
@@ -1509,6 +1585,7 @@ class TestQwen3VLMoeConverterConvert:
         assert torch.equal(result.tensor.transpose(1, 2), tensor)
         assert result.tensor.is_contiguous()
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_hf_down_proj_is_transposed(self):
         key, tensor = _vlmoe_hf_down()
         result = self.converter.convert(key, tensor)
@@ -1516,6 +1593,7 @@ class TestQwen3VLMoeConverterConvert:
         assert result.tensor.shape == (VLMOE_NUM_EXPERTS, VLMOE_HIDDEN, VLMOE_INTERMEDIATE)
         assert torch.equal(result.tensor.transpose(1, 2), tensor)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_v5_layout_passes_through_unchanged(self):
         # Simulate a checkpoint previously saved by VeOmni in v5-native layout.
         gate_up_v5 = torch.randn(VLMOE_NUM_EXPERTS, 2 * VLMOE_INTERMEDIATE, VLMOE_HIDDEN)
@@ -1527,10 +1605,12 @@ class TestQwen3VLMoeConverterConvert:
         assert gate_up_result is not None and torch.equal(gate_up_result.tensor, gate_up_v5)
         assert down_result is not None and torch.equal(down_result.tensor, down_v5)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_rejects_non_expert_key(self):
         result = self.converter.convert("model.embed_tokens.weight", torch.randn(4, 4))
         assert result is None
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_raises_on_wrong_rank(self):
         with pytest.raises(RuntimeError, match="expected 3-D"):
             self.converter.convert(
@@ -1538,6 +1618,7 @@ class TestQwen3VLMoeConverterConvert:
                 torch.randn(VLMOE_NUM_EXPERTS, VLMOE_HIDDEN),  # 2-D
             )
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_raises_on_wrong_num_experts(self):
         with pytest.raises(RuntimeError, match="dim-0 == num_experts"):
             self.converter.convert(
@@ -1545,6 +1626,7 @@ class TestQwen3VLMoeConverterConvert:
                 torch.randn(VLMOE_NUM_EXPERTS + 1, VLMOE_HIDDEN, 2 * VLMOE_INTERMEDIATE),
             )
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_raises_on_unrecognized_middle_dim(self):
         with pytest.raises(RuntimeError, match="unrecognized layout"):
             self.converter.convert(
@@ -1552,6 +1634,7 @@ class TestQwen3VLMoeConverterConvert:
                 torch.randn(VLMOE_NUM_EXPERTS, 999, VLMOE_HIDDEN),
             )
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     @pytest.mark.parametrize(
         ("projection", "hidden_size", "intermediate_size", "shape"),
         [
@@ -1571,6 +1654,7 @@ class TestQwen3VLMoeConverterConvert:
             maybe_convert_checkpoint_tensor(f"l.mlp.experts.{projection}", tensor, converter)
         assert torch.equal(tensor, original)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     @pytest.mark.parametrize("projection", ("gate_up_proj", "down_proj"))
     @pytest.mark.parametrize("layout", ("hf", "veomni"))
     def test_raises_on_wrong_last_dim(self, projection, layout):
@@ -1586,6 +1670,7 @@ class TestQwen3VLMoeConverterConvert:
 
 
 class TestQwen3VLMoeConverterFinalize:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_finalize_is_noop(self):
         converter = Qwen3VLMoeCheckpointTensorConverter(
             num_experts=VLMOE_NUM_EXPERTS,
@@ -1598,6 +1683,7 @@ class TestQwen3VLMoeConverterFinalize:
 
 
 class TestQwen3VLMoeConverterFactory:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_factory_with_nested_config(self):
         # Top-level Qwen3VLMoeConfig — has nested `text_config`.
         text_config = SimpleNamespace(
@@ -1612,6 +1698,7 @@ class TestQwen3VLMoeConverterFactory:
         assert converter.hidden_size == VLMOE_HIDDEN
         assert converter.intermediate_size == VLMOE_INTERMEDIATE
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_factory_with_flat_text_config(self):
         # Qwen3VLMoeTextModel is constructed directly from Qwen3VLMoeTextConfig —
         # the config has `num_experts` etc. at top level (no nested text_config).
@@ -1630,6 +1717,7 @@ class TestQwen3VLMoeConverterFactory:
 class TestQwen3VLMoeConverterIntegration:
     """End-to-end through `maybe_convert_checkpoint_tensor` using an HF-layout checkpoint."""
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_full_layer_conversion(self):
         converter = Qwen3VLMoeCheckpointTensorConverter(
             num_experts=VLMOE_NUM_EXPERTS,
@@ -1703,20 +1791,24 @@ class TestQwen3OmniMoeConverterCanHandle:
     def setup_method(self):
         self.converter = Qwen3OmniMoeCheckpointTensorConverter(num_experts=OMNIMOE_NUM_EXPERTS)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_matches_thinker_per_expert_keys(self):
         assert self.converter.can_handle("thinker.model.layers.0.mlp.experts.0.gate_proj.weight")
         assert self.converter.can_handle("thinker.model.layers.10.mlp.experts.3.up_proj.weight")
         assert self.converter.can_handle("thinker.model.layers.5.mlp.experts.2.down_proj.weight")
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_matches_talker_per_expert_keys(self):
         # Talker tower shares the same expert layout convention.
         assert self.converter.can_handle("talker.model.layers.0.mlp.experts.0.gate_proj.weight")
         assert self.converter.can_handle("talker.model.layers.3.mlp.experts.1.down_proj.weight")
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_matches_standalone_text_model_keys(self):
         # When the thinker text submodel is loaded standalone the prefix is just `model.*`.
         assert self.converter.can_handle("model.layers.3.mlp.experts.2.gate_proj.weight")
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_rejects_other_keys(self):
         assert not self.converter.can_handle("thinker.model.layers.0.self_attn.q_proj.weight")
         # Fused keys (VeOmni-saved v5 layout) must NOT match — they pass through.
@@ -1729,6 +1821,7 @@ class TestQwen3OmniMoeConverterConvert:
     def setup_method(self):
         self.converter = Qwen3OmniMoeCheckpointTensorConverter(num_experts=OMNIMOE_NUM_EXPERTS)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_buffers_until_all_experts_arrive(self):
         # gate_proj for experts 0..N-2 should return None (still buffering).
         for e in range(OMNIMOE_NUM_EXPERTS - 1):
@@ -1736,6 +1829,7 @@ class TestQwen3OmniMoeConverterConvert:
             result = self.converter.convert(key, torch.randn(OMNIMOE_INTERMEDIATE, OMNIMOE_HIDDEN))
             assert result is None
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_gate_up_merge_after_full_stack(self):
         prefix = "thinker.model.layers.0.mlp"
         tensors = _omnimoe_per_expert_tensors(prefix)
@@ -1772,6 +1866,7 @@ class TestQwen3OmniMoeConverterConvert:
                 merged[e, OMNIMOE_INTERMEDIATE:], torch.full_like(merged[e, OMNIMOE_INTERMEDIATE:], 200.0 + e)
             )
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_down_proj_emits_after_full_stack(self):
         prefix = "thinker.model.layers.0.mlp"
         tensors = _omnimoe_per_expert_tensors(prefix)
@@ -1790,12 +1885,14 @@ class TestQwen3OmniMoeConverterConvert:
         # v5 layout for down_proj is [E, H, I] which matches stacking of HF [H, I].
         assert emitted[0].tensor.shape == (OMNIMOE_NUM_EXPERTS, OMNIMOE_HIDDEN, OMNIMOE_INTERMEDIATE)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_rejects_non_expert_key(self):
         result = self.converter.convert("thinker.model.embed_tokens.weight", torch.randn(4, 4))
         assert result is None
 
 
 class TestQwen3OmniMoeConverterFinalize:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_finalize_noop_when_all_flushed(self):
         converter = Qwen3OmniMoeCheckpointTensorConverter(num_experts=OMNIMOE_NUM_EXPERTS)
         prefix = "thinker.model.layers.0.mlp"
@@ -1804,6 +1901,7 @@ class TestQwen3OmniMoeConverterFinalize:
             converter.convert(key, t)
         assert converter.finalize() == []
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_finalize_raises_on_incomplete_experts(self):
         converter = Qwen3OmniMoeCheckpointTensorConverter(num_experts=OMNIMOE_NUM_EXPERTS)
         # Feed only 2 of 4 gate_proj experts.
@@ -1815,6 +1913,7 @@ class TestQwen3OmniMoeConverterFinalize:
         with pytest.raises(RuntimeError, match="incomplete checkpoint"):
             converter.finalize()
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_finalize_raises_on_missing_up_after_full_gate_stack(self):
         converter = Qwen3OmniMoeCheckpointTensorConverter(num_experts=OMNIMOE_NUM_EXPERTS)
         # Complete gate_proj but no up_proj — stacked buffer has dangling 'gate_proj'.
@@ -1828,6 +1927,7 @@ class TestQwen3OmniMoeConverterFinalize:
 
 
 class TestQwen3OmniMoeConverterFactory:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_factory_with_top_level_omni_config(self):
         # Qwen3OmniMoeConfig — has `thinker_config.text_config`.
         text_config = SimpleNamespace(num_experts=OMNIMOE_NUM_EXPERTS)
@@ -1837,6 +1937,7 @@ class TestQwen3OmniMoeConverterFactory:
         assert isinstance(converter, Qwen3OmniMoeCheckpointTensorConverter)
         assert converter.num_experts == OMNIMOE_NUM_EXPERTS
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_factory_with_thinker_config(self):
         # Qwen3OmniMoeThinkerForConditionalGeneration — `config.text_config`.
         text_config = SimpleNamespace(num_experts=OMNIMOE_NUM_EXPERTS)
@@ -1844,6 +1945,7 @@ class TestQwen3OmniMoeConverterFactory:
         converter = create_qwen3_omni_moe_checkpoint_tensor_converter(model)
         assert converter.num_experts == OMNIMOE_NUM_EXPERTS
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_factory_with_flat_text_config(self):
         # Qwen3OmniMoeThinkerTextModel loaded standalone — flat config.
         flat = SimpleNamespace(num_experts=OMNIMOE_NUM_EXPERTS)
@@ -1855,6 +1957,7 @@ class TestQwen3OmniMoeConverterFactory:
 class TestQwen3OmniMoeConverterIntegration:
     """End-to-end through `maybe_convert_checkpoint_tensor` using an HF per-expert checkpoint."""
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_full_layer_conversion(self):
         converter = Qwen3OmniMoeCheckpointTensorConverter(num_experts=OMNIMOE_NUM_EXPERTS)
         prefix = "thinker.model.layers.0.mlp"
@@ -1890,6 +1993,7 @@ class TestQwen3OmniMoeConverterIntegration:
             OMNIMOE_INTERMEDIATE,
         )
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_veomni_saved_fused_keys_pass_through(self):
         """A VeOmni-saved checkpoint stores fused keys directly; converter should ignore them."""
         converter = Qwen3OmniMoeCheckpointTensorConverter(num_experts=OMNIMOE_NUM_EXPERTS)

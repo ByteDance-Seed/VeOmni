@@ -37,11 +37,6 @@ from veomni.utils.device import (
 )
 
 
-_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
-
-_CI_ACCELERATOR_4 = LaunchSpec(nproc=4, device="accelerator")
-
-
 _PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
 
 
@@ -745,6 +740,7 @@ def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int, 
 
 
 @pytest.mark.parametrize("with_compressor,layer_idx", [(False, 0), (True, 0), (True, 3)])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_attention_fixture_initializes_empty_parameters(monkeypatch, with_compressor, layer_idx):
     """Recycled allocator contents must not decide whether CP fixtures produce NaNs."""
     original_empty = torch.empty
@@ -781,6 +777,7 @@ _WINDOW_COMPRESSORS = {
 
 
 @pytest.mark.parametrize("kind", list(_WINDOW_COMPRESSORS))
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_deepseek_v4_cp_rejects_a_narrow_shard(kind):
     """A halo comes from one neighbour, so a sub-rate shard cannot work.
 
@@ -807,6 +804,7 @@ def test_deepseek_v4_cp_rejects_a_narrow_shard(kind):
 
 
 @pytest.mark.parametrize("with_compressor", [False, True])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_deepseek_v4_attention_cp_rejects_a_kv_cache(with_compressor):
     """Decode would append this rank's shard to a cache the other ranks also gather."""
     from transformers import DynamicCache
@@ -820,6 +818,7 @@ def test_deepseek_v4_attention_cp_rejects_a_kv_cache(with_compressor):
 
 
 @pytest.mark.parametrize("with_compressor", [False, True])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_deepseek_v4_attention_cp_rejects_a_local_length_mask(with_compressor):
     """A shard-width mask would let rank 0 attend everywhere uncaused and later ranks time out."""
     config, forward, hidden, position_ids, _ = _build_local_attention(
@@ -844,6 +843,7 @@ def _build_toy_model(seq_len: int):
 
 
 @pytest.mark.parametrize("sp_state", [_cp_state, _ulysses_state], ids=["cp", "ulysses"])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_deepseek_v4_model_sp_rejects_absent_position_ids(sp_state):
     """A shard cannot invent global positions, so the forward refuses to guess them.
 
@@ -865,6 +865,7 @@ def test_deepseek_v4_model_sp_rejects_absent_position_ids(sp_state):
             model(input_ids=input_ids)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_deepseek_v4_model_without_sp_still_defaults_position_ids():
     """With sequence parallelism off this rank holds the whole sequence, so ``arange`` is right."""
     model, input_ids = _build_toy_model(seq_len=32)
