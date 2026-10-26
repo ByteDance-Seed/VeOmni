@@ -77,6 +77,7 @@ model:
   accelerator:
     fsdp_config:
       fp8_all_gather: true
+      expert_fsdp_shard_dim: 0
       mixed_precision:
         enable: true
         param_dtype: bfloat16
@@ -124,6 +125,45 @@ On eight GPUs, EP8 has expert FSDP size one and no expert all-gather to reduce.
 Use EP4 with FSDP size two to measure this path locally, or sixteen GPUs for
 EP8 with FSDP size two. Compare identical parallel layouts and include the
 all-gather and gradient reduction in the measured forward/backward step.
+
+### Whole-expert FSDP sharding and EP combine
+
+`model.accelerator.fsdp_config.expert_fsdp_shard_dim` optionally overrides
+EP expert FSDP placement. `null` (the default) preserves the existing hidden
+split/Muon selection, `1` splits expert matrix rows, and `0` shards whole
+experts. An explicit value overrides `muon_expert_zero_comm` for EP. The setting
+applies to declared EP groups in FSDP2; other parameter groups are unchanged.
+Dim 0 requires a dim-0 EP plan with at least one 3D expert stack, and each
+matched parameter's local first dimension must divide the expert FSDP size.
+Unsupported dim-0 layouts fail during wrapping.
+
+This option works with BF16 GEMMs and DeepGEMM FP8. Whole-expert shards avoid
+FSDP's hidden-dimension all-gather copy-out reorder and backward gradient
+concatenation. DCP metadata records the chosen dimension; checkpoint loading
+can reshard between layouts. Same-dimension EP/FSDP splits use strided
+placement metadata to preserve EP-first expert order. Older checkpoints
+written with the previous Muon dim-0 metadata encoded a permuted global expert
+order. VeOmni now versions EP-first ordering in DCP planner metadata. Resuming
+into whole-expert shards rejects unversioned checkpoints before loading tensors,
+including optimizer-only and trainable-only loads; such checkpoints require
+explicit migration. Existing dim-1-to-dim-1 resumes remain unchanged. Low-level
+DCP callers must use the VeOmni save/load planners for this version check.
+This destination-based guard does not identify legacy dim-0 checkpoints when
+loading into dim-1 or plain tensors; those existing unsupported conversions
+also need migration. Master weights, optimizer state, and gradient
+reduction dtypes are unchanged. FP32 reduce-scatter buffers can still dominate
+peak memory, so FP8 parameter transport alone need not lower the step peak.
+
+The common EP combine path selects `moe_unpermute/standard/triton` on NVIDIA
+GPUs and `eager` on other devices or when deterministic algorithms are enabled. It fuses route weighting into FP32 scatter
+accumulation and gathers gradients directly, avoiding expanded weighted-token
+and FP32 token copies in forward and backward. Both BF16 and FP8 expert
+backends use it. Multiplication retains the promoted input/weight dtype's
+rounding before FP32 accumulation; the EP dispatcher restores the original
+token dtype after the combine. The router
+weight gradient similarly rounds each product before its channel reduction.
+Floating-point atomic summation order may differ from the eager scatter.
+The operator supports first-order autograd and requires valid token indices.
 
 The implementation is in
 [fp8_all_gather.py](../../veomni/distributed/fsdp2/fp8_all_gather.py), with a

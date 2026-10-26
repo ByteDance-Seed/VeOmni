@@ -28,7 +28,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
 from ..arguments import MixedPrecisionConfig
-from ..arguments.arguments_types import validate_fp8_all_gather, validate_low_precision_reduce_scatter_comm
+from ..arguments.arguments_types import (
+    validate_expert_fsdp_shard_dim,
+    validate_fp8_all_gather,
+    validate_low_precision_reduce_scatter_comm,
+)
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
 from ..utils import logging, recompute_utils
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
@@ -318,23 +322,15 @@ def _can_shard_extra_parallel_dim0(
     para_name: str,
     para_fsdp_size: int,
 ) -> bool:
-    """Return whether ``para_name``'s weights may take FSDP ``Shard(0)`` for Muon.
+    """Return whether the extra-parallel group supports whole-expert FSDP shards.
 
-    Zero communication is only reachable for a 3D expert stack that
-    ``ParallelPlan`` already slices on dim 0, since that is the sole layout
-    ``DistributedMuon`` classifies as ``moe_local_3d``. So the group needs at
-    least one such stack; a group of only 2D weights (an ``emb`` plan) would
-    gain nothing and must keep the default hidden-dim split. Plans that slice a
-    dim other than 0 are rejected outright — dim-0 FSDP sharding would not line
-    up with them.
+    Require at least one 3D expert stack and a dim-0 parallel plan. This is
+    also the layout DistributedMuon recognizes as ``moe_local_3d``. Every
+    matched parameter, including 2D biases, must divide the FSDP mesh on dim
+    0 because the placement applies to the entire wrapped module.
 
-    Every matched param, 2D biases included, still has to divide the FSDP mesh
-    on dim 0, because ``shard_placement_fn`` applies one dim to the whole
-    wrapped module.
-
-    Plan keys are glob patterns such as ``model.layers.*.mlp.experts.gate_up_proj``,
-    so they only resolve through ``check_fqn_match``. The plan must be the runtime
-    one (``get_runtime_parallel_plan``) for PEFT-prefixed FQNs to match.
+    Plan keys are glob patterns resolved by ``check_fqn_match``. Use the
+    runtime plan so PEFT-prefixed parameter names match as well.
     """
     if parallel_plan is None or not parallel_plan.extra_parallel_plan:
         return False
@@ -351,14 +347,14 @@ def _can_shard_extra_parallel_dim0(
             matched += 1
             if shard.dim != 0:
                 logger.warning_rank0(
-                    f"[muon_expert_zero_comm] {para_name}: {fqn!r} is sliced on dim {shard.dim}; "
+                    f"[expert FSDP Shard(0)] {para_name}: {fqn!r} is sliced on dim {shard.dim}; "
                     "Shard(0) only lines up with a dim-0 plan."
                 )
                 return False
             # ParallelPlan.apply already cut dim 0 down to the local expert count.
             if param.shape[0] % para_fsdp_size != 0:
                 logger.warning_rank0(
-                    f"[muon_expert_zero_comm] {para_name}: {fqn!r} dim-0 ({param.shape[0]}) is not "
+                    f"[expert FSDP Shard(0)] {para_name}: {fqn!r} dim-0 ({param.shape[0]}) is not "
                     f"divisible by {para_name}_fsdp size {para_fsdp_size}."
                 )
                 return False
@@ -368,13 +364,13 @@ def _can_shard_extra_parallel_dim0(
 
     if matched == 0:
         logger.warning_rank0(
-            f"[muon_expert_zero_comm] {para_name}: no parameter matched the plan patterns {sorted(para_plan)}."
+            f"[expert FSDP Shard(0)] {para_name}: no parameter matched the plan patterns {sorted(para_plan)}."
         )
         return False
     if expert_stacks == 0:
         logger.warning_rank0(
-            f"[muon_expert_zero_comm] {para_name}: the plan holds no 3D expert stack, "
-            "so there is no zero-communication path to enable."
+            f"[expert FSDP Shard(0)] {para_name}: the plan holds no 3D expert stack, "
+            "so whole-expert sharding is not applicable."
         )
         return False
     return True
@@ -431,6 +427,7 @@ def parallelize_model_fsdp2(
     muon_expert_zero_comm: bool = False,
     low_precision_reduce_scatter_comm: bool = False,
     fp8_all_gather: bool = False,
+    expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
@@ -461,6 +458,7 @@ def parallelize_model_fsdp2(
     parallel_state = get_parallel_state()
 
     validate_fp8_all_gather(fp8_all_gather, mixed_precision, offload=bool(kwargs.get("enable_fsdp_offload", False)))
+    validate_expert_fsdp_shard_dim(expert_fsdp_shard_dim)
     use_low_precision_transport = validate_low_precision_reduce_scatter_comm(
         low_precision_reduce_scatter_comm, mixed_precision
     )
@@ -707,7 +705,15 @@ def parallelize_model_fsdp2(
             # default hidden-dim sharding. A para this model's plan does not
             # declare wraps nothing here, so leave it out of the report.
             declared = parallel_plan is not None and para in (parallel_plan.extra_parallel_plan or {})
-            if muon_expert_zero_comm and declared:
+            if para == "ep" and declared and expert_fsdp_shard_dim is not None:
+                para_fsdp_size = para_mesh[f"{para}_fsdp"].size()
+                if expert_fsdp_shard_dim == 0 and not _can_shard_extra_parallel_dim0(
+                    model, parallel_plan, para, para_fsdp_size
+                ):
+                    raise ValueError("expert_fsdp_shard_dim=0 requires evenly divisible EP expert stacks.")
+                shard_dim_for_para = expert_fsdp_shard_dim
+                logger.info_rank0(f"Using explicit EP expert FSDP Shard({shard_dim_for_para}).")
+            elif muon_expert_zero_comm and declared:
                 para_fsdp_size = para_mesh[f"{para}_fsdp"].size()
                 if _can_shard_extra_parallel_dim0(model, parallel_plan, para, para_fsdp_size):
                     shard_dim_for_para = 0
@@ -1018,6 +1024,7 @@ def build_parallelize_model(
     muon_expert_zero_comm: bool = False,
     low_precision_reduce_scatter_comm: bool = False,
     fp8_all_gather: bool = False,
+    expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
@@ -1036,6 +1043,7 @@ def build_parallelize_model(
             enabled gradient checkpointing and before FSDP2 shards the blocks.
     """
     parallel_state = get_parallel_state()
+    validate_expert_fsdp_shard_dim(expert_fsdp_shard_dim, fsdp_mode=parallel_state.dp_mode)
     validate_fp8_all_gather(
         fp8_all_gather,
         mixed_precision,
@@ -1113,6 +1121,7 @@ def build_parallelize_model(
                 muon_expert_zero_comm=muon_expert_zero_comm,
                 low_precision_reduce_scatter_comm=low_precision_reduce_scatter_comm,
                 fp8_all_gather=fp8_all_gather,
+                expert_fsdp_shard_dim=expert_fsdp_shard_dim,
                 compile_config=compile_config,
                 should_skip_hf_weight_load=should_skip_hf_weight_load,
                 **kwargs,

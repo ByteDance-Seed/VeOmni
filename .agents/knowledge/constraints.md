@@ -102,7 +102,7 @@ Core entry points:
    - Token routing: `veomni/distributed/moe/moe_layer.py` — `preprocess()` computes dispatch counts, `token_pre_all2all()` / `tokens_post_all2all()` exchange tokens between EP ranks via `all_to_all` / `all_to_all_async` in `moe/comm.py`.
    - Expert computation: `EPGroupGemm` runs fused expert MLP on grouped tokens per rank.
    - Device mesh: `init_parallel_state_from_config()` builds `[ep × ep_fsdp]` submesh; accessed via `ParallelState.extra_parallel_mesh("ep")`, `ep_group`, `ep_rank`.
-   - In FSDP2: expert modules get `fully_shard()` on the `ep_fsdp` submesh with `Shard(1)` placement so hidden-dim sharding composes with EP's dim-0 sharding.
+   - In FSDP2: expert modules get `fully_shard()` on the `ep_fsdp` submesh with `Shard(1)` by default. `expert_fsdp_shard_dim=0` explicitly selects whole-expert FSDP shards after validating the EP plan and even local expert divisibility; `None` preserves the existing placement/Muon policy. Record the selected FSDP dimension in `SpecInfo`. If EP/FSDP split the same tensor dimension, DCP must use `_StridedShard(dim, split_factor=ep_size)` on the FSDP mesh axis: physical sharding is EP-first even though the mesh lists FSDP first. Two ordinary `Shard(0)` placements silently permute global expert IDs. VeOmni DCP save/load planners version this corrected ordering in `planner_data` and reject unversioned checkpoints when loading whole-expert shards; do not bypass those planners for production resumes.
 
 8a. **Persistent 2D ExtraParallel parameters require a complete 2D mesh**
    - Persistent ExtraParallel parameters currently require a 2D `(<para>_fsdp, <para>)` mesh covering the complete world. HSDP replicas and FSDP CPU offload remain unsupported.

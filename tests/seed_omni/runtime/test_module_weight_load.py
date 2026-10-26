@@ -101,6 +101,7 @@ def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPat
                 offload_pin_memory=False,
                 low_precision_reduce_scatter_comm=False,
                 fp8_all_gather=fp8_all_gather,
+                expert_fsdp_shard_dim=0,
                 max_load_broadcast_size=20.0,
             ),
             offload_config=SimpleNamespace(enable_activation=False, enable_async_activation=False),
@@ -111,3 +112,4 @@ def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPat
 
     assert parallelize.call_args.kwargs["should_skip_hf_weight_load"] is False
     assert parallelize.call_args.kwargs["fp8_all_gather"] is fp8_all_gather
+    assert parallelize.call_args.kwargs["expert_fsdp_shard_dim"] == 0

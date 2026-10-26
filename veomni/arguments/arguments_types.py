@@ -624,6 +624,12 @@ def validate_fp8_all_gather(enabled, mixed_precision, *, fsdp_mode="fsdp2", offl
         raise ValueError("fp8_all_gather requires FSDP2, BF16 mixed precision and no CPU offload.")
 
 
+def validate_expert_fsdp_shard_dim(dim, *, fsdp_mode="fsdp2"):
+    """Validate an explicit expert FSDP placement independently of its optimizer."""
+    if dim is not None and (type(dim) is not int or dim not in (0, 1) or fsdp_mode != "fsdp2"):
+        raise ValueError("expert_fsdp_shard_dim must be null, 0 or 1 and requires FSDP2.")
+
+
 @dataclass
 class FSDPConfig:
     """model.accelerator.fsdp_config.* — FSDP sharding configuration."""
@@ -680,6 +686,12 @@ class FSDPConfig:
             )
         },
     )
+    expert_fsdp_shard_dim: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Override EP expert FSDP sharding: 0 keeps whole experts, 1 splits hidden dimensions. Null preserves existing placement/Muon policy. Dim 0 requires evenly divisible local expert stacks."
+        },
+    )
     fp8_all_gather: bool = field(
         default=False,
         metadata={
@@ -720,6 +732,7 @@ class FSDPConfig:
         validate_fp8_all_gather(
             self.fp8_all_gather, self.mixed_precision, fsdp_mode=self.fsdp_mode, offload=self.offload
         )
+        validate_expert_fsdp_shard_dim(self.expert_fsdp_shard_dim, fsdp_mode=self.fsdp_mode)
         validate_low_precision_reduce_scatter_comm(
             self.low_precision_reduce_scatter_comm, self.mixed_precision, fsdp_mode=self.fsdp_mode
         )

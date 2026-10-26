@@ -41,6 +41,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.tensor.placement_types import _StridedShard
 
 from ..distributed.parallel_state import get_parallel_state
 from ..optim.optimizer import restore_optimizer_param_group_defaults
@@ -67,6 +68,18 @@ _EXTRA_STATE_DIRNAME = "extra_state"
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 
 
+_EP_LAYOUT_FORMAT_KEY = "__veomni_ep_first_layout__"
+
+
+class _ExtraParallelSavePlanner(DefaultSavePlanner):
+    """Version canonical EP-first ordering without adding model state keys."""
+
+    def create_global_plan(self, all_plans):
+        plans, metadata = super().create_global_plan(all_plans)
+        metadata.planner_data = {**(metadata.planner_data or {}), _EP_LAYOUT_FORMAT_KEY: 1}
+        return plans, metadata
+
+
 class _ModelStrictLoadPlanner(DefaultLoadPlanner):
     """Allow partial optimizer state while requiring a complete full-model DCP."""
 
@@ -75,6 +88,19 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
         self.strict_model = strict_model
 
     def create_local_plan(self):
+        # Old same-axis EP/FSDP checkpoints described global experts in the
+        # wrong order. Refuse ambiguous resumes before DCP writes into any
+        # tensor, including optimizer-only and trainable-only loads.
+        needs_ep_order = any(
+            isinstance(value, DTensor) and any(isinstance(p, _StridedShard) for p in value.placements)
+            for value in self.state_dict.values()
+        )
+        if needs_ep_order and (self.metadata.planner_data or {}).get(_EP_LAYOUT_FORMAT_KEY) != 1:
+            raise RuntimeError(
+                "Whole-expert FSDP resume requires versioned EP-first checkpoint metadata. "
+                "This unversioned checkpoint needs explicit layout migration before loading; "
+                "legacy Muon dim-0 checkpoints may contain permuted global expert IDs."
+            )
         plan = super().create_local_plan()
         if not self.strict_model:
             return plan
@@ -427,7 +453,7 @@ def restore_extra_parallel_dim(
     Restore ExtraParallel dim so that DCP can be aware about ExtraParallel ranks
 
     The ExtraParallel (e.g. ``ep``) dim and the FSDP dim shard the tensor along
-    DIFFERENT axes: ``ep_shard_dim`` (the EP plan's ``Shard.dim``, dim 0 for
+    their configured axes: ``ep_shard_dim`` (the EP plan's ``Shard.dim``, dim 0 for
     experts) and ``fsdp_shard_dim`` (1 by default, 0 for the Muon zero-comm
     layout). They must be mapped to the matching mesh dims explicitly.
 
@@ -442,15 +468,11 @@ def restore_extra_parallel_dim(
         fsdp_shard_dim (int): Tensor dim FSDP shards along.
 
     Note:
-        When ``ep_shard_dim == fsdp_shard_dim`` (e.g. the Muon zero-comm layout
-        shards experts on dim 0 just like EP), both mesh dims split the SAME
-        tensor dim. The mesh order ``(ep_fsdp, ep)`` then composes ``ep_fsdp``
-        OUTER of ``ep``, whereas the physical layout is EP-outer / FSDP-inner,
-        so the reconstructed GLOBAL tensor is block-transposed along that dim.
-        Save->load into the SAME parallel config still round-trips correctly
-        (drop is the exact inverse); only resharding / external reads of such a
-        checkpoint see the permuted layout. Fixing this needs the EP mesh dims
-        reordered so ``ep`` precedes ``ep_fsdp`` (a parallel_state change).
+        When both splits use the same tensor dimension, physical sharding is
+        EP-first/FSDP-second despite the mesh order ``(ep_fsdp, ep)``. Describe
+        that with ``_StridedShard`` on the FSDP mesh axis, just as native FSDP2
+        does for same-dimension TP. This preserves global expert identities in
+        DCP metadata without communication or copying the local tensor.
     """
     assert fsdp_mesh.ndim in (2, 3), f"global_mesh.ndim must be 2 or 3, got {fsdp_mesh.ndim}"
 
@@ -458,10 +480,15 @@ def restore_extra_parallel_dim(
         # ExtraParallel+FSDP2. mesh order is (ep_fsdp, ep) or, for HSDP,
         # (ep_replicate, ep_fsdp, ep): ep_fsdp -> Shard(fsdp_shard_dim),
         # ep -> Shard(ep_shard_dim), ep_replicate -> Replicate().
+        fsdp_placement = (
+            _StridedShard(fsdp_shard_dim, split_factor=fsdp_mesh.size(-1))
+            if ep_shard_dim == fsdp_shard_dim and fsdp_mesh.size(-1) > 1
+            else Shard(fsdp_shard_dim)
+        )
         if fsdp_mesh.ndim == 3:
-            placements = [Replicate(), Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
+            placements = [Replicate(), fsdp_placement, Shard(ep_shard_dim)]
         else:
-            placements = [Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
+            placements = [fsdp_placement, Shard(ep_shard_dim)]
         dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
     elif torch.is_tensor(orgin_tensor):
         # If there is no FSDP but only ExtraParallel
@@ -1183,7 +1210,7 @@ class DistributedCheckpointer(CheckpointerBase):
         outlive its own next write. ``timeout_seconds`` is that slot's group
         timeout, applied when the group is created.
         """
-        planner = DefaultSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
+        planner = _ExtraParallelSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
         if save_async:
             # Lazily create this slot's dedicated Gloo process group. Creating a
             # group is itself collective, and every rank runs the same save

@@ -482,6 +482,7 @@ class VeOmniModelRuntime:
             max_load_broadcast_size=args.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
             fp8_all_gather=args.accelerator.fsdp_config.fp8_all_gather,
+            expert_fsdp_shard_dim=args.accelerator.fsdp_config.expert_fsdp_shard_dim,
             low_precision_reduce_scatter_comm=args.accelerator.fsdp_config.low_precision_reduce_scatter_comm,
             compile_config=compile_config,
             **kwargs,

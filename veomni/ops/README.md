@@ -123,6 +123,13 @@ gradients directly from the FP32 accumulator in the GEMM epilogue. Recomputing
 Triton SwiGLU limits temporary storage. See [FP8 MoE training](../../docs/design/deepgemm_fp8_moe.md)
 for dependency installation, configuration, precision and distributed coverage.
 
+The common EP combine uses the registered `moe_unpermute/standard` op:
+`triton` on NVIDIA GPUs and `eager` elsewhere or in deterministic mode. It accepts routed tokens
+`[R,H]`, route weights `[R]`, valid destination indices `[R]`, and the output
+token count. The Triton implementation fuses weighting with FP32 scatter
+accumulation and computes both token and router-weight gradients without
+expanded intermediate tensors. This optimization also applies to BF16 GEMMs.
+
 ## Registering an op
 
 Each row provides either:

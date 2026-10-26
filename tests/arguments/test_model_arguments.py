@@ -90,8 +90,11 @@ def test_fp8_all_gather_reaches_parallel_builder(monkeypatch, enabled):
     )
     monkeypatch.setattr(torch_parallelize, "parallelize_model_fsdp2", lambda **kw: calls.append(kw) or kw["model"])
     model = nn.Linear(2, 2)
-    torch_parallelize.build_parallelize_model(model, fp8_all_gather=enabled, enable_gradient_checkpointing=False)
+    torch_parallelize.build_parallelize_model(
+        model, fp8_all_gather=enabled, expert_fsdp_shard_dim=0, enable_gradient_checkpointing=False
+    )
     assert calls[0]["fp8_all_gather"] is enabled
+    assert calls[0]["expert_fsdp_shard_dim"] == 0
 
 
 def test_fp8_all_gather_rejects_compile_before_wrapping(monkeypatch):
@@ -121,3 +124,25 @@ def test_fp8_all_gather_rejects_non_swiglu_before_collectives():
     module.use_swiglu_mlp = False
     with pytest.raises(ValueError, match="SwiGLU"):
         register_deepgemm_fp8_all_gather(module)
+
+
+@pytest.mark.parametrize("value", [-1, 2, True, False, "0", 0.0])
+def test_expert_fsdp_shard_dim_rejects_invalid_values(value):
+    from veomni.arguments.arguments_types import FSDPConfig
+
+    with pytest.raises(ValueError, match="expert_fsdp_shard_dim"):
+        FSDPConfig(expert_fsdp_shard_dim=value)
+
+
+@pytest.mark.parametrize("value", [None, 0, 1])
+def test_expert_fsdp_shard_dim_valid_values(value):
+    from veomni.arguments.arguments_types import FSDPConfig
+
+    assert FSDPConfig(expert_fsdp_shard_dim=value).expert_fsdp_shard_dim == value
+
+
+def test_expert_fsdp_shard_dim_rejects_ddp():
+    from veomni.arguments.arguments_types import FSDPConfig
+
+    with pytest.raises(ValueError, match="expert_fsdp_shard_dim"):
+        FSDPConfig(expert_fsdp_shard_dim=0, fsdp_mode="ddp")

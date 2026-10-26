@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 from scripts.ci.accelerator.launch_plan import from_parameter, runner_device_count
 from tests.ops.moe_experts.reference import standard_ep_reference
@@ -226,10 +227,15 @@ class _MetaModel(nn.Module):
         return self.experts(x, routing, indices)
 
 
-def _builder_worker(rank, world, directory, rendezvous):
+def _builder_worker(rank, world, shard_dim, directory, rendezvous):
     import torch.distributed.checkpoint as dcp
 
-    from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState
+    from veomni.checkpoint.dcp_checkpointer import (
+        ModelState,
+        OptimizerState,
+        _ExtraParallelSavePlanner,
+        _ModelStrictLoadPlanner,
+    )
     from veomni.distributed.torch_parallelize import build_parallelize_model
     from veomni.ops.kernels.moe_experts.shared.fp8_weight import FP8ExpertWeight
     from veomni.optim import build_optimizer
@@ -244,8 +250,14 @@ def _builder_worker(rank, world, directory, rendezvous):
         with torch.device("meta"):
             model = _MetaModel()
         model = build_parallelize_model(
-            model, init_device="meta", fp8_all_gather=True, enable_gradient_checkpointing=False
+            model,
+            init_device="meta",
+            fp8_all_gather=True,
+            expert_fsdp_shard_dim=shard_dim,
+            enable_gradient_checkpointing=False,
         )
+        assert all(p.placements[0].dim == shard_dim for p in model.parameters())
+        assert all(spec.fsdp_shard_dim == shard_dim for spec in model._fqn2spec_info.values())
         opt = build_optimizer(model, lr=1e-3)
         x = torch.randn(127, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         routing = torch.rand(127, 2, device="cuda", requires_grad=True)
@@ -273,7 +285,9 @@ def _builder_worker(rank, world, directory, rendezvous):
                     for key, value in state.items()
                 }
                 dcp.save(
-                    {"model": ModelState(model), "optimizer": OptimizerState(model, opt)}, checkpoint_id=directory
+                    {"model": ModelState(model), "optimizer": OptimizerState(model, opt)},
+                    checkpoint_id=directory,
+                    planner=_ExtraParallelSavePlanner(),
                 )
             elif step == 1:
                 expected = y.detach().clone()
@@ -287,10 +301,43 @@ def _builder_worker(rank, world, directory, rendezvous):
                 dcp.load(
                     {"model": ModelState(model), "optimizer": OptimizerState(model, opt, load=True)},
                     checkpoint_id=directory,
+                    planner=_ModelStrictLoadPlanner(strict_model=True),
                 )
                 for (group, param, key), expected_value in saved_optim.items():
                     actual_value = opt.optimizers_dict[group].state[param][key]
                     torch.testing.assert_close(actual_value, expected_value, rtol=0, atol=0)
+        # DCP must restore the same global experts when the FSDP layout changes.
+        with torch.device("meta"):
+            restored = _MetaModel()
+        restored = build_parallelize_model(
+            restored,
+            init_device="meta",
+            fp8_all_gather=True,
+            expert_fsdp_shard_dim=1 - shard_dim,
+            enable_gradient_checkpointing=False,
+        )
+        restored_opt = build_optimizer(restored, lr=1e-3)
+        dcp.load(
+            {"model": ModelState(restored), "optimizer": OptimizerState(restored, restored_opt, load=True)},
+            checkpoint_id=directory,
+            planner=_ModelStrictLoadPlanner(strict_model=True),
+        )
+        parameter_map = dict(zip(model.parameters(), restored.parameters()))
+        for (group, param, key), expected_value in saved_optim.items():
+            actual_value = restored_opt.optimizers_dict[group].state[parameter_map[param]][key]
+            if isinstance(actual_value, DTensor):
+                actual_value, expected_value = actual_value.full_tensor(), expected_value.full_tensor()
+            torch.testing.assert_close(actual_value, expected_value, rtol=0, atol=0)
+        for original, loaded in zip(model.parameters(), restored.parameters()):
+            torch.testing.assert_close(original.full_tensor(), loaded.full_tensor(), rtol=0, atol=0)
+        restored_y = restored(x, routing, indices)
+        torch.testing.assert_close(restored_y, expected, rtol=0, atol=0)
+        restored_y.float().square().mean().backward()
+        for original, loaded in zip(model.parameters(), restored.parameters()):
+            # The original accumulated two identical microbatches.
+            torch.testing.assert_close(
+                original.grad.full_tensor() / 2, loaded.grad.full_tensor(), rtol=1e-5, atol=1e-7
+            )
         dist.barrier()
     finally:
         dist.destroy_process_group()
@@ -299,7 +346,8 @@ def _builder_worker(rank, world, directory, rendezvous):
 
 @pytest.mark.launch_plan(provider=from_parameter("world"))
 @pytest.mark.parametrize("world", [4])
-def test_fp8_all_gather_public_builder_checkpoint_and_accumulation(world, tmp_path):
+@pytest.mark.parametrize("shard_dim", [0, 1])
+def test_fp8_all_gather_public_builder_checkpoint_and_accumulation(world, shard_dim, tmp_path):
     """Cover meta materialization, EP/FSDP wiring, AdamW and real DCP reload."""
     if not torch.cuda.is_available() or torch.cuda.device_count() < world or torch.version.hip is not None:
         pytest.skip("Requires four NVIDIA GPUs.")
@@ -307,5 +355,8 @@ def test_fp8_all_gather_public_builder_checkpoint_and_accumulation(world, tmp_pa
         pytest.skip("Requires Hopper/Blackwell.")
     pytest.importorskip("deep_gemm")
     mp.spawn(
-        _builder_worker, args=(world, str(tmp_path / "dcp"), f"file://{tmp_path / 'rdzv'}"), nprocs=world, join=True
+        _builder_worker,
+        args=(world, shard_dim, str(tmp_path / "dcp"), f"file://{tmp_path / 'rdzv'}"),
+        nprocs=world,
+        join=True,
     )

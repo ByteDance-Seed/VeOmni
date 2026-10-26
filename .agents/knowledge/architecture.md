@@ -342,3 +342,10 @@ The pre-hook quantizes local shards and separately gathers compact scales;
 native FSDP gathers payloads. `FP8ExpertWeight` carries the results to
 `GroupedLinear`, preserving BF16-facing autograd and high precision master
 shards. Native FSDP manages both payload and scale storage on reshard.
+
+`FSDPConfig.expert_fsdp_shard_dim` follows the same runtime path and optionally
+overrides EP expert FSDP placement for either BF16 or FP8. Whole-expert
+`Shard(0)` avoids hidden-dimension gather/scatter reordering; the selected
+dimension is recorded in `SpecInfo` for DCP resharding. The shared EP combine
+uses the registered `moe_unpermute` op with fused weighting/scatter on NVIDIA
+GPUs and eager PyTorch on other devices, retaining FP32 accumulation.
