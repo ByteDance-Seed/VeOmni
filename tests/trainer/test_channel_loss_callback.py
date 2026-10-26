@@ -17,6 +17,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
 
 _real_find_spec = importlib.util.find_spec
 
@@ -341,6 +343,109 @@ def test_channel_loss_extracts_fused_inputs_from_models_loss_partial():
         assert computer._result[0]["token_count"].item() == 2
     finally:
         computer.uninstall()
+
+
+@pytest.mark.parametrize("implementation", ["eager", "chunk_loss"])
+@pytest.mark.parametrize("bias_kind", ["full", "factored"])
+@pytest.mark.parametrize("explicit_shift", [False, True])
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_preserves_full_and_factored_bias(
+    monkeypatch, implementation, bias_kind, explicit_shift, strict, dtype
+):
+    from veomni.models.loss_utils import ForCausalLMLoss
+    from veomni.ops import VeomniOp
+
+    _install_test_parallel_state(monkeypatch)
+    monkeypatch.setattr(ChannelLossComputer, "EAGER_CHUNK_SIZE", 3)
+    model = torch.nn.Module()
+    model.loss_function = partial(ForCausalLMLoss, op=VeomniOp("cross_entropy_loss", "standard", implementation))
+    torch.manual_seed(125)
+    hidden = torch.randn(2, 7, 3, dtype=dtype, requires_grad=True)
+    weight = torch.randn(7, 3, dtype=dtype, requires_grad=True)
+    bias = torch.randn(2, 7, 2 if bias_kind == "factored" else 7, dtype=dtype, requires_grad=True)
+    tensors = [hidden, weight, bias]
+    if bias_kind == "factored":
+        tensors.append(torch.randn(7, 2, dtype=dtype, requires_grad=True))
+    labels = torch.arange(14).reshape(2, 7) % 7
+    labels[:, 3] = IGNORE_INDEX
+    targets = labels if explicit_shift else F.pad(labels, (0, 1), value=IGNORE_INDEX)[:, 1:].contiguous()
+    kwargs = dict(labels=labels, vocab_size=7, chunk_size=3)
+    if explicit_shift:
+        kwargs["shift_labels"] = targets
+
+    def compute(inputs):
+        return model.loss_function(
+            **kwargs,
+            hidden_states=inputs[0],
+            weights=inputs[1],
+            logits_bias=inputs[2],
+            logits_bias_weight=inputs[3] if bias_kind == "factored" else None,
+        )[0]
+
+    reference_inputs = [t.detach().clone().requires_grad_() for t in tensors]
+    reference = compute(reference_inputs)
+    reference.backward()
+    computer = ChannelLossComputer()
+    computer.strict = strict
+    computer._source_ids = ["first", "second"]
+    computer._position_ids = torch.arange(7).expand(2, -1)
+    try:
+        computer.install(model)
+        with computer.capture():
+            actual = compute(tensors)
+        actual.backward()
+    finally:
+        computer.uninstall()
+
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    for tensor, expected in zip(tensors, reference_inputs, strict=True):
+        torch.testing.assert_close(tensor.grad, expected.grad, rtol=0, atol=0)
+    logits = F.linear(hidden.detach(), weight.detach()).float()
+    bias_logits = F.linear(bias.detach(), tensors[3].detach()) if bias_kind == "factored" else bias.detach()
+    per_token = F.cross_entropy(
+        (logits + bias_logits.float()).reshape(-1, 7), targets.reshape(-1), ignore_index=IGNORE_INDEX, reduction="none"
+    ).reshape(2, 7)
+    assert not computer.strict_observation_errors
+    assert [entry["source_id"] for entry in computer._result] == ["first", "second"]
+    for row, entry in enumerate(computer._result):
+        torch.testing.assert_close(entry["loss_sum"], per_token[row].sum(), rtol=1e-6, atol=1e-6)
+        assert entry["token_count"].item() == targets[row].ne(IGNORE_INDEX).sum().item()
+
+
+@pytest.mark.parametrize("bias_kind", ["full", "factored"])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_rejects_unsupported_bias_without_false_metrics(monkeypatch, bias_kind):
+    from veomni.models.loss_utils import ForCausalLMLoss
+
+    _install_test_parallel_state(monkeypatch)
+
+    def unsupported_op(*args, **kwargs):
+        pytest.fail("An unsupported bias backend must be rejected before execution")
+
+    unsupported_op.impl = "liger_kernel"
+    model = torch.nn.Module()
+    model.loss_function = partial(ForCausalLMLoss, op=unsupported_op)
+    computer = ChannelLossComputer()
+    computer.strict = True
+    computer._source_ids = ["source"]
+    computer._position_ids = torch.arange(5).unsqueeze(0)
+    kwargs = dict(
+        labels=torch.zeros(1, 5, dtype=torch.long),
+        hidden_states=torch.randn(1, 5, 3),
+        weights=torch.randn(7, 3),
+        logits_bias=torch.randn(1, 5, 2 if bias_kind == "factored" else 7),
+    )
+    if bias_kind == "factored":
+        kwargs["logits_bias_weight"] = torch.randn(7, 2)
+    try:
+        computer.install(model)
+        with pytest.raises(NotImplementedError, match="logits_bias is only supported"), computer.capture():
+            model.loss_function(**kwargs)
+    finally:
+        computer.uninstall()
+    assert not computer._result
 
 
 def test_channel_loss_chunk_kernel_reuses_main_projection(monkeypatch):
