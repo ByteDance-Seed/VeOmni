@@ -287,3 +287,14 @@ When adding a row, test its numerical contract, registration, hardware
 requirement, and optional-package requirements. When adding model-specific
 argument policy, test it in `tests/models` rather than duplicating it in
 the raw-kernel suite.
+
+### GDN projection exchange
+
+Qwen4-Exp, Qwen3.5 and Qwen3.5-MoE automatically coalesce same-dtype Q/K/V,
+beta and decay projections before their explicit-group sequence exchange.
+Mixed projection dtypes retain five separate collectives without casting.
+The packed width retains the key/value head ratio. Peer packets are padded to
+512 bytes, then unpadded before interpreting the sequence; backward inverts the
+same permutation without rescaling. Output exchange, recurrence and packed
+boundaries are unchanged, and existing head-divisibility requirements remain.
+No `OpsImplementationConfig` flag is needed for this layout optimization.
