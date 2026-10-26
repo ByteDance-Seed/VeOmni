@@ -170,7 +170,10 @@ def test_qwen3_llm_and_text_encoder_save_reload_via_registry(tmp_path: Path):
     assert te2.config.vocab_size == 128
 
 
-def test_qwen3_accelerated_forward_and_packing_roundtrip(monkeypatch):
+@pytest.mark.parametrize("attn_impl", ["eager", "sdpa", "veomni_sdpa"])
+def test_qwen3_accelerated_packed_matches_separate_forwards_and_grads(monkeypatch, attn_impl):
+    import copy
+
     import veomni.models.seed_omni.modules.qwen3.llm.accelerated.accelerated as qwen3_llm_acc
 
     monkeypatch.setattr(
@@ -180,33 +183,94 @@ def test_qwen3_accelerated_forward_and_packing_roundtrip(monkeypatch):
     )
     Qwen3LlmAcc = OMNI_ACCELERATED_MODEL_REGISTRY["qwen3_llm"]()
     Qwen3LlmConfig = OMNI_CONFIG_REGISTRY["qwen3_llm"]()
-    llm = Qwen3LlmAcc(
-        Qwen3LlmConfig(text_config=_tiny_qwen3_cfg(), ops_implementation={"attn_implementation": "eager"})
-    )
+    torch.manual_seed(42)
+    llm_packed = Qwen3LlmAcc(
+        Qwen3LlmConfig(text_config=_tiny_qwen3_cfg(), ops_implementation={"attn_implementation": attn_impl})
+    ).eval()
+    llm_sep = copy.deepcopy(llm_packed).eval()
+
+    s0_u = torch.randn(3, 32, requires_grad=True)
+    s0_a = torch.randn(2, 32, requires_grad=True)
+    s1_u = torch.randn(4, 32, requires_grad=True)
+
+    s0_u_sep = s0_u.detach().clone().requires_grad_(True)
+    s0_a_sep = s0_a.detach().clone().requires_grad_(True)
+    s1_u_sep = s1_u.detach().clone().requires_grad_(True)
 
     conversations = [
         [
-            ConversationItem(type="text", value=torch.randn(3, 32), role="user"),
-            ConversationItem(type="text", value=torch.randn(2, 32), role="assistant"),
+            ConversationItem(type="text", value=s0_u, role="user"),
+            ConversationItem(type="text", value=s0_a, role="assistant"),
         ],
         [
-            ConversationItem(type="text", value=torch.randn(4, 32), role="user"),
+            ConversationItem(type="text", value=s1_u, role="user"),
         ],
     ]
-    pre_out = llm.pre_forward("forward", conversation_list=conversations)
-    fwd_out = llm(**pre_out)
-    post_out = llm.post_forward("forward", **fwd_out)
+    pre_out = llm_packed.pre_forward("forward", conversation_list=conversations)
+    fwd_out = llm_packed(**pre_out)
+    out_conv = llm_packed.post_forward("forward", **fwd_out)["conversation_list"]
 
-    out_conv = post_out["conversation_list"]
     assert [tuple(item.value.shape) for item in out_conv[0]] == [(3, 32), (2, 32)]
     assert [tuple(item.value.shape) for item in out_conv[1]] == [(4, 32)]
 
+    conv_0 = [
+        [
+            ConversationItem(type="text", value=s0_u_sep, role="user"),
+            ConversationItem(type="text", value=s0_a_sep, role="assistant"),
+        ]
+    ]
+    pre_0 = llm_sep.pre_forward("forward", conversation_list=conv_0)
+    out_0 = llm_sep.post_forward("forward", **llm_sep(**pre_0))["conversation_list"]
+
+    conv_1 = [[ConversationItem(type="text", value=s1_u_sep, role="user")]]
+    pre_1 = llm_sep.pre_forward("forward", conversation_list=conv_1)
+    out_1 = llm_sep.post_forward("forward", **llm_sep(**pre_1))["conversation_list"]
+
+    torch.testing.assert_close(out_conv[0][0].value, out_0[0][0].value, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out_conv[0][1].value, out_0[0][1].value, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out_conv[1][0].value, out_1[0][0].value, atol=1e-5, rtol=1e-5)
+
+    w0 = torch.randn_like(out_conv[0][0].value)
+    w1 = torch.randn_like(out_conv[0][1].value)
+    w2 = torch.randn_like(out_conv[1][0].value)
+
+    loss_packed = (
+        (out_conv[0][0].value * w0).sum() + (out_conv[0][1].value * w1).sum() + (out_conv[1][0].value * w2).sum()
+    )
+    loss_packed.backward()
+
+    loss_sep = (out_0[0][0].value * w0).sum() + (out_0[0][1].value * w1).sum() + (out_1[0][0].value * w2).sum()
+    loss_sep.backward()
+
+    torch.testing.assert_close(s0_u.grad, s0_u_sep.grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(s0_a.grad, s0_a_sep.grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(s1_u.grad, s1_u_sep.grad, atol=1e-5, rtol=1e-5)
+    for (n1, p1), (_, p2) in zip(llm_packed.named_parameters(), llm_sep.named_parameters(), strict=True):
+        torch.testing.assert_close(p1.grad, p2.grad, atol=1e-5, rtol=1e-5, msg=n1)
+
     # Verify pack_llm_conversations_for_forward + scatter_llm_hidden_states preserves attention_mask across calls.
-    packed_embeds, mask, pids, shape = pack_llm_conversations_for_forward(out_conv, torch.device("cpu"))
+    packed_embeds, mask, pids, _ = pack_llm_conversations_for_forward(out_conv, torch.device("cpu"))
     assert tuple(packed_embeds.shape) == (1, 9, 32)
     assert tuple(mask.shape) == (1, 9)
     assert tuple(pids.shape) == (1, 9)
     scatter_llm_hidden_states(out_conv, [torch.zeros(3, 32), torch.zeros(2, 32), torch.zeros(4, 32)])
+
+
+def test_qwen3_text_encoder_generate_works_with_omitted_generation_kwargs():
+    Qwen3TextEncoder = OMNI_MODEL_REGISTRY["qwen3_text_encoder"]()
+    te = Qwen3TextEncoder(Qwen3TextEncoderConfig(vocab_size=32, hidden_size=16, tie_word_embeddings=True))
+    te._tokenizer = SimpleNamespace(
+        eos_token_id=0,
+        convert_tokens_to_ids=lambda tok: 1,
+        decode=lambda ids, skip_special_tokens=True: "decoded",
+    )
+    te._chat_template = Qwen3ChatTemplate(te._tokenizer)
+    te._prompt_encoded = True
+
+    conversation_list = [ConversationItem(type="output", value=torch.randn(1, 16), role="assistant")]
+    out = te.generate(conversation_list=conversation_list)
+    assert "conversation_list" in out
+    assert out["conversation_list"][-1].value.shape == (1, 16)
 
 
 def test_qwen3_train_and_infer_yaml_configs_load():

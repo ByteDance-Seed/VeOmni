@@ -74,6 +74,8 @@ class TrainingMixin(BaseTrainingMixin):
         keep[ids] = True
         self._trainable_row_mask = keep
         self.embed_tokens.weight.requires_grad_(True)
+        if self.lm_head is not None:
+            self.lm_head.requires_grad_(False)
         # The weight parameter is replaced by parallelization (FSDP2 shards it, the
         # emb plan splits its rows), so a hook on it now would be lost. FSDP2's own
         # pre-forward hook is prepended, so on the first lookup this one sees the
