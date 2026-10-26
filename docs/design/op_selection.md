@@ -26,7 +26,7 @@ If a field is not in this table, it is not an op-selection knob.
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `liger_kernel`, `torch_npu` | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Same `rope/full` op with an independent model-side implementation choice |
+| Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `torch_npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `torch_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `triton` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `triton`, `fla_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
@@ -282,7 +282,7 @@ model:
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `liger_kernel` | Fused linear + CE raw forward/backward | `liger-kernel` package + GPU/MLU |
+| `liger_kernel` | Fused linear + CE raw forward/backward | `liger-kernel` package + CUDA/MLU |
 | `chunk_loss` | Chunked `F.linear` + CE with one global denominator | — |
 | `eager` | PyTorch `F.linear`/`F.cross_entropy` | — |
 
@@ -398,7 +398,7 @@ supported values are `triton` and `eager`.
 ## 4. Qwen3.5 GatedDeltaNet Ops
 
 Qwen3.5 exposes three additional model-specific op fields. They default to
-`fla`, which registers GPU, MLU, and Ascend NPU rows. To use the vendored
+`fla`, which registers CUDA, MLU, and Ascend NPU rows. To use the vendored
 Ascend kernels, select them explicitly:
 
 ```yaml
