@@ -83,6 +83,7 @@ def _run_fused_vs_eager(
     concentrated_routing: bool = False,
     routing_dtype: torch.dtype = torch.bfloat16,
 ):
+    """Compare fused MoE-LoRA forward and gradients against the eager reference."""
     torch.manual_seed(0)
     device = torch.device("npu" if impl == "fused_npu" else "cuda")
     dtype = torch.bfloat16
@@ -259,6 +260,7 @@ def test_triton_matches_eager(variant, base_trainable, shape):
 @pytest.mark.parametrize("routing_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("variant", ["shared", "independent"])
 def test_triton_matches_eager_with_concentrated_routes(variant, routing_dtype):
+    """Triton MoE-LoRA matches eager under concentrated duplicate routing and FP32/BF16 weights."""
     _run_fused_vs_eager("fused_triton", variant, concentrated_routing=True, routing_dtype=routing_dtype)
 
 
@@ -559,6 +561,7 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
         generator = torch.Generator().manual_seed(7123)
 
         def random_tensor(shape: tuple[int, ...], scale: float) -> torch.Tensor:
+            """Draw a deterministic scaled random tensor on the worker device."""
             return (torch.randn(shape, generator=generator) * scale).to(device=device, dtype=dtype)
 
         hidden = random_tensor((2, batch, hidden_size), 0.5)[rank]

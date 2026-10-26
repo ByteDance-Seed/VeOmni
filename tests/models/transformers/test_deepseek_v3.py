@@ -54,6 +54,7 @@ def _build_ours(config: DeepseekV3Config, ops: SimpleNamespace | None = None):
 
 
 def test_deepseek_v3_eager_matches_hf():
+    """Patched DeepSeek-V3 eager forward matches upstream Hugging Face bitwise."""
     torch.manual_seed(0)
     config = _tiny_config()
     hf = HFDeepseekV3ForCausalLM(config)
@@ -82,6 +83,7 @@ def test_deepseek_v3_experts_routing_weight_dtype_follows_impl(impl: str):
 
     class _RecordingOp:
         def __call__(self, *args, **kwargs):
+            """Record positional and keyword arguments passed to ``veomni_moe``."""
             captured["args"] = args
             captured["kwargs"] = kwargs
             return torch.zeros_like(hidden_states)

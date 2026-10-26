@@ -164,6 +164,7 @@ def test_deepseek_v4_attention_preserves_q_norm_and_rope_dtype_modes():
 
 @pytest.mark.parametrize("impl", ["eager", "fused_triton", "deepgemm_fp8"])
 def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
+    """DeepSeek-V4 experts forward passes merged weights, raw routing weights, and ``swiglu_limit``."""
     config = _tiny_config()
     model = _build_ours(config)
     experts = model.model.layers[3].mlp.experts
@@ -176,6 +177,7 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
     captured = {}
 
     def record(*args, **kwargs):
+        """Record positional and keyword arguments passed to ``veomni_moe``."""
         captured["args"] = args
         captured["kwargs"] = kwargs
         return torch.zeros_like(hidden_states)
