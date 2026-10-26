@@ -379,17 +379,33 @@ four-rank run at step 1, eager and Inductor pre-clipping gradient norms agree to
 
 ### 8. E2E Parallel Alignment (`tests/e2e/test_e2e_parallel.py`)
 
-**Purpose**: Full torchrun training runs across SP/EP configurations. Asserts that loss and grad_norm match regardless of parallelism settings.
+**Purpose**: Short FSDP2 training runs compare loss and grad norm across the
+selected SP/EP configurations. These aggregate checks do not establish
+per-parameter gradient/update equivalence or convergence. Cases with
+`compare_alignment=False` provide smoke coverage only.
 
 **Configurations tested**:
-- `sp_size` in [1, 2], `ep_size` in [1] (base) or [1, 2] (MoE)
-- FSDP2 always enabled, `nproc_per_node = sp_size * 4`
-- 2 epochs, 2 max_steps per run
+
+| Case | `(SP, EP)` modes | Processes per run |
+|---|---|---|
+| Ordinary dense | `(1,1)`, `(2,1)` | 4 |
+| Ordinary MoE | `(1,1)`, `(2,2)` | 4 |
+| Qwen3-MoE representative | `(1,1)`, `(1,2)`, `(2,1)`, `(2,2)` | 4 at SP1, 8 at SP2 |
+| GPT-OSS representative | `(1,1)`, `(2,1)`, `(2,2)` | 4 |
+
+Modes run sequentially within a case, with two optimizer steps per run.
+The callbacks use `dp_mean` for losses because fixed-world-size SP changes
+the DP size. Capability-restricted cases use supported modes: GLM-MoE-DSA
+disables SP, while DeepSeek-V4 has dedicated EP alignment and separate SP2
+smokes. GPT-OSS FA4/Quack requires SM90+ CUDA and skips on SM89 GPUs and NPU.
+See the [new-model coverage policy](transformers_v5/testing_new_model.md)
+for matrix selection, representative coverage, and exception requirements.
 
 **Models**: The text, VLM, omni, and DiT parameter tables in
 `tests/e2e/test_e2e_parallel.py` define coverage.
 
-**GPU**: 4+ GPUs (up to 8 for sp=2).
+**Devices**: Follow the case's launch plan; ordinary model alignment uses four,
+with eight retained for the Qwen3-MoE SP2 topology.
 
 ---
 
@@ -616,9 +632,8 @@ See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_
 | Step | Test File | What to Do |
 |---|---|---|
 | 1. **Create toy config** | `tests/toy_config/<model>_toy/` | Minimal config (few layers, small dims). Add `README.md` noting the source config and changes. |
-| 2. **Registry + model parity** | `tests/models/` | Add the registry case and a family test for eager fwd/bwd parity and model-specific contracts. |
-| 3. **E2E parallel alignment** | `tests/e2e/test_e2e_parallel.py` | Add entry to `text_test_cases` (text) or the appropriate VLM/omni list. Set `max_sp_size=1` if SP not yet supported. |
-| 4. **FSDP equivalence** | `tests/distributed/test_fsdp_equivalence.py` | Add entry to verify single-GPU vs FSDP2 grad_norm matches. |
+| 2. **Registry + model parity** | `tests/models/` | Add registry and eager family parity; cover one supported accelerator training configuration against a reference. |
+| 3. **E2E parallel alignment** | `tests/e2e/test_e2e_parallel.py` | Extend the appropriate family table using the [default matrix or a justified exception](transformers_v5/testing_new_model.md#default-matrix); compare loss and grad norm. |
 
 ### Conditional Tests (depending on model type)
 
@@ -627,10 +642,11 @@ See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_
 | **VLM model** | `tests/trainer/test_vlm_trainer.py` | Add toy config to `_FREEZE_VIT_VLM_CASES_*`. |
 | **VLM model** | `tests/distributed/test_dummy_forward.py` | Add test case for asymmetric multimodal batches. |
 | **MoE model** | `tests/models/transformers/` | Cover eager parity and selectable fused expert implementations in the family test. |
-| **MoE model** | `tests/e2e/test_e2e_parallel.py` | Set `is_moe=True` to include `ep_size` iteration. |
+| **MoE model** | `tests/e2e/test_e2e_parallel.py` | Set `is_moe=True`; the ordinary default is `(1,1)` versus `(2,2)`, with capability limits and representatives documented. |
+| **Text model needing single-device/FSDP comparison** | `tests/distributed/test_fsdp_equivalence.py` | Extend the supported text-only suite; this is additional coverage, not a requirement for VLM/omni models. |
 | **MoE with fused experts** | `tests/models/base/test_checkpoint_tensor_converter.py` | Add converter tests if a custom `CheckpointTensorConverter` is needed. |
 | **Custom checkpoint layout** | `tests/models/base/test_checkpoint_tensor_converter.py` | Add converter tests for any on-disk HF↔VeOmni key or tensor-layout conversion. |
-| **Custom fused ops** | `tests/ops/<family>/` | Add op-specific correctness and registration tests. |
+| **Custom fused ops** | `tests/ops/<family>/` | Cover distinct variants/backends and backward paths, including EP/non-EP when implemented; EP-local compute tests do not qualify cross-card transport. |
 | **New data modality** | `tests/data/` | Add data processing and collation tests. |
 
 ### Verification Commands

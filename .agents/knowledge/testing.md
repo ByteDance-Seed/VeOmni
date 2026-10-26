@@ -3,6 +3,30 @@
 How to decide whether a change needs a test, where to put it, and whether CI
 will actually run it. Read this before adding a test file.
 
+## New-model coverage policy
+
+Follow [Testing a New Model](../../docs/transformers_v5/testing_new_model.md)
+for the maintained coverage matrix. Require registry/build, eager family
+forward/backward parity, one supported accelerator training configuration
+against a reference, and E2E alignment for supported parallel modes.
+
+Ordinary dense E2E uses `(SP1, EP1)` and `(SP2, EP1)`; ordinary MoE uses
+`(SP1, EP1)` and `(SP2, EP2)`, with four processes per run. Qwen3-MoE retains
+the full matrix and eight-process SP2 topology. GPT-OSS uses three four-process
+modes `(1,1)`, `(2,1)`, `(2,2)` for its dedicated Quack variant. Check the SOP
+for capability exceptions and justification for additional representatives.
+Preserve a common initial checkpoint, data and global batch; fixed-world-size
+SP changes DP size, so compare DP-mean losses and grad norm. Aggregate metric
+alignment does not prove per-parameter update equivalence.
+
+Keep alignment assertions enabled. Smoke tests establish execution only;
+record any numerical gap explicitly. Separate model integration, raw operator
+numerics, and full distributed execution: standard Quack and GPT-OSS Quack
+need distinct coverage, and an EP-local GEMM test does not exercise all-to-all.
+Record GPU/NPU eligibility and actual skips; SM90-only cases skipped by SM89
+CI are not validated by that job. Use the same mode list for command creation
+and resource plans, reserving the actual sequential peak device count.
+
 ## CI selects tests by explicit enumeration
 
 GPU/NPU suite selections are enumerated in `scripts/ci/accelerator/suites/gpu.json` and
