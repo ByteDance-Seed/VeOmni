@@ -253,8 +253,11 @@ class TestTrainGraph:
         "modules_file",
         [
             "modules_train.yaml",
+            "modules_train_deepgemm_fp8.yaml",
             "modules_train_mtp.yaml",
             "modules_train_full.yaml",
+            "modules_train_full128.yaml",
+            "modules_train_full128_deepgemm_fp8.yaml",
             "modules_train_scaled64.yaml",
         ],
     )
@@ -264,6 +267,24 @@ class TestTrainGraph:
             "accelerator"
         ]["fsdp_config"]
         assert fsdp_config["mixed_precision"]["cast_forward_inputs"] is False
+
+    @pytest.mark.parametrize(
+        "modules_file",
+        [
+            "modules_train_deepgemm_fp8.yaml",
+            "modules_train_full128_deepgemm_fp8.yaml",
+        ],
+    )
+    def test_deepgemm_fp8_configs_pair_deepgemm_with_qat_none_and_stream_load(self, modules_file):
+        train = yaml.safe_load((CONFIG_ROOT / "train" / modules_file).read_text())
+        for mod in ("deepseek_v41_ngram", "deepseek_v41_llm"):
+            assert train[mod]["ep_sharded_stream_load"] is True
+            assert train[mod]["broadcast_model_weights_from_rank0"] is False
+        assert train["deepseek_v41_ngram"]["model_config"]["freeze"] is True
+        llm = train["deepseek_v41_llm"]
+        assert llm["model_config"]["weight_quantization"] is None
+        assert llm["ops_implementation"]["moe_implementation"] == "deepgemm_fp8"
+        assert llm["ops_implementation"]["qat_implementation"] == "none"
 
     def test_full_training_freezes_nothing_in_the_llm(self):
         llm = yaml.safe_load((CONFIG_ROOT / "train/modules_train_full.yaml").read_text())["deepseek_v41_llm"][

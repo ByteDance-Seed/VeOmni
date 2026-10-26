@@ -186,3 +186,24 @@ class TestConverterDeclaresTheCompanions:
         converter._layer_map, converter._engram_map = {0: 0, 20: 1}, {}
         assert converter.dim0_rowwise_companion(EXPERTS) is None
         assert not converter.should_skip_without_loading(f"{EXPERTS}_scale")
+
+    def test_full_depth_with_dspark_disabled_skips_mtp_tensors(self):
+        """40-layer runs with ``dspark_block_size=0`` (e.g. 128-GPU full128) must skip ``model.mtp.*`` at load."""
+        from veomni.models.seed_omni.modules.deepseek_v41.checkpoint_tensor_converter import DeepseekV41LlmConverter
+
+        config = SimpleNamespace(
+            num_hidden_layers=40,
+            num_nextn_predict_layers=3,
+            dspark_block_size=0,
+            n_routed_experts=N_EXPERTS,
+            dspark_n_routed_experts=N_EXPERTS,
+        )
+        converter = DeepseekV41LlmConverter(config, dequantize=True)
+        assert converter.should_skip_without_loading("model.mtp.0.self_attn.wq_a.weight") is True
+        assert converter.should_skip_without_loading("model.mtp.0.self_attn.wq_a.weight_scale") is True
+        assert converter.should_skip_without_loading("model.mtp.0.mlp.experts.0.w1.weight") is True
+        assert converter.should_skip_without_loading("model.layers.0.self_attn.wq_a.weight") is False
+        assert converter.dim0_rowwise_companion("model.layers.0.self_attn.wq_a.weight") == (
+            "model.layers.0.self_attn.wq_a.weight_scale"
+        )
+        assert converter.dim0_rowwise_companion("model.mtp.0.self_attn.wq_a.weight") is None

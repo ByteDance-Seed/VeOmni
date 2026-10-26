@@ -104,6 +104,9 @@ deepseek_v41_llm:
     dspark_block_size: 0
   ops_implementation:
     # Fake-quant dense GEMMs to fp8 and routed experts to fp4 (`expert_dtype`).
+    # For native FP8 expert training with DeepGEMM, use
+    # `modules_train_full128_deepgemm_fp8.yaml` (`moe_implementation: deepgemm_fp8`
+    # and `qat_implementation: none`).
     qat_implementation: fp8_blockwise
   optimizer:
     type: muon

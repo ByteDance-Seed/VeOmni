@@ -60,6 +60,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.activations import ACT2FN
 
 from ......distributed.moe import dispatch_to_ep_class
 from ......distributed.parallel_state import get_parallel_state
@@ -427,13 +428,34 @@ class DeepseekV41QuantizedExperts(DeepseekV4Experts):
     """
 
     def __init__(self, config, quant_dtype: torch.dtype | None = None) -> None:
-        super().__init__(config)
+        nn.Module.__init__(self)
+        self.num_experts = config.num_local_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.intermediate_size
+        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
+        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
+        self.act_fn = ACT2FN[config.hidden_act]
+        self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
+        self.limit = config.swiglu_limit
+        self.assume_distinct_experts = False
+        self.expert_dtype = getattr(config, "expert_dtype", "fp8")
         self.veomni_moe = VeomniOp(
             "moe_experts",
             "standard",
             resolve_module_op_impl(config, "moe_implementation"),
         )
         self.qat_implementation = resolve_module_qat_impl(config)
+        if self.veomni_moe.impl == "deepgemm_fp8" and self.qat_implementation != "none":
+            raise ValueError(
+                "moe_implementation='deepgemm_fp8' cannot be combined with "
+                f"qat_implementation={self.qat_implementation!r}. Set qat_implementation='none'; "
+                "DeepGEMM already quantizes the expert GEMM operands."
+            )
+        if self.veomni_moe.impl == "deepgemm_fp8" and quant_dtype is not None:
+            raise ValueError(
+                "moe_implementation='deepgemm_fp8' requires BF16 expert parameters; "
+                "set weight_quantization=None so checkpoint weights dequantize at load."
+            )
         self.experts_are_quantized = quant_dtype is not None
         if not self.experts_are_quantized:
             return

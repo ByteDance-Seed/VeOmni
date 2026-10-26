@@ -167,6 +167,7 @@ class DeepseekV41SparseMoeBlock(nn.Module):
                 config.num_experts_per_tok = num_experts_per_tok
         self.gate = DeepseekV41TopKRouter(config)
         self.experts = DeepseekV41QuantizedExperts(config, quant_dtype=expert_quant_dtype(config))
+        self.experts.assume_distinct_experts = True
         self.shared_experts = DeepseekV41SharedExpert(config, quant_dtype=linear_quant_dtype(config))
 
     def forward(

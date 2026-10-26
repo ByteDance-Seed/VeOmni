@@ -46,6 +46,15 @@ _LAYER_KEY = re.compile(r"^model\.layers\.(\d+)\.(.*)$")
 _ENGRAM_KEY = re.compile(r"^model\.engram\.(\d+)\.(.*)$")
 
 
+def _drop_mtp_stages(config) -> bool:
+    """Whether ``config`` omits the checkpoint's ``mtp.*`` DSpark draft stages."""
+    if config is None:
+        return False
+    n_draft = getattr(config, "num_nextn_predict_layers", None)
+    block_size = getattr(config, "dspark_block_size", None)
+    return (n_draft is not None and n_draft <= 0) or (block_size is not None and block_size <= 0)
+
+
 def _shrink_maps(config) -> tuple[dict[int, int], dict[int, int], bool] | None:
     """Layer / Engram old->new maps, plus whether draft stages are dropped.
 
@@ -62,7 +71,7 @@ def _shrink_maps(config) -> tuple[dict[int, int], dict[int, int], bool] | None:
     schedule = shrink_layer_schedule(n_layers, n_draft=n_draft)
     layer_map = {orig: new for new, orig in enumerate(schedule["kept_layer_ids"])}
     engram_map = dict(zip(RELEASED_ENGRAM_LAYER_IDS, schedule["engram_layer_ids"], strict=False))
-    return layer_map, engram_map, n_draft == 0
+    return layer_map, engram_map, _drop_mtp_stages(config)
 
 
 def remap_shrunk_checkpoint_key(
@@ -139,7 +148,7 @@ class DeepseekV41DequantConverter:
         if maps is None:
             self._layer_map: dict[int, int] | None = None
             self._engram_map: dict[int, int] | None = None
-            self._drop_mtp = False
+            self._drop_mtp = _drop_mtp_stages(config)
         else:
             self._layer_map, self._engram_map, self._drop_mtp = maps
 

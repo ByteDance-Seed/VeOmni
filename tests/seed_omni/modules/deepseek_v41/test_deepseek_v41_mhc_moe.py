@@ -272,6 +272,101 @@ class TestSparseMoeBlock:
         assert output.shape == hidden.shape
         assert logits.shape == (2 * 5, config.n_routed_experts)
 
+    @pytest.mark.parametrize("impl", ["eager", "fused_triton", "deepgemm_fp8"])
+    def test_experts_pass_merged_weights_dtype_and_swiglu_limit(self, impl):
+        from unittest.mock import Mock
+
+        config = make_config()
+        block = DeepseekV41SparseMoeBlock(config)
+        experts = block.experts
+        assert experts.assume_distinct_experts is True
+
+        hidden_states = torch.linspace(-0.7, 0.8, steps=4 * config.hidden_size).reshape(4, config.hidden_size)
+        selected_experts = torch.tensor([[0, 1], [2, 0], [1, 2], [0, 2]], dtype=torch.long)
+        top_k_weights = torch.tensor(
+            [[0.7, 0.3], [0.6, 0.4], [0.55, 0.45], [0.8, 0.2]],
+            dtype=torch.float64,
+        )
+        captured = {}
+
+        def record(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return torch.zeros_like(hidden_states)
+
+        experts.veomni_moe = Mock(impl=impl, side_effect=record)
+        actual = experts(hidden_states, selected_experts, top_k_weights)
+        args = captured["args"]
+        kwargs = captured["kwargs"]
+
+        assert args[0] is hidden_states
+        expected_weights = top_k_weights if impl == "eager" else top_k_weights.to(hidden_states.dtype)
+        torch.testing.assert_close(args[1], expected_weights, rtol=0, atol=0)
+        assert args[2] is selected_experts
+        assert args[3].numel() == 0
+        assert args[4].numel() == 0
+        assert args[5] is experts.down_proj
+        assert args[6] is experts.gate_up_proj
+        assert kwargs == {
+            "num_experts": experts.num_experts,
+            "swiglu_limit": config.swiglu_limit,
+            "assume_distinct_experts": True,
+        }
+        torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)
+
+    def test_deepseek_v41_experts_deepgemm_fp8_forward_backward(self):
+        """Select DeepGEMM FP8 on DeepseekV41SparseMoeBlock and verify forward/backward numerics."""
+        from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
+
+        if not IS_CUDA_AVAILABLE or torch.version.hip is not None:
+            pytest.skip("NVIDIA Hopper or Blackwell is required.")
+        if get_torch_device().get_device_capability() not in ((9, 0), (10, 0)):
+            pytest.skip("Requires SM90 or SM100.")
+        pytest.importorskip("deep_gemm")
+        from deep_gemm.testing import calc_diff
+
+        from tests.ops.moe_experts.reference import standard_ep_reference
+
+        config = make_config(
+            hidden_size=256,
+            moe_intermediate_size=128,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            swiglu_limit=10.0,
+            ops_implementation={"moe_implementation": "deepgemm_fp8", "qat_implementation": "none"},
+        )
+        device = get_device_type()
+        block = DeepseekV41SparseMoeBlock(config).to(device=device, dtype=torch.bfloat16)
+        experts = block.experts
+        assert experts.veomni_moe.impl == "deepgemm_fp8"
+        assert experts.qat_implementation == "none"
+        assert experts.assume_distinct_experts is True
+
+        torch.manual_seed(91)
+        with torch.no_grad():
+            experts.gate_up_proj.normal_(std=0.03)
+            experts.down_proj.normal_(std=0.03)
+        x = torch.randn(131, config.hidden_size, device=device, dtype=torch.bfloat16, requires_grad=True)
+        routing = torch.rand(131, 2, device=device, requires_grad=True)
+        indices = torch.randint(0, config.n_routed_experts - 1, (131, 2), device=device)
+        grad = torch.randn_like(x) * 0.1
+        y = experts(x, indices, routing)
+        actual = (y, *torch.autograd.grad(y, (x, routing, experts.gate_up_proj, experts.down_proj), grad))
+
+        xr, rr, w1, w2 = (
+            t.detach().clone().requires_grad_() for t in (x, routing, experts.gate_up_proj, experts.down_proj)
+        )
+        gate, up = w1.chunk(2, dim=1)
+        yr = standard_ep_reference(
+            xr, rr.to(xr.dtype), indices, gate, up, w2, num_experts=config.n_routed_experts, swiglu_limit=10.0
+        )
+        expected = (yr, *torch.autograd.grad(yr, (xr, rr, w1, w2), grad))
+        for result, reference in zip(actual, expected):
+            assert torch.isfinite(result).all()
+            assert calc_diff(result, reference) < 0.004
+        assert torch.count_nonzero(actual[-1][-1]) == 0
+        assert torch.count_nonzero(actual[-2][-1]) == 0
+
 
 class TestDecoderLayerWiring:
     """The one-site-delayed ``pre``, with the sublayers stubbed out.

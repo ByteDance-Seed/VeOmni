@@ -45,12 +45,29 @@ SCALE_FMT = "ue8m0"
 SCALE_DTYPE = torch.float8_e8m0fnu
 
 
+def _llm_uses_deepgemm_fp8(config) -> bool:
+    """Whether ``config`` is a ``deepseek_v41_llm`` config with ``moe_implementation='deepgemm_fp8'``."""
+    if getattr(config, "model_type", None) != "deepseek_v41_llm":
+        return False
+    ops_impl = getattr(config, "ops_implementation", None)
+    if isinstance(ops_impl, dict) and ops_impl.get("moe_implementation") is not None:
+        return ops_impl["moe_implementation"] == "deepgemm_fp8"
+    from ....ops.config import get_ops_config
+
+    global_ops = get_ops_config()
+    return getattr(global_ops, "moe_implementation", None) == "deepgemm_fp8"
+
+
 def quantized_storage_dtype(config) -> Optional[torch.dtype]:
     """The dtype the released weights are stored in, or ``None`` for bf16.
 
     ``config.weight_quantization`` is present on the converted files (released
     dtypes). Training clears it so the llm allocates bf16 Parameters and
-    ``DeepseekV41DequantConverter`` spends the scales at load.
+    ``DeepseekV41DequantConverter`` spends the scales at load. Selecting
+    ``moe_implementation='deepgemm_fp8'`` on ``deepseek_v41_llm`` implies the
+    same bf16 parameter allocation and load-time dequantization automatically,
+    since DeepGEMM FP8 MoE training consumes bf16 expert parameters and
+    quantizes GEMM operands on the fly.
 
     The scheme is checked rather than assumed. The kernels index a weight's
     scale by the same block counter as the activation's, so a checkpoint
@@ -58,7 +75,7 @@ def quantized_storage_dtype(config) -> Optional[torch.dtype]:
     the wrong scale for every block and return plausible nonsense.
     """
     declared = getattr(config, "weight_quantization", None)
-    if not declared:
+    if not declared or _llm_uses_deepgemm_fp8(config):
         return None
 
     block_size = declared.get("weight_block_size", [QUANT_BLOCK_SIZE, QUANT_BLOCK_SIZE])

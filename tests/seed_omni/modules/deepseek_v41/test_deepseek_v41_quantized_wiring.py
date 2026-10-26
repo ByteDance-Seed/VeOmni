@@ -318,6 +318,46 @@ class TestRoutedExperts:
         expected = torch.nn.functional.silu(torch.tensor([[5.0, -10.0]])) * torch.tensor([[5.0, -5.0]])
         torch.testing.assert_close(experts._apply_gate(gate_up), expected)
 
+    def test_deepgemm_fp8_forces_bf16_storage_and_load_time_dequantization(self):
+        """Selecting ``deepgemm_fp8`` on ``deepseek_v41_llm`` turns off quantized
+        inference storage even when ``config.weight_quantization`` is present on disk."""
+        from veomni.models.seed_omni.modules.deepseek_v41.checkpoint_tensor_converter import (
+            DeepseekV41LlmConverter,
+        )
+        from veomni.models.seed_omni.modules.deepseek_v41.quant_scheme import quantized_storage_dtype
+
+        config = make_config(
+            weight_quantization=RELEASED_QUANTIZATION,
+            ops_implementation={"moe_implementation": "deepgemm_fp8", "qat_implementation": "none"},
+        )
+        assert quantized_storage_dtype(config) is None
+        assert linear_quant_dtype(config) is None
+        assert expert_quant_dtype(config) is None
+        converter = DeepseekV41LlmConverter(config, dequantize=quantized_storage_dtype(config) is None)
+        assert converter.dequantize is True
+
+    def test_deepgemm_fp8_rejects_qat_and_quantized_storage(self, monkeypatch):
+        from unittest.mock import Mock
+
+        import veomni.models.seed_omni.modules.deepseek_v41.llm.quantized as quant_mod
+
+        monkeypatch.setattr(
+            quant_mod,
+            "VeomniOp",
+            lambda _domain, _variant, impl: Mock(impl=impl or "deepgemm_fp8"),
+        )
+        config_with_qat = make_config(
+            ops_implementation={"moe_implementation": "deepgemm_fp8", "qat_implementation": "fp8_blockwise"},
+        )
+        with pytest.raises(ValueError, match="cannot be combined with qat_implementation='fp8_blockwise'"):
+            DeepseekV41QuantizedExperts(config_with_qat, quant_dtype=None)
+
+        config_no_qat = make_config(
+            ops_implementation={"moe_implementation": "deepgemm_fp8", "qat_implementation": "none"},
+        )
+        with pytest.raises(ValueError, match="requires BF16 expert parameters"):
+            DeepseekV41QuantizedExperts(config_no_qat, quant_dtype=torch.float4_e2m1fn_x2)
+
     @requires_sm90
     def test_the_routed_forward_matches_its_dequantized_slabs(self):
         """Routing, gating and weighting must survive the slabs going to 4 bits.

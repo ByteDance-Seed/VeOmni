@@ -51,6 +51,7 @@ deepseek_v41_ngram:
     freeze: true
   # Rank-0 cannot hold the 196.6 B tables to broadcast them.
   broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
   accelerator:
     # Row-sharded over 8 ranks -> ~23.6 GiB each in the released fp8. The lookup
     # is an all-to-all gather, bit-identical to the full-table result.
@@ -96,6 +97,9 @@ deepseek_v41_llm:
   ops_implementation:
     # Fake-quant dense GEMMs to fp8 and routed experts to fp4 (`expert_dtype`).
     # Needs SM90+ (the 8xH20 job); `none` trains in bf16 with no rounding.
+    # For native FP8 expert training with DeepGEMM, use
+    # `modules_train_deepgemm_fp8.yaml` (`moe_implementation: deepgemm_fp8` and
+    # `qat_implementation: none`).
     # Resolved per-module from `config.ops_implementation` during init.
     qat_implementation: fp8_blockwise
   accelerator:

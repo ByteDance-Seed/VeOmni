@@ -500,3 +500,56 @@ def test_dequantized_experts_match_the_split_converter_math(release):
     stacked = dequant_converted_weight(torch.stack(w1), torch.stack(s1))
     per_expert = torch.stack([dequant_converted_weight(w, s) for w, s in zip(w1, s1, strict=True)])
     assert torch.equal(stacked, per_expert)
+
+
+def test_deepgemm_fp8_streams_and_dequantizes_quantized_release(tmp_path, monkeypatch):
+    """Under ``moe_implementation='deepgemm_fp8'``, streaming a quantized release
+    automatically dequantizes FP8 dense and packed FP4 expert weights to BF16/FP32
+    parameters even when ``config.weight_quantization`` is left on disk."""
+    from unittest.mock import Mock
+
+    import veomni.models.seed_omni.modules.deepseek_v41.llm.quantized as quant_mod
+    from veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated.accelerated import DeepseekV41LlmAccelerated
+
+    path = str(tmp_path / "release_quant")
+    tensors = _release(path, quantized=True)
+    monkeypatch.setattr(
+        quant_mod,
+        "VeomniOp",
+        lambda _domain, _variant, impl: Mock(impl=impl or "deepgemm_fp8"),
+    )
+
+    layout = build_deepseek_v41_hf_layout(path)
+    ranks = []
+    for ep_rank in range(EP_SIZE):
+        config = layout.build_module_configs(path)[LLM]
+        assert config.weight_quantization is not None
+        config._set_ops_implementation({"moe_implementation": "deepgemm_fp8", "qat_implementation": "none"})
+        with init_empty_weights():
+            model = DeepseekV41Llm._from_config(config, dtype=torch.bfloat16)
+        assert not model.model.layers[0].mlp.experts.experts_are_quantized
+        for name, param in list(model.named_parameters()):
+            if _EXPERT_PARAM.search(name):
+                owner, attr = model.get_submodule(name.rsplit(".", 1)[0]), name.rsplit(".", 1)[1]
+                local = torch.empty((param.shape[0] // EP_SIZE, *param.shape[1:]), dtype=param.dtype, device="meta")
+                setattr(owner, attr, torch.nn.Parameter(local, requires_grad=param.requires_grad))
+        model.get_parallel_plan = types.MethodType(DeepseekV41LlmAccelerated.get_parallel_plan, model)
+        attach_hf_source_converter(model, HFSource(path=os.path.realpath(path), model_type="deepseek_v41"), LLM)
+        monkeypatch.setattr(
+            module_utils,
+            "_ep_dim0_slice_meta",
+            lambda _state, _group, target0, r=ep_rank: (EP_SIZE, r, target0 * EP_SIZE),
+        )
+        load_model_weights_ep_sharded(model, path, "cpu")
+        ranks.append({name: tensor.detach() for name, tensor in model.state_dict().items()})
+
+    experts_key = "model.layers.0.mlp.experts.gate_up_proj"
+    dense_key = "model.layers.0.self_attn.wq_a.weight"
+    streamed_experts = torch.cat([state[experts_key] for state in ranks])
+    assert streamed_experts.dtype == torch.bfloat16
+    w1 = [_dequant_release(tensors, f"layers.0.ffn.experts.{e}.w1.weight") for e in range(N_EXPERTS)]
+    w3 = [_dequant_release(tensors, f"layers.0.ffn.experts.{e}.w3.weight") for e in range(N_EXPERTS)]
+    want_experts = torch.stack([torch.cat(pair) for pair in zip(w1, w3, strict=True)]).bfloat16()
+    torch.testing.assert_close(streamed_experts, want_experts, rtol=0, atol=0)
+    want_dense = _dequant_release(tensors, "layers.0.attn.wq_a.weight").bfloat16()
+    torch.testing.assert_close(ranks[0][dense_key], want_dense, rtol=0, atol=0)
