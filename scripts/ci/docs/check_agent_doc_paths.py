@@ -182,8 +182,8 @@ def main() -> int:
     parser.add_argument(
         "--repo-root",
         type=Path,
-        default=Path(__file__).resolve().parent.parent.parent,
-        help="VeOmni repository root (default: two levels above this file, i.e. repo root from scripts/ci/)",
+        default=Path(__file__).resolve().parents[3],
+        help="VeOmni repository root (default: repository root above scripts/ci/docs/)",
     )
     args = parser.parse_args()
     repo_root: Path = args.repo_root.resolve()

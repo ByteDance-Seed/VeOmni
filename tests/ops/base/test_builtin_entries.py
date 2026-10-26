@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import OP_REGISTRY
 from veomni.ops.platform import (
     GpuKernelRequirement,
@@ -24,6 +27,9 @@ from veomni.ops.platform import (
     NvidiaGpuPlatform,
     RocmGpuPlatform,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 _ANY = None

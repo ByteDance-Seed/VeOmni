@@ -19,7 +19,6 @@ import torch
 import torch.distributed as dist
 import yaml
 from tools import resolve_ops_overrides
-from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
 from utils import (
     DummyDataset,
@@ -31,6 +30,7 @@ from utils import (
     setup_test_distributed,
 )
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
 from veomni.data.dataset import WeightedMultiSourceDataset
@@ -41,6 +41,9 @@ from veomni.utils import helper
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.helper import get_cache_dir
+
+
+_CI_LAUNCH = LaunchSpec(nproc=2)
 
 
 logger = helper.create_logger(__name__)
@@ -807,12 +810,11 @@ class TestLoadStateDictBoundary:
 
 
 def build_command():
-    port = find_free_port()
     command = [
         "torchrun",
         "--nnodes=1",
-        "--nproc_per_node=2",
-        f"--master_port={port}",
+        f"--nproc_per_node={_CI_LAUNCH.nproc}",
+        "--standalone",
         "tests/data/test_multisource_dataset.py",
         "--model.config_path=test",
         "--data.train_path=None",
@@ -834,6 +836,7 @@ def build_command():
     return command
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 def test_multisource_dataset_chain():
     if sys.platform == "darwin":
         pytest.skip(f"torch_shm_manager not supported on macOS: executable={_torch_shm_manager_executable()}")
