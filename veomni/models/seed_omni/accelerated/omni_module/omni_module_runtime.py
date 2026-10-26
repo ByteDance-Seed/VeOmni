@@ -184,9 +184,11 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         Inference only: it skips :meth:`setup`, so it has no mesh, no
         :class:`ParallelState` and no wrap. The generic parallelize step rejects
-        ``eager`` for training.
+        ``eager`` for training. A module that asks for ``ep`` or ``emb`` is not
+        eager even with ``fsdp_mode='eager'``; see
+        :attr:`OmniModuleRuntimeArguments.needs_distributed_build`.
         """
-        return self.args.accelerator.fsdp_config.fsdp_mode == "eager"
+        return not self.args.needs_distributed_build
 
     @property
     def wrap_omni_model(self) -> bool:
@@ -556,11 +558,18 @@ class ModuleRuntime(VeOmniModelRuntime):
         A distributed optimizer (Muon) reads ``get_parallel_state()`` at build
         time, so it must resolve to this module's mesh, not the orchestrator's.
         A no-op for a fully-frozen module: there is nothing to step.
+
+        A module that defines ``configure_optimizer(optimizer)`` gets the built
+        optimizer before the lr-scheduler is built and a checkpoint is loaded into
+        it, so it can adjust its param groups or register step hooks.
         """
         if not self.has_trainable_parameters:
             return
         with self._scoped():
             super()._build_optimizer(param_groups)
+            configure_optimizer = getattr(self.omni_module, "configure_optimizer", None)
+            if callable(configure_optimizer):
+                configure_optimizer(self.optimizer)
 
     def _build_lr_scheduler(self, total_steps: int) -> None:
         """Build this module's lr-scheduler over ``total_steps``.
