@@ -299,3 +299,14 @@ Variable-length integer tables are built from host boundaries and uploaded toget
 including the exact forward and reverse cumsum tile sizes. No floating state is cached
 across calls. Additional activation memory depends on heads, dimensions and length;
 measure the full training peak before enabling it on another profile.
+
+### GDN projection exchange
+
+Qwen4-Exp, Qwen3.5 and Qwen3.5-MoE automatically coalesce same-dtype Q/K/V,
+beta and decay projections before their explicit-group sequence exchange.
+Mixed projection dtypes retain five separate collectives without casting.
+The packed width retains the key/value head ratio. Peer packets are padded to
+512 bytes, then unpadded before interpreting the sequence; backward inverts the
+same permutation without rescaling. Output exchange, recurrence and packed
+boundaries are unchanged, and existing head-divisibility requirements remain.
+No `OpsImplementationConfig` flag is needed for this layout optimization.
