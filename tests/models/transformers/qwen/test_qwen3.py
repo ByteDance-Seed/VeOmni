@@ -256,3 +256,135 @@ def test_qwen3_packed_dense_matches_independent_samples(impl):
             assert p_packed.grad is None, name
             continue
         torch.testing.assert_close(p_packed.grad, p_sep.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL, msg=name)
+
+
+def test_qwen3_packed_veomni_sdpa_with_ulysses_matches_non_sp(monkeypatch):
+    """Packed Qwen3 forward with ``veomni_sdpa`` under Ulysses SP=2 (local 4 tokens, global 8x8 mask)
+    must match the non-SP packed forward without raising a mask/hidden_states length mismatch."""
+    import copy
+    from types import SimpleNamespace
+
+    from veomni.ops.kernels.attention import ulysses as ulysses_mod
+    from veomni.ops.kernels.attention.standard import sdpa as sdpa_mod
+
+    torch.manual_seed(321)
+    config = _tiny_config()
+    config._attn_implementation = "veomni_sdpa"
+    ops = eager_ops_config()
+    ops.attn_implementation = "veomni_sdpa"
+    ref_model = _build_qwen3(config, ops).eval()
+    sp_model = copy.deepcopy(ref_model).eval()
+
+    packed_input_ids = torch.tensor([[5, 6, 7, 8, 9, 10, 11, 12]])
+    full_position_ids = torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]])
+    full_attention_mask = torch.ones_like(packed_input_ids)
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+
+    ref_logits = ref_model(
+        input_ids=packed_input_ids,
+        attention_mask=full_attention_mask,
+        position_ids=full_position_ids,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+        use_cache=False,
+    ).logits
+
+    # Simulate rank 0 and rank 1 under Ulysses SP=2 by exchanging the two 4-token shards in prepare/restore.
+    full_qkv_by_layer: dict[tuple[int, str], list[torch.Tensor]] = {}
+    fake_ps = SimpleNamespace(ulysses_size=2, ulysses_group="fake_group")
+    monkeypatch.setattr(ulysses_mod, "get_parallel_state", lambda: fake_ps)
+    monkeypatch.setattr(sdpa_mod, "get_parallel_state", lambda: fake_ps)
+
+    current_rank = 0
+
+    def fake_prepare_ulysses_qkv(q, k, v, *, group, ulysses_size):
+        del group
+        assert q.shape[1] == 4 and ulysses_size == 2
+        q_full = full_qkv_by_layer["q"]
+        k_full = full_qkv_by_layer["k"]
+        v_full = full_qkv_by_layer["v"]
+        q_heads = q.shape[2]
+        kv_heads = k.shape[2]
+        local_q_heads = q_heads // ulysses_size
+        local_kv_heads = kv_heads // ulysses_size
+        q_slice = q_full[:, :, current_rank * local_q_heads : (current_rank + 1) * local_q_heads, :]
+        k_slice = k_full[:, :, current_rank * local_kv_heads : (current_rank + 1) * local_kv_heads, :]
+        v_slice = v_full[:, :, current_rank * local_kv_heads : (current_rank + 1) * local_kv_heads, :]
+        return q_slice, k_slice, v_slice, q_heads
+
+    monkeypatch.setattr(sdpa_mod, "prepare_ulysses_qkv", fake_prepare_ulysses_qkv)
+    monkeypatch.setattr(
+        sdpa_mod,
+        "_slice_ulysses_attention_mask",
+        lambda mask, **kw: mask,
+    )
+
+    # Verify a single layer's Qwen3Attention under Ulysses SP=2 with local 4-token hidden_states
+    # and global 8x8 mask + cu_seqlens=[0, 3, 8] matches the non-SP attention output on each shard.
+    layer = sp_model.model.layers[0]
+    with torch.no_grad():
+        full_hidden = sp_model.model.embed_tokens(packed_input_ids)
+        full_normed = layer.input_layernorm(full_hidden)
+        full_pos_emb = sp_model.model.rotary_emb(full_normed, full_position_ids)
+
+        # Build the full Q/K/V post-RoPE for the simulated Ulysses all-to-all
+        bsz, q_len = full_normed.shape[:2]
+        hidden_shape = (bsz, q_len, -1, layer.self_attn.head_dim)
+        q_all = layer.self_attn.q_norm(layer.self_attn.q_proj(full_normed).view(hidden_shape)).transpose(1, 2)
+        k_all = layer.self_attn.k_norm(layer.self_attn.k_proj(full_normed).view(hidden_shape)).transpose(1, 2)
+        v_all = layer.self_attn.v_proj(full_normed).view(hidden_shape).transpose(1, 2)
+        q_all, k_all = layer.self_attn.veomni_rope(q=q_all, k=k_all, cos=full_pos_emb[0], sin=full_pos_emb[1])
+        full_qkv_by_layer["q"] = q_all.transpose(1, 2)
+        full_qkv_by_layer["k"] = k_all.transpose(1, 2)
+        full_qkv_by_layer["v"] = v_all.transpose(1, 2)
+
+        from transformers.masking_utils import create_causal_mask
+
+        # Pre-built 4D mask from create_causal_mask with local inputs_embeds (4 tokens) and full 2D mask (8 tokens)
+        causal_4d = create_causal_mask(
+            config=sp_model.config,
+            inputs_embeds=full_normed[:, :4],
+            attention_mask=full_attention_mask,
+            past_key_values=None,
+            position_ids=full_position_ids[:, :4],
+            allow_is_causal_skip=False,
+        )
+        assert causal_4d.shape == (1, 1, 8, 8)
+
+        rank_outputs = {}
+
+        def fake_restore(output, *, group):
+            del group
+            rank_outputs[current_rank] = output
+            # Repeat local heads to full head count as a dummy return for o_proj;
+            # the real cross-rank head concat is checked below from rank_outputs.
+            return output[:, current_rank * 4 : (current_rank + 1) * 4, :, :].repeat(1, 1, 2, 1)
+
+        monkeypatch.setattr(sdpa_mod, "restore_ulysses_output", fake_restore)
+
+        for rank in (0, 1):
+            current_rank = rank
+            sl = slice(rank * 4, (rank + 1) * 4)
+            layer.self_attn(
+                hidden_states=full_normed[:, sl],
+                position_embeddings=(full_pos_emb[0][:, sl], full_pos_emb[1][:, sl]),
+                attention_mask=causal_4d,
+                cu_seq_lens_q=cu_seqlens,
+                cu_seq_lens_k=cu_seqlens,
+            )
+
+        # Combine the two head-sharded full-sequence outputs [1, 8, H_local, D] -> [1, 8, H, D]
+        combined_attn_out = torch.cat([rank_outputs[0], rank_outputs[1]], dim=2).reshape(1, 8, -1)
+        sp_attn_proj = layer.self_attn.o_proj(combined_attn_out)
+
+        # Compare against non-SP reference attention on the same layer
+        monkeypatch.setattr(ulysses_mod, "get_parallel_state", lambda: SimpleNamespace(ulysses_size=1))
+        ref_attn_proj, _ = ref_model.model.layers[0].self_attn(
+            hidden_states=full_normed,
+            position_embeddings=full_pos_emb,
+            attention_mask=torch.ones(1, 8, dtype=torch.bool),
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+        )
+        torch.testing.assert_close(sp_attn_proj, ref_attn_proj, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+        assert ref_logits.shape == (1, 8, config.vocab_size)
