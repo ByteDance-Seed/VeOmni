@@ -1,5 +1,4 @@
 import os
-import random
 import subprocess
 import sys
 
@@ -13,17 +12,30 @@ from veomni.utils.data_balance.data_balance import Qwen3VLEncoderDataBalance
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
-_CI_LAUNCH = LaunchSpec(nproc=8)
+_CI_LAUNCH = LaunchSpec(nproc=4)
+
+# Deterministic imbalanced per-rank image grids (t, h, w):
+# - Rank 0 & 2 hold many large/mixed images and scatter to multiple target ranks;
+# - Rank 1 & 3 hold fewer images than world_size (1 and 2 images), guaranteeing
+#   empty all-to-all send buckets alongside multi-source receives.
+_IMBALANCED_GRIDS_BY_RANK = (
+    ((1, 48, 44), (1, 42, 40), (1, 38, 36), (1, 34, 32), (1, 28, 24), (1, 20, 18)),
+    ((1, 10, 10),),
+    ((1, 46, 42), (1, 36, 30), (1, 24, 22), (1, 16, 14), (1, 12, 10)),
+    ((1, 30, 28), (1, 14, 12)),
+)
 
 
 def construct_data():
-    batch_size = random.randint(3, 15)
-    image_grid_thw = torch.ones((batch_size, 3), dtype=torch.long, device=get_device_type())
-    for i in range(batch_size):
-        image_grid_thw[i, 1] = random.randint(10, 50)
-        image_grid_thw[i, 2] = random.randint(10, 50)
+    rank = dist.get_rank()
+    device = get_device_type()
+    grids = _IMBALANCED_GRIDS_BY_RANK[rank % len(_IMBALANCED_GRIDS_BY_RANK)]
+    image_grid_thw = torch.tensor(grids, dtype=torch.long, device=device)
     pixel_lengths = torch.prod(image_grid_thw, dim=1)
-    pixel_values = torch.cat([torch.randn((pl, 1152), device=get_device_type()) for pl in pixel_lengths])
+    generator = torch.Generator(device="cpu").manual_seed(1000 + rank)
+    pixel_values = torch.cat(
+        [torch.randn((int(pl.item()), 1152), generator=generator).to(device) for pl in pixel_lengths]
+    )
 
     return pixel_values, image_grid_thw
 
@@ -36,6 +48,14 @@ def check_recover_precision(pixel_values, image_grid_thw):
     databalance = Qwen3VLEncoderDataBalance(spatial_merge_unit=1)
     # balance
     balanced_pixel_values, balanced_image_grid_thw = databalance.balance_data(pixel_values, image_grid_thw)
+    # Imbalanced inputs must redistribute across ranks (including empty send buckets on sparse ranks)
+    assert not (
+        balanced_image_grid_thw.shape == image_grid_thw.shape and balanced_image_grid_thw.equal(image_grid_thw)
+    ), f"rank {dist.get_rank()}: expected cross-rank redistribution for imbalanced inputs"
+    if image_grid_thw.shape[0] < dist.get_world_size():
+        assert any(length == 0 for (length,) in databalance.state_buffer["image"]["pixel_values_origin"]), (
+            f"rank {dist.get_rank()}: expected at least one empty send bucket when image count < world_size"
+        )
     # recover
     re_pixel_values, re_deepstack_feat_list = databalance.data_bridge(
         hidden_state=balanced_pixel_values, deepstack_feature_lists=[balanced_pixel_values, balanced_pixel_values]

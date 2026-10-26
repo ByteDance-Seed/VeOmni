@@ -11,8 +11,24 @@ import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+import torch
+import torch.distributed as dist
+
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.utils.device import get_device_type
+
+
+def dp_mean(value: float, trainer) -> float:
+    """Average a logged scalar over the trainer model's data-parallel group."""
+    if not (dist.is_available() and dist.is_initialized()):
+        return float(value)
+    ps = trainer.model.parallel_state
+    dp_group = ps.dp_group
+    if dp_group is None or ps.dp_size <= 1:
+        return float(value)
+    tensor = torch.tensor([float(value)], dtype=torch.float32, device=trainer.device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=dp_group)
+    return float(tensor.item() / dist.get_world_size(dp_group))
 
 
 # NPU ops_implementation overrides per model. Every per-op field is pinned so

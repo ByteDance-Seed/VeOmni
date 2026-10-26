@@ -86,6 +86,103 @@ def test_launch_plan_parameters_use_owned_capacity(monkeypatch, tmp_path):
     assert from_parameter("cp_size")(context).nproc == 4
 
 
+@pytest.mark.parametrize("backend", ["cuda", "npu"])
+def test_e2e_alignment_preserves_fused_moe_training_paths(backend):
+    from scripts.ci.accelerator.launch_plan import RunnerCapabilities
+    from tests.e2e.utils import alignment_plan, prepare_exec_cmd
+
+    caps = RunnerCapabilities(backend, tuple("01234567"))
+    for model_name in ("gpt_oss", "qwen3_moe"):
+        options = dict(is_moe=True, model_name=model_name, min_sp_size=2 if model_name == "gpt_oss" else None)
+        commands = prepare_exec_cmd(
+            ["train_text_test"],
+            config_path="config",
+            model_path="weights",
+            train_path="data",
+            output_dir="outputs",
+            **options,
+        )
+        modes = {(cmd["parallel_config"].sp_size, cmd["parallel_config"].ep_size): cmd["nproc"] for _, cmd in commands}
+        assert modes[(2, 1)] == modes[(2, 2)] == (4 if model_name == "gpt_oss" else 8)
+        if model_name == "qwen3_moe":
+            assert modes[(1, 1)] == modes[(1, 2)] == 4
+        plan = alignment_plan(caps, **options)
+        assert plan.cards(caps) == max(modes.values())
+        assert all(len(group) == 1 for group in plan.groups)
+
+
+def test_wan_dit_uses_bfloat16_and_flash_attention():
+    from tests.e2e.utils import prepare_exec_cmd
+    from tests.tools.training_utils import build_torchrun_cmd
+
+    command_list = prepare_exec_cmd(
+        ["train_dit_test"],
+        "wan_t2v",
+        "./tests/toy_config/wan_t2v_toy",
+        model_path="./wan_t2v",
+        train_path="./dummy_wan_t2v",
+        output_dir="./wan_t2v",
+        is_moe=False,
+        max_sp_size=1,
+    )
+
+    assert command_list
+    for _, cmd_kwargs in command_list:
+        cmd = build_torchrun_cmd(**cmd_kwargs)
+        assert cmd_kwargs["extra_args"] == [
+            "--model.accelerator.fsdp_config.mixed_precision.enable=True",
+            "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+            "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+        ]
+        assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
+
+
+def test_deepseek_v4_e2e_casts_fused_triton_moe_to_bfloat16():
+    from tests.e2e.utils import prepare_exec_cmd
+
+    command_list = prepare_exec_cmd(
+        ["train_text_test"],
+        "deepseek_v4",
+        "./tests/toy_config/deepseek_v4_toy",
+        model_path="./deepseek_v4",
+        train_path="./dummy_text",
+        output_dir="./deepseek_v4",
+        is_moe=True,
+        max_ep_size=1,
+    )
+
+    assert command_list
+    for _, cmd_kwargs in command_list:
+        assert cmd_kwargs["extra_args"] == [
+            "--model.accelerator.fsdp_config.mixed_precision.enable=True",
+            "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+            "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+        ]
+
+
+def test_gpt_oss_parallel_uses_fa4_and_quack():
+    from tests.e2e.utils import prepare_exec_cmd
+    from tests.tools.training_utils import build_torchrun_cmd
+
+    command_list = prepare_exec_cmd(
+        ["train_text_test"],
+        "gpt_oss",
+        "./tests/toy_config/gpt_oss_toy",
+        model_path="./gpt_oss",
+        train_path="./dummy_text",
+        output_dir="./gpt_oss",
+        is_moe=True,
+    )
+
+    assert command_list
+    assert {cmd_kwargs["parallel_config"].ep_size for _, cmd_kwargs in command_list} == {1, 2}
+    assert {cmd_kwargs["parallel_config"].sp_size for _, cmd_kwargs in command_list} == {1, 2}
+    for _, cmd_kwargs in command_list:
+        cmd = build_torchrun_cmd(**cmd_kwargs)
+        assert "--model.ops_implementation.attn_implementation=flash_attention_4" in cmd
+        assert "--model.ops_implementation.moe_implementation=fused_quack" in cmd
+
+
 def test_npu_adapter_preserves_owned_host_slice_and_resets_ranks():
     import threading
 
@@ -320,6 +417,224 @@ def test_cpu_optimizer_does_not_query_hidden_accelerator(monkeypatch, cpu, forea
     finally:
         protocol.close()
     assert optimizer_module._get_foreach_kernels_supported_devices is vendor_device_query
+
+
+@pytest.mark.parametrize("cpu", [False, True])
+@pytest.mark.parametrize("fail_body", [False, True])
+def test_cpu_dataloader_avoids_vendor_device_queries_and_restores_patch(monkeypatch, cpu, fail_body):
+    import sys
+    from types import SimpleNamespace
+
+    from torch.utils.data import DataLoader, dataloader
+
+    from scripts.ci.accelerator import pytest_plugin
+
+    original_init = dataloader._MultiProcessingDataLoaderIter.__init__
+    device_queries = []
+
+    def vendor_init(self, *args, **kwargs):
+        # torch_npu 2.10 queries NPU affinity even for an all-CPU DataLoader.
+        device_queries.append("npu_affinity")
+        original_init(self, *args, **kwargs)
+
+    vendor = SimpleNamespace(_mpdl_iter_init=vendor_init, origin_mpdl_iter_init=original_init)
+    monkeypatch.setitem(sys.modules, "torch_npu.utils._module", vendor)
+    monkeypatch.setattr(dataloader._MultiProcessingDataLoaderIter, "__init__", vendor_init)
+    monkeypatch.delenv("CI_CASE_PROGRESS", raising=False)
+    plan = CasePlan.sequential(LaunchSpec(device="cpu" if cpu else "accelerator"))
+    item = SimpleNamespace(
+        nodeid="sample", config=SimpleNamespace(_ci_batch_cases={"sample": {"plan": plan.to_dict()}}, _ci_results={})
+    )
+    protocol = pytest_plugin.pytest_runtest_protocol(item, None)
+    next(protocol)
+    try:
+        assert list(DataLoader(list(range(8)), batch_size=None, num_workers=2)) == list(range(8))
+        assert device_queries == ([] if cpu else ["npu_affinity"])
+    finally:
+        if fail_body:
+            with pytest.raises(RuntimeError, match="test body failed"):
+                protocol.throw(RuntimeError("test body failed"))
+        else:
+            protocol.close()
+        assert dataloader._MultiProcessingDataLoaderIter.__init__ is vendor_init
+
+
+@pytest.mark.parametrize("cpu", [False, True])
+@pytest.mark.parametrize("previously_disabled", [False, True])
+@pytest.mark.parametrize("fail_body", [False, True])
+def test_cpu_inductor_avoids_npu_registration_and_restores_policy(monkeypatch, cpu, previously_disabled, fail_body):
+    import sys
+    from types import SimpleNamespace
+
+    import torch
+    from torch._dynamo.exc import BackendCompilerFailed
+    from torch._dynamo.utils import counters
+
+    from scripts.ci.accelerator import pytest_plugin
+
+    class VendorRegistry:
+        _disabled_register = previously_disabled
+
+        @classmethod
+        def disable_register(cls):
+            cls._disabled_register = True
+
+        @classmethod
+        def register_inductor_npu(cls):
+            if not cls._disabled_register:
+                raise RuntimeError("Inductor queried hidden NPU")
+
+    original_call = torch._TorchCompileInductorWrapper.__call__
+
+    def vendor_call(self, model, inputs):
+        VendorRegistry.register_inductor_npu()
+        return original_call(self, model, inputs)
+
+    monkeypatch.setitem(sys.modules, "torch_npu.utils._dynamo", SimpleNamespace(_InductorNpuRegistry=VendorRegistry))
+    monkeypatch.setattr(torch._TorchCompileInductorWrapper, "__call__", vendor_call)
+    monkeypatch.delenv("CI_CASE_PROGRESS", raising=False)
+    plan = CasePlan.sequential(LaunchSpec(device="cpu" if cpu else "accelerator"))
+    item = SimpleNamespace(
+        nodeid="sample", config=SimpleNamespace(_ci_batch_cases={"sample": {"plan": plan.to_dict()}}, _ci_results={})
+    )
+    torch.compiler.reset()
+    protocol = pytest_plugin.pytest_runtest_protocol(item, None)
+    next(protocol)
+    try:
+        value = torch.arange(8, dtype=torch.float32, requires_grad=True)
+        compiled = torch.compile(lambda x: x.square() + 1, fullgraph=True)
+        if cpu or previously_disabled:
+            graphs = counters["stats"]["unique_graphs"]
+            torch.testing.assert_close(compiled(value), value.square() + 1)
+            compiled(value).sum().backward()
+            torch.testing.assert_close(value.grad, 2 * value.detach())
+            assert counters["stats"]["unique_graphs"] > graphs
+        else:
+            with pytest.raises(BackendCompilerFailed, match="Inductor queried hidden NPU"):
+                compiled(value)
+    finally:
+        try:
+            if fail_body:
+                with pytest.raises(RuntimeError, match="test body failed"):
+                    protocol.throw(RuntimeError("test body failed"))
+            else:
+                protocol.close()
+            assert VendorRegistry._disabled_register is previously_disabled
+        finally:
+            torch.compiler.reset()
+
+
+@pytest.mark.parametrize("cpu", [False, True])
+@pytest.mark.parametrize("existing_cpu", [False, True])
+def test_cpu_inductor_preserves_vendor_and_existing_cpu_overrides(monkeypatch, cpu, existing_cpu):
+    from types import SimpleNamespace
+
+    import torch
+    from torch._inductor.codegen import common
+    from torch._inductor.codegen.cpu_device_op_overrides import CpuDeviceOpOverrides
+
+    from scripts.ci.accelerator import pytest_plugin
+
+    npu_override = object()
+    cpu_override = CpuDeviceOpOverrides()
+    overrides = {"npu": npu_override}
+    if existing_cpu:
+        overrides["cpu"] = cpu_override
+    # torch_npu populates this registry at import. Torch 2.10 only imports its
+    # CPU entry when the whole registry is empty; Torch 2.11 repairs missing keys.
+    monkeypatch.setattr(common, "device_op_overrides_dict", overrides)
+    monkeypatch.delenv("CI_CASE_PROGRESS", raising=False)
+    plan = CasePlan.sequential(LaunchSpec(device="cpu" if cpu else "accelerator"))
+    item = SimpleNamespace(
+        nodeid="sample", config=SimpleNamespace(_ci_batch_cases={"sample": {"plan": plan.to_dict()}}, _ci_results={})
+    )
+    protocol = pytest_plugin.pytest_runtest_protocol(item, None)
+    next(protocol)
+    try:
+        assert overrides["npu"] is npu_override
+        if existing_cpu:
+            assert overrides["cpu"] is cpu_override
+        elif cpu:
+            assert isinstance(overrides.get("cpu"), CpuDeviceOpOverrides)
+        else:
+            assert "cpu" not in overrides
+        if cpu:
+            torch.compiler.reset()
+            value = torch.arange(8, dtype=torch.float32)
+            torch.testing.assert_close(torch.compile(lambda x: x + 1, fullgraph=True)(value), value + 1)
+    finally:
+        protocol.close()
+        torch.compiler.reset()
+    assert overrides["npu"] is npu_override
+
+
+@pytest.mark.parametrize(
+    "failure", ["foreach_lookup", "cpu_codegen", "dataloader_original", "registry_policy", "registry_disable"]
+)
+def test_cpu_isolation_restores_state_when_setup_fails(monkeypatch, failure):
+    import sys
+    from types import SimpleNamespace
+
+    import torch.optim.optimizer as optimizer_module
+    from torch._inductor.codegen import common
+    from torch.utils.checkpoint import DefaultDeviceType
+    from torch.utils.data import dataloader
+
+    from scripts.ci.accelerator import pytest_plugin
+
+    original_device = DefaultDeviceType.get_device_type()
+    original_foreach = optimizer_module._get_foreach_kernels_supported_devices
+    original_init = dataloader._MultiProcessingDataLoaderIter.__init__
+
+    def vendor_init(*args, **kwargs):
+        raise AssertionError("hidden accelerator queried")
+
+    class VendorRegistry:
+        _disabled_register = False
+
+        @classmethod
+        def disable_register(cls):
+            cls._disabled_register = True
+            if failure == "registry_disable":
+                raise RuntimeError("vendor setup failed")
+
+    vendor = SimpleNamespace(_mpdl_iter_init=vendor_init, origin_mpdl_iter_init=original_init)
+    monkeypatch.setitem(sys.modules, "torch_npu.utils._module", vendor)
+    monkeypatch.setitem(sys.modules, "torch_npu.utils._dynamo", SimpleNamespace(_InductorNpuRegistry=VendorRegistry))
+    monkeypatch.setattr(dataloader._MultiProcessingDataLoaderIter, "__init__", vendor_init)
+    monkeypatch.delenv("CI_CASE_PROGRESS", raising=False)
+    if failure == "foreach_lookup":
+        monkeypatch.delattr(optimizer_module, "_get_foreach_kernels_supported_devices")
+    elif failure == "cpu_codegen":
+        monkeypatch.setattr(common, "device_op_overrides_dict", {})
+
+        def fail_codegen(*args):
+            raise RuntimeError("CPU codegen setup failed")
+
+        monkeypatch.setattr(common, "register_device_op_overrides", fail_codegen)
+    elif failure == "dataloader_original":
+        del vendor.origin_mpdl_iter_init
+    elif failure == "registry_policy":
+        del VendorRegistry._disabled_register
+
+    plan = CasePlan.sequential(LaunchSpec(device="cpu"))
+    item = SimpleNamespace(
+        nodeid="sample", config=SimpleNamespace(_ci_batch_cases={"sample": {"plan": plan.to_dict()}}, _ci_results={})
+    )
+    protocol = pytest_plugin.pytest_runtest_protocol(item, None)
+    expected_error = AttributeError if failure == "foreach_lookup" else RuntimeError
+    with pytest.raises(expected_error):
+        next(protocol)
+    assert DefaultDeviceType.get_device_type() == original_device
+    if failure == "foreach_lookup":
+        assert not hasattr(optimizer_module, "_get_foreach_kernels_supported_devices")
+    else:
+        assert optimizer_module._get_foreach_kernels_supported_devices is original_foreach
+    assert dataloader._MultiProcessingDataLoaderIter.__init__ is vendor_init
+    if failure == "registry_policy":
+        assert not hasattr(VendorRegistry, "_disabled_register")
+    else:
+        assert VendorRegistry._disabled_register is False
 
 
 def test_case_workspaces_isolate_relative_checkpoints_and_caches(tmp_path):
@@ -794,8 +1109,12 @@ def test_runner_failure_artifacts_match_execution(monkeypatch, tmp_path, capsys,
     monkeypatch.setattr(runner, "run_process", run_process)
     if failure == "child_failure":
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    manifest = json.loads((Path(runner.__file__).parent / "suites/gpu.json").read_text())
+    ci_selection = next(row["name"] for row in manifest if any(arg.rstrip("/") == "tests/ci" for arg in row["args"]))
     monkeypatch.setattr(
-        sys, "argv", ["ci", "--suite", "unit", "--backend", "cpu", "--only", "ci-unit", "--output-dir", str(output)]
+        sys,
+        "argv",
+        ["ci", "--suite", "unit", "--backend", "cpu", "--only", ci_selection, "--output-dir", str(output)],
     )
     if failure in ("keep_going_failure", "cleanup_failure"):
         sys.argv.append("--keep-going")
