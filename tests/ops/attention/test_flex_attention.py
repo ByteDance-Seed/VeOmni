@@ -28,6 +28,7 @@ import torch
 from torch import nn
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, create_mask
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.attention.attention_cases import clone_qkv, dense_mask, flex_mask, math_sdpa_reference
 from tests.ops.attention.utils import UlyssesHelperRecorder
 from tests.ops.tol import (
@@ -966,6 +967,7 @@ def test_flex_rejects_invalid_qkv_before_exchange(monkeypatch, query_shape, key_
 
 
 @pytest.mark.parametrize("cross_attention", [False, True])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_flex_thd_matches_bhsd_outputs_lse_and_gradients_on_cpu(monkeypatch, cross_attention):
     """Use MATH as the kernel to isolate layout, packing, and autograd behavior."""
     if cross_attention:
