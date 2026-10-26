@@ -57,6 +57,13 @@ class OmniModuleRuntimeArguments(ModelArguments):
     is the projection onto an HF module descriptor.
     """
 
+    def __post_init__(self):
+        super().__post_init__()
+        if self.accelerator.fsdp_config.fsdp_mode == "eager" and self.needs_distributed_build:
+            self.accelerator.fsdp_config.fsdp_mode = "fsdp2"
+            self.accelerator.fsdp_config.extra_parallel_only = True
+            self.accelerator._validate_init_device()
+
     @property
     def needs_distributed_build(self) -> bool:
         """True when this module must be built under a process group, not loaded whole.

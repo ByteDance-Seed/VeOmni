@@ -144,19 +144,23 @@ class DeepseekV41AttentionCache:
         if self.window.shape[1] > self.sliding_window:
             self.window = self.window[:, -self.sliding_window :]
 
-    def snapshot(self) -> dict[str, torch.Tensor | None]:
-        """Clone every carried tensor so a rejected draft can roll this layer back."""
+    def snapshot(self) -> dict[str, torch.Tensor | int | None]:
+        """Snapshot carried state so a rejected draft can roll this layer back."""
         return {
             "window": None if self.window is None else self.window.clone(),
-            "compress_kv": None if self.compress_kv is None else self.compress_kv.clone(),
-            "index_k": None if self.index_k is None else self.index_k.clone(),
+            "compress_len": None if self.compress_kv is None else int(self.compress_kv.shape[1]),
+            "index_len": None if self.index_k is None else int(self.index_k.shape[1]),
             "pending": None if self.pending is None else self.pending.clone(),
         }
 
-    def restore(self, snap: dict[str, torch.Tensor | None]) -> None:
+    def restore(self, snap: dict[str, torch.Tensor | int | None]) -> None:
         self.window = snap["window"]
-        self.compress_kv = snap["compress_kv"]
-        self.index_k = snap["index_k"]
+        compress_len = snap["compress_len"]
+        self.compress_kv = (
+            None if compress_len is None or self.compress_kv is None else self.compress_kv[:, :compress_len]
+        )
+        index_len = snap["index_len"]
+        self.index_k = None if index_len is None or self.index_k is None else self.index_k[:, :index_len]
         self.pending = snap["pending"]
 
 

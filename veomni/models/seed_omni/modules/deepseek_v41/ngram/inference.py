@@ -65,7 +65,7 @@ class DeepseekV41NgramInferenceMixin:
         del kwargs
         if getattr(self, "_ngram_cache", None) is None:
             self._ngram_cache = DeepseekV41NgramCache.from_config(self.config)
-            input_ids, token_mask = pack_ngram_inputs([conversation_list], self.device, self.config.pad_token_id)
+            input_ids, token_mask, _ = pack_ngram_inputs([conversation_list], self.device, self.config.pad_token_id)
         else:
             input_ids, token_mask = self._sampled_token(conversation_list)
 

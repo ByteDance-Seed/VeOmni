@@ -82,7 +82,11 @@ class DeepseekV41TextEncoder(TextEncoder):
         if hidden_states.dim() == 2:
             hidden_states = hidden_states.unsqueeze(0)
         sampling = self._extract_sampling_kwargs(generation_kwargs, 1.0, 1.0, {})
-        output_token_id = self._sample_token(hidden_states, **sampling)
+        sampled_id = tail.meta.pop("dspark_sampled_id", None)
+        if sampled_id is not None:
+            output_token_id = int(sampled_id)
+        else:
+            output_token_id = self._sample_token(hidden_states, **sampling)
         spec_rest: List[int] = []
         if self._dspark_queue:
             proposed = self._dspark_queue.pop(0)

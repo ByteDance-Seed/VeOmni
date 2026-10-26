@@ -371,6 +371,8 @@ class InferenceMixin:
             return {"conversation_list": conversation_list}
         patches, grids, token_types, slots = build_deepseek_v41_vit_batch(items, device=self.device, dtype=self.dtype)
         metadata = build_deepseek_v41_vit_metadata(grids, self.config.rope_dim, self.config.rope_theta, self.device)
+        if get_parallel_state().sp_enabled:
+            patches = sp_pad_and_slice(patches, dim=0, pad_value=0)
         spans = self._encode(patches, grids, token_types, metadata)
         scatter_deepseek_v41_visual_embeds(slots, spans)
         return {"conversation_list": conversation_list}

@@ -67,7 +67,7 @@ class DeepseekV41Ngram(DeepseekV41NgramInferenceMixin, PretrainedOmniModule):
     config_class = DeepseekV41NgramConfig
     base_model_prefix = "deepseek_v41_ngram"
     main_input_name = "input_ids"
-    _no_split_modules = ["Embedding"]
+    _no_split_modules = ["DeepseekV41NgramTable"]
     supports_gradient_checkpointing = False
 
     @staticmethod
@@ -141,16 +141,20 @@ class DeepseekV41Ngram(DeepseekV41NgramInferenceMixin, PretrainedOmniModule):
         token_mask: Optional[torch.Tensor] = None,
         history: Optional[torch.Tensor] = None,
         start_pos: int = 0,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Hash ids of the n-grams ending at each position: ``[B, L, n_layers, n_hash_cols]``.
 
         ``token_mask`` is ``False`` for positions that take no part in an n-gram
         (image spans); those become :data:`DEAD` so the lookback stops there.
         ``history`` / ``start_pos`` are the decode path -- see
-        :meth:`compress` for what a caller carries across steps.
+        :meth:`compress` for what a caller carries across steps. ``position_ids``
+        restarts at zero per sample in a packed micro-batch.
         """
         compressed = self.compress(input_ids, token_mask)
-        tokens, blocked = gather_lookback(compressed, self.config.max_ngram_size, history, start_pos)
+        tokens, blocked = gather_lookback(
+            compressed, self.config.max_ngram_size, history, start_pos, position_ids=position_ids
+        )
         tokens = torch.where(blocked, self.compressed_pad_id, tokens)
         return rolling_hash(tokens, self.multipliers, self.primes, self.offsets)
 
@@ -182,10 +186,11 @@ class DeepseekV41Ngram(DeepseekV41NgramInferenceMixin, PretrainedOmniModule):
         token_mask: Optional[torch.Tensor] = None,
         history: Optional[torch.Tensor] = None,
         start_pos: int = 0,
+        position_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         del kwargs
-        hash_ids = self.hash_ids(input_ids, token_mask, history, start_pos)
+        hash_ids = self.hash_ids(input_ids, token_mask, history, start_pos, position_ids=position_ids)
         return {
             "ngram_embeds": self.lookup(hash_ids),
             "ngram_compressed": self.compress(input_ids, token_mask),

@@ -356,3 +356,57 @@ def test_build_omni_model_runtime_args_rejects_top_level_dp_size_mismatch(monkey
     )
     with pytest.raises(ValueError, match="Top-level `model.accelerator` resolved to dp_size=4"):
         build_omni_model_runtime_args(args_sp2)
+
+
+def test_module_override_can_change_or_disable_inherited_ep_size(monkeypatch):
+    """Stripping the inherited folded ``ep`` entry in ``_module_base`` lets a module
+    override ``ep_size`` from 8 to 4 or disable it with ``ep_size=1``."""
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    global_args = OmniModuleRuntimeArguments(
+        model_path="/tmp/model",
+        accelerator=AcceleratorConfig(ep_size=8),
+    )
+    modules = build_omni_module_runtime_args(
+        global_args,
+        "/tmp/model",
+        {
+            "keep_ep8": {"model_path": "keep_ep8"},
+            "shrink_ep4": {"accelerator": {"ep_size": 4}},
+            "disable_ep": {"accelerator": {"ep_size": 1}},
+        },
+    )
+    assert modules["keep_ep8"].accelerator.ep_size == 8
+    assert modules["keep_ep8"].accelerator.extra_parallel_sizes == [8]
+    assert modules["shrink_ep4"].accelerator.ep_size == 4
+    assert modules["shrink_ep4"].accelerator.extra_parallel_sizes == [4]
+    assert modules["disable_ep"].accelerator.ep_size == 1
+    assert modules["disable_ep"].accelerator.extra_parallel_sizes == [1]
+
+
+def test_inference_ep_or_emb_with_default_eager_normalizes_to_extra_parallel_only(monkeypatch):
+    """An inference module that sets ``ep_size`` or ``emb`` without overriding
+    ``fsdp_mode='eager'`` is normalized to ``fsdp_mode='fsdp2', extra_parallel_only=True``."""
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    global_args = OmniModuleRuntimeArguments(model_path="/tmp/model")
+    modules = build_omni_module_runtime_args(
+        global_args,
+        "/tmp/model",
+        {
+            "ep_mod": {"accelerator": {"ep_size": 4}},
+            "emb_mod": {
+                "accelerator": {
+                    "extra_parallel_names": ["emb"],
+                    "extra_parallel_sizes": [8],
+                    "extra_parallel_placement_innermost": [False],
+                }
+            },
+            "eager_mod": {"model_path": "eager_mod"},
+        },
+        for_inference=True,
+    )
+    for name in ("ep_mod", "emb_mod"):
+        assert modules[name].needs_distributed_build is True
+        assert modules[name].accelerator.fsdp_config.fsdp_mode == "fsdp2"
+        assert modules[name].accelerator.fsdp_config.extra_parallel_only is True
+    assert modules["eager_mod"].needs_distributed_build is False
+    assert modules["eager_mod"].accelerator.fsdp_config.fsdp_mode == "eager"

@@ -221,10 +221,11 @@ class DeepseekV41LlmInferenceMixin:
                 image_mask=None,
             )
             accepted = 1
+            rejected_sample = None
             self._next_position += 1
         else:
             spec_hiddens = None
-            accepted, hidden_states = self._verify_block(
+            accepted, hidden_states, rejected_sample = self._verify_block(
                 inputs_embeds,
                 ngram_embeds,
                 spec_ids,
@@ -240,6 +241,10 @@ class DeepseekV41LlmInferenceMixin:
             ngram_commit(accepted)
 
         outputs = self._emit(conversation_list, hidden_states)
+        if rejected_sample is not None:
+            conversation_list[-1].meta["dspark_sampled_id"] = rejected_sample
+        else:
+            conversation_list[-1].meta.pop("dspark_sampled_id", None)
         markov = None if spec_hiddens is None else self.model.mtp[-1].markov_head
         last_id = tail.meta.get("input_ids")
         if last_id is not None:
@@ -273,6 +278,7 @@ class DeepseekV41LlmInferenceMixin:
         spec = [] if spec_ids is None else [int(token) for token in spec_ids.reshape(-1).tolist()]
         hiddens = []
         accepted = 1
+        rejected_sample: int | None = None
         for index in range(n_tokens):
             snap = self._decode_cache.snapshot()
             hidden = decode_backbone_step(
@@ -290,12 +296,13 @@ class DeepseekV41LlmInferenceMixin:
                 sampled = self._sample_hidden(hiddens[-1], lm_head_weight, sampling)
                 if sampled != spec[index - 1]:
                     self._decode_cache.restore(snap)
+                    rejected_sample = sampled
                     break
                 accepted = index + 1
             hiddens.append(hidden)
 
         self._next_position = position + accepted
-        return accepted, hiddens[accepted - 1]
+        return accepted, hiddens[accepted - 1], rejected_sample
 
     def _fill_spec_embeds(self, tail: ConversationItem, inputs_embeds: torch.Tensor, accepted: int) -> None:
         """Point DSpark's next draft at the last verified token, not the first of the block."""

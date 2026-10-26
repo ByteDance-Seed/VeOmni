@@ -194,7 +194,7 @@ class TrainingMixin(TrainingModuleMixin):
         ngram_embeds = self._align_ngram_embeds(ngram_embeds, inputs_embeds.shape[1])
         if self.dspark_trains:
             # Image rows never carry a DSpark label, so the id they pack to is arbitrary.
-            kwargs["dspark_input_ids"], _ = pack_ngram_inputs(conversation_list, self.device, pad_token_id=0)
+            kwargs["dspark_input_ids"], _, _ = pack_ngram_inputs(conversation_list, self.device, pad_token_id=0)
 
         # This rank's own per-sample lengths, read off the packed position ids --
         # the same tensor the backbone derives its sample boundaries from, so the

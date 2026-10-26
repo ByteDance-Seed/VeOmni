@@ -1,30 +1,30 @@
-# DeepSeek-V4.1-Flash (`deepseek_v41`) End-to-End Verification Report (8-GPU & 128-GPU in Group 356)
+# DeepSeek-V4.1-Flash (`deepseek_v41`) End-to-End Verification Report (8-GPU & 128-GPU H100)
 
 ## 1. Overview & Experiment Summary
 
-All experiments were executed in **Group 356 (`Zhi-wh-h100`, `cluster_id: 8`, `cluster_name: "kiwi-be2a"`, `queue_name: "h100-sxm-80gb.wh.ai"`)** on control plane `i18n-bd-seed` with **WandB tracking enabled (`--train.wandb.enable true`, project `VeOmni_omni`)**.
+All experiments were executed on **8×H100-SXM-80GB and 128×H100-SXM-80GB (`16 × 8`) nodes** with **WandB tracking enabled (`--train.wandb.enable true`, project `VeOmni_omni`)**.
 
 ### Summary of All Trials & Links
 
-| Phase | Experiment | GPUs | Configuration Highlights | Status | Merlin Trial Link | WandB Run Link |
+| Phase | Experiment | GPUs | Configuration Highlights | Status | Job ID | WandB Run Link |
 | :--- | :--- | :---: | :--- | :---: | :--- | :--- |
-| **8-GPU Basic** | **Task 1a (Direct HF Load, 20 steps)** | 8 | `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash`, `ep_sharded_stream_load: true`, 2 LLM layers, freeze `vision` & `ngram`, no MTP | Pass (`rc=0`) | `8740749312e87373 (trial 304253057)` | `run_20261016_74cfac94` |
-| **8-GPU Basic** | **Task 1a (Offline Split Baseline, 20 steps)** | 8 | `/mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash`, `ep_sharded_stream_load: false`, 2 LLM layers | Pass (`rc=0`) | `ed32d00c417d8747 (trial 304237079)` | N/A (Pre-WandB baseline) |
-| **8-GPU Basic** | **Task 1b (5-Step Training + `save_hf_weights: true`)** | 8 | Single-root FP8/FP4 release export to `hf_ckpt/` | Pass (`rc=0`) | `32ff41805ba0d454 (trial 304253096)` | `run_20261016_98787067` |
-| **8-GPU Basic** | **Task 1b (Layout Unit Tests + 8-GPU 40L FP8/FP4 Inference)** | 8 | `pytest test_deepseek_v41_hf_layout.py` (25/25 passed) + `infer_omni.py` full 40-layer multimodal inference | Pass (`rc=0`) | `4c51cfcbb96ee6f7 (trial 304265455)` | N/A (Inference / Pytest) |
-| **8-GPU Basic** | **Task 2 (100-Step Loss Curve)** | 8 | 100 steps, separated `total_loss` / `ce_loss` / `indexer_kl_loss` | Pass (`rc=0`) | `45832427c488a318 (trial 304253122)` | `run_20261016_4de69078` |
-| **8-GPU Basic** | **Task 3 (SP8 `cp_size=8` Long-Context `4k–32k`, 10 steps)** | 8 | `cp_size: 8`, `max_seq_len: 32768`, `data_long_4k32k.yaml` | Pass (`rc=0`, 10/10) | `a35f84f30068e649 (trial 304265481)` | `run_20261017_758f28fe` |
-| **8-GPU Basic** | **Task 3 (SP4 `cp_size=4` Long-Context `4k–32k` Comparison)** | 8 | `cp_size: 4`, `NCCL_MAX_NCHANNELS=16`, `max_seq_len: 32768` | 7/10 steps (OOM @ `19.6k` seq) | `f87938816d18dad5 (trial 304267070)` | `run_20261017_6511b9c0` |
-| **128-GPU Full** | **BSZ Probe (`mbs=2, gbs=256`, 40 LLM layers, `ep=64`)** | 128 | All 40 LLM layers, freeze `vision` & `ngram`, no MTP, Muon optimizer | OOM @ Step 2 (`73.60 GiB` alloc) | `45cf7268b49e64a2 (trial 304281947)` | `run_20261017_6db78f14` |
-| **128-GPU Full** | **100-Step Main Run (`mbs=1, gbs=128`, 40 LLM layers, `ep=128`, Muon `lr=5e-4`) + Single-Root FP8/FP4 Export** | 128 | All 40 LLM layers (`550.56B`), freeze `vision` & `ngram`, no MTP, `ep_size=128`, `save_hf_weights: true` | **Pass (`rc=0`, 100/100 steps + 48-shard export)** | `0abc0b09f0eeb205 (trial 304282868)` | `run_20261017_e040c085` |
-| **128-GPU Full** | **128-GPU Long-Context SP8 (`cp_size=8`, `4k–32k` seq_len, 10 steps)** | 128 | All 40 LLM layers, `cp_size: 8`, `ep_size: 128`, `max_seq_len: 32768`, `gbs=16, mbs=1` | **Pass (`rc=0`, 10/10 steps)** | `0abc0b09f0eeb205 (trial 304282868)` | `run_20261017_5f3d8e3d` |
-| **128-GPU Full** | **8-GPU Multimodal Inference Round-Trip on 128-GPU Exported Checkpoint** | 8 (Node 0) | `tasks/omni/infer_omni.py` loading `/mnt/hdfs/.../global_step_100/hf_ckpt` with `modules_infer_fsdp.yaml` | **Pass (`rc=0`, 40-layer FP8/FP4 generation)** | `0abc0b09f0eeb205 (trial 304282868)` | N/A (Inference stage in `304282868`) |
+| **8-GPU Basic** | **Task 1a (Direct HF Load, 20 steps)** | 8 | `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash`, `ep_sharded_stream_load: true`, 2 LLM layers, freeze `vision` & `ngram`, no MTP | Pass (`rc=0`) | `8740749312e87373` | `run_20261016_74cfac94` |
+| **8-GPU Basic** | **Task 1a (Offline Split Baseline, 20 steps)** | 8 | `/mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash`, `ep_sharded_stream_load: false`, 2 LLM layers | Pass (`rc=0`) | `ed32d00c417d8747` | N/A (Pre-WandB baseline) |
+| **8-GPU Basic** | **Task 1b (5-Step Training + `save_hf_weights: true`)** | 8 | Single-root FP8/FP4 release export to `hf_ckpt/` | Pass (`rc=0`) | `32ff41805ba0d454` | `run_20261016_98787067` |
+| **8-GPU Basic** | **Task 1b (Layout Unit Tests + 8-GPU 40L FP8/FP4 Inference)** | 8 | `pytest test_deepseek_v41_hf_layout.py` (25/25 passed) + `infer_omni.py` full 40-layer multimodal inference | Pass (`rc=0`) | `4c51cfcbb96ee6f7` | N/A (Inference / Pytest) |
+| **8-GPU Basic** | **Task 2 (100-Step Loss Curve)** | 8 | 100 steps, separated `total_loss` / `ce_loss` / `indexer_kl_loss` | Pass (`rc=0`) | `45832427c488a318` | `run_20261016_4de69078` |
+| **8-GPU Basic** | **Task 3 (SP8 `cp_size=8` Long-Context `4k–32k`, 10 steps)** | 8 | `cp_size: 8`, `max_seq_len: 32768`, `data_long_4k32k.yaml` | Pass (`rc=0`, 10/10) | `a35f84f30068e649` | `run_20261017_758f28fe` |
+| **8-GPU Basic** | **Task 3 (SP4 `cp_size=4` Long-Context `4k–32k` Comparison)** | 8 | `cp_size: 4`, `NCCL_MAX_NCHANNELS=16`, `max_seq_len: 32768` | 7/10 steps (OOM @ `19.6k` seq) | `f87938816d18dad5` | `run_20261017_6511b9c0` |
+| **128-GPU Full** | **BSZ Probe (`mbs=2, gbs=256`, 40 LLM layers, `ep=64`)** | 128 | All 40 LLM layers, freeze `vision` & `ngram`, no MTP, Muon optimizer | OOM @ Step 2 (`73.60 GiB` alloc) | `45cf7268b49e64a2` | `run_20261017_6db78f14` |
+| **128-GPU Full** | **100-Step Main Run (`mbs=1, gbs=128`, 40 LLM layers, `ep=128`, Muon `lr=5e-4`) + Single-Root FP8/FP4 Export** | 128 | All 40 LLM layers (`550.56B`), freeze `vision` & `ngram`, no MTP, `ep_size=128`, `save_hf_weights: true` | **Pass (`rc=0`, 100/100 steps + 48-shard export)** | `0abc0b09f0eeb205` | `run_20261017_e040c085` |
+| **128-GPU Full** | **128-GPU Long-Context SP8 (`cp_size=8`, `4k–32k` seq_len, 10 steps)** | 128 | All 40 LLM layers, `cp_size: 8`, `ep_size: 128`, `max_seq_len: 32768`, `gbs=16, mbs=1` | **Pass (`rc=0`, 10/10 steps)** | `0abc0b09f0eeb205` | `run_20261017_5f3d8e3d` |
+| **128-GPU Full** | **8-GPU Multimodal Inference Round-Trip on 128-GPU Exported Checkpoint** | 8 (Node 0) | `tasks/omni/infer_omni.py` loading `/mnt/hdfs/.../global_step_100/hf_ckpt` with `modules_infer_fsdp.yaml` | **Pass (`rc=0`, 40-layer FP8/FP4 generation)** | `0abc0b09f0eeb205` | N/A (Inference stage) |
 | **8-GPU CP Alignment** | **Suite A: `BaseTrainer`-Aligned FSDP2 `text_encoder` (`cp=1` 10 steps & `cp=2` Step 1)** | 8 | Deterministic batch (`seed=42, shuffle=false, gbs=8, mbs=1`), `text_encoder` FSDP2 (`no emb`) | **Pass (`cp=1` 10/10; `cp=2` Step 1 exact match)** | `2304d1595f72d42c` / `0aa9829c2c54b033` | `run_20261019_97fe4507` |
 | **8-GPU CP Alignment** | **Suite B: `emb=8, extra_parallel_only=true` `text_encoder` (`cp=1` 10 steps & `cp=2` Step 1)** | 8 | Deterministic batch (`seed=42, shuffle=false, gbs=8, mbs=1`), `_extra_parallel_only` grad-sync fix | **Pass (`cp=1` 10/10; `cp=2` Step 1 exact match)** | `65d2fbffbbf7a959` | `run_20261019_1210172e` / `run_20261019_30fd740c` |
-| **8-GPU CP Alignment** | **Full `cp=1, 2, 4, 8` Multi-Step Suite (`DeepSeek-V4.1-Flash-1017`, `VeomniOp` + `ViT Ulysses SP + LLM CP`)** | 8 | `commit 3e5ac5936`, `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`, `vision.accelerator.ulysses_size=S, cp_size=1` + `llm.accelerator.cp_size=S` (`S=1,2,4,8`), **12/12 runs (Suite MM Multimodal + Suite A `FSDP2 text_encoder` + Suite B `emb=8 text_encoder`, 10 steps each)** | **Pass (`rc=0`, 12/12 runs, 120/120 steps)** | `2ffef1a6ffbca0ae (trial 304706398)` | `run_20261026_85ec989d` .. `run_20261026_ddceb476` (all 12 in Section 6.2) |
-| **128-GPU Multimodal** | **200-Step Multimodal (`tulu` + `sharegpt4v`) Speed & Convergence + Single-Root FP8/FP4 Export (`DeepSeek-V4.1-Flash-1017`)** | 128 | `commit 3e5ac5936`, `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`, Local NVMe `/tmp/vdata`, `vision` trainable (`freeze: false`), `text_encoder` FSDP2 (`BaseTrainer`-aligned), `ep=128`, `save_hf_weights: true` | **Pass (`rc=0`, 200/200 steps + 48-shard export in `381.42s`)** | `fb4feeb3eb8b46aa (trial 304705201)` | `run_20261026_e61daeaa` |
-| **8-GPU Inference Round-Trip** | **8-GPU 40-Layer FP8/FP4 Multimodal Inference on 128-GPU 200-Step Exported `DeepSeek-V4.1-Flash-1017` Checkpoint** | 8 | `commit 69f577234`, `infer_omni.py` loading `/mnt/hdfs/.../mm200/checkpoints/global_step_200/hf_ckpt` with `modules_infer_fsdp.yaml` | **Pass (`rc=0`, 40-layer + 3-MTP quantized generation)** | `63eecb31d32921a1 (trial 304714243)` | N/A (Inference / `reply.txt`) |
-| **8-GPU Long-Context** | **SP8 (`ViT Ulysses SP=8 + LLM CP=8`) Long-Context `4k–32k` (`DeepSeek-V4.1-Flash-1017`, 10 steps)** | 8 | `commit 69f577234`, `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`, `cp_size: 8`, `vision.ulysses_size: 8`, `max_seq_len: 32768`, `data_long_4k32k.yaml` | **Pass (`rc=0`, 10/10 steps)** | `d1648f5d525261ba (trial 304715334)` | `run_20261026_29b134ca` |
+| **8-GPU CP Alignment** | **Full `cp=1, 2, 4, 8` Multi-Step Suite (`DeepSeek-V4.1-Flash-1017`, `VeomniOp` + `ViT Ulysses SP + LLM CP`)** | 8 | `commit 3e5ac5936`, `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`, `vision.accelerator.ulysses_size=S, cp_size=1` + `llm.accelerator.cp_size=S` (`S=1,2,4,8`), **12/12 runs (Suite MM Multimodal + Suite A `FSDP2 text_encoder` + Suite B `emb=8 text_encoder`, 10 steps each)** | **Pass (`rc=0`, 12/12 runs, 120/120 steps)** | `2ffef1a6ffbca0ae` | `run_20261026_85ec989d` .. `run_20261026_ddceb476` (all 12 in Section 6.2) |
+| **128-GPU Multimodal** | **200-Step Multimodal (`tulu` + `sharegpt4v`) Speed & Convergence + Single-Root FP8/FP4 Export (`DeepSeek-V4.1-Flash-1017`)** | 128 | `commit 3e5ac5936`, `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`, Local NVMe `/tmp/vdata`, `vision` trainable (`freeze: false`), `text_encoder` FSDP2 (`BaseTrainer`-aligned), `ep=128`, `save_hf_weights: true` | **Pass (`rc=0`, 200/200 steps + 48-shard export in `381.42s`)** | `fb4feeb3eb8b46aa` | `run_20261026_e61daeaa` |
+| **8-GPU Inference Round-Trip** | **8-GPU 40-Layer FP8/FP4 Multimodal Inference on 128-GPU 200-Step Exported `DeepSeek-V4.1-Flash-1017` Checkpoint** | 8 | `commit 69f577234`, `infer_omni.py` loading `/mnt/hdfs/.../mm200/checkpoints/global_step_200/hf_ckpt` with `modules_infer_fsdp.yaml` | **Pass (`rc=0`, 40-layer + 3-MTP quantized generation)** | `63eecb31d32921a1` | N/A (Inference / `reply.txt`) |
+| **8-GPU Long-Context** | **SP8 (`ViT Ulysses SP=8 + LLM CP=8`) Long-Context `4k–32k` (`DeepSeek-V4.1-Flash-1017`, 10 steps)** | 8 | `commit 69f577234`, `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`, `cp_size: 8`, `vision.ulysses_size: 8`, `max_seq_len: 32768`, `data_long_4k32k.yaml` | **Pass (`rc=0`, 10/10 steps)** | `d1648f5d525261ba` | `run_20261026_29b134ca` |
 
 ---
 
@@ -38,10 +38,10 @@ All experiments were executed in **Group 356 (`Zhi-wh-h100`, `cluster_id: 8`, `c
   - `deepseek_v41_ngram`: `196.61B` params (`freeze: true`, FP8 buffers, `emb_size=128` sharded, `ep_sharded_stream_load: true`)
   - `deepseek_v41_llm`: `550.56B` params (**all 40 layers**, `dspark_block_size: 0`, `num_nextn_predict_layers: 0`, `dsa_indexer_loss: true`, `ep_sharded_stream_load: true`, Muon optimizer)
 - **Batch Size Probe Results**:
-  1. **`micro_batch_size: 2, global_batch_size: 256` (`ep_size=64`)** (`45cf7268b49e64a2 (trial 304281947)`, WandB `run_20261017_6db78f14`):
+  1. **`micro_batch_size: 2, global_batch_size: 256` (`ep_size=64`)** (`45cf7268b49e64a2`, WandB `run_20261017_6db78f14`):
      - Completed Step 1 (`total_loss: 1.99, ce_loss: 1.19, indexer_kl_loss: 0.80, grad_norm: 27.63`) and `optimizer.step()`.
      - OOM'd at Step 2 (`73.60 GiB` allocated, requesting `98 MiB` on `79.11 GiB` H100) once the `17.2 GiB` Muon momentum buffer was materialized alongside `mbs=2` activations.
-  2. **`micro_batch_size: 1, global_batch_size: 128` (`ep_size=128`)** (`0abc0b09f0eeb205 (trial 304282868)`, WandB `run_20261017_e040c085`):
+  2. **`micro_batch_size: 1, global_batch_size: 128` (`ep_size=128`)** (`0abc0b09f0eeb205`, WandB `run_20261017_e040c085`):
      - Because `384 % 128 == 0`, setting `ep_size: 128` places **3 routed experts per GPU** (`ep_fsdp_size = 1`, `[Replicate(), Shard(0)]`).
      - In `veomni/optim/muon.py:_classify_param`, `[Replicate(), Shard(0)]` is classified as `_KIND_MOE_LOCAL_3D`, enabling **zero-communication local 3D batched Newton-Schulz** across the 3 local experts per rank while maintaining full compatibility with `save_hf_weights: true` (`len(expert_dims) == 1` in `export.py:_local_experts`).
      - **Stably completed all 100 steps with a peak memory of `57.81 GiB` (`21.3 GiB` headroom on 80GB H100)**!
@@ -60,7 +60,7 @@ Measured directly from `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash` (`
 | **`deepseek_v41_llm`** (All 40 layers) | `550.56B` (Trainable BF16/FP32) | `ep_size=128, ep_fsdp=1` + `FSDP2 (dp_shard=128)` | **`89s` / `63s`** (`1.33–1.86s/shard`, incl. on-the-fly FP8/FP4 -> BF16 dequant) | Read `80` ExtraParallel-sliced, `842` dense, `80` buffer tensors/rank; stacked `720` local expert tensors (`3/384` experts) and skipped `91,440` other ranks' expert tensors | `~18.9 GB` (pre-train) | **`~19.5 GB`** (pre-train) |
 | **Total (All 4 Modules)** | **`748.98B`** | 128 GPUs (`16 × 8 H100`) | **`151s` (`2m31s`) / `119s` (`1m59s`)** | Pure 48-shard streaming (`ngram` + `llm`): **`108s` (Stage 1) / `78s` (Stage 2)** | `~18.9 GB` | **`~19.5 GB`** |
 
-*(Comparison: Increasing `ep_size` from `64` to `128` reduced `deepseek_v41_llm` 48-shard streaming load + FP4/FP8 dequantization time from **`151s` (`2m31s`)** in trial `304281947` to **`63s–89s` (`1m03s–1m29s`)** in trial `304282868` because each rank only dequantizes `720` expert tensors instead of `1,440`.)*
+*(Comparison: Increasing `ep_size` from `64` to `128` reduced `deepseek_v41_llm` 48-shard streaming load + FP4/FP8 dequantization time from **`151s` (`2m31s`)** in the corresponding run to **`63s–89s` (`1m03s–1m29s`)** in the corresponding run because each rank only dequantizes `720` expert tensors instead of `1,440`.)*
 
 ---
 
@@ -78,8 +78,8 @@ Measured directly from `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash` (`
 #### Why Previous 256-GPU Muon Runs Had Flat Loss & How It Was Fixed
 1. **Warmup Horizon Mismatch (`train_sample: 1,000,000`)**:
    - In `full.yaml` / `full128.yaml`, `data.train_sample` defaulted to `1,000,000` (`7,812` steps at `gbs=128`) with `lr_warmup_ratio: 0.03` (`234` warmup steps). Because `OmniTrainer._build_lr_scheduler()` uses `args.train_steps = train_sample // global_batch_size`, a 100-step run spent its entire duration in the bottom fraction of linear warmup unless `data.train_sample` was scaled to `max_steps * global_batch_size` (`12,800`).
-2. **Muon Effective LR Under `match_rms_adamw`**:
-   - In `modules_train_full128.yaml`, `muon_lr` defaulted to `None` (falling back to `adamw_lr = 1.0e-5`). Under `adjust_lr_fn="match_rms_adamw"`, Muon scales updates by `0.2 * sqrt(max(A, B))`, which requires `muon_lr` in the `3e-4 – 5e-4` range for fast SFT convergence.
+2. **Muon Effective LR Under `match_rms_adamw` (Historical)**:
+   - In earlier revisions of `modules_train_full128.yaml`, `muon_lr` defaulted to `None` (falling back to `adamw_lr = 1.0e-5`). Under `adjust_lr_fn="match_rms_adamw"`, Muon scales updates by `0.2 * sqrt(max(A, B))`, which requires `muon_lr` in the `3e-4 – 5e-4` range for fast SFT convergence; `modules_train_full128.yaml` now sets `muon_lr: 5.0e-4` by default.
 3. **Tuned Hyperparameters Used in `0abc0b09f0eeb205` (`run_20261017_e040c085`)**:
    - `--data.train_sample 12800 --train.max_steps 100`
    - `--model.optimizer.lr 1.0e-4 --model.optimizer.lr_min 1.0e-5 --model.optimizer.lr_warmup_ratio 0.05` (5 warmup steps)
@@ -89,7 +89,7 @@ Measured directly from `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash` (`
      - `deepseek_v41_llm.forward.indexer_kl_loss` dropped monotonically by **66%**, from **`0.80` (Step 2)** down to **`0.25–0.27` (Steps 88–100)**!
      - `deepseek_v41_text_encoder.decode.ce_loss` dropped from **`1.03` (Step 3)** down to **`0.67–0.73` (Steps 5–24)** and **`0.93` (Step 100)** across the variable-difficulty Tulu-3 SFT mixture!
 
-#### Full 100-Step Numerical Loss Table (`sid: 0abc0b09f0eeb205`, `trial_sid: 304282868`, WandB `run_20261017_e040c085`)
+#### Full 100-Step Numerical Loss Table (`sid: 0abc0b09f0eeb205`, WandB `run_20261017_e040c085`)
 
 | Step | `total_loss` | `ce_loss` (`deepseek_v41_text_encoder.decode.ce_loss`) | `indexer_kl_loss` (`deepseek_v41_llm.forward.indexer_kl_loss`) | `grad_norm` | Step | `total_loss` | `ce_loss` (`deepseek_v41_text_encoder.decode.ce_loss`) | `indexer_kl_loss` (`deepseek_v41_llm.forward.indexer_kl_loss`) | `grad_norm` |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -149,15 +149,15 @@ Measured directly from `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash` (`
 ### 2.5 Metric 4: 128-GPU Single-Root FP8/FP4 Release Export (`save_hf_weights: true`) & 8-GPU Inference Round-Trip
 
 1. **128-GPU Distributed DCP + Single-Root FP8/FP4 Release Export**:
-   - At Step 100 of Stage 1 (`0abc0b09f0eeb205` / `trial_sid: 304282868`), `OmniTrainer` first saved the distributed DCP checkpoint (`deepseek_v41_vision` in `22s`, `deepseek_v41_text_encoder` in `21s`, `deepseek_v41_llm` in `69s`), and then executed `save_hf_source_checkpoint` (`save_hf_weights: true`):
+   - At Step 100 of Stage 1 (`0abc0b09f0eeb205`), `OmniTrainer` first saved the distributed DCP checkpoint (`deepseek_v41_vision` in `22s`, `deepseek_v41_text_encoder` in `21s`, `deepseek_v41_llm` in `69s`), and then executed `save_hf_source_checkpoint` (`save_hf_weights: true`):
      - Re-quantized all 40 trained `deepseek_v41_llm` layers back into release FP8 (`float8_e4m3fn` + `scale_inv`) and packed FP4 (`uint8` nibbles + `uint8` E8M0 scale + `bfloat16` `scale_2`) while copying `2,405` frozen/untrained source tensors (`ngram` + `mtp`) directly from the source shards.
-     - Exported all **48 safetensors shards (`model-00001-of-00048.safetensors` .. `model-00048-of-00048.safetensors`) + `model.safetensors.index.json` (`7.2 MB`)** to `/mnt/hdfs/__MERLIN_USER_DIR__/dsv41_128gpu_ckpt_main/main_100steps/checkpoints/global_step_100/hf_ckpt` in **`435.17s` (`7m15s`)**.
+     - Exported all **48 safetensors shards (`model-00001-of-00048.safetensors` .. `model-00048-of-00048.safetensors`) + `model.safetensors.index.json` (`7.2 MB`)** to `<export_root>/dsv41_128gpu_ckpt_main/main_100steps/checkpoints/global_step_100/hf_ckpt` in **`435.17s` (`7m15s`)**.
 2. **8-GPU Full 40-Layer Multimodal Inference Round-Trip (Stage 3 on `NODE_RANK=0`)**:
    - Command:
      ```bash
      torchrun --nnodes=1 --nproc_per_node=8 \
        tasks/omni/infer_omni.py configs/seed_omni/DeepSeek/deepseek_v41_flash/train/base.yaml \
-       --model.model_path /mnt/hdfs/__MERLIN_USER_DIR__/dsv41_128gpu_ckpt_main/main_100steps/checkpoints/global_step_100/hf_ckpt \
+       --model.model_path <export_root>/dsv41_128gpu_ckpt_main/main_100steps/checkpoints/global_step_100/hf_ckpt \
        --model.model_config.modules configs/seed_omni/DeepSeek/deepseek_v41_flash/infer/modules_infer_fsdp.yaml \
        --model.ep_sharded_stream_load true \
        --model.broadcast_model_weights_from_rank0 false \
@@ -180,7 +180,7 @@ Measured directly from `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash` (`
 ### 2.6 Metric 5: 128-GPU Long-Context Training (`SP8` / `cp_size: 8`, `4k–32k` Sequence Length)
 
 - **Trial & WandB**:
-  - Merlin Trial: `0abc0b09f0eeb205 (trial 304282868)` (Stage 2)
+  - Job ID: `0abc0b09f0eeb205` (Stage 2)
   - WandB Run: `run_20261017_5f3d8e3d` (`dsv41_128gpu_sp8_long_4k32k`)
 - **Configuration**:
   - `cp_size: 8` (16 independent SP8 context-parallel groups across 128 GPUs), `ep_size: 128` (`dp_shard_sp_size = 128`, `ep_fsdp_size = 1`)
@@ -273,8 +273,8 @@ To verify that Context Parallelism (`cp_size > 1`) produces the exact same loss 
 - **Root Cause Analysis**:
   1. In job `0aa9829c2c54b033` (`ep_size: 8` on 8 GPUs, `ep_fsdp=1`), `deepseek_v41_llm` had `n_trainable_layers=2` and fell back to top-level AdamW (2 FP32 moments = `8.25 GiB` per trainable layer) without gradient checkpointing. After `optimizer.step()` at Step 1 materialized `16.5 GiB` of AdamW state across 2 layers, static memory reached `69.24 GiB`, causing Step 2 micro-step accumulation under `cp=2` (`dp_shard=4, cp=2`) to OOM by `~350 MiB`.
   2. In job `6fd0c0aef891741e` (`ep_size: 4` on 8 GPUs, `ep_fsdp=2`), each rank held `96` experts (`384 / 4 = 96`), so unsharding a single MoE layer during backward allocated `4.22 GiB` (`2 × 2.11 GiB`) of temporary BF16 all-gather buffers on top of `68.48 GiB`, also exceeding `79.11 GiB`.
-- **Resolution in Job `45245145371ac415 (trial 304385619)` (`commit f92839dc2`)**:
-  - Updated to `origin/szl.omniv2-deepseek-v4.1-flash` (`commit f92839dc236db89c145c2dc529972fe1c334e118`), which includes:
+- **Resolution in Job `45245145371ac415` (`commit f92839dc2`)**:
+  - Updated to `the verification branch` (`commit f92839dc236db89c145c2dc529972fe1c334e118`), which includes:
     1. **`2ee61e9cf`**: Hybrid sequence parallelism supporting `deepseek_v41_vision` Ulysses SP (`ulysses_size: S, cp_size: 1`) + `deepseek_v41_llm` CP (`cp_size: S, ulysses_size: 1`). Whenever top-level or LLM `cp_size = S` (`S > 1`), `deepseek_v41_vision.accelerator.ulysses_size` is explicitly set to `S` (with `cp_size: 1`) so that all modules resolve to a uniform `dp_size = world_size // S`.
     2. **`5f09fc231` & `f92839dc2`**: Instance-level `VeomniOp` migration across `deepseek_v41` (`llm`, `vision`, `text_encoder`) with per-module `config.ops_implementation` resolution (`veomni_rms_norm`, `veomni_mhc_post`, `veomni_unweighted_rms_norm`, `veomni_swiglu_mlp`, `veomni_moe`, `veomni_attn`, `veomni_dspark_ce`) and `qat_implementation: fp8_blockwise`.
   - Memory configuration on 8×H100 (80GB): `ep_size: 8` (`48` experts/rank, zero expert all-gather buffer), `gradient_checkpointing: enable: true`, and `deepseek_v41_vision` trainable (`freeze: false`), reducing steady-state VRAM by `>8 GiB` so `cp=1, 2, 4, 8` all fit comfortably within 80GB H100.
@@ -313,7 +313,7 @@ Executed the full `tests/seed_omni/modules/deepseek_v41/` test suite (22 test fi
 
 1. **Checkpoint Verification (`/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`)**:
    - `config.json`, `model.safetensors.index.json`, `tokenizer.json`, and all 48 safetensors shard tensor shapes/dtypes (`475.3 GB` total) are structurally identical to `DeepSeek-V4.1-Flash`, with updated post-trained weights.
-2. **Code Refactoring & Fixes on `szl.omniv2-deepseek-v4.1-flash` (`3e5ac5936 .. 69f577234`)**:
+2. **Code Refactoring & Fixes on the verification branch (`3e5ac5936 .. 69f577234`)**:
    - **`17bde2f5c` & `3e5ac5936`**: Reused `deepseek_v4` DSpark (`DSparkMarkovHead`, `DSparkConfidenceHead`, `dense_sparse_attn`, `main_window_indices`) and FP8/FP4 dequant/export primitives (`_dequantize_scaled_weight`, `split_moe_params`, `validate_deepseek_v4_export_quant_support`), and fixed rank-partitioned `save_state` size gathering in `_size_balanced_index_mapping`.
    - **`6ba73caa6` (`veomni/models/seed_omni/modules/deepseek_v41/llm/quantized.py`)**: Restored `_apply_gate` (`swiglu_limit` clamp + `act_fn(gate) * up`) on `DeepseekV41QuantizedExperts` after `PatchedDeepseekV4Experts` migrated to `self.veomni_moe`.
    - **`69f577234` (`veomni/ops/kernels/swiglu_mlp/__init__.py`)**: Updated `has_plain_linear_projections(mlp)` to return `False` when any projection has `getattr(proj, "is_quantized", False) == True` (`DeepseekV41Linear` with FP8 weights), ensuring quantized shared experts dispatch through `DeepseekV41Linear.forward` (`quantized_matmul`) during inference rather than passing raw `float8_e4m3fn` weights into `F.linear`.
@@ -323,7 +323,7 @@ Executed the full `tests/seed_omni/modules/deepseek_v41/` test suite (22 test fi
 
 ### 6.2 8-GPU `cp=1, 2, 4, 8` (`ViT Ulysses SP + LLM CP`) Multi-Step Alignment on `DeepSeek-V4.1-Flash-1017`
 
-- **Merlin Trial**: `2ffef1a6ffbca0ae (trial 304706398)`
+- **Job ID**: `2ffef1a6ffbca0ae`
 - **HDFS Logs**: `/mnt/hdfs/veomni/smoke_logs/dsv41_1017_cp_align_3e5ac5936/`
 - **Setup**:
   - Model: `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`, `deepseek_v41_vision` trainable (`freeze: false`, `ulysses_size: S, cp_size: 1`), `deepseek_v41_llm` (`cp_size: S, ulysses_size: 1, ep_size: 8`, Muon `lr=1e-4, muon_lr=5e-4`, `gradient_checkpointing: true`).
@@ -364,7 +364,7 @@ Executed the full `tests/seed_omni/modules/deepseek_v41/` test suite (22 test fi
 ### 6.3 128-GPU (`16 × 8 H100`) 200-Step Multimodal SFT (`tulu` + `sharegpt4v`), Single-Root FP8/FP4 Export, & 8-GPU Inference Round-Trip (`DeepSeek-V4.1-Flash-1017`)
 
 1. **128-GPU 200-Step Multimodal SFT Convergence & Speed**:
-   - **Merlin Trial**: `fb4feeb3eb8b46aa (trial 304705201)`
+   - **Job ID**: `fb4feeb3eb8b46aa`
    - **WandB Run**: `run_20261026_e61daeaa` (`dsv41_1017_128gpu_200steps_mm_export`)
    - **Configuration**:
      - Model: `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017` (all 40 LLM layers, `ep_size: 128`, Muon `lr=1e-4, muon_lr=5e-4`; `deepseek_v41_vision` trainable `freeze: false`; `deepseek_v41_text_encoder` FSDP2; `deepseek_v41_ngram` frozen FP8 `emb=128`).
@@ -378,11 +378,11 @@ Executed the full `tests/seed_omni/modules/deepseek_v41/` test suite (22 test fi
      - `deepseek_v41_text_encoder.decode.ce_loss`: **`1.24` (Step 2)** -> **`0.75` (Step 20)** -> **`0.94` (Step 150)** -> **`1.09` (Step 200)**.
 
 2. **128-GPU Single-Root FP8/FP4 Release Export (`save_hf_weights: true`)**:
-   - At Step 200, `save_hf_source_checkpoint` re-quantized all 40 trained `deepseek_v41_llm` layers to release FP8/FP4, exported the trained `deepseek_v41_vision` and `deepseek_v41_text_encoder` weights, and copied `2,405` frozen `ngram` + `mtp` source tensors into all **48 safetensors shards (`model-00001-of-00048.safetensors` .. `model-00048-of-00048.safetensors`) + `model.safetensors.index.json`** at `/mnt/hdfs/__MERLIN_USER_DIR__/dsv41_1017_128gpu_ckpt/mm200/checkpoints/global_step_200/hf_ckpt` in **`381.42s` (`6m21s`)**.
+   - At Step 200, `save_hf_source_checkpoint` re-quantized all 40 trained `deepseek_v41_llm` layers to release FP8/FP4, exported the trained `deepseek_v41_vision` and `deepseek_v41_text_encoder` weights, and copied `2,405` frozen `ngram` + `mtp` source tensors into all **48 safetensors shards (`model-00001-of-00048.safetensors` .. `model-00048-of-00048.safetensors`) + `model.safetensors.index.json`** at `<export_root>/dsv41_1017_128gpu_ckpt/mm200/checkpoints/global_step_200/hf_ckpt` in **`381.42s` (`6m21s`)**.
 
 3. **8-GPU Full 40-Layer + 3-MTP Multimodal Inference Round-Trip on Exported `DeepSeek-V4.1-Flash-1017` Checkpoint**:
-   - **Merlin Trial**: `63eecb31d32921a1 (trial 304714243)`
-   - **Command**: Loaded `/mnt/hdfs/__MERLIN_USER_DIR__/dsv41_1017_128gpu_ckpt/mm200/checkpoints/global_step_200/hf_ckpt` on 8 GPUs using `tasks/omni/infer_omni.py` and `modules_infer_fsdp.yaml` (`ep_sharded_stream_load: true`, keeping all 40 LLM layers + 3 MTP stages in quantized FP8/FP4 format).
+   - **Job ID**: `63eecb31d32921a1`
+   - **Command**: Loaded `<export_root>/dsv41_1017_128gpu_ckpt/mm200/checkpoints/global_step_200/hf_ckpt` on 8 GPUs using `tasks/omni/infer_omni.py` and `modules_infer_fsdp.yaml` (`ep_sharded_stream_load: true`, keeping all 40 LLM layers + 3 MTP stages in quantized FP8/FP4 format).
    - **Execution & Output**:
      - Streamed all 48 shards in `2m48s` (`172` ExtraParallel-sliced, `1,263` dense, `86` buffer tensors/rank; stacked `11,808` local per-expert tensors across 40 LLM layers + 3 MTP stages).
      - Executed `[FSM] step 0: prompt_encode` -> `[FSM] step 1: text_ar` -> `finalize: reply (162 chars)`.
@@ -394,7 +394,7 @@ Executed the full `tests/seed_omni/modules/deepseek_v41/` test suite (22 test fi
 
 ### 6.4 Long-Context `SP8` (`ViT Ulysses SP=8 + LLM CP=8`, `4k–32k` Sequence Length) on `DeepSeek-V4.1-Flash-1017`
 
-- **Merlin Trial**: `d1648f5d525261ba (trial 304715334)`
+- **Job ID**: `d1648f5d525261ba`
 - **WandB Run**: `run_20261026_29b134ca` (`dsv41_1017_8gpu_sp8_vitsp8_long_4k32k`)
 - **Configuration**: `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`, `cp_size: 8` + `deepseek_v41_vision.accelerator.ulysses_size: 8, cp_size: 1`, `data_long_4k32k.yaml` (`max_seq_len: 32768`, avg sequence length `10,090.3` tokens/step), 10 steps.
 - **Result**: Completed all **10/10 steps (`rc=0`)** with peak allocated memory **`76.07 GB`**:

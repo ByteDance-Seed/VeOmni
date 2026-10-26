@@ -70,16 +70,17 @@ class TestAlignmentWithTheBackboneRow:
 
     def test_length_matches_the_packed_backbone_row(self):
         conversation = [[text_item([5, 6, 7]), image_item(4), text_item([8, 9])]]
-        ids, mask = pack_ngram_inputs(conversation, CPU, PAD)
+        ids, mask, positions = pack_ngram_inputs(conversation, CPU, PAD)
         embeds, _, _, _ = pack_llm_conversations_for_forward(conversation, CPU)
         assert ids.shape[1] == embeds.shape[1] == 9
         assert mask.shape == ids.shape
+        assert positions.shape == ids.shape
 
     def test_image_spans_are_covered_rather_than_skipped(self):
         """`pack_input_ids` drops them; this packer must not, or every position
         after the first image is off by the image's length."""
         conversation = [[text_item([5, 6]), image_item(3), text_item([7])]]
-        ids, mask = pack_ngram_inputs(conversation, CPU, PAD)
+        ids, mask, _ = pack_ngram_inputs(conversation, CPU, PAD)
         assert torch.equal(ids[0], torch.tensor([5, 6, PAD, PAD, PAD, 7]))
         assert torch.equal(mask[0], torch.tensor([True, True, False, False, False, True]))
 
@@ -88,13 +89,14 @@ class TestAlignmentWithTheBackboneRow:
             [text_item([1, 2]), image_item(2)],
             [image_item(1), text_item([3, 4, 5])],
         ]
-        ids, _ = pack_ngram_inputs(conversation, CPU, PAD)
+        ids, _, positions = pack_ngram_inputs(conversation, CPU, PAD)
         embeds, _, _, _ = pack_llm_conversations_for_forward(conversation, CPU)
         assert ids.shape[1] == embeds.shape[1]
+        assert torch.equal(positions[0], torch.tensor([0, 1, 2, 3, 0, 1, 2, 3]))
 
     def test_dummy_items_are_skipped_the_way_the_packer_skips_them(self):
         conversation = [[text_item([1, 2]), dummy_item(5), image_item(2)]]
-        ids, _ = pack_ngram_inputs(conversation, CPU, PAD)
+        ids, _, _ = pack_ngram_inputs(conversation, CPU, PAD)
         embeds, _, _, _ = pack_llm_conversations_for_forward(conversation, CPU)
         assert ids.shape[1] == embeds.shape[1] == 4
 
@@ -104,7 +106,7 @@ class TestIdsSurviveTheTextEncoder:
         """After encode, `value` is an embedding. Reading it would either raise
         on the dtype or hash float bits."""
         conversation = [[text_item([11, 12, 13])]]
-        ids, _ = pack_ngram_inputs(conversation, CPU, PAD)
+        ids, _, _ = pack_ngram_inputs(conversation, CPU, PAD)
         assert torch.equal(ids[0], torch.tensor([11, 12, 13]))
 
     def test_same_result_before_and_after_the_encoder_has_run(self):
@@ -181,7 +183,7 @@ class TestContractWithTheBackbone:
         )
 
         conversation = self._conversation()
-        ids, _ = pack_ngram_inputs(conversation, CPU, PAD)
+        ids, _, _ = pack_ngram_inputs(conversation, CPU, PAD)
         embeds, _, _, _ = pack_llm_conversations_for_forward(conversation, CPU)
 
         # One row per position, as the lookup would emit.
@@ -232,10 +234,40 @@ class TestMaskReachesTheHashing:
             model.token_map.copy_(torch.arange(config.vocab_size) % config.compressed_vocab_size)
 
         conversation = [[text_item([5, 6]), image_item(3), text_item([7])]]
-        ids, mask = pack_ngram_inputs(conversation, CPU, PAD)
+        ids, mask, _ = pack_ngram_inputs(conversation, CPU, PAD)
         compressed = model.compress(ids, mask)
         assert (compressed[0, 2:5] == DEAD).all()
         assert (compressed[0, :2] != DEAD).all() and compressed[0, 5] != DEAD
+
+    def test_packed_samples_do_not_hash_across_sample_boundaries(self):
+        """Each sample's leading tokens must hash identically whether packed after
+        another sample or run alone."""
+        from veomni.models.seed_omni.modules.deepseek_v41.ngram.configuration import DeepseekV41NgramConfig
+        from veomni.models.seed_omni.modules.deepseek_v41.ngram.modeling import DeepseekV41Ngram
+
+        config = DeepseekV41NgramConfig(
+            layer_ids=[0, 1],
+            num_embeddings=[1024, 1024],
+            max_ngram_size=4,
+            n_heads=2,
+            head_dim=8,
+            vocab_size=64,
+            hash_vocab_size=64,
+            compressed_vocab_size=32,
+            pad_token_id=PAD,
+        )
+        model = DeepseekV41Ngram(config)
+        with torch.no_grad():
+            model.token_map.copy_(torch.arange(config.vocab_size) % config.compressed_vocab_size)
+
+        sample_a = [text_item([5, 6, 7, 8])]
+        sample_b = [text_item([9, 10, 11, 12])]
+        ids_packed, mask_packed, pos_packed = pack_ngram_inputs([sample_a, sample_b], CPU, PAD)
+        ids_b, mask_b, pos_b = pack_ngram_inputs([sample_b], CPU, PAD)
+
+        hashes_packed = model.hash_ids(ids_packed, mask_packed, position_ids=pos_packed)
+        hashes_b = model.hash_ids(ids_b, mask_b, position_ids=pos_b)
+        assert torch.equal(hashes_packed[:, 4:], hashes_b)
 
 
 class TestTheTwoVocabSizes:

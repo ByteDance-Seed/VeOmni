@@ -192,8 +192,10 @@ Until the shards are removed the table takes twice its size on disk.
 Before writing, the merge checks that the shards cover exactly the rows and
 bytes the export recorded. If one is missing or foreign, or the index is
 missing, it raises and leaves the marker and shards in place. The script goes
-on to the next export and exits non-zero at the end. The marker is removed before the shards, so an
-interrupted merge can be rerun.
+on to the next export and exits non-zero at the end. Rerunning is possible
+while `pending_merge.json` remains; once `merge_pending_hf_shards` removes the
+marker before deleting `sharded/`, an interrupted cleanup leaves an orphaned
+`sharded/` directory that `scan()` reports for manual cleanup.
 
 ## See Also
 

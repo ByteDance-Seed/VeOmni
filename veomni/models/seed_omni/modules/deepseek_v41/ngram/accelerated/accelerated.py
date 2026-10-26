@@ -80,10 +80,12 @@ class TrainingMixin(TrainingModuleMixin):
         conversation_list: Optional[List[List[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        input_ids, token_mask = pack_ngram_inputs(conversation_list, self.device, self.config.pad_token_id)
+        input_ids, token_mask, position_ids = pack_ngram_inputs(
+            conversation_list, self.device, self.config.pad_token_id
+        )
         self._conversation_carrier = conversation_list
         self.metric_meter_set_seqlens("forward", [int(input_ids.numel())])
-        return dict(input_ids=input_ids, token_mask=token_mask, **kwargs)
+        return dict(input_ids=input_ids, token_mask=token_mask, position_ids=position_ids, **kwargs)
 
     @post_forward("forward")
     def forward_post(self, **outputs: Any) -> Dict[str, Any]:

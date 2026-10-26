@@ -32,14 +32,17 @@ def pack_ngram_inputs(
     conversations: List[List[ConversationItem]],
     device: torch.device,
     pad_token_id: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(input_ids, token_mask)`` over the packed row the backbone will see.
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(input_ids, token_mask, position_ids)`` over the packed row the backbone will see.
 
-    Both are ``[1, total]``, and *total* is the full packed length **including
+    All three are ``[1, total]``, and *total* is the full packed length **including
     image spans** -- not the text-only length the text encoder embeds. That
     distinction is the whole reason this packer exists rather than reusing
     ``pack_input_ids``: the rows this module emits are indexed positionally by
     the backbone, so they have to cover every position the backbone has.
+
+    ``position_ids`` restarts at zero for each sample in ``conversations`` so
+    n-gram lookback stops at sample boundaries in a packed micro-batch.
 
     Image spans contribute ``pad_token_id`` and a ``False`` mask. The id is
     never hashed: the mask turns those positions into ``DEAD``, which stops the
@@ -53,7 +56,9 @@ def pack_ngram_inputs(
     """
     ids: List[torch.Tensor] = []
     mask: List[torch.Tensor] = []
+    positions: List[torch.Tensor] = []
     for sample in conversations:
+        sample_len = 0
         for item in sample:
             if item.is_dummy:
                 continue
@@ -65,15 +70,18 @@ def pack_ngram_inputs(
                         "and the text encoder overwrites `value` with embeddings. DeepseekV41ChatTemplate."
                         "tokenize stashes the copy -- a conversation built by another template will not have it."
                     )
+                length = token_ids.numel()
                 ids.append(token_ids.reshape(-1).to(device))
-                mask.append(torch.ones(token_ids.numel(), dtype=torch.bool, device=device))
+                mask.append(torch.ones(length, dtype=torch.bool, device=device))
             else:
                 # The span's length is the number of tokens vision produced for
                 # it, which is why this node must run after the vision one.
                 length = item.value.size(0)
                 ids.append(torch.full((length,), pad_token_id, dtype=torch.long, device=device))
                 mask.append(torch.zeros(length, dtype=torch.bool, device=device))
-    return torch.cat(ids).unsqueeze(0), torch.cat(mask).unsqueeze(0)
+            positions.append(torch.arange(sample_len, sample_len + length, dtype=torch.long, device=device))
+            sample_len += length
+    return torch.cat(ids).unsqueeze(0), torch.cat(mask).unsqueeze(0), torch.cat(positions).unsqueeze(0)
 
 
 __all__ = ["pack_ngram_inputs"]

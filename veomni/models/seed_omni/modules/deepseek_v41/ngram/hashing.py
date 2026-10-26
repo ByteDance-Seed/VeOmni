@@ -109,12 +109,15 @@ def gather_lookback(
     max_ngram_size: int,
     history: Optional[torch.Tensor] = None,
     start_pos: int = 0,
+    position_ids: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Stack each position with the ``max_ngram_size - 1`` compressed ids before it.
 
     ``compressed`` is ``[B, L]`` in the compressed id space, already carrying
     :data:`DEAD` where the token is an image. ``history`` (``[B, start_pos]``,
-    decode only) supplies positions before this call's window.
+    decode only) supplies positions before this call's window. ``position_ids``
+    (``[B, L]``, packed training) restarts at zero for each sample so lookback
+    does not cross sample boundaries.
 
     Returns ``(tokens, blocked)``: ``tokens`` is ``[B, L, max_ngram_size]`` with
     blocked slots left as :data:`DEAD` for the caller to fill with its pad id,
@@ -128,13 +131,14 @@ def gather_lookback(
     window = compressed if history is None else torch.cat([history, compressed], dim=1)
     offset = 0 if history is None else history.shape[1]
 
-    positions = torch.arange(start_pos, start_pos + seqlen, device=compressed.device).expand(batch, seqlen)
+    row_positions = torch.arange(start_pos, start_pos + seqlen, device=compressed.device).expand(batch, seqlen)
+    sample_positions = row_positions if position_ids is None else position_ids.to(compressed.device)
     tokens, blocked_slots = [], []
-    blocked = torch.zeros_like(positions, dtype=torch.bool)
+    blocked = torch.zeros_like(row_positions, dtype=torch.bool)
     for shift in range(max_ngram_size):
-        index = (positions - start_pos + offset - shift).clamp_min(0)
+        index = (row_positions - start_pos + offset - shift).clamp_min(0)
         source = window.gather(1, index)
-        blocked = blocked | (positions < shift) | (source == DEAD)
+        blocked = blocked | (sample_positions < shift) | (source == DEAD)
         tokens.append(source)
         blocked_slots.append(blocked)
     return torch.stack(tokens, dim=-1), torch.stack(blocked_slots, dim=-1)

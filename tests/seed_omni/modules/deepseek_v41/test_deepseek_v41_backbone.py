@@ -641,6 +641,16 @@ class TestDsparkDraftSampling:
         assert conversation[-1].meta["input_ids"].reshape(-1).tolist() == [4]
         assert "dspark_spec_ids" not in conversation[-1].meta
 
+    def test_generate_reuses_rejected_target_sample_without_resampling(self):
+        encoder, conversation = self._encoder_ready_to_sample()
+        conversation[-1].meta["dspark_sampled_id"] = 11
+        encoder._sample_token = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("should not resample when dspark_sampled_id is present")
+        )
+        encoder.generate(conversation, generation_kwargs={"do_sample": True})
+        assert encoder._text_token_cache == [11]
+        assert "dspark_sampled_id" not in conversation[-1].meta
+
     def test_draft_appends_verified_extra_tokens(self):
         encoder, conversation = self._encoder_ready_to_sample()
         encoder._text_token_cache = [7]
@@ -682,3 +692,34 @@ class TestDsparkSpecOnGenerate:
         model._decode_cache.dspark_ready = True
         spec = model._run_spec(tail)
         assert spec.shape == (1, model.config.dspark_block_size, HIDDEN)
+
+    def test_verify_block_preserves_mismatched_target_sample_on_tail_meta(self, monkeypatch):
+        from veomni.models.seed_omni.modules.deepseek_v41.llm import inference as inference_mod
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.decode import DeepseekV41DecodeCache
+        from veomni.models.seed_omni.utils.conversation import ConversationItem
+
+        model = DeepseekV41Llm(make_config())
+        model.eval()
+        model._decode_cache = DeepseekV41DecodeCache.empty(model.config)
+        model._next_position = 3
+        monkeypatch.setattr(
+            inference_mod,
+            "decode_backbone_step",
+            lambda _m, embeds, _pos, _cache, **_kw: embeds.clone(),
+        )
+        monkeypatch.setattr(model, "_sample_hidden", lambda *_args, **_kwargs: 19)
+
+        tail = ConversationItem(type="output", value=torch.randn(1, 2, HIDDEN), role="assistant")
+        tail.meta["input_ids"] = torch.tensor([[5, 7]])
+        tail.meta["dspark_spec_ids"] = torch.tensor([7])
+        ngram_embeds = [torch.randn(1, 2, 2, 8) for _ in model.config.engram_layer_ids]
+        model._step(
+            [tail],
+            ngram_embeds,
+            {
+                "dspark_lm_head_weight": torch.randn(model.config.vocab_size, HIDDEN),
+                "dspark_sampling": {"do_sample": True},
+            },
+        )
+        assert tail.meta.get("dspark_sampled_id") == 19
+        assert model._next_position == 4

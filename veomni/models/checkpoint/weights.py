@@ -1109,7 +1109,7 @@ def load_model_weights_ep_sharded(
                         target0=target0,
                         para_rank=para_rank,
                         expected_full0=expected_full0,
-                        zero_pad=zero_pad or companion is not None,
+                        zero_pad=zero_pad,
                         row_transform=row_transform,
                     )
                     if row_transform is None:
