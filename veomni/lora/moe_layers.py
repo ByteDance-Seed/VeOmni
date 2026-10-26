@@ -714,7 +714,7 @@ class LoraSharedExperts(nn.Module):
 
         return self.veomni_moe_lora(
             hidden_states,
-            top_k_weights.to(hidden_states.dtype),
+            top_k_weights,
             top_k_index,
             self.gate_up_proj.base_layer.weight,
             self.down_proj.base_layer.weight,
@@ -1012,7 +1012,7 @@ class LoraIndependentExperts(nn.Module):
 
         return self.veomni_moe_lora(
             hidden_states,
-            top_k_weights.to(hidden_states.dtype),
+            top_k_weights,
             top_k_index,
             self.gate_up_proj.base_layer.weight,
             self.down_proj.base_layer.weight,
