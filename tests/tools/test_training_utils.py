@@ -180,7 +180,7 @@ def test_deepseek_v3_gpu_keeps_default_moe(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "fault", ["missing_package", "unavailable", "wrong_count", "compute_error", "bad_readback", None]
+    "fault", ["missing_package", "unavailable", "wrong_count", "compute_error", "bad_readback", "wrong_device", None]
 )
 def test_npu_ci_preflight_fails_closed(monkeypatch, fault):
     """Reject runtime failures and visit all eight devices on the success path."""
@@ -196,6 +196,7 @@ def test_npu_ci_preflight_fails_closed(monkeypatch, fault):
             """Track the device identity and scalar value for the fake runtime."""
             self.index = index
             self.value = 1.0
+            self.device = SimpleNamespace(type="cpu" if fault == "wrong_device" and index == 3 else "npu")
 
         def add_(self, value):
             """Model arithmetic or a device-specific execution failure."""
@@ -225,6 +226,10 @@ def test_npu_ci_preflight_fails_closed(monkeypatch, fault):
     if fault == "missing_package":
         with pytest.raises(ModuleNotFoundError, match="torch_npu"):
             check_npu_runtime()
+    elif fault == "wrong_device":
+        with pytest.raises(RuntimeError, match="compute/readback failed on NPU 3"):
+            check_npu_runtime()
+        assert visited == synchronized == [0, 1, 2, 3]
     elif fault is not None:
         with pytest.raises(RuntimeError):
             check_npu_runtime()
