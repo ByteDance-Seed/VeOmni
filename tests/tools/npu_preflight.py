@@ -26,7 +26,7 @@ def check_npu_runtime(expected_devices: int = 8) -> int:
         torch.npu.set_device(index)
         value = torch.ones(1, device=f"npu:{index}").add_(1).mul_(3)
         torch.npu.synchronize()
-        if value.device.type != "npu" or value.item() != 6.0:
+        if value.device.type != "npu" or value.device.index != index or value.item() != 6.0:
             raise RuntimeError(f"Ascend CI compute/readback failed on NPU {index}")
     return count
 
