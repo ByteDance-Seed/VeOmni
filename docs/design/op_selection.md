@@ -730,3 +730,26 @@ model:
 
 - Fused MoE scatter/gather and backward launch bounds: [`fused_moe_ops.md`](fused_moe_ops.md)
 - Package layout and registration: `veomni/ops/README.md`
+
+### Coalescing GDN sequence-parallel exchanges
+
+Qwen4-Exp, Qwen3.5 and Qwen3.5-MoE automatically exchange Q, K, V, beta and
+decay in one packed collective when all five projection dtypes match. There is
+no separate model or op-selection switch. Mixed dtypes use the previous five
+collectives without casts. The recurrence, output projection, packed boundaries
+and model-selected process group are unchanged.
+
+Both key-head and value-head counts must remain divisible by that group's size.
+Coalescing does not enable new topologies or remove the head-layout constraint.
+Peer packets are padded to 512-byte boundaries and unpadded before restoring
+tensor axes. Backward applies the inverse permutation without gradient scaling.
+
+Q/K projection slices retain shared storage instead of being copied eagerly;
+V retains a view when its grouped-head layout permits one. Beta and decay are
+contiguous for their kernel consumers. Flattening multiple strided local heads
+may still require a copy before the final convolution input is concatenated.
+Temporary packing storage trades memory traffic for fewer collective launches.
+
+`tests/models/test_qwen4_exp_gdn_exchange.py` covers exact CPU/Gloo permutations,
+projection view storage, and native NCCL/HCCL model parity with same/mixed dtypes.
+CPU tests do not establish native throughput or numerical acceptance.

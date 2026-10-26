@@ -3,6 +3,16 @@
 
 model:
   model_path: DeepSeek-V4-Flash-Base
+  # Optional DeepSeek-V4 model_config overrides (DSpark MTP & DSA indexer loss):
+  # model_config:
+  #   dspark_block_size: 0
+  #   dspark_noise_token_id: 128799
+  #   dspark_target_layer_ids: null
+  #   dspark_markov_rank: 256
+  #   dspark_n_routed_experts: null
+  #   dspark_num_experts_per_tok: null
+  #   mtp_loss_coef: 1.0
+  #   freeze_mtp: false
   ops_implementation:
     attn_implementation: eager
     moe_implementation: fused_triton

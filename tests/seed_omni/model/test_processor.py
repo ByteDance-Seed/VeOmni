@@ -110,7 +110,7 @@ def test_omni_processor_preprocess_mutates_existing_conversation():
     processor = OmniProcessor({"a": _RecordingPreprocessor("only", calls)})
     conversation = [ConversationItem(type="text", value="hi", role="user")]
 
-    out = processor.preprocess(conversation, inference=True)
+    out = processor.preprocess(conversation)
 
     assert calls == ["only"]
     assert out["conversation_list"] is conversation

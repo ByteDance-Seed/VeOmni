@@ -458,7 +458,7 @@ class MultiSourceInfoTracker:
                     f"multi_source/step_consumed_tokens(M)/{self.names[ds_idx]}": global_counter[ds_idx].num_tokens
                     / 1e6,
                     f"multi_source/step_consumed_ratio/{self.names[ds_idx]}": global_counter[ds_idx].num_tokens
-                    / step_consumed_tokens,
+                    / max(step_consumed_tokens, 1),
                 }
             )
 

@@ -310,6 +310,14 @@ DeepSeek-V4-only by construction: no other model's config declares them.
 | --- | --- | --- | --- |
 | dsa_indexer_loss | `bool` | `False` | Train the DeepSeek sparse attention Lightning Indexer with the DeepSeek-V3.2 eq. (4) sparse KL objective. Requires `dsa_indexer_implementation: tilelang` and `dsa_attention_implementation: tilelang`, both refused at model build before any weight is read, and `ulysses_size: 1` with `cp_size: 1`, refused on the first forward. GPU-only; NPU refuses it. No unsupported combination is silently downgraded. |
 | dsa_indexer_loss_coef | `float` | `1.0` | Weight on the indexer KL when it is folded into the total loss. `0.0` switches the objective off entirely: no teacher is recomputed, no gradient reaches the indexer and no metric is reported, so it costs exactly what `dsa_indexer_loss: false` costs. Negative and non-finite values are refused. It is not a learning-rate knob for the indexer — see below before tuning it. |
+| dspark_block_size | `int` | `0` | Speculative draft block size for DeepSeek-V4 DSpark (`mtp.*`) stages. `0` leaves DSpark disabled; set to a positive integer (e.g. `5` in released DeepSeek-V4-Flash checkpoints) alongside `num_nextn_predict_layers > 0` to build and train the `model.mtp` stages. |
+| dspark_noise_token_id | `int` | `128799` | Noise token ID used to fill draft slots past slot 0 during speculative decoding. |
+| dspark_target_layer_ids | `list[int] \| None` | `None` | Backbone decoder layer indices whose stream averages feed stage 0's `main_proj`. Defaults to the last 3 backbone layers (`[num_hidden_layers - 3, ..., num_hidden_layers - 1]`). |
+| dspark_markov_rank | `int` | `256` | Bottleneck rank of the last DSpark stage's `DSparkMarkovHead` (`embed` + `head` residual over the shared LM head). |
+| dspark_n_routed_experts | `int \| None` | `None` | Number of routed experts in each `mtp.*` stage; defaults to `n_routed_experts` when `None`. |
+| dspark_num_experts_per_tok | `int \| None` | `None` | Top-k routed experts per token in each `mtp.*` stage; defaults to `num_experts_per_tok` when `None`. |
+| mtp_loss_coef | `float` | `1.0` | Weight on the teacher-forced DSpark slot-0 cross-entropy loss (`aux_metrics["mtp_loss"]`) folded into the total loss. Must be finite and `>= 0`; `0.0` disables the MTP loss term. |
+| freeze_mtp | `bool` | `False` | When `True`, freezes all `model.mtp` parameters and skips the MTP forward/loss during training. |
 
 Both fields are serialised into the checkpoint's `config.json`, so a checkpoint
 produced by a flag-on run reports `dsa_indexer_loss: true` when it is reloaded. To
