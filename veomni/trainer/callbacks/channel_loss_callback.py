@@ -905,6 +905,8 @@ class ChannelLossComputer:
                 shift_labels=call_args.get("shift_labels"),
                 ignore_index=ignore_index,
                 reused_per_token_loss=reused[0] if reused else None,
+                logits_bias=call_args.get("logits_bias"),
+                logits_bias_weight=call_args.get("logits_bias_weight"),
             )
 
         return main_loss
@@ -919,6 +921,8 @@ class ChannelLossComputer:
         shift_labels: torch.Tensor | None = None,
         ignore_index: int = IGNORE_INDEX,
         reused_per_token_loss: torch.Tensor | None = None,
+        logits_bias: torch.Tensor | None = None,
+        logits_bias_weight: torch.Tensor | None = None,
     ) -> None:
         observer_device = next(
             (
@@ -947,6 +951,8 @@ class ChannelLossComputer:
                 ignore_index=ignore_index,
                 defer_sp=True,
                 reused_per_token_loss=reused_per_token_loss,
+                logits_bias=logits_bias,
+                logits_bias_weight=logits_bias_weight,
             )
             if result:
                 if self._data_result is None and self._pending_data_observation_index is None:
@@ -989,6 +995,8 @@ class ChannelLossComputer:
         ignore_index: int,
         defer_sp: bool = False,
         reused_per_token_loss: torch.Tensor | None = None,
+        logits_bias: torch.Tensor | None = None,
+        logits_bias_weight: torch.Tensor | None = None,
     ) -> list[dict[str, Any]] | _PendingSPObservation:
         descriptor = self._capture_sp_descriptor
         if descriptor is None:
@@ -1017,7 +1025,9 @@ class ChannelLossComputer:
         per_token_loss = (
             reused_per_token_loss.reshape(-1)
             if reused_per_token_loss is not None
-            else self._per_token_ce(logits, labels_flat, vocab_size, hidden_states, weights, ignore_index)
+            else self._per_token_ce(
+                logits, labels_flat, vocab_size, hidden_states, weights, ignore_index, logits_bias, logits_bias_weight
+            )
         )
         if per_token_loss is None:
             return []
@@ -1076,11 +1086,15 @@ class ChannelLossComputer:
         hidden_states: torch.Tensor | None,
         weights: torch.Tensor | None,
         ignore_index: int,
+        logits_bias: torch.Tensor | None = None,
+        logits_bias_weight: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         if hidden_states is not None and weights is not None:
             hs = hidden_states.detach().reshape(-1, hidden_states.size(-1))
             w = weights.detach()
-            return self._eager_chunked(hs, w, labels_flat.to(hs.device), ignore_index)
+            bias = logits_bias.detach().reshape(-1, logits_bias.size(-1)) if logits_bias is not None else None
+            bias_weight = logits_bias_weight.detach() if logits_bias_weight is not None else None
+            return self._eager_chunked(hs, w, labels_flat.to(hs.device), ignore_index, bias, bias_weight)
 
         if logits is not None:
             vocab = vocab_size if vocab_size is not None else logits.size(-1)
@@ -1115,12 +1129,19 @@ class ChannelLossComputer:
         weights: torch.Tensor,
         labels_flat: torch.Tensor,
         ignore_index: int,
+        logits_bias: torch.Tensor | None = None,
+        logits_bias_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         seq_len = hidden_states.size(0)
         result = torch.empty(seq_len, device=hidden_states.device, dtype=torch.float32)
         for start in range(0, seq_len, cls.EAGER_CHUNK_SIZE):
             end = min(start + cls.EAGER_CHUNK_SIZE, seq_len)
             chunk_logits = F.linear(hidden_states[start:end], weights).float()
+            if logits_bias is not None:
+                bias = logits_bias[start:end]
+                if logits_bias_weight is not None:
+                    bias = F.linear(bias, logits_bias_weight)
+                chunk_logits = chunk_logits + bias.float()
             result[start:end] = F.cross_entropy(
                 chunk_logits,
                 labels_flat[start:end],

@@ -22,6 +22,7 @@ ignore_index, num_items_in_batch)``.
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import lru_cache
 from typing import Any
 
 from torch import Tensor, nn
@@ -38,6 +39,12 @@ from .chunk_topk_distill import chunk_topk_distill_function
 def _default_op() -> VeomniOp:
     """Return the default eager token-level cross-entropy op."""
     return VeomniOp("cross_entropy_loss", "standard", "eager")
+
+
+@lru_cache(maxsize=1)
+def _chunk_loss_op() -> VeomniOp:
+    """Return the chunked token-level cross-entropy op."""
+    return VeomniOp("cross_entropy_loss", "standard", "chunk_loss")
 
 
 def _select_hidden_weight(
@@ -130,11 +137,17 @@ def ForCausalLMLoss(
     teacher_topk_log_probs = kwargs.pop("teacher_topk_log_probs", None)
     log_prob_min_clamp = kwargs.pop("log_prob_min_clamp", None)
     chunk_size = kwargs.pop("chunk_size", 1024)
+    logits_bias = kwargs.pop("logits_bias", None)
+    logits_bias_weight = kwargs.pop("logits_bias_weight", None)
 
     if hidden_states is None and logits is None:
         raise ValueError("hidden_states or logits must be provided.")
+    if logits_bias_weight is not None and logits_bias is None:
+        raise ValueError("logits_bias_weight requires logits_bias to be provided.")
 
     if return_log_probs:
+        if logits_bias is not None:
+            raise NotImplementedError("logits_bias is supported by the chunk_loss loss path, not return_log_probs.")
         if hidden_states is None:
             raise ValueError("return_log_probs=True requires hidden_states (fused-linear path).")
         if weights is None:
@@ -179,7 +192,34 @@ def ForCausalLMLoss(
         )
         return None, None, FusedLinearAuxOutput(log_probs=log_probs, entropy=entropy)
 
-    token_op = op if op is not None else _default_op()
+    if logits_bias is not None:
+        if hidden_states is None or weights is None:
+            raise NotImplementedError("logits_bias is only supported on the fused hidden_states + weights path.")
+        if logits_bias.shape[:-1] != hidden_states.shape[:-1]:
+            raise ValueError(
+                f"logits_bias rows {tuple(logits_bias.shape[:-1])} do not match hidden_states rows "
+                f"{tuple(hidden_states.shape[:-1])}."
+            )
+        if logits_bias_weight is not None:
+            if logits_bias_weight.ndim != 2 or logits_bias_weight.shape != (weights.shape[0], logits_bias.shape[-1]):
+                raise ValueError(
+                    f"logits_bias_weight shape {tuple(logits_bias_weight.shape)} must match "
+                    f"(vocab_size={weights.shape[0]}, rank={logits_bias.shape[-1]})."
+                )
+        elif logits_bias.shape[-1] != weights.shape[0]:
+            raise ValueError(
+                f"logits_bias last dim {logits_bias.shape[-1]} does not match vocab_size {weights.shape[0]}."
+            )
+        logits_bias = logits_bias.reshape(-1, logits_bias.size(-1))
+        token_op = _chunk_loss_op() if op is None else op
+        if getattr(token_op, "impl", None) not in ("chunk_loss", "eager"):
+            raise NotImplementedError(
+                "logits_bias is only supported by cross_entropy_loss_implementation in ('chunk_loss', 'eager') "
+                "on the fused hidden_states + weights path."
+            )
+    else:
+        token_op = op if op is not None else _default_op()
+
     device = logits.device if logits is not None else hidden_states.device
     sp_enabled = get_parallel_state().sp_enabled
     target = _select_causal_target(labels, shift_labels, ignore_index=ignore_index, sp_enabled=sp_enabled)
@@ -195,6 +235,10 @@ def ForCausalLMLoss(
     token_kwargs: dict[str, Any] = {}
     if getattr(token_op, "impl", None) == "chunk_loss":
         token_kwargs["chunk_size"] = chunk_size
+    if logits_bias is not None:
+        token_kwargs["logits_bias"] = logits_bias
+    if logits_bias_weight is not None:
+        token_kwargs["logits_bias_weight"] = logits_bias_weight
     loss = token_op(
         hidden,
         target,

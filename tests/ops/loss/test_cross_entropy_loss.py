@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -23,6 +25,7 @@ from torch import Tensor
 from torch.utils._python_dispatch import TorchDispatchMode
 from transformers.loss.loss_utils import fixed_cross_entropy
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.tol import (
     CE_FUSED_ATOL,
     CE_FUSED_GRAD_ATOL,
@@ -36,6 +39,55 @@ from tests.ops.tol import (
 from tests.ops.utils import make_grad_leaf
 from veomni.ops import resolve_op
 from veomni.utils.device import IS_CUDA_AVAILABLE
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("bias_kind", ["full", "factored"])
+@pytest.mark.parametrize("trainable", ["all", "bias_only", "none"])
+@pytest.mark.parametrize("all_ignored", [False, True])
+def test_chunk_observer_preserves_logits_bias_and_gradients(bias_kind, trainable, all_ignored):
+    """Observation must preserve both bias forms, including bias-only gradients."""
+    from torch.autograd.graph import saved_tensors_hooks
+
+    from veomni.utils.loss_observer import capture_chunk_loss_per_token
+
+    torch.manual_seed(712)
+    hidden = torch.randn(2, 7, 8)
+    weight = torch.randn(19, 8)
+    bias = torch.randn(2, 7, 4 if bias_kind == "factored" else 19)
+    tensors = [hidden, weight, bias]
+    if bias_kind == "factored":
+        tensors.append(torch.randn(19, 4))
+    labels = torch.randint(0, 19, (2, 7))
+    labels[:, 1:3] = -100
+    if all_ignored:
+        labels.fill_(-100)
+
+    results, captured = [], []
+    for observe in (False, True):
+        args = [
+            tensor.detach().clone().requires_grad_(trainable == "all" or (trainable == "bias_only" and i >= 2))
+            for i, tensor in enumerate(tensors)
+        ]
+        context = capture_chunk_loss_per_token(captured.append) if observe else nullcontext()
+        with context, saved_tensors_hooks(lambda tensor: tensor.detach().clone(), lambda tensor: tensor):
+            loss = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(
+                args[0], labels, args[1], *args[2:], chunk_size=3
+            )
+            if loss.requires_grad:
+                loss.backward()
+        results.append((loss.detach(), *(arg.grad for arg in args)))
+
+    for actual, expected in zip(results[1], results[0], strict=True):
+        if expected is None:
+            assert actual is None
+        else:
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    logits = F.linear(hidden, weight)
+    logits = logits + (F.linear(bias, tensors[3]) if bias_kind == "factored" else bias)
+    expected_tokens = F.cross_entropy(logits.reshape(-1, 19), labels.reshape(-1), reduction="none").reshape_as(labels)
+    assert len(captured) == 1
+    torch.testing.assert_close(captured[0], expected_tokens)
 
 
 class _FullWeightAddCounter(TorchDispatchMode):
@@ -543,17 +595,34 @@ def test_chunk_loss_rejects_mismatched_empty_token_counts(hidden_shape, labels_s
         resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(hidden, labels, weight)
 
 
-def test_chunk_loss_empty_returns_connected_zero():
+@pytest.mark.parametrize("impl", ["eager", "chunk_loss"])
+def test_chunk_loss_empty_returns_connected_zero(impl):
     hidden = torch.empty(2, 0, 4, requires_grad=True)
     labels = torch.empty(2, 0, dtype=torch.long)
     weight = torch.randn(8, 4, requires_grad=True)
 
-    loss = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(hidden, labels, weight)
+    loss = resolve_op("cross_entropy_loss", "standard", impl).wrapper(hidden, labels, weight)
 
     assert loss.item() == 0.0
     loss.backward()
     torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden))
     torch.testing.assert_close(weight.grad, torch.zeros_like(weight))
+
+
+def test_liger_empty_backward_returns_three_grads():
+    from veomni.ops.kernels.loss.cross_entropy_loss.standard import liger_kernel as liger_row
+
+    hidden = torch.empty(2, 0, 4, requires_grad=True)
+    labels = torch.empty(2, 0, dtype=torch.long)
+    weight = torch.randn(8, 4, requires_grad=True)
+
+    loss, saved = liger_row.forward(hidden, labels, weight, grad_enabled=True)
+    assert loss.item() == 0.0
+    grads = liger_row.backward(torch.ones_like(loss), saved)
+    assert len(grads) == 3
+    assert grads[0] is not None and grads[0].shape == hidden.shape
+    assert grads[1] is None
+    assert grads[2] is not None and grads[2].shape == weight.shape
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
