@@ -20,10 +20,10 @@ import ast
 import textwrap
 
 import pytest
+from patchgen.codegen import ModelingCodeGenerator
+from patchgen.patch_spec import Patch, PatchConfig, PatchType
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.patchgen.codegen import ModelingCodeGenerator
-from veomni.patchgen.patch_spec import Patch, PatchConfig, PatchType
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
