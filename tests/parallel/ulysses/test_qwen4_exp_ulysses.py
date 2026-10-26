@@ -478,9 +478,9 @@ def test_qwen4_exp_compact_qsa_gqa_matches_full_sequence():
     torchrun(_run_qsa_equivalence, _CI_ACCELERATOR_2.nproc, 4, 2)
 
 
-@_CUDA_ONLY
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 def test_qwen4_exp_compact_qsa_cp_nondivisible_heads_matches_full_sequence():
+    """Check packed CP-only QSA outputs and gradients on CUDA and Ascend."""
     torchrun(_run_qsa_equivalence, _CI_ACCELERATOR_2.nproc, 3, 1, "cp", "eager")
 
 
