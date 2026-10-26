@@ -199,7 +199,7 @@ apart from the compatibility aliases documented below.
 
 | Field | GPU | Ascend NPU | Cambricon MLU |
 |---|---|---|---|
-| `moe_implementation` | `fused_triton` | `fused_npu` | `fused_mlu` with Apex, else `fused_triton` |
+| `moe_implementation` | `fused_triton` | `fused_npu` | `fused_mlu` |
 | `cross_entropy_loss_implementation` | `liger_kernel` | `chunk_loss` | `liger_kernel` |
 | `rms_norm_implementation` | `liger_kernel` | `torch_npu` (`eager` for `unweighted`) | `liger_kernel` |
 | `swiglu_mlp_implementation` | `liger_kernel` | `eager` | `liger_kernel` |
@@ -207,7 +207,8 @@ apart from the compatibility aliases documented below.
 | `rotary_pos_emb_vision_implementation` | `liger_kernel` | `torch_npu` | `liger_kernel` |
 | `load_balancing_loss_implementation` | `triton` | `eager` | `eager` |
 
-**Note:** `liger_kernel` on MLU requires the Cambricon MLU build (the `liger_kernel` wheel
+**Note:** `moe_implementation=fused_mlu` on MLU requires the Cambricon MLU Apex build, else fallback to `fused_triton`;
+`liger_kernel` on MLU requires the Cambricon MLU liger_kernel build (the `liger_kernel` wheel
 versioned `+mlu*`). Without it, MLU fields default to `eager`.
 
 Explicit values are never rewritten, including explicit GPU values on NPU.

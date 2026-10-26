@@ -31,7 +31,7 @@ If a field is not in this table, it is not an op-selection knob.
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `triton` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `triton`, `fla_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU) | `"triton"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
 | QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Model `__init__` stores `self.qat_implementation`; patched helpers consume that bound recipe |
 
 `qat_implementation` has no per-model registry variants. `fp8_blockwise` is
@@ -282,7 +282,7 @@ model:
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `liger_kernel` | Fused linear + CE raw forward/backward | `liger-kernel` package (GPU, MLU) |
+| `liger_kernel` | Fused linear + CE raw forward/backward | `liger-kernel` package + GPU/MLU |
 | `chunk_loss` | Chunked `F.linear` + CE with one global denominator | — |
 | `eager` | PyTorch `F.linear`/`F.cross_entropy` | — |
 
@@ -336,7 +336,7 @@ model:
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `liger_kernel` | Registered Liger RMSNorm row | `liger-kernel` package (GPU, MLU) |
+| `liger_kernel` | Registered Liger RMSNorm row | `liger-kernel` package |
 | `npu` | Registered `torch_npu.npu_rms_norm` row for `standard`, `offset`, and `deepseek_v4`; `unweighted` resolves `npu` to `eager` | `torch_npu` |
 | `triton` | Registered model-specific Triton row (for example DeepSeek-V3 batch-invariant RMSNorm) | `triton` |
 | `eager` | Registered PyTorch reference row | — |
@@ -349,7 +349,7 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `liger_kernel` | Registered Liger RoPE row | `liger-kernel` package (GPU, MLU) |
+| `liger_kernel` | Registered Liger RoPE row | `liger-kernel` package |
 | `npu` | Registered `torch_npu.npu_rotary_mul` row | `torch_npu` |
 | `triton` | Registered model-specific Triton row (DeepSeek-V3 deterministic RoPE, DeepSeek-V4 fused partial-interleaved RoPE, Wan DiT) | `triton` |
 | `eager` | Registered PyTorch reference row | — |
@@ -358,7 +358,7 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `liger_kernel` | Registered Liger SwiGLU row | `liger-kernel` package (GPU, MLU) |
+| `liger_kernel` | Registered Liger SwiGLU row | `liger-kernel` package |
 | `eager` | Registered PyTorch reference row | — |
 
 ### What gets patched
