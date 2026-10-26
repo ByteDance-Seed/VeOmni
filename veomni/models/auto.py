@@ -98,6 +98,16 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     if IS_NPU_AVAILABLE and model_type != "qwen4_exp":
         raise NotImplementedError("Context parallelism on Ascend/NPU is currently implemented for Qwen4-Exp only.")
 
+    from .seed_omni.modules.module_configuration_base import OmniModuleConfig
+
+    if isinstance(config, OmniModuleConfig):
+        if getattr(config, "_supports_context_parallel", False):
+            return
+        inner_config = getattr(config, "text_config", None) or getattr(config, "vision_config", None)
+        inner_model_type = getattr(inner_config, "model_type", None)
+        if inner_model_type in CONTEXT_PARALLEL_MODEL_TYPES:
+            return
+
     if model_type in CONTEXT_PARALLEL_MODEL_TYPES:
         return
 

@@ -30,6 +30,23 @@ def test_hybrid_opt_in_rejects_non_booleans_before_topology_resolution(monkeypat
         AcceleratorConfig(allow_hybrid_cp=value)
 
 
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None, [], {}])
+@pytest.mark.parametrize("constructor", ["state", "init"])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_direct_hybrid_state_rejects_non_booleans_before_mesh_creation(monkeypatch, value, constructor):
+    import veomni.distributed.parallel_state as parallel_state
+
+    def unexpected_mesh(*args, **kwargs):
+        pytest.fail("Invalid hybrid opt-in must fail before mesh creation")
+
+    monkeypatch.setattr(parallel_state, "init_device_mesh", unexpected_mesh)
+    with pytest.raises(ValueError, match="allow_hybrid_cp must be a boolean"):
+        if constructor == "state":
+            parallel_state.ParallelState(allow_hybrid_cp=value)
+        else:
+            parallel_state._init_parallel_state(allow_hybrid_cp=value, name=None, device_type="cpu")
+
+
 def test_false_hybrid_opt_in_preserves_single_axis_topology(monkeypatch):
     monkeypatch.setenv("WORLD_SIZE", "32")
     config = AcceleratorConfig(ulysses_size=8, allow_hybrid_cp=False)

@@ -79,6 +79,8 @@ class ParallelState:
     async_enabled: Optional[bool] = False
 
     def __post_init__(self):
+        if not isinstance(self.allow_hybrid_cp, bool):
+            raise ValueError(f"allow_hybrid_cp must be a boolean; got {self.allow_hybrid_cp!r}.")
         if not self.include_sp_in_fsdp:
             raise NotImplementedError("Decoupled sequence parallel has not been implemented.")
 
@@ -89,6 +91,8 @@ class ParallelState:
         # directly, which is how a per-module state under use_parallel_state is made.
         if self.cp_size < 1:
             raise ValueError(f"cp_size must be a positive integer; got {self.cp_size}.")
+        if self.ulysses_size < 1:
+            raise ValueError(f"ulysses_size must be a positive integer; got {self.ulysses_size}.")
 
         if self.cp_size > 1 and self.ulysses_size > 1 and not self.allow_hybrid_cp:
             raise NotImplementedError(
@@ -533,6 +537,9 @@ def _init_parallel_state(
     with the same topology hands back this same object.
     """
     global _PARALLEL_STATE
+
+    if not isinstance(allow_hybrid_cp, bool):
+        raise ValueError(f"allow_hybrid_cp must be a boolean; got {allow_hybrid_cp!r}.")
 
     if name is not None and name in _PARALLEL_STATE_REGISTRY:
         logger.debug(

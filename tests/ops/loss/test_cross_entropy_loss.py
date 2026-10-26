@@ -543,17 +543,34 @@ def test_chunk_loss_rejects_mismatched_empty_token_counts(hidden_shape, labels_s
         resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(hidden, labels, weight)
 
 
-def test_chunk_loss_empty_returns_connected_zero():
+@pytest.mark.parametrize("impl", ["eager", "chunk_loss"])
+def test_chunk_loss_empty_returns_connected_zero(impl):
     hidden = torch.empty(2, 0, 4, requires_grad=True)
     labels = torch.empty(2, 0, dtype=torch.long)
     weight = torch.randn(8, 4, requires_grad=True)
 
-    loss = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(hidden, labels, weight)
+    loss = resolve_op("cross_entropy_loss", "standard", impl).wrapper(hidden, labels, weight)
 
     assert loss.item() == 0.0
     loss.backward()
     torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden))
     torch.testing.assert_close(weight.grad, torch.zeros_like(weight))
+
+
+def test_liger_empty_backward_returns_three_grads():
+    from veomni.ops.kernels.loss.cross_entropy_loss.standard import liger_kernel as liger_row
+
+    hidden = torch.empty(2, 0, 4, requires_grad=True)
+    labels = torch.empty(2, 0, dtype=torch.long)
+    weight = torch.randn(8, 4, requires_grad=True)
+
+    loss, saved = liger_row.forward(hidden, labels, weight, grad_enabled=True)
+    assert loss.item() == 0.0
+    grads = liger_row.backward(torch.ones_like(loss), saved)
+    assert len(grads) == 3
+    assert grads[0] is not None and grads[0].shape == hidden.shape
+    assert grads[1] is None
+    assert grads[2] is not None and grads[2].shape == weight.shape
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
