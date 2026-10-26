@@ -27,6 +27,12 @@ first pass through its model's existing dequantization/weight-loading path.
 quantizes its GEMM operands; model-side QAT would add a fake-quantization pass
 before dispatch. This setting is independent of rollout/export quantization.
 
+MoE-LoRA on routed expert weights is unsupported with `deepgemm_fp8`. Both
+shared and independent LoRA wrappers raise before moving the base parameters,
+instead of silently switching to BF16 eager execution. Select a supported
+MoE-LoRA backend such as `fused_triton` on GPU, or exclude expert weights from
+the LoRA targets. This restriction does not apply to LoRA on dense modules.
+
 The mainline DeepSeek V4 expert module is covered by a real forward/backward
 integration test, using its existing merged weights and routing-score cast.
 This is operator integration, not full-model convergence validation.
