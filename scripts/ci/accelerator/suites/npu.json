@@ -358,7 +358,7 @@
     ]
   },
   {
-    "name": "npu-unit-41",
+    "name": "npu-unit-36",
     "suite": "unit",
     "conditional": false,
     "args": [
@@ -368,24 +368,13 @@
     ]
   },
   {
-    "name": "npu-unit-36",
+    "name": "npu-unit-37",
     "suite": "unit",
     "conditional": false,
     "args": [
       "-s",
       "-x",
       "tests/ci/"
-    ]
-  },
-  {
-    "name": "npu-unit-37",
-    "suite": "unit",
-    "conditional": false,
-    "args": [
-      "-v",
-      "-s",
-      "-x",
-      "tests/utils/test_moe_router_replay_api.py"
     ]
   },
   {
@@ -396,11 +385,22 @@
       "-v",
       "-s",
       "-x",
+      "tests/utils/test_moe_router_replay_api.py"
+    ]
+  },
+  {
+    "name": "npu-unit-39",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-v",
+      "-s",
+      "-x",
       "tests/utils/test_save_safetensor_utils.py"
     ]
   },
   {
-    "name": "npu-e2e-39",
+    "name": "npu-e2e-40",
     "suite": "e2e",
     "args": [
       "-v",
@@ -410,7 +410,7 @@
     ]
   },
   {
-    "name": "npu-e2e-40",
+    "name": "npu-e2e-41",
     "suite": "e2e",
     "args": [
       "-v",

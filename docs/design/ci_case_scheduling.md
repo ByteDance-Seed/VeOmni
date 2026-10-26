@@ -60,7 +60,7 @@ collected against the complete runner slice to catch such losses.
 
 `pytest.mark.skipif(device_count < N)` markers express eligibility,
 not exact resource reservations. For example,
-[the CP eligibility marker](../../tests/parallel/context_parallel/test_deepseek_v4_cp.py#L920)
+[the CP eligibility marker](../../tests/parallel/context_parallel/test_deepseek_v4_cp.py#L1174)
 checks a two-device minimum but launches either two or four workers according
 to its parameter. The
 [launcher defaults](../../tests/tools/launch_utils.py#L149) and
@@ -220,7 +220,7 @@ Unrelated processes are outside the cancellation scope. Interrupted execution
 records retain a failure return code and the summary records the interruption.
 
 Foreground case logs use `[unit-09-case-0001][STATUS][devices=0,1,2,3] nodeid`,
-with `[e2e-57-case-0001]` for e2e and `[devices=cpu]` for CPU batches. Entry
+with `[e2e-59-case-0001]` for e2e and `[devices=cpu]` for CPU batches. Entry
 IDs come from the manifest; case IDs are one-based indices within each entry's
 collected inventory, including parameterized cases. IDs remain stable across
 batching, sorting and dispatch order. Batch indices are not displayed.

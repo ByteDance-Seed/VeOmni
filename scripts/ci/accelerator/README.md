@@ -128,7 +128,9 @@ Inductor registry, restoring its previous policy afterward. CPU graphs still
 compile with Inductor; accelerator cases keep normal NPU registration.
 CPU cases initialize a missing built-in CPU device-op override as well. This
 handles Torch 2.10's partially populated registry after importing torch_npu,
-while preserving existing CPU and vendor overrides.
+while preserving existing CPU and vendor overrides. Setup is also covered by
+the restoration scope: partial setup failures restore every state already
+changed. Missing vendor isolation interfaces fail explicitly before test execution.
 
 ## Results and local commands
 
@@ -145,9 +147,11 @@ including `durations.json`, are reporting artifacts and are not scheduling input
 
 Manifest selection numbers run consecutively from one across each file,
 including both unit and e2e entries. Keep the existing order when renumbering.
+The GPU manifest has unit entries 01–58 and e2e entries 59–61. The NPU
+manifest has unit entries 01–39 and e2e entries 40–41.
 Foreground case statuses use `[unit-09-case-0001][STATUS][devices=0,1,2,3] nodeid`
-(or `[e2e-58-case-0001]` and `[devices=cpu]`). The entry ID comes from the
-manifest: `09-unit` becomes `unit-09`, `npu-e2e-38` becomes `e2e-38`, and
+(or `[e2e-59-case-0001]` and `[devices=cpu]`). The entry ID comes from the
+manifest: `09-unit` becomes `unit-09`, `npu-e2e-40` becomes `e2e-40`, and
 the GPU CI planner selection `55-unit` becomes `unit-55`. Each case gets a
 one-based, four-digit index within
 its entry's collected inventory, including parameterized cases. This index is
@@ -169,7 +173,7 @@ entry `display_id`; aggregated `cases.json` carries each case's full
 [unit-09][START][devices=cpu] tests/foo/test_bar.py (cases=2)
 [unit-09-case-0001][RUN][devices=cpu] tests/foo/test_bar.py::test_a
 [unit-09-case-0001][PASSED (12/4508)][devices=cpu] tests/foo/test_bar.py::test_a
-[e2e-57-case-0001][FAILED (3/120)][devices=0,1,2,3] tests/e2e/test_parallel.py::test_alignment
+[e2e-59-case-0001][FAILED (3/120)][devices=0,1,2,3] tests/e2e/test_parallel.py::test_alignment
     ... traceback ...
 ```
 
@@ -210,7 +214,7 @@ text-only fixtures use vocabularies of 4096. Qwen3-MoE retains four MoE
 layers for the LoRA per-layer EP slicing assertions. Vision/audio widths are matched to
 the text connectors. Existing numerical tolerances and checkpoint/optimizer
 round-trip assertions are unchanged. GPU and NPU e2e suites each include one
-Wan alignment invocation. Qwen3-MoE EP1/4/8 saveload cases check HF export
+Wan alignment invocation. Qwen3-MoE EP1/2/4 saveload cases on four cards check HF export
 alongside DCP/optimizer restoration and independent CLI DCP-to-HF verification.
 
 Fused checkpoint formats also require distinguishable weight layouts: for
