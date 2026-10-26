@@ -162,7 +162,7 @@ def test_deepseek_v4_attention_preserves_q_norm_and_rope_dtype_modes():
     assert not torch.equal(captured["query"], wrong_fp32_multiply)
 
 
-@pytest.mark.parametrize("impl", ["eager", "fused_triton", "fused_deepgemm_fp8"])
+@pytest.mark.parametrize("impl", ["eager", "fused_triton", "deepgemm_fp8"])
 def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
     config = _tiny_config()
     model = _build_ours(config)
@@ -223,10 +223,10 @@ def test_deepseek_v4_experts_deepgemm_fp8_forward_backward():
         swiglu_limit=10.0,
     )
     device = get_device_type()
-    ops = OpsImplementationConfig(moe_implementation="fused_deepgemm_fp8", qat_implementation="none")
+    ops = OpsImplementationConfig(moe_implementation="deepgemm_fp8", qat_implementation="none")
     with ops_config_scope(ops):
         experts = _dsv4_module().DeepseekV4Experts(config).to(device=device, dtype=torch.bfloat16)
-    assert experts.veomni_moe.impl == "fused_deepgemm_fp8"
+    assert experts.veomni_moe.impl == "deepgemm_fp8"
     torch.manual_seed(91)
     with torch.no_grad():
         experts.gate_up_proj.normal_(std=0.03)

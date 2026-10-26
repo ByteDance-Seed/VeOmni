@@ -235,7 +235,7 @@ VeOmni uses FSDP2 exclusively.
    - `fully_shard()` on root model
 4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention; the FSDP shard mesh fuses with SP mesh (`dp_shard_sp`)
 5. EP token routing is in model MoE code + `moe_layer.py` using `ep_group` from `ParallelState`
-   - `moe_experts/standard/fused_deepgemm_fp8` uses the same dispatch with
+   - `moe_experts/standard/deepgemm_fp8` uses the same dispatch with
      Hopper/Blackwell FP8 grouped forward/dgrad/wgrad in `ops/kernels/moe_experts/`.
      FSDP2 and EP communication retain their configured precision. Quantized
      weights are invocation-local; see `docs/design/deepgemm_fp8_moe.md`.

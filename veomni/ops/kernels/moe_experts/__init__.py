@@ -97,7 +97,7 @@ register_op(
 register_op(
     "moe_experts",
     "standard",
-    "fused_deepgemm_fp8",
+    "deepgemm_fp8",
     description="DeepGEMM blockwise FP8 expert forward, input gradients and weight gradients",
     wrapper=standard_deepgemm.wrapper,
     requirement=GpuKernelRequirement(

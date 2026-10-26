@@ -31,7 +31,7 @@ If a field is not in this table, it is not an op-selection knob.
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `triton` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `triton`, `fla_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU) | `"triton"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_deepgemm_fp8` (SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `deepgemm_fp8` (SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Model `__init__` stores `self.qat_implementation`; patched helpers consume that bound recipe |
 
 `qat_implementation` has no per-model registry variants. `fp8_blockwise` is
@@ -463,7 +463,7 @@ model:
   ops_implementation:
     moe_implementation: fused_triton   # Triton group-gemm (GPU, SM70+ or MLU)
     # moe_implementation: fused_quack  # Quack CUTLASS/CuTe (NVIDIA SM90+)
-    # moe_implementation: fused_deepgemm_fp8  # Native FP8 training (Hopper SM90 / Blackwell SM100)
+    # moe_implementation: deepgemm_fp8  # Native FP8 training (Hopper SM90 / Blackwell SM100)
     # moe_implementation: fused_npu    # NPU group-gemm (Ascend)
     # moe_implementation: fused_mlu    # Apex grouped-GEMM (MLU)
     # moe_implementation: eager   # Reference PyTorch loop (very slow, debug only)
@@ -483,7 +483,7 @@ raise during config validation or op binding.
 | `eager` | PyTorch expert loop | Any | No |
 | `fused_triton` | Triton group-gemm | GPU, SM70+ or MLU | Yes |
 | `fused_quack` | Quack CUTLASS/CuTe | GPU, SM90+ (H100+) | Yes |
-| `fused_deepgemm_fp8` | DeepGEMM FP8 forward/dgrad/wgrad | NVIDIA Hopper SM90 / Blackwell SM100 | Yes |
+| `deepgemm_fp8` | DeepGEMM FP8 forward/dgrad/wgrad | NVIDIA Hopper SM90 / Blackwell SM100 | Yes |
 | `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
 | `fused_mlu` | Apex grouped-GEMM | Cambricon MLU | Yes |
 
@@ -590,8 +590,8 @@ All four are defined in `transformers.integrations`:
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
 | **Mechanism** | Each patched experts module constructs `VeomniOp("moe_experts", variant, impl)` in `__init__` and always calls that handle in `forward`; the selected row may be eager, fused Triton, fused Quack, FP8 DeepGEMM, fused NPU, or fused MLU. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
-| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused_triton"` / `"fused_quack"` / `"fused_deepgemm_fp8"` / `"fused_npu"` / `"fused_mlu"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
-| **EP support** | `fused_triton`, `fused_quack`, `fused_deepgemm_fp8` and `fused_npu` support Expert Parallelism via VeOmni's EP sharding | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
+| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused_triton"` / `"fused_quack"` / `"deepgemm_fp8"` / `"fused_npu"` / `"fused_mlu"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
+| **EP support** | `fused_triton`, `fused_quack`, `deepgemm_fp8` and `fused_npu` support Expert Parallelism via VeOmni's EP sharding | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
 | **When** | Handle resolution in model `__init__`; dispatch at forward time | Decorator at class definition time; dispatch at forward time |
 
 **Note:** Transformers v5 hardcodes two MoE experts implementations (`batched_mm` and `grouped_mm`) and does not expose a registration interface for external fused implementations, so VeOmni models call their local `VeomniOp` handles rather than routing through `ALL_EXPERTS_FUNCTIONS`.

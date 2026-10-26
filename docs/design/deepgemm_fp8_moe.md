@@ -1,6 +1,6 @@
 # FP8 MoE training with DeepGEMM on Hopper and Blackwell
 
-`moe_implementation: fused_deepgemm_fp8` selects native FP8 grouped GEMMs for
+`moe_implementation: deepgemm_fp8` selects native FP8 grouped GEMMs for
 routed SwiGLU experts' forward, activation gradients (dgrad), and weight
 gradients (wgrad). It implements the existing `moe_experts/standard` contract
 and is opt-in. It does not require Transformer Engine.
@@ -12,7 +12,7 @@ For a model using the standard SwiGLU expert contract:
 ```yaml
 model:
   ops_implementation:
-    moe_implementation: fused_deepgemm_fp8
+    moe_implementation: deepgemm_fp8
     qat_implementation: none
 ```
 
@@ -61,32 +61,35 @@ This is operator integration, not full-model convergence validation.
   precision. This change does not add FP8 all-gather, quantized optimizer state,
   or a persistent FP8 parameter cache.
 
-## Optional dependency
+## Installation
 
-DeepGEMM is deliberately outside the default GPU environment and is imported
-only when this implementation runs. The validated version is commit
-`5081f8513af57e61696de4f4f04b0e707ffb503e` (2.8.2), with PyTorch 2.11.0+cu130
-and Triton 3.6.0:
+`uv sync` with the `gpu` extra installs the pinned DeepGEMM wheel from
+[verl-wheelhouse](https://github.com/verl-project/verl-wheelhouse). The wheels
+package commit `5081f8513af57e61696de4f4f04b0e707ffb503e` as
+`deep-gemm==2.8.2+5081f85`, built for PyTorch 2.11.0 and CUDA 13.0.2.
+`pyproject.toml` selects the release asset for Python 3.11 or 3.12 and Linux
+x86_64 or aarch64; `uv.lock` records its SHA256. CPU-only and NPU environments
+do not install this package.
 
 ```bash
 uv sync --extra gpu --dev --locked
-git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git /tmp/DeepGEMM
-git -C /tmp/DeepGEMM checkout 5081f8513af57e61696de4f4f04b0e707ffb503e
-git -C /tmp/DeepGEMM submodule update --init --recursive
-DG_FORCE_BUILD=1 DG_USE_LOCAL_VERSION=1 \
-  uv pip install --python .venv/bin/python --no-build-isolation /tmp/DeepGEMM
 ```
 
-The upstream build requires the CUDA toolkit/compiler, a C++20 compiler and
-standard library (validated with GCC 13), and development headers including
-libdw. Preserve the host's CUDA compatibility library paths. An exact
-`uv sync` can prune this optional installation; install it again afterwards.
-Prebuilt wheels are being prepared in
-[verl-wheelhouse](https://github.com/verl-project/verl-wheelhouse/pull/33).
-Wheel dependencies will be added separately after that change is merged and
-the matching artifacts have been built and validated.
-Missing dependencies and unsupported devices raise instead of falling back to
-BF16. Merely importing `veomni.ops` does not import DeepGEMM or its Triton kernels.
+These are native Linux wheels built on Ubuntu 24.04, not portable manylinux
+wheels. Their host extension requires glibc 2.38 or newer and libstdc++ providing
+`GLIBCXX_3.4.31` on x86_64 or `GLIBCXX_3.4.29` on aarch64. The supported
+NGC 25.11 / Ubuntu 24.04 environment satisfies these requirements.
+
+Installation uses the prebuilt host extension, but the first invocation of a
+new GEMM specialization still JIT-compiles a GPU kernel. Keep the CUDA 13
+NVCC toolkit and a C++20 compiler/standard library available (validated with
+GCC 13), and preserve the host's CUDA compatibility library paths. The wheel
+includes the DeepJIT/CUTLASS headers; a DeepGEMM source checkout is not required.
+No Transformer Engine dependency is added.
+
+The backend remains opt-in. Missing dependencies and unsupported devices raise
+instead of falling back to BF16. Merely importing `veomni.ops` does not import
+DeepGEMM or its Triton kernels.
 
 ## Computation and memory
 
@@ -153,7 +156,7 @@ kernels.
 
 ## Tests
 
-Run on Hopper or Blackwell SM100 with the optional dependency installed:
+Run on Hopper or Blackwell SM100 after syncing the GPU environment:
 
 ```bash
 OMP_NUM_THREADS=4 PYTHONPATH=. .venv/bin/pytest -q \
@@ -167,7 +170,7 @@ OMP_NUM_THREADS=4 PYTHONPATH=. .venv/bin/pytest -q \
 Coverage includes quantizer parity with the pinned DeepGEMM helpers,
 forward/dgrad/wgrad numerical checks, SwiGLU/clamp gradients, empty and repeated
 routes, activation checkpointing, EP/FSDP2, and optimizer updates. Registry and
-lazy-import checks remain available without the optional GPU dependency.
+lazy-import checks remain available without the GPU dependency.
 
 ## Implementation entry points
 

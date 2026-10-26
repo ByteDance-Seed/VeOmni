@@ -94,9 +94,9 @@ def wrapper(
         or torch.version.hip is not None
         or torch.cuda.get_device_capability(hidden_states.device) not in ((9, 0), (10, 0))
     ):
-        raise RuntimeError("fused_deepgemm_fp8 requires NVIDIA Hopper SM90 or Blackwell SM100.")
+        raise RuntimeError("deepgemm_fp8 requires NVIDIA Hopper SM90 or Blackwell SM100.")
     if hidden_states.ndim != 2 or hidden_states.dtype != torch.bfloat16:
-        raise ValueError("fused_deepgemm_fp8 requires BF16 hidden_states with shape [tokens, hidden].")
+        raise ValueError("deepgemm_fp8 requires BF16 hidden_states with shape [tokens, hidden].")
     if (
         selected_experts.ndim != 2
         or selected_experts.shape[1] == 0

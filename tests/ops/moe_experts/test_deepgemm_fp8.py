@@ -372,7 +372,7 @@ def test_full_moe_forward_backward(merged, limit, routing_dtype):
     # Expert 3 is empty. Duplicate assignments are legal on the non-EP path.
     selected = torch.randint(0, e - 1, (t, 2), device="cuda")
     grad = torch.randn_like(x) * 0.1
-    backend = resolve_op("moe_experts", "standard", "fused_deepgemm_fp8").wrapper
+    backend = resolve_op("moe_experts", "standard", "deepgemm_fp8").wrapper
     empty = torch.empty(0, device="cuda")
     results = []
     for reference in ("kernel", "bf16", "quantized"):
