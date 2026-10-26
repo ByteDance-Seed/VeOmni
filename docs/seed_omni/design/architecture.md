@@ -9,20 +9,12 @@ and a generation request walk them. For running a model see
 
 ## 1. What SeedOmni is
 
-SeedOmni is a **model-agnostic runtime**. The framework (`OmniModel`) knows
-nothing about Janus, vision towers, VQ codecs or boundary tokens. It only knows
-how to:
-
-1. build a set of independent sub-models (modules), each a HuggingFace
-   `PreTrainedModel`;
-2. walk a **graph** declared in YAML, calling one module per node;
-3. pass a single shared data object, the **conversation list**, through those
-   calls, and sum each training node's `_loss` dict.
-
-Everything model-specific (how to embed a SigLIP image, when to emit a
-`<begin_of_image>` token, how to decode a VQ grid) lives inside the modules.
-Swap the modules and the YAML graph and you have a different model, with no
-framework change.
+SeedOmni is a **model-agnostic runtime**. `OmniModel` builds independent
+sub-models (each a HuggingFace `PreTrainedModel`), walks a **graph** declared in
+YAML by calling one module per node, threads a single shared **conversation
+list** through those calls, and sums each training node's `_loss` dict.
+Model-specific logic (how to embed an image, when to emit a boundary token, how
+to decode a VQ grid) lives inside the modules.
 
 ```mermaid
 flowchart LR
@@ -82,13 +74,10 @@ class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin): ...
 class JanusLlamaAccelerated(VeOmniMixin, JanusLlama): ...
 ```
 
-Rule of thumb: **if an HF user loading this checkpoint outside VeOmni would
-expect it to work (chat, `generate`, `AutoModel.from_pretrained`), it belongs in
-`modeling.py`.** Only things that are meaningless without the VeOmni graph
-runtime (FSDP dummy inputs, sequence-parallel slicing, the per-module metric
-meter, training pre/post hooks) belong in `accelerated/accelerated.py`. If
-accelerated behavior genuinely differs from native inference, override the one
-method on the accelerated class rather than duplicating it.
+Standalone HuggingFace behavior (weights, `forward`, `generate`,
+`AutoModel.from_pretrained`) lives in `modeling.py`. VeOmni graph-runtime
+hooks (FSDP dummy inputs, sequence-parallel slicing, per-module metric metering,
+training `pre_forward` / `post_forward`) live in `accelerated/accelerated.py`.
 
 Both classes are registered by `model_type`: `OMNI_MODEL_REGISTRY` maps to the
 native class (`OmniModel.from_pretrained`, eager inference) and
@@ -110,6 +99,7 @@ Training-graph hooks on the accelerated class, all optional with safe defaults:
 | `pre_forward(method, **kwargs)` | training | prepare inputs (the conversation list, or packed tensors for Janus `pack_*` nodes) |
 | `post_forward(method, **outputs)` | training | write results back (the conversation list, or packed features / losses) |
 | `freeze_model()` | build | freeze a parameter subset |
+| `configure_optimizer(optimizer)` | build | adjust the module's param groups or register step hooks, before the lr scheduler is built and a checkpoint is loaded |
 | `get_parallel_plan()` | build | per-module FSDP / SP plan |
 | `get_assets()` | save | processors / tokenizers to checkpoint |
 | `dummy_inputs(...)` | training | zero placeholders that keep FSDP aligned |
@@ -138,8 +128,8 @@ output once and train from the cache).
 
 ### 2.2 `ConversationItem`: the data carrier (`utils/conversation.py`)
 
-There are **no per-field data channels** between modules. A single mutable list
-is threaded through every call. One element:
+A single mutable list of `ConversationItem` objects is threaded through every
+module call:
 
 ```python
 @dataclass
@@ -154,7 +144,10 @@ class ConversationItem:
 - Training carries a **batch**: `list[list[ConversationItem]]`.
 - Inference carries **one request**: `list[ConversationItem]`.
 
-The training graph must keep the list structure fixed: mutate `ConversationItem` fields in place, and do not replace the list, append items, or drop items. Structural changes (dummy rows, packing layout) belong in the processor / collator stage before the graph runs. Under `fsdp_scope: model`, FSDP2's root pre-forward may rebuild the outer dicts and lists but keeps the same item objects, so in-place field writes still reach the trainer.
+The processor and collator finalize the list structure (including dummy rows and
+packing layout) before the training graph runs, and graph nodes mutate
+`ConversationItem` fields in place so updates propagate through `fsdp_scope:
+model`'s root pre-forward.
 
 `value` has a lifecycle; modules overwrite it as data flows downstream:
 
@@ -165,10 +158,9 @@ flowchart LR
     C -->|decode head| D["loss / sampled token"]
 ```
 
-Items carry no module ownership. Which module takes an item is decided by its
-`type` / `role` / `meta` tags alone (for example the data layer's `_img_tag` =
-`"und"` / `"gen"` / `"edit"`), so the same data works under any combination of
-modules. The on-disk schema and the transform that builds these items are in
+Modules select items by `type`, `role`, and `meta` tags (for example `_img_tag`
+= `"und"` / `"gen"` / `"edit"`), so the same data works across module
+combinations. The on-disk schema and transform are in
 [Data Format](../usage/data_format.md).
 
 An `is_dummy=True` item is a zero-tensor placeholder appended per sample during
@@ -180,24 +172,20 @@ aligned across ranks.
 
 ### 2.3 Two graph views (`graphs/`)
 
-There is **no shared `nodes` / `edges` pool**. Both views are plain lists of
-edges (`{from, to}`), and each endpoint is a self-describing `module[.method]`
-string. A bare endpoint takes the view's default method (`forward` for training,
-`generate` for inference); a dotted `module.method` uses that method verbatim. A
-node's identity is its canonical `"<module>.<method>"` form.
+Both views are lists of edges (`{from, to}`) whose endpoints are
+`module[.method]` strings. A bare endpoint uses the view's default method
+(`forward` for training, `generate` for inference); a dotted `module.method`
+uses that method verbatim. A node's canonical identity is `"<module>.<method>"`.
 
 - **`TrainingGraph`** (`graphs/training_graph.py`) is a **DAG**.
-  `training_graph` is a flat list of edges; active nodes come from the endpoints
-  and a topological sort gives the forward order. Each active node runs exactly
-  once per forward. Edges are pure topology: they declare order, not data
-  routing.
+  Active nodes are derived from the edge endpoints and executed once per forward
+  in topological order.
 - **`GenerationGraph`** (`graphs/generation_graph.py`) is a **finite-state
-  machine**. Each `state.body` is a list of inline `{from, to}` edges to run that
-  step; `transitions` pick the next state by `module_signal` (a string a module
-  writes into `ctx`) or `default`. Building it checks only the FSM's structure;
-  the modules and methods its nodes name are checked at the start of
-  `OmniModel.generate`, so a training run that loads only some modules (such as
-  an offline-cache stage) can still carry the checkpoint's generation graph.
+  machine**. Each `state.body` is a list of inline `{from, to}` edges;
+  `transitions` pick the next state by `module_signal` (written into `ctx` by a
+  module) or `default`. Module and method resolution happens at the start of
+  `OmniModel.generate`, allowing partial-module training runs (such as offline
+  encoding) to preserve the checkpoint's generation graph.
 
 ### 2.4 `OmniModel`: the graph runtime (`modeling_omni.py`)
 
@@ -282,9 +270,9 @@ With Ulysses enabled, each module slices the replicated sample inside its own
 
 `OmniModel.generate(request, trace, generation_kwargs)` loops: run the current
 state's body, drain any one-shot `generated` payloads, then take the first
-matching transition. It stops at the `done` state or the
-`generation_kwargs["max_new_tokens"]` cap (default 2048). It does **not** reset
-the FSM; `OmniInferencer` calls `reset()` at request boundaries.
+matching transition until reaching the `done` state or
+`generation_kwargs["max_new_tokens"]` (default 2048). `OmniInferencer` calls
+`reset()` at request boundaries.
 
 The same modules back several FSMs, selected by `model.model_config.infer_type`
 (a key into the `model.model_config.infer_graph` map, each value one

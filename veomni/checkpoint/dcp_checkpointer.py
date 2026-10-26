@@ -811,7 +811,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 which is what ``stage_dir`` keys its staging directory on. Callers that
                 fold the step into ``path`` themselves get a staging directory per step.
             module: name of the model this checkpoint belongs to, for a job that trains
-                several (SeedOmni). Nests every artifact under ``model/<module>/``.
+                several (SeedOmni V2). Nests every artifact under ``model/<module>/``.
                 Empty for a single-model job, which is the only difference between the
                 two cases.
             trainable_only: when True, only persist parameters with ``requires_grad=True``
@@ -1065,7 +1065,7 @@ class DistributedCheckpointer(CheckpointerBase):
 
         Before weights and optimizer were separated there was one DCP directory
         per model, marked by its own ``.metadata``: at the step root for a
-        single-model job, and at ``<step>/<module>/`` for SeedOmni. Neither has
+        single-model job, and at ``<step>/<module>/`` for SeedOmni V2. Neither has
         a ``model/`` subtree, which is what tells the two apart.
         """
         if os.path.exists(os.path.join(weights_dir(path, module), DCP_MARKER_FILENAME)):

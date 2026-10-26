@@ -61,6 +61,8 @@ def _revert_model_weight_conversions_for_hf(
     model: Optional[torch.nn.Module],
     state_dict: Dict[str, torch.Tensor],
 ) -> Dict[str, torch.Tensor]:
+    while isinstance(getattr(model, "module", None), torch.nn.Module):
+        model = model.module
     if model is None or not getattr(model, "_export_hf_checkpoint_with_weight_conversions", False):
         return state_dict
 

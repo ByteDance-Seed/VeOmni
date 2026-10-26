@@ -138,8 +138,17 @@ def _check_hf_source_exportable(model_path: str) -> None:
         raise ValueError(f"`train.checkpoint.save_hf_weights` cannot write this source back: {e}") from e
 
 
-def _validate_hf_view_modules(model_path: str, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
-    """Under an HF ``model_path`` every module is one the family layout cuts from that checkpoint."""
+def _validate_hf_view_modules(
+    model_path: str,
+    modules: dict[str, OmniModuleRuntimeArguments],
+    *,
+    ep_sharded_stream_load: bool = False,
+) -> None:
+    """Under an HF ``model_path`` every module is one the family layout cuts from that checkpoint.
+
+    ``ep_sharded_stream_load`` is the top-level flag, which the composed wrap
+    (``fsdp_scope: model``) reads instead of the per-module ones.
+    """
     from ..models.seed_omni.utils.hf_layout import read_hf_source
 
     source = read_hf_source(model_path)
@@ -159,6 +168,12 @@ def _validate_hf_view_modules(model_path: str, modules: dict[str, OmniModuleRunt
                 f"HuggingFace `{source.model_type}` checkpoint every module loads from. Drop the per-module "
                 "model_path, or convert the checkpoint to compose modules from several sources."
             )
+    streaming = sorted(name for name, args in modules.items() if args.ep_sharded_stream_load)
+    if ep_sharded_stream_load or streaming:
+        raise ValueError(
+            f"ep_sharded_stream_load (model: {ep_sharded_stream_load}, modules: {streaming}) does not apply the "
+            f"`{source.model_type}` HF layout's key renames. Disable it, or convert the checkpoint to a split one."
+        )
     overrides = {
         name: sorted(keys) for name, args in modules.items() if (keys := hf_module_model_config(args.model_config))
     }
@@ -249,7 +264,9 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         for_inference=for_inference,
         checkpoint_modules=ckpt_modules,
     )
-    _validate_hf_view_modules(seed_omni_model_path, modules)
+    _validate_hf_view_modules(
+        seed_omni_model_path, modules, ep_sharded_stream_load=model_runtime.ep_sharded_stream_load
+    )
     for module_args in modules.values():
         _validate_omni_accelerator(module_args.accelerator)
     _validate_composed_wrap(model_runtime.accelerator, modules)
@@ -856,10 +873,10 @@ def _validate_omni_dp_size(
 ) -> None:
     """Verify every distributed module and ``model.accelerator`` resolve to the same ``dp_size``.
 
-    Each module in a SeedOmni model may independently choose Ulysses SP (``ulysses_size``),
-    Context Parallelism (``cp_size``), or hybrid ``cp * sp`` (``cp_size * ulysses_size``),
-    provided every distributed module and the outer ``model.accelerator`` share the **same
-    ``dp_size``** (and therefore the same ``sp_size = cp_size * ulysses_size = world_size // dp_size``).
+    Each module in a SeedOmni model may independently choose Ulysses SP (``ulysses_size``)
+    or Context Parallelism (``cp_size``), provided every distributed module and the outer
+    ``model.accelerator`` share the **same ``dp_size``** (and therefore the same
+    ``sp_size = cp_size * ulysses_size = world_size // dp_size`` with ``pp_size = tp_size = 1``).
     Because ``ParallelState`` always orders its device mesh ``[pp, dp_replicate, dp_shard, cp, ulysses, tp]``,
     matching ``dp_size`` guarantees identical ``dp_rank``, ``dp_group``, ``sp_group`` (replication group),
     and ``fsdp_group`` across all modules and the outer trainer.

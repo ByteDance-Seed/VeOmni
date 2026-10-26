@@ -24,7 +24,6 @@ from .arguments_types import (
     InferArguments,
     MixedPrecisionConfig,
     ModelArguments,
-    ModelRuntimeArguments,
     OffloadConfig,
     OpsImplementationConfig,
     OptimizerConfig,

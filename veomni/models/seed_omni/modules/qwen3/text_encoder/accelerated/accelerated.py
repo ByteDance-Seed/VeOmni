@@ -17,14 +17,13 @@ from veomni.distributed.parallel_state import get_parallel_state
 
 from .....mixins.training_module_mixin import post_forward, pre_forward
 from .....utils.conversation import ConversationItem
-from ....qwen3vl.text_encoder.chat_template import Qwen3VLChatTemplate
 from ....text_encoder.accelerated import (
     TrainingMixin as BaseTrainingMixin,
 )
 from ....text_encoder.accelerated import (
     VeOmniMixin as BaseVeOmniMixin,
 )
-from ..chat_template import Qwen3ChatTemplate
+from ..chat_template import Qwen3ChatTemplate, Qwen3VLChatTemplate
 from ..configuration import Qwen3TextEncoderConfig
 from ..modeling import Qwen3TextEncoder
 
@@ -75,6 +74,8 @@ class TrainingMixin(BaseTrainingMixin):
         keep[ids] = True
         self._trainable_row_mask = keep
         self.embed_tokens.weight.requires_grad_(True)
+        if self.lm_head is not None:
+            self.lm_head.requires_grad_(False)
         # The weight parameter is replaced by parallelization (FSDP2 shards it, the
         # emb plan splits its rows), so a hook on it now would be lost. FSDP2's own
         # pre-forward hook is prepended, so on the first lookup this one sees the

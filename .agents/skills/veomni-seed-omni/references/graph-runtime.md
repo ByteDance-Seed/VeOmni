@@ -26,12 +26,11 @@ configs/seed_omni/<Model>/<variant>/
 
 Each task folder holds its launcher plus the fragments only that task uses. A
 fragment two or more tasks share moves up — to `infer/` for inference graphs and
-module overrides, or to the model root for `data.yaml`. A task whose inference
+module overrides, or to the model root for `configs/seed_omni/<Model>/<variant>/data.yaml`. A task whose inference
 graph is its own alone keeps it inside its own folder.
 
 `base.yaml` points to module and graph files. **A graph file *is* its graph** —
-the payload sits at the file top level with no wrapper key. Do not redeclare
-unrelated launcher config in graph files.
+the payload sits at the file top level with no wrapper key.
 
 ## Training Graph
 
@@ -61,9 +60,9 @@ level:
 - `states.<state>.body` is an ordered inline edge list.
 - State transitions use `module_signal` or `default`.
 - `default` must be the last transition.
-- Do not declare a `done` state. It is framework-injected.
-- Use module code to emit semantic signals such as `text_done` or
-  `image_complete`; do not make the FSM inspect raw token IDs.
+- `done` is injected automatically by the framework.
+- Module code emits semantic `module_signal` strings (such as `text_done` or
+  `image_complete`) to drive state transitions.
 
 One authoring file declares one scenario. `model.model_config.infer_graph` maps every
 scenario name to its file, and `model.model_config.infer_type` picks the active one:
@@ -109,8 +108,8 @@ default:
 ## Module Config
 
 Module files map module names to model paths and optional per-module training or
-accelerator settings. `model_type` belongs in the module checkpoint
-`config.json`, not in YAML.
+accelerator settings; `model_type` is read from each module's checkpoint
+`config.json`.
 
 ## Templates
 

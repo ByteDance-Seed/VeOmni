@@ -32,7 +32,7 @@ class JanusTextEncoder(TextEncoder):
     def generate(
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
-        generation_kwargs: Dict[str, Any] = dict,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         tail = conversation_list[-1]

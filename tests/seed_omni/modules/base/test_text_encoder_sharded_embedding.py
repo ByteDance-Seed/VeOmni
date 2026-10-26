@@ -19,6 +19,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.emb_parallel import sharded_embedding
 from veomni.models.seed_omni.modules.qwen3.text_encoder.accelerated import Qwen3TextEncoderAccelerated
 from veomni.models.seed_omni.modules.qwen3.text_encoder.accelerated import accelerated as qwen3_accelerated
@@ -31,6 +32,9 @@ _VOCAB, _HIDDEN = 8, 4
 # One vision row in emb rank 0's half of the table, two in rank 1's.
 _VISION_IDS = {"<|vision_start|>": 1, "<|vision_end|>": 6, "<|image_pad|>": 7}
 _RANK_IDS = [[0, 1, 1, 5], [6, 2, 7], [3, 4, 7, 1], []]  # the last rank holds no tokens
+_CI_CPU_4 = LaunchSpec(nproc=4, device="cpu")
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _table() -> torch.Tensor:
@@ -160,6 +164,7 @@ def _fsdp_rank_main(rank: int, rendezvous: str, out_dir: str, layout: str) -> No
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_4)
 @pytest.mark.parametrize("layout", ["emb", "dp"])
 def test_qwen3_image_mode_trains_only_vision_rows_through_fsdp(tmp_path, layout):
     world = len(_RANK_IDS)
@@ -235,6 +240,46 @@ def test_text_only_qwen3_trains_every_row(monkeypatch):
     logits.sum().backward()
     assert not text_encoder.embed_tokens._forward_pre_hooks
     assert text_encoder.embed_tokens.weight.grad[[0, 5]].abs().sum() > 0
+
+
+def test_qwen3_image_mode_untied_head_is_frozen_and_undecayed(monkeypatch):
+    _install_state(None, monkeypatch)
+    config = Qwen3TextEncoderConfig(
+        vocab_size=_VOCAB,
+        hidden_size=_HIDDEN,
+        tie_word_embeddings=False,
+        enable_image=True,
+        ops_implementation={"cross_entropy_loss_implementation": "eager"},
+    )
+    text_encoder = Qwen3TextEncoderAccelerated(config)
+    text_encoder._tokenizer = SimpleNamespace(convert_tokens_to_ids=_VISION_IDS.__getitem__)
+    text_encoder.freeze_model()
+    assert not text_encoder.lm_head.weight.requires_grad
+
+    text_encoder.embed_tokens.weight = nn.Parameter(_table())
+    head_init = text_encoder.lm_head.weight.detach().clone()
+
+    trainable = [p for p in text_encoder.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=_LR, weight_decay=_WD, foreach=False)
+    text_encoder.configure_optimizer(optimizer)
+
+    embeds = text_encoder.encode(input_ids=torch.tensor(_RANK_IDS[0], dtype=torch.long))["inputs_embeds"]
+    labels = torch.tensor([_RANK_IDS[0]], dtype=torch.long)
+    loss = text_encoder.decode(hidden_states=embeds.unsqueeze(0), labels=labels)["loss"]
+    loss.backward()
+
+    assert text_encoder.lm_head.weight.grad is None
+    vision = _vision_rows()
+    assert torch.equal(
+        text_encoder.embed_tokens.weight.grad[~vision],
+        torch.zeros_like(text_encoder.embed_tokens.weight.grad[~vision]),
+    )
+    reference = _dense_adamw_step(_table(), text_encoder.embed_tokens.weight.grad)
+    optimizer.step()
+
+    assert torch.equal(text_encoder.lm_head.weight.detach(), head_init)
+    assert torch.equal(text_encoder.embed_tokens.weight.detach()[~vision], _table()[~vision])
+    torch.testing.assert_close(text_encoder.embed_tokens.weight.detach()[vision], reference[vision])
 
 
 @pytest.mark.parametrize("pad_token_id", [None, 3])

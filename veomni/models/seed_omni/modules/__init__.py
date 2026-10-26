@@ -40,7 +40,8 @@ Concrete modules: ``modules/<family>/<sub_module>/(configuration.py,
 modeling.py[, processing.py])``.  Each sub-module gets its own folder; the
 folder name carries the namespace so the inner files use short names rather
 than re-spelling ``<family>_<sub_module>`` per file.  The shared
-word-token embedding + LM head module lives at ``modules/text_encoder/``.
+word-token embedding + LM head module lives at ``modules/text_encoder/``, and
+cross-family packing helpers live under ``modules/base/``.
 """
 
 from transformers import PretrainedConfig

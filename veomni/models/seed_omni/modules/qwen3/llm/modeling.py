@@ -5,11 +5,17 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 
-from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import Qwen3Model
+from veomni.utils.device import IS_NPU_AVAILABLE
 
 from ...base.llm_packing import SimpleArGenerationMixin
 from ...module_modeling_base import PretrainedOmniModule
 from .configuration import Qwen3LlmConfig
+
+
+if IS_NPU_AVAILABLE:
+    from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_npu import Qwen3Model
+else:
+    from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import Qwen3Model
 
 
 class Qwen3Llm(SimpleArGenerationMixin, PretrainedOmniModule):

@@ -34,6 +34,8 @@ from veomni.models.seed_omni.utils.conversation import (
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
 # ── helpers ────────────────────────────────────────────────────────────────────
 
 

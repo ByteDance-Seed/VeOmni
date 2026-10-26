@@ -2,9 +2,13 @@
 
 This page covers the workflow every SeedOmni model shares: config layout,
 checkpoint conversion, training, resume, inference, and the graph debugging
-tools. The per-model pages under `models/` give the concrete commands
-(for example [Janus](../models/janus.md)); the concepts behind them are in
+tools; the concepts behind them are in
 [Architecture](../design/architecture.md).
+
+> **Note:** On `main`, the in-tree runnable stand-in config and modules live
+> under `configs/seed_omni/fake_model/` (`veomni/models/seed_omni/modules/fake_model/`).
+> The `Janus` / `Qwen` / `Bagel` family paths shown in the examples below use
+> the model implementations on the `omniv2` branch (and follow-up model PRs).
 
 ## 1. Config layout
 
@@ -90,32 +94,20 @@ with a registered layout loads through it, and any other type is an error.
   Module weights are read from the upstream checkpoint at weight-load time:
   each HF key is renamed onto the module that owns it, and keys owned by other
   modules are skipped without being read. This works for training (FSDP2, DDP,
-  rank-0 broadcast, expert-parallel streaming load, `fsdp_scope: model`) and
-  for eager and distributed inference; under `ep_sharded_stream_load` each rank
-  reads only its own experts, also when the upstream checkpoint stores them
-  one per key.
+  rank-0 broadcast, `fsdp_scope: model`) and for eager and distributed
+  inference.
 - **Save.** The HF export (`save_hf_weights`) is one checkpoint in the upstream
   layout under `global_step_N/hf_ckpt/`: the same keys, dtypes, shard files and
   non-weight files as the source, so it loads wherever the source does
   (`transformers`, or `model.model_path` again). Tensors of frozen modules and
   of LoRA bases are copied from the source; LoRA adapters still export per
   module. DCP checkpoints and resume stay per module.
-- **Limits.** Every module in the `modules` YAML must be one the layout cuts
-  from the checkpoint and keep its default `model_path` (the module name). A
-  model composed from several sources, like Qwen3 text + the Qwen3-VL ViT,
-  still needs split checkpoints. Per-module `model_config` overrides apply to
-  the run but not to the exported `config.json`, which is the source's (a
-  warning lists them). A module whose checkpoint tensor converter renames or
-  reshapes tensors, and whose layout declares no `export_state` to undo it, or
-  that adds a parameter with no upstream counterpart (a freshly initialized
-  projector or head), loads from the upstream root but cannot export to it:
-  the HF export raises rather than write the stale source copy or drop the new
-  weight. Export such a run from a split checkpoint, or disable
-  `save_hf_weights`. Each HF export reads every source tensor no
-  trained module produces (frozen modules, unclaimed keys) into host memory,
-  spread across the ranks. Eager loads take `device_map` as
-  `from_pretrained` does; a module spread over several devices (`"auto"`) is
-  loaded on CPU first, so host memory must hold it once.
+- **Requirements.** Direct HF loading applies when all active modules come from
+  that single upstream checkpoint with their default `model_path` (the module
+  name) and standard weight loading (`ep_sharded_stream_load: false`). Direct HF
+  export (`save_hf_weights`) is supported when module tensor converters preserve
+  upstream parameter names and shapes; if a model composes multiple source
+  checkpoints or adds new parameters, convert to a split checkpoint first.
 
 The offline convert of such a family goes through the same layout, so a split
 checkpoint and the direct load hold identical module weights. To add a layout
@@ -127,6 +119,10 @@ for a family, see [Upstream Checkpoint Layout](hf_layout.md).
 handles single- or multi-node runs):
 
 ```bash
+# In-tree stand-in config:
+bash train.sh tasks/omni/train_omni.py configs/seed_omni/fake_model/train/base.yaml
+
+# Janus family config (on omniv2 / follow-up model PRs):
 bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml
 ```
 
@@ -157,15 +153,13 @@ janus_text_encoder:
     extra_parallel_placement_innermost: [false]
 ```
 
-Sequence parallelism is set once for the whole job with
-`--model.accelerator.ulysses_size N`. What a module may choose, what the job
-shares, and why SP is not a per-module setting are covered in
+All distributed modules share one `dp_size` (and therefore one unified
+`sp_size = cp_size * ulysses_size`), while each module may choose Ulysses SP or
+Context Parallelism; see
 [Per-Module Parallelism](../distributed/per_module_parallelism.md) and
-[Sequence Parallelism](../distributed/sequence_parallel.md).
-
-If your environment exports `TORCH_DISTRIBUTED_DEBUG=DETAIL`, unset it: its
-`_ProcessGroupWrapper` lacks the coalesced all-gather that FSDP2's tied-head
-`full_tensor()` needs, which crashes FSDP2 runs.
+[Sequence & Context Parallelism](../distributed/sequence_parallel.md). Keep
+`TORCH_DISTRIBUTED_DEBUG` unset (or `OFF`) on FSDP2 runs so coalesced
+all-gather remains available for tied heads.
 
 ## 4. Resume
 
@@ -256,34 +250,35 @@ bash train.sh tasks/omni/infer_omni.py \
 
 ### Inferring from a trained checkpoint
 
-Training writes each module's HF weights under
-`<output_dir>/checkpoints/global_step_N/hf_ckpt/<module>/`. A module whose
-row-sharded embedding tables are too large for one file (DeepSeek-V4.1's n-gram)
-leaves them unmerged; run `python scripts/merge_hf_export.py "$STEP/hf_ckpt"` first
-([details](../../usage/checkpoint_conversion.md#finishing-an-hf-export-with-unmerged-tables)).
-Link each module's folder into a flat root and pass it as `--model.model_path`:
+Training writes the root `config.json` and graph sidecars once under
+`<output_dir>/model_assets/` and each trainable module's HF weights under
+`<output_dir>/checkpoints/global_step_N/hf_ckpt/<module>/` (fully frozen modules
+have no checkpoint manager and remain in the original split checkpoint). A module
+whose row-sharded embedding tables are too large for one file (DeepSeek-V4.1's
+n-gram) leaves them unmerged; run `python scripts/merge_hf_export.py "$STEP/hf_ckpt"`
+first ([details](../../usage/checkpoint_conversion.md#finishing-an-hf-export-with-unmerged-tables)).
+Link the root files, each trained module's step export, and any frozen module's
+original subfolder into a flat root and pass it as `--model.model_path`:
 
 ```bash
-STEP=outputs/janus_1.3b_omni_sft/checkpoints/global_step_20
-ASM=outputs/janus_1.3b_omni_sft/infer_ckpt/global_step_20
+ORIG=/path/to/seed_omni/Janus-1.3B
+OUT=outputs/janus_1.3b_omni_sft
+STEP="$OUT/checkpoints/global_step_20"
+ASM="$OUT/infer_ckpt/global_step_20"
 mkdir -p "$ASM"
+for f in config.json training_graph.yaml generation_graph.yaml; do
+  [ -f "$OUT/model_assets/$f" ] && ln -sfn "$(realpath "$OUT/model_assets/$f")" "$ASM/$f"
+done
 for m in janus_siglip janus_vqvae janus_text_encoder janus_llama; do
-  ln -sfn "$(realpath "$STEP/hf_ckpt/$m")" "$ASM/$m"
+  if [ -d "$STEP/hf_ckpt/$m" ]; then
+    ln -sfn "$(realpath "$STEP/hf_ckpt/$m")" "$ASM/$m"
+  else
+    ln -sfn "$(realpath "$ORIG/$m")" "$ASM/$m"
+  fi
 done
 ```
 
 ## 6. Debugging the graph
-
-### Visualize
-
-Render the training DAG and every generation FSM a launcher resolves, through the
-same config loader as training and inference:
-
-```bash
-python scripts/seed_omni/visualize_graph.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml
-# -> graphs/janus_1.3b_base/{training,infer_gen,infer_und,infer_interleave}.mmd
-# add --visualize.format html for browser-renderable output
-```
 
 ### Graph profiler
 
@@ -305,9 +300,3 @@ Inference always writes the graph path to `<output_dir>/<infer_type>/trace.txt`;
 the `enable_*` switches only add fields to the node lines. Training writes rank-0
 traces under `train.checkpoint.output_dir/graph_trace` only when a detail switch
 is enabled.
-
-### Smoke test
-
-`scripts/seed_omni/run_smoke.sh` runs a short train and inference for each
-shipped model and prints a PASS / FAIL summary; see the script header for the
-model list and environment knobs.
