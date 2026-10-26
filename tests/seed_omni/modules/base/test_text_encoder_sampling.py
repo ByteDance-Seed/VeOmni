@@ -20,8 +20,11 @@ decode step later. A tensor that escapes here therefore fails far from the line
 that produced it -- as a nested-list TypeError inside the tokenizer.
 """
 
+import pytest
 import torch
 
+from veomni.arguments.omni_arguments_types import OmniInferArguments
+from veomni.distributed.moe.moe_utils import unpermute
 from veomni.models.seed_omni.modules.text_encoder.modeling import InferenceMixin
 
 
@@ -105,3 +108,48 @@ class TestRanksAgree:
         sampler = _Sampler()
         assert sampler._sample_token(torch.zeros(1, 4, 8), do_sample=False) == 3
         assert sampler._sample_token(torch.zeros(1, 4, 8)) == 3
+
+
+def _combine_operands(num_tokens: int, num_experts: int, topk: int, hidden: int, device: str):
+    """Operands for ``unpermute``, ordered the way ``token_pre_all2all`` leaves them.
+
+    ``unpermute`` recovers each row's weight with
+    ``routing_weights.T.masked_select(routing_map)``, so the rows must be
+    grouped by expert -- expert-major, exactly as the all-to-all delivers them.
+    """
+    routing_map = torch.zeros(num_experts, num_tokens, dtype=torch.bool, device=device)
+    routing_weights = torch.zeros(num_tokens, num_experts, device=device)
+    for token in range(num_tokens):
+        for slot in range(topk):
+            expert = (token + slot) % num_experts
+            routing_map[expert, token] = True
+            routing_weights[token, expert] = 1.0 / topk
+
+    mapping = torch.tensor(
+        [token for expert in range(num_experts) for token in range(num_tokens) if routing_map[expert, token]],
+        dtype=torch.long,
+        device=device,
+    )
+    tokens = torch.randn(mapping.numel(), hidden, dtype=torch.bfloat16, device=device)
+    return tokens, routing_weights, torch.Size([num_tokens, hidden]), mapping, routing_map
+
+
+def test_inference_full_determinism_is_opt_in():
+    """Serving default matches training / vLLM: bitwise kernels are opt-in."""
+    assert OmniInferArguments().enable_full_determinism is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="scatter_add_ only races on CUDA")
+def test_combine_is_bitwise_reproducible_under_full_determinism():
+    was_enabled = torch.are_deterministic_algorithms_enabled()
+    was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    try:
+        # topk > 1 is what puts repeated indices in the mapping; a hidden size in
+        # the thousands is what gives the atomics enough contention to diverge.
+        operands = _combine_operands(num_tokens=256, num_experts=8, topk=6, hidden=2048, device="cuda")
+        first = unpermute(*operands)
+        for _ in range(4):
+            assert torch.equal(unpermute(*operands), first)
+    finally:
+        torch.use_deterministic_algorithms(was_enabled, warn_only=was_warn_only)
