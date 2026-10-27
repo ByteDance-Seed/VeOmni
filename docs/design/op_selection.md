@@ -19,7 +19,7 @@ If a field is not in this table, it is not an op-selection knob.
 |--------|-------------|------------------|---------|----------------|
 | Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `magi_attention`, `sage_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` rewrite + model `__init__` via `VeomniOp("attention", "standard", config._attn_implementation)` stored on the attention module |
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
-| DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
+| DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `triton` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+), `cann` (DeepSeek-V4, Ascend) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
@@ -238,6 +238,10 @@ to `eager` and never silently falls back after `tilelang` is selected. The mHC
 implementation is provided by the `tile-kernels` package.
 TileKernels' training path supports forward and backward with BF16 activations
 and DeepSeek V4's `hc_mult=4` layout.
+
+On AMD ROCm GPUs, `dsa_attention_implementation: triton` selects the same
+DeepSeek-V4 sparse MQA contract. The indexer and mHC remain independent;
+the optional indexer-loss teacher still requires both TileLang selections.
 
 The same three fields select `cann` on Ascend, which requires
 `cann_ops_transformer`:
@@ -497,9 +501,9 @@ separate `ModuleList` fork. LoRA experts follow the wrapped module's
 unavailable on the device.
 
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
-SM90+ `tilelang` and Ascend `cann` indexer and attention implementations. Its MoE path
-uses the independent `moe_implementation` selection and therefore defaults to
-`fused_triton` on GPU.
+SM90+ `tilelang` and Ascend `cann` indexer and attention implementations, plus
+ROCm `triton` attention. Its MoE path uses the independent
+`moe_implementation` selection and therefore defaults to `fused_triton` on GPU.
 The v4-specific patched experts path passes the merged `gate_up_proj` tensor
 directly to the local `VeomniOp` and forwards `swiglu_limit` so every
 supported fused backend preserves V4's clamped SwiGLU pre-activation semantics.

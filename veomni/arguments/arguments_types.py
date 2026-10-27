@@ -1524,12 +1524,12 @@ class OpsImplementationConfig:
             "cann_ops_transformer)."
         },
     )
-    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "cann", "tilelang"] = field(
+    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "cann", "tilelang", "triton"] = field(
         default="eager",
         metadata={
-            "help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', 'cann', or "
-            "'tilelang'. 'cann' is the DeepSeek-V4 Ascend CANN sparse FlashMLA (requires "
-            "cann_ops_transformer)."
+            "help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', 'cann', "
+            "'tilelang', or 'triton'. 'cann' is the DeepSeek-V4 Ascend CANN sparse FlashMLA "
+            "(requires cann_ops_transformer); 'triton' is DeepSeek-V4 sparse MQA on AMD ROCm."
         },
     )
     mhc_implementation: Literal["eager", "cann", "tilelang"] = field(

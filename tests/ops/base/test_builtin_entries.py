@@ -42,6 +42,7 @@ _GPU_NVIDIA_SM90 = ("gpu", (("nvidia", 90, None),))
 _GPU_NVIDIA_SM90_OR_SM100 = ("gpu", (("nvidia", 90, 90), ("nvidia", 100, 100)))
 _GPU_NVIDIA_SM100 = ("gpu", (("nvidia", 100, None),))
 _GPU_NVIDIA_SM90_TO_SM100 = ("gpu", (("nvidia", 90, 100),))
+_GPU_ROCM = ("gpu", (("rocm", None, None),))
 _NPU = ("npu", ())
 _MLU = ("mlu", ())
 
@@ -96,6 +97,7 @@ _BUILTIN_ENTRIES = (
     ("attention", "standard", "veomni_sdpa", "any", _ANY, ()),
     ("dsa_attention", "deepseek_v4", "eager", "any", _ANY, ()),
     ("dsa_attention", "deepseek_v4", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
+    ("dsa_attention", "deepseek_v4", "triton", "cuda", _GPU_ROCM, ("triton",)),
     ("dsa_attention", "deepseek_v4", "cann", "npu", _NPU, ("cann_ops_transformer",)),
     ("dsa_attention", "glm", "eager", "any", _ANY, ()),
     ("dsa_attention", "glm", "flashmla_cudnn", "cuda", _GPU_NVIDIA_SM90, ("cudnn", "flash_mla")),
