@@ -1913,17 +1913,22 @@ def test_channel_loss_async_child_without_sources_runs_main_loss():
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_dpo_loss_wrapper_async_child_with_sources_uses_main_loss_only():
     computer = ChannelLossComputer(parallel_state=_test_parallel_state())
-    computer._original_loss_fn = lambda labels: torch.tensor(1.0)
+    computer._original_loss_fn = lambda labels: labels.square().sum()
     computer._dpo_segments = True
     computer._source_ids = [0]
 
     async def run():
         async def child():
-            assert computer._wrapped_loss_fn(labels=torch.tensor([[1]])).item() == 1.0
+            labels = torch.tensor([[2.0]], requires_grad=True)
+            loss = computer._wrapped_loss_fn(labels=labels)
+            computer.observe_dpo_log_probs(torch.zeros(1, 1), labels, [0, 1])
+            loss.backward()
+            assert loss.item() == 4.0
+            assert labels.grad.item() == 4.0
 
         with computer.capture():
             await asyncio.create_task(child())
-            computer._source_ids = []
+        assert computer._result is None
 
     asyncio.run(run())
 

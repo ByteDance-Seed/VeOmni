@@ -457,7 +457,12 @@ class ChannelLossComputer:
 
     def observe_dpo_log_probs(self, log_probs: torch.Tensor, labels: torch.Tensor, attention_cu: Any) -> None:
         """Observe expanded policy log-probs, after any model-side row compaction."""
-        if not self._dpo_segments or not self._source_ids or not self.capture_active:
+        if (
+            not self._dpo_segments
+            or not self._source_ids
+            or _ACTIVE_CHANNEL_LOSS_COMPUTER.get() is not self
+            or self._capture_owner != _capture_owner()
+        ):
             return
         self._capture_attempts += 1
         try:
