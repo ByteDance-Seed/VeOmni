@@ -21,7 +21,7 @@ if get_device_type() == "cpu" or not c10d.is_available() or not c10d.is_backend_
 
 from torch.testing._internal.common_utils import run_tests
 
-from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+from veomni.distributed.parallel_state import use_parallel_state
 from veomni.models.transformers.flux.config_flux import FluxConfig
 from veomni.models.transformers.flux.modeling_flux import FluxModel
 
@@ -93,46 +93,42 @@ class FluxUlyssesPaddingTest(SequenceParallelTest):
         torch.set_float32_matmul_precision("highest")
         model = _build_model(device)
 
-        try:
-            _init_parallel_state(dp_size=self.world_size, ulysses_size=1, device_type=get_device_type(), name=None)
-            refs = {}
+        refs = {}
+        with use_parallel_state(self.dp_state):
             for name, (hw, txt, entities) in CASES.items():
                 inputs, weight = _make_inputs(hw, txt, entities, device)
                 refs[name] = (inputs, weight, *_forward_backward(model, inputs, weight))
-            clear_parallel_state()
 
-            _init_parallel_state(dp_size=1, ulysses_size=self.world_size, device_type=get_device_type(), name=None)
-            failures = []
-            for name, (inputs, weight, ref_out, ref_grads) in refs.items():
-                try:
+        failures = []
+        for name, (inputs, weight, ref_out, ref_grads) in refs.items():
+            try:
+                with use_parallel_state(self.sp_state):
                     out, grads = _forward_backward(model, inputs, weight)
-                except RuntimeError as e:
-                    failures.append(f"{name}: {str(e).splitlines()[0]}")
-                    continue
-                out_err = ((out - ref_out).norm() / ref_out.norm()).item()
+            except RuntimeError as e:
+                failures.append(f"{name}: {str(e).splitlines()[0]}")
+                continue
+            out_err = ((out - ref_out).norm() / ref_out.norm()).item()
 
-                sp_grad_names = [None] * self.world_size
-                c10d.all_gather_object(sp_grad_names, set(grads), group=group)
-                ref_grad_names = set(ref_grads)
-                assert all(names == ref_grad_names for names in sp_grad_names), (
-                    f"{name}: gradient-name mismatch; "
-                    f"missing per rank: {[sorted(ref_grad_names - names) for names in sp_grad_names]}"
-                )
+            sp_grad_names = [None] * self.world_size
+            c10d.all_gather_object(sp_grad_names, set(grads), group=group)
+            ref_grad_names = set(ref_grads)
+            assert all(names == ref_grad_names for names in sp_grad_names), (
+                f"{name}: gradient-name mismatch; "
+                f"missing per rank: {[sorted(ref_grad_names - names) for names in sp_grad_names]}"
+            )
 
-                # Each rank's param grads cover only its own tokens, and the loss is replicated on
-                # every SP rank, so sum over SP and divide by its size (FSDP's mean over the SP mesh).
-                diff_sq = ref_sq = 0.0
-                for n, g in grads.items():
-                    c10d.all_reduce(g, group=group)
-                    g /= self.world_size
-                    diff_sq += (g - ref_grads[n]).pow(2).sum().item()
-                    ref_sq += ref_grads[n].pow(2).sum().item()
-                grad_err = (diff_sq / ref_sq) ** 0.5
-                if out_err > 1e-5 or grad_err > 1e-3:
-                    failures.append(f"{name}: output rel err {out_err:.2e}, grad rel err {grad_err:.2e}")
-            assert not failures, "\n".join(failures)
-        finally:
-            clear_parallel_state()
+            # Each rank's param grads cover only its own tokens, and the loss is replicated on
+            # every SP rank, so sum over SP and divide by its size (FSDP's mean over the SP mesh).
+            diff_sq = ref_sq = 0.0
+            for n, g in grads.items():
+                c10d.all_reduce(g, group=group)
+                g /= self.world_size
+                diff_sq += (g - ref_grads[n]).pow(2).sum().item()
+                ref_sq += ref_grads[n].pow(2).sum().item()
+            grad_err = (diff_sq / ref_sq) ** 0.5
+            if out_err > 1e-5 or grad_err > 1e-3:
+                failures.append(f"{name}: output rel err {out_err:.2e}, grad rel err {grad_err:.2e}")
+        assert not failures, "\n".join(failures)
 
 
 if __name__ == "__main__":
