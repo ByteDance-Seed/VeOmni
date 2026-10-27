@@ -250,17 +250,32 @@ class ChannelLossComputer:
 
     def _wrapped_loss_fn(self, *args: Any, **kwargs: Any) -> Any:
         assert self._original_loss_fn is not None
-        main_loss = self._original_loss_fn(*args, **kwargs)
+        if not self.capture_active or not self._source_ids:
+            return self._original_loss_fn(*args, **kwargs)
+
+        from ...ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
+
+        captured = {}
+        token = chunk_loss._CAPTURE.set(captured)
+        try:
+            main_loss = self._original_loss_fn(*args, **kwargs)
+        finally:
+            chunk_loss._CAPTURE.reset(token)
+        if captured.get("error"):
+            logger.warning_rank0("Channel loss: chunk observation failed; recomputing detached metrics.")
+            captured.clear()
 
         call_args = _bind_loss_call_args(self._original_loss_fn, args, kwargs)
         logits = call_args.get("logits")
         labels = call_args.get("labels")
+        if labels is None:
+            labels = call_args.get("shift_labels")
         vocab_size = call_args.get("vocab_size")
         ignore_index = call_args.get("ignore_index", IGNORE_INDEX)
         if ignore_index is None:
             ignore_index = IGNORE_INDEX
         if self.capture_active and self._source_ids and labels is not None:
-            self.compute_side_channel(
+            observer_kwargs = dict(
                 logits=logits,
                 labels=labels,
                 vocab_size=vocab_size,
@@ -269,6 +284,13 @@ class ChannelLossComputer:
                 shift_labels=call_args.get("shift_labels"),
                 ignore_index=ignore_index,
             )
+            if getattr(self.compute_side_channel, "__func__", None) is ChannelLossComputer.compute_side_channel:
+                observer_kwargs.update(
+                    reused_per_token_loss=captured.get("per_token"),
+                    logits_bias=call_args.get("logits_bias"),
+                    logits_bias_weight=call_args.get("logits_bias_weight"),
+                )
+            self.compute_side_channel(**observer_kwargs)
 
         return main_loss
 
@@ -281,9 +303,12 @@ class ChannelLossComputer:
         weights: torch.Tensor | None,
         shift_labels: torch.Tensor | None = None,
         ignore_index: int = IGNORE_INDEX,
+        reused_per_token_loss: torch.Tensor | None = None,
+        logits_bias: torch.Tensor | None = None,
+        logits_bias_weight: torch.Tensor | None = None,
     ) -> None:
         try:
-            self._result = self._compute_channel_loss(
+            compute_kwargs = dict(
                 logits=logits,
                 labels=labels,
                 vocab_size=vocab_size,
@@ -293,6 +318,13 @@ class ChannelLossComputer:
                 shift_labels=shift_labels,
                 ignore_index=ignore_index,
             )
+            if getattr(self._compute_channel_loss, "__func__", None) is ChannelLossComputer._compute_channel_loss:
+                compute_kwargs.update(
+                    reused_per_token_loss=reused_per_token_loss,
+                    logits_bias=logits_bias,
+                    logits_bias_weight=logits_bias_weight,
+                )
+            self._result = self._compute_channel_loss(**compute_kwargs)
         except ChannelLossMetadataError:
             if self.strict:
                 raise
@@ -313,6 +345,9 @@ class ChannelLossComputer:
         attention_mask: torch.Tensor | None,
         shift_labels: torch.Tensor | None,
         ignore_index: int,
+        reused_per_token_loss: torch.Tensor | None = None,
+        logits_bias: torch.Tensor | None = None,
+        logits_bias_weight: torch.Tensor | None = None,
     ) -> list[dict[str, Any]]:
         sp_enabled = bool(self.parallel_state.sp_enabled)
         # Match ``ForCausalLMLoss``: a provided ``shift_labels`` wins, including under SP.
@@ -329,7 +364,14 @@ class ChannelLossComputer:
             labels=labels,
             effective_labels=effective_labels,
         )
-        per_token_loss = self._per_token_ce(logits, labels_flat, vocab_size, hidden_states, weights, ignore_index)
+        if reused_per_token_loss is not None:
+            per_token_loss = reused_per_token_loss.detach().reshape(-1)
+            if per_token_loss.numel() != labels_flat.numel():
+                raise ChannelLossMetadataError("Captured token loss does not match labels.")
+        else:
+            per_token_loss = self._per_token_ce(
+                logits, labels_flat, vocab_size, hidden_states, weights, ignore_index, logits_bias, logits_bias_weight
+            )
         if per_token_loss is None:
             return []
         labels_flat = labels_flat.to(per_token_loss.device)
@@ -356,11 +398,13 @@ class ChannelLossComputer:
         hidden_states: torch.Tensor | None,
         weights: torch.Tensor | None,
         ignore_index: int,
+        logits_bias: torch.Tensor | None = None,
+        logits_bias_weight: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         if hidden_states is not None and weights is not None:
             hs = hidden_states.detach().reshape(-1, hidden_states.size(-1))
             w = weights.detach()
-            return self._eager_chunked(hs, w, labels_flat.to(hs.device), ignore_index)
+            return self._eager_chunked(hs, w, labels_flat.to(hs.device), ignore_index, logits_bias, logits_bias_weight)
 
         if logits is not None:
             vocab = vocab_size if vocab_size is not None else logits.size(-1)
@@ -395,12 +439,19 @@ class ChannelLossComputer:
         weights: torch.Tensor,
         labels_flat: torch.Tensor,
         ignore_index: int,
+        logits_bias: torch.Tensor | None = None,
+        logits_bias_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         seq_len = hidden_states.size(0)
         result = torch.empty(seq_len, device=hidden_states.device, dtype=torch.float32)
         for start in range(0, seq_len, cls.EAGER_CHUNK_SIZE):
             end = min(start + cls.EAGER_CHUNK_SIZE, seq_len)
             chunk_logits = F.linear(hidden_states[start:end], weights).float()
+            if logits_bias is not None:
+                bias = logits_bias.detach().reshape(-1, logits_bias.size(-1))[start:end]
+                if logits_bias_weight is not None:
+                    bias = F.linear(bias, logits_bias_weight.detach())
+                chunk_logits = chunk_logits + bias.float()
             result[start:end] = F.cross_entropy(
                 chunk_logits,
                 labels_flat[start:end],
@@ -1201,8 +1252,26 @@ def _bind_loss_call_args(
             elif parameter.kind is inspect.Parameter.VAR_POSITIONAL:
                 bound_args.pop(name, None)
 
-        for key, value in zip(_LOSS_CALL_POSITIONAL_KEYS, args):
-            bound_args.setdefault(key, value)
+        has_varargs = any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in signature.parameters.values())
+        positional_names = [
+            p.name
+            for p in signature.parameters.values()
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        known_names = set(_LOSS_CALL_POSITIONAL_KEYS) | {
+            "hidden_states",
+            "weights",
+            "shift_labels",
+            "logits_bias",
+            "logits_bias_weight",
+        }
+        for index, (key, value) in enumerate(zip(_LOSS_CALL_POSITIONAL_KEYS, args)):
+            if (
+                key in signature.parameters
+                or (has_varargs and index >= len(positional_names))
+                or (index < 3 and index < len(positional_names) and positional_names[index] not in known_names)
+            ):
+                bound_args.setdefault(key, value)
         return bound_args
     except (TypeError, ValueError):
         bound_args = dict(zip(_LOSS_CALL_POSITIONAL_KEYS, args))

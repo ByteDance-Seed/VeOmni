@@ -20,6 +20,15 @@
     ]
   },
   {
+    "name": "qwen38-channel_loss_callback-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_channel_loss_callback.py"
+    ]
+  },
+  {
     "name": "npu-unit-03",
     "suite": "unit",
     "args": [
