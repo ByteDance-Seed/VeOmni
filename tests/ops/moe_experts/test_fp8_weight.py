@@ -6,8 +6,12 @@
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.offloading import OffloadPolicy, custom_save_on_cpu
 from veomni.ops.kernels.moe_experts.shared.fp8_weight import FP8ExpertWeight
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 @pytest.mark.parametrize("pin_memory", [False, True])
