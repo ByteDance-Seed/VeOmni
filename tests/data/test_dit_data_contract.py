@@ -5,9 +5,13 @@ from pathlib import Path
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import parse_args
 from veomni.models.auto import build_config
 from veomni.trainer.dit_trainer import VeOmniDiTArguments
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 ROOT = Path(__file__).resolve().parents[2]

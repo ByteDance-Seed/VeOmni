@@ -156,7 +156,10 @@ Create `configs/multimodal/your_model/your_model.yaml` with `model.config_path`,
 
 ### Step 10: Test
 
-See the testing checklist below for what to add.
+Follow [Testing a New Model](../../transformers_v5/testing_new_model.md), the
+source of truth for model parity, SP/EP mode selection, representative models,
+and capability exceptions. Use the testing checklist below to track the
+integration-specific additions.
 
 ---
 
@@ -220,7 +223,11 @@ For implementation details of each patch, refer to the example docs.
 - [ ] `DummyYourModelDataset` in `veomni/data/dummy_dataset.py` (multimodal)
 - [ ] Registry case in `tests/models/base/test_auto_registry.py`
 - [ ] Family parity and contract tests under `tests/models/transformers/`
-- [ ] Test case + fixture + test function in `tests/e2e/test_e2e_parallel.py` (Level 2)
+- [ ] One supported accelerator configuration has reference loss/backward coverage
+- [ ] E2E case extends an existing family table/fixture in `tests/e2e/test_e2e_parallel.py`
+- [ ] Dense uses `(SP1, EP1)` / `(SP2, EP1)`; ordinary MoE uses `(SP1, EP1)` / `(SP2, EP2)`
+- [ ] Extra modes, capability limits, and smoke-only gaps are justified in the case
+- [ ] GPU/NPU eligibility and CI selection checked; launch plan matches worker process count
 - [ ] For VLM models, add the toy config to the `freeze_vit` smoke test list in `tests/trainer/test_vlm_trainer.py`
 
 ---

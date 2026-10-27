@@ -26,6 +26,7 @@ tensor converter). Conversion runs at save time (and is cached on the model afte
 load when an index mapping is supplied).
 """
 
+import inspect
 import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, Generator, List, Optional, Protocol, Tuple, Union
@@ -287,7 +288,12 @@ def maybe_convert_fqn_to_index_mapping(
         return fqn_to_index_mapping
 
     original_size = len(fqn_to_index_mapping)
-    converted = converter(fqn_to_index_mapping)
+    try:
+        params = inspect.signature(converter).parameters
+        accepts_model = "model" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):
+        accepts_model = False
+    converted = converter(fqn_to_index_mapping, model=model) if accepts_model else converter(fqn_to_index_mapping)
     if len(converted) != original_size:
         logger.info_rank0(
             f"Converted fqn_to_index_mapping for {type(model).__name__} ({original_size} -> {len(converted)} entries)."
@@ -348,7 +354,8 @@ def _map_moe_params_common(name, tensor, ep_rank):
         yield new_key, tensor[i].to(tensor.device, non_blocking=True)
 
 
-def _process_moe_params(name, tensor, ep_rank):
+def split_moe_params(name, tensor, ep_rank=0):
+    """Split a fused MoE expert tensor (``gate_up_proj`` or ``down_proj``) into per-expert ``(key, tensor)`` pairs."""
     if "gate_up_proj" in name:
         gate, up = tensor.chunk(2, dim=1)
         params = {
@@ -360,6 +367,9 @@ def _process_moe_params(name, tensor, ep_rank):
 
     for key, value in params.items():
         yield from _map_moe_params_common(key, value, ep_rank)
+
+
+_process_moe_params = split_moe_params
 
 
 def export_weights(model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -391,10 +401,10 @@ def export_weights(model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor]
             for src_ep_rank in range(ep_size):
                 tensor = unsharded_tensor if src_ep_rank == ep_rank else buffer
                 torch.distributed.broadcast(tensor, group_src=src_ep_rank, group=ps.ep_group)
-                yield from _process_moe_params(name, tensor, ep_rank=src_ep_rank)
+                yield from split_moe_params(name, tensor, ep_rank=src_ep_rank)
 
         else:
             if is_expert_layer:
-                yield from _process_moe_params(name, unsharded_tensor, ep_rank=0)
+                yield from split_moe_params(name, unsharded_tensor, ep_rank=0)
             else:
                 yield name, unsharded_tensor

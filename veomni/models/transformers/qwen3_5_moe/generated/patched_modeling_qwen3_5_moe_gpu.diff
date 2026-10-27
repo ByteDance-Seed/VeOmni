@@ -158,7 +158,7 @@
 +from transformers.utils.generic import (
      accepts_precomputed_kwargs,
 -    get_max_seqlen,
-     is_flash_attention_requested,
+-    is_flash_attention_requested,
      maybe_autocast,
      merge_with_config_defaults,
  )
@@ -174,6 +174,7 @@
 +
 +from veomni.distributed.parallel_state import get_parallel_state
 +from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
++from veomni.distributed.sequence_parallel.gdn_exchange import coalesced_gather_aligned
 +from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 +from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 +from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
@@ -527,7 +528,7 @@
 
          z = self.in_proj_z(hidden_states)
          z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
-@@ -452,59 +804,159 @@
+@@ -452,59 +804,160 @@
          b = self.in_proj_b(hidden_states)
          a = self.in_proj_a(hidden_states)
 
@@ -562,15 +563,16 @@
 +            k_proj = k_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
 +            v_proj = v_proj.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 +
-+            # All-to-all: gather full sequence, scatter heads -> [B, S_full, local_heads, head_dim]
-+            q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-+            k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-+            v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-+
 +            b = b.reshape(batch_size, seq_len, self.num_v_heads)
 +            a = a.reshape(batch_size, seq_len, self.num_v_heads)
-+            b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
-+            a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
++            if q_proj.dtype == k_proj.dtype == v_proj.dtype == b.dtype == a.dtype:
++                q_proj, k_proj, v_proj, b, a = coalesced_gather_aligned(q_proj, k_proj, v_proj, b, a, ulysses_group)
++            else:
++                q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=ulysses_group)
++                k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=ulysses_group)
++                v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=ulysses_group)
++                b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
++                a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
 +
 +            # Flatten heads back to channels and concat for conv1d: [B, S_full, local_dim]
 +            q_proj = q_proj.reshape(q_proj.shape[0], q_proj.shape[1], -1)
@@ -723,7 +725,7 @@
                  query,
                  key,
                  value,
-@@ -513,81 +965,46 @@
+@@ -513,81 +966,46 @@
                  initial_state=recurrent_state,
                  output_final_state=cache_params is not None,
                  use_qk_l2norm_in_kernel=True,
@@ -832,7 +834,7 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -627,9 +1044,16 @@
+@@ -627,9 +1045,16 @@
      return attn_output, attn_weights
 
 
@@ -849,7 +851,7 @@
      def __init__(self, config: Qwen3_5MoeConfig, layer_idx: int):
          super().__init__()
          self.config = config
-@@ -655,6 +1079,9 @@
+@@ -655,6 +1080,9 @@
          self.k_norm = Qwen3_5MoeRMSNorm(
              self.head_dim, eps=config.rms_norm_eps
          )  # thus post q_norm does not need reshape
@@ -859,7 +861,7 @@
 
      def forward(
          self,
-@@ -677,16 +1104,12 @@
+@@ -677,16 +1105,12 @@
          value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -878,7 +880,7 @@
              self,
              query_states,
              key_states,
-@@ -704,9 +1127,15 @@
+@@ -704,9 +1128,15 @@
          return attn_output, attn_weights
 
 
@@ -896,7 +898,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = intermediate_size
-@@ -714,24 +1143,43 @@
+@@ -714,24 +1144,43 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -945,7 +947,7 @@
 
      def forward(
          self,
-@@ -739,25 +1187,27 @@
+@@ -739,25 +1188,27 @@
          top_k_index: torch.Tensor,
          top_k_weights: torch.Tensor,
      ) -> torch.Tensor:
@@ -992,7 +994,7 @@
 
 
  class Qwen3_5MoeTopKRouter(nn.Module):
-@@ -779,6 +1229,12 @@
+@@ -779,6 +1230,12 @@
          return router_logits, router_scores, router_indices
 
 
@@ -1005,7 +1007,7 @@
  class Qwen3_5MoeSparseMoeBlock(nn.Module):
      def __init__(self, config):
          super().__init__()
-@@ -787,38 +1243,71 @@
+@@ -787,38 +1244,71 @@
          self.shared_expert = Qwen3_5MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
          self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
@@ -1086,7 +1088,7 @@
 
 
  class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
-@@ -834,6 +1323,7 @@
+@@ -834,6 +1324,7 @@
          self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
          self.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -1094,7 +1096,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -841,29 +1331,49 @@
+@@ -841,29 +1332,49 @@
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
          past_key_values: Cache | None = None,
@@ -1147,7 +1149,7 @@
              )
 
          hidden_states = residual + hidden_states
-@@ -873,11 +1383,68 @@
+@@ -873,11 +1384,68 @@
          hidden_states = self.post_attention_layernorm(hidden_states)
          hidden_states = self.mlp(hidden_states)
          # For the MoE layers, we need to unpack
@@ -1218,7 +1220,7 @@
 
 
  class Qwen3_5MoePreTrainedModel(PreTrainedModel):
-@@ -969,21 +1536,14 @@
+@@ -969,21 +1537,14 @@
          return x
 
 
@@ -1245,7 +1247,7 @@
      def __init__(self, config: Qwen3_5MoeVisionConfig) -> None:
          super().__init__()
          self.dim = config.hidden_size
-@@ -996,13 +1556,16 @@
+@@ -996,13 +1557,16 @@
          self.config = config
          self.attention_dropout = 0.0
          self.is_causal = False
@@ -1263,7 +1265,7 @@
          **kwargs,
      ) -> torch.Tensor:
          seq_length = hidden_states.shape[0]
-@@ -1010,20 +1573,21 @@
+@@ -1010,56 +1574,34 @@
              self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
          )
          cos, sin = position_embeddings
@@ -1278,41 +1280,72 @@
 -            self.config._attn_implementation, eager_attention_forward
 -        )
 -
-         if is_flash_attention_requested(self.config):
+-        if is_flash_attention_requested(self.config):
 -            # Flash Attention: Use cu_seqlens for variable length attention
 -            max_seqlen = get_max_seqlen(cu_seqlens, self.config, kwargs={"max_seqlen": max_seqlen})
 -            attn_output, _ = attention_interface(
-+            # Modification: prefer the int max_seqlen pre-computed once in
-+            # Qwen3_5VisionModel.forward (Patch.5). Fall back to the original
-+            # GPU-side reduction so this method still works when the model forward
-+            # has not been patched (e.g. external callers, unit tests).
-+            max_seqlen = kwargs.pop("vision_max_seqlen", None)
-+            if max_seqlen is None:
-+                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-+            attn_output, _ = self.veomni_attn(
-                 self,
-                 query_states,
-                 key_states,
-@@ -1039,6 +1603,9 @@
-                 **kwargs,
-             )
-         else:
-+            # Modification: drop `vision_max_seqlen` from kwargs before falling through
-+            # to the non-FA path so it doesn't reach kernels that don't expect it.
-+            kwargs.pop("vision_max_seqlen", None)
-             # Other implementations: Process each chunk separately
-             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-             splits = [
-@@ -1046,7 +1613,7 @@
-             ]
-
-             attn_outputs = [
+-                self,
+-                query_states,
+-                key_states,
+-                value_states,
+-                attention_mask=None,
+-                scaling=self.scaling,
+-                dropout=0.0 if not self.training else self.attention_dropout,
+-                cu_seq_lens_q=cu_seqlens,
+-                cu_seq_lens_k=cu_seqlens,
+-                max_length_q=max_seqlen,
+-                max_length_k=max_seqlen,
+-                is_causal=False,
+-                **kwargs,
+-            )
+-        else:
+-            # Other implementations: Process each chunk separately
+-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+-            splits = [
+-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
+-            ]
+-
+-            attn_outputs = [
 -                attention_interface(
-+                self.veomni_attn(
-                     self,
-                     q,
-                     k,
-@@ -1096,6 +1663,12 @@
+-                    self,
+-                    q,
+-                    k,
+-                    v,
+-                    attention_mask=None,
+-                    scaling=self.scaling,
+-                    dropout=0.0 if not self.training else self.attention_dropout,
+-                    is_causal=False,
+-                    **kwargs,
+-                )[0]
+-                for q, k, v in zip(*splits)
+-            ]
+-            attn_output = torch.cat(attn_outputs, dim=1)
++        # Modification: prefer the int max_seqlen pre-computed once in
++        # Qwen3_5VisionModel.forward (Patch.5). Fall back to the original
++        # GPU-side reduction so this method still works when the model forward
++        # has not been patched (e.g. external callers, unit tests).
++        max_seqlen = kwargs.pop("vision_max_seqlen", None)
++        if max_seqlen is None:
++            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
++        attn_output, _ = self.veomni_attn(
++            self,
++            query_states,
++            key_states,
++            value_states,
++            attention_mask=None,
++            scaling=self.scaling,
++            dropout=0.0 if not self.training else self.attention_dropout,
++            cu_seq_lens_q=cu_seqlens,
++            cu_seq_lens_k=cu_seqlens,
++            max_length_q=max_seqlen,
++            max_length_k=max_seqlen,
++            is_causal=False,
++            **kwargs,
++        )
+
+         attn_output = attn_output.reshape(seq_length, -1).contiguous()
+         attn_output = self.proj(attn_output)
+@@ -1096,6 +1638,12 @@
          return hidden_states
 
 
@@ -1325,7 +1358,7 @@
  class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
      config: Qwen3_5MoeVisionConfig
      input_modalities = ("image", "video")
-@@ -1134,30 +1707,127 @@
+@@ -1134,30 +1682,127 @@
 
          self.post_init()
 
@@ -1475,7 +1508,7 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1172,33 +1842,150 @@
+@@ -1172,33 +1817,145 @@
          Returns:
              `torch.Tensor`: hidden_states.
          """
@@ -1616,15 +1649,10 @@
 +        # `**kwargs` to every block; the patched Qwen3_5VisionAttention.forward
 +        # picks it up via `vision_max_seqlen` and falls back to the original
 +        # recompute when the key is absent (so non-VeOmni callers keep working).
-+        # Gate is two-pronged:
-+        #   (a) `_VEOMNI_VISION_ATTENTION_PATCHED` — set per generated file. True
-+        #       when Qwen3_5VisionAttention.forward is patched to consume
-+        #       ``vision_max_seqlen``. GPU and NPU both register that consumer.
-+        #   (b) `is_flash_attention_requested(self.config)` — only FA's
-+        #       `flash_attn_varlen_func` benefits from the int hand-off; eager
-+        #       and sdpa paths in the consumer pop+discard the kwarg, so the
-+        #       host sync would be wasted.
-+        if _VEOMNI_VISION_ATTENTION_PATCHED and is_flash_attention_requested(self.config):
++        # Gate: `_VEOMNI_VISION_ATTENTION_PATCHED` is set per generated file when
++        # Qwen3_5VisionAttention.forward is patched to consume ``vision_max_seqlen``.
++        # GPU and NPU both register that consumer.
++        if _VEOMNI_VISION_ATTENTION_PATCHED:
 +            if precomputed_max_seqlen is not None:
 +                # Collator-side max already accounts for sp-pad; use as-is.
 +                kwargs["vision_max_seqlen"] = precomputed_max_seqlen
@@ -1641,7 +1669,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -1209,6 +1996,36 @@
+@@ -1209,6 +1966,36 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -1678,7 +1706,7 @@
 
 
  @auto_docstring
-@@ -1224,6 +2041,16 @@
+@@ -1224,6 +2011,16 @@
      router_logits: tuple[torch.FloatTensor] | None = None
 
 
@@ -1695,7 +1723,7 @@
  @auto_docstring
  @dataclass
  class Qwen3_5MoeCausalLMOutputWithPast(CausalLMOutputWithPast):
-@@ -1236,6 +2063,37 @@
+@@ -1236,6 +2033,37 @@
      rope_deltas: torch.LongTensor | None = None
      router_logits: tuple[torch.FloatTensor] | None = None
      aux_loss: torch.FloatTensor | None = None
@@ -1733,7 +1761,7 @@
 
 
  class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
-@@ -1264,8 +2122,14 @@
+@@ -1264,8 +2092,14 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -1749,7 +1777,7 @@
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-@@ -1275,7 +2139,6 @@
+@@ -1275,7 +2109,6 @@
          if use_cache and past_key_values is None:
              past_key_values = DynamicCache(config=self.config)
 
@@ -1757,7 +1785,7 @@
          if position_ids is None:
              past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
              position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
-@@ -1283,6 +2146,20 @@
+@@ -1283,6 +2116,20 @@
          elif position_ids.ndim == 2:
              position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
 
@@ -1778,7 +1806,7 @@
          if position_ids.ndim == 3 and position_ids.shape[0] == 4:
              text_position_ids = position_ids[0]
              position_ids = position_ids[1:]
-@@ -1290,7 +2167,6 @@
+@@ -1290,7 +2137,6 @@
              text_position_ids = None
 
          if not isinstance(causal_mask_mapping := attention_mask, dict):
@@ -1786,7 +1814,7 @@
              mask_kwargs = {
                  "config": self.config,
                  "inputs_embeds": inputs_embeds,
-@@ -1298,7 +2174,6 @@
+@@ -1298,7 +2144,6 @@
                  "past_key_values": past_key_values,
                  "position_ids": text_position_ids,
              }
@@ -1794,7 +1822,7 @@
              causal_mask_mapping = {
                  "full_attention": create_causal_mask(**mask_kwargs),
                  "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
-@@ -1318,12 +2193,30 @@
+@@ -1318,12 +2163,30 @@
                  **kwargs,
              )
 
@@ -1827,7 +1855,7 @@
 
 
  @auto_docstring
-@@ -1333,10 +2226,18 @@
+@@ -1333,10 +2196,18 @@
      accepts_loss_kwargs = False
      _no_split_modules = ["Qwen3_5MoeDecoderLayer", "Qwen3_5MoeVisionBlock"]
 
@@ -1848,7 +1876,7 @@
          self.rope_deltas = None  # cache rope_deltas here
 
          # Initialize weights and apply final processing
-@@ -1506,58 +2407,43 @@
+@@ -1506,58 +2377,43 @@
          self,
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
@@ -1936,7 +1964,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1623,37 +2509,189 @@
+@@ -1623,37 +2479,189 @@
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
          mm_token_type_ids: torch.IntTensor | None = None,
@@ -2136,7 +2164,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1663,6 +2701,17 @@
+@@ -1663,6 +2671,17 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -2154,7 +2182,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1670,13 +2719,15 @@
+@@ -1670,13 +2689,15 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -2174,7 +2202,7 @@
 
 
  def load_balancing_loss_func(
-@@ -1748,6 +2799,12 @@
+@@ -1748,6 +2769,12 @@
      return overall_loss * num_experts
 
 
@@ -2187,7 +2215,7 @@
  @auto_docstring
  class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1757,6 +2814,7 @@
+@@ -1757,6 +2784,7 @@
      config: Qwen3_5MoeTextConfig
      _keys_to_ignore_on_load_unexpected = [r"^mtp.*", r"^model.visual.*"]
 
@@ -2195,7 +2223,7 @@
      def __init__(self, config):
          super().__init__(config)
          self.model = Qwen3_5MoeTextModel(config)
-@@ -1765,8 +2823,15 @@
+@@ -1765,8 +2793,15 @@
          self.router_aux_loss_coef = config.router_aux_loss_coef
          self.num_experts = config.num_experts
          self.num_experts_per_tok = config.num_experts_per_tok
@@ -2213,7 +2241,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -1781,14 +2846,17 @@
+@@ -1781,14 +2816,17 @@
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
          output_router_logits: bool | None = None,
@@ -2232,7 +2260,7 @@
 
          Example:
 
-@@ -1820,30 +2888,42 @@
+@@ -1820,30 +2858,42 @@
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
              output_router_logits=output_router_logits,
@@ -2285,7 +2313,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1851,7 +2931,19 @@
+@@ -1851,7 +2901,19 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
@@ -2306,7 +2334,7 @@
 
 
  class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMixin):
-@@ -1862,11 +2954,29 @@
+@@ -1862,11 +2924,29 @@
 
      _fsdp_plan = {"lm_head": "keep_full_weight"}
 
@@ -2337,7 +2365,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -1909,97 +3019,125 @@
+@@ -1909,97 +2989,125 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -2526,7 +2554,7 @@
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
          # Overwritten -- requires 3D position ids
-@@ -2186,6 +3324,30 @@
+@@ -2186,6 +3294,30 @@
 
          return input_ids, model_kwargs
 

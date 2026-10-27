@@ -44,8 +44,7 @@ Under `veomni/models/seed_omni/modules/<family>/<sub>/`:
 - `processing.py` (optional): when the module consumes raw images, audio or
   video.
 
-Reuse the cross-family helpers in `modules/base/` where possible (text encoder,
-packing, LLM generation).
+Reuse the shared `TextEncoder` module in `modules/text_encoder/` where possible.
 
 ### IDE type stubs
 
@@ -117,8 +116,19 @@ If the model needs a new data source, add a preprocessor as described in
   module's own micro-batch.
 - Read inputs in `pre_forward`, write results in `post_forward`. Conversation
   nodes return `{"conversation_list": ...}` so the carrier flows on.
-- Implement `dummy_inputs()` for any encoder whose modality can be absent from a
-  micro-batch, so FSDP stays aligned.
+- Implement `dummy_inputs()` and `ModulePreprocessorBase.bind_dummy_inputs()` for
+  any encoder whose modality can be absent from a sample, and inject `is_dummy=True`
+  placeholders **per sample** in `preprocess_conversations(..., inference=False)` so
+  FSDP stays aligned when `OmniProcessor` runs per sample in `seedomni_transform`.
+- Populate `item.meta[_OMNI_TOKEN_LEN]` (`from veomni.models.seed_omni.utils.conversation import _OMNI_TOKEN_LEN`)
+  on every `ConversationItem` (real and `is_dummy=True`) in your module's CPU
+  preprocessor / chat template so dynamic batching (`train.dyn_bsz: true`) can
+  compute both physical (`total`, including dummy items) and supervised
+  (`effective`, excluding dummy items) token lengths at the Dataset stage:
+  - `TextEncoderChatTemplate` sets `_OMNI_TOKEN_LEN` and `meta["labels"]` automatically
+    (preserve both if overriding `tokenize` / `merge_text_embeds`).
+  - Vision / audio / codec preprocessors set `item.meta[_OMNI_TOKEN_LEN]` to the
+    token count the item contributes to the module / backbone sequence.
 - Under Ulysses, slice in `pre_forward` and gather in `post_forward`; see
   [Sequence Parallelism](../distributed/sequence_parallel.md).
 - For inference, emit `module_signal` strings to drive FSM transitions and clear

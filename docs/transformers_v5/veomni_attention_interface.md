@@ -1,6 +1,6 @@
 # VeOmni Attention Interface
 
-VeOmni registers sequence-parallel FlashAttention, FlexAttention, SDPA,
+VeOmni registers sequence-parallel FlashAttention, AITER, FlexAttention, SDPA,
 SageAttention, and MagiAttention FFA adapters in Transformers'
 `ALL_ATTENTION_FUNCTIONS`. There is no `fused_attention_forward` facade and
 no replaceable module-level `_flash_attention_forward` slots. Patched models
@@ -45,6 +45,7 @@ same way:
 | `flash_attention_3_hub` | `veomni_flash_attention_3_hub` |
 | `flash_attention_4` | `veomni_flash_attention_4` |
 | `flex_attention` | `veomni_flex_attention` |
+| `aiter` | `veomni_flash_attention_aiter` |
 | `magi_attention` | `veomni_magi_attention` |
 
 The native Transformers `flex_attention` registry entry is left unchanged.
@@ -74,11 +75,26 @@ attention globally. The short `flex_attention` and `magi_attention` rows resolve
 their `veomni_*` interfaces so they share the adapters' device and backend
 behavior when selected directly through the ops registry.
 
+The AITER row resolves `veomni_flash_attention_aiter` only on AMD ROCm. It
+reuses the flash/Ulysses adapter, while the patched local-kernel loader supplies
+AITER's dense and varlen functions. Both its public and normalized names are
+rejected on Ascend before Transformers can select an NPU attention path.
+
 The Magi default prepares an explicit `FA4AttnArg` and reuses it while the range tensors and attention shape remain unchanged, avoiding the upstream facade's repeated GPU-to-CPU range conversion in every transformer layer. VeOmni's FA4 autograd function passes that prepared argument directly to MagiAttention's lower-level `fa4_fwd` and `fa4_bwd` functions. MagiAttention is available on NVIDIA SM100 and newer GPUs through CUTE DSL/JIT. VeOmni validates the query device once per device.
 
 All registered adapters use the Transformers attention-forward convention.
 Q/K/V inputs use `[batch, heads, sequence, head_dim]`; the returned attention
 output uses `[batch, sequence, heads, head_dim]`.
+
+For `sdpa`, `veomni_sdpa`, `eager` (with `is_causal=False`), and
+`veomni_sage_attention`, unmasked (`attention_mask=None`) batch-size-1 calls
+carrying multi-segment `cu_seqlens` (`cu_seq_lens_q`/`k` or `cu_seqlens_q`/`k`)
+are automatically split per segment inside the wrapper and concatenated back
+along the sequence dimension. In `veomni_sdpa` and `veomni_sage_attention`,
+this split happens after the Ulysses sequence-gather/head-scatter exchange so
+global `cu_seqlens` match the gathered sequence length. Single-segment metadata
+or calls already isolated by a 3D/4D dense `attention_mask` strip the packed
+metadata without splitting.
 
 ## FlexAttention mask contract
 

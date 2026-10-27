@@ -95,6 +95,9 @@ _GPT_OSS_FA4_QUACK_TRAINING_ARGS = [
 ]
 
 
+_FULL_8GPU_MOE_MODELS = {"qwen3_moe"}
+
+
 def _base_model_modes():
     modes = []
     for sp_size in _SP_SIZE:
@@ -102,41 +105,71 @@ def _base_model_modes():
     return modes
 
 
-def _moe_model_modes():
-    modes = []
-    for sp_size in _SP_SIZE:
-        for ep_size in _EP_SIZE:
-            modes.append(ParallelMode(sp_size, ep_size))
-    return modes
+def _moe_model_modes(*, full_matrix: bool = False, max_sp_size=None, max_ep_size=None):
+    if full_matrix:
+        return [ParallelMode(sp_size, ep_size) for sp_size in _SP_SIZE for ep_size in _EP_SIZE]
+    if max_sp_size == 1:
+        return [ParallelMode(1, 1), ParallelMode(1, 2)]
+    if max_ep_size == 1:
+        return [ParallelMode(1, 1), ParallelMode(2, 1)]
+    return [ParallelMode(1, 1), ParallelMode(2, 2)]
 
 
-def parallel_launches(is_moe, max_sp_size=None, max_ep_size=None):
-    modes = _moe_model_modes() if is_moe else _base_model_modes()
+def parallel_launches(
+    is_moe,
+    max_sp_size=None,
+    max_ep_size=None,
+    *,
+    model_name: str | None = None,
+    min_sp_size: int | None = None,
+):
+    full_8gpu = bool(is_moe and model_name in _FULL_8GPU_MOE_MODELS)
+    if is_moe and model_name == "gpt_oss":
+        # Keep a baseline and change SP, then EP, for the dedicated Quack variant.
+        modes = [ParallelMode(1, 1), ParallelMode(2, 1), ParallelMode(2, 2)]
+    elif is_moe:
+        modes = _moe_model_modes(full_matrix=full_8gpu, max_sp_size=max_sp_size, max_ep_size=max_ep_size)
+    else:
+        modes = _base_model_modes()
     return [
-        (mode, LaunchSpec(nproc=mode.sp_size * 4))
+        (mode, LaunchSpec(nproc=(mode.sp_size * 4) if full_8gpu else 4))
         for mode in modes
-        if (max_sp_size is None or mode.sp_size <= max_sp_size)
+        if (min_sp_size is None or mode.sp_size >= min_sp_size)
+        and (max_sp_size is None or mode.sp_size <= max_sp_size)
         and (max_ep_size is None or mode.ep_size <= max_ep_size)
     ]
 
 
-def alignment_plan(capabilities, is_moe=False, max_sp_size=None, max_ep_size=None):
-    groups, group, count = [], [], 0
-    for _, launch in parallel_launches(is_moe, max_sp_size, max_ep_size):
-        if group and count + launch.nproc > max(1, len(capabilities.devices)):
-            groups.append(tuple(group))
-            group, count = [], 0
-        group.append(launch)
-        count += launch.nproc
-    if group:
-        groups.append(tuple(group))
-    return CasePlan(tuple(groups))
+def alignment_plan(
+    capabilities,
+    is_moe=False,
+    max_sp_size=None,
+    max_ep_size=None,
+    *,
+    model_name: str | None = None,
+    min_sp_size: int | None = None,
+):
+    launches = [
+        launch
+        for _, launch in parallel_launches(
+            is_moe,
+            max_sp_size,
+            max_ep_size,
+            model_name=model_name,
+            min_sp_size=min_sp_size,
+        )
+    ]
+    return CasePlan.sequential(*launches)
 
 
 def alignment_case_plan(context):
     return alignment_plan(
         context.capabilities,
-        **{key: context.params[key] for key in ("is_moe", "max_sp_size", "max_ep_size") if key in context.params},
+        **{
+            key: context.params[key]
+            for key in ("is_moe", "max_sp_size", "max_ep_size", "model_name")
+            if key in context.params
+        },
     )
 
 
@@ -150,31 +183,15 @@ def prepare_exec_cmd(
     is_moe: bool,
     max_sp_size: int | None = None,
     max_ep_size: int | None = None,
+    min_sp_size: int | None = None,
 ) -> list[tuple[str, dict]]:
-    """Prepare torchrun command kwargs for every (task, parallel-mode) combination.
-
-    Port allocation is deferred to execution time to avoid TOCTOU races —
-    the caller must pass each dict to ``build_torchrun_cmd(**kwargs)`` right
-    before ``subprocess.run()``.
-
-    Args:
-        test_tasks: Script basenames under tests/train_scripts/ to run (e.g. ["train_text_test"]).
-        model_name: Short name used for directory naming and log output.
-        config_path: Path to the model's toy config directory or config.json.
-        model_path: Path to materialized model weights.
-        train_path: Path to the dummy training dataset directory.
-        output_dir: Root directory for per-run output (logs, checkpoints).
-        is_moe: If True, also iterates over ep_size values (expert parallelism).
-        max_sp_size: If set, filters out modes with sp_size > this value.
-            Use 1 to skip sp=2 when the model does not support sequence parallelism yet.
-        max_ep_size: If set, filters out modes with ep_size > this value.
-            Use 1 to skip ep=2 when the model does not support expert parallelism yet.
-
-    Returns:
-        List of (task_name, cmd_kwargs) tuples, where cmd_kwargs is a dict of
-        keyword arguments for :func:`build_torchrun_cmd`.
-    """
-    launches = parallel_launches(is_moe, max_sp_size, max_ep_size)
+    launches = parallel_launches(
+        is_moe,
+        max_sp_size,
+        max_ep_size,
+        model_name=model_name,
+        min_sp_size=min_sp_size,
+    )
 
     command_list = []
     for task in test_tasks:

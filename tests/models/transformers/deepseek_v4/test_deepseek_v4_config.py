@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from contextlib import contextmanager
 from pathlib import Path
@@ -136,3 +137,113 @@ def test_undeclared_is_not_the_same_as_absent(tmp_path: Path):
 
     assert not hasattr(UpstreamConfig.from_pretrained(tmp_path, dsa_indexer_loss=True), "dsa_indexer_loss")
     assert DeepseekV4Config.from_pretrained(tmp_path, dsa_indexer_loss=True).dsa_indexer_loss is True
+
+
+def test_dspark_mtp_config_fields_and_defaults():
+    config = DeepseekV4Config(num_hidden_layers=4, layer_types=["compressed_sparse_attention"] * 4)
+    assert config.dspark_block_size == 0
+    assert config.dspark_target_layer_ids == [1, 2, 3]
+    assert config.mtp_loss_coef == 1.0
+    assert config.freeze_mtp is False
+    assert config.moe_config_for_layer(0) == (config.n_routed_experts, config.num_experts_per_tok)
+    assert config.moe_config_for_layer(4) == (config.n_routed_experts, config.num_experts_per_tok)
+
+    custom = DeepseekV4Config(
+        num_hidden_layers=4,
+        compress_ratios=[0, 0, 4, 128, 0, 0, 0],
+        dspark_block_size=5,
+        dspark_n_routed_experts=2,
+        dspark_num_experts_per_tok=1,
+    )
+    assert custom.num_nextn_predict_layers == 3
+    assert custom.moe_config_for_layer(4) == (2, 1)
+
+    explicit_zero = DeepseekV4Config(
+        num_hidden_layers=4,
+        compress_ratios=[0, 0, 4, 128, 0, 0, 0],
+        num_nextn_predict_layers=0,
+    )
+    assert explicit_zero.num_nextn_predict_layers == 0
+
+    explicit_one = DeepseekV4Config(
+        num_hidden_layers=4,
+        compress_ratios=[0, 0, 4, 128, 0, 0, 0],
+        num_nextn_predict_layers=1,
+    )
+    assert explicit_one.num_nextn_predict_layers == 1
+
+    # Verify from_dict override where dspark_block_size is passed as a kwarg override
+    # while compress_ratios is in the base dict (simulating YAML model_config override).
+    from_dict_cfg = DeepseekV4Config.from_dict(
+        {"num_hidden_layers": 4, "compress_ratios": [0, 0, 4, 128, 0, 0, 0]},
+        dspark_block_size=5,
+    )
+    assert from_dict_cfg.num_nextn_predict_layers == 3
+    assert from_dict_cfg.dspark_block_size == 5
+    assert "_explicit_num_nextn_predict_layers" not in copy.deepcopy(from_dict_cfg).to_dict()
+
+    # On-disk config.json with placeholder "num_nextn_predict_layers": 1 + 43+3 compress_ratios
+    # infers 3 stages unless the caller explicitly overrides num_nextn_predict_layers in kwargs.
+    on_disk_dict = {
+        "num_hidden_layers": 4,
+        "num_nextn_predict_layers": 1,
+        "compress_ratios": [0, 0, 4, 128, 0, 0, 0],
+        "dspark_target_layer_ids": [1, 2, 3],
+    }
+    inferred_from_disk = DeepseekV4Config.from_dict(on_disk_dict, dspark_block_size=5)
+    assert inferred_from_disk.num_nextn_predict_layers == 3
+
+    overridden_to_one = DeepseekV4Config.from_dict(
+        on_disk_dict,
+        dspark_block_size=5,
+        num_nextn_predict_layers=1,
+    )
+    assert overridden_to_one.num_nextn_predict_layers == 1
+
+    # Overriding num_hidden_layers via from_dict kwargs recomputes default dspark_target_layer_ids.
+    shrunk_cfg = DeepseekV4Config.from_dict(
+        on_disk_dict,
+        num_hidden_layers=2,
+        dspark_block_size=5,
+    )
+    assert shrunk_cfg.num_hidden_layers == 2
+    assert shrunk_cfg.dspark_target_layer_ids == [0, 1]
+    shrunk_cfg.validate_build_prerequisites()
+
+    # Non-default explicit dspark_target_layer_ids in config_dict is preserved so validation catches it.
+    custom_targets_dict = dict(on_disk_dict, dspark_target_layer_ids=[0, 2, 3])
+    shrunk_custom_targets = DeepseekV4Config.from_dict(
+        custom_targets_dict,
+        num_hidden_layers=2,
+        dspark_block_size=5,
+    )
+    assert shrunk_custom_targets.dspark_target_layer_ids == [0, 2, 3]
+    with pytest.raises(ValueError, match="dspark_target_layer_ids"):
+        shrunk_custom_targets.validate_build_prerequisites()
+
+    # Increasing num_hidden_layers via from_dict without explicit layer_types raises ValueError.
+    with pytest.raises(ValueError, match="Pass layer_types explicitly"):
+        DeepseekV4Config.from_dict(on_disk_dict, num_hidden_layers=6)
+
+
+@pytest.mark.parametrize("coef", [-1.0, float("nan"), float("inf")])
+def test_mtp_loss_coef_rejects_negative_and_non_finite(coef):
+    config = DeepseekV4Config(
+        num_hidden_layers=4,
+        layer_types=["compressed_sparse_attention"] * 4,
+        dspark_block_size=5,
+        mtp_loss_coef=coef,
+    )
+    with pytest.raises(ValueError, match="mtp_loss_coef"):
+        config.validate_build_prerequisites()
+
+
+def test_dspark_target_layer_ids_rejects_out_of_range_when_mtp_enabled():
+    config = DeepseekV4Config(
+        num_hidden_layers=4,
+        layer_types=["compressed_sparse_attention"] * 4,
+        dspark_block_size=5,
+        dspark_target_layer_ids=[2, 4],
+    )
+    with pytest.raises(ValueError, match="dspark_target_layer_ids"):
+        config.validate_build_prerequisites()

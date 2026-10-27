@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops.kernels.attention.standard.flex import _fa4_sm90_compat as fa4_sm90_compat
 from veomni.utils.device import IS_CUDA_AVAILABLE
 
@@ -401,6 +402,16 @@ def test_fa4_shared_cache_broadcast_layouts(monkeypatch, record_property, broadc
 def test_fa4_shared_cache_outer_compile_materializes_broadcast(monkeypatch, record_property):
     from functools import wraps
 
+    from veomni.utils import device as device_utils
+
+    if device_utils.get_gpu_compute_capability(torch.device("cuda")) != 90:
+        pytest.skip("requires NVIDIA SM90 for the SM90 compatibility tests")
+
+    from veomni.ops.kernels.attention.standard import flex
+
+    if not flex._fa4._flash_attn_cute_available():
+        pytest.skip("requires FA4 for the SM90 compatibility tests")
+
     from flash_attn.cute import interface
 
     original = interface._flash_attn_fwd
@@ -419,3 +430,24 @@ def test_fa4_shared_cache_outer_compile_materializes_broadcast(monkeypatch, reco
             monkeypatch, query_heads, kv_heads, 129, 259, False, record_property, outer_compile=True
         )
     assert observed_strides
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("capability", [80, 89, 100])
+def test_fa4_outer_compile_skips_other_architectures_before_optional_import(monkeypatch, capability):
+    import builtins
+
+    from veomni.utils import device as device_utils
+
+    original_import = builtins.__import__
+
+    def reject_fa4_import(name, globals=None, locals=None, fromlist=(), level=0):
+        imports_flex = name == "veomni.ops.kernels.attention.standard" and "flex" in (fromlist or ())
+        if imports_flex or name == "flash_attn.cute":
+            raise AssertionError("An unsupported GPU must not import flex or FA4")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(device_utils, "get_gpu_compute_capability", lambda device: capability)
+    monkeypatch.setattr(builtins, "__import__", reject_fa4_import)
+    with pytest.raises(pytest.skip.Exception, match="requires NVIDIA SM90"):
+        test_fa4_shared_cache_outer_compile_materializes_broadcast(monkeypatch, lambda *args: None)

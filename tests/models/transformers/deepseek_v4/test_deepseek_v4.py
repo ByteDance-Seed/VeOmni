@@ -162,8 +162,9 @@ def test_deepseek_v4_attention_preserves_q_norm_and_rope_dtype_modes():
     assert not torch.equal(captured["query"], wrong_fp32_multiply)
 
 
-@pytest.mark.parametrize("impl", ["eager", "fused_triton"])
+@pytest.mark.parametrize("impl", ["eager", "fused_triton", "deepgemm_fp8"])
 def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
+    """DeepSeek-V4 experts forward passes merged weights, raw routing weights, and ``swiglu_limit``."""
     config = _tiny_config()
     model = _build_ours(config)
     experts = model.model.layers[3].mlp.experts
@@ -176,6 +177,7 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
     captured = {}
 
     def record(*args, **kwargs):
+        """Record positional and keyword arguments passed to ``veomni_moe``."""
         captured["args"] = args
         captured["kwargs"] = kwargs
         return torch.zeros_like(hidden_states)
@@ -186,8 +188,8 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
     kwargs = captured["kwargs"]
 
     assert args[0] is hidden_states
-    expected_weights = top_k_weights if impl == "eager" else top_k_weights.to(hidden_states.dtype)
-    torch.testing.assert_close(args[1], expected_weights, rtol=0, atol=0)
+    assert args[1] is top_k_weights
+    torch.testing.assert_close(args[1], top_k_weights, rtol=0, atol=0)
     assert args[2] is selected_experts
     assert args[3].numel() == 0
     assert args[4].numel() == 0
@@ -199,6 +201,55 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
         "assume_distinct_experts": True,
     }
     torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)
+
+
+def test_deepseek_v4_experts_deepgemm_fp8_forward_backward():
+    """Select FP8 through the public config and execute the real expert module."""
+    from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
+
+    if not IS_CUDA_AVAILABLE or torch.version.hip is not None:
+        pytest.skip("NVIDIA Hopper or Blackwell is required.")
+    if get_torch_device().get_device_capability() not in ((9, 0), (10, 0)):
+        pytest.skip("Requires SM90 or SM100.")
+    pytest.importorskip("deep_gemm")
+    from deep_gemm.testing import calc_diff
+
+    from tests.ops.moe_experts.reference import standard_ep_reference
+    from veomni.arguments import OpsImplementationConfig
+
+    config = SimpleNamespace(
+        num_local_experts=4,
+        hidden_size=256,
+        intermediate_size=128,
+        hidden_act="silu",
+        swiglu_limit=10.0,
+    )
+    device = get_device_type()
+    ops = OpsImplementationConfig(moe_implementation="deepgemm_fp8", qat_implementation="none")
+    with ops_config_scope(ops):
+        experts = _dsv4_module().DeepseekV4Experts(config).to(device=device, dtype=torch.bfloat16)
+    assert experts.veomni_moe.impl == "deepgemm_fp8"
+    torch.manual_seed(91)
+    with torch.no_grad():
+        experts.gate_up_proj.normal_(std=0.03)
+        experts.down_proj.normal_(std=0.03)
+    x = torch.randn(131, config.hidden_size, device=device, dtype=torch.bfloat16, requires_grad=True)
+    routing = torch.rand(131, 2, device=device, requires_grad=True)
+    indices = torch.randint(0, config.num_local_experts - 1, (131, 2), device=device)
+    grad = torch.randn_like(x) * 0.1
+    y = experts(x, indices, routing)
+    actual = (y, *torch.autograd.grad(y, (x, routing, experts.gate_up_proj, experts.down_proj), grad))
+    xr, rr, w1, w2 = (
+        t.detach().clone().requires_grad_() for t in (x, routing, experts.gate_up_proj, experts.down_proj)
+    )
+    gate, up = w1.chunk(2, dim=1)
+    yr = standard_ep_reference(xr, rr, indices, gate, up, w2, num_experts=config.num_local_experts, swiglu_limit=10.0)
+    expected = (yr, *torch.autograd.grad(yr, (xr, rr, w1, w2), grad))
+    for result, reference in zip(actual, expected):
+        assert torch.isfinite(result).all()
+        assert calc_diff(result, reference) < 0.004
+    assert torch.count_nonzero(actual[-1][-1]) == 0
+    assert torch.count_nonzero(actual[-2][-1]) == 0
 
 
 def test_deepseek_v4_sparse_moe_block_opts_topk_layers_into_tight_max_m_bound():
@@ -597,3 +648,403 @@ def test_deepseek_v4_expert_parallel_fixed_route_vjp_matches_fp32_reference(seed
         nprocs=_EP_ORACLE_LAUNCH.nproc,
         join=True,
     )
+
+
+@pytest.mark.parametrize("num_mtp_layers", [1, 3])
+def test_deepseek_v4_dspark_mtp_forward_backward_and_packed_isolation(num_mtp_layers: int):
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = num_mtp_layers
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+    config.dspark_n_routed_experts = 2
+    config.dspark_num_experts_per_tok = 1
+    config.mtp_loss_coef = 0.5
+
+    model = _build_ours(config).train()
+    assert len(model.model.mtp) == num_mtp_layers
+    assert "DeepseekV4DSparkBlock" in model._no_split_modules
+    assert not model._keys_to_ignore_on_load_unexpected
+    assert hasattr(model.model.mtp[0], "main_proj")
+    assert hasattr(model.model.mtp[-1], "markov_head")
+    assert hasattr(model.model.mtp[-1], "hc_head")
+    assert not model.model.mtp[-1].confidence_head.proj.weight.requires_grad
+    assert model.model.mtp[0].mlp.experts.num_experts == 2
+
+    from veomni.optim.muon import split_muon_adamw_params
+
+    _, _, muon_names, adamw_names = split_muon_adamw_params(model)
+    assert any("markov_head.embed.weight" in n for n in adamw_names)
+    assert any("markov_head.head.weight" in n for n in adamw_names)
+    assert not any("markov_head" in n for n in muon_names)
+
+    # Without return_mtp_outputs=True, DeepseekV4Model.forward skips running MTP stages.
+    raw_model_out = model.model(input_ids=torch.randint(3, config.vocab_size, (1, 4)), use_cache=False)
+    assert raw_model_out.mtp_hidden_states is None
+    assert raw_model_out.mtp_markov_embed is None
+    assert raw_model_out.mtp_markov_head_weight is None
+    assert raw_model_out.mtp_markov_bias is None
+
+    # With return_mtp_outputs=True, DeepseekV4Model.forward returns low-rank mtp_markov_embed
+    # and mtp_markov_head_weight without materializing a full [B, S, V] mtp_markov_bias.
+    with torch.no_grad():
+        mtp_model_out = model.model(
+            input_ids=torch.randint(3, config.vocab_size, (1, 4)),
+            return_mtp_outputs=True,
+            use_cache=False,
+        )
+    assert mtp_model_out.mtp_markov_embed is not None
+    assert mtp_model_out.mtp_markov_embed.shape == (1, 4, config.dspark_markov_rank)
+    assert mtp_model_out.mtp_markov_head_weight is not None
+    assert mtp_model_out.mtp_markov_head_weight.shape == (config.vocab_size, config.dspark_markov_rank)
+    assert mtp_model_out.mtp_markov_bias is None
+
+    # Two packed samples of length 4 each: position_ids restarts at 0 at index 4.
+    input_ids = torch.randint(3, config.vocab_size, (1, 8))
+    position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]], dtype=torch.long)
+    labels = input_ids.clone()
+    labels[0, 4] = -100  # packed sample boundary
+
+    out = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        labels=labels,
+        packed_sequence_slices=((0, 4), (4, 8)),
+        attention_mask_is_all_ones=True,
+        use_cache=False,
+    )
+    assert out.loss is not None
+    assert out.aux_metrics is not None and "mtp_loss" in out.aux_metrics
+    mtp_loss = out.aux_metrics["mtp_loss"]
+    assert torch.isfinite(mtp_loss) and mtp_loss.item() > 0
+
+    # Compare against coef=0.0 baseline to verify loss == lm_loss + mtp_loss_coef * mtp_loss.
+    model.config.mtp_loss_coef = 0.0
+    with torch.no_grad():
+        base_out = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            packed_sequence_slices=((0, 4), (4, 8)),
+            attention_mask_is_all_ones=True,
+            use_cache=False,
+        )
+    model.config.mtp_loss_coef = 0.5
+    torch.testing.assert_close(out.loss.detach(), base_out.loss + 0.5 * mtp_loss, atol=1e-5, rtol=1e-5)
+
+    out.loss.backward()
+    for name, param in [
+        ("mtp.0.main_proj", model.model.mtp[0].main_proj.weight),
+        ("mtp.0.self_attn.kv_proj", model.model.mtp[0].self_attn.kv_proj.weight),
+        ("mtp.0.mlp.experts.down_proj", model.model.mtp[0].mlp.experts.down_proj),
+        ("mtp.-1.hc_head.hc_fn", model.model.mtp[-1].hc_head.hc_fn),
+        ("mtp.-1.markov_head.embed", model.model.mtp[-1].markov_head.embed.weight),
+        ("mtp.-1.markov_head.head", model.model.mtp[-1].markov_head.head.weight),
+        ("lm_head", model.lm_head.weight),
+    ]:
+        assert param.grad is not None, f"Missing gradient for {name}"
+        assert torch.isfinite(param.grad).all() and param.grad.count_nonzero() > 0, f"Zero/non-finite grad for {name}"
+
+
+def test_deepseek_v4_freeze_mtp_disables_mtp_grads_and_loss():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 1
+    config.freeze_mtp = True
+
+    model = _build_ours(config).train()
+    assert len(model.model.mtp) == 1
+    assert all(not p.requires_grad for p in model.model.mtp.parameters())
+
+    input_ids = torch.randint(3, config.vocab_size, (1, 6))
+    out = model(input_ids=input_ids, labels=input_ids.clone(), use_cache=False)
+    assert out.aux_metrics is None or "mtp_loss" not in out.aux_metrics
+
+
+def test_deepseek_v4_dspark_packed_samples_do_not_attend_across_boundary():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 2
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+
+    model = _build_ours(config).eval()
+    sample_a1 = torch.tensor([[4, 5, 6, 7]], dtype=torch.long)
+    sample_a2 = torch.tensor([[20, 21, 22, 23]], dtype=torch.long)
+    sample_b = torch.tensor([[10, 11, 12, 13]], dtype=torch.long)
+    position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]], dtype=torch.long)
+
+    with torch.no_grad():
+        out_1 = model.model(
+            input_ids=torch.cat([sample_a1, sample_b], dim=1),
+            position_ids=position_ids,
+            packed_sequence_slices=((0, 4), (4, 8)),
+            attention_mask_is_all_ones=True,
+            return_mtp_outputs=True,
+            use_cache=False,
+        )
+        out_2 = model.model(
+            input_ids=torch.cat([sample_a2, sample_b], dim=1),
+            position_ids=position_ids,
+            packed_sequence_slices=((0, 4), (4, 8)),
+            attention_mask_is_all_ones=True,
+            return_mtp_outputs=True,
+            use_cache=False,
+        )
+    assert out_1.mtp_hidden_states is not None and out_2.mtp_hidden_states is not None
+    assert not torch.allclose(out_1.mtp_hidden_states[:, :4], out_2.mtp_hidden_states[:, :4])
+    torch.testing.assert_close(out_1.mtp_hidden_states[:, 4:], out_2.mtp_hidden_states[:, 4:], atol=1e-6, rtol=1e-6)
+
+
+def test_deepseek_v4_dspark_batch_gt_1_and_output_router_logits():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 2
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+    config.n_routed_experts = 8
+    config.dspark_n_routed_experts = 4
+    config.dspark_num_experts_per_tok = 1
+
+    model = _build_ours(config).train()
+    input_ids = torch.randint(3, config.vocab_size, (2, 6))
+    labels = input_ids.clone()
+
+    # position_ids=None with batch_size=2 exercises [1, S] broadcast position_ids in _packed_draft_attention,
+    # and output_router_logits=True exercises mixed expert counts between backbone (8) and MTP (4).
+    out = model(
+        input_ids=input_ids,
+        labels=labels,
+        output_router_logits=True,
+        use_cache=False,
+    )
+    assert out.loss is not None
+    assert out.aux_loss is not None and torch.isfinite(out.aux_loss)
+    assert out.aux_metrics is not None and "mtp_loss" in out.aux_metrics
+    out.loss.backward()
+    assert model.model.mtp[0].main_proj.weight.grad is not None
+
+
+def test_deepseek_v4_dspark_left_padding_mask_excludes_masked_tokens():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.compress_rates = {"compressed_sparse_attention": 8, "heavily_compressed_attention": 16}
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 2
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+
+    model = _build_ours(config).train()
+    attention_mask = torch.tensor([[0, 1, 1, 1]], dtype=torch.long)
+    input_ids_a = torch.tensor([[4, 10, 11, 12]], dtype=torch.long)
+    input_ids_b = torch.tensor([[99, 10, 11, 12]], dtype=torch.long)
+    labels = torch.tensor([[-100, -100, 11, 12]], dtype=torch.long)
+
+    with torch.no_grad():
+        out_a = model(
+            input_ids=input_ids_a,
+            attention_mask=attention_mask,
+            labels=labels,
+            use_cache=False,
+        )
+        out_b = model(
+            input_ids=input_ids_b,
+            attention_mask=attention_mask,
+            labels=labels,
+            use_cache=False,
+        )
+    assert out_a.aux_metrics is not None and out_b.aux_metrics is not None
+    torch.testing.assert_close(out_a.aux_metrics["mtp_loss"], out_b.aux_metrics["mtp_loss"], atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(out_a.loss, out_b.loss, atol=1e-6, rtol=1e-6)
+
+
+def test_deepseek_v4_dspark_packed_unpacked_parity_beyond_sliding_window():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.sliding_window = 4
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 2
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+
+    model = _build_ours(config).eval()
+    input_ids = torch.randint(3, config.vocab_size, (1, 10))
+    position_ids = torch.arange(10, dtype=torch.long).unsqueeze(0)
+    labels = input_ids.clone()
+
+    with torch.no_grad():
+        unpacked_out = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            return_mtp_outputs=True,
+            use_cache=False,
+        )
+        packed_out = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            packed_sequence_slices=((0, 10),),
+            attention_mask_is_all_ones=True,
+            return_mtp_outputs=True,
+            use_cache=False,
+        )
+    assert unpacked_out.aux_metrics is not None and packed_out.aux_metrics is not None
+    torch.testing.assert_close(
+        unpacked_out.aux_metrics["mtp_loss"],
+        packed_out.aux_metrics["mtp_loss"],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    torch.testing.assert_close(unpacked_out.loss, packed_out.loss, atol=1e-5, rtol=1e-5)
+
+
+def test_deepseek_v4_dspark_presliced_shift_labels_with_logits_to_keep():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 1
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+
+    model = _build_ours(config).train()
+    input_ids = torch.randint(3, config.vocab_size, (1, 6))
+    labels = input_ids.clone()
+    logits_to_keep = torch.tensor([1, 3, 4], dtype=torch.long)
+    shift_labels = torch.tensor([[5, 6, 7]], dtype=torch.long)
+
+    out = model(
+        input_ids=input_ids,
+        labels=labels,
+        shift_labels=shift_labels,
+        logits_to_keep=logits_to_keep,
+        use_cache=False,
+    )
+    assert out.loss is not None
+    assert out.aux_metrics is not None and "mtp_loss" in out.aux_metrics
+    assert torch.isfinite(out.aux_metrics["mtp_loss"])
+
+    # With logits_to_keep=1, a valid 1-token shift_labels, and an all-ones 2D attention_mask,
+    # the final row keeps its supervision and matches the attention_mask=None run.
+    model.zero_grad(set_to_none=True)
+    one_tok_shift = torch.tensor([[3]], dtype=torch.long)
+    all_ones_mask = torch.ones_like(input_ids)
+    with torch.no_grad():
+        no_mask_out = model(
+            input_ids=input_ids,
+            labels=labels,
+            shift_labels=one_tok_shift,
+            logits_to_keep=1,
+            use_cache=False,
+        )
+    masked_out = model(
+        input_ids=input_ids,
+        attention_mask=all_ones_mask,
+        labels=labels,
+        shift_labels=one_tok_shift,
+        logits_to_keep=1,
+        use_cache=False,
+    )
+    assert masked_out.aux_metrics is not None and no_mask_out.aux_metrics is not None
+    assert masked_out.aux_metrics["mtp_loss"].item() > 0
+    torch.testing.assert_close(
+        masked_out.aux_metrics["mtp_loss"],
+        no_mask_out.aux_metrics["mtp_loss"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    masked_out.loss.backward()
+    assert model.model.mtp[0].main_proj.weight.grad is not None
+    assert model.model.mtp[0].main_proj.weight.grad.count_nonzero() > 0
+
+
+def test_deepseek_v4_dspark_mtp_loss_coef_zero_ddp_two_iterations(monkeypatch):
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    from tests.tools.launch_utils import find_free_port
+
+    already_init = dist.is_available() and dist.is_initialized()
+    if not already_init:
+        monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+        monkeypatch.setenv("MASTER_PORT", str(find_free_port()))
+        dist.init_process_group("gloo", rank=0, world_size=1)
+    try:
+        # Case 1: mtp_loss_coef=0.0 configured at model construction time freezes self.mtp
+        # so DDP (find_unused_parameters=False) runs multiple iterations cleanly.
+        config_init_zero = _tiny_config()
+        config_init_zero.layer_types = ["sliding_attention"] * config_init_zero.num_hidden_layers
+        config_init_zero.dspark_block_size = 5
+        config_init_zero.num_nextn_predict_layers = 1
+        config_init_zero.dspark_target_layer_ids = [1, 2, 3]
+        config_init_zero.dspark_markov_rank = 8
+        config_init_zero.mtp_loss_coef = 0.0
+
+        model_init_zero = _build_ours(config_init_zero).train()
+        assert len(model_init_zero.model.mtp) == 1
+        assert all(not p.requires_grad for p in model_init_zero.model.mtp.parameters())
+
+        ddp_init_zero = DDP(model_init_zero, find_unused_parameters=False)
+        input_ids = torch.randint(3, config_init_zero.vocab_size, (1, 6))
+        labels = input_ids.clone()
+        for _ in range(2):
+            ddp_init_zero.zero_grad(set_to_none=True)
+            out = ddp_init_zero(input_ids=input_ids, labels=labels, use_cache=False)
+            assert out.loss is not None
+            assert out.aux_metrics is None or "mtp_loss" not in out.aux_metrics
+            out.loss.backward()
+
+        # Case 2: mtp_loss_coef mutated to 0.0 after DDP wrap still completes two DDP iterations.
+        config_runtime_zero = _tiny_config()
+        config_runtime_zero.layer_types = ["sliding_attention"] * config_runtime_zero.num_hidden_layers
+        config_runtime_zero.dspark_block_size = 5
+        config_runtime_zero.num_nextn_predict_layers = 1
+        config_runtime_zero.dspark_target_layer_ids = [1, 2, 3]
+        config_runtime_zero.dspark_markov_rank = 8
+        config_runtime_zero.mtp_loss_coef = 1.0
+
+        model_runtime_zero = _build_ours(config_runtime_zero).train()
+        ddp_runtime_zero = DDP(model_runtime_zero, find_unused_parameters=False)
+        model_runtime_zero.config.mtp_loss_coef = 0.0
+        for _ in range(2):
+            ddp_runtime_zero.zero_grad(set_to_none=True)
+            out = ddp_runtime_zero(input_ids=input_ids, labels=labels, use_cache=False)
+            assert out.loss is not None
+            assert out.aux_metrics is None or "mtp_loss" not in out.aux_metrics
+            out.loss.backward()
+
+        # Case 3: Under FSDP2+EP, MTP dense and expert parameters live as DTensors on
+        # different meshes; skipping MTP with return_mtp_outputs=False must not sum
+        # DTensors across meshes.
+        from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard
+
+        mesh_1d = DeviceMesh("cpu", [0], mesh_dim_names=("dp_shard",))
+        mesh_2d = DeviceMesh("cpu", [[0]], mesh_dim_names=("ep_fsdp", "ep"))
+        dtensor_model = _build_ours(config_runtime_zero).train()
+        dtensor_model.config.mtp_loss_coef = 1.0
+        dtensor_model.model.mtp[0].main_proj.weight = torch.nn.Parameter(
+            DTensor.from_local(dtensor_model.model.mtp[0].main_proj.weight.detach(), mesh_1d, [Shard(0)])
+        )
+        dtensor_model.model.mtp[0].mlp.experts.gate_up_proj = torch.nn.Parameter(
+            DTensor.from_local(
+                dtensor_model.model.mtp[0].mlp.experts.gate_up_proj.detach(),
+                mesh_2d,
+                [Replicate(), Shard(0)],
+            )
+        )
+        out_dtensor = dtensor_model(
+            input_ids=input_ids,
+            labels=labels,
+            return_mtp_outputs=False,
+            use_cache=False,
+        )
+        assert out_dtensor.loss is not None
+        assert not isinstance(out_dtensor.loss, DTensor)
+        out_dtensor.loss.backward()
+    finally:
+        if not already_init and dist.is_initialized():
+            dist.destroy_process_group()

@@ -89,6 +89,19 @@ class ModelCheckpointManager:
             ckpt_manager=self.config.manager,
             dist_backend=runtime.args.accelerator.fsdp_config.fsdp_mode,
         )
+        if getattr(self.config, "save_hf_weights", False) and not bool(
+            getattr(self.runtime.args, "lora_config", None)
+        ):
+            from ...utils.save_safetensor_utils import should_use_distributed_hf_safetensor_save
+
+            if should_use_distributed_hf_safetensor_save(getattr(self.config, "manager", None)):
+                from .convert import get_checkpoint_tensor_converter
+
+                model = getattr(runtime, "model", None)
+                converter = get_checkpoint_tensor_converter(model) if model is not None else None
+                validate_export = getattr(converter, "validate_export_support", None)
+                if callable(validate_export):
+                    validate_export(model, fqn_to_index_mapping=getattr(runtime.args, "fqn_to_index_mapping", None))
 
     @property
     def parallel_state(self):

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 from diffusers import WanTransformer3DModel as OfficialWanTransformer3DModel
@@ -35,6 +36,7 @@ from tests.models.tiny_configs import tiny_wan_t2v_config as _tiny_config
 from veomni.models.diffusers.wan_t2v.wan_transformer.configuration_wan_transformer import (
     WanTransformer3DModelConfig,
 )
+from veomni.ops.platform import RocmGpuPlatform
 
 
 _OFFICIAL_FORWARD = OfficialWanTransformer3DModel.forward
@@ -126,14 +128,20 @@ def test_wan_t2v_public_training_forward_matches_official(monkeypatch):
             torch.testing.assert_close(actual[key].grad, expected[key].grad)
 
 
-def test_wan_t2v_flash2_kernel_passes_full_sequence_varlen_kwargs(available_nvidia_ops):
+@pytest.mark.parametrize(
+    "implementation",
+    ("veomni_flash_attention_2", "veomni_flash_attention_aiter"),
+)
+def test_wan_t2v_flash_kernel_passes_full_sequence_varlen_kwargs(monkeypatch, available_nvidia_ops, implementation):
+    if implementation == "veomni_flash_attention_aiter":
+        monkeypatch.setattr(RocmGpuPlatform, "matches", lambda self: True)
     ops = eager_ops_config()
-    ops.attn_implementation = "veomni_flash_attention_2"
+    ops.attn_implementation = implementation
     model = _build_ours(_tiny_config(), ops).to(dtype=torch.bfloat16)
     attn = model.blocks[0].attn1
     processor = attn.processor
-    assert processor.veomni_attn.impl == "veomni_flash_attention_2"
-    assert processor._use_flash2
+    assert processor.veomni_attn.impl == implementation
+    assert processor._use_flash
 
     captured: dict = {}
 
@@ -157,7 +165,7 @@ def test_wan_t2v_eager_falls_back_to_veomni_sdpa():
     attn = model.blocks[0].attn1
     processor = attn.processor
     assert processor.veomni_attn.impl == "veomni_sdpa"
-    assert not processor._use_flash2
+    assert not processor._use_flash
 
     hidden = torch.randn(2, 8, attn.to_q.in_features, dtype=torch.bfloat16)
     output = processor(attn, hidden, encoder_hidden_states=None, attention_mask=None, rotary_emb=None)
@@ -174,7 +182,7 @@ def test_wan_t2v_sdpa_skips_full_sequence_varlen_kwargs():
         return query.transpose(1, 2), None
 
     assert attn.processor.veomni_attn.impl == "sdpa"
-    assert not attn.processor._use_flash2
+    assert not attn.processor._use_flash
     attn.processor.veomni_attn = record
     hidden = torch.randn(2, 8, attn.to_q.in_features, dtype=torch.bfloat16)
     attn.processor(attn, hidden, encoder_hidden_states=None, attention_mask=None, rotary_emb=None)
