@@ -691,11 +691,11 @@ pytest → test_text_parallel_align(model_name, config, ...)
   → materialize_weights(config) → random weights on disk
   → DummyDataset(dataset_type) → parquet files
   → prepare_exec_cmd() → kwargs for each (sp_size, ep_size)
-  → dispatch independent modes on disjoint devices when GPU parallel mode is enabled
+  → run each mode sequentially, one torchrun launch at a time
       build_torchrun_cmd(**kwargs) → fresh torchrun command and rendezvous port
       subprocess.run(torchrun ... train_text_test.py ...)
         → TestTextTrainer.train() → log_dict.json
-  → compare_multi_items(all_log_dicts, rtol, atol)
+  → compare_metrics(all_log_dicts, rtol, atol)
 ```
 
 ### FSDP Equivalence Test Flow
