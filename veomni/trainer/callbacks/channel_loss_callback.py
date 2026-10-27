@@ -284,12 +284,21 @@ class ChannelLossComputer:
                 shift_labels=call_args.get("shift_labels"),
                 ignore_index=ignore_index,
             )
-            if getattr(self.compute_side_channel, "__func__", None) is ChannelLossComputer.compute_side_channel:
-                observer_kwargs.update(
-                    reused_per_token_loss=captured.get("per_token"),
-                    logits_bias=call_args.get("logits_bias"),
-                    logits_bias_weight=call_args.get("logits_bias_weight"),
+            extras = {
+                "reused_per_token_loss": captured.get("per_token"),
+                "logits_bias": call_args.get("logits_bias"),
+                "logits_bias_weight": call_args.get("logits_bias_weight"),
+            }
+            accepted = _supported_observer_kwargs(self.compute_side_channel, extras)
+            if any(extras[key] is not None and key not in accepted for key in ("logits_bias", "logits_bias_weight")):
+                self._result = None
+                if self.strict:
+                    raise ChannelLossMetadataError("Custom channel observer cannot receive logits bias.")
+                logger.warning_rank0(
+                    "Channel loss: custom observer cannot receive logits bias; skipping this micro-batch."
                 )
+                return main_loss
+            observer_kwargs.update(accepted)
             self.compute_side_channel(**observer_kwargs)
 
         return main_loss
@@ -318,12 +327,15 @@ class ChannelLossComputer:
                 shift_labels=shift_labels,
                 ignore_index=ignore_index,
             )
-            if getattr(self._compute_channel_loss, "__func__", None) is ChannelLossComputer._compute_channel_loss:
-                compute_kwargs.update(
-                    reused_per_token_loss=reused_per_token_loss,
-                    logits_bias=logits_bias,
-                    logits_bias_weight=logits_bias_weight,
-                )
+            extras = {
+                "reused_per_token_loss": reused_per_token_loss,
+                "logits_bias": logits_bias,
+                "logits_bias_weight": logits_bias_weight,
+            }
+            accepted = _supported_observer_kwargs(self._compute_channel_loss, extras)
+            if any(extras[key] is not None and key not in accepted for key in ("logits_bias", "logits_bias_weight")):
+                raise ChannelLossMetadataError("Custom channel loss computation cannot receive logits bias.")
+            compute_kwargs.update(accepted)
             self._result = self._compute_channel_loss(**compute_kwargs)
         except ChannelLossMetadataError:
             if self.strict:
@@ -331,6 +343,12 @@ class ChannelLossComputer:
             logger.warning_rank0("Channel loss: metadata mismatch; skipping this micro-batch.", exc_info=True)
             self._result = None
         except Exception:
+            if (
+                self.strict
+                and getattr(self._compute_channel_loss, "__func__", None)
+                is not ChannelLossComputer._compute_channel_loss
+            ):
+                raise
             logger.warning_rank0("Channel loss: per-token CE failed; skipping this micro-batch.", exc_info=True)
             self._result = None
 
@@ -1232,6 +1250,20 @@ def _as_flat_list(value: Any) -> list[Any]:
             result.extend(_as_flat_list(item))
         return result
     return [value]
+
+
+def _supported_observer_kwargs(method: Callable[..., Any], extras: dict[str, Any]) -> dict[str, Any]:
+    """Pass extensions accepted by old or user-overridden observer signatures."""
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {
+        name: value
+        for name, value in extras.items()
+        if name in parameters
+        and parameters[name].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
 
 
 def _bind_loss_call_args(

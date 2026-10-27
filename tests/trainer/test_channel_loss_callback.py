@@ -1323,6 +1323,142 @@ def test_loss_call_binding_does_not_treat_weight_as_ignore_index():
     assert "ignore_index" not in bound
 
 
+@pytest.mark.parametrize("strict", [False, True])
+def test_legacy_observer_exception_keeps_upstream_propagation(strict):
+    class LegacyComputer(ChannelLossComputer):
+        def compute_side_channel(
+            self, logits, labels, vocab_size, hidden_states, weights, shift_labels=None, ignore_index=-100
+        ):
+            raise RuntimeError("observer only")
+
+    computer = LegacyComputer(parallel_state=_test_parallel_state())
+    computer.strict = strict
+    computer._source_ids = ["source"]
+    computer._original_loss_fn = lambda logits, labels, vocab_size: logits.square().sum()
+    logits = torch.ones(1, 2, 3, requires_grad=True)
+    with pytest.raises(RuntimeError, match="observer only"), computer.capture():
+        computer._wrapped_loss_fn(logits, torch.tensor([[0, 1]]), 3)
+    assert computer._result is None
+
+
+@pytest.mark.parametrize("override", ["compute_side_channel", "_compute_channel_loss"])
+@pytest.mark.parametrize("bias_kind", ["full", "factored"])
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("variadic", [False, True])
+def test_legacy_observer_without_bias_support_never_reports_unbiased_metrics(override, bias_kind, strict, variadic):
+    calls = []
+
+    def side(self, logits, labels, vocab_size, hidden_states, weights, shift_labels=None, ignore_index=-100):
+        calls.append(1)
+
+    def compute(self, logits, labels, vocab_size, hidden_states, weights, attention_mask, shift_labels, ignore_index):
+        calls.append(1)
+        return []
+
+    def side_variadic(
+        self, logits, labels, vocab_size, hidden_states, weights, shift_labels=None, ignore_index=-100, **kwargs
+    ):
+        calls.append(1)
+
+    def compute_variadic(
+        self, logits, labels, vocab_size, hidden_states, weights, attention_mask, shift_labels, ignore_index, **kwargs
+    ):
+        calls.append(1)
+        return []
+
+    methods = {
+        "compute_side_channel": side_variadic if variadic else side,
+        "_compute_channel_loss": compute_variadic if variadic else compute,
+    }
+    legacy = type("LegacyComputer", (ChannelLossComputer,), {override: methods[override]})
+    computer = legacy(parallel_state=_test_parallel_state())
+    computer.strict = strict
+    computer._source_ids = ["source"]
+    computer._position_ids = torch.arange(3).unsqueeze(0)
+    hidden = torch.randn(1, 3, 2, requires_grad=True)
+    weight = torch.randn(4, 2)
+    bias = torch.randn(1, 3, 4 if bias_kind == "full" else 2)
+    bias_weight = torch.randn(4, 2) if bias_kind == "factored" else None
+
+    def loss_fn(hidden_states, labels, weights, logits_bias=None, logits_bias_weight=None):
+        scores = F.linear(hidden_states, weights)
+        scores = scores + (
+            F.linear(logits_bias, logits_bias_weight) if logits_bias_weight is not None else logits_bias
+        )
+        return scores.square().sum()
+
+    computer._original_loss_fn = loss_fn
+    labels = torch.tensor([[0, 1, 2]])
+    with pytest.raises(ChannelLossMetadataError, match="logits bias") if strict else nullcontext():
+        with computer.capture():
+            loss = computer._wrapped_loss_fn(hidden, labels, weight, logits_bias=bias, logits_bias_weight=bias_weight)
+    if not strict:
+        loss.backward()
+        assert torch.isfinite(hidden.grad).all()
+    assert not calls and computer._result is None
+
+
+def test_modern_observer_override_receives_supported_bias():
+    seen = []
+
+    class ModernComputer(ChannelLossComputer):
+        def compute_side_channel(
+            self,
+            logits,
+            labels,
+            vocab_size,
+            hidden_states,
+            weights,
+            shift_labels=None,
+            ignore_index=-100,
+            logits_bias=None,
+            logits_bias_weight=None,
+        ):
+            seen.append((logits_bias, logits_bias_weight))
+
+    computer = ModernComputer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["source"]
+    computer._original_loss_fn = lambda logits, labels, vocab_size, logits_bias=None: logits.square().sum()
+    bias = torch.randn(1, 2, 3)
+    with computer.capture():
+        loss = computer._wrapped_loss_fn(
+            torch.ones(1, 2, 3, requires_grad=True), torch.tensor([[0, 1]]), 3, logits_bias=bias
+        )
+    loss.backward()
+    assert seen == [(bias, None)]
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_legacy_compute_exception_respects_strict_mode(strict):
+    class LegacyComputer(ChannelLossComputer):
+        def _compute_channel_loss(
+            self, logits, labels, vocab_size, hidden_states, weights, attention_mask, shift_labels, ignore_index
+        ):
+            raise RuntimeError("legacy compute failed")
+
+    computer = LegacyComputer(parallel_state=_test_parallel_state())
+    computer.strict = strict
+    computer._source_ids = ["source"]
+    computer._original_loss_fn = lambda logits, labels, vocab_size: logits.square().sum()
+    logits = torch.ones(1, 2, 3, requires_grad=True)
+    with pytest.raises(RuntimeError, match="legacy compute failed") if strict else nullcontext():
+        with computer.capture():
+            loss = computer._wrapped_loss_fn(logits, torch.tensor([[0, 1]]), 3)
+    if not strict:
+        loss.backward()
+        torch.testing.assert_close(logits.grad, 2 * logits.detach(), rtol=0, atol=0)
+    assert computer._result is None
+
+
+def test_positional_only_bias_is_not_claimed_as_supported():
+    def observer(logits_bias=None, /, **kwargs):
+        pass
+
+    bias = torch.ones(1)
+    supported = channel_loss_module._supported_observer_kwargs(observer, {"logits_bias": bias, "defer_sp": True})
+    assert "logits_bias" not in supported and "defer_sp" not in supported
+
+
 def _gloo_chunk_capture_fallback_worker(rank, world_size, endpoint):
     from datetime import timedelta
 
