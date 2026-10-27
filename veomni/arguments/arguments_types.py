@@ -1695,6 +1695,8 @@ class OpsImplementationConfig:
                 setattr(instance, f.name, f.default)
             elif f.default_factory is not MISSING:
                 setattr(instance, f.name, f.default_factory())
+        if "attn_implementation" not in data and get_env("MODELING_BACKEND") == "veomni":
+            instance.attn_implementation = "veomni_flash_attention_2"
         for k, v in data.items():
             if not hasattr(instance, k):
                 setattr(instance, k, v)

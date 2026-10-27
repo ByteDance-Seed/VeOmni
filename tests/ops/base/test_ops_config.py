@@ -142,3 +142,166 @@ def test_deepgemm_qat_guard_preserves_valid_selections(monkeypatch, values):
     config = OpsImplementationConfig(**values)
     assert config.moe_implementation == values["moe_implementation"]
     assert config.qat_implementation == values.get("qat_implementation", "none")
+
+
+def test_upstream_llama_config_ops_config_save_and_reload(tmp_path):
+    """Upstream PretrainedConfig subclasses support ops_implementation init, save, and reload."""
+    import json
+
+    from transformers import AutoConfig
+    from transformers.models.llama.configuration_llama import LlamaConfig
+
+    import veomni.models  # noqa: F401 - ensures PretrainedConfig patch is applied
+
+    bare = LlamaConfig(hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4)
+    assert bare.ops_implementation == {}
+    assert "ops_implementation" not in bare.to_diff_dict()
+    assert bare.ops_config.attn_implementation == "veomni_flash_attention_2"
+    assert bare.ops_config.rms_norm_implementation is None
+
+    configured = LlamaConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        ops_implementation={"rms_norm_implementation": "eager", "attn_implementation": "sdpa"},
+    )
+    assert configured.ops_implementation == {
+        "rms_norm_implementation": "eager",
+        "attn_implementation": "veomni_sdpa",
+    }
+    assert configured.ops_config.rms_norm_implementation == "eager"
+    assert configured.ops_config.attn_implementation == "veomni_sdpa"
+    assert configured._attn_implementation == "veomni_sdpa"
+
+    # Serialization must not fail on dataclass attributes and only writes explicit sparse keys.
+    json_payload = json.loads(configured.to_json_string())
+    assert json_payload["ops_implementation"] == {
+        "rms_norm_implementation": "eager",
+        "attn_implementation": "veomni_sdpa",
+    }
+
+    configured.save_pretrained(tmp_path)
+    reloaded = AutoConfig.from_pretrained(tmp_path)
+    assert reloaded.ops_implementation == {
+        "rms_norm_implementation": "eager",
+        "attn_implementation": "veomni_sdpa",
+    }
+    assert reloaded.ops_config.rms_norm_implementation == "eager"
+    assert reloaded.ops_config.attn_implementation == "veomni_sdpa"
+    assert reloaded._attn_implementation == "veomni_sdpa"
+
+    overridden = LlamaConfig.from_pretrained(
+        tmp_path,
+        ops_implementation={"swiglu_mlp_implementation": "eager"},
+    )
+    assert overridden.ops_implementation == {
+        "rms_norm_implementation": "eager",
+        "attn_implementation": "veomni_sdpa",
+        "swiglu_mlp_implementation": "eager",
+    }
+
+
+def test_pretrained_config_attn_implementation_bidirectional_sync():
+    """config._attn_implementation and config.ops_config.attn_implementation stay synchronized."""
+    from transformers.models.llama.configuration_llama import LlamaConfig
+    from transformers.models.llama.modeling_llama import LlamaForCausalLM as HFLlamaForCausalLM
+
+    import veomni.models  # noqa: F401
+
+    # 1. Passing attn_implementation kwarg reflects in ops_config.
+    cfg_hf_attn = LlamaConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        attn_implementation="eager",
+    )
+    assert cfg_hf_attn._attn_implementation == "eager"
+    assert cfg_hf_attn.ops_config.attn_implementation == "eager"
+
+    # 2. When both attn_implementation and ops_implementation["attn_implementation"] are passed at init,
+    # ops_implementation wins and updates _attn_implementation.
+    cfg_both = LlamaConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        attn_implementation="eager",
+        ops_implementation={"attn_implementation": "flex_attention"},
+    )
+    assert cfg_both._attn_implementation == "veomni_flex_attention"
+    assert cfg_both.ops_config.attn_implementation == "veomni_flex_attention"
+
+    # 3. Updating _attn_implementation later (as _from_config(..., attn_implementation=...) does)
+    # updates ops_implementation["attn_implementation"] and ops_config.attn_implementation.
+    cfg_both._attn_implementation = "eager"
+    assert cfg_both._attn_implementation == "eager"
+    assert cfg_both.ops_implementation["attn_implementation"] == "eager"
+    assert cfg_both.ops_config.attn_implementation == "eager"
+
+    # 4. Bare config passed into PreTrainedModel.__init__ resolves None -> "sdpa" on both attributes.
+    cfg_bare = LlamaConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+    )
+    HFLlamaForCausalLM(cfg_bare)
+    assert cfg_bare._attn_implementation == "sdpa"
+    assert cfg_bare.ops_config.attn_implementation == "sdpa"
+
+
+def test_composite_qwen3_vl_config_subconfig_merge_isolation_and_save(tmp_path):
+    """Nested sub_configs merge parent defaults under child overrides without sharing mutable state."""
+    import json
+
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
+
+    import veomni.models  # noqa: F401
+
+    cfg = Qwen3VLConfig(
+        ops_implementation={"rms_norm_implementation": "eager", "attn_implementation": "sdpa"},
+        vision_config={"ops_implementation": {"attn_implementation": "eager"}},
+    )
+
+    assert cfg.ops_implementation == {
+        "rms_norm_implementation": "eager",
+        "attn_implementation": "veomni_sdpa",
+    }
+    assert cfg.text_config.ops_implementation == {
+        "rms_norm_implementation": "eager",
+        "attn_implementation": "veomni_sdpa",
+    }
+    assert cfg.vision_config.ops_implementation == {
+        "rms_norm_implementation": "eager",
+        "attn_implementation": "eager",
+    }
+    assert cfg.text_config._attn_implementation == "veomni_sdpa"
+    assert cfg.vision_config._attn_implementation == "eager"
+    assert cfg.text_config.ops_config.attn_implementation == "veomni_sdpa"
+    assert cfg.vision_config.ops_config.attn_implementation == "eager"
+
+    # Sub-configs must own distinct dicts so mutating one does not leak to siblings or root.
+    assert cfg.text_config.ops_implementation is not cfg.ops_implementation
+    assert cfg.vision_config.ops_implementation is not cfg.ops_implementation
+    assert cfg.text_config.ops_implementation is not cfg.vision_config.ops_implementation
+
+    # Saving writes only the child diff relative to parent and round-trips cleanly.
+    cfg.save_pretrained(tmp_path)
+    raw = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert raw["ops_implementation"] == {
+        "rms_norm_implementation": "eager",
+        "attn_implementation": "veomni_sdpa",
+    }
+    assert "ops_implementation" not in raw["text_config"]
+    assert raw["vision_config"]["ops_implementation"] == {"attn_implementation": "eager"}
+
+    reloaded = Qwen3VLConfig.from_pretrained(tmp_path)
+    assert reloaded.text_config.ops_config.rms_norm_implementation == "eager"
+    assert reloaded.text_config.ops_config.attn_implementation == "veomni_sdpa"
+    assert reloaded.vision_config.ops_config.rms_norm_implementation == "eager"
+    assert reloaded.vision_config.ops_config.attn_implementation == "eager"
