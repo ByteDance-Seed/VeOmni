@@ -30,7 +30,11 @@ unverified**. Real-data training requires the complete pretrained components.
   generator is captured by `DiTModelRuntime.extra_state()`.
 - AdamW is an explicit VeOmni example choice, not a claim of reproducing the
   official Muon optimizer trajectory. Frozen text runs in fp16, VAE in fp32,
-  and trainable inputs in bf16. Model mixed precision is owned by FSDP2.
+  and trainable inputs in bf16. `model.condition_model_cfg.condition_dtype`
+  controls the returned training inputs (default `bfloat16`), independently of
+  the frozen encoders' dtypes. The older condition-config `dtype` key remains
+  an input alias. Model mixed precision is owned by FSDP2.
+  The unused T2V vision projection is frozen while retaining all checkpoint keys.
 - Native block activation checkpointing is supported. FSDP2 uses the generic
   runtime; no ExtraParallel plan is introduced. The historical comparison used
   eight-rank FSDP2 with sequence parallelism disabled.
@@ -85,7 +89,9 @@ absolute path; they are not copied. Recreate the JSONL after moving the dataset.
 
 The example reuses `dit_online` and the existing Tom-and-Jerry preprocessor.
 It selects 33 frames with the existing uniform sampling rules, aligns to 4n+1,
-resizes/crops to 480 x 832, and normalizes to [-1,1]. The fixed frame limit
+resizes/crops to 480 x 832, and normalizes to [-1,1]. The example leaves
+`video_min_pixels` and `video_max_pixels` unset so the decoder preserves spatial
+resolution until this single aspect-preserving resize and center crop. The fixed frame limit
 takes precedence over the fps budget; it does not restore motion absent from
 the source video. Captions remain paired with their original videos.
 These short clips are an integration workload, not a reproduction of a
@@ -279,3 +285,5 @@ pre-review measurements in [PR #1319](https://github.com/ByteDance-Seed/VeOmni/p
 not a rerun of the optimized mask. They show close loss trajectories and a
 remaining gradient-norm difference; they do not establish gradient equivalence
 or long-run convergence.
+
+![Historical GPU and NPU precision comparison](../assets/hunyuanvideo15_gpu_npu_precision.png)

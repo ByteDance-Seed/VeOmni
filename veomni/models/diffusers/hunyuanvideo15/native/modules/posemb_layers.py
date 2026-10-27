@@ -83,7 +83,7 @@ def get_meshgrid_nd(start, *args, dim=2):
     axis_grid = []
     for i in range(dim):
         a, b, n = start[i], stop[i], num[i]
-        g = torch.linspace(a, b, n + 1, dtype=torch.float32)[:n]
+        g = torch.linspace(a, b, n + 1, dtype=torch.float32, device="cpu")[:n]
         axis_grid.append(g)
     grid = torch.meshgrid(*axis_grid, indexing="ij")  # dim x [W, H, D]
     grid = torch.stack(grid, dim=0)  # [dim, W, H, D]
@@ -282,7 +282,6 @@ def get_nd_rotary_pos_embed(
         return emb
 
 
-@cache
 def get_1d_rotary_pos_embed(
     dim: int,
     pos: Union[torch.FloatTensor, int],
@@ -312,14 +311,14 @@ def get_1d_rotary_pos_embed(
         freqs_cos, freqs_sin: Precomputed frequency tensor with real and imaginary parts separately. [S, D]
     """
     if isinstance(pos, int):
-        pos = torch.arange(pos).float()
+        pos = torch.arange(pos, device="cpu").float()
 
     # proposed by reddit user bloc97, to rescale rotary embeddings to longer sequence length without fine-tuning
     # has some connection to NTK literature
     if theta_rescale_factor != 1.0:
         theta *= theta_rescale_factor ** (dim / (dim - 2))
 
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))  # [D/2]
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device="cpu")[: (dim // 2)].float() / dim))  # [D/2]
     # assert interpolation_factor == 1.0, f"interpolation_factor: {interpolation_factor}"
     freqs = torch.outer(pos * interpolation_factor, freqs)  # [S, D/2]
     if use_real:

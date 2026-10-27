@@ -23,6 +23,7 @@ from operator import attrgetter
 import pytest
 from transformers import PretrainedConfig
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config, ops_config_scope, stamp_attn_implementation
 from tests.models.tiny_configs import (
     tiny_deepseek_v3_config as _tiny_deepseek_v3_config,
@@ -179,7 +180,34 @@ def _eager_ops(model_case: _ModelCase) -> tuple[tuple[str, str], ...]:
     return tuple(item for item in model_case.eager_ops if item[0] not in _NPU_ABSENT_EAGER_OPS)
 
 
+def _tiny_hunyuanvideo15_config(architecture):
+    from veomni.models.diffusers.hunyuanvideo15.configuration_hunyuanvideo15 import HunyuanVideo15Config
+
+    config = HunyuanVideo15Config(
+        hidden_size=24,
+        heads_num=2,
+        rope_dim_list=[4, 4, 4],
+        in_channels=2,
+        out_channels=2,
+        mm_double_blocks_depth=1,
+        text_states_dim=16,
+        vision_states_dim=8,
+    )
+    config.architectures = [architecture]
+    return config
+
+
 _MODEL_CASES = (
+    _ModelCase(
+        model_type="HunyuanVideo15Model",
+        config_factory=_tiny_hunyuanvideo15_config,
+        architectures=("HunyuanVideo15Model",),
+        has_registered_config=True,
+        registered_config_aliases=("HunyuanVideo15ConditionModel",),
+        registered_model_aliases=("HunyuanVideo15ConditionModel",),
+        stamps_hf_attn=False,
+        eager_ops=(),
+    ),
     _ModelCase(
         model_type="deepseek_v3",
         eager_ops=(
@@ -617,6 +645,7 @@ def test_build_foundation_model_requires_ops_config():
 
 
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_build_foundation_model_constructs_registered_model(model_case: _ModelCase):
     cfg = eager_ops_config()
     with ops_config_scope(None):
@@ -706,6 +735,7 @@ def test_model_instances_keep_distinct_impls(model_case: _ModelCase, available_n
 
 
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_model_registry_entries(model_case: _ModelCase):
     assert (model_case.model_type in MODEL_CONFIG_REGISTRY.valid_keys()) is model_case.has_registered_config
     assert set(model_case.registered_config_aliases) <= set(MODEL_CONFIG_REGISTRY.valid_keys())
@@ -716,6 +746,7 @@ def test_model_registry_entries(model_case: _ModelCase):
 
 
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_get_model_class_returns_registered_architectures(model_case: _ModelCase):
     for architecture in model_case.architectures:
         model_cls = get_model_class(model_case.config_factory(architecture))
@@ -785,6 +816,7 @@ def test_context_parallel_gate_is_inert_when_no_parallel_state_was_installed(mon
     check_context_parallel_supported(_tiny_qwen3_config())
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_hunyuanvideo15_registry(tmp_path, monkeypatch):
     from veomni.models.diffusers.hunyuanvideo15.configuration_hunyuanvideo15 import HunyuanVideo15Config
     from veomni.models.diffusers.hunyuanvideo15.modeling_hunyuanvideo15 import HunyuanVideo15Model

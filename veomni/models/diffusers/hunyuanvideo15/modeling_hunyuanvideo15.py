@@ -64,6 +64,9 @@ class HunyuanVideo15Model(PreTrainedModel):
             for module in self.modules():
                 module._is_hf_initialized = True
         self.post_init()
+        # T2V retains the official vision state keys but never consumes images.
+        if self.vision_in is not None:
+            self.vision_in.requires_grad_(False)
 
     @torch.no_grad()
     def _init_weights(self, module):

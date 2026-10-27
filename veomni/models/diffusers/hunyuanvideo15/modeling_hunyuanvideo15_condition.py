@@ -160,7 +160,7 @@ class HunyuanVideo15ConditionModel(PreTrainedModel):
                 "byt5_text_mask",
             )
         }
-        dtype = self.config.dtype
+        dtype = self.config.condition_dtype
         dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
         for latent, text, mask, glyph, glyph_mask in zip(*fields):
             sampled = self.noise(latent.to(device=self.generator.device, dtype=dtype))

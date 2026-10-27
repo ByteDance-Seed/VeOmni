@@ -275,11 +275,10 @@ class SingleTokenRefiner(nn.Module):
         if mask is None:
             context_aware_representations = x.mean(dim=1)
         else:
-            # Keep the masked reduction in the text feature dtype. Casting the
-            # mask to float32 promotes BF16 features and makes the following
-            # BF16 Linear backend-dependent (accepted by NPU, rejected by CUDA).
-            mask_for_reduction = mask.to(dtype=x.dtype).unsqueeze(-1)  # [B, L, 1]
-            context_aware_representations = (x * mask_for_reduction).sum(dim=1) / mask_for_reduction.sum(dim=1)
+            # Accumulate token counts and features in FP32, then match the Linear dtype.
+            mask_float = mask.float().unsqueeze(-1)  # [B, L, 1]
+            denominator = mask_float.sum(dim=1).clamp_min(1)
+            context_aware_representations = ((x.float() * mask_float).sum(dim=1) / denominator).to(x.dtype)
         context_aware_representations = self.c_embedder(context_aware_representations)
         c = timestep_aware_representations + context_aware_representations
         x = self.input_embedder(x)

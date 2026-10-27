@@ -46,8 +46,6 @@ data:
     max_frames: 33
     frame_factor: 4
     frame_factor_remainder: 1
-    video_max_pixels: 399360
-    video_min_pixels: 0
   dataloader:
     type: native
     num_workers: 0

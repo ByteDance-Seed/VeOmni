@@ -602,7 +602,14 @@ class HunyuanVideo_1_5_DiffusionTransformer(nn.Module):
                 )
                 extra_encoder_hidden_states = extra_encoder_hidden_states + cond_emb
             txt, text_mask = self.reorder_txt_token(extra_encoder_hidden_states, txt, extra_attention_mask, text_mask)
-        freqs_cis = RotaryTables(freqs_cos, freqs_sin) if freqs_cos is not None else None
+        freqs_cis = (
+            RotaryTables(
+                freqs_cos.to(device=hidden_states.device, dtype=torch.float32),
+                freqs_sin.to(device=hidden_states.device, dtype=torch.float32),
+            )
+            if freqs_cos is not None
+            else None
+        )
         for index, block in enumerate(self.double_blocks):
             force_full_attn = (
                 self.attn_mode in ["flex-block-attn"]
