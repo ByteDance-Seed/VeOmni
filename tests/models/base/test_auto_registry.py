@@ -592,7 +592,7 @@ _MODEL_CASES = (
             ("dit.blocks.0.attn.veomni_attn", "attention"),
             ("dit.blocks.0.attn.veomni_rope", "rope"),
         ),
-        isolation_op_path="dit.blocks.0.attn.veomni_attn",
+        isolation_op_path="dit.blocks.0.attn.q_norm.veomni_rms_norm",
         stamps_hf_attn=False,
         eager_attn_impl="veomni_sdpa",
     ),
@@ -651,23 +651,22 @@ def test_get_model_class_hf_backend(monkeypatch):
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 def test_build_foundation_model_requires_ops_config():
-    with ops_config_scope(None):
-        with pytest.raises(ValueError, match="ops_implementation"):
-            build_foundation_model(_tiny_qwen3_config())
+    with pytest.raises(ValueError, match="ops_implementation"):
+        build_foundation_model(_tiny_qwen3_config())
 
 
 @pytest.mark.launch_plan(provider=_ACCELERATOR_LAUNCH)
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
 def test_build_foundation_model_constructs_registered_model(model_case: _ModelCase):
     cfg = eager_ops_config()
-    with ops_config_scope(None):
+    with ops_config_scope(cfg):
         model = build_foundation_model(
             model_case.config_factory(model_case.architectures[0]),
             torch_dtype="float32",
             init_device="cpu",
             ops_implementation=cfg,
         )
-        assert get_ops_config() is cfg
+    assert model.config.ops_implementation["rms_norm_implementation"] == "eager"
     assert model.__class__.__name__ == model_case.architectures[0]
     _assert_expected_generated_module_source(model_case.model_type, type(model))
     for path, expected_op in _eager_ops(model_case):
@@ -683,7 +682,7 @@ _ALTERNATE_OP_IMPLS = {
     "cross_entropy_loss": ("cross_entropy_loss_implementation", "chunk_loss"),
     "moe_experts": ("moe_implementation", "fused_triton"),
     "rms_norm": ("rms_norm_implementation", "liger_kernel"),
-    "attention": ("attn_implementation", "sdpa"),
+    "attention": ("attn_implementation", "veomni_flash_attention_2"),
     "rope": ("rotary_pos_emb_implementation", "liger_kernel"),
 }
 
@@ -731,6 +730,7 @@ def test_model_instances_keep_distinct_impls(model_case: _ModelCase, available_n
         # to sdpa, so eager construction must stamp as well.
         if selected_op_name == "attention" and model_case.stamps_hf_attn:
             stamp_attn_implementation(model_config, config.attn_implementation)
+        model_config._set_ops_implementation(config)
         with ops_config_scope(config):
             model_cls = get_model_class(model_config)
             _assert_expected_generated_module_source(model_case.model_type, model_cls)

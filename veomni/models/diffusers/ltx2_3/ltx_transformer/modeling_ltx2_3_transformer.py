@@ -227,6 +227,8 @@ class _LTXModelInitShim(LTXModel):
 class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
     config_class = LTXVideoTransformerModelConfig
     supports_gradient_checkpointing = True
+    _supports_sdpa = True
+    _supports_flash_attn = True
     _no_split_modules = ["BasicAVTransformerBlock"]
     _checkpoint_conversion_mapping = {
         "^model\\.diffusion_model\\.": "",

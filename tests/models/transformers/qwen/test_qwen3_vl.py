@@ -34,10 +34,8 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
-    ops_config_scope,
     qwen_image_inputs,
     qwen_video_inputs,
-    stamp_attn_implementation,
 )
 from tests.models.tiny_configs import tiny_qwen3_vl_config as _tiny_config
 
@@ -61,10 +59,8 @@ def _qwen3_vl_cls():
 
 
 def _build_ours(config: Qwen3VLConfig, ops: SimpleNamespace | None = None):
-    ops = ops if ops is not None else eager_ops_config()
-    stamp_attn_implementation(config, ops.attn_implementation)
-    with ops_config_scope(ops):
-        return _qwen3_vl_cls()(config)
+    config._set_ops_implementation(ops if ops is not None else eager_ops_config())
+    return _qwen3_vl_cls()(config)
 
 
 def test_qwen3_vl_eager_matches_hf_text_only():

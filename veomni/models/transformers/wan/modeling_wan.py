@@ -451,6 +451,7 @@ def _rope_freqs_for_block(freqs_full: torch.Tensor, freqs_local: torch.Tensor, s
 class WanModel(PreTrainedModel):
     config_class = WanConfig
     _supports_flash_attn_2 = True
+    _supports_sdpa = True
     supports_gradient_checkpointing = True
     _no_split_modules = ["DiTBlock"]
 

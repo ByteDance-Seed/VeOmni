@@ -1661,6 +1661,26 @@ class OpsImplementationConfig:
         """Serialize non-None op implementation selections to a dict."""
         return {k: v for k, v in asdict(self).items() if v is not None}
 
+    def resolve_impl(
+        self,
+        field: str,
+        *,
+        variant: Optional[str] = None,
+        eager_as: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return ``getattr(self, field)`` with optional ``variant`` alias and ``eager_as`` remapping."""
+        impl = getattr(self, field)
+        if variant is not None:
+            alias = _DEPRECATED_VARIANT_IMPLEMENTATION_ALIASES.get(field, {}).get(variant, {}).get(impl)
+            if alias is not None:
+                logger.info_once(
+                    f"{field}={impl!r} has no third-party {variant!r} kernel; {variant!r} uses {alias!r}."
+                )
+                impl = alias
+        if eager_as is not None and impl == "eager":
+            return eager_as
+        return impl
+
     @classmethod
     def validate_and_extract_dict(cls, d: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         """Validate a sparse op-selection mapping and return only its explicitly provided non-None keys."""

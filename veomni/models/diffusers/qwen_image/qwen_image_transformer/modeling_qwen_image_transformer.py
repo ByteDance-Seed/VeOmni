@@ -472,6 +472,7 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
     # dispatch table. Still declare support so PreTrainedModel accepts
     # ``attn_implementation=sdpa`` / ``veomni_sdpa`` at init.
     _supports_sdpa = True
+    _supports_flash_attn = True
 
     def __init__(self, config: QwenImageTransformer2DModelConfig, **kwargs):
         PreTrainedModel.__init__(self, config, **kwargs)

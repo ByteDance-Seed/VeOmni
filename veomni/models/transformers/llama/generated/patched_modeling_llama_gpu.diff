@@ -1,6 +1,6 @@
 --- a/transformers/models/llama/modeling_llama.py
 +++ b/patched_modeling_llama_gpu.py
-@@ -1,70 +1,96 @@
+@@ -1,70 +1,100 @@
 -# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 +# ==============================================================================
 +#  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
@@ -27,6 +27,10 @@
 +#      Always call the local rms_norm VeomniOp
 +#    - method_override: LlamaMLP.__init__
 +#      Construct a local swiglu_mlp VeomniOp
++#    - method_override: LlamaDecoderLayer.__init__
++#      Pass config to LlamaRMSNorm instances
++#    - method_override: LlamaModel.__init__
++#      Pass config to final LlamaRMSNorm
 +#    - method_override: LlamaMLP.forward
 +#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 +#    - method_override: LlamaForCausalLM.__init__
@@ -100,7 +104,6 @@
 +from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 +from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 +from veomni.ops import VeomniOp
-+from veomni.ops.config import resolve_op_impl
 +from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
@@ -116,15 +119,17 @@
 
  @use_kernel_forward_from_hub("RMSNorm")
  class LlamaRMSNorm(nn.Module):
-     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
 -        """
 -        LlamaRMSNorm is equivalent to T5LayerNorm
 -        """
 -        super().__init__()
++    def __init__(self, hidden_size, eps: float = 1e-6, config=None) -> None:
 +        nn.Module.__init__(self)
          self.weight = nn.Parameter(torch.ones(hidden_size))
          self.variance_epsilon = eps
-+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
++        impl = "eager" if config is None else config.ops_config.rms_norm_implementation
++        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
      def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
 -        input_dtype = hidden_states.dtype
@@ -136,7 +141,7 @@
 
      def extra_repr(self):
          return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-@@ -127,42 +153,15 @@
+@@ -127,42 +157,15 @@
          return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -184,11 +189,11 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -170,10 +169,20 @@
+@@ -170,10 +173,20 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
-+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
++        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
      def forward(self, x):
 -        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -207,7 +212,7 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -213,10 +222,16 @@
+@@ -213,10 +226,16 @@
      return attn_output, attn_weights
 
 
@@ -225,17 +230,17 @@
      def __init__(self, config: LlamaConfig, layer_idx: int):
          super().__init__()
          self.config = config
-@@ -239,6 +254,9 @@
+@@ -239,6 +258,9 @@
          self.o_proj = nn.Linear(
              config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
          )
 +        # Bind instance-local rope and attention VeomniOps
-+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
++        self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
++        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
      def forward(
          self,
-@@ -256,16 +274,19 @@
+@@ -256,16 +278,19 @@
          value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -261,7 +266,7 @@
              self,
              query_states,
              key_states,
-@@ -273,7 +294,7 @@
+@@ -273,7 +298,7 @@
              attention_mask,
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
@@ -270,7 +275,63 @@
          )
 
          attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-@@ -417,6 +438,12 @@
+@@ -281,16 +306,20 @@
+         return attn_output, attn_weights
+
+
++# ======================================================================
++# [MODIFIED CLASS] LlamaDecoderLayer
++# Methods patched: __init__
++# ======================================================================
++
++
+ class LlamaDecoderLayer(GradientCheckpointingLayer):
+-    def __init__(self, config: LlamaConfig, layer_idx: int):
++    def __init__(self, config, layer_idx: int):
+         super().__init__()
+         self.hidden_size = config.hidden_size
+-
+         self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
+-
+         self.mlp = LlamaMLP(config)
+-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
++        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+
+     def forward(
+         self,
+@@ -343,9 +372,15 @@
+     }
+
+
++# ======================================================================
++# [MODIFIED CLASS] LlamaModel
++# Methods patched: __init__
++# ======================================================================
++
++
+ @auto_docstring
+ class LlamaModel(LlamaPreTrainedModel):
+-    def __init__(self, config: LlamaConfig):
++    def __init__(self, config):
+         super().__init__(config)
+         self.padding_idx = config.pad_token_id
+         self.vocab_size = config.vocab_size
+@@ -354,11 +389,10 @@
+         self.layers = nn.ModuleList(
+             [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+         )
+-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+         self.rotary_emb = LlamaRotaryEmbedding(config=config)
+         self.gradient_checkpointing = False
+
+-        # Initialize weights and apply final processing
+         self.post_init()
+
+     @merge_with_config_defaults
+@@ -417,6 +451,12 @@
          )
 
 
@@ -283,19 +344,19 @@
  @auto_docstring
  class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -429,8 +456,9 @@
+@@ -429,8 +469,9 @@
          self.model = LlamaModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 -
 -        # Initialize weights and apply final processing
-+        impl = resolve_op_impl("cross_entropy_loss_implementation")
++        impl = config.ops_config.cross_entropy_loss_implementation
 +        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
 +        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
          self.post_init()
 
      @can_return_tuple
-@@ -444,55 +472,110 @@
+@@ -444,55 +485,110 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -375,7 +436,7 @@
 +class LlamaForSequenceClassification(GenericForSequenceClassification, LlamaPreTrainedModel):
 +    def __init__(self, config):
 +        super().__init__(config)
-+        impl = resolve_op_impl("cross_entropy_loss_implementation")
++        impl = config.ops_config.cross_entropy_loss_implementation
 +        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
 +        self.loss_function = partial(ForSequenceClassificationLoss, op=self.veomni_ce)
 +

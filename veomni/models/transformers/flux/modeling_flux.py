@@ -440,6 +440,7 @@ class FluxModel(PreTrainedModel):
     _no_split_modules = ["FluxJointTransformerBlock", "FluxSingleTransformerBlock"]
     _supports_flash_attn_2 = True
     _supports_flash_attn_3 = True
+    _supports_sdpa = True
 
     def __init__(self, config: FluxConfig, **kwargs):
         super().__init__(config, **kwargs)

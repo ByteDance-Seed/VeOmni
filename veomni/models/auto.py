@@ -29,7 +29,6 @@ from transformers import (
 from veomni.distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
 from veomni.models.loader import get_loader
 from veomni.models.registry import get_model_config, get_model_processor
-from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.utils import logging
 from veomni.utils.device import IS_NPU_AVAILABLE
 
@@ -182,35 +181,48 @@ def build_foundation_model(
 ) -> PreTrainedModel:
     """Build a foundation model from the models registry.
 
-    Callers must pass ``ops_implementation`` or pre-install a config with
-    ``set_ops_config``. There is no silent all-eager fallback.
+    Callers must pass ``ops_implementation`` or a ``PretrainedConfig`` with
+    ``ops_implementation`` populated. There is no silent all-eager fallback.
     """
-    if ops_implementation is not None:
-        attn_implementation = ops_implementation.attn_implementation
-        _validate_attention_parallelism(attn_implementation)
-        set_ops_config(ops_implementation)
-    else:
-        installed = get_ops_config()
-        if installed is None:
-            raise ValueError(
-                "build_foundation_model requires `ops_implementation` (or a prior "
-                "`set_ops_config(...)` call). There is no silent all-eager fallback."
-            )
-        if attn_implementation is None:
-            attn_implementation = installed.attn_implementation
-        else:
-            from veomni.arguments.arguments_types import OpsImplementationConfig
+    from veomni.arguments.arguments_types import OpsImplementationConfig
 
-            attn_implementation = OpsImplementationConfig.normalize_hub_attention_backend(attn_implementation)
+    has_config_ops = isinstance(config_path, PretrainedConfig) and bool(
+        getattr(config_path, "ops_implementation", None)
+    )
+    if ops_implementation is None and not has_config_ops:
+        raise ValueError(
+            "build_foundation_model requires `ops_implementation` (or a `PretrainedConfig` with "
+            "`ops_implementation` populated). There is no silent all-eager fallback."
+        )
+
+    if attn_implementation is not None:
+        attn_implementation = OpsImplementationConfig.normalize_hub_attention_backend(attn_implementation)
         _validate_attention_parallelism(attn_implementation)
+
+    if ops_implementation is not None:
+        effective_attn = (
+            attn_implementation if attn_implementation is not None else ops_implementation.attn_implementation
+        )
+        _validate_attention_parallelism(effective_attn)
+    else:
+        effective_attn = (
+            attn_implementation if attn_implementation is not None else config_path.ops_config.attn_implementation
+        )
+        _validate_attention_parallelism(effective_attn)
 
     if config_kwargs is None:
         config_kwargs = {}
 
     if isinstance(config_path, PretrainedConfig):
         config = config_path
+        if ops_implementation is not None:
+            config._set_ops_implementation(ops_implementation)
     else:
-        config = build_config(config_path, **config_kwargs)
+        config = build_config(config_path, ops_implementation=ops_implementation, **config_kwargs)
+
+    if attn_implementation is not None:
+        config._attn_implementation = attn_implementation
+    attn_implementation = effective_attn
 
     check_context_parallel_supported(config)
     check_model_build_prerequisites(config)
