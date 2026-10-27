@@ -23,6 +23,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 from transformers.modeling_layers import GradientCheckpointingLayer
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.arguments_types import OffloadConfig
 from veomni.distributed.async_offload import (
     GetCnt,
@@ -37,6 +38,9 @@ from veomni.distributed.async_offload import (
     reset_async_activation_offload,
 )
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_torch_device
+
+
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 
 class _AsyncOffloadFSDPBlock(GradientCheckpointingLayer):
@@ -206,6 +210,15 @@ def test_async_offload_patch_is_confined_to_selected_instances_and_models():
     second_model = Toy()
     apply_async_activation_offload(first_model, ["selected"])
     apply_async_activation_offload(second_model, ["selected"])
+
+    patched_class = type(first_model.selected)
+    apply_async_activation_offload(first_model, ["selected"])
+    assert type(first_model.selected) is patched_class
+    value = torch.randn(2, 4, requires_grad=True)
+    output = first_model.selected(value)
+    torch.testing.assert_close(output, value * 2)
+    output.sum().backward()
+    torch.testing.assert_close(value.grad, torch.full_like(value, 2))
 
     assert type(first_model.selected) is not DecoderLayer
     assert type(first_model.unselected) is DecoderLayer
@@ -510,7 +523,7 @@ def _run_async_offload_base_trainer_fsdp2_gc():
         TorchCompileConfig,
     )
     from veomni.distributed.parallel_state import _init_parallel_state, use_parallel_state
-    from veomni.trainer.base import BaseTrainer
+    from veomni.models.model_runtime import VeOmniModelRuntime
 
     world_size = dist.get_world_size()
     _init_parallel_state(
@@ -521,55 +534,55 @@ def _run_async_offload_base_trainer_fsdp2_gc():
         name="base",
     )
 
-    trainer = object.__new__(BaseTrainer)
-    trainer.model = _AsyncOffloadFSDPModel(device="meta")
-    trainer.args = SimpleNamespace(
-        model=SimpleNamespace(
-            lora_config=None,
-            fqn_to_index_mapping=None,
-            model_path=None,
-            basic_modules=[],
-            optimizer=OptimizerConfig(),
-            broadcast_model_weights_from_rank0=False,
-            ep_sharded_stream_load=False,
-            accelerator=SimpleNamespace(
-                offload_config=OffloadConfig(
-                    enable_async_activation=True,
-                    activation_offload_host_cache_limit_gb=0.01,
-                ),
-                fsdp_config=FSDPConfig(mixed_precision=MixedPrecisionConfig(enable=False)),
-                init_device="meta",
-                gradient_checkpointing=GradientCheckpointingConfig(enable=True),
-                torch_compile=TorchCompileConfig(enable=False),
+    runtime = object.__new__(VeOmniModelRuntime)
+    runtime.model = _AsyncOffloadFSDPModel(device="meta")
+    runtime.model_name = "base"
+    runtime.args = SimpleNamespace(
+        lora_config=None,
+        fqn_to_index_mapping=None,
+        model_path=None,
+        basic_modules=[],
+        optimizer=OptimizerConfig(),
+        broadcast_model_weights_from_rank0=False,
+        ep_sharded_stream_load=False,
+        accelerator=SimpleNamespace(
+            offload_config=OffloadConfig(
+                enable_async_activation=True,
+                activation_offload_host_cache_limit_gb=0.01,
             ),
+            fsdp_config=FSDPConfig(mixed_precision=MixedPrecisionConfig(enable=False)),
+            init_device="meta",
+            gradient_checkpointing=GradientCheckpointingConfig(enable=True),
+            torch_compile=TorchCompileConfig(enable=False),
         ),
-        train=SimpleNamespace(
-            checkpoint=SimpleNamespace(load_path=None),
-        ),
+    )
+    runtime.train_args = SimpleNamespace(
+        checkpoint=SimpleNamespace(load_path=None),
     )
 
     torch.manual_seed(0)
     with use_parallel_state("base"):
-        trainer._build_parallelized_model()
+        runtime._build_parallelized_model()
 
-    assert all(layer.gradient_checkpointing for layer in trainer.model.layers)
-    manager = trainer.model.layers[0]._veomni_offload_manager
+    assert all(layer.gradient_checkpointing for layer in runtime.model.layers)
+    manager = runtime.model.layers[0]._veomni_offload_manager
     hidden_states = torch.randn(2, 8, 16, device=get_device_type(), requires_grad=True)
     with use_parallel_state("base"):
-        output = trainer.model(hidden_states)
+        output = runtime.model(hidden_states)
     with use_parallel_state("base"):
         output.float().square().mean().backward()
 
     assert torch.isfinite(output).all()
     assert manager.host_buffer_pool.allocations > 0
     assert not manager.items
-    for parameter in trainer.model.parameters():
+    for parameter in runtime.model.parameters():
         if parameter.grad is not None:
             local_grad = parameter.grad.to_local() if hasattr(parameter.grad, "to_local") else parameter.grad
             assert torch.isfinite(local_grad).all()
     dist.barrier()
 
 
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 @pytest.mark.skipif(
     not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE),
     reason="CUDA or NPU is required for FSDP2 async-offload integration",
@@ -577,4 +590,4 @@ def _run_async_offload_base_trainer_fsdp2_gc():
 def test_async_offload_base_trainer_fsdp2_gc_integration():
     from ..tools.launch_utils import torchrun
 
-    torchrun(_run_async_offload_base_trainer_fsdp2_gc, world_size=2)
+    torchrun(_run_async_offload_base_trainer_fsdp2_gc, world_size=_CI_ACCELERATOR_2.nproc)

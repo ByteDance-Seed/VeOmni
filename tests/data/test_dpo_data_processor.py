@@ -1,9 +1,14 @@
 import types
 
+import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.data_transform import process_dpo_example
 from veomni.utils.constants import IGNORE_INDEX
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _fake_ps(sp_enabled: bool, sp_size: int = 1, sp_rank: int = 0):

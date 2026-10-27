@@ -13,11 +13,14 @@
 # limitations under the License.
 
 
+import json
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Sequence, Union
 
 import torch
+import torch.nn.functional as F
 
 from veomni.utils import logging
 
@@ -35,6 +38,36 @@ ROLE_SUPPORTED = ["system", "user", "assistant", "tool"]
 CHAT_TEMPLATE_REGISTRY = Registry("ChatTemplate")
 
 
+def add_mtp_labels(feature: Dict[str, torch.Tensor | List[int]], num_depths: int) -> None:
+    """Add future-token labels to one un-packed sample when MTP is enabled."""
+    if num_depths <= 0:
+        return
+    labels = feature["labels"]
+    if not isinstance(labels, torch.Tensor):
+        labels = torch.tensor(labels)
+    feature["mtp_labels"] = torch.stack(
+        [F.pad(labels, (0, depth + 2), value=IGNORE_INDEX)[..., depth + 2 :] for depth in range(num_depths)],
+        dim=-2,
+    )
+
+
+def _get_mtp_num_hidden_layers(tokenizer_or_processor) -> int:
+    tokenizer = getattr(tokenizer_or_processor, "tokenizer", tokenizer_or_processor)
+    name_or_path = getattr(tokenizer, "name_or_path", None)
+    if not name_or_path:
+        name_or_path = getattr(tokenizer, "init_kwargs", {}).get("name_or_path")
+    if not name_or_path:
+        return 0
+    config_path = Path(name_or_path) / "config.json"
+    try:
+        with config_path.open() as config_file:
+            config = json.load(config_file)
+    except (OSError, json.JSONDecodeError):
+        return 0
+    text_config = config.get("text_config", config)
+    return int(text_config.get("mtp_num_hidden_layers", 0) or 0)
+
+
 def build_chat_template(
     template_name: str,
     tokenizer_or_processor: Union["PreTrainedTokenizer", "ProcessorMixin"],
@@ -42,9 +75,9 @@ def build_chat_template(
 ) -> "ChatTemplate":
     """Builds any registered template, text-only or multimodal.
 
-    Text-only templates take a tokenizer; multimodal ones take the processor,
-    which carries both the tokenizer and the grid parameters they need. Callers
-    pass whatever their modality has, matching the template their config names.
+    Multimodal templates need the processor, which carries both the tokenizer and
+    the grid parameters they use. Text-only templates accept either and encode
+    through the tokenizer, so callers can pass the processor whenever one loaded.
 
     ``kwargs`` reach the template constructor. No template currently declares
     one, so an unrecognised option raises there instead of being silently
@@ -58,15 +91,8 @@ class ChatTemplate(ABC):
     Abstract class for chat template.
     """
 
-    def __init__(self, tokenizer: "PreTrainedTokenizer") -> None:
-        self.tokenizer = tokenizer
-
-    def save_pretrained(self, output_dir: str) -> None:
-        self.tokenizer.chat_template = self.get_jinja_template()
-        try:
-            self.tokenizer.save_pretrained(output_dir)
-        except Exception:
-            logger.warning("Failed to save tokenizer.")
+    def __init__(self, tokenizer_or_processor: Union["PreTrainedTokenizer", "ProcessorMixin"]) -> None:
+        self.tokenizer = getattr(tokenizer_or_processor, "tokenizer", tokenizer_or_processor)
 
     @abstractmethod
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
@@ -75,12 +101,17 @@ class ChatTemplate(ABC):
         """
         ...
 
-    @abstractmethod
     def get_jinja_template(self) -> str:
+        """This template's layout expressed as jinja, for whoever wants to serialise it.
+
+        Optional, and read by nothing in the training or export path: training
+        lays out tokens through :meth:`encode_messages`, and an export keeps the
+        jinja the checkpoint shipped with rather than substituting a job's
+        formatting choice. A layout that jinja cannot express — image
+        placeholders sized from the processor's grid parameters — says so by
+        leaving this alone.
         """
-        Gets the jinja template for the chat template.
-        """
-        ...
+        return ""
 
 
 @CHAT_TEMPLATE_REGISTRY.register("default")
@@ -154,11 +185,8 @@ class TokenizerTemplate(ChatTemplate):
 
         input_ids = input_ids[-max_seq_len:]
         labels = labels[-max_seq_len:]
-        return {
-            "input_ids": input_ids,
-            "attention_mask": [1] * len(input_ids),
-            "labels": labels,
-        }
+        model_inputs = {"input_ids": input_ids, "attention_mask": [1] * len(input_ids), "labels": labels}
+        return model_inputs
 
     def get_jinja_template(self) -> str:
         if not self.tokenizer.chat_template:
@@ -170,8 +198,9 @@ class TokenizerTemplate(ChatTemplate):
 class GptOssTokenizerTemplate(TokenizerTemplate):
     """GPT-OSS native template with its terminal assistant-token rewrite."""
 
-    def __init__(self, tokenizer: "PreTrainedTokenizer") -> None:
-        super().__init__(tokenizer)
+    def __init__(self, tokenizer_or_processor: Union["PreTrainedTokenizer", "ProcessorMixin"]) -> None:
+        super().__init__(tokenizer_or_processor)
+        tokenizer = self.tokenizer
         self.return_token_id = tokenizer.convert_tokens_to_ids("<|return|>")
         self.end_token_id = tokenizer.convert_tokens_to_ids("<|end|>")
         if self.return_token_id == tokenizer.unk_token_id or self.end_token_id == tokenizer.unk_token_id:
@@ -284,6 +313,22 @@ class ChatmlTemplate(ChatTemplate):
         )
 
 
+class MTPLabelMixin:
+    def __init__(self, tokenizer_or_processor):
+        super().__init__(tokenizer_or_processor)
+        self.mtp_num_hidden_layers = _get_mtp_num_hidden_layers(tokenizer_or_processor)
+
+    def encode_messages(self, *args, **kwargs):
+        feature = super().encode_messages(*args, **kwargs)
+        add_mtp_labels(feature, self.mtp_num_hidden_layers)
+        return feature
+
+
+@CHAT_TEMPLATE_REGISTRY.register("qwen3_5")
+class Qwen3_5ChatTemplate(MTPLabelMixin, ChatmlTemplate):
+    pass
+
+
 class MultimodalChatTemplate(ChatTemplate):
     """Base for templates whose messages carry non-text content.
 
@@ -308,9 +353,6 @@ class MultimodalChatTemplate(ChatTemplate):
         """
         Encodes messages to a dictionary of input_ids, attention_mask, labels, and mm with mm_seqlens.
         """
-
-    def get_jinja_template(self) -> str:
-        return ""
 
 
 class Qwen2VLTemplate(MultimodalChatTemplate):
@@ -566,3 +608,8 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
             )
 
         return self._tokenize_and_remap(messages)
+
+
+@CHAT_TEMPLATE_REGISTRY.register("qwen3_5vl")
+class Qwen3_5VLChatTemplate(MTPLabelMixin, Qwen3VLChatTemplate):
+    pass

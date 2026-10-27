@@ -27,17 +27,23 @@ CPU tensors (no Python-list sidecar); the collator packs them via
 ``DataCollateInfo`` and the model hook does the ``.tolist()`` once at batch
 time. The batch-level cu_seqlens / window cu_seqlens derivation is per-model
 and lives in the patchgen-generated helpers — its sync behaviour is gated by
-``tests/models/test_model_forward_no_implicit_sync.py``.
+``tests/models/transformers/test_model_forward_no_implicit_sync.py``.
 """
 
 import os
 
+import pytest
 import torch
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 # Bootstrap a single-rank "process group" env so collator import doesn't crash
 # on `get_parallel_state()`. Mirrors the pattern used by
-# tests/models/test_model_forward_no_implicit_sync.py.
+# tests/models/transformers/test_model_forward_no_implicit_sync.py.
 os.environ.setdefault("RANK", "0")
 os.environ.setdefault("LOCAL_RANK", "0")
 os.environ.setdefault("WORLD_SIZE", "1")

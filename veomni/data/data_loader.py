@@ -36,7 +36,7 @@ from .dataset import (
     DynamicBatchingSizeDataset,
     _MapStyleSamplerWrapper,
     get_aligned_length,
-    get_length_by_attention_mask_fn,
+    get_length_fn,
     get_length_fn_by_count_mode,
 )
 from .dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
@@ -184,7 +184,7 @@ def build_native_dataloader(
             cp_aligned_physical_length_fn = partial(
                 get_aligned_length,
                 alignment=2 * cp_size,
-                get_length_fn=get_length_by_attention_mask_fn,
+                get_length_fn=get_length_fn,
             )
             if dyn_bsz_count_mode == "total":
                 # The packing collator inserts ignored tokens so every document can
@@ -197,7 +197,7 @@ def build_native_dataloader(
                     f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {dyn_bsz_physical_overflow_ratio}."
                 )
             physical_token_cap = math.ceil(batching_token_len * dyn_bsz_physical_overflow_ratio)
-            dyn_bsz_physical_length_fn = cp_aligned_physical_length_fn or get_length_by_attention_mask_fn
+            dyn_bsz_physical_length_fn = cp_aligned_physical_length_fn or get_length_fn
         else:
             physical_token_cap = None
             dyn_bsz_physical_length_fn = None

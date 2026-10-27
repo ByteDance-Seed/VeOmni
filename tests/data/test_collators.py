@@ -3,8 +3,18 @@ import types
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.data.chat_template import add_mtp_labels
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+def _assert_host_packed_metadata(out, slices):
+    assert out["packed_sequence_slices"] == slices
+    assert out["attention_mask_is_all_ones"] is True
 
 
 def _fake_ps(sp_enabled: bool, sp_size: int = 1, sp_rank: int = 0):
@@ -35,6 +45,37 @@ def features_two_samples():
     return [f1, f2]
 
 
+def test_mtp_labels_pack_on_the_sequence_dim_without_crossing_samples(monkeypatch):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+    features = [
+        {
+            "input_ids": torch.tensor([10, 11, 12, 13]),
+            "attention_mask": torch.ones(4, dtype=torch.long),
+            "labels": torch.tensor([10, 11, 12, 13]),
+        },
+        {
+            "input_ids": torch.tensor([20, 21, 22]),
+            "attention_mask": torch.ones(3, dtype=torch.long),
+            "labels": torch.tensor([20, 21, 22]),
+        },
+    ]
+    for feature in features:
+        add_mtp_labels(feature, num_depths=2)
+
+    collator = m.MainCollator()
+    out = collator(features)
+
+    expected = torch.tensor(
+        [
+            [12, 13, IGNORE_INDEX, IGNORE_INDEX, 22, IGNORE_INDEX, IGNORE_INDEX],
+            [13, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX],
+        ]
+    ).unsqueeze(0)
+    assert torch.equal(out["mtp_labels"], expected)
+
+
 def test_seqcls_collator_sp_disabled(monkeypatch, features_two_samples):
     import veomni.data.data_collator as m
 
@@ -57,6 +98,7 @@ def test_seqcls_collator_sp_disabled(monkeypatch, features_two_samples):
     assert torch.equal(out["cu_seq_lens_k"], exp_cu_seq_lens)
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
+    _assert_host_packed_metadata(out, ((0, 3), (3, 5)))
 
 
 def test_seqcls_collator_sp_enabled(monkeypatch, features_two_samples):
@@ -81,11 +123,11 @@ def test_seqcls_collator_sp_enabled(monkeypatch, features_two_samples):
     assert torch.equal(out["cu_seq_lens_k"], exp_cu_seq_lens)
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
+    _assert_host_packed_metadata(out, ((0, 3), (3, 5)))
 
 
+@pytest.mark.skipif(IS_NPU_AVAILABLE, reason="NPU does not support this padding test yet.")
 def test_data_collator_pad_to_length_sp_disabled(monkeypatch, features_two_samples):
-    if IS_NPU_AVAILABLE:
-        pytest.skip("NPU does not support this padding test yet.")
     import veomni.data.data_collator as m
 
     pad_to_length = 8
@@ -121,6 +163,7 @@ def test_data_collator_pad_to_length_sp_disabled(monkeypatch, features_two_sampl
     assert int(out["tail_padding_length"]) == 3
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
+    _assert_host_packed_metadata(out, ((0, 3), (3, 5), (5, 8)))
 
 
 def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samples):
@@ -160,6 +203,7 @@ def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samp
     assert int(out["tail_padding_length"]) == 3
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
+    _assert_host_packed_metadata(out, ((0, 3), (3, 5), (5, 8)))
 
     monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True, sp_size=sp_size, sp_rank=1))
     collator = m.MainCollator(pad_to_length=pad_to_length)
@@ -183,6 +227,7 @@ def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samp
     assert int(out["tail_padding_length"]) == 3
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
+    _assert_host_packed_metadata(out, ((0, 3), (3, 5), (5, 8)))
 
 
 def test_packing_collator_clamps_linear_attn_tail_padding_length(monkeypatch, features_two_samples):
@@ -206,6 +251,27 @@ def test_packing_collator_clamps_linear_attn_tail_padding_length(monkeypatch, fe
     out = collator(token_labels)
 
     assert m._LINEAR_ATTN_TAIL_PADDING_LENGTH not in out
+
+
+@pytest.mark.parametrize(
+    ("attention_mask", "expected"),
+    [
+        (None, True),
+        (torch.tensor([[1, 1, 1, 1, 1]]), True),
+        (torch.tensor([[1, 1, 0, 1, 1]]), False),
+        (torch.ones(1, 5, dtype=torch.long, device="meta"), None),
+    ],
+)
+def test_attention_mask_is_all_ones_only_reports_checked_masks(attention_mask, expected):
+    from veomni.data.data_collator import add_flash_attention_kwargs_from_position_ids
+
+    batch = {"position_ids": torch.tensor([[0, 1, 2, 0, 1]])}
+    if attention_mask is not None:
+        batch["attention_mask"] = attention_mask
+
+    add_flash_attention_kwargs_from_position_ids(batch)
+
+    assert batch["attention_mask_is_all_ones"] is expected
 
 
 # TODO: add omni data ci test

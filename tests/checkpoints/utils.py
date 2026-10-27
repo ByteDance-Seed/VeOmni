@@ -8,7 +8,8 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tools import hf_local_or_remote, resolve_ops_overrides
-from tools.launch_utils import find_free_port
+
+from veomni.checkpoint.layout import weights_dir
 
 
 def get_checkpoint_test_nproc() -> int:
@@ -39,23 +40,35 @@ MODEL_CONFIGS = {
 
 
 # Get some dir functions.
-# ``dp_replicate_size`` is threaded into the dir name so HSDP runs
-# (dp_replicate>1) don't collide with the pure-FSDP run for the same model/ep.
-def get_output_dir(model_name, ep_size, dp_replicate_size=None):
+# ``dp_replicate_size`` and ``nproc`` are threaded into the dir name so HSDP
+# runs and different world sizes don't collide.
+def get_output_dir(model_name, ep_size, dp_replicate_size=None, nproc=None):
     suffix = f"_dpr{dp_replicate_size}" if dp_replicate_size else ""
+    if nproc is not None:
+        suffix += f"_n{nproc}"
     return f"./test_trainer_saveload_{model_name}_{ep_size}{suffix}"
 
 
-def get_checkpoint_dir(model_name, ep_size, dp_replicate_size=None):
-    return os.path.join(get_output_dir(model_name, ep_size, dp_replicate_size), "checkpoints", "global_step_5")
+def get_checkpoint_dir(model_name, ep_size, dp_replicate_size=None, nproc=None, save_step=1):
+    """Step directory. Resume takes this; it is not itself a DCP directory."""
+    return os.path.join(
+        get_output_dir(model_name, ep_size, dp_replicate_size, nproc=nproc),
+        "checkpoints",
+        f"global_step_{save_step}",
+    )
 
 
-def get_hf_output_dir(model_name, ep_size, dp_replicate_size=None):
-    return os.path.join(get_output_dir(model_name, ep_size, dp_replicate_size), "hf_ckpt")
+def get_dcp_weights_dir(model_name, ep_size, dp_replicate_size=None, nproc=None, save_step=1):
+    """DCP directory holding the weights, which is what a reader of shards wants."""
+    return weights_dir(get_checkpoint_dir(model_name, ep_size, dp_replicate_size, nproc=nproc, save_step=save_step))
 
 
-def get_model_assets_dir(model_name, ep_size, dp_replicate_size=None):
-    return os.path.join(get_output_dir(model_name, ep_size, dp_replicate_size), "model_assets")
+def get_hf_output_dir(model_name, ep_size, dp_replicate_size=None, nproc=None):
+    return os.path.join(get_output_dir(model_name, ep_size, dp_replicate_size, nproc=nproc), "hf_ckpt")
+
+
+def get_model_assets_dir(model_name, ep_size, dp_replicate_size=None, nproc=None):
+    return os.path.join(get_output_dir(model_name, ep_size, dp_replicate_size, nproc=nproc), "model_assets")
 
 
 # running command functions
@@ -64,12 +77,14 @@ def get_checkpoint_test_command(
     ep_size,
     save_hf_weights=False,
     dp_replicate_size=None,
+    nproc=None,
+    max_steps=2,
 ):
     config_path = MODEL_CONFIGS[model_name]["config_path"]
     tokenizer_path = hf_local_or_remote(MODEL_CONFIGS[model_name]["tokenizer_path"])
-    output_dir = get_output_dir(model_name, ep_size, dp_replicate_size)
-    port = find_free_port()
-    nproc = get_checkpoint_test_nproc()
+    output_dir = get_output_dir(model_name, ep_size, dp_replicate_size, nproc=nproc)
+    if nproc is None:
+        nproc = get_checkpoint_test_nproc()
     if ep_size > nproc:
         raise ValueError(f"ep_size={ep_size} exceeds checkpoint-test world size nproc={nproc}")
     # Keep global batch a multiple of micro_batch * dp_size. With micro_batch=1
@@ -77,7 +92,7 @@ def get_checkpoint_test_command(
     global_batch_size = nproc
 
     params = [
-        f"{sys.executable} -m torch.distributed.run --nnodes=1 --nproc_per_node={nproc} --master-port={port}",
+        f"{sys.executable} -m torch.distributed.run --nnodes=1 --nproc_per_node={nproc} --standalone",
         "tests/checkpoints/test_trainer_saveload.py",
         f"--model.config_path {config_path}",
         f"--model.tokenizer_path {tokenizer_path}",
@@ -93,13 +108,13 @@ def get_checkpoint_test_command(
         f"--model.accelerator.ep_size {ep_size}",
         f"--train.global_batch_size {global_batch_size}",
         "--train.micro_batch_size 1",
-        "--model.optimizer.lr 1e-7",
-        "--model.optimizer.lr_warmup_ratio 0.007",
+        "--model.optimizer.lr 1e-4",
+        "--model.optimizer.lr_warmup_ratio 0.0",
         "--model.optimizer.lr_decay_style constant",
         "--model.optimizer.lr_decay_ratio 1.0",
         "--model.optimizer.weight_decay 0.01",
         "--model.optimizer.max_grad_norm 1.0",
-        "--train.max_steps 5",
+        f"--train.max_steps {max_steps}",
         "--train.checkpoint.manager dcp",
         "--train.checkpoint.save_async True",
         f"--train.checkpoint.save_hf_weights {save_hf_weights}",
@@ -120,10 +135,12 @@ def get_merge_dcp_to_hf_command(
     model_name,
     ep_size,
     dp_replicate_size=None,
+    nproc=None,
+    save_step=1,
 ):
-    checkpoint_dir = get_checkpoint_dir(model_name, ep_size, dp_replicate_size)
-    hf_output_dir = get_hf_output_dir(model_name, ep_size, dp_replicate_size)
-    model_assets_dir = get_model_assets_dir(model_name, ep_size, dp_replicate_size)
+    checkpoint_dir = get_checkpoint_dir(model_name, ep_size, dp_replicate_size, nproc=nproc, save_step=save_step)
+    hf_output_dir = get_hf_output_dir(model_name, ep_size, dp_replicate_size, nproc=nproc)
+    model_assets_dir = get_model_assets_dir(model_name, ep_size, dp_replicate_size, nproc=nproc)
 
     params = [
         "python",

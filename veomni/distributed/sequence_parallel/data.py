@@ -7,7 +7,6 @@ from torch.distributed import ProcessGroup
 
 from ...distributed.parallel_state import get_parallel_state
 from .comm import get_ulysses_sequence_parallel_group, get_unified_sequence_parallel_group
-from .ring_attention import layout as _ring_layout
 from .ulysses import _Gather, _Slice
 from .utils import pad_tensor, unpadding_tensor_for_seqeunce_parallel
 
@@ -147,7 +146,6 @@ def gather_outputs(
     return x
 
 
-# ── Per-module SP redistribution ────────────────────────────────────────────────
 #
 # The orchestrator runs with SP disabled, so every rank owns a DISTINCT DP-shard
 # sample. A module may declare a larger ``ulysses_size`` (its SP size); the SP
@@ -299,9 +297,21 @@ def sp_take_own_seq(full: Tensor, dim: int, seg_lengths: List[int], sp_rank: int
     return full.narrow(dim, offset, seg_lengths[sp_rank])
 
 
-# Compatibility exports. Ring-specific implementations live in ring_attention.layout.
-local_cu_seqlens = _ring_layout.local_cu_seqlens
-zigzag_block_order = _ring_layout.zigzag_block_order
-zigzag_reorder = _ring_layout.zigzag_reorder
-zigzag_reorder_varlen = _ring_layout.zigzag_reorder_varlen
-zigzag_undo = _ring_layout.zigzag_undo
+#
+# Balanced causal ring attention (see ``ring_attention.zigzag_ring_flash_attn``)
+# requires the sequence to be laid out so that context-parallel rank ``r`` owns
+# blocks ``r`` and ``2*cp-1-r`` of a ``2*cp``-way split. ``zigzag_reorder``
+# permutes the FULL (pre-slice) sequence so that a subsequent CONTIGUOUS slice
+# into ``cp`` equal chunks hands each cp-rank exactly those two blocks (in the
+# ``[low_block, high_block]`` order the kernel expects). ``zigzag_undo`` is the
+# inverse permutation, applied to per-rank outputs after they are gathered.
+
+
+from .ring_attention.layout import (  # noqa: E402,F401
+    local_cu_seqlens,
+    prepare_usp_metadata,
+    zigzag_block_order,
+    zigzag_reorder,
+    zigzag_reorder_varlen,
+    zigzag_undo,
+)

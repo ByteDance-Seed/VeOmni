@@ -18,6 +18,10 @@ import pytest
 import torch
 
 import veomni.distributed.sequence_parallel.ring_attention.gpu as ring_gpu
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class _LocalRingComm:

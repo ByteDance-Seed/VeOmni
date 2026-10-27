@@ -33,16 +33,21 @@ Run (4 GPUs):
 import os
 from typing import Any, Dict, List, Optional
 
+import pytest
 import torch
 from torch.distributed.checkpoint import FileSystemReader
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.arguments import VeOmniArguments, parse_args
+from veomni.checkpoint.layout import weights_dir
 from veomni.data import build_dummy_dataset
-from veomni.models.checkpoint_manager import ModelCheckpointManager
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
 from veomni.utils import helper
+
+
+_LORA_MAX_NPROC = 4
 
 
 os.environ["NCCL_DEBUG"] = "OFF"
@@ -130,7 +135,7 @@ class _LoraCheckpointCallback(CheckpointCallback):
             # silently get restored on load and defeat the size optimisation.
             model_keys = [
                 k
-                for k in FileSystemReader(self.trainer.dcp_ckpt_path).read_metadata().state_dict_metadata
+                for k in FileSystemReader(weights_dir(self.trainer.dcp_ckpt_path)).read_metadata().state_dict_metadata
                 if k.startswith("model.")
             ]
             base_keys_in_dcp = [k for k in model_keys if "lora_" not in k]
@@ -202,9 +207,6 @@ class LoraTrainerSaveLoadTest(BaseTrainer):
 
     # -- dataset / asset overrides -----------------------------------------
 
-    def _build_model_assets(self) -> None:
-        self.model_assets = [self.model_config]
-
     def _build_data_transform(self) -> None:
         pass
 
@@ -217,7 +219,6 @@ class LoraTrainerSaveLoadTest(BaseTrainer):
     # -- callbacks ----------------------------------------------------------
 
     def _init_callbacks(self) -> None:
-        self.checkpoint = ModelCheckpointManager(self)
         self.environ_meter_callback = _EnvironMeterCallbackTest(self)
         self.checkpoint_callback = _LoraCheckpointCallback(self)
         self.check_callback = _LoraCheckCallback(self)
@@ -274,6 +275,9 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.launch_plan(
+    provider=lambda context: LaunchSpec(nproc=max(1, min(len(context.capabilities.devices), _LORA_MAX_NPROC)))
+)
 def test_lora_trainer_saveload():
     """Run the LoRA save/load test via torchrun and assert it passes."""
     import shutil
@@ -283,22 +287,19 @@ def test_lora_trainer_saveload():
 
     from veomni.utils.device import get_torch_device
 
-    from ..tools.launch_utils import find_free_port
-
     torch_device = get_torch_device()
-    device_count = torch_device.device_count() if torch_device.is_available() else 0
+    device_count = runner_device_count() if torch_device.is_available() else 0
     if device_count < 1:
         pytest.skip("Requires at least 1 accelerator device")
 
-    nproc = min(device_count, 4)
-    output_dir = "/tmp/test_lora_saveload"
-    port = find_free_port()
+    nproc = min(device_count, _LORA_MAX_NPROC)
+    output_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "test_lora_saveload")
 
     cmd = [
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={nproc}",
-        f"--master_port={port}",
+        "--standalone",
         __file__,
         "tests/lora/qwen3_toy_lora.yaml",  # positional config_file
         f"--train.checkpoint.output_dir={output_dir}",

@@ -28,6 +28,7 @@ from ..utils import logging
 from ..utils.constants import IGNORE_INDEX, MODALITY
 from ..utils.seqlen_pos_transform_utils import (
     coalesce_tail_padding_cu_seqlens,
+    packed_sequence_slices_from_cu_seqlens,
     prepare_fa_kwargs_from_position_ids,
     valid_seqlens_from_cu_seqlens,
 )
@@ -62,8 +63,9 @@ def add_flash_attention_kwargs_from_position_ids(
 
     Args:
         batch: The batch dictionary containing position_ids. Will be modified in-place to add
-               cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k, and
-               linear_attn_cu_seq_lens_q. When ``linear_attn_tail_padding_length > 0``,
+               cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k,
+               linear_attn_cu_seq_lens_q, packed_sequence_slices, and
+               attention_mask_is_all_ones. When ``linear_attn_tail_padding_length > 0``,
                also stores ``tail_padding_length`` (0-d ``torch.int32`` tensor) so
                downstream valid-seqlens helpers can strip the coalesced pad segment and
                distributed/PP stages preserve the metadata.
@@ -99,6 +101,18 @@ def add_flash_attention_kwargs_from_position_ids(
     batch["max_length_q"] = max_length_q
     batch["max_length_k"] = max_length_k
     batch["linear_attn_cu_seq_lens_q"] = cu_seq_lens_q
+    # Slice conversion is host-side. Compile/GPU callers may already have moved
+    # ``cu_seq_lens_q``; copy rather than reject, matching DSV4's fallback.
+    host_cu = cu_seq_lens_q if cu_seq_lens_q.device.type == "cpu" else cu_seq_lens_q.detach().cpu()
+    batch["packed_sequence_slices"] = packed_sequence_slices_from_cu_seqlens(host_cu)
+    attention_mask = batch.get("attention_mask")
+    if not isinstance(attention_mask, torch.Tensor):
+        batch["attention_mask_is_all_ones"] = True
+    elif attention_mask.device.type == "cpu":
+        batch["attention_mask_is_all_ones"] = bool(attention_mask.all())
+    else:
+        # ``None`` leaves the device-side check to the consumer.
+        batch["attention_mask_is_all_ones"] = None
 
     return cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k
 
@@ -138,6 +152,7 @@ class DataCollateInfo:
 DEFAULT_DATA_COLLATE_INFO: Dict[str, DataCollateInfo] = {
     "input_ids": DataCollateInfo(-1, True, 0, 1),
     "labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
+    "mtp_labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
     "attention_mask": DataCollateInfo(-1, False, 1, 1),
     "position_ids": DataCollateInfo(-1, False, 0, 1),
     "pixel_values": DataCollateInfo(0, True, 0, 4),
@@ -581,6 +596,10 @@ class SequenceParallelCollator(DataCollator):
                 batch[key] = self.sp_slice(key, batch[key], dim=pack_dim)
 
         add_flash_attention_kwargs_from_position_ids(batch, linear_attn_tail_padding_length)
+        if self.cp_size > 1 and self._cp_cu_seqlens is not None:
+            from ..distributed.sequence_parallel.data import prepare_usp_metadata
+
+            batch.update(prepare_usp_metadata(self._cp_cu_seqlens, self.cp_size))
 
         batch["position_ids"] = self.sp_slice(
             "position_ids", batch["position_ids"], dim=self.collate_infos["position_ids"].pack_dim
@@ -622,6 +641,7 @@ class MainCollator(DataCollator):
     """
 
     def __post_init__(self):
+        """Build the ordered collation pipeline and merge model-specific field rules."""
         self.preforward_pipeline = []
         self.collate_infos: Dict[str, DataCollateInfo] = {}
 

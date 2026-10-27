@@ -30,7 +30,7 @@ undo`` and is applied by the collator before slicing.
 The Ulysses half (all-to-all head/seq exchange) is orthogonal: USP first does
 the Ulysses all-to-all over the ``ulysses`` group, then runs ring attention over
 the ``cp`` group on the resulting shard (see
-``veomni/ops/kernels/attention/__init__.py``).
+``veomni/ops/kernels/attention/standard/flash.py``).
 """
 
 import inspect
@@ -45,24 +45,25 @@ from ..comm import get_context_parallel_group
 from .comm import RingComm
 
 
-# Flash-attention backend selection for the ring kernels.
-#
-# The zig-zag ring attention needs the LOW-LEVEL forward/backward primitives
-# (they must return the log-sum-exp so the online-softmax merge can run across
-# ring steps, and take pre-allocated ``dq/dk/dv`` out-tensors in backward). Two
-# backends expose such primitives and are auto-detected here:
-#
-#   * ``"fa2"`` — classic FlashAttention-2 (``flash_attn.flash_attn_interface``).
-#     Available on Ampere/Hopper GPUs with the CUDA extension built.
-#   * ``"fa4"`` — FlashAttention-4 CuTe backend (``flash_attn.cute.interface``).
-#     The only backend with SM10.0 (Blackwell / GB200) kernels; FA3 is
-#     Hopper-only and has no Blackwell image, so it is not used here.
-#
-# Both return the SAME log-sum-exp layout (dense ``(b, h, s)`` / varlen
-# ``(h, total)``), so the online-softmax merge code is backend-agnostic; only
-# the thin ``_fa_*`` wrappers below differ. ``FA_BACKEND`` records the choice.
-FA_BACKEND = None
+def _supports_fa4_interface(forward, backward) -> bool:
+    """Check every optional argument used by the dense and packed wrappers."""
+    shared = {
+        "softmax_scale",
+        "causal",
+        "window_size_left",
+        "window_size_right",
+        "cu_seqlens_q",
+        "cu_seqlens_k",
+        "max_seqlen_q",
+        "max_seqlen_k",
+    }
+    return (shared | {"return_lse"}).issubset(inspect.signature(forward).parameters) and (
+        shared | {"dq", "dk", "dv", "deterministic"}
+    ).issubset(inspect.signature(backward).parameters)
 
+
+# Load independently: the GPU extra can install both packages. Import order
+# must not override the attention implementation selected by the model.
 try:
     from flash_attn.flash_attn_interface import (
         _flash_attn_backward,
@@ -71,38 +72,31 @@ try:
         _flash_attn_varlen_forward,
     )
 
-    _FA_AVAILABLE = True
-    FA_BACKEND = "fa2"
-except ImportError:  # pragma: no cover - depends on installed flash-attn build
-    _FA_AVAILABLE = False
+    _FA2_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional accelerator dependency
+    _FA2_AVAILABLE = False
 
-if not _FA_AVAILABLE:
-    try:
-        from flash_attn.cute.interface import (
-            _flash_attn_bwd as _fa4_bwd,
-        )
-        from flash_attn.cute.interface import (
-            _flash_attn_fwd as _fa4_fwd,
-        )
+try:
+    from flash_attn.cute.interface import _flash_attn_bwd as _fa4_bwd
+    from flash_attn.cute.interface import _flash_attn_fwd as _fa4_fwd
 
-        # The ring wrappers below drive the FA4 CuTe primitives with the LSE /
-        # varlen / in-place-grad API introduced in recent FA4 builds. Older
-        # CuTe builds expose the same names with a narrower signature, on which
-        # those calls would raise deep inside a kernel launch; verify the
-        # required parameters exist up front and otherwise decline the backend.
-        _fa4_fwd_params = inspect.signature(_fa4_fwd).parameters
-        _fa4_bwd_params = inspect.signature(_fa4_bwd).parameters
-        _fa4_ok = all(p in _fa4_fwd_params for p in ("return_lse", "cu_seqlens_q", "max_seqlen_q")) and all(
-            p in _fa4_bwd_params
-            for p in ("dq", "dk", "dv", "cu_seqlens_q", "max_seqlen_q", "window_size_left", "deterministic")
+    _FA4_AVAILABLE = _supports_fa4_interface(_fa4_fwd, _fa4_bwd)
+except ImportError:  # pragma: no cover - optional accelerator dependency
+    _FA4_AVAILABLE = False
+
+FA_BACKENDS = frozenset(name for name, available in (("fa2", _FA2_AVAILABLE), ("fa4", _FA4_AVAILABLE)) if available)
+# Preserve the default for direct primitive callers; production passes a backend.
+FA_BACKEND = "fa2" if _FA2_AVAILABLE else "fa4" if _FA4_AVAILABLE else None
+
+
+def resolve_ring_backend(backend: Optional[str] = None) -> str:
+    """Validate the requested primitives before entering any collective."""
+    selected = FA_BACKEND if backend is None else backend
+    if selected not in FA_BACKENDS:
+        raise NotImplementedError(
+            f"USP Ring backend {selected!r} is unavailable or incompatible; available backends: {sorted(FA_BACKENDS)}."
         )
-        if _fa4_ok:
-            _FA_AVAILABLE = True
-            FA_BACKEND = "fa4"
-        else:  # pragma: no cover - only hit on older/narrower FA4 CuTe builds
-            _FA_AVAILABLE = False
-    except ImportError:  # pragma: no cover - depends on installed flash-attn build
-        _FA_AVAILABLE = False
+    return selected
 
 
 __all__ = [
@@ -110,14 +104,13 @@ __all__ = [
     "zigzag_ring_flash_attn_func",
     "zigzag_ring_flash_attn_varlen_func",
     "update_out_and_lse",
-    "forward",
-    "packed_forward",
+    "RingComm",
 ]
 
 
-def _fa_forward(q, k, v, softmax_scale, causal, dropout_p=0.0):
+def _fa_forward(q, k, v, softmax_scale, causal, dropout_p=0.0, backend=None):
     """Dense low-level FA forward returning ``(out, lse)`` with ``lse`` as ``(b, h, s)``."""
-    if FA_BACKEND == "fa4":
+    if (backend or FA_BACKEND) == "fa4":
         out, lse, *_ = _fa4_fwd(
             q,
             k,
@@ -145,11 +138,11 @@ def _fa_forward(q, k, v, softmax_scale, causal, dropout_p=0.0):
     return out, lse
 
 
-def _fa_backward(dout, q, k, v, out, lse, softmax_scale, causal, dropout_p=0.0):
+def _fa_backward(dout, q, k, v, out, lse, softmax_scale, causal, dropout_p=0.0, backend=None):
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
-    if FA_BACKEND == "fa4":
+    if (backend or FA_BACKEND) == "fa4":
         _fa4_bwd(
             q,
             k,
@@ -232,7 +225,7 @@ def update_out_and_lse(
 # Plain ring attention (Q fixed, K/V rotate). Correct for full (non-causal)    #
 # attention and for causal, but causal work is load-imbalanced across ranks.   #
 # --------------------------------------------------------------------------- #
-def _ring_forward(group, q, k, v, softmax_scale, causal):
+def _ring_forward(group, q, k, v, softmax_scale, causal, backend=None):
     comm = RingComm(group)
     out = None
     lse = None
@@ -245,7 +238,7 @@ def _ring_forward(group, q, k, v, softmax_scale, causal):
 
         if not causal or step <= comm.rank:
             block_causal = causal and step == 0
-            block_out, block_lse = _fa_forward(q, k, v, softmax_scale, block_causal)
+            block_out, block_lse = _fa_forward(q, k, v, softmax_scale, block_causal, backend=backend)
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
         if step + 1 != comm.world_size:
@@ -257,7 +250,7 @@ def _ring_forward(group, q, k, v, softmax_scale, causal):
     return out, lse
 
 
-def _ring_backward(group, dout, q, k, v, out, lse, softmax_scale, causal):
+def _ring_backward(group, dout, q, k, v, out, lse, softmax_scale, causal, backend=None):
     kv_comm = RingComm(group)
     d_kv_comm = RingComm(group)
     dq = torch.zeros_like(q, dtype=torch.float32)
@@ -275,7 +268,7 @@ def _ring_backward(group, dout, q, k, v, out, lse, softmax_scale, causal):
 
         if not causal or step <= kv_comm.rank:
             block_causal = causal and step == 0
-            bdq, bdk, bdv = _fa_backward(dout, q, k, v, out, lse, softmax_scale, block_causal)
+            bdq, bdk, bdv = _fa_backward(dout, q, k, v, out, lse, softmax_scale, block_causal, backend=backend)
             dq += bdq
             if dk is None:
                 dk = bdk.to(torch.float32)
@@ -310,7 +303,7 @@ def _ring_backward(group, dout, q, k, v, out, lse, softmax_scale, causal):
 # concatenated along the sequence dim. This makes every ring step's causal      #
 # workload constant. ``q``/``k``/``v`` are ``(b, 2*local, h, d)``.              #
 # --------------------------------------------------------------------------- #
-def _zigzag_ring_forward(group, q, k, v, softmax_scale):
+def _zigzag_ring_forward(group, q, k, v, softmax_scale, backend=None):
     comm = RingComm(group)
     world = comm.world_size
     rank = comm.rank
@@ -330,19 +323,19 @@ def _zigzag_ring_forward(group, q, k, v, softmax_scale):
 
         if step == 0:
             # local KV vs local Q: causal over the full 2-block local sequence.
-            block_out, block_lse = _fa_forward(q, k, v, softmax_scale, True)
+            block_out, block_lse = _fa_forward(q, k, v, softmax_scale, True, backend=backend)
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
         elif step <= rank:
             # incoming KV is entirely earlier than both local Q blocks; only the
             # FIRST KV half is needed (the second KV half is later than q_low).
             k0 = k[:, :block]
             v0 = v[:, :block]
-            block_out, block_lse = _fa_forward(q, k0, v0, softmax_scale, False)
+            block_out, block_lse = _fa_forward(q, k0, v0, softmax_scale, False, backend=backend)
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
         else:
             # incoming KV is later than q_low but earlier than q_high; only the
             # SECOND Q half attends, to the full incoming KV.
-            block_out, block_lse = _fa_forward(q1, k, v, softmax_scale, False)
+            block_out, block_lse = _fa_forward(q1, k, v, softmax_scale, False, backend=backend)
             out, lse = update_out_and_lse(out, lse, block_out, block_lse, slice_=(slice(None), slice(block, None)))
 
         if step + 1 != world:
@@ -354,7 +347,7 @@ def _zigzag_ring_forward(group, q, k, v, softmax_scale):
     return out, lse
 
 
-def _zigzag_ring_backward(group, dout, q, k, v, out, lse, softmax_scale):
+def _zigzag_ring_backward(group, dout, q, k, v, out, lse, softmax_scale, backend=None):
     kv_comm = RingComm(group)
     d_kv_comm = RingComm(group)
     world = kv_comm.world_size
@@ -382,7 +375,7 @@ def _zigzag_ring_backward(group, dout, q, k, v, out, lse, softmax_scale):
     def bwd(dout_, q_, k_, v_, out_, lse_, causal):
         sq = q_.shape[1]
         skv = k_.shape[1]
-        if FA_BACKEND == "fa4":
+        if (backend or FA_BACKEND) == "fa4":
             _fa4_bwd(
                 q_,
                 k_,
@@ -472,15 +465,16 @@ def _zigzag_ring_backward(group, dout, q, k, v, out, lse, softmax_scale):
 
 class _RingFlashAttn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, group, q, k, v, softmax_scale, causal, zigzag):
+    def forward(ctx, group, q, k, v, softmax_scale, causal, zigzag, backend):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** -0.5
         if zigzag:
-            out, lse = _zigzag_ring_forward(group, q, k, v, softmax_scale)
+            out, lse = _zigzag_ring_forward(group, q, k, v, softmax_scale, backend=backend)
         else:
-            out, lse = _ring_forward(group, q, k, v, softmax_scale, causal)
+            out, lse = _ring_forward(group, q, k, v, softmax_scale, causal, backend=backend)
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.group = group
+        ctx.backend = backend
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.zigzag = zigzag
@@ -490,10 +484,14 @@ class _RingFlashAttn(torch.autograd.Function):
     def backward(ctx, dout):
         q, k, v, out, lse = ctx.saved_tensors
         if ctx.zigzag:
-            dq, dk, dv = _zigzag_ring_backward(ctx.group, dout, q, k, v, out, lse, ctx.softmax_scale)
+            dq, dk, dv = _zigzag_ring_backward(
+                ctx.group, dout, q, k, v, out, lse, ctx.softmax_scale, backend=ctx.backend
+            )
         else:
-            dq, dk, dv = _ring_backward(ctx.group, dout, q, k, v, out, lse, ctx.softmax_scale, ctx.causal)
-        return None, dq, dk, dv, None, None, None
+            dq, dk, dv = _ring_backward(
+                ctx.group, dout, q, k, v, out, lse, ctx.softmax_scale, ctx.causal, backend=ctx.backend
+            )
+        return None, dq, dk, dv, None, None, None, None
 
 
 def ring_flash_attn_func(
@@ -503,12 +501,12 @@ def ring_flash_attn_func(
     softmax_scale: Optional[float] = None,
     causal: bool = True,
     group: Optional[ProcessGroup] = None,
+    backend: Optional[str] = None,
 ) -> Tensor:
     """Plain ring attention. ``q/k/v`` are ``(b, s_local, h, d)``."""
-    if not _FA_AVAILABLE:
-        raise RuntimeError("ring_flash_attn_func requires a flash-attn backend (FA2 or FA4) to be installed.")
+    backend = resolve_ring_backend(backend)
     group = get_context_parallel_group() if group is None else group
-    return _RingFlashAttn.apply(group, q, k, v, softmax_scale, causal, False)
+    return _RingFlashAttn.apply(group, q, k, v, softmax_scale, causal, False, backend)
 
 
 def zigzag_ring_flash_attn_func(
@@ -518,17 +516,17 @@ def zigzag_ring_flash_attn_func(
     softmax_scale: Optional[float] = None,
     causal: bool = True,
     group: Optional[ProcessGroup] = None,
+    backend: Optional[str] = None,
 ) -> Tensor:
     """Balanced (zig-zag) causal ring attention.
 
     ``q/k/v`` are ``(b, 2*local, h, d)`` laid out so that dim-1 concatenates the
     two zig-zag blocks the rank owns (see ``.layout.zigzag_reorder``).
     """
-    if not _FA_AVAILABLE:
-        raise RuntimeError("zigzag_ring_flash_attn_func requires a flash-attn backend (FA2 or FA4) to be installed.")
+    backend = resolve_ring_backend(backend)
     assert causal, "zigzag ring attention is only defined for causal attention"
     group = get_context_parallel_group() if group is None else group
-    return _RingFlashAttn.apply(group, q, k, v, softmax_scale, causal, True)
+    return _RingFlashAttn.apply(group, q, k, v, softmax_scale, causal, True, backend)
 
 
 # --------------------------------------------------------------------------- #
@@ -536,16 +534,16 @@ def zigzag_ring_flash_attn_func(
 #                                                                              #
 # Packed sequences hold several documents back-to-back. Under USP each document #
 # is INDEPENDENTLY zig-zag split across the ``cp`` group (see                  #
-# ``.layout.zigzag_reorder_packed``): rank ``r`` holds, for every document, that  #
+# ``.layout.zigzag_reorder_varlen``): rank ``r`` holds, for every document, that  #
 # document's blocks ``r`` and ``2*cp-1-r`` concatenated. The local packed shard #
 # therefore has, per document, a ``front half`` (block r) and a ``back half``  #
 # (block 2*cp-1-r). ``cu_seqlens`` here are the LOCAL per-rank document offsets #
 # (each document's local length == doc_len / cp); every document length must be #
 # divisible by ``2 * cp``.                                                      #
 # --------------------------------------------------------------------------- #
-def _fa_varlen_forward(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale, causal):
+def _fa_varlen_forward(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale, causal, backend=None):
     """Varlen low-level FA forward returning ``(out, lse)`` with ``lse`` as ``(h, total)``."""
-    if FA_BACKEND == "fa4":
+    if (backend or FA_BACKEND) == "fa4":
         out, lse, *_ = _fa4_fwd(
             q,
             k,
@@ -581,8 +579,10 @@ def _fa_varlen_forward(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale, causal)
     return out, lse
 
 
-def _fa_varlen_backward(dout, q, k, v, out, lse, dq, dk, dv, cu_q, cu_k, max_q, max_k, softmax_scale, causal):
-    if FA_BACKEND == "fa4":
+def _fa_varlen_backward(
+    dout, q, k, v, out, lse, dq, dk, dv, cu_q, cu_k, max_q, max_k, softmax_scale, causal, backend=None
+):
+    if (backend or FA_BACKEND) == "fa4":
         _fa4_bwd(
             q,
             k,
@@ -630,43 +630,6 @@ def _fa_varlen_backward(dout, q, k, v, out, lse, dq, dk, dv, cu_q, cu_k, max_q, 
     )
 
 
-def _varlen_half_index(cu_seqlens: Tensor, front: bool) -> Tensor:
-    """Boolean mask selecting each document's front / back half.
-
-    ``cu_seqlens`` are the LOCAL packed offsets; each document occupies
-    ``[cu[i], cu[i+1])`` and is split at its midpoint.
-    """
-    total = int(cu_seqlens[-1].item())
-    index = torch.zeros((total,), dtype=torch.bool, device=cu_seqlens.device)
-    for i in range(len(cu_seqlens) - 1):
-        start = int(cu_seqlens[i].item())
-        end = int(cu_seqlens[i + 1].item())
-        mid = (start + end) // 2
-        if front:
-            index[start:mid] = True
-        else:
-            index[mid:end] = True
-    return index
-
-
-def _varlen_half_lse(lse: Tensor, cu_seqlens: Tensor, front: bool) -> Tensor:
-    """Take each document's front / back half of a ``(h, total)`` LSE."""
-    h = lse.shape[0]
-    total_half = int(cu_seqlens[-1].item()) // 2
-    new_lse = torch.empty((h, total_half), dtype=lse.dtype, device=lse.device)
-    for i in range(len(cu_seqlens) - 1):
-        start = int(cu_seqlens[i].item())
-        end = int(cu_seqlens[i + 1].item())
-        seqlen = end - start
-        new_start, new_end = start // 2, end // 2
-        if front:
-            src_start, src_end = start, end - seqlen // 2
-        else:
-            src_start, src_end = start + seqlen // 2, end
-        new_lse[:, new_start:new_end] = lse[:, src_start:src_end]
-    return new_lse
-
-
 def _update_out_and_lse_varlen(out, lse, block_out, block_lse, index=None):
     """Online-softmax merge for varlen tensors.
 
@@ -689,7 +652,7 @@ def _update_out_and_lse_varlen(out, lse, block_out, block_lse, index=None):
     return out, lse
 
 
-def _zigzag_ring_varlen_forward(group, q, k, v, cu_seqlens, max_seqlen, half0, half1, softmax_scale):
+def _zigzag_ring_varlen_forward(group, q, k, v, cu_seqlens, max_seqlen, half0, half1, softmax_scale, backend=None):
     comm = RingComm(group)
     world = comm.world_size
     rank = comm.rank
@@ -710,7 +673,7 @@ def _zigzag_ring_varlen_forward(group, q, k, v, cu_seqlens, max_seqlen, half0, h
 
         if step == 0:
             block_out, block_lse = _fa_varlen_forward(
-                q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, softmax_scale, True
+                q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, softmax_scale, True, backend=backend
             )
             block_out = block_out.to(torch.float32)
             lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)  # (total, h, 1)
@@ -719,12 +682,12 @@ def _zigzag_ring_varlen_forward(group, q, k, v, cu_seqlens, max_seqlen, half0, h
             k0 = k[half0]
             v0 = v[half0]
             block_out, block_lse = _fa_varlen_forward(
-                q, k0, v0, cu_seqlens, half_cu, max_seqlen, half_max, softmax_scale, False
+                q, k0, v0, cu_seqlens, half_cu, max_seqlen, half_max, softmax_scale, False, backend=backend
             )
             out, lse = _update_out_and_lse_varlen(out, lse, block_out, block_lse)
         else:
             block_out, block_lse = _fa_varlen_forward(
-                q1, k, v, half_cu, cu_seqlens, half_max, max_seqlen, softmax_scale, False
+                q1, k, v, half_cu, cu_seqlens, half_max, max_seqlen, softmax_scale, False, backend=backend
             )
             out, lse = _update_out_and_lse_varlen(out, lse, block_out, block_lse, index=half1)
 
@@ -737,7 +700,9 @@ def _zigzag_ring_varlen_forward(group, q, k, v, cu_seqlens, max_seqlen, half0, h
     return out, lse
 
 
-def _zigzag_ring_varlen_backward(group, dout, q, k, v, out, lse, cu_seqlens, max_seqlen, half0, half1, softmax_scale):
+def _zigzag_ring_varlen_backward(
+    group, dout, q, k, v, out, lse, cu_seqlens, max_seqlen, half0, half1, softmax_scale, backend=None
+):
     kv_comm = RingComm(group)
     d_kv_comm = RingComm(group)
     world = kv_comm.world_size
@@ -750,7 +715,7 @@ def _zigzag_ring_varlen_backward(group, dout, q, k, v, out, lse, cu_seqlens, max
     dout1 = dout[half1]
     q1 = q[half1]
     out1 = out[half1]
-    lse1 = _varlen_half_lse(lse, cu_seqlens, front=False).contiguous()
+    lse1 = lse[:, half1].contiguous()
 
     dq = None
     dk = None
@@ -788,6 +753,7 @@ def _zigzag_ring_varlen_backward(group, dout, q, k, v, out, lse, cu_seqlens, max
                 max_seqlen,
                 softmax_scale,
                 True,
+                backend=backend,
             )
             dq = dq_b.to(torch.float32)
             dk = dk_b.to(torch.float32)
@@ -812,6 +778,7 @@ def _zigzag_ring_varlen_backward(group, dout, q, k, v, out, lse, cu_seqlens, max
                     half_max,
                     softmax_scale,
                     False,
+                    backend=backend,
                 )
                 dq += dq_b
             else:
@@ -831,6 +798,7 @@ def _zigzag_ring_varlen_backward(group, dout, q, k, v, out, lse, cu_seqlens, max
                     max_seqlen,
                     softmax_scale,
                     False,
+                    backend=backend,
                 )
                 dq[half1] += dq_b[:block]
 
@@ -863,16 +831,17 @@ def _zigzag_ring_varlen_backward(group, dout, q, k, v, out, lse, cu_seqlens, max
 
 class _ZigzagRingVarlenFlashAttn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, group, q, k, v, cu_seqlens, max_seqlen, softmax_scale):
+    def forward(ctx, group, q, k, v, cu_seqlens, max_seqlen, softmax_scale, half0, half1, backend):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** -0.5
         k = k.contiguous()
         v = v.contiguous()
-        half0 = _varlen_half_index(cu_seqlens, front=True)
-        half1 = _varlen_half_index(cu_seqlens, front=False)
-        out, lse = _zigzag_ring_varlen_forward(group, q, k, v, cu_seqlens, max_seqlen, half0, half1, softmax_scale)
+        out, lse = _zigzag_ring_varlen_forward(
+            group, q, k, v, cu_seqlens, max_seqlen, half0, half1, softmax_scale, backend=backend
+        )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens, half0, half1)
         ctx.group = group
+        ctx.backend = backend
         ctx.softmax_scale = softmax_scale
         ctx.max_seqlen = max_seqlen
         return out
@@ -881,9 +850,21 @@ class _ZigzagRingVarlenFlashAttn(torch.autograd.Function):
     def backward(ctx, dout):
         q, k, v, out, lse, cu_seqlens, half0, half1 = ctx.saved_tensors
         dq, dk, dv = _zigzag_ring_varlen_backward(
-            ctx.group, dout, q, k, v, out, lse, cu_seqlens, ctx.max_seqlen, half0, half1, ctx.softmax_scale
+            ctx.group,
+            dout,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            cu_seqlens,
+            ctx.max_seqlen,
+            half0,
+            half1,
+            ctx.softmax_scale,
+            backend=ctx.backend,
         )
-        return None, dq, dk, dv, None, None, None
+        return None, dq, dk, dv, None, None, None, None, None, None
 
 
 def zigzag_ring_flash_attn_varlen_func(
@@ -895,6 +876,8 @@ def zigzag_ring_flash_attn_varlen_func(
     softmax_scale: Optional[float] = None,
     causal: bool = True,
     group: Optional[ProcessGroup] = None,
+    half_indices: Optional[Tuple[Tensor, Tensor]] = None,
+    backend: Optional[str] = None,
 ) -> Tensor:
     """Balanced (zig-zag) causal ring attention for packed (varlen) sequences.
 
@@ -902,51 +885,46 @@ def zigzag_ring_flash_attn_varlen_func(
     every document, this rank's two zig-zag block halves. ``cu_seqlens`` are the
     LOCAL per-rank document offsets and every document's local length must be
     even (its global length divisible by ``2 * cp_size``). See
-    ``.layout.zigzag_reorder_packed``.
+    ``.layout.zigzag_reorder_varlen``.
     """
-    if not _FA_AVAILABLE:
-        raise RuntimeError("zigzag_ring_flash_attn_varlen_func requires a flash-attn backend (FA2 or FA4).")
+    backend = resolve_ring_backend(backend)
     assert causal, "zigzag ring attention is only defined for causal attention"
     group = get_context_parallel_group() if group is None else group
-    return _ZigzagRingVarlenFlashAttn.apply(group, q, k, v, cu_seqlens, max_seqlen, softmax_scale)
+    if half_indices is None:
+        # Direct kernel callers can prepare once themselves; production supplies
+        # collator metadata and never copies sequence lengths from the device.
+        from .layout import prepare_usp_metadata
+
+        metadata = prepare_usp_metadata(cu_seqlens.cpu(), cp_size=1)
+        half_indices = (metadata["usp_half0"].to(q.device), metadata["usp_half1"].to(q.device))
+    return _ZigzagRingVarlenFlashAttn.apply(
+        group, q, k, v, cu_seqlens, max_seqlen, softmax_scale, *half_indices, backend
+    )
 
 
-def forward(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    softmax_scale: Optional[float] = None,
-    causal: bool = True,
-    group: Optional[ProcessGroup] = None,
-    dropout_p: float = 0.0,
-) -> Tensor:
-    """Run balanced causal Ring Attention on fixed-shape CUDA tensors."""
+def forward(q, k, v, softmax_scale=None, causal=True, group=None, dropout_p=0.0, backend=None):
+    """Run dense GPU Ring using the requested FlashAttention backend."""
     if dropout_p:
-        raise NotImplementedError("CUDA Ring Attention does not support nonzero dropout.")
-    return zigzag_ring_flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=causal, group=group)
+        raise NotImplementedError("GPU Ring does not support dropout")
+    return zigzag_ring_flash_attn_func(q, k, v, softmax_scale, causal, group, backend=backend)
 
 
 def packed_forward(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    cu_seqlens: Tensor,
-    max_seqlen: int,
-    softmax_scale: Optional[float] = None,
-    causal: bool = True,
-    group: Optional[ProcessGroup] = None,
-    dropout_p: float = 0.0,
-) -> Tensor:
-    """Run balanced causal Ring Attention on packed CUDA tensors."""
+    q,
+    k,
+    v,
+    cu_seqlens,
+    max_seqlen,
+    softmax_scale=None,
+    causal=True,
+    group=None,
+    dropout_p=0.0,
+    half_indices=None,
+    backend=None,
+):
+    """Run packed GPU Ring with CPU-precomputed collator metadata."""
     if dropout_p:
-        raise NotImplementedError("CUDA Ring Attention does not support nonzero dropout.")
+        raise NotImplementedError("GPU Ring does not support dropout")
     return zigzag_ring_flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_seqlens,
-        max_seqlen,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        group=group,
+        q, k, v, cu_seqlens, max_seqlen, softmax_scale, causal, group, half_indices=half_indices, backend=backend
     )

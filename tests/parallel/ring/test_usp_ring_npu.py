@@ -21,9 +21,11 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.common_utils import run_tests
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed import parallel_state as PS
 from veomni.distributed.sequence_parallel.ring_attention.layout import (
     local_cu_seqlens,
+    prepare_usp_metadata,
     zigzag_reorder,
     zigzag_reorder_packed,
 )
@@ -35,7 +37,8 @@ from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torc
 from veomni.utils.import_utils import is_torch_npu_available
 
 
-pytestmark = pytest.mark.skipif(not is_torch_npu_available(), reason="torch_npu is required")
+if not is_torch_npu_available():
+    pytest.skip("torch_npu is required", allow_module_level=True)
 
 _ATOL = 8e-2
 _RTOL = 6e-2
@@ -75,6 +78,9 @@ def _varlen_reference(
 
 
 class NPUZigzagRingTest(MultiProcessTestCase):
+    def ci_launch_plan(self):
+        return LaunchSpec(nproc=self.world_size)
+
     @property
     def world_size(self):
         return 2
@@ -180,7 +186,7 @@ class _AttentionModule(torch.nn.Module):
         self.is_causal = True
 
         class _Config:
-            _attn_implementation = "veomni_flash_attention_2_with_sp"
+            _attn_implementation = "veomni_flash_attention_2"
 
         self.config = _Config()
         self.layer_idx = 0
@@ -189,6 +195,9 @@ class _AttentionModule(torch.nn.Module):
 class NPUUSPAttentionTest(MultiProcessTestCase):
     ulysses_size = 2
     cp_size = 2
+
+    def ci_launch_plan(self):
+        return LaunchSpec(nproc=self.world_size)
 
     @property
     def world_size(self):
@@ -204,10 +213,10 @@ class NPUUSPAttentionTest(MultiProcessTestCase):
         dist.init_process_group(get_dist_comm_backend(), store=store, rank=self.rank, world_size=self.world_size)
         mesh = init_device_mesh(
             get_device_type(),
-            (self.ulysses_size, self.cp_size),
-            mesh_dim_names=("ulysses", "cp"),
+            (self.cp_size, self.ulysses_size),
+            mesh_dim_names=("cp", "ulysses"),
         )
-        mesh[("ulysses", "cp")]._flatten(mesh_dim_name="sp")
+        mesh[("cp", "ulysses")]._flatten(mesh_dim_name="sp")
         PS._PARALLEL_STATE = PS.ParallelState(
             cp_layout="zigzag",
             dp_size=1,
@@ -233,7 +242,7 @@ class NPUUSPAttentionTest(MultiProcessTestCase):
         return cp_region[:, ulysses_rank * ulysses_chunk : (ulysses_rank + 1) * ulysses_chunk].clone()
 
     def _run_unified_attention_case(self, packed: bool):
-        from veomni.ops.kernels.attention import flash_attention_forward
+        from veomni.ops.kernels.attention.standard.flash import flash_attention_forward
 
         mesh = self._init()
         device = get_device_type()
@@ -263,6 +272,13 @@ class NPUUSPAttentionTest(MultiProcessTestCase):
             return local.transpose(1, 2).contiguous()
 
         kwargs = {"cu_seq_lens_q": cu, "cu_seq_lens_k": cu} if packed else {}
+        if packed:
+            kwargs.update(
+                {
+                    name: value.to(device) if isinstance(value, torch.Tensor) else value
+                    for name, value in prepare_usp_metadata(cu.cpu(), self.cp_size).items()
+                }
+            )
         out, _ = flash_attention_forward(
             _AttentionModule().to(device),
             shard_bhsd(q),

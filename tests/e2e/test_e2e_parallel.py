@@ -8,24 +8,29 @@ import pytest
 import torch
 import yaml
 
-from veomni.models.auto import build_foundation_model
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
+from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec, runner_capabilities, runner_device_count
+from scripts.ci.accelerator.runtime.devices import child_environment
+from scripts.ci.accelerator.scheduler import DeviceJob
+from veomni.models import build_foundation_model
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability, get_torch_device
 from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available
 
-from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
+from ..tools import DummyDataset, ParallelConfig, build_torchrun_cmd, compare_metrics, print_comparison_table
 from ..tools.training_utils import make_eager_ops_config
-from .utils import prepare_exec_cmd
+from .utils import alignment_case_plan, alignment_plan, prepare_exec_cmd
+
+
+_QWEN4_LAUNCH = LaunchSpec(nproc=2)
+_LORA_PARALLEL = dict(is_moe=False, max_sp_size=1)
+_DYN_PARALLEL = dict(is_moe=True, min_sp_size=2, max_sp_size=2, max_ep_size=1)
+_DEEPSEEK_V4_EP_PARALLEL = dict(is_moe=True, max_sp_size=1, max_ep_size=2)
+_DEEPSEEK_V4_COMPILE_LAUNCH = LaunchSpec(nproc=4)
 
 
 # Models without a patchgen path are commented out in their respective case
 # lists with a TODO; uncomment once the corresponding model gains a v5
 # patchgen path.
 _dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires diffusers")
-# Qwen3.5 GatedDeltaNet has no NPU kernel today; eager-only path also requires
-# non-varlen training (dyn_bsz=False), but the e2e command uses dyn_bsz=True.
-_qwen3_5_npu_skip = pytest.mark.skipif(
-    IS_NPU_AVAILABLE, reason="Qwen3.5 GatedDeltaNet has no NPU backend (varlen path)"
-)
 _qwen_image_npu_skip = pytest.mark.skipif(IS_NPU_AVAILABLE, reason="Qwen-Image training is GPU-only for now")
 
 
@@ -54,6 +59,26 @@ _DEEPSEEK_V4_TILELANG_TRAINING_ARGS = [
     "--model.ops_implementation.dsa_indexer_implementation=tilelang",
     "--model.ops_implementation.dsa_attention_implementation=tilelang",
     "--model.ops_implementation.mhc_implementation=tilelang",
+]
+
+_QWEN4_EXP_CONFIG = "./tests/toy_config/qwen4_exp_toy/config.json"
+_ACCELERATOR = get_torch_device()
+# GatedDeltaNet under Ulysses SP rejects eager, so both hardware paths need a varlen kernel:
+# flash-linear-attention on CUDA, torch_npu plus the vendored Triton-Ascend kernels on Ascend.
+_QWEN4_EXP_RMS = "fla" if IS_CUDA_AVAILABLE else "torch_npu"
+_QWEN4_EXP_VARLEN = "fla" if IS_CUDA_AVAILABLE else "triton"
+_QWEN4_EXP_TRAINING_ARGS = [
+    "--model.ops_implementation.attn_implementation=flash_attention_2",
+    f"--model.ops_implementation.qsa_attention_implementation={'tilelang' if IS_CUDA_AVAILABLE else 'eager'}",
+    f"--model.ops_implementation.rms_norm_gated_implementation={_QWEN4_EXP_RMS}",
+    f"--model.ops_implementation.causal_conv1d_implementation={_QWEN4_EXP_VARLEN}",
+    f"--model.ops_implementation.chunk_gated_delta_rule_implementation={_QWEN4_EXP_VARLEN}",
+    "--model.accelerator.extra_parallel_names=ple",
+    "--model.accelerator.extra_parallel_sizes=2",
+    "--model.accelerator.extra_parallel_placement_innermost=false",
+    "--model.broadcast_model_weights_from_rank0=false",
+    "--model.ep_sharded_stream_load=true",
+    "--train.enable_batch_invariant_mode=False",
 ]
 
 
@@ -86,23 +111,14 @@ def main(
     train_path: str,
     max_sp_size: int | None = None,
     max_ep_size: int | None = None,
+    min_sp_size: int | None = None,
     compare_alignment: bool = True,
     extra_args: list[str] | None = None,
 ):
-    test_path = f"./{model_name}"
+    test_path = f"./{model_name}_{os.getpid()}"
     os.makedirs(test_path, exist_ok=True)
 
-    # Models with stacked 3D expert params (gate_up_proj [E, 2*I, H], down_proj [E, H, I]):
-    #
-    # - qwen3_5_moe: native HF safetensor format is already stacked. HF's save_pretrained() with
-    #   save_original_format=True calls revert_weight_conversion() that splits them into per-expert
-    #   keys (experts.*.gate_proj.weight, etc.), but VeOmni has no runtime converter for this model.
-    #   Disable save_original_format to save in native stacked format.
-    #
-    # - qwen3_moe (v5): VeOmni registers a runtime CheckpointTensorConverter that merges per-expert
-    #   HF keys back to fused format at load time, so save_original_format=True works correctly.
-    save_original_format = model_name != "qwen3_5_moe"
-    _materialize_weights_dir(config_path, test_path, save_original_format=save_original_format)
+    _materialize_weights_dir(config_path, test_path)
 
     test_tasks = [task_name]
     command_list = prepare_exec_cmd(
@@ -115,6 +131,7 @@ def main(
         is_moe=is_moe,
         max_sp_size=max_sp_size,
         max_ep_size=max_ep_size,
+        min_sp_size=min_sp_size,
     )
     if len(command_list) < 1:
         raise AssertionError("Training tests require at least one parallel mode.")
@@ -122,21 +139,33 @@ def main(
         raise AssertionError(
             "Alignment tests require at least two parallel modes. Use a smoke test for single-mode coverage."
         )
-    res = {}
-    log_keys = []
-    for task_name, cmd_kwargs in command_list:
-        print(f"{'-' * 10} {task_name} {'-' * 10}")
+
+    def execute(job, assigned):
+        task_name, cmd_kwargs = job.payload
         if extra_args:
             cmd_kwargs["extra_args"] = [*cmd_kwargs.get("extra_args", []), *extra_args]
         cmd = build_torchrun_cmd(**cmd_kwargs)
-        subprocess.run(cmd, check=True)
+        env = os.environ.copy()
+        if assigned:
+            env = child_environment(runner_capabilities(), assigned, environ=env)
+        subprocess.run(cmd, check=True, env=env)
         with open(os.path.join(test_path, f"{task_name}/log_dict.json")) as f:
-            output = json.load(f)
-        if not log_keys:
-            log_keys = set(output.keys())
-        else:
-            assert log_keys == set(output.keys())
-        res[task_name] = output
+            return json.load(f)
+
+    # Execute modes sequentially so each case's runtime peak matches its
+    # sequential CasePlan (allowing two 4-GPU E2E cases to run concurrently).
+    jobs = [DeviceJob(name, kwargs["nproc"], (name, kwargs)) for name, kwargs in command_list]
+    res = {job.name: execute(job, []) for job in jobs}
+    assert res and all(res.values()), f"[{model_name}] empty log_dict results: {res}"
+    log_keys = set(next(iter(res.values())))
+    assert log_keys, f"[{model_name}] no metric keys recorded in log_dict"
+    assert all(set(values) == log_keys for values in res.values())
+    for run_name, run_metrics in res.items():
+        step_lengths = {k: len(v) for k, v in run_metrics.items()}
+        assert all(n > 0 for n in step_lengths.values()), f"[{run_name}] empty metric step list: {step_lengths}"
+        assert len(set(step_lengths.values())) == 1, (
+            f"[{run_name}] inconsistent step counts across keys: {step_lengths}"
+        )
 
     if compare_alignment:
         assert len(res) >= 2, "Alignment tests require at least two completed runs."
@@ -199,6 +228,15 @@ text_test_cases = [
         None,  # max_sp_size
         None,  # max_ep_size
     ),
+    pytest.param(
+        "glm_moe_dsa",
+        "./tests/toy_config/glm_moe_dsa_toy",
+        True,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        1,  # max_sp_size: the DSA attention / indexer has no sequence-parallel path
+        None,  # max_ep_size
+    ),
 ]
 
 deepseek_v4_text_smoke_test_cases = [
@@ -208,14 +246,9 @@ deepseek_v4_text_smoke_test_cases = [
         True,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        # DeepSeek-V4 uses an eager/TileLang SP path (Q Ulysses + MQA sequence
-        # gather around compressors). Exercise SP=1 vs SP=2 alignment.
-        2,
-        # The GPU fused-MoE path now preserves DeepSeek-V4's ``swiglu_limit``
-        # clamp, so keep the smoke test on the default fused_triton MoE path.
-        # EP remains disabled here because the surrounding V4 e2e coverage is
-        # an SP alignment smoke test, not an EP alignment test.
-        1,
+        2,  # min_sp_size: SP=1 is already covered by test_deepseek_v4_expert_parallel_alignment
+        2,  # max_sp_size
+        1,  # max_ep_size
     ),
     pytest.param(
         "gpt_oss",
@@ -223,6 +256,7 @@ deepseek_v4_text_smoke_test_cases = [
         True,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        2,  # min_sp_size: retain both non-EP Quack and EP grouped-GEMM training
         None,  # max_sp_size
         None,  # max_ep_size
         marks=_gpt_oss_fa4_quack_skip,
@@ -283,7 +317,6 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
-        marks=_qwen3_5_npu_skip,
     ),
     pytest.param(
         "qwen3_5",
@@ -292,7 +325,6 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
-        marks=_qwen3_5_npu_skip,
     ),
 ]
 
@@ -335,19 +367,6 @@ qwen_image_dit_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         2,  # Ulysses SP enabled via QwenImageSPAttnProcessor + forward patch.
-        marks=[_dit_only, _qwen_image_npu_skip],
-    ),
-]
-
-# Reuses the toy model config; only the dataset differs (odd seq lens).
-qwen_image_dit_padding_test_cases = [
-    pytest.param(
-        "qwen_image",
-        "./tests/toy_config/qwen_image_toy/config.json",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        2,
         marks=[_dit_only, _qwen_image_npu_skip],
     ),
 ]
@@ -441,6 +460,7 @@ def dummy_qwen_image_padding_dataset():
     del dummy_dataset
 
 
+@pytest.mark.launch_plan(provider=alignment_case_plan)
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size, max_ep_size", text_test_cases)
 def test_text_parallel_align(
     model_name: str,
@@ -465,8 +485,19 @@ def test_text_parallel_align(
     )
 
 
+@pytest.mark.launch_plan(
+    provider=lambda context: alignment_plan(
+        context.capabilities,
+        **{
+            key: context.params[key]
+            for key in ("is_moe", "min_sp_size", "max_sp_size", "max_ep_size", "model_name")
+            if key in context.params
+        },
+    )
+)
 @pytest.mark.parametrize(
-    "model_name, config_path, is_moe, rtol, atol, max_sp_size, max_ep_size", deepseek_v4_text_smoke_test_cases
+    "model_name, config_path, is_moe, rtol, atol, min_sp_size, max_sp_size, max_ep_size",
+    deepseek_v4_text_smoke_test_cases,
 )
 def test_text_parallel_smoke(
     model_name: str,
@@ -474,6 +505,7 @@ def test_text_parallel_smoke(
     is_moe: bool,
     rtol: float,
     atol: float,
+    min_sp_size: int | None,
     max_sp_size: int | None,
     max_ep_size: int | None,
     dummy_text_dataset,
@@ -486,12 +518,91 @@ def test_text_parallel_smoke(
         rtol=rtol,
         atol=atol,
         train_path=dummy_text_dataset,
+        min_sp_size=min_sp_size,
         max_sp_size=max_sp_size,
         max_ep_size=max_ep_size,
         compare_alignment=False,
     )
 
 
+@pytest.mark.launch_plan(provider=lambda context: alignment_plan(context.capabilities, **_DEEPSEEK_V4_EP_PARALLEL))
+def test_deepseek_v4_expert_parallel_alignment(dummy_deepseek_v4_dense_packed_text_dataset):
+    """Compare two optimizer steps with EP=1/2 on the same four-rank FSDP2 job.
+
+    Keep SP disabled so this explicitly validates expert sharding and token
+    dispatch rather than conflating it with the existing SP-only smoke test.
+    Eager DSA/mHC work on the SM89 CI fleet; routed MoE stays fused.
+    """
+    main(
+        task_name="train_text_test",
+        model_name="deepseek_v4",
+        config_path="./tests/toy_config/deepseek_v4_toy",
+        is_moe=_DEEPSEEK_V4_EP_PARALLEL["is_moe"],
+        rtol=_DEFAULT_RTOL,
+        atol=_DEFAULT_ATOL,
+        train_path=dummy_deepseek_v4_dense_packed_text_dataset,
+        max_sp_size=_DEEPSEEK_V4_EP_PARALLEL["max_sp_size"],
+        max_ep_size=_DEEPSEEK_V4_EP_PARALLEL["max_ep_size"],
+        compare_alignment=True,
+        extra_args=[
+            "--model.ops_implementation.dsa_indexer_implementation=eager",
+            "--model.ops_implementation.dsa_attention_implementation=eager",
+            "--model.ops_implementation.mhc_implementation=eager",
+        ],
+    )
+
+
+@pytest.mark.skipif(
+    not IS_CUDA_AVAILABLE or runner_device_count() < _DEEPSEEK_V4_COMPILE_LAUNCH.nproc,
+    reason="DeepSeek V4 compiled trainer parity requires four CUDA devices",
+)
+@pytest.mark.launch_plan(provider=CasePlan.sequential(_DEEPSEEK_V4_COMPILE_LAUNCH, _DEEPSEEK_V4_COMPILE_LAUNCH))
+def test_deepseek_v4_compiled_fsdp2_training_alignment(dummy_deepseek_v4_dense_packed_text_dataset, tmp_path):
+    """Compare eager/Inductor through packed FSDP2 training, with EP off."""
+    config = "./tests/toy_config/deepseek_v4_toy"
+    weights = tmp_path / "weights"
+    _materialize_weights_dir(config, str(weights))
+    results = {}
+    for enabled in (False, True):
+        name = "inductor" if enabled else "eager"
+        output = tmp_path / name
+        cmd = build_torchrun_cmd(
+            script="tests/train_scripts/train_text_test.py",
+            config_path=config,
+            model_path=str(weights),
+            train_path=dummy_deepseek_v4_dense_packed_text_dataset,
+            output_dir=str(output),
+            parallel_config=ParallelConfig(sp_size=1, ep_size=1, fsdp_mode="fsdp2"),
+            nproc=_DEEPSEEK_V4_COMPILE_LAUNCH.nproc,
+            model_name="deepseek_v4",
+            extra_args=[
+                "--data.max_seq_len=512",
+                "--data.dataloader.num_workers=0",
+                "--train.dyn_bsz=True",
+                "--train.pad_to_length=True",
+                f"--model.accelerator.torch_compile.enable={enabled}",
+                "--model.accelerator.torch_compile.fullgraph=True",
+                "--model.ops_implementation.rms_norm_implementation=eager",
+                "--model.ops_implementation.swiglu_mlp_implementation=eager",
+                "--model.ops_implementation.cross_entropy_loss_implementation=eager",
+                "--model.ops_implementation.rotary_pos_emb_implementation=eager",
+                "--model.ops_implementation.dsa_indexer_implementation=eager",
+                "--model.ops_implementation.dsa_attention_implementation=eager",
+                "--model.ops_implementation.mhc_implementation=eager",
+            ],
+        )
+        subprocess.run(cmd, check=True)
+        with open(output / "log_dict.json") as f:
+            results[name] = json.load(f)
+        assert results[name] and all(
+            len(values) == 2 and torch.isfinite(torch.tensor(values)).all() for values in results[name].values()
+        )
+    for metric in results["eager"]:
+        print_comparison_table(results, metric, title="DeepSeek V4 FSDP2 compile")
+    compare_metrics(results, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.launch_plan(provider=lambda context: alignment_plan(context.capabilities, **_DYN_PARALLEL))
 @_deepseek_v4_tilelang_skip
 @pytest.mark.parametrize("dataset_fixture, case_args", deepseek_v4_tilelang_dyn_bsz_test_cases)
 def test_deepseek_v4_tilelang_dyn_bsz_smoke(
@@ -504,17 +615,19 @@ def test_deepseek_v4_tilelang_dyn_bsz_smoke(
         task_name="train_text_test",
         model_name="deepseek_v4",
         config_path="./tests/toy_config/deepseek_v4_toy",
-        is_moe=True,
+        is_moe=_DYN_PARALLEL["is_moe"],
         rtol=_DEFAULT_RTOL,
         atol=_DEFAULT_ATOL,
         train_path=request.getfixturevalue(dataset_fixture),
-        max_sp_size=2,
-        max_ep_size=1,
+        min_sp_size=_DYN_PARALLEL["min_sp_size"],
+        max_sp_size=_DYN_PARALLEL["max_sp_size"],
+        max_ep_size=_DYN_PARALLEL["max_ep_size"],
         compare_alignment=False,
         extra_args=[*_DEEPSEEK_V4_TILELANG_TRAINING_ARGS, *case_args],
     )
 
 
+@pytest.mark.launch_plan(provider=alignment_case_plan)
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", qwen2vl_test_cases)
 def test_qwen2vl_parallel_align(
     model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_qwen2vl_dataset
@@ -530,6 +643,7 @@ def test_qwen2vl_parallel_align(
     )
 
 
+@pytest.mark.launch_plan(provider=alignment_case_plan)
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", qwen3vl_test_cases)
 def test_qwen3vl_parallel_align(
     model_name: str,
@@ -552,6 +666,7 @@ def test_qwen3vl_parallel_align(
     )
 
 
+@pytest.mark.launch_plan(provider=lambda context: alignment_plan(context.capabilities, **_LORA_PARALLEL))
 def test_qwen3vl_lora_smoke(dummy_qwen3vl_dataset, tmp_path):
     lora_config_path = tmp_path / "qwen3vl_lora_smoke.yaml"
     lora_config_path.write_text(
@@ -571,11 +686,11 @@ def test_qwen3vl_lora_smoke(dummy_qwen3vl_dataset, tmp_path):
         task_name="train_vlm_test",
         model_name="qwen3vl",
         config_path="./tests/toy_config/qwen3vl_toy",
-        is_moe=False,
+        is_moe=_LORA_PARALLEL["is_moe"],
         rtol=_DEFAULT_RTOL,
         atol=_DEFAULT_ATOL,
         train_path=dummy_qwen3vl_dataset,
-        max_sp_size=1,
+        max_sp_size=_LORA_PARALLEL["max_sp_size"],
         compare_alignment=False,
         extra_args=[
             str(lora_config_path),
@@ -590,6 +705,56 @@ def test_qwen3vl_lora_smoke(dummy_qwen3vl_dataset, tmp_path):
     )
 
 
+@pytest.mark.skipif(
+    not _ACCELERATOR.is_available() or runner_device_count() < 2,
+    reason="Qwen4-Exp VLM SFT pipeline smoke requires two CUDA or NPU devices",
+)
+@pytest.mark.launch_plan(provider=_QWEN4_LAUNCH)
+def test_qwen4_exp_training_smoke(tmp_path):
+    """Exercise toy Qwen4-Exp VLM SFT with PLE=2, EP=2, and SP=2."""
+    model_path = tmp_path / "model"
+    output_dir = tmp_path / "output"
+    _materialize_weights_dir(_QWEN4_EXP_CONFIG, str(model_path), save_original_format=False)
+
+    dummy_dataset = DummyDataset(
+        num_samples=8,
+        seq_len=64,
+        dataset_type="qwen4exp",
+        cache_name=f"qwen4_exp_pipeline_{tmp_path.name}",
+    )
+    try:
+        cmd = build_torchrun_cmd(
+            script="tests/train_scripts/train_vlm_test.py",
+            config_path=_QWEN4_EXP_CONFIG,
+            model_path=str(model_path),
+            train_path=dummy_dataset.save_path,
+            output_dir=str(output_dir),
+            parallel_config=ParallelConfig(sp_size=2, ep_size=2, fsdp_mode="fsdp2"),
+            nproc=_QWEN4_LAUNCH.nproc,
+            extra_args=[
+                *_QWEN4_EXP_TRAINING_ARGS,
+                "--data.max_seq_len=64",
+                "--train.global_batch_size=4",
+                "--model.accelerator.gradient_checkpointing.enable=false",
+                "--model.optimizer.lr=0.01",
+            ],
+            model_name="qwen4_exp",
+        )
+        env = dict(os.environ)
+        if IS_NPU_AVAILABLE:
+            env.setdefault("HCCL_HOST_SOCKET_PORT_RANGE", "auto")
+            env.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", "auto")
+        subprocess.run(cmd, check=True, env=env)
+
+        with open(output_dir / "log_dict.json") as f:
+            result = json.load(f)
+        assert result
+        assert all(values and torch.isfinite(torch.tensor(values)).all() for values in result.values())
+    finally:
+        dummy_dataset.clean_cache()
+
+
+@pytest.mark.launch_plan(provider=alignment_case_plan)
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", qwen2omni_test_cases)
 def test_qwen2omni_parallel_align(
     model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_qwen2omni_dataset
@@ -605,6 +770,7 @@ def test_qwen2omni_parallel_align(
     )
 
 
+@pytest.mark.launch_plan(provider=alignment_case_plan)
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", qwen3omni_test_cases)
 def test_qwen3omni_parallel_align(
     model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_qwen3omni_dataset
@@ -620,50 +786,7 @@ def test_qwen3omni_parallel_align(
     )
 
 
-def test_wan_dit_uses_bfloat16_and_flash_attention():
-    command_list = prepare_exec_cmd(
-        ["train_dit_test"],
-        "wan_t2v",
-        "./tests/toy_config/wan_t2v_toy",
-        model_path="./wan_t2v",
-        train_path="./dummy_wan_t2v",
-        output_dir="./wan_t2v",
-        is_moe=False,
-        max_sp_size=1,
-    )
-
-    assert command_list
-    for _, cmd_kwargs in command_list:
-        cmd = build_torchrun_cmd(**cmd_kwargs)
-        assert cmd_kwargs["extra_args"] == [
-            "--model.accelerator.fsdp_config.mixed_precision.enable=True",
-            "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
-            "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
-        ]
-        assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
-
-
-@_gpt_oss_fa4_quack_skip
-def test_gpt_oss_parallel_uses_fa4_and_quack():
-    command_list = prepare_exec_cmd(
-        ["train_text_test"],
-        "gpt_oss",
-        "./tests/toy_config/gpt_oss_toy",
-        model_path="./gpt_oss",
-        train_path="./dummy_text",
-        output_dir="./gpt_oss",
-        is_moe=True,
-    )
-
-    assert command_list
-    assert {cmd_kwargs["parallel_config"].ep_size for _, cmd_kwargs in command_list} == {1, 2}
-    assert {cmd_kwargs["parallel_config"].sp_size for _, cmd_kwargs in command_list} == {1, 2}
-    for _, cmd_kwargs in command_list:
-        cmd = build_torchrun_cmd(**cmd_kwargs)
-        assert "--model.ops_implementation.attn_implementation=flash_attention_4" in cmd
-        assert "--model.ops_implementation.moe_implementation=fused_quack" in cmd
-
-
+@pytest.mark.launch_plan(provider=alignment_case_plan)
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", wan_dit_test_cases)
 def test_wan_dit_parallel_align(
     model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_wan_t2v_dataset
@@ -682,6 +805,7 @@ def test_wan_dit_parallel_align(
     )
 
 
+@pytest.mark.launch_plan(provider=alignment_case_plan)
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", qwen_image_dit_test_cases)
 def test_qwen_image_dit_parallel_align(
     model_name: str,
@@ -691,42 +815,48 @@ def test_qwen_image_dit_parallel_align(
     atol: float,
     max_sp_size: int,
     dummy_qwen_image_dataset,
-):
-    """Validate that QwenImageTransformer2DModel loss and grad_norm are identical
-    with and without Ulysses sequence-parallelism at equal DP sizes.
-    """
-    main(
-        task_name="train_dit_test",
-        model_name=model_name,
-        config_path=config_path,
-        is_moe=is_moe,
-        rtol=rtol,
-        atol=atol,
-        train_path=dummy_qwen_image_dataset,
-        max_sp_size=max_sp_size,
-    )
-
-
-@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", qwen_image_dit_padding_test_cases)
-def test_qwen_image_dit_parallel_align_padding(
-    model_name: str,
-    config_path: str,
-    is_moe: bool,
-    rtol: float,
-    atol: float,
-    max_sp_size: int,
     dummy_qwen_image_padding_dataset,
 ):
-    """SP-vs-no-SP alignment with non-``sp_size``-divisible image/text lengths,
-    exercising the Ulysses-SP pad/truncate path that the default 16/8 case skips.
+    """Validate that QwenImageTransformer2DModel loss and grad_norm are identical
+    with and without Ulysses sequence-parallelism for both unpadded (16/8) and
+    padded (non-sp_size-divisible) image/text sequence lengths, reusing the same
+    process launches.
     """
-    main(
-        task_name="train_dit_test",
-        model_name=model_name,
-        config_path=config_path,
+    test_path = f"./{model_name}_{os.getpid()}"
+    os.makedirs(test_path, exist_ok=True)
+    _materialize_weights_dir(config_path, test_path)
+
+    command_list = prepare_exec_cmd(
+        ["train_dit_test"],
+        model_name,
+        config_path,
+        model_path=test_path,
+        train_path=dummy_qwen_image_dataset,
+        output_dir=test_path,
         is_moe=is_moe,
-        rtol=rtol,
-        atol=atol,
-        train_path=dummy_qwen_image_padding_dataset,
         max_sp_size=max_sp_size,
     )
+    unpadded_res = {}
+    padded_res = {}
+    try:
+        for task_name, cmd_kwargs in command_list:
+            cmd_kwargs["extra_args"] = [
+                *cmd_kwargs.get("extra_args", []),
+                f"--extra_train_path={dummy_qwen_image_padding_dataset}",
+            ]
+            cmd = build_torchrun_cmd(**cmd_kwargs)
+            subprocess.run(cmd, check=True, env=os.environ.copy())
+            with open(os.path.join(test_path, f"{task_name}/log_dict.json")) as f:
+                unpadded_res[task_name] = json.load(f)
+            with open(os.path.join(test_path, f"{task_name}_padding/log_dict.json")) as f:
+                padded_res[f"{task_name}_padding"] = json.load(f)
+
+        for label, res in (("unpadded", unpadded_res), ("padded", padded_res)):
+            assert len(res) >= 2 and all(res.values()), f"[{model_name}:{label}] empty log_dict: {res}"
+            log_keys = set(next(iter(res.values())))
+            assert all(set(values) == log_keys for values in res.values())
+            for key in log_keys:
+                print_comparison_table(res, key, title=f"{model_name} ({label})")
+            compare_metrics(res, rtol=rtol, atol=atol)
+    finally:
+        shutil.rmtree(test_path, ignore_errors=True)
