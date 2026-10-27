@@ -76,7 +76,7 @@ The sidecar bounds each custom or Merlin upload subprocess to 3,600 seconds by d
 | Config / integration | Effect |
 |-----|--------|
 | `npu_postprocess: true` (default) | Analyse the finalized raw capture in a detached sidecar; copy it when `trace_dir` is `hdfs://` |
-| `npu_upload: true` (default) | Upload through an explicit or platform file uploader without requiring a JobRun; `merlin-cli` fallback and automatic Trial association require a JobRun context |
+| `npu_upload: true` (default) | Upload through an explicit or platform file uploader without requiring a JobRun; `merlin-cli` fallback requires Merlin/Arnold upload context; association prefers `ARNOLD_TRIAL_ID` (`trial_id`), otherwise `RH2_JOB_RUN_ID` or `MERLIN_JOB_ID` (`job_id`) |
 | `VEOMNI_UPLOAD_CMD=...` | Optional explicit user uploader; the command is parsed as argv and runs on `trace_view.json.gz` (`{trace}` placeholder supported) |
 
 VeOmni waits for an automatically spawned sidecar for up to `npu_sidecar_wait_timeout` seconds when training ends. A timeout is non-fatal and leaves the raw local capture in place; for very large captures, use the manual postprocess command below while the pod remains alive.
