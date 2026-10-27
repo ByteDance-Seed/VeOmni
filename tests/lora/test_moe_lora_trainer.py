@@ -20,9 +20,9 @@ emit, then validates both resume paths bit-exact (modulo bf16 storage):
 
     1. Writer subprocess
        - DCP shards under ``<output_dir>/checkpoints/global_step_<S>/``
-         (model + optimizer + extra_state -- the format ``BaseTrainer``
+         (model + optimizer + lr_scheduler -- the format ``BaseTrainer``
          resumes via ``train.checkpoint.load_path``).
-       - HF-format LoRA adapter under ``<output_dir>/global_step_<S>/``
+       - HF-format LoRA adapter in the same directory
          (``adapter_model.safetensors`` + ``adapter_config.json``; the MoE mode +
          rank/alpha VeOmni's wrappers need to re-install themselves on resume
          live in the ``veomni_lora`` block of ``adapter_config.json``) -- the
@@ -80,14 +80,18 @@ import torch
 import torch.distributed as dist
 import yaml
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.arguments import VeOmniArguments, parse_args
+from veomni.checkpoint.layout import weights_dir
 from veomni.data import build_dummy_dataset
-from veomni.models.checkpoint_manager import ModelCheckpointManager
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 from veomni.utils import helper
+
+
+_LORA_MAX_NPROC = 4
 
 
 _LORA_KEYS = ("lora_A", "lora_B")
@@ -124,12 +128,24 @@ logger = helper.create_logger(__name__)
 
 
 def _to_full_cpu(tensor: torch.Tensor) -> torch.Tensor:
-    """Materialize an FSDP-sharded tensor on rank 0 and move to CPU.
+    """Materialize an FSDP/EP-sharded tensor on rank 0 and move to CPU.
 
-    ``full_tensor`` triggers an all-gather across the FSDP group, so all
-    ranks must call this; we just discard the result on non-rank-0.
+    ``full_tensor`` triggers an all-gather across the FSDP (or ``ep_fsdp``)
+    group; for 3D per-expert LoRA tensors under ``ep_size > 1``, we also
+    all-gather across ``ep_group`` so rank 0's snapshot covers all experts
+    ``[E, ...]`` rather than only EP rank 0's local ``[E/ep, ...]`` slice.
     """
-    full = tensor.full_tensor() if hasattr(tensor, "full_tensor") else tensor.detach()
+    full = tensor.full_tensor().detach() if hasattr(tensor, "full_tensor") else tensor.detach()
+    if dist.is_available() and dist.is_initialized() and full.ndim == 3:
+        from veomni.distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
+
+        if is_parallel_state_initialized():
+            ps = get_parallel_state()
+            if ps.ep_enabled and ps.ep_group is not None:
+                ep_world = dist.get_world_size(group=ps.ep_group)
+                gathered = [torch.empty_like(full) for _ in range(ep_world)]
+                dist.all_gather(gathered, full.contiguous(), group=ps.ep_group)
+                full = torch.cat(gathered, dim=0)
     return full.cpu()
 
 
@@ -241,9 +257,10 @@ class _LogDictSaveCallback(Callback):
         # ``on_step_end`` so that invariant holds.
         device = self.trainer.device if hasattr(self.trainer, "device") else torch.device("cpu")
         # float32: HCCL allreduce does not support float64 (at::kDouble).
+        # Use SUM / group_size instead of ReduceOp.AVG for HCCL compatibility.
         t = torch.tensor([float(value)], dtype=torch.float32, device=device)
-        dist.all_reduce(t, op=dist.ReduceOp.AVG, group=dp_group)
-        return float(t.item())
+        dist.all_reduce(t, op=dist.ReduceOp.SUM, group=dp_group)
+        return float(t.item() / dist.get_world_size(dp_group))
 
     def on_step_end(
         self, state: TrainerState, loss: float, loss_dict: dict[str, float], grad_norm: float, **kwargs
@@ -273,9 +290,6 @@ class MoeLoraTrainer(BaseTrainer):
     any state the checkpoint callback loaded.
     """
 
-    def _build_model_assets(self) -> None:
-        self.model_assets = [self.model_config]
-
     def _build_data_transform(self) -> None:
         pass
 
@@ -286,7 +300,6 @@ class MoeLoraTrainer(BaseTrainer):
         self.train_steps = args.train_steps
 
     def _init_callbacks(self) -> None:
-        self.checkpoint = ModelCheckpointManager(self)
         self.environ_meter_callback = _EnvironMeterCallbackTest(self)
         # CheckpointCallback drives DCP save+load and the HF LoRA export; the
         # ``train.checkpoint.load_path`` resume case in the resume test
@@ -375,8 +388,9 @@ def _build_and_save_toy_base(dest_dir: str) -> None:
     16 experts, 4 layers). Module-scoped means once per pytest invocation.
     """
     from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.models import build_foundation_model
     from veomni.utils import helper as _helper
+
+    from .utils import build_lora_test_model
 
     _helper.set_seed(42)
     ops = OpsImplementationConfig(
@@ -387,7 +401,7 @@ def _build_and_save_toy_base(dest_dir: str) -> None:
         swiglu_mlp_implementation="eager",
         rotary_pos_emb_implementation="eager",
     )
-    model = build_foundation_model(
+    model = build_lora_test_model(
         config_path=_TOY_CONFIG_PATH,
         weights_path=None,
         torch_dtype="bfloat16",
@@ -435,18 +449,16 @@ def torchrun_trainer(
     output_dir: str,
     *,
     extra_overrides: list[str] | None = None,
-    nproc: int = 4,
+    nproc: int = _LORA_MAX_NPROC,
 ) -> None:
     """Spawn this module under torchrun; raise on non-zero exit."""
     import subprocess
-
-    from ..tools.launch_utils import find_free_port
 
     cmd = [
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={nproc}",
-        f"--master_port={find_free_port()}",
+        "--standalone",
         __file__,
         yaml_path,
         f"--train.checkpoint.output_dir={output_dir}",
@@ -555,12 +567,12 @@ def _model_path_overrides(toy_base_dir: str) -> list[str]:
     ]
 
 
-def _gpu_count_or_skip(min_count: int = 1, max_count: int = 4) -> int:
+def _gpu_count_or_skip(min_count: int = 1, max_count: int = _LORA_MAX_NPROC) -> int:
     """Return the nproc to use for torchrun, or skip the test if no devices."""
     from veomni.utils.device import get_torch_device
 
     device = get_torch_device()
-    n = device.device_count() if device.is_available() else 0
+    n = runner_device_count() if device.is_available() else 0
     if n < min_count:
         pytest.skip(f"Requires at least {min_count} accelerator device(s); got {n}")
     return min(n, max_count)
@@ -585,9 +597,11 @@ def _writer_adapter_path(writer_dir: str, save_step: int = 4) -> str:
     """Path to the writer's HF-format LoRA adapter (the resume target for the adapter test).
 
     Uses the *final* step's adapter so the resumer's pre-snapshot can be
-    compared directly against the writer's post-snapshot.
+    compared directly against the writer's post-snapshot. The adapter is an
+    export and lives in its own ``lora_ckpt/``, beside the resume state rather
+    than inside it.
     """
-    return os.path.join(writer_dir, f"global_step_{save_step}")
+    return os.path.join(writer_dir, "checkpoints", f"global_step_{save_step}", "lora_ckpt")
 
 
 def _assert_writer_artifacts_exist(writer_dir: str, mode: str, *, final_step: int = 4) -> None:
@@ -602,10 +616,12 @@ def _assert_writer_artifacts_exist(writer_dir: str, mode: str, *, final_step: in
     hf_dir = _writer_adapter_path(writer_dir, save_step=final_step)
 
     assert os.path.isdir(dcp_dir), f"[{mode}] missing DCP checkpoint dir at {dcp_dir}"
-    dcp_files = os.listdir(dcp_dir)
-    # DCP writes one .distcp file per rank plus a .metadata file -- enough
+    # The weights are their own DCP directory now; the optimizer state sits in a
+    # sibling. DCP writes one .distcp file per rank plus a .metadata file -- enough
     # to verify the save actually ran rather than just creating the dir.
-    assert any(f.endswith(".metadata") for f in dcp_files), f"[{mode}] DCP metadata missing in {dcp_dir}: {dcp_files}"
+    weights = weights_dir(dcp_dir)
+    dcp_files = os.listdir(weights)
+    assert any(f.endswith(".metadata") for f in dcp_files), f"[{mode}] DCP metadata missing in {weights}: {dcp_files}"
 
     assert os.path.isdir(hf_dir), f"[{mode}] missing HF LoRA adapter dir at {hf_dir}"
     # VeOmniLoraModel embeds MoE metadata inside adapter_config.json (under the
@@ -632,54 +648,54 @@ def _assert_writer_artifacts_exist(writer_dir: str, mode: str, *, final_step: in
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.launch_plan(
+    provider=lambda context: LaunchSpec(nproc=max(1, min(len(context.capabilities.devices), _LORA_MAX_NPROC)))
+)
 @pytest.mark.parametrize("mode", ["independent", "shared"])
 def test_save_load_resume_round_trip(tmp_path, toy_base_dir, mode):
-    """End-to-end save -> resume (DCP) -> resume (LoRA adapter) for one mode."""
+    """End-to-end EP=1 save -> resume (DCP) round-trip for one mode.
+
+    HF LoRA-adapter reload (``SNAPSHOT_PRE`` bit-exact against writer's
+    ``SNAPSHOT_POST``) is asserted for both EP=1 and EP=2 resumers in
+    ``test_moe_lora_ep2.py::test_moe_lora_ep_save_load_parallel_align``.
+    """
     nproc = _gpu_count_or_skip()
     yaml_path = _yaml_for_mode(mode)
-    base_overrides = _model_path_overrides(toy_base_dir)
+    final_step = 2
+    save_step = 1
+    step_overrides = [
+        f"--train.max_steps={final_step}",
+        f"--train.checkpoint.save_steps={save_step}",
+        f"--train.checkpoint.hf_save_steps={final_step}",
+    ]
+    base_overrides = _model_path_overrides(toy_base_dir) + step_overrides
 
     # ── 1. Writer ──────────────────────────────────────────────────────
-    # Full N=4 steps, DCP saved at step 2 and step 4, HF LoRA at the same
-    # cadence. Snapshots dumped at on_train_begin (= post-load, here
-    # nothing to load so == post-init) and on_train_end (= post-train).
+    # N=2 steps, DCP saved at step 1 and step 2, HF LoRA at step 2.
+    # Snapshots dumped at on_train_begin and on_train_end.
     writer_dir = str(tmp_path / "writer")
     torchrun_trainer(yaml_path, writer_dir, extra_overrides=base_overrides, nproc=nproc)
-    _assert_writer_artifacts_exist(writer_dir, mode)
+    _assert_writer_artifacts_exist(writer_dir, mode, final_step=final_step)
+
+    writer_pre = _load_snapshot(os.path.join(writer_dir, SNAPSHOT_PRE))
+    writer_post = _load_snapshot(os.path.join(writer_dir, SNAPSHOT_POST))
+    assert any(
+        not torch.equal(writer_pre[k].to(torch.bfloat16), writer_post[k].to(torch.bfloat16)) for k in writer_post
+    ), f"[{mode}] expected writer training to mutate LoRA weights between pre and post snapshots"
 
     # ── 2. DCP resume ──────────────────────────────────────────────────
-    # Load step 2 DCP shard; GlobalStateCallback bumps global_step to 2
-    # and the trainer continues for the remaining
-    # 2 steps. Different output_dir keeps the resumer's saves from
-    # clobbering the writer.
-    #
-    # DCP ships model + optimizer + RNG + dataloader state, so two
-    # trainers seeing the same ordering must converge to identical
-    # weights at the same step -- bit-exact under bf16 (and even under
-    # fp32, since DCP saves raw bytes).
+    # Load step-1 DCP shard; GlobalStateCallback restores step=1 and the
+    # trainer continues for step 2. End-state must be bit-exact vs writer.
     dcp_resumer_dir = str(tmp_path / "resumer_dcp")
-    dcp_overrides = base_overrides + [f"--train.checkpoint.load_path={_writer_dcp_path(writer_dir)}"]
+    dcp_overrides = base_overrides + [
+        f"--train.checkpoint.load_path={_writer_dcp_path(writer_dir, save_step=save_step)}",
+        "--train.checkpoint.save_steps=0",
+        "--train.checkpoint.save_hf_weights=False",
+        "--train.checkpoint.hf_save_steps=0",
+    ]
     torchrun_trainer(yaml_path, dcp_resumer_dir, extra_overrides=dcp_overrides, nproc=nproc)
     _compare_snapshots_bit_exact(
         actual_path=os.path.join(dcp_resumer_dir, SNAPSHOT_POST),
         ref_path=os.path.join(writer_dir, SNAPSHOT_POST),
         label=f"{mode}/dcp",
-    )
-
-    # ── 3. LoRA-adapter resume ─────────────────────────────────────────
-    # Load the writer's final-step HF LoRA adapter via
-    # ``model.lora_config.lora_adapter`` -> ``_setup_lora`` resume branch
-    # -> ``VeOmniLoraModel.from_pretrained`` (rebuilds MoE wrappers from the
-    # ``veomni_lora`` block in adapter_config.json) -> FSDP2 adapter-load path
-    # inside ``build_parallelize_model``. The resumer's pre-train snapshot is
-    # exactly the writer's saved adapter (= the writer's post-train
-    # snapshot, modulo the bf16 cast PEFT applies on save).
-    adapter_resumer_dir = str(tmp_path / "resumer_adapter")
-    resume_yaml = str(tmp_path / "resume_adapter.yaml")
-    _make_lora_adapter_resume_yaml(yaml_path, _writer_adapter_path(writer_dir), resume_yaml)
-    torchrun_trainer(resume_yaml, adapter_resumer_dir, extra_overrides=base_overrides, nproc=nproc)
-    _compare_snapshots_bit_exact(
-        actual_path=os.path.join(adapter_resumer_dir, SNAPSHOT_PRE),
-        ref_path=os.path.join(writer_dir, SNAPSHOT_POST),
-        label=f"{mode}/lora_adapter",
     )

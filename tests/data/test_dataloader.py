@@ -6,9 +6,13 @@ import pytest
 import torch
 from utils import DummyDataset, process_dummy_example
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data import build_dataloader, build_dataset
 from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 from veomni.utils.constants import IGNORE_INDEX
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _fake_ps(sp_size: int, cp_size: int = 1):
@@ -147,12 +151,12 @@ def test_build_dataloader_dyn_bsz_count_mode(
         assert isinstance(dl.batching_strategy, TextBatchingStrategy)
         assert dl.batching_strategy.buffer._get_length_fn is m_ds.get_length_by_labels_fn
         assert dl.batching_strategy.physical_token_cap == 48
-        assert dl.batching_strategy.buffer._get_physical_length_fn is m_ds.get_length_by_attention_mask_fn
+        assert dl.batching_strategy.buffer._get_physical_length_fn is m_ds.get_length_fn
     else:
         assert isinstance(dl.dataset, m_ds.DynamicBatchingSizeDataset)
         assert dl.dataset.get_length_fn is m_ds.get_length_by_labels_fn
         assert dl.dataset.physical_token_cap == 48
-        assert dl.dataset.get_physical_length_fn is m_ds.get_length_by_attention_mask_fn
+        assert dl.dataset.get_physical_length_fn is m_ds.get_length_fn
 
 
 @pytest.mark.parametrize("dyn_bsz_runtime", ["main", "worker"])

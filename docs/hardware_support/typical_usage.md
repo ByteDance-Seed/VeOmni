@@ -64,16 +64,16 @@ model:
   ops_implementation:
     attn_implementation: flash_attention_2
     moe_implementation: fused_npu
-    cross_entropy_loss_implementation: npu
-    rms_norm_implementation: npu
-    rotary_pos_emb_implementation: npu
+    cross_entropy_loss_implementation: chunk_loss
+    rms_norm_implementation: torch_npu
+    rotary_pos_emb_implementation: torch_npu
     swiglu_mlp_implementation: eager           # no NPU backend available
     load_balancing_loss_implementation: eager  # current NPU config normalization selects eager
     # Qwen3.5 GatedDeltaNet trio — for both dense and MoE Qwen3.5 models;
     # select the NPU kernels explicitly; the default `fla` backend is GPU-only:
-    rms_norm_gated_implementation: npu
-    causal_conv1d_implementation: npu
-    chunk_gated_delta_rule_implementation: npu
+    rms_norm_gated_implementation: torch_npu
+    causal_conv1d_implementation: triton
+    chunk_gated_delta_rule_implementation: triton
 ```
 
 These configurations specify the optimal implementation for each operator type when running on NPUs:
@@ -118,3 +118,5 @@ Key checkpoint configuration parameters:
 - `save_steps`: Number of steps between checkpoint saves
 - `save_epochs`: Number of epochs between checkpoint saves
 - `save_hf_weights`: Whether to save Hugging Face model weights in addition to the VeOmni checkpoint format (only in the last checkpoint directory)
+
+On-disk files under `output_dir`: [Checkpoint layout](../usage/checkpoint.md).

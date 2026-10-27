@@ -20,8 +20,12 @@ from unittest.mock import patch
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.lora.config import LORA_MODULES_BY_MODEL_TYPE, VeOmniLoraConfig
 from veomni.utils.count_flops import VeomniFlopsCounter, get_device_flops
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _to_namespace(value):
@@ -107,6 +111,12 @@ def qwen3_5_moe_counter():
 
 
 @pytest.fixture
+def qwen4_exp_counter():
+    config = _load_toy_config("tests/toy_config/qwen4_exp_toy")
+    return VeomniFlopsCounter(config)
+
+
+@pytest.fixture
 def gpt_oss_config():
     return _load_toy_config("tests/toy_config/gpt_oss_toy")
 
@@ -134,6 +144,9 @@ def deepseek_v4_counter(deepseek_v4_config):
     return VeomniFlopsCounter(deepseek_v4_config)
 
 
+# Numerical snapshots use the canonical compact fixtures: H=256, four layers
+# (three linear + one full attention), explicit head_dim=256 and vocab=248320.
+# The two-layer ViT contributes 5_536_481_280 FLOPs for image lengths [256, 512].
 class TestQwen35Flops:
     pytestmark = pytest.mark.usefixtures("mock_device_flops")
 
@@ -141,13 +154,13 @@ class TestQwen35Flops:
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=1.0)
         # Embedding lookup is not a matmul; only lm_head contributes vocab_size * hidden_size.
-        assert flops == pytest.approx(106.965220982784, rel=1e-9)
+        assert flops == pytest.approx(1.729445756928, rel=1e-9)
 
     def test_numerical_with_vit(self, qwen3_5_counter):
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=1.0, images_seqlens=[256, 512])
         # Embedding lookup is not a matmul; only lm_head contributes vocab_size * hidden_size.
-        assert flops == pytest.approx(109.196454395904, rel=1e-9)
+        assert flops == pytest.approx(1.734982238208, rel=1e-9)
 
 
 class TestQwen35LoraFlops:
@@ -328,7 +341,7 @@ class TestQwen35MoeFlops:
         )
         # The embedding lookup is excluded. The shared-expert scalar gate is
         # an ordinary trainable linear and follows the FFT factor-six convention.
-        assert flops == pytest.approx(16.888079843328 + shared_expert_gate_flops, rel=1e-9)
+        assert flops == pytest.approx(1.749175762944 + shared_expert_gate_flops, rel=1e-9)
 
     def test_numerical_with_vit(self, qwen3_5_moe_counter):
         batch_seqlens = [1024, 1024, 1024, 1024]
@@ -337,7 +350,54 @@ class TestQwen35MoeFlops:
         shared_expert_gate_flops = (
             6 * text_config.hidden_size * text_config.num_hidden_layers * sum(batch_seqlens) / 1e12
         )
-        assert flops == pytest.approx(19.05408344064 + shared_expert_gate_flops, rel=1e-9)
+        assert flops == pytest.approx(1.754712244224 + shared_expert_gate_flops, rel=1e-9)
+
+
+class TestQwen4ExpFlops:
+    pytestmark = pytest.mark.usefixtures("mock_device_flops")
+
+    def test_numerical(self, qwen4_exp_counter):
+        flops, promised_flops = qwen4_exp_counter.estimate_flops([12, 5], delta_time=1.0)
+
+        assert flops == pytest.approx(10_515_264 / 1e12, rel=1e-9)
+        assert promised_flops == 1000.0
+
+    def test_transformers_normalized_layer_types(self, qwen4_exp_counter):
+        expected_flops, _ = qwen4_exp_counter.estimate_flops([12, 5], delta_time=1.0)
+        config = deepcopy(qwen4_exp_counter.config)
+        config.text_config.layer_types = [
+            "qwen_sparse_attention" if layer_type == "full_attention" else layer_type
+            for layer_type in config.text_config.layer_types
+        ]
+
+        actual_flops, _ = VeomniFlopsCounter(config).estimate_flops([12, 5], delta_time=1.0)
+
+        assert actual_flops == expected_flops
+
+    def test_qsa_selected_token_budget(self, qwen4_exp_counter):
+        counter = qwen4_exp_counter
+
+        assert counter._compute_qsa_attention_score_sum([5], compress_ratio=2, token_budget=4) == 15
+        assert counter._compute_qsa_attention_score_sum([8], compress_ratio=2, token_budget=4) == 28
+
+    def test_ple_table_size_is_not_counted(self, qwen4_exp_counter):
+        baseline, _ = qwen4_exp_counter.estimate_flops([12, 5], delta_time=1.0)
+        qwen4_exp_counter.config.text_config.ngram_vocab_size_base *= 1_000_000
+        enlarged_table, _ = qwen4_exp_counter.estimate_flops([12, 5], delta_time=1.0)
+
+        assert enlarged_table == baseline
+
+    def test_vision_flops_follow_input_and_freeze_state(self, qwen4_exp_counter):
+        text_only, _ = qwen4_exp_counter.estimate_flops([12, 5], delta_time=2.0)
+        full_vlm, _ = qwen4_exp_counter.estimate_flops(
+            [12, 5], delta_time=2.0, images_seqlens=[8, 4], freeze_vit=False
+        )
+        frozen_vlm, _ = qwen4_exp_counter.estimate_flops(
+            [12, 5], delta_time=2.0, images_seqlens=[8, 4], freeze_vit=True
+        )
+
+        assert text_only < frozen_vlm < full_vlm
+        assert frozen_vlm - text_only == pytest.approx((full_vlm - text_only) / 3)
 
 
 class TestQwen3Flops:
@@ -546,7 +606,7 @@ class TestGptOssFlops:
     def test_numerical(self, gpt_oss_counter):
         batch_seqlens = [12, 5]
         flops, promised_flops = gpt_oss_counter.estimate_flops(batch_seqlens, delta_time=1.0)
-        assert flops == pytest.approx(0.000326931456, rel=1e-9)
+        assert flops == pytest.approx(0.000328366848, rel=1e-9)
         assert promised_flops == 1000.0
 
     def test_sliding_attention_reduces_quadratic_flops(self, gpt_oss_config):

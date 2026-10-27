@@ -14,7 +14,6 @@
 
 from typing import Optional
 
-import torch
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
@@ -22,6 +21,8 @@ from ....utils.device import get_device_type
 from .comm import RingComm
 from .gpu import (
     FA_BACKEND,
+    FA_BACKENDS,
+    resolve_ring_backend,
     ring_flash_attn_func,
     update_out_and_lse,
     zigzag_ring_flash_attn_func,
@@ -29,6 +30,7 @@ from .gpu import (
 )
 from .layout import (
     local_cu_seqlens,
+    prepare_usp_metadata,
     zigzag_block_order,
     zigzag_reorder,
     zigzag_reorder_packed,
@@ -42,6 +44,9 @@ __all__ = [
     "ring_attention",
     "RingComm",
     "FA_BACKEND",
+    "FA_BACKENDS",
+    "resolve_ring_backend",
+    "prepare_usp_metadata",
     "local_cu_seqlens",
     "zigzag_block_order",
     "zigzag_reorder",
@@ -81,6 +86,8 @@ def ring_attention(
     dropout_p: float = 0.0,
     causal: bool = True,
     device_type: Optional[str] = None,
+    backend_name: Optional[str] = None,
+    usp_metadata: Optional[dict] = None,
 ) -> Tensor:
     """Run the device-specific balanced causal Ring Attention implementation."""
     if not causal:
@@ -91,7 +98,8 @@ def ring_attention(
         )
 
     backend = _load_backend(get_device_type() if device_type is None else device_type)
-    is_packed = cu_seqlens is not None and cu_seqlens.numel() > 2
+    backend_kwargs = {"backend": backend_name} if backend_name is not None else {}
+    is_packed = usp_metadata is not None or (cu_seqlens is not None and cu_seqlens.numel() > 2)
     if not is_packed:
         return backend.forward(
             query,
@@ -101,11 +109,18 @@ def ring_attention(
             causal=True,
             group=group,
             dropout_p=dropout_p,
+            **backend_kwargs,
         )
 
-    local_cu = local_cu_seqlens(cu_seqlens.to(torch.int32), cp_size)
-    local_lengths = local_cu[1:] - local_cu[:-1]
-    local_max_seqlen = int(local_lengths.max().item()) if local_lengths.numel() else 0
+    if usp_metadata is None:
+        usp_metadata = prepare_usp_metadata(cu_seqlens.cpu(), cp_size)
+        usp_metadata = {
+            key: value.to(query.device) if isinstance(value, Tensor) else value for key, value in usp_metadata.items()
+        }
+    local_cu = usp_metadata["usp_cu_seqlens"]
+    local_max_seqlen = usp_metadata["usp_max_seqlen"]
+    if backend_name is not None:
+        backend_kwargs["half_indices"] = (usp_metadata["usp_half0"], usp_metadata["usp_half1"])
     output = backend.packed_forward(
         query.squeeze(0),
         key.squeeze(0),
@@ -116,5 +131,6 @@ def ring_attention(
         causal=True,
         group=group,
         dropout_p=dropout_p,
+        **backend_kwargs,
     )
     return output.unsqueeze(0)

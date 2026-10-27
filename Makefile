@@ -27,4 +27,4 @@ check-patchgen:
 	patchgen --check
 
 check-agent-docs:
-	python3 scripts/ci/check_agent_doc_paths.py
+	python3 scripts/ci/docs/check_agent_doc_paths.py

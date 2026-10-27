@@ -39,6 +39,8 @@ from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.common_utils import run_tests
 from transformers import Qwen3Config
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.pytest_plugin import validate_launch
 from veomni.data.data_collator import MainCollator, PackingCollator
 from veomni.distributed import parallel_state as PS
 from veomni.models.auto import build_foundation_model
@@ -101,6 +103,17 @@ def _to_device(batch: dict, device: torch.device) -> dict:
     return {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
 
 
+def _forward_with_logits(model, batch):
+    output = model(**batch, use_cache=False)
+    # Training CE no longer materializes logits. A label-free pass checks the
+    # same weights and attention independently without altering loss backward.
+    with torch.no_grad():
+        output.logits = model(
+            **{key: value for key, value in batch.items() if key != "labels"}, use_cache=False
+        ).logits
+    return output
+
+
 def _reshape_logits(output, batch: dict[str, torch.Tensor]) -> torch.Tensor:
     return output.logits.reshape(*batch["input_ids"].shape, VOCAB_SIZE)
 
@@ -132,6 +145,8 @@ def _assert_relative_vector_close(
 
     relative_l2 = torch.linalg.vector_norm(actual - expected) / expected_norm
     cosine = F.cosine_similarity(actual, expected, dim=0)
+    if dist.get_rank() == 0:
+        print(f"{name}: relative_l2={relative_l2.item():.6f}, cosine={cosine.item():.6f}", flush=True)
     assert relative_l2.item() <= max_relative_l2, (
         f"{name}: relative L2 error {relative_l2.item():.4f} exceeds {max_relative_l2:.4f}"
     )
@@ -139,6 +154,9 @@ def _assert_relative_vector_close(
 
 
 class USPTrainingEquivalenceE2ETest(MultiProcessTestCase):
+    def ci_launch_plan(self):
+        return LaunchSpec(nproc=self.world_size)
+
     @property
     def world_size(self):
         return CP_SIZE * ULYSSES_SIZE
@@ -146,6 +164,7 @@ class USPTrainingEquivalenceE2ETest(MultiProcessTestCase):
     def setUp(self):
         super().setUp()
         os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
+        validate_launch(self.world_size)
         self._spawn_processes()
 
     def _init_parallel_states(self) -> tuple[PS.ParallelState, PS.ParallelState]:
@@ -268,10 +287,10 @@ class USPTrainingEquivalenceE2ETest(MultiProcessTestCase):
 
         with PS.use_parallel_state(reference_state):
             with torch.no_grad():
-                unaligned_output = reference_model(**unaligned_batch, use_cache=False)
-            aligned_output = reference_model(**aligned_batch, use_cache=False)
+                unaligned_output = _forward_with_logits(reference_model, unaligned_batch)
+            aligned_output = _forward_with_logits(reference_model, aligned_batch)
         with PS.use_parallel_state(usp_state):
-            usp_output = usp_model(**usp_batch, use_cache=False)
+            usp_output = _forward_with_logits(usp_model, usp_batch)
 
         unaligned_logits = _reshape_logits(unaligned_output, unaligned_batch)
         aligned_logits = _reshape_logits(aligned_output, aligned_batch)
@@ -322,10 +341,16 @@ class USPTrainingEquivalenceE2ETest(MultiProcessTestCase):
                 full_usp_gradients[name],
                 reference_grad,
                 name=f"gradient {name}",
-                max_relative_l2=0.15,
-                min_cosine=0.985,
+                max_relative_l2=0.03,
+                min_cosine=0.999,
             )
 
+        # Keep master weights and optimizer arithmetic in FP32. Subtracting two
+        # BF16 norm weights near 1 rounds small updates to zero and makes a
+        # relative update error measure BF16 quantization instead of SGD parity.
+        reference_model.float()
+        usp_model.float()
+        reference_parameters = dict(reference_model.named_parameters())
         reference_before = {name: parameter.detach().clone() for name, parameter in reference_parameters.items()}
         usp_before = _full_parameter_state(usp_model)
         torch.optim.SGD(reference_model.parameters(), lr=0.5).step()
@@ -339,8 +364,8 @@ class USPTrainingEquivalenceE2ETest(MultiProcessTestCase):
                 usp_delta,
                 reference_delta,
                 name=f"optimizer delta {name}",
-                max_relative_l2=0.2,
-                min_cosine=0.98,
+                max_relative_l2=0.03,
+                min_cosine=0.999,
             )
 
         dist.barrier()

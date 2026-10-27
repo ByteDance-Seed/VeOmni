@@ -10,6 +10,8 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec
+
 from ..tools import DummyDataset as DummyDataset
 from ..tools import ParallelConfig
 
@@ -93,6 +95,9 @@ _GPT_OSS_FA4_QUACK_TRAINING_ARGS = [
 ]
 
 
+_FULL_8GPU_MOE_MODELS = {"qwen3_moe"}
+
+
 def _base_model_modes():
     modes = []
     for sp_size in _SP_SIZE:
@@ -100,12 +105,72 @@ def _base_model_modes():
     return modes
 
 
-def _moe_model_modes():
-    modes = []
-    for sp_size in _SP_SIZE:
-        for ep_size in _EP_SIZE:
-            modes.append(ParallelMode(sp_size, ep_size))
-    return modes
+def _moe_model_modes(*, full_matrix: bool = False, max_sp_size=None, max_ep_size=None):
+    if full_matrix:
+        return [ParallelMode(sp_size, ep_size) for sp_size in _SP_SIZE for ep_size in _EP_SIZE]
+    if max_sp_size == 1:
+        return [ParallelMode(1, 1), ParallelMode(1, 2)]
+    if max_ep_size == 1:
+        return [ParallelMode(1, 1), ParallelMode(2, 1)]
+    return [ParallelMode(1, 1), ParallelMode(2, 2)]
+
+
+def parallel_launches(
+    is_moe,
+    max_sp_size=None,
+    max_ep_size=None,
+    *,
+    model_name: str | None = None,
+    min_sp_size: int | None = None,
+):
+    full_8gpu = bool(is_moe and model_name in _FULL_8GPU_MOE_MODELS)
+    # Non-EP Quack and EP grouped GEMM use distinct autograd implementations.
+    full_matrix = full_8gpu or model_name == "gpt_oss"
+    modes = (
+        _moe_model_modes(full_matrix=full_matrix, max_sp_size=max_sp_size, max_ep_size=max_ep_size)
+        if is_moe
+        else _base_model_modes()
+    )
+    return [
+        (mode, LaunchSpec(nproc=(mode.sp_size * 4) if full_8gpu else 4))
+        for mode in modes
+        if (min_sp_size is None or mode.sp_size >= min_sp_size)
+        and (max_sp_size is None or mode.sp_size <= max_sp_size)
+        and (max_ep_size is None or mode.ep_size <= max_ep_size)
+    ]
+
+
+def alignment_plan(
+    capabilities,
+    is_moe=False,
+    max_sp_size=None,
+    max_ep_size=None,
+    *,
+    model_name: str | None = None,
+    min_sp_size: int | None = None,
+):
+    launches = [
+        launch
+        for _, launch in parallel_launches(
+            is_moe,
+            max_sp_size,
+            max_ep_size,
+            model_name=model_name,
+            min_sp_size=min_sp_size,
+        )
+    ]
+    return CasePlan.sequential(*launches)
+
+
+def alignment_case_plan(context):
+    return alignment_plan(
+        context.capabilities,
+        **{
+            key: context.params[key]
+            for key in ("is_moe", "max_sp_size", "max_ep_size", "model_name")
+            if key in context.params
+        },
+    )
 
 
 def prepare_exec_cmd(
@@ -118,39 +183,19 @@ def prepare_exec_cmd(
     is_moe: bool,
     max_sp_size: int | None = None,
     max_ep_size: int | None = None,
+    min_sp_size: int | None = None,
 ) -> list[tuple[str, dict]]:
-    """Prepare torchrun command kwargs for every (task, parallel-mode) combination.
-
-    Port allocation is deferred to execution time to avoid TOCTOU races —
-    the caller must pass each dict to ``build_torchrun_cmd(**kwargs)`` right
-    before ``subprocess.run()``.
-
-    Args:
-        test_tasks: Script basenames under tests/train_scripts/ to run (e.g. ["train_text_test"]).
-        model_name: Short name used for directory naming and log output.
-        config_path: Path to the model's toy config directory or config.json.
-        model_path: Path to materialized model weights.
-        train_path: Path to the dummy training dataset directory.
-        output_dir: Root directory for per-run output (logs, checkpoints).
-        is_moe: If True, also iterates over ep_size values (expert parallelism).
-        max_sp_size: If set, filters out modes with sp_size > this value.
-            Use 1 to skip sp=2 when the model does not support sequence parallelism yet.
-        max_ep_size: If set, filters out modes with ep_size > this value.
-            Use 1 to skip ep=2 when the model does not support expert parallelism yet.
-
-    Returns:
-        List of (task_name, cmd_kwargs) tuples, where cmd_kwargs is a dict of
-        keyword arguments for :func:`build_torchrun_cmd`.
-    """
-    model_modes: list[ParallelMode] = _base_model_modes() if not is_moe else _moe_model_modes()
-    if max_sp_size is not None:
-        model_modes = [m for m in model_modes if m.sp_size <= max_sp_size]
-    if max_ep_size is not None:
-        model_modes = [m for m in model_modes if m.ep_size <= max_ep_size]
+    launches = parallel_launches(
+        is_moe,
+        max_sp_size,
+        max_ep_size,
+        model_name=model_name,
+        min_sp_size=min_sp_size,
+    )
 
     command_list = []
     for task in test_tasks:
-        for mode in model_modes:
+        for mode, launch in launches:
             task_name = f"{model_name}_{task}_{mode}"
             cmd_kwargs = dict(
                 script=f"tests/train_scripts/{task}.py",
@@ -159,7 +204,7 @@ def prepare_exec_cmd(
                 train_path=train_path,
                 output_dir=os.path.join(output_dir, task_name),
                 parallel_config=ParallelConfig(sp_size=mode.sp_size, ep_size=mode.ep_size, fsdp_mode="fsdp2"),
-                nproc=mode.sp_size * 4,
+                nproc=launch.nproc,
                 # Forwarded to ``resolve_ops_overrides`` inside
                 # ``build_torchrun_cmd`` so per-model NPU eager fallbacks
                 # (e.g. DeepSeek-V3 RMSNorm/RoPE, Qwen2-VL multimodal RoPE)
@@ -167,6 +212,10 @@ def prepare_exec_cmd(
                 model_name=model_name,
             )
             if model_name == "wan_t2v":
+                cmd_kwargs["extra_args"] = list(_WAN_BFLOAT16_TRAINING_ARGS)
+            elif model_name == "deepseek_v4":
+                # fused_triton MoE needs bf16/fp16 activations; the toy
+                # checkpoint is materialized in float32.
                 cmd_kwargs["extra_args"] = list(_WAN_BFLOAT16_TRAINING_ARGS)
             elif model_name == "gpt_oss":
                 cmd_kwargs["extra_args"] = list(_GPT_OSS_FA4_QUACK_TRAINING_ARGS)

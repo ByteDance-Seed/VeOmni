@@ -112,12 +112,12 @@ generated file, and the TTS path is excluded anyway.
      build) for callers that bypass `MainCollator`.
   6. `dummy_forward` (FSDP path): build the `vit_metadata` sub-dict host-side.
   7. Add the model to `_MM_METADATA_WIRED_CASES` in
-     `tests/models/test_model_forward_no_implicit_sync.py`.
+     `tests/models/transformers/test_model_forward_no_implicit_sync.py`.
   When SP is enabled and you need to all-gather `input_ids` (or any tensor that
   went through `MainCollator`'s `pack_dim=-1` path) back to full seq on each
   rank, use `torch.cat(list, dim=1)` — the collator's `PackingCollator.__call__`
-  does `torch.cat(..., dim=pack_dim).unsqueeze(0)` (see
-  `veomni/data/data_collator.py:246-248`), so the shape at model forward is
+  does `torch.cat(..., dim=pack_dim).unsqueeze(0)` (see `PackingCollator.__call__` in
+  `veomni/data/data_collator.py`), so the shape at model forward is
   `[1, seq_per_rank]`, not flat `[seq_per_rank]`. Using `dim=0` would wrongly
   produce `[sp_size, seq_per_rank]` and silently break downstream mask slicing.
 

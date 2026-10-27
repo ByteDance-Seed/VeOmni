@@ -1,12 +1,10 @@
 import argparse
 import copy
-import dataclasses
 import os
 import subprocess
 import sys
 import time
 from contextlib import nullcontext
-from dataclasses import field
 from functools import partial
 from typing import Any, Dict, List, Literal, cast
 from unittest.mock import patch
@@ -21,12 +19,10 @@ import torch
 import torch.distributed as dist
 import yaml
 from tools import resolve_ops_overrides
-from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
-from transformers import PretrainedConfig
 from utils import (
     DummyDataset,
-    FakeModel,
+    FakeModelRuntime,
     StepAwareResumeGlobalStateCallback,
     compare_global_batch,
     compare_metrics,
@@ -34,6 +30,7 @@ from utils import (
     setup_test_distributed,
 )
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
 from veomni.data.dataset import WeightedMultiSourceDataset
@@ -42,9 +39,11 @@ from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks import Callback, TrainerState
 from veomni.utils import helper
 from veomni.utils.constants import IGNORE_INDEX
-from veomni.utils.device import get_device_type
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.helper import get_cache_dir
+
+
+_CI_LAUNCH = LaunchSpec(nproc=2)
 
 
 logger = helper.create_logger(__name__)
@@ -97,8 +96,8 @@ class TrainerTest(BaseTrainer):
     multisource_names = ["dataset_a", "dataset_b"]
     multisource_weights = [0.5, 0.5]
 
-    def _setup(self):
-        self.device, _ = setup_test_distributed(self.args)
+    def _setup(self, args):
+        device, _ = setup_test_distributed(args)
 
         self.multisource_datasets = [DummyDataset(size=100, dataset_name=name) for name in self.multisource_names]
         self.multisource_paths = [dataset.save_path for dataset in self.multisource_datasets]
@@ -124,27 +123,13 @@ class TrainerTest(BaseTrainer):
 
         self.args.train.num_train_epochs = 3
 
-        # we have to add a shuffle field to the args because it does not have one,
-        # and we need it to control the behavior of HF datasets,
-        # because it is shuffled it will store samples in a buffer,
-        # and such a buffer will be en  which will be discarded during resuming,
-        # thus causing the resumed training to see different samples from the original training
-        shuffle_field = field(default=True)
-        shuffle_field.name = "shuffle"
-        shuffle_field.type = bool
-        shuffle_field._field_type = dataclasses._FIELD
-        self.args.data.__dataclass_fields__["shuffle"] = shuffle_field
-        self.args.data.shuffle = False
+        # The HF streaming shuffle buffer is not checkpointed, so a resumed run
+        # would see different samples from the original one.
+        self.args.data.dataloader.shuffle = False
+        return device
 
-    def _freeze_model_module(self):
-        pass
-
-    def _build_model(self):
-        self.model = FakeModel().to(get_device_type())
-        self.model_config = PretrainedConfig()
-
-    def _build_model_assets(self):
-        self.model_assets = [self.model_config]
+    def _build_model_runtime(self):
+        return FakeModelRuntime(self.args.model, train=self.args.train)
 
     def _build_data_transform(self):
         self.data_transform = partial(_convert_list_to_tensor_fn, max_seq_len=self.args.data.max_seq_len)
@@ -198,16 +183,10 @@ class TrainerTest(BaseTrainer):
             prefetch_factor=args.data.dataloader.prefetch_factor,
         )
 
-    def _build_parallelized_model(self):
-        self.model.train()
-
-    def _build_optimizer(self):
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.args.model.optimizer.lr)
-
     def _build_lr_scheduler(self):
-        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lambda _: 1.0)
+        self.model.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.model.optimizer, lambda _: 1.0)
 
-    def _build_training_context(self):
+    def _build_training_context(self, model=None):
         self.model_fwd_context = nullcontext()
         self.model_bwd_context = nullcontext()
 
@@ -272,7 +251,7 @@ class EnvironMeterCallbackTest(Callback):
         super().__init__(trainer)
         args = self.trainer.args
         self.trainer.environ_meter = helper.EnvironMeter(
-            config=trainer.model_config,
+            config=trainer.model.model_config,
             global_batch_size=args.train.global_batch_size,
             empty_cache_steps=args.train.empty_cache_steps,
             enable_multisource=args.data.enable_multisource,
@@ -303,7 +282,7 @@ class EnvironMeterCallbackTest(Callback):
             f"training/{k}": all_reduce(v, group=get_parallel_state().fsdp_group)
             for k, v in step_train_metrics.items()
         }
-        step_train_metrics["training/lr"] = max(self.trainer.lr_scheduler.get_last_lr())
+        step_train_metrics["training/lr"] = max(self.trainer.model.lr_scheduler.get_last_lr())
 
         step_env_metrics.update(step_train_metrics)
         self.trainer.step_train_metrics = step_train_metrics
@@ -423,6 +402,7 @@ def _make_simple_dataset(
     )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_state_dict_structure():
     ds1 = MockIterableDataset([{"input_ids": [1, 2]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [3, 4, 5]}], name="b")
@@ -443,6 +423,7 @@ def test_state_dict_structure():
     assert sorted(state["runtime"]["exhausted"].keys()) == ["id_a", "id_b"]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_exhausted_state_save_restore_and_elastic():
     """Test exhausted state save/restore with elastic source add/remove scenarios."""
     # Scenario 1: Basic save and restore
@@ -495,6 +476,7 @@ def test_exhausted_state_save_restore_and_elastic():
     assert dataset_removed._exhausted == [True]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_exhausted_state_backward_compatible():
     """Test that loading old checkpoint without exhausted field defaults to all False."""
     ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
@@ -521,6 +503,7 @@ def test_exhausted_state_backward_compatible():
     assert dataset._exhausted == [False, False]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_elastic_load_add_source():
     ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [2]}], name="b")
@@ -541,6 +524,7 @@ def test_elastic_load_add_source():
     assert ds1.state_dict()["consumed"] >= 1
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_elastic_load_remove_source():
     ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [2]}], name="b")
@@ -560,6 +544,7 @@ def test_elastic_load_remove_source():
     assert ds1.state_dict()["consumed"] >= 1
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_elastic_load_strict_policy():
     ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [2]}], name="b")
@@ -578,6 +563,7 @@ def test_elastic_load_strict_policy():
         dataset_new.load_state_dict(state, reconcile_policy="strict")
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_stopping_strategy_first_exhausted():
     ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [2]}], name="b")
@@ -595,6 +581,7 @@ def test_stopping_strategy_first_exhausted():
         dataset._next_sample(0)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_stopping_strategy_all_exhausted():
     ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [2]}], name="b")
@@ -612,6 +599,7 @@ def test_stopping_strategy_all_exhausted():
     assert second["input_ids"] == [1]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_stopping_strategy_never_exhausted():
     ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [2]}], name="b")
@@ -629,6 +617,7 @@ def test_stopping_strategy_never_exhausted():
     assert second["input_ids"] == [1]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_determinism_with_seed():
     data_a = [{"input_ids": [i]} for i in range(10)]
     data_b = [{"input_ids": [i]} for i in range(10, 20)]
@@ -658,6 +647,7 @@ def test_determinism_with_seed():
         assert sample1["ds_idx"] == sample2["ds_idx"]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_level_token_weighting():
     ds1 = MockIterableDataset([{"input_ids": [1, 2, 3, 4]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [5]}], name="b")
@@ -674,6 +664,7 @@ def test_level_token_weighting():
     assert weights[1] == 0.8
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
@@ -727,6 +718,7 @@ def test_init_validation(kwargs, match):
         WeightedMultiSourceDataset(**kwargs, seed=42)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize(
     ("sample", "expected"),
     [
@@ -746,18 +738,21 @@ def test_default_sample_token_len(sample, expected):
 
 
 class TestLoadStateDictBoundary:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_missing_topology(self):
         ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
         dataset = _make_simple_dataset(datasets=[ds1], weights=[1.0], source_ids=["id_a"])
         with pytest.raises(ValueError, match="state_dict missing required keys"):
             dataset.load_state_dict({"runtime": {}})
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_missing_runtime(self):
         ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
         dataset = _make_simple_dataset(datasets=[ds1], weights=[1.0], source_ids=["id_a"])
         with pytest.raises(ValueError, match="state_dict missing required keys"):
             dataset.load_state_dict({"topology": {}})
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_missing_source_ids_in_topology(self):
         ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
         dataset = _make_simple_dataset(datasets=[ds1], weights=[1.0], source_ids=["id_a"])
@@ -773,6 +768,7 @@ class TestLoadStateDictBoundary:
         with pytest.raises(ValueError, match="state_dict missing topology.source_ids"):
             dataset.load_state_dict(state)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_avg_len_not_dict(self):
         ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
         dataset = _make_simple_dataset(datasets=[ds1], weights=[1.0], source_ids=["id_a"])
@@ -788,6 +784,7 @@ class TestLoadStateDictBoundary:
         with pytest.raises(ValueError, match="must be dicts keyed by source_id"):
             dataset.load_state_dict(state)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_dataset_states_not_dict(self):
         ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
         dataset = _make_simple_dataset(datasets=[ds1], weights=[1.0], source_ids=["id_a"])
@@ -803,6 +800,7 @@ class TestLoadStateDictBoundary:
         with pytest.raises(ValueError, match="must be a dict keyed by source_id"):
             dataset.load_state_dict(state)
 
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_warn_only_policy(self):
         ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
         ds2 = MockIterableDataset([{"input_ids": [2]}], name="b")
@@ -831,12 +829,11 @@ class TestLoadStateDictBoundary:
 
 
 def build_command():
-    port = find_free_port()
     command = [
         "torchrun",
         "--nnodes=1",
-        "--nproc_per_node=2",
-        f"--master_port={port}",
+        f"--nproc_per_node={_CI_LAUNCH.nproc}",
+        "--standalone",
         "tests/data/test_multisource_dataset.py",
         "--model.config_path=test",
         "--data.train_path=None",
@@ -858,6 +855,7 @@ def build_command():
     return command
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 def test_multisource_dataset_chain():
     if sys.platform == "darwin":
         pytest.skip(f"torch_shm_manager not supported on macOS: executable={_torch_shm_manager_executable()}")

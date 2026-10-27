@@ -18,7 +18,11 @@ import pytest
 import torch
 
 import veomni.distributed.sequence_parallel.ring_attention as ring_attention_module
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.utils.device import get_device_type
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_ring_attention_routes_fixed_shape_input(monkeypatch):
@@ -94,3 +98,32 @@ def test_ring_attention_validates_supported_inputs(causal, attention_mask, match
             causal=causal,
             device_type=get_device_type(),
         )
+
+
+def test_gpu_dispatch_preserves_precomputed_metadata(monkeypatch):
+    from veomni.distributed.sequence_parallel.ring_attention.layout import prepare_usp_metadata
+
+    metadata = prepare_usp_metadata(torch.tensor([0, 8, 16], dtype=torch.int32), 2)
+    calls = []
+
+    def packed_forward(query, key, value, cu_seqlens, max_seqlen, **kwargs):
+        calls.append((cu_seqlens, max_seqlen, kwargs))
+        return query
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("production metadata must not be recomputed inside attention")
+
+    monkeypatch.setattr(ring_attention_module, "prepare_usp_metadata", forbidden)
+    monkeypatch.setattr(
+        ring_attention_module, "_load_backend", lambda _: SimpleNamespace(packed_forward=packed_forward)
+    )
+    query = torch.randn(1, 8, 2, 4)
+    ring_attention_module.ring_attention(
+        query, query, query, group=object(), cp_size=2, backend_name="fa4", usp_metadata=metadata
+    )
+    offsets, maximum, kwargs = calls[0]
+    assert offsets is metadata["usp_cu_seqlens"]
+    assert maximum == metadata["usp_max_seqlen"]
+    assert kwargs["backend"] == "fa4"
+    assert kwargs["half_indices"][0] is metadata["usp_half0"]
+    assert kwargs["half_indices"][1] is metadata["usp_half1"]
