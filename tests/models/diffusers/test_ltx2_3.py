@@ -39,12 +39,11 @@ from ltx_core.model.transformer.attention import (
 from ltx_core.model.transformer.model import LTXModel
 # isort: on
 
-from tests.models.compare import assert_outputs_and_grads_match, eager_ops_config, ops_config_scope
+from tests.models.compare import assert_outputs_and_grads_match, eager_ops_config
 from tests.models.tiny_configs import tiny_ltx2_3_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_ltx2_3_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from veomni.ops import resolve_op
-from veomni.ops.config import get_ops_config, resolve_op_impl, set_ops_config
 
 
 def _sdpa_ops_config() -> SimpleNamespace:
@@ -94,15 +93,13 @@ def _bind_math_sdpa(model: torch.nn.Module) -> None:
 
 
 def _call_rms(x: torch.Tensor, weight: torch.Tensor | None, ops: SimpleNamespace | None = None):
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
-        impl = resolve_op_impl("rms_norm_implementation")
-        if weight is None:
-            return resolve_op("rms_norm", "unweighted", impl).wrapper(x, eps=1e-6)
-        return resolve_op("rms_norm", "standard", impl).wrapper(x, weight, eps=1e-6)
-    finally:
-        set_ops_config(previous)
+    cfg = _tiny_config()
+    cfg._set_ops_implementation(ops if ops is not None else eager_ops_config())
+    if weight is None:
+        impl = cfg.ops_config.resolve_impl("rms_norm_implementation", variant="unweighted")
+        return resolve_op("rms_norm", "unweighted", impl).wrapper(x, eps=1e-6)
+    impl = cfg.ops_config.rms_norm_implementation
+    return resolve_op("rms_norm", "standard", impl).wrapper(x, weight, eps=1e-6)
 
 
 def _ltx_inputs() -> dict:
@@ -129,12 +126,12 @@ def test_ltx2_3_condition_builds_from_registered_class_without_assets(monkeypatc
 def test_ltx2_3_eager_forward_and_backward_match_vendored_reference():
     torch.manual_seed(2)
     config = _tiny_config()
-    with ops_config_scope(_sdpa_ops_config()):
-        official = ltx_modeling.LTXVideoTransformerModel(config)
-        official.apply(official._init_weights)
-        _bind_math_sdpa(official)
-        ours = ltx_modeling.LTXVideoTransformerModel(config)
-        ours.load_state_dict(official.state_dict())
+    config._set_ops_implementation(_sdpa_ops_config())
+    official = ltx_modeling.LTXVideoTransformerModel(config)
+    official.apply(official._init_weights)
+    _bind_math_sdpa(official)
+    ours = ltx_modeling.LTXVideoTransformerModel(config)
+    ours.load_state_dict(official.state_dict())
     official_inputs = _ltx_inputs()
     ours_inputs = {key: [value.detach().clone() for value in values] for key, values in official_inputs.items()}
 
@@ -160,8 +157,9 @@ def test_ltx2_3_eager_forward_and_backward_match_vendored_reference():
 
 
 def test_ltx2_3_video_only_model_rejects_audio_input():
-    with ops_config_scope(_sdpa_ops_config()):
-        model = ltx_modeling.LTXVideoTransformerModel(_tiny_config())
+    config = _tiny_config()
+    config._set_ops_implementation(_sdpa_ops_config())
+    model = ltx_modeling.LTXVideoTransformerModel(config)
     with pytest.raises(ValueError, match="Audio is not enabled"):
         ltx_modeling.LTXVideoModel_forward(
             model,
@@ -227,47 +225,50 @@ def test_ltx2_3_connector_forwards_use_explicit_unweighted_rms_eps():
     wrong_eps = _explicit_unweighted_rms(hidden, 1e-3)
     assert not torch.allclose(expected, wrong_eps, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
-    with ops_config_scope(_sdpa_ops_config()):
-        connector = Embeddings1DConnector(
-            attention_head_dim=4,
-            num_attention_heads=2,
-            num_layers=0,
-            num_learnable_registers=None,
-        )
-        block = _BasicTransformerBlock1D(dim=8, heads=2, dim_head=4)
+    config = _tiny_config()
+    config._set_ops_implementation(_sdpa_ops_config())
+    connector = Embeddings1DConnector(
+        attention_head_dim=4,
+        num_attention_heads=2,
+        num_layers=0,
+        num_learnable_registers=None,
+        config=config,
+    )
+    block = _BasicTransformerBlock1D(dim=8, heads=2, dim_head=4, config=config)
 
-        connector_hidden = hidden.detach().clone().requires_grad_(True)
-        connector_out, _ = connector(connector_hidden)
-        torch.testing.assert_close(connector_out, expected, atol=EAGER_ATOL, rtol=EAGER_RTOL)
-        connector_out.sum().backward()
-        torch.testing.assert_close(
-            connector_hidden.grad,
-            torch.autograd.grad(expected.sum(), hidden)[0],
-            atol=EAGER_GRAD_ATOL,
-            rtol=EAGER_GRAD_RTOL,
-        )
+    connector_hidden = hidden.detach().clone().requires_grad_(True)
+    connector_out, _ = connector(connector_hidden)
+    torch.testing.assert_close(connector_out, expected, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    connector_out.sum().backward()
+    torch.testing.assert_close(
+        connector_hidden.grad,
+        torch.autograd.grad(expected.sum(), hidden)[0],
+        atol=EAGER_GRAD_ATOL,
+        rtol=EAGER_GRAD_RTOL,
+    )
 
-        block_hidden = hidden.detach().clone().requires_grad_(True)
-        recorded_eps: list[float] = []
-        bound = block.veomni_rms_norm_unweighted
+    block_hidden = hidden.detach().clone().requires_grad_(True)
+    recorded_eps: list[float] = []
+    bound = block.veomni_rms_norm_unweighted
 
-        def _record_eps(x, *args, **kwargs):
-            recorded_eps.append(kwargs["eps"])
-            return bound(x, *args, **kwargs)
+    def _record_eps(x, *args, **kwargs):
+        recorded_eps.append(kwargs["eps"])
+        return bound(x, *args, **kwargs)
 
-        block.veomni_rms_norm_unweighted = _record_eps
-        block_out = block(block_hidden)
-        assert recorded_eps == [_UNWEIGHTED_RMS_NORM_EPS, _UNWEIGHTED_RMS_NORM_EPS]
-        assert torch.isfinite(block_out).all()
-        block_out.sum().backward()
-        assert block_hidden.grad is not None
-        assert torch.isfinite(block_hidden.grad).all()
+    block.veomni_rms_norm_unweighted = _record_eps
+    block_out = block(block_hidden)
+    assert recorded_eps == [_UNWEIGHTED_RMS_NORM_EPS, _UNWEIGHTED_RMS_NORM_EPS]
+    assert torch.isfinite(block_out).all()
+    block_out.sum().backward()
+    assert block_hidden.grad is not None
+    assert torch.isfinite(block_hidden.grad).all()
 
 
 def test_ltx_automatic_to_callable_reads_ops_config():
-    with ops_config_scope(_sdpa_ops_config()):
-        adapter = AttentionFunction.AUTOMATIC.to_callable()
-        masked = MaskedAttentionFunction.AUTOMATIC.to_callable()
+    config = _tiny_config()
+    config._set_ops_implementation(_sdpa_ops_config())
+    adapter = AttentionFunction.AUTOMATIC.to_callable(config=config)
+    masked = MaskedAttentionFunction.AUTOMATIC.to_callable(config=config)
     assert isinstance(adapter, VeomniLTXAttention)
     assert adapter.veomni_attn.impl == "sdpa"
     assert adapter.veomni_attn_masked is adapter.veomni_attn
@@ -292,9 +293,10 @@ def test_ltx_non_sdpa_masked_falls_back_to_veomni_sdpa(available_nvidia_ops):
 
 
 def test_ltx_automatic_eager_selects_veomni_sdpa():
-    with ops_config_scope(eager_ops_config()):
-        adapter = AttentionFunction.AUTOMATIC.to_callable()
-        masked = MaskedAttentionFunction.AUTOMATIC.to_callable()
+    config = _tiny_config()
+    config._set_ops_implementation(eager_ops_config())
+    adapter = AttentionFunction.AUTOMATIC.to_callable(config=config)
+    masked = MaskedAttentionFunction.AUTOMATIC.to_callable(config=config)
     assert adapter.veomni_attn.impl == "veomni_sdpa"
     assert adapter.veomni_attn_masked is adapter.veomni_attn
     assert masked.veomni_attn.impl == "veomni_sdpa"

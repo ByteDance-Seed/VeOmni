@@ -208,7 +208,9 @@ class LTXVideoConditionModel(PreTrainedModel):
             f"VeOmni audio_connector_num_attention_heads: {_tc.get('audio_connector_num_attention_heads', 'NOT_SET')}"
         )
 
-        self.embeddings_processor = build_embeddings_processor(transformer_config, with_feature_extractor=False)
+        self.embeddings_processor = build_embeddings_processor(
+            transformer_config, with_feature_extractor=False, model_config=self.config
+        )
 
         load_device = torch.device("cpu") if self.meta_init else device
         _load_embeddings_processor_weights(self.embeddings_processor, base, device=load_device, dtype=torch.bfloat16)

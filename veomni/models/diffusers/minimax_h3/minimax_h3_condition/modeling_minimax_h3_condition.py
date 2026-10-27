@@ -70,8 +70,10 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         from ._module_utils import init_empty_weights
 
         with init_empty_weights():
-            self._text_encoder = MiniMaxH3TextEncoder(num_retained_layers=config.text_encoder_num_retained_layers)
-            self._video_vae = MiniMaxH3VideoVAE()
+            self._text_encoder = MiniMaxH3TextEncoder(
+                num_retained_layers=config.text_encoder_num_retained_layers, config=config
+            )
+            self._video_vae = MiniMaxH3VideoVAE(config=config)
             self._audio_vae = MiniMaxH3AudioVAE()
 
         # Processor / tokenizer

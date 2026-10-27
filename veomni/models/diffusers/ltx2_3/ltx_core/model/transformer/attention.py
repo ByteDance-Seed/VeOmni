@@ -13,7 +13,6 @@ from ltx_core.model.transformer.ops import (
 from ltx_core.model.transformer.rope import LTXRopeType
 
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 
 
 _SDPA_ATTN_IMPLS = frozenset({"sdpa", "veomni_sdpa"})
@@ -92,9 +91,11 @@ class VeomniLTXAttention:
         return output.reshape(batch, seq_q, heads * dim_head)
 
 
-def _impl_from_attention_function(fn: "AttentionFunction") -> str:
+def _impl_from_attention_function(fn: "AttentionFunction", config=None) -> str:
     if fn is AttentionFunction.AUTOMATIC:
-        return resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
+        if config is None:
+            return "veomni_sdpa"
+        return config.ops_config.resolve_impl("attn_implementation", eager_as="veomni_sdpa")
     if fn is AttentionFunction.FLASH_ATTENTION_3:
         return "flash_attention_3"
     if fn is AttentionFunction.FLASH_ATTENTION_4:
@@ -102,9 +103,11 @@ def _impl_from_attention_function(fn: "AttentionFunction") -> str:
     return "veomni_sdpa"
 
 
-def _impl_from_masked_function(fn: "MaskedAttentionFunction") -> str:
+def _impl_from_masked_function(fn: "MaskedAttentionFunction", config=None) -> str:
     if fn is MaskedAttentionFunction.AUTOMATIC:
-        return resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
+        if config is None:
+            return "veomni_sdpa"
+        return config.ops_config.resolve_impl("attn_implementation", eager_as="veomni_sdpa")
     return "veomni_sdpa"
 
 
@@ -119,14 +122,14 @@ class AttentionFunction(Enum):
     SDPA_MATH = "sdpa_math"
     AUTOMATIC = "automatic"
 
-    def to_callable(self) -> AttentionCallable:
+    def to_callable(self, config=None) -> AttentionCallable:
         """Resolve to a VeOmni attention adapter at module construction time.
 
-        ``AUTOMATIC`` reads ``resolve_op_impl("attn_implementation")`` and maps
+        ``AUTOMATIC`` reads ``config.ops_config.attn_implementation`` and maps
         ``eager`` to ``veomni_sdpa``. SDPA pin names and xformers collapse to
         ``veomni_sdpa``. Flash-3/4 keep those impl names.
         """
-        return VeomniLTXAttention(_impl_from_attention_function(self))
+        return VeomniLTXAttention(_impl_from_attention_function(self, config=config))
 
 
 class MaskedAttentionFunction(Enum):
@@ -143,9 +146,9 @@ class MaskedAttentionFunction(Enum):
     SDPA_MATH = "sdpa_math"
     AUTOMATIC = "automatic"
 
-    def to_callable(self) -> MaskedAttentionCallable:
+    def to_callable(self, config=None) -> MaskedAttentionCallable:
         """Resolve to the same adapter used by :class:`AttentionFunction`."""
-        return VeomniLTXAttention(_impl_from_masked_function(self))
+        return VeomniLTXAttention(_impl_from_masked_function(self, config=config))
 
 
 @dataclass(frozen=True)
@@ -171,10 +174,14 @@ class Attention(torch.nn.Module):
         rope_type: LTXRopeType = LTXRopeType.SPLIT,
         ops: AttentionOps | None = None,
         apply_gated_attention: bool = False,
+        config=None,
     ) -> None:
         super().__init__()
         if ops is None:
-            ops = AttentionOps()
+            ops = AttentionOps(
+                attention_function=AttentionFunction.AUTOMATIC.to_callable(config=config),
+                masked_attention_function=MaskedAttentionFunction.AUTOMATIC.to_callable(config=config),
+            )
         self.rope_type = rope_type
         self.attention_function = ops.attention_function
         self.masked_attention_function = ops.masked_attention_function

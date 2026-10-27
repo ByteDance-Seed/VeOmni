@@ -22,7 +22,6 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
@@ -155,8 +154,12 @@ class QwenImageSPAttnProcessor:
     attention mask stays valid without any reordering.
     """
 
-    def __init__(self):
-        impl = resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
+    def __init__(self, config=None):
+        impl = (
+            config.ops_config.resolve_impl("attn_implementation", eager_as="veomni_sdpa")
+            if config is not None
+            else "veomni_sdpa"
+        )
         self.veomni_attn = VeomniOp("attention", "standard", impl)
         self.veomni_attn_masked = (
             self.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "veomni_sdpa")
@@ -486,7 +489,7 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
 
         # Install the Ulysses-SP joint-attention processor on every block. It is
         # a no-op (plain diffusers joint attention) when SP is disabled.
-        sp_processor = QwenImageSPAttnProcessor()
+        sp_processor = QwenImageSPAttnProcessor(config)
         for block in self.transformer_blocks:
             block.attn.set_processor(sp_processor)
 

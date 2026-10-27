@@ -29,7 +29,6 @@ from diffusers import WanTransformer3DModel as OfficialWanTransformer3DModel
 from tests.models.compare import (
     assert_outputs_and_grads_match,
     eager_ops_config,
-    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_wan_t2v_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_wan_t2v_config as _tiny_config
@@ -54,8 +53,8 @@ def _build_ours(config: WanTransformer3DModelConfig, ops: SimpleNamespace | None
         WanTransformer3DModel,
     )
 
-    with ops_config_scope(ops if ops is not None else _sdpa_ops_config()):
-        return WanTransformer3DModel(config)
+    config._set_ops_implementation(ops if ops is not None else _sdpa_ops_config())
+    return WanTransformer3DModel(config)
 
 
 def test_wan_t2v_condition_builds_from_registered_class_without_assets(monkeypatch):
@@ -83,8 +82,8 @@ def test_wan_t2v_public_training_forward_matches_official(monkeypatch):
     # Registry resolution installs the production backbone forward. Restore that
     # class-level patch after this test, including when an assertion fails.
     monkeypatch.setattr(OfficialWanTransformer3DModel, "forward", OfficialWanTransformer3DModel.forward)
-    with ops_config_scope(_sdpa_ops_config()):
-        ours = get_model_class(config)(config)
+    config._set_ops_implementation(_sdpa_ops_config())
+    ours = get_model_class(config)(config)
     ours.load_state_dict(official.state_dict())
     samples = [
         {

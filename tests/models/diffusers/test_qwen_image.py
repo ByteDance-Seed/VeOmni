@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 from diffusers import QwenImageTransformer2DModel as OfficialQwenImageTransformer2DModel
 
-from tests.models.compare import assert_outputs_and_grads_match, eager_ops_config, ops_config_scope
+from tests.models.compare import assert_outputs_and_grads_match, eager_ops_config
 from tests.models.tiny_configs import tiny_qwen_image_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_qwen_image_config as _tiny_config
 
@@ -62,8 +62,8 @@ def test_qwen_image_public_forward_matches_official_without_sp(monkeypatch, trai
     config = _tiny_config()
     official = OfficialQwenImageTransformer2DModel(**config.to_diffuser_dict())
     monkeypatch.setattr(OfficialQwenImageTransformer2DModel, "forward", OfficialQwenImageTransformer2DModel.forward)
-    with ops_config_scope(_sdpa_ops_config()):
-        ours = get_model_class(config)(config)
+    config._set_ops_implementation(_sdpa_ops_config())
+    ours = get_model_class(config)(config)
     processor = ours.transformer_blocks[0].attn.processor
     assert processor.veomni_attn.impl == "sdpa"
     assert processor.veomni_attn_masked is processor.veomni_attn
@@ -189,8 +189,9 @@ def test_qwen_image_processor_uses_primary_handle_without_mask(monkeypatch):
         "get_parallel_state",
         lambda: SimpleNamespace(sp_enabled=False, ulysses_group=None),
     )
-    with ops_config_scope(_sdpa_ops_config()):
-        processor = modeling.QwenImageSPAttnProcessor()
+    config = _tiny_config()
+    config._set_ops_implementation(_sdpa_ops_config())
+    processor = modeling.QwenImageSPAttnProcessor(config)
 
     used: dict[str, object] = {}
 
@@ -228,8 +229,9 @@ def test_qwen_image_eager_config_runs_unmasked_attention(monkeypatch):
         "get_parallel_state",
         lambda: SimpleNamespace(sp_enabled=False, ulysses_group=None),
     )
-    with ops_config_scope(eager_ops_config()):
-        processor = modeling.QwenImageSPAttnProcessor()
+    config = _tiny_config()
+    config._set_ops_implementation(eager_ops_config())
+    processor = modeling.QwenImageSPAttnProcessor(config)
     assert processor.veomni_attn.impl == "veomni_sdpa"
     assert processor.veomni_attn_masked is processor.veomni_attn
 

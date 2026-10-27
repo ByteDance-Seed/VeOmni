@@ -1,7 +1,7 @@
 """Core utilities for MiniMax H3.
 
 Attention binds an instance-local ``attention/standard`` handle through
-``resolve_op_impl``. Gradient checkpointing lives in ``veomni.utils.recompute_utils``.
+``config.ops_config``. Gradient checkpointing lives in ``veomni.utils.recompute_utils``.
 """
 
 from __future__ import annotations
@@ -12,12 +12,16 @@ import torch
 import torch.nn as nn
 
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 
 
-def bind_minimax_attention(module: nn.Module, *, is_causal: bool, impl: str | None = None) -> None:
+def bind_minimax_attention(module: nn.Module, *, is_causal: bool, impl: str | None = None, config=None) -> None:
     """Attach the configured ``attention/standard`` handle and HF interface attrs."""
-    impl = impl or resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
+    if impl is None:
+        impl = (
+            config.ops_config.resolve_impl("attn_implementation", eager_as="veomni_sdpa")
+            if config is not None
+            else "veomni_sdpa"
+        )
     num_heads = module.num_heads
     module.veomni_attn = VeomniOp("attention", "standard", impl)
     module.is_causal = is_causal

@@ -87,10 +87,10 @@ def encode_prompt(text_encoder, processor, tokenizer, prompt, *, device, dtype, 
 
 
 class MiniMaxH3TextEncoder(torch.nn.Module):
-    def __init__(self, num_retained_layers: int = 64):
+    def __init__(self, num_retained_layers: int = 64, config=None):
         super().__init__()
         self.num_retained_layers = num_retained_layers
-        config = Qwen3VLConfig(
+        qwen_config = Qwen3VLConfig(
             **{
                 "architectures": ["Qwen3VLForConditionalGeneration"],
                 "image_token_id": 151655,
@@ -144,11 +144,13 @@ class MiniMaxH3TextEncoder(torch.nn.Module):
                 "vision_start_token_id": 151652,
             }
         )
-        self.model = Qwen3VLModel(config)
+        if config is not None and getattr(config, "ops_implementation", None):
+            qwen_config._set_ops_implementation(config.ops_implementation)
+        self.model = Qwen3VLModel(qwen_config)
         self.model.language_model.norm = torch.nn.Identity()
-        self.config = config
-        self.image_token_id = config.image_token_id
-        self.video_token_id = config.video_token_id
+        self.config = qwen_config
+        self.image_token_id = qwen_config.image_token_id
+        self.video_token_id = qwen_config.video_token_id
 
     def forward(
         self,

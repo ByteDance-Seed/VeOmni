@@ -25,7 +25,6 @@ from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.transformer_args import TransformerArgs
 
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 
 
 @dataclass
@@ -58,12 +57,15 @@ class TransformerOpsConfig:
         gated_attention: GatedAttentionCallable | None = None,
         ada_zero: AdaZeroCallable | None = None,
         post_sa: PostSACallable | None = None,
+        config=None,
     ) -> "TransformerOpsConfig":
         """Build a config from individual functions or enums. Each *None* slot
         falls back to the standard PyTorch implementation."""
-        attention_callable = attention.to_callable() if isinstance(attention, AttentionFunction) else attention
+        attention_callable = (
+            attention.to_callable(config=config) if isinstance(attention, AttentionFunction) else attention
+        )
         masked_callable = (
-            masked_attention.to_callable()
+            masked_attention.to_callable(config=config)
             if isinstance(masked_attention, MaskedAttentionFunction)
             else masked_attention
         )
@@ -75,14 +77,14 @@ class TransformerOpsConfig:
         )
         return cls(
             attention_ops=attention_ops,
-            ada_zero_function=ada_zero if ada_zero is not None else PytorchAdaZeroFunction(),
-            post_sa_function=post_sa if post_sa is not None else PytorchPostSAFunction(),
+            ada_zero_function=ada_zero if ada_zero is not None else PytorchAdaZeroFunction(config=config),
+            post_sa_function=post_sa if post_sa is not None else PytorchPostSAFunction(config=config),
         )
 
 
 # Import-time snapshot of stock PyTorch callables. Do not pass this object
 # into a model that should follow the active ops config; construct a fresh
-# ``TransformerOpsConfig()`` at model ``__init__`` instead.
+# ``TransformerOpsConfig.from_functions(config=config)`` at model ``__init__`` instead.
 DEFAULT_TRANSFORMER_OPS = TransformerOpsConfig()
 
 
@@ -94,14 +96,18 @@ class BasicAVTransformerBlock(torch.nn.Module):
         rope_type: LTXRopeType = LTXRopeType.SPLIT,
         norm_eps: float = 1e-6,
         ops: TransformerOpsConfig | None = None,
+        config=None,
     ):
         super().__init__()
 
         if ops is None:
-            ops = TransformerOpsConfig()
-        self.veomni_rms_norm_unweighted = VeomniOp(
-            "rms_norm", "unweighted", resolve_op_impl("rms_norm_implementation", variant="unweighted")
+            ops = TransformerOpsConfig.from_functions(config=config)
+        unweighted_impl = (
+            config.ops_config.resolve_impl("rms_norm_implementation", variant="unweighted")
+            if config is not None
+            else "eager"
         )
+        self.veomni_rms_norm_unweighted = VeomniOp("rms_norm", "unweighted", unweighted_impl)
         self.ada_zero_function = ops.ada_zero_function
         self.post_sa_function = ops.post_sa_function
         if video is not None:

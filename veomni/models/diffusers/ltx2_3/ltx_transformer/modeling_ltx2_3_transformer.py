@@ -285,6 +285,7 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
             caption_projection=caption_projection,
             audio_caption_projection=audio_caption_projection,
             cross_attention_adaln=config.cross_attention_adaln,
+            config=config,
         )
         self.config: LTXVideoTransformerModelConfig = config
         self.config.tie_word_embeddings = False

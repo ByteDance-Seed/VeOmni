@@ -16,7 +16,6 @@ from veomni.distributed.sequence_parallel.ulysses import (
     _Gather,
 )
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 
 from .core import (
     bind_minimax_attention,
@@ -61,11 +60,12 @@ def unpack_audio(rows: torch.Tensor, audio_channel: int, steps: int, latent_dim:
 class VeomniRMSNorm(nn.Module):
     """``rms_norm`` / ``standard``. Impl from ``rms_norm_implementation``, else eager."""
 
-    def __init__(self, size: int, *, eps: float):
+    def __init__(self, size: int, *, eps: float, config=None):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(size))
-        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+        rms_norm_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", rms_norm_impl)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the interned ``rms_norm`` handle."""
@@ -145,23 +145,28 @@ class MiniMaxH3TimeEmbedder(nn.Module):
 
 
 class MiniMaxH3Attention(nn.Module):
-    def __init__(self, hidden_size, num_attention_heads, attention_head_dim, qk_norm_eps):
+    def __init__(self, hidden_size, num_attention_heads, attention_head_dim, qk_norm_eps, config=None):
         super().__init__()
         self.num_heads = num_attention_heads
         self.head_dim = attention_head_dim
         inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
         self.qkv_proj = nn.Linear(hidden_size, inner_dim * 3, bias=False)
-        self.q_norm = VeomniRMSNorm(attention_head_dim, eps=qk_norm_eps)
-        self.k_norm = VeomniRMSNorm(attention_head_dim, eps=qk_norm_eps)
+        self.q_norm = VeomniRMSNorm(attention_head_dim, eps=qk_norm_eps, config=config)
+        self.k_norm = VeomniRMSNorm(attention_head_dim, eps=qk_norm_eps, config=config)
         self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
         # Packed FA is bound later. FA3/FA4 cannot be constructed on NPU or pre-SM90.
-        impl = resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
+        impl = (
+            config.ops_config.resolve_impl("attn_implementation", eager_as="veomni_sdpa")
+            if config is not None
+            else "veomni_sdpa"
+        )
         if is_flash_attn_impl(impl):
             impl = "veomni_sdpa"
-        bind_minimax_attention(self, is_causal=False, impl=impl)
+        bind_minimax_attention(self, is_causal=False, impl=impl, config=config)
         # 3-axis rope is shorter than head_dim (96 vs 128 in production). q/k are [S, H, D].
-        self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
+        rope_impl = config.ops_config.rotary_pos_emb_implementation if config is not None else "eager"
+        self.veomni_rope = VeomniOp("rope", "partial", rope_impl)
 
     def _run_packed_attention(
         self,
@@ -340,11 +345,15 @@ class MiniMaxH3AdalnProj(nn.Module):
 
 
 class MiniMaxH3TokenRefinerBlock(nn.Module):
-    def __init__(self, hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, norm_eps, qk_norm_eps):
+    def __init__(
+        self, hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, norm_eps, qk_norm_eps, config=None
+    ):
         super().__init__()
-        self.norm1 = VeomniRMSNorm(hidden_size, eps=norm_eps)
-        self.norm2 = VeomniRMSNorm(hidden_size, eps=norm_eps)
-        self.attn = MiniMaxH3Attention(hidden_size, num_attention_heads, attention_head_dim, qk_norm_eps)
+        self.norm1 = VeomniRMSNorm(hidden_size, eps=norm_eps, config=config)
+        self.norm2 = VeomniRMSNorm(hidden_size, eps=norm_eps, config=config)
+        self.attn = MiniMaxH3Attention(
+            hidden_size, num_attention_heads, attention_head_dim, qk_norm_eps, config=config
+        )
         self.mlp = MiniMaxH3MLP(hidden_size, ffn_hidden_size)
 
     def forward(self, x, *, cu_seqlens, max_seqlen, valid_seqlen):
@@ -371,17 +380,24 @@ class MiniMaxH3TokenRefiner(nn.Module):
         norm_eps,
         qk_norm_eps,
         final_norm_eps,
+        config=None,
     ):
         super().__init__()
         self.blocks = nn.ModuleList(
             [
                 MiniMaxH3TokenRefinerBlock(
-                    hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, norm_eps, qk_norm_eps
+                    hidden_size,
+                    num_attention_heads,
+                    attention_head_dim,
+                    ffn_hidden_size,
+                    norm_eps,
+                    qk_norm_eps,
+                    config=config,
                 )
                 for _ in range(num_layers)
             ]
         )
-        self.final_norm = VeomniRMSNorm(hidden_size, eps=final_norm_eps)
+        self.final_norm = VeomniRMSNorm(hidden_size, eps=final_norm_eps, config=config)
 
     def forward(self, x, *, cu_seqlens, max_seqlen, valid_seqlen=None, sample_local=False):
         if sample_local and isinstance(cu_seqlens, _PackedBounds) and len(cu_seqlens.host) > 2:
@@ -419,11 +435,14 @@ class MiniMaxH3DiTBlock(nn.Module):
         adaln_out_features,
         norm_eps,
         qk_norm_eps,
+        config=None,
     ):
         super().__init__()
-        self.norm1 = VeomniRMSNorm(hidden_size, eps=norm_eps)
-        self.norm2 = VeomniRMSNorm(hidden_size, eps=norm_eps)
-        self.attn = MiniMaxH3Attention(hidden_size, num_attention_heads, attention_head_dim, qk_norm_eps)
+        self.norm1 = VeomniRMSNorm(hidden_size, eps=norm_eps, config=config)
+        self.norm2 = VeomniRMSNorm(hidden_size, eps=norm_eps, config=config)
+        self.attn = MiniMaxH3Attention(
+            hidden_size, num_attention_heads, attention_head_dim, qk_norm_eps, config=config
+        )
         self.mlp = MiniMaxH3MLP(hidden_size, ffn_hidden_size)
         self.adaln_proj = MiniMaxH3AdalnProj(
             hidden_size, time_embed_dim, adaln_out_features, expand_ratio=6, modality_num=MINIMAX_H3_ADALN_MODALITY_NUM
@@ -474,10 +493,11 @@ class MiniMaxH3FinalLayer(nn.Module):
         audio_latents_dim,
         patch_size,
         final_norm_eps,
+        config=None,
     ):
         super().__init__()
         video_patch_dim = latents_dim * patch_size[0] * patch_size[1] * patch_size[2]
-        self.norm = VeomniRMSNorm(hidden_size, eps=final_norm_eps)
+        self.norm = VeomniRMSNorm(hidden_size, eps=final_norm_eps, config=config)
         self.adaln_proj = MiniMaxH3AdalnProj(
             hidden_size, time_embed_dim, final_adaln_out_features, expand_ratio=2, modality_num=1
         )
@@ -517,6 +537,7 @@ class MiniMaxH3DiT(nn.Module):
         norm_eps: float = 1e-5,
         qk_norm_eps: float = 1e-5,
         final_norm_eps: float = 1e-5,
+        config=None,
         **kwargs,
     ):
         super().__init__()
@@ -544,6 +565,7 @@ class MiniMaxH3DiT(nn.Module):
             norm_eps,
             qk_norm_eps,
             final_norm_eps,
+            config=config,
         )
         self.blocks = nn.ModuleList(
             [
@@ -556,6 +578,7 @@ class MiniMaxH3DiT(nn.Module):
                     adaln_out_features,
                     norm_eps,
                     qk_norm_eps,
+                    config=config,
                 )
                 for _ in range(num_layers)
             ]
@@ -568,6 +591,7 @@ class MiniMaxH3DiT(nn.Module):
             audio_latents_dim,
             patch_size,
             final_norm_eps,
+            config=config,
         )
 
     def enable_block_offload(self, split: int = None):

@@ -87,9 +87,10 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             norm_eps=config.norm_eps,
             qk_norm_eps=config.qk_norm_eps,
             final_norm_eps=config.final_norm_eps,
+            config=config,
         )
 
-        self._configure_packed_attention(config._attn_implementation)
+        self._configure_packed_attention(config.ops_config.attn_implementation)
 
     def _configure_packed_attention(self, attn_implementation):
         """Record the attention backend. Do not bind it yet: FA4/NPU/pre-SM90

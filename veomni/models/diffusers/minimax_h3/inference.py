@@ -28,7 +28,6 @@ from PIL import Image
 from tqdm import tqdm
 
 from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
-from veomni.ops.config import set_ops_config
 from veomni.utils.device import get_device_type
 
 from .minimax_h3_condition.configuration_minimax_h3_condition import MiniMaxH3ConditionModelConfig
@@ -377,9 +376,6 @@ class MiniMaxH3Pipeline(BasePipeline):
           tokenizer/processor) via MiniMaxH3ConditionModel.
         - DiT via MiniMaxH3DiTModel on meta, then load_model_weights on CPU.
         """
-        if ops_implementation is not None:
-            set_ops_config(ops_implementation)
-
         pipe = MiniMaxH3Pipeline(device=device, torch_dtype=torch_dtype)
 
         # Condition model: encoders are always needed at inference time, so
@@ -390,6 +386,8 @@ class MiniMaxH3Pipeline(BasePipeline):
         # config default subfolder "video_vae" has no safetensors directly.
         condition_model_cfg.setdefault("video_vae_subfolder", "video_vae/source")
         condition_cfg = MiniMaxH3ConditionModelConfig.from_pretrained(condition_model_path, **condition_model_cfg)
+        if ops_implementation is not None:
+            condition_cfg._set_ops_implementation(ops_implementation)
         condition_model = MiniMaxH3ConditionModel._from_config(condition_cfg)
         condition_model.eval()
 
@@ -425,6 +423,8 @@ class MiniMaxH3Pipeline(BasePipeline):
         dit_config = MiniMaxH3DiTModelConfig.from_pretrained(
             transformer_config_path, **(transformer_config_kwargs or {})
         )
+        if ops_implementation is not None:
+            dit_config._set_ops_implementation(ops_implementation)
         with init_empty_weights():
             pipe.dit = MiniMaxH3DiTModel._from_config(dit_config, torch_dtype=torch.bfloat16)
         load_model_weights(pipe.dit, transformer_weights_path, init_device="cpu")

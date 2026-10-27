@@ -19,7 +19,6 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
@@ -139,8 +138,12 @@ def _assert_wan_flash_attention_bf16(
 class WanSPAttnProcessor(WanAttnProcessor):
     """Video self-attn / text cross-attn through the interned ``attention`` kernel."""
 
-    def __init__(self):
-        impl = resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
+    def __init__(self, config=None):
+        impl = (
+            config.ops_config.resolve_impl("attn_implementation", eager_as="veomni_sdpa")
+            if config is not None
+            else "veomni_sdpa"
+        )
         self.veomni_attn = VeomniOp("attention", "standard", impl)
         self._use_flash = impl in _WAN_FLASH_IMPLS
         self.config = SimpleNamespace(_attn_implementation=impl)
@@ -489,6 +492,7 @@ class _WanTransformerInitShim(_WanTransformer3DModel):
 class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
     config_class = WanTransformer3DModelConfig
     supports_gradient_checkpointing = True
+    _supports_sdpa = True
     _supports_flash_attn = True
     _no_split_modules = ["WanTransformerBlock"]
 
@@ -502,7 +506,7 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
         self.config: WanTransformer3DModelConfig = config
         self.config.tie_word_embeddings = False
 
-        sp_processor = WanSPAttnProcessor()
+        sp_processor = WanSPAttnProcessor(config)
         for block in self.blocks:
             block.attn1.set_processor(sp_processor)
             block.attn2.set_processor(sp_processor)
