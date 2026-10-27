@@ -1,12 +1,17 @@
 import gzip
 import json
+import subprocess
 import sys
 import types
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.utils import hdfs_io
 from veomni.utils import npu_offline_postprocess as post
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _install_fake_torch_npu(monkeypatch, analyse):
@@ -245,7 +250,7 @@ def test_postprocess_upload_without_analyse_uses_existing_trace(tmp_path, monkey
     trace.write_text("{}", encoding="utf-8")
     uploads = []
 
-    monkeypatch.setattr(post, "run_upload_cmd", lambda cmd, path: uploads.append((cmd, path)))
+    monkeypatch.setattr(post, "run_upload_cmd", lambda cmd, path, **kwargs: uploads.append((cmd, path)))
 
     packed = post.postprocess(raw, analyse=False, upload_cmd="upload-trace {trace}")
     assert packed is not None
@@ -265,7 +270,7 @@ def test_custom_upload_preserves_json_braces_and_quotes_trace_path(tmp_path, mon
     assert calls == [
         (
             (["upload", "--json", '{"asset_type":"perfetto"}', "--file", str(trace)],),
-            {"check": True},
+            {"check": True, "timeout": post.DEFAULT_UPLOAD_TIMEOUT_SECONDS},
         )
     ]
 
@@ -288,7 +293,7 @@ def test_merlin_upload_uses_argv_without_shell(tmp_path, monkeypatch):
     payload = json.loads(argv[4])
     assert payload["name"] == "npu trace"
     assert payload["file_path"] == str(packed)
-    assert calls[0][1] == {"check": True}
+    assert calls[0][1] == {"check": True, "timeout": post.DEFAULT_UPLOAD_TIMEOUT_SECONDS}
 
 
 def test_merlin_upload_without_cli_rejects_sdk_fallback(tmp_path, monkeypatch):
@@ -330,3 +335,38 @@ def test_postprocess_requires_action(tmp_path):
     raw = tmp_path / "rank0_ascend_pt"
     raw.mkdir()
     assert post.main(["--raw-dir", str(raw)]) == 2
+
+
+def test_upload_timeout_reports_failure_and_preserves_trace(tmp_path, monkeypatch):
+    trace = tmp_path / "trace.json.gz"
+    trace.write_bytes(b"profile")
+
+    def timed_out(argv, **kwargs):
+        assert kwargs == {"check": True, "timeout": 0.25}
+        raise subprocess.TimeoutExpired(argv, 0.25)
+
+    monkeypatch.setattr(post.subprocess, "run", timed_out)
+    with pytest.raises(RuntimeError, match="Upload timed out after 0.25s"):
+        post.run_upload_cmd("uploader", trace, timeout=0.25)
+    assert trace.read_bytes() == b"profile"
+
+
+@pytest.mark.parametrize("merlin", [False, True])
+def test_upload_timeout_cli_reaches_both_uploaders(tmp_path, monkeypatch, merlin):
+    raw = tmp_path / "rank0_ascend_pt"
+    out = raw / "ASCEND_PROFILER_OUTPUT"
+    out.mkdir(parents=True)
+    (out / "trace_view.json").write_text("[]")
+    calls = []
+    monkeypatch.setattr(post.shutil, "which", lambda command: "/usr/bin/merlin-cli")
+    monkeypatch.setattr(post.subprocess, "run", lambda *args, **kwargs: calls.append(kwargs))
+    upload = ["--merlin-upload"] if merlin else ["--upload-cmd", "uploader"]
+    assert post.main(["--raw-dir", str(raw), "--upload-timeout", "2.5", *upload]) == 0
+    assert calls == [{"check": True, "timeout": 2.5}]
+
+
+@pytest.mark.parametrize("timeout", ["0", "-1", "nan", "inf"])
+def test_upload_timeout_cli_rejects_unbounded_values(timeout):
+    with pytest.raises(SystemExit) as exc:
+        post.build_arg_parser().parse_args(["--raw-dir", "unused", "--upload-timeout", timeout])
+    assert exc.value.code == 2

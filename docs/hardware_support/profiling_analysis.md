@@ -71,6 +71,8 @@ Use pod-local storage for large Ascend captures, then copy / parse / upload outs
 
 In `offline` mode, VeOmni can spawn a detached postprocess sidecar after raw finalization:
 
+The sidecar bounds each custom or Merlin upload subprocess to 3,600 seconds by default. For manual postprocessing, pass `--upload-timeout SECONDS` to `python -m veomni.utils.npu_offline_postprocess`; increase it for large captures. The value must be finite and positive. An upload timeout reports an error and preserves the raw capture and packed trace for retry.
+
 | Config / integration | Effect |
 |-----|--------|
 | `npu_postprocess: true` (default) | Analyse the finalized raw capture in a detached sidecar; copy it when `trace_dir` is `hdfs://` |

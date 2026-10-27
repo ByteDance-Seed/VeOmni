@@ -25,6 +25,7 @@ import argparse
 import gzip
 import json
 import logging
+import math
 import os
 import shlex
 import shutil
@@ -37,6 +38,7 @@ from typing import Optional
 
 
 logger = logging.getLogger("veomni.npu_offline_postprocess")
+DEFAULT_UPLOAD_TIMEOUT_SECONDS = 3600.0
 
 
 def _is_ascend_pt_dir(path: Path) -> bool:
@@ -193,10 +195,25 @@ def _upload_argv(upload_cmd: str | list[str], trace_file: Path) -> list[str]:
     return [*argv, str(trace_file)]
 
 
-def run_upload_cmd(upload_cmd: str | list[str], trace_file: Path) -> None:
+def _positive_upload_timeout(value: str | float) -> float:
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("Upload timeout must be finite and positive")
+    return timeout
+
+
+def run_upload_cmd(
+    upload_cmd: str | list[str], trace_file: Path, *, timeout: float = DEFAULT_UPLOAD_TIMEOUT_SECONDS
+) -> None:
+    timeout = _positive_upload_timeout(timeout)
     argv = _upload_argv(upload_cmd, trace_file)
     logger.info("Uploading with argv: %s", shlex.join(argv))
-    subprocess.run(argv, check=True)
+    try:
+        subprocess.run(argv, check=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Upload timed out after {timeout:g}s: {argv[0]}. Trace remains on disk at {trace_file}"
+        ) from exc
 
 
 def build_merlin_upload_cmd(trace_file: Path, name: Optional[str] = None) -> list[str]:
@@ -217,10 +234,12 @@ def build_merlin_upload_cmd(trace_file: Path, name: Optional[str] = None) -> lis
     return ["merlin-cli", "profiling", "upload", "--json", json.dumps(payload, ensure_ascii=False)]
 
 
-def upload_merlin_profile(trace_file: Path, name: Optional[str] = None) -> None:
+def upload_merlin_profile(
+    trace_file: Path, name: Optional[str] = None, *, timeout: float = DEFAULT_UPLOAD_TIMEOUT_SECONDS
+) -> None:
     """Upload through Merlin's file-based CLI and fail safely when unavailable."""
     if shutil.which("merlin-cli"):
-        run_upload_cmd(build_merlin_upload_cmd(trace_file, name=name), trace_file)
+        run_upload_cmd(build_merlin_upload_cmd(trace_file, name=name), trace_file, timeout=timeout)
         return
 
     raise RuntimeError(
@@ -238,6 +257,7 @@ def postprocess(
     upload_cmd: Optional[str] = None,
     merlin_upload: bool = False,
     upload_name: Optional[str] = None,
+    upload_timeout: float = DEFAULT_UPLOAD_TIMEOUT_SECONDS,
     max_process_number: Optional[int] = None,
 ) -> Optional[Path]:
     resolved = resolve_raw_dir(raw_dir)
@@ -259,10 +279,10 @@ def postprocess(
     trace_path = find_trace_view(resolved)
     packed = gzip_trace(trace_path)
     if merlin_upload:
-        upload_merlin_profile(packed, name=upload_name)
+        upload_merlin_profile(packed, name=upload_name, timeout=upload_timeout)
     else:
         assert upload_cmd is not None
-        run_upload_cmd(upload_cmd, packed)
+        run_upload_cmd(upload_cmd, packed, timeout=upload_timeout)
     return packed
 
 
@@ -301,6 +321,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Upload the parsed Chrome trace with the file-based Merlin CLI.",
     )
     parser.add_argument("--upload-name", default=None, help="Optional Merlin asset display name")
+    parser.add_argument(
+        "--upload-timeout",
+        type=_positive_upload_timeout,
+        default=DEFAULT_UPLOAD_TIMEOUT_SECONDS,
+        help="Finite positive timeout in seconds for each upload process (default: 3600).",
+    )
     parser.add_argument("--max-process-number", type=int, default=None, help="torch_npu analyse parallelism")
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
@@ -319,6 +345,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         upload_cmd=args.upload_cmd,
         merlin_upload=args.merlin_upload,
         upload_name=args.upload_name,
+        upload_timeout=args.upload_timeout,
         max_process_number=args.max_process_number,
     )
     return 0
