@@ -1,13 +1,16 @@
+import asyncio
 import importlib.util
 import math
 import os
 import queue
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import timedelta
 from functools import partial
 from importlib.machinery import ModuleSpec
+from threading import Event
 from types import SimpleNamespace
 
 
@@ -18,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.tools.launch_utils import spawn_with_rendezvous
 
 
 _real_find_spec = importlib.util.find_spec
@@ -55,6 +59,13 @@ try:
     from veomni.utils.constants import IGNORE_INDEX
 finally:
     importlib.util.find_spec = _real_find_spec  # type: ignore[assignment]
+
+
+def _legacy_computer(*args, **kwargs):
+    """Exercise the internal legacy aggregation helpers without a producer."""
+    computer = ChannelLossComputer(*args, **kwargs)
+    computer._require_source_provenance = False
+    return computer
 
 
 def _stub_parallel_state(monkeypatch, **overrides):
@@ -141,7 +152,7 @@ def test_channel_loss_uses_shift_labels_when_sequence_parallel_is_on():
     shift_labels = torch.tensor([[4, 5, 6]], dtype=torch.long)
 
     def run(sp_enabled: bool, shift: torch.Tensor | None):
-        computer = ChannelLossComputer(
+        computer = _legacy_computer(
             parallel_state=SimpleNamespace(sp_enabled=sp_enabled, sp_group=None, sp_size=1, sp_rank=0)
         )
         computer._source_ids = [0]
@@ -173,7 +184,7 @@ def test_channel_loss_computer_aggregates_packed_logits_by_source():
     position_ids = torch.tensor([[0, 1, 2, 0, 1]], dtype=torch.long)
     logits = torch.randn(1, 5, vocab_size)
 
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     computer._source_ids = [0, 1]
     computer._position_ids = position_ids
 
@@ -218,7 +229,7 @@ def test_channel_loss_computer_hidden_states_path_matches_logits_path():
     weights = torch.randn(vocab_size, hidden_size)
     logits = F.linear(hidden_states, weights)
 
-    logits_computer = ChannelLossComputer()
+    logits_computer = _legacy_computer()
     logits_computer._source_ids = ["a", "b"]
     logits_computer._position_ids = position_ids
     logits_result = logits_computer._compute_channel_loss(
@@ -232,7 +243,7 @@ def test_channel_loss_computer_hidden_states_path_matches_logits_path():
         ignore_index=IGNORE_INDEX,
     )
 
-    hs_computer = ChannelLossComputer()
+    hs_computer = _legacy_computer()
     hs_computer._source_ids = ["a", "b"]
     hs_computer._position_ids = position_ids
     hs_result = hs_computer._compute_channel_loss(
@@ -250,7 +261,7 @@ def test_channel_loss_computer_hidden_states_path_matches_logits_path():
 
 
 def test_channel_loss_computer_counts_attention_masked_input_tokens():
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     computer._source_ids = ["repoqa"]
     computer._position_ids = torch.tensor([[0, 1, 2, 3]])
 
@@ -308,7 +319,7 @@ def test_channel_loss_wrapper_forwards_original_call_unchanged():
             return "main-loss"
 
     model = DummyModel()
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     computer._source_ids = [0]
     computer._position_ids = torch.tensor([[0, 1, 2]])
     logits = torch.randn(1, 3, 8)
@@ -343,7 +354,7 @@ def test_channel_loss_extracts_fused_inputs_from_models_loss_partial():
             self.loss_function = partial(ForCausalLMLoss, op=fake_ce)
 
     model = DummyModel()
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     computer._source_ids = [0]
     computer._position_ids = torch.tensor([[0, 1, 2]])
     labels = torch.tensor([[1, 2, 3]])
@@ -412,7 +423,7 @@ def test_channel_loss_preserves_full_and_factored_bias(
     reference_inputs = [t.detach().clone().requires_grad_() for t in tensors]
     reference = compute(reference_inputs)
     reference.backward()
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     computer.strict = strict
     computer._source_ids = ["first", "second"]
     computer._position_ids = torch.arange(7).expand(2, -1)
@@ -452,7 +463,7 @@ def test_channel_loss_rejects_unsupported_bias_without_false_metrics(monkeypatch
     unsupported_op.impl = "liger_kernel"
     model = torch.nn.Module()
     model.loss_function = partial(ForCausalLMLoss, op=unsupported_op)
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     computer.strict = True
     computer._source_ids = ["source"]
     computer._position_ids = torch.arange(5).unsqueeze(0)
@@ -493,7 +504,7 @@ def test_channel_loss_chunk_kernel_reuses_main_projection(monkeypatch):
     kwargs = dict(logits=None, labels=labels, vocab_size=7, chunk_size=8)
     reference, _, _ = model.loss_function(**kwargs, hidden_states=ref_hidden, weights=ref_weight)
     reference.backward()
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     computer._source_ids = ["source"]
     computer._position_ids = torch.arange(17).unsqueeze(0)
     projections = []
@@ -535,7 +546,7 @@ def test_channel_loss_capture_is_scoped_to_instance_loss(monkeypatch, capture_co
                 consumer(torch.zeros_like(labels, dtype=torch.float32))
             return "main-loss"
 
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     computer._source_ids = ["a"]
     computer._position_ids = torch.arange(3).unsqueeze(0)
     model = Model()
@@ -598,7 +609,7 @@ def test_channel_loss_unwraps_native_lora_model_for_eager_loss():
         VeOmniLoraConfig(target_modules=["unused"]),
         inject=False,
     )
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     computer._source_ids = [0]
     computer._position_ids = torch.tensor([[0, 1, 2]])
     logits = torch.randn(1, 3, 8)
@@ -632,7 +643,7 @@ def test_channel_loss_unwraps_omni_thinker_loss(model_cls):
     model = object.__new__(model_cls)
     torch.nn.Module.__init__(model)
     model.thinker = thinker
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     computer._source_ids = [0]
     computer._position_ids = torch.tensor([[0, 1, 2]])
     logits = torch.randn(1, 3, 8)
@@ -680,6 +691,8 @@ def test_channel_loss_sp_reduce_preserves_batch_order_for_multiple_sources(monke
         attention_mask_flat=None,
         source_ids=["batch0", "batch1"],
         positions=torch.tensor([[0, 1], [0, 1]]),
+        packed_global_cu_seqlens=[0, 4, 8],
+        tail_padding_length=0,
         seq_len=4,
         ignore_index=IGNORE_INDEX,
         parallel_state=parallel_state,
@@ -745,14 +758,21 @@ def test_channel_loss_sp_reduce_filters_uneven_remote_padding_segments(monkeypat
     monkeypatch.setattr(channel_loss_module.dist, "all_gather_object", fake_all_gather_object)
     monkeypatch.setattr(channel_loss_module.dist, "all_gather", fake_all_gather)
 
-    result = ChannelLossComputer._aggregate_sp(
-        per_token_loss=torch.tensor([1.0, 2.0]),
-        labels_flat=torch.tensor([1, 1]),
-        attention_mask_flat=torch.ones(2, dtype=torch.long),
+    result = ChannelLossComputer._reduce_sp(
+        local_segments=[
+            {
+                "batch_idx": 0,
+                "sp_rank": 0,
+                "local_order": 0,
+                "is_start": True,
+                "has_explicit_padding_mask": torch.tensor(False),
+                "has_only_zero_positions": False,
+                "loss_sum": torch.tensor(3.0),
+                "token_count": torch.tensor(2),
+            }
+        ],
         source_ids=["doc"],
-        positions=torch.tensor([[0, 1]]),
-        seq_len=2,
-        ignore_index=IGNORE_INDEX,
+        device=torch.device("cpu"),
         parallel_state=parallel_state,
         strict=True,
     )
@@ -852,7 +872,7 @@ def test_channel_loss_preserves_zero_supervision_tail_when_later_row_has_padding
 
 
 def test_channel_loss_compute_uses_position_aligned_mask_for_padding_evidence(monkeypatch):
-    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
     computer.strict = True
     computer._source_ids = ["row0_normal", "row0_zero", "row1_normal"]
     computer._position_ids = torch.tensor([[0, 1, 2, 0], [0, 1, 0, 0]])
@@ -1034,7 +1054,7 @@ def test_channel_loss_sp_rejects_stale_global_cu_for_headwise_tail():
     )
 
     assert ChannelLossComputer._aggregate_by_source(**kwargs, strict=False) == []
-    with pytest.raises(ChannelLossMetadataError, match="do not describe the same headwise microbatch"):
+    with pytest.raises(ChannelLossMetadataError, match="global geometry|do not describe the same headwise microbatch"):
         ChannelLossComputer._aggregate_by_source(**kwargs, strict=True)
 
 
@@ -1097,7 +1117,7 @@ def test_channel_loss_sp_rank_local_cu_rejects_inconsistent_tail_provenance():
     )
 
     assert ChannelLossComputer._aggregate_by_source(**kwargs, strict=False) == []
-    with pytest.raises(ChannelLossMetadataError, match="tail_padding_length"):
+    with pytest.raises(ChannelLossMetadataError, match="tail"):
         ChannelLossComputer._aggregate_by_source(**kwargs, strict=True)
 
 
@@ -1121,10 +1141,10 @@ def test_channel_loss_sp_rejects_malformed_local_cu_instead_of_falling_back_to_p
         ChannelLossComputer._aggregate_by_source(**kwargs, strict=True)
 
 
-def test_channel_loss_sp_valid_global_cu_falls_back_for_standard_ulysses_slice():
+def test_channel_loss_sp_rejects_inconsistent_global_cu_for_ulysses_slice():
     parallel_state = _test_parallel_state(sp_enabled=True, sp_size=2)
 
-    result = ChannelLossComputer._aggregate_by_source(
+    kwargs = dict(
         per_token_loss=torch.arange(1, 5, dtype=torch.float32),
         labels_flat=torch.ones(4, dtype=torch.long),
         attention_mask_flat=torch.ones(4, dtype=torch.long),
@@ -1132,16 +1152,16 @@ def test_channel_loss_sp_valid_global_cu_falls_back_for_standard_ulysses_slice()
         position_ids=torch.tensor([[0, 1, 0, 1]]),
         packed_cu_seqlens=[0, 4, 8],
         packed_global_cu_seqlens=[0, 4, 8],
+        tail_padding_length=0,
         ignore_index=IGNORE_INDEX,
         sp_enabled=True,
         parallel_state=parallel_state,
-        strict=True,
     )
-
-    assert result == [
-        {"source_id": "first", "loss_sum": 3.0, "token_count": 2},
-        {"source_id": "second", "loss_sum": 7.0, "token_count": 2},
-    ]
+    # A rank-zero width-four contiguous shard of [0,4,8] has no reset at
+    # local position two. Treating the local reset as source two misattributes.
+    assert ChannelLossComputer._aggregate_by_source(**kwargs, strict=False) == []
+    with pytest.raises(ChannelLossMetadataError, match="global CU cannot prove"):
+        ChannelLossComputer._aggregate_by_source(**kwargs, strict=True)
 
 
 def test_channel_loss_sp_rejects_stale_cu_endpoint_instead_of_falling_back_to_positions():
@@ -1161,7 +1181,7 @@ def test_channel_loss_sp_rejects_stale_cu_endpoint_instead_of_falling_back_to_po
     )
 
     assert ChannelLossComputer._aggregate_by_source(**kwargs, strict=False) == []
-    with pytest.raises(ChannelLossMetadataError, match="standard-Ulysses global provenance"):
+    with pytest.raises(ChannelLossMetadataError, match="endpoint"):
         ChannelLossComputer._aggregate_by_source(**kwargs, strict=True)
 
 
@@ -1228,7 +1248,7 @@ def test_channel_loss_sp_keeps_zero_supervision_segment_before_tail_padding(monk
 
 def test_channel_loss_sp_capture_reuses_snapshot():
     parallel_state = _test_parallel_state(sp_enabled=True)
-    computer = ChannelLossComputer(parallel_state=parallel_state)
+    computer = _legacy_computer(parallel_state=parallel_state)
     computer.strict = True
     computer._source_ids = ["source-a"]
     computer._position_ids = torch.tensor([[0, 1]])
@@ -1339,7 +1359,7 @@ def test_channel_loss_sp_packet_preserves_float_values_and_int64_counts(loss_val
 
 
 def test_channel_loss_failed_observation_exchange_aborts_unsafe_process_group(monkeypatch):
-    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
     computer._source_ids = ["source-a"]
     monkeypatch.setattr(channel_loss_module.dist, "is_available", lambda: True)
     monkeypatch.setattr(channel_loss_module.dist, "is_initialized", lambda: True)
@@ -1359,7 +1379,7 @@ def test_channel_loss_failed_observation_exchange_aborts_unsafe_process_group(mo
 def test_channel_loss_failed_sp_payload_exchange_aborts_unsafe_process_group(monkeypatch):
     group = object()
     state = _test_parallel_state(sp_enabled=True, sp_group=group, sp_size=2, sp_rank=0)
-    computer = ChannelLossComputer(parallel_state=state)
+    computer = _legacy_computer(parallel_state=state)
     computer._source_ids = ["source-a"]
     segment = {
         "batch_idx": 0,
@@ -1421,7 +1441,7 @@ def test_channel_loss_logits_path_computes_ce_in_chunks(monkeypatch):
     logits = torch.randn(1, 5, 8)
     labels_flat = torch.tensor([1, 2, 3, 4, 5])
 
-    result = ChannelLossComputer()._per_token_ce(
+    result = _legacy_computer()._per_token_ce(
         logits=logits,
         labels_flat=labels_flat,
         vocab_size=8,
@@ -1443,7 +1463,7 @@ def test_channel_loss_config_validates_sampling_interval():
 
 def test_channel_loss_releases_observer_cache_after_side_channel(monkeypatch):
     events = []
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     computer.release_cache = True
 
     def compute(**kwargs):
@@ -1511,7 +1531,7 @@ def test_channel_loss_observer_cache_cleanup_is_noop_on_cpu(monkeypatch):
 
 
 def test_channel_loss_cleanup_failure_does_not_abort_observation(monkeypatch):
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     computer.release_cache = True
     computer._source_ids = ["source-a"]
     observed = [
@@ -1542,7 +1562,7 @@ def test_channel_loss_cleanup_failure_does_not_abort_observation(monkeypatch):
 
 
 def test_channel_loss_cleanup_failure_preserves_strict_metadata_error(monkeypatch):
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     computer.strict = True
     computer.release_cache = True
 
@@ -1571,7 +1591,7 @@ def test_channel_loss_cleanup_failure_preserves_strict_metadata_error(monkeypatc
 
 
 def test_channel_loss_multiple_objectives_count_primary_data_once(monkeypatch):
-    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
     computer._source_ids = ["source-a"]
     computer._position_ids = torch.tensor([[0, 1]])
     results = iter(
@@ -1656,7 +1676,7 @@ def test_channel_loss_qwen35_mtp_counts_primary_batch_once(auxiliary_first, copy
     mtp_labels = torch.tensor([[[3, 4, IGNORE_INDEX, IGNORE_INDEX]]])
     expected = model(hidden, labels, mtp_labels)
     expected_grads = torch.autograd.grad(expected, (hidden, model.weight))
-    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
     computer.strict = True
     computer.begin_step([["source-a"]], [torch.arange(4)[None]], [None])
     computer.before_micro_step(primary_labels=labels, mtp_labels=mtp_labels)
@@ -1688,8 +1708,9 @@ def test_channel_loss_qwen35_mtp_counts_primary_batch_once(auxiliary_first, copy
         ([[IGNORE_INDEX, 1, IGNORE_INDEX, IGNORE_INDEX]], [[[IGNORE_INDEX] * 4]], [[0, 1, 2, 3]], ["a"], [1]),
     ],
 )
+@pytest.mark.parametrize("with_provenance", [False, True])
 def test_qwen35_mtp_observer_handles_multiple_depths_and_empty_targets(
-    labels, mtp_labels, positions, sources, expected_counts
+    labels, mtp_labels, positions, sources, expected_counts, with_provenance
 ):
     from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import compute_mtp_loss
 
@@ -1716,9 +1737,20 @@ def test_qwen35_mtp_observer_handles_multiple_depths_and_empty_targets(
     hidden = torch.randn(1, labels.size(-1), 3, requires_grad=True)
     expected = model(hidden, labels, mtp_labels)
     reference_grad = torch.autograd.grad(expected, (hidden, model.weight))
-    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
     computer.strict = True
-    computer.begin_step([sources], [positions], [None])
+    points = positions[0].eq(0).nonzero(as_tuple=True)[0].tolist() + [positions.size(-1)]
+    provenance = {
+        "source_ids": sources,
+        "source_cu": points,
+        "input_mask": torch.ones(positions.numel(), dtype=torch.bool),
+        "tail": 0,
+        "sp_size": 1,
+        "sp_rank": 0,
+    }
+    computer.begin_step(
+        [sources], [positions], [None], per_mb_source_provenances=[provenance] if with_provenance else None
+    )
     computer.before_micro_step(primary_labels=labels, mtp_labels=mtp_labels)
     try:
         computer.install(model)
@@ -1732,10 +1764,15 @@ def test_qwen35_mtp_observer_handles_multiple_depths_and_empty_targets(
         torch.testing.assert_close(value, reference, rtol=0, atol=0)
     assert [computer.step_totals[source][1].item() for source in sources] == expected_counts
     assert not computer.strict_observation_errors
+    if with_provenance:
+        assert [computer.step_data_totals[source][0].item() for source in sources] == [1] * len(sources)
+        assert [computer.step_data_totals[source][1].item() for source in sources] == [
+            end - start for start, end in zip(points, points[1:])
+        ]
 
 
 def test_channel_loss_rejects_ambiguous_primary_and_mtp_targets():
-    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
     computer._primary_labels = torch.tensor([[1, 1, 1]])
     computer._require_primary_labels = True
     computer._mtp_labels = torch.tensor([[[1, 1, 1]]])
@@ -1744,8 +1781,36 @@ def test_channel_loss_rejects_ambiguous_primary_and_mtp_targets():
         computer._matched_mtp_targets(copied_labels, copied_labels, IGNORE_INDEX)
 
 
+def test_mtp_provenance_checks_every_depth_for_supervised_padding():
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["source"]
+    computer._source_provenance = {
+        "source_ids": ["source"],
+        "source_cu": [0, 2],
+        "input_mask": torch.ones(2, dtype=torch.bool),
+        "tail": 2,
+        "sp_size": 1,
+        "sp_rank": 0,
+    }
+    computer._primary_labels = torch.tensor([[0, 1, IGNORE_INDEX, IGNORE_INDEX]])
+    computer._require_primary_labels = True
+    computer._mtp_labels = torch.tensor([[[1, 2, IGNORE_INDEX, IGNORE_INDEX], [2, 3, 4, IGNORE_INDEX]]])
+    targets = computer._mtp_labels.reshape(2, 4)
+    with pytest.raises(ChannelLossMetadataError, match="tail contains supervised labels"):
+        computer._compute_channel_loss(
+            logits=torch.randn(2, 4, 5),
+            labels=targets,
+            vocab_size=5,
+            hidden_states=None,
+            weights=None,
+            attention_mask=None,
+            shift_labels=targets,
+            ignore_index=IGNORE_INDEX,
+        )
+
+
 def test_channel_loss_strict_rejects_missing_primary_microbatch_labels():
-    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
     computer.strict = True
     computer.begin_step([["source"]], [torch.tensor([[0, 1]])], [None])
     computer.before_micro_step(primary_labels=None)
@@ -1755,7 +1820,7 @@ def test_channel_loss_strict_rejects_missing_primary_microbatch_labels():
 
 
 def test_channel_loss_primary_data_is_reset_between_microbatches():
-    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
     computer.strict = True
     computer.begin_step([["same"], ["same"]], [torch.arange(4)[None]] * 2, [None, None])
     for labels in (torch.tensor([[1, 2, 3, 4]]), torch.tensor([[1, IGNORE_INDEX, 3, IGNORE_INDEX]])):
@@ -1775,7 +1840,7 @@ def test_dpo_channel_loss_masks_segment_boundaries_and_counts_preference_pairs(s
     raw = torch.tensor([[1, 2, 3, 4, 5]])
     labels = F.pad(raw[:, 1:], (0, 1), value=IGNORE_INDEX) if sp_enabled else raw
     before = labels.clone()
-    computer = ChannelLossComputer(parallel_state=_test_parallel_state(sp_enabled=sp_enabled))
+    computer = _legacy_computer(parallel_state=_test_parallel_state(sp_enabled=sp_enabled))
     computer.strict = True
     computer._dpo_segments = True
     computer._source_repeat = 2
@@ -1794,7 +1859,7 @@ def test_dpo_channel_loss_masks_segment_boundaries_and_counts_preference_pairs(s
 
 
 def test_dpo_channel_loss_rejects_unproven_headwise_cp_tail():
-    computer = ChannelLossComputer(
+    computer = _legacy_computer(
         parallel_state=_test_parallel_state(sp_enabled=True, sp_size=2, sp_rank=0, sp_group=object())
     )
     computer._source_ids = ["source", "source"]
@@ -1812,7 +1877,7 @@ def test_dpo_channel_loss_rejects_unproven_headwise_cp_tail():
 
 
 def test_channel_loss_strict_success_plus_failure_discards_partial_evidence(monkeypatch):
-    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
     computer.strict = True
     computer._source_ids = ["source-a"]
     successful = [
@@ -1851,7 +1916,7 @@ def test_channel_loss_strict_success_plus_failure_discards_partial_evidence(monk
 
 
 def test_channel_loss_strict_failure_blocks_later_capture_evidence(monkeypatch):
-    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
     computer.strict = True
     computer._source_ids = ["source-a"]
     successful = [
@@ -1892,7 +1957,7 @@ def test_channel_loss_strict_failure_blocks_later_capture_evidence(monkeypatch):
 
 
 def test_channel_loss_computer_aggregates_step_results_locally():
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     computer.begin_step([], [], [])
     computer._result = [
         {
@@ -1928,7 +1993,7 @@ def test_channel_loss_computer_aggregates_step_results_locally():
 
 
 def test_channel_loss_begin_step_rejects_parallel_metadata_list_mismatch():
-    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
 
     with pytest.raises(ChannelLossMetadataError, match="per-microbatch metadata list lengths"):
         computer.begin_step(
@@ -2274,6 +2339,17 @@ def test_dpo_channel_loss_real_base_dispatch_repeats_metadata_and_emits_policy_t
         "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]]),
         "labels": torch.tensor([[1, 2, IGNORE_INDEX, 4, IGNORE_INDEX, 6, IGNORE_INDEX, 7]]),
         "position_ids": torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]]),
+        "cu_seq_lens_q": torch.tensor([0, 2, 4, 6, 8]),
+        "_veomni_channel_loss_source_provenance": channel_loss_module._ChannelLossProvenance(
+            {
+                "source_ids": [3, 4],
+                "source_cu": [0, 4, 8],
+                "input_mask": torch.ones(8, dtype=torch.bool),
+                "tail": 0,
+                "sp_size": 1,
+                "sp_rank": 0,
+            }
+        ),
         "ds_idx": torch.tensor([3, 4]),
         "source_name": ["train/a", "train/b"],
     }
@@ -2281,7 +2357,7 @@ def test_dpo_channel_loss_real_base_dispatch_repeats_metadata_and_emits_policy_t
     try:
         base.channel_loss_callback.computer.install(policy_model)
         TextDPOTrainer.on_step_begin(trainer, micro_batches=[micro_batch])
-        assert base.channel_loss_callback.computer._per_mb_source_ids == [[3, 3, 4, 4]]
+        assert base.channel_loss_callback.computer._per_mb_source_ids == [[3, 4]]
         TextDPOTrainer.forward_backward_step(trainer, micro_batch)
 
         assert policy_model.loss_calls == 1
@@ -2289,6 +2365,9 @@ def test_dpo_channel_loss_real_base_dispatch_repeats_metadata_and_emits_policy_t
         assert set(base.channel_loss_callback.computer.step_totals) == {3, 4}
         assert base.channel_loss_callback.computer.step_totals[3][1].item() == 2
         assert base.channel_loss_callback.computer.step_totals[4][1].item() == 2
+        for source_id in (3, 4):
+            samples, inputs, labels = base.channel_loss_callback.computer.step_data_totals[source_id]
+            assert (samples.item(), inputs.item(), labels.item()) == (1, 4, 2)
         assert base.channel_loss_callback.computer.source_names == {3: "train/a", 4: "train/b"}
         assert policy_model.scale.grad is not None
         assert reference_model.scale.grad is None
@@ -2908,7 +2987,7 @@ def test_channel_loss_callback_strict_raises_observer_failure_before_backward(mo
 def test_strict_observer_failure_prevents_real_train_step_optimizer_update(monkeypatch):
     import veomni.trainer.base as base_module
 
-    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
     computer.strict = True
     computer._source_ids = ["source-a"]
     monkeypatch.setattr(
@@ -3113,10 +3192,12 @@ def _gloo_sp_preflight_worker(rank, world_size, init_file, result_queue):
                     sp_rank=rank,
                 )
 
-            computer = ChannelLossComputer(parallel_state=scenario_state)
+            computer = _legacy_computer(parallel_state=scenario_state)
             computer.strict = not (scenario == "strict_mismatch" and rank == 1)
             computer._source_ids = ["source-a"]
             computer._position_ids = torch.tensor([[0, 1]]) if rank == 0 else torch.tensor([[2, 3]])
+            computer._packed_global_cu_seqlens = [0, 4]
+            computer._tail_padding_length = 0
             if scenario == "primary_mismatch" and rank == 1:
                 computer._primary_labels = torch.tensor([[3, 4]])
             original_serialize = channel_loss_module._serialize_channel_sp_observation
@@ -3259,11 +3340,13 @@ def _gloo_packed_channel_parity_worker(rank, world_size, init_file, result_queue
         state = _test_parallel_state(
             sp_enabled=True, sp_group=torch.distributed.group.WORLD, sp_size=world_size, sp_rank=rank
         )
-        computer = ChannelLossComputer(parallel_state=state)
+        computer = _legacy_computer(parallel_state=state)
         computer.strict = True
         computer._source_ids = ["a", "b", "c"]
         computer._position_ids = torch.tensor([[0, 1, 2, 0]]) if rank == 0 else torch.tensor([[1, 2, 0, 1]])
         computer._packed_cu_seqlens = [0, 3, 4, 4] if rank == 0 else [0, 0, 2, 4]
+        computer._packed_global_cu_seqlens = [0, 3, 6, 8]
+        computer._tail_padding_length = 0
         all_logits = torch.arange(40, dtype=torch.float32).reshape(8, 5) / 19
         all_labels = torch.tensor([0, 1, IGNORE_INDEX, 2, 3, 4, 1, 0])
         local_logits = all_logits[rank * 4 : (rank + 1) * 4].clone().requires_grad_()
@@ -3332,11 +3415,12 @@ def _gloo_dpo_mtp_channel_worker(rank, world_size, init_file, result_queue):
             sp_enabled=True, sp_group=torch.distributed.group.WORLD, sp_size=world_size, sp_rank=rank
         )
 
-        dpo = ChannelLossComputer(parallel_state=parallel)
+        dpo = _legacy_computer(parallel_state=parallel)
         dpo.strict = True
         dpo._source_ids = ["source", "source"]
         dpo._position_ids = torch.tensor([[0, 1, 2]])
         dpo._packed_cu_seqlens = dpo._packed_global_cu_seqlens = [0, 3, 6]
+        dpo._tail_padding_length = 0
         dpo._dpo_segments = True
         dpo._source_repeat = 2
         dpo_labels = torch.tensor([[2, 3, 4]]) if rank == 0 else torch.tensor([[5, 6, IGNORE_INDEX]])
@@ -3348,11 +3432,13 @@ def _gloo_dpo_mtp_channel_worker(rank, world_size, init_file, result_queue):
         assert dpo.step_totals["source"][1].item() == 4
         assert tuple(item.item() for item in dpo.step_data_totals["source"]) == (1, 6, 4)
 
-        computer = ChannelLossComputer(parallel_state=parallel)
+        computer = _legacy_computer(parallel_state=parallel)
         computer.strict = True
         computer._source_ids = ["a", "b", "c"]
         computer._position_ids = torch.tensor([[0, 1, 2, 0]]) if rank == 0 else torch.tensor([[1, 2, 0, 1]])
         computer._packed_cu_seqlens = [0, 3, 4, 4] if rank == 0 else [0, 0, 2, 4]
+        computer._packed_global_cu_seqlens = [0, 3, 6, 8]
+        computer._tail_padding_length = 0
         primary = torch.tensor([[0, 1, IGNORE_INDEX, 2]]) if rank == 0 else torch.tensor([[3, 4, 5, 6]])
         mtp = (
             torch.tensor([[[1, IGNORE_INDEX, 2, 3], [IGNORE_INDEX, 4, 5, IGNORE_INDEX]]])
@@ -3491,7 +3577,7 @@ def test_chunk_observer_failure_preserves_main_loss_and_gradients(monkeypatch, s
         return original_ce(*args, **kwargs)
 
     monkeypatch.setattr(F, "cross_entropy", fail_observer)
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     computer.strict = strict
     computer._source_ids = ["a"]
     computer._position_ids = torch.arange(8).unsqueeze(0)
@@ -3521,7 +3607,7 @@ def test_chunk_observer_failure_preserves_main_loss_and_gradients(monkeypatch, s
 @pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
 def test_capture_forward_failure_discards_observations_without_collectives(monkeypatch, nested, error_type):
     _install_test_parallel_state(monkeypatch)
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     monkeypatch.setattr(channel_loss_module.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(
         channel_loss_module.dist, "all_gather_object", lambda *a, **kw: pytest.fail("collective on failed forward")
@@ -3623,7 +3709,7 @@ def test_wrapped_chunk_loss_accepts_shift_labels_without_raw_labels(monkeypatch)
             self.loss_function = partial(ForCausalLMLoss, op=VeomniOp("cross_entropy_loss", "standard", "chunk_loss"))
 
     model = Model()
-    computer = ChannelLossComputer()
+    computer = _legacy_computer()
     computer.strict = True
     computer._source_ids = ["shift-only"]
     computer._position_ids = torch.arange(7).unsqueeze(0)
@@ -3641,3 +3727,1711 @@ def test_wrapped_chunk_loss_accepts_shift_labels_without_raw_labels(monkeypatch)
         assert computer._result[0]["loss_sum"].item() == pytest.approx(loss.item() * 6, rel=1e-6)
     finally:
         computer.uninstall()
+
+
+def _channel_features():
+    return [
+        {
+            "input_ids": torch.tensor([], dtype=torch.long),
+            "labels": torch.tensor([], dtype=torch.long),
+            "attention_mask": torch.tensor([], dtype=torch.long),
+            "ds_idx": 0,
+        },
+        {
+            "input_ids": torch.tensor([0, 1, 2, 3]),
+            "labels": torch.tensor([0, 1, 2, 3]),
+            "attention_mask": torch.tensor([1, 0, 1, 1]),
+            "position_ids": torch.tensor([0, 1, 0, 1]),
+            "ds_idx": 1,
+        },
+    ]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("enabled", [False, True])
+def test_channel_loss_does_not_change_nonfirst_empty_sample_handling(monkeypatch, enabled):
+    import veomni.data.data_collator as data_collator
+
+    state = _stub_parallel_state(monkeypatch)
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: state)
+    cfg = ChannelLossConfig(enable=enabled)
+    keys = tuple(cfg.source_id_keys) if enabled else None
+    with pytest.raises(IndexError):
+        data_collator.MainCollator(channel_loss_source_id_keys=keys)(list(reversed(_channel_features())))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_uses_original_feature_boundaries_without_changing_training(monkeypatch):
+    import veomni.data.data_collator as data_collator
+
+    state = _stub_parallel_state(monkeypatch)
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: state)
+    cfg = ChannelLossConfig(enable=True, interval=1, strict=True)
+    baseline = data_collator.MainCollator()(_channel_features())
+    observed = data_collator.MainCollator(channel_loss_source_id_keys=tuple(cfg.source_id_keys))(_channel_features())
+    proof = observed[data_collator.CHANNEL_LOSS_PROVENANCE]
+    assert proof["source_cu"] == [0, 0, 4]
+    assert observed["cu_seq_lens_q"].tolist() == [0, 2, 4]
+    for key in baseline:
+        if isinstance(baseline[key], torch.Tensor):
+            torch.testing.assert_close(observed[key], baseline[key], rtol=0, atol=0)
+        else:
+            assert observed[key] == baseline[key]
+
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+    callback.on_step_begin(TrainerState(global_step=1), micro_batches=[observed])
+    assert data_collator.CHANNEL_LOSS_PROVENANCE not in observed
+    callback.computer.before_micro_step(primary_labels=observed["labels"])
+    callback.computer._original_loss_fn = lambda logits, labels, vocab_size: F.cross_entropy(
+        logits.reshape(-1, vocab_size),
+        F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:].reshape(-1),
+        ignore_index=IGNORE_INDEX,
+    )
+    logits = torch.randn(1, 4, 5, requires_grad=True)
+    reference = logits.detach().clone().requires_grad_()
+    with callback.computer.capture():
+        loss = callback.computer._wrapped_loss_fn(logits, observed["labels"], 5)
+    reference_loss = callback.computer._original_loss_fn(reference, baseline["labels"], 5)
+    loss.backward()
+    reference_loss.backward()
+    torch.testing.assert_close(loss, reference_loss, rtol=0, atol=0)
+    torch.testing.assert_close(logits.grad, reference.grad, rtol=0, atol=0)
+    result = callback.computer._result
+    assert [(item["source_id"], item["token_count"].item()) for item in result] == [(0, 0), (1, 3)]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("strict", [False, True])
+def test_channel_loss_empty_first_source_and_padding_counts_input_tokens(monkeypatch, strict):
+    import veomni.data.data_collator as data_collator
+
+    state = _stub_parallel_state(monkeypatch)
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: state)
+
+    def features():
+        examples = _channel_features()
+        examples[1].update(
+            input_ids=torch.tensor([0, 1, 2]),
+            labels=torch.tensor([0, 1, 2]),
+            attention_mask=torch.ones(3, dtype=torch.long),
+            position_ids=torch.arange(3),
+        )
+        return examples
+
+    cfg = ChannelLossConfig(enable=True, interval=1, strict=strict)
+    baseline = data_collator.MainCollator(pad_to_length=4)(features())
+    batch = data_collator.MainCollator(pad_to_length=4, channel_loss_source_id_keys=tuple(cfg.source_id_keys))(
+        features()
+    )
+    assert batch[data_collator.CHANNEL_LOSS_PROVENANCE]["source_cu"] == [0, 0, 3]
+    assert batch["tail_padding_length"].item() == 1
+    torch.testing.assert_close(batch["labels"], baseline["labels"], rtol=0, atol=0)
+
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+    callback.on_step_begin(TrainerState(global_step=1), micro_batches=[batch])
+    callback.computer.before_micro_step(primary_labels=batch["labels"])
+    callback.computer._original_loss_fn = lambda logits, labels, vocab_size: F.cross_entropy(
+        logits.reshape(-1, vocab_size),
+        F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:].reshape(-1),
+        ignore_index=IGNORE_INDEX,
+    )
+    logits = torch.randn(1, 4, 5, requires_grad=True)
+    reference = logits.detach().clone().requires_grad_()
+    with callback.computer.capture():
+        loss = callback.computer._wrapped_loss_fn(logits, batch["labels"], 5)
+    reference_loss = callback.computer._original_loss_fn(reference, baseline["labels"], 5)
+    loss.backward()
+    reference_loss.backward()
+    torch.testing.assert_close(loss, reference_loss, rtol=0, atol=0)
+    torch.testing.assert_close(logits.grad, reference.grad, rtol=0, atol=0)
+    assert [(item["source_id"], item["input_token_count"].item()) for item in callback.computer._data_result] == [
+        (0, 0),
+        (1, 3),
+    ]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_private_provenance_is_removed_on_unsampled_step(monkeypatch):
+    import veomni.data.data_collator as data_collator
+
+    state = _stub_parallel_state(monkeypatch)
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: state)
+    cfg = ChannelLossConfig(enable=True, interval=2)
+    batch = data_collator.MainCollator(channel_loss_source_id_keys=tuple(cfg.source_id_keys))(_channel_features())
+    callback = ChannelLossCallback(SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg))))
+    callback.on_step_begin(TrainerState(global_step=1), micro_batches=[batch])
+    assert data_collator.CHANNEL_LOSS_PROVENANCE not in batch
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_rejects_metadata_hook_token_reordering(monkeypatch):
+    import veomni.data.data_collator as data_collator
+
+    state = _stub_parallel_state(monkeypatch)
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: state)
+
+    def reorder(batch, _sp_pad):
+        batch["input_ids"] = batch["input_ids"].flip(-1)
+
+    cfg = ChannelLossConfig(enable=True, interval=1)
+    batch = data_collator.MainCollator(
+        channel_loss_source_id_keys=tuple(cfg.source_id_keys), metadata_collate_func=reorder
+    )(_channel_features())
+    assert batch[data_collator.CHANNEL_LOSS_PROVENANCE] == {"error": "unsupported source layout"}
+    callback = ChannelLossCallback(SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg))))
+    callback.on_step_begin(TrainerState(global_step=1), micro_batches=[batch])
+    callback.computer.before_micro_step(primary_labels=batch["labels"])
+    callback.computer._original_loss_fn = lambda logits, labels, vocab_size: logits.sum()
+    logits = torch.ones(1, 4, 5, requires_grad=True)
+    with callback.computer.capture():
+        loss = callback.computer._wrapped_loss_fn(logits, batch["labels"], 5)
+    loss.backward()
+    assert callback.computer._result is None
+    assert torch.equal(logits.grad, torch.ones_like(logits))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_diagnostic_snapshot_failure_preserves_collation(monkeypatch):
+    import veomni.data.data_collator as data_collator
+
+    state = _stub_parallel_state(monkeypatch)
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: state)
+    hook_calls = []
+
+    def hook(batch, _sp_pad):
+        hook_calls.append(True)
+
+    baseline = data_collator.MainCollator(metadata_collate_func=hook)(_channel_features())
+    cfg = ChannelLossConfig(enable=True, interval=1)
+
+    def fail_clone(*args, **kwargs):
+        raise RuntimeError("injected observer-only snapshot failure")
+
+    monkeypatch.setattr(torch.Tensor, "clone", fail_clone)
+    observed = data_collator.MainCollator(
+        channel_loss_source_id_keys=tuple(cfg.source_id_keys), metadata_collate_func=hook
+    )(_channel_features())
+    assert observed.pop(data_collator.CHANNEL_LOSS_PROVENANCE) == {"error": "unsupported source layout"}
+    assert len(hook_calls) == 2
+    for key in baseline:
+        if isinstance(baseline[key], torch.Tensor):
+            torch.testing.assert_close(observed[key], baseline[key], rtol=0, atol=0)
+        else:
+            assert observed[key] == baseline[key]
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_dpo_channel_loss_emits_policy_totals(monkeypatch, compact):
+    _stub_parallel_state(monkeypatch)
+
+    class DpoLossModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.0))
+            self.loss_calls = 0
+            self.parallel_state = object()
+
+        def loss_function(self, logits, labels, vocab_size, **kwargs):
+            self.loss_calls += 1
+            return logits.sum() * 0
+
+        def forward(self, labels=None, **kwargs):
+            seq_len = labels.size(-1) if labels is not None else 8
+            logits = torch.randn(1, seq_len, 8)
+            if labels is not None:
+                self.loss_function(
+                    logits=logits[:, :4] if compact else logits,
+                    labels=labels[:, :4] if compact else labels,
+                    vocab_size=8,
+                )
+            if compact:
+                rows = torch.tensor([0, 1, 0, 1, 2, 3, 2, 3])
+                log_probs = -torch.arange(1, 5, dtype=torch.float32).index_select(0, rows).unsqueeze(0) / 10
+            else:
+                log_probs = -torch.arange(1, seq_len + 1, dtype=torch.float32).unsqueeze(0) / 10
+            log_probs = self.scale * log_probs
+            return SimpleNamespace(fused_linear_aux=SimpleNamespace(log_probs=log_probs))
+
+    cfg = ChannelLossConfig(enable=True, interval=1)
+    state = TrainerState(global_step=1)
+    policy_model = DpoLossModel()
+    reference_model = DpoLossModel()
+    base = SimpleNamespace(
+        args=SimpleNamespace(
+            train=SimpleNamespace(channel_loss=cfg, enable_batch_invariant_mode=False),
+            dpo_config=SimpleNamespace(
+                beta=0.1,
+                label_smoothing=0.0,
+                loss_type="sigmoid",
+                reference_free=False,
+                average_log_prob=False,
+            ),
+        ),
+        state=state,
+        model=policy_model,
+        model_fwd_context=nullcontext(),
+        model_bwd_context=nullcontext(),
+        preforward=lambda micro_batch: micro_batch,
+    )
+    base.channel_loss_callback = ChannelLossCallback(base)
+    trainer = object.__new__(TextDPOTrainer)
+    trainer.base = base
+    trainer.policy_model = policy_model
+    trainer.reference_model = reference_model
+    trainer.state = state
+    trainer.channel_loss_callback = base.channel_loss_callback
+    base._callbacks = [base.channel_loss_callback]
+    base._get_registered_channel_loss_callback = lambda: base.channel_loss_callback
+    base.on_step_begin = lambda micro_batches=None, **kwargs: BaseTrainer.on_step_begin(
+        base, micro_batches=micro_batches, **kwargs
+    )
+    trainer.post_forward = SimpleNamespace(compute_seqlens_func=lambda micro_batch: [2, 2, 2, 2])
+    trainer.sp_enabled = False
+    micro_batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]]),
+        "labels": torch.tensor([[1, 2, IGNORE_INDEX, 4, IGNORE_INDEX, 6, IGNORE_INDEX, 7]]),
+        "position_ids": torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]]),
+        "cu_seq_lens_q": torch.tensor([0, 2, 4, 6, 8]),
+        "_veomni_channel_loss_source_provenance": channel_loss_module._ChannelLossProvenance(
+            {
+                "source_ids": [3, 4],
+                "source_cu": [0, 4, 8],
+                "input_mask": torch.ones(8, dtype=torch.bool),
+                "tail": 0,
+                "sp_size": 1,
+                "sp_rank": 0,
+            }
+        ),
+        "ds_idx": torch.tensor([3, 4]),
+        "source_name": ["train/a", "train/b"],
+    }
+
+    try:
+        base.channel_loss_callback.computer.install(policy_model)
+        TextDPOTrainer.on_step_begin(trainer, micro_batches=[micro_batch])
+        assert base.channel_loss_callback.computer._per_mb_source_ids == [[3, 4]]
+        loss, _ = TextDPOTrainer.forward_backward_step(trainer, micro_batch)
+
+        assert policy_model.loss_calls == 1
+        assert reference_model.loss_calls == 1
+        assert set(base.channel_loss_callback.computer.step_totals) == {3, 4}
+        assert base.channel_loss_callback.computer.step_totals[3][1].item() == 2
+        assert base.channel_loss_callback.computer.step_totals[4][1].item() == 2
+        torch.testing.assert_close(
+            base.channel_loss_callback.computer.step_totals[3][0], torch.tensor(0.2 if compact else 0.4)
+        )
+        torch.testing.assert_close(
+            base.channel_loss_callback.computer.step_totals[4][0], torch.tensor(0.6 if compact else 1.2)
+        )
+        assert base.channel_loss_callback.computer.source_names == {3: "train/a", 4: "train/b"}
+        assert policy_model.scale.grad is not None
+        assert reference_model.scale.grad is None
+        observed_grad = policy_model.scale.grad.detach().clone()
+        policy_model.scale.grad = None
+        base.channel_loss_callback.computer.uninstall()
+        trainer.channel_loss_callback = None
+        baseline, _ = TextDPOTrainer.forward_backward_step(trainer, micro_batch)
+        torch.testing.assert_close(loss, baseline, rtol=0, atol=0)
+        torch.testing.assert_close(observed_grad, policy_model.scale.grad, rtol=0, atol=0)
+    finally:
+        base.channel_loss_callback.computer.uninstall()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_dpo_shared_prefix_reordering_uses_expanded_policy_log_probs(monkeypatch):
+    from veomni.data.data_collator import CHANNEL_LOSS_PROVENANCE
+    from veomni.models.transformers.qwen3_5.shared_prefix import build_shared_prefix_plan
+
+    _stub_parallel_state(monkeypatch)
+    prefix = list(range(64))
+    ids = torch.tensor([prefix + [100, 101] + prefix + [102, 103]])
+    positions = torch.tensor([list(range(66)) * 2])
+    cu = torch.tensor([0, 66, 132], dtype=torch.int32)
+    plan = build_shared_prefix_plan(ids, cu, positions)
+    assert plan is not None
+    labels = torch.tensor([prefix + [100, 101] + [IGNORE_INDEX] * 64 + [102, 103]])
+    target = F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
+    _, compact_labels, inverse = plan.lm_rows(target)
+    assert compact_labels.numel() == target.numel() == 132
+    assert not torch.equal(inverse, torch.arange(132))
+
+    cfg = ChannelLossConfig(enable=True, interval=1, strict=True)
+    callback = ChannelLossCallback(SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg))))
+    batch = {
+        "labels": labels,
+        "position_ids": positions,
+        "cu_seq_lens_q": cu,
+        "ds_idx": torch.tensor([0]),
+        CHANNEL_LOSS_PROVENANCE: channel_loss_module._ChannelLossProvenance(
+            {
+                "source_ids": [0],
+                "source_cu": [0, 132],
+                "input_mask": torch.ones(132, dtype=torch.bool),
+                "tail": 0,
+                "sp_size": 1,
+                "sp_rank": 0,
+            }
+        ),
+    }
+    callback.on_step_begin(TrainerState(global_step=1), micro_batches=[batch], channel_loss_source_repeat=2)
+    callback.computer.before_micro_step(primary_labels=batch["labels"])
+
+    def compact_loss(logits, labels, vocab_size):
+        return F.cross_entropy(logits.reshape(-1, vocab_size), labels.reshape(-1), ignore_index=IGNORE_INDEX)
+
+    callback.computer._original_loss_fn = compact_loss
+    torch.manual_seed(3)
+    logits = torch.randn(132, 106, requires_grad=True)
+    baseline_logits = logits.detach().clone().requires_grad_()
+    with callback.computer.capture():
+        loss = callback.computer._wrapped_loss_fn(logits.unsqueeze(0), compact_labels.unsqueeze(0), 106)
+        per_token = F.cross_entropy(logits, compact_labels, ignore_index=IGNORE_INDEX, reduction="none")
+        expanded = per_token.index_select(0, inverse).unsqueeze(0)
+        callback.computer.observe_dpo_log_probs(-expanded, labels, batch["cu_seq_lens_q"])
+    baseline = compact_loss(baseline_logits.unsqueeze(0), compact_labels.unsqueeze(0), 106)
+    loss.backward()
+    baseline.backward()
+    torch.testing.assert_close(loss, baseline, rtol=0, atol=0)
+    torch.testing.assert_close(logits.grad, baseline_logits.grad, rtol=0, atol=0)
+    valid = target.ne(IGNORE_INDEX)
+    valid[0, torch.tensor([65, 131])] = False
+    result = callback.computer._result[0]
+    assert result["token_count"].item() == valid.sum().item() == 67
+    torch.testing.assert_close(result["loss_sum"], expanded.detach()[valid].sum())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_headwise_cp_uses_local_packed_boundaries():
+    state = _test_parallel_state(sp_enabled=True)
+    result = ChannelLossComputer._aggregate_by_source(
+        per_token_loss=torch.arange(1, 11, dtype=torch.float32),
+        labels_flat=torch.tensor(
+            [1, 1, IGNORE_INDEX, IGNORE_INDEX, 1, 1, 1, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]
+        ),
+        attention_mask_flat=torch.tensor([1, 1, 0, 0, 1, 1, 1, 0, 1, 1]),
+        source_ids=["first", "second"],
+        position_ids=torch.tensor([[0, 1, 0, 0, 0, 1, 2, 0, 0, 0]]),
+        packed_cu_seqlens=[0, 4, 8, 10],
+        packed_global_cu_seqlens=[0, 4, 8, 10],
+        packed_global_physical_seq_len=10,
+        tail_padding_length=2,
+        ignore_index=IGNORE_INDEX,
+        sp_enabled=True,
+        parallel_state=state,
+        strict=True,
+    )
+    assert [item["source_id"] for item in result] == ["first", "second"]
+    assert [item["loss_sum"].item() for item in result] == [3, 18]
+    assert [item["token_count"].item() for item in result] == [2, 3]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("failure", ["missing_positions", "supervised_tail", "stale_cu"])
+def test_channel_loss_sp_rejects_ambiguous_metadata(failure):
+    state = _test_parallel_state(sp_enabled=True)
+    labels = torch.tensor([1, 1, IGNORE_INDEX, IGNORE_INDEX])
+    positions = torch.tensor([[0, 1, 0, 0]])
+    cu, tail = [0, 2, 4], 2
+    if failure == "missing_positions":
+        positions = None
+    elif failure == "supervised_tail":
+        labels[-1] = 2
+    else:
+        cu = [0, 2, 5]
+    with pytest.raises(ChannelLossMetadataError):
+        ChannelLossComputer._aggregate_by_source(
+            per_token_loss=torch.ones(4),
+            labels_flat=labels,
+            attention_mask_flat=None,
+            source_ids=["source"],
+            position_ids=positions,
+            packed_cu_seqlens=cu,
+            packed_global_cu_seqlens=[0, 2, 4],
+            packed_global_physical_seq_len=4,
+            tail_padding_length=tail,
+            ignore_index=IGNORE_INDEX,
+            sp_enabled=True,
+            parallel_state=state,
+            strict=True,
+        )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "cu", [[], torch.tensor([], dtype=torch.int64), torch.tensor([[0, 2, 4]], dtype=torch.int32), [[0, 2, 4]]]
+)
+def test_channel_loss_rejects_malformed_cu(cu):
+    with pytest.raises(ChannelLossMetadataError, match="invalid packed CU"):
+        ChannelLossComputer._aggregate_sp(
+            per_token_loss=torch.ones(4),
+            labels_flat=torch.ones(4, dtype=torch.long),
+            attention_mask_flat=None,
+            source_ids=["first", "second"],
+            positions=torch.tensor([[0, 1, 0, 1]]),
+            packed_cu_seqlens=cu,
+            seq_len=4,
+            ignore_index=IGNORE_INDEX,
+            parallel_state=_test_parallel_state(sp_enabled=True),
+            strict=True,
+        )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_headwise_cp_keeps_empty_source():
+    result = ChannelLossComputer._aggregate_sp(
+        per_token_loss=torch.empty(0),
+        labels_flat=torch.empty(0, dtype=torch.long),
+        attention_mask_flat=torch.empty(0, dtype=torch.long),
+        source_ids=["empty"],
+        positions=torch.empty((1, 0), dtype=torch.long),
+        packed_cu_seqlens=[0, 0],
+        seq_len=0,
+        ignore_index=IGNORE_INDEX,
+        parallel_state=_test_parallel_state(sp_enabled=True),
+        strict=True,
+    )
+    assert len(result) == 1 and result[0]["source_id"] == "empty"
+    assert result[0]["loss_sum"].item() == result[0]["token_count"].item() == 0
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_rejects_stale_local_cu_without_global_mask():
+    state = _test_parallel_state(sp_enabled=True, sp_size=2)
+    state.cp_size = 2
+    with pytest.raises(ChannelLossMetadataError, match="global geometry"):
+        ChannelLossComputer._aggregate_sp(
+            per_token_loss=torch.ones(4),
+            labels_flat=torch.ones(4, dtype=torch.long),
+            attention_mask_flat=None,
+            source_ids=["first", "second"],
+            positions=torch.tensor([[0, 1, 0, 1]]),
+            packed_cu_seqlens=[0, 1, 4],
+            packed_global_cu_seqlens=[0, 4, 8],
+            seq_len=4,
+            ignore_index=IGNORE_INDEX,
+            parallel_state=state,
+            strict=True,
+        )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_ulysses_global_spans_are_intersected_per_batch_row():
+    points = [0, 3, 6, 8, 11, 14, 16]
+    assert channel_loss_module._ulysses_local_span_lengths(points, 2, 4, 0, 2) == [3, 1, 0, 3, 1, 0]
+    assert channel_loss_module._ulysses_local_span_lengths(points, 2, 4, 1, 2) == [0, 2, 2, 0, 2, 2]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_accumulates_multiple_loss_calls():
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["source"]
+    computer._position_ids = torch.tensor([[0, 1]])
+    computer._original_loss_fn = lambda logits, labels, vocab_size, shift_labels: F.cross_entropy(
+        logits.reshape(-1, vocab_size), labels.reshape(-1), ignore_index=IGNORE_INDEX
+    )
+    labels = torch.tensor([[1, 2]])
+    logits = [torch.randn(1, 2, 4) for _ in range(2)]
+    with computer.capture():
+        for value in logits:
+            computer._wrapped_loss_fn(value, labels, 4, labels)
+    computer.after_micro_step()
+    expected = sum(F.cross_entropy(value.reshape(-1, 4), labels.reshape(-1), reduction="sum") for value in logits)
+    loss_sum, token_count = computer.step_totals["source"]
+    torch.testing.assert_close(loss_sum, expected)
+    assert token_count.item() == 4
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("strict", [False, True])
+def test_channel_loss_discards_partially_reduced_observations(monkeypatch, strict):
+    computer = _legacy_computer(parallel_state=_test_parallel_state(sp_enabled=True, sp_size=1))
+    computer.strict = strict
+    computer._source_ids = ["source"]
+    computer._capture_topology = computer._snapshot_topology()
+    computer._observation_attempt_count = 2
+    segment = {
+        "batch_idx": 0,
+        "sp_rank": 0,
+        "local_order": 0,
+        "is_start": True,
+        "loss_sum": torch.tensor(1.0),
+        "token_count": torch.tensor(1),
+        "has_explicit_padding_mask": torch.tensor(False),
+        "has_only_zero_positions": False,
+    }
+    computer._pending_observations = [
+        {
+            "segments": [segment],
+            "source_ids": ["source"],
+            "device": torch.device("cpu"),
+            "data": False,
+            "mode": "source",
+        }
+        for _ in range(2)
+    ]
+    results = iter([[{"source_id": "source", "loss_sum": torch.tensor(1.0), "token_count": torch.tensor(1)}], []])
+    monkeypatch.setattr(computer, "_merge_sp_segments", lambda *args, **kwargs: next(results))
+    context = pytest.raises(ChannelLossMetadataError, match="no source-aligned") if strict else nullcontext()
+    with context:
+        computer._finalize_capture()
+    assert computer._result is None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_strict_rejects_missing_non_sp_observation():
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
+    computer.strict = True
+    computer._source_ids = ["source"]
+    computer._position_ids = torch.tensor([[0, 1]])
+    computer._original_loss_fn = lambda labels: torch.tensor(1.0)
+    with pytest.raises(ChannelLossMetadataError, match="no source-aligned"):
+        with computer.capture():
+            computer._wrapped_loss_fn(labels=torch.tensor([[1, 2]]))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_rejects_concurrent_capture_on_same_computer():
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
+    entered, release = Event(), Event()
+
+    def worker():
+        with computer.capture():
+            entered.set()
+            assert release.wait(10)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(worker)
+        assert entered.wait(10)
+        try:
+            with pytest.raises(RuntimeError, match="Concurrent capture"), computer.capture():
+                pass
+        finally:
+            release.set()
+        future.result(timeout=10)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_rejects_async_child_capture_on_same_computer():
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
+
+    async def run():
+        async def child():
+            with pytest.raises(RuntimeError, match="Concurrent capture"), computer.capture():
+                pass
+
+        with computer.capture():
+            await asyncio.gather(child(), child())
+            with computer.capture():
+                pass
+
+    asyncio.run(run())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_async_child_direct_and_expired_context():
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["source"]
+    computer._position_ids = torch.tensor([[0, 1]])
+    computer._original_loss_fn = lambda logits, labels, vocab_size, shift_labels: torch.tensor(1.0)
+    logits, labels = torch.randn(1, 2, 4), torch.tensor([[1, 2]])
+
+    async def run():
+        release = asyncio.Event()
+
+        async def child():
+            assert computer._wrapped_loss_fn(logits, labels, 4, labels).item() == 1.0
+            assert computer._foreign_capture_errors
+            await release.wait()
+            assert not computer.capture_active
+            computer._wrapped_loss_fn(logits, labels, 4, labels)
+            assert computer._result is None
+            with computer.capture():
+                assert computer.capture_active
+
+        with computer.capture():
+            task = asyncio.create_task(child())
+            await asyncio.sleep(0)
+        release.set()
+        await task
+
+    asyncio.run(run())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_async_child_without_sources_runs_main_loss():
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
+    computer._original_loss_fn = lambda labels: torch.tensor(1.0)
+    computer._dpo_segments = True
+
+    async def run():
+        async def child():
+            assert computer._wrapped_loss_fn(labels=torch.tensor([[1]])).item() == 1.0
+            computer.observe_dpo_log_probs(torch.zeros(1, 1), torch.ones(1, 1), None)
+
+        with computer.capture():
+            await asyncio.create_task(child())
+            assert computer._result is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_dpo_loss_wrapper_async_child_with_sources_uses_main_loss_only():
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
+    computer._original_loss_fn = lambda labels: labels.square().sum()
+    computer._dpo_segments = True
+    computer._source_ids = [0]
+
+    async def run():
+        async def child():
+            labels = torch.tensor([[2.0]], requires_grad=True)
+            loss = computer._wrapped_loss_fn(labels=labels)
+            computer.observe_dpo_log_probs(torch.zeros(1, 1), labels, [0, 1])
+            loss.backward()
+            assert loss.item() == 4.0
+            assert labels.grad.item() == 4.0
+
+        with computer.capture():
+            await asyncio.create_task(child())
+        assert computer._result is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("nested", [False, True])
+def test_channel_loss_discards_observation_when_forward_fails(nested):
+    computer = _legacy_computer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["source"]
+    computer._position_ids = torch.tensor([[0, 1]])
+    computer._original_loss_fn = lambda logits, labels, vocab_size, shift_labels: torch.tensor(1.0)
+    labels = torch.tensor([[1, 2]])
+    logits = torch.randn(1, 2, 4)
+    outer = computer.capture() if nested else nullcontext()
+    with outer:
+        with pytest.raises(RuntimeError, match="model failure"):
+            with computer.capture():
+                computer._wrapped_loss_fn(logits, labels, 4, labels)
+                raise RuntimeError("model failure")
+        assert computer._result is None
+
+
+def _gloo_channel_provenance_worker(rank, world_size, scenario, endpoint):
+    import veomni.data.data_collator as data_collator
+
+    global_rank = rank
+    try:
+        torch.distributed.init_process_group(
+            "gloo", store=endpoint.connect(), rank=rank, world_size=world_size, timeout=timedelta(seconds=40)
+        )
+        sp_size = 2 if scenario in {"two_stripes", "strict_two_stripes"} else world_size
+        dp_size = world_size // sp_size
+        dpo = scenario in {"dpo_cp", "dpo_observer_error", "dpo_global_cu_mismatch", "dpo_attention_cu_mismatch"}
+        use_cp = scenario in {
+            "cp_tail",
+            "dpo_cp",
+            "dpo_observer_error",
+            "dpo_global_cu_mismatch",
+            "dpo_attention_cu_mismatch",
+            "two_stripes",
+            "strict_two_stripes",
+            "mismatched_mask",
+            "mismatched_global_cu",
+        }
+        state = parallel_state_module._init_parallel_state(
+            dp_size=dp_size,
+            dp_shard_size=dp_size,
+            cp_size=sp_size if use_cp else 1,
+            ulysses_size=1 if use_cp else sp_size,
+            device_type="cpu",
+            name="channel-provenance-test",
+        )
+        source_base = 10 * (global_rank // sp_size) if scenario in {"two_stripes", "strict_two_stripes"} else 0
+        if scenario == "empty_internal_reset":
+            positions = [[], [0, 1, 0, 1]]
+        elif dpo:
+            positions = [[0, 1, 2, 0, 1], [0, 0, 1, 2]]
+        elif scenario == "ulysses_no_tail":
+            positions = [[0, 1, 2], [0, 1, 2, 3, 4]]
+        else:
+            positions = [[0, 1, 2], [0, 1, 2, 3]]
+
+        def features():
+            return [
+                {
+                    "input_ids": torch.arange(len(pos), dtype=torch.long) % 5,
+                    "labels": torch.arange(len(pos), dtype=torch.long) % 5,
+                    "position_ids": torch.tensor(pos, dtype=torch.long),
+                    "attention_mask": torch.tensor([int(i % 3 != 1) for i in range(len(pos))]),
+                    "ds_idx": source_base + index,
+                }
+                for index, pos in enumerate(positions)
+            ]
+
+        cfg = ChannelLossConfig(enable=True, interval=1, strict=scenario == "strict_two_stripes")
+        batch = data_collator.MainCollator(channel_loss_source_id_keys=tuple(cfg.source_id_keys))(features())
+        proof = batch[data_collator.CHANNEL_LOSS_PROVENANCE]
+        if scenario == "missing_provenance":
+            batch.pop(data_collator.CHANNEL_LOSS_PROVENANCE)
+        if (scenario == "mismatched_mask" and state.sp_rank == 1) or (
+            scenario == "strict_two_stripes" and global_rank == 3
+        ):
+            proof["input_mask"][0] = ~proof["input_mask"][0]
+        if scenario in {"mismatched_global_cu", "dpo_global_cu_mismatch"} and state.sp_rank == 1:
+            key = "linear_attn_cu_seqlens_list_q"
+            if key not in batch:
+                key = "linear_attn_cu_seq_lens_q"
+            cu = batch[key]
+            cu = cu.clone() if isinstance(cu, torch.Tensor) else list(cu)
+            cu[1] -= 1
+            batch[key] = cu
+        if scenario == "dpo_attention_cu_mismatch" and state.sp_rank == 1:
+            batch["cu_seq_lens_q"] = batch["cu_seq_lens_q"].clone()
+            batch["cu_seq_lens_q"][1] -= 1
+        trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+        callback = ChannelLossCallback(trainer)
+        callback.on_step_begin(
+            TrainerState(global_step=1), micro_batches=[batch], channel_loss_source_repeat=2 if dpo else 1
+        )
+        callback.computer.before_micro_step(primary_labels=batch["labels"])
+
+        def training_loss(logits, labels, vocab_size, shift_labels=None):
+            return F.cross_entropy(logits.reshape(-1, vocab_size), shift_labels.reshape(-1), ignore_index=IGNORE_INDEX)
+
+        callback.computer._original_loss_fn = training_loss
+        labels = batch["labels"]
+        logits = torch.zeros(*labels.shape, 5, requires_grad=True)
+        reference = logits.detach().clone().requires_grad_()
+        failed = False
+        try:
+            with callback.computer.capture():
+                loss = callback.computer._wrapped_loss_fn(logits, labels, 5, shift_labels=labels)
+                if dpo:
+                    token_loss = F.cross_entropy(
+                        logits.reshape(-1, 5), labels.reshape(-1), ignore_index=IGNORE_INDEX, reduction="none"
+                    ).reshape_as(labels)
+                    log_probs = -token_loss
+                    if scenario == "dpo_observer_error" and state.sp_rank == 1:
+
+                        class FaultyLogProbs:
+                            def detach(self):
+                                raise RuntimeError("injected observer-only allocation failure")
+
+                        log_probs = FaultyLogProbs()
+                    callback.computer.observe_dpo_log_probs(log_probs, labels, batch["cu_seq_lens_q"])
+        except ChannelLossMetadataError:
+            if scenario != "strict_two_stripes":
+                raise
+            failed = True
+        if scenario == "strict_two_stripes":
+            assert failed
+        expected_loss = training_loss(reference, labels, 5, shift_labels=labels)
+        loss.backward()
+        expected_loss.backward()
+        torch.testing.assert_close(loss, expected_loss, rtol=0, atol=0)
+        torch.testing.assert_close(logits.grad, reference.grad, rtol=0, atol=0)
+        result = callback.computer._result
+        if scenario in {
+            "mismatched_mask",
+            "mismatched_global_cu",
+            "dpo_global_cu_mismatch",
+            "dpo_attention_cu_mismatch",
+            "dpo_observer_error",
+            "strict_two_stripes",
+            "missing_provenance",
+        }:
+            assert result is None
+            return
+
+        # Recreate the exact global shifted training labels independently of the
+        # source observer, then mask DPO chosen/rejected segment ends.
+        raw_labels = [torch.arange(len(pos), dtype=torch.long) % 5 for pos in positions]
+        for raw in raw_labels[1:]:
+            if raw.numel():
+                raw[0] = IGNORE_INDEX
+        shifted = F.pad(torch.cat(raw_labels), (0, 1), value=IGNORE_INDEX)[1:]
+        if dpo:
+            shifted[torch.tensor([2, 4, 5, 8])] = IGNORE_INDEX
+        expected = []
+        start = 0
+        for pos in positions:
+            expected.append(int((shifted[start : start + len(pos)] != IGNORE_INDEX).sum()))
+            start += len(pos)
+        assert [item["source_id"] for item in result] == [source_base, source_base + 1]
+        assert [int(item["token_count"].item()) for item in result] == expected
+        assert [int(item["sample_count"].item()) for item in result] == [1] * len(positions)
+        assert [int(item["input_token_count"].item()) for item in result] == [
+            sum(i % 3 != 1 for i in range(len(pos))) for pos in positions
+        ]
+        for item, count in zip(result, expected):
+            torch.testing.assert_close(item["loss_sum"], torch.tensor(count * math.log(5)), rtol=1e-6, atol=1e-6)
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+        parallel_state_module.clear_parallel_state()
+
+
+@pytest.mark.parametrize(
+    ("scenario", "world_size"),
+    [
+        ("empty_internal_reset", 2),
+        ("ulysses_no_tail", 2),
+        ("cp_tail", 2),
+        ("dpo_cp", 2),
+        ("mismatched_mask", 2),
+        ("missing_provenance", 2),
+        ("mismatched_global_cu", 2),
+        ("dpo_global_cu_mismatch", 2),
+        ("dpo_attention_cu_mismatch", 2),
+        ("dpo_observer_error", 2),
+        ("two_stripes", 4),
+        ("strict_two_stripes", 4),
+    ],
+)
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_real_gloo_channel_provenance(scenario, world_size):
+    spawn_with_rendezvous(_gloo_channel_provenance_worker, args=(world_size, scenario), nprocs=world_size)
+
+
+def _gloo_parent_packed_loss_worker(rank, world_size, scenario, endpoint):
+    global_rank = rank
+    try:
+        torch.distributed.init_process_group(
+            "gloo", store=endpoint.connect(), rank=rank, world_size=world_size, timeout=timedelta(seconds=40)
+        )
+        sp_size = 2 if scenario == "two_stripes" else world_size
+        dp_size = world_size // sp_size
+        use_cp = scenario in (
+            "headwise",
+            "headwise_tail",
+            "cu_mismatch",
+            "layout_mismatch",
+            "global_cu_mismatch",
+            "cp_contiguous",
+            "cp_global_contiguous",
+            "cp_global_tail",
+            "cp_mixed_geometry",
+            "cp_shared_stale",
+            "cp_no_global",
+            "cp_only_global",
+            "cp_only_global_strict",
+            "cp_asymmetric",
+            "cp_stale_contiguous",
+            "cp_no_local",
+            "two_stripes",
+        )
+        state = parallel_state_module._init_parallel_state(
+            dp_size=dp_size,
+            dp_shard_size=dp_size,
+            cp_size=sp_size if use_cp else 1,
+            ulysses_size=1 if use_cp else sp_size,
+            device_type="cpu",
+            name="channel-loss-test",
+        )
+        rank, world_size = state.sp_rank, state.sp_size
+        if scenario == "two_stripes":
+            expected_group = [global_rank // 2 * 2, global_rank // 2 * 2 + 1]
+            assert torch.distributed.get_process_group_ranks(state.sp_group) == expected_group
+        if scenario == "strict_step_missing":
+            cfg = ChannelLossConfig(enable=True, interval=1, strict=True)
+            trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+            callback = ChannelLossCallback(trainer)
+            batch = {} if rank == 0 else {"ds_idx": 1}
+            with pytest.raises(ValueError, match="no configured source ID"):
+                callback.on_step_begin(TrainerState(global_step=1), micro_batches=[batch])
+            return
+        computer = _legacy_computer(parallel_state=state)
+        computer.strict = scenario in (
+            "headwise",
+            "headwise_tail",
+            "ulysses",
+            "ulysses_local_cu",
+            "ulysses_local_tail",
+            "cp_contiguous",
+            "strict_missing",
+            "cp_only_global_strict",
+            "bad_global_no_local_strict",
+        )
+        if scenario in (
+            "ulysses",
+            "ulysses_local_cu",
+            "ulysses_local_tail",
+            "ulysses_stale_local",
+            "cp_contiguous",
+            "cp_global_contiguous",
+            "cp_global_tail",
+            "ulysses_no_global",
+            "ulysses_no_global_stale",
+        ):
+            computer._source_ids = ["first", "second", "third"]
+            tail = scenario in ("ulysses_local_tail", "cp_global_tail")
+            full_labels = torch.tensor(
+                [0, 1, IGNORE_INDEX, 2, 3, 4, 1, 0] + ([IGNORE_INDEX, IGNORE_INDEX] if tail else [])
+            )
+            full_positions = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1] + ([0, 0] if tail else []))
+            full_logits = torch.arange(full_labels.numel() * 5, dtype=torch.float32).reshape(-1, 5) / 19
+            width = full_labels.numel() // world_size
+            start, end = rank * width, (rank + 1) * width
+            labels = full_labels[start:end]
+            logits = full_logits[start:end].clone().requires_grad_()
+            computer._position_ids = full_positions[start:end].reshape(1, -1)
+            if scenario == "cp_global_tail":
+                computer._packed_cu_seqlens = [0, 3, 6, 8, 10]
+                computer._packed_global_cu_seqlens = [0, 3, 6, 8, 10]
+                computer._tail_padding_length = 2
+            elif scenario == "ulysses_local_tail":
+                computer._packed_cu_seqlens = [0, 3, 5, 5, 5] if rank == 0 else [0, 0, 1, 3, 5]
+                computer._packed_global_cu_seqlens = [0, 3, 6, 8, 10]
+                computer._tail_padding_length = 2
+            elif scenario in (
+                "ulysses_local_cu",
+                "ulysses_stale_local",
+                "cp_contiguous",
+                "ulysses_no_global",
+                "ulysses_no_global_stale",
+            ):
+                computer._packed_cu_seqlens = [0, 3, 4, 4] if rank == 0 else [0, 0, 2, 4]
+                if scenario in ("ulysses_stale_local", "ulysses_no_global_stale") and rank == 1:
+                    computer._packed_cu_seqlens = [0, 0, 1, 4]
+                if scenario not in ("ulysses_no_global", "ulysses_no_global_stale"):
+                    computer._packed_global_cu_seqlens = [0, 3, 6, 8]
+            else:
+                computer._packed_cu_seqlens = [0, 3, 6, 8]
+                computer._packed_global_cu_seqlens = [0, 3, 6, 8]
+                if scenario == "ulysses":
+                    computer._tail_padding_length = 0
+            tokens = F.cross_entropy(full_logits, full_labels, ignore_index=IGNORE_INDEX, reduction="none")
+            expected = torch.stack((tokens[:3].sum(), tokens[3:6].sum(), tokens[6:].sum()))
+            expected_counts = [2, 3, 2]
+        elif scenario == "headwise_tail":
+            computer._source_ids = ["first", "second", "empty"]
+            computer._position_ids = torch.zeros((1, 8), dtype=torch.long)
+            computer._packed_cu_seqlens = [0, 2, 4, 4, 8]
+            computer._packed_global_cu_seqlens = [0, 3, 5, 5, 16]
+            computer._packed_global_physical_seq_len = 32
+            computer._tail_padding_length = 11
+            labels = torch.tensor(
+                [
+                    0 if rank < 3 else IGNORE_INDEX,
+                    IGNORE_INDEX,
+                    1 if rank < 2 else IGNORE_INDEX,
+                    IGNORE_INDEX,
+                    IGNORE_INDEX,
+                    IGNORE_INDEX,
+                    IGNORE_INDEX,
+                    IGNORE_INDEX,
+                ]
+            )
+            logits = (torch.arange(40, dtype=torch.float32).reshape(8, 5) / 19 + rank / 13).requires_grad_()
+            expected = torch.zeros(3)
+            for other_rank in range(world_size):
+                other_labels = torch.tensor(
+                    [
+                        0 if other_rank < 3 else IGNORE_INDEX,
+                        IGNORE_INDEX,
+                        1 if other_rank < 2 else IGNORE_INDEX,
+                        IGNORE_INDEX,
+                        IGNORE_INDEX,
+                        IGNORE_INDEX,
+                        IGNORE_INDEX,
+                        IGNORE_INDEX,
+                    ]
+                )
+                other_logits = torch.arange(40, dtype=torch.float32).reshape(8, 5) / 19 + other_rank / 13
+                tokens = F.cross_entropy(other_logits, other_labels, ignore_index=IGNORE_INDEX, reduction="none")
+                expected += torch.stack((tokens[:2].sum(), tokens[2:4].sum(), tokens[4:4].sum()))
+            expected_counts = [3, 2, 0]
+        else:
+            computer._source_ids = (
+                ["first", "second"] if rank != 0 or scenario not in ("missing", "strict_missing") else []
+            )
+            computer._position_ids = torch.tensor([[0, 1, 0, 0]])
+            computer._packed_cu_seqlens = [0, 2, 4]
+            if use_cp and scenario != "cp_no_global":
+                computer._packed_global_cu_seqlens = [0, 2 * world_size, 4 * world_size]
+                computer._packed_global_physical_seq_len = 4 * world_size
+            labels = torch.tensor([0, 1, 2, IGNORE_INDEX])
+            logits = (torch.arange(20, dtype=torch.float32).reshape(4, 5) / 19 + rank / 13).requires_grad_()
+            expected = torch.zeros(2)
+            for other_rank in range(world_size):
+                other_logits = torch.arange(20, dtype=torch.float32).reshape(4, 5) / 19 + other_rank / 13
+                tokens = F.cross_entropy(other_logits, labels, ignore_index=IGNORE_INDEX, reduction="none")
+                expected += torch.stack((tokens[:2].sum(), tokens[2:].sum()))
+            expected_counts = [2 * world_size, world_size]
+        if scenario == "side_failure" and rank == 0:
+
+            def fail_ce(*args, **kwargs):
+                raise RuntimeError("injected rank-local observer failure")
+
+            computer._per_token_ce = fail_ce
+        if scenario == "layout_mismatch" and rank == 0:
+            computer._packed_cu_seqlens = [0, 4, 8]
+            computer._packed_global_cu_seqlens = [0, 4, 8]
+        if scenario == "cu_mismatch" and rank == 0:
+            computer._packed_cu_seqlens = [0, 1, 4]
+        if scenario == "global_cu_mismatch":
+            computer._packed_global_cu_seqlens = [0, 3, 6] if rank == 0 else [0, 4, 8]
+            computer._packed_global_physical_seq_len = 8
+        if scenario == "cp_mixed_geometry":
+            computer._packed_cu_seqlens = [0, 2, 4] if rank == 0 else [0, 0, 4]
+            computer._packed_global_cu_seqlens = [0, 4, 8]
+            computer._packed_global_physical_seq_len = 8
+        if scenario == "cp_shared_stale":
+            computer._position_ids = torch.tensor([[0, 1, 2, 3]])
+        if scenario == "cp_only_global":
+            computer._packed_cu_seqlens = [0, 4, 8]
+            computer._position_ids = torch.tensor([[0, 3, 0, 3] if rank == 0 else [1, 2, 1, 2]])
+        if scenario == "cp_only_global_strict" and rank == 0:
+            computer._packed_cu_seqlens = [0, 4, 8]
+        if scenario == "cp_asymmetric":
+            computer._packed_cu_seqlens = [0, 4, 16]
+            computer._packed_global_cu_seqlens = [0, 4, 16]
+            computer._packed_global_physical_seq_len = 16
+            computer._position_ids = torch.tensor(
+                [[0, 1, 2, 3, 0, 1, 2, 3] if rank == 0 else [1, 2, 3, 4, 5, 6, 7, 8]]
+            )
+            labels = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])
+            logits = (torch.arange(40, dtype=torch.float32).reshape(8, 5) / 19 + rank / 13).requires_grad_()
+        if scenario == "cp_stale_contiguous":
+            computer._packed_cu_seqlens = [0, 3, 4] if rank == 0 else [0, 0, 4]
+            computer._packed_global_cu_seqlens = [0, 3, 8]
+            computer._packed_global_physical_seq_len = 8
+            computer._position_ids = torch.tensor([[0, 1, 2, 3]])
+        if scenario in (
+            "ulysses_empty_tail_no_global",
+            "ulysses_empty_tail_global_missing",
+            "ulysses_empty_tail_global_explicit",
+            "ulysses_empty_tail_local_explicit",
+            "ulysses_empty_tail_unknown",
+            "ulysses_empty_tail_local_missing",
+        ):
+            computer._source_ids = ["empty", "real"]
+            computer._position_ids = torch.tensor([[0, 1] if rank == 0 else [2, 0]])
+            computer._tail_padding_length = 1
+            all_labels = torch.tensor([0, 1, 2, IGNORE_INDEX])
+            all_logits = torch.arange(20, dtype=torch.float32).reshape(4, 5) / 19
+            labels = all_labels[rank * 2 : rank * 2 + 2]
+            logits = all_logits[rank * 2 : rank * 2 + 2].clone().requires_grad_()
+            if scenario == "ulysses_empty_tail_no_global":
+                computer._packed_cu_seqlens = [0, 0, 2]
+            elif scenario == "ulysses_empty_tail_global_missing":
+                computer._packed_cu_seqlens = [0, 3, 4]
+                computer._packed_global_cu_seqlens = [0, 3, 4]
+            elif scenario == "ulysses_empty_tail_unknown":
+                computer._packed_cu_seqlens = [0, 3, 4]
+                computer._packed_global_cu_seqlens = [0, 3, 4]
+                computer._tail_padding_length = None
+            elif scenario == "ulysses_empty_tail_local_missing":
+                computer._packed_cu_seqlens = [0, 2, 2] if rank == 0 else [0, 1, 2]
+                computer._packed_global_cu_seqlens = [0, 3, 4]
+            elif scenario == "ulysses_empty_tail_global_explicit":
+                computer._packed_cu_seqlens = [0, 0, 3, 4]
+                computer._packed_global_cu_seqlens = [0, 0, 3, 4]
+            else:
+                computer._packed_cu_seqlens = [0, 0, 2, 2] if rank == 0 else [0, 0, 1, 2]
+                computer._packed_global_cu_seqlens = [0, 0, 3, 4]
+                computer._packed_global_physical_seq_len = 4
+                tokens = F.cross_entropy(all_logits, all_labels, ignore_index=IGNORE_INDEX, reduction="none")
+                expected = torch.stack((tokens[:0].sum(), tokens[:3].sum()))
+                expected_counts = [0, 3]
+        if scenario in ("ulysses_supervised_tail", "ulysses_valid_tail"):
+            computer._source_ids = ["first", "second"]
+            computer._position_ids = torch.tensor([[0, 1, 2, 0] if rank == 0 else [1, 2, 0, 0]])
+            computer._packed_cu_seqlens = [0, 3, 6, 8]
+            computer._packed_global_cu_seqlens = [0, 3, 6, 8]
+            computer._tail_padding_length = 2
+            all_labels = torch.tensor([0, 1, 2, 3, 4, 0, IGNORE_INDEX, IGNORE_INDEX])
+            if scenario == "ulysses_supervised_tail":
+                all_labels[-2:] = torch.tensor([1, 2])
+            all_logits = torch.arange(40, dtype=torch.float32).reshape(8, 5) / 19
+            labels = all_labels[rank * 4 : rank * 4 + 4]
+            logits = all_logits[rank * 4 : rank * 4 + 4].clone().requires_grad_()
+            tokens = F.cross_entropy(all_logits, all_labels, ignore_index=IGNORE_INDEX, reduction="none")
+            expected = torch.stack((tokens[:3].sum(), tokens[3:6].sum()))
+            expected_counts = [3, 3]
+        if scenario == "cp_no_local":
+            computer._packed_cu_seqlens = None
+            computer._packed_global_cu_seqlens = None
+        if scenario in ("bad_global_no_local", "bad_global_no_local_strict"):
+            computer._packed_cu_seqlens = None
+            computer._packed_global_cu_seqlens = torch.tensor([[0, 8]]) if rank == 0 else [0, 8]
+        reference = logits.detach().clone().requires_grad_()
+        reference_loss = F.cross_entropy(reference, labels, ignore_index=IGNORE_INDEX, reduction="sum")
+
+        def main_loss(logits, labels, vocab_size, shift_labels):
+            return F.cross_entropy(
+                logits.reshape(-1, vocab_size), labels.reshape(-1), ignore_index=IGNORE_INDEX, reduction="sum"
+            )
+
+        computer._original_loss_fn = main_loss
+        if scenario in ("strict_missing", "bad_global_no_local_strict", "cp_only_global_strict"):
+            with pytest.raises(
+                ChannelLossMetadataError,
+                match="SP ranks disagree|no causal-loss|global packed CU|CP requires|source metadata is missing",
+            ):
+                with computer.capture():
+                    computer._wrapped_loss_fn(logits.unsqueeze(0), labels.unsqueeze(0), 5, labels.unsqueeze(0))
+            return
+        with computer.capture():
+            loss = computer._wrapped_loss_fn(logits.unsqueeze(0), labels.unsqueeze(0), 5, labels.unsqueeze(0))
+        loss.backward()
+        reference_loss.backward()
+        torch.testing.assert_close(loss, reference_loss, rtol=0, atol=0)
+        torch.testing.assert_close(logits.grad, reference.grad, rtol=0, atol=0)
+        if scenario in (
+            "missing",
+            "side_failure",
+            "layout_mismatch",
+            "cu_mismatch",
+            "global_cu_mismatch",
+            "ulysses_stale_local",
+            "ulysses_no_global",
+            "ulysses_no_global_stale",
+            "ulysses_empty_tail_no_global",
+            "ulysses_empty_tail_global_missing",
+            "ulysses_empty_tail_global_explicit",
+            "ulysses_empty_tail_unknown",
+            "ulysses_empty_tail_local_missing",
+            "ulysses_supervised_tail",
+            "cp_mixed_geometry",
+            "cp_no_global",
+            "cp_shared_stale",
+            "cp_only_global",
+            "cp_asymmetric",
+            "cp_stale_contiguous",
+            "cp_no_local",
+            "cp_global_contiguous",
+            "cp_global_tail",
+            "bad_global_no_local",
+        ):
+            assert computer._result is None
+            return
+        assert [item["source_id"] for item in computer._result] == computer._source_ids
+        torch.testing.assert_close(torch.stack([item["loss_sum"] for item in computer._result]), expected)
+        assert [item["token_count"].item() for item in computer._result] == expected_counts
+    finally:
+        if torch.distributed.is_initialized():
+            parallel_state_module.clear_parallel_state()
+            torch.distributed.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=lambda context: LaunchSpec(device="cpu", nproc=context.params["world_size"]))
+@pytest.mark.parametrize(
+    "world_size,scenario",
+    [
+        (2, "headwise"),
+        (4, "headwise"),
+        (4, "headwise_tail"),
+        (4, "two_stripes"),
+        (2, "ulysses"),
+        (2, "ulysses_local_cu"),
+        (2, "ulysses_local_tail"),
+        (2, "ulysses_no_global"),
+        (2, "ulysses_no_global_stale"),
+        (2, "ulysses_empty_tail_no_global"),
+        (2, "ulysses_empty_tail_global_missing"),
+        (2, "ulysses_empty_tail_global_explicit"),
+        (2, "ulysses_empty_tail_local_explicit"),
+        (2, "ulysses_empty_tail_unknown"),
+        (2, "ulysses_empty_tail_local_missing"),
+        (2, "ulysses_supervised_tail"),
+        (2, "ulysses_valid_tail"),
+        (2, "cp_contiguous"),
+        (2, "cp_global_contiguous"),
+        (2, "cp_global_tail"),
+        (2, "ulysses_stale_local"),
+        (4, "ulysses"),
+        (2, "missing"),
+        (2, "strict_missing"),
+        (2, "strict_step_missing"),
+        (2, "side_failure"),
+        (2, "layout_mismatch"),
+        (2, "cu_mismatch"),
+        (2, "global_cu_mismatch"),
+        (2, "cp_mixed_geometry"),
+        (2, "cp_shared_stale"),
+        (2, "cp_no_global"),
+        (2, "cp_only_global"),
+        (2, "cp_only_global_strict"),
+        (2, "cp_asymmetric"),
+        (2, "cp_stale_contiguous"),
+        (2, "cp_no_local"),
+        (2, "bad_global_no_local"),
+        (2, "bad_global_no_local_strict"),
+    ],
+)
+def test_channel_loss_real_gloo_packed_parity(world_size, scenario):
+    spawn_with_rendezvous(_gloo_parent_packed_loss_worker, args=(world_size, scenario), nprocs=world_size)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("key", ["_veomni_channel_loss_hook_changed", "_veomni_channel_loss_source_provenance"])
+def test_channel_loss_does_not_consume_colliding_user_metadata(monkeypatch, key):
+    import veomni.data.data_collator as data_collator
+
+    state = _stub_parallel_state(monkeypatch)
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: state)
+
+    def features():
+        values = _channel_features()
+        for feature in values:
+            feature[key] = False
+        return values
+
+    cfg = ChannelLossConfig(enable=True, interval=1)
+    baseline = data_collator.MainCollator()(features())
+    batch = data_collator.MainCollator(channel_loss_source_id_keys=tuple(cfg.source_id_keys))(features())
+    callback = ChannelLossCallback(SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg))))
+    callback.on_step_begin(TrainerState(global_step=1), micro_batches=[batch])
+    callback.strip_model_inputs(batch)
+    torch.testing.assert_close(batch[key], baseline[key], rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_base_preforward_strips_only_private_provenance_without_callback():
+    from veomni.data.data_collator import CHANNEL_LOSS_PROVENANCE, _ChannelLossProvenance
+
+    trainer = object.__new__(BaseTrainer)
+    trainer.device = torch.device("cpu")
+    trainer.LOG_SAMPLE = False
+    private = {"input_ids": torch.tensor([[1, 2]]), CHANNEL_LOSS_PROVENANCE: _ChannelLossProvenance({})}
+    assert CHANNEL_LOSS_PROVENANCE not in trainer.preforward(private)
+    user = {"input_ids": torch.tensor([[1, 2]]), CHANNEL_LOSS_PROVENANCE: torch.tensor([7])}
+    torch.testing.assert_close(trainer.preforward(user)[CHANNEL_LOSS_PROVENANCE], torch.tensor([7]))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_provenance_survives_dataloader_worker_serialization():
+    import pickle
+
+    from veomni.data.data_collator import CHANNEL_LOSS_PROVENANCE, _ChannelLossProvenance
+
+    batch = {CHANNEL_LOSS_PROVENANCE: _ChannelLossProvenance({"source_cu": [0, 3]})}
+    restored = pickle.loads(pickle.dumps(batch))
+    assert isinstance(restored[CHANNEL_LOSS_PROVENANCE], _ChannelLossProvenance)
+    assert channel_loss_module._pop_channel_loss_provenance(restored)["source_cu"] == [0, 3]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("add_labels", [False, True])
+def test_channel_loss_rejects_metadata_hook_changing_mtp_labels(monkeypatch, add_labels):
+    import veomni.data.data_collator as data_collator
+
+    state = _stub_parallel_state(monkeypatch)
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: state)
+    features = _channel_features()
+    if not add_labels:
+        for feature in features:
+            feature["mtp_labels"] = feature["labels"].clone()
+
+    def mutate_mtp(batch, _sp_pad):
+        if add_labels:
+            batch["mtp_labels"] = torch.zeros_like(batch["labels"])
+        batch["mtp_labels"][0, -1] = 7
+
+    cfg = ChannelLossConfig(enable=True)
+    batch = data_collator.MainCollator(
+        channel_loss_source_id_keys=tuple(cfg.source_id_keys), metadata_collate_func=mutate_mtp
+    )(features)
+    assert batch[data_collator.CHANNEL_LOSS_PROVENANCE] == {"error": "unsupported source layout"}
+    assert batch["mtp_labels"][0, -1].item() == 7
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_chunk_loss_async_child_does_not_write_parent_capture():
+    from veomni.ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
+
+    hidden = torch.randn(1, 2, 3)
+    labels = torch.tensor([[1, 2]])
+    weight = torch.randn(5, 3)
+
+    async def run():
+        owner = channel_loss_module._capture_owner()
+        capture = {"_is_owner": lambda: channel_loss_module._capture_owner() == owner}
+        token = chunk_loss._CAPTURE.set(capture)
+        release = asyncio.Event()
+        try:
+
+            async def child():
+                return chunk_loss.forward(hidden, labels, weight, grad_enabled=False)[0]
+
+            async def late_child():
+                await release.wait()
+                return await child()
+
+            late = asyncio.create_task(late_child())
+            child_loss = await asyncio.create_task(child())
+            assert "per_token" not in capture
+            parent_loss = chunk_loss.forward(hidden, labels, weight, grad_enabled=False)[0]
+            assert capture["per_token"].shape == labels.shape
+            original_tokens = capture["per_token"]
+            torch.testing.assert_close(child_loss, parent_loss, rtol=0, atol=0)
+        finally:
+            chunk_loss._CAPTURE.reset(token)
+        release.set()
+        torch.testing.assert_close(await late, parent_loss, rtol=0, atol=0)
+        assert capture["per_token"] is original_tokens and "error" not in capture
+
+    asyncio.run(run())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_channel_loss_rejects_metadata_hook_adding_attention_mask(monkeypatch):
+    import veomni.data.data_collator as data_collator
+
+    state = _stub_parallel_state(monkeypatch)
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: state)
+    features = _channel_features()
+    for feature in features:
+        feature.pop("attention_mask")
+
+    def add_mask(batch, _sp_pad):
+        batch["attention_mask"] = torch.tensor([[1, 0, 1, 1]])
+        batch["attention_mask_is_all_ones"] = False
+
+    cfg = ChannelLossConfig(enable=True)
+    batch = data_collator.MainCollator(
+        channel_loss_source_id_keys=tuple(cfg.source_id_keys), metadata_collate_func=add_mask
+    )(features)
+    assert batch[data_collator.CHANNEL_LOSS_PROVENANCE] == {"error": "unsupported source layout"}
+    assert batch["attention_mask"].sum().item() == 3
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_direct_channel_computer_without_source_proof_skips_without_changing_loss():
+    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["empty", "real"]
+    computer._position_ids = torch.tensor([[0, 1, 0, 1]])
+    computer._original_loss_fn = lambda logits, labels, vocab_size: F.cross_entropy(
+        logits.reshape(-1, vocab_size), labels.reshape(-1), ignore_index=IGNORE_INDEX
+    )
+    labels = torch.tensor([[0, 1, 2, 3]])
+    logits = torch.randn(1, 4, 5, requires_grad=True)
+    baseline_logits = logits.detach().clone().requires_grad_()
+    with computer.capture():
+        loss = computer._wrapped_loss_fn(logits, labels, 5)
+    baseline = computer._original_loss_fn(baseline_logits, labels, 5)
+    loss.backward()
+    baseline.backward()
+    assert computer._result is None
+    torch.testing.assert_close(loss, baseline, rtol=0, atol=0)
+    torch.testing.assert_close(logits.grad, baseline_logits.grad, rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_dpo_half_precision_log_probs_accumulate_in_fp32(dtype):
+    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["source"]
+    computer._dpo_segments = True
+    computer._source_provenance = {
+        "source_ids": ["source"],
+        "source_cu": [0, 14000],
+        "input_mask": torch.ones(14000, dtype=torch.bool),
+        "tail": 0,
+        "sp_size": 1,
+        "sp_rank": 0,
+    }
+    labels = torch.zeros(1, 14000, dtype=torch.long)
+    log_probs = torch.full((1, 14000), -8, dtype=dtype, requires_grad=True)
+    baseline_logits = log_probs.detach().clone().requires_grad_()
+    with computer.capture():
+        objective = log_probs.float().square().mean()
+        computer.observe_dpo_log_probs(log_probs, labels, [0, 7000, 14000])
+    baseline = baseline_logits.float().square().mean()
+    objective.backward()
+    baseline.backward()
+    torch.testing.assert_close(objective, baseline, rtol=0, atol=0)
+    torch.testing.assert_close(log_probs.grad, baseline_logits.grad, rtol=0, atol=0)
+    result = computer._result[0]
+    assert result["token_count"].item() == 13998
+    assert result["loss_sum"].dtype == torch.float32
+    assert result["loss_sum"].item() == 111984
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_compiled_chunk_loss_falls_back_to_detached_source_observation():
+    from veomni.ops import resolve_op
+
+    hidden = torch.randn(1, 4, 3)
+    weight = torch.randn(7, 3)
+    labels = torch.tensor([[0, 1, 2, 3]])
+    shift = F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
+    op = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper
+    compiled = torch.compile(op, backend="eager", fullgraph=True)
+    with torch.no_grad():
+        reference = op(hidden, shift, weight, chunk_size=3)
+        # Compile while unsampled, then enable observation on the same graph.
+        torch.testing.assert_close(compiled(hidden, shift, weight, chunk_size=3), reference)
+
+    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["source"]
+    computer._source_provenance = {
+        "source_ids": ["source"],
+        "source_cu": [0, 4],
+        "input_mask": torch.ones(4, dtype=torch.bool),
+        "tail": 0,
+        "sp_size": 1,
+        "sp_rank": 0,
+    }
+
+    def model_loss(logits, labels, vocab_size, hidden_states, weights):
+        shifted = F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
+        return compiled(hidden_states, shifted, weights, chunk_size=3)
+
+    computer._original_loss_fn = model_loss
+    with torch.no_grad(), computer.capture():
+        actual = computer._wrapped_loss_fn(None, labels, 7, hidden, weight)
+    torch.testing.assert_close(actual, reference)
+    expected = F.cross_entropy(F.linear(hidden, weight).reshape(-1, 7), shift.reshape(-1), reduction="none")
+    torch.testing.assert_close(computer._result[0]["loss_sum"], expected.sum())
+    assert computer._result[0]["token_count"].item() == 3
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_loss_signature_preserves_positional_aliases_without_mislabeling_weights():
+    values = (torch.tensor(1), torch.tensor(2), 3)
+
+    def generic(a, b, c):
+        return a, b, c
+
+    bound = channel_loss_module._bind_loss_call_args(generic, values, {})
+    assert (bound["logits"], bound["labels"], bound["vocab_size"]) == values
+
+    def named(logits, labels, vocab_size, hidden_states, weights):
+        return logits, labels, vocab_size, hidden_states, weights
+
+    bound = channel_loss_module._bind_loss_call_args(named, (*values, torch.tensor(4), torch.tensor(5)), {})
+    assert "ignore_index" not in bound and "num_items_in_batch" not in bound
+    assert bound["hidden_states"].item() == 4 and bound["weights"].item() == 5
+
+    def named_with_varargs(logits, labels, vocab_size, hidden_states, weights, *args):
+        return logits, labels, vocab_size, hidden_states, weights, args
+
+    bound = channel_loss_module._bind_loss_call_args(
+        named_with_varargs, (*values, torch.tensor(4), torch.tensor(5)), {}
+    )
+    assert "ignore_index" not in bound and "num_items_in_batch" not in bound
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("dpo", [False, True])
+def test_stale_async_child_cannot_contaminate_next_capture(dpo):
+    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["source"]
+    computer._dpo_segments = dpo
+    computer._source_provenance = {
+        "source_ids": ["source"],
+        "source_cu": [0, 2],
+        "input_mask": torch.ones(2, dtype=torch.bool),
+        "tail": 0,
+        "sp_size": 1,
+        "sp_rank": 0,
+    }
+    labels = torch.tensor([[0, 1]])
+    logits = torch.randn(1, 2, 3, requires_grad=True)
+    computer._original_loss_fn = lambda logits, labels, vocab_size: F.cross_entropy(
+        logits.reshape(-1, vocab_size), labels.reshape(-1)
+    )
+
+    async def run():
+        release = asyncio.Event()
+
+        async def stale_child():
+            await release.wait()
+            computer._wrapped_loss_fn(logits, labels, 3)
+            computer.observe_dpo_log_probs(torch.zeros(1, 2), labels, [0, 1, 2])
+
+        with computer.capture():
+            task = asyncio.create_task(stale_child())
+            await asyncio.sleep(0)
+        with computer.capture():
+            release.set()
+            await task
+            assert not computer._capture_errors
+            if dpo:
+                computer.observe_dpo_log_probs(torch.zeros(1, 2), labels, [0, 1, 2])
+            else:
+                computer._wrapped_loss_fn(logits, labels, 3)
+        assert computer._result is not None
+
+    asyncio.run(run())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("dpo", [False, True])
+def test_foreign_thread_cannot_mutate_errors_during_capture_finalization(monkeypatch, dpo):
+    import contextvars
+    import threading
+
+    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["source"]
+    computer._dpo_segments = dpo
+    computer._original_loss_fn = lambda labels: labels.square().sum()
+    started, release, done = Event(), Event(), Event()
+    outcomes = []
+
+    def child():
+        started.set()
+        assert release.wait(timeout=5)
+        labels = torch.tensor([[2.0]], requires_grad=True)
+        loss = computer._wrapped_loss_fn(labels=labels)
+        computer.observe_dpo_log_probs(torch.zeros(1, 1), labels, [0, 1])
+        loss.backward()
+        outcomes.append((loss.item(), labels.grad.item()))
+        done.set()
+
+    def finalize():
+        release.set()
+        assert done.wait(timeout=5)
+        assert not computer._capture_errors
+
+    monkeypatch.setattr(computer, "_finalize_capture", finalize)
+
+    with computer.capture():
+        context = contextvars.copy_context()
+        thread = threading.Thread(target=lambda: context.run(child), daemon=True)
+        thread.start()
+        assert started.wait(timeout=5)
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert outcomes == [(4.0, 4.0)]
+
+
+def _gloo_late_observer_thread_worker(rank, world_size, endpoint):
+    import contextvars
+    import threading
+
+    import veomni.data.data_collator as data_collator
+
+    try:
+        torch.distributed.init_process_group(
+            "gloo", store=endpoint.connect(), rank=rank, world_size=world_size, timeout=timedelta(seconds=40)
+        )
+        parallel_state_module._init_parallel_state(
+            dp_size=1, dp_shard_size=1, cp_size=1, ulysses_size=world_size, device_type="cpu", name="late-observer"
+        )
+        cfg = ChannelLossConfig(enable=True, interval=1)
+        batch = data_collator.MainCollator(channel_loss_source_id_keys=tuple(cfg.source_id_keys))(
+            [{"input_ids": torch.tensor([0, 1, 2, 3]), "labels": torch.tensor([0, 1, 2, 3]), "ds_idx": 0}]
+        )
+        callback = ChannelLossCallback(SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg))))
+        callback.on_step_begin(TrainerState(global_step=1), micro_batches=[batch])
+        callback.on_micro_step_begin(TrainerState(global_step=1), micro_batch=batch)
+        computer = callback.computer
+
+        def training_loss(logits, labels, vocab_size, shift_labels=None):
+            return F.cross_entropy(logits.reshape(-1, vocab_size), shift_labels.reshape(-1), ignore_index=IGNORE_INDEX)
+
+        computer._original_loss_fn = training_loss
+        labels = batch["labels"]
+        logits = torch.zeros(*labels.shape, 5, requires_grad=True)
+        release, done = threading.Event(), threading.Event()
+        errors = []
+
+        def child():
+            try:
+                assert release.wait(timeout=20)
+                other = torch.ones(*labels.shape, 5, requires_grad=True)
+                child_loss = computer._wrapped_loss_fn(other, labels, 5, shift_labels=labels)
+                child_loss.backward()
+                assert other.grad is not None
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                done.set()
+
+        original_all_gather = torch.distributed.all_gather
+        original_all_gather_object = torch.distributed.all_gather_object
+        fired = False
+
+        def trigger():
+            nonlocal fired
+            if rank == 0 and not fired:
+                fired = True
+                release.set()
+                assert done.wait(timeout=20)
+                assert not errors and not computer._capture_errors
+
+        def all_gather(*args, **kwargs):
+            trigger()
+            return original_all_gather(*args, **kwargs)
+
+        def all_gather_object(*args, **kwargs):
+            trigger()
+            return original_all_gather_object(*args, **kwargs)
+
+        try:
+            with computer.capture():
+                loss = computer._wrapped_loss_fn(logits, labels, 5, shift_labels=labels)
+                if rank == 0:
+                    context = contextvars.copy_context()
+                    thread = threading.Thread(target=lambda: context.run(child))
+                    thread.start()
+                torch.distributed.all_gather = all_gather
+                torch.distributed.all_gather_object = all_gather_object
+        finally:
+            torch.distributed.all_gather = original_all_gather
+            torch.distributed.all_gather_object = original_all_gather_object
+        if rank == 0:
+            thread.join(timeout=5)
+            assert fired and not thread.is_alive() and not errors
+        loss.backward()
+        assert logits.grad is not None and computer._result[0]["token_count"].item() == 3
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+        parallel_state_module.clear_parallel_state()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_real_gloo_late_observer_thread_does_not_diverge_collectives():
+    spawn_with_rendezvous(_gloo_late_observer_thread_worker, args=(2,), nprocs=2)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("strict", [False, True])
+def test_foreign_observation_survives_unrelated_nested_capture_rollback(strict):
+    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+    computer.strict = strict
+    computer._source_ids = ["source"]
+    computer._source_provenance = {
+        "source_ids": ["source"],
+        "source_cu": [0, 2],
+        "input_mask": torch.ones(2, dtype=torch.bool),
+        "tail": 0,
+        "sp_size": 1,
+        "sp_rank": 0,
+    }
+    labels = torch.tensor([[0, 1]])
+    logits = torch.randn(1, 2, 3, requires_grad=True)
+    computer._original_loss_fn = lambda logits, labels, vocab_size: F.cross_entropy(
+        logits.reshape(-1, vocab_size), labels.reshape(-1)
+    )
+
+    async def run():
+        release = asyncio.Event()
+
+        async def child():
+            await release.wait()
+            return computer._wrapped_loss_fn(logits, labels, 3)
+
+        with computer.capture():
+            task = asyncio.create_task(child())
+            with pytest.raises(ValueError, match="unrelated nested failure"):
+                with computer.capture():
+                    release.set()
+                    child_loss = await task
+                    raise ValueError("unrelated nested failure")
+            outer_loss = computer._wrapped_loss_fn(logits, labels, 3)
+            (child_loss + outer_loss).backward()
+        assert computer._result is None
+        assert logits.grad is not None
+
+    if strict:
+        with pytest.raises(ChannelLossMetadataError, match="another task"):
+            asyncio.run(run())
+    else:
+        asyncio.run(run())

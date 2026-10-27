@@ -567,7 +567,9 @@ targets are handled the same way.
 The standard `chunk_loss` backend reuses the main LM-head projection, but detached
 per-token CE still needs a chunk-sized full-vocabulary workspace. Other fused-loss
 backends may recompute the LM-head projection on sampled steps, so the default
-interval is 10 steps; set `interval=1` for per-step metrics. When explicitly
+interval is 10 steps; set `interval=1` for per-step metrics. Compiled `chunk_loss`
+also uses detached recomputation instead of injecting a capture into the compiled
+graph. When explicitly
 enabled, `release_cache` synchronizes and releases detached CE allocator cache
 before backward, trading extra synchronization for lower memory pressure. DiT trainers and
 `data.data_type="classification"` are not supported because they do not optimize
@@ -579,6 +581,23 @@ segment-tail masking follows the objective; SP/CP layouts without provable tail
 positions are skipped (or rejected in strict mode). If distinct source names sanitize to
 the same metric key, the stable source-ID prefix keeps their time series
 distinct from the first emission.
+
+The standard `MainCollator` records source IDs, original feature boundaries and
+padding before packing. The observer intersects those boundaries with the
+contiguous SP shards used by the collator, including Ulysses and CP; attention
+sequence boundaries are kept separate because one source feature can contain
+more than one attention segment. DPO requires exactly two nonempty attention
+segments per preference pair, and the observer masks their last positions
+without changing the training labels. Private source metadata is removed before
+the model forward, including on unsampled steps.
+
+Custom collators and model hooks that reorder token inputs are not automatically
+covered by this provenance contract. If source layout cannot be proved or SP
+ranks disagree, non-strict mode skips the affected channel metrics; strict mode
+raises a metadata error. The non-strict path leaves the training objective and
+gradients unchanged. Direct `ChannelLossComputer` use also requires provenance
+by default; position-derived attention boundaries alone do not prove sample
+source boundaries.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |

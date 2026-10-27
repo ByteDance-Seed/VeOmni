@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
-import sys
+from collections.abc import Callable
+from contextvars import ContextVar
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +29,11 @@ from . import eager as _eager
 from .eager import _grad_and_value, _Meta, _needs_input_grad
 
 
+# Channel-loss capture is opt-in and scoped by the trainer. Keeping this state
+# in the op preserves standalone use without importing the trainer package.
+_CAPTURE: ContextVar[dict[str, Any] | None] = ContextVar("chunk_loss_capture", default=None)
+
+
 def _ce_loss_func(
     hidden_states: Tensor,
     weight: Tensor,
@@ -35,7 +42,7 @@ def _ce_loss_func(
     ignore_index: int,
     logits_bias: Tensor | None = None,
     logits_bias_weight: Tensor | None = None,
-    observe=None,
+    observe: Callable[[Tensor, Tensor], None] | None = None,
 ) -> Tensor:
     """Per-chunk projection and CE, optionally recording detached token losses."""
     labels_flat = labels.reshape(-1)
@@ -142,16 +149,15 @@ def forward(
     bias_chunks = (
         logits_bias.split(chunk_size, dim=split_dim) if logits_bias is not None else (None,) * len(hidden_chunks)
     )
-    # A capture can only be active after the callback module is loaded. Looking
-    # it up avoids importing the trainer stack for standalone loss-op callers.
-    callback = sys.modules.get("veomni.trainer.callbacks.channel_loss_callback")
-    consumer = callback.get_chunk_loss_consumer() if callback is not None else None
-    token_chunks: list[Tensor] = []
-    capture_failed = False
+    # ContextVar.get cannot be traced by Dynamo. A compiled op therefore uses
+    # the unchanged training path; the trainer can recompute detached metrics.
+    capture = None if torch.compiler.is_compiling() else _CAPTURE.get()
+    if capture is not None and callable(is_owner := capture.get("_is_owner")) and not is_owner():
+        capture = None
+    token_chunks = [] if capture is not None else None
 
     def observe(logits: Tensor, chunk_labels: Tensor) -> None:
-        nonlocal capture_failed
-        if capture_failed:
+        if capture is None or capture.get("error") is not None:
             return
         try:
             with torch.no_grad():
@@ -161,22 +167,21 @@ def forward(
                     ).reshape_as(chunk_labels)
                 )
         except Exception as error:
-            capture_failed = True
+            capture["error"] = f"{type(error).__name__}: {error}"
             token_chunks.clear()
-            if callback is None or not callback.report_chunk_loss_observer_error(error):
-                raise
 
     def finish_capture() -> None:
-        if consumer is not None and not capture_failed:
+        if capture is not None and capture.get("error") is None:
+            if "per_token" in capture:
+                capture["error"] = "multiple chunk-loss observations in one causal-loss call"
+                capture.pop("per_token", None)
+                return
             try:
-                consumer(torch.cat(token_chunks, dim=split_dim).detach())
+                capture["per_token"] = torch.cat(token_chunks, dim=split_dim).detach()
             except Exception as error:
-                if callback is None or not callback.report_chunk_loss_observer_error(error):
-                    raise
-            finally:
-                token_chunks.clear()
+                capture["error"] = f"{type(error).__name__}: {error}"
 
-    observe_chunk = observe if consumer is not None else None
+    observe_chunk = observe if capture is not None else None
     accumulated_loss = torch.zeros((), device=hidden.device, dtype=torch.float32)
     if not (hidden_needs_grad or weight_needs_grad or bias_needs_grad or bias_weight_needs_grad):
         for hidden_chunk, label_chunk, bias_chunk in zip(hidden_chunks, label_chunks, bias_chunks, strict=True):
