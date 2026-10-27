@@ -24,6 +24,7 @@ import pytest
 import torch
 from torch import Tensor
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import OP_REGISTRY, VeomniOp, register_op, resolve_op
 from veomni.ops.platform import (
     ANY_DEVICE,
@@ -34,6 +35,9 @@ from veomni.ops.platform import (
 )
 from veomni.ops.registry import OpEntry, SavedState
 from veomni.utils.import_utils import is_package_available
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 _GPU = GpuKernelRequirement()

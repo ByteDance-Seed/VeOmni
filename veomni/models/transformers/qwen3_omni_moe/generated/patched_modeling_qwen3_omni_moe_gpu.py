@@ -140,6 +140,7 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice, unpad_tensor
 from veomni.distributed.sequence_parallel.ulysses import _Gather
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
+from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
@@ -1763,6 +1764,13 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
+        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
+            kwargs,
+            impl=self.veomni_attn.impl,
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+        )
+
         attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
@@ -1772,7 +1780,7 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
-            **kwargs,
+            **attn_kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()

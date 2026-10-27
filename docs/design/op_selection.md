@@ -31,11 +31,14 @@ If a field is not in this table, it is not an op-selection knob.
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `triton` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `triton`, `fla_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU) | `"triton"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
+| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `deepgemm_fp8` (SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
 | QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Model `__init__` stores `self.qat_implementation`; patched helpers consume that bound recipe |
 
 `qat_implementation` has no per-model registry variants. `fp8_blockwise` is
 rejected at config-parse time on anything but an SM90+ NVIDIA CUDA GPU.
+It also cannot be combined with `moe_implementation: deepgemm_fp8`; that
+backend requires `qat_implementation: none` because it already quantizes
+the expert GEMM operands. Conflicting selections raise at config-parse time.
 Constructed DeepSeek-V4 modules freeze the recipe on `self.qat_implementation`;
 changing the process-global ops config later does not retarget an existing
 instance.
@@ -473,6 +476,7 @@ model:
   ops_implementation:
     moe_implementation: fused_triton   # Triton group-gemm (GPU, SM70+ or MLU)
     # moe_implementation: fused_quack  # Quack CUTLASS/CuTe (NVIDIA SM90+)
+    # moe_implementation: deepgemm_fp8  # Native FP8 training (Hopper SM90 / Blackwell SM100)
     # moe_implementation: fused_npu    # NPU group-gemm (Ascend)
     # moe_implementation: fused_mlu    # Apex grouped-GEMM (MLU)
     # moe_implementation: eager   # Reference PyTorch loop (very slow, debug only)
@@ -491,7 +495,8 @@ raise during config validation or op binding.
 |-------|--------|----------|:----------:|
 | `eager` | PyTorch expert loop | Any | No |
 | `fused_triton` | Triton group-gemm | GPU, SM70+ or MLU | Yes |
-| `fused_quack` | Quack CUTLASS/CuTe | GPU, SM90+ (H100+) | No |
+| `fused_quack` | Quack CUTLASS/CuTe | GPU, SM90+ (H100+) | Yes |
+| `deepgemm_fp8` | DeepGEMM FP8 forward/dgrad/wgrad | NVIDIA Hopper SM90 / Blackwell SM100 | Yes |
 | `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
 | `fused_mlu` | Apex grouped-GEMM | Cambricon MLU | Yes |
 
@@ -597,9 +602,9 @@ All four are defined in `transformers.integrations`:
 
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
-| **Mechanism** | Each patched experts module constructs `VeomniOp("moe_experts", variant, impl)` in `__init__` and always calls that handle in `forward`; the selected row may be eager, fused Triton, fused Quack, fused NPU, or fused MLU. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
-| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused_triton"` / `"fused_quack"` / `"fused_npu"` / `"fused_mlu"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
-| **EP support** | `fused_triton` and `fused_npu` paths support Expert Parallelism via VeOmni's EP sharding | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
+| **Mechanism** | Each patched experts module constructs `VeomniOp("moe_experts", variant, impl)` in `__init__` and always calls that handle in `forward`; the selected row may be eager, fused Triton, fused Quack, FP8 DeepGEMM, fused NPU, or fused MLU. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
+| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused_triton"` / `"fused_quack"` / `"deepgemm_fp8"` / `"fused_npu"` / `"fused_mlu"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
+| **EP support** | `fused_triton`, `fused_quack`, `deepgemm_fp8` and `fused_npu` support Expert Parallelism via VeOmni's EP sharding | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
 | **When** | Handle resolution in model `__init__`; dispatch at forward time | Decorator at class definition time; dispatch at forward time |
 
 **Note:** Transformers v5 hardcodes two MoE experts implementations (`batched_mm` and `grouped_mm`) and does not expose a registration interface for external fused implementations, so VeOmni models call their local `VeomniOp` handles rather than routing through `ALL_EXPERTS_FUNCTIONS`.
@@ -740,3 +745,26 @@ model:
 
 - Fused MoE scatter/gather and backward launch bounds: [`fused_moe_ops.md`](fused_moe_ops.md)
 - Package layout and registration: `veomni/ops/README.md`
+
+### Coalescing GDN sequence-parallel exchanges
+
+Qwen4-Exp, Qwen3.5 and Qwen3.5-MoE automatically exchange Q, K, V, beta and
+decay in one packed collective when all five projection dtypes match. There is
+no separate model or op-selection switch. Mixed dtypes use the previous five
+collectives without casts. The recurrence, output projection, packed boundaries
+and model-selected process group are unchanged.
+
+Both key-head and value-head counts must remain divisible by that group's size.
+Coalescing does not enable new topologies or remove the head-layout constraint.
+Peer packets are padded to 512-byte boundaries and unpadded before restoring
+tensor axes. Backward applies the inverse permutation without gradient scaling.
+
+Q/K projection slices retain shared storage instead of being copied eagerly;
+V retains a view when its grouped-head layout permits one. Beta and decay are
+contiguous for their kernel consumers. Flattening multiple strided local heads
+may still require a copy before the final convolution input is concatenated.
+Temporary packing storage trades memory traffic for fewer collective launches.
+
+`tests/models/test_qwen4_exp_gdn_exchange.py` covers exact CPU/Gloo permutations,
+projection view storage, and native NCCL/HCCL model parity with same/mixed dtypes.
+CPU tests do not establish native throughput or numerical acceptance.

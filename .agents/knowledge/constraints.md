@@ -226,6 +226,7 @@ Core files:
 23. **Device-agnostic code must use `veomni.utils.device` helpers**
    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
    - Direct CUDA calls break NPU and MLU compatibility.
+   - The opt-in DeepGEMM FP8 MoE backend is CUDA-only and requires one CUDA device per process. The pinned DeepGEMM `5081f85` caches device-bound kernel handles without a device key; switching GPUs can fail with `CUDA_ERROR_INVALID_HANDLE` even on identical GPUs. `GroupedLayout.from_counts()` enforces this restriction and sets the operand device context before accessing DeepGEMM. Other DeepGEMM calls in the worker must use the same device. `OpsImplementationConfig` rejects `moe_implementation='deepgemm_fp8'` together with non-`none` QAT to prevent double quantization before expert GEMMs. Test non-current-device handling in a fresh spawned worker; standard one-worker-per-GPU EP/FSDP2 is supported.
 
 ## Trainer Extensions
 
