@@ -50,6 +50,7 @@ from veomni.distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
@@ -129,6 +130,10 @@ config.add_import(
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
+)
+config.add_import(
+    "veomni.models.utils.attention_utils",
+    names=["prepare_dense_attention_inputs"],
 )
 
 
@@ -432,48 +437,27 @@ def qwen3_vl_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = self.veomni_attn
-
-    if is_flash_attention_requested(self.config):
-        # --- Patch.1 ---
-        # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-        # --- Patch.1 ---
-        # Vision tokens stay on the attention-internal sync Ulysses path
-        # even when text async is on. Do not pass skip_ulysses; cu_seqlens
-        # still describes the global packed sequence.
-        attn_output, _ = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask=None,
-            scaling=self.scaling,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            cu_seq_lens_q=cu_seqlens,
-            cu_seq_lens_k=cu_seqlens,
-            max_length_q=max_seqlen,
-            max_length_k=max_seqlen,
-            is_causal=False,
-            **kwargs,
-        )
-    else:
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
-        attn_outputs = [
-            attention_interface(
-                self,
-                q,
-                k,
-                v,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                is_causal=False,
-                **kwargs,
-            )[0]
-            for q, k, v in zip(*splits)
-        ]
-        attn_output = torch.cat(attn_outputs, dim=1)
+    # --- Patch.1 ---
+    # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+    # --- Patch.1 ---
+    # Vision tokens stay on the attention-internal sync Ulysses path
+    # even when text async is on. Do not pass skip_ulysses; cu_seqlens
+    # still describes the global packed sequence.
+    attn_output, _ = self.veomni_attn(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask=None,
+        scaling=self.scaling,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+        max_length_q=max_seqlen,
+        max_length_k=max_seqlen,
+        is_causal=False,
+        **kwargs,
+    )
 
     attn_output = attn_output.reshape(seq_length, -1).contiguous()
     attn_output = self.proj(attn_output)
@@ -931,6 +915,12 @@ def qwen3_vl_text_attention_forward_patched(
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     attention_interface = self.veomni_attn
+    attn_kwargs, attention_mask = prepare_dense_attention_inputs(
+        kwargs,
+        impl=attention_interface.impl,
+        attention_mask=attention_mask,
+        hidden_states=hidden_states,
+    )
 
     attn_output, attn_weights = attention_interface(
         self,
@@ -940,7 +930,7 @@ def qwen3_vl_text_attention_forward_patched(
         attention_mask,
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
-        **kwargs,
+        **attn_kwargs,
     )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()

@@ -22,6 +22,10 @@ import sys
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 _EXPORT_QUANT = "veomni.models.transformers.deepseek_v4.export_quant"
 _ACT_QUANT = "veomni.models.transformers.deepseek_v4.act_quant"

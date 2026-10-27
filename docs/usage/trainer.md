@@ -169,6 +169,15 @@ CP/Ulysses, the legacy FLOPs meter leaves those boundaries unchanged; it does
 not multiply each document by the SP degree. The collator counters above remain
 the authoritative global token totals.
 
+Dataloader collators built by the standard text and VLM trainers enable the
+accounting sidecar; standalone `MainCollator` callers get model-ready inputs
+by default. Custom trainer collators can opt in with
+`collect_token_accounting=True` and must pass the sidecar to the meter.
+DPO token counts exclude targets crossing packed chosen/rejected boundaries,
+matching the objective's per-segment mask. RL trainers pack after the meter's
+input callback, so their collator accounting is currently unavailable and the
+derived `token_accounting/*` metrics are suppressed rather than estimated.
+
 On-disk layout for weights, optimizer, scheduler and job cursor, and how a checkpoint from an earlier layout is still resumed: [Checkpoint layout](checkpoint.md).
 
 ### Custom Callbacks

@@ -664,7 +664,7 @@
 
      def forward(
          self,
-@@ -556,25 +656,35 @@
+@@ -556,25 +656,33 @@
          top_k_index: torch.Tensor,
          top_k_weights: torch.Tensor,
      ) -> torch.Tensor:
@@ -691,18 +691,16 @@
 +            return merged_experts_act_fn_forward(
 +                hidden_states,
 +                top_k_index,
-+                top_k_weights.to(hidden_states.dtype),
++                top_k_weights,
 +                self.gate_up_proj,
 +                self.down_proj,
 +                self.act_fn,
 +                self.num_experts,
 +            )
 +        unused = self.gate_up_proj.new_empty(0)
-+        # Eager keeps the fp32 router weights so it stays bitwise with HF's expert loop.
-+        routing_weights = top_k_weights if self.veomni_moe.impl == "eager" else top_k_weights.to(hidden_states.dtype)
 +        return self.veomni_moe(
 +            hidden_states,
-+            routing_weights,
++            top_k_weights,
 +            top_k_index,
 +            unused,
 +            unused,
@@ -719,7 +717,7 @@
 
 
  class GlmMoeDsaMoE(nn.Module):
-@@ -591,10 +701,11 @@
+@@ -591,10 +699,11 @@
              config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
          )
 
@@ -732,7 +730,7 @@
          hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
          hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
          hidden_states = hidden_states + self.shared_experts(residuals)
-@@ -756,6 +867,12 @@
+@@ -756,6 +865,12 @@
          )
 
 
@@ -745,7 +743,7 @@
  @auto_docstring
  class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -768,8 +885,9 @@
+@@ -768,8 +883,9 @@
          self.model = GlmMoeDsaModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -757,7 +755,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -783,52 +901,61 @@
+@@ -783,52 +899,61 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,

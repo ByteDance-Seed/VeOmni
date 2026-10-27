@@ -56,6 +56,24 @@ _LINEAR_ATTN_TAIL_PADDING_LENGTH = "_linear_attn_tail_padding_length"
 _TOKEN_ACCOUNTING_PARTIAL = "_token_accounting_partial"
 
 
+def _count_causal_loss_tokens(
+    shifted_labels: torch.Tensor,
+    position_ids: torch.Tensor | None,
+    *,
+    per_segment: bool,
+) -> int | None:
+    """Count targets without changing the labels consumed by the model."""
+    if not per_segment:
+        return count_loss_tokens(shifted_labels)
+    if position_ids is None or position_ids.shape != shifted_labels.shape:
+        logger.warning_rank0("Skipping per-segment token accounting: position IDs do not match the labels.")
+        return None
+    # DPO masks the target at the beginning of each packed segment, whereas
+    # ordinary causal LM loss uses the globally shifted labels unchanged.
+    next_is_segment_start = F.pad(position_ids[..., 1:].eq(0), (0, 1), value=False)
+    return int((shifted_labels.ne(IGNORE_INDEX) & ~next_is_segment_start).sum().item())
+
+
 def add_flash_attention_kwargs_from_position_ids(
     batch: Dict[str, "torch.Tensor"],
     linear_attn_tail_padding_length: int = 0,
@@ -248,6 +266,8 @@ class PackingCollator(DataCollator):
     # Model-provided hook (see ``MetadataCollateFunc``). ``None`` for text
     # models / pipelines without multimodal metadata — then this is a no-op.
     metadata_collate_func: Optional[MetadataCollateFunc] = None
+    per_segment_loss_accounting: bool = False
+    collect_token_accounting: bool = False
 
     def __post_init__(self):
         self.sp_enabled = get_parallel_state().sp_enabled
@@ -316,12 +336,13 @@ class PackingCollator(DataCollator):
                 if pack_dim == -1:
                     batch[key] = batch[key].unsqueeze(0)
 
-        if "position_ids" in batch:
-            document_stats = summarize_document_lengths(document_lengths_from_position_ids(batch["position_ids"]))
-        else:
-            sequence_length = int(batch["input_ids"].shape[-1]) if "input_ids" in batch else 0
-            document_stats = summarize_document_lengths([sequence_length] if sequence_length else [])
-        batch[_TOKEN_ACCOUNTING_PARTIAL] = document_stats
+        if self.collect_token_accounting:
+            if "position_ids" in batch:
+                document_stats = summarize_document_lengths(document_lengths_from_position_ids(batch["position_ids"]))
+            else:
+                sequence_length = int(batch["input_ids"].shape[-1]) if "input_ids" in batch else 0
+                document_stats = summarize_document_lengths([sequence_length] if sequence_length else [])
+            batch[_TOKEN_ACCOUNTING_PARTIAL] = document_stats
 
         linear_attn_tail_padding_length = 0
         if self.pad_to_length:
@@ -338,19 +359,22 @@ class PackingCollator(DataCollator):
             # the hook sees the SP-padded batch + per-modality pad counts.
             if self.metadata_collate_func is not None:
                 self.metadata_collate_func(batch, {"pixel_values": 0, "pixel_values_videos": 0})
-            if not self.seq_classification and "labels" in batch:
-                shifted_labels = F.pad(batch["labels"][..., 1:].contiguous(), (0, 1), "constant", IGNORE_INDEX)
-                loss_tokens = count_loss_tokens(shifted_labels)
-            else:
-                loss_tokens = count_loss_tokens(batch["labels"]) if "labels" in batch else 0
             partial_accounting = batch.pop(_TOKEN_ACCOUNTING_PARTIAL, None)
             if partial_accounting is not None:
-                _finalize_token_accounting(
-                    batch,
-                    partial=partial_accounting,
-                    loss_tokens=loss_tokens,
-                    tail_padding_length=linear_attn_tail_padding_length,
-                )
+                if not self.seq_classification and "labels" in batch:
+                    shifted_labels = F.pad(batch["labels"][..., 1:].contiguous(), (0, 1), "constant", IGNORE_INDEX)
+                    loss_tokens = _count_causal_loss_tokens(
+                        shifted_labels, batch.get("position_ids"), per_segment=self.per_segment_loss_accounting
+                    )
+                else:
+                    loss_tokens = count_loss_tokens(batch["labels"]) if "labels" in batch else 0
+                if loss_tokens is not None:
+                    _finalize_token_accounting(
+                        batch,
+                        partial=partial_accounting,
+                        loss_tokens=loss_tokens,
+                        tail_padding_length=linear_attn_tail_padding_length,
+                    )
         elif linear_attn_tail_padding_length:
             batch[_LINEAR_ATTN_TAIL_PADDING_LENGTH] = linear_attn_tail_padding_length
         return batch
@@ -396,6 +420,7 @@ class SequenceParallelCollator(DataCollator):
     # Model-provided hook (see ``MetadataCollateFunc``). ``None`` for text
     # models / pipelines without multimodal metadata — then this is a no-op.
     metadata_collate_func: Optional[MetadataCollateFunc] = None
+    per_segment_loss_accounting: bool = False
 
     def __post_init__(self):
         self.sp_size = get_parallel_state().sp_size
@@ -444,13 +469,17 @@ class SequenceParallelCollator(DataCollator):
 
     def __call__(self, batch: Dict[str, Union[torch.Tensor, List[torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         partial_accounting = batch.pop(_TOKEN_ACCOUNTING_PARTIAL, None)
+        loss_tokens = None
         if not self.seq_classification:
             # shift labels
             labels = batch["labels"][..., 1:].contiguous()
             labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
             batch["labels"] = labels
-            loss_tokens = count_loss_tokens(labels)
-        else:
+            if partial_accounting is not None:
+                loss_tokens = _count_causal_loss_tokens(
+                    labels, batch.get("position_ids"), per_segment=self.per_segment_loss_accounting
+                )
+        elif partial_accounting is not None:
             loss_tokens = count_loss_tokens(batch["labels"]) if "labels" in batch else 0
 
         linear_attn_tail_padding_length = int(batch.pop(_LINEAR_ATTN_TAIL_PADDING_LENGTH, 0))
@@ -490,7 +519,7 @@ class SequenceParallelCollator(DataCollator):
                 batch[key] = self.sp_slice(key, batch[key], dim=pack_dim)
 
         add_flash_attention_kwargs_from_position_ids(batch, linear_attn_tail_padding_length)
-        if partial_accounting is not None:
+        if partial_accounting is not None and loss_tokens is not None:
             _finalize_token_accounting(
                 batch,
                 partial=partial_accounting,
@@ -518,6 +547,8 @@ class MainCollator(DataCollator):
     pad_to_length: bool = False
     seq_classification: bool = False
     metadata_collate_func: Optional[MetadataCollateFunc] = None
+    per_segment_loss_accounting: bool = False
+    collect_token_accounting: bool = False
 
     """
     Data collator pipeline with a unified collate info.
@@ -529,6 +560,12 @@ class MainCollator(DataCollator):
             Whether to pad sequence to a fixed length. Default is False.
         seq_classification:
             If True, sequence classification task. Default is False.
+        per_segment_loss_accounting:
+            Count causal targets independently within each packed segment, as
+            required by DPO. This only changes the accounting sidecar.
+        collect_token_accounting:
+            Attach an accounting sidecar for a trainer meter to consume.
+            Off by default so direct callers get model-ready inputs.
         metadata_collate_func:
             Optional model-provided hook (``model.get_metadata_collate_func()``)
             that derives ``multimodal_metadata`` from the packed + SP-padded
@@ -565,6 +602,8 @@ class MainCollator(DataCollator):
                 collate_infos=self.collate_infos,
                 pad_to_length=self.pad_to_length,
                 seq_classification=self.seq_classification,
+                per_segment_loss_accounting=self.per_segment_loss_accounting,
+                collect_token_accounting=self.collect_token_accounting,
                 metadata_collate_func=self.metadata_collate_func,
             )
         )
@@ -573,6 +612,7 @@ class MainCollator(DataCollator):
                 SequenceParallelCollator(
                     collate_infos=self.collate_infos,
                     seq_classification=self.seq_classification,
+                    per_segment_loss_accounting=self.per_segment_loss_accounting,
                     metadata_collate_func=self.metadata_collate_func,
                 )
             )

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops.platform import (
     NVIDIA_SM70_PLUS,
     ROCM_GPU,
@@ -25,6 +26,9 @@ from veomni.ops.platform import (
     NvidiaGpuPlatform,
     RocmGpuPlatform,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_nvidia_platform_rejects_rocm_without_reading_cuda_cc(monkeypatch):

@@ -48,7 +48,7 @@ when the selected implementation runs.
 | `layer_norm` | `standard` | `eager`, `apex` (`fused_layer_norm_cuda`); nested by async Ulysses QKV when `norm_type="layernorm"` |
 | `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
 | `swiglu_mlp` | `standard`, `geglu` | `eager`, `liger_kernel` |
-| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `fused_npu`, `fused_mlu` as supported by the variant |
+| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `deepgemm_fp8` (standard, SM90/SM100), `fused_npu`, `fused_mlu` as supported by the variant |
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
@@ -107,6 +107,14 @@ and is optional; install it with:
 ```bash
 uv sync --extra gpu --extra magi --dev
 ```
+
+The opt-in `deepgemm_fp8` MoE backend uses native FP8 grouped GEMMs
+for forward, input gradients and weight gradients on Hopper and Blackwell SM100.
+Its hidden states and expert weights remain BF16; routing weights retain their
+supplied dtype. Hopper uses a bounded FP32 wgrad workspace; SM100 writes BF16
+gradients directly from the FP32 accumulator in the GEMM epilogue. Recomputing
+Triton SwiGLU limits temporary storage. See [FP8 MoE training](../../docs/design/deepgemm_fp8_moe.md)
+for dependency installation, configuration, precision and distributed coverage.
 
 ## Registering an op
 
@@ -244,16 +252,21 @@ into the outer custom-autograd state.
 ## Process-wide integrations
 
 The `sdpa` and `veomni_sdpa` attention rows accept ordinary dense attention
-masks but do not expose a packed/varlen API, following the public
-[`torch.nn.functional.scaled_dot_product_attention` signature](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html),
-which has `attn_mask` but no `cu_seqlens` arguments. `packed_causal_mask`
-composes the segments into a dense block-diagonal mask for these
+masks, while the underlying
+[`torch.nn.functional.scaled_dot_product_attention` signature](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html)
+has `attn_mask` and no `cu_seqlens` arguments. `packed_causal_mask`
+composes segments into a dense block-diagonal mask for these
 implementations. Their attention calls and the VeOmni SDPA mask builder drop
 cumulative-length and varlen maximum-length metadata when it describes at most
-one segment per batch row, or when the call carries a 3-D/4-D dense mask.
-Several segments per row without such a mask raise, because SDPA would attend
-across samples. Opaque dense masks are not inspected to infer whether they
-encode sequence boundaries.
+one segment per batch row, or when the call carries a 3-D/4-D dense mask. When
+an `sdpa`, `veomni_sdpa`, `eager` (with `is_causal=False`), or
+`veomni_sage_attention` attention call has `attention_mask=None` and
+`batch_size == 1` with multiple segments, the wrapper splits `Q/K/V` along
+the sequence dimension by the segment lengths derived from `cu_seqlens` (after
+any Ulysses gather) and concatenates the per-segment outputs. Multi-segment
+metadata with a 2-D mask or `batch_size != 1` raises, as does multi-segment
+metadata passed to `sdpa_attention_mask_builder`. Opaque dense masks are not
+inspected to infer whether they encode sequence boundaries.
 
 The VeOmni SDPA mask builder only honors causal mask-elision hints for the
 canonical causal predicate with equal Q/K lengths and offsets. Bidirectional
@@ -282,3 +295,14 @@ When adding a row, test its numerical contract, registration, hardware
 requirement, and optional-package requirements. When adding model-specific
 argument policy, test it in `tests/models` rather than duplicating it in
 the raw-kernel suite.
+
+### GDN projection exchange
+
+Qwen4-Exp, Qwen3.5 and Qwen3.5-MoE automatically coalesce same-dtype Q/K/V,
+beta and decay projections before their explicit-group sequence exchange.
+Mixed projection dtypes retain five separate collectives without casting.
+The packed width retains the key/value head ratio. Peer packets are padded to
+512 bytes, then unpadded before interpreting the sequence; backward inverts the
+same permutation without rescaling. Output exchange, recurrence and packed
+boundaries are unchanged, and existing head-divisibility requirements remain.
+No `OpsImplementationConfig` flag is needed for this layout optimization.

@@ -3,6 +3,7 @@ import types
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.token_accounting import (
     TOKEN_ACCOUNTING_KEY,
@@ -11,6 +12,9 @@ from veomni.utils.token_accounting import (
     metrics_from_totals,
     pop_token_accounting,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _parallel_state(*, sp_size: int, sp_rank: int = 0):
@@ -41,7 +45,7 @@ def _collate(monkeypatch, *, sp_size: int):
     import veomni.data.data_collator as data_collator
 
     monkeypatch.setattr(data_collator, "get_parallel_state", lambda: _parallel_state(sp_size=sp_size))
-    batch = data_collator.MainCollator(pad_to_length=16)(_documents())
+    batch = data_collator.MainCollator(pad_to_length=16, collect_token_accounting=True)(_documents())
     assert TOKEN_ACCOUNTING_KEY in batch
     return pop_token_accounting(batch)
 
@@ -172,7 +176,7 @@ def test_environ_meter_consumes_accounting_before_model_forward(monkeypatch):
     meter.batch_seqlens = []
     meter.images_seqlens = []
     monkeypatch.setattr(helper, "_compute_seqlens", lambda _: [12])
-    monkeypatch.setattr(helper, "_compute_image_seqlens", lambda _: [])
+    monkeypatch.setattr(helper, "_compute_image_seqlens", lambda _, config: [])
 
     batch = {TOKEN_ACCOUNTING_KEY: TokenAccounting(16, 12, 12, 10, 2, 7, 74).to_dict()}
     meter.add(batch)
@@ -181,6 +185,121 @@ def test_environ_meter_consumes_accounting_before_model_forward(monkeypatch):
     assert meter.batch_accounting_expected == 1
     assert meter.batch_accounting_observed == 1
     assert meter.batch_token_accountings == [TokenAccounting(16, 12, 12, 10, 2, 7, 74)]
+
+
+@pytest.mark.parametrize("as_list", [False, True])
+@pytest.mark.parametrize("with_grid", [False, True])
+def test_environ_meter_counts_tokens_and_gemma3_images_together(as_list, with_grid):
+    from veomni.utils import helper
+
+    meter = object.__new__(helper.EnvironMeter)
+    meter.config = types.SimpleNamespace(model_type="gemma3", vision_config=types.SimpleNamespace(patch_size=14))
+    meter.enable_multisource = False
+    meter.batch_token_accountings = []
+    meter.batch_accounting_expected = 0
+    meter.batch_accounting_observed = 0
+    meter.batch_seqlens = []
+    meter.images_seqlens = []
+    accounting = TokenAccounting(4, 4, 4, 3, 1, 4, 16)
+    batch = {
+        TOKEN_ACCOUNTING_KEY: accounting.to_dict(),
+        "attention_mask": torch.ones((1, 4), dtype=torch.int64),
+        "pixel_values": torch.empty(2, 3, 28, 28),
+    }
+    if with_grid:
+        batch["image_grid_thw"] = torch.tensor([[1, 2, 3], [1, 2, 4]])
+
+    meter.add([batch] if as_list else batch)
+
+    assert TOKEN_ACCOUNTING_KEY not in batch
+    assert meter.batch_accounting_expected == meter.batch_accounting_observed == 1
+    assert meter.batch_token_accountings == [accounting]
+    assert meter.batch_seqlens == [4]
+    assert meter.images_seqlens == ([6, 8] if with_grid else [4, 4])
+
+
+@pytest.mark.parametrize(("sp_size", "sp_rank"), [(1, 0), (2, 0), (2, 1)])
+@pytest.mark.parametrize(("per_segment", "expected"), [(False, 4), (True, 3)])
+def test_supervised_token_accounting_respects_objective(monkeypatch, sp_size, sp_rank, per_segment, expected):
+    import veomni.data.data_collator as data_collator
+    from veomni.trainer.text_dpo_trainer import _build_dpo_labels_list
+
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: _parallel_state(sp_size=sp_size, sp_rank=sp_rank))
+    feature = {
+        "input_ids": torch.tensor([1, 2, 3, 4, 5]),
+        "attention_mask": torch.ones(5, dtype=torch.long),
+        "labels": torch.tensor([1, 2, 3, 4, 5]),
+        "position_ids": torch.tensor([0, 1, 2, 0, 1]),
+    }
+    batch = data_collator.MainCollator(per_segment_loss_accounting=per_segment, collect_token_accounting=True)(
+        [feature]
+    )
+
+    assert pop_token_accounting(batch).loss_tokens == expected
+    if per_segment:
+        labels = feature["labels"]
+        if sp_size > 1:
+            labels = torch.nn.functional.pad(labels[1:], (0, 1), value=IGNORE_INDEX)
+        actual_objective_labels = _build_dpo_labels_list(labels, [3, 2], sp_enabled=sp_size > 1)
+        assert sum(int((segment != IGNORE_INDEX).sum()) for segment in actual_objective_labels) == expected
+    # The accounting policy must never modify the training labels.
+    expected_labels = [1, 2, 3, 4, 5] if sp_size == 1 else ([2, 3, 4] if sp_rank == 0 else [5, -100, -100])
+    assert batch["labels"].reshape(-1).tolist() == expected_labels
+
+
+@pytest.mark.parametrize("sp_size", [1, 2])
+def test_standalone_collator_returns_model_inputs_without_accounting(monkeypatch, sp_size):
+    import veomni.data.data_collator as data_collator
+
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: _parallel_state(sp_size=sp_size))
+    batch = data_collator.MainCollator()(_documents())
+
+    assert TOKEN_ACCOUNTING_KEY not in batch
+    assert "_token_accounting_partial" not in batch
+
+
+@pytest.mark.parametrize("trainer_kind", ["text", "dpo", "vlm"])
+def test_standard_trainer_collators_enable_accounting(monkeypatch, trainer_kind):
+    import veomni.data.data_collator as data_collator
+    from veomni.trainer.base import BaseTrainer
+    from veomni.trainer.vlm_trainer import VLMTrainer
+
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: _parallel_state(sp_size=1))
+    base = types.SimpleNamespace(
+        args=types.SimpleNamespace(
+            data=types.SimpleNamespace(data_type="conversation"),
+            train=types.SimpleNamespace(pad_to_length=False),
+        ),
+        model=types.SimpleNamespace(unwrapped_module=torch.nn.Identity()),
+    )
+    if trainer_kind == "vlm":
+        VLMTrainer._build_collate_fn(types.SimpleNamespace(base=base))
+    else:
+        BaseTrainer._build_collate_fn(base, per_segment_loss_accounting=trainer_kind == "dpo")
+
+    batch = base.collate_fn(_documents())
+    assert pop_token_accounting(batch).loss_tokens == 10
+
+
+@pytest.mark.parametrize("use_rl", [False, True])
+def test_preforward_never_passes_accounting_metadata_to_model(monkeypatch, use_rl):
+    import veomni.data.data_collator as data_collator
+    from veomni.trainer.base import BaseTrainer
+    from veomni.trainer.base_rl_trainer import BaseRLTrainer
+
+    monkeypatch.setattr(data_collator, "get_parallel_state", lambda: _parallel_state(sp_size=1))
+    trainer = object.__new__(BaseRLTrainer if use_rl else BaseTrainer)
+    trainer.device = torch.device("cpu")
+    trainer.LOG_SAMPLE = False
+    collator = data_collator.MainCollator(collect_token_accounting=True)
+    if use_rl:
+        trainer.pre_forward = collator
+        prepared = trainer.preforward(_documents())
+    else:
+        prepared = trainer.preforward(collator(_documents()))
+
+    assert TOKEN_ACCOUNTING_KEY not in prepared
+    assert prepared["input_ids"].shape[-1] == 12
 
 
 def test_loss_count_excludes_padding_and_pack_boundaries(monkeypatch):

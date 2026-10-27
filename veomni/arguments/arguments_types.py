@@ -133,11 +133,11 @@ class OptimizerConfig:
         default="per_module",
         metadata={
             "help": (
-                "Which parameters max_grad_norm is computed over. 'per_module' clips each "
-                "module against its own norm; 'global' clips every module against one norm "
-                "taken across all of them. A single-model job has one module, so the two "
-                "agree; 'global' only becomes meaningful once an omni model owns several, "
-                "and is not implemented yet."
+                "How OmniTrainer applies max_grad_norm across OmniModules. "
+                "'per_module' (default): clip each module to max_grad_norm independently, "
+                "then report sqrt(sum n_i^2). "
+                "'global': measure each module unclipped, total=sqrt(sum n_i^2), then scale "
+                "all modules by one coefficient (single-model / seedream gradient_clip_val semantics)."
             )
         },
     )
@@ -247,13 +247,6 @@ class OptimizerConfig:
             )
         },
     )
-
-    def __post_init__(self):
-        if self.grad_clip_scope == "global":
-            raise NotImplementedError(
-                "model.optimizer.grad_clip_scope='global' needs a clip that spans several "
-                "modules, which arrives with the omni module runtime. Use 'per_module'."
-            )
 
 
 @dataclass
@@ -866,6 +859,8 @@ class AcceleratorConfig:
         # "derive it", cp_size is always an explicit divisor of the world size.
         if self.cp_size < 1:
             raise ValueError(f"cp_size must be a positive integer; got {self.cp_size}.")
+        if self.ulysses_size < 1:
+            raise ValueError(f"ulysses_size must be a positive integer; got {self.ulysses_size}.")
 
         non_dp_size = self.pp_size * self.ulysses_size * self.cp_size * self.tp_size
         if self.world_size % non_dp_size != 0:
@@ -1416,7 +1411,7 @@ class OpsImplementationConfig:
         default=None,
         metadata={
             "help": "MoE experts forward. 'fused_triton' (GPU SM70+ or MLU) | "
-            "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | "
+            "'fused_quack' (GPU SM90+) | 'deepgemm_fp8' (SM90/SM100 FP8 training) | 'fused_npu' (NPU) | "
             "'fused_mlu' (MLU Apex grouped-GEMM) | 'eager'. "
             "Unset: 'fused_triton' on GPU, 'fused_npu' on NPU, 'fused_mlu' on MLU with Apex "
             "and 'fused_triton' otherwise."
@@ -1558,7 +1553,7 @@ class OpsImplementationConfig:
             "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
             "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
             "recipe rather than an op-registry implementation, so it is not selected through "
-            "VeomniOp -- see veomni/ops/qat/."
+            "VeomniOp -- see veomni/ops/qat/. Must be 'none' when moe_implementation='deepgemm_fp8'."
         },
     )
 
@@ -1646,13 +1641,20 @@ class OpsImplementationConfig:
         )
 
     def _validate_implementations(self):
-        """Fail fast on hardware/op mismatch at config-parse time.
+        """Fail fast on incompatible selections and hardware/op mismatch at config-parse time.
 
         Only checks things cheaper to catch here than at model-build time.
         Package availability (liger / torch_npu) and model-specific backend
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
+        if self.moe_implementation == "deepgemm_fp8" and self.qat_implementation != "none":
+            raise ValueError(
+                "moe_implementation='deepgemm_fp8' cannot be combined with "
+                f"qat_implementation={self.qat_implementation!r}. Set qat_implementation='none'; "
+                "DeepGEMM already quantizes the expert GEMM operands."
+            )
+
         from ..utils.device import IS_NPU_AVAILABLE
         from ..utils.import_utils import (
             is_apex_mlu_available,

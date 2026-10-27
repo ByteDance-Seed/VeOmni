@@ -358,14 +358,12 @@ class OmniConfig(PretrainedConfig):
             loaded = self._module_configs.get(name)
             if loaded is None:
                 continue
-            loaded.ops_implementation = {
-                **dict(loaded.ops_implementation or {}),
-                **self.ops_implementation,
-                **dict(self._module_entries[name].get("ops_implementation") or {}),
-            }
-            attn_implementation = loaded.ops_implementation.get("attn_implementation")
-            if attn_implementation is not None:
-                loaded._attn_implementation = attn_implementation
+            loaded._apply_composed_overwrites(
+                model_config=None,
+                processor_config=None,
+                ops_implementation=self._module_entries[name].get("ops_implementation"),
+                base_ops_implementation=self.ops_implementation,
+            )
         return remaining
 
     @property
