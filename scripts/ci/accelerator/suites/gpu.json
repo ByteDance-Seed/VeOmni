@@ -667,5 +667,17 @@
       "-x",
       "tests/optim/test_cpu_offload_adamw_device.py"
     ]
+  },
+  {
+    "name": "qwen38-ple-file-state-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_file_backed_state.py",
+      "tests/optim/test_ple_muon_grad_groups.py",
+      "tests/optim/test_ple_world_profile.py",
+      "tests/optim/test_qwen38_ple_file_state.py"
+    ]
   }
 ]

@@ -594,6 +594,13 @@ class VeOmniModelRuntime:
         """
         opt = self.args.optimizer
         from ..optim import build_optimizer
+        from ..optim.ple_world_profile import for_job, validate_before_build
+
+        receipt = for_job(self.train_args)
+        self._ple_profile_receipt = receipt
+        validate_before_build(
+            opt, self.args.accelerator, self.train_args.checkpoint, receipt, model_name=self.model_name
+        )
 
         self.optimizer = build_optimizer(
             self.model,
@@ -606,6 +613,7 @@ class VeOmniModelRuntime:
             no_decay_modules=opt.no_decay_modules,
             no_decay_params=opt.no_decay_params,
             optimizer_config=opt,
+            ple_profile_receipt=receipt,
         )
 
     def _build_lr_scheduler(self, total_steps: int) -> None:

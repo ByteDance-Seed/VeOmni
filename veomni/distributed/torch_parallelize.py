@@ -30,6 +30,12 @@ from torch.utils.checkpoint import noop_context_fn
 from ..arguments import MixedPrecisionConfig
 from ..arguments.arguments_types import validate_low_precision_reduce_scatter_comm
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
+from ..models.qwen4_gdn_precision import (
+    expected_qwen4_gdn_layer_ids,
+    is_qwen4_exp_config,
+    qwen4_gdn_modules,
+    qwen4_gdn_parameters,
+)
 from ..utils import logging, recompute_utils
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
@@ -469,7 +475,24 @@ def parallelize_model_fsdp2(
         logger.info_rank0("Parameter dtype matches reduce dtype; using the native PyTorch collective.")
 
     model_no_split_modules = getattr(model, "_no_split_modules", None) or []
+    keep_qwen4_gdn_fp32 = is_qwen4_exp_config(getattr(model, "config", None))
+    expected_gdn_ids = {id(module) for module in qwen4_gdn_modules(model)} if keep_qwen4_gdn_fp32 else set()
+    wrapped_gdn_ids = set()
+    if keep_qwen4_gdn_fp32 and not expected_gdn_ids:
+        if expected_qwen4_gdn_layer_ids(model.config) == set():
+            keep_qwen4_gdn_fp32 = False
+        else:
+            raise RuntimeError("Qwen4-Exp FSDP requires recognizable GDN modules")
+    if keep_qwen4_gdn_fp32 and expected_qwen4_gdn_layer_ids(model.config) == set():
+        raise RuntimeError("Qwen4-Exp config declares no GDN layers but GDN modules are present")
+    if keep_qwen4_gdn_fp32 and compile_config is not None and compile_config.enable:
+        raise NotImplementedError("Qwen4 FP32 GDN parameter groups are not yet qualified with torch.compile")
     target_classes = set(model_no_split_modules) | set(basic_modules or [])
+    if keep_qwen4_gdn_fp32:
+        # The VLM wrapper's HF _no_split_modules may name a different decoder
+        # class than the actual text stack. Always include the actual class so
+        # no GDN scalar is accidentally left in the root FSDP group.
+        target_classes.add("Qwen4ExpTextDecoderLayer")
 
     # Make a list of tuples that contains target classes' name and module
     # Note that all target classes should include all ExtraParallel modules.
@@ -768,6 +791,10 @@ def parallelize_model_fsdp2(
     for layer_fqn, (layer_mod, extra_parallel_mod) in layer_pairs_list:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
         layer_mod._fsdp_modules = []
+        gdn_modules = qwen4_gdn_modules(layer_mod) if keep_qwen4_gdn_fp32 else []
+        if wrapped_gdn_ids.intersection(map(id, gdn_modules)):
+            raise RuntimeError("Qwen4 GDN belongs to multiple FSDP wrap targets")
+        gdn_params = set().union(*(qwen4_gdn_parameters(gdn) for gdn in gdn_modules))
 
         for para in parallel_state.extra_parallel_names:
             # para (e.g. ep, emb) enabled and this layer contains the para module(s)
@@ -809,6 +836,8 @@ def parallelize_model_fsdp2(
         if mp_ignored_classes:
             for sub_mod in layer_mod.modules():
                 if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
+                    if sub_mod in gdn_modules:
+                        raise RuntimeError("Qwen4 GDN cannot also be an ignored mixed-precision module")
                     fully_shard(sub_mod, **fsdp_kwargs_without_mp)
                     # Keep these modules off transport_reduction_scales: their genuine FP32
                     # gradients need native FP32 communication, not a lossy wire cast.
@@ -820,12 +849,31 @@ def parallelize_model_fsdp2(
         #      when layer_mod (also called as target module, e.g. decoder.embed_tokens),
         #      is the parent of or equal to extra_parallel_mod[para] (e.g. ToyEmbed),
         #      no need to shard layer_mod again.
+        if isinstance(layer_mod, FSDPModule) and gdn_modules:
+            raise RuntimeError("Cannot assign FP32 GDN parameters: decoder is already an FSDP module")
         if not isinstance(layer_mod, FSDPModule):
-            fully_shard(layer_mod, **fsdp_kwargs)
+            layer_fsdp_kwargs = dict(fsdp_kwargs)
+            if gdn_params:
+                layer_fsdp_kwargs["ignored_params"] = set(layer_fsdp_kwargs.get("ignored_params", ())) | gdn_params
+            fully_shard(layer_mod, **layer_fsdp_kwargs)
+            for gdn in gdn_modules:
+                # Parent wrapping replaces its managed Parameters. Rebuild the
+                # excluded set from the live objects before wrapping the child.
+                fp32_params = qwen4_gdn_parameters(gdn)
+                gdn_kwargs = dict(fsdp_kwargs)
+                gdn_kwargs.pop("mp_policy", None)
+                gdn_kwargs["reshard_after_forward"] = False
+                gdn_kwargs["ignored_params"] = {p for p in gdn.parameters() if p not in fp32_params}
+                fully_shard(gdn, **gdn_kwargs)
+                wrapped_gdn_ids.add(id(gdn))
+                layer_mod._fsdp_modules.append(gdn)
             if transport_reduction_scales is not None and fsdp_transport_enabled:
                 transport_reduction_scales[layer_mod] = fsdp_reduction_scale
             layer_mod._fsdp_modules.append(layer_mod)
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
+
+    if wrapped_gdn_ids != expected_gdn_ids:
+        raise RuntimeError("Not every Qwen4 GDN was assigned to an FP32 FSDP group")
 
     # Shard root WITHOUT explicit `reshard_after_forward` so FSDP2's
     # auto-no-reshard for the root kicks in (`_fsdp_state.py:_lazy_init`).
@@ -860,7 +908,7 @@ def parallelize_model_fsdp2(
 
     # configure manual prefetching when needed
     need_manual_prefetch = (
-        parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
+        parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None or keep_qwen4_gdn_fp32
     ) and kwargs.pop("enable_forward_prefetch", True)
     if need_manual_prefetch:
         blocks = [pair[1][0] for pair in layer_pairs_list]  # all target modules

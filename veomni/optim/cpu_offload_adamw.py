@@ -108,15 +108,38 @@ class CPUOffloadAdamW(FullFP32AdamW):
             return torch.float32
         return self.cpu_moment_dtype if id(param) in self._offloaded else self.resident_moment_dtype
 
+    def checkpoint_state_fields(self, param):
+        """Required state inventory, including for strict DCP load targets."""
+        return ("step", "master_weight", "exp_avg", "exp_avg_sq")
+
+    def _initialize_state(self, param, target):
+        # Transfer BF16 first: do not create a full FP32 NPU master.
+        master = param.detach().to(device=target, copy=True).float()
+        return dict(
+            step=torch.tensor(0.0),
+            master_weight=master,
+            exp_avg=torch.zeros_like(master, dtype=self._state_dtype(param, "exp_avg")),
+            exp_avg_sq=torch.zeros_like(master, dtype=self._state_dtype(param, "exp_avg_sq")),
+        )
+
+    def _finish_parameter_update(self, param, state):
+        """Hook for storage policies that must flush after a parameter update."""
+
+    def _finish_state_chunk(self, param, state, start, count):
+        """Hook for bounded storage policies after a moment chunk is written."""
+
     def load_state_dict(self, state_dict):
         restored = []
         for saved_group, group in zip(state_dict["param_groups"], self.param_groups, strict=True):
             for key, param in zip(saved_group["params"], group["params"], strict=True):
                 saved = state_dict["state"].get(key, {})
                 if saved:
-                    if set(saved) != {"step", "master_weight", "exp_avg", "exp_avg_sq"}:
+                    required = self.checkpoint_state_fields(param)
+                    if set(saved) != set(required):
                         raise RuntimeError("CPU offload requires complete master_weight/exp_avg/exp_avg_sq/step state")
-                    for name in ("master_weight", "exp_avg", "exp_avg_sq"):
+                    for name in required:
+                        if name == "step":
+                            continue
                         expected_dtype = self._state_dtype(param, name)
                         if saved[name].dtype != expected_dtype:
                             raise RuntimeError(
@@ -136,7 +159,9 @@ class CPUOffloadAdamW(FullFP32AdamW):
                 continue
             target = torch.device("cpu") if offload else param.device
             state = {"step": torch.as_tensor(saved["step"]).detach().cpu().clone()}
-            for name in ("master_weight", "exp_avg", "exp_avg_sq"):
+            for name in self.checkpoint_state_fields(param):
+                if name == "step":
+                    continue
                 tensor = saved[name]
                 # Reuse DCP's already correctly placed buffers. Cloning every
                 # resident state here would transiently double accelerator
@@ -226,14 +251,7 @@ class CPUOffloadAdamW(FullFP32AdamW):
                 state = self.state[param]
                 if not state:
                     target = torch.device("cpu") if offload else param.device
-                    # Transfer BF16 first: do not create a full FP32 NPU master.
-                    master = param.detach().to(device=target, copy=True).float()
-                    state.update(
-                        step=torch.tensor(0.0),
-                        master_weight=master,
-                        exp_avg=torch.zeros_like(master, dtype=self._state_dtype(param, "exp_avg")),
-                        exp_avg_sq=torch.zeros_like(master, dtype=self._state_dtype(param, "exp_avg_sq")),
-                    )
+                    state.update(self._initialize_state(param, target))
                 tensors = [_local(state[key]) for key in ("master_weight", "exp_avg", "exp_avg_sq")]
                 target = torch.device("cpu") if offload else weight.device
                 state_names = ("master_weight", "exp_avg", "exp_avg_sq")
@@ -273,6 +291,8 @@ class CPUOffloadAdamW(FullFP32AdamW):
                         self._synchronize(w.device)
                     else:
                         w[section].copy_(effective)
+                    self._finish_state_chunk(param, state, start, second.numel())
+                self._finish_parameter_update(param, state)
         for device in sorted(devices, key=str):
             self._synchronize(device)
         self.last_step_seconds = time.perf_counter() - started

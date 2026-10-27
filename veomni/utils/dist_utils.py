@@ -14,6 +14,7 @@
 
 
 import os
+import pickle
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Union
 
@@ -66,6 +67,21 @@ def all_reduce(
         return data.tolist()
 
 
+def _control_collective_device(backend: str) -> str:
+    """Choose a device registered for this group's control reduction."""
+    backend = str(backend).lower()
+    if backend in ("gloo", "cpu:gloo"):
+        return "cpu"
+    preferred = get_device_type()
+    devices = {part.split(":", 1)[0].strip() for part in backend.split(",") if ":" in part}
+    aliases = {preferred}
+    if preferred == "npu":
+        aliases.add("privateuseone")
+    if devices and not (devices & aliases) and "cpu" in devices:
+        return "cpu"
+    return preferred
+
+
 def any_rank_failed(failed: bool, group: Optional[Any] = None) -> bool:
     """Whether *any* rank hit an error, so every rank can agree on what to do next.
 
@@ -75,10 +91,37 @@ def any_rank_failed(failed: bool, group: Optional[Any] = None) -> bool:
     """
     if not dist.is_initialized():
         return failed
-    device = "cpu" if group is not None and dist.get_backend(group) == "gloo" else get_device_type()
+    device = _control_collective_device(dist.get_backend(group))
     flag = torch.tensor([1 if failed else 0], dtype=torch.int32, device=device)
     dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
     return bool(flag.item())
+
+
+def require_same_rank_value(value: Any, what: str, group: Optional[Any] = None) -> None:
+    """Fail on every participant when a distributed control-flow setting differs.
+
+    Call this only from a phase reached by every rank in ``group``. In
+    particular, checking merely whether *any* rank enables an option does not
+    prevent a later optimizer collective from being skipped by other ranks.
+    """
+    if not dist.is_initialized():
+        return
+    payload, error = None, None
+    try:
+        payload = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as exc:
+        error = exc
+    raise_if_any_rank_failed(error, f"serializing {what}", group=group)
+    payloads = [None] * dist.get_world_size(group=group)
+    dist.all_gather_object(payloads, payload, group=group)
+    error = None
+    try:
+        values = [pickle.loads(item) for item in payloads]
+        if any(other != values[0] for other in values[1:]):
+            raise RuntimeError(f"{what} differs across ranks: {values}")
+    except Exception as exc:
+        error = exc
+    raise_if_any_rank_failed(error, f"comparing {what}", group=group)
 
 
 def raise_if_any_rank_failed(error: Optional[BaseException], what: str, group: Optional[Any] = None) -> None:

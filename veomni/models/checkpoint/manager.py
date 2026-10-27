@@ -32,9 +32,11 @@ Two blobs, two owners:
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch.distributed as dist
+from torch.distributed.checkpoint.api import CheckpointException
 
 from ...checkpoint import CheckpointerBase, build_checkpointer, layout
 from ...utils import helper
+from ...utils.dist_utils import raise_if_any_rank_failed
 
 
 if TYPE_CHECKING:
@@ -165,10 +167,16 @@ class ModelCheckpointManager:
 
     def _checkpointer_kwargs(self) -> Dict[str, Any]:
         """Keyword arguments shared by ``checkpointer.save`` and ``checkpointer.load``."""
-        return {
+        result = {
             "trainable_only": self.trainable_only,
             "parallel_state": self.parallel_state,
         }
+        from ...optim.ple_world_profile import _Receipt
+
+        receipt = getattr(self.runtime, "_ple_profile_receipt", None)
+        if isinstance(receipt, _Receipt):
+            result["file_profile_receipt"] = receipt
+        return result
 
     def wait_for_pending_save(self) -> None:
         """Block until the in-flight async save is on disk, if there is one."""
@@ -212,7 +220,18 @@ class ModelCheckpointManager:
             state,
             **self._checkpointer_kwargs(),
         )
-        self._load_extra_state(state["extra_state"])
+        error = None
+        try:
+            from ...checkpoint.dcp_checkpointer import _file_backed_mode
+
+            if _file_backed_mode(self.runtime.optimizer) and self.runtime.lr_scheduler is not None:
+                extra = state["extra_state"]
+                if not isinstance(extra, dict) or extra.get("lr_scheduler") is None:
+                    raise RuntimeError("File-backed full resume requires the saved learning-rate scheduler")
+            self._load_extra_state(state["extra_state"])
+        except (Exception, CheckpointException) as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "restoring model checkpoint extra state")
         dist.barrier()
         logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")
 
@@ -222,7 +241,12 @@ class ModelCheckpointManager:
         Only model-bound state goes in here. Job-level state — where the
         dataloader is, the rng — has its own writer.
         """
-        extra_state = self._extra_state(state)
+        extra_state, error = None, None
+        try:
+            extra_state = self._extra_state(state)
+        except (Exception, CheckpointException) as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "preparing model checkpoint extra state")
         helper.empty_cache()
         self.checkpointer.save(
             self.config.save_path,

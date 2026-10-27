@@ -17,9 +17,13 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 _CI_SHARD_LAUNCH = LaunchSpec(nproc=2, device="cpu")
 
 
-PACKAGE = "_qwen38_optimizer_test"
+ROOT_PACKAGE = "_qwen38_optimizer_test"
+root_package = types.ModuleType(ROOT_PACKAGE)
+root_package.__path__ = [str(Path(__file__).parents[2] / "veomni")]
+sys.modules.setdefault(ROOT_PACKAGE, root_package)
+PACKAGE = f"{ROOT_PACKAGE}.optim"
 package = types.ModuleType(PACKAGE)
-package.__path__ = [str(Path(__file__).parents[2] / "veomni/optim")]
+package.__path__ = [str(Path(root_package.__path__[0]) / "optim")]
 sys.modules.setdefault(PACKAGE, package)
 spec = importlib.util.spec_from_file_location(f"{PACKAGE}.qwen38_muon", Path(package.__path__[0]) / "qwen38_muon.py")
 module = importlib.util.module_from_spec(spec)
@@ -254,7 +258,13 @@ def _distributed_worker(rank, world, rendezvous, checkpoint_dir):
                 reference_p.grad = grad
                 opt.step()
                 reference.step()
-                for key in ("master_weight", "exp_avg", "exp_avg_sq"):
+                pure_muon_expert = len(shape) == 3 and all(kind == "muon" for kind, _, _ in plan)
+                assert ("exp_avg_sq" in opt.state[p]) == (not pure_muon_expert)
+                assert ("exp_avg_sq" in reference.state[reference_p]) == (not pure_muon_expert)
+                fields = (
+                    ("master_weight", "exp_avg") if pure_muon_expert else ("master_weight", "exp_avg", "exp_avg_sq")
+                )
+                for key in fields:
                     wanted = distribute_tensor(reference.state[reference_p][key], mesh, [Shard(axis)]).to_local()
                     torch.testing.assert_close(opt.state[p][key].to_local(), wanted, atol=1e-7, rtol=1e-6)
                 if step == 1:

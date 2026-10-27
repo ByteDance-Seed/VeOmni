@@ -109,6 +109,14 @@ class OptimizerConfig:
         default="float32",
         metadata={"help": "Moment storage precision for CPU-offloaded parameters; master stays FP32."},
     )
+    qwen38_ple_moments_scratch_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Local scratch directory for FP32 PLE moments; rebuilt from DCP on resume."},
+    )
+    qwen38_ple_moments_world_profile: bool = field(
+        default=False,
+        metadata={"help": "Declare that all world ranks participate in the PLE scratch optimizer profile."},
+    )
     lr: float = field(
         default=5e-5,
         metadata={"help": "Maximum learning rate or default learning rate, or init learning rate for warmup."},

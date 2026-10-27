@@ -56,6 +56,13 @@ from veomni.models.checkpoint.convert import (
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
+from veomni.models.qwen4_gdn_precision import (
+    has_qwen4_exp_assets,
+    is_qwen4_exp_config,
+    is_qwen4_gdn_parameter,
+    preserve_qwen4_gdn_fp32,
+    validate_qwen4_gdn_pairs,
+)
 from veomni.utils import logging
 from veomni.utils.device import get_device_type, synchronize
 from veomni.utils.helper import empty_cache, get_cache_dir, get_dtype_size
@@ -274,8 +281,19 @@ def _dispatch_parameter(
     NOTE: FSDP module must use in-place operators.
     """
     full_param_name = name
+    strict_gdn = is_qwen4_exp_config(getattr(module, "config", None)) and is_qwen4_gdn_parameter(name)
     module, local_name = _find_submodule(module, name)
-    orig_tensor = module._parameters[local_name].data
+    # Keep the FSDP parameter and its local storage intact. A legacy .data
+    # alias can fail when native CPU offload pins a DTensor's local shard.
+    orig_tensor = module._parameters[local_name]
+    if strict_gdn:
+        if tensor.dtype != torch.float32 or orig_tensor.dtype != torch.float32:
+            raise RuntimeError(
+                f"Qwen4 GDN {full_param_name} requires FP32 source and target; "
+                f"got source={tensor.dtype}, target={orig_tensor.dtype}"
+            )
+        if not tensor_is_local_dtensor_shard and tuple(tensor.shape) != tuple(orig_tensor.shape):
+            raise RuntimeError(f"Qwen4 GDN {full_param_name} source and target shapes differ")
 
     # Handle parameter slicing according to parallel_plan, now only ExtraParallel-aware
     if parallel_plan is not None:
@@ -1667,6 +1685,11 @@ def post_process_after_weight_loading(
     """
     parameter_names_left = parameter_names_left or set()
 
+    if is_qwen4_exp_config(getattr(model, "config", None)):
+        missing_gdn = sorted(name for name in parameter_names_left if is_qwen4_gdn_parameter(name))
+        if missing_gdn:
+            raise RuntimeError(f"Qwen4 checkpoint is missing required FP32 GDN parameters: {missing_gdn}")
+
     for name, buffer in buffer_dict.items():
         _dispatch_buffer(model, name, buffer, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu)
     if parameter_names_left:
@@ -1735,6 +1758,7 @@ def _get_shard_info(
     save_dtype: Optional[Union[str, "torch.dtype"]],
     shard_size: int,
     safe_serialization: bool,
+    preserve_fp32_keys: Optional[set[str]] = None,
 ) -> Tuple[bool, int, Dict[str, str]]:
     """
     Gets the shard information, should be executed at rank 0.
@@ -1743,7 +1767,11 @@ def _get_shard_info(
     current_size, total_size = 0, 0
     current_shard, shard_list = [], []
     for name, tensor in state_dict.items():
-        dtype = _resolve_save_dtype(tensor, save_dtype)
+        dtype = (
+            tensor.dtype
+            if preserve_fp32_keys and name in preserve_fp32_keys
+            else _resolve_save_dtype(tensor, save_dtype)
+        )
         tensor_size = _get_tensor_save_size(tensor, dtype, safe_serialization)
         if current_size != 0 and current_size + tensor_size > shard_size:
             total_size += current_size
@@ -1800,6 +1828,7 @@ def save_model_weights(
     shard_size: int = 5_000_000_000,
     safe_serialization: bool = True,
     model_assets: Optional[Sequence["ModelAssets"]] = None,
+    qwen4_gdn_fp32: bool = False,
 ) -> None:
     """
     Saves full model weights. The model parameters should be either tensor or dtensor.
@@ -1816,7 +1845,33 @@ def save_model_weights(
 
     os.makedirs(output_dir, exist_ok=True)
     save_dtype = _normalize_save_dtype(save_dtype)
-    is_sharded, total_size, weight_map = _get_shard_info(state_dict, save_dtype, shard_size, safe_serialization)
+    if qwen4_gdn_fp32 or has_qwen4_exp_assets(model_assets):
+        qwen4_config = next((asset for asset in model_assets or () if is_qwen4_exp_config(asset)), None)
+        validate_qwen4_gdn_pairs(state_dict, qwen4_config)
+        invalid = [
+            name
+            for name, tensor in state_dict.items()
+            if is_qwen4_gdn_parameter(name) and tensor.dtype != torch.float32
+        ]
+        if invalid:
+            raise RuntimeError(f"Cannot export non-FP32 Qwen4 GDN parameters without explicit migration: {invalid}")
+    elif not any(getattr(asset, "model_type", None) for asset in model_assets or ()) and any(
+        is_qwen4_gdn_parameter(name)
+        and tensor.is_floating_point()
+        and _resolve_save_dtype(tensor, save_dtype) != tensor.dtype
+        for name, tensor in state_dict.items()
+    ):
+        logger.warning_rank0(
+            "GDN model identity is unknown; provide Qwen4 model assets or qwen4_gdn_fp32 to preserve precision."
+        )
+    preserve_fp32_keys = (
+        {name for name in state_dict if is_qwen4_gdn_parameter(name)}
+        if qwen4_gdn_fp32 or preserve_qwen4_gdn_fp32(model_assets)
+        else set()
+    )
+    is_sharded, total_size, weight_map = _get_shard_info(
+        state_dict, save_dtype, shard_size, safe_serialization, preserve_fp32_keys
+    )
     full_state_dict = OrderedDict()
     prev_file_name = None
     for name, tensor in state_dict.items():
@@ -1825,7 +1880,7 @@ def save_model_weights(
         else:
             tensor = tensor.data
 
-        target_dtype = _resolve_save_dtype(tensor, save_dtype)
+        target_dtype = tensor.dtype if name in preserve_fp32_keys else _resolve_save_dtype(tensor, save_dtype)
         if tensor.dtype != target_dtype:
             tensor = tensor.to(dtype=target_dtype)
 
