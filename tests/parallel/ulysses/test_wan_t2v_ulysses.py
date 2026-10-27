@@ -131,7 +131,11 @@ class WanT2VUlyssesTest(SequenceParallelTest):
                     diff_sq += (g - ref_grads[n]).pow(2).sum().item()
                     ref_sq += ref_grads[n].pow(2).sum().item()
                 grad_err = (diff_sq / ref_sq) ** 0.5
-                if out_err > 1e-5 or grad_err > 1e-5:
+                # NaN compares False against the tolerance, so check finiteness explicitly.
+                tensors = [out, ref_out, *grads.values(), *ref_grads.values()]
+                if not all(torch.isfinite(t).all() for t in tensors):
+                    failures.append(f"{tag}: non-finite output or grad")
+                elif out_err > 1e-5 or grad_err > 1e-5:
                     failures.append(f"{tag}: output rel err {out_err:.2e}, grad rel err {grad_err:.2e}")
                 if entered != set(range(len(model.blocks))):
                     failures.append(f"{tag}: blocks bypassed nn.Module.__call__: {entered}")
