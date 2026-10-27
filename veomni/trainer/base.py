@@ -49,7 +49,7 @@ from ..data import (
     build_dataloader,
     build_dataset,
 )
-from ..data.data_collator import DataCollator, MainCollator
+from ..data.data_collator import CHANNEL_LOSS_PROVENANCE, DataCollator, MainCollator, _ChannelLossProvenance
 from ..data.data_transform import build_data_transform
 from ..distributed.async_offload import reset_async_activation_offload
 from ..distributed.offloading import build_activation_offloading_context
@@ -618,7 +618,11 @@ class BaseTrainer(Stateful, ABC):
                 return {k: _to_device(vv) for k, vv in v.items()}
             return v
 
-        micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
+        micro_batch = {
+            k: _to_device(v)
+            for k, v in micro_batch.items()
+            if not (k == CHANNEL_LOSS_PROVENANCE and isinstance(v, _ChannelLossProvenance))
+        }
         if getattr(self, "LOG_SAMPLE", True):
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
             self.LOG_SAMPLE = False

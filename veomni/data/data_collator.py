@@ -47,7 +47,11 @@ logger = logging.get_logger(__name__)
 
 _LINEAR_ATTN_TAIL_PADDING_LENGTH = "_linear_attn_tail_padding_length"
 CHANNEL_LOSS_PROVENANCE = "_veomni_channel_loss_source_provenance"
-_CHANNEL_LOSS_HOOK_CHANGED = "_veomni_channel_loss_hook_changed"
+_CHANNEL_LOSS_HOOK_CHANGED = object()
+
+
+class _ChannelLossProvenance(dict):
+    """Distinguish private observer metadata from identically named user data."""
 
 
 @dataclass(frozen=True)
@@ -57,7 +61,7 @@ class _GuardChannelLossMetadataHook:
     hook: MetadataCollateFunc
 
     def __call__(self, batch: Dict[str, Any], sp_pad: Dict[str, int]) -> None:
-        keys = ("input_ids", "labels", "position_ids", "attention_mask")
+        keys = ("input_ids", "labels", "mtp_labels", "position_ids", "attention_mask")
         try:
             before = {key: value.clone() for key in keys if isinstance(value := batch.get(key), torch.Tensor)}
         except Exception:
@@ -65,8 +69,12 @@ class _GuardChannelLossMetadataHook:
         self.hook(batch, sp_pad)
         try:
             changed = before is None or any(
-                not isinstance(batch.get(key), torch.Tensor) or not torch.equal(value, batch[key])
-                for key, value in before.items()
+                (key in batch) != (key in before)
+                or (
+                    key in before
+                    and (not isinstance(batch[key], torch.Tensor) or not torch.equal(before[key], batch[key]))
+                )
+                for key in keys
             )
         except Exception:
             changed = True
@@ -327,8 +335,7 @@ class PackingCollator(DataCollator):
                 # first token of packed sequence must be IGNORE_INDEX
                 if key == "labels" and not self.seq_classification:
                     for i in range(1, len(batch[key])):
-                        if batch[key][i].numel():
-                            batch[key][i][0] = IGNORE_INDEX
+                        batch[key][i][0] = IGNORE_INDEX
 
                 batch[key] = torch.cat(batch[key], dim=pack_dim)
                 if pack_dim == -1:
@@ -604,7 +611,10 @@ class MainCollator(DataCollator):
                     )
                 else:
                     valid = False
-            micro_batch[CHANNEL_LOSS_PROVENANCE] = provenance if valid else {"error": "unsupported source layout"}
+            if CHANNEL_LOSS_PROVENANCE not in micro_batch:
+                micro_batch[CHANNEL_LOSS_PROVENANCE] = _ChannelLossProvenance(
+                    provenance if valid else {"error": "unsupported source layout"}
+                )
         return micro_batch
 
     def log_collate_infos(self) -> None:

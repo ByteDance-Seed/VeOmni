@@ -37,7 +37,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from ...data.data_collator import CHANNEL_LOSS_PROVENANCE
+from ...data.data_collator import CHANNEL_LOSS_PROVENANCE, _ChannelLossProvenance
 from ...distributed.parallel_state import get_parallel_state
 from ...utils.constants import IGNORE_INDEX
 from ...utils.device import get_device_id, get_device_type
@@ -46,6 +46,12 @@ from .base import Callback, TrainerState
 
 
 logger = get_logger(__name__)
+
+
+def _pop_channel_loss_provenance(batch: Any) -> _ChannelLossProvenance | None:
+    if isinstance(batch, dict) and isinstance(batch.get(CHANNEL_LOSS_PROVENANCE), _ChannelLossProvenance):
+        return batch.pop(CHANNEL_LOSS_PROVENANCE)
+    return None
 
 
 if TYPE_CHECKING:
@@ -58,6 +64,7 @@ _LOSS_CALL_POSITIONAL_KEYS = ("logits", "labels", "vocab_size", "num_items_in_ba
 _ACTIVE_CHANNEL_LOSS_COMPUTER: ContextVar[ChannelLossComputer | None] = ContextVar(
     "veomni_active_channel_loss_computer", default=None
 )
+_ACTIVE_CHANNEL_LOSS_EPOCH: ContextVar[object | None] = ContextVar("veomni_active_channel_loss_epoch", default=None)
 
 
 class ChannelLossMetadataError(ValueError):
@@ -99,7 +106,7 @@ class ChannelLossComputer:
         self._packed_global_physical_seq_len: int | None = None
         self._tail_padding_length: Any | None = None
         self._source_provenance: dict[str, Any] | None = None
-        self._require_source_provenance = False
+        self._require_source_provenance = True
         self._dpo_segments = False
         self._dpo_attention_cu: Any | None = None
         self._result: list[dict[str, Any]] | None = None
@@ -107,7 +114,11 @@ class ChannelLossComputer:
         self._capture_errors: list[str] = []
         self._capture_attempts = 0
         self._capture_lock = Lock()
+        self._capture_state_lock = Lock()
+        self._capture_accepting = False
+        self._foreign_capture_errors: list[str] = []
         self._capture_owner: tuple[int, Any] | None = None
+        self._capture_epoch: object | None = None
         self._per_mb_source_ids: list[list[ChannelKey]] = []
         self._per_mb_position_ids: list[torch.Tensor | None] = []
         self._per_mb_attention_masks: list[torch.Tensor | None] = []
@@ -224,11 +235,25 @@ class ChannelLossComputer:
 
     @property
     def capture_active(self) -> bool:
-        if _ACTIVE_CHANNEL_LOSS_COMPUTER.get() is not self or self._capture_owner is None:
+        if _ACTIVE_CHANNEL_LOSS_COMPUTER.get() is not self:
             return False
-        if self._capture_owner != _capture_owner():
-            raise RuntimeError("Concurrent capture on the same ChannelLossComputer is unsupported.")
-        return True
+        with self._capture_state_lock:
+            if not self._capture_accepting or _ACTIVE_CHANNEL_LOSS_EPOCH.get() is not self._capture_epoch:
+                return False
+            if self._capture_owner != _capture_owner():
+                raise RuntimeError("Concurrent capture on the same ChannelLossComputer is unsupported.")
+            return True
+
+    def _can_observe(self, kind: str) -> bool:
+        if _ACTIVE_CHANNEL_LOSS_COMPUTER.get() is not self:
+            return False
+        with self._capture_state_lock:
+            if not self._capture_accepting or _ACTIVE_CHANNEL_LOSS_EPOCH.get() is not self._capture_epoch:
+                return False
+            if self._capture_owner != _capture_owner():
+                self._foreign_capture_errors.append(f"{kind} ran in another task; skipping its observation")
+                return False
+            return True
 
     @contextmanager
     def capture(self) -> Iterator[None]:
@@ -237,17 +262,27 @@ class ChannelLossComputer:
         if not nested:
             if not self._capture_lock.acquire(blocking=False):
                 raise RuntimeError("Concurrent capture on the same ChannelLossComputer is unsupported.")
-            self._capture_owner = owner
+            with self._capture_state_lock:
+                self._capture_owner = owner
+                self._capture_epoch = object()
+                self._capture_accepting = True
+                self._foreign_capture_errors = []
             self._pending_sp, self._capture_errors, self._capture_attempts = [], [], 0
         previous_result = self._result
         pending_count, error_count, attempts = len(self._pending_sp), len(self._capture_errors), self._capture_attempts
         token = _ACTIVE_CHANNEL_LOSS_COMPUTER.set(self)
+        epoch_token = _ACTIVE_CHANNEL_LOSS_EPOCH.set(self._capture_epoch)
         completed = False
         try:
             yield
             completed = True
         finally:
+            if not nested:
+                with self._capture_state_lock:
+                    self._capture_accepting = False
+                    self._capture_errors.extend(self._foreign_capture_errors)
             _ACTIVE_CHANNEL_LOSS_COMPUTER.reset(token)
+            _ACTIVE_CHANNEL_LOSS_EPOCH.reset(epoch_token)
             if not completed:
                 self._result = previous_result
                 del self._pending_sp[pending_count:]
@@ -259,7 +294,9 @@ class ChannelLossComputer:
                         self._finish_capture()
                 finally:
                     self._pending_sp, self._capture_errors, self._capture_attempts = [], [], 0
-                    self._capture_owner = None
+                    with self._capture_state_lock:
+                        self._capture_owner = None
+                        self._capture_epoch = None
                     self._capture_lock.release()
 
     def _finish_capture(self) -> None:
@@ -412,12 +449,13 @@ class ChannelLossComputer:
 
     def _wrapped_loss_fn(self, *args: Any, **kwargs: Any) -> Any:
         assert self._original_loss_fn is not None
-        if not self._source_ids or self._dpo_segments or not self.capture_active:
+        if not self._source_ids or self._dpo_segments or not self._can_observe("causal loss"):
             return self._original_loss_fn(*args, **kwargs)
         self._capture_attempts += 1
         from ...ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
 
-        capture = {}
+        owner = _capture_owner()
+        capture = {"_is_owner": lambda: _capture_owner() == owner}
         token = chunk_loss._CAPTURE.set(capture)
         try:
             main_loss = self._original_loss_fn(*args, **kwargs)
@@ -457,12 +495,7 @@ class ChannelLossComputer:
 
     def observe_dpo_log_probs(self, log_probs: torch.Tensor, labels: torch.Tensor, attention_cu: Any) -> None:
         """Observe expanded policy log-probs, after any model-side row compaction."""
-        if (
-            not self._dpo_segments
-            or not self._source_ids
-            or _ACTIVE_CHANNEL_LOSS_COMPUTER.get() is not self
-            or self._capture_owner != _capture_owner()
-        ):
+        if not self._dpo_segments or not self._source_ids or not self._can_observe("DPO log-probs"):
             return
         self._capture_attempts += 1
         try:
@@ -594,6 +627,7 @@ class ChannelLossComputer:
             )
         if per_token_loss is None:
             return []
+        per_token_loss = per_token_loss.float()
         labels_flat = labels_flat.to(per_token_loss.device)
         if attention_mask_flat is not None:
             attention_mask_flat = attention_mask_flat.to(per_token_loss.device)
@@ -1316,10 +1350,7 @@ class ChannelLossCallback(Callback):
             raise ValueError(f"Channel loss source_repeat must be >= 1, got {source_repeat}.")
 
         self.computer._dpo_segments = source_repeat > 1
-        provenances = [
-            batch.pop(CHANNEL_LOSS_PROVENANCE, None) if isinstance(batch, dict) else None
-            for batch in micro_batches or []
-        ]
+        provenances = [_pop_channel_loss_provenance(batch) for batch in micro_batches or []]
 
         self._collect_step = state.global_step % self.config.interval == 0
         if not self._collect_step:
@@ -1416,7 +1447,7 @@ class ChannelLossCallback(Callback):
     def strip_model_inputs(self, micro_batch: dict[str, Any]) -> None:
         if not self.enabled or not isinstance(micro_batch, dict):
             return
-        micro_batch.pop(CHANNEL_LOSS_PROVENANCE, None)
+        _pop_channel_loss_provenance(micro_batch)
         for key in self._strip_keys:
             micro_batch.pop(key, None)
 
@@ -1981,8 +2012,28 @@ def _bind_loss_call_args(
             elif parameter.kind is inspect.Parameter.VAR_POSITIONAL:
                 bound_args.pop(name, None)
 
-        for key, value in zip(_LOSS_CALL_POSITIONAL_KEYS, args):
-            bound_args.setdefault(key, value)
+        has_varargs = any(
+            parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in signature.parameters.values()
+        )
+        positional_names = [
+            parameter.name
+            for parameter in signature.parameters.values()
+            if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        known_names = set(_LOSS_CALL_POSITIONAL_KEYS) | {
+            "hidden_states",
+            "weights",
+            "shift_labels",
+            "logits_bias",
+            "logits_bias_weight",
+        }
+        for index, (key, value) in enumerate(zip(_LOSS_CALL_POSITIONAL_KEYS, args)):
+            if (
+                key in signature.parameters
+                or (has_varargs and index >= len(positional_names))
+                or (index < 3 and index < len(positional_names) and positional_names[index] not in known_names)
+            ):
+                bound_args.setdefault(key, value)
         return bound_args
     except (TypeError, ValueError):
         bound_args = dict(zip(_LOSS_CALL_POSITIONAL_KEYS, args))

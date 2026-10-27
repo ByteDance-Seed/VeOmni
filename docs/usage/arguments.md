@@ -554,7 +554,9 @@ from the model loss inputs, aggregates by packed-sequence source metadata, and
 adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics. It does
 not change the returned training loss or gradients. Fused-loss backends may
 recompute the LM-head projection on sampled steps, so the default interval is
-10 steps; set `interval=1` for per-step metrics. DiT trainers and
+10 steps; set `interval=1` for per-step metrics. Compiled `chunk_loss` likewise
+falls back to detached recomputation instead of
+injecting a capture into the compiled graph. DiT trainers and
 `data.data_type="classification"` are not supported because they do not optimize
 a causal-LM objective. `BaseRLTrainer` is unsupported because it packs source
 alignment metadata after the common step lifecycle. In DPO training, only the policy-model forward is observed; the
@@ -576,7 +578,9 @@ Custom collators and model hooks that reorder token inputs are not automatically
 covered by this provenance contract. If source layout cannot be proved or SP
 ranks disagree, non-strict mode skips the affected channel metrics; strict mode
 raises a metadata error. The non-strict path leaves the training objective and
-gradients unchanged.
+gradients unchanged. Direct `ChannelLossComputer` use also requires provenance
+by default; position-derived attention boundaries alone do not prove sample
+source boundaries.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |

@@ -149,7 +149,11 @@ def forward(
     bias_chunks = (
         logits_bias.split(chunk_size, dim=split_dim) if logits_bias is not None else (None,) * len(hidden_chunks)
     )
-    capture = _CAPTURE.get()
+    # ContextVar.get cannot be traced by Dynamo. A compiled op therefore uses
+    # the unchanged training path; the trainer can recompute detached metrics.
+    capture = None if torch.compiler.is_compiling() else _CAPTURE.get()
+    if capture is not None and callable(is_owner := capture.get("_is_owner")) and not is_owner():
+        capture = None
     token_chunks = [] if capture is not None else None
 
     def observe(logits: Tensor, chunk_labels: Tensor) -> None:
