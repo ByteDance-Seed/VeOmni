@@ -70,6 +70,10 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "tests/distributed/test_async_activation_offload.py",
     "tests/models/test_qwen_image_precision.py",
     "tests/precision/qwen_image.py",
+    # Compute-unit lookup is asserted per backend by name (cuda / npu / xpu /
+    # mlu), with each namespace stubbed; the literals are fixtures, not device
+    # management.
+    "tests/utils/test_get_compute_units.py",
     # Vendored Ascend Triton kernels for Qwen3.5 gated delta-rule (FLA + Huawei
     # port) are kept byte-identical to upstream; the FLA-origin code references
     # ``.cuda`` in fallback/util paths. Excluded wholesale, matching the ruff
