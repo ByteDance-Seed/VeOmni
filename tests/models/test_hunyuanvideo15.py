@@ -5,9 +5,11 @@ import os
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.models.diffusers.hunyuanvideo15.conditioning import FlowMatchingConditioner
 from veomni.models.diffusers.hunyuanvideo15.configuration_hunyuanvideo15 import HunyuanVideo15Config
 from veomni.models.diffusers.hunyuanvideo15.modeling_hunyuanvideo15 import HunyuanVideo15Model
+from veomni.utils.device import get_device_type
 
 
 @pytest.fixture(autouse=True)
@@ -269,6 +271,11 @@ def _hunyuanvideo15_fsdp_checkpoint_worker():
         )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
+@pytest.mark.skipif(
+    get_device_type() not in ("cuda", "npu") or runner_device_count() < 2,
+    reason="Two accessible CUDA GPUs or NPUs are required",
+)
 def test_hunyuanvideo15_fsdp_bf16_checkpoint():
     """The documented FSDP2/BF16 path must survive checkpoint recomputation."""
     from tests.tools.launch_utils import torchrun
@@ -434,6 +441,7 @@ def _check_vae_tile_parallel_decode(rank, rendezvous):
         clear_parallel_state()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="requires the CPU Gloo backend")
 def test_vae_tile_parallel_decode_with_idle_rank(tmp_path):
     """Decode one tile on two ranks, then an uneven tile distribution, without hanging."""
