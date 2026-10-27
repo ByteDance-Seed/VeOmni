@@ -31,9 +31,15 @@ class OffloadPolicy(enum.Enum):
 
 class custom_save_on_cpu(saved_tensors_hooks):
     def __init__(self, gpu_limit_in_gb: float = 0, pin_memory: bool = False, min_offload_size: int = 1024) -> None:
+        from ..ops.kernels.moe_experts.shared.fp8_weight import FP8ExpertWeight
+
         self.cur_gpu_ram_in_mb = 0.0
 
         def pack_to_cpu(tensor: torch.Tensor) -> Tuple[OffloadPolicy, torch.device, torch.Tensor]:
+            # FSDP frees and repopulates these payload/scale buffers on reshard
+            # and unshard. Keep their identity instead of offloading a second copy.
+            if isinstance(tensor, FP8ExpertWeight):
+                return (OffloadPolicy.IGNORE, tensor.device, tensor)
             tensor_num_bytes = tensor.element_size() * tensor.nelement()
             # heuristic to skip nn.Linear.weight
             if type(tensor.grad_fn).__name__ == "TBackward0" or tensor_num_bytes <= min_offload_size:

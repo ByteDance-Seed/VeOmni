@@ -99,6 +99,7 @@ Core entry points:
 
 8. **EP shards expert weights and exchanges tokens via all-to-all**
    - Weight sharding: `ParallelPlan` in `parallel_plan.py` defines which expert parameters get `Shard(0)` on the EP mesh. `ParallelPlan.apply()` wraps matching params as DTensors and redistributes to local shards.
+   - Synchronous activation offload must skip `FP8ExpertWeight` containers saved by DeepGEMM: native FSDP owns their payload/scale storage and repopulates it before backward. Copying the opaque container to CPU is unsupported; it must not consume the activation offloader's GPU budget either. Ordinary activations still follow the configured offload policy.
    - Token routing: `veomni/distributed/moe/moe_layer.py` — `preprocess()` computes dispatch counts, `token_pre_all2all()` / `tokens_post_all2all()` exchange tokens between EP ranks via `all_to_all` / `all_to_all_async` in `moe/comm.py`.
    - Expert computation: `EPGroupGemm` runs fused expert MLP on grouped tokens per rank.
    - Device mesh: `init_parallel_state_from_config()` builds `[ep × ep_fsdp]` submesh; accessed via `ParallelState.extra_parallel_mesh("ep")`, `ep_group`, `ep_rank`.

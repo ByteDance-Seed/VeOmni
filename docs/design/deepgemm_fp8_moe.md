@@ -108,6 +108,11 @@ and unshard, including backward and activation recomputation. Local shards
 are requantized on every unshard, so optimizer updates cannot leave an
 across-step FP8 cache stale.
 
+Synchronous activation offload remains supported: it skips the gathered FP8
+weight container and offloads ordinary saved activations as usual. FSDP owns
+the weight payload/scale storage and restores it before backward; activation
+offload must not copy that container to CPU or count it against its GPU budget.
+
 Initial constraints:
 
 - Two merged expert weights `[E,2*I,H]` and `[E,H,I]`, selected by the actual
@@ -116,7 +121,7 @@ Initial constraints:
 - Even sharding, with complete 128x128 blocks inside every shard. The default
   EP FSDP `Shard(1)` layout must divide both `2*I` and `H` into multiples of
   128. Unsupported shapes fail before the first training parameter all-gather.
-- No CPU offload, integer partial resharding, `torch.compile`, or CUDA graphs.
+- No FSDP parameter CPU offload, integer partial resharding, `torch.compile`, or CUDA graphs.
   Register the hooks after wrapping and initial weight materialization, before
   the first forward. In-place checkpoint loading is supported; replacing
   parameters or moving the wrapped model after registration is unsupported.

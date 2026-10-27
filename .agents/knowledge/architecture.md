@@ -342,6 +342,8 @@ The pre-hook quantizes local shards and separately gathers compact scales;
 native FSDP gathers payloads. `FP8ExpertWeight` carries the results to
 `GroupedLinear`, preserving BF16-facing autograd and high precision master
 shards. Native FSDP manages both payload and scale storage on reshard.
+Synchronous activation offload skips the opaque weight container and leaves
+that lifecycle to FSDP, while ordinary saved activations still offload.
 
 `FSDPConfig.expert_fsdp_shard_dim` follows the same runtime path and optionally
 overrides EP expert FSDP placement for either BF16 or FP8. Whole-expert

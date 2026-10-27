@@ -53,9 +53,11 @@ class _Experts(nn.Module):
         )
 
 
-def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_gather, rendezvous):
+def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_gather, use_offload, rendezvous):
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
     from torch.distributed.tensor import Shard
+
+    from veomni.distributed.offloading import build_activation_offloading_context
 
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -111,6 +113,7 @@ def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_ga
             module.register_forward_pre_hook(check_gathered_weights)
         opt = torch.optim.SGD(module.parameters(), lr=0.01)
         divisor = world if use_fsdp else 1
+        forward_context, backward_context = build_activation_offloading_context(use_offload, use_checkpoint)
         for step in range(2):
             xi, ri = x[rank].clone().requires_grad_(), routing[rank].clone().requires_grad_()
             opt.zero_grad(set_to_none=True)
@@ -119,9 +122,11 @@ def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_ga
                     quantize_weights(p.full_tensor().bfloat16(), store_transpose=False)
                     for p in (module.fc1, module.fc2)
                 ]
-            y = module(xi, ri, indices[rank])
+            with forward_context:
+                y = module(xi, ri, indices[rank])
             assert y.dtype == xi.dtype
-            y.backward(grad[rank])
+            with backward_context:
+                y.backward(grad[rank])
             xr, rr, wr1, wr2 = [a.detach().clone().requires_grad_() for a in (x, routing, w1, w2)]
             gate, up = wr1.bfloat16().chunk(2, dim=1)
             yr = standard_ep_reference(
@@ -167,28 +172,32 @@ def _worker(rank, world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_ga
 
 @pytest.mark.launch_plan(provider=from_parameter("world"))
 @pytest.mark.parametrize(
-    "world,ep_size,use_fsdp,repeated,use_checkpoint,fp8_all_gather",
+    "world,ep_size,use_fsdp,repeated,use_checkpoint,fp8_all_gather,use_offload",
     [
         pytest.param(
             *case,
             marks=pytest.mark.skipif(runner_device_count() < case[0], reason=f"Requires {case[0]} GPUs."),
         )
         for case in (
-            (2, 2, False, False, False, False),
-            (2, 1, True, False, False, False),
-            (4, 2, True, False, False, False),
-            (4, 2, True, True, False, False),
-            (4, 4, False, True, False, False),
-            (8, 8, False, True, False, False),
-            (2, 1, True, False, True, False),
-            (4, 2, True, True, True, False),
-            (2, 1, True, False, False, True),
-            (4, 2, True, True, False, True),
-            (4, 2, True, True, True, True),
+            (2, 2, False, False, False, False, False),
+            (2, 1, True, False, False, False, False),
+            (4, 2, True, False, False, False, False),
+            (4, 2, True, True, False, False, False),
+            (4, 4, False, True, False, False, False),
+            (8, 8, False, True, False, False, False),
+            (2, 1, True, False, True, False, False),
+            (4, 2, True, True, True, False, False),
+            (2, 1, True, False, False, True, False),
+            (4, 2, True, True, False, True, False),
+            (4, 2, True, True, True, True, False),
+            (4, 2, True, True, False, True, True),
+            (4, 2, True, True, True, True, True),
         )
     ],
 )
-def test_distributed_fp8_experts(world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_gather, tmp_path):
+def test_distributed_fp8_experts(
+    world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_gather, use_offload, tmp_path
+):
     if not torch.cuda.is_available() or torch.version.hip is not None:
         pytest.skip("NVIDIA Hopper or Blackwell is required.")
     if torch.cuda.device_count() < world or any(
@@ -198,7 +207,16 @@ def test_distributed_fp8_experts(world, ep_size, use_fsdp, repeated, use_checkpo
     pytest.importorskip("deep_gemm")
     mp.spawn(
         _worker,
-        args=(world, ep_size, use_fsdp, repeated, use_checkpoint, fp8_all_gather, f"file://{tmp_path / 'rdzv'}"),
+        args=(
+            world,
+            ep_size,
+            use_fsdp,
+            repeated,
+            use_checkpoint,
+            fp8_all_gather,
+            use_offload,
+            f"file://{tmp_path / 'rdzv'}",
+        ),
         nprocs=world,
         join=True,
     )
