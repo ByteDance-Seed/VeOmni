@@ -35,7 +35,6 @@ from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.ops.mask import packed_causal_mask, sliding_window_mask
 from veomni.patchgen.patch_spec import PatchConfig
@@ -59,10 +58,6 @@ config.add_import(
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
-config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
@@ -105,10 +100,8 @@ def gemma3_textmodel_forward_patched(
         position_ids = position_ids.unsqueeze(0)
 
     if not isinstance(causal_mask_mapping := attention_mask, dict):
-        # Mask builders must follow this instance's attention impl. Reading the
-        # global ops config would let SDPA return None while eager attention
-        # still needs a causal triangle.
-        attn_impl = resolve_op_impl("attn_implementation")
+        # Mask builders must follow this instance's attention impl.
+        attn_impl = self.config.ops_config.attn_implementation
         for layer in self.layers[: self.config.num_hidden_layers]:
             handle = getattr(getattr(layer, "self_attn", None), "veomni_attn", None)
             if handle is not None:
@@ -198,7 +191,7 @@ def gemma3_forcausallm_init_patched(self, config):
     self.model = Gemma3TextModel(config)
     self.vocab_size = config.vocab_size
     self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
@@ -280,11 +273,12 @@ def gemma3_forcausallm_forward_patched(
     "Gemma3RMSNorm.__init__",
     description="Construct a local rms_norm offset VeomniOp",
 )
-def gemma3_rmsnorm_init_patched(self, dim: int, eps: float = 1e-6) -> None:
+def gemma3_rmsnorm_init_patched(self, dim: int, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.eps = eps
     self.weight = nn.Parameter(torch.zeros(dim))
-    self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
+    impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+    self.veomni_rms_norm = VeomniOp("rms_norm", "offset", impl)
 
 
 @config.override_method(
@@ -298,7 +292,66 @@ def gemma3_rmsnorm_forward_patched(self, x):
 @config.modify_init("Gemma3MLP", description="Bind instance-local geglu swiglu_mlp VeomniOp")
 def gemma3_mlp_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "geglu", resolve_op_impl("swiglu_mlp_implementation"))
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "geglu", self.config.ops_config.swiglu_mlp_implementation)
+
+
+@config.override_method(
+    "Gemma3DecoderLayer.__init__",
+    description="Pass config to Gemma3RMSNorm instances",
+)
+def gemma3_decoder_layer_init_patched(self, config, layer_idx: int):
+    super().__init__()
+    self.config = config
+    self.hidden_size = config.hidden_size
+    self.layer_idx = layer_idx
+    self.self_attn = Gemma3Attention(config=config, layer_idx=layer_idx)  # noqa: F821
+    self.mlp = Gemma3MLP(config)  # noqa: F821
+    self.input_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+    self.post_attention_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+    self.pre_feedforward_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+    self.post_feedforward_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+
+
+@config.override_method(
+    "Gemma3TextModel.__init__",
+    description="Pass config to final Gemma3RMSNorm",
+)
+def gemma3_textmodel_init_patched(self, config):
+    super().__init__(config)
+    self.padding_idx = config.pad_token_id
+    self.vocab_size = config.vocab_size
+
+    self.embed_tokens = Gemma3TextScaledWordEmbedding(  # noqa: F821
+        config.vocab_size, config.hidden_size, self.padding_idx, embed_scale=self.config.hidden_size**0.5
+    )
+    self.layers = nn.ModuleList(
+        [Gemma3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]  # noqa: F821
+    )
+    self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+    self.rotary_emb = Gemma3RotaryEmbedding(config)  # noqa: F821
+    self.gradient_checkpointing = False
+
+    self.post_init()
+
+
+@config.override_method(
+    "Gemma3MultiModalProjector.__init__",
+    description="Pass config to Gemma3RMSNorm",
+)
+def gemma3_multimodal_projector_init_patched(self, config):
+    super().__init__()
+    self.mm_input_projection_weight = nn.Parameter(
+        torch.zeros(config.vision_config.hidden_size, config.text_config.hidden_size)
+    )
+    self.mm_soft_emb_norm = Gemma3RMSNorm(  # noqa: F821
+        config.vision_config.hidden_size,
+        eps=config.vision_config.layer_norm_eps,
+        config=config.vision_config,
+    )
+    self.patches_per_image = int(config.vision_config.image_size // config.vision_config.patch_size)
+    self.tokens_per_side = int(config.mm_tokens_per_image**0.5)
+    self.kernel_size = self.patches_per_image // self.tokens_per_side
+    self.avg_pool = nn.AvgPool2d(kernel_size=self.kernel_size, stride=self.kernel_size)
 
 
 @config.override_method(
@@ -324,8 +377,10 @@ def gemma3_mlp_forward_patched(self, x):
 @config.modify_init("Gemma3Attention", description="Bind instance-local rope and attention VeomniOps")
 def gemma3_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.q_norm = Gemma3RMSNorm(dim=self.config.head_dim, eps=self.config.rms_norm_eps, config=self.config)  # noqa: F821
+    self.k_norm = Gemma3RMSNorm(dim=self.config.head_dim, eps=self.config.rms_norm_eps, config=self.config)  # noqa: F821
+    self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(

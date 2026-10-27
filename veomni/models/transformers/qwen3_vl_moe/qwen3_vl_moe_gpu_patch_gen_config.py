@@ -58,6 +58,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_text_deepstack_process_patched,
     qwen3_vl_text_mlp_forward_patched,
     qwen3_vl_text_mlp_init_patched,
+    qwen3_vl_text_model_init_patched,
     qwen3_vl_vision_attention_bind_ops,
     qwen3_vl_vision_attention_forward_patched,
     qwen3_vl_vision_block_forward_patched,
@@ -68,7 +69,6 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
 )
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import Qwen3VLMoeCausalLMOutputWithLogProbs
 
@@ -122,10 +122,6 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "Qwen3VLMoeCausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
 config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
@@ -190,6 +186,32 @@ config.override_method(
     name_map=_NAME_MAP,
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
+
+
+@config.override_method(
+    "Qwen3VLMoeTextDecoderLayer.__init__",
+    description="Pass config to Qwen3VLMoeTextRMSNorm instances",
+)
+def qwen3_vl_moe_text_decoder_layer_init_patched(self, config, layer_idx: int):
+    super().__init__()
+    self.self_attn = Qwen3VLMoeTextAttention(config, layer_idx)
+    if (layer_idx not in config.mlp_only_layers) and (
+        config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+    ):
+        self.mlp = Qwen3VLMoeTextSparseMoeBlock(config)
+    else:
+        self.mlp = Qwen3VLMoeTextMLP(config, intermediate_size=config.intermediate_size)
+    self.input_layernorm = Qwen3VLMoeTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.post_attention_layernorm = Qwen3VLMoeTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.hidden_size = config.hidden_size
+
+
+config.override_method(
+    "Qwen3VLMoeTextModel.__init__",
+    replacement=qwen3_vl_text_model_init_patched,
+    name_map=_NAME_MAP,
+    description="Pass config to final Qwen3VLMoeTextRMSNorm",
+)
 config.modify_init(
     "Qwen3VLMoeVisionAttention",
     replacement=qwen3_vl_vision_attention_bind_ops,
@@ -231,10 +253,11 @@ config.override_method(
     name_map=_NAME_MAP,
     description="Provide dummy vision forward for FSDP path with SP-aware shape",
 )
-config.modify_init(
-    "Qwen3VLMoeTextAttention",
+config.override_method(
+    "Qwen3VLMoeTextAttention.__init__",
     replacement=qwen3_vl_text_attention_bind_ops,
-    description="Bind instance-local rope and attention VeomniOps",
+    name_map=_NAME_MAP,
+    description="Pass config to Qwen3VLMoeTextRMSNorm and bind instance-local rope and attention VeomniOps",
 )
 config.override_method(
     "Qwen3VLMoeTextAttention.forward",
@@ -300,7 +323,7 @@ class PatchedQwen3VLMoeTextExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
         self,
@@ -635,13 +658,13 @@ def qwen3_vl_moe_for_conditional_generation_init_patched(self, config):
     super().__init__(config)
     self.model = Qwen3VLMoeModel(config)
     self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.veomni_lb = VeomniOp(
         "load_balancing_loss",
         "standard",
-        resolve_op_impl("load_balancing_loss_implementation"),
+        config.ops_config.load_balancing_loss_implementation,
     )
     self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
     self.post_init()

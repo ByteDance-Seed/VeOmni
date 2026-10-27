@@ -23,7 +23,6 @@ from einops import rearrange, repeat
 from transformers import T5EncoderModel
 
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 
 
 def get_timestep_embedding(
@@ -270,9 +269,14 @@ def init_weights_on_device(device=None, include_buffers: bool = False):
 _SDPA_ATTN_IMPLS = frozenset({"sdpa", "veomni_sdpa"})
 
 
-def bind_flux_attention(module: torch.nn.Module, impl: str | None = None) -> None:
+def bind_flux_attention(module: torch.nn.Module, impl: str | None = None, config=None) -> None:
     """Attach configured ``attention/standard`` plus a one-time SDPA mask fallback."""
-    impl = resolve_op_impl("attn_implementation", eager_as="veomni_sdpa") if impl is None else impl
+    if impl is None:
+        impl = (
+            config.ops_config.resolve_impl("attn_implementation", eager_as="veomni_sdpa")
+            if config is not None
+            else "veomni_sdpa"
+        )
     module.veomni_attn = VeomniOp("attention", "standard", impl)
     module.veomni_attn_masked = (
         module.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "veomni_sdpa")

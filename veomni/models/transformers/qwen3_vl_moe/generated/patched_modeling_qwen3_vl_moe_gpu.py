@@ -19,6 +19,10 @@
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: Qwen3VLMoeTextMLP.forward
 #      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
+#    - method_override: Qwen3VLMoeTextDecoderLayer.__init__
+#      Pass config to Qwen3VLMoeTextRMSNorm instances
+#    - method_override: Qwen3VLMoeTextModel.__init__
+#      Pass config to final Qwen3VLMoeTextRMSNorm
 #    - init_modification: Qwen3VLMoeVisionAttention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3VLMoeVisionAttention.forward
@@ -33,8 +37,8 @@
 #      VeOmni SP + deepstack + precomputed max_seqlen; return BaseModelOutputWithDeepstackFeatures
 #    - method_override: Qwen3VLMoeVisionModel.dummy_forward
 #      Provide dummy vision forward for FSDP path with SP-aware shape
-#    - init_modification: Qwen3VLMoeTextAttention
-#      Bind instance-local rope and attention VeomniOps
+#    - method_override: Qwen3VLMoeTextAttention.__init__
+#      Pass config to Qwen3VLMoeTextRMSNorm and bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3VLMoeTextAttention.forward
 #      Route through async Ulysses fused QKV/Output projection when async_enabled
 #    - method_override: Qwen3VLMoeTextModel._deepstack_process
@@ -119,7 +123,6 @@ from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 
 # Additional imports for patches
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
@@ -187,7 +190,7 @@ def _qwen3_vl_async_ulysses_attention_forward(
     if not is_flash_attention_requested(self.config):
         raise ValueError(
             "Async Ulysses attention only supports flash attention implementations. "
-            f"Current implementation: '{self.config._attn_implementation}'. "
+            f"Current implementation: '{self.config.ops_config.attn_implementation}'. "
             "Please set attn_implementation to a flash attention variant or disable async Ulysses."
         )
 
@@ -367,11 +370,12 @@ class _Qwen3VLMoeFakeForPosID(SimpleNamespace):  # noqa: F821 SimpleNamespace de
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3VLMoeTextRMSNorm(nn.Module):
     # ── RMSNorm (always call local VeomniOp) ─────────────────────────────────
-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size, eps: float = 1e-6, config=None) -> None:
         nn.Module.__init__(self)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+        impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
@@ -408,7 +412,7 @@ class Qwen3VLMoeTextExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
         self,
@@ -511,16 +515,22 @@ def eager_attention_forward(
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLMoeTextAttention
-# Methods patched: forward, __init__
+# Methods patched: __init__, forward
 # ======================================================================
 
 
 class Qwen3VLMoeTextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    # [modified __init__] Bind instance-local rope and attention VeomniOps
-    def __init__(self, config: Qwen3VLMoeTextConfig, layer_idx: int):
-        super().__init__()
+    # ================================================================
+    # Patch: Qwen3VLMoeTextAttention.forward
+    # 1. route through the async Ulysses fused QKV/Output projection path
+    #    (defined via add_post_import_block as a module-level helper) when
+    #    `get_parallel_state().async_enabled` is True; otherwise fall
+    #    through to the upstream logic unchanged
+    # ================================================================
+    def __init__(self, config, layer_idx: int):
+        nn.Module.__init__(self)
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
         self.config = config
         self.layer_idx = layer_idx
@@ -543,14 +553,13 @@ class Qwen3VLMoeTextAttention(nn.Module):
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
         self.q_norm = Qwen3VLMoeTextRMSNorm(
-            self.head_dim, eps=config.rms_norm_eps
+            self.head_dim, eps=config.rms_norm_eps, config=config
         )  # unlike olmo, only on the head dim!
         self.k_norm = Qwen3VLMoeTextRMSNorm(
-            self.head_dim, eps=config.rms_norm_eps
+            self.head_dim, eps=config.rms_norm_eps, config=config
         )  # thus post q_norm does not need reshape
-        # Bind instance-local rope and attention VeomniOps
-        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+        self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
     def forward(
         self,
@@ -626,7 +635,7 @@ class Qwen3VLMoeTextMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
     def forward(self, x):
         if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
@@ -642,8 +651,14 @@ class Qwen3VLMoeTextMLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3VLMoeTextDecoderLayer
+# Methods patched: __init__
+# ======================================================================
+
+
 class Qwen3VLMoeTextDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3VLMoeTextConfig, layer_idx: int):
+    def __init__(self, config, layer_idx: int):
         super().__init__()
         self.self_attn = Qwen3VLMoeTextAttention(config, layer_idx)
         if (layer_idx not in config.mlp_only_layers) and (
@@ -652,8 +667,10 @@ class Qwen3VLMoeTextDecoderLayer(GradientCheckpointingLayer):
             self.mlp = Qwen3VLMoeTextSparseMoeBlock(config)
         else:
             self.mlp = Qwen3VLMoeTextMLP(config, intermediate_size=config.intermediate_size)
-        self.input_layernorm = Qwen3VLMoeTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3VLMoeTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = Qwen3VLMoeTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.post_attention_layernorm = Qwen3VLMoeTextRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, config=config
+        )
         self.hidden_size = config.hidden_size
 
     def forward(
@@ -759,8 +776,8 @@ class Qwen3VLMoeVisionAttention(nn.Module):
         self.attention_dropout = 0.0
         self.is_causal = False
         # Bind instance-local rope and attention VeomniOps
-        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+        self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_vision_implementation)
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
     def forward(
         self,
@@ -1401,7 +1418,7 @@ class Qwen3VLMoeTextRotaryEmbedding(nn.Module):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLMoeTextModel
-# Methods patched: _deepstack_process
+# Methods patched: __init__, _deepstack_process
 # ======================================================================
 
 
@@ -1415,7 +1432,7 @@ class Qwen3VLMoeTextModel(Qwen3VLMoePreTrainedModel):
     config: Qwen3VLMoeTextConfig
     input_modalities = ("text",)
 
-    def __init__(self, config: Qwen3VLMoeTextConfig):
+    def __init__(self, config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -1424,11 +1441,10 @@ class Qwen3VLMoeTextModel(Qwen3VLMoePreTrainedModel):
         self.layers = nn.ModuleList(
             [Qwen3VLMoeTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = Qwen3VLMoeTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3VLMoeTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.rotary_emb = Qwen3VLMoeTextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
-        # Initialize weights and apply final processing
         self.post_init()
 
     @merge_with_config_defaults
@@ -2225,13 +2241,13 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
         super().__init__(config)
         self.model = Qwen3VLMoeModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-        impl = resolve_op_impl("cross_entropy_loss_implementation")
+        impl = config.ops_config.cross_entropy_loss_implementation
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.veomni_lb = VeomniOp(
             "load_balancing_loss",
             "standard",
-            resolve_op_impl("load_balancing_loss_implementation"),
+            config.ops_config.load_balancing_loss_implementation,
         )
         self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
         self.post_init()

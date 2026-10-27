@@ -35,7 +35,6 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
-    ops_config_scope,
     qwen_image_inputs,
     qwen_video_inputs,
 )
@@ -50,8 +49,8 @@ def _build_ours(config: Qwen2_5_VLConfig, ops: SimpleNamespace | None = None):
         Qwen2_5_VLForConditionalGeneration,
     )
 
-    with ops_config_scope(ops if ops is not None else eager_ops_config()):
-        return Qwen2_5_VLForConditionalGeneration(config)
+    config._set_ops_implementation(ops if ops is not None else eager_ops_config())
+    return Qwen2_5_VLForConditionalGeneration(config)
 
 
 def _mask_kwargs(input_ids: torch.Tensor) -> dict:

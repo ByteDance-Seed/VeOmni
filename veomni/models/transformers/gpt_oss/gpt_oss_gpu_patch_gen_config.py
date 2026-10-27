@@ -42,7 +42,6 @@ from transformers.utils.output_capturing import OutputRecorder
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
@@ -64,10 +63,6 @@ config.add_import(
     names=["prepare_dense_attention_inputs"],
 )
 config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
-config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "load_balancing_loss"],
 )
@@ -81,11 +76,12 @@ config.drop_import_names("MoeCausalLMOutputWithPast")
     "GptOssRMSNorm.__init__",
     description="Construct a local rms_norm VeomniOp",
 )
-def gpt_oss_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+def gpt_oss_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.weight = nn.Parameter(torch.ones(hidden_size))
     self.variance_epsilon = eps
-    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+    impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
 
 @config.override_method(
@@ -94,6 +90,39 @@ def gpt_oss_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
 )
 def gpt_oss_rmsnorm_forward_patched(self, hidden_states) -> torch.Tensor:
     return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
+
+
+@config.override_method(
+    "GptOssDecoderLayer.__init__",
+    description="Pass config to GptOssRMSNorm instances",
+)
+def gpt_oss_decoder_layer_init_patched(self, config, layer_idx: int):
+    super().__init__()
+    self.hidden_size = config.hidden_size
+    self.self_attn = GptOssAttention(config=config, layer_idx=layer_idx)
+    self.mlp = GptOssMLP(config)
+    self.input_layernorm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.post_attention_layernorm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+
+
+@config.override_method(
+    "GptOssModel.__init__",
+    description="Pass config to final GptOssRMSNorm",
+)
+def gpt_oss_model_init_patched(self, config):
+    super().__init__(config)
+    self.padding_idx = config.pad_token_id
+    self.vocab_size = config.vocab_size
+
+    self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+    self.layers = nn.ModuleList(
+        [GptOssDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+    )
+    self.norm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.rotary_emb = GptOssRotaryEmbedding(config=config)
+    self.gradient_checkpointing = False
+
+    self.post_init()
 
 
 @config.replace_class(
@@ -157,7 +186,7 @@ class PatchedGptOssExperts(nn.Module):
         self.down_proj_bias = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
         self.alpha = 1.702
         self.limit = 7.0
-        self.veomni_moe = VeomniOp("moe_experts", "gpt_oss", resolve_op_impl("moe_implementation"))
+        self.veomni_moe = VeomniOp("moe_experts", "gpt_oss", config.ops_config.moe_implementation)
 
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         return self.veomni_moe(
@@ -215,13 +244,13 @@ def gpt_oss_forcausallm_init_patched(self, config):
     self.router_aux_loss_coef = config.router_aux_loss_coef
     self.num_experts = config.num_local_experts
     self.num_experts_per_tok = config.num_experts_per_tok
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.veomni_lb = VeomniOp(
         "load_balancing_loss",
         "standard",
-        resolve_op_impl("load_balancing_loss_implementation"),
+        config.ops_config.load_balancing_loss_implementation,
     )
     self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
     self.post_init()
@@ -304,8 +333,8 @@ def gpt_oss_forcausallm_forward_patched(
 @config.modify_init("GptOssAttention", description="Bind instance-local rope and attention VeomniOps")
 def gpt_oss_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(

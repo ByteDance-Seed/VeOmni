@@ -31,6 +31,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_text_deepstack_process_patched,
     qwen3_vl_text_mlp_forward_patched,
     qwen3_vl_text_mlp_init_patched,
+    qwen3_vl_text_model_init_patched,
     qwen3_vl_vision_attention_forward_patched,
     qwen3_vl_vision_block_forward_patched,
     qwen3_vl_vision_dummy_forward_patched,
@@ -45,6 +46,7 @@ from veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config i
     qwen3_vl_moe_get_parallel_plan_patched,
     qwen3_vl_moe_model_forward_patched,
     qwen3_vl_moe_model_init_patched,
+    qwen3_vl_moe_text_decoder_layer_init_patched,
 )
 from veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config import (
     config as gpu_config,
@@ -104,6 +106,17 @@ config.override_method(
     replacement=qwen3_vl_text_mlp_forward_patched,
     name_map=_NAME_MAP,
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+)
+config.override_method(
+    "Qwen3VLMoeTextDecoderLayer.__init__",
+    replacement=qwen3_vl_moe_text_decoder_layer_init_patched,
+    description="Pass config to Qwen3VLMoeTextRMSNorm instances",
+)
+config.override_method(
+    "Qwen3VLMoeTextModel.__init__",
+    replacement=qwen3_vl_text_model_init_patched,
+    name_map=_NAME_MAP,
+    description="Pass config to final Qwen3VLMoeTextRMSNorm",
 )
 config.override_method(
     "Qwen3VLMoeVisionAttention.forward",

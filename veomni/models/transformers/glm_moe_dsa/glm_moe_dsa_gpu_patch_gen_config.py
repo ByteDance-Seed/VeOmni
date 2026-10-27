@@ -30,7 +30,6 @@ from veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config imp
     deepseek_v3_topk_router_forward_patched,
 )
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, translate_fused_dsa_mask
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
@@ -55,10 +54,6 @@ config.add_import(
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
-config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
 )
@@ -82,11 +77,12 @@ GlmMoeDsaRMSNorm = None
     "GlmMoeDsaRMSNorm.__init__",
     description="Construct a local rms_norm VeomniOp",
 )
-def glm_moe_dsa_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+def glm_moe_dsa_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.weight = nn.Parameter(torch.ones(hidden_size))
     self.variance_epsilon = eps
-    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+    impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
 
 @config.override_method(
@@ -110,7 +106,42 @@ def glm_moe_dsa_mlp_init_patched(self, config, intermediate_size=None):
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+
+
+@config.override_method(
+    "GlmMoeDsaDecoderLayer.__init__",
+    description="Pass config to GlmMoeDsaRMSNorm instances",
+)
+def glm_moe_dsa_decoder_layer_init_patched(self, config: GlmMoeDsaConfig, layer_idx: int):
+    super().__init__()
+    self.hidden_size = config.hidden_size
+    self.self_attn = GlmMoeDsaAttention(config, layer_idx)  # noqa: F821
+
+    self.mlp = GlmMoeDsaMoE(config) if config.mlp_layer_types[layer_idx] == "sparse" else GlmMoeDsaMLP(config)  # noqa: F821
+
+    self.input_layernorm = GlmMoeDsaRMSNorm(config.hidden_size, config.rms_norm_eps, config=config)  # noqa: F821
+    self.post_attention_layernorm = GlmMoeDsaRMSNorm(config.hidden_size, config.rms_norm_eps, config=config)  # noqa: F821
+
+
+@config.override_method(
+    "GlmMoeDsaModel.__init__",
+    description="Pass config to final GlmMoeDsaRMSNorm",
+)
+def glm_moe_dsa_model_init_patched(self, config: GlmMoeDsaConfig):
+    super().__init__(config)
+    self.padding_idx = config.pad_token_id
+    self.vocab_size = config.vocab_size
+
+    self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+    self.layers = nn.ModuleList(
+        [GlmMoeDsaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]  # noqa: F821
+    )
+    self.norm = GlmMoeDsaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+    self.rotary_emb = GlmMoeDsaRotaryEmbedding(config=config)  # noqa: F821
+    self.gradient_checkpointing = False
+
+    self.post_init()
 
 
 @config.override_method(
@@ -186,7 +217,7 @@ def glm_moe_dsa_indexer_init_patched(self, config: "GlmMoeDsaConfig", layer_idx:
     self.veomni_dsa_indexer = VeomniOp(
         "dsa_indexer",
         "glm",
-        resolve_op_impl("dsa_indexer_implementation"),
+        config.ops_config.dsa_indexer_implementation,
     )
 
 
@@ -274,7 +305,7 @@ def glm_moe_dsa_attention_init_patched(self, config: GlmMoeDsaConfig, layer_idx:
         if self.q_lora_rank is not None
         else None
     )
-    self.q_a_layernorm = GlmMoeDsaRMSNorm(config.q_lora_rank) if self.q_lora_rank is not None else None
+    self.q_a_layernorm = GlmMoeDsaRMSNorm(config.q_lora_rank, config=config) if self.q_lora_rank is not None else None
     self.q_b_proj = (
         nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
         if self.q_lora_rank is not None
@@ -286,7 +317,7 @@ def glm_moe_dsa_attention_init_patched(self, config: GlmMoeDsaConfig, layer_idx:
         self.kv_lora_rank + self.qk_rope_head_dim,
         bias=config.attention_bias,
     )
-    self.kv_a_layernorm = GlmMoeDsaRMSNorm(self.kv_lora_rank)
+    self.kv_a_layernorm = GlmMoeDsaRMSNorm(self.kv_lora_rank, config=config)
     self.kv_b_proj = nn.Linear(
         self.kv_lora_rank,
         self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -304,19 +335,20 @@ def glm_moe_dsa_attention_init_patched(self, config: GlmMoeDsaConfig, layer_idx:
     self.veomni_dsa_attention = VeomniOp(
         "dsa_attention",
         "glm",
-        resolve_op_impl("dsa_attention_implementation"),
+        config.ops_config.dsa_attention_implementation,
     )
     self.veomni_attn = None
     if self.veomni_dsa_attention.impl == "eager":
         # Eager DSA folds the top-k selection into the attention mask, which
         # only the eager and SDPA rows consume; any other row would silently
         # run dense attention.
-        if config._attn_implementation not in ("eager", "sdpa", "veomni_sdpa"):
+        attn_impl = config.ops_config.attn_implementation
+        if attn_impl not in ("eager", "sdpa", "veomni_sdpa"):
             raise ValueError(
                 "GLM-MoE-DSA with dsa_attention_implementation='eager' requires attn_implementation "
-                f"'eager' or 'sdpa', got {config._attn_implementation!r}."
+                f"'eager' or 'sdpa', got {attn_impl!r}."
             )
-        self.veomni_attn = VeomniOp("attention", "standard", config._attn_implementation)
+        self.veomni_attn = VeomniOp("attention", "standard", attn_impl)
 
 
 @config.override_method(
@@ -475,7 +507,7 @@ def glm_moe_dsa_forcausallm_init_patched(self, config):
     self.model = GlmMoeDsaModel(config)
     self.vocab_size = config.vocab_size
     self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()

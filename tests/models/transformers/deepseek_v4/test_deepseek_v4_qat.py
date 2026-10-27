@@ -38,7 +38,6 @@ from torch import nn
 from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling_gpu
 from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as modeling_npu
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
 
 
@@ -185,83 +184,75 @@ def test_qat_covers_exactly_the_activations_inference_stores_quantized(modeling)
 
 @pytest.mark.parametrize("modeling", [modeling_gpu, modeling_npu], ids=["gpu", "npu"])
 def test_qat_is_off_until_asked_for(modeling):
-    """Missing ops config must leave the QAT recipe disabled."""
-    previous = get_ops_config()
-    try:
-        set_ops_config(None)
-        assert modeling.resolve_qat_impl() == "none"
-    finally:
-        set_ops_config(previous)
-
-
-def test_qat_resolves_from_the_installed_ops_config():
-    previous = get_ops_config()
-    try:
-        set_ops_config(SimpleNamespace(qat_implementation="fp8_blockwise"))
-        assert modeling_gpu.resolve_qat_impl() == "fp8_blockwise"
-    finally:
-        set_ops_config(previous)
-
-
-def test_qat_recipe_stays_on_the_constructed_instance():
-    """A later global switch must not retarget an already-built FP32 module."""
-    from tests.models.compare import eager_ops_config, ops_config_scope
+    """Default ops config must leave the QAT recipe disabled."""
     from tests.models.tiny_configs import tiny_deepseek_v4_config
 
     config = tiny_deepseek_v4_config()
+    assert config.ops_config.qat_implementation == "none"
+    assert not modeling._qat_is_fp8_blockwise(None)
+    assert not modeling._qat_is_fp8_blockwise("none")
+
+
+def test_qat_resolves_from_the_installed_ops_config():
+    from tests.models.tiny_configs import tiny_deepseek_v4_config
+
+    config = tiny_deepseek_v4_config()
+    config._set_ops_implementation({"qat_implementation": "fp8_blockwise"})
+    assert config.ops_config.qat_implementation == "fp8_blockwise"
+    assert modeling_gpu._qat_is_fp8_blockwise(config.ops_config.qat_implementation)
+
+
+def test_qat_recipe_stays_on_the_constructed_instance():
+    """A later config change must not retarget an already-built FP32 module."""
+    from tests.models.compare import eager_ops_config
+    from tests.models.tiny_configs import tiny_deepseek_v4_config
+
     none_ops = eager_ops_config()
     none_ops.qat_implementation = "none"
     qat_ops = eager_ops_config()
     qat_ops.qat_implementation = "fp8_blockwise"
 
-    with ops_config_scope(none_ops):
-        none_mlp = modeling_gpu.DeepseekV4MLP(config)
-    with ops_config_scope(qat_ops):
-        qat_mlp = modeling_gpu.DeepseekV4MLP(config)
+    none_cfg = tiny_deepseek_v4_config()
+    none_cfg._set_ops_implementation(none_ops)
+    none_mlp = modeling_gpu.DeepseekV4MLP(none_cfg)
+
+    qat_cfg = tiny_deepseek_v4_config()
+    qat_cfg._set_ops_implementation(qat_ops)
+    qat_mlp = modeling_gpu.DeepseekV4MLP(qat_cfg)
     assert none_mlp.qat_implementation == "none"
     assert qat_mlp.qat_implementation == "fp8_blockwise"
 
-    x = torch.randn(2, 5, config.hidden_size)
-    with ops_config_scope(qat_ops):
-        none_out = none_mlp(x)
+    x = torch.randn(2, 5, none_cfg.hidden_size)
+    none_out = none_mlp(x)
     assert none_out.shape == x.shape
     assert torch.isfinite(none_out).all()
-    with ops_config_scope(none_ops):
-        assert qat_mlp.qat_implementation == "fp8_blockwise"
-        assert none_mlp.qat_implementation == "none"
+    assert qat_mlp.qat_implementation == "fp8_blockwise"
+    assert none_mlp.qat_implementation == "none"
 
 
-def test_qat_linear_helper_is_a_passthrough_while_disabled(monkeypatch):
+def test_qat_linear_helper_is_a_passthrough_while_disabled():
     """Disabled QAT must be bit-identical, not merely close.
 
     Every call site routes through the helper whether or not QAT is on, so an
     `enabled=False` path that perturbed the result would change the numerics of
     every run that never asked for QAT.
     """
-    monkeypatch.setattr(modeling_gpu, "resolve_qat_impl", _qat_impl("none"))
-
     torch.manual_seed(0)
     linear = nn.Linear(256, 128, bias=False, dtype=torch.bfloat16)
     x = torch.randn(4, 256, dtype=torch.bfloat16)
 
-    assert torch.equal(modeling_gpu.veomni_qat_linear(linear, x), linear(x))
+    assert torch.equal(modeling_gpu.veomni_qat_linear(linear, x, qat_implementation="none"), linear(x))
 
 
-def test_qat_linear_helper_fake_quantizes_when_enabled(monkeypatch):
+def test_qat_linear_helper_fake_quantizes_when_enabled():
     _require_tilelang_cuda()
     from veomni.ops.qat import qat_linear
-
-    monkeypatch.setattr(
-        modeling_gpu,
-        "resolve_qat_impl",
-        _qat_impl("fp8_blockwise"),
-    )
 
     torch.manual_seed(0)
     linear = nn.Linear(256, 128, bias=False, device=DEVICE, dtype=torch.bfloat16)
     x = torch.randn(8, 256, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
 
-    actual = modeling_gpu.veomni_qat_linear(linear, x)
+    actual = modeling_gpu.veomni_qat_linear(linear, x, qat_implementation="fp8_blockwise")
 
     assert torch.equal(actual, qat_linear(linear, x, enabled=True))
     assert not torch.equal(actual, linear(x)), "the enabled path returned the unquantized product"
@@ -276,40 +267,34 @@ def test_qat_linear_helper_fake_quantizes_when_enabled(monkeypatch):
     "helper, args",
     [("veomni_qat_fake_quant_kv", (64,)), ("veomni_qat_fake_quant_act", ())],
 )
-def test_activation_helpers_pass_through_while_disabled(monkeypatch, helper, args):
-    monkeypatch.setattr(modeling_gpu, "resolve_qat_impl", _qat_impl("none"))
-
+def test_activation_helpers_pass_through_while_disabled(helper, args):
     x = torch.randn(2, 3, 512, dtype=torch.bfloat16)
 
-    assert getattr(modeling_gpu, helper)(x, *args) is x
+    assert getattr(modeling_gpu, helper)(x, *args, qat_implementation="none") is x
 
 
 @pytest.mark.parametrize(
     "helper, args, shape",
     [("veomni_qat_fake_quant_kv", (64,), (2, 0, 512)), ("veomni_qat_fake_quant_act", (), (2, 0, 128))],
 )
-def test_activation_helpers_pass_empty_entries_through(monkeypatch, helper, args, shape):
+def test_activation_helpers_pass_empty_entries_through(helper, args, shape):
     """A compressor produces a zero-length KV until its first window closes."""
-    monkeypatch.setattr(modeling_gpu, "resolve_qat_impl", _qat_impl("fp8_blockwise"))
-
     x = torch.zeros(shape, dtype=torch.bfloat16)
 
-    assert getattr(modeling_gpu, helper)(x, *args) is x
+    assert getattr(modeling_gpu, helper)(x, *args, qat_implementation="fp8_blockwise") is x
 
 
-def test_kv_helper_quantizes_the_nope_channels_and_spares_the_rope_tail(monkeypatch):
+def test_kv_helper_quantizes_the_nope_channels_and_spares_the_rope_tail():
     """The split is the whole point of this recipe: RoPE channels stay BF16."""
     _require_tilelang_cuda()
     from veomni.ops.qat import fp8_fake_quant_act_prefix
-
-    monkeypatch.setattr(modeling_gpu, "resolve_qat_impl", _qat_impl("fp8_blockwise"))
 
     torch.manual_seed(0)
     head_dim, rope_features = 512, 64
     nope = head_dim - rope_features
     x = torch.randn(2, 3, head_dim, device=DEVICE, dtype=torch.bfloat16)
 
-    actual = modeling_gpu.veomni_qat_fake_quant_kv(x, rope_features)
+    actual = modeling_gpu.veomni_qat_fake_quant_kv(x, rope_features, qat_implementation="fp8_blockwise")
 
     assert torch.equal(actual[..., nope:], x[..., nope:]), "the RoPE tail was quantized"
     assert not torch.equal(actual[..., :nope], x[..., :nope]), "the NoPE channels were left alone"
@@ -318,37 +303,31 @@ def test_kv_helper_quantizes_the_nope_channels_and_spares_the_rope_tail(monkeypa
 
 
 @pytest.mark.parametrize("expert_dtype", ["fp4", "fp8"])
-def test_expert_weight_recipe_follows_the_checkpoint_dtype(monkeypatch, expert_dtype):
+def test_expert_weight_recipe_follows_the_checkpoint_dtype(expert_dtype):
     """V4-Flash ships FP4 experts; the geometry differs, not just the width."""
     _require_tilelang_cuda()
     from veomni.ops.qat import fp4_fake_quant_weight, fp8_fake_quant_stacked_weight
 
-    monkeypatch.setattr(modeling_gpu, "resolve_qat_impl", _qat_impl("fp8_blockwise"))
-
     torch.manual_seed(0)
     weight = torch.randn(2, 256, 384, device=DEVICE, dtype=torch.bfloat16)
 
-    actual = modeling_gpu.veomni_qat_fake_quant_expert_weight(weight, expert_dtype)
+    actual = modeling_gpu.veomni_qat_fake_quant_expert_weight(weight, expert_dtype, qat_implementation="fp8_blockwise")
 
     expected = fp4_fake_quant_weight(weight) if expert_dtype == "fp4" else fp8_fake_quant_stacked_weight(weight)
     assert torch.equal(actual, expected)
     assert not torch.equal(actual, weight)
 
 
-def test_expert_weight_recipe_is_a_passthrough_while_disabled(monkeypatch):
-    monkeypatch.setattr(modeling_gpu, "resolve_qat_impl", _qat_impl("none"))
-
+def test_expert_weight_recipe_is_a_passthrough_while_disabled():
     weight = torch.randn(2, 256, 384, dtype=torch.bfloat16)
 
-    assert modeling_gpu.veomni_qat_fake_quant_expert_weight(weight, "fp4") is weight
+    assert modeling_gpu.veomni_qat_fake_quant_expert_weight(weight, "fp4", qat_implementation="none") is weight
 
 
-def test_expert_weights_reach_the_fused_kernel_quantized(monkeypatch):
+def test_expert_weights_reach_the_fused_kernel_quantized():
     """Pin what the fused kernel is handed, since QAT is applied outside it."""
     _require_tilelang_cuda()
     from veomni.ops.qat import fp4_fake_quant_weight, fp8_fake_quant_act
-
-    monkeypatch.setattr(modeling_gpu, "resolve_qat_impl", _qat_impl("fp8_blockwise"))
 
     config = SimpleNamespace(
         num_local_experts=2,
@@ -357,6 +336,7 @@ def test_expert_weights_reach_the_fused_kernel_quantized(monkeypatch):
         hidden_act="silu",
         swiglu_limit=7.0,
         expert_dtype="fp4",
+        ops_config=SimpleNamespace(moe_implementation="fused_triton", qat_implementation="fp8_blockwise"),
     )
     torch.manual_seed(0)
     experts = modeling_gpu.DeepseekV4Experts(config).to(device=DEVICE, dtype=torch.bfloat16)
@@ -425,6 +405,7 @@ def test_expert_weight_gradients_survive_the_straight_through_estimator():
         hidden_act="silu",
         swiglu_limit=7.0,
         expert_dtype="fp4",
+        ops_config=SimpleNamespace(moe_implementation="fused_triton", qat_implementation="none"),
     )
     torch.manual_seed(0)
     experts = modeling_gpu.DeepseekV4Experts(config).to(device=DEVICE, dtype=torch.bfloat16)
@@ -457,17 +438,15 @@ def test_expert_weight_gradients_survive_the_straight_through_estimator():
         assert not torch.equal(grad, plain_grads[name])
 
 
-def test_act_helper_quantizes_the_whole_last_dimension(monkeypatch):
+def test_act_helper_quantizes_the_whole_last_dimension():
     """Shared by the indexer entries and the routed-expert activations."""
     _require_tilelang_cuda()
     from veomni.ops.qat import fp8_fake_quant_act
 
-    monkeypatch.setattr(modeling_gpu, "resolve_qat_impl", _qat_impl("fp8_blockwise"))
-
     torch.manual_seed(0)
     x = torch.randn(2, 3, 4, 128, device=DEVICE, dtype=torch.bfloat16)
 
-    actual = modeling_gpu.veomni_qat_fake_quant_act(x)
+    actual = modeling_gpu.veomni_qat_fake_quant_act(x, qat_implementation="fp8_blockwise")
 
     assert torch.equal(actual, fp8_fake_quant_act(x, block_size=128))
     # Unlike the KV recipe, the trailing RoPE channels are rounded too.

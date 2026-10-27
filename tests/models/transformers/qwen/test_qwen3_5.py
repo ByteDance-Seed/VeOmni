@@ -38,9 +38,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated, to
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
-    ops_config_scope,
     qwen_image_inputs,
-    stamp_attn_implementation,
 )
 from tests.models.tiny_configs import (
     tiny_qwen3_5_config as _tiny_vl_config,
@@ -72,18 +70,16 @@ def _qwen3_5_classes():
 
 def _build_causal(config: Qwen3_5TextConfig, ops: SimpleNamespace | None = None):
     ops = ops if ops is not None else eager_ops_config()
-    stamp_attn_implementation(config, ops.attn_implementation)
-    with ops_config_scope(ops):
-        causal_cls, _ = _qwen3_5_classes()
-        return causal_cls(config)
+    config._set_ops_implementation(ops)
+    causal_cls, _ = _qwen3_5_classes()
+    return causal_cls(config)
 
 
 def _build_vlm(config: Qwen3_5Config, ops: SimpleNamespace | None = None):
     ops = ops if ops is not None else eager_ops_config()
-    stamp_attn_implementation(config, ops.attn_implementation)
-    with ops_config_scope(ops):
-        _, vlm_cls = _qwen3_5_classes()
-        return vlm_cls(config)
+    config._set_ops_implementation(ops)
+    _, vlm_cls = _qwen3_5_classes()
+    return vlm_cls(config)
 
 
 def _empty_cu_seq_lens() -> torch.Tensor:
@@ -203,7 +199,7 @@ def test_qwen3_5_sdpa_full_attention_accepts_single_sequence_cu_seq_lens_q():
     config = _tiny_text_config(layer_types=["full_attention", "full_attention"])
     ours = _build_causal(config, ops).eval()
     input_ids = torch.randint(3, config.vocab_size, (1, 32))
-    with ops_config_scope(ops), torch.no_grad():
+    with torch.no_grad():
         output = ours(
             input_ids=input_ids,
             use_cache=False,
@@ -222,7 +218,7 @@ def test_qwen3_5_sdpa_packed_sequences_are_isolated():
     packed_input_ids = torch.cat((first_input_ids, second_input_ids), dim=1)
     packed_position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
     packed_cu = torch.tensor([0, 4, 8], dtype=torch.int32)
-    with ops_config_scope(ops), torch.no_grad():
+    with torch.no_grad():
         packed_logits = model(
             input_ids=packed_input_ids,
             attention_mask=torch.ones_like(packed_input_ids),
@@ -259,7 +255,7 @@ def test_qwen3_5_sdpa_editing_first_packed_sample_does_not_move_second():
     packed_position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
     packed_cu = torch.tensor([0, 4, 8], dtype=torch.int32)
     attention_mask = torch.ones_like(packed_input_ids)
-    with ops_config_scope(ops), torch.no_grad():
+    with torch.no_grad():
         base_logits = model(
             input_ids=packed_input_ids,
             attention_mask=attention_mask,
@@ -297,38 +293,37 @@ def test_qwen3_5_packed_padding_matches_separate_logits_and_grads(ops_factory):
     packed_attention_mask = torch.cat((first_attention_mask, second_attention_mask), dim=1)
     packed_position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
     packed_cu = torch.tensor([0, 4, 8], dtype=torch.int32)
-    with ops_config_scope(ops):
-        packed_logits = packed_model(
-            input_ids=packed_input_ids,
-            attention_mask=packed_attention_mask,
-            position_ids=packed_position_ids,
-            cu_seq_lens_q=packed_cu,
-            use_cache=False,
-        ).logits
-        first_logits = separate_model(
-            input_ids=first_input_ids,
-            attention_mask=first_attention_mask,
-            position_ids=torch.arange(4).unsqueeze(0),
-            cu_seq_lens_q=torch.tensor([0, 4], dtype=torch.int32),
-            use_cache=False,
-        ).logits
-        second_logits = separate_model(
-            input_ids=second_input_ids,
-            attention_mask=second_attention_mask,
-            position_ids=torch.arange(4).unsqueeze(0),
-            cu_seq_lens_q=torch.tensor([0, 4], dtype=torch.int32),
-            use_cache=False,
-        ).logits
-        separate_logits = torch.cat((first_logits, second_logits), dim=1)
-        torch.testing.assert_close(packed_logits, separate_logits, rtol=1e-5, atol=1e-5)
-        loss_weights = torch.randn_like(packed_logits)
-        (packed_logits * loss_weights).sum().backward()
-        (separate_logits * loss_weights).sum().backward()
-        packed_grads = {name: parameter.grad for name, parameter in packed_model.named_parameters()}
-        separate_grads = {name: parameter.grad for name, parameter in separate_model.named_parameters()}
-        assert packed_grads.keys() == separate_grads.keys()
-        for name in packed_grads:
-            assert (packed_grads[name] is None) == (separate_grads[name] is None), name
-            if packed_grads[name] is None:
-                continue
-            torch.testing.assert_close(packed_grads[name], separate_grads[name], rtol=1e-4, atol=1e-5)
+    packed_logits = packed_model(
+        input_ids=packed_input_ids,
+        attention_mask=packed_attention_mask,
+        position_ids=packed_position_ids,
+        cu_seq_lens_q=packed_cu,
+        use_cache=False,
+    ).logits
+    first_logits = separate_model(
+        input_ids=first_input_ids,
+        attention_mask=first_attention_mask,
+        position_ids=torch.arange(4).unsqueeze(0),
+        cu_seq_lens_q=torch.tensor([0, 4], dtype=torch.int32),
+        use_cache=False,
+    ).logits
+    second_logits = separate_model(
+        input_ids=second_input_ids,
+        attention_mask=second_attention_mask,
+        position_ids=torch.arange(4).unsqueeze(0),
+        cu_seq_lens_q=torch.tensor([0, 4], dtype=torch.int32),
+        use_cache=False,
+    ).logits
+    separate_logits = torch.cat((first_logits, second_logits), dim=1)
+    torch.testing.assert_close(packed_logits, separate_logits, rtol=1e-5, atol=1e-5)
+    loss_weights = torch.randn_like(packed_logits)
+    (packed_logits * loss_weights).sum().backward()
+    (separate_logits * loss_weights).sum().backward()
+    packed_grads = {name: parameter.grad for name, parameter in packed_model.named_parameters()}
+    separate_grads = {name: parameter.grad for name, parameter in separate_model.named_parameters()}
+    assert packed_grads.keys() == separate_grads.keys()
+    for name in packed_grads:
+        assert (packed_grads[name] is None) == (separate_grads[name] is None), name
+        if packed_grads[name] is None:
+            continue
+        torch.testing.assert_close(packed_grads[name], separate_grads[name], rtol=1e-4, atol=1e-5)

@@ -131,7 +131,7 @@ class VeOmniPretrainedConfig(PretrainedConfig):
         if isinstance(ops_implementation, OpsImplementationConfig):
             self.ops_implementation = ops_implementation.to_dict()
         elif isinstance(ops_implementation, SimpleNamespace):
-            self.ops_implementation = OpsImplementationConfig.validate_and_extract_dict(vars(ops_implementation))
+            self.ops_implementation = {k: v for k, v in vars(ops_implementation).items() if v is not None}
         elif ops_implementation is None or isinstance(ops_implementation, Mapping):
             self.ops_implementation = OpsImplementationConfig.validate_and_extract_dict(ops_implementation)
         else:

@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,7 +8,7 @@ import torch
 import yaml
 from transformers import AutoConfig
 
-from tests.models.compare import eager_ops_config, ops_config_scope, stamp_attn_implementation
+from tests.models.compare import eager_ops_config
 from veomni.distributed.parallel_plan import get_runtime_parallel_plan
 from veomni.distributed.utils import check_fqn_match
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
@@ -36,8 +37,8 @@ INTERMEDIATE_DIM = 6
 
 
 def _eager_ops(config):
-    stamp_attn_implementation(config, "eager")
-    return ops_config_scope(eager_ops_config())
+    config._set_ops_implementation(eager_ops_config())
+    return nullcontext()
 
 
 class _SumFusion(torch.nn.Module):

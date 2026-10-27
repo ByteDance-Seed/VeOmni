@@ -19,7 +19,7 @@ import torch
 from transformers.models.gemma3.configuration_gemma3 import Gemma3Config, Gemma3TextConfig
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 
-from tests.models.compare import eager_ops_config, ops_config_scope, stamp_attn_implementation
+from tests.models.compare import eager_ops_config
 from tests.models.tiny_configs import tiny_gemma3_text_config
 from veomni.models.transformers.gemma3.generated import patched_modeling_gemma3_npu as gemma3_modeling
 from veomni.ops import VeomniOp
@@ -42,10 +42,8 @@ def _build_tiny_gemma3_vlm():
         image_token_index=120,
         tie_word_embeddings=False,
     )
-    ops = eager_ops_config()
-    stamp_attn_implementation(config, ops.attn_implementation)
-    with ops_config_scope(ops):
-        return gemma3_modeling.Gemma3ForConditionalGeneration(config)
+    config._set_ops_implementation(eager_ops_config())
+    return gemma3_modeling.Gemma3ForConditionalGeneration(config)
 
 
 def test_gemma3_vlm_binds_instance_local_ops_and_runs_text_loss():

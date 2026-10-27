@@ -91,17 +91,15 @@ def test_model_reuses_metadata_without_changing_outputs_or_gradients(monkeypatch
 
     from transformers import AutoConfig
 
-    from tests.models.compare import ops_config_scope
     from tests.tools.training_utils import make_eager_ops_config
 
     module = import_module("veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu")
     config = AutoConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").text_config
     config.ple_layer_ids = []
     config.layer_types = ["full_attention"] * config.num_hidden_layers
-    config._attn_implementation = "eager"
-    with ops_config_scope(make_eager_ops_config()):
-        candidate = module.Qwen4ExpTextModel(config)
-        reference = copy.deepcopy(candidate)
+    config._set_ops_implementation(make_eager_ops_config())
+    candidate = module.Qwen4ExpTextModel(config)
+    reference = copy.deepcopy(candidate)
     if checkpointing:
         for model in (candidate, reference):
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})

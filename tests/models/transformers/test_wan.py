@@ -25,7 +25,7 @@ import pytest
 import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from tests.models.compare import eager_ops_config, ops_config_scope
+from tests.models.compare import eager_ops_config
 from tests.models.tiny_configs import tiny_wan_config as _tiny_config
 from veomni.models.transformers.wan import fa3_fp8
 from veomni.models.transformers.wan import modeling_wan as wan_modeling
@@ -39,8 +39,8 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def _build_ours(config: WanConfig, ops: SimpleNamespace | None = None):
     from veomni.models.transformers.wan.modeling_wan import WanModel
 
-    with ops_config_scope(ops if ops is not None else eager_ops_config()):
-        return WanModel(config)
+    config._set_ops_implementation(ops if ops is not None else eager_ops_config())
+    return WanModel(config)
 
 
 def _wan_inputs(in_dim: int, text_len: int, text_dim: int) -> dict[str, torch.Tensor]:
@@ -187,8 +187,9 @@ def test_wan_async_self_attn_passes_dit_qkv_biases(monkeypatch):
             return self._inner(*args, **kwargs)
 
     monkeypatch.setattr(wan_modeling, "VeomniOp", CaptureOp)
-    with ops_config_scope(eager_ops_config()):
-        attn = SelfAttention(SimpleNamespace(_attn_implementation="eager"), dim=32, num_heads=4)
+    cfg = _tiny_config()
+    cfg._set_ops_implementation(eager_ops_config())
+    attn = SelfAttention(cfg, dim=32, num_heads=4)
     attn.sp_async = True
     hidden = torch.randn(1, 8, 32)
     freqs = precompute_freqs_cis(8, end=8).reshape(8, 1, -1)
@@ -231,8 +232,9 @@ def test_wan_async_self_attn_uses_full_sequence_freqs(monkeypatch):
             return self._inner(*args, **kwargs)
 
     monkeypatch.setattr(wan_modeling, "VeomniOp", FullSeqOp)
-    with ops_config_scope(eager_ops_config()):
-        attn = SelfAttention(SimpleNamespace(_attn_implementation="eager"), dim=dim, num_heads=4)
+    cfg = _tiny_config()
+    cfg._set_ops_implementation(eager_ops_config())
+    attn = SelfAttention(cfg, dim=dim, num_heads=4)
     attn.sp_async = True
     hidden = torch.randn(1, local_seq, dim)
     freqs = precompute_freqs_cis(head_dim, end=full_seq).reshape(full_seq, 1, -1)
@@ -261,8 +263,8 @@ def test_wan_mixed_sp_async_is_rejected_under_ulysses(monkeypatch):
 
     monkeypatch.setattr(wan_modeling, "get_parallel_state", lambda: FakeState())
     config = _tiny_config()
-    with ops_config_scope(eager_ops_config()):
-        model = WanModel(config)
+    config._set_ops_implementation(eager_ops_config())
+    model = WanModel(config)
     model.blocks[0].self_attn.sp_async = False
     model.blocks[1].self_attn.sp_async = True
     with pytest.raises(ValueError, match="same SelfAttention.sp_async mode"):

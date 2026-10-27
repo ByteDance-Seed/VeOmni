@@ -33,9 +33,26 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_sliding_window_causal_mask
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+    COMPRESSOR_CLASSES,
+    DeepseekV4Attention,
     DeepseekV4CSACache,
+    DeepseekV4DecoderLayer,
+    DeepseekV4Experts,
+    DeepseekV4GroupedLinear,
+    DeepseekV4HashRouter,
     DeepseekV4HCACache,
+    DeepseekV4HyperConnection,
+    DeepseekV4HyperHead,
+    DeepseekV4Indexer,
     DeepseekV4IndexerScorer,
+    DeepseekV4MLP,
+    DeepseekV4Model,
+    DeepseekV4RMSNorm,
+    DeepseekV4RotaryEmbedding,
+    DeepseekV4SparseMoeBlock,
+    DeepseekV4TopKRouter,
+    DeepseekV4UnweightedRMSNorm,
+    maybe_autocast,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
@@ -62,10 +79,6 @@ from veomni.models.transformers.deepseek_v4.packed_utils import (
 )
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
-from veomni.ops.config import (
-    resolve_op_impl,
-    resolve_qat_impl,
-)
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.ops.qat import (
@@ -105,13 +118,6 @@ config.add_import("typing", names=["Optional"])
 config.add_import("functools", names=["partial"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
-config.add_import(
-    "veomni.ops.config",
-    names=[
-        "resolve_op_impl",
-        "resolve_qat_impl",
-    ],
-)
 config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
@@ -198,8 +204,9 @@ config.add_import(
 
 
 @config.add_helper
-def _deepseek_v4_rope_op() -> VeomniOp:
-    return VeomniOp("rope", "deepseek_v4", resolve_op_impl("rotary_pos_emb_implementation"))
+def _deepseek_v4_rope_op(config=None) -> VeomniOp:
+    impl = config.ops_config.rotary_pos_emb_implementation if config is not None else "eager"
+    return VeomniOp("rope", "deepseek_v4", impl)
 
 
 # ================================================================
@@ -209,11 +216,12 @@ def _deepseek_v4_rope_op() -> VeomniOp:
     "DeepseekV4RMSNorm.__init__",
     description="Construct a local rms_norm VeomniOp",
 )
-def deepseek_v4_rms_norm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+def deepseek_v4_rms_norm_init_patched(self, hidden_size, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.weight = nn.Parameter(torch.ones(hidden_size))
     self.variance_epsilon = eps
-    self.veomni_rms_norm = VeomniOp("rms_norm", "deepseek_v4", resolve_op_impl("rms_norm_implementation"))
+    rms_norm_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+    self.veomni_rms_norm = VeomniOp("rms_norm", "deepseek_v4", rms_norm_impl)
 
 
 @config.override_method(
@@ -228,12 +236,15 @@ def deepseek_v4_rms_norm_forward_patched(self, hidden_states: torch.Tensor) -> t
     "DeepseekV4UnweightedRMSNorm.__init__",
     description="Construct a local unweighted rms_norm VeomniOp",
 )
-def deepseek_v4_unweighted_rmsnorm_init_patched(self, eps: float = 1.0e-6) -> None:
+def deepseek_v4_unweighted_rmsnorm_init_patched(self, eps: float = 1.0e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.eps = eps
-    self.veomni_unweighted_rms_norm = VeomniOp(
-        "rms_norm", "unweighted", resolve_op_impl("rms_norm_implementation", variant="unweighted")
+    unweighted_impl = (
+        config.ops_config.resolve_impl("rms_norm_implementation", variant="unweighted")
+        if config is not None
+        else "eager"
     )
+    self.veomni_unweighted_rms_norm = VeomniOp("rms_norm", "unweighted", unweighted_impl)
 
 
 @config.override_method(
@@ -278,12 +289,12 @@ def deepseek_v4_hyper_connection_init_patched(self, config: "DeepseekV4Config"):
     self.hc_mult = config.hc_mult
     self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
     self.hc_eps = config.hc_eps
-    self.input_norm = DeepseekV4UnweightedRMSNorm(eps=config.rms_norm_eps)
+    self.input_norm = DeepseekV4UnweightedRMSNorm(eps=config.rms_norm_eps, config=config)
     mix = (2 + self.hc_mult) * self.hc_mult
     self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * config.hidden_size))
     self.base = nn.Parameter(torch.empty(mix))
     self.scale = nn.Parameter(torch.empty(3))
-    self.veomni_mhc_pre = VeomniOp("mhc", "pre", resolve_op_impl("mhc_implementation"))
+    self.veomni_mhc_pre = VeomniOp("mhc", "pre", config.ops_config.mhc_implementation)
 
 
 @config.override_method(
@@ -313,12 +324,12 @@ def deepseek_v4_hyper_connection_forward_patched(
 def deepseek_v4_hyper_head_init_patched(self, config: "DeepseekV4Config"):
     nn.Module.__init__(self)
     self.hc_mult = config.hc_mult
-    self.input_norm = DeepseekV4UnweightedRMSNorm(eps=config.rms_norm_eps)
+    self.input_norm = DeepseekV4UnweightedRMSNorm(eps=config.rms_norm_eps, config=config)
     self.eps = config.hc_eps
     self.hc_fn = nn.Parameter(torch.empty(self.hc_mult, self.hc_mult * config.hidden_size))
     self.hc_base = nn.Parameter(torch.empty(self.hc_mult))
     self.hc_scale = nn.Parameter(torch.empty(1))
-    self.veomni_mhc_head = VeomniOp("mhc", "head", resolve_op_impl("mhc_implementation"))
+    self.veomni_mhc_head = VeomniOp("mhc", "head", config.ops_config.mhc_implementation)
 
 
 @config.override_method(
@@ -346,11 +357,11 @@ def deepseek_v4_decoder_layer_init_patched(self, config: "DeepseekV4Config", lay
     self.layer_idx = layer_idx
     self.self_attn = DeepseekV4Attention(config, layer_idx)
     self.mlp = DeepseekV4SparseMoeBlock(config, layer_idx)
-    self.input_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-    self.post_attention_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    self.input_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.post_attention_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
     self.attn_hc = DeepseekV4HyperConnection(config)
     self.ffn_hc = DeepseekV4HyperConnection(config)
-    self.veomni_mhc_post = VeomniOp("mhc", "post", resolve_op_impl("mhc_implementation"))
+    self.veomni_mhc_post = VeomniOp("mhc", "post", config.ops_config.mhc_implementation)
 
 
 @config.override_method(
@@ -396,8 +407,7 @@ def deepseek_v4_decoder_layer_forward_patched(
 @config.add_helper
 def _qat_is_fp8_blockwise(qat_implementation: str | None) -> bool:
     """Use the instance recipe when the caller bound one at construct time."""
-    impl = resolve_qat_impl() if qat_implementation is None else qat_implementation
-    return impl == "fp8_blockwise"
+    return qat_implementation == "fp8_blockwise"
 
 
 @config.add_helper
@@ -441,18 +451,39 @@ def veomni_qat_fake_quant_expert_weight(
 # 1. Keep every HCA/CSA compression window within one packed sequence.
 # 2. Reset compressed RoPE positions and causal ranges at each boundary.
 # ================================================================
-@config.modify_init("DeepseekV4HCACompressor", description="Bind instance-local rope VeomniOp")
-def deepseek_v4_hca_compressor_bind_rope(original_init, self, *args, **kwargs):
-    original_init(self, *args, **kwargs)
-    self.veomni_rope = _deepseek_v4_rope_op()
-    self.qat_implementation = resolve_qat_impl()
+@config.override_method(
+    "DeepseekV4HCACompressor.__init__",
+    description="Pass config to DeepseekV4RMSNorm and bind instance-local rope VeomniOp",
+)
+def deepseek_v4_hca_compressor_init_patched(self, config: "DeepseekV4Config"):
+    nn.Module.__init__(self)
+    self.compress_rate = config.compress_rates["heavily_compressed_attention"]
+    self.head_dim = config.head_dim
+    self.kv_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+    self.gate_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+    self.position_bias = nn.Parameter(torch.empty(self.compress_rate, self.head_dim))
+    self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
+    self.rotary_emb = DeepseekV4RotaryEmbedding(config)
+    self.veomni_rope = _deepseek_v4_rope_op(config)
+    self.qat_implementation = config.ops_config.qat_implementation
 
 
-@config.modify_init("DeepseekV4CSACompressor", description="Bind instance-local rope VeomniOp")
-def deepseek_v4_csa_compressor_bind_rope(original_init, self, *args, **kwargs):
-    original_init(self, *args, **kwargs)
-    self.veomni_rope = _deepseek_v4_rope_op()
-    self.qat_implementation = resolve_qat_impl()
+@config.override_method(
+    "DeepseekV4CSACompressor.__init__",
+    description="Pass config to DeepseekV4RMSNorm and bind instance-local rope VeomniOp",
+)
+def deepseek_v4_csa_compressor_init_patched(self, config: "DeepseekV4Config"):
+    nn.Module.__init__(self)
+    self.compress_rate = config.compress_rates["compressed_sparse_attention"]
+    self.head_dim = config.head_dim
+    self.kv_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
+    self.gate_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
+    self.position_bias = nn.Parameter(torch.empty(self.compress_rate, 2 * self.head_dim))
+    self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
+    self.rotary_emb = DeepseekV4RotaryEmbedding(config)
+    self.indexer = DeepseekV4Indexer(config)
+    self.veomni_rope = _deepseek_v4_rope_op(config)
+    self.qat_implementation = config.ops_config.qat_implementation
 
 
 @config.override_method(
@@ -799,17 +830,17 @@ def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
     self.kv_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
     self.gate_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
     self.position_bias = nn.Parameter(torch.empty(self.compress_rate, 2 * self.head_dim))
-    self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+    self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
     self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
     self.scorer = DeepseekV4IndexerScorer(config)
     self.veomni_dsa_indexer = VeomniOp(
         "dsa_indexer",
         "deepseek_v4",
-        resolve_op_impl("dsa_indexer_implementation"),
+        config.ops_config.dsa_indexer_implementation,
     )
-    self.veomni_rope = _deepseek_v4_rope_op()
-    self.qat_implementation = resolve_qat_impl()
+    self.veomni_rope = _deepseek_v4_rope_op(config)
+    self.qat_implementation = config.ops_config.qat_implementation
 
 
 @config.override_method(
@@ -1097,11 +1128,11 @@ def deepseek_v4_attention_init_patched(self, config: "DeepseekV4Config", layer_i
     self.scaling = self.head_dim**-0.5
 
     self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
-    self.q_a_norm = DeepseekV4RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
+    self.q_a_norm = DeepseekV4RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps, config=config)
     self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
-    self.q_b_norm = DeepseekV4UnweightedRMSNorm(eps=config.rms_norm_eps)
+    self.q_b_norm = DeepseekV4UnweightedRMSNorm(eps=config.rms_norm_eps, config=config)
     self.kv_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
-    self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+    self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
     self.o_a_proj = DeepseekV4GroupedLinear(
         self.num_heads * self.head_dim // config.o_groups, config.o_groups * config.o_lora_rank, config.o_groups
     )
@@ -1111,11 +1142,11 @@ def deepseek_v4_attention_init_patched(self, config: "DeepseekV4Config", layer_i
     self.veomni_dsa_attention = VeomniOp(
         "dsa_attention",
         "deepseek_v4",
-        resolve_op_impl("dsa_attention_implementation"),
+        config.ops_config.dsa_attention_implementation,
     )
-    self.veomni_attn = VeomniOp("attention", "standard", config._attn_implementation)
-    self.veomni_rope = _deepseek_v4_rope_op()
-    self.qat_implementation = resolve_qat_impl()
+    self.veomni_attn = VeomniOp("attention", "standard", config.ops_config.attn_implementation)
+    self.veomni_rope = _deepseek_v4_rope_op(config)
+    self.qat_implementation = config.ops_config.qat_implementation
 
 
 @config.override_method(
@@ -1423,7 +1454,7 @@ def deepseek_v4_model_init_patched(self, config: "DeepseekV4Config"):
     )
     if getattr(config, "freeze_mtp", False) or getattr(config, "mtp_loss_coef", 1.0) <= 0:
         self.mtp.requires_grad_(False)
-    self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
     self.gradient_checkpointing = False
     self.hc_head = DeepseekV4HyperHead(config)
@@ -1722,8 +1753,8 @@ class PatchedDeepseekV4Experts(nn.Module):
         # Absent from `DeepseekV4Config`; a published checkpoint carries it as an
         # extra config key, and only V4-Flash sets it to "fp4".
         self.expert_dtype = getattr(config, "expert_dtype", "fp8")
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
-        self.qat_implementation = resolve_qat_impl()
+        self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
+        self.qat_implementation = config.ops_config.qat_implementation
 
     def forward(
         self,
@@ -1814,8 +1845,8 @@ def deepseek_v4_mlp_init_patched(self, config):
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
     self.act_fn = ACT2FN[config.hidden_act]
     self.limit = config.swiglu_limit
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
-    self.qat_implementation = resolve_qat_impl()
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+    self.qat_implementation = config.ops_config.qat_implementation
 
 
 @config.override_method(
@@ -1904,13 +1935,13 @@ def deepseek_v4_forcausallm_init_patched(self, config):
     self.router_aux_loss_coef = config.router_aux_loss_coef
     self.num_experts = config.num_local_experts
     self.num_experts_per_tok = config.num_experts_per_tok
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.veomni_lb = VeomniOp(
         "load_balancing_loss",
         "standard",
-        resolve_op_impl("load_balancing_loss_implementation"),
+        config.ops_config.load_balancing_loss_implementation,
     )
     self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
     if len(self.model.mtp) > 0:

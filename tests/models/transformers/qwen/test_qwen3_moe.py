@@ -37,7 +37,6 @@ from tests.models.compare import (
     assert_eager_matches_hf,
     assert_sequence_classification_matches_hf,
     eager_ops_config,
-    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_qwen3_moe_config as _tiny_config
 
@@ -71,8 +70,8 @@ def _qwen3_moe_classes():
 
 
 def _construct_ours(model_cls, config: Qwen3MoeConfig, ops: SimpleNamespace | None = None):
-    with ops_config_scope(ops if ops is not None else eager_ops_config()):
-        return model_cls(config)
+    config._set_ops_implementation(ops if ops is not None else eager_ops_config())
+    return model_cls(config)
 
 
 def _build_ours(config: Qwen3MoeConfig, ops: SimpleNamespace | None = None):
@@ -96,8 +95,8 @@ def test_qwen3_moe_rope_reads_selected_impl(monkeypatch):
     ops = eager_ops_config()
     ops.rotary_pos_emb_implementation = "test_impl"
     config = _tiny_config()
-    with ops_config_scope(ops):
-        attn = modeling.Qwen3MoeAttention(config, layer_idx=0)
+    config._set_ops_implementation(ops)
+    attn = modeling.Qwen3MoeAttention(config, layer_idx=0)
 
     assert ("rope", "full", "test_impl") in selected
     assert attn.veomni_rope is not None

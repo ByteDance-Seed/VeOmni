@@ -33,7 +33,6 @@ from transformers.utils import TransformersKwargs
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
@@ -63,10 +62,6 @@ config.add_import(
 )
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
-config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
 )
@@ -77,11 +72,12 @@ config.exclude_from_output("apply_rotary_pos_emb", "rotate_half")
     "SeedOssRMSNorm.__init__",
     description="Construct a local rms_norm VeomniOp",
 )
-def seed_oss_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+def seed_oss_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.weight = nn.Parameter(torch.ones(hidden_size))
     self.variance_epsilon = eps
-    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+    impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
 
 @config.override_method(
@@ -106,7 +102,40 @@ def seed_oss_mlp_init_patched(self, config):
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
     self.act_fn = ACT2FN[config.hidden_act]
     self.residual_dropout = config.residual_dropout
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+
+
+@config.override_method(
+    "SeedOssDecoderLayer.__init__",
+    description="Pass config to SeedOssRMSNorm instances",
+)
+def seed_oss_decoder_layer_init_patched(self, config, layer_idx: int):
+    super().__init__()
+    self.hidden_size = config.hidden_size
+    self.self_attn = SeedOssAttention(config=config, layer_idx=layer_idx)
+    self.mlp = SeedOssMLP(config)
+    self.input_layernorm = SeedOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.post_attention_layernorm = SeedOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+
+
+@config.override_method(
+    "SeedOssModel.__init__",
+    description="Pass config to final SeedOssRMSNorm",
+)
+def seed_oss_model_init_patched(self, config):
+    super().__init__(config)
+    self.padding_idx = config.pad_token_id
+    self.vocab_size = config.vocab_size
+
+    self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+    self.layers = nn.ModuleList(
+        [SeedOssDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+    )
+    self.norm = SeedOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.rotary_emb = SeedOssRotaryEmbedding(config=config)
+    self.gradient_checkpointing = False
+
+    self.post_init()
 
 
 @config.override_method(
@@ -138,7 +167,7 @@ def seed_oss_forcausallm_init_patched(self, config):
     self.model = SeedOssModel(config)
     self.vocab_size = config.vocab_size
     self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
@@ -203,8 +232,8 @@ def seed_oss_forcausallm_forward_patched(
 @config.modify_init("SeedOssAttention", description="Bind instance-local rope and attention VeomniOps")
 def seed_oss_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(

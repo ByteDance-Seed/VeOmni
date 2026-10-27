@@ -30,10 +30,12 @@ from veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config import (
 from veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config import (
     qwen3_attention_forward_patched,
     qwen3_attention_init_patched,
+    qwen3_decoder_layer_init_patched,
     qwen3_forcausallm_forward_patched,
     qwen3_forcausallm_init_patched,
     qwen3_mlp_forward_patched,
     qwen3_mlp_init_patched,
+    qwen3_model_init_patched,
     qwen3_rmsnorm_forward_patched,
     qwen3_rmsnorm_init_patched,
     qwen3_seq_cls_init_patched,
@@ -74,6 +76,16 @@ config.override_method(
     "Qwen3MLP.forward",
     replacement=qwen3_mlp_forward_patched,
     description="Always call the local swiglu_mlp VeomniOp",
+)
+config.override_method(
+    "Qwen3DecoderLayer.__init__",
+    replacement=qwen3_decoder_layer_init_patched,
+    description="Pass config to Qwen3RMSNorm instances",
+)
+config.override_method(
+    "Qwen3Model.__init__",
+    replacement=qwen3_model_init_patched,
+    description="Pass config to final Qwen3RMSNorm",
 )
 config.override_method(
     "Qwen3Attention.__init__",

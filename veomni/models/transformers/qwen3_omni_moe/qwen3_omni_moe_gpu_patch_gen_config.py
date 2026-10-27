@@ -52,7 +52,17 @@ from transformers.modeling_outputs import (
 )
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     BaseModelOutputWithDeepstackFeatures,
+    Qwen3OmniMoeAudioEncoder,
+    Qwen3OmniMoeTextRMSNorm,
     Qwen3OmniMoeThinkerForConditionalGeneration,
+    Qwen3OmniMoeThinkerTextAttention,
+    Qwen3OmniMoeThinkerTextDecoderLayer,
+    Qwen3OmniMoeThinkerTextMLP,
+    Qwen3OmniMoeThinkerTextModel,
+    Qwen3OmniMoeThinkerTextRMSNorm,
+    Qwen3OmniMoeThinkerTextRotaryEmbedding,
+    Qwen3OmniMoeThinkerTextSparseMoeBlock,
+    Qwen3OmniMoeVisionEncoder,
     _get_feat_extract_output_lengths,
 )
 from transformers.processing_utils import Unpack
@@ -70,7 +80,6 @@ from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import (
@@ -115,10 +124,6 @@ config.add_import(
     names=["prepare_dense_attention_inputs"],
 )
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
-config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
 config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
@@ -221,11 +226,12 @@ config.drop_import_names("use_kernel_forward_from_hub")
     "Qwen3OmniMoeThinkerTextRMSNorm.__init__",
     description="Construct a local rms_norm VeomniOp",
 )
-def qwen3_omni_moe_thinker_text_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+def qwen3_omni_moe_thinker_text_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.weight = nn.Parameter(torch.ones(hidden_size))
     self.variance_epsilon = eps
-    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+    rms_norm_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", rms_norm_impl)
 
 
 @config.override_method(
@@ -240,11 +246,12 @@ def qwen3_omni_moe_thinker_text_rmsnorm_forward_patched(self, hidden_states: tor
     "Qwen3OmniMoeTextRMSNorm.__init__",
     description="Construct a local rms_norm VeomniOp",
 )
-def qwen3_omni_moe_text_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+def qwen3_omni_moe_text_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.weight = nn.Parameter(torch.ones(hidden_size))
     self.variance_epsilon = eps
-    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+    rms_norm_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", rms_norm_impl)
 
 
 @config.override_method(
@@ -268,7 +275,7 @@ def qwen3_omni_moe_thinker_text_mlp_init_patched(self, config, intermediate_size
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
 
 @config.override_method(
@@ -287,6 +294,45 @@ def qwen3_omni_moe_thinker_text_mlp_forward_patched(self, x):
             self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
         )
     return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+@config.override_method(
+    "Qwen3OmniMoeThinkerTextDecoderLayer.__init__",
+    description="Pass config to Qwen3OmniMoeThinkerTextRMSNorm",
+)
+def qwen3_omni_moe_thinker_text_decoder_layer_init_patched(self, config, layer_idx):
+    nn.Module.__init__(self)
+    self.self_attn = Qwen3OmniMoeThinkerTextAttention(config, layer_idx)
+    if (layer_idx not in config.mlp_only_layers) and (
+        config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+    ):
+        self.mlp = Qwen3OmniMoeThinkerTextSparseMoeBlock(config)
+    else:
+        self.mlp = Qwen3OmniMoeThinkerTextMLP(config, intermediate_size=config.intermediate_size)
+    self.input_layernorm = Qwen3OmniMoeThinkerTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.post_attention_layernorm = Qwen3OmniMoeThinkerTextRMSNorm(
+        config.hidden_size, eps=config.rms_norm_eps, config=config
+    )
+    self.hidden_size = config.hidden_size
+
+
+@config.override_method(
+    "Qwen3OmniMoeThinkerTextModel.__init__",
+    description="Pass config to Qwen3OmniMoeTextRMSNorm",
+)
+def qwen3_omni_moe_thinker_text_model_init_patched(self, config):
+    super(Qwen3OmniMoeThinkerTextModel, self).__init__(config)
+    self.padding_idx = config.pad_token_id
+    self.vocab_size = config.vocab_size
+
+    self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+    self.layers = nn.ModuleList(
+        [Qwen3OmniMoeThinkerTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+    )
+    self.norm = Qwen3OmniMoeTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.rotary_emb = Qwen3OmniMoeThinkerTextRotaryEmbedding(config)
+    self.gradient_checkpointing = False
+    self.post_init()
 
 
 # ================================================================
@@ -630,8 +676,8 @@ def qwen3_omni_moe_get_rope_index_patched(
 @config.modify_init("Qwen3OmniMoeVisionAttention", description="Bind instance-local rope and attention VeomniOps")
 def qwen3_omni_moe_vision_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_vision_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(
@@ -1161,7 +1207,7 @@ class PatchedQwen3OmniMoeThinkerTextExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
         self,
@@ -1208,13 +1254,13 @@ def qwen3_omni_moe_thinker_init_patched(self, config):
     self.num_experts = config.text_config.num_experts
     self.num_experts_per_tok = config.text_config.num_experts_per_tok
     self.router_aux_loss_coef = config.text_config.router_aux_loss_coef
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.veomni_lb = VeomniOp(
         "load_balancing_loss",
         "standard",
-        resolve_op_impl("load_balancing_loss_implementation"),
+        config.ops_config.load_balancing_loss_implementation,
     )
     self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
     self.post_init()
@@ -1866,7 +1912,7 @@ def qwen3_omni_moe_text_get_parallel_plan_patched(self):
 @config.modify_init("Qwen3OmniMoeAudioAttention", description="Bind instance-local attention VeomniOp")
 def qwen3_omni_moe_audio_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(
@@ -1913,11 +1959,33 @@ def qwen3_omni_moe_audio_attention_forward_patched(
     return attn_output
 
 
-@config.modify_init("Qwen3OmniMoeThinkerTextAttention", description="Bind instance-local rope and attention VeomniOps")
-def qwen3_omni_moe_thinker_text_attention_bind_ops(original_init, self, *args, **kwargs):
-    original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+@config.override_method(
+    "Qwen3OmniMoeThinkerTextAttention.__init__",
+    description="Pass config to Qwen3OmniMoeThinkerTextRMSNorm and bind instance-local rope and attention VeomniOps",
+)
+def qwen3_omni_moe_thinker_text_attention_init_patched(self, config, layer_idx):
+    nn.Module.__init__(self)
+    self.config = config
+    self.layer_idx = layer_idx
+    self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+    self.scaling = self.head_dim**-0.5
+    self.attention_dropout = config.attention_dropout
+    self.is_causal = True
+
+    self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias)
+    self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+    self.q_norm = Qwen3OmniMoeThinkerTextRMSNorm(
+        self.head_dim, eps=config.rms_norm_eps, config=config
+    )  # unlike olmo, only on the head dim!
+    self.k_norm = Qwen3OmniMoeThinkerTextRMSNorm(
+        self.head_dim, eps=config.rms_norm_eps, config=config
+    )  # thus post q_norm does not need reshape
+    self.sliding_window = None
+    self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(

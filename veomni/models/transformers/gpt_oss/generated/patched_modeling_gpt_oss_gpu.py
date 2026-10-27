@@ -13,6 +13,10 @@
 #      Construct a local rms_norm VeomniOp
 #    - method_override: GptOssRMSNorm.forward
 #      Always call the local rms_norm VeomniOp
+#    - method_override: GptOssDecoderLayer.__init__
+#      Pass config to GptOssRMSNorm instances
+#    - method_override: GptOssModel.__init__
+#      Pass config to final GptOssRMSNorm
 #    - class_replacement: GptOssPreTrainedModel
 #      Allow VeOmni FA4 implementation names during Transformers attention backend validation
 #    - class_replacement: GptOssExperts
@@ -62,7 +66,6 @@ from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 
@@ -73,11 +76,12 @@ from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 
 class GptOssRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size, eps: float = 1e-6, config=None) -> None:
         nn.Module.__init__(self)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+        impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
     def forward(self, hidden_states) -> torch.Tensor:
         return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
@@ -104,7 +108,7 @@ class GptOssExperts(nn.Module):
         self.down_proj_bias = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
         self.alpha = 1.702
         self.limit = 7.0
-        self.veomni_moe = VeomniOp("moe_experts", "gpt_oss", resolve_op_impl("moe_implementation"))
+        self.veomni_moe = VeomniOp("moe_experts", "gpt_oss", config.ops_config.moe_implementation)
 
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         return self.veomni_moe(
@@ -290,8 +294,8 @@ class GptOssAttention(nn.Module):
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
         self.sinks = nn.Parameter(torch.empty(config.num_attention_heads))
         # Bind instance-local rope and attention VeomniOps
-        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+        self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
     def forward(
         self,
@@ -342,14 +346,20 @@ class GptOssAttention(nn.Module):
         return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] GptOssDecoderLayer
+# Methods patched: __init__
+# ======================================================================
+
+
 class GptOssDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: GptOssConfig, layer_idx: int):
+    def __init__(self, config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = GptOssAttention(config=config, layer_idx=layer_idx)
         self.mlp = GptOssMLP(config)
-        self.input_layernorm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.post_attention_layernorm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
 
     def forward(
         self,
@@ -430,9 +440,15 @@ class GptOssPreTrainedModel(PreTrainedModel):
             init.normal_(module.bias, mean=0.0, std=std)
 
 
+# ======================================================================
+# [MODIFIED CLASS] GptOssModel
+# Methods patched: __init__
+# ======================================================================
+
+
 @auto_docstring
 class GptOssModel(GptOssPreTrainedModel):
-    def __init__(self, config: GptOssConfig):
+    def __init__(self, config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -441,11 +457,10 @@ class GptOssModel(GptOssPreTrainedModel):
         self.layers = nn.ModuleList(
             [GptOssDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.rotary_emb = GptOssRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
-        # Initialize weights and apply final processing
         self.post_init()
 
     @merge_with_config_defaults
@@ -598,13 +613,13 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_local_experts
         self.num_experts_per_tok = config.num_experts_per_tok
-        impl = resolve_op_impl("cross_entropy_loss_implementation")
+        impl = config.ops_config.cross_entropy_loss_implementation
         self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.veomni_lb = VeomniOp(
             "load_balancing_loss",
             "standard",
-            resolve_op_impl("load_balancing_loss_implementation"),
+            config.ops_config.load_balancing_loss_implementation,
         )
         self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
         self.post_init()

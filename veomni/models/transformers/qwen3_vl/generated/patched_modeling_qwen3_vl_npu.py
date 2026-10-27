@@ -37,8 +37,6 @@
 #      Provide dummy vision forward for FSDP path with SP-aware shape
 #    - init_modification: Qwen3VLVisionAttention
 #      Bind instance-local rope and attention VeomniOps
-#    - init_modification: Qwen3VLTextAttention
-#      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3VLTextAttention.forward
 #      Route through async Ulysses fused QKV/Output projection when async_enabled
 #    - method_override: Qwen3VLTextModel._deepstack_process
@@ -689,14 +687,13 @@ class Qwen3VLTextRMSNorm(nn.Module):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLTextAttention
-# Methods patched: forward, __init__
+# Methods patched: forward
 # ======================================================================
 
 
 class Qwen3VLTextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Qwen3VLTextConfig, layer_idx: int):
         super().__init__()
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
@@ -724,11 +721,6 @@ class Qwen3VLTextAttention(nn.Module):
         self.k_norm = Qwen3VLTextRMSNorm(
             self.head_dim, eps=config.rms_norm_eps
         )  # thus post q_norm does not need reshape
-        # Bind instance-local rope and attention VeomniOps
-        self.q_norm = Qwen3VLTextRMSNorm(self.head_dim, eps=self.config.rms_norm_eps, config=self.config)
-        self.k_norm = Qwen3VLTextRMSNorm(self.head_dim, eps=self.config.rms_norm_eps, config=self.config)
-        self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
-        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
     def forward(
         self,

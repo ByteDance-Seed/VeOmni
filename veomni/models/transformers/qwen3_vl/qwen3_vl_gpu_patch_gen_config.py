@@ -897,11 +897,31 @@ def qwen3_vl_vision_dummy_forward_patched(self):
 #    `get_parallel_state().async_enabled` is True; otherwise fall
 #    through to the upstream logic unchanged
 # ================================================================
-@config.modify_init("Qwen3VLTextAttention", description="Bind instance-local rope and attention VeomniOps")
-def qwen3_vl_text_attention_bind_ops(original_init, self, *args, **kwargs):
-    original_init(self, *args, **kwargs)
-    self.q_norm = Qwen3VLTextRMSNorm(self.head_dim, eps=self.config.rms_norm_eps, config=self.config)
-    self.k_norm = Qwen3VLTextRMSNorm(self.head_dim, eps=self.config.rms_norm_eps, config=self.config)
+@config.override_method(
+    "Qwen3VLTextAttention.__init__",
+    description="Pass config to Qwen3VLTextRMSNorm and bind instance-local rope and attention VeomniOps",
+)
+def qwen3_vl_text_attention_bind_ops(self, config, layer_idx: int):
+    nn.Module.__init__(self)
+    self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
+    self.config = config
+    self.layer_idx = layer_idx
+    self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+    self.scaling = self.head_dim**-0.5
+    self.attention_dropout = config.attention_dropout
+    self.is_causal = True
+
+    self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias)
+    self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+    self.q_norm = Qwen3VLTextRMSNorm(
+        self.head_dim, eps=config.rms_norm_eps, config=config
+    )  # unlike olmo, only on the head dim!
+    self.k_norm = Qwen3VLTextRMSNorm(
+        self.head_dim, eps=config.rms_norm_eps, config=config
+    )  # thus post q_norm does not need reshape
     self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
     self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 

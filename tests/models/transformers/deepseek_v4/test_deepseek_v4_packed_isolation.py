@@ -24,7 +24,7 @@ import torch
 import yaml
 from transformers import AutoConfig
 
-from tests.models.compare import eager_ops_config, ops_config_scope
+from tests.models.compare import eager_ops_config
 from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as npu_modeling
 from veomni.ops import resolve_op
@@ -37,7 +37,7 @@ _TOY_CONFIG = "tests/toy_config/deepseek_v4_toy"
 
 def _toy_config():
     config = AutoConfig.from_pretrained(_TOY_CONFIG)
-    config._attn_implementation = "eager"
+    config._set_ops_implementation(eager_ops_config())
     return config
 
 
@@ -48,8 +48,8 @@ def _eager_compressors(config):
     zeros it in ``_init_weights``. Standalone construction must do the same or
     softmax-gated compression sees allocator garbage / NaNs.
     """
-    with ops_config_scope(eager_ops_config()):
-        compressors = [cls(config) for cls in (modeling.DeepseekV4HCACompressor, modeling.DeepseekV4CSACompressor)]
+    config._set_ops_implementation(eager_ops_config())
+    compressors = [cls(config) for cls in (modeling.DeepseekV4HCACompressor, modeling.DeepseekV4CSACompressor)]
     with torch.no_grad():
         for compressor in compressors:
             torch.nn.init.zeros_(compressor.position_bias)
@@ -105,8 +105,7 @@ def test_deepseek_v4_stateless_forward_does_not_create_decode_cache():
     from transformers.cache_utils import DynamicCache
 
     config = _toy_config()
-    with ops_config_scope(eager_ops_config()):
-        model = modeling.DeepseekV4Model(config)
+    model = modeling.DeepseekV4Model(config)
     seen_caches = []
 
     for layer in model.layers:
@@ -219,8 +218,7 @@ def test_deepseek_v4_packed_indexer_op_receives_segments_cann_accepts(module, mo
     packed_metadata = build_packed_compression_metadata(
         hidden_states, position_ids, sequence_slices, tuple(config.compress_rates.values())
     )
-    with ops_config_scope(eager_ops_config()):
-        compressor = module.DeepseekV4CSACompressor(config)
+    compressor = module.DeepseekV4CSACompressor(config)
     with torch.no_grad():
         torch.nn.init.zeros_(compressor.position_bias)
         torch.nn.init.zeros_(compressor.indexer.position_bias)
@@ -270,8 +268,7 @@ def test_deepseek_v4_npu_config_collator_preserves_packed_segments_for_model():
     seq_len = sum(lengths)
     assert batch["cu_seq_lens_q"].tolist() == [0, lengths[0], seq_len]
 
-    with ops_config_scope(eager_ops_config()):
-        model = npu_modeling.DeepseekV4Model(_toy_config())
+    model = npu_modeling.DeepseekV4Model(_toy_config())
     seen_slices = []
     for layer in model.layers:
 
@@ -397,8 +394,7 @@ def test_deepseek_v4_packed_model_forward_skips_dense_mask(module, monkeypatch):
     config = _toy_config()
     segment_lengths = (24, 40)
     total_len = sum(segment_lengths)
-    with ops_config_scope(eager_ops_config()):
-        model = module.DeepseekV4Model(config).eval()
+    model = module.DeepseekV4Model(config).eval()
 
     def fail_on_dense_mask(*args, **kwargs):
         raise AssertionError("packed forward must not build a dense causal mask")
@@ -445,8 +441,7 @@ def test_deepseek_v4_mask_free_packed_eager_forward_matches_samples_run_alone(mo
     torch.manual_seed(12)
     config = _toy_config()
     segment_lengths = (24, 40)
-    with ops_config_scope(eager_ops_config()):
-        model = modeling.DeepseekV4Model(config).eval()
+    model = modeling.DeepseekV4Model(config).eval()
 
     inputs = _packed_model_inputs(config, segment_lengths)
     expected = []
