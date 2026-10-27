@@ -1,6 +1,6 @@
 """Exercise the registered chunk CE under production offload/checkpoint hooks."""
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import pytest
 import torch
@@ -9,7 +9,7 @@ from torch.utils.checkpoint import checkpoint
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.offloading import OffloadPolicy, build_activation_offloading_context
 from veomni.ops import VeomniOp
-from veomni.trainer.callbacks.channel_loss_callback import capture_chunk_loss_per_token
+from veomni.ops.kernels.loss.cross_entropy_loss.standard import chunk_loss as chunk_loss_impl
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
@@ -18,6 +18,19 @@ DEVICES = [
     pytest.param("cuda", marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="requires CUDA")),
     pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires native NPU")),
 ]
+
+
+@contextmanager
+def _capture_chunk_tokens(target):
+    capture = {}
+    token = chunk_loss_impl._CAPTURE.set(capture)
+    try:
+        yield
+        assert "error" not in capture, capture.get("error")
+        assert isinstance(capture.get("per_token"), torch.Tensor)
+        target.append(capture["per_token"])
+    finally:
+        chunk_loss_impl._CAPTURE.reset(token)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -80,7 +93,7 @@ def _run(device, dtype, *, offload, recompute, frozen, all_ignored, bias_kind=No
     def body(x, head, bias, bias_weight):
         return op(x.sin(), labels, head, bias, bias_weight, chunk_size=5)
 
-    capture = capture_chunk_loss_per_token(observed.append) if observed is not None else nullcontext()
+    capture = _capture_chunk_tokens(observed) if observed is not None else nullcontext()
     with capture, contexts[0]:
         inputs = (hidden, weight, bias, bias_weight)
         loss = checkpoint(body, *inputs, use_reentrant=False) if recompute else body(*inputs)

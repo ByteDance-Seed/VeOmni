@@ -23,14 +23,13 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-import pickle
 import re
 from collections import defaultdict
 from collections.abc import Hashable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from numbers import Integral
-from threading import local
+from threading import Lock
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
@@ -39,6 +38,7 @@ import torch.nn.functional as F
 
 from ...distributed.parallel_state import get_parallel_state
 from ...utils.constants import IGNORE_INDEX
+from ...utils.device import get_device_id, get_device_type
 from ...utils.logging import get_logger
 from .base import Callback, TrainerState
 
@@ -56,188 +56,16 @@ _LOSS_CALL_POSITIONAL_KEYS = ("logits", "labels", "vocab_size", "num_items_in_ba
 _ACTIVE_CHANNEL_LOSS_COMPUTER: ContextVar[ChannelLossComputer | None] = ContextVar(
     "veomni_active_channel_loss_computer", default=None
 )
-_CHUNK_LOSS_CAPTURE = local()
-
-
-@contextmanager
-def capture_chunk_loss_per_token(
-    consumer: Callable[[torch.Tensor], None], on_error: Callable[[str], None] | None = None
-) -> Iterator[None]:
-    """Enable detached token-loss capture for one sampled model-loss call."""
-    previous = getattr(_CHUNK_LOSS_CAPTURE, "value", None)
-    _CHUNK_LOSS_CAPTURE.value = (consumer, on_error)
-    try:
-        yield
-    finally:
-        _CHUNK_LOSS_CAPTURE.value = previous
-
-
-def get_chunk_loss_consumer() -> Callable[[torch.Tensor], None] | None:
-    capture = getattr(_CHUNK_LOSS_CAPTURE, "value", None)
-    return capture[0] if capture is not None else None
-
-
-def report_chunk_loss_observer_error(error: Exception) -> bool:
-    capture = getattr(_CHUNK_LOSS_CAPTURE, "value", None)
-    handler = capture[1] if capture is not None else None
-    if handler is None:
-        return False
-    handler(f"{type(error).__name__}: {error}")
-    return True
 
 
 class ChannelLossMetadataError(ValueError):
     """Raised when channel metadata cannot be aligned with packed segments."""
 
 
-class ChannelLossCollectiveError(RuntimeError):
-    """Raised when an observer collective fails and its process group is unsafe."""
-
-
-def _source_signature_digest(source_ids: list[ChannelKey]) -> str:
-    return hashlib.sha256(repr(_source_id_signature(source_ids)).encode("utf-8", errors="surrogatepass")).hexdigest()
-
-
-def _serialize_channel_sp_observation(observation):
-    segments = observation["segments"]
-    device = observation["device"]
-    losses = (
-        torch.stack([s["loss_sum"].detach().to(device=device, dtype=torch.float32) for s in segments]).cpu().tolist()
-        if segments
-        else []
-    )
-    columns = ("token_count", "has_explicit_padding_mask")
-    if observation["data"]:
-        columns += ("sample_count", "input_token_count")
-    integer = (
-        torch.stack([torch.stack([s[k].to(device=device, dtype=torch.int64) for k in columns]) for s in segments])
-        .cpu()
-        .tolist()
-        if segments
-        else []
-    )
-    integer = [
-        row[:2] + [int(segment["has_only_zero_positions"])] + row[2:]
-        for segment, row in zip(segments, integer, strict=True)
-    ]
-    return {
-        "mode": observation["mode"],
-        "data": observation["data"],
-        "source_digest": _source_signature_digest(observation["source_ids"]),
-        "segments": [
-            (int(s["batch_idx"]), int(s["sp_rank"]), int(s["local_order"]), bool(s["is_start"]), loss, values)
-            for s, loss, values in zip(segments, losses, integer, strict=True)
-        ],
-    }
-
-
-def _channel_sp_topology(parallel_state, *, initialized, global_rank):
-    status = {"enabled": False, "sp_rank": 0, "sp_size": 1, "members": (), "topology_error": ""}
-    try:
-        status["enabled"] = bool(parallel_state.sp_enabled)
-        if status["enabled"]:
-            size = int(parallel_state.sp_size)
-            group = parallel_state.sp_group
-            rank = int(parallel_state.sp_rank)
-            if rank < 0:
-                rank = int(dist.get_rank(group)) if initialized and group is not None else 0
-            if size < 1 or rank < 0 or rank >= size or (size > 1 and (group is None or not initialized)):
-                raise ValueError("invalid or unavailable SP group")
-            if group is None:
-                members = (global_rank,)
-            elif hasattr(dist, "get_process_group_ranks"):
-                members = tuple(int(r) for r in dist.get_process_group_ranks(group))
-            else:
-                members = tuple(int(dist.get_global_rank(group, r)) for r in range(size))
-            status.update(sp_rank=rank, sp_size=size, members=members)
-    except Exception as error:
-        status["topology_error"] = f"{type(error).__name__}: {error}"
-    return status
-
-
-def _validate_channel_sp_topologies(statuses):
-    if not statuses or any(s["topology_error"] for s in statuses):
-        return f"SP topology could not be resolved on all ranks: {[s['topology_error'] for s in statuses]}"
-    if len({s["enabled"] for s in statuses}) != 1:
-        return "SP enablement differs across ranks"
-    if not statuses[0]["enabled"]:
-        return None
-    count = len(statuses)
-    for rank, status in enumerate(statuses):
-        members, local_rank, size = status["members"], status["sp_rank"], status["sp_size"]
-        if (
-            len(members) != size
-            or not 0 <= local_rank < size
-            or len(set(members)) != size
-            or any(not 0 <= member < count for member in members)
-            or members[local_rank] != rank
-            or any(statuses[member]["members"] != members for member in members)
-        ):
-            return "SP group membership differs across ranks"
-    return None
-
-
-def _validate_channel_sp_group(statuses):
-    if not statuses:
-        return "empty SP group"
-    signatures = [s["source_digest"] for s in statuses]
-    source_counts = [s["source_count"] for s in statuses]
-    attempts = [s["attempts"] for s in statuses]
-    if not any(source_counts) and all(n == 0 for n in attempts) and not any(s["errors"] for s in statuses):
-        return None
-    if (
-        any(s["errors"] for s in statuses)
-        or any(not count for count in source_counts)
-        or any(count != source_counts[0] for count in source_counts)
-        or any(sig != signatures[0] for sig in signatures)
-        or len(set(attempts)) != 1
-        or attempts[0] < 1
-        or any(len(s["observations"]) != attempts[0] for s in statuses)
-    ):
-        return "SP source metadata or observation differs across ranks"
-    for index in range(attempts[0]):
-        observations = [s["observations"][index] for s in statuses]
-        if (
-            len({o["mode"] for o in observations}) != 1
-            or len({o["data"] for o in observations}) != 1
-            or observations[0]["mode"] not in ("packed_cu", "positions")
-        ):
-            return "SP observation layouts differ across ranks"
-        for rank, observation in enumerate(observations):
-            if observation["source_digest"] != signatures[rank]:
-                return "SP observation source metadata changed during capture"
-            if observation["mode"] == "packed_cu" and observation["segment_count"] != source_counts[rank]:
-                return "rank-local packed spans do not match source count"
-            if not observation["valid_rows"]:
-                return "SP observation segment metadata is invalid"
-    return None
-
-
-def _materialize_channel_sp_segments(payloads, observation_index, *, device):
-    observations = [payload[observation_index] for payload in payloads]
-    records = [segment for observation in observations for segment in observation["segments"]]
-    if not records:
-        return []
-    losses = torch.tensor([row[4] for row in records], dtype=torch.float32, device=device)
-    integers = torch.tensor([row[5] for row in records], dtype=torch.int64, device=device)
-    include_data = observations[0]["data"]
-    result = []
-    for index, (batch_idx, sp_rank, local_order, is_start, _, _) in enumerate(records):
-        segment = {
-            "batch_idx": batch_idx,
-            "sp_rank": sp_rank,
-            "local_order": local_order,
-            "is_start": is_start,
-            "loss_sum": losses[index],
-            "token_count": integers[index, 0],
-            "has_explicit_padding_mask": integers[index, 1].bool(),
-            "has_only_zero_positions": integers[index, 2].bool(),
-        }
-        if include_data:
-            segment["sample_count"] = integers[index, 3]
-            segment["input_token_count"] = integers[index, 4]
-        result.append(segment)
-    return result
+def _collective_device(group: Any) -> torch.device:
+    if dist.get_backend(group) == "gloo":
+        return torch.device("cpu")
+    return torch.device(get_device_type(), get_device_id())
 
 
 class ChannelLossComputer:
@@ -261,11 +89,10 @@ class ChannelLossComputer:
         self._packed_global_physical_seq_len: int | None = None
         self._tail_padding_length: Any | None = None
         self._result: list[dict[str, Any]] | None = None
-        self._pending_observations: list[dict[str, Any] | list[dict[str, Any]]] = []
-        self._observation_attempt_count = 0
-        self._capture_errors: list[tuple[str, str]] = []
-        self._capture_topology: dict[str, Any] | None = None
-        self._capture_group: Any | None = None
+        self._pending_sp: list[dict[str, Any]] = []
+        self._capture_errors: list[str] = []
+        self._capture_attempts = 0
+        self._capture_lock = Lock()
         self._per_mb_source_ids: list[list[ChannelKey]] = []
         self._per_mb_position_ids: list[torch.Tensor | None] = []
         self._per_mb_attention_masks: list[torch.Tensor | None] = []
@@ -274,12 +101,7 @@ class ChannelLossComputer:
         self._per_mb_packed_global_physical_seq_lens: list[int | None] = []
         self._per_mb_tail_padding_lengths: list[Any | None] = []
         self._micro_step = 0
-        self._micro_step_observation_count = 0
-        self._micro_step_failed = False
-        self.missing_observation_micro_steps: list[int] = []
-        self.strict_observation_errors: list[tuple[int, str]] = []
         self.step_totals: dict[ChannelKey, tuple[torch.Tensor, torch.Tensor]] = {}
-        self.step_data_totals: dict[ChannelKey, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self.source_names: dict[ChannelKey, str] = {}
         self.strict = False
 
@@ -392,8 +214,11 @@ class ChannelLossComputer:
     def capture(self) -> Iterator[None]:
         nested = self.capture_active
         if not nested:
-            self._reset_capture_state()
-            self._capture_topology = self._snapshot_topology()
+            if not self._capture_lock.acquire(blocking=False):
+                raise RuntimeError("Concurrent capture on the same ChannelLossComputer is unsupported.")
+            self._pending_sp, self._capture_errors, self._capture_attempts = [], [], 0
+        previous_result = self._result
+        pending_count, error_count, attempts = len(self._pending_sp), len(self._capture_errors), self._capture_attempts
         token = _ACTIVE_CHANNEL_LOSS_COMPUTER.set(self)
         completed = False
         try:
@@ -401,216 +226,62 @@ class ChannelLossComputer:
             completed = True
         finally:
             _ACTIVE_CHANNEL_LOSS_COMPUTER.reset(token)
+            if not completed:
+                self._result = previous_result
+                del self._pending_sp[pending_count:]
+                del self._capture_errors[error_count:]
+                self._capture_attempts = attempts
             if not nested:
-                if completed:
-                    self._finalize_capture()
-                else:
-                    # Do not issue observer collectives while unwinding model
-                    # exceptions: peers may still be in model collectives.
-                    # The distributed launcher must tear down failed ranks.
-                    self._reset_capture_state()
-
-    def _reset_capture_state(self) -> None:
-        self._pending_observations = []
-        self._observation_attempt_count = 0
-        self._capture_errors = []
-        self._capture_topology = None
-        self._capture_group = None
-
-    def _snapshot_topology(self) -> dict[str, Any]:
-        initialized = dist.is_available() and dist.is_initialized()
-        try:
-            rank = dist.get_rank() if initialized else 0
-            topology = _channel_sp_topology(self.parallel_state, initialized=initialized, global_rank=rank)
-            if topology["enabled"] and not topology["topology_error"]:
-                self._capture_group = self.parallel_state.sp_group
-            return topology
-        except Exception as error:
-            return {
-                "enabled": False,
-                "sp_rank": 0,
-                "sp_size": 1,
-                "members": (),
-                "topology_error": f"{type(error).__name__}: {error}",
-            }
-
-    def _finalize_capture(self) -> None:
-        """Coordinate detached observations and surface strict failures before backward."""
-        initialized = dist.is_available() and dist.is_initialized()
-        try:
-            try:
-                world = dist.get_world_size() if initialized else 1
-            except Exception as error:
-                raise ChannelLossCollectiveError(
-                    "Channel loss could not inspect the default process group."
-                ) from error
-            status = dict(self._capture_topology or self._snapshot_topology())
-            status.update(
-                source_count=0,
-                source_digest="",
-                attempts=self._observation_attempt_count,
-                strict=self.strict,
-                errors=[(kind, message[:512]) for kind, message in self._capture_errors],
-                observations=[],
-            )
-            payload = b""
-            try:
-                status["source_count"] = len(self._source_ids)
-                status["source_digest"] = _source_signature_digest(self._source_ids)
-                if self._source_ids and self._observation_attempt_count == 0:
-                    status["errors"].append(("metadata", "source metadata was present but no loss hook was observed"))
-                if len(self._pending_observations) != self._observation_attempt_count:
-                    status["errors"].append(("metadata", "successful observations do not match loss-hook calls"))
-                if status["enabled"]:
-                    local_observations = [
-                        _serialize_channel_sp_observation(item) for item in self._pending_observations
-                    ]
-                    for observation in local_observations:
-                        rows = observation["segments"]
-                        status["observations"].append(
-                            {
-                                "mode": observation["mode"],
-                                "data": observation["data"],
-                                "source_digest": observation["source_digest"],
-                                "segment_count": len(rows),
-                                "valid_rows": all(
-                                    row[0] >= 0 and row[1] == status["sp_rank"] and row[2] >= 0 for row in rows
-                                ),
-                            }
-                        )
-                    # Prepare the exact CPU bytes before the status exchange.
-                    payload = pickle.dumps(local_observations, protocol=pickle.HIGHEST_PROTOCOL)
-            except Exception as error:
-                failure = ("generic", f"observation preparation failed: {type(error).__name__}: {str(error)[:512]}")
-                status["errors"].append(failure)
-                self._capture_errors.append(failure)
-            if initialized:
-                statuses = [None] * world
                 try:
-                    dist.all_gather_object(statuses, status)
-                except Exception as error:
-                    raise ChannelLossCollectiveError(
-                        "Channel loss world status exchange failed; the process group is unsafe."
-                    ) from error
-            else:
-                statuses = [status]
-            topology_error = _validate_channel_sp_topologies(statuses)
-            strict_values = [entry["strict"] for entry in statuses]
-            strict_enabled = any(strict_values)
-            world_error = topology_error
-            if len(set(strict_values)) != 1:
-                world_error = "channel-loss strict mode differs across ranks"
-            if strict_enabled and world_error is None:
-                for rank, entry in enumerate(statuses):
-                    if entry["errors"] or not entry["source_count"]:
-                        world_error = f"rank {rank}: {entry['errors'] or 'source metadata is missing'}"
-                        break
-                if world_error is None and status["enabled"]:
-                    for members in {entry["members"] for entry in statuses}:
-                        group_error = _validate_channel_sp_group([statuses[member] for member in members])
-                        if group_error:
-                            world_error = f"SP group {members}: {group_error}"
-                            break
-            if strict_enabled and world_error:
-                self._record_capture_failure(world_error)
-                raise ChannelLossMetadataError(world_error)
+                    if completed:
+                        self._finish_capture()
+                finally:
+                    self._pending_sp, self._capture_errors, self._capture_attempts = [], [], 0
+                    self._capture_lock.release()
 
-            local_error = None
-            try:
-                if topology_error:
-                    local_error = topology_error
-                elif not status["enabled"]:
-                    prior_errors = len(self.strict_observation_errors)
-                    self._finalize_local_capture()
-                    if self.strict and len(self.strict_observation_errors) > prior_errors:
-                        local_error = self.strict_observation_errors[-1][1]
-                else:
-                    group_statuses = [statuses[member] for member in status["members"]]
-                    local_error = _validate_channel_sp_group(group_statuses)
-                    if not local_error and self._pending_observations:
-                        if status["sp_size"] > 1:
-                            group_payloads = [None] * status["sp_size"]
-                            try:
-                                dist.all_gather_object(group_payloads, payload, group=self._capture_group)
-                            except Exception as error:
-                                raise ChannelLossCollectiveError(
-                                    "Channel loss SP observation exchange failed; the process group is unsafe."
-                                ) from error
-                        else:
-                            group_payloads = [payload]
-                        decoded = [pickle.loads(item) for item in group_payloads]
-                        reduced = []
-                        for index, observation in enumerate(self._pending_observations):
-                            segments = _materialize_channel_sp_segments(decoded, index, device=observation["device"])
-                            aligned = self._merge_sp_segments(
-                                segments, self._source_ids, strict=True, include_data_stats=observation["data"]
-                            )
-                            if not aligned:
-                                raise ChannelLossMetadataError("SP reduction produced no source-aligned CE payload")
-                            reduced.append(aligned)
-                        self._append_observations(reduced)
-            except ChannelLossCollectiveError:
-                raise
-            except Exception as error:
-                local_error = (
-                    f"channel-loss forward finalization failed with {type(error).__name__}: {str(error)[:512]}"
-                )
-
-            if strict_enabled:
-                if initialized:
-                    failures = [None] * world
-                    try:
-                        dist.all_gather_object(failures, local_error)
-                    except Exception as error:
-                        raise ChannelLossCollectiveError(
-                            "Channel loss strict error exchange failed; the process group is unsafe."
-                        ) from error
-                else:
-                    failures = [local_error]
-                if any(failures):
-                    message = f"channel-loss observation failed before backward: {failures}"
-                    self._record_capture_failure(message)
-                    raise ChannelLossMetadataError(message)
-            elif local_error:
-                self._record_capture_failure(local_error)
-        finally:
-            self._reset_capture_state()
-
-    def _finalize_local_capture(self) -> None:
-        errors = list(self._capture_errors)
-        if self._source_ids and self._observation_attempt_count == 0:
-            errors.append(("metadata", "source metadata was present but no causal-LM loss hook was observed"))
-        if len(self._pending_observations) != self._observation_attempt_count:
-            errors.append(
-                ("metadata", "successful observation count does not match the number of observed causal-LM loss calls")
+    def _finish_capture(self) -> None:
+        """Agree within the SP group before entering any observer reduction."""
+        group = self.parallel_state.sp_group if self.parallel_state.sp_enabled else None
+        world = self.parallel_state.sp_size if group is not None else 1
+        if self._source_ids and self._capture_attempts == 0:
+            self._capture_errors.append("no causal-loss observation was recorded")
+        if self._capture_attempts != len(self._pending_sp) and self.parallel_state.sp_enabled:
+            self._capture_errors.append("some causal-loss observations failed")
+        if group is not None and world > 1:
+            signature = (
+                tuple((type(value).__name__, repr(value)) for value in self._source_ids),
+                tuple(observation["layout"] for observation in self._pending_sp),
             )
-        if any(not isinstance(observation, list) for observation in self._pending_observations):
-            errors.append(("generic", "an SP payload was prepared while sequence parallelism was disabled"))
-        if errors:
-            self._record_capture_failure(_format_capture_errors(errors))
-            return
-        self._append_observations(self._pending_observations)
-
-    def _append_observations(self, observations: list[list[dict[str, Any]]]) -> None:
-        if not observations or (self.strict and self._micro_step_failed):
-            return
-        if self._result is None:
-            self._result = []
-        for observation in observations:
-            self._result.extend(observation)
-        self._micro_step_observation_count += len(observations)
-
-    def _record_capture_failure(self, message: str) -> None:
-        if self.strict:
-            # A strict micro-step is atomic evidence: one failed observation
-            # invalidates successful observations from the same micro-step.
-            self._micro_step_failed = True
+            digest = int.from_bytes(hashlib.sha256(repr(signature).encode()).digest()[:8], "little", signed=True)
+            device = _collective_device(group)
+            status = torch.tensor(
+                [int(bool(self._capture_errors)), self._capture_attempts, digest], dtype=torch.int64, device=device
+            )
+            statuses = [torch.empty_like(status) for _ in range(world)]
+            dist.all_gather(statuses, status, group=group)
+            values = torch.stack(statuses).cpu().tolist()
+            if any(value[0] for value in values) or any(value[1:] != values[0][1:] for value in values):
+                self._capture_errors.append("SP ranks disagree on observer status, source order or packed layout")
+        if self._capture_errors:
             self._result = None
-            self._micro_step_observation_count = 0
-            self.strict_observation_errors.append((self._micro_step, message))
-            logger.warning_rank0(f"Channel loss: strict observation failure: {message}")
+            message = "Channel loss: " + "; ".join(self._capture_errors)
+            if self.strict:
+                raise ChannelLossMetadataError(message)
+            logger.warning_rank0(message + "; skipping this micro-batch.")
             return
-        logger.warning_rank0(f"Channel loss: {message} Skipping this model forward.")
+        if self._pending_sp:
+            combined = []
+            for pending in self._pending_sp:
+                reduced = self._reduce_sp(
+                    pending["segments"], self._source_ids, pending["device"], self.parallel_state, self.strict
+                )
+                if not reduced:
+                    if self.strict:
+                        raise ChannelLossMetadataError("Channel loss: SP reduction produced no source-aligned result.")
+                    logger.warning_rank0("Channel loss: SP reduction produced no result; skipping this micro-batch.")
+                    return
+                combined.extend(reduced)
+            self._result = (self._result or []) + combined
 
     def begin_step(
         self,
@@ -625,43 +296,14 @@ class ChannelLossComputer:
         self._per_mb_source_ids = per_mb_source_ids
         self._per_mb_position_ids = per_mb_position_ids
         self._per_mb_attention_masks = per_mb_attention_masks
-        self._per_mb_packed_cu_seqlens = (
-            per_mb_packed_cu_seqlens if per_mb_packed_cu_seqlens is not None else [None] * len(per_mb_source_ids)
+        self._per_mb_packed_cu_seqlens = per_mb_packed_cu_seqlens or [None] * len(per_mb_source_ids)
+        self._per_mb_packed_global_cu_seqlens = per_mb_packed_global_cu_seqlens or [None] * len(per_mb_source_ids)
+        self._per_mb_packed_global_physical_seq_lens = per_mb_packed_global_physical_seq_lens or [None] * len(
+            per_mb_source_ids
         )
-        self._per_mb_packed_global_cu_seqlens = (
-            per_mb_packed_global_cu_seqlens
-            if per_mb_packed_global_cu_seqlens is not None
-            else [None] * len(per_mb_source_ids)
-        )
-        self._per_mb_packed_global_physical_seq_lens = (
-            per_mb_packed_global_physical_seq_lens
-            if per_mb_packed_global_physical_seq_lens is not None
-            else [None] * len(per_mb_source_ids)
-        )
-        self._per_mb_tail_padding_lengths = (
-            per_mb_tail_padding_lengths if per_mb_tail_padding_lengths is not None else [None] * len(per_mb_source_ids)
-        )
-        metadata_lengths = {
-            "position_ids": len(self._per_mb_position_ids),
-            "attention_masks": len(self._per_mb_attention_masks),
-            "packed_cu_seqlens": len(self._per_mb_packed_cu_seqlens),
-            "packed_global_cu_seqlens": len(self._per_mb_packed_global_cu_seqlens),
-            "packed_global_physical_seq_lens": len(self._per_mb_packed_global_physical_seq_lens),
-            "tail_padding_lengths": len(self._per_mb_tail_padding_lengths),
-        }
-        mismatched = {name: length for name, length in metadata_lengths.items() if length != len(per_mb_source_ids)}
-        if mismatched:
-            raise ChannelLossMetadataError(
-                "Channel loss: per-microbatch metadata list lengths do not match source metadata "
-                f"(source_microbatches={len(per_mb_source_ids)}, mismatched={mismatched})."
-            )
+        self._per_mb_tail_padding_lengths = per_mb_tail_padding_lengths or [None] * len(per_mb_source_ids)
         self._micro_step = 0
-        self._micro_step_observation_count = 0
-        self._micro_step_failed = False
-        self.missing_observation_micro_steps = []
-        self.strict_observation_errors = []
         self.step_totals = {}
-        self.step_data_totals = {}
 
     def before_micro_step(self) -> None:
         step = self._micro_step
@@ -682,13 +324,8 @@ class ChannelLossComputer:
             self._packed_global_physical_seq_len = None
             self._tail_padding_length = None
         self._result = None
-        self._micro_step_observation_count = 0
-        self._micro_step_failed = False
-        self._reset_capture_state()
 
     def after_micro_step(self) -> None:
-        if self.strict and self._source_ids and self._micro_step_observation_count == 0:
-            self.missing_observation_micro_steps.append(self._micro_step)
         if self._result:
             for item in self._result:
                 source_id = item["source_id"]
@@ -699,18 +336,6 @@ class ChannelLossComputer:
                     self.step_totals[source_id] = (loss_sum, token_count)
                 else:
                     self.step_totals[source_id] = (previous[0] + loss_sum, previous[1] + token_count)
-
-                sample_count = item.get("sample_count", token_count.new_ones(()).to(dtype=torch.int64)).detach()
-                input_token_count = item.get("input_token_count", token_count).detach()
-                data_previous = self.step_data_totals.get(source_id)
-                if data_previous is None:
-                    self.step_data_totals[source_id] = (sample_count, input_token_count, token_count)
-                else:
-                    self.step_data_totals[source_id] = (
-                        data_previous[0] + sample_count,
-                        data_previous[1] + input_token_count,
-                        data_previous[2] + token_count,
-                    )
         self._source_ids = []
         self._position_ids = None
         self._attention_mask = None
@@ -719,7 +344,6 @@ class ChannelLossComputer:
         self._packed_global_physical_seq_len = None
         self._tail_padding_length = None
         self._result = None
-        self._reset_capture_state()
         self._micro_step += 1
 
     def record_source_names(self, source_ids: list[ChannelKey], source_names: list[str]) -> None:
@@ -734,21 +358,20 @@ class ChannelLossComputer:
 
     def _wrapped_loss_fn(self, *args: Any, **kwargs: Any) -> Any:
         assert self._original_loss_fn is not None
-        reused = []
-        errors = []
-        active = self.capture_active and bool(self._source_ids)
-        if active:
-            with capture_chunk_loss_per_token(reused.append, on_error=errors.append):
-                main_loss = self._original_loss_fn(*args, **kwargs)
-        else:
+        if not (self.capture_active and self._source_ids):
             return self._original_loss_fn(*args, **kwargs)
-        if errors:
-            self._observation_attempt_count += 1
-            self._capture_errors.extend(("generic", error) for error in errors)
-            return main_loss
-        if len(reused) > 1:
-            self._observation_attempt_count += 1
-            self._capture_errors.append(("generic", "multiple chunk-loss observations in one causal loss call"))
+        self._capture_attempts += 1
+        from ...ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
+
+        capture = {}
+        token = chunk_loss._CAPTURE.set(capture)
+        try:
+            main_loss = self._original_loss_fn(*args, **kwargs)
+            reused_per_token_loss = capture.get("per_token")
+        finally:
+            chunk_loss._CAPTURE.reset(token)
+        if capture.get("error"):
+            self._capture_errors.append(f"chunk-loss observation failed: {capture['error']}")
             return main_loss
 
         call_args = _bind_loss_call_args(self._original_loss_fn, args, kwargs)
@@ -769,10 +392,12 @@ class ChannelLossComputer:
                 weights=call_args.get("weights"),
                 shift_labels=call_args.get("shift_labels"),
                 ignore_index=ignore_index,
-                reused_per_token_loss=reused[0] if reused else None,
+                reused_per_token_loss=reused_per_token_loss,
                 logits_bias=call_args.get("logits_bias"),
                 logits_bias_weight=call_args.get("logits_bias_weight"),
             )
+        elif self.capture_active and self._source_ids:
+            self._capture_errors.append("loss call did not provide labels")
 
         return main_loss
 
@@ -789,11 +414,6 @@ class ChannelLossComputer:
         logits_bias: torch.Tensor | None = None,
         logits_bias_weight: torch.Tensor | None = None,
     ) -> None:
-        standalone = not self.capture_active
-        if standalone:
-            self._reset_capture_state()
-            self._capture_topology = self._snapshot_topology()
-        self._observation_attempt_count += 1
         try:
             result = self._compute_channel_loss(
                 logits=logits,
@@ -804,24 +424,32 @@ class ChannelLossComputer:
                 attention_mask=self._attention_mask,
                 shift_labels=shift_labels,
                 ignore_index=ignore_index,
-                defer_sp=True,
                 reused_per_token_loss=reused_per_token_loss,
                 logits_bias=logits_bias,
                 logits_bias_weight=logits_bias_weight,
             )
-            if result:
-                self._pending_observations.append(result)
+            if not result:
+                raise ChannelLossMetadataError("no source-aligned per-token loss observation was produced")
+            if isinstance(result, dict):
+                self._pending_sp.append(result)
+            elif self.capture_active:
+                self._result = (self._result or []) + result
             else:
-                self._capture_errors.append(
-                    ("metadata", "channel-loss observation produced no source-aligned CE payload")
-                )
+                self._result = result
         except ChannelLossMetadataError as error:
-            self._capture_errors.append(("metadata", str(error)))
+            if self.capture_active:
+                self._capture_errors.append(str(error))
+                return
+            if self.strict:
+                raise
+            logger.warning_rank0("Channel loss: metadata mismatch; skipping this micro-batch.", exc_info=True)
+            self._result = None
         except Exception as error:
-            self._capture_errors.append(("generic", f"{type(error).__name__}: {error}"))
-        finally:
-            if standalone:
-                self._finalize_capture()
+            if self.capture_active:
+                self._capture_errors.append(f"{type(error).__name__}: {error}")
+                return
+            logger.warning_rank0("Channel loss: per-token CE failed; skipping this micro-batch.", exc_info=True)
+            self._result = None
 
     @torch.no_grad()
     def _compute_channel_loss(
@@ -834,13 +462,12 @@ class ChannelLossComputer:
         attention_mask: torch.Tensor | None,
         shift_labels: torch.Tensor | None,
         ignore_index: int,
-        defer_sp: bool = False,
         reused_per_token_loss: torch.Tensor | None = None,
         logits_bias: torch.Tensor | None = None,
         logits_bias_weight: torch.Tensor | None = None,
     ) -> list[dict[str, Any]] | dict[str, Any]:
-        topology = self._capture_topology or self._snapshot_topology()
-        sp_enabled = topology["enabled"]
+        sp_enabled = bool(self.parallel_state.sp_enabled)
+        # Match ``ForCausalLMLoss``: a provided ``shift_labels`` wins, including under SP.
         if shift_labels is not None:
             effective_labels = shift_labels
         elif not sp_enabled:
@@ -848,26 +475,29 @@ class ChannelLossComputer:
         else:
             effective_labels = labels
 
-        if reused_per_token_loss is not None:
-            reused_per_token_loss = self._align_reused_per_token_loss(
-                reused_per_token_loss,
-                effective_labels,
-                sp_enabled=sp_enabled,
-            )
-
         labels_flat = effective_labels.reshape(-1)
         attention_mask_flat = _position_aligned_attention_mask_flat(
             attention_mask=attention_mask,
             labels=labels,
             effective_labels=effective_labels,
         )
-        per_token_loss = (
-            reused_per_token_loss.reshape(-1)
-            if reused_per_token_loss is not None
-            else self._per_token_ce(
+        if reused_per_token_loss is not None:
+            if reused_per_token_loss.numel() == effective_labels.numel():
+                per_token_loss = reused_per_token_loss.reshape_as(effective_labels)
+            elif (
+                not sp_enabled
+                and reused_per_token_loss.dim() == effective_labels.dim()
+                and reused_per_token_loss.shape[:-1] == effective_labels.shape[:-1]
+                and reused_per_token_loss.size(-1) + 1 == effective_labels.size(-1)
+            ):
+                per_token_loss = F.pad(reused_per_token_loss, (0, 1))
+            else:
+                raise ChannelLossMetadataError("Channel loss: chunk-loss observation and labels do not align.")
+            per_token_loss = per_token_loss.reshape(-1)
+        else:
+            per_token_loss = self._per_token_ce(
                 logits, labels_flat, vocab_size, hidden_states, weights, ignore_index, logits_bias, logits_bias_weight
             )
-        )
         if per_token_loss is None:
             return []
         labels_flat = labels_flat.to(per_token_loss.device)
@@ -880,42 +510,15 @@ class ChannelLossComputer:
             attention_mask_flat=attention_mask_flat,
             source_ids=self._source_ids,
             position_ids=self._position_ids,
+            ignore_index=ignore_index,
             packed_cu_seqlens=self._packed_cu_seqlens,
             packed_global_cu_seqlens=self._packed_global_cu_seqlens,
             packed_global_physical_seq_len=self._packed_global_physical_seq_len,
             tail_padding_length=self._tail_padding_length,
-            ignore_index=ignore_index,
             sp_enabled=sp_enabled,
-            parallel_state=self.parallel_state if sp_enabled else None,
-            sp_rank_override=topology["sp_rank"] if sp_enabled else None,
-            sp_size_override=topology["sp_size"] if sp_enabled else None,
+            parallel_state=self.parallel_state,
             strict=self.strict,
-            include_data_stats=False,
-            defer_sp=defer_sp,
-        )
-
-    @staticmethod
-    def _align_reused_per_token_loss(
-        per_token_loss: torch.Tensor,
-        effective_labels: torch.Tensor,
-        *,
-        sp_enabled: bool,
-    ) -> torch.Tensor:
-        """Align causal ``S-1`` main-loss observations with callback ``S`` labels."""
-
-        # The registered CE consumes flattened targets selected by ForCausalLMLoss.
-        if per_token_loss.numel() == effective_labels.numel():
-            return per_token_loss.reshape_as(effective_labels)
-        if (
-            not sp_enabled
-            and per_token_loss.dim() == effective_labels.dim()
-            and per_token_loss.shape[:-1] == effective_labels.shape[:-1]
-            and per_token_loss.size(-1) + 1 == effective_labels.size(-1)
-        ):
-            return F.pad(per_token_loss, (0, 1), value=0.0)
-        raise ChannelLossMetadataError(
-            "Channel loss: reused main-loss CE shape does not align with effective labels "
-            f"({tuple(per_token_loss.shape)} vs {tuple(effective_labels.shape)})."
+            defer_sp=self.capture_active,
         )
 
     def _per_token_ce(
@@ -933,8 +536,7 @@ class ChannelLossComputer:
             hs = hidden_states.detach().reshape(-1, hidden_states.size(-1))
             w = weights.detach()
             bias = logits_bias.detach().reshape(-1, logits_bias.size(-1)) if logits_bias is not None else None
-            bias_weight = logits_bias_weight.detach() if logits_bias_weight is not None else None
-            return self._eager_chunked(hs, w, labels_flat.to(hs.device), ignore_index, bias, bias_weight)
+            return self._eager_chunked(hs, w, labels_flat.to(hs.device), ignore_index, bias, logits_bias_weight)
 
         if logits is not None:
             vocab = vocab_size if vocab_size is not None else logits.size(-1)
@@ -979,9 +581,11 @@ class ChannelLossComputer:
             chunk_logits = F.linear(hidden_states[start:end], weights).float()
             if logits_bias is not None:
                 bias = logits_bias[start:end]
-                if logits_bias_weight is not None:
-                    bias = F.linear(bias, logits_bias_weight)
-                chunk_logits = chunk_logits + bias.float()
+                chunk_logits = chunk_logits + (
+                    F.linear(bias, logits_bias_weight.detach()).float()
+                    if logits_bias_weight is not None
+                    else bias.float()
+                )
             result[start:end] = F.cross_entropy(
                 chunk_logits,
                 labels_flat[start:end],
@@ -1005,10 +609,7 @@ class ChannelLossComputer:
         tail_padding_length: Any | None = None,
         sp_enabled: bool = False,
         parallel_state: ParallelState | None = None,
-        sp_rank_override: int | None = None,
-        sp_size_override: int | None = None,
         strict: bool = False,
-        include_data_stats: bool = False,
         defer_sp: bool = False,
     ) -> list[dict[str, Any]] | dict[str, Any]:
         if not source_ids:
@@ -1037,17 +638,14 @@ class ChannelLossComputer:
                     attention_mask_flat=attention_mask_flat,
                     source_ids=source_ids,
                     positions=pos_2d,
+                    seq_len=seq_len,
+                    ignore_index=ignore_index,
                     packed_cu_seqlens=packed_cu_seqlens,
                     packed_global_cu_seqlens=packed_global_cu_seqlens,
                     packed_global_physical_seq_len=packed_global_physical_seq_len,
                     tail_padding_length=tail_padding_length,
-                    seq_len=seq_len,
-                    ignore_index=ignore_index,
                     parallel_state=parallel_state,
-                    sp_rank_override=sp_rank_override,
-                    sp_size_override=sp_size_override,
                     strict=strict,
-                    include_data_stats=include_data_stats,
                     defer_reduce=defer_sp,
                 )
 
@@ -1092,23 +690,16 @@ class ChannelLossComputer:
         for i, (_, start, end) in enumerate(segments):
             labels_slice = labels_flat[start : end + 1]
             loss_slice = per_token_loss[start : end + 1]
-            mask_slice = attention_mask_flat[start : end + 1] if attention_mask_flat is not None else None
             valid = labels_slice != ignore_index
             token_count = valid.sum()
             loss_sum = loss_slice[valid].sum()
-            item = {
-                "source_id": source_ids[i],
-                "loss_sum": loss_sum,
-                "token_count": token_count,
-            }
-            if include_data_stats:
-                item["sample_count"] = torch.ones((), device=labels_slice.device, dtype=torch.int64)
-                item["input_token_count"] = (
-                    mask_slice.to(torch.bool).sum(dtype=torch.int64)
-                    if mask_slice is not None
-                    else torch.as_tensor(labels_slice.numel(), device=labels_slice.device, dtype=torch.int64)
-                )
-            channel_loss.append(item)
+            channel_loss.append(
+                {
+                    "source_id": source_ids[i],
+                    "loss_sum": loss_sum,
+                    "token_count": token_count,
+                }
+            )
         return channel_loss
 
     @staticmethod
@@ -1125,21 +716,13 @@ class ChannelLossComputer:
         packed_global_physical_seq_len: int | None = None,
         tail_padding_length: Any | None = None,
         parallel_state: ParallelState | None = None,
-        sp_rank_override: int | None = None,
-        sp_size_override: int | None = None,
         strict: bool = False,
-        include_data_stats: bool = False,
         defer_reduce: bool = False,
     ) -> list[dict[str, Any]] | dict[str, Any]:
         if parallel_state is None:
             raise ValueError("parallel_state is required for SP channel-loss aggregation.")
         sp_group = parallel_state.sp_group
-        sp_rank = int(parallel_state.sp_rank if sp_rank_override is None else sp_rank_override)
-        if sp_rank < 0:
-            sp_rank = dist.get_rank(sp_group) if sp_group is not None else 0
-        sp_size = int(getattr(parallel_state, "sp_size", 1) if sp_size_override is None else sp_size_override)
-        if sp_size < 1:
-            raise ChannelLossMetadataError(f"Channel loss: invalid sequence-parallel size {sp_size}.")
+        sp_rank = dist.get_rank(sp_group) if sp_group is not None else 0
         segments: list[dict[str, Any]] = []
 
         if positions.dim() == 1:
@@ -1160,7 +743,7 @@ class ChannelLossComputer:
             *,
             flat_indices: bool = False,
         ) -> None:
-            if end < start:
+            if end < start or (end == start and not flat_indices):
                 return
             flat_start = start if flat_indices else batch_idx * local_width + start
             flat_end = min(end if flat_indices else batch_idx * local_width + end, seq_len)
@@ -1184,95 +767,124 @@ class ChannelLossComputer:
                 else false_flag
             )
             has_only_zero_positions = bool(pos_slice.eq(0).all().tolist()) if pos_slice.numel() > 0 else False
-            segment = {
-                "batch_idx": batch_idx,
-                "sp_rank": sp_rank,
-                "local_order": local_order,
-                "is_start": is_start,
-                "has_explicit_padding_mask": has_explicit_padding_mask,
-                "has_only_zero_positions": has_only_zero_positions,
-                "loss_sum": loss_sum,
-                "token_count": token_count,
-            }
-            if include_data_stats:
-                segment["sample_count"] = torch.as_tensor(int(is_start), device=labels_slice.device, dtype=torch.int64)
-                segment["input_token_count"] = (
-                    mask_slice.to(torch.bool).sum(dtype=torch.int64)
-                    if mask_slice is not None
-                    else torch.as_tensor(labels_slice.numel(), device=labels_slice.device, dtype=torch.int64)
-                )
-            segments.append(segment)
+            segments.append(
+                {
+                    "batch_idx": batch_idx,
+                    "sp_rank": sp_rank,
+                    "local_order": local_order,
+                    "is_start": is_start,
+                    "has_explicit_padding_mask": has_explicit_padding_mask,
+                    "has_only_zero_positions": has_only_zero_positions,
+                    "loss_sum": loss_sum,
+                    "token_count": token_count,
+                }
+            )
 
-        packed_source_spans, packed_segment_count, packed_metadata_error = _rank_local_packed_source_spans(
-            packed_cu_seqlens,
-            packed_global_cu_seqlens=packed_global_cu_seqlens,
-            packed_global_physical_seq_len=packed_global_physical_seq_len,
-            source_count=len(source_ids),
-            seq_len=seq_len,
-            sp_size=sp_size,
-            labels_flat=labels_flat,
-            positions_flat=positions_cpu.reshape(-1)[:seq_len],
-            attention_mask_flat=attention_mask_flat,
-            ignore_index=ignore_index,
-            tail_padding_length=tail_padding_length,
-        )
-        if packed_metadata_error is not None:
+        points, points_error = _packed_cu_points(packed_cu_seqlens)
+        if points_error:
             if strict:
-                raise ChannelLossMetadataError(packed_metadata_error)
-            logger.warning_rank0(packed_metadata_error)
-            return []
-        if packed_source_spans is not None:
-            alignment_mode = "packed_cu"
-            # Headwise CP keeps one rank-local span per original packed sample.
-            # Use those authoritative boundaries instead of interpreting every
-            # padding ``position_id == 0`` as a new sample. Exactly one SP rank
-            # owns each logical start; all other ranks contribute continuation
-            # totals for the same source index.
-            for source_idx, (start, end) in enumerate(packed_source_spans):
-                _partial(
-                    source_idx,
-                    start,
-                    end,
-                    is_start=sp_rank == 0,
-                    local_order=0,
-                    flat_indices=True,
-                )
-        elif packed_segment_count is not None:
-            _validate_segment_count(
-                packed_segment_count,
-                len(source_ids),
-                strict,
-                "SP packed segment count",
+                raise ChannelLossMetadataError(f"Channel loss: invalid packed CU metadata: {points_error}.")
+            logger.warning_rank0(
+                f"Channel loss: invalid packed CU metadata: {points_error}; skipping this micro-batch."
             )
             return []
-        else:
-            alignment_mode = "positions"
-            for batch_idx, row_pos in enumerate(positions_cpu):
-                row_len = min(local_width, max(seq_len - batch_idx * local_width, 0))
-                if row_len <= 0:
-                    continue
-                local_starts = row_pos[:row_len].eq(0).nonzero(as_tuple=True)[0].tolist()
-                local_order = 0
-                if not local_starts:
-                    _partial(batch_idx, 0, row_len, is_start=False, local_order=local_order)
-                    continue
+        if points and points[-1] not in (seq_len, seq_len * parallel_state.sp_size):
+            if strict:
+                raise ChannelLossMetadataError(
+                    "Channel loss: packed CU endpoint does not match the local or global width."
+                )
+            logger.warning_rank0("Channel loss: packed CU endpoint mismatch; skipping this micro-batch.")
+            return []
+        global_points, global_error = _packed_cu_points(packed_global_cu_seqlens)
+        if global_error:
+            if strict:
+                raise ChannelLossMetadataError(f"Channel loss: invalid global packed CU metadata: {global_error}.")
+            logger.warning_rank0(
+                f"Channel loss: invalid global packed CU metadata: {global_error}; skipping this micro-batch."
+            )
+            return []
+        if points and points[-1] != seq_len and global_points != points:
+            if strict:
+                raise ChannelLossMetadataError("Channel loss: global Ulysses CU metadata is missing or inconsistent.")
+            logger.warning_rank0("Channel loss: global Ulysses CU metadata mismatch; skipping this micro-batch.")
+            return []
+        local_spans = list(zip(points, points[1:])) if points and points[-1] == seq_len else None
+        tail_lengths = _as_flat_list(tail_padding_length)
+        has_tail = len(tail_lengths) == 1 and isinstance(tail_lengths[0], Integral) and tail_lengths[0] > 0
+        if local_spans is not None and global_points is not None and parallel_state.sp_size > 1:
+            multiple = 2 * parallel_state.sp_size
+            expected = [
+                ((end - start + multiple - 1) // multiple) * 2 for start, end in zip(global_points, global_points[1:])
+            ]
+            if (
+                packed_global_physical_seq_len is not None
+                and packed_global_physical_seq_len != seq_len * parallel_state.sp_size
+            ) or expected != [end - start for start, end in local_spans]:
+                if strict:
+                    raise ChannelLossMetadataError("Channel loss: local packed CU disagrees with global geometry.")
+                logger.warning_rank0("Channel loss: packed CU geometry mismatch; skipping this micro-batch.")
+                return []
+        if local_spans is not None and len(local_spans) == len(source_ids) + 1 and has_tail:
+            valid_global = (
+                global_points is not None
+                and len(global_points) == len(local_spans) + 1
+                and global_points[-1] - global_points[-2] == tail_lengths[0]
+                and packed_global_physical_seq_len == seq_len * parallel_state.sp_size
+            )
+            if valid_global:
+                multiple = 2 * parallel_state.sp_size
+                expected = [
+                    ((end - start + multiple - 1) // multiple) * 2
+                    for start, end in zip(global_points, global_points[1:])
+                ]
+                valid_global = expected == [end - start for start, end in local_spans]
+            if not valid_global:
+                if strict:
+                    raise ChannelLossMetadataError("Channel loss: packed tail does not match global CU metadata.")
+                logger.warning_rank0("Channel loss: packed tail metadata mismatch; skipping this micro-batch.")
+                return []
+            tail_start, tail_end = local_spans[-1]
+            tail_labels = labels_flat[tail_start:tail_end]
+            tail_positions = positions_cpu.reshape(-1)[tail_start:tail_end]
+            if not bool(tail_labels.eq(ignore_index).all()) or not bool(tail_positions.eq(0).all()):
+                if strict:
+                    raise ChannelLossMetadataError("Channel loss: packed tail contains non-padding tokens.")
+                logger.warning_rank0(
+                    "Channel loss: packed tail contains non-padding tokens; skipping this micro-batch."
+                )
+                return []
+            local_spans = local_spans[:-1]
+        if local_spans is not None:
+            if not _validate_segment_count(len(local_spans), len(source_ids), strict, "SP packed segment count"):
+                return []
+            for source_idx, (start, end) in enumerate(local_spans):
+                _partial(source_idx, int(start), int(end), sp_rank == 0, 0, flat_indices=True)
+        for batch_idx, row_pos in enumerate(positions_cpu if local_spans is None else []):
+            row_len = min(local_width, max(seq_len - batch_idx * local_width, 0))
+            if row_len <= 0:
+                continue
+            local_starts = row_pos[:row_len].eq(0).nonzero(as_tuple=True)[0].tolist()
+            local_order = 0
+            if not local_starts:
+                _partial(batch_idx, 0, row_len, is_start=False, local_order=local_order)
+                continue
 
-                first = local_starts[0]
-                if first > 0:
-                    _partial(batch_idx, 0, first, is_start=False, local_order=local_order)
-                    local_order += 1
-                ends = local_starts[1:] + [row_len]
-                for start, end in zip(local_starts, ends):
-                    _partial(batch_idx, start, end, is_start=True, local_order=local_order)
-                    local_order += 1
+            first = local_starts[0]
+            if first > 0:
+                _partial(batch_idx, 0, first, is_start=False, local_order=local_order)
+                local_order += 1
+            ends = local_starts[1:] + [row_len]
+            for start, end in zip(local_starts, ends):
+                _partial(batch_idx, start, end, is_start=True, local_order=local_order)
+                local_order += 1
 
         if defer_reduce:
             return {
                 "segments": segments,
-                "source_ids": list(source_ids),
                 "device": per_token_loss.device,
-                "data": include_data_stats,
-                "mode": alignment_mode,
+                "layout": ("cu", tuple(points))
+                if local_spans is not None
+                else ("positions", tuple(global_points or ())),
             }
 
         reduced = ChannelLossComputer._reduce_sp(
@@ -1281,24 +893,15 @@ class ChannelLossComputer:
             device=per_token_loss.device,
             parallel_state=parallel_state,
             strict=strict,
-            include_data_stats=include_data_stats,
         )
-        result = []
-        for item in reduced:
-            converted = {
+        return [
+            {
                 "source_id": item["source_id"],
                 "loss_sum": torch.as_tensor(item["loss_sum"], device=per_token_loss.device, dtype=torch.float32),
                 "token_count": torch.as_tensor(item["token_count"], device=per_token_loss.device, dtype=torch.int64),
             }
-            if include_data_stats:
-                converted["sample_count"] = torch.as_tensor(
-                    item["sample_count"], device=per_token_loss.device, dtype=torch.int64
-                )
-                converted["input_token_count"] = torch.as_tensor(
-                    item["input_token_count"], device=per_token_loss.device, dtype=torch.int64
-                )
-            result.append(converted)
-        return result
+            for item in reduced
+        ]
 
     @staticmethod
     def _reduce_sp(
@@ -1307,7 +910,6 @@ class ChannelLossComputer:
         device: torch.device,
         parallel_state: ParallelState | None = None,
         strict: bool = False,
-        include_data_stats: bool = False,
     ) -> list[dict[str, Any]]:
         if local_segments:
             local_zero_position_flags = torch.tensor(
@@ -1355,24 +957,12 @@ class ChannelLossComputer:
                     local_zero_position_flags = torch.stack(
                         [segment["has_only_zero_positions"] for segment in local_segments]
                     ).to(device=device, dtype=torch.int64)
-                    integer_columns = [local_token_counts]
-                    if include_data_stats:
-                        integer_columns.extend(
-                            [
-                                torch.stack([segment["sample_count"] for segment in local_segments]).to(
-                                    device=device, dtype=torch.int64
-                                ),
-                                torch.stack([segment["input_token_count"] for segment in local_segments]).to(
-                                    device=device, dtype=torch.int64
-                                ),
-                            ]
-                        )
-                    integer_columns.extend([local_explicit_padding_flags, local_zero_position_flags])
-                    local_integer_stats = torch.stack(integer_columns, dim=1)
+                    local_integer_stats = torch.stack(
+                        [local_token_counts, local_explicit_padding_flags, local_zero_position_flags], dim=1
+                    )
                 else:
                     local_loss_sums = torch.empty(0, dtype=torch.float32, device=device)
-                    integer_column_count = 5 if include_data_stats else 3
-                    local_integer_stats = torch.empty((0, integer_column_count), dtype=torch.int64, device=device)
+                    local_integer_stats = torch.empty((0, 3), dtype=torch.int64, device=device)
 
                 loss_padding = local_loss_sums.new_zeros(max_segment_count - local_loss_sums.size(0))
                 integer_padding = local_integer_stats.new_zeros(
@@ -1388,33 +978,16 @@ class ChannelLossComputer:
                 for rank_idx, rank_metadata in enumerate(gathered_metadata):
                     for segment_idx, metadata in enumerate(rank_metadata or []):
                         integer_stats = gathered_integer_stats[rank_idx][segment_idx]
-                        stats_offset = 2 if include_data_stats else 0
-                        segment = {
-                            **metadata,
-                            "loss_sum": gathered_loss_sums[rank_idx][segment_idx],
-                            "token_count": integer_stats[0],
-                            "has_explicit_padding_mask": integer_stats[1 + stats_offset].to(torch.bool),
-                            "has_only_zero_positions": integer_stats[2 + stats_offset].to(torch.bool),
-                        }
-                        if include_data_stats:
-                            segment["sample_count"] = integer_stats[1]
-                            segment["input_token_count"] = integer_stats[2]
-                        all_segments.append(segment)
+                        all_segments.append(
+                            {
+                                **metadata,
+                                "loss_sum": gathered_loss_sums[rank_idx][segment_idx],
+                                "token_count": integer_stats[0],
+                                "has_explicit_padding_mask": integer_stats[1].to(torch.bool),
+                                "has_only_zero_positions": integer_stats[2].to(torch.bool),
+                            }
+                        )
 
-        return ChannelLossComputer._merge_sp_segments(
-            all_segments,
-            source_ids,
-            strict=strict,
-            include_data_stats=include_data_stats,
-        )
-
-    @staticmethod
-    def _merge_sp_segments(
-        all_segments: list[dict[str, Any]],
-        source_ids: list[ChannelKey],
-        strict: bool,
-        include_data_stats: bool,
-    ) -> list[dict[str, Any]]:
         all_segments.sort(
             key=lambda segment: (
                 int(segment.get("batch_idx", 0)),
@@ -1445,15 +1018,13 @@ class ChannelLossComputer:
         for segment in all_segments:
             batch_idx = int(segment.get("batch_idx", 0))
             if segment["is_start"]:
-                item = {
-                    "source_id": source_ids[doc_idx],
-                    "loss_sum": segment["loss_sum"],
-                    "token_count": segment["token_count"],
-                }
-                if include_data_stats:
-                    item["sample_count"] = segment["sample_count"]
-                    item["input_token_count"] = segment["input_token_count"]
-                result.append(item)
+                result.append(
+                    {
+                        "source_id": source_ids[doc_idx],
+                        "loss_sum": segment["loss_sum"],
+                        "token_count": segment["token_count"],
+                    }
+                )
                 last_result_idx_by_batch[batch_idx] = len(result) - 1
                 doc_idx += 1
                 continue
@@ -1470,9 +1041,6 @@ class ChannelLossComputer:
                 continue
             result[result_idx]["loss_sum"] += segment["loss_sum"]
             result[result_idx]["token_count"] += segment["token_count"]
-            if include_data_stats:
-                result[result_idx]["sample_count"] += segment["sample_count"]
-                result[result_idx]["input_token_count"] += segment["input_token_count"]
         return result
 
 
@@ -1573,12 +1141,8 @@ class ChannelLossCallback(Callback):
         if not self._collect_step:
             self.computer.begin_step([], [], [])
             if self.config.strict:
-                missing_source_micro_steps = []
-                for micro_step, micro_batch in enumerate(micro_batches or []):
-                    source_ids, _, _, _, _, _, _, _ = self._extract_metadata(micro_batch)
-                    if not source_ids:
-                        missing_source_micro_steps.append(micro_step)
-                self._raise_if_missing_source_ids(missing_source_micro_steps)
+                missing = any(not self._extract_metadata(batch)[0] for batch in micro_batches or [])
+                self._require_source_ids([] if missing else [True])
             return
 
         per_mb_source_ids: list[list[ChannelKey]] = []
@@ -1588,34 +1152,32 @@ class ChannelLossCallback(Callback):
         per_mb_packed_global_cu_seqlens: list[Any | None] = []
         per_mb_packed_global_physical_seq_lens: list[int | None] = []
         per_mb_tail_padding_lengths: list[Any | None] = []
-        missing_source_micro_steps = []
-        for micro_step, micro_batch in enumerate(micro_batches or []):
+        missing = False
+        for micro_batch in micro_batches or []:
             (
                 source_ids,
                 source_names,
                 position_ids,
                 attention_mask,
-                packed_cu_seqlens,
-                packed_global_cu_seqlens,
-                packed_global_physical_seq_len,
-                tail_padding_length,
+                packed_cu,
+                global_cu,
+                global_width,
+                tail_padding,
             ) = self._extract_metadata(micro_batch)
-            if self.config.strict and not source_ids:
-                missing_source_micro_steps.append(micro_step)
-            source_ids, source_names = self._repeat_source_metadata(
-                source_ids,
-                source_names,
-                source_repeat,
-            )
+            if self.config.strict:
+                missing = missing or not source_ids
+            source_ids, source_names = self._repeat_source_metadata(source_ids, source_names, source_repeat)
             self.computer.record_source_names(source_ids, source_names)
             per_mb_source_ids.append(source_ids)
             per_mb_position_ids.append(position_ids)
             per_mb_attention_masks.append(attention_mask)
-            per_mb_packed_cu_seqlens.append(packed_cu_seqlens)
-            per_mb_packed_global_cu_seqlens.append(packed_global_cu_seqlens)
-            per_mb_packed_global_physical_seq_lens.append(packed_global_physical_seq_len)
-            per_mb_tail_padding_lengths.append(tail_padding_length)
+            per_mb_packed_cu_seqlens.append(packed_cu)
+            per_mb_packed_global_cu_seqlens.append(global_cu)
+            per_mb_packed_global_physical_seq_lens.append(global_width)
+            per_mb_tail_padding_lengths.append(tail_padding)
 
+        if self.config.strict:
+            self._require_source_ids([] if missing else [True])
         self.computer.begin_step(
             per_mb_source_ids,
             per_mb_position_ids,
@@ -1625,8 +1187,6 @@ class ChannelLossCallback(Callback):
             per_mb_packed_global_physical_seq_lens,
             per_mb_tail_padding_lengths,
         )
-        if self.config.strict:
-            self._raise_if_missing_source_ids(missing_source_micro_steps)
 
     @staticmethod
     def _repeat_source_metadata(
@@ -1642,13 +1202,18 @@ class ChannelLossCallback(Callback):
             source_names = [source_name for source_name in source_names for _ in range(repeat)]
         return repeated_ids, source_names
 
-    def _raise_if_missing_source_ids(self, local_missing_micro_steps: list[int]) -> None:
-        if not self._synchronize_strict_failure(bool(local_missing_micro_steps)):
+    def _require_source_ids(self, source_ids: list[ChannelKey]) -> None:
+        missing = not bool(source_ids)
+        ps = self.parallel_state
+        if ps.sp_enabled and ps.sp_group is not None and ps.sp_size > 1 and dist.is_initialized():
+            flag = torch.tensor([int(missing)], dtype=torch.int32, device=_collective_device(ps.sp_group))
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=ps.sp_group)
+            missing = bool(flag.item())
+        if not missing:
             return
         raise ValueError(
-            "train.channel_loss.enable=True but no configured source ID was found in a micro-batch on at least "
-            f"one rank. Checked keys: {self.config.source_id_keys}; "
-            f"local missing micro-batch indices: {local_missing_micro_steps}."
+            "train.channel_loss.enable=True but no configured source ID was found in a micro-batch. "
+            f"Checked keys: {self.config.source_id_keys}."
         )
 
     def on_micro_step_begin(
@@ -1701,31 +1266,9 @@ class ChannelLossCallback(Callback):
         if not self._collect_step:
             return
 
-        if self.config.strict and self._synchronize_missing_observation():
-            raise ChannelLossMetadataError(
-                "Channel loss: sampled micro-step had source metadata but produced no causal-LM CE observation "
-                "or raised a channel-loss observation error "
-                f"(local missing micro-step indices: {self.computer.missing_observation_micro_steps}; "
-                f"local observation errors: {self.computer.strict_observation_errors})."
-            )
-
-        strict_reduction_errors: list[str] = []
-        totals, source_names = self._reduce_step_totals(
-            self.computer.step_totals,
-            strict_errors=strict_reduction_errors if self.config.strict else None,
-        )
+        totals, source_names = self._reduce_step_totals(self.computer.step_totals)
         if not totals:
-            if self.config.strict and any(self.computer._per_mb_source_ids):
-                strict_reduction_errors.append(
-                    "Channel loss: sampled optimizer step had source metadata but produced no causal-LM CE totals. "
-                    "The model forward did not invoke an observed loss path."
-                )
-            if self.config.strict:
-                self._raise_if_strict_post_collective_failure(strict_reduction_errors)
             return
-
-        if self.config.strict:
-            self._raise_if_strict_post_collective_failure(strict_reduction_errors)
 
         metrics = self._build_metrics(totals, source_names)
         if not metrics:
@@ -1739,35 +1282,9 @@ class ChannelLossCallback(Callback):
         self.trainer.step_train_metrics.update(metrics)
         self.trainer.step_env_metrics.update(metrics)
 
-    def _synchronize_missing_observation(self) -> bool:
-        missing = bool(self.computer.missing_observation_micro_steps or self.computer.strict_observation_errors)
-        return self._synchronize_strict_failure(missing)
-
-    def _synchronize_strict_failure(self, failed: bool) -> bool:
-        if not dist.is_available() or not dist.is_initialized():
-            return failed
-
-        device = self._totals_device(self.computer.step_totals)
-        failure_count = torch.tensor(int(failed), dtype=torch.int64, device=device)
-        # This helper is called only at a common world boundary, before any
-        # group-specific collective or after every such collective completes.
-        dist.all_reduce(failure_count)
-        return bool(failure_count.cpu().item())
-
-    def _raise_if_strict_post_collective_failure(self, local_errors: list[str]) -> None:
-        if not self._synchronize_strict_failure(bool(local_errors)):
-            return
-        local_detail = " | ".join(local_errors) if local_errors else "none on this rank"
-        raise ChannelLossMetadataError(
-            "Channel loss: strict reduction/registry validation failed on at least one rank after all "
-            f"group-specific collectives completed (local errors: {local_detail})."
-        )
-
     def _reduce_step_totals(
         self,
         local_totals: dict[ChannelKey, tuple[torch.Tensor, torch.Tensor]],
-        *,
-        strict_errors: list[str] | None = None,
     ) -> tuple[dict[ChannelKey, tuple[float, int]], dict[ChannelKey, str]]:
         ps = self.parallel_state
         dp_size = ps.dp_size
@@ -1803,11 +1320,8 @@ class ChannelLossCallback(Callback):
             if len(candidates) > 1:
                 msg = f"Channel loss: source_id={source_id!r} has inconsistent names across DP ranks: {candidates}."
                 if self.config.strict:
-                    if strict_errors is None:
-                        raise ChannelLossMetadataError(msg)
-                    strict_errors.append(msg)
-                else:
-                    logger.warning_rank0(msg + " Using the lexicographically first name.")
+                    raise ChannelLossMetadataError(msg)
+                logger.warning_rank0(msg + " Using the lexicographically first name.")
             if candidates:
                 synchronized_names[source_id] = candidates[0]
 
@@ -1830,19 +1344,13 @@ class ChannelLossCallback(Callback):
             source_id: (float(loss_values[index]), int(token_values[index]))
             for index, source_id in enumerate(source_ids)
         }
-        registered_names = self._register_sources(
-            source_ids,
-            synchronized_names,
-            strict_errors=strict_errors,
-        )
+        registered_names = self._register_sources(source_ids, synchronized_names)
         return totals, registered_names
 
     def _register_sources(
         self,
         source_ids: list[ChannelKey],
         source_names: dict[ChannelKey, str] | None = None,
-        *,
-        strict_errors: list[str] | None = None,
     ) -> dict[ChannelKey, str]:
         source_names = source_names or {}
         for source_id in source_ids:
@@ -1861,11 +1369,8 @@ class ChannelLossCallback(Callback):
             candidates = sorted({registered_name, incoming_name})
             msg = f"Channel loss: source_id={source_id!r} has inconsistent names across sampled steps: {candidates}."
             if self.config.strict:
-                if strict_errors is None:
-                    raise ChannelLossMetadataError(msg)
-                strict_errors.append(msg)
-            else:
-                logger.warning_once(msg + " Using the lexicographically first name.")
+                raise ChannelLossMetadataError(msg)
+            logger.warning_once(msg + " Using the lexicographically first name.")
             self._source_registry[source_id] = candidates[0]
 
         registered_names = {
@@ -1970,41 +1475,32 @@ class ChannelLossCallback(Callback):
             source_ids = self._first_present_list(micro_batch, self.config.source_id_keys, _as_channel_key_list)
             source_names = self._first_present_list(micro_batch, self.config.source_name_keys, _as_str_list)
             position_ids = micro_batch.get("position_ids")
-            # Headwise CP keeps the full attention mask for full-attention
-            # kernels, while its router mask is rank-local and excludes the
-            # per-sample CP padding. Channel-loss metadata must follow the
-            # local labels/positions rather than the global full-attention
-            # shape.
-            labels = micro_batch.get("labels")
-            global_attention_mask = micro_batch.get("attention_mask")
-            packed_global_physical_seq_len = None
-            router_attention_mask = micro_batch.get("router_attention_mask")
+            attention_mask = micro_batch.get("attention_mask")
+            global_width = None
+            router_mask, labels = micro_batch.get("router_attention_mask"), micro_batch.get("labels")
             if (
-                isinstance(router_attention_mask, torch.Tensor)
+                isinstance(router_mask, torch.Tensor)
                 and isinstance(labels, torch.Tensor)
-                and router_attention_mask.numel() == labels.numel()
+                and router_mask.numel() == labels.numel()
             ):
-                attention_mask = router_attention_mask
-                if isinstance(global_attention_mask, torch.Tensor):
-                    packed_global_physical_seq_len = int(global_attention_mask.numel())
-            else:
-                attention_mask = global_attention_mask
-            packed_cu_seqlens = micro_batch.get("cu_seqlens_list_q")
-            if packed_cu_seqlens is None:
-                packed_cu_seqlens = micro_batch.get("cu_seq_lens_q")
-            packed_global_cu_seqlens = micro_batch.get("linear_attn_cu_seqlens_list_q")
-            if packed_global_cu_seqlens is None:
-                packed_global_cu_seqlens = micro_batch.get("linear_attn_cu_seq_lens_q")
-            tail_padding_length = micro_batch.get("tail_padding_length")
+                if isinstance(attention_mask, torch.Tensor):
+                    global_width = attention_mask.numel()
+                attention_mask = router_mask
+            packed_cu = micro_batch.get("cu_seqlens_list_q")
+            if packed_cu is None:
+                packed_cu = micro_batch.get("cu_seq_lens_q")
+            global_cu = micro_batch.get("linear_attn_cu_seqlens_list_q")
+            if global_cu is None:
+                global_cu = micro_batch.get("linear_attn_cu_seq_lens_q")
             return (
                 source_ids,
                 source_names,
                 position_ids if isinstance(position_ids, torch.Tensor) else None,
                 attention_mask if isinstance(attention_mask, torch.Tensor) else None,
-                packed_cu_seqlens,
-                packed_global_cu_seqlens,
-                packed_global_physical_seq_len,
-                tail_padding_length,
+                packed_cu,
+                global_cu,
+                global_width,
+                micro_batch.get("tail_padding_length"),
             )
 
         if isinstance(micro_batch, (list, tuple)):
@@ -2029,6 +1525,24 @@ class ChannelLossCallback(Callback):
             if key in batch:
                 return converter(batch[key])
         return []
+
+
+def _packed_cu_points(value: Any | None) -> tuple[list[int] | None, str | None]:
+    if value is None:
+        return None, None
+    if isinstance(value, torch.Tensor):
+        if value.ndim != 1 or value.dtype not in (torch.int32, torch.int64):
+            return None, "expected a one-dimensional int32/int64 tensor"
+        points = value.detach().cpu().tolist()
+    elif isinstance(value, (list, tuple)):
+        points = list(value)
+    else:
+        return None, f"expected a tensor/list/tuple, got {type(value).__name__}"
+    if not points or any(not isinstance(point, Integral) or isinstance(point, bool) for point in points):
+        return None, "CU points must be a nonempty list of integers"
+    if points[0] != 0 or any(end < start for start, end in zip(points, points[1:])):
+        return None, "CU points must start at zero and be nondecreasing"
+    return [int(point) for point in points], None
 
 
 def _as_flat_list(value: Any) -> list[Any]:
@@ -2087,167 +1601,6 @@ def _position_aligned_attention_mask_flat(
     if attention_mask.numel() == labels.numel() or attention_mask.numel() == effective_labels.numel():
         return attention_mask.reshape(-1)
     return None
-
-
-def _rank_local_packed_source_spans(
-    packed_cu_seqlens: Any | None,
-    *,
-    packed_global_cu_seqlens: Any | None,
-    packed_global_physical_seq_len: int | None,
-    source_count: int,
-    seq_len: int,
-    sp_size: int,
-    labels_flat: torch.Tensor,
-    positions_flat: torch.Tensor,
-    attention_mask_flat: torch.Tensor | None,
-    ignore_index: int,
-    tail_padding_length: Any | None,
-) -> tuple[list[tuple[int, int]] | None, int | None, str | None]:
-    """Resolve authoritative rank-local packed spans when they match sources.
-
-    Standard contiguous Ulysses can retain global CU metadata after slicing;
-    its final CU point therefore does not match the rank-local loss width and
-    deliberately falls back to position-based alignment. Headwise CP instead
-    publishes one local CU span per packed source, plus at most one explicit
-    padding-only tail span introduced by ``pad_to_length``.
-    """
-
-    points, points_error = _packed_cu_points(packed_cu_seqlens)
-    if points_error is not None:
-        return None, None, f"Channel loss: invalid packed CU metadata: {points_error}."
-    if points is None:
-        return None, None, None
-    if points[-1] != seq_len:
-        # Standard contiguous Ulysses retains the same authoritative global CU
-        # in both FA and linear-attention metadata while labels/loss are sliced.
-        # Do not infer that provenance from an endpoint mismatch alone: stale
-        # rank-local metadata must fail closed instead of falling back to
-        # position-based source alignment.
-        global_points, global_points_error = _packed_cu_points(packed_global_cu_seqlens)
-        if global_points_error is not None:
-            return None, None, f"Channel loss: invalid global packed CU metadata: {global_points_error}."
-        expected_global_width = seq_len * sp_size
-        if global_points is None or global_points != points or points[-1] != expected_global_width:
-            return (
-                None,
-                None,
-                (
-                    "Channel loss: packed CU endpoint does not match the local loss width and lacks "
-                    "standard-Ulysses global provenance "
-                    f"(endpoint={points[-1]}, local_width={seq_len}, sp_size={sp_size})."
-                ),
-            )
-        return None, None, None
-
-    spans = list(zip(points, points[1:]))
-    if len(spans) == source_count:
-        return spans, len(spans), None
-    if len(spans) != source_count + 1:
-        return None, len(spans), None
-    # ``tail_padding_length`` is emitted by the collator from the exact
-    # pre-padding sequence length. Without that provenance, an empty or
-    # unsupervised real sample is indistinguishable from synthetic padding.
-    tail_padding_length = _optional_non_negative_int(tail_padding_length)
-    if tail_padding_length is None or tail_padding_length <= 0:
-        return None, len(spans), None
-
-    global_points, global_points_error = _packed_cu_points(packed_global_cu_seqlens)
-    if global_points_error is not None:
-        return None, None, f"Channel loss: invalid global packed CU metadata: {global_points_error}."
-    if global_points is None:
-        return None, len(spans), None
-    global_spans = list(zip(global_points, global_points[1:]))
-    if len(global_spans) != source_count + 1:
-        return (
-            None,
-            None,
-            (
-                "Channel loss: global packed CU metadata does not prove the synthetic tail "
-                f"(source_count={source_count}, global_segment_count={len(global_spans)})."
-            ),
-        )
-    global_tail_start, global_tail_end = global_spans[-1]
-    if global_tail_end - global_tail_start != tail_padding_length:
-        return (
-            None,
-            None,
-            (
-                "Channel loss: tail_padding_length does not match the global packed CU tail "
-                f"({tail_padding_length} != {global_tail_end - global_tail_start})."
-            ),
-        )
-
-    global_physical_seq_len = _optional_non_negative_int(packed_global_physical_seq_len)
-    if global_physical_seq_len is None:
-        return (
-            None,
-            None,
-            "Channel loss: synthetic tail requires the global physical packed width from the same microbatch.",
-        )
-    if global_physical_seq_len != seq_len * sp_size:
-        return (
-            None,
-            None,
-            (
-                "Channel loss: global physical packed width does not match the local SP shard "
-                f"({global_physical_seq_len} != {seq_len} * {sp_size})."
-            ),
-        )
-
-    sample_multiple = 2 * sp_size
-    global_lengths = [end - start for start, end in global_spans]
-    padded_global_lengths = [
-        ((length + sample_multiple - 1) // sample_multiple) * sample_multiple for length in global_lengths
-    ]
-    local_lengths = [end - start for start, end in spans]
-    expected_local_lengths = [length // sp_size for length in padded_global_lengths]
-    if sum(padded_global_lengths) != global_physical_seq_len or local_lengths != expected_local_lengths:
-        return (
-            None,
-            None,
-            (
-                "Channel loss: global/local packed CU metadata do not describe the same headwise microbatch "
-                f"(global_physical_width={global_physical_seq_len}, "
-                f"expected_local_lengths={expected_local_lengths}, local_lengths={local_lengths})."
-            ),
-        )
-
-    tail_start, tail_end = spans[-1]
-    if tail_start == tail_end:
-        return spans[:-1], len(spans) - 1, None
-    tail_mask = attention_mask_flat[tail_start:tail_end] if attention_mask_flat is not None else None
-    if not _is_padding_only_segment(
-        labels_slice=labels_flat[tail_start:tail_end],
-        positions_slice=positions_flat[tail_start:tail_end],
-        attention_mask_slice=tail_mask,
-        ignore_index=ignore_index,
-    ):
-        return None, len(spans), None
-    return spans[:-1], len(spans) - 1, None
-
-
-def _packed_cu_points(value: Any | None) -> tuple[list[int] | None, str | None]:
-    if value is None:
-        return None, None
-    if isinstance(value, torch.Tensor):
-        if value.ndim != 1 or value.dtype not in (torch.int32, torch.int64):
-            return None, "expected a one-dimensional int32/int64 tensor"
-        raw_points = value.detach().cpu().tolist()
-    elif isinstance(value, (list, tuple)):
-        raw_points = list(value)
-    else:
-        return None, f"expected a tensor/list/tuple, got {type(value).__name__}"
-
-    points: list[int] = []
-    for point in raw_points:
-        if isinstance(point, bool) or not isinstance(point, Integral):
-            return None, "all CU points must be integers"
-        points.append(int(point))
-    if not points or points[0] != 0:
-        return None, "CU points must start at zero"
-    if any(end < start for start, end in zip(points, points[1:])):
-        return None, "CU points must be non-decreasing"
-    return points, None
 
 
 def _filter_surplus_tail_padding_segments(
@@ -2409,17 +1762,6 @@ def _validate_segment_count(segment_count: int, source_count: int, strict: bool,
     return False
 
 
-def _optional_non_negative_int(value: Any) -> int | None:
-    if isinstance(value, torch.Tensor):
-        if value.numel() != 1 or value.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8):
-            return None
-        value = value.detach().cpu().item()
-    if isinstance(value, bool) or not isinstance(value, Integral):
-        return None
-    value = int(value)
-    return value if value >= 0 else None
-
-
 def _as_channel_key_list(value: Any) -> list[ChannelKey]:
     result: list[ChannelKey] = []
     for item in _as_flat_list(value):
@@ -2447,31 +1789,6 @@ def _as_str_list(value: Any) -> list[str]:
         if text:
             result.append(text)
     return result
-
-
-def _as_scalar_tensor(
-    value: Any,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-    name: str,
-) -> torch.Tensor:
-    tensor = torch.as_tensor(value, device=device, dtype=dtype)
-    if tensor.numel() != 1:
-        raise ChannelLossMetadataError(
-            f"Channel loss: local SP {name} must be scalar, got shape={tuple(tensor.shape)}."
-        )
-    return tensor.reshape(())
-
-
-def _source_id_signature(source_ids: list[ChannelKey]) -> tuple[tuple[str, str], ...]:
-    return tuple((type(source_id).__name__, repr(source_id)) for source_id in source_ids)
-
-
-def _format_capture_errors(errors: list[tuple[str, str]]) -> str:
-    return "Channel loss observation failed: " + " | ".join(
-        f"{error_type}: {message}" for error_type, message in errors
-    )
 
 
 def _sanitize_metric_fragment(value: Any) -> str:
