@@ -1,5 +1,6 @@
 from copy import deepcopy
 
+import torch
 from transformers import PretrainedConfig
 
 
@@ -57,6 +58,11 @@ class HunyuanVideo15Config(PretrainedConfig):
         return {key: getattr(self, key) for key in NATIVE_DEFAULTS}
 
 
+def _normalize_condition_dtype(dtype):
+    # HF only serializes torch.dtype values automatically for its own dtype field.
+    return str(dtype).removeprefix("torch.") if isinstance(dtype, torch.dtype) else dtype
+
+
 class HunyuanVideo15ConditionConfig(PretrainedConfig):
     model_type = "HunyuanVideo15ConditionModel"
 
@@ -78,7 +84,7 @@ class HunyuanVideo15ConditionConfig(PretrainedConfig):
         # Accept older condition configs without setting HF's construction dtype.
         legacy_dtype = kwargs.pop("dtype", None)
         super().__init__(**kwargs)
-        self.condition_dtype = legacy_dtype or condition_dtype
+        self.condition_dtype = _normalize_condition_dtype(legacy_dtype or condition_dtype)
         self.base_model_path = base_model_path
         self.seed = seed
         self.generator_device = generator_device
@@ -99,6 +105,8 @@ class HunyuanVideo15ConditionConfig(PretrainedConfig):
         legacy_dtype = kwargs.pop("dtype", None)
         if legacy_dtype is not None:
             kwargs.setdefault("condition_dtype", legacy_dtype)
+        if "condition_dtype" in kwargs:
+            kwargs["condition_dtype"] = _normalize_condition_dtype(kwargs["condition_dtype"])
         return super().from_dict(config_dict, **kwargs)
 
     @classmethod

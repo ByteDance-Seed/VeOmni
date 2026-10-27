@@ -1,5 +1,6 @@
 """CPU/GPU/NPU correctness checks; full pretrained trainer acceptance is separate."""
 
+import json
 import os
 
 import pytest
@@ -60,8 +61,11 @@ def batch(glyph=False):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("dtype_key", ["condition_dtype", "dtype"])
-@pytest.mark.parametrize("config_source", ["constructor", "from_dict", "from_pretrained"])
-def test_condition_construction_preserves_component_dtypes(monkeypatch, tmp_path, dtype_key, config_source):
+@pytest.mark.parametrize("dtype_value", ["bfloat16", torch.bfloat16], ids=["string", "torch_dtype"])
+@pytest.mark.parametrize("config_source", ["constructor", "dict_payload", "from_dict", "from_pretrained"])
+def test_condition_construction_preserves_component_dtypes(
+    monkeypatch, tmp_path, dtype_key, dtype_value, config_source
+):
     from veomni.models.diffusers.hunyuanvideo15.configuration_hunyuanvideo15 import HunyuanVideo15ConditionConfig
     from veomni.models.diffusers.hunyuanvideo15.modeling_hunyuanvideo15_condition import HunyuanVideo15ConditionModel
 
@@ -74,12 +78,14 @@ def test_condition_construction_preserves_component_dtypes(monkeypatch, tmp_path
         self.byt5_model = torch.nn.Linear(2, 2, device=device)
 
     monkeypatch.setattr(HunyuanVideo15ConditionModel, "_load_components", load_components)
-    overrides = {"generator_device": "cpu", dtype_key: "bfloat16"}
+    overrides = {"generator_device": "cpu", dtype_key: dtype_value}
     if config_source == "from_pretrained":
         (tmp_path / "config.json").write_text("{}")
         config = HunyuanVideo15ConditionConfig.from_pretrained(tmp_path, **overrides)
     elif config_source == "from_dict":
-        config = HunyuanVideo15ConditionConfig.from_dict({}, **overrides)
+        config = HunyuanVideo15ConditionConfig.from_dict({"condition_dtype": "float32"}, **overrides)
+    elif config_source == "dict_payload":
+        config = HunyuanVideo15ConditionConfig.from_dict(overrides)
     else:
         config = HunyuanVideo15ConditionConfig(**overrides)
     # Exercise the trainer's actual Transformers construction entry point.
@@ -91,7 +97,9 @@ def test_condition_construction_preserves_component_dtypes(monkeypatch, tmp_path
     assert model.byt5_model.weight.dtype == torch.float32
     assert not any(parameter.requires_grad for parameter in model.parameters())
     config.save_pretrained(tmp_path)
-    restored = HunyuanVideo15ConditionConfig(**config.to_dict())
+    saved = json.loads((tmp_path / "config.json").read_text())
+    assert saved["condition_dtype"] == "bfloat16"
+    restored = HunyuanVideo15ConditionConfig.from_dict(saved)
     assert restored.condition_dtype == "bfloat16" and restored.dtype is None
     result = model.process_condition(
         latents=[torch.randn(1, 2, 1, 2, 2)],

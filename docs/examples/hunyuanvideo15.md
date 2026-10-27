@@ -33,7 +33,10 @@ unverified**. Real-data training requires the complete pretrained components.
   and trainable inputs in bf16. `model.condition_model_cfg.condition_dtype`
   controls the returned training inputs (default `bfloat16`), independently of
   the frozen encoders' dtypes. The older condition-config `dtype` key remains
-  an input alias. Model mixed precision is owned by FSDP2.
+  an input alias. Python callers may pass either a string such as `"bfloat16"`
+  or a `torch.dtype` such as `torch.bfloat16` to either key; configuration
+  loading normalizes these values to strings for JSON serialization.
+  Model mixed precision is owned by FSDP2.
   The unused T2V vision projection is frozen while retaining all checkpoint keys.
 - Native block activation checkpointing is supported. FSDP2 uses the generic
   runtime; no ExtraParallel plan is introduced. The historical comparison used
