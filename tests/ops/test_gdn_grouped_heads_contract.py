@@ -39,7 +39,6 @@ from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_g
 from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu import (
     get_parallel_state as qwen4_exp_get_parallel_state,
 )
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -112,20 +111,18 @@ def _make_config(model_name: str):
 
 
 def _build_layer(model_name: str, impl: str, calls: list[dict[str, object]]):
+    from tests.models.compare import eager_ops_config
+
     config = _make_config(model_name)
-    prev_cfg = get_ops_config()
-    set_ops_config(None)
-    try:
-        if model_name == "qwen3_5":
-            layer = Qwen3_5GatedDeltaNet(config, layer_idx=0)
-        elif model_name == "qwen3_5_moe":
-            layer = Qwen3_5MoeGatedDeltaNet(config, layer_idx=0)
-        elif model_name == "qwen4_exp":
-            layer = Qwen4ExpTextGatedDeltaNet(config, layer_idx=0)
-        else:
-            raise ValueError(f"Unsupported model_name={model_name!r}")
-    finally:
-        set_ops_config(prev_cfg)
+    config._set_ops_implementation(eager_ops_config())
+    if model_name == "qwen3_5":
+        layer = Qwen3_5GatedDeltaNet(config, layer_idx=0)
+    elif model_name == "qwen3_5_moe":
+        layer = Qwen3_5MoeGatedDeltaNet(config, layer_idx=0)
+    elif model_name == "qwen4_exp":
+        layer = Qwen4ExpTextGatedDeltaNet(config, layer_idx=0)
+    else:
+        raise ValueError(f"Unsupported model_name={model_name!r}")
 
     layer.veomni_causal_conv1d = _PassthroughConv1d(impl=impl)
     layer.veomni_chunk_gated_delta_rule = _RecordingGdnOp(impl=impl, calls=calls)

@@ -27,7 +27,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.models.compare import eager_ops_config, ops_config_scope, qwen_image_inputs, stamp_attn_implementation
+from tests.models.compare import eager_ops_config, qwen_image_inputs, stamp_attn_implementation
 from tests.models.tiny_configs import (
     tiny_deepseek_v3_config,
     tiny_deepseek_v4_config,
@@ -48,33 +48,34 @@ from veomni.ops import VeomniOp
 @pytest.mark.parametrize("impl", ["torch_npu", "npu"])
 @pytest.mark.parametrize("family", ["flux", "ltx2_3", "deepseek_v4"])
 def test_unweighted_rms_norm_preserves_explicit_npu_compatibility(family, impl):
-    if family == "ltx2_3":
-        # Package imports construct standard-op defaults before the instance
-        # below exercises its unweighted compatibility alias.
-        with ops_config_scope(eager_ops_config()):
-            from veomni.models.diffusers.ltx2_3.ltx_core.model.transformer.ops import PytorchAdaZeroFunction
-
     cfg = eager_ops_config()
     cfg.rms_norm_implementation = impl
-    with ops_config_scope(cfg):
-        if family == "flux":
-            from veomni.models.transformers.flux.modeling_flux import RMSNorm
+    if family == "flux":
+        from veomni.models.transformers.flux.modeling_flux import RMSNorm
 
-            handle = RMSNorm(8, eps=1e-6, elementwise_affine=False).veomni_rms_norm
-        elif family == "ltx2_3":
-            handle = PytorchAdaZeroFunction().veomni_rms_norm
-        else:
-            from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
-                DeepseekV4UnweightedRMSNorm,
-            )
+        model_cfg = tiny_flux_config()
+        model_cfg._set_ops_implementation(cfg)
+        handle = RMSNorm(8, eps=1e-6, elementwise_affine=False, config=model_cfg).veomni_rms_norm
+    elif family == "ltx2_3":
+        from veomni.models.diffusers.ltx2_3.ltx_core.model.transformer.ops import PytorchAdaZeroFunction
 
-            handle = DeepseekV4UnweightedRMSNorm().veomni_unweighted_rms_norm
-        assert cfg.rms_norm_implementation == impl
-        assert handle.variant == "unweighted"
-        assert handle.impl == "eager"
-        hidden = torch.randn(2, 8)
-        expected = hidden * torch.rsqrt(hidden.square().mean(-1, keepdim=True) + 1e-6)
-        torch.testing.assert_close(handle(hidden, eps=1e-6), expected)
+        model_cfg = tiny_ltx2_3_config()
+        model_cfg._set_ops_implementation(cfg)
+        handle = PytorchAdaZeroFunction(config=model_cfg).veomni_rms_norm
+    else:
+        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+            DeepseekV4UnweightedRMSNorm,
+        )
+
+        model_cfg = tiny_deepseek_v4_config()
+        model_cfg._set_ops_implementation(cfg)
+        handle = DeepseekV4UnweightedRMSNorm(config=model_cfg).veomni_unweighted_rms_norm
+    assert cfg.rms_norm_implementation == impl
+    assert handle.variant == "unweighted"
+    assert handle.impl == "eager"
+    hidden = torch.randn(2, 8)
+    expected = hidden * torch.rsqrt(hidden.square().mean(-1, keepdim=True) + 1e-6)
+    torch.testing.assert_close(handle(hidden, eps=1e-6), expected)
 
 
 def _output_tensor(result):
@@ -126,15 +127,17 @@ def _assert_isolated(
     poison_cfg: SimpleNamespace,
     hf_config: object | None = None,
 ) -> None:
-    stamp_attn_implementation(hf_config, eager_cfg.attn_implementation)
-    with ops_config_scope(eager_cfg):
-        seed = build()
-        state = {key: value.detach().clone() for key, value in seed.state_dict().items()}
+    if hf_config is not None:
+        stamp_attn_implementation(hf_config, eager_cfg.attn_implementation)
+        hf_config._set_ops_implementation(eager_cfg)
+    seed = build()
+    state = {key: value.detach().clone() for key, value in seed.state_dict().items()}
 
     def construct(cfg: SimpleNamespace) -> torch.nn.Module:
-        stamp_attn_implementation(hf_config, cfg.attn_implementation)
-        with ops_config_scope(cfg):
-            model = build()
+        if hf_config is not None:
+            stamp_attn_implementation(hf_config, cfg.attn_implementation)
+            hf_config._set_ops_implementation(cfg)
+        model = build()
         model.load_state_dict(state)
         model.eval()
         return model
@@ -151,15 +154,17 @@ def _assert_isolated(
     check(alternate, alt_cfg.attn_implementation)
 
     with torch.no_grad():
-        with ops_config_scope(eager_cfg):
-            eager_ref = _output_tensor(run(eager))
-        with ops_config_scope(alt_cfg):
-            alt_ref = _output_tensor(run(alternate))
-        with ops_config_scope(poison_cfg):
-            eager_out = _output_tensor(run(eager))
-            alt_out = _output_tensor(run(alternate))
-            check(eager, eager_cfg.attn_implementation)
-            check(alternate, alt_cfg.attn_implementation)
+        eager_ref = _output_tensor(run(eager))
+        alt_ref = _output_tensor(run(alternate))
+        if hf_config is not None:
+            from veomni.models.auto import _iter_configs
+
+            for sub_cfg in _iter_configs(hf_config):
+                sub_cfg.ops_implementation = dict(vars(poison_cfg))
+        eager_out = _output_tensor(run(eager))
+        alt_out = _output_tensor(run(alternate))
+        check(eager, eager_cfg.attn_implementation)
+        check(alternate, alt_cfg.attn_implementation)
 
     torch.testing.assert_close(eager_out, eager_ref)
     torch.testing.assert_close(alt_out, alt_ref)
@@ -223,6 +228,7 @@ def test_wan_condition_forward_keeps_construction_impls():
         eager_cfg=_attn_cfg("eager"),
         alt_cfg=_attn_cfg("sdpa"),
         poison_cfg=_poison_cfg(),
+        hf_config=config,
     )
 
 
@@ -247,6 +253,7 @@ def test_flux_forward_keeps_construction_impls():
         eager_cfg=_attn_cfg("sdpa"),
         alt_cfg=_attn_cfg("veomni_sdpa"),
         poison_cfg=_poison_cfg(),
+        hf_config=config,
     )
 
 
@@ -282,6 +289,7 @@ def test_ltx_forward_keeps_construction_impls(monkeypatch):
         eager_cfg=_attn_cfg("sdpa"),
         alt_cfg=_attn_cfg("veomni_sdpa"),
         poison_cfg=_poison_cfg(),
+        hf_config=config,
     )
 
 
@@ -323,6 +331,7 @@ def test_minimax_h3_forward_keeps_construction_impls():
         eager_cfg=_attn_cfg("sdpa"),
         alt_cfg=_attn_cfg("veomni_sdpa"),
         poison_cfg=_poison_cfg(),
+        hf_config=config,
     )
 
 
@@ -346,6 +355,7 @@ def test_qwen_image_forward_keeps_construction_impls():
         eager_cfg=_attn_cfg("sdpa"),
         alt_cfg=_attn_cfg("veomni_sdpa"),
         poison_cfg=_poison_cfg(),
+        hf_config=config,
     )
 
 
@@ -410,13 +420,15 @@ def test_gemma3_eager_instance_keeps_first_token_causal_after_global_sdpa_switch
     from veomni.models.transformers.gemma3.generated.patched_modeling_gemma3_gpu import Gemma3ForCausalLM
 
     config = tiny_gemma3_text_config()
-    with ops_config_scope(_attn_cfg("eager")):
-        model = Gemma3ForCausalLM(config).eval()
+    config._set_ops_implementation(_attn_cfg("eager"))
+    model = Gemma3ForCausalLM(config).eval()
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
     mutated = input_ids.clone()
     mutated[:, -1] = (mutated[:, -1] + 3) % config.vocab_size
     sdpa_cfg = _attn_cfg("sdpa")
-    with torch.no_grad(), ops_config_scope(sdpa_cfg):
+    other_config = tiny_gemma3_text_config()
+    other_config._set_ops_implementation(sdpa_cfg)
+    with torch.no_grad():
         logits = model(input_ids=input_ids, use_cache=False).logits
         mutated_logits = model(input_ids=mutated, use_cache=False).logits
     torch.testing.assert_close(logits[:, 0], mutated_logits[:, 0])
@@ -441,13 +453,13 @@ def test_deepseek_v3_rope_keeps_construction_impl():
     poison = eager_ops_config()
     poison.rotary_pos_emb_implementation = "triton"
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
-    with ops_config_scope(eager_cfg):
-        model = DeepseekV3ForCausalLM(config).eval()
+    config._set_ops_implementation(eager_cfg)
+    model = DeepseekV3ForCausalLM(config).eval()
     assert model.model.layers[0].self_attn.veomni_rope.impl == "eager"
     assert model.model.rotary_emb.veomni_rope_use_triton is False
-    with torch.no_grad(), ops_config_scope(eager_cfg):
+    with torch.no_grad():
         reference = model(input_ids=input_ids, use_cache=False).logits
-    with torch.no_grad(), ops_config_scope(poison):
+        config._set_ops_implementation(poison)
         isolated = model(input_ids=input_ids, use_cache=False).logits
         assert model.model.layers[0].self_attn.veomni_rope.impl == "eager"
         assert model.model.rotary_emb.veomni_rope_use_triton is False
@@ -471,12 +483,12 @@ def test_deepseek_v4_rope_keeps_construction_impl():
     poison = eager_ops_config()
     poison.rotary_pos_emb_implementation = "triton"
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
-    with ops_config_scope(eager_cfg):
-        model = DeepseekV4ForCausalLM(config).eval()
+    config._set_ops_implementation(eager_cfg)
+    model = DeepseekV4ForCausalLM(config).eval()
     assert model.model.layers[0].self_attn.veomni_rope.impl == "eager"
-    with torch.no_grad(), ops_config_scope(eager_cfg):
+    with torch.no_grad():
         reference = model(input_ids=input_ids, use_cache=False).logits
-    with torch.no_grad(), ops_config_scope(poison):
+        config._set_ops_implementation(poison)
         isolated = model(input_ids=input_ids, use_cache=False).logits
         assert model.model.layers[0].self_attn.veomni_rope.impl == "eager"
     torch.testing.assert_close(isolated, reference)

@@ -82,7 +82,7 @@ Use these separate mechanisms only when their semantics require them:
 4. Import the family from `veomni/ops/kernels/__init__.py` so registration
    happens when `veomni.ops` is imported.
 5. In each consuming model, construct a `VeomniOp` from
-   `resolve_op_impl(...)` and store it on the model/module instance.
+   `config.ops_config.<field>` and store it on the model/module instance.
 6. For a compound raw kernel, call the nested row's raw `forward`/`backward`
    and use the saved-state helpers in `veomni/ops/compound.py`; do not call
    the nested autograd wrapper.

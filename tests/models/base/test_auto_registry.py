@@ -24,7 +24,7 @@ import pytest
 from transformers import PretrainedConfig
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from tests.models.compare import eager_ops_config, ops_config_scope, stamp_attn_implementation
+from tests.models.compare import eager_ops_config, stamp_attn_implementation
 from tests.models.tiny_configs import (
     tiny_deepseek_v3_config as _tiny_deepseek_v3_config,
 )
@@ -129,7 +129,6 @@ from veomni.models import (
     get_model_class,
 )
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
@@ -189,9 +188,9 @@ class _ModelCase:
     # Representative integration points, not an exhaustive snapshot of model internals.
     eager_ops: tuple[tuple[str, str], ...] = (("veomni_ce", "cross_entropy_loss"),)
     isolation_op_path: str | None = None
-    # Attention that binds from ``config._attn_implementation`` needs the
-    # ops selection stamped before HF construction. resolve_op_impl families
-    # leave HF attn as eager; stamping sdpa makes PreTrainedModel reject them.
+    # Attention that binds from ``config.ops_config.attn_implementation`` needs the
+    # ops selection stamped before HF construction. Families that keep HF attn
+    # as eager leave HF attn as eager; stamping sdpa makes PreTrainedModel reject them.
     stamps_hf_attn: bool = True
     # Families without a local ``eager_attention_forward`` select ``veomni_sdpa`` for ``eager``.
     eager_attn_impl: str = "eager"
@@ -659,13 +658,12 @@ def test_build_foundation_model_requires_ops_config():
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
 def test_build_foundation_model_constructs_registered_model(model_case: _ModelCase):
     cfg = eager_ops_config()
-    with ops_config_scope(cfg):
-        model = build_foundation_model(
-            model_case.config_factory(model_case.architectures[0]),
-            torch_dtype="float32",
-            init_device="cpu",
-            ops_implementation=cfg,
-        )
+    model = build_foundation_model(
+        model_case.config_factory(model_case.architectures[0]),
+        torch_dtype="float32",
+        init_device="cpu",
+        ops_implementation=cfg,
+    )
     assert model.config.ops_implementation["rms_norm_implementation"] == "eager"
     assert model.__class__.__name__ == model_case.architectures[0]
     _assert_expected_generated_module_source(model_case.model_type, type(model))
@@ -718,23 +716,18 @@ def test_model_instances_keep_distinct_impls(model_case: _ModelCase, available_n
     This checks selection only; platform gates are stubbed and no optimized
     kernel executes. Family parity and ops tests own numerical execution.
     """
-    previous = get_ops_config()
     eager_config = eager_ops_config()
     selected_path = model_case.isolation_op_path or model_case.eager_ops[0][0]
     selected_op_name = next(op for path, op in model_case.eager_ops if path == selected_path)
 
     def construct(config):
         model_config = model_case.config_factory(model_case.architectures[0])
-        # HF-interface attention binds from ``config._attn_implementation``.
-        # VL nested ``to_dict()`` also drops the field and HF then defaults
-        # to sdpa, so eager construction must stamp as well.
         if selected_op_name == "attention" and model_case.stamps_hf_attn:
             stamp_attn_implementation(model_config, config.attn_implementation)
         model_config._set_ops_implementation(config)
-        with ops_config_scope(config):
-            model_cls = get_model_class(model_config)
-            _assert_expected_generated_module_source(model_case.model_type, model_cls)
-            return model_cls(model_config)
+        model_cls = get_model_class(model_config)
+        _assert_expected_generated_module_source(model_case.model_type, model_cls)
+        return model_cls(model_config)
 
     eager = construct(eager_config)
     selected_op = attrgetter(selected_path)
@@ -747,11 +740,8 @@ def test_model_instances_keep_distinct_impls(model_case: _ModelCase, available_n
     assert selected_op(alternate).impl == alternate_impl
     alternate_bindings = _op_bindings(alternate, selected_path)
 
-    for config in (alternate_config, eager_config, None):
-        with ops_config_scope(config):
-            assert _op_bindings(eager, selected_path) == eager_bindings
-            assert _op_bindings(alternate, selected_path) == alternate_bindings
-    assert get_ops_config() is previous
+    assert _op_bindings(eager, selected_path) == eager_bindings
+    assert _op_bindings(alternate, selected_path) == alternate_bindings
 
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)
@@ -809,14 +799,14 @@ def test_the_generic_hook_reaches_the_model_that_implements_it():
 
     cfg = eager_ops_config()
     cfg.dsa_indexer_implementation = "eager"
-    with ops_config_scope(cfg):
-        config = DeepseekV4Config(
-            num_hidden_layers=2,
-            layer_types=["compressed_sparse_attention"] * 2,
-            dsa_indexer_loss=True,
-        )
-        with pytest.raises(ValueError, match="dsa_indexer_implementation"):
-            check_model_build_prerequisites(config)
+    config = DeepseekV4Config(
+        num_hidden_layers=2,
+        layer_types=["compressed_sparse_attention"] * 2,
+        dsa_indexer_loss=True,
+        ops_implementation=cfg,
+    )
+    with pytest.raises(ValueError, match="dsa_indexer_implementation"):
+        check_model_build_prerequisites(config)
 
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)

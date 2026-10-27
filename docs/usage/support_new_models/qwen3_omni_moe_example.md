@@ -204,7 +204,6 @@ if sp_enabled and pixel_values is not None:
 The standard HuggingFace MoE uses `nn.ModuleList` of individual expert MLPs. VeOmni replaces this with a single module holding stacked 3D weight tensors and an instance-local `moe_experts` handle. `eager` is a registered row, not a separate `ModuleList` fork. EP sharding also requires the stacked layout.
 
 ```python
-from veomni.ops.config import resolve_op_impl
 from veomni.ops import VeomniOp
 
 
@@ -221,7 +220,7 @@ class YourModelExperts(nn.Module):
         self.down_proj = nn.Parameter(
             torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
         )
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
         unused = self.gate_up_proj.new_empty(0)
@@ -306,11 +305,10 @@ instance-local registry handle to get fused selection and correct SP loss reduct
 from functools import partial
 
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.ops.config import resolve_op_impl
 from veomni.ops import VeomniOp
 
 # In the model constructor:
-impl = resolve_op_impl("cross_entropy_loss_implementation")
+impl = config.ops_config.cross_entropy_loss_implementation
 self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
 self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
 

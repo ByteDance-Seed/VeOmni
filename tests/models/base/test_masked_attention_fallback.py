@@ -19,24 +19,29 @@ from __future__ import annotations
 import pytest
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from tests.models.compare import eager_ops_config, ops_config_scope
+from tests.models.compare import eager_ops_config
+from tests.models.tiny_configs import tiny_flux_config, tiny_qwen_image_config
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def _flux_joint_attention():
+def _flux_joint_attention(ops):
     from veomni.models.transformers.flux.modeling_flux import FluxJointAttention
 
-    return FluxJointAttention(32, 32, 4, 8)
+    cfg = tiny_flux_config()
+    cfg._set_ops_implementation(ops)
+    return FluxJointAttention(32, 32, 4, 8, config=cfg)
 
 
-def _qwen_image_processor():
+def _qwen_image_processor(ops):
     from veomni.models.diffusers.qwen_image.qwen_image_transformer.modeling_qwen_image_transformer import (
         QwenImageSPAttnProcessor,
     )
 
-    return QwenImageSPAttnProcessor()
+    cfg = tiny_qwen_image_config()
+    cfg._set_ops_implementation(ops)
+    return QwenImageSPAttnProcessor(cfg)
 
 
 @pytest.mark.parametrize(
@@ -49,8 +54,7 @@ def _qwen_image_processor():
 def test_masked_attention_falls_back_to_veomni_sdpa(available_nvidia_ops, build):
     ops = eager_ops_config()
     ops.attn_implementation = "flash_attention_2"
-    with ops_config_scope(ops):
-        module = build()
+    module = build(ops)
 
     assert module.veomni_attn.impl == "flash_attention_2"
     assert module.veomni_attn_masked.impl == "veomni_sdpa"

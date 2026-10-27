@@ -457,29 +457,22 @@ class TestGlmMoeDsaConverter:
         assert isinstance(converter, GlmMoeDsaCheckpointTensorConverter)
         assert converter.num_experts == 8
 
-    @pytest.fixture
-    def eager_ops(self):
-        from tests.tools.training_utils import make_eager_ops_config
-        from veomni.ops.config import get_ops_config, set_ops_config
-
-        previous = get_ops_config()
-        set_ops_config(make_eager_ops_config())
-        try:
-            yield
-        finally:
-            set_ops_config(previous)
-
     @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
-    def test_per_expert_checkpoint_loads_into_fused_experts(self, tmp_path, eager_ops):
+    def test_per_expert_checkpoint_loads_into_fused_experts(self, tmp_path):
         """The released GLM-5 layout: per-expert routed experts plus an unbuilt MTP layer."""
         from safetensors.torch import save_file
 
+        from tests.tools.training_utils import make_eager_ops_config
         from veomni.models.auto import build_foundation_model
         from veomni.models.checkpoint.weights import load_model_weights
 
         toy_config = Path(__file__).resolve().parents[2] / "toy_config" / "glm_moe_dsa_toy"
         model = build_foundation_model(
-            config_path=str(toy_config), weights_path=None, torch_dtype="float32", init_device="cpu"
+            config_path=str(toy_config),
+            weights_path=None,
+            torch_dtype="float32",
+            init_device="cpu",
+            ops_implementation=make_eager_ops_config(),
         )
         config = model.config
         generator = torch.Generator().manual_seed(0)
@@ -512,7 +505,11 @@ class TestGlmMoeDsaConverter:
         config.save_pretrained(tmp_path)
         save_file(on_disk, str(tmp_path / "model.safetensors"))
         loaded = build_foundation_model(
-            config_path=str(tmp_path), weights_path=None, torch_dtype="float32", init_device="cpu"
+            config_path=str(tmp_path),
+            weights_path=None,
+            torch_dtype="float32",
+            init_device="cpu",
+            ops_implementation=make_eager_ops_config(),
         )
         from veomni.utils.device import IS_NPU_AVAILABLE
 

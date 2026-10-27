@@ -2,10 +2,10 @@ import json
 import os
 from typing import Optional, Tuple
 
-from transformers import PretrainedConfig
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
 
-class WanTransformer3DConditionModelConfig(PretrainedConfig):
+class WanTransformer3DConditionModelConfig(VeOmniPretrainedConfig):
     model_type = "WanTransformer3DConditionModel"
 
     def __init__(

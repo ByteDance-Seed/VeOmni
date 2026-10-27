@@ -140,7 +140,6 @@ def _build_model(toy_path: str, ce_impl: str = "chunk_loss"):
     from transformers import AutoConfig
 
     from tests.models.compare import eager_ops_config, pin_eager_attn_implementation
-    from veomni.ops.config import get_ops_config, set_ops_config
 
     config = AutoConfig.from_pretrained(toy_path)
     if config.model_type == "qwen3":
@@ -156,12 +155,8 @@ def _build_model(toy_path: str, ce_impl: str = "chunk_loss"):
 
     ops = eager_ops_config()
     ops.cross_entropy_loss_implementation = ce_impl
-    previous = get_ops_config()
-    set_ops_config(ops)
-    try:
-        model = ModelClass(config)
-    finally:
-        set_ops_config(previous)
+    config._set_ops_implementation(ops)
+    model = ModelClass(config)
     pin_eager_attn_implementation(model)
     return model.to(device=get_device_type(), dtype=torch.float32)
 

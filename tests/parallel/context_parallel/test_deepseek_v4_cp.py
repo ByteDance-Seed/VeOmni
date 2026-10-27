@@ -40,11 +40,16 @@ from veomni.utils.device import (
 _PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
 
 
-def _load_dsv4_toy_config():
+def _load_dsv4_toy_config(**ops_overrides):
     from transformers import AutoConfig
 
+    from tests.models.compare import eager_ops_config
+
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
-    config._attn_implementation = "eager"
+    ops = eager_ops_config()
+    for key, value in ops_overrides.items():
+        setattr(ops, key, value)
+    config._set_ops_implementation(ops)
     return config
 
 
@@ -198,18 +203,14 @@ def _init_cp_attention(
 
     from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
-    from veomni.ops.config import set_ops_config
 
     cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
     dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
-    set_ops_config(
-        SimpleNamespace(
-            dsa_attention_implementation=dsa_attention_impl,
-            dsa_indexer_implementation="eager",
-        )
-    )
 
-    config = _load_dsv4_toy_config()
+    config = _load_dsv4_toy_config(
+        dsa_attention_implementation=dsa_attention_impl,
+        dsa_indexer_implementation="eager",
+    )
     torch.manual_seed(0)
     layer = dsv4.DeepseekV4Attention(config, layer_idx=layer_idx).to(device=device_type, dtype=dtype)
     if not with_compressor:
@@ -471,13 +472,11 @@ def _run_compressor_cp(
 
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
-    from veomni.ops.config import set_ops_config
 
     cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
     dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
-    set_ops_config(SimpleNamespace(dsa_attention_implementation="eager", dsa_indexer_implementation="eager"))
 
-    config = _load_dsv4_toy_config()
+    config = _load_dsv4_toy_config(dsa_attention_implementation="eager", dsa_indexer_implementation="eager")
     torch.manual_seed(0)
     compressor_class = dsv4.DeepseekV4HCACompressor if kind == "hca" else dsv4.DeepseekV4CSACompressor
     compressor = compressor_class(config).to(device=device_type, dtype=torch.float32)
@@ -603,13 +602,11 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int, *,
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
     from veomni.ops import resolve_op
-    from veomni.ops.config import set_ops_config
 
     cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
     dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
-    set_ops_config(SimpleNamespace(dsa_indexer_implementation="tilelang"))
 
-    config = _load_dsv4_toy_config()
+    config = _load_dsv4_toy_config(dsa_indexer_implementation="tilelang")
     torch.manual_seed(0)
     indexer = dsv4.DeepseekV4Indexer(config).to(device=device_type, dtype=torch.bfloat16)
     _init_position_bias(indexer)
@@ -909,16 +906,13 @@ def _run_model_cp_packed(
         )
 
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
-    from veomni.ops.config import set_ops_config
 
     cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
     dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
     if tilelang:
-        set_ops_config(SimpleNamespace(dsa_attention_implementation="tilelang", dsa_indexer_implementation="tilelang"))
+        config = _load_dsv4_toy_config(dsa_attention_implementation="tilelang", dsa_indexer_implementation="tilelang")
     else:
-        set_ops_config(SimpleNamespace(dsa_attention_implementation="eager", dsa_indexer_implementation="eager"))
-
-    config = _load_dsv4_toy_config()
+        config = _load_dsv4_toy_config(dsa_attention_implementation="eager", dsa_indexer_implementation="eager")
     torch.manual_seed(0)
     model = dsv4.DeepseekV4Model(config).to(device=device_type, dtype=dtype)
     _init_every_position_bias(model)

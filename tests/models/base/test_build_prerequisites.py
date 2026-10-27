@@ -185,7 +185,13 @@ def test_hub_flash_build_passes_normalized_name_to_loader(
 
     auto.build_foundation_model(config, init_device="cpu", **kwargs)
 
-    assert load_model.call_args.kwargs["init_kwargs"]["attn_implementation"] == _normalized_hub_name(implementation)
+    init_kwargs = load_model.call_args.kwargs["init_kwargs"]
+    assert init_kwargs["config"]._attn_implementation == _normalized_hub_name(implementation)
+    assert init_kwargs["config"].ops_config.attn_implementation == _normalized_hub_name(implementation)
+    if entry == "override":
+        assert init_kwargs["attn_implementation"] == _normalized_hub_name(implementation)
+    else:
+        assert "attn_implementation" not in init_kwargs
 
 
 def test_aiter_config_maps_to_veomni_backend(monkeypatch: pytest.MonkeyPatch):

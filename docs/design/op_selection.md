@@ -101,11 +101,11 @@ OpsImplementationConfig.__post_init__()       # (2) config parse time
 
 VeOmniModelRuntime._build_model()             # (3) model build time
   └─ models.build_foundation_model(..., ops_implementation=ops)
-       ├─ set_ops_config(ops)
+       ├─ config._set_ops_implementation(ops)
        └─ model init + weight loading
-            ├─ patched modules construct local VeomniOp handles
+            ├─ patched modules construct local VeomniOp handles from config.ops_config
             ├─ registry validates row hardware + optional packages
-            ├─ VeomniOp("attention", "standard", config._attn_implementation)
+            ├─ VeomniOp("attention", "standard", config.ops_config.attn_implementation)
             ├─ self.veomni_ce = VeomniOp("cross_entropy_loss", ...)
             ├─ self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
             └─ RMSNorm / RoPE / SwiGLU / MoE / DSA / mHC bind local handles
@@ -123,11 +123,11 @@ Transformers' `LOSS_MAPPING`. Each model resolves its configured CE row once,
 stores an instance-local `VeomniOp`, and binds that handle to the model
 helper with `functools.partial`; there is no per-forward implementation lookup.
 
-**Ownership.** `models.build_foundation_model` installs the supplied
-`ops_implementation` through `set_ops_config` before constructing the
-model. Callers that provide neither an explicit config nor a previously
-installed ops config receive `ValueError`; there is no silent all-eager
-fallback.
+**Ownership.** `models.build_foundation_model` attaches the supplied
+`ops_implementation` onto the model `PretrainedConfig` (exposed as
+`config.ops_config`) before constructing the model. Callers that provide neither
+an explicit `ops_implementation` nor a `PretrainedConfig` with `ops_implementation`
+populated receive `ValueError`; there is no silent all-eager fallback.
 
 ---
 
@@ -175,7 +175,7 @@ public values to VeOmni adapters:
 `apply_veomni_attention_patch()` registers those names and matching mask
 builders on Transformers' `ALL_ATTENTION_FUNCTIONS` /
 `ALL_MASK_ATTENTION_FUNCTIONS`. Patched modeling constructs
-`VeomniOp("attention", "standard", config._attn_implementation)` in
+`VeomniOp("attention", "standard", config.ops_config.attn_implementation)` in
 `__init__` (or `modify_init`) and stores `self.veomni_attn`. `forward` calls
 that handle. The registered row looks up the same Transformers interface.
 
@@ -187,7 +187,7 @@ can select its NPU attention path.
 
 `eager` resolves the modeling file's own `eager_attention_forward`, as in
 Transformers. Flux, Qwen-Image, LTX-2.3, and MiniMax-H3 define none, so
-they read the field with `resolve_op_impl("attn_implementation",
+they read the field with `config.ops_config.resolve_impl("attn_implementation",
 eager_as="veomni_sdpa")`. Their masked fallback for a mask-less backend is
 also `veomni_sdpa`.
 
@@ -403,7 +403,7 @@ supported values are `triton` and `eager`.
 
 ### Key files
 
-- Config singleton: `veomni/ops/config.py` — `get_ops_config()`, `set_ops_config()`
+- Config base class: `veomni/models/configuration_base.py` — `VeOmniPretrainedConfig`, `config.ops_config`
 - Unified registry: `veomni/ops/registry.py` — `register_op()`, `resolve_op()`, `VeomniOp`
 - Backend registration: `veomni/ops/kernels/{rms_norm,rope,swiglu_mlp}/__init__.py`
 - Model integration: `veomni/models/transformers/{model}/*_patch_gen_config.py`
@@ -512,7 +512,7 @@ raise during config validation or op binding.
 | `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
 | `fused_mlu` | Apex grouped-GEMM | Cambricon MLU | Yes |
 
-Patched experts modules construct `VeomniOp("moe_experts", variant, resolve_op_impl("moe_implementation"))`
+Patched experts modules construct `VeomniOp("moe_experts", variant, config.ops_config.moe_implementation)`
 in `__init__` and always call that handle. `eager` is a registered row, not a
 separate `ModuleList` fork. LoRA experts follow the wrapped module's
 `veomni_moe.impl` and fall back to `eager` when that `moe_experts_lora` row is
@@ -538,7 +538,7 @@ CANN and `torch_npu` stack to enable the fused activation.
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
 - Registration: `veomni/ops/kernels/moe_experts/__init__.py`
-- Config helper: `veomni/ops/config.py` — `resolve_op_impl("moe_implementation")`
+- Config base class: `veomni/models/configuration_base.py` — `config.ops_config.moe_implementation`
 - Model integration: `veomni/models/transformers/*/*_patch_gen_config.py`
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
 

@@ -42,7 +42,7 @@ ls veomni/models/transformers/<model>/generated/patched_modeling_*_gpu.py
 rg -n "cuda|triton|flash_attention|flex_attention|liger|is_cuda|\.cuda\(" \
   veomni/models/transformers/<model>
 
-rg -n "VeomniOp|resolve_op_impl|attn_implementation|RMSNorm|apply_rotary|cross_entropy" \
+rg -n "VeomniOp|ops_config|attn_implementation|RMSNorm|apply_rotary|cross_entropy" \
   veomni/models/transformers/<model> \
   veomni/ops/kernels
 ```
@@ -78,17 +78,17 @@ config.target_file = "patched_modeling_<model>_npu.py"
 config.description = "<Model> with VeomniOp NPU replacements"
 ```
 
-Model classes must own instance-local `VeomniOp` handles. Resolve the configured implementation during construction and call the handle unconditionally; the registry's `eager` row supplies the CPU/GPU fallback.
+Model classes must own instance-local `VeomniOp` handles. Resolve the configured implementation from `config.ops_config` during construction and call the handle unconditionally; the registry's `eager` row supplies the CPU/GPU fallback.
 
 ```python
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 
 
+rms_norm_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
 self.veomni_rms_norm = VeomniOp(
     "rms_norm",
     "standard",
-    resolve_op_impl("rms_norm_implementation"),
+    rms_norm_impl,
 )
 hidden_states = self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 ```
