@@ -42,6 +42,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     compute_mtp_loss,
     get_position_id,
     mm_token_type_ids_from_input_ids,
+    qwen3_5_attention_bind_ops,
     qwen3_5_attention_forward_patched,
     qwen3_5_decoder_layer_init_patched,
     qwen3_5_forcausallm_forward_patched,
@@ -940,6 +941,11 @@ config.override_method(
         "the per-block host sync that flash_attn_varlen_func incurs when "
         "`max_length_q/k` are 0-D device tensors."
     ),
+)
+config.override_method(
+    "Qwen3_5Attention.__init__",
+    replacement=qwen3_5_attention_bind_ops,
+    description="Pass config to Qwen3_5RMSNorm and bind instance-local rope and attention VeomniOps",
 )
 config.override_method(
     "Qwen3_5Attention.forward",

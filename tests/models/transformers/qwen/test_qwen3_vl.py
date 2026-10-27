@@ -176,3 +176,24 @@ def test_qwen3_vl_async_helper_forwards_skip_ulysses(monkeypatch):
     assert captured["skip_ulysses"] is True
     assert captured["query_seq"] == 8
     assert captured["rms_norm"] is rms_handle
+
+
+def test_qwen3_vl_npu_generated_attention_binds_ops_and_runs_eager_forward():
+    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_npu import (
+        Qwen3VLForConditionalGeneration,
+    )
+
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config._set_ops_implementation(eager_ops_config())
+    model = Qwen3VLForConditionalGeneration(config).eval()
+    attn = model.model.language_model.layers[0].self_attn
+    assert attn.veomni_rope.impl == "eager"
+    assert attn.veomni_attn.impl == "eager"
+    assert attn.q_norm.veomni_rms_norm.impl == "eager"
+    assert attn.k_norm.veomni_rms_norm.impl == "eager"
+
+    input_ids = torch.randint(3, 100, (1, 6))
+    with torch.no_grad():
+        out = model(input_ids=input_ids, use_cache=False)
+    assert torch.isfinite(out.logits).all()

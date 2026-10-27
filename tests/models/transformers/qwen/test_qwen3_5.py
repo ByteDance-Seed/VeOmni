@@ -327,3 +327,28 @@ def test_qwen3_5_packed_padding_matches_separate_logits_and_grads(ops_factory):
         if packed_grads[name] is None:
             continue
         torch.testing.assert_close(packed_grads[name], separate_grads[name], rtol=1e-4, atol=1e-5)
+
+
+def test_qwen3_5_npu_generated_attention_binds_ops_and_runs_eager_forward(monkeypatch):
+    from veomni.models.transformers.qwen3_5.generated import patched_modeling_qwen3_5_npu as npu_modeling
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu
+
+    monkeypatch.setattr(fla_npu, "precompute_varlen_metadata", lambda **kwargs: ([0, 6], None, None))
+    torch.manual_seed(0)
+    config = _tiny_text_config(layer_types=["full_attention", "full_attention"])
+    config._set_ops_implementation(eager_ops_config())
+    model = npu_modeling.Qwen3_5ForCausalLM(config).eval()
+    attn = model.model.layers[0].self_attn
+    assert attn.veomni_rope.impl == "eager"
+    assert attn.veomni_attn.impl == "eager"
+    assert attn.q_norm.veomni_rms_norm.impl == "eager"
+    assert attn.k_norm.veomni_rms_norm.impl == "eager"
+
+    input_ids = torch.randint(3, config.vocab_size, (1, 6))
+    with torch.no_grad():
+        out = model(
+            input_ids=input_ids,
+            cu_seq_lens_q=torch.tensor([0, 6], dtype=torch.int32),
+            use_cache=False,
+        )
+    assert torch.isfinite(out.logits).all()

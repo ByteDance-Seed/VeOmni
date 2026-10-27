@@ -27,6 +27,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_model_get_placeholder_mask_patched,
     qwen3_vl_rmsnorm_forward_patched,
     qwen3_vl_rmsnorm_init_patched,
+    qwen3_vl_text_attention_bind_ops,
     qwen3_vl_text_attention_forward_patched,
     qwen3_vl_text_deepstack_process_patched,
     qwen3_vl_text_mlp_forward_patched,
@@ -155,6 +156,12 @@ config.override_method(
     description="Provide dummy vision forward for FSDP path with SP-aware shape",
 )
 config.adopt_init_modifications(gpu_config)
+config.override_method(
+    "Qwen3VLMoeTextAttention.__init__",
+    replacement=qwen3_vl_text_attention_bind_ops,
+    name_map=_NAME_MAP,
+    description="Pass config to Qwen3VLMoeTextRMSNorm and bind instance-local rope and attention VeomniOps",
+)
 config.override_method(
     "Qwen3VLMoeTextAttention.forward",
     replacement=qwen3_vl_text_attention_forward_patched,

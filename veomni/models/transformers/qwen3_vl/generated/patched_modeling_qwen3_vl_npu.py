@@ -37,6 +37,8 @@
 #      Provide dummy vision forward for FSDP path with SP-aware shape
 #    - init_modification: Qwen3VLVisionAttention
 #      Bind instance-local rope and attention VeomniOps
+#    - method_override: Qwen3VLTextAttention.__init__
+#      Pass config to Qwen3VLTextRMSNorm and bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3VLTextAttention.forward
 #      Route through async Ulysses fused QKV/Output projection when async_enabled
 #    - method_override: Qwen3VLTextModel._deepstack_process
@@ -687,15 +689,22 @@ class Qwen3VLTextRMSNorm(nn.Module):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLTextAttention
-# Methods patched: forward
+# Methods patched: __init__, forward
 # ======================================================================
 
 
 class Qwen3VLTextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Qwen3VLTextConfig, layer_idx: int):
-        super().__init__()
+    # ================================================================
+    # Patch: Qwen3VLTextAttention.forward
+    # 1. route through the async Ulysses fused QKV/Output projection path
+    #    (defined via add_post_import_block as a module-level helper) when
+    #    `get_parallel_state().async_enabled` is True; otherwise fall
+    #    through to the upstream logic unchanged
+    # ================================================================
+    def __init__(self, config, layer_idx: int):
+        nn.Module.__init__(self)
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
         self.config = config
         self.layer_idx = layer_idx
@@ -717,10 +726,14 @@ class Qwen3VLTextAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        self.q_norm = Qwen3VLTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
+        self.q_norm = Qwen3VLTextRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, config=config
+        )  # unlike olmo, only on the head dim!
         self.k_norm = Qwen3VLTextRMSNorm(
-            self.head_dim, eps=config.rms_norm_eps
+            self.head_dim, eps=config.rms_norm_eps, config=config
         )  # thus post q_norm does not need reshape
+        self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
     def forward(
         self,

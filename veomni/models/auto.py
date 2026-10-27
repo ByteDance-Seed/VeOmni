@@ -132,6 +132,23 @@ def build_config(config_path: str, **config_kwargs) -> PretrainedConfig:
     return get_model_config(config_path, trust_remote_code=trust_remote_code, **config_kwargs)
 
 
+def _iter_configs(config: PretrainedConfig) -> list[PretrainedConfig]:
+    seen: set[int] = set()
+    order: list[PretrainedConfig] = []
+    stack = [config]
+    while stack:
+        cfg = stack.pop()
+        if not isinstance(cfg, PretrainedConfig) or id(cfg) in seen:
+            continue
+        seen.add(id(cfg))
+        order.append(cfg)
+        for key in cfg.sub_configs:
+            sub = getattr(cfg, key, None)
+            if isinstance(sub, PretrainedConfig):
+                stack.append(sub)
+    return order
+
+
 def _validate_attention_parallelism(attn_implementation: str | None) -> None:
     if attn_implementation not in ("magi_attention", "veomni_magi_attention"):
         return
@@ -186,8 +203,8 @@ def build_foundation_model(
     """
     from veomni.arguments.arguments_types import OpsImplementationConfig
 
-    has_config_ops = isinstance(config_path, PretrainedConfig) and bool(
-        getattr(config_path, "ops_implementation", None)
+    has_config_ops = isinstance(config_path, PretrainedConfig) and any(
+        bool(getattr(cfg, "ops_implementation", None)) for cfg in _iter_configs(config_path)
     )
     if ops_implementation is None and not has_config_ops:
         raise ValueError(
@@ -205,10 +222,10 @@ def build_foundation_model(
         )
         _validate_attention_parallelism(effective_attn)
     else:
-        effective_attn = (
-            attn_implementation if attn_implementation is not None else config_path.ops_config.attn_implementation
-        )
-        _validate_attention_parallelism(effective_attn)
+        for cfg in _iter_configs(config_path):
+            _validate_attention_parallelism(
+                attn_implementation if attn_implementation is not None else cfg.ops_config.attn_implementation
+            )
 
     if config_kwargs is None:
         config_kwargs = {}
@@ -222,7 +239,12 @@ def build_foundation_model(
 
     if attn_implementation is not None:
         config._attn_implementation = attn_implementation
-    attn_implementation = effective_attn
+    else:
+        for cfg in _iter_configs(config):
+            if getattr(cfg, "_attn_implementation_internal", None) is None:
+                cfg._attn_implementation_internal = cfg.ops_config.attn_implementation
+
+    effective_attn = attn_implementation if attn_implementation is not None else config.ops_config.attn_implementation
 
     check_context_parallel_supported(config)
     check_model_build_prerequisites(config)
@@ -253,13 +275,14 @@ def build_foundation_model(
     init_kwargs = {
         "config": config,
         "torch_dtype": getattr(torch, torch_dtype),
-        "attn_implementation": attn_implementation,
         "trust_remote_code": True,
     }
+    if attn_implementation is not None:
+        init_kwargs["attn_implementation"] = attn_implementation
 
-    if attn_implementation not in _VEOMNI_SP_ATTN:
+    if effective_attn not in _VEOMNI_SP_ATTN:
         logger.warning_rank0(
-            f"building foundation model with attn_implementation: {attn_implementation}.. "
+            f"building foundation model with attn_implementation: {effective_attn}.. "
             "you are missing sequence parallelism support. Please use a veomni_* attention implementation for SP."
         )
 

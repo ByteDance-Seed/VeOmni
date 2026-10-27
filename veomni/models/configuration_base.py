@@ -32,14 +32,47 @@ _orig_from_dict = PretrainedConfig.from_dict.__func__
 _orig_to_diff_dict = PretrainedConfig.to_diff_dict
 
 
-def _veomni_post_init(self: PretrainedConfig, **kwargs: Any) -> None:
-    sub_snapshots = {
-        key: (
+def _prune_subconfig_ops_diff(config: PretrainedConfig, diff: dict[str, Any]) -> None:
+    if not diff.get("ops_implementation"):
+        diff.pop("ops_implementation", None)
+    parent_ops = getattr(config, "ops_implementation", None) or {}
+    for key in config.sub_configs:
+        sub_cfg = getattr(config, key, None)
+        sub_dict = diff.get(key)
+        if not isinstance(sub_cfg, PretrainedConfig) or not isinstance(sub_dict, dict):
+            continue
+        _prune_subconfig_ops_diff(sub_cfg, sub_dict)
+        if "ops_implementation" in sub_dict:
+            sub_ops = sub_dict["ops_implementation"]
+            if isinstance(sub_ops, Mapping):
+                sub_diff = {k: v for k, v in sub_ops.items() if parent_ops.get(k) != v}
+                if sub_diff:
+                    sub_dict["ops_implementation"] = sub_diff
+                else:
+                    sub_dict.pop("ops_implementation", None)
+
+
+def _snapshot_subconfigs(config: PretrainedConfig) -> dict[int, tuple[PretrainedConfig, dict[str, Any], str | None]]:
+    snapshots: dict[int, tuple[PretrainedConfig, dict[str, Any], str | None]] = {}
+    for key in config.sub_configs:
+        sub = getattr(config, key, None)
+        if not isinstance(sub, PretrainedConfig) or id(sub) in snapshots:
+            continue
+        snapshots[id(sub)] = (
+            sub,
             dict(getattr(sub, "ops_implementation", None) or {}),
             getattr(sub, "_attn_implementation_internal", None),
         )
-        for key in self.sub_configs
-        if isinstance(sub := getattr(self, key, None), PretrainedConfig)
+        snapshots.update(_snapshot_subconfigs(sub))
+    return snapshots
+
+
+def _veomni_post_init(self: PretrainedConfig, **kwargs: Any) -> None:
+    from ..arguments import OpsImplementationConfig
+
+    sub_snapshots = _snapshot_subconfigs(self)
+    direct_sub_ids = {
+        key: id(sub) for key in self.sub_configs if isinstance(sub := getattr(self, key, None), PretrainedConfig)
     }
     ops_implementation = kwargs.pop("ops_implementation", getattr(self, "ops_implementation", None))
     explicit_attn = kwargs.get("attn_implementation")
@@ -47,15 +80,22 @@ def _veomni_post_init(self: PretrainedConfig, **kwargs: Any) -> None:
     self.ops_implementation = {}
     _orig_post_init(self, **kwargs)
 
-    for key, (sub_ops, sub_attn) in sub_snapshots.items():
-        sub = getattr(self, key, None)
-        if not isinstance(sub, PretrainedConfig):
-            continue
+    explicit_map_ids = (
+        {direct_sub_ids[key] for key in explicit_attn if key in direct_sub_ids}
+        if isinstance(explicit_attn, Mapping)
+        else set()
+    )
+    has_ops_attn = isinstance(ops_implementation, (OpsImplementationConfig, SimpleNamespace)) or (
+        isinstance(ops_implementation, Mapping) and ops_implementation.get("attn_implementation") is not None
+    )
+    for sub_id, (sub, sub_ops, sub_attn) in sub_snapshots.items():
         sub.ops_implementation = dict(sub_ops)
-        if isinstance(explicit_attn, Mapping) and key in explicit_attn:
+        if sub_id in explicit_map_ids:
             continue
         if sub_attn is not None:
             sub._attn_implementation_internal = sub_attn
+        elif not isinstance(explicit_attn, str) or has_ops_attn:
+            sub._attn_implementation_internal = None
 
     self._set_ops_implementation(ops_implementation, _is_post_init=True)
 
@@ -151,10 +191,10 @@ class VeOmniPretrainedConfig(PretrainedConfig):
             elif _is_post_init:
                 sub_own = dict(getattr(subconfig, "ops_implementation", None) or {})
                 sub_attn = getattr(subconfig, "_attn_implementation_internal", None)
-                merged = {**self.ops_implementation, **sub_own}
-                subconfig._set_ops_implementation(merged)
                 if "attn_implementation" not in sub_own and sub_attn is not None:
-                    subconfig._attn_implementation_internal = sub_attn
+                    sub_own["attn_implementation"] = sub_attn
+                merged = {**self.ops_implementation, **sub_own}
+                subconfig._set_ops_implementation(merged, _is_post_init=True)
             elif self.ops_implementation:
                 sub_own = dict(getattr(subconfig, "ops_implementation", None) or {})
                 subconfig._set_ops_implementation({**sub_own, **self.ops_implementation})
@@ -174,19 +214,7 @@ class VeOmniPretrainedConfig(PretrainedConfig):
 
     def to_diff_dict(self) -> dict[str, Any]:
         diff = _orig_to_diff_dict(self)
-        if not diff.get("ops_implementation"):
-            diff.pop("ops_implementation", None)
-        parent_ops = getattr(self, "ops_implementation", None) or {}
-        for key in self.sub_configs:
-            sub_dict = diff.get(key)
-            if isinstance(sub_dict, dict) and "ops_implementation" in sub_dict:
-                sub_ops = sub_dict["ops_implementation"]
-                if isinstance(sub_ops, Mapping):
-                    sub_diff = {k: v for k, v in sub_ops.items() if parent_ops.get(k) != v}
-                    if sub_diff:
-                        sub_dict["ops_implementation"] = sub_diff
-                    else:
-                        sub_dict.pop("ops_implementation", None)
+        _prune_subconfig_ops_diff(self, diff)
         return diff
 
 

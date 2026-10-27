@@ -305,3 +305,87 @@ def test_composite_qwen3_vl_config_subconfig_merge_isolation_and_save(tmp_path):
     assert reloaded.text_config.ops_config.attn_implementation == "veomni_sdpa"
     assert reloaded.vision_config.ops_config.rms_norm_implementation == "eager"
     assert reloaded.vision_config.ops_config.attn_implementation == "eager"
+
+
+def test_three_level_nested_config_preserves_grandchild_overrides(tmp_path, monkeypatch):
+    """Three-level configs (root -> thinker_config -> text_config) keep parent < child < grandchild priority."""
+    import json
+
+    from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
+
+    import veomni.models  # noqa: F401
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
+
+    cfg = Qwen3OmniMoeConfig(
+        ops_implementation={"rms_norm_implementation": "eager", "attn_implementation": "sdpa"},
+        thinker_config={
+            "text_config": {
+                "ops_implementation": {
+                    "rms_norm_implementation": "liger_kernel",
+                    "attn_implementation": "eager",
+                }
+            }
+        },
+    )
+
+    assert cfg.ops_config.rms_norm_implementation == "eager"
+    assert cfg.ops_config.attn_implementation == "veomni_sdpa"
+    assert cfg.thinker_config.ops_config.rms_norm_implementation == "eager"
+    assert cfg.thinker_config.ops_config.attn_implementation == "veomni_sdpa"
+    assert cfg.thinker_config.vision_config.ops_config.rms_norm_implementation == "eager"
+    assert cfg.thinker_config.vision_config.ops_config.attn_implementation == "veomni_sdpa"
+    assert cfg.thinker_config.text_config.ops_config.rms_norm_implementation == "liger_kernel"
+    assert cfg.thinker_config.text_config.ops_config.attn_implementation == "eager"
+    assert cfg.thinker_config.text_config._attn_implementation == "eager"
+
+    cfg.save_pretrained(tmp_path)
+    raw = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert "ops_implementation" not in raw["thinker_config"]
+    assert "ops_implementation" not in raw["thinker_config"]["vision_config"]
+    assert raw["thinker_config"]["text_config"]["ops_implementation"] == {
+        "rms_norm_implementation": "liger_kernel",
+        "attn_implementation": "eager",
+    }
+
+    reloaded = Qwen3OmniMoeConfig.from_pretrained(tmp_path)
+    assert reloaded.thinker_config.vision_config.ops_config.rms_norm_implementation == "eager"
+    assert reloaded.thinker_config.vision_config.ops_config.attn_implementation == "veomni_sdpa"
+    assert reloaded.thinker_config.text_config.ops_config.rms_norm_implementation == "liger_kernel"
+    assert reloaded.thinker_config.text_config.ops_config.attn_implementation == "eager"
+    assert reloaded.thinker_config.text_config._attn_implementation == "eager"
+
+
+@pytest.mark.parametrize("sub_as_instance", [False, True], ids=["dict", "config_instance"])
+@pytest.mark.parametrize("parent_via_hf_attn", [False, True], ids=["parent_ops_impl", "parent_hf_attn"])
+def test_subconfig_hf_attn_implementation_merges_and_roundtrips(tmp_path, sub_as_instance, parent_via_hf_attn):
+    """A child sub-config specifying HF attn_implementation updates both _attn_implementation and ops_config."""
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
+
+    import veomni.models  # noqa: F401
+
+    vision_arg = (
+        Qwen3VLVisionConfig(attn_implementation="eager") if sub_as_instance else {"attn_implementation": "eager"}
+    )
+    parent_kwargs = (
+        {"attn_implementation": "sdpa", "ops_implementation": {"rms_norm_implementation": "eager"}}
+        if parent_via_hf_attn
+        else {"ops_implementation": {"attn_implementation": "sdpa", "rms_norm_implementation": "eager"}}
+    )
+    cfg = Qwen3VLConfig(vision_config=vision_arg, **parent_kwargs)
+
+    assert cfg.text_config._attn_implementation == "veomni_sdpa"
+    assert cfg.text_config.ops_config.attn_implementation == "veomni_sdpa"
+    assert cfg.vision_config._attn_implementation == "eager"
+    assert cfg.vision_config.ops_config.attn_implementation == "eager"
+    assert cfg.vision_config.ops_implementation["attn_implementation"] == "eager"
+
+    save_dir = tmp_path / f"{sub_as_instance}_{parent_via_hf_attn}"
+    cfg.save_pretrained(save_dir)
+    reloaded = Qwen3VLConfig.from_pretrained(save_dir)
+    assert reloaded.text_config._attn_implementation == "veomni_sdpa"
+    assert reloaded.text_config.ops_config.attn_implementation == "veomni_sdpa"
+    assert reloaded.vision_config._attn_implementation == "eager"
+    assert reloaded.vision_config.ops_config.attn_implementation == "eager"

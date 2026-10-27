@@ -840,3 +840,30 @@ def test_context_parallel_gate_is_inert_when_no_parallel_state_was_installed(mon
     monkeypatch.setattr(parallel_state_module.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(parallel_state_module.dist, "get_world_size", lambda: 2)
     check_context_parallel_supported(_tiny_qwen3_config())
+
+
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
+def test_build_foundation_model_preserves_subconfig_independent_attention():
+    """build_foundation_model must not flatten sub-config attention unless attn_implementation is passed."""
+    from veomni.models.auto import build_foundation_model
+
+    config = _tiny_qwen3_vl_config()
+    config._set_ops_implementation(eager_ops_config())
+    config.vision_config._set_ops_implementation({"attn_implementation": "sdpa"})
+
+    assert config._attn_implementation == "eager"
+    assert config.text_config._attn_implementation == "eager"
+    assert config.vision_config._attn_implementation == "veomni_sdpa"
+
+    model = build_foundation_model(config_path=config, init_device="meta")
+    assert model.config.text_config._attn_implementation == "eager"
+    assert model.config.vision_config._attn_implementation == "veomni_sdpa"
+    assert model.model.language_model.layers[0].self_attn.veomni_attn.impl == "eager"
+    assert model.model.visual.blocks[0].attn.veomni_attn.impl == "veomni_sdpa"
+
+    # Explicit attn_implementation kwarg overrides all sub-configs.
+    overridden = build_foundation_model(config_path=config, init_device="meta", attn_implementation="eager")
+    assert overridden.config.text_config._attn_implementation == "eager"
+    assert overridden.config.vision_config._attn_implementation == "eager"
+    assert overridden.model.language_model.layers[0].self_attn.veomni_attn.impl == "eager"
+    assert overridden.model.visual.blocks[0].attn.veomni_attn.impl == "eager"

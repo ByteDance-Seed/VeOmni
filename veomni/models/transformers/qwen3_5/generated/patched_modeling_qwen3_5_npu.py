@@ -63,6 +63,8 @@
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3_5VisionAttention.forward
 #      Read pre-computed `vision_max_seqlen` (Python int) from kwargs to avoid the per-block host sync that flash_attn_varlen_func incurs when `max_length_q/k` are 0-D device tensors.
+#    - method_override: Qwen3_5Attention.__init__
+#      Pass config to Qwen3_5RMSNorm and bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3_5Attention.forward
 #      Always call the local rope and attention VeomniOps
 #
@@ -969,15 +971,15 @@ def eager_attention_forward(
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5Attention
-# Methods patched: forward
+# Methods patched: __init__, forward
 # ======================================================================
 
 
 class Qwen3_5Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Qwen3_5Config, layer_idx: int):
-        super().__init__()
+    def __init__(self, config, layer_idx: int):
+        nn.Module.__init__(self)
         self.config = config
         self.layer_idx = layer_idx
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -997,8 +999,10 @@ class Qwen3_5Attention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
-        self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
+        self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)  # noqa: F821
+        self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)  # noqa: F821
+        self.veomni_rope = VeomniOp("rope", "partial", self.config.ops_config.rotary_pos_emb_implementation)
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
     def forward(
         self,
