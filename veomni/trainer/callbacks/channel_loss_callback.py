@@ -29,6 +29,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from numbers import Integral
+from threading import local
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
@@ -39,7 +40,6 @@ from ...distributed.parallel_state import get_parallel_state
 from ...utils.constants import IGNORE_INDEX
 from ...utils.device import empty_cache, get_torch_device, stream_synchronize
 from ...utils.logging import get_logger
-from ...utils.loss_observer import capture_chunk_loss_per_token
 from .base import Callback, TrainerState
 
 
@@ -56,6 +56,34 @@ _LOSS_CALL_POSITIONAL_KEYS = ("logits", "labels", "vocab_size", "num_items_in_ba
 _ACTIVE_CHANNEL_LOSS_COMPUTER: ContextVar[ChannelLossComputer | None] = ContextVar(
     "veomni_active_channel_loss_computer", default=None
 )
+_CHUNK_LOSS_CAPTURE = local()
+
+
+@contextmanager
+def capture_chunk_loss_per_token(
+    consumer: Callable[[torch.Tensor], None], on_error: Callable[[str], None] | None = None
+) -> Iterator[None]:
+    """Enable detached token-loss capture for one sampled model-loss call."""
+    previous = getattr(_CHUNK_LOSS_CAPTURE, "value", None)
+    _CHUNK_LOSS_CAPTURE.value = (consumer, on_error)
+    try:
+        yield
+    finally:
+        _CHUNK_LOSS_CAPTURE.value = previous
+
+
+def get_chunk_loss_consumer() -> Callable[[torch.Tensor], None] | None:
+    capture = getattr(_CHUNK_LOSS_CAPTURE, "value", None)
+    return capture[0] if capture is not None else None
+
+
+def report_chunk_loss_observer_error(error: Exception) -> bool:
+    capture = getattr(_CHUNK_LOSS_CAPTURE, "value", None)
+    handler = capture[1] if capture is not None else None
+    if handler is None:
+        return False
+    handler(f"{type(error).__name__}: {error}")
+    return True
 
 
 class ChannelLossMetadataError(ValueError):

@@ -496,7 +496,7 @@ def test_channel_loss_chunk_kernel_reuses_main_projection(monkeypatch):
 
 @pytest.mark.parametrize("capture_count", [0, 2])
 def test_channel_loss_capture_is_scoped_to_instance_loss(monkeypatch, capture_count):
-    from veomni.utils.loss_observer import get_chunk_loss_consumer
+    from veomni.trainer.callbacks.channel_loss_callback import get_chunk_loss_consumer
 
     _install_test_parallel_state(monkeypatch)
 
@@ -520,6 +520,38 @@ def test_channel_loss_capture_is_scoped_to_instance_loss(monkeypatch, capture_co
     assert model.loss_function == original
     assert get_chunk_loss_consumer() is None
     assert bool(computer._result) == (capture_count == 0)
+
+
+def test_chunk_capture_restores_nested_scope_and_is_thread_local():
+    import threading
+
+    from veomni.trainer.callbacks.channel_loss_callback import capture_chunk_loss_per_token, get_chunk_loss_consumer
+
+    first, second = [], []
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def worker(output):
+        try:
+            with capture_chunk_loss_per_token(output.append):
+                barrier.wait(timeout=5)
+                get_chunk_loss_consumer()(torch.tensor(1))
+                with capture_chunk_loss_per_token(second.append):
+                    assert get_chunk_loss_consumer() == second.append
+                assert get_chunk_loss_consumer() == output.append
+        except Exception as error:
+            errors.append(error)
+
+    worker_thread = threading.Thread(target=worker, args=(first,))
+    worker_thread.start()
+    with capture_chunk_loss_per_token(second.append):
+        barrier.wait(timeout=5)
+        assert get_chunk_loss_consumer() == second.append
+    worker_thread.join(timeout=5)
+    assert not worker_thread.is_alive()
+    assert not errors
+    assert len(first) == 1 and not second
+    assert get_chunk_loss_consumer() is None
 
 
 def test_channel_loss_unwraps_native_lora_model_for_eager_loss():
@@ -3056,7 +3088,7 @@ def test_chunk_observer_with_offload_hooks_preserves_loss_and_gradients(monkeypa
     from torch.autograd.graph import saved_tensors_hooks
 
     from veomni.ops import resolve_op
-    from veomni.utils.loss_observer import capture_chunk_loss_per_token
+    from veomni.trainer.callbacks.channel_loss_callback import capture_chunk_loss_per_token
 
     torch.manual_seed(319)
     hidden = torch.randn(2, 11, 64, requires_grad=True)
