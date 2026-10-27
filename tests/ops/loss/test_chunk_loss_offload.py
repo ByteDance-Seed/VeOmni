@@ -14,6 +14,23 @@ from veomni.utils.device import IS_NPU_AVAILABLE
 DEVICES = ["cpu", pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires native NPU"))]
 
 
+@pytest.fixture(autouse=True)
+def _deterministic_reductions(device):
+    """Bitwise offload parity requires repeatable device reductions."""
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    num_threads = torch.get_num_threads()
+    try:
+        # Avoid first-call parallel CPU math noise in the bitwise reference.
+        if device == "cpu":
+            torch.set_num_threads(1)
+        torch.use_deterministic_algorithms(True, warn_only=False)
+        yield
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+        torch.set_num_threads(num_threads)
+
+
 def _run(device, dtype, *, offload, recompute, frozen, all_ignored):
     torch.manual_seed(127)
     hidden = torch.randn(2, 23, 64).to(device=device, dtype=dtype).requires_grad_(frozen != "hidden")
