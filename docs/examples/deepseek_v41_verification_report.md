@@ -401,3 +401,38 @@ Executed the full `tests/seed_omni/modules/deepseek_v41/` test suite (22 test fi
   - Step 1: `total_loss: 15.51` (`ce_loss: 15.45, indexer_kl_loss: 0.06, grad_norm: 21.72`)
   - Step 5: `total_loss: 14.23` (`ce_loss: 14.18, indexer_kl_loss: 0.06, grad_norm: 27.91`)
   - Step 10: `total_loss: 14.93` (`ce_loss: 14.87, indexer_kl_loss: 0.05, grad_norm: 86.63`, step time `20.67s – 36.54s/it`).
+
+---
+
+### 6.5 Video Understanding SFT (`llava_video`) with Full Training (`ViT GC + TextEncoder + 40L LLM + 3L MTP + dyn_bsz: true`), 48-Shard Export, & Before/After 8-GPU Video Inference Comparison
+
+To verify end-to-end **video understanding SFT + 3-layer DSpark MTP training (`dspark_block_size: 5, num_nextn_predict_layers: 3`) + ViT Gradient Checkpointing + Dynamic Batching (`dyn_bsz: true`)** on `DeepSeek-V4.1-Flash-1017`, we added video frame expansion (`type="video"` -> up to 8 frames with proportional per-frame token budget `~93` tokens/frame, `~744` visual tokens per 8-frame video) and per-block `GradientCheckpointingLayer` support in `DeepseekV41ViT` (`commit 8b0955bc2`), and executed the three-stage closed loop on `/mnt/hdfs/veomni/datasets/llava_video`:
+
+1. **Stage 1 — 8-GPU Baseline Video Understanding Inference Before SFT (`431e0ff3d885ff39`, `VIDEO_EVAL_BEFORE_RC=0`)**:
+   - Loaded `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017` on 8×H100 (`modules_infer_fsdp.yaml`, 40 LLM layers + 3 MTP stages) and evaluated 6 temporal video QA test cases (`fps=2.0, max_frames=8`, `max_new_tokens=64`, greedy decoding) from `llava_video/0.parquet`.
+   - **Baseline Behavior**: Before SFT, even when prompted with *"Please respond with only the letter of the correct answer"*, the base model treated the 8 video frames as separate images and launched into a verbose frame-by-frame chain-of-thought (`"The user wants me to identify... 1. Analyze the image sequence: * Image 1: ... * Image 2: ..."`) without emitting `</think>` or the final option within 64 tokens (**`0 / 6` direct option matches**).
+
+2. **Stage 2 — 64-GPU Full Training (`ViT GC + TextEncoder + 40L LLM + 3L MTP + dyn_bsz: true`) + 48-Shard FP8/FP4 Export**:
+   - **Training Runs**:
+     - `017b505b2b5df5bd` (WandB `run_20261027_ec978def`): Trained all 4 modules (`deepseek_v41_vision` with `gradient_checkpointing: true`, `deepseek_v41_text_encoder` with FSDP2 CPU offload, `deepseek_v41_ngram` frozen `emb=64`, and `deepseek_v41_llm` with all **40 backbone layers + 3 DSpark MTP stages (`dspark_block_size: 5, num_nextn_predict_layers: 3`)**, `dsa_indexer_loss: true`, `qat_implementation: fp8_blockwise`, `ep_size: 64`, Muon `lr=1e-4, muon_lr=5e-4`, CPU-pinned Muon momentum buffer, `dyn_bsz: true, dyn_bsz_count_mode: effective, dyn_bsz_physical_overflow_ratio: 1.0`). Across Steps 1 -> 11 (`832` samples / `613.4K` tokens consumed, avg sequence length `843.0` tokens):
+       - **`total_loss`**: **`4.90` -> `1.32`** (`-73.1%`)
+       - **`ce_loss`**: **`1.72` -> `0.38`** (`-77.9%`)
+       - **`mtp_loss` (3-layer DSpark MTP)**: **`2.41` -> `0.48`** (`-80.1%`)
+       - **`indexer_kl_loss`**: **`0.77` -> `0.47`** (`-39.0%`)
+     - `b26a5e3cca0e42ce` (WandB `run_20261027_439e6075`): Completed all **12/12 steps (`TRAIN_RC=0`)** on `LLaVA-Video-178K` (`85%` weight, `634` video QA chunks, avg `845.5` tokens) + `tulu-3-sft-mixture` (`15%` weight, `228` text chunks, avg `379.4` tokens) with `max_seq_len: 900`:
+       - **Loss Trajectory**: Step 1 `total_loss: 3.95` (`ce_loss: 1.35, mtp_loss: 1.83, indexer_kl_loss: 0.78`) -> Step 3 `total_loss: 2.14` (`ce_loss: 0.61, mtp_loss: 1.02, indexer_kl_loss: 0.51`) -> Step 7 `total_loss: 1.64` (`ce_loss: 0.51, mtp_loss: 0.73, indexer_kl_loss: 0.39`).
+       - **VRAM Usage**: **`36.22 GB` resident (after epoch 1)**, **`75.62 GB` peak allocated** (`76.48 GB` WandB max) across all 40 LLM layers + 3 MTP stages + trainable ViT + trainable TextEncoder on 64×H100.
+       - **Checkpoint & Single-Root 48-Shard Export (`save_hf_weights: true`)**: Saved DCP checkpoints for `deepseek_v41_vision`, `deepseek_v41_text_encoder`, and `deepseek_v41_llm` (40L + 3L MTP), and exported all **48 safetensors shards (`model-00001-of-00048.safetensors` .. `model-00048-of-00048.safetensors`) + `model.safetensors.index.json`** (with trained `llm` + trained `mtp` re-quantized to FP8/FP4, trained `vision` + `text_encoder`, and only `4` frozen `ngram` tensors copied from source) to `<export_root>/dsv41_1017_64gpu_ckpt/full_mtp_video_100steps/checkpoints/global_step_12/hf_ckpt` in **`391.44s`**.
+
+3. **Stage 3 — 8-GPU Post-Training Video Understanding Inference on Exported 48-Shard Checkpoint (`b26a5e3cca0e42ce`, `video_eval_after_done`)**:
+   - Immediately after exporting the 48-shard checkpoint, Node 0 launched the exact same 8-GPU `eval_llava_video.py` script loading `<export_root>/dsv41_1017_64gpu_ckpt/full_mtp_video_100steps/checkpoints/global_step_12/hf_ckpt`.
+   - **Before vs. After SFT Comparison (`5 / 6` exact ground-truth matches after SFT vs. `0 / 6` before SFT)**:
+
+| Case ID | Video QA Task (`fps=2.0, max_frames=8`) | Ground Truth (`llava_video`) | Before SFT (`DeepSeek-V4.1-Flash-1017`, 8-GPU Infer) | After SFT (`ViT GC + TextEncoder + 40L LLM + 3L MTP + dyn_bsz`, 8-GPU Infer) | Match |
+| :--- | :--- | :--- | :--- | :--- | :---: |
+| **`vid0_q1_after_bend`** | Temporal action after bending down to pick up object | `'D.'` | `'The user wants me to identify what the man did after bending down... * Image 1: Man is at the table...'` *(no final answer in 64 tokens)* | **`'</think>D.'`** | **Exact Match** |
+| **`vid0_q2_new_item_end`** | New item appearing in background by end of video | `'A. A calendar.'` | `'The user wants me to identify a new item that appears in the background... 1. Analyze the initial frames...'` *(truncated)* | **`'</think>A. A calendar.'`** | **Exact Match** |
+| **`vid1_q3_first_action`** | First action performed in kitchen video | `'D.'` | `'The user wants me to identify the first action... * Image 1: The person is standing...'` *(no final answer in 64 tokens)* | **`'</think>D.'`** | **Exact Match** |
+| **`vid1_q4_after_stove`** | Action after placing frying pan on stove | `'D. They adjust the controls of the stove.'` | `'The user wants me to identify the action the person takes after placing the frying pan...'` *(no final answer in 64 tokens)* | **`'</think>D. They adjust the controls of the stove.'`** | **Exact Match** |
+| **`vid2_q5_final_scene_sofa`** | Activity on sofa in the final scene (after backyard pool) | `'C.'` | `'The user wants me to identify what the person on the sofa is doing... * A. Eating... * B. Sleeping...'` *(truncated)* | **`'</think>D.'`** *(concise direct option format)* | Format learned (`D.` vs `C.`) |
+| **`vid3_q6_after_chopping_herbs`** | Chef action after chopping herbs | `'A. Adds the herbs to the simmering red sauce.'` | `'The user wants me to identify the action the chef takes... * Image 1: Chef looking at a pan...'` *(truncated)* | **`'</think>A. Adds the herbs to the simmering red sauce.'`** | **Exact Match** |
