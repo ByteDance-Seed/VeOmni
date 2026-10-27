@@ -98,8 +98,6 @@ def check_context_parallel_supported(config: PretrainedConfig, attn_implementati
             raise NotImplementedError("USP requires MODELING_BACKEND=veomni for its attention and shifted loss.")
         implementation = attn_implementation or getattr(config, "_attn_implementation", None)
         supported_backends = {
-            "flash_attention_2",
-            "flash_attention_4",
             "veomni_flash_attention_2",
             "veomni_flash_attention_4",
         }

@@ -45,6 +45,8 @@ def test_usp_layout_is_explicit(monkeypatch):
         ("qwen3", "contiguous", "veomni_flash_attention_2", False),
         ("qwen3", "zigzag", "veomni_flash_attention_2", True),
         ("qwen3", "zigzag", "veomni_flash_attention_4", True),
+        ("qwen3", "zigzag", "flash_attention_2", False),
+        ("qwen3", "zigzag", "flash_attention_4", False),
         ("qwen3", "zigzag", "veomni_flex_attention", False),
         ("qwen3_next", "zigzag", "veomni_flash_attention_2", False),
     ],
@@ -150,3 +152,39 @@ def test_usp_rejects_sequence_classification(monkeypatch):
     config = SimpleNamespace(model_type="qwen3", architectures=["Qwen3ForSequenceClassification"])
     with pytest.raises(NotImplementedError, match="Qwen3ForCausalLM"):
         auto.check_context_parallel_supported(config, "veomni_flash_attention_2")
+
+
+@pytest.mark.parametrize("layout", [{"cp_layout": "contiguous"}, {}])
+def test_contiguous_cp_keeps_standard_flash_path(monkeypatch, layout):
+    monkeypatch.setenv("FLASH_ATTENTION_DETERMINISTIC", "1")
+    monkeypatch.setattr(flash, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, **layout))
+    monkeypatch.setattr(flash, "should_apply_ulysses", lambda **kwargs: False)
+    calls = []
+
+    def standard(query, key, value, mask, **kwargs):
+        calls.append(kwargs["attn_implementation"])
+        return query
+
+    monkeypatch.setattr(flash, "_flash_attention_forward", standard)
+    module = SimpleNamespace(config=SimpleNamespace(_attn_implementation="veomni_flash_attention_2"), is_causal=True)
+    q = torch.zeros(1, 2, 8, 4, dtype=torch.bfloat16)
+    out, _ = flash.flash_attention_forward(module, q, q, q, None)
+    torch.testing.assert_close(out, q.transpose(1, 2))
+    assert calls == ["flash_attention_2"]
+
+
+@pytest.mark.parametrize("backend", ["flash_attention_2", "flash_attention_4"])
+def test_installed_ops_cannot_bypass_usp_with_plain_attention(monkeypatch, backend):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(auto, "IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr(
+        auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_layout="zigzag", device_type="cuda")
+    )
+    monkeypatch.setattr(
+        auto, "get_ops_config", lambda: SimpleNamespace(attn_implementation="veomni_flash_attention_2")
+    )
+    config = auto.PretrainedConfig()
+    config.model_type = "qwen3"
+    with pytest.raises(NotImplementedError, match="VeOmni FlashAttention"):
+        auto.build_foundation_model(config, attn_implementation=backend, init_device="meta")

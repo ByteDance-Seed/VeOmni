@@ -183,7 +183,11 @@ def flash_attention_forward(
         is_causal = module.is_causal
 
     cp_state = get_parallel_state()
-    ring_enabled = getattr(cp_state, "cp_enabled", False) and not skip_ulysses
+    ring_enabled = (
+        getattr(cp_state, "cp_enabled", False)
+        and getattr(cp_state, "cp_layout", "contiguous") == "zigzag"
+        and not skip_ulysses
+    )
     if ring_enabled:
         if (
             kwargs.get("deterministic", False)
@@ -191,8 +195,6 @@ def flash_attention_forward(
             or os.environ.get("FLASH_ATTENTION_DETERMINISTIC") == "1"
         ):
             raise NotImplementedError("USP deterministic backward is not supported yet.")
-        if cp_state.cp_layout != "zigzag":
-            raise NotImplementedError("USP flash attention requires cp_layout='zigzag'.")
         if not is_causal or attention_mask is not None:
             raise NotImplementedError("USP requires causal attention without an explicit attention mask.")
         if dropout or sliding_window is not None or softcap not in (None, 0.0) or kwargs.get("s_aux") is not None:
