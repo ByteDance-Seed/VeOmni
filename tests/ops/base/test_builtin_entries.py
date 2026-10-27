@@ -42,6 +42,7 @@ _GPU_NVIDIA_SM90 = ("gpu", (("nvidia", 90, None),))
 _GPU_NVIDIA_SM90_OR_SM100 = ("gpu", (("nvidia", 90, 90), ("nvidia", 100, 100)))
 _GPU_NVIDIA_SM100 = ("gpu", (("nvidia", 100, None),))
 _GPU_NVIDIA_SM90_TO_SM100 = ("gpu", (("nvidia", 90, 100),))
+_GPU_ROCM = ("gpu", (("rocm", None, None),))
 _NPU = ("npu", ())
 _MLU = ("mlu", ())
 
@@ -96,6 +97,7 @@ _BUILTIN_ENTRIES = (
     ("attention", "standard", "veomni_sdpa", "any", _ANY, ()),
     ("dsa_attention", "deepseek_v4", "eager", "any", _ANY, ()),
     ("dsa_attention", "deepseek_v4", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
+    ("dsa_attention", "deepseek_v4", "triton", "cuda", _GPU_ROCM, ("triton",)),
     ("dsa_attention", "deepseek_v4", "cann", "npu", _NPU, ("cann_ops_transformer",)),
     ("dsa_attention", "glm", "eager", "any", _ANY, ()),
     ("dsa_attention", "glm", "flashmla_cudnn", "cuda", _GPU_NVIDIA_SM90, ("cudnn", "flash_mla")),
@@ -132,6 +134,7 @@ _BUILTIN_ENTRIES = (
     ("load_balancing_loss", "standard", "triton", "cuda", _GPU, ("triton",)),
     ("cross_entropy_loss", "standard", "eager", "any", _ANY, ()),
     ("cross_entropy_loss", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("cross_entropy_loss", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("cross_entropy_loss", "standard", "chunk_loss", "any", _ANY, ()),
     ("cross_entropy_loss", "standard", "chunk_loss", "npu", _NPU, ()),
     ("mhc", "pre", "eager", "any", _ANY, ()),
@@ -170,21 +173,27 @@ _BUILTIN_ENTRIES = (
     ("layer_norm", "standard", "apex", "cuda", _GPU, ("fused_layer_norm_cuda",)),
     ("rms_norm", "standard", "eager", "any", _ANY, ()),
     ("rms_norm", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("rms_norm", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("rms_norm", "standard", "torch_npu", "npu", _NPU, ()),
     ("rms_norm", "standard", "triton", "cuda", _GPU, ("triton",)),
     ("rms_norm", "deepseek_v4", "eager", "any", _ANY, ()),
     ("rms_norm", "deepseek_v4", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("rms_norm", "deepseek_v4", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("rms_norm", "deepseek_v4", "torch_npu", "npu", _NPU, ()),
     ("rms_norm", "offset", "eager", "any", _ANY, ()),
     ("rms_norm", "offset", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("rms_norm", "offset", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("rms_norm", "offset", "torch_npu", "npu", _NPU, ()),
     ("rms_norm", "unweighted", "eager", "any", _ANY, ()),
     ("rms_norm", "unweighted", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("rms_norm", "unweighted", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("rope", "full", "eager", "any", _ANY, ()),
     ("rope", "full", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("rope", "full", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("rope", "full", "torch_npu", "npu", _NPU, ()),
     ("rope", "partial", "eager", "any", _ANY, ()),
     ("rope", "partial", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("rope", "partial", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("rope", "partial", "torch_npu", "npu", _NPU, ()),
     ("rope", "interleave", "eager", "any", _ANY, ()),
     ("rope", "mrope", "eager", "any", _ANY, ()),
@@ -195,8 +204,10 @@ _BUILTIN_ENTRIES = (
     ("rope", "wan", "torch_npu", "npu", _NPU, ()),
     ("swiglu_mlp", "standard", "eager", "any", _ANY, ()),
     ("swiglu_mlp", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("swiglu_mlp", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("swiglu_mlp", "geglu", "eager", "any", _ANY, ()),
     ("swiglu_mlp", "geglu", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("swiglu_mlp", "geglu", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
 )
 
 
@@ -243,6 +254,7 @@ def test_builtin_entry_catalog_is_exact():
 
 _BUILTIN_DEFAULT_ENTRIES = {
     ("cross_entropy_loss", "standard", "liger_kernel", "cuda"),
+    ("cross_entropy_loss", "standard", "liger_kernel", "mlu"),
     ("cross_entropy_loss", "standard", "chunk_loss", "npu"),
     ("load_balancing_loss", "standard", "triton", "cuda"),
     ("moe_experts", "standard", "fused_triton", "cuda"),
@@ -252,18 +264,26 @@ _BUILTIN_DEFAULT_ENTRIES = {
     ("moe_experts", "swiglu_oai", "fused_triton", "cuda"),
     ("moe_experts", "swiglu_oai", "fused_npu", "npu"),
     ("rms_norm", "standard", "liger_kernel", "cuda"),
+    ("rms_norm", "standard", "liger_kernel", "mlu"),
     ("rms_norm", "standard", "torch_npu", "npu"),
     ("rms_norm", "deepseek_v4", "liger_kernel", "cuda"),
+    ("rms_norm", "deepseek_v4", "liger_kernel", "mlu"),
     ("rms_norm", "deepseek_v4", "torch_npu", "npu"),
     ("rms_norm", "offset", "liger_kernel", "cuda"),
+    ("rms_norm", "offset", "liger_kernel", "mlu"),
     ("rms_norm", "offset", "torch_npu", "npu"),
     ("rms_norm", "unweighted", "liger_kernel", "cuda"),
+    ("rms_norm", "unweighted", "liger_kernel", "mlu"),
     ("rope", "full", "liger_kernel", "cuda"),
+    ("rope", "full", "liger_kernel", "mlu"),
     ("rope", "full", "torch_npu", "npu"),
     ("rope", "partial", "liger_kernel", "cuda"),
+    ("rope", "partial", "liger_kernel", "mlu"),
     ("rope", "partial", "torch_npu", "npu"),
     ("swiglu_mlp", "standard", "liger_kernel", "cuda"),
+    ("swiglu_mlp", "standard", "liger_kernel", "mlu"),
     ("swiglu_mlp", "geglu", "liger_kernel", "cuda"),
+    ("swiglu_mlp", "geglu", "liger_kernel", "mlu"),
 }
 
 
