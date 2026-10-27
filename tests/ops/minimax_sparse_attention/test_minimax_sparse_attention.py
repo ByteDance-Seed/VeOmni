@@ -21,6 +21,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops.kernels.minimax_sparse_attention import (
     minimax_sparse_attention_eager,
     minimax_sparse_indexer_eager,
@@ -139,6 +140,7 @@ def _upstream_attention(indexer, sample, q, k, v, block_indices):
     return output[0]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_indexer_matches_upstream_per_sample():
     _, samples = _per_sample_inputs()
     block_indices = minimax_sparse_indexer_eager(
@@ -160,6 +162,7 @@ def test_indexer_matches_upstream_per_sample():
 # float64 guards padded query rows: a fully masked row turns into NaN once the
 # float32 softmax sees the float64 dtype-min mask, and leaks into K/V gradients.
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["fp32", "fp64"])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_attention_matches_upstream_per_sample_forward_and_backward(dtype):
     indexer, samples = _per_sample_inputs()
     for sample in samples:
@@ -201,6 +204,7 @@ def test_attention_matches_upstream_per_sample_forward_and_backward(dtype):
         torch.testing.assert_close(packed_grad, torch.cat(grads))
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_indexer_output_feeds_attention_with_wider_topk_slots():
     """The indexer pads to ``topk_blocks`` slots even when the batch has fewer key blocks."""
     _, samples = _per_sample_inputs()
@@ -231,6 +235,7 @@ def test_indexer_output_feeds_attention_with_wider_topk_slots():
     assert torch.isfinite(output).all()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_padded_layout_round_trips_sp_padding_segment():
     packed = torch.arange(14, dtype=torch.float32).view(7, 2)
 
@@ -244,6 +249,7 @@ def test_padded_layout_round_trips_sp_padding_segment():
     assert torch.equal(_pack(padded, indices), packed)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_rejects_device_tensor_max_seqlen():
     q = torch.randn(4, _NUM_QUERY_HEADS, _HEAD_DIM)
     k = torch.randn(4, _NUM_GROUPS, _HEAD_DIM)
@@ -254,6 +260,7 @@ def test_rejects_device_tensor_max_seqlen():
         )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_rejects_block_indices_not_grouped_by_kv_head():
     q = torch.randn(4, _NUM_QUERY_HEADS, _HEAD_DIM)
     k = torch.randn(4, _NUM_GROUPS, _HEAD_DIM)
@@ -265,6 +272,7 @@ def test_rejects_block_indices_not_grouped_by_kv_head():
 
 
 @pytest.mark.parametrize(("seq_len", "block_size"), [(9, 2), (8, 4), (5, 8)], ids=["ragged", "exact", "one-block"])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_bfloat16_block_expansion_matches_boolean_expansion(seq_len, block_size):
     """The NPU-only bfloat16 expansion path must build exactly the boolean mask."""
     torch.manual_seed(0)

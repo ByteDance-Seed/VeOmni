@@ -6,9 +6,13 @@ import torch
 from PIL import Image
 from transformers.video_utils import VideoMetadata
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.chat_template import MiniMaxM3VLChatTemplate
 from veomni.data.data_transform import process_sample_minimax_m3_vl
 from veomni.utils.import_utils import is_ffmpeg_available
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _render_fake_minimax_chat_template(messages, *, add_generation_prompt):

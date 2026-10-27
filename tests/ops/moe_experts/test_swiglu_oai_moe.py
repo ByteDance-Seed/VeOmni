@@ -3,12 +3,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops.kernels.moe_experts.shared.swiglu import (
     swiglu_activation,
     swiglu_activation_backward,
     swiglu_oai,
     swiglu_oai_backward,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_swiglu_oai_moe_variant_registers_eager_gpu_and_npu_rows():
