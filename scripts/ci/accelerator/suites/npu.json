@@ -442,5 +442,14 @@
       "-x",
       "tests/optim/test_qwen38_muon.py"
     ]
+  },
+  {
+    "name": "qwen38-cpu_offload_adamw_device-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_cpu_offload_adamw_device.py"
+    ]
   }
 ]
