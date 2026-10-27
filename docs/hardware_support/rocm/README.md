@@ -113,10 +113,73 @@ The image bakes in the following ROCm-specific environment variables (you can ov
 | `MIOPEN_DEBUG_FORCE_IMMED_MODE_FALLBACK` | `1` | Skip MIOpen conv3d exhaustive tuning (otherwise the Wan VAE conv3d autotunes for minutes on the first call) |
 | `TOKENIZERS_PARALLELISM` | `false` | Suppress tokenizer fork warnings |
 
+## Use AMD AITER for better performance
+
+[AITER](https://github.com/ROCm/aiter) is AMD's kernel library for ROCm.
+VeOmni can route attention to its FMHA-v3 kernels instead of the default
+flash-attn 2.8.3 composable-kernel build:
+
+```yaml
+model:
+  ops_implementation:
+    attn_implementation: aiter
+```
+
+`aiter` comes from the base image rather than being installed by the
+Dockerfile. The distribution is named `amd_aiter`, not `aiter`:
+
+```bash
+python -c "from importlib.metadata import version; print(version('amd_aiter'))"
+```
+
+### Numerical parity
+
+Measured against a `flash_attention_2` baseline with the same seed and data
+(`transformers==5.16.1`, 8×MI308X):
+
+| model | run | result |
+|---|---|---|
+| Wan2.1-1.3B DiT | 30 steps, LoRA | \|Δ\| = 0 on every step — no observable difference |
+| Qwen3-Omni-30B | 25 steps, full SFT | max \|Δ\| = 0.02 (mean 0.006) |
+
+### Expected speedup
+
+Measured in end-to-end training with the default configs
+(`transformers==5.16.1`, 8×MI308X):
+
+| model | attention share of kernel time | s/step FA2 → aiter | speedup |
+|---|---|---|---|
+| Wan2.1-1.3B DiT | 57% | 5.00 → 4.00 | **1.25×** |
+| Qwen3-Omni-30B MoE | 7% (MoE group-gemm is 53%) | 27.0 → 26.0 | 1.04× |
+
+> Note: VeOmni packs short samples up to `max_seq_len`, so attention in the
+> default Qwen run is block-diagonal and already cheap. That is why its speedup
+> is lower than the sweep below, which feeds one unpacked sequence per step.
+
+The gain grows with sequence length because attention is O(s²) while the rest
+of the step is linear. The sequence-length sweeps below are unchanged from the
+`transformers==5.12.1` run.
+
+| Wan2.1-1.3B DiT (LoRA, ulysses 2) | 8,064 | 16,422 (default) | 32,256 (real 480P) |
+|---|---|---|---|
+| s/step FA2 → aiter | 2.56 → 2.33 | 5.42 → 4.25 | 16.00 → 11.78 |
+| speedup | 1.10× | 1.28× | **1.36×** |
+
+| Qwen3-Omni-30B MoE (full SFT) | 8,192 | 16,384 | 32,768 | 65,536 |
+|---|---|---|---|---|
+| s/step FA2 → aiter | 34 → 30 | 69 → 56 | 188 → 135 | 631 → 428 |
+| speedup | 1.13× | 1.23× | 1.39× | **1.47×** |
+
+Exclude the first step when benchmarking: AITER pays a one-time CK/FMHA-v3
+kernel-load and JIT cost (~550 s on a cold cache).
+
 ## Known limitations
 
 Validated on 8×MI308X / ROCm 7.14. End-to-end training (FSDP2 sharding, Ulysses SP, expert parallel EP, VLM/Omni, DiT) works and aligns numerically. Known limitations:
 
-- **CUDA-only kernels** (FA3/FA4/Quack/FlashMLA/DSA, e.g. `gpt_oss`) fall back to triton/eager on ROCm, or are skipped.
+- **CUDA-only kernels** (FA3/FA4/Quack/FlashMLA/DSA, e.g. `gpt_oss`) fall back to triton/eager on ROCm, or are skipped. For attention specifically, `attn_implementation: aiter` is the ROCm-native alternative.
+- **Attention sinks are not supported by `aiter`** — models that pass `s_aux` / `learnable_sink` (such as DeepSeek-V4; `gpt_oss` only declares FA3 Hub and FA4 as compatible flash implementations) raise rather than silently dropping the sinks. Use `eager` if they are required.
+- **`aiter` cannot train with an attention logits softcap.** Its varlen forward applies the cap, but its backward ignores it. VeOmni raises under autograd and permits the correct inference-only forward; use `eager` for training.
+- **`aiter` rejects a `window_size` tuple that is neither 2 nor 3 elements wide.** `None` is accepted and selects full attention.
 - **GatedDeltaNet (qwen3_5 / qwen3_5_moe)** runs on FLA's Triton kernels. TileLang is not part of the `rocm` extra; its ROCm backend has a HIP wrapper/codegen defect, so if you install it, set `FLA_TILELANG=0` to keep FLA on Triton.
 - **DCP → HF weight consolidation**: the version guard in `veomni/checkpoint/dcp_consolidation.py` only allows torch `2.9`/`2.11` and rejects the image's torch `2.12`. Relax the guard or use a 2.9/2.11 ROCm torch build; otherwise disable `save_hf_weights`.
