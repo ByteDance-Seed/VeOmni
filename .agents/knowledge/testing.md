@@ -3,31 +3,150 @@
 How to decide whether a change needs a test, where to put it, and whether CI
 will actually run it. Read this before adding a test file.
 
+## New-model coverage policy
+
+Follow [Testing a New Model](../../docs/transformers_v5/testing_new_model.md)
+for the maintained coverage matrix. Require registry/build, eager family
+forward/backward parity, one supported accelerator training configuration
+against a reference, and E2E alignment for supported parallel modes.
+
+Ordinary dense E2E uses `(SP1, EP1)` and `(SP2, EP1)`; ordinary MoE uses
+`(SP1, EP1)` and `(SP2, EP2)`, with four processes per run. Qwen3-MoE retains
+the full matrix and eight-process SP2 topology. GPT-OSS uses three four-process
+modes `(1,1)`, `(2,1)`, `(2,2)` for its dedicated Quack variant. Check the SOP
+for capability exceptions and justification for additional representatives.
+Preserve a common initial checkpoint, data and global batch; fixed-world-size
+SP changes DP size, so compare DP-mean losses and grad norm. Aggregate metric
+alignment does not prove per-parameter update equivalence.
+
+Keep alignment assertions enabled. Smoke tests establish execution only;
+record any numerical gap explicitly. Separate model integration, raw operator
+numerics, and full distributed execution: standard Quack and GPT-OSS Quack
+need distinct coverage, and an EP-local GEMM test does not exercise all-to-all.
+Record GPU/NPU eligibility and actual skips; SM90-only cases skipped by SM89
+CI are not validated by that job. Use the same mode list for command creation
+and resource plans, reserving the actual sequential peak device count.
+
 ## CI selects tests by explicit enumeration
 
-A test that passes locally is not necessarily a test CI runs.
+GPU/NPU suite selections are enumerated in `scripts/ci/accelerator/suites/gpu.json` and
+`scripts/ci/accelerator/suites/npu.json`. Both use the common accelerator case scheduler in
+`scripts/ci/accelerator/runner.py`; GPU/NPU unit and e2e workflows all use
+parallel dispatch. Add a suite selection for a file outside a collected
+directory. Do not add per-file pytest workflow lines or manual device quotas.
+CPU-only parsing, preprocessing, eager references and mocked backend tests need
+an explicit CPU launch plan. Mark entire modules only when all cases are CPU-only;
+use individual case markers in files that also exercise accelerator kernels.
+The lightweight device-API workflow runs architecture, op-documentation and
+generated-call-site-signature tests with `pytest --noconftest`, without Torch.
+The patchgen workflow owns `test_modify_init.py`, using the standalone
+`patchgen` package and `pytest --noconftest` to avoid runtime fixture imports.
+Device-API acceptance also includes the three `check_device_api_usage.py`
+scans over `tasks`, `veomni`, and `tests`; the pytest guards alone do not cover
+that workflow. CPU tests checking device-name forwarding should use a mock
+backend sentinel when no real hardware API is involved.
+CPU-planned worker cases scope `torch.utils.checkpoint.DefaultDeviceType` to
+`cpu` and restore it afterward. On Ascend, CPU-only checkpoint inputs otherwise
+fall back to the registered NPU and AMP capability queries can initialize a
+hidden device. Preserve this scope across fixture setup and teardown as well
+as the test body; accelerator plans and full-visibility collection stay unchanged.
+During that scope, optimizer foreach-capability queries use the canonical
+`torch.utils._foreach_utils` helper. torch_npu 2.10 replaces the optimizer's
+alias with a device-name lookup that initializes NPU even for CPU parameters.
+Restore the prior alias on exit, preserving explicit foreach/fused options.
+The restoration scope includes setup itself, so partial initialization failures
+also undo changes already applied. Unsupported vendor isolation interfaces
+raise an explicit error before the test runs.
+torch_npu 2.10 also replaces the multi-worker DataLoader iterator constructor
+with unconditional NPU synchronization/affinity calls, even for CPU datasets.
+CPU-planned cases temporarily use the vendor module's saved Torch constructor
+and restore the patch after teardown or failure. Only replace the known vendor
+wrapper; preserve unrelated constructor patches and all accelerator plans.
+The vendor Inductor wrapper also registers its NPU backend before compiling
+CPU graphs. CPU cases temporarily disable that registration through the loaded
+vendor registry and restore its prior disabled state after teardown or failure.
+Keep real CPU Inductor compilation and gradient checks enabled; do not replace
+compiled-mask coverage with eager execution to avoid hidden-device queries.
+CPU cases must also register Torch's built-in CPU device-op overrides when
+missing. torch_npu populates the override registry at import; Torch 2.10 then
+skips all built-ins because the registry is nonempty. Torch 2.11 repairs missing
+keys, so testing only that version misses the NPU CI failure. Preserve existing
+CPU/vendor entries and validate the pinned Torch version's startup state.
+A synthetic registered backend alone misses vendor monkeypatches: exercise
+the pinned wheel's optimizer patch in CPU isolation audits too.
+
+CPU numerical flakes need fresh-process reproduction, not only warm repeats.
+The QSA CPU fused-kernel mock promotes only `exp` to FP64 and casts back:
+PyTorch 2.11 CPU FP32 `torch.exp` was observed to return inaccurate values on
+its first parallel call, reproducing the original 757-element CI mismatch.
+Keep the adapter's FP32 arithmetic and strict output/gradient tolerances; the
+independent FP64 SDPA oracle alone does not fix an inaccurate candidate mock.
+
+New functions/parameters already included by an existing selection need no
+manifest update. Check node-ID and pytest filters as well as file/directory
+paths. See `docs/testing.md` under "Registering Tests in CI" for the manifest
+example and collection verification command.
+
+Resource plans use the same `nproc/world_size` configuration as worker startup.
+Use `pytest.mark.launch_plan(provider=...)` for multi-card tests; an unmarked
+case defaults to one selected accelerator card, or CPU on a CPU-only host.
+Explicit CPU plans reserve zero cards. See `docs/design/ci_case_scheduling.md`
+for the author API, defaults and mismatch rules, and `scripts/ci/accelerator/README.md` for
+local commands and result artifacts.
+
+A CPU launch plan isolates devices only when the accelerator runner executes
+the test. CPU-only launcher regressions must also isolate their subprocess
+environment before importing torch, so ordinary pytest on a GPU/NPU host does
+not choose an accelerator backend for CPU tensors. Architecture-specific
+kernel tests must check hardware eligibility before importing optional kernels.
+
+Distributed rendezvous must own its listener through worker startup. Use
+`tests.tools.launch_utils.spawn_with_rendezvous` for raw spawn workers (the
+endpoint is appended to their arguments; initialize with `store=endpoint.connect()`)
+or the existing `torchrun` callable helper. Single-node torchrun commands use
+`--standalone`; CI keeps agent Store sharing enabled. `find_free_port()` only
+returns a number and its run registry only coordinates cooperating callers:
+probing, closing, then binding in a child still races with other sockets.
+After `mp.spawn` returns its context, the helper reaps workers before releasing
+the Store on failure, interruption and success. Partial startup failures before
+that return rely on the runner's enclosing process-scope cleanup. Never solve a bind race by retrying an entire
+training/checkpoint operation that may already have produced side effects.
+
+A test that passes locally is not necessarily a test CI runs. The entries below
+describe selections in `scripts/ci/accelerator/suites/gpu.json` and `npu.json`.
 
 | Path | How CI picks it up |
 |------|--------------------|
-| `tests/data/` | whole directory, in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
-| `tests/checkpoints/` | whole directory, in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
-| `tests/ops/` | whole directory in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
-| `tests/models/` | whole directory in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
-| `tests/parallel/context_parallel/` | whole directory, `gpu_unit_tests.yml` only |
-| everything else | **one `pytest` line per file**, listed in `gpu_unit_tests.yml`, and separately in `npu_unit_tests.yml` when it should run on Ascend |
-| `tests/e2e/test_e2e_parallel.py`, `tests/distributed/test_fsdp_equivalence.py` | `gpu_e2e_test.yml` / `npu_e2e_test.yml` |
+| `tests/ci/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
+| `tests/data/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
+| `tests/checkpoints/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
+| `tests/ops/` | directory in both GPU/NPU unit manifests, excluding `base/test_op_documentation.py` (device-API workflow) |
+| `tests/models/` | unit selection in both manifests, excluding `base/test_modify_init.py` (patchgen workflow) and `transformers/test_generated_call_site_signatures.py` (device-API workflow); GPU additionally excludes `test_omni_fsdp.py` |
+| `tests/parallel/context_parallel/` | whole directory, GPU manifest only (`suite: unit`) |
+| everything else | **one selection per file** in the appropriate GPU/NPU suite manifest |
+| `tests/e2e/test_e2e_parallel.py`, `tests/distributed/test_fsdp_equivalence.py` | GPU/NPU manifests (`suite: e2e`) |
+| `tests/models/test_omni_fsdp.py` | GPU manifest `61-e2e` (`suite: e2e`); NPU coverage remains in the models unit selection |
 
 Consequences that cut both ways:
 
 - Adding a file under one of the directory-level entries above is already
-  covered. Adding a workflow line for it is redundant churn.
+  covered. Adding another selection for it is redundant churn.
 - Adding a file anywhere else is **invisible to CI** until it is enumerated —
-  usually in two workflows. Roughly thirty existing files under
+  in the GPU and/or NPU suite manifests. Roughly thirty existing files under
   `tests/{trainer,utils,tools,lora,distributed,parallel,e2e}` are in exactly
   this state, so "a test file exists for X" does not mean X is guarded.
 - The GPU unit job runs on one self-hosted L20-8 fleet with a 120-minute budget
   and `-x` fail-fast. Every new file pays process startup plus model build, and a
   new flaky file blocks the whole suite for everyone.
+
+The accelerator runner cancels running peers on the first failure by default;
+`--keep-going` continues all cases. Foreground logs must identify case progress,
+the original failure and cancelled peers without conflating their outcomes.
+Accelerator runner thread pools must cancel owned worker scopes before waiting
+for callbacks on interruption. Preserve scoped process cleanup and failure
+artifacts; do not terminate unrelated device users or rely on the batch timeout.
+Use future completion to prove callbacks drained: an interrupted `Thread.join`
+can report a stopped thread before its callback finishes cleanup.
 
 ## What the NPU job can actually run
 
@@ -48,8 +167,8 @@ Check whether a file is wired — by name, and by the directory it sits in:
 
 ```bash
 TEST_PATH=tests/trainer/test_my_new_thing.py
-rg -n "$(basename "$TEST_PATH")" .github/workflows/
-rg -n "$(dirname  "$TEST_PATH")" .github/workflows/
+rg -n "$(basename "$TEST_PATH")" scripts/ci/accelerator/suites/*.json
+rg -n "$(dirname  "$TEST_PATH")" scripts/ci/accelerator/suites/*.json
 ```
 
 ## Decision rule
@@ -89,8 +208,8 @@ which cases each job runs.
 **3. It genuinely needs a new file elsewhere.** Prefer folding it into an
 enumerated file in the same directory first. If a separate file is warranted
 (different fixtures, different launcher, meaningfully different runtime), then
-add it to `gpu_unit_tests.yml`, and to `npu_unit_tests.yml` if the behaviour is
-not GPU-specific. Say in the PR what it costs in wall time.
+add it to the GPU suite manifest, and the NPU suite manifest if the behaviour
+is not GPU-specific. Say in the PR what it costs in wall time.
 
 **4. Add no test.** Legitimate cases:
 
@@ -113,9 +232,7 @@ needed" without a reason is what the reviewer is looking for.
   graph and differentiate each graph once without retaining it. Keep test inputs
   deterministic; do not disable compiler buffer donation globally for a test.
 - A test double wrapping a `VeomniOp` must expose the handle attributes its
-  consumer reads, including `impl`. DeepSeek-V4 keeps eager routing weights in
-  their incoming dtype and casts them for fused MoE; a recording double must
-  identify which path it represents and assert the corresponding dtype.
+  consumer reads, including `impl`.
 - CPU substitutes for Diffusers RMSNorm on Ascend hosts must preserve the
   pinned upstream CPU math and dtype promotion. `F.rms_norm` is not a drop-in
   replacement for BF16 inputs with FP32 weights: its BF16 output cannot feed

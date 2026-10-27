@@ -75,6 +75,7 @@ gpu = [
   # Pinned so the rocm extra's newer FLA does not pull this environment along.
   "flash-linear-attention==0.4.1",
   "quack-kernels[cu13]==0.5.0",
+  "deep-gemm==2.8.2+5081f85; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'x86_64')",
   # Dao-AILab Gram Newton-Schulz (default muon_ns_implementation=gram_quack).
   # Pure-torch `gram` path does not need this; package ImportError falls back to gram.
   "gram-newton-schulz==0.1.6",
@@ -354,6 +355,15 @@ flash-mla = [
   { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'" },
   { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" },
 ]
+# DeepGEMM host extension and DeepJIT headers, pinned to the validated source revision.
+# Native Linux wheels (glibc >=2.38); runtime GEMM JIT still needs NVCC/C++20.
+# Rebuild all four wheels when changing the torch/CUDA ABI.
+deep-gemm = [
+  { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/deep-gemm-5081f8513af57e61696de4f4f04b0e707ffb503e-py3.11-torch2.11.0-cu130/deep_gemm-2.8.2%2B5081f85-cp311-cp311-linux_aarch64.whl", extra = "gpu", marker = "sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'aarch64'" },
+  { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/deep-gemm-5081f8513af57e61696de4f4f04b0e707ffb503e-py3.12-torch2.11.0-cu130/deep_gemm-2.8.2%2B5081f85-cp312-cp312-linux_aarch64.whl", extra = "gpu", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'aarch64'" },
+  { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/deep-gemm-5081f8513af57e61696de4f4f04b0e707ffb503e-py3.11-torch2.11.0-cu130/deep_gemm-2.8.2%2B5081f85-cp311-cp311-linux_x86_64.whl", extra = "gpu", marker = "sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'" },
+  { url = "https://github.com/verl-project/verl-wheelhouse/releases/download/deep-gemm-5081f8513af57e61696de4f4f04b0e707ffb503e-py3.12-torch2.11.0-cu130/deep_gemm-2.8.2%2B5081f85-cp312-cp312-linux_x86_64.whl", extra = "gpu", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" },
+]
 # Pinned wheels avoid FFmpeg build dep in CI. x86_64: 3.11 → 14.4.0,
 # 3.12 → 14.2.0. aarch64: 14.2.0 for both (14.4.0 has no aarch64 wheel).
 av = [
@@ -503,6 +513,7 @@ line-ending = "auto"
 # is on sys.path. NPU CI still uses pytest 7.4, which already resolved `tests`.
 pythonpath = ["."]
 markers = [
+    "launch_plan(provider): shared process launch configuration used for case scheduling",
     "benchmark: marks tests as benchmark tests (deselect with '-m \"not benchmark\"')",
     "qwen3_5_ulysses: Qwen3.5 GatedDeltaNet Ulysses SP tests (run when ulysses or qwen3_5 code is touched)",
 ]

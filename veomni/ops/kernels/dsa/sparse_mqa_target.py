@@ -50,6 +50,22 @@ def sparse_mqa_target_fwd(
     return sparse_mqa_target_fwd_interface(q, kv, topk_idxs, lse, sm_scale)
 
 
+def sparse_attn_tilelang(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    sm_scale: float | None = None,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Sparse MQA over selected gathered KV entries via TileLang (SM90+ only)."""
+    _require_tilelang_sm90()
+    from .vendor.tilelang_sparse_mla import sparse_attn_tilelang as _impl
+
+    return _impl(q, kv, attn_sink, topk_idxs, sm_scale=sm_scale, return_lse=return_lse)
+
+
 __all__ = [
+    "sparse_attn_tilelang",
     "sparse_mqa_target_fwd",
 ]

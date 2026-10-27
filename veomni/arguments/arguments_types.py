@@ -133,11 +133,11 @@ class OptimizerConfig:
         default="per_module",
         metadata={
             "help": (
-                "Which parameters max_grad_norm is computed over. 'per_module' clips each "
-                "module against its own norm; 'global' clips every module against one norm "
-                "taken across all of them. A single-model job has one module, so the two "
-                "agree; 'global' only becomes meaningful once an omni model owns several, "
-                "and is not implemented yet."
+                "How OmniTrainer applies max_grad_norm across OmniModules. "
+                "'per_module' (default): clip each module to max_grad_norm independently, "
+                "then report sqrt(sum n_i^2). "
+                "'global': measure each module unclipped, total=sqrt(sum n_i^2), then scale "
+                "all modules by one coefficient (single-model / seedream gradient_clip_val semantics)."
             )
         },
     )
@@ -247,13 +247,6 @@ class OptimizerConfig:
             )
         },
     )
-
-    def __post_init__(self):
-        if self.grad_clip_scope == "global":
-            raise NotImplementedError(
-                "model.optimizer.grad_clip_scope='global' needs a clip that spans several "
-                "modules, which arrives with the omni module runtime. Use 'per_module'."
-            )
 
 
 @dataclass
@@ -866,6 +859,8 @@ class AcceleratorConfig:
         # "derive it", cp_size is always an explicit divisor of the world size.
         if self.cp_size < 1:
             raise ValueError(f"cp_size must be a positive integer; got {self.cp_size}.")
+        if self.ulysses_size < 1:
+            raise ValueError(f"ulysses_size must be a positive integer; got {self.ulysses_size}.")
 
         non_dp_size = self.pp_size * self.ulysses_size * self.cp_size * self.tp_size
         if self.world_size % non_dp_size != 0:
@@ -1303,9 +1298,17 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
 
 # MLU compatibility tables for ``_validate_implementations``.
 # ``fused_triton`` is the same group-gemm as on GPU; ``fused_mlu`` is Apex grouped-GEMM.
+# ``liger_kernel`` rows resolve against the Cambricon MLU liger build, which keeps
+# the upstream ``liger_kernel.ops.*`` API; ``is_liger_kernel_mlu_available`` gates it.
 _MLU_ALLOWED: Dict[str, frozenset] = {
+    "rms_norm_implementation": frozenset({"liger_kernel"}),
+    "rotary_pos_emb_implementation": frozenset({"liger_kernel"}),
+    "rotary_pos_emb_vision_implementation": frozenset({"liger_kernel"}),
+    "swiglu_mlp_implementation": frozenset({"liger_kernel"}),
+    "cross_entropy_loss_implementation": frozenset({"liger_kernel", "chunk_loss"}),
     "moe_implementation": frozenset({"fused_mlu", "fused_triton"}),
 }
+
 
 # Values renamed by the OpSlot -> VeomniOp migration. They still parse, resolve to
 # the new name with a warning, and are listed in docs/usage/arguments.md.
@@ -1376,7 +1379,7 @@ class OpsImplementationConfig:
       is documented in the field metadata.
 
     Backends: ``"eager"`` (HF reference, always available),
-    ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"torch_npu"`` (Ascend),
+    ``"liger_kernel"`` (GPU, needs ``liger-kernel``), (MLU, needs the Cambricon liger_kernel build), ``"torch_npu"`` (Ascend),
     ``"triton"`` (CUDA ``triton``, or Triton-Ascend on NPU). Load-balancing loss has a CUDA Triton
     backend; its NPU default is ``"eager"``.
     """
@@ -1416,7 +1419,7 @@ class OpsImplementationConfig:
         default=None,
         metadata={
             "help": "MoE experts forward. 'fused_triton' (GPU SM70+ or MLU) | "
-            "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | "
+            "'fused_quack' (GPU SM90+) | 'deepgemm_fp8' (SM90/SM100 FP8 training) | 'fused_npu' (NPU) | "
             "'fused_mlu' (MLU Apex grouped-GEMM) | 'eager'. "
             "Unset: 'fused_triton' on GPU, 'fused_npu' on NPU, 'fused_mlu' on MLU with Apex "
             "and 'fused_triton' otherwise."
@@ -1425,36 +1428,36 @@ class OpsImplementationConfig:
     cross_entropy_loss_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Cross-entropy loss. 'liger_kernel' (GPU; fused linear+CE — "
+            "help": "Cross-entropy loss. 'liger_kernel' (GPU, MLU; fused linear+CE — "
             "requires VeOmni-patched modeling that passes hidden_states=/weights= to "
             "self.loss_function; unpatched HF models raise) | 'chunk_loss' (chunked "
             "F.linear+CE, hardware-agnostic) | 'eager' (PyTorch F.cross_entropy). "
-            "Unset: 'liger_kernel' on GPU, 'chunk_loss' on NPU, 'eager' on MLU."
+            "Unset: 'liger_kernel' on GPU/MLU, 'chunk_loss' on NPU."
         },
     )
     rms_norm_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "RMSNorm. 'liger_kernel' (GPU) | 'torch_npu' (Ascend; the unweighted "
+            "help": "RMSNorm. 'liger_kernel' (GPU, MLU) | 'torch_npu' (Ascend; the unweighted "
             "variant has no Ascend kernel and uses 'eager') | "
             "'triton' (DeepSeek-V3 batch-invariant; GPU only) | 'eager'. "
-            "Unset: 'liger_kernel' on GPU, 'torch_npu' on NPU, 'eager' on MLU."
+            "Unset: 'liger_kernel' on GPU/MLU, 'torch_npu' on NPU."
         },
     )
     swiglu_mlp_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "SwiGLU MLP. 'liger_kernel' (GPU) | 'eager'. No NPU backend. "
-            "Unset: 'liger_kernel' on GPU, 'eager' on NPU and MLU."
+            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'eager'. No NPU backend. "
+            "Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
         },
     )
     rotary_pos_emb_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Rotary positional embedding. 'liger_kernel' (GPU) | "
+            "help": "Rotary positional embedding. 'liger_kernel' (GPU, MLU) | "
             "'torch_npu' (Ascend) | 'triton' (per-model: DeepSeek-V3 deterministic, "
             "DeepSeek-V4 fused partial-interleaved, Wan; GPU only) | 'eager'. "
-            "Unset: 'liger_kernel' on GPU, 'torch_npu' on NPU, 'eager' on MLU."
+            "Unset: 'liger_kernel' on GPU/MLU, 'torch_npu' on NPU."
         },
     )
     rotary_pos_emb_vision_implementation: Optional[str] = field(
@@ -1462,7 +1465,7 @@ class OpsImplementationConfig:
         metadata={
             "help": "Rank-3 vision layout for full rotary positional embedding. "
             "Uses the same 'rope' op with an independent implementation choice: 'liger_kernel' | 'torch_npu' | 'eager'. "
-            "Unset: 'liger_kernel' on GPU, 'torch_npu' on NPU, 'eager' elsewhere."
+            "Unset: 'liger_kernel' on GPU/MLU, 'torch_npu' on NPU."
         },
     )
     load_balancing_loss_implementation: Optional[str] = field(
@@ -1509,14 +1512,16 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises when the model resolves its kernel."
         },
     )
-    qsa_attention_implementation: Literal["eager", "tilelang"] = field(
+    qsa_attention_implementation: Literal["eager", "tilelang", "torch_npu"] = field(
         default="eager",
         metadata={
             "help": "Qwen4-Exp QSA sparse attention. 'eager' expands the compact global token "
             "selection to a dense mask and runs quadratic PyTorch attention (numerical reference). "
-            "'tilelang' gathers the selected K/V rows instead (requires tilelang, bf16, NVIDIA CUDA); "
-            "it covers training forward/backward only, no KV cache, and raises on an attention mask. "
-            "Nonzero attention dropout falls back to eager with a warning."
+            "'tilelang' gathers the selected K/V rows instead (requires tilelang, bf16, NVIDIA CUDA). "
+            "'torch_npu' prunes per-query-chunk KV intervals with an int8 scatter mask and runs "
+            "torch_npu.npu_fusion_attention (requires bf16, Ascend NPU). "
+            "Both fused backends cover training forward/backward only, no KV cache, and raise on an "
+            "attention mask. Nonzero attention dropout falls back to eager with a warning."
         },
     )
     dsa_indexer_implementation: Literal["eager", "cudnn", "cann", "tilelang"] = field(
@@ -1527,12 +1532,12 @@ class OpsImplementationConfig:
             "cann_ops_transformer)."
         },
     )
-    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "cann", "tilelang"] = field(
+    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "cann", "tilelang", "triton"] = field(
         default="eager",
         metadata={
-            "help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', 'cann', or "
-            "'tilelang'. 'cann' is the DeepSeek-V4 Ascend CANN sparse FlashMLA (requires "
-            "cann_ops_transformer)."
+            "help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', 'cann', "
+            "'tilelang', or 'triton'. 'cann' is the DeepSeek-V4 Ascend CANN sparse FlashMLA "
+            "(requires cann_ops_transformer); 'triton' is DeepSeek-V4 sparse MQA on AMD ROCm."
         },
     )
     mhc_implementation: Literal["eager", "cann", "tilelang"] = field(
@@ -1556,7 +1561,7 @@ class OpsImplementationConfig:
             "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
             "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
             "recipe rather than an op-registry implementation, so it is not selected through "
-            "VeomniOp -- see veomni/ops/qat/."
+            "VeomniOp -- see veomni/ops/qat/. Must be 'none' when moe_implementation='deepgemm_fp8'."
         },
     )
 
@@ -1644,16 +1649,24 @@ class OpsImplementationConfig:
         )
 
     def _validate_implementations(self):
-        """Fail fast on hardware/op mismatch at config-parse time.
+        """Fail fast on incompatible selections and hardware/op mismatch at config-parse time.
 
         Only checks things cheaper to catch here than at model-build time.
         Package availability (liger / torch_npu) and model-specific backend
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
+        if self.moe_implementation == "deepgemm_fp8" and self.qat_implementation != "none":
+            raise ValueError(
+                "moe_implementation='deepgemm_fp8' cannot be combined with "
+                f"qat_implementation={self.qat_implementation!r}. Set qat_implementation='none'; "
+                "DeepGEMM already quantizes the expert GEMM operands."
+            )
+
         from ..utils.device import IS_NPU_AVAILABLE
         from ..utils.import_utils import (
             is_apex_mlu_available,
+            is_liger_kernel_mlu_available,
             is_torch_mlu_available,
         )
 
@@ -1681,6 +1694,12 @@ class OpsImplementationConfig:
             if on_mlu:
                 if value == "fused_mlu" and not is_apex_mlu_available():
                     raise ValueError("moe_implementation='fused_mlu' requires apex_mlu installed on Cambricon MLU.")
+                if value == "liger_kernel" and not is_liger_kernel_mlu_available():
+                    raise ValueError(
+                        f"{field_name}='liger_kernel' requires the Cambricon MLU liger_kernel build on MLU "
+                        "(upstream GPU liger-kernel does not run on MLU). Install the MLU liger_kernel wheel, "
+                        "set 'eager', or leave the field unset."
+                    )
                 if value not in mlu_ok:
                     allowed = sorted(mlu_ok | {"eager"})
                     raise ValueError(

@@ -1,4 +1,4 @@
-"""``ConversationItem`` — the single carrier object of SeedOmni V2.
+"""``ConversationItem`` — the single carrier object of SeedOmni.
 
 The whole pipeline (training and inference) operates on one batched
 ``conversation_list`` (``list[list[ConversationItem]]`` for training, a flat
@@ -19,8 +19,9 @@ Each item is ``{type, value, role, is_dummy, meta}``:
   ``"audio"`` is a standalone sound item (speech in, or speech out once sealed).
   Sound carried *inside* a video clip is not an ``"audio"`` item — it rides on
   the video item's own ``value`` (``VideoInputs.audio``) so that one clip stays
-  one item and the backbone can interleave both streams on a shared timeline.
-  Either way its rate is stated the same way, in ``meta["audio_metadata"]``.
+  one item and the backbone can interleave both streams on a shared timeline;
+  see ``docs/seed_omni/design/media.md``. Either way its rate is stated the
+  same way, in ``meta["audio_metadata"]``.
 * ``value`` — polymorphic: raw content (``str`` / PIL image / pixel tensor /
   ``(samples,)`` waveform) before encoding, an ``(L, D)`` / ``(1, L, D)``
   embedding tensor after.
@@ -71,6 +72,11 @@ ItemValue = Union[str, torch.Tensor, Image.Image]
 # routing reads it via ``iter_desired_items(..., meta={_IMG_TAG_KEY: [...]})`` or
 # ``item.meta.get(_IMG_TAG_KEY)``; this module only owns the key.
 _IMG_TAG_KEY = "_img_tag"
+
+# Per-item sequence-token length written on ``meta`` by CPU preprocessors so
+# ``dyn_bsz`` (``get_length_fn`` / ``get_length_by_labels_fn``)
+# can measure each sample's backbone token length before collation.
+_OMNI_TOKEN_LEN = "_omni_token_len"
 
 
 @dataclass
@@ -291,4 +297,5 @@ __all__ = [
     "iter_desired_items",
     "collect_desired_values",
     "_IMG_TAG_KEY",
+    "_OMNI_TOKEN_LEN",
 ]

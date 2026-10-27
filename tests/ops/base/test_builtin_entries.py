@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import OP_REGISTRY
 from veomni.ops.platform import (
     GpuKernelRequirement,
@@ -26,6 +29,9 @@ from veomni.ops.platform import (
 )
 
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
 _ANY = None
 _GPU = ("gpu", (("nvidia", None, None), ("rocm", None, None)))
 _GPU_SM70 = ("gpu", (("nvidia", 70, None), ("rocm", None, None)))
@@ -33,8 +39,10 @@ _GPU_SM80 = ("gpu", (("nvidia", 80, None), ("rocm", None, None)))
 _GPU_NVIDIA = ("gpu", (("nvidia", None, None),))
 _GPU_NVIDIA_SM80 = ("gpu", (("nvidia", 80, None),))
 _GPU_NVIDIA_SM90 = ("gpu", (("nvidia", 90, None),))
+_GPU_NVIDIA_SM90_OR_SM100 = ("gpu", (("nvidia", 90, 90), ("nvidia", 100, 100)))
 _GPU_NVIDIA_SM100 = ("gpu", (("nvidia", 100, None),))
 _GPU_NVIDIA_SM90_TO_SM100 = ("gpu", (("nvidia", 90, 100),))
+_GPU_ROCM = ("gpu", (("rocm", None, None),))
 _NPU = ("npu", ())
 _MLU = ("mlu", ())
 
@@ -89,6 +97,7 @@ _BUILTIN_ENTRIES = (
     ("attention", "standard", "veomni_sdpa", "any", _ANY, ()),
     ("dsa_attention", "deepseek_v4", "eager", "any", _ANY, ()),
     ("dsa_attention", "deepseek_v4", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
+    ("dsa_attention", "deepseek_v4", "triton", "cuda", _GPU_ROCM, ("triton",)),
     ("dsa_attention", "deepseek_v4", "cann", "npu", _NPU, ("cann_ops_transformer",)),
     ("dsa_attention", "glm", "eager", "any", _ANY, ()),
     ("dsa_attention", "glm", "flashmla_cudnn", "cuda", _GPU_NVIDIA_SM90, ("cudnn", "flash_mla")),
@@ -125,6 +134,7 @@ _BUILTIN_ENTRIES = (
     ("load_balancing_loss", "standard", "triton", "cuda", _GPU, ("triton",)),
     ("cross_entropy_loss", "standard", "eager", "any", _ANY, ()),
     ("cross_entropy_loss", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("cross_entropy_loss", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("cross_entropy_loss", "standard", "chunk_loss", "any", _ANY, ()),
     ("cross_entropy_loss", "standard", "chunk_loss", "npu", _NPU, ()),
     ("mhc", "pre", "eager", "any", _ANY, ()),
@@ -138,10 +148,12 @@ _BUILTIN_ENTRIES = (
     ("mhc", "head", "cann", "npu", _NPU, ()),
     ("qsa_attention", "standard", "eager", "any", _ANY, ()),
     ("qsa_attention", "standard", "tilelang", "cuda", _GPU_NVIDIA, ("tilelang",)),
+    ("qsa_attention", "standard", "torch_npu", "npu", _NPU, ()),
     ("moe_experts", "standard", "eager", "any", _ANY, ()),
     ("moe_experts", "standard", "fused_triton", "cuda", _GPU_SM70, ("triton",)),
     ("moe_experts", "standard", "fused_triton", "mlu", _MLU, ("triton",)),
     ("moe_experts", "standard", "fused_quack", "cuda", _GPU_NVIDIA_SM90, ("quack",)),
+    ("moe_experts", "standard", "deepgemm_fp8", "cuda", _GPU_NVIDIA_SM90_OR_SM100, ("deep_gemm", "triton")),
     ("moe_experts", "standard", "fused_npu", "npu", _NPU, ()),
     ("moe_experts", "standard", "fused_mlu", "mlu", _MLU, ("apex",)),
     ("moe_experts", "gpt_oss", "eager", "any", _ANY, ()),
@@ -156,21 +168,27 @@ _BUILTIN_ENTRIES = (
     ("layer_norm", "standard", "apex", "cuda", _GPU, ("fused_layer_norm_cuda",)),
     ("rms_norm", "standard", "eager", "any", _ANY, ()),
     ("rms_norm", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("rms_norm", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("rms_norm", "standard", "torch_npu", "npu", _NPU, ()),
     ("rms_norm", "standard", "triton", "cuda", _GPU, ("triton",)),
     ("rms_norm", "deepseek_v4", "eager", "any", _ANY, ()),
     ("rms_norm", "deepseek_v4", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("rms_norm", "deepseek_v4", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("rms_norm", "deepseek_v4", "torch_npu", "npu", _NPU, ()),
     ("rms_norm", "offset", "eager", "any", _ANY, ()),
     ("rms_norm", "offset", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("rms_norm", "offset", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("rms_norm", "offset", "torch_npu", "npu", _NPU, ()),
     ("rms_norm", "unweighted", "eager", "any", _ANY, ()),
     ("rms_norm", "unweighted", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("rms_norm", "unweighted", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("rope", "full", "eager", "any", _ANY, ()),
     ("rope", "full", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("rope", "full", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("rope", "full", "torch_npu", "npu", _NPU, ()),
     ("rope", "partial", "eager", "any", _ANY, ()),
     ("rope", "partial", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("rope", "partial", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("rope", "partial", "torch_npu", "npu", _NPU, ()),
     ("rope", "interleave", "eager", "any", _ANY, ()),
     ("rope", "mrope", "eager", "any", _ANY, ()),
@@ -181,8 +199,10 @@ _BUILTIN_ENTRIES = (
     ("rope", "wan", "torch_npu", "npu", _NPU, ()),
     ("swiglu_mlp", "standard", "eager", "any", _ANY, ()),
     ("swiglu_mlp", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("swiglu_mlp", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("swiglu_mlp", "geglu", "eager", "any", _ANY, ()),
     ("swiglu_mlp", "geglu", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("swiglu_mlp", "geglu", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
 )
 
 
@@ -208,18 +228,28 @@ def _requirement_metadata(requirement):
 
 
 def test_builtin_entry_catalog_is_exact():
-    """Built-in rows expose the intended device, platform, and package metadata."""
+    """Verify every built-in row and its hardware/dependency metadata alongside structural invariants."""
+    assert OP_REGISTRY._entries, "OP_REGISTRY must not be empty"
     actual = {
         (*key, _requirement_metadata(entry.requirement), entry.requires) for key, entry in OP_REGISTRY._entries.items()
     }
-    expected = set(_BUILTIN_ENTRIES)
+    for op, variant, impl, device, req_meta, _requires in actual:
+        if device == "any":
+            assert req_meta is None, f"{op}/{variant}/{impl} on device='any' must not set hardware requirement"
+        else:
+            expected_kind = "gpu" if device == "cuda" else device
+            assert req_meta is not None and req_meta[0] == expected_kind, (
+                f"{op}/{variant}/{impl} on device={device!r} has mismatched requirement {req_meta}"
+            )
 
-    assert len(expected) == len(_BUILTIN_ENTRIES)
+    expected = set(_BUILTIN_ENTRIES)
+    assert len(expected) == len(_BUILTIN_ENTRIES), "Duplicate expected built-in rows"
     assert actual == expected
 
 
 _BUILTIN_DEFAULT_ENTRIES = {
     ("cross_entropy_loss", "standard", "liger_kernel", "cuda"),
+    ("cross_entropy_loss", "standard", "liger_kernel", "mlu"),
     ("cross_entropy_loss", "standard", "chunk_loss", "npu"),
     ("load_balancing_loss", "standard", "triton", "cuda"),
     ("moe_experts", "standard", "fused_triton", "cuda"),
@@ -227,18 +257,26 @@ _BUILTIN_DEFAULT_ENTRIES = {
     ("moe_experts", "standard", "fused_triton", "mlu"),
     ("moe_experts", "standard", "fused_npu", "npu"),
     ("rms_norm", "standard", "liger_kernel", "cuda"),
+    ("rms_norm", "standard", "liger_kernel", "mlu"),
     ("rms_norm", "standard", "torch_npu", "npu"),
     ("rms_norm", "deepseek_v4", "liger_kernel", "cuda"),
+    ("rms_norm", "deepseek_v4", "liger_kernel", "mlu"),
     ("rms_norm", "deepseek_v4", "torch_npu", "npu"),
     ("rms_norm", "offset", "liger_kernel", "cuda"),
+    ("rms_norm", "offset", "liger_kernel", "mlu"),
     ("rms_norm", "offset", "torch_npu", "npu"),
     ("rms_norm", "unweighted", "liger_kernel", "cuda"),
+    ("rms_norm", "unweighted", "liger_kernel", "mlu"),
     ("rope", "full", "liger_kernel", "cuda"),
+    ("rope", "full", "liger_kernel", "mlu"),
     ("rope", "full", "torch_npu", "npu"),
     ("rope", "partial", "liger_kernel", "cuda"),
+    ("rope", "partial", "liger_kernel", "mlu"),
     ("rope", "partial", "torch_npu", "npu"),
     ("swiglu_mlp", "standard", "liger_kernel", "cuda"),
+    ("swiglu_mlp", "standard", "liger_kernel", "mlu"),
     ("swiglu_mlp", "geglu", "liger_kernel", "cuda"),
+    ("swiglu_mlp", "geglu", "liger_kernel", "mlu"),
 }
 
 

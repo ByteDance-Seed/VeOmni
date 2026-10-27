@@ -3,6 +3,7 @@
 Checks QK-norm grads after reverse all-to-all, including padded sequences.
 """
 
+import os
 import sys
 
 import pytest
@@ -13,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from scripts.ci.accelerator.launch_plan import runner_device_count
 from tests.parallel.ulysses.utils import SequenceParallelTest, sync_tensor
 from veomni.distributed.parallel_state import use_parallel_state
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
@@ -219,16 +221,8 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
         except RuntimeError:
             pass
 
-    @pytest.mark.skipif(
-        get_torch_device().device_count() < DIT_SP_WORLD_SIZE,
-        reason=f"device_count should be >= {DIT_SP_WORLD_SIZE}",
-    )
-    @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses dit")
-    def test_self_attn_dit(self):
-        """Compare DiT async and sync attention outputs and grads."""
-        self._get_process_group()
+    def _check_unpadded(self, sp_group) -> None:
         self._configure_repro()
-        sp_group = get_ulysses_sequence_parallel_group()
         full_input = self._get_input_data()
         unpad_size = full_input.size(1)
         part_input = slice_input_tensor(full_input, dim=1, group=sp_group)
@@ -306,17 +300,10 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
             "q_norm.weight.grad", attn_dp_q_norm_grad, attn_sp_q_norm_grad, atol=2e-3, rtol=1e-4
         )
         _assert_close_with_diagnostics("input.grad", full_input_grad, part_input_grad, atol=1e-4, rtol=1e-4)
+        dist.barrier()
 
-    @pytest.mark.skipif(
-        get_torch_device().device_count() < DIT_SP_WORLD_SIZE,
-        reason=f"device_count should be >= {DIT_SP_WORLD_SIZE}",
-    )
-    @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses dit")
-    def test_self_attn_dit_padding(self):
-        """Same comparison with a sequence length that needs SP padding."""
-        self._get_process_group()
+    def _check_padded(self, sp_group) -> None:
         self._configure_repro()
-        sp_group = get_ulysses_sequence_parallel_group()
         full_input = self._get_input_data_for_padding()
         unpad_size = full_input.size(1)
         part_input = slice_input_tensor(full_input, dim=1, group=sp_group)
@@ -400,6 +387,22 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
             "[padding] q_norm.weight.grad", attn_dp_q_norm_grad, attn_sp_q_norm_grad, atol=2e-3, rtol=1e-4
         )
         _assert_close_with_diagnostics("[padding] input.grad", full_input_grad, part_input_grad, atol=1e-4, rtol=1e-4)
+        dist.barrier()
+
+    @pytest.mark.skipif(
+        runner_device_count() < DIT_SP_WORLD_SIZE,
+        reason=f"device_count should be >= {DIT_SP_WORLD_SIZE}",
+    )
+    @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses dit")
+    def test_self_attn_dit(self):
+        """Compare DiT async and sync attention outputs and grads (unpadded and padded)."""
+        self._get_process_group()
+        sp_group = get_ulysses_sequence_parallel_group()
+        checks = [self._check_unpadded, self._check_padded]
+        if os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1":
+            checks = list(reversed(checks))
+        for check in checks:
+            check(sp_group)
 
 
 if __name__ == "__main__":
