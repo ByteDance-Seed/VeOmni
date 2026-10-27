@@ -10,11 +10,15 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.omni.omni_trainer import OmniTrainer, cascade_module_reshard
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_the_export_stage_reaches_every_module_checkpoint_manager():

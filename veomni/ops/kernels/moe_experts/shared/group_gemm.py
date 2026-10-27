@@ -168,7 +168,7 @@ def _same_nk_tile_prefix_kernel(cumsum_ptr, prefix_ptr, G: tl.constexpr, LANES: 
 def merged_same_nk_tile_prefix(cumsum_M: torch.Tensor, total_M: int) -> Optional[torch.Tensor]:
     """Build an optional device schedule without reading expert counts on the host."""
     G = cumsum_M.numel()
-    if cumsum_M.device.type != "cuda" or _GROUP_GEMM_BLOCK["BLOCK_M"] != 128 or not 0 < G <= 256 or total_M <= 0:
+    if not cumsum_M.is_cuda or _GROUP_GEMM_BLOCK["BLOCK_M"] != 128 or not 0 < G <= 256 or total_M <= 0:
         return None
     assert cumsum_M.ndim == 1 and cumsum_M.is_contiguous()
     assert cumsum_M.dtype in (torch.int32, torch.int64)

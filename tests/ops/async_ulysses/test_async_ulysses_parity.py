@@ -1,5 +1,6 @@
 """Two-GPU dense async Ulysses parity against the sync attention path."""
 
+import os
 import sys
 
 import pytest
@@ -7,6 +8,7 @@ import torch
 import torch.distributed as c10d
 import torch.distributed as dist
 
+from scripts.ci.accelerator.launch_plan import runner_device_count
 from tests.parallel.ulysses.attention import Attention
 from tests.parallel.ulysses.utils import SequenceParallelTest, sync_tensor
 from veomni.distributed.parallel_state import use_parallel_state
@@ -94,12 +96,8 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         t = torch.ones_like(output)
         return torch.sum(output * t)
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
-    @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses")
-    def test_self_attn(self):
-        self._get_process_group()
+    def _check_unpadded(self, sp_group) -> None:
         self._configure_repro()
-        sp_group = get_ulysses_sequence_parallel_group()
         full_input = self._get_input_data()
         unpad_size = full_input.size(1)
         part_input = slice_input_tensor(full_input, dim=1, group=sp_group)
@@ -138,16 +136,13 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
             attn_dp_grads = _parameter_gradients(attn_dp)
         full_input_grad = full_input.grad.detach().clone()
 
-        torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5, msg="[unpadded] forward")
         _assert_parameter_gradients_close(attn_dp_grads, attn_sp_grads)
-        torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5, msg="[unpadded] input.grad")
+        dist.barrier()
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
-    @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses")
-    def test_self_attn_padding(self):
-        self._get_process_group()
+    def _check_padded(self, sp_group) -> None:
         self._configure_repro()
-        sp_group = get_ulysses_sequence_parallel_group()
         full_input = self._get_input_data_for_padding()
         unpad_size = full_input.size(1)
         part_input = slice_input_tensor(full_input, dim=1, group=sp_group)
@@ -186,9 +181,21 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
             attn_dp_grads = _parameter_gradients(attn_dp)
         full_input_grad = full_input.grad.detach().clone()
 
-        torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5, msg="[padded] forward")
         _assert_parameter_gradients_close(attn_dp_grads, attn_sp_grads)
-        torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5, msg="[padded] input.grad")
+        dist.barrier()
+
+    @pytest.mark.skipif(runner_device_count() < 2, reason="device_count should be >= 2")
+    @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses")
+    def test_self_attn(self):
+        self._get_process_group()
+        sp_group = get_ulysses_sequence_parallel_group()
+        checks = [self._check_unpadded, self._check_padded]
+        if os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1":
+            checks = list(reversed(checks))
+        for check in checks:
+            check(sp_group)
 
 
 if __name__ == "__main__":

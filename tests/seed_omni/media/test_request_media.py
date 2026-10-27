@@ -36,6 +36,7 @@ import soundfile as sf
 import torch
 from PIL import Image
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.seed_omni.utils.media import fetch_media
 from veomni.data.seed_omni.utils.media_metadata import (
     AUDIO_METADATA_KEY,
@@ -47,6 +48,9 @@ from veomni.models.seed_omni.processing_omni import OmniProcessor, _as_list
 from veomni.models.seed_omni.utils.conversation import build_conversation
 
 from .utils import require_video_stack
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 _RATE = 24_000

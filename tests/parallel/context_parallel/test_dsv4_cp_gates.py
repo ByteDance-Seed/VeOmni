@@ -34,9 +34,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed import parallel_state as parallel_state_module
 from veomni.models import auto as auto_module
 from veomni.models.auto import build_config, check_context_parallel_supported
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_gate_is_inert_when_no_parallel_state_was_installed(monkeypatch):
@@ -73,3 +77,36 @@ def test_gate_allows_context_parallel_models_on_gpu(monkeypatch, model_type):
     monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", False)
 
     check_context_parallel_supported(SimpleNamespace(model_type=model_type))
+
+
+def test_gate_allows_seed_omni_module_config_under_cp(monkeypatch):
+    from veomni.models.seed_omni.modules.fake_model.fake_module_a.configuration import FakeModuleAConfig
+    from veomni.models.seed_omni.modules.module_configuration_base import OmniModuleConfig
+    from veomni.models.seed_omni.modules.text_encoder.configuration import TextEncoderConfig
+
+    monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(
+        auto_module,
+        "get_parallel_state",
+        lambda: SimpleNamespace(cp_enabled=True),
+    )
+    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", False)
+
+    # TextEncoderConfig explicitly opts in via _supports_context_parallel = True.
+    check_context_parallel_supported(TextEncoderConfig(vocab_size=64, hidden_size=16))
+
+    # A SeedOmni wrapper around a CP-supported inner model_type (e.g. deepseek_v4) is allowed.
+    class _WrappedCPModuleConfig(OmniModuleConfig):
+        model_type = "dummy_cp_llm"
+
+        def __init__(self):
+            self.text_config = SimpleNamespace(model_type="deepseek_v4")
+            super().__init__()
+
+    check_context_parallel_supported(_WrappedCPModuleConfig())
+
+    # An unported OmniModuleConfig subclass is still rejected under cp_enabled=True.
+    with pytest.raises(
+        NotImplementedError, match="Context parallelism is not implemented for model type 'fake_module_a'"
+    ):
+        check_context_parallel_supported(FakeModuleAConfig(hidden_size=16))

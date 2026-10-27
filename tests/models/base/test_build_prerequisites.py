@@ -25,9 +25,13 @@ import torch
 from transformers import PretrainedConfig
 
 import veomni.models.auto as auto
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config, ops_config_scope
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.ops.config import get_ops_config
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 _TOY_CONFIG_DIR = Path(__file__).resolve().parents[2] / "toy_config"
@@ -36,6 +40,11 @@ _HUB_FLASH_IMPLEMENTATIONS = (
     "flash_attention_3_hub",
     "veomni_flash_attention_2_hub",
     "veomni_flash_attention_3_hub",
+)
+_AITER_IMPLEMENTATIONS = (
+    "aiter",
+    "veomni_flash_attention_aiter",
+    "veomni_flash_attention_aiter_with_sp",
 )
 
 
@@ -177,6 +186,84 @@ def test_hub_flash_build_passes_normalized_name_to_loader(
         auto.build_foundation_model(PretrainedConfig(), init_device="cpu", **kwargs)
 
     assert load_model.call_args.kwargs["init_kwargs"]["attn_implementation"] == _normalized_hub_name(implementation)
+
+
+def test_aiter_config_maps_to_veomni_backend(monkeypatch: pytest.MonkeyPatch):
+    _host(monkeypatch, on_npu=False, modeling_backend="veomni")
+
+    config = OpsImplementationConfig(attn_implementation="aiter")
+
+    assert config.attn_implementation == "veomni_flash_attention_aiter"
+
+
+def test_aiter_legacy_with_sp_name_is_rejected_on_gpu(monkeypatch: pytest.MonkeyPatch):
+    _host(monkeypatch, on_npu=False, modeling_backend="veomni")
+
+    with pytest.raises(ValueError, match="veomni_flash_attention_aiter_with_sp is not a supported"):
+        OpsImplementationConfig(attn_implementation="veomni_flash_attention_aiter_with_sp")
+
+
+@pytest.mark.parametrize("implementation", ("aiter", "veomni_flash_attention_aiter"))
+@pytest.mark.parametrize("entry", ("ops", "override", "installed"))
+def test_aiter_build_passes_normalized_name_to_loader(
+    monkeypatch: pytest.MonkeyPatch, implementation: str, entry: str
+):
+    _host(monkeypatch, on_npu=False, modeling_backend="veomni")
+    monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=False, global_rank=0))
+    load_model = _stub_loader(monkeypatch)
+    installed = eager_ops_config()
+    kwargs = {}
+    if entry == "ops":
+        kwargs["ops_implementation"] = OpsImplementationConfig(attn_implementation=implementation)
+    elif entry == "override":
+        kwargs["attn_implementation"] = implementation
+    else:
+        installed = OpsImplementationConfig(attn_implementation=implementation)
+
+    with ops_config_scope(installed):
+        auto.build_foundation_model(PretrainedConfig(), init_device="cpu", **kwargs)
+
+    assert load_model.call_args.kwargs["init_kwargs"]["attn_implementation"] == "veomni_flash_attention_aiter"
+
+
+@pytest.mark.parametrize("implementation", _AITER_IMPLEMENTATIONS)
+def test_aiter_config_rejects_npu(monkeypatch: pytest.MonkeyPatch, implementation: str):
+    _host(monkeypatch, on_npu=True, modeling_backend="veomni")
+
+    with pytest.raises(ValueError, match="AMD ROCm-only"):
+        OpsImplementationConfig(attn_implementation=implementation)
+
+
+@pytest.mark.parametrize("implementation", _AITER_IMPLEMENTATIONS)
+def test_aiter_config_rejects_huggingface_modeling_backend(monkeypatch: pytest.MonkeyPatch, implementation: str):
+    _host(monkeypatch, on_npu=False, modeling_backend="hf")
+
+    with pytest.raises(ValueError, match="requires MODELING_BACKEND=veomni"):
+        OpsImplementationConfig(attn_implementation=implementation)
+
+
+@pytest.mark.parametrize("implementation", _AITER_IMPLEMENTATIONS)
+@pytest.mark.parametrize(
+    ("on_npu", "modeling_backend", "error"),
+    ((True, "veomni", "AMD ROCm-only"), (False, "hf", "MODELING_BACKEND")),
+)
+def test_aiter_override_is_refused_before_config_load(
+    monkeypatch: pytest.MonkeyPatch,
+    implementation: str,
+    on_npu: bool,
+    modeling_backend: str,
+    error: str,
+):
+    _host(monkeypatch, on_npu=on_npu, modeling_backend=modeling_backend)
+    build_config = _forbid_config_load(monkeypatch)
+    installed = eager_ops_config()
+
+    with ops_config_scope(installed):
+        with pytest.raises(ValueError, match=error):
+            auto.build_foundation_model("unused", attn_implementation=implementation)
+        assert get_ops_config() is installed
+
+    build_config.assert_not_called()
 
 
 # --- Model-declared prerequisites ----------------------------------------------------

@@ -23,11 +23,15 @@ import veomni.ops.platform.requirement as requirement_mod
 import veomni.ops.registry as registry_mod
 import veomni.utils.device as device
 import veomni.utils.import_utils as import_utils
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import ops_config_scope
 from veomni.arguments import OpsImplementationConfig
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 from veomni.ops.platform import GpuKernelRequirement
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 _HOST_FIELDS = (
@@ -81,12 +85,13 @@ _EXPECTED_DEFAULTS: dict[str, dict[str, str]] = {
 }
 
 
-def _set_host(monkeypatch: pytest.MonkeyPatch, host: str, *, apex_mlu: bool = False) -> None:
+def _set_host(monkeypatch: pytest.MonkeyPatch, host: str, *, apex_mlu: bool = False, mlu_liger: bool = False) -> None:
     monkeypatch.delenv("MODELING_BACKEND", raising=False)
     monkeypatch.setattr(VeomniOp, "_intern", {})
     monkeypatch.setattr(device, "IS_NPU_AVAILABLE", host == "npu")
     monkeypatch.setattr(import_utils, "is_torch_mlu_available", lambda: host == "mlu")
     monkeypatch.setattr(import_utils, "is_apex_mlu_available", lambda: apex_mlu)
+    monkeypatch.setattr(import_utils, "is_liger_kernel_mlu_available", lambda: mlu_liger)
     monkeypatch.setattr(
         registry_mod, "get_device_type", lambda: GpuKernelRequirement.device if host == "gpu" else host
     )
@@ -175,9 +180,36 @@ def test_explicit_npu_value_raises_off_npu(field_name: str, monkeypatch: pytest.
 
 
 def test_explicit_gpu_value_is_kept_on_mlu(monkeypatch: pytest.MonkeyPatch):
-    _set_host(monkeypatch, "mlu")
+    _set_host(monkeypatch, "mlu", mlu_liger=True)
     config = OpsImplementationConfig(rms_norm_implementation="liger_kernel")
     assert config.rms_norm_implementation == "liger_kernel"
+
+
+def test_explicit_liger_without_mlu_build_raises_on_mlu(monkeypatch: pytest.MonkeyPatch):
+    """Upstream GPU liger does not run on MLU; only the Cambricon build satisfies an explicit selection."""
+    _set_host(monkeypatch, "mlu")
+    with pytest.raises(ValueError, match="requires the Cambricon MLU liger_kernel build"):
+        OpsImplementationConfig(rms_norm_implementation="liger_kernel")
+
+
+def test_unset_fields_resolve_to_mlu_liger_defaults(monkeypatch: pytest.MonkeyPatch):
+    """With the Cambricon liger build, unset liger-capable fields default to liger_kernel on MLU."""
+    _set_host(monkeypatch, "mlu", mlu_liger=True)
+    config = OpsImplementationConfig()
+    assert {name: getattr(config, name) for name in _HOST_FIELDS} == dict.fromkeys(_HOST_FIELDS)
+    with ops_config_scope(config):
+        resolved = {
+            name: VeomniOp(op, variant, resolve_op_impl(name)).impl
+            for name, (op, variant) in _FIELD_OP_VARIANTS.items()
+        }
+    expected = _EXPECTED_DEFAULTS["mlu"] | {
+        "cross_entropy_loss_implementation": "liger_kernel",
+        "rms_norm_implementation": "liger_kernel",
+        "swiglu_mlp_implementation": "liger_kernel",
+        "rotary_pos_emb_implementation": "liger_kernel",
+        "rotary_pos_emb_vision_implementation": "liger_kernel",
+    }
+    assert resolved == expected
 
 
 def test_installed_torch_npu_without_runtime_keeps_gpu_defaults(monkeypatch: pytest.MonkeyPatch):

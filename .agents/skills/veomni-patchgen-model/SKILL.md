@@ -491,10 +491,11 @@ and regenerate. This is a hard rule called out in `AGENTS.md`.
 
 ## Phase 6: Add Test Cases
 
-Follow `docs/transformers_v5/testing_new_model.md`. Every file below is already
-enumerated in a CI workflow — the unit-test ones, or `gpu_e2e_test.yml` /
-`npu_e2e_test.yml` for the e2e tables — so appending a case needs no workflow
-change. That is exactly why this phase extends tables instead of adding files.
+Follow [Testing a New Model](../../../docs/transformers_v5/testing_new_model.md)
+for the coverage policy. Extend existing family tables and fixtures first;
+check the GPU/NPU suite manifests and filters in `.agents/knowledge/testing.md`
+to verify collection. A case already covered by a selection needs no manifest
+change.
 `tests/models/base/test_auto_registry.py` and the matching family test under
 `tests/models/transformers/` or `tests/models/diffusers/` are part of the
 minimum too: the first proves the registry constructs the registered class; the
@@ -509,7 +510,12 @@ Minimum coverage:
    `tests/models/base/test_auto_registry.py`, using the canonical tiny-config
    factory from `tests/models/tiny_configs.py`.
 3. **`tests/e2e/test_e2e_parallel.py`**: append a `pytest.param(...)`. Use
-   `max_sp_size=1` if SP not yet supported, else `None`.
+   the SOP's default matrix (dense SP1/2 with EP1; ordinary MoE SP1/EP1 versus
+   SP2/EP2) and four-process launch plan. Qwen3-MoE's full matrix and
+   GPT-OSS's three modes are implementation/topology representatives, not
+   templates for every model. Use `max_sp_size=1` only when SP is unsupported,
+   explain restrictions and smoke-only gaps, and verify the plan matches the
+   worker launches.
 4. **VLM only** — `tests/trainer/test_vlm_trainer.py`: add to the freeze-ViT
    VLM cases list.
 5. **VLM / Omni only** — `tests/distributed/test_dummy_forward.py`: add a
@@ -540,6 +546,12 @@ Minimum coverage:
    dims silently hide dispatch bugs. Separately verify that the ambiguous
    `hidden == 2 * intermediate` gate/up and `hidden == intermediate` down
    layouts raise rather than transposing a v5-saved checkpoint.
+
+Also add loss/backward parity for one supported accelerator training
+configuration, using the shared model-patch suite, low-precision oracle, or
+the owning family test as appropriate. Alternate attention/fallback/backend
+combinations use representatives chosen by distinct implementation paths;
+do not duplicate a full backend Cartesian product for every model.
 
 ---
 
@@ -599,7 +611,9 @@ Extra e2e gotchas:
 
 - `test_models_transformers` family parity under `tests/models/transformers/`
   matches Hugging Face on the eager path for the new architecture.
-- `test_e2e_parallel` passes across all `(sp_size, ep_size)` combos.
+- Accelerator model parity passes for the supported training configuration.
+- `test_e2e_parallel` compares loss and grad norm for the selected SOP modes;
+  any unsupported mode, hardware skip, or smoke-only gap is recorded explicitly.
 - `make quality` is clean.
 
 ---

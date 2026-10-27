@@ -28,6 +28,7 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM as HFLlama
 from transformers.models.llama.modeling_llama import LlamaForTokenClassification as HFLlamaForTokenClassification
 from transformers.models.llama.modeling_llama import LlamaModel as HFLlamaModel
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import (
     assert_eager_matches_hf,
     assert_sequence_classification_matches_hf,
@@ -35,6 +36,9 @@ from tests.models.compare import (
     ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_llama_config as _tiny_config
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _llama_classes():

@@ -232,6 +232,7 @@ def test_registered_fa4_adapter_matches_attention_sink_reference_and_gradients()
         ("veomni_flash_attention_3", "flash_attention_3"),
         ("veomni_flash_attention_3_hub", "veomni_flash_attention_3_hub"),
         ("veomni_flash_attention_4", "veomni_flash_attention_4"),
+        ("veomni_flash_attention_aiter", "veomni_flash_attention_aiter"),
     ),
 )
 def test_selected_flash_row_pins_backend_when_module_config_differs(monkeypatch, selected, expected_backend):

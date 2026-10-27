@@ -24,12 +24,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.tiny_configs import tiny_wan_config as _tiny_config
 from veomni.models.transformers.wan import fa3_fp8
 from veomni.models.transformers.wan import modeling_wan as wan_modeling
 from veomni.models.transformers.wan.config_wan import WanConfig
 from veomni.models.transformers.wan.fa3_fp8 import should_use_fa3_fp8
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _build_ours(config: WanConfig, ops: SimpleNamespace | None = None):
