@@ -53,13 +53,15 @@ class _ExpertAllGather:
         return weight, (scale,)
 
 
-def register_deepgemm_fp8_all_gather(model: torch.nn.Module) -> int:
+def register_deepgemm_fp8_all_gather(model: torch.nn.Module, *, allow_empty: bool = False) -> int:
     """Install hooks after FSDP wrapping/materialization and before first forward.
 
     Select only modules whose instance-local moe_experts handle uses DeepGEMM.
     Master shards remain ordinary tensors. Complete 128x128 blocks must fit
     inside each shard; uneven and block-splitting layouts fail before training.
     This integration targets the pinned Torch 2.11 eager FSDP extension API.
+    ``allow_empty`` is for composed-model children inheriting a global policy;
+    it does not relax validation of any selected expert parameter.
     """
     selected = {}
     for name, module in model.named_modules():
@@ -73,6 +75,8 @@ def register_deepgemm_fp8_all_gather(model: torch.nn.Module) -> int:
         for param_name, param in params:
             selected[id(param)] = f"{name}.{param_name}"
     if not selected:
+        if allow_empty:
+            return 0
         raise ValueError("FP8 all-gather requires routed experts using moe_implementation='deepgemm_fp8'.")
     pending = []
     for module in model.modules():

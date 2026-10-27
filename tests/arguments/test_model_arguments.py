@@ -75,7 +75,8 @@ def test_fp8_all_gather_is_opt_in():
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_fp8_all_gather_reaches_parallel_builder(monkeypatch, enabled):
+@pytest.mark.parametrize("module_scope", [False, True])
+def test_fp8_all_gather_reaches_parallel_builder(monkeypatch, enabled, module_scope):
     from types import SimpleNamespace
 
     from torch import nn
@@ -91,10 +92,15 @@ def test_fp8_all_gather_reaches_parallel_builder(monkeypatch, enabled):
     monkeypatch.setattr(torch_parallelize, "parallelize_model_fsdp2", lambda **kw: calls.append(kw) or kw["model"])
     model = nn.Linear(2, 2)
     torch_parallelize.build_parallelize_model(
-        model, fp8_all_gather=enabled, expert_fsdp_shard_dim=0, enable_gradient_checkpointing=False
+        model,
+        fp8_all_gather=enabled,
+        expert_fsdp_shard_dim=0,
+        enable_gradient_checkpointing=False,
+        module_scope=module_scope,
     )
     assert calls[0]["fp8_all_gather"] is enabled
     assert calls[0]["expert_fsdp_shard_dim"] == 0
+    assert calls[0]["module_scope"] is module_scope
 
 
 def test_fp8_all_gather_rejects_compile_before_wrapping(monkeypatch):
@@ -124,6 +130,30 @@ def test_fp8_all_gather_rejects_non_swiglu_before_collectives():
     module.use_swiglu_mlp = False
     with pytest.raises(ValueError, match="SwiGLU"):
         register_deepgemm_fp8_all_gather(module)
+
+
+def test_fp8_all_gather_allows_empty_selection_only_for_module_scope():
+    from torch import nn
+
+    from veomni.distributed.fsdp2.fp8_all_gather import register_deepgemm_fp8_all_gather
+
+    module = nn.Linear(2, 2)
+    with pytest.raises(ValueError, match="requires routed experts"):
+        register_deepgemm_fp8_all_gather(module)
+    assert register_deepgemm_fp8_all_gather(module, allow_empty=True) == 0
+
+
+def test_fp8_all_gather_module_scope_still_validates_selected_experts():
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from veomni.distributed.fsdp2.fp8_all_gather import register_deepgemm_fp8_all_gather
+
+    module = nn.Linear(2, 2)
+    module.veomni_moe = SimpleNamespace(impl="deepgemm_fp8")
+    with pytest.raises(ValueError, match="two merged expert weights"):
+        register_deepgemm_fp8_all_gather(module, allow_empty=True)
 
 
 @pytest.mark.parametrize("value", [-1, 2, True, False, "0", 0.0])

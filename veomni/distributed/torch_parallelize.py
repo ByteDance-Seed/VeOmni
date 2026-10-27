@@ -430,6 +430,7 @@ def parallelize_model_fsdp2(
     expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
+    module_scope: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """
@@ -913,7 +914,7 @@ def parallelize_model_fsdp2(
     if fp8_all_gather:
         from .fsdp2.fp8_all_gather import register_deepgemm_fp8_all_gather
 
-        count = register_deepgemm_fp8_all_gather(model)
+        count = register_deepgemm_fp8_all_gather(model, allow_empty=module_scope)
         logger.info_rank0(f"Enabled DeepGEMM FP8 all-gather for {count} expert parameters.")
 
     if materialize_device == "cpu":
@@ -1027,6 +1028,7 @@ def build_parallelize_model(
     expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
+    module_scope: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -1041,6 +1043,8 @@ def build_parallelize_model(
             EP-local dim is divisible by ``ep_fsdp_size``.
         recompute_policy: Per-block recomputation strategy, bound after HF has
             enabled gradient checkpointing and before FSDP2 shards the blocks.
+        module_scope: Allow a composed-model child with no DeepGEMM experts to
+            inherit the global FP8 all-gather policy without registering hooks.
     """
     parallel_state = get_parallel_state()
     validate_expert_fsdp_shard_dim(expert_fsdp_shard_dim, fsdp_mode=parallel_state.dp_mode)
@@ -1124,6 +1128,7 @@ def build_parallelize_model(
                 expert_fsdp_shard_dim=expert_fsdp_shard_dim,
                 compile_config=compile_config,
                 should_skip_hf_weight_load=should_skip_hf_weight_load,
+                module_scope=module_scope,
                 **kwargs,
             )
         else:

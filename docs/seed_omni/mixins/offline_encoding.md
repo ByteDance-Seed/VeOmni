@@ -141,7 +141,7 @@ full, or it is built on meta.
   gets an optimizer or a checkpoint manager, and
   [`OmniTrainer`](../../../veomni/trainer/omni/omni_trainer.py#L276) allows the
   empty optimizer. A `fsdp_mode: ddp` module is
-  [loaded but left unwrapped](../../../veomni/distributed/torch_parallelize.py#L979),
+  [loaded but left unwrapped](../../../veomni/distributed/torch_parallelize.py#L1000),
   because DDP rejects a module with no parameter that requires grad.
 - **`online_training`.** The module is built like any other.
 
@@ -353,8 +353,8 @@ A missing module or method still fails before the first request runs.
   [it is frozen and never wrapped, trained or saved](../../../tests/seed_omni/runtime/test_module_runtime.py#L209),
   and [an `offline_embedding` run freezes every module](../../../tests/seed_omni/runtime/test_module_runtime.py#L241).
 - [`tests/seed_omni/runtime/test_omni_model_runtime.py`](../../../tests/seed_omni/runtime/test_omni_model_runtime.py):
-  [under `fsdp_scope: model`, cache readers stay on meta outside the composed wrap](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L409), and
-  [under a module-level input cast, a node's item edits reach the batch only from its hooks or its return](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L296).
+  [under `fsdp_scope: model`, cache readers stay on meta outside the composed wrap](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L413), and
+  [under a module-level input cast, a node's item edits reach the batch only from its hooks or its return](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L300).
 - [`tests/seed_omni/test_offline_cache_writer.py`](../../../tests/seed_omni/test_offline_cache_writer.py):
   [the `seedomni_cached` transform](../../../tests/seed_omni/test_offline_cache_writer.py#L33), the
   [writer round trip](../../../tests/seed_omni/test_offline_cache_writer.py#L51),

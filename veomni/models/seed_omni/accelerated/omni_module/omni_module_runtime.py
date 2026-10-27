@@ -441,7 +441,7 @@ class ModuleRuntime(VeOmniModelRuntime):
                 "OmniModel (accelerator.fsdp_config.fsdp_scope='model')."
             )
             return
-        super()._build_parallelized_model()
+        super()._build_parallelized_model(module_scope=True)
 
     def build_after_omni_model_wrap(self) -> None:
         """Training steps that need the wrapped parameters, once the composed OmniModel is wrapped.

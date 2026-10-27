@@ -28,6 +28,16 @@ A module's choices live in its block of the `modules` YAML, under
 | Sequence / Context parallel | `ulysses_size: U`, `cp_size: C` (one axis `> 1` per module, with `U * C = W / dp_size` and `pp_size = tp_size = 1` across all modules) | Ulysses SP on encoders/ViT, CP on long-context backbones |
 | Gradient checkpointing | `gradient_checkpointing.enable: false` | Off for cheap modules (text encoders, VAE, flow connector) |
 
+With `fsdp_scope: module`, FSDP2 children can inherit `fp8_all_gather: true`
+from the global accelerator. `ModuleRuntime._build_parallelized_model()` calls
+the base runtime with `module_scope=True`; the parallel builder passes this
+scope to FP8 registration. A child without any `deepgemm_fp8` experts registers
+no hooks. Selected experts still undergo all shape, device and FSDP checks.
+Standalone models and the composed `fsdp_scope: model` wrap remain strict:
+enabling FP8 all-gather with no matching experts is an error. A child using an
+incompatible policy such as DDP must explicitly set `fp8_all_gather: false`.
+See [DeepGEMM FP8 transport](../../design/deepgemm_fp8_moe.md#optional-fp8-parameter-all-gather).
+
 Two per-module properties are not accelerator settings but change how the
 module is wrapped and saved:
 
