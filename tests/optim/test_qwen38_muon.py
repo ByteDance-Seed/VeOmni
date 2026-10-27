@@ -60,6 +60,13 @@ def reference_polar(matrix):
     return x.T if transpose else x
 
 
+def _cpu_dcp_writer(path):
+    # Avoid accelerator stream initialization for a CPU-only checkpoint test.
+    from torch.distributed.checkpoint import FileSystemWriter
+
+    return FileSystemWriter(path, per_thread_copy_ahead=0)
+
+
 @pytest.mark.parametrize("shape", [(5, 17), (17, 5), (8, 8)])
 def test_polar_against_high_precision_reference(shape):
     torch.manual_seed(21)
@@ -270,7 +277,7 @@ def _distributed_worker(rank, world, rendezvous, checkpoint_dir):
                 if step == 1:
                     path = str(Path(checkpoint_dir) / f"case{case_id}-ndim{len(shape)}-axis{axis}")
                     msd, osd = get_state_dict(model, opt)
-                    dcp.save({"model": msd, "optimizer": osd}, checkpoint_id=path)
+                    dcp.save({"model": msd, "optimizer": osd}, storage_writer=_cpu_dcp_writer(path))
                     fresh_p = torch.nn.Parameter(distribute_tensor(torch.zeros_like(full), mesh, [Shard(axis)]))
                     model.weight = fresh_p
                     fresh = make_optimizer(fresh_p, plan)
@@ -295,7 +302,7 @@ def test_distributed_updates_and_dcp_resume(tmp_path):
         args=(_CI_SHARD_LAUNCH.nproc, str(tmp_path / "rdzv"), str(tmp_path / "dcp")),
         nprocs=_CI_SHARD_LAUNCH.nproc,
         join=True,
-        start_method="fork",
+        start_method="spawn",
     )
 
 
@@ -367,7 +374,7 @@ def _cold_process_worker(rank, world, rendezvous, path, phase):
                 model.weight.grad = distribute_tensor(grad, mesh, [Shard(0)])
                 opt.step()
             msd, osd = get_state_dict(model, opt)
-            dcp.save({"model": msd, "optimizer": osd}, checkpoint_id=path)
+            dcp.save({"model": msd, "optimizer": osd}, storage_writer=_cpu_dcp_writer(path))
         else:
             model.weight.grad = torch.zeros_like(model.weight)
             opt.step()
@@ -399,7 +406,7 @@ def test_fresh_process_dcp_next_update_is_exact(tmp_path):
             args=(_CI_SHARD_LAUNCH.nproc, str(tmp_path / f"rdzv-{phase}"), str(tmp_path / "checkpoint"), phase),
             nprocs=_CI_SHARD_LAUNCH.nproc,
             join=True,
-            start_method="fork",
+            start_method="spawn",
         )
 
 
@@ -474,7 +481,7 @@ def _ple_asymmetric_worker(rank, world, rendezvous, path, phase, mode):
                     "model": ModelState(model, parallel_state=ps),
                     "optimizer": OptimizerState(model, optimizer, parallel_state=ps),
                 },
-                checkpoint_id=path,
+                storage_writer=_cpu_dcp_writer(path),
             )
             assert set(leaf.state) == set(before)
             assert partial in leaf.state if active else partial not in leaf.state
@@ -546,7 +553,7 @@ def test_ple_asymmetric_owner_checkpoint_and_cold_resume(tmp_path, mode):
             ),
             nprocs=_ple_owner_launch(mode).nproc,
             join=True,
-            start_method="fork",
+            start_method="spawn",
         )
 
 
