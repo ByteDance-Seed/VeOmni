@@ -1498,7 +1498,7 @@ def _gloo_chunk_capture_fallback_worker(rank, world_size, endpoint):
         torch.distributed.destroy_process_group()
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
 def test_gloo_chunk_capture_fallback_keeps_ranks_in_same_collective():
     spawn_with_rendezvous(_gloo_chunk_capture_fallback_worker, args=(2,), nprocs=2)
 
