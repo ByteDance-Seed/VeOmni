@@ -3515,7 +3515,7 @@ def _run_gloo_workers(worker, *, world_size, init_file, timeout_seconds=120):
     assert exit_codes == [0] * world_size
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
 def test_channel_loss_real_gloo_sp_preflight_avoids_divergent_payload_collectives(tmp_path):
     _run_gloo_workers(
         _gloo_sp_preflight_worker,
@@ -3524,7 +3524,7 @@ def test_channel_loss_real_gloo_sp_preflight_avoids_divergent_payload_collective
     )
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=4))
 def test_channel_loss_real_gloo_two_sp_stripes_propagate_strict_failure_worldwide(tmp_path):
     _run_gloo_workers(
         _gloo_two_stripe_worker,
@@ -3533,12 +3533,12 @@ def test_channel_loss_real_gloo_two_sp_stripes_propagate_strict_failure_worldwid
     )
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
 def test_channel_loss_real_gloo_packed_loss_and_training_gradient_parity(tmp_path):
     _run_gloo_workers(_gloo_packed_channel_parity_worker, world_size=2, init_file=tmp_path / "sp-packed-init")
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
 def test_channel_loss_real_gloo_dpo_and_mtp_depths(tmp_path):
     _run_gloo_workers(_gloo_dpo_mtp_channel_worker, world_size=2, init_file=tmp_path / "sp-dpo-mtp-init")
 
@@ -4478,7 +4478,7 @@ def _gloo_channel_provenance_worker(rank, world_size, scenario, endpoint):
         ("strict_two_stripes", 4),
     ],
 )
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.launch_plan(provider=lambda context: LaunchSpec(device="cpu", nproc=context.params["world_size"]))
 def test_real_gloo_channel_provenance(scenario, world_size):
     spawn_with_rendezvous(_gloo_channel_provenance_worker, args=(world_size, scenario), nprocs=world_size)
 
@@ -5357,7 +5357,7 @@ def _gloo_legacy_compute_without_defer_worker(rank, world_size, strict, variadic
         torch.distributed.destroy_process_group()
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
 @pytest.mark.parametrize("strict", [False, True])
 @pytest.mark.parametrize("variadic", [False, True])
 def test_gloo_legacy_compute_without_defer_fails_closed(strict, variadic):
@@ -5403,7 +5403,7 @@ def _gloo_modern_compute_accepts_defer_worker(rank, world_size, endpoint):
         torch.distributed.destroy_process_group()
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
 def test_gloo_modern_compute_receives_deferred_sp():
     spawn_with_rendezvous(_gloo_modern_compute_accepts_defer_worker, args=(2,), nprocs=2)
 
@@ -5463,7 +5463,7 @@ def _gloo_chunk_capture_failure_worker(rank, world_size, endpoint):
         torch.distributed.destroy_process_group()
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
 def test_gloo_one_rank_chunk_capture_failure_skips_synchronously():
     spawn_with_rendezvous(_gloo_chunk_capture_failure_worker, args=(2,), nprocs=2)
 
