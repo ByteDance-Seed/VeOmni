@@ -101,7 +101,7 @@ def _get_wan_full_sequence_varlen_kwargs(
     }
 
 
-_WAN_FLASH2_IMPLS = frozenset({"flash_attention_2", "veomni_flash_attention_2"})
+_WAN_FLASH_IMPLS = frozenset({"flash_attention_2", "veomni_flash_attention_2", "veomni_flash_attention_aiter"})
 
 
 def _get_weight_dtype(module):
@@ -142,7 +142,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
     def __init__(self):
         impl = resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
         self.veomni_attn = VeomniOp("attention", "standard", impl)
-        self._use_flash2 = impl in _WAN_FLASH2_IMPLS
+        self._use_flash = impl in _WAN_FLASH_IMPLS
         self.config = SimpleNamespace(_attn_implementation=impl)
         super().__init__()
 
@@ -159,7 +159,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
         key_length: int | None = None,
     ) -> torch.Tensor:
         kwargs = {}
-        if self._use_flash2:
+        if self._use_flash:
             kwargs = _get_wan_full_sequence_varlen_kwargs(
                 query, key, value, query_length=query_length, key_length=key_length
             )
@@ -257,7 +257,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
             query = _apply_rope(query, *rotary_emb)
             key = _apply_rope(key, *rotary_emb)
 
-        if self._use_flash2:
+        if self._use_flash:
             _assert_wan_flash_attention_bf16(query, key, value, attn)
 
         kernel_module = WanAttentionKernelModule(self.config, attn)
@@ -268,7 +268,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
             key_img = attn.norm_added_k(key_img)
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
-            if self._use_flash2:
+            if self._use_flash:
                 assert key_img.dtype == torch.bfloat16 and value_img.dtype == torch.bfloat16, (
                     "Wan image flash-attention expects bf16 added K/V tensors, "
                     f"got key={key_img.dtype}, value={value_img.dtype}."
