@@ -3207,7 +3207,7 @@ def _gloo_sp_preflight_worker(rank, world_size, init_file, result_queue):
             elif scenario == "missing" and rank == 1:
                 computer._source_ids = []
             elif scenario == "generic" and rank == 1:
-                computer._compute_channel_loss = lambda **kwargs: (_ for _ in ()).throw(
+                computer._compute_channel_loss = lambda *, defer_sp=False, **kwargs: (_ for _ in ()).throw(
                     RuntimeError("rank-local CE preparation failed")
                 )
             elif scenario == "metadata" and rank == 1:
@@ -5406,6 +5406,66 @@ def _gloo_modern_compute_accepts_defer_worker(rank, world_size, endpoint):
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_gloo_modern_compute_receives_deferred_sp():
     spawn_with_rendezvous(_gloo_modern_compute_accepts_defer_worker, args=(2,), nprocs=2)
+
+
+def _gloo_chunk_capture_failure_worker(rank, world_size, endpoint):
+    from veomni.ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
+
+    torch.distributed.init_process_group(
+        "gloo", store=endpoint.connect(), rank=rank, world_size=world_size, timeout=timedelta(seconds=30)
+    )
+    try:
+        state = SimpleNamespace(
+            sp_enabled=True, sp_group=torch.distributed.group.WORLD, sp_size=world_size, sp_rank=rank
+        )
+        computer = ChannelLossComputer(parallel_state=state)
+        computer._source_ids = ["source"]
+        computer._position_ids = torch.tensor([[rank * 2, rank * 2 + 1]])
+        computer._source_provenance = {
+            "source_ids": ["source"],
+            "source_cu": [0, 4],
+            "input_mask": torch.ones(4, dtype=torch.bool),
+            "tail": 0,
+            "sp_size": 2,
+            "sp_rank": rank,
+        }
+        labels = torch.tensor([[0, 1]]) if rank == 0 else torch.tensor([[2, IGNORE_INDEX]])
+        logits = torch.randn(1, 2, 4, requires_grad=True)
+
+        def loss_fn(logits, labels, vocab_size):
+            capture = chunk_loss._CAPTURE.get()
+            if rank == 0:
+                capture["error"] = "observer failed"
+            else:
+                capture["per_token"] = F.cross_entropy(
+                    logits.detach().reshape(-1, vocab_size),
+                    labels.reshape(-1),
+                    ignore_index=IGNORE_INDEX,
+                    reduction="none",
+                ).reshape_as(labels)
+            return logits.square().sum()
+
+        computer._original_loss_fn = loss_fn
+        with computer.capture():
+            loss = computer._wrapped_loss_fn(logits, labels, 4)
+            assert computer._observation_attempt_count == 1
+            if rank == 0:
+                assert len(computer._capture_errors) == 1
+                assert "observer failed" in computer._capture_errors[0][1]
+                assert not computer._pending_observations
+            else:
+                assert not computer._capture_errors
+                assert len(computer._pending_observations) == 1
+        loss.backward()
+        assert computer._result is None
+        torch.testing.assert_close(logits.grad, 2 * logits.detach(), rtol=0, atol=0)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_gloo_one_rank_chunk_capture_failure_skips_synchronously():
+    spawn_with_rendezvous(_gloo_chunk_capture_failure_worker, args=(2,), nprocs=2)
 
 
 def test_positional_only_bias_is_not_claimed_as_supported():
