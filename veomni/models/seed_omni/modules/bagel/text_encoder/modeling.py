@@ -17,10 +17,6 @@ from .processing import BagelTextEncoderPreprocessor, apply_image_marker
 SIGNAL_START_IMAGE_GEN = "start_image_gen"
 SIGNAL_TEXT_DONE = "text_done"
 
-# Sentinel written by BagelTextEncoderPreprocessor onto every text item so
-# encode_pre can skip tokenizer work already completed by a DataLoader worker.
-_OMNI_TOKENIZED = "_omni_tokenized"
-
 
 def prepare_bagel_encode_input_ids(
     conversation_list: Optional[List[List[ConversationItem]]],
@@ -36,9 +32,9 @@ def prepare_bagel_encode_input_ids(
     for item in iter_desired_items(conversation_list, types=["text"]):
         if item.is_dummy:
             continue
-        if not item.meta.get(_OMNI_TOKENIZED):
-            raise ValueError("BAGEL text encoder expects CPU-preprocessed text items.")
         token_ids = item.meta.get("input_ids")
+        if not torch.is_tensor(token_ids):
+            raise ValueError("BAGEL text encoder expects CPU-preprocessed text items.")
         input_ids.append(token_ids.reshape(-1))
 
     if not input_ids:

@@ -601,3 +601,71 @@ def test_an_offline_embedding_run_skips_the_export_check(tmp_path, monkeypatch):
     args.train.training_task = "online_training"
     build_omni_model_runtime_args(args)
     assert len(checked) == 1
+
+
+def test_large_carried_tensors_are_sliced_across_ranks_and_consolidated_on_every_rank(hf_root, tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+
+    import torch.distributed as dist
+    import torch.distributed.checkpoint as dcp
+    import torch.distributed.checkpoint._consolidate_hf_safetensors as consolidate_mod
+    from torch.distributed.tensor import DTensor, Shard
+    from torch.testing._internal.distributed.fake_pg import FakeStore
+
+    import veomni.models.seed_omni.utils.hf_layout as hf_layout_mod
+    import veomni.utils.save_safetensor_utils as save_utils_mod
+
+    root, tensors = hf_root
+    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
+    source = model.config._hf_source
+    module_a = model.modules_dict[FAKE_A]
+
+    # Lower the threshold so the 4x4 carried tensor ``decoder.proj.weight`` is sliced across ranks.
+    monkeypatch.setattr(hf_layout_mod, "_SHARDED_CARRY_BYTES", 8)
+    group = object()
+    monkeypatch.setattr(save_utils_mod, "_consolidation_process_group", lambda: group)
+
+    saved_states = []
+    saved_groups = []
+    writers = []
+
+    class FakeWriter:
+        def __init__(self, **kwargs):
+            writers.append(kwargs)
+
+    monkeypatch.setattr("torch.distributed.checkpoint.HuggingFaceStorageWriter", FakeWriter)
+    monkeypatch.setattr(
+        dcp,
+        "save",
+        lambda state_dict, storage_writer, process_group=None: (
+            saved_states.append(state_dict),
+            saved_groups.append(process_group),
+        ),
+    )
+    on_every_rank = MagicMock()
+    monkeypatch.setattr(consolidate_mod, "consolidate_safetensors_files_on_every_rank", on_every_rank)
+    monkeypatch.setattr(hf_layout_mod, "_restore_single_file_name", lambda path: None)
+    monkeypatch.setattr(dist, "barrier", lambda *a, **kw: None)
+
+    parallel_state = MagicMock(dp_mode="ddp")
+    for rank in range(3):
+        dist.init_process_group("fake", store=FakeStore(), rank=rank, world_size=3)
+        try:
+            save_hf_source_checkpoint(source, {FAKE_A: (module_a, parallel_state)}, str(tmp_path / "export"))
+        finally:
+            dist.destroy_process_group()
+
+    assert all(not w["enable_consolidation"] for w in writers)
+    assert saved_groups == [group, group, group]
+    assert [call.kwargs["process_group"] for call in on_every_rank.call_args_list] == [group, group, group]
+
+    slices = []
+    for state in saved_states:
+        carried = state["decoder.proj.weight"]
+        assert isinstance(carried, DTensor)
+        assert carried.placements == (Shard(0),)
+        assert tuple(carried.shape) == tuple(tensors["decoder.proj.weight"].shape)
+        slices.append(carried._local_tensor)
+    # 8 rows across 3 ranks -> ceil(8/3)=3 rows on ranks 0 and 1, 2 rows on rank 2.
+    assert [s.shape[0] for s in slices] == [3, 3, 2]
+    assert torch.equal(torch.cat(slices, dim=0), tensors["decoder.proj.weight"])

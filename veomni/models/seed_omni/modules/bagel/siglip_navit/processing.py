@@ -20,7 +20,7 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 
-from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
+from ....utils.conversation import _IMG_TAG_KEY, _OMNI_TOKEN_LEN, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from ..sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig
@@ -325,7 +325,6 @@ def _flattened_position_ids(
 
 
 _OMNI_POSITION_IDS = "bagel_siglip_navit_position_ids"
-_OMNI_TOKEN_LEN = "bagel_siglip_navit_token_len"
 
 
 class BagelSiglipNavitPreprocessor(ModulePreprocessorBase):

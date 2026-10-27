@@ -21,7 +21,7 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 
-from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
+from ....utils.conversation import _IMG_TAG_KEY, _OMNI_TOKEN_LEN, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from ..sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT, bagel_context
 from .configuration import BagelVAEConfig
@@ -468,6 +468,7 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
         infer_type = None if generation_kwargs is None else generation_kwargs.get("infer_type")
         route_image_contexts(conversation_list, inference=inference, infer_type=infer_type)
 
+        stride = max(int(getattr(self._image_processor, "image_stride", 16)), 1)
         image_items: list[ConversationItem] = []
         missing_samples: list[list[ConversationItem]] = []
         for sample in conversation_list:
@@ -475,6 +476,13 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
                 iter_desired_items([sample], types=["image"], meta={BAGEL_CONTEXT_KEY: [BAGEL_VAE_CONTEXT]})
             )
             if sample_image_items:
+                for item in sample_image_items:
+                    if item.meta.get(BAGEL_VAE_POSTERIOR) and _OMNI_TOKEN_LEN not in item.meta:
+                        shape = item.meta.get(BAGEL_VAE_PIXEL_SHAPE)
+                        if shape is not None and len(shape) >= 2:
+                            item.meta[_OMNI_TOKEN_LEN] = max((int(shape[0]) // stride) * (int(shape[1]) // stride), 1)
+                        elif isinstance(item.value, torch.Tensor) and item.value.ndim >= 2:
+                            item.meta[_OMNI_TOKEN_LEN] = max(int(item.value.shape[-2] * item.value.shape[-1]), 1)
                 image_items.extend(
                     item for item in sample_image_items if not item.is_dummy and not item.meta.get(BAGEL_VAE_POSTERIOR)
                 )
@@ -491,6 +499,7 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
                 item.value = pixels.to(dtype=self._dtype)
                 item.meta[BAGEL_CONTEXT_KEY] = BAGEL_VAE_CONTEXT
                 item.meta[BAGEL_VAE_PIXEL_SHAPE] = pixel_shape.to(dtype=torch.long)
+                item.meta[_OMNI_TOKEN_LEN] = max((int(pixel_shape[0]) // stride) * (int(pixel_shape[1]) // stride), 1)
 
         if not missing_samples:
             return
@@ -510,6 +519,7 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
             dummy_pixel_values = self._dummy_pixel_values.to(dtype=self._dtype)
             dummy_pixel_shape = self._dummy_pixel_shape.to(dtype=torch.long)
 
+        dummy_token_len = max((int(dummy_pixel_shape[0]) // stride) * (int(dummy_pixel_shape[1]) // stride), 1)
         # The placeholder stands in for a generation target, the primary VAE row.
         for sample in missing_samples:
             sample.append(
@@ -522,6 +532,7 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
                         _IMG_TAG_KEY: "gen",
                         BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT,
                         BAGEL_VAE_PIXEL_SHAPE: dummy_pixel_shape.clone(),
+                        _OMNI_TOKEN_LEN: dummy_token_len,
                     },
                 )
             )

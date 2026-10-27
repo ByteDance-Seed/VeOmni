@@ -116,12 +116,12 @@ def read_model_type(model_path: str) -> str:
     return model_type
 
 
-# Side-effect only: attach @register factories under bagel/, base/, janus/, qwen3/,
-# qwen3_moe/, qwen3vl/, text_encoder/, fake_model/. Imported after ``read_hf_model_type``
-# so the convert_registry ↔ modules cycle resolves: each family's ``convert_model``
+# Side-effect only: attach @register factories under bagel/, base/, deepseek_v41/, janus/, qwen3/,
+# qwen3_moe/, qwen3vl/, text_encoder/, fake_model/. Imported after ``read_hf_model_type`` so the
+# convert_registry ↔ modules cycle resolves: each family's ``convert_model``
 # imports ``convert_registry``, whose ``convert_checkpoint`` reads
 # ``read_hf_model_type`` back from this module.
-from . import bagel, base, fake_model, janus, qwen3, qwen3_moe, qwen3vl, text_encoder  # noqa: F401  E402
+from . import bagel, base, deepseek_v41, fake_model, janus, qwen3, qwen3_moe, qwen3vl, text_encoder  # noqa: F401  E402
 
 
 __all__ = [

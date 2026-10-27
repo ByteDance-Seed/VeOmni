@@ -56,7 +56,7 @@ def test_bagel_text_encoder_injects_raw_bos_for_understanding() -> None:
         type="text",
         value=torch.tensor([1, 2]),
         role="user",
-        meta={"_omni_tokenized": True, "input_ids": torch.tensor([1, 2])},
+        meta={"input_ids": torch.tensor([1, 2])},
     )
     conversation = model.generate([prompt], generation_kwargs={"infer_type": "infer_und"})["conversation_list"]
 

@@ -1,0 +1,80 @@
+# Full-parameter 40-layer training on 128 x H100/H20 (16 nodes) with DeepGEMM
+# FP8 routed experts (`moe_implementation: deepgemm_fp8`, `qat_implementation: none`)
+# and per-rank low-precision streaming load (`ep_sharded_stream_load: true`).
+#
+# - `deepseek_v41_ngram` (196.6 B) stays frozen in fp8 (1 byte/param, ~1.5 GB/card).
+# - `deepseek_v41_llm` (550.6 B) streams only each rank's 3 local experts per layer
+#   from the low-precision fp8/fp4 checkpoint, dequantizes them at load into bf16
+#   parameters, and runs forward, dgrad, and wgrad on Hopper/Blackwell FP8 Tensor
+#   Cores via DeepGEMM (`m_grouped_fp8_gemm_nt_contiguous` /
+#   `k_grouped_fp8_gemm_nt_contiguous`).
+
+deepseek_v41_vision:
+  model_path: deepseek_v41_vision
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    ulysses_size: 1
+    cp_size: 1
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+deepseek_v41_text_encoder:
+  model_path: deepseek_v41_text_encoder
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_ngram:
+  model_path: deepseek_v41_ngram
+  model_config:
+    freeze: true
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  accelerator:
+    extra_parallel_sizes: [128]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      reshard_after_forward: false
+      mixed_precision:
+        enable: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_llm:
+  model_path: deepseek_v41_llm
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  model_config:
+    weight_quantization: null
+    dsa_indexer_loss: true
+    dspark_block_size: 0
+  ops_implementation:
+    moe_implementation: deepgemm_fp8
+    qat_implementation: none
+  optimizer:
+    type: muon
+    lr: 1.0e-4
+    muon_lr: 5.0e-4
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_weight_decay: 0.01
+    muon_expert_zero_comm: false
+  accelerator:
+    ep_size: 128
+    ep_outside: false
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        cast_forward_inputs: false

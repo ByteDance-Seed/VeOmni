@@ -1,0 +1,132 @@
+# Full-parameter training on 128 x H20 (16 nodes): all 40 backbone layers, the
+# text encoder and the ViT train; the n-gram tables stay frozen in fp8 and the
+# DSpark/MTP stages are not built. The llm uses Muon.
+#
+# Trainable parameters (meta build of the released config):
+#
+#   vision          0.49 B   FSDP2 alone, AdamW
+#   text_encoder    1.32 B   emb, AdamW (0.66 B wte row-sharded + 0.66 B untied lm_head, replicated)
+#   llm           550.6  B   ep, Muon   (543.6 B routed experts, 6.7 B dense, 0.3 B engram)
+#   ngram         196.6  B   frozen, kept fp8 (1 byte a parameter), row-sharded over emb
+#
+# State per card at 128:
+#
+#   llm     12 B/param  fp32 master, fp32 grad, one fp32 momentum   51.6 GB
+#   lm_head  8 B/param  bf16, replicated on every card               5.3 GB
+#   ngram    1 B/param  fp8 rows, no grad                            1.5 GB
+#   rest                                                             0.1 GB
+#                                                                   -------
+#                                                                   58.5 GB
+#
+# AdamW's second moment would make the llm 68.8 GB and the total 75.7 GB. The
+# 256-card full run (full.yaml) measured ~45 GB above its state at mbs 1 --
+# activations under checkpointing, gathered layers, QAT copies, NCCL buffers --
+# for both AdamW (90-95 GB peak) and Muon (84 GB). With that overhead Muon
+# lands at ~100 GB here against the H20's ~96, so this is borderline; dropping
+# MTP takes some of the overhead with it, which is the margin it has to come
+# from. AdamW does not fit.
+#
+# If it OOMs, in order of what it costs the run:
+#   * export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (fragmentation);
+#   * freeze the text encoder: its replicated lm_head grad and moments are ~4 GB;
+#   * trainable_layer_ids on the llm: each frozen layer frees its fp32 grad and
+#     momentum, ~0.85 GB a card (its fp32 master copy stays).
+#
+# The counts that must divide 128: extra_parallel_only needs emb to span the
+# whole FSDP axis (dp_shard x cp_size), so emb is 128 at any cp_size; the
+# vocabulary (129280) and the padded table rows divide by 128; EP 64 divides the
+# 384 routed experts, leaving ep_fsdp 2.
+#
+# Muon at the AdamW lr starts with steps about a fifth of AdamW's
+# (muon_adjust_lr_fn=match_rms_adamw matches AdamW's steady state, not its
+# first steps); raise muon_lr if the loss moves too slowly.
+
+deepseek_v41_vision:
+  model_path: deepseek_v41_vision
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    ulysses_size: 1
+    cp_size: 1
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+deepseek_v41_text_encoder:
+  model_path: deepseek_v41_text_encoder
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_ngram:
+  model_path: deepseek_v41_ngram
+  model_config:
+    # Frozen tables keep the released fp8 rows: no gradient, so no bf16 copy.
+    freeze: true
+  # Rank 0 cannot hold the 196.6 GB of tables to broadcast them; each rank
+  # streams its own slice.
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  accelerator:
+    extra_parallel_sizes: [128]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      reshard_after_forward: false
+      mixed_precision:
+        enable: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_llm:
+  model_path: deepseek_v41_llm
+  # Each rank reads only its own experts' shards rather than taking a
+  # broadcast of the whole module from rank 0.
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  model_config:
+    # Checkpoint files stay fp8/fp4. Clearing this makes the module allocate
+    # bf16 Parameters; DeepseekV41DequantConverter spends the scales at load.
+    weight_quantization: null
+    # Indexer weights only get a gradient through this KL -- top-k does not
+    # backprop into the scores. Off, the indexer is frozen in all but name.
+    dsa_indexer_loss: true
+    # 0 builds no DSpark stages; the loader skips their checkpoint tensors.
+    # num_nextn_predict_layers stays 3 so the released 43-entry compress_ratios
+    # still lines up. freeze_mtp would not do it: a full-parameter run never
+    # reaches freeze_model's MTP branch.
+    dspark_block_size: 0
+  ops_implementation:
+    # Fake-quant dense GEMMs to fp8 and routed experts to fp4 (`expert_dtype`).
+    # For native FP8 expert training with DeepGEMM, use
+    # `modules_train_full128_deepgemm_fp8.yaml` (`moe_implementation: deepgemm_fp8`
+    # and `qat_implementation: none`).
+    qat_implementation: fp8_blockwise
+  optimizer:
+    type: muon
+    lr: 1.0e-4
+    muon_lr: 5.0e-4
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_weight_decay: 0.01
+    # The setting the 256-card Muon run trained and resumed with.
+    muon_expert_zero_comm: false
+  accelerator:
+    # 3 experts a rank; ep_fsdp=1 at 128 cards.
+    ep_size: 128
+    ep_outside: false
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        # FSDP2 would cast the fp32 hyper-connection mix to bf16 and hand each
+        # layer a copy of the shared KV state; see require_fp32_pre_mix.
+        cast_forward_inputs: false

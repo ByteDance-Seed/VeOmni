@@ -700,36 +700,63 @@ def make_list(item):
 
 
 class ProfilerWithMem:
-    """Thin wrapper that toggles CUDA-allocator tracing around profiler.step()"""
+    """Thin wrapper that records the CUDA-allocator history for the profiled steps.
+
+    The history captures a stack trace on every allocation, so it follows the
+    schedule rather than ``start()``: recorded from the first step, it costs
+    every step before ``start_step`` and fills the snapshot with them.
+    """
 
     def __init__(self, inner):
         self._p = inner
+        self._recording = False
 
     # delegate ctx-manager behaviour
     def __enter__(self):
-        return self._p.__enter__()
+        out = self._p.__enter__()
+        self._follow_schedule()
+        return out
 
     def __exit__(self, *a):
-        return self._p.__exit__(*a)
+        out = self._p.__exit__(*a)
+        self._set_recording(False)
+        return out
+
+    def _set_recording(self, enabled: bool) -> None:
+        if enabled == self._recording:
+            return
+        memory = get_torch_device().memory
+        if enabled and get_device_type() == "cuda":
+            try:
+                # Keep stacks for live allocations; recording every free traceback
+                # can crash profiler-enabled training during activation recomputation.
+                memory._record_memory_history(enabled="all", context="state")
+            except TypeError:
+                memory._record_memory_history(enabled="all")
+        else:
+            memory._record_memory_history(enabled="all" if enabled else None)
+        self._recording = enabled
+
+    def _follow_schedule(self) -> None:
+        # The trace handler dumps the snapshot inside the step that ends the
+        # window, before this runs, so stopping here keeps the dumped history.
+        action = getattr(self._p, "current_action", None)
+        self._set_recording(action is None or action.name != "NONE")
 
     def start(self):
         out = self._p.start()
-        memory = get_torch_device().memory
-        if get_device_type() == "cuda":
-            # Keep stacks for live allocations; recording every free traceback
-            # can crash profiler-enabled training during activation recomputation.
-            memory._record_memory_history(context="state")
-        else:
-            memory._record_memory_history()
+        self._follow_schedule()
         return out
 
     def stop(self):
         out = self._p.stop()
-        get_torch_device().memory._record_memory_history(enabled=None)  # step recording memory snapshot
+        self._set_recording(False)
         return out
 
     def step(self, *a, **kw):
-        return self._p.step(*a, **kw)
+        out = self._p.step(*a, **kw)
+        self._follow_schedule()
+        return out
 
 
 def create_profiler(

@@ -1,0 +1,16 @@
+# Text-only tulu-3. The -le1024 copy keeps the 78.8% of samples at or under
+# 1000 tokens: the SeedOmni V2 path ignores data.max_seq_len, and the longest
+# raw samples (~150k tokens) OOM a rank on their fp32 logits grad alone.
+# The upstream shards are sorted by tulu subset, and each dataloader worker
+# streams its own shards on every rank, so one global step would be a single
+# subset; the -shuffled copy permutes rows across shards.
+sources:
+  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture-le1024-shuffled/data
+names:
+  - tulu-3-sft-mixture
+schedule:
+  - schedule_type: const
+    weights: [1.0]
+level: token
+stopping_strategy: all_exhausted
+upstream_sharded: true

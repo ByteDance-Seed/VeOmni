@@ -117,6 +117,40 @@ def test_extra_pairs_reach_the_family_converter(tmp_path):
     assert seen["mimi_path"] == "kyutai/mimi"
 
 
+def test_a_streaming_converter_writes_its_own_subfolders(tmp_path):
+    """A converter that takes ``output_dir`` writes the modules; the registry writes only the root.
+
+    DeepSeek-V4.1 cannot be built to be converted (510 GB of released weights),
+    so it renames tensors straight into the module subfolders.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "streaming_convert_test"}), encoding="utf-8")
+    output = tmp_path / "omni"
+    training_graphs, generation_graphs = load_fake_omni_graphs()
+
+    def _stream(model_path: str, output_dir: str, **kwargs) -> dict:
+        del model_path, kwargs
+        FakeModuleA(FakeModuleAConfig(hidden_size=8)).save_pretrained(f"{output_dir}/{FAKE_A}")
+        FakeModuleB(FakeModuleBConfig()).save_pretrained(f"{output_dir}/{FAKE_B}")
+        return {
+            "module_names": [FAKE_A, FAKE_B],
+            "training_graphs": training_graphs,
+            "generation_graphs": generation_graphs,
+        }
+
+    if "streaming_convert_test" not in OMNI_CONVERT_REGISTRY.valid_keys():
+        OMNI_CONVERT_REGISTRY.register("streaming_convert_test", lambda: _stream)
+
+    convert_checkpoint(str(source), str(output))
+
+    config = OmniConfig.from_pretrained(output)
+    assert config.training_graphs == training_graphs
+    loaded = OmniModel.from_pretrained(output)
+    assert set(loaded.modules_dict) == {FAKE_A, FAKE_B}
+    assert loaded.get_module(FAKE_A).config.hidden_size == 8
+
+
 def test_convert_fake_omni_writes_both_graphs_and_loads(tmp_path):
     source = _write_fake_omni_source(tmp_path / "src", hidden_size=8)
     output = tmp_path / "omni"

@@ -42,7 +42,32 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
-CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4", "qwen4_exp"})
+# Models whose forward implements context parallelism. An allow-list rather than
+# a deny-list so that a model has to be ported deliberately: CP is enabled
+# model-agnostically (``ParallelState`` and ``TrainingArguments`` both admit
+# ``cp_size > 1`` for anything), and nothing downstream would notice a model that
+# has not been. ``SequenceParallelCollator`` shards the sequence on
+# ``sp_enabled``, which CP alone turns on, while every unported model gates its
+# sequence-parallel collectives on ``ulysses_enabled``, which CP alone leaves
+# false — so the shards are never gathered, each rank attends only within its own
+# 1/cp_size of the sequence, and the run trains to a plausible loss curve while
+# being silently wrong.
+#
+# SeedOmni builds each module under its own ParallelState (sharing one dp_size).
+# The DeepSeek-V4.1 llm shards the row over cp itself, its n-gram tables run
+# whole rows, and its text encoder slices on ``sp_group`` (which is the cp group
+# when CP is on). ``deepseek_v41_vision`` instead shards patches and scatters
+# attention heads over Ulysses (``ulysses_size``, ``cp_size=1``), so it is not on
+# the CP allow-list.
+CONTEXT_PARALLEL_MODEL_TYPES = frozenset(
+    {
+        "deepseek_v4",
+        "deepseek_v41_llm",
+        "deepseek_v41_ngram",
+        "deepseek_v41_text_encoder",
+        "qwen4_exp",
+    }
+)
 
 _VEOMNI_SP_ATTN = (
     "veomni_flex_attention",
@@ -70,10 +95,11 @@ def check_model_build_prerequisites(config: PretrainedConfig) -> None:
     the parallel state) and takes no arguments. Kept as a plain ``getattr`` for the
     same reason: a config that has nothing to refuse should not have to say so.
 
-    ``DeepseekV4Config.validate_build_prerequisites`` is the only implementation
-    today. It refuses a Lightning Indexer KL objective configured without the TileLang
-    indexer and attention it is defined in terms of -- a disagreement between a model
-    field and two op selections, which no single dataclass can see.
+    ``DeepseekV4Config.validate_build_prerequisites`` refuses a Lightning Indexer KL
+    objective configured without the TileLang indexer and attention it is defined in
+    terms of -- a disagreement between a model field and two op selections, which
+    no single dataclass can see. ``DeepseekV41LlmConfig``'s refuses Ulysses, since that
+    backbone shards its sequence over context parallelism only.
     """
     validate = getattr(config, "validate_build_prerequisites", None)
     if callable(validate):

@@ -57,14 +57,12 @@ logger = helper.create_logger(__name__)
 def _module_needs_distributed(module_args: OmniModuleRuntimeArguments) -> bool:
     """True when a module opts into a distributed build (FSDP2 / ExtraParallel / DDP).
 
-    A module needs an initialised process group + its own :class:`ParallelState`
-    whenever it is **not** a single-process ``eager`` load — i.e. ``fsdp2``
-    (incl. expert-parallel ``ep`` / vocab-parallel ``emb``) or ``ddp`` (a replicated backbone alongside
-    the sharded modules). ``eager`` is the inference default
-    (``build_omni_module_runtime_args``) and loads via ``device_map`` without collectives.
+    See :attr:`OmniModuleRuntimeArguments.needs_distributed_build`, which
+    ``ModuleRuntime`` reads too -- the inferencer decides here whether to set up
+    a process group at all, and the runtime decides per module how to build,
+    and the two must not be able to disagree.
     """
-    fsdp_mode = module_args.accelerator.fsdp_config.fsdp_mode
-    return bool(fsdp_mode and str(fsdp_mode).lower() not in ("eager",))
+    return module_args.needs_distributed_build
 
 
 @dataclass
@@ -102,7 +100,13 @@ class OmniInferencer:
         )
         if self._distributed:
             self.device = OmniTrainer._setup(args, save_launch_args=False)
-        helper.set_seed(args.infer.seed)
+        helper.set_seed(args.infer.seed, args.infer.enable_full_determinism)
+        if args.infer.enable_full_determinism:
+            logger.info_rank0(
+                "OmniInferencer: full determinism is ON "
+                "(NCCL_DETERMINISTIC / cuDNN disabled). "
+                "Pass --infer.enable_full_determinism false for serving speed."
+            )
         self._build_model()
 
         # Nest artefacts under <output_dir>/<infer_type>/ (infer_type is resolved

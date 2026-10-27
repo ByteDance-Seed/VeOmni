@@ -15,7 +15,7 @@
 # ruff: noqa: F821
 # Reason: This module patches PyTorch internal functions using types.FunctionType
 # with __globals__ bound to the target module. Variables like DATA_OFFSETS_KEY,
-# _read_tensor_data_mmap, etc. are resolved at runtime from torch.distributed.checkpoint.
+# _write_sub_tensor_to_file_optimized, etc. are resolved at runtime from torch.distributed.checkpoint.
 
 """Patches for PyTorch DCP (Distributed Checkpoint) safetensors consolidation.
 
@@ -77,7 +77,7 @@ def apply_dcp_consolidation_patch():
 
     The patch uses types.FunctionType to create a new function with __globals__
     bound to the target module, enabling access to internal functions like
-    _read_tensor_data_mmap and _write_sub_tensor_to_file_optimized.
+    _get_dcp_custom_metadata and _write_sub_tensor_to_file_optimized.
     """
     global _dcp_consolidation_patch_applied
 
@@ -254,7 +254,7 @@ def apply_dcp_consolidation_patch():
                     )
 
     # Create a new function with the target module's globals
-    # This ensures that internal functions like _read_tensor_data_mmap are resolved correctly
+    # This ensures that internal functions like _write_sub_tensor_to_file_optimized are resolved correctly
     patched_func = types.FunctionType(
         _process_output_file_impl.__code__,
         hf_module.__dict__,  # Use target module's globals for symbol resolution

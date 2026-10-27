@@ -8,13 +8,10 @@ from typing import Any
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from ....utils.conversation import ConversationItem
+from ....utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
 from ...text_encoder.chat_template import ChatMarkers, TextEncoderChatTemplate
 from ..sources import BAGEL_CONTEXT_KEY, bagel_context
 from .processing import is_bagel_vision_marker
-
-
-_OMNI_TOKENIZED = "_omni_tokenized"
 
 
 @dataclass(frozen=True)
@@ -88,7 +85,7 @@ class BagelChatTemplate(TextEncoderChatTemplate):
 
         for item in sample:
             if item.type == "text" and not is_bagel_vision_marker(item):
-                if not item.meta.get(_OMNI_TOKENIZED) and not torch.is_tensor(item.value):
+                if not torch.is_tensor(item.value):
                     item.value = f"{self.chat_markers.bos_token}{item.value}{self.chat_markers.eos_token}"
                     item.meta["loss_mask"] = int(item.role == "assistant")
 
@@ -99,7 +96,7 @@ class BagelChatTemplate(TextEncoderChatTemplate):
 
     def tokenize(self, parts: list[ConversationItem]) -> None:
         for item in parts:
-            if item.type != "text" or item.is_dummy or item.meta.get(_OMNI_TOKENIZED):
+            if item.type != "text" or item.is_dummy:
                 continue
 
             token_ids = self._token_ids_for_text_item(item)
@@ -110,7 +107,7 @@ class BagelChatTemplate(TextEncoderChatTemplate):
             item.meta["labels"] = (
                 token_ids.detach().clone() if loss_mask else torch.full_like(token_ids, -100, dtype=torch.long)
             )
-            item.meta[_OMNI_TOKENIZED] = True
+            item.meta[_OMNI_TOKEN_LEN] = int(token_ids.numel())
 
             if (
                 item.value in {self.chat_markers.bos_token, self.chat_markers.eos_token}

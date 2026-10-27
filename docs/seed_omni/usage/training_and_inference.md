@@ -80,9 +80,10 @@ The `output_dir` becomes `model.model_path` in `base.yaml`.
 
 ### 2.1 Load an upstream checkpoint directly
 
-A family that registers an HF layout (`OMNI_HF_LAYOUT_REGISTRY`, today `qwen3`)
-skips the convert: `model.model_path` (or `OmniModel.from_pretrained` /
-`OmniProcessor.from_pretrained`) can name the upstream HF checkpoint. Detection
+A family that registers an HF layout (`OMNI_HF_LAYOUT_REGISTRY`, today `qwen3`
+and `deepseek_v41`) skips the convert: `model.model_path` (or
+`OmniModel.from_pretrained` / `OmniProcessor.from_pretrained`) can name the
+upstream HF checkpoint. Detection
 is by the root `config.json`'s `model_type`: `omni` is a split checkpoint, a type
 with a registered layout loads through it, and any other type is an error.
 
@@ -103,7 +104,8 @@ with a registered layout loads through it, and any other type is an error.
   module. DCP checkpoints and resume stay per module.
 - **Requirements.** Direct HF loading applies when all active modules come from
   that single upstream checkpoint with their default `model_path` (the module
-  name) and standard weight loading (`ep_sharded_stream_load: false`). Direct HF
+  name). `ep_sharded_stream_load: true` is supported: each source key is renamed
+  before its rank slice is planned. Direct HF
   export (`save_hf_weights`) is supported when module tensor converters preserve
   upstream parameter names and shapes; if a model composes multiple source
   checkpoints or adds new parameters, convert to a split checkpoint first.
@@ -252,8 +254,11 @@ bash train.sh tasks/omni/infer_omni.py \
 Training writes the root `config.json` and graph sidecars once under
 `<output_dir>/model_assets/` and each trainable module's HF weights under
 `<output_dir>/checkpoints/global_step_N/hf_ckpt/<module>/` (fully frozen modules
-have no checkpoint manager and remain in the original split checkpoint). Link
-the root files, each trained module's step export, and any frozen module's
+have no checkpoint manager and remain in the original split checkpoint). A module
+whose row-sharded embedding tables are too large for one file (DeepSeek-V4.1's
+n-gram) leaves them unmerged; run `python scripts/merge_hf_export.py "$STEP/hf_ckpt"`
+first ([details](../../usage/checkpoint_conversion.md#finishing-an-hf-export-with-unmerged-tables)).
+Link the root files, each trained module's step export, and any frozen module's
 original subfolder into a flat root and pass it as `--model.model_path`:
 
 ```bash

@@ -359,6 +359,9 @@ def test_seedomni_conversation_list_dyn_bsz_lengths_and_strategy():
     from veomni.data.seed_omni.collator import SeedOmniCollator
     from veomni.models.seed_omni.utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
 
+    # Sample with user text (3 tokens, ignored in loss), user image (4 tokens),
+    # assistant text (5 tokens, 4 supervised), assistant gen image (8 tokens),
+    # and a dummy user image (2 tokens).
     conv_sample = {
         "conversation_list": [
             ConversationItem(

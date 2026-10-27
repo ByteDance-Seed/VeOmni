@@ -126,7 +126,7 @@ class TrainingMixin(TrainingModuleMixin):
         self._conversation_carrier = None
         loss = outputs.pop("loss", None)
         if loss is not None:
-            outputs["_loss"] = loss
+            outputs["_loss"] = {"ce_loss": loss}
         outputs["conversation_list"] = conversation
         return outputs
 

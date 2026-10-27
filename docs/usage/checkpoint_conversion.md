@@ -155,6 +155,48 @@ If model config or tokenizer is missing from the output:
 - Check that the directory contains `config.json` and tokenizer files
 - Verify the model type is supported by HuggingFace's `AutoConfig` and `AutoProcessor`
 
+## Finishing an HF Export with Unmerged Tables
+
+The training-time HF export (`train.checkpoint.save_hf_weights`) consolidates
+every tensor into its `model-*.safetensors` file except one kind. A tensor that
+embedding parallelism (`emb`) shards by whole rows (`Shard(0)`) and that is
+larger than one output file (5 GB) is left as the per-rank shards DCP wrote.
+Whole rows means the table is not also FSDP-sharded by columns, so the module
+sets `extra_parallel_only: true`, as the DeepSeek-V4.1 n-gram configs do. This
+applies only to the distributed export (`ckpt_manager: dcp`, torch >= 2.9, not
+on NPU); other tables and export paths still consolidate every tensor. Consolidating it would mean
+one rank streaming the whole tensor into one file while every other rank waits:
+about an hour for each of DeepSeek-V4.1's 197 GB n-gram tables on an HDFS mount.
+
+Such an export holds, beside the usual files:
+
+- `sharded/`: each rank's rows of the deferred tensors, as `shard-*-model-*.safetensors`;
+- `pending_merge.json`: the deferred tensors and the output files they belong in.
+
+`model.safetensors.index.json` already lists every tensor, the deferred files
+included, but loaders refuse the directory while `pending_merge.json` is there.
+Write the missing files off the training job:
+
+```bash
+python scripts/merge_hf_export.py <output_dir>/checkpoints/global_step_N/hf_ckpt
+```
+
+The argument may be one export or any directory above several; every export
+holding a marker below it is merged, and a `sharded/` directory left without a
+marker is reported. Each output file is written by one thread (`--num-threads`
+caps how many at once), appending the shards in row order a 64 MB chunk at a
+time, so memory stays small and an append-only mount such as HDFS FUSE works.
+It is still one stream per file; local disk is faster when there is room.
+Until the shards are removed the table takes twice its size on disk.
+
+Before writing, the merge checks that the shards cover exactly the rows and
+bytes the export recorded. If one is missing or foreign, or the index is
+missing, it raises and leaves the marker and shards in place. The script goes
+on to the next export and exits non-zero at the end. Rerunning is possible
+while `pending_merge.json` remains; once `merge_pending_hf_shards` removes the
+marker before deleting `sharded/`, an interrupted cleanup leaves an orphaned
+`sharded/` directory that `scan()` reports for manual cleanup.
+
 ## See Also
 
 - [Basic Modules](basic_modules.md) - Understanding VeOmni's checkpoint saving

@@ -329,7 +329,7 @@ def test_janus_text_encoder_emit_image_start_replaces_output_tail():
 
 
 def test_text_encoder_decode_returns_single_loss_key():
-    """Single-loss protocol: ``post_forward`` maps ``loss`` → ``_loss``."""
+    """Loss protocol: ``post_forward`` maps ``loss`` → ``_loss["ce_loss"]``."""
     TextEncoder = _accelerated_model_cls("text_encoder")
     TextEncoderConfig = _config_cls("text_encoder")
     te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16))
@@ -338,7 +338,7 @@ def test_text_encoder_decode_returns_single_loss_key():
     out = te.decode(hidden_states=h, labels=labels)
     assert out["loss"] is not None and out["loss"].dim() == 0
     graph_out = te.post_forward("decode", **out)
-    assert "_loss" in graph_out and graph_out["_loss"].dim() == 0
+    assert set(graph_out["_loss"]) == {"ce_loss"} and graph_out["_loss"]["ce_loss"].dim() == 0
     assert "lm_loss" not in graph_out
 
 

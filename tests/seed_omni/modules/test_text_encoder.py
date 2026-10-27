@@ -66,7 +66,7 @@ def test_text_encoder_save_reload_via_registry(tmp_path: Path):
 
 
 def test_text_encoder_decode_returns_single_loss_key():
-    """Single-loss protocol: ``post_forward`` maps ``loss`` → ``_loss``."""
+    """Loss protocol: ``post_forward`` maps ``loss`` → ``_loss["ce_loss"]``."""
     AccTextEncoder = _accelerated_model_cls("text_encoder")
     TextEncoderCfg = _config_cls("text_encoder")
     te = AccTextEncoder(TextEncoderCfg(vocab_size=64, hidden_size=16))
@@ -75,7 +75,7 @@ def test_text_encoder_decode_returns_single_loss_key():
     out = te.decode(hidden_states=h, labels=labels)
     assert out["loss"] is not None and out["loss"].dim() == 0
     graph_out = te.post_forward("decode", **out)
-    assert "_loss" in graph_out and graph_out["_loss"].dim() == 0
+    assert set(graph_out["_loss"]) == {"ce_loss"} and graph_out["_loss"]["ce_loss"].dim() == 0
     assert "lm_loss" not in graph_out
 
 

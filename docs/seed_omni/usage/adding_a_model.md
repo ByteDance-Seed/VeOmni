@@ -112,8 +112,10 @@ If the model needs a new data source, add a preprocessor as described in
 
 ## 5. Honour the contracts
 
-- Return at most one scalar `_loss` per node, token-mean reduced over the
-  module's own micro-batch.
+- Return at most one `_loss` per node: a `{loss_name: scalar}` dict, each value
+  token-mean reduced over the module's own micro-batch. Name each term
+  (`ce_loss`, `mtp_loss`, ...) so it logs separately as
+  `{module}.{method}.{loss_name}`.
 - Read inputs in `pre_forward`, write results in `post_forward`. Conversation
   nodes return `{"conversation_list": ...}` so the carrier flows on.
 - Implement `dummy_inputs()` and `ModulePreprocessorBase.bind_dummy_inputs()` for

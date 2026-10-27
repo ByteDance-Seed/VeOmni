@@ -184,9 +184,11 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         Inference only: it skips :meth:`setup`, so it has no mesh, no
         :class:`ParallelState` and no wrap. The generic parallelize step rejects
-        ``eager`` for training.
+        ``eager`` for training. A module that asks for ``ep`` or ``emb`` is not
+        eager even with ``fsdp_mode='eager'``; see
+        :attr:`OmniModuleRuntimeArguments.needs_distributed_build`.
         """
-        return self.args.accelerator.fsdp_config.fsdp_mode == "eager"
+        return not self.args.needs_distributed_build
 
     @property
     def wrap_omni_model(self) -> bool:

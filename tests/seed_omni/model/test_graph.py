@@ -493,6 +493,44 @@ def test_omni_model_without_a_generation_graph_refuses_to_generate():
         model.generate({})
 
 
+def test_omni_model_forward_names_each_loss_by_node_and_key():
+    """A ``_loss`` dict logs as ``{node}.{key}``; a bare scalar as ``{node}.loss``; the total sums all."""
+
+    class _LossModule(_FakeOmniModule):
+        def __init__(self, name: str, loss) -> None:
+            super().__init__(name)
+            self._loss = loss
+
+        def forward(self, **kwargs):
+            out = super().forward(**kwargs)
+            if self._loss is not None:
+                out["_loss"] = self._loss
+            return out
+
+    edges = _fan_in_edges()
+    g = TrainingGraph(edges)
+    first, second, *_ = g.execution_order
+    emitted = {
+        g.module_of(first): {"ce_loss": torch.tensor(1.0), "mtp_loss": torch.tensor(2.0), "off_loss": None},
+        g.module_of(second): torch.tensor(4.0),
+    }
+    modules = {name: _LossModule(name, emitted.get(name)) for name in {g.module_of(n) for n in g.execution_order}}
+    config = OmniConfig(
+        _module_entries={name: {"model_path": name} for name in modules},
+        training_graphs={"default": edges},
+        generation_graphs={},
+    )
+
+    out = OmniModel(config, modules)({"conversation_list": []})
+
+    assert out["losses"] == {
+        f"{first}.ce_loss": torch.tensor(1.0),
+        f"{first}.mtp_loss": torch.tensor(2.0),
+        f"{second}.loss": torch.tensor(4.0),
+    }
+    assert out["loss"] == torch.tensor(7.0)
+
+
 def test_modeling_omni_imports_no_veomni_runtime_package():
     """``modeling_omni`` must stay liftable into another framework.
 

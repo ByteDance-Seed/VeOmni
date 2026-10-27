@@ -94,6 +94,7 @@ def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPat
                 fsdp_mode="fsdp2",
                 fsdp_scope="module",
                 reshard_after_forward=True,
+                extra_parallel_only=False,
                 mixed_precision=SimpleNamespace(enable=False),
                 forward_prefetch=False,
                 offload=False,

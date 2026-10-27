@@ -424,6 +424,24 @@ def test_a_split_table_outside_its_own_fsdp_unit_is_rejected(emb_state):
         embedding.project(torch.randn(1, 4))
 
 
+def test_a_split_table_outside_any_fsdp_wrap_dispatches(emb_state, monkeypatch):
+    """``extra_parallel_only`` builds no FSDP unit at all, so no parent can regather the rows."""
+    group = object()
+    emb_state(_emb_state(group=group, size=2))
+    embedding = _sliced(ShardedEmbedding(8, 4), rows=4)
+    embedding.outside_fsdp = True
+    groups = []
+
+    def fake_all_to_all(dispatch_group, ids, weight):
+        groups.append(dispatch_group)
+        return torch.zeros(*ids.shape, weight.shape[-1])
+
+    monkeypatch.setattr(sharded_embedding.AllToAllEmbedding, "apply", fake_all_to_all)
+
+    assert embedding(torch.tensor([1, 6])).shape == (2, 4)
+    assert groups == [group]
+
+
 @pytest.mark.parametrize(("emb_rank", "local_padding_idx"), [(0, None), (1, 1)])
 def test_padding_idx_indexes_the_rows_this_rank_holds(emb_state, emb_rank, local_padding_idx):
     """Initializers that zero ``weight[padding_idx]`` must hit global row 5 on its owner only."""

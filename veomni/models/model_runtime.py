@@ -465,6 +465,7 @@ class VeOmniModelRuntime:
             weights_path=self.weights_path,
             should_skip_hf_weight_load=skip_hf_weight_load,
             enable_reshard_after_forward=args.accelerator.fsdp_config.reshard_after_forward,
+            extra_parallel_only=args.accelerator.fsdp_config.extra_parallel_only,
             mixed_precision=args.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=gc_cfg.enable,
             # Configured classes only, in configuration order: parallelize reads
