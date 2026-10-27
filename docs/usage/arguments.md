@@ -481,9 +481,14 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 
 `model.optimizer.*` — Optimizer and learning-rate schedule.
 
+`master_fp32_adamw` keeps FP32 master weights with BF16 moments, including for FP32 compute parameters; `full_fp32_adamw` also keeps FP32 moments. `cpu_offload_adamw` puts selected parameters' masters/moments on CPU while compute weights and gradients stay on the accelerator; unselected state stays resident. It defaults to FP32 moments on both devices. Checkpoint resume requires matching optimizer-state precision; dtype migrations must be explicit. See [optimizer CPU offload](../design/optimizer_cpu_offload.md).
+
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| type | `Literal["adamw", "anyprecision_adamw", "muon"]` | `"adamw"` | Optimizer type. `muon` builds Muon and AdamW parameter groups. |
+| type | `Literal["adamw", "anyprecision_adamw", "muon", "master_fp32_adamw", "full_fp32_adamw", "cpu_offload_adamw"]` | `"adamw"` | Optimizer type. `muon` combines Muon and AdamW; FP32-master and optimizer-only offload options are described below. |
+| cpu_offload_param_patterns | `List[str]` | `[]` | Required for `cpu_offload_adamw`. Match full parameter names using `re.search`; anchor patterns for exact matching. Empty lists and patterns matching no trainable parameter are rejected. |
+| cpu_offload_resident_moment_dtype | `Literal["float32", "bfloat16"]` | `"float32"` | Moment storage for resident `cpu_offload_adamw` parameters. Masters and update arithmetic stay FP32. BF16 moments are lossy. |
+| cpu_offload_cpu_moment_dtype | `Literal["float32", "bfloat16"]` | `"float32"` | Moment storage for CPU-offloaded `cpu_offload_adamw` parameters. Masters and update arithmetic stay FP32. BF16 moments are lossy. |
 | lr | `float` | `5e-5` | Maximum / default learning rate. |
 | lr_min | `float` | `1e-7` | Minimum learning rate. |
 | lr_start | `float` | `0.0` | Starting learning rate for warmup. |

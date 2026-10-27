@@ -377,13 +377,18 @@ model = build_parallelize_model(
 
 ### Optimizer and LR Scheduler
 
-`build_optimizer` supports three optimizer types via `model.optimizer.type`:
+`build_optimizer` supports six optimizer types via `model.optimizer.type`:
 
 | Type | Description |
 |------|-------------|
 | `adamw` (default) | Standard `torch.optim.AdamW`. |
 | `anyprecision_adamw` | Mixed-precision AdamW (Llama-recipes' AnyPrecisionAdamW). |
+| `master_fp32_adamw` | FP32 master weights and updates with BF16 first/second moments, including for FP32 compute parameters. |
+| `full_fp32_adamw` | FP32 master weights, moments and updates, with compute weights kept in their original dtype. |
+| `cpu_offload_adamw` | Selective optimizer-only CPU offload: matched parameters' FP32 masters and moments live on CPU; model weights and gradients stay on the accelerator. |
 | `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases and norms. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
+
+For `cpu_offload_adamw`, `cpu_offload_param_patterns` defaults to `[]` but must be nonempty. Each regex uses `re.search` against full parameter names; anchor it for exact matching. Every pattern must match a trainable parameter. Unmatched parameters keep resident optimizer state. `cpu_offload_resident_moment_dtype` and `cpu_offload_cpu_moment_dtype` independently select `float32` (default) or lossy `bfloat16` moment storage; masters and update arithmetic remain FP32. Resume does not silently change saved precision. See [optimizer CPU offload](../design/optimizer_cpu_offload.md).
 
 Muon-specific hyperparameters live under `model.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` continue to drive the AdamW sibling group.
 
