@@ -10,6 +10,55 @@ from veomni.distributed.hccl_options import ep_backend_override, validate_ep_hcc
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"npu_ep_hccl_buffer_mib": 32},
+        {"npu_ep_hccl_expansion_mode": "host"},
+        {"npu_ep_hccl_buffer_mib": 32, "npu_ep_hccl_expansion_mode": "host"},
+    ],
+)
+def test_config_rejects_hccl_options_when_effective_ep_is_disabled(monkeypatch, options):
+    from veomni.arguments.arguments_types import AcceleratorConfig
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    with pytest.raises(ValueError, match="require an enabled ep dimension"):
+        AcceleratorConfig(ep_size=1, **options)
+    # Restored extra-parallel metadata determines the mesh, even if ep_size differs.
+    with pytest.raises(ValueError, match="require an enabled ep dimension"):
+        AcceleratorConfig(
+            ep_size=2,
+            extra_parallel_names=["ep"],
+            extra_parallel_sizes=[1],
+            extra_parallel_placement_innermost=[False],
+            **options,
+        )
+
+
+def test_config_accepts_hccl_options_for_effective_ep_and_default_without_ep(monkeypatch):
+    from dataclasses import asdict
+
+    from veomni.arguments.arguments_types import AcceleratorConfig, MixedPrecisionConfig
+    from veomni.arguments.parser import _instantiate_recursive
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    assert AcceleratorConfig(ep_size=1).ep_size == 1
+    config = AcceleratorConfig(ep_size=2, npu_ep_hccl_buffer_mib=32)
+    assert dict(zip(config.extra_parallel_names, config.extra_parallel_sizes))["ep"] == 2
+    roundtrip = _instantiate_recursive(AcceleratorConfig, asdict(config))
+    assert roundtrip.extra_parallel_names.count("ep") == 1
+    assert dict(zip(roundtrip.extra_parallel_names, roundtrip.extra_parallel_sizes))["ep"] == 2
+    assert isinstance(roundtrip.fsdp_config.mixed_precision, MixedPrecisionConfig)
+    restored = AcceleratorConfig(
+        ep_size=1,
+        extra_parallel_names=["ep"],
+        extra_parallel_sizes=[2],
+        extra_parallel_placement_innermost=[False],
+        npu_ep_hccl_expansion_mode="host",
+    )
+    assert dict(zip(restored.extra_parallel_names, restored.extra_parallel_sizes))["ep"] == 2
+
+
 @pytest.mark.parametrize("size,mode", [(0, None), (-1, None), (True, None), (1.5, None), (None, "invalid")])
 def test_invalid_options_fail(size, mode):
     """Bad options fail before constructing any distributed communicator."""

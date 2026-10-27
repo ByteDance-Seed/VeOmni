@@ -861,6 +861,10 @@ class AcceleratorConfig:
             self.extra_parallel_names.append("ep")
             self.extra_parallel_placement_innermost.append(self.ep_outside)
 
+        ep_size = dict(zip(self.extra_parallel_names, self.extra_parallel_sizes)).get("ep", 1)
+        if (self.npu_ep_hccl_buffer_mib is not None or self.npu_ep_hccl_expansion_mode is not None) and ep_size <= 1:
+            raise ValueError("HCCL expert-parallel options require an enabled ep dimension")
+
         # world_size and dp_size are plain attributes rather than fields: an omni model
         # builds one of these per module, and a field would let asdict() round-trip a
         # value derived under a different WORLD_SIZE back in as if the user had set it.
