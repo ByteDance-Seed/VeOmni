@@ -88,6 +88,8 @@ class ParallelState:
         # directly, which is how a per-module state under use_parallel_state is made.
         if self.cp_size < 1:
             raise ValueError(f"cp_size must be a positive integer; got {self.cp_size}.")
+        if self.ulysses_size < 1:
+            raise ValueError(f"ulysses_size must be a positive integer; got {self.ulysses_size}.")
 
         if self.cp_size > 1 and self.ulysses_size > 1:
             raise NotImplementedError(

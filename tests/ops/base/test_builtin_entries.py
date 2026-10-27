@@ -39,6 +39,7 @@ _GPU_SM80 = ("gpu", (("nvidia", 80, None), ("rocm", None, None)))
 _GPU_NVIDIA = ("gpu", (("nvidia", None, None),))
 _GPU_NVIDIA_SM80 = ("gpu", (("nvidia", 80, None),))
 _GPU_NVIDIA_SM90 = ("gpu", (("nvidia", 90, None),))
+_GPU_NVIDIA_SM90_OR_SM100 = ("gpu", (("nvidia", 90, 90), ("nvidia", 100, 100)))
 _GPU_NVIDIA_SM100 = ("gpu", (("nvidia", 100, None),))
 _GPU_NVIDIA_SM90_TO_SM100 = ("gpu", (("nvidia", 90, 100),))
 _NPU = ("npu", ())
@@ -149,6 +150,7 @@ _BUILTIN_ENTRIES = (
     ("moe_experts", "standard", "fused_triton", "cuda", _GPU_SM70, ("triton",)),
     ("moe_experts", "standard", "fused_triton", "mlu", _MLU, ("triton",)),
     ("moe_experts", "standard", "fused_quack", "cuda", _GPU_NVIDIA_SM90, ("quack",)),
+    ("moe_experts", "standard", "deepgemm_fp8", "cuda", _GPU_NVIDIA_SM90_OR_SM100, ("deep_gemm", "triton")),
     ("moe_experts", "standard", "fused_npu", "npu", _NPU, ()),
     ("moe_experts", "standard", "fused_mlu", "mlu", _MLU, ("apex",)),
     ("moe_experts", "gpt_oss", "eager", "any", _ANY, ()),
@@ -215,13 +217,22 @@ def _requirement_metadata(requirement):
 
 
 def test_builtin_entry_catalog_is_exact():
-    """Built-in rows expose the intended device, platform, and package metadata."""
+    """Verify every built-in row and its hardware/dependency metadata alongside structural invariants."""
+    assert OP_REGISTRY._entries, "OP_REGISTRY must not be empty"
     actual = {
         (*key, _requirement_metadata(entry.requirement), entry.requires) for key, entry in OP_REGISTRY._entries.items()
     }
-    expected = set(_BUILTIN_ENTRIES)
+    for op, variant, impl, device, req_meta, _requires in actual:
+        if device == "any":
+            assert req_meta is None, f"{op}/{variant}/{impl} on device='any' must not set hardware requirement"
+        else:
+            expected_kind = "gpu" if device == "cuda" else device
+            assert req_meta is not None and req_meta[0] == expected_kind, (
+                f"{op}/{variant}/{impl} on device={device!r} has mismatched requirement {req_meta}"
+            )
 
-    assert len(expected) == len(_BUILTIN_ENTRIES)
+    expected = set(_BUILTIN_ENTRIES)
+    assert len(expected) == len(_BUILTIN_ENTRIES), "Duplicate expected built-in rows"
     assert actual == expected
 
 
