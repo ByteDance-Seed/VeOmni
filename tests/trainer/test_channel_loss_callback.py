@@ -1,16 +1,13 @@
-import asyncio
 import importlib.util
 import math
 import os
 import queue
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import timedelta
 from functools import partial
 from importlib.machinery import ModuleSpec
-from threading import Event
 from types import SimpleNamespace
 
 
@@ -1398,7 +1395,7 @@ def test_channel_loss_failed_sp_payload_exchange_aborts_unsafe_process_group(mon
         "data": False,
         "mode": "packed_cu",
     }
-    monkeypatch.setattr(computer, "_compute_channel_loss", lambda **kwargs: observation)
+    monkeypatch.setattr(computer, "_compute_channel_loss", lambda *, defer_sp=False, **kwargs: observation)
     monkeypatch.setattr(channel_loss_module.dist, "is_available", lambda: True)
     monkeypatch.setattr(channel_loss_module.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(channel_loss_module.dist, "get_rank", lambda *args: 0)
@@ -4292,115 +4289,6 @@ def test_channel_loss_strict_rejects_missing_non_sp_observation():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_channel_loss_rejects_concurrent_capture_on_same_computer():
-    computer = _legacy_computer(parallel_state=_test_parallel_state())
-    entered, release = Event(), Event()
-
-    def worker():
-        with computer.capture():
-            entered.set()
-            assert release.wait(10)
-
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(worker)
-        assert entered.wait(10)
-        try:
-            with pytest.raises(RuntimeError, match="Concurrent capture"), computer.capture():
-                pass
-        finally:
-            release.set()
-        future.result(timeout=10)
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_channel_loss_rejects_async_child_capture_on_same_computer():
-    computer = _legacy_computer(parallel_state=_test_parallel_state())
-
-    async def run():
-        async def child():
-            with pytest.raises(RuntimeError, match="Concurrent capture"), computer.capture():
-                pass
-
-        with computer.capture():
-            await asyncio.gather(child(), child())
-            with computer.capture():
-                pass
-
-    asyncio.run(run())
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_channel_loss_async_child_direct_and_expired_context():
-    computer = _legacy_computer(parallel_state=_test_parallel_state())
-    computer._source_ids = ["source"]
-    computer._position_ids = torch.tensor([[0, 1]])
-    computer._original_loss_fn = lambda logits, labels, vocab_size, shift_labels: torch.tensor(1.0)
-    logits, labels = torch.randn(1, 2, 4), torch.tensor([[1, 2]])
-
-    async def run():
-        release = asyncio.Event()
-
-        async def child():
-            assert computer._wrapped_loss_fn(logits, labels, 4, labels).item() == 1.0
-            assert computer._foreign_capture_errors
-            await release.wait()
-            assert not computer.capture_active
-            computer._wrapped_loss_fn(logits, labels, 4, labels)
-            assert computer._result is None
-            with computer.capture():
-                assert computer.capture_active
-
-        with computer.capture():
-            task = asyncio.create_task(child())
-            await asyncio.sleep(0)
-        release.set()
-        await task
-
-    asyncio.run(run())
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_channel_loss_async_child_without_sources_runs_main_loss():
-    computer = _legacy_computer(parallel_state=_test_parallel_state())
-    computer._original_loss_fn = lambda labels: torch.tensor(1.0)
-    computer._dpo_segments = True
-
-    async def run():
-        async def child():
-            assert computer._wrapped_loss_fn(labels=torch.tensor([[1]])).item() == 1.0
-            computer.observe_dpo_log_probs(torch.zeros(1, 1), torch.ones(1, 1), None)
-
-        with computer.capture():
-            await asyncio.create_task(child())
-            assert computer._result is None
-
-    asyncio.run(run())
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_dpo_loss_wrapper_async_child_with_sources_uses_main_loss_only():
-    computer = _legacy_computer(parallel_state=_test_parallel_state())
-    computer._original_loss_fn = lambda labels: labels.square().sum()
-    computer._dpo_segments = True
-    computer._source_ids = [0]
-
-    async def run():
-        async def child():
-            labels = torch.tensor([[2.0]], requires_grad=True)
-            loss = computer._wrapped_loss_fn(labels=labels)
-            computer.observe_dpo_log_probs(torch.zeros(1, 1), labels, [0, 1])
-            loss.backward()
-            assert loss.item() == 4.0
-            assert labels.grad.item() == 4.0
-
-        with computer.capture():
-            await asyncio.create_task(child())
-        assert computer._result is None
-
-    asyncio.run(run())
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("nested", [False, True])
 def test_channel_loss_discards_observation_when_forward_fails(nested):
     computer = _legacy_computer(parallel_state=_test_parallel_state())
@@ -5040,44 +4928,6 @@ def test_channel_loss_rejects_metadata_hook_changing_mtp_labels(monkeypatch, add
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_chunk_loss_async_child_does_not_write_parent_capture():
-    from veomni.ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
-
-    hidden = torch.randn(1, 2, 3)
-    labels = torch.tensor([[1, 2]])
-    weight = torch.randn(5, 3)
-
-    async def run():
-        owner = channel_loss_module._capture_owner()
-        capture = {"_is_owner": lambda: channel_loss_module._capture_owner() == owner}
-        token = chunk_loss._CAPTURE.set(capture)
-        release = asyncio.Event()
-        try:
-
-            async def child():
-                return chunk_loss.forward(hidden, labels, weight, grad_enabled=False)[0]
-
-            async def late_child():
-                await release.wait()
-                return await child()
-
-            late = asyncio.create_task(late_child())
-            child_loss = await asyncio.create_task(child())
-            assert "per_token" not in capture
-            parent_loss = chunk_loss.forward(hidden, labels, weight, grad_enabled=False)[0]
-            assert capture["per_token"].shape == labels.shape
-            original_tokens = capture["per_token"]
-            torch.testing.assert_close(child_loss, parent_loss, rtol=0, atol=0)
-        finally:
-            chunk_loss._CAPTURE.reset(token)
-        release.set()
-        torch.testing.assert_close(await late, parent_loss, rtol=0, atol=0)
-        assert capture["per_token"] is original_tokens and "error" not in capture
-
-    asyncio.run(run())
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_channel_loss_rejects_metadata_hook_adding_attention_mask(monkeypatch):
     import veomni.data.data_collator as data_collator
 
@@ -5216,222 +5066,373 @@ def test_loss_signature_preserves_positional_aliases_without_mislabeling_weights
     assert "ignore_index" not in bound and "num_items_in_batch" not in bound
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize("dpo", [False, True])
-def test_stale_async_child_cannot_contaminate_next_capture(dpo):
-    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
+@pytest.mark.parametrize("override", ["compute_side_channel", "_compute_channel_loss"])
+def test_channel_loss_preserves_legacy_observer_overrides(override):
+    calls = []
+
+    def side_channel(self, logits, labels, vocab_size, hidden_states, weights, shift_labels=None, ignore_index=-100):
+        calls.append("side")
+
+    def compute(self, logits, labels, vocab_size, hidden_states, weights, attention_mask, shift_labels, ignore_index):
+        calls.append("compute")
+        return []
+
+    method = side_channel if override == "compute_side_channel" else compute
+    custom_computer = type("LegacyComputer", (ChannelLossComputer,), {override: method})
+    computer = custom_computer(parallel_state=_test_parallel_state())
     computer._source_ids = ["source"]
-    computer._dpo_segments = dpo
+    computer._original_loss_fn = lambda logits, labels, vocab_size: logits.square().sum()
+    logits = torch.ones(1, 2, 3, requires_grad=True)
+    with computer.capture():
+        loss = computer._wrapped_loss_fn(logits, torch.tensor([[0, 1]]), 3)
+    loss.backward()
+    assert calls == ["side" if override == "compute_side_channel" else "compute"]
+    torch.testing.assert_close(logits.grad, 2 * logits.detach(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("override", ["compute_side_channel", "_compute_channel_loss"])
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("variadic", [False, True])
+def test_dpo_legacy_observer_without_expanded_log_probs_fails_closed(override, strict, variadic):
+    calls = []
+
+    def legacy_side(self, logits, labels, vocab_size, hidden_states, weights, shift_labels=None, ignore_index=-100):
+        calls.append(1)
+        return [{"source_id": "source", "loss_sum": torch.tensor(123.0), "token_count": torch.tensor(1)}]
+
+    def legacy_compute(
+        self, logits, labels, vocab_size, hidden_states, weights, attention_mask, shift_labels, ignore_index
+    ):
+        calls.append(1)
+        return [{"source_id": "source", "loss_sum": torch.tensor(123.0), "token_count": torch.tensor(1)}]
+
+    def legacy_side_variadic(
+        self, logits, labels, vocab_size, hidden_states, weights, shift_labels=None, ignore_index=-100, **kwargs
+    ):
+        calls.append(1)
+
+    def legacy_compute_variadic(
+        self, logits, labels, vocab_size, hidden_states, weights, attention_mask, shift_labels, ignore_index, **kwargs
+    ):
+        calls.append(1)
+        return []
+
+    methods = {
+        "compute_side_channel": legacy_side_variadic if variadic else legacy_side,
+        "_compute_channel_loss": legacy_compute_variadic if variadic else legacy_compute,
+    }
+    custom_computer = type("LegacyComputer", (ChannelLossComputer,), {override: methods[override]})
+    computer = custom_computer(parallel_state=_test_parallel_state())
+    computer.strict = strict
+    computer._dpo_segments = True
+    computer._source_ids = ["source"]
+    log_probs = torch.randn(1, 4, requires_grad=True)
+    labels = torch.tensor([[0, 1, 2, 3]])
+
+    def observe():
+        with computer.capture():
+            objective = log_probs.square().sum()
+            computer.observe_dpo_log_probs(log_probs, labels, [0, 2, 4])
+        return objective
+
+    if strict:
+        with pytest.raises(ChannelLossMetadataError, match="expanded per-token log-probs"):
+            observe()
+    else:
+        loss = observe()
+        loss.backward()
+        torch.testing.assert_close(log_probs.grad, 2 * log_probs.detach(), rtol=0, atol=0)
+    assert not calls
+    assert computer._result is None
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_legacy_observer_exception_is_handled_without_losing_main_loss(strict):
+    class LegacyComputer(ChannelLossComputer):
+        def compute_side_channel(
+            self, logits, labels, vocab_size, hidden_states, weights, shift_labels=None, ignore_index=-100
+        ):
+            raise RuntimeError("observer only")
+
+    computer = LegacyComputer(parallel_state=_test_parallel_state())
+    computer.strict = strict
+    computer._source_ids = ["source"]
+    computer._original_loss_fn = lambda logits, labels, vocab_size: logits.square().sum()
+    logits = torch.ones(1, 2, 3, requires_grad=True)
+
+    def observe():
+        with computer.capture():
+            return computer._wrapped_loss_fn(logits, torch.tensor([[0, 1]]), 3)
+
+    if strict:
+        with pytest.raises(ChannelLossMetadataError, match="observer only"):
+            observe()
+    else:
+        loss = observe()
+        loss.backward()
+        torch.testing.assert_close(logits.grad, 2 * logits.detach(), rtol=0, atol=0)
+    assert computer._result is None
+
+
+@pytest.mark.parametrize("override", ["compute_side_channel", "_compute_channel_loss"])
+@pytest.mark.parametrize("bias_kind", ["full", "factored"])
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("variadic", [False, True])
+def test_legacy_observer_without_bias_support_never_reports_unbiased_metrics(override, bias_kind, strict, variadic):
+    calls = []
+
+    def side(self, logits, labels, vocab_size, hidden_states, weights, shift_labels=None, ignore_index=-100):
+        calls.append(1)
+
+    def compute(self, logits, labels, vocab_size, hidden_states, weights, attention_mask, shift_labels, ignore_index):
+        calls.append(1)
+        return []
+
+    def side_variadic(
+        self, logits, labels, vocab_size, hidden_states, weights, shift_labels=None, ignore_index=-100, **kwargs
+    ):
+        calls.append(1)
+
+    def compute_variadic(
+        self, logits, labels, vocab_size, hidden_states, weights, attention_mask, shift_labels, ignore_index, **kwargs
+    ):
+        calls.append(1)
+        return []
+
+    methods = {
+        "compute_side_channel": side_variadic if variadic else side,
+        "_compute_channel_loss": compute_variadic if variadic else compute,
+    }
+    legacy = type("LegacyComputer", (ChannelLossComputer,), {override: methods[override]})
+    computer = legacy(parallel_state=_test_parallel_state())
+    computer.strict = strict
+    computer._source_ids = ["source"]
+    computer._position_ids = torch.arange(3).unsqueeze(0)
+    hidden = torch.randn(1, 3, 2, requires_grad=True)
+    weight = torch.randn(4, 2)
+    bias = torch.randn(1, 3, 4 if bias_kind == "full" else 2)
+    bias_weight = torch.randn(4, 2) if bias_kind == "factored" else None
+
+    def loss_fn(hidden_states, labels, weights, logits_bias=None, logits_bias_weight=None):
+        scores = F.linear(hidden_states, weights)
+        scores = scores + (
+            F.linear(logits_bias, logits_bias_weight) if logits_bias_weight is not None else logits_bias
+        )
+        return scores.square().sum()
+
+    computer._original_loss_fn = loss_fn
+    labels = torch.tensor([[0, 1, 2]])
+    with pytest.raises(ChannelLossMetadataError, match="logits bias") if strict else nullcontext():
+        with computer.capture():
+            loss = computer._wrapped_loss_fn(hidden, labels, weight, logits_bias=bias, logits_bias_weight=bias_weight)
+    if not strict:
+        loss.backward()
+        assert torch.isfinite(hidden.grad).all()
+    assert not calls and computer._result is None
+
+
+def test_modern_observer_override_receives_supported_bias():
+    seen = []
+
+    class ModernComputer(ChannelLossComputer):
+        def compute_side_channel(
+            self,
+            logits,
+            labels,
+            vocab_size,
+            hidden_states,
+            weights,
+            shift_labels=None,
+            ignore_index=-100,
+            logits_bias=None,
+            logits_bias_weight=None,
+        ):
+            seen.append((logits_bias, logits_bias_weight))
+
+    computer = ModernComputer(parallel_state=_test_parallel_state())
+    computer._source_ids = ["source"]
+    computer._original_loss_fn = lambda logits, labels, vocab_size, logits_bias=None: logits.square().sum()
+    bias = torch.randn(1, 2, 3)
+    with computer.capture():
+        loss = computer._wrapped_loss_fn(
+            torch.ones(1, 2, 3, requires_grad=True), torch.tensor([[0, 1]]), 3, logits_bias=bias
+        )
+    loss.backward()
+    assert seen == [(bias, None)]
+
+
+@pytest.mark.parametrize("override", ["compute_side_channel", "_compute_channel_loss"])
+def test_legacy_observer_without_bias_keeps_source_metrics(override):
+    def side(self, logits, labels, vocab_size, hidden_states, weights, shift_labels=None, ignore_index=-100):
+        return super(type(self), self).compute_side_channel(
+            logits, labels, vocab_size, hidden_states, weights, shift_labels, ignore_index
+        )
+
+    def compute(self, logits, labels, vocab_size, hidden_states, weights, attention_mask, shift_labels, ignore_index):
+        return super(type(self), self)._compute_channel_loss(
+            logits, labels, vocab_size, hidden_states, weights, attention_mask, shift_labels, ignore_index
+        )
+
+    legacy = type(
+        "LegacyComputer", (ChannelLossComputer,), {override: side if override == "compute_side_channel" else compute}
+    )
+    computer = legacy(parallel_state=_test_parallel_state())
+    computer.strict = True
+    computer._source_ids = ["source"]
+    computer._position_ids = torch.arange(3).unsqueeze(0)
     computer._source_provenance = {
         "source_ids": ["source"],
-        "source_cu": [0, 2],
-        "input_mask": torch.ones(2, dtype=torch.bool),
+        "source_cu": [0, 3],
+        "input_mask": torch.ones(3, dtype=torch.bool),
         "tail": 0,
         "sp_size": 1,
         "sp_rank": 0,
     }
-    labels = torch.tensor([[0, 1]])
-    logits = torch.randn(1, 2, 3, requires_grad=True)
-    computer._original_loss_fn = lambda logits, labels, vocab_size: F.cross_entropy(
-        logits.reshape(-1, vocab_size), labels.reshape(-1)
-    )
-
-    async def run():
-        release = asyncio.Event()
-
-        async def stale_child():
-            await release.wait()
-            computer._wrapped_loss_fn(logits, labels, 3)
-            computer.observe_dpo_log_probs(torch.zeros(1, 2), labels, [0, 1, 2])
-
-        with computer.capture():
-            task = asyncio.create_task(stale_child())
-            await asyncio.sleep(0)
-        with computer.capture():
-            release.set()
-            await task
-            assert not computer._capture_errors
-            if dpo:
-                computer.observe_dpo_log_probs(torch.zeros(1, 2), labels, [0, 1, 2])
-            else:
-                computer._wrapped_loss_fn(logits, labels, 3)
-        assert computer._result is not None
-
-    asyncio.run(run())
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize("dpo", [False, True])
-def test_foreign_thread_cannot_mutate_errors_during_capture_finalization(monkeypatch, dpo):
-    import contextvars
-    import threading
-
-    computer = ChannelLossComputer(parallel_state=_test_parallel_state())
-    computer._source_ids = ["source"]
-    computer._dpo_segments = dpo
-    computer._original_loss_fn = lambda labels: labels.square().sum()
-    started, release, done = Event(), Event(), Event()
-    outcomes = []
-
-    def child():
-        started.set()
-        assert release.wait(timeout=5)
-        labels = torch.tensor([[2.0]], requires_grad=True)
-        loss = computer._wrapped_loss_fn(labels=labels)
-        computer.observe_dpo_log_probs(torch.zeros(1, 1), labels, [0, 1])
-        loss.backward()
-        outcomes.append((loss.item(), labels.grad.item()))
-        done.set()
-
-    def finalize():
-        release.set()
-        assert done.wait(timeout=5)
-        assert not computer._capture_errors
-
-    monkeypatch.setattr(computer, "_finalize_capture", finalize)
-
+    logits = torch.randn(1, 3, 4, requires_grad=True)
+    labels = torch.tensor([[0, 1, 2]])
+    computer._original_loss_fn = lambda logits, labels, vocab_size: logits.square().sum()
     with computer.capture():
-        context = contextvars.copy_context()
-        thread = threading.Thread(target=lambda: context.run(child), daemon=True)
-        thread.start()
-        assert started.wait(timeout=5)
-    thread.join(timeout=5)
-    assert not thread.is_alive()
-    assert outcomes == [(4.0, 4.0)]
+        loss = computer._wrapped_loss_fn(logits, labels, 4)
+    loss.backward()
+    shifted = F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
+    expected = F.cross_entropy(
+        logits.detach().reshape(-1, 4), shifted.reshape(-1), ignore_index=IGNORE_INDEX, reduction="sum"
+    )
+    torch.testing.assert_close(computer._result[0]["loss_sum"], expected)
+    assert computer._result[0]["token_count"].item() == 2
 
 
-def _gloo_late_observer_thread_worker(rank, world_size, endpoint):
-    import contextvars
-    import threading
-
-    import veomni.data.data_collator as data_collator
-
+def _gloo_legacy_compute_without_defer_worker(rank, world_size, strict, variadic, endpoint):
+    torch.distributed.init_process_group(
+        "gloo", store=endpoint.connect(), rank=rank, world_size=world_size, timeout=timedelta(seconds=30)
+    )
     try:
-        torch.distributed.init_process_group(
-            "gloo", store=endpoint.connect(), rank=rank, world_size=world_size, timeout=timedelta(seconds=40)
+        calls = []
+
+        def legacy(
+            self, logits, labels, vocab_size, hidden_states, weights, attention_mask, shift_labels, ignore_index
+        ):
+            calls.append(1)
+            return []
+
+        def legacy_variadic(
+            self,
+            logits,
+            labels,
+            vocab_size,
+            hidden_states,
+            weights,
+            attention_mask,
+            shift_labels,
+            ignore_index,
+            **kwargs,
+        ):
+            calls.append(1)
+            return []
+
+        LegacyComputer = type(
+            "LegacyComputer",
+            (ChannelLossComputer,),
+            {"_compute_channel_loss": legacy_variadic if variadic else legacy},
         )
-        parallel_state_module._init_parallel_state(
-            dp_size=1, dp_shard_size=1, cp_size=1, ulysses_size=world_size, device_type="cpu", name="late-observer"
+
+        state = SimpleNamespace(
+            sp_enabled=True, sp_group=torch.distributed.group.WORLD, sp_size=world_size, sp_rank=rank
         )
-        cfg = ChannelLossConfig(enable=True, interval=1)
-        batch = data_collator.MainCollator(channel_loss_source_id_keys=tuple(cfg.source_id_keys))(
-            [{"input_ids": torch.tensor([0, 1, 2, 3]), "labels": torch.tensor([0, 1, 2, 3]), "ds_idx": 0}]
-        )
-        callback = ChannelLossCallback(SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg))))
-        callback.on_step_begin(TrainerState(global_step=1), micro_batches=[batch])
-        callback.on_micro_step_begin(TrainerState(global_step=1), micro_batch=batch)
-        computer = callback.computer
-
-        def training_loss(logits, labels, vocab_size, shift_labels=None):
-            return F.cross_entropy(logits.reshape(-1, vocab_size), shift_labels.reshape(-1), ignore_index=IGNORE_INDEX)
-
-        computer._original_loss_fn = training_loss
-        labels = batch["labels"]
-        logits = torch.zeros(*labels.shape, 5, requires_grad=True)
-        release, done = threading.Event(), threading.Event()
-        errors = []
-
-        def child():
-            try:
-                assert release.wait(timeout=20)
-                other = torch.ones(*labels.shape, 5, requires_grad=True)
-                child_loss = computer._wrapped_loss_fn(other, labels, 5, shift_labels=labels)
-                child_loss.backward()
-                assert other.grad is not None
-            except BaseException as error:
-                errors.append(error)
-            finally:
-                done.set()
-
-        original_all_gather = torch.distributed.all_gather
-        original_all_gather_object = torch.distributed.all_gather_object
-        fired = False
-
-        def trigger():
-            nonlocal fired
-            if rank == 0 and not fired:
-                fired = True
-                release.set()
-                assert done.wait(timeout=20)
-                assert not errors and not computer._capture_errors
-
-        def all_gather(*args, **kwargs):
-            trigger()
-            return original_all_gather(*args, **kwargs)
-
-        def all_gather_object(*args, **kwargs):
-            trigger()
-            return original_all_gather_object(*args, **kwargs)
-
-        try:
+        computer = LegacyComputer(parallel_state=state)
+        computer.strict = strict
+        computer._source_ids = ["source"]
+        computer._position_ids = torch.tensor([[rank * 2, rank * 2 + 1]])
+        computer._original_loss_fn = lambda logits, labels, vocab_size: logits.square().sum()
+        logits = torch.randn(1, 2, 4, requires_grad=True)
+        labels = torch.tensor([[0, 1]])
+        with pytest.raises(ChannelLossMetadataError, match="cannot defer SP") if strict else nullcontext():
             with computer.capture():
-                loss = computer._wrapped_loss_fn(logits, labels, 5, shift_labels=labels)
-                if rank == 0:
-                    context = contextvars.copy_context()
-                    thread = threading.Thread(target=lambda: context.run(child))
-                    thread.start()
-                torch.distributed.all_gather = all_gather
-                torch.distributed.all_gather_object = all_gather_object
-        finally:
-            torch.distributed.all_gather = original_all_gather
-            torch.distributed.all_gather_object = original_all_gather_object
-        if rank == 0:
-            thread.join(timeout=5)
-            assert fired and not thread.is_alive() and not errors
-        loss.backward()
-        assert logits.grad is not None and computer._result[0]["token_count"].item() == 3
+                loss = computer._wrapped_loss_fn(logits, labels, 4)
+        if not strict:
+            loss.backward()
+            torch.testing.assert_close(logits.grad, 2 * logits.detach(), rtol=0, atol=0)
+        assert not calls and computer._result is None
     finally:
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
-        parallel_state_module.clear_parallel_state()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_real_gloo_late_observer_thread_does_not_diverge_collectives():
-    spawn_with_rendezvous(_gloo_late_observer_thread_worker, args=(2,), nprocs=2)
+        torch.distributed.destroy_process_group()
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("strict", [False, True])
-def test_foreign_observation_survives_unrelated_nested_capture_rollback(strict):
+@pytest.mark.parametrize("variadic", [False, True])
+def test_gloo_legacy_compute_without_defer_fails_closed(strict, variadic):
+    spawn_with_rendezvous(_gloo_legacy_compute_without_defer_worker, args=(2, strict, variadic), nprocs=2)
+
+
+def _gloo_modern_compute_accepts_defer_worker(rank, world_size, endpoint):
+    torch.distributed.init_process_group(
+        "gloo", store=endpoint.connect(), rank=rank, world_size=world_size, timeout=timedelta(seconds=30)
+    )
+    try:
+        calls = []
+
+        class ModernComputer(ChannelLossComputer):
+            def _compute_channel_loss(self, *args, defer_sp=False, **kwargs):
+                calls.append(defer_sp)
+                return super()._compute_channel_loss(*args, defer_sp=defer_sp, **kwargs)
+
+        state = SimpleNamespace(
+            sp_enabled=True, sp_group=torch.distributed.group.WORLD, sp_size=world_size, sp_rank=rank
+        )
+        computer = ModernComputer(parallel_state=state)
+        computer.strict = True
+        computer._source_ids = ["source"]
+        computer._position_ids = torch.tensor([[rank * 2, rank * 2 + 1]])
+        computer._source_provenance = {
+            "source_ids": ["source"],
+            "source_cu": [0, 4],
+            "input_mask": torch.ones(4, dtype=torch.bool),
+            "tail": 0,
+            "sp_size": 2,
+            "sp_rank": rank,
+        }
+        computer._original_loss_fn = lambda logits, labels, vocab_size: logits.square().sum()
+        logits = torch.randn(1, 2, 4, requires_grad=True)
+        with computer.capture():
+            loss = computer._wrapped_loss_fn(logits, torch.tensor([[0, 1]]), 4)
+        loss.backward()
+        assert calls == [True]
+        assert computer._result[0]["token_count"].item() == 4
+        torch.testing.assert_close(logits.grad, 2 * logits.detach(), rtol=0, atol=0)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_gloo_modern_compute_receives_deferred_sp():
+    spawn_with_rendezvous(_gloo_modern_compute_accepts_defer_worker, args=(2,), nprocs=2)
+
+
+def test_positional_only_bias_is_not_claimed_as_supported():
+    def observer(logits_bias=None, /, **kwargs):
+        pass
+
+    bias = torch.ones(1)
+    supported = channel_loss_module._supported_observer_kwargs(observer, {"logits_bias": bias, "defer_sp": True})
+    assert "logits_bias" not in supported and "defer_sp" not in supported
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_dpo_observer_detach_error_is_coordinated(strict):
+    class BadLogProbs:
+        def detach(self):
+            raise RuntimeError("observer detach failed")
+
     computer = ChannelLossComputer(parallel_state=_test_parallel_state())
     computer.strict = strict
+    computer._dpo_segments = True
     computer._source_ids = ["source"]
-    computer._source_provenance = {
-        "source_ids": ["source"],
-        "source_cu": [0, 2],
-        "input_mask": torch.ones(2, dtype=torch.bool),
-        "tail": 0,
-        "sp_size": 1,
-        "sp_rank": 0,
-    }
-    labels = torch.tensor([[0, 1]])
-    logits = torch.randn(1, 2, 3, requires_grad=True)
-    computer._original_loss_fn = lambda logits, labels, vocab_size: F.cross_entropy(
-        logits.reshape(-1, vocab_size), labels.reshape(-1)
-    )
-
-    async def run():
-        release = asyncio.Event()
-
-        async def child():
-            await release.wait()
-            return computer._wrapped_loss_fn(logits, labels, 3)
-
+    logits = torch.randn(1, 4, requires_grad=True)
+    with pytest.raises(ChannelLossMetadataError, match="observer detach failed") if strict else nullcontext():
         with computer.capture():
-            task = asyncio.create_task(child())
-            with pytest.raises(ValueError, match="unrelated nested failure"):
-                with computer.capture():
-                    release.set()
-                    child_loss = await task
-                    raise ValueError("unrelated nested failure")
-            outer_loss = computer._wrapped_loss_fn(logits, labels, 3)
-            (child_loss + outer_loss).backward()
-        assert computer._result is None
-        assert logits.grad is not None
-
-    if strict:
-        with pytest.raises(ChannelLossMetadataError, match="another task"):
-            asyncio.run(run())
-    else:
-        asyncio.run(run())
+            loss = logits.square().sum()
+            computer.observe_dpo_log_probs(BadLogProbs(), torch.tensor([[0, 1, 2, 3]]), [0, 2, 4])
+    if not strict:
+        loss.backward()
+        torch.testing.assert_close(logits.grad, 2 * logits.detach(), rtol=0, atol=0)
+    assert computer._result is None

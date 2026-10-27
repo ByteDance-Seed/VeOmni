@@ -21,7 +21,6 @@ under ``torch.no_grad()`` before the extra CE work runs.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import inspect
 import pickle
@@ -31,7 +30,7 @@ from collections.abc import Hashable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from numbers import Integral
-from threading import Lock, get_ident, local
+from threading import local
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
@@ -65,7 +64,6 @@ _LOSS_CALL_POSITIONAL_KEYS = ("logits", "labels", "vocab_size", "num_items_in_ba
 _ACTIVE_CHANNEL_LOSS_COMPUTER: ContextVar[ChannelLossComputer | None] = ContextVar(
     "veomni_active_channel_loss_computer", default=None
 )
-_ACTIVE_CHANNEL_LOSS_EPOCH: ContextVar[object | None] = ContextVar("veomni_active_channel_loss_epoch", default=None)
 _CHUNK_LOSS_CAPTURE = local()
 
 
@@ -77,8 +75,7 @@ def capture_chunk_loss_per_token(
     from ...ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
 
     previous = getattr(_CHUNK_LOSS_CAPTURE, "value", None)
-    owner = _capture_owner()
-    capture = {"_is_owner": lambda: _capture_owner() == owner}
+    capture = {}
     token = chunk_loss._CAPTURE.set(capture)
     _CHUNK_LOSS_CAPTURE.value = (consumer, on_error)
     completed = False
@@ -136,14 +133,6 @@ def _release_observer_cache(device: torch.device) -> None:
 
 def _source_signature_digest(source_ids: list[ChannelKey]) -> str:
     return hashlib.sha256(repr(_source_id_signature(source_ids)).encode("utf-8", errors="surrogatepass")).hexdigest()
-
-
-def _capture_owner() -> tuple[int, Any]:
-    try:
-        task = asyncio.current_task()
-    except RuntimeError:
-        task = None
-    return get_ident(), task
 
 
 def _serialize_channel_sp_observation(observation):
@@ -336,12 +325,6 @@ class ChannelLossComputer:
         self._capture_topology: dict[str, Any] | None = None
         self._capture_group: Any | None = None
         self._observer_devices: list[torch.device] = []
-        self._capture_lock = Lock()
-        self._capture_state_lock = Lock()
-        self._capture_accepting = False
-        self._foreign_capture_errors: list[tuple[str, str]] = []
-        self._capture_owner: tuple[int, Any] | None = None
-        self._capture_epoch: object | None = None
         self._per_mb_source_ids: list[list[ChannelKey]] = []
         self._per_mb_position_ids: list[torch.Tensor | None] = []
         self._per_mb_attention_masks: list[torch.Tensor | None] = []
@@ -464,39 +447,12 @@ class ChannelLossComputer:
 
     @property
     def capture_active(self) -> bool:
-        if _ACTIVE_CHANNEL_LOSS_COMPUTER.get() is not self:
-            return False
-        with self._capture_state_lock:
-            if not self._capture_accepting or _ACTIVE_CHANNEL_LOSS_EPOCH.get() is not self._capture_epoch:
-                return False
-            if self._capture_owner != _capture_owner():
-                raise RuntimeError("Concurrent capture on the same ChannelLossComputer is unsupported.")
-            return True
-
-    def _can_observe(self, kind: str) -> bool:
-        if _ACTIVE_CHANNEL_LOSS_COMPUTER.get() is not self:
-            return False
-        with self._capture_state_lock:
-            if not self._capture_accepting or _ACTIVE_CHANNEL_LOSS_EPOCH.get() is not self._capture_epoch:
-                return False
-            if self._capture_owner != _capture_owner():
-                self._foreign_capture_errors.append(
-                    ("metadata", f"{kind} ran in another task; skipping its observation")
-                )
-                return False
-            return True
+        return _ACTIVE_CHANNEL_LOSS_COMPUTER.get() is self
 
     @contextmanager
     def capture(self) -> Iterator[None]:
         nested = self.capture_active
         if not nested:
-            if not self._capture_lock.acquire(blocking=False):
-                raise RuntimeError("Concurrent capture on the same ChannelLossComputer is unsupported.")
-            with self._capture_state_lock:
-                self._capture_owner = _capture_owner()
-                self._capture_epoch = object()
-                self._capture_accepting = True
-                self._foreign_capture_errors = []
             self._reset_capture_state()
             self._capture_topology = self._snapshot_topology()
         pending_count = len(self._pending_observations)
@@ -506,18 +462,12 @@ class ChannelLossComputer:
         devices_count = len(self._observer_devices)
         previous_result, previous_data = self._result, self._data_result
         token = _ACTIVE_CHANNEL_LOSS_COMPUTER.set(self)
-        epoch_token = _ACTIVE_CHANNEL_LOSS_EPOCH.set(self._capture_epoch)
         completed = False
         try:
             yield
             completed = True
         finally:
-            if not nested:
-                with self._capture_state_lock:
-                    self._capture_accepting = False
-                    self._capture_errors.extend(self._foreign_capture_errors)
             _ACTIVE_CHANNEL_LOSS_COMPUTER.reset(token)
-            _ACTIVE_CHANNEL_LOSS_EPOCH.reset(epoch_token)
             if not completed:
                 del self._pending_observations[pending_count:]
                 del self._capture_errors[error_count:]
@@ -526,16 +476,10 @@ class ChannelLossComputer:
                 self._pending_data_observation_index = data_index
                 self._result, self._data_result = previous_result, previous_data
             if not nested:
-                try:
-                    if completed:
-                        self._finalize_capture()
-                    else:
-                        self._reset_capture_state()
-                finally:
-                    with self._capture_state_lock:
-                        self._capture_owner = None
-                        self._capture_epoch = None
-                    self._capture_lock.release()
+                if completed:
+                    self._finalize_capture()
+                else:
+                    self._reset_capture_state()
 
     def _reset_capture_state(self) -> None:
         self._pending_observations = []
@@ -912,7 +856,7 @@ class ChannelLossComputer:
 
     def _wrapped_loss_fn(self, *args: Any, **kwargs: Any) -> Any:
         assert self._original_loss_fn is not None
-        if not self._source_ids or self._dpo_segments or not self._can_observe("causal loss"):
+        if not self._source_ids or self._dpo_segments or not self.capture_active:
             return self._original_loss_fn(*args, **kwargs)
         reused = []
         errors = []
@@ -937,7 +881,7 @@ class ChannelLossComputer:
         if ignore_index is None:
             ignore_index = IGNORE_INDEX
         if self.capture_active and self._source_ids and labels is not None:
-            self.compute_side_channel(
+            observer_kwargs = dict(
                 logits=logits,
                 labels=labels,
                 vocab_size=vocab_size,
@@ -945,18 +889,42 @@ class ChannelLossComputer:
                 weights=call_args.get("weights"),
                 shift_labels=call_args.get("shift_labels"),
                 ignore_index=ignore_index,
-                reused_per_token_loss=reused[0] if reused else None,
-                logits_bias=call_args.get("logits_bias"),
-                logits_bias_weight=call_args.get("logits_bias_weight"),
             )
+            extras = {
+                "reused_per_token_loss": reused[0] if reused else None,
+                "logits_bias": call_args.get("logits_bias"),
+                "logits_bias_weight": call_args.get("logits_bias_weight"),
+            }
+            accepted = _supported_observer_kwargs(self.compute_side_channel, extras)
+            if any(extras[key] is not None and key not in accepted for key in ("logits_bias", "logits_bias_weight")):
+                self._observation_attempt_count += 1
+                self._capture_errors.append(("metadata", "custom channel observer cannot receive logits bias"))
+                return main_loss
+            observer_kwargs.update(accepted)
+            try:
+                self.compute_side_channel(**observer_kwargs)
+            except Exception as error:
+                self._observation_attempt_count += 1
+                self._capture_errors.append(
+                    ("generic", f"custom channel observer failed: {type(error).__name__}: {error}")
+                )
 
         return main_loss
 
     def observe_dpo_log_probs(self, log_probs: torch.Tensor, labels: torch.Tensor, attention_cu: Any) -> None:
         """Observe expanded policy log-probs, after any model-side row compaction."""
-        if not self._dpo_segments or not self._source_ids or not self._can_observe("DPO log-probs"):
+        if not self._dpo_segments or not self._source_ids or not self.capture_active:
             return
         try:
+            extras = {"reused_per_token_loss": -log_probs.detach()}
+            observer_extras = _supported_observer_kwargs(self.compute_side_channel, extras)
+            compute_extras = _supported_observer_kwargs(self._compute_channel_loss, extras)
+            if "reused_per_token_loss" not in observer_extras or "reused_per_token_loss" not in compute_extras:
+                self._observation_attempt_count += 1
+                self._capture_errors.append(
+                    ("metadata", "custom DPO observers must accept expanded per-token log-probs")
+                )
+                return
             self._dpo_attention_cu = attention_cu
             self.compute_side_channel(
                 logits=None,
@@ -964,7 +932,7 @@ class ChannelLossComputer:
                 vocab_size=None,
                 hidden_states=None,
                 weights=None,
-                reused_per_token_loss=-log_probs.detach(),
+                **observer_extras,
             )
         except Exception as error:
             self._observation_attempt_count += 1
@@ -1002,7 +970,7 @@ class ChannelLossComputer:
             if device is not None:
                 self._observer_devices.append(device)
         try:
-            result = self._compute_channel_loss(
+            compute_kwargs = dict(
                 logits=logits,
                 labels=labels,
                 vocab_size=vocab_size,
@@ -1011,11 +979,20 @@ class ChannelLossComputer:
                 attention_mask=self._attention_mask,
                 shift_labels=shift_labels,
                 ignore_index=ignore_index,
-                defer_sp=True,
-                reused_per_token_loss=reused_per_token_loss,
-                logits_bias=logits_bias,
-                logits_bias_weight=logits_bias_weight,
             )
+            extras = {
+                "defer_sp": True,
+                "reused_per_token_loss": reused_per_token_loss,
+                "logits_bias": logits_bias,
+                "logits_bias_weight": logits_bias_weight,
+            }
+            accepted = _supported_observer_kwargs(self._compute_channel_loss, extras)
+            if self.parallel_state.sp_enabled and "defer_sp" not in accepted:
+                raise ChannelLossMetadataError("Custom channel loss computation cannot defer SP reduction.")
+            if any(extras[key] is not None and key not in accepted for key in ("logits_bias", "logits_bias_weight")):
+                raise ChannelLossMetadataError("Custom channel loss computation cannot receive logits bias.")
+            compute_kwargs.update(accepted)
+            result = self._compute_channel_loss(**compute_kwargs)
             if result:
                 is_mtp = isinstance(result, dict) and "depth_observations" in result
                 observations = result["depth_observations"] if is_mtp else [result]
@@ -2599,6 +2576,20 @@ def _as_flat_list(value: Any) -> list[Any]:
             result.extend(_as_flat_list(item))
         return result
     return [value]
+
+
+def _supported_observer_kwargs(method: Callable[..., Any], extras: dict[str, Any]) -> dict[str, Any]:
+    """Pass extensions accepted by old or user-overridden observer signatures."""
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {
+        name: value
+        for name, value in extras.items()
+        if name in parameters
+        and parameters[name].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
 
 
 def _bind_loss_call_args(
