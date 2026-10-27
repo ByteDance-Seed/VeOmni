@@ -10,8 +10,9 @@ trainer — `bash train.sh tasks/train_vlm.py <config>` — with no
 task-specific scripts. Verified on 8×910B3 with a 300-step full-parameter
 run (resumed from a step-10 distributed checkpoint): loss `13.7 → 4.4`,
 ~15 s/step, distributed checkpoint and resumable trainer state saved.
-The model package is also built to run on NVIDIA GPUs (end-to-end
-verification in progress); see [Start training on GPU](#start-training-on-gpu).
+The model package also runs the same trainer on NVIDIA GPUs, with verified
+training parity against the NPU stacks; see
+[Start training on GPU](#start-training-on-gpu).
 
 ## Install dependencies
 
@@ -133,11 +134,41 @@ bash train.sh tasks/train_vlm.py configs/multimodal/kimi_k3/kimi_k3_vl.yaml \
     --data.train_path configs/multimodal/data/k3_coco.yaml
 ```
 
-Not yet verified end-to-end in this guide — GPU parity runs against the
-NPU baseline are still in progress. Expected step-1 loss ≈ 13 (same random
-init over the 163 840 vocab). `ep_size: 2` routes the eager expert loop
-through the shared EP all-to-all — it trades compute replication for less
-expert memory per rank.
+Expected step-1 loss ≈ 13 (same random init over the 163 840 vocab).
+`ep_size: 2` routes the eager expert loop through the shared EP all-to-all —
+it trades compute replication for less expert memory per rank.
+
+### NPU↔GPU training parity
+
+Training parity between the GPU eager recipe and both NPU stacks (eager and
+fused) is verified with a fixed 200-step resume protocol. Both sides restart
+from the *same* step-10 distributed checkpoint — a published snapshot at
+ModelScope `wangyier7/kimi-k3-align-ckpt` (resume from its
+`checkpoints/global_step_10`) — with identical data order, seeding,
+batching and lr schedule:
+
+```bash
+--data.dataloader.shuffle false
+--train.seed 1234
+--train.enable_full_determinism true
+--train.max_steps 200
+--train.micro_batch_size 1  --train.global_batch_size 8
+--train.checkpoint.load_path <...>/checkpoints/global_step_10
+```
+
+Per-step loss deviation over the 200 steps:
+
+| pair | mean | median | max | loss @ step 200 |
+|---|---|---|---|---|
+| NPU fused vs GPU eager | 0.46% | 0.32% | 2.96% | 6.315 / 6.294 |
+| NPU eager vs GPU eager | 0.45% | 0.34% | 2.97% | 6.304 / 6.294 |
+
+The cross-machine deviation sits at the run-to-run variation the GPU
+platform itself shows under this protocol (about 0.4% mean between repeated
+runs), and the NPU side is bit-reproducible run over run on both stacks.
+One asymmetry to know: at global batch 8 the NPU **eager** stack needs
+`--model.accelerator.fsdp_config.offload true` to fit, while the fused
+stack runs without offload.
 
 ## Scale up
 
@@ -202,13 +233,3 @@ hand:
 make patchgen          # regenerate patchgen configs
 make check-patchgen    # CI gate: generated files up to date
 ```
-
-## Troubleshooting
-
-| Symptom | Cause / fix |
-|---|---|
-| `SpaceRegistry is nullptr` / `561103` | container must use ascend runtime + privileged mode, not runc + raw davinci mounts |
-| `tiling function does not exist` | fla-npu OPP pack not installed |
-| `ImportError: chunk_kda_bwd` | fla-npu too old; install the local build |
-| OOM at CE with many images per pack | expanded-length hook not engaged — check the collate table log at startup |
-| GPU vision tower `ImportError: flash_attn` | install the gpu extra (`uv sync --extra gpu` / `pip install -e ".[gpu]"`) — the vision varlen fallback imports flash-attn lazily |

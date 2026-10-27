@@ -92,12 +92,22 @@ class ShortConvolution(nn.Conv1d):
 
 
 class FusedRMSNormGated(nn.Module):
-    """Eager gated RMSNorm: ``rms_norm(x) * sigmoid(gate)`` (fla-compatible interface)."""
+    """Eager gated RMSNorm: ``rms_norm(x) * sigmoid(gate)`` (fla-compatible interface,
+    including the learnable affine scale)."""
 
-    def __init__(self, dim: int, eps: float = 1e-5, activation: str = "sigmoid", **kwargs):
+    def __init__(
+        self, dim: int, eps: float = 1e-5, activation: str = "sigmoid", elementwise_affine: bool = True, **kwargs
+    ):
         super().__init__()
         self.eps = eps
         self.activation = activation
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+
+    def reset_parameters(self):
+        if self.elementwise_affine:
+            self.weight.data.fill_(1.0)
 
     def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
@@ -109,6 +119,8 @@ class FusedRMSNormGated(nn.Module):
             g = F.silu(g.float())
         else:
             raise NotImplementedError(f"Unsupported gated activation: {self.activation!r}")
+        if self.elementwise_affine:
+            x_f = x_f * self.weight
         return (x_f * g).to(dtype)
 
 

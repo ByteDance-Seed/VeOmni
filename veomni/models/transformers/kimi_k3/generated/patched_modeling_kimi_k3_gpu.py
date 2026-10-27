@@ -72,6 +72,7 @@ import torch.nn.functional as F
 import torch.nn.init as init
 import torch.utils.checkpoint
 from einops import rearrange
+from torch.distributed.tensor import DTensor
 from transformers.activations import ACT2FN, PytorchGELUTanh
 from transformers.cache_utils import Cache
 from transformers.configuration_utils import PretrainedConfig
@@ -121,6 +122,40 @@ logger = logging.get_logger(__name__)
 # VL_VISION_ATTENTION_FUNCTIONS. The "flash_attention_2" vision implementation
 # requires a flash_attn installation and is not supported on NPU.
 flash_attn_varlen_func = None
+
+
+def _zero_embedding_padding_row(weight: torch.Tensor, padding_idx: int) -> None:
+    """Zero an embedding's padding row without cross-rank collectives.
+
+    ``weight.data[padding_idx].zero_()`` on a ``Shard(0)`` DTensor triggers an
+    implicit Shard -> Replicate redistribution: under FSDP2 CPU offload the
+    materialized-on-CPU tensor has no communication backend (hard crash), and
+    even on device the indexed write lands in a discarded replicate copy, so
+    the padding row silently stays non-zero. Zeroing the owning rank's local
+    shard needs no collective and actually takes effect; plain (non-DTensor)
+    weights keep the original one-liner.
+    """
+
+    if not isinstance(weight, DTensor):
+        weight[padding_idx].zero_()
+        return
+    local = weight.to_local()
+    for mesh_dim, placement in enumerate(weight.placements):
+        if not placement.is_shard() or placement.dim != 0:
+            continue
+        coordinate = weight.device_mesh.get_coordinate()
+        if coordinate is None:
+            return
+        rank_along_dim = coordinate[mesh_dim]
+        num_shards = weight.device_mesh.size(mesh_dim)
+        base, remainder = divmod(weight.shape[0], num_shards)
+        offset = rank_along_dim * base + min(rank_along_dim, remainder)
+        length = base + (1 if rank_along_dim < remainder else 0)
+        if offset <= padding_idx < offset + length:
+            local[padding_idx - offset].zero_()
+        return
+    if padding_idx < local.shape[0]:
+        local[padding_idx].zero_()
 
 
 # ======================================================================
@@ -1505,7 +1540,11 @@ class KimiPreTrainedModel(PreTrainedModel):
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
+                _zero_embedding_padding_row(module.weight.data, module.padding_idx)
+        elif isinstance(module, FusedRMSNormGated):
+            module.reset_parameters()
+        elif isinstance(module, Learnable2DInterpPosEmbDivided_fixed):
+            module.reset_parameters()
 
 
 def _apply_attn_res(prefix_sum, block_residual, proj, norm):
@@ -1607,6 +1646,11 @@ class KimiLinearModel(KimiPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
+        # NOTE: under packed training the eager/sdpa attention implementations
+        # receive a plain causal mask over the whole pack -- samples later in a
+        # dynamic pack attend to earlier samples. Only the flash varlen path
+        # (cu_seqlens from the collator) is a valid numerical reference under
+        # packing; keep eager/sdpa to debug configurations.
         causal_mask = create_causal_mask(
             config=self.config,
             inputs_embeds=inputs_embeds,
@@ -2654,7 +2698,11 @@ class KimiK3PreTrainedModel(PreTrainedModel):
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
+                _zero_embedding_padding_row(module.weight.data, module.padding_idx)
+        elif isinstance(module, FusedRMSNormGated):
+            module.reset_parameters()
+        elif isinstance(module, Learnable2DInterpPosEmbDivided_fixed):
+            module.reset_parameters()
 
 
 class VisionTowerConfig(PretrainedConfig):

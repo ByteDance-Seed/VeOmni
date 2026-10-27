@@ -177,6 +177,7 @@ See the testing checklist below for what to add.
 | Position ID transposition | — | ✓ | ✓ |
 | `ForCausalLMLoss` | ✓ | ✓ | ✓ |
 | `get_position_id_func` | — | ✓ | ✓ |
+| `get_dyn_bsz_length_fn` expanded-length hook | — | if placeholders expand in-model | if placeholders expand in-model |
 
 For implementation details of each patch, refer to the example docs.
 
@@ -197,6 +198,7 @@ For implementation details of each patch, refer to the example docs.
 - [ ] SP ViT-to-LM fill-back (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`)
 - [ ] `get_position_id_func` using VeOmni token ID constants
 - [ ] `process_sample_*` in `data_transform.py`; `build_data_transform` in `VLMTrainer`
+- [ ] `get_dyn_bsz_length_fn` model hook when modality placeholders expand inside the model (dynamic batching must budget the expanded length)
 
 ### MoE Models
 

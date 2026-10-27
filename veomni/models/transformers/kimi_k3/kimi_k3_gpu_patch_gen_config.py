@@ -1167,7 +1167,11 @@ def kimi_pretrained_init_weights_patched(self, module):
     elif isinstance(module, nn.Embedding):
         module.weight.data.normal_(mean=0.0, std=std)
         if module.padding_idx is not None:
-            module.weight.data[module.padding_idx].zero_()
+            _zero_embedding_padding_row(module.weight.data, module.padding_idx)
+    elif isinstance(module, FusedRMSNormGated):
+        module.reset_parameters()
+    elif isinstance(module, Learnable2DInterpPosEmbDivided_fixed):
+        module.reset_parameters()
 
 
 @config.override_method(
@@ -1240,7 +1244,11 @@ def kimi_k3_pretrained_init_weights_patched(self, module):
     elif isinstance(module, nn.Embedding):
         module.weight.data.normal_(mean=0.0, std=std)
         if module.padding_idx is not None:
-            module.weight.data[module.padding_idx].zero_()
+            _zero_embedding_padding_row(module.weight.data, module.padding_idx)
+    elif isinstance(module, FusedRMSNormGated):
+        module.reset_parameters()
+    elif isinstance(module, Learnable2DInterpPosEmbDivided_fixed):
+        module.reset_parameters()
 
 
 @config.override_method(
@@ -1335,3 +1343,4 @@ KimiDecoderLayer = None  # noqa: E305
 KimiBlockSparseMLP = None  # noqa: E305
 KimiDeltaAttention = None  # noqa: E305
 KimiLinearModel = None  # noqa: E305
+Learnable2DInterpPosEmbDivided_fixed = None  # noqa: E305

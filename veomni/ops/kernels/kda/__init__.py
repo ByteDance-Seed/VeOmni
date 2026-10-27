@@ -20,8 +20,7 @@ training contract (varlen cu_seqlens, use_gate_in_kernel, beta-sigmoid) with
 initial_state=None / output_final_state=False. ``eager`` resolves the
 modeling-side reference lazily (fla ``chunk_kda`` when flash-linear-attention
 is installed, else ``chunk_kda_naive``) to avoid an ops -> models import
-cycle. A standalone triton fused entry was removed earlier (EP>1 NaN race
-with the MoE alltoall); the ascendc path covers production.
+cycle. The ascendc path is the production path.
 """
 
 from ...platform import NpuKernelRequirement

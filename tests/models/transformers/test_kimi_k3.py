@@ -524,3 +524,146 @@ def test_sp2_packed_forward_matches_single_rank(tmp_path):
         # fp32 reduction orders differ (per-shard CE means, a2a head exchange),
         # so the comparison carries a small absolute floor.
         torch.testing.assert_close(summed, _SP2_NPROC * ref, rtol=1e-3, atol=1e-3, msg=key)
+
+
+# ---------------------------------------------------------------------------
+# _init_weights: DTensor-safe padding row zeroing (FSDP2 Shard(0) embeddings)
+
+
+_PAD_NPROC = 2
+
+
+def _shard_ones(vocab, mesh, rank):
+    from torch.distributed.tensor import DTensor, Shard
+
+    base, remainder = divmod(vocab, _PAD_NPROC)
+    length = base + (1 if rank < remainder else 0)
+    offset = rank * base + min(rank, remainder)
+    local = torch.ones(length, 4)
+    shard = DTensor.from_local(local, mesh, [Shard(0)], shape=(vocab, 4), stride=(4, 1), run_check=False)
+    return shard, offset, length
+
+
+def _pad_row_worker(rank, rendezvous):
+    from torch.distributed.device_mesh import DeviceMesh
+
+    from veomni.models.transformers.kimi_k3.source.modeling_kimi_k3 import _zero_embedding_padding_row
+
+    os.environ["WORLD_SIZE"] = str(_PAD_NPROC)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=_PAD_NPROC,
+        timeout=timedelta(minutes=5),
+    )
+    try:
+        init_parallel_state_from_config(AcceleratorConfig(ulysses_size=_PAD_NPROC), name=None)
+        mesh = DeviceMesh("cpu", torch.arange(_PAD_NPROC))
+
+        # (vocab, padding_idx) pairs covering even and uneven chunk splits plus
+        # both shard boundaries: the padding row must be zeroed on the owning
+        # rank only, and every other row must stay untouched.
+        for vocab, padding_idx in ((10, 7), (10, 4), (11, 5), (11, 6)):
+            shard, offset, length = _shard_ones(vocab, mesh, rank)
+            _zero_embedding_padding_row(shard, padding_idx)
+            local = shard.to_local()
+            for row in range(length):
+                global_row = offset + row
+                if global_row == padding_idx:
+                    assert local[row].eq(0).all(), (vocab, padding_idx, rank)
+                else:
+                    assert local[row].eq(1).all(), (vocab, padding_idx, rank, global_row)
+
+        # The real ``_init_weights`` must wire the helper: on a DTensor-sharded
+        # embedding the padding row is zeroed on the owning rank while the
+        # element-wise ``normal_`` fill (shard-local by construction) keeps
+        # every other row non-zero.
+        model = _build_model()
+        embedding = torch.nn.Embedding(11, 4, padding_idx=6)
+        shard, offset, length = _shard_ones(11, mesh, rank)
+        embedding.weight = torch.nn.Parameter(shard)
+        model._init_weights(embedding)
+        local = embedding.weight.to_local()
+        for row in range(length):
+            global_row = offset + row
+            if global_row == 6:
+                assert local[row].eq(0).all(), rank
+            else:
+                assert local[row].abs().sum() > 0, (rank, global_row)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=_PAD_NPROC))
+def test_init_weights_padding_row_zeroed_on_shard(tmp_path):
+    """``weight.data[padding_idx].zero_()`` is a no-op (and, when params are
+    CPU-materialized under fsdp offload, a crash) on ``Shard(0)`` DTensors:
+    the indexed read redistributes to a discarded Replicate copy.  The fix
+    zeros the owning rank's local shard without any collective; this pins the
+    chunk-offset math on even and uneven splits plus the ``_init_weights``
+    wiring on a real (tiny) model.
+    """
+    mp.spawn(_pad_row_worker, args=((tmp_path / "rendezvous").as_uri(),), nprocs=_PAD_NPROC)
+
+
+def test_zero_embedding_padding_row_plain_tensor():
+    from veomni.models.transformers.kimi_k3.source.modeling_kimi_k3 import _zero_embedding_padding_row
+
+    weight = torch.ones(10, 4)
+    _zero_embedding_padding_row(weight, 3)
+    assert weight[3].eq(0).all()
+    assert weight.sum() == 36.0
+
+
+def test_kda_o_norm_affine_matches_fla_semantics():
+    from veomni.models.transformers.kimi_k3.source.kda_fallback import FusedRMSNormGated
+
+    # fla's FusedRMSNormGated defaults to elementwise_affine=True with a
+    # ones-initialised learnable scale; the vendored fallback must mirror it
+    # so released checkpoints carry (and load) the o_norm scale.
+    norm = FusedRMSNormGated(8)
+    assert norm.elementwise_affine
+    assert norm.weight.shape == (8,) and norm.weight.eq(1).all()
+
+    x = torch.randn(4, 8, generator=torch.Generator().manual_seed(0))
+    g = torch.randn(4, 8, generator=torch.Generator().manual_seed(1))
+    x_f = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + norm.eps)
+    ref = (x_f * torch.sigmoid(g.float())).to(x.dtype)
+    torch.testing.assert_close(norm(x, g), ref)  # weight=1 is an exact no-op
+
+    with torch.no_grad():
+        norm.weight.mul_(2.0)
+    torch.testing.assert_close(norm(x, g), ref * 2.0)  # scale applies post-norm
+
+    plain = FusedRMSNormGated(8, elementwise_affine=False)
+    assert not hasattr(plain, "weight")
+    torch.testing.assert_close(plain(x, g), ref)
+
+
+def test_init_weights_reinits_o_norm_and_vision_pos_emb():
+    from veomni.models.transformers.kimi_k3.source.kda_fallback import FusedRMSNormGated
+
+    model = _build_model()
+
+    # every KDA layer must expose the affine o_norm weight in the state dict
+    assert any(n.endswith("o_norm.weight") for n, _ in model.named_parameters())
+
+    # to_empty leaves allocator garbage behind; _init_weights must restore
+    # construction defaults for module types outside the Linear/Embedding
+    # chain. The pos-emb is taken from the built model itself so the
+    # isinstance dispatch matches the modeling backend under test.
+    pos_embs = [m for m in model.modules() if m.__class__.__name__ == "Learnable2DInterpPosEmbDivided_fixed"]
+    assert pos_embs, "vision pos-emb module missing from the built model"
+    pos_emb = pos_embs[0]
+    pos_emb.weight.data.fill_(float("nan"))
+    model._init_weights(pos_emb)
+    assert torch.isfinite(pos_emb.weight).all() and pos_emb.weight.abs().sum() > 0
+
+    # FusedRMSNormGated is shared with the generated modules (they import it
+    # from the vendored source module), so a standalone instance dispatches.
+    o_norm = FusedRMSNormGated(8)
+    o_norm.weight.data.fill_(float("nan"))
+    model._init_weights(o_norm)
+    assert o_norm.weight.eq(1).all()
